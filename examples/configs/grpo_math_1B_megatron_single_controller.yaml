@@ -181,6 +181,14 @@ rollout_checkpointing:
   extra_fingerprint_excluded_paths: []
 
 policy:
+  reference:
+    colocated:
+      enabled: true
+      # Resources apply only when enabled is false.
+      resources:
+        placement: separate_nodes  # same_node uses distinct GPUs on policy hosts
+        num_nodes: 1
+        gpus_per_node: 8
   dtensor_cfg:
     enabled: false
   megatron_cfg:

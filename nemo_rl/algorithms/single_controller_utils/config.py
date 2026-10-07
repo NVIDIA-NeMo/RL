@@ -62,7 +62,7 @@ from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
 )
-from nemo_rl.models.policy import MegatronConfig, PolicyConfig
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig, ReferencePlacementConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -849,6 +849,20 @@ class MasterConfig(BaseModel, extra="allow"):
     telemetry: Optional[TelemetryConfig] = None
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
 
+    @property
+    def reference_resources(self) -> Optional[ReferencePlacementConfig]:
+        reference = self.policy.get("reference")
+        if reference is None or reference.colocated.enabled:
+            return None
+        return reference.colocated.resources
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_top_level_reference(cls, value: Any) -> Any:
+        if isinstance(value, Mapping) and "reference" in value:
+            raise ValueError("Use policy.reference.colocated instead of reference")
+        return value
+
     @model_validator(mode="after")
     def validate_algorithm_block(self) -> "MasterConfig":
         # Both are Optional so a PPO run can omit `grpo`; without this the
@@ -1305,6 +1319,14 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    if master_config.reference_resources is not None and (
+        master_config.loss_fn.reference_policy_kl_penalty <= 0
+        or algo_cfg.skip_reference_policy_logprobs_calculation
+    ):
+        raise ValueError(
+            "Separate reference placement requires reference-policy logprobs"
+        )
 
     reward_penalties_enabled = any(
         getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS

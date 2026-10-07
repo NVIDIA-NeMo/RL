@@ -97,6 +97,96 @@ from nemo_rl.utils.logger import LoggerConfig, WandbConfig
 _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
 
 
+@pytest.mark.parametrize("typed_draft", [False, True])
+def test_reference_loads_initial_weights_without_optimizer_or_second_reference(
+    monkeypatch,
+    typed_draft,
+) -> None:
+    from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+
+    draft = Eagle3DraftConfig(enabled=True) if typed_draft else {"enabled": True}
+    config = _make_master_config()
+    config.policy.update(
+        {
+            "model_name": "initial-checkpoint",
+            "dtensor_cfg": {"cpu_offload": True},
+            "draft": draft,
+            "router_replay": {"enabled": True},
+            "megatron_cfg": {"enabled": True, "tensor_model_parallel_size": 2},
+        }
+    )
+    config.policy["generation"].update({"top_k": 10, "top_p": 0.9, "temperature": 0.7})
+    factory = MagicMock()
+    monkeypatch.setattr(sc_setup_mod, "TQPolicy", factory)
+    sc_setup_mod._build_reference(MagicMock(), config, "tokenizer", None)
+    kwargs = factory.call_args.kwargs
+    assert kwargs["init_optimizer"] is False
+    assert kwargs["init_reference_model"] is False
+    assert kwargs["reference_only"] is True
+    assert "weights_path" not in kwargs and "optimizer_path" not in kwargs
+    frozen = kwargs["config"]
+    assert frozen["model_name"] == "initial-checkpoint"
+    assert frozen["megatron_cfg"] == config.policy["megatron_cfg"]
+    assert frozen["generation"]["top_k"] is None
+    assert frozen["generation"]["top_p"] == 1.0
+    assert frozen["generation"]["temperature"] == 0.7
+    assert frozen["dtensor_cfg"]["cpu_offload"] is False
+    assert "draft" not in frozen
+    assert frozen["router_replay"]["enabled"] is False
+    assert config.policy["router_replay"]["enabled"] is True
+    assert draft == (
+        Eagle3DraftConfig(enabled=True) if typed_draft else {"enabled": True}
+    )
+    assert config.policy["generation"]["top_k"] == 10
+    assert config.policy["dtensor_cfg"]["cpu_offload"] is True
+
+
+def test_same_node_reference_pins_partial_policy_allocations_to_distinct_hosts(
+    monkeypatch,
+) -> None:
+    config = _make_master_config(colocated=True)
+    config.policy["generation"]["colocated"]["resources"] = {
+        "num_nodes": None,
+        "gpus_per_node": None,
+    }
+    _set_reference(config, placement="same_node", num_nodes=2, gpus_per_node=4)
+    nodes = [
+        {
+            "Alive": True,
+            "NodeID": "a",
+            "NodeManagerAddress": "10.0.0.1",
+            "Resources": {"GPU": 8},
+        },
+        {
+            "Alive": True,
+            "NodeID": "b",
+            "NodeManagerAddress": "10.0.0.2",
+            "Resources": {"GPU": 8},
+        },
+        {
+            "Alive": True,
+            "NodeID": "head",
+            "NodeManagerAddress": "10.0.0.3",
+            "Resources": {},
+        },
+    ]
+    monkeypatch.setattr(sc_setup_mod.ray, "nodes", lambda: nodes)
+    monkeypatch.setattr(
+        sc_setup_mod,
+        "get_ray_cluster_topology",
+        lambda: {"a": ("unknown", 1), "b": ("unknown", 2), "head": ("unknown", 0)},
+    )
+    cluster_factory = MagicMock()
+    monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", cluster_factory)
+    sc_setup_mod._build_clusters(config)
+    kwargs = cluster_factory.call_args.kwargs
+    assert kwargs["bundle_ct_per_node_list"] == [4, 4]
+    assert kwargs["node_resource_constraints"] == [
+        {"node:10.0.0.1": 0.001},
+        {"node:10.0.0.2": 0.001},
+    ]
+
+
 class _CheckpointingCustomSampler(WindowedSampler):
     """Custom sampler whose static capability must be validated during setup."""
 
@@ -257,6 +347,8 @@ def patched_factories():
     fake_policy = MagicMock(name="policy")
 
     with (
+        patch.object(sc_setup_mod.VllmGeneration, "init_cluster_placement_groups"),
+        patch.object(sc_setup_mod.MegatronGeneration, "init_cluster_placement_groups"),
         patch.object(
             sc_setup_mod,
             "setup_response_data",
@@ -321,6 +413,38 @@ def patched_factories():
             "fake_gen": fake_gen,
             "fake_policy": fake_policy,
         }
+
+
+def test_same_node_reference_reserves_gpus_before_separate_generation(
+    patched_factories, monkeypatch
+) -> None:
+    config = _make_master_config(
+        loss_cfg=ClippedPGLossConfig(reference_policy_kl_penalty=0.01)
+    )
+    _set_reference(config, placement="same_node", num_nodes=1, gpus_per_node=4)
+    events = []
+    reference_cluster = MagicMock()
+    reference_handle = MagicMock()
+    monkeypatch.setattr(
+        sc_setup_mod,
+        "_reserve_reference_cluster",
+        lambda *_: events.append("reference") or reference_cluster,
+    )
+    monkeypatch.setattr(
+        sc_setup_mod.VllmGeneration,
+        "init_cluster_placement_groups",
+        lambda *_: events.append("generation"),
+    )
+    monkeypatch.setattr(sc_setup_mod, "_build_reference", lambda *_: reference_handle)
+    monkeypatch.setattr(sc_setup_mod, "get_ray_cluster_topology", lambda: {})
+    monkeypatch.setattr(
+        sc_setup_mod.ray.util,
+        "placement_group_table",
+        lambda _: {"bundles_to_node_id": {}},
+    )
+    args, _ = setup_single_controller(config, MagicMock())
+    assert events == ["reference", "generation"]
+    assert args.reference_handle is reference_handle
 
 
 def test_build_generation_passes_sglang_config():
@@ -570,11 +694,16 @@ def test_single_controller_token_capture_nightly_recipe_resolves_to_runtime_cont
 
 
 @pytest.mark.parametrize(
-    ("reference_policy_kl_penalty", "expected_init_reference_model"),
-    [(0.0, False), (0.01, True)],
+    (
+        "reference_policy_kl_penalty",
+        "separate_reference",
+        "expected_init_reference_model",
+    ),
+    [(0.0, False, False), (0.01, False, True), (0.01, True, False)],
 )
 def test_build_trainer_initializes_reference_model_only_for_nonzero_kl(
     reference_policy_kl_penalty: float,
+    separate_reference: bool,
     expected_init_reference_model: bool,
 ) -> None:
     master_config = _make_master_config(
@@ -582,6 +711,8 @@ def test_build_trainer_initializes_reference_model_only_for_nonzero_kl(
             reference_policy_kl_penalty=reference_policy_kl_penalty
         )
     )
+    if separate_reference:
+        _set_reference(master_config, num_nodes=1, gpus_per_node=8)
 
     with patch.object(sc_setup_mod, "TQPolicy") as mock_policy:
         sc_setup_mod._build_trainer(
@@ -589,8 +720,8 @@ def test_build_trainer_initializes_reference_model_only_for_nonzero_kl(
             master_config,
             MagicMock(name="tokenizer"),
             None,
-            weights_path=None,
-            optimizer_path=None,
+            weights_path=Path("resumed-policy"),
+            optimizer_path=Path("resumed-optimizer"),
             checkpointing=True,
             reserved_http_server_ports={0: 5555, 2: 6666},
         )
@@ -600,6 +731,8 @@ def test_build_trainer_initializes_reference_model_only_for_nonzero_kl(
         is expected_init_reference_model
     )
     assert mock_policy.call_args.kwargs["checkpointing"] is True
+    assert mock_policy.call_args.kwargs["weights_path"] == Path("resumed-policy")
+    assert mock_policy.call_args.kwargs["optimizer_path"] == Path("resumed-optimizer")
     assert mock_policy.call_args.kwargs["reserved_http_server_ports"] == {
         0: 5555,
         2: 6666,
@@ -3097,3 +3230,216 @@ def test_load_opd_full_teacher_lm_heads_loads_one_head_per_unique_teacher(monkey
         "Qwen/teacher-a",
         "Qwen/teacher-b",
     ]
+
+
+@pytest.mark.parametrize("segment_size", [None, 1])
+@pytest.mark.parametrize(
+    "total_nodes,teacher_nodes,colocated,placement,reference_gpus,expected",
+    [
+        (2, 0, False, "separate_nodes", 4, ([4], [4])),
+        (1, 0, True, "same_node", 4, ([4], [4])),
+        (5, 2, False, "separate_nodes", 4, ([8], [4])),
+        (1, 0, False, "same_node", 2, ([2], [4])),
+        (2, 1, False, "same_node", 2, ([2], [4])),
+        (3, 1, False, "separate_nodes", 4, ([4], [4])),
+    ],
+)
+def test_reference_budget_uses_existing_student_split(
+    monkeypatch,
+    total_nodes,
+    teacher_nodes,
+    colocated,
+    placement,
+    reference_gpus,
+    expected,
+    segment_size,
+):
+    config = _make_master_config(colocated=colocated)
+    config.policy["generation"]["vllm_cfg"] = {"tensor_parallel_size": 1}
+    config.cluster = ClusterConfig(
+        num_nodes=total_nodes, gpus_per_node=8, segment_size=segment_size
+    )
+    config.policy["generation"]["colocated"]["resources"] = {
+        "num_nodes": 1,
+        "gpus_per_node": 4,
+    }
+    _set_reference(
+        config, placement=placement, num_nodes=1, gpus_per_node=reference_gpus
+    )
+    monkeypatch.setattr(
+        sc_setup_mod, "_non_colocated_teacher_node_count", lambda _: teacher_nodes
+    )
+    nodes = [
+        {
+            "Alive": True,
+            "NodeID": "a",
+            "NodeManagerAddress": "10.0.0.1",
+            "Resources": {"GPU": 8},
+        }
+    ]
+    monkeypatch.setattr(sc_setup_mod.ray, "nodes", lambda: nodes)
+    monkeypatch.setattr(
+        sc_setup_mod, "get_ray_cluster_topology", lambda: {"a": ("unknown", 0)}
+    )
+    monkeypatch.setattr(
+        sc_setup_mod,
+        "prepare_segment_topology",
+        lambda *args, **kwargs: (
+            [{"domain": 0.001}],
+            ["b"],
+            {"a": ("domain", 0), "b": ("domain", 1)},
+        ),
+    )
+    factory = MagicMock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", factory)
+    policy, generation, _ = sc_setup_mod._build_clusters(config)
+    assert policy.bundle_ct_per_node_list == expected[0]
+    assert generation.bundle_ct_per_node_list == expected[1]
+    if placement == "same_node" or total_nodes - teacher_nodes == 2:
+        assert policy.node_resource_constraints == [{"node:10.0.0.1": 0.001}]
+        assert generation.node_resource_constraints == policy.node_resource_constraints
+
+
+@pytest.mark.parametrize("reference_gpus", [4, 8])
+def test_same_node_reference_requires_gpus_left_for_policy(reference_gpus):
+    config = _make_master_config(colocated=False)
+    config.cluster = ClusterConfig(num_nodes=1, gpus_per_node=8)
+    config.policy["generation"]["colocated"]["resources"] = {
+        "num_nodes": 1,
+        "gpus_per_node": 4,
+    }
+    _set_reference(
+        config, placement="same_node", num_nodes=1, gpus_per_node=reference_gpus
+    )
+    with pytest.raises(ValueError, match="policy"):
+        sc_setup_mod._build_clusters(config)
+
+
+def test_misspelled_reference_setting_is_rejected():
+    from pydantic import ValidationError
+
+    from nemo_rl.algorithms.single_controller_utils.config import (
+        ReferencePlacementConfig,
+    )
+
+    with pytest.raises(ValidationError):
+        ReferencePlacementConfig(num_nodes=1, gpus_per_node=4, placment="same_node")
+
+
+@pytest.mark.parametrize(
+    "placement,expected_host", [("same_node", "a"), ("separate_nodes", "c")]
+)
+@pytest.mark.parametrize("segment_size", [None, 1])
+def test_reference_reservation_follows_actual_student_hosts(
+    monkeypatch, placement, expected_host, segment_size
+):
+    config = _make_master_config()
+    config.cluster = ClusterConfig(
+        num_nodes=3, gpus_per_node=8, segment_size=segment_size
+    )
+    _set_reference(config, placement=placement, num_nodes=1, gpus_per_node=4)
+    nodes = [
+        {
+            "Alive": True,
+            "NodeID": host,
+            "NodeManagerAddress": host,
+            "Resources": {"GPU": 8},
+        }
+        for host in ("a", "b", "c")
+    ]
+    monkeypatch.setattr(sc_setup_mod.ray, "nodes", lambda: nodes)
+    monkeypatch.setattr(
+        sc_setup_mod,
+        "get_ray_cluster_topology",
+        lambda: {host: ("fabric", i) for i, host in enumerate(("a", "b", "c"))},
+    )
+    policy, generation = MagicMock(), MagicMock()
+    policy.get_placement_groups.return_value = ["policy-pg"]
+    generation.get_placement_groups.return_value = ["generation-pg"]
+    monkeypatch.setattr(
+        sc_setup_mod.ray.util,
+        "placement_group_table",
+        lambda pg: {"bundles_to_node_id": {0: "a" if pg == "policy-pg" else "b"}},
+    )
+    factory = MagicMock()
+    monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", factory)
+    result = sc_setup_mod._reserve_reference_cluster(config, policy, generation)
+    assert factory.call_args.kwargs["node_resource_constraints"] == [
+        {f"node:{expected_host}": 0.001}
+    ]
+    assert factory.call_args.kwargs["bundle_ct_per_node_list"] == [4]
+    result.get_placement_groups.assert_called_once_with()
+
+
+def test_legacy_setup_reserves_teachers_before_generation(
+    patched_factories, monkeypatch
+):
+    config = _make_master_config()
+    events = []
+    monkeypatch.setattr(
+        sc_setup_mod.opd_module, "is_non_colocated_teachers_enabled", lambda _: True
+    )
+    monkeypatch.setattr(
+        sc_setup_mod.opd_module,
+        "reserve_teacher_clusters",
+        lambda *args, **kwargs: events.append("teachers") or {},
+    )
+    monkeypatch.setattr(
+        sc_setup_mod.VllmGeneration,
+        "init_cluster_placement_groups",
+        lambda *args: events.append("generation"),
+    )
+    monkeypatch.setattr(
+        sc_setup_mod,
+        "_build_generation",
+        lambda *args, **kwargs: (
+            events.append("generation") or patched_factories["fake_gen"],
+            0.0,
+        ),
+    )
+    setup_single_controller(config, tokenizer="tokenizer", processor=None)
+    assert events == ["teachers", "generation"]
+
+
+def _set_reference(config, **resources):
+    from nemo_rl.models.policy import ReferenceConfig
+
+    config.policy["reference"] = ReferenceConfig.model_validate(
+        {"colocated": {"enabled": False, "resources": resources}}
+    )
+
+
+def test_reference_colocation_defaults_and_resource_validation():
+    from omegaconf import OmegaConf
+    from pydantic import ValidationError
+
+    from nemo_rl.models.policy import ReferenceConfig
+    from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+
+    register_omegaconf_resolvers()
+    config = MasterConfig.model_validate(
+        OmegaConf.to_container(
+            load_config(
+                "examples/configs/grpo_math_1B_megatron_single_controller.yaml"
+            ),
+            resolve=True,
+        )
+    )
+    assert config.reference_resources is None
+    config.policy["reference"] = ReferenceConfig()
+    assert config.policy["reference"].colocated.enabled
+    assert config.reference_resources is None
+    config.policy["reference"] = ReferenceConfig.model_validate(
+        {"colocated": {"resources": {"num_nodes": 2, "gpus_per_node": 4}}}
+    )
+    assert config.reference_resources is None
+    _set_reference(config, num_nodes=1, gpus_per_node=8)
+    restored = type(config).model_validate(config.model_dump())
+    assert restored.reference_resources.num_nodes == 1
+    assert restored.reference_resources.gpus_per_node == 8
+    with pytest.raises(ValidationError, match="requires resources"):
+        ReferenceConfig.model_validate({"colocated": {"enabled": False}})
+    with pytest.raises(ValidationError, match="policy.reference.colocated"):
+        type(config).model_validate({**config.model_dump(), "reference": None})
+    with pytest.raises(ValidationError):
+        ReferenceConfig.model_validate({"colocated": {"enable": False}})

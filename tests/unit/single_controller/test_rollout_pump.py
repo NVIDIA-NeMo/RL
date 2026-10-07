@@ -1425,6 +1425,7 @@ def test_rollout_pump_writes_expected_tq_data(
     actor_args = SingleControllerActorArgs(
         gen_handle=vllm_generation,
         trainer_handle=object(),
+        reference_handle=None,
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]  # unused by _rollout_pump
         inference_cluster=None,  # type: ignore[arg-type]

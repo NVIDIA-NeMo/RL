@@ -809,6 +809,7 @@ def _make_actor_args(
     return SingleControllerActorArgs(
         gen_handle=gen if gen is not None else _FakeGeneration(),
         trainer_handle=trainer if trainer is not None else _FakeTrainer(),
+        reference_handle=None,
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]
         inference_cluster=None,  # type: ignore[arg-type]
