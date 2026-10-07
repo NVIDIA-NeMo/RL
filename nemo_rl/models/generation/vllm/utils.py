@@ -482,26 +482,209 @@ def attach_token_information_to_chat_response_choices(
                     f"logprob_count={len(generation_logprob_details)}."
                 )
             generation_log_probs = []
-            for token_id, position_logprobs in zip(
-                generation_token_ids, generation_logprob_details
-            ):
-                selected_token_logprob = position_logprobs.get(token_id)
-                if selected_token_logprob is None:
-                    raise RuntimeError(
-                        "vLLM generation log probabilities did not include the "
-                        "selected token while attaching token information to "
-                        "the OpenAI-compatible chat response: "
-                        f"choice_idx={choice.index}, token_id={token_id}."
+            flat = flat_logprobs_lists(generation_logprob_details)
+            if flat is not None:
+                # FlatLogprobs (the sampler top-k path): vLLM stores the sampled
+                # token first at every position, so read it off the primitive
+                # lists instead of materializing k+1 Logprob objects per token
+                # through FlatLogprobs.__getitem__.
+                start_indices, _, flat_token_ids, flat_logprobs, _ = flat
+                for position, token_id in enumerate(generation_token_ids):
+                    start = start_indices[position]
+                    if flat_token_ids[start] == token_id:
+                        selected_logprob = float(flat_logprobs[start])
+                    else:
+                        selected = generation_logprob_details[position].get(token_id)
+                        if selected is None:
+                            raise RuntimeError(
+                                "vLLM generation log probabilities did not include the "
+                                "selected token while attaching token information to "
+                                "the OpenAI-compatible chat response: "
+                                f"choice_idx={choice.index}, token_id={token_id}."
+                            )
+                        selected_logprob = float(selected.logprob)
+                    generation_log_probs.append(
+                        max(selected_logprob, VLLM_LOGPROB_FLOOR)
                     )
-                generation_log_probs.append(
-                    max(float(selected_token_logprob.logprob), VLLM_LOGPROB_FLOOR)
-                )
+            else:
+                for token_id, position_logprobs in zip(
+                    generation_token_ids, generation_logprob_details
+                ):
+                    selected_token_logprob = position_logprobs.get(token_id)
+                    if selected_token_logprob is None:
+                        raise RuntimeError(
+                            "vLLM generation log probabilities did not include the "
+                            "selected token while attaching token information to "
+                            "the OpenAI-compatible chat response: "
+                            f"choice_idx={choice.index}, token_id={token_id}."
+                        )
+                    generation_log_probs.append(
+                        max(float(selected_token_logprob.logprob), VLLM_LOGPROB_FLOOR)
+                    )
 
         choice.message.prompt_token_ids = list(prompt_token_ids)
         choice.message.generation_token_ids = generation_token_ids
         choice.message.generation_log_probs = generation_log_probs
 
     return response
+
+
+# SamplingParams.extra_args marker: the LogprobsProcessor hook below skips
+# candidate detokenization for requests carrying it.
+SAMPLER_TOPK_EXTRA_ARG = "nrl_sampler_topk"
+
+
+def widen_sampling_params_logprobs(sampling_params: Any, k: int) -> Any:
+    """Ask the engine for ``k`` candidate log-probs per token, cheaply.
+
+    ``SamplingParams.logprobs = k`` alone makes vLLM's v1 frontend build ``k+1``
+    ``Logprob`` objects per generated token and detokenize every candidate, on the
+    process that also serves the HTTP endpoint; at SWE concurrency that slowed
+    rollouts enough to multiply harness timeouts (8n-11-tksc smoke, 2026-10-07:
+    416 vs 31 unfinished OpenCode rollouts at step 1). Besides the count this sets
+
+    * ``flat_logprobs = True`` -- the frontend keeps candidates in ``FlatLogprobs``'
+      primitive lists instead of per-token dicts of ``Logprob`` objects;
+    * ``extra_args[SAMPLER_TOPK_EXTRA_ARG] = k`` -- the
+      :func:`install_sampler_topk_logprobs_patch` hook then builds the request's
+      ``LogprobsProcessor`` without a tokenizer, so no candidate is detokenized.
+
+    Ported from NeMo RL ``sdevare/score-centering`` (c6a93de5f).
+    """
+    k = int(k or 0)
+    if k <= 0:
+        return sampling_params
+    current = getattr(sampling_params, "logprobs", None) or 0
+    if current != -1 and current < k:  # -1 = full vocabulary, already a superset
+        sampling_params.logprobs = k
+    if hasattr(sampling_params, "flat_logprobs"):
+        sampling_params.flat_logprobs = True
+    extra_args = dict(getattr(sampling_params, "extra_args", None) or {})
+    extra_args[SAMPLER_TOPK_EXTRA_ARG] = k
+    sampling_params.extra_args = extra_args
+    return sampling_params
+
+
+_SAMPLER_TOPK_LOGPROBS_PATCH_ATTR = "_nemo_rl_sampler_topk_patch"
+
+
+def install_sampler_topk_logprobs_patch(logger: Any = None) -> bool:
+    """Stop vLLM's v1 frontend from detokenizing the sampler top-k candidates.
+
+    ``LogprobsProcessor._update_sample_logprobs`` runs the tokenizer over every
+    candidate id of every generated token unless the processor was built with
+    ``tokenizer=None``. The top-k capture needs ids and log-probs only, so for
+    requests marked by :func:`widen_sampling_params_logprobs` this builds the
+    processor without a tokenizer. Output text is untouched (the incremental
+    detokenizer gets the tokenizer separately). Must run in the process hosting
+    the engine frontend before marked requests arrive; idempotent. Returns False
+    when vLLM's layout is unknown (capture still works, just slower).
+    """
+    try:
+        from vllm.v1.engine.logprobs import LogprobsProcessor
+    except Exception as exc:  # pragma: no cover - depends on the installed vLLM
+        if logger is not None:
+            logger.warning("sampler top-k: could not patch vLLM LogprobsProcessor: %s", exc)
+        return False
+    if getattr(LogprobsProcessor, _SAMPLER_TOPK_LOGPROBS_PATCH_ATTR, False):
+        return True
+    original = LogprobsProcessor.__dict__.get("from_new_request")
+    if original is None or not hasattr(original, "__func__"):
+        if logger is not None:
+            logger.warning(
+                "sampler top-k: LogprobsProcessor.from_new_request is not a "
+                "classmethod; candidate detokenization stays on"
+            )
+        return False
+    original_func = original.__func__
+
+    def from_new_request(cls, tokenizer, request, *args, **kwargs):
+        sampling_params = getattr(request, "sampling_params", None)
+        extra_args = getattr(sampling_params, "extra_args", None) or {}
+        if extra_args.get(SAMPLER_TOPK_EXTRA_ARG):
+            tokenizer = None
+        return original_func(cls, tokenizer, request, *args, **kwargs)
+
+    from_new_request.__doc__ = original_func.__doc__
+    LogprobsProcessor.from_new_request = classmethod(from_new_request)  # type: ignore[method-assign]
+    setattr(LogprobsProcessor, _SAMPLER_TOPK_LOGPROBS_PATCH_ATTR, True)
+    if logger is not None:
+        logger.info(
+            "sampler top-k: vLLM LogprobsProcessor candidate detokenization "
+            "disabled for marked requests"
+        )
+    return True
+
+
+def flat_logprobs_lists(
+    logprobs: Any,
+) -> Optional[tuple[list, list, list, list, list]]:
+    """``(start_indices, end_indices, token_ids, logprobs, ranks)`` of a vLLM ``FlatLogprobs``.
+
+    Duck-typed on the primitive lists; None for the classic
+    ``list[dict[int, Logprob]]`` container.
+    """
+    if logprobs is None or isinstance(logprobs, (list, tuple, dict)):
+        return None
+    lists = []
+    for name in ("start_indices", "end_indices", "token_ids", "logprobs", "ranks"):
+        value = getattr(logprobs, name, None)
+        if value is None:
+            return None
+        lists.append(value)
+    return tuple(lists)  # type: ignore[return-value]
+
+
+def _topk_from_flat_logprobs(
+    flat: tuple[list, list, list, list, list], *, top_k: int, choice_idx: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[T, top_k]`` ids (int32) / log-probs (float32, floored) from ``FlatLogprobs``.
+
+    vLLM stores, per position, the sampled token first followed by the
+    ``top_k`` candidates in rank order 1..top_k. When every position has exactly
+    ``top_k + 1`` entries with candidate ranks 1..top_k (normal sampling) the head
+    is columns 1..top_k of the ``[T, top_k + 1]`` view, built in one tensor
+    construction. Anything irregular falls back to a per-position rank sort on the
+    primitive slices, with the same semantics as the dict path.
+    """
+    start_indices, end_indices, token_ids, logprobs, ranks = flat
+    num_positions = len(start_indices)
+    if num_positions == 0:
+        return (
+            torch.empty((0, top_k), dtype=torch.int32),
+            torch.empty((0, top_k), dtype=torch.float32),
+        )
+    width = top_k + 1
+    lo, hi = start_indices[0], end_indices[num_positions - 1]
+    if hi - lo == num_positions * width and all(
+        end_indices[p] - start_indices[p] == width for p in range(num_positions)
+    ):
+        flat_ranks = torch.tensor(ranks[lo:hi], dtype=torch.int64).view(num_positions, width)
+        if bool((flat_ranks[:, 1:] == torch.arange(1, width, dtype=torch.int64)).all()):
+            ids = torch.tensor(token_ids[lo:hi], dtype=torch.int32).view(num_positions, width)
+            lps = torch.tensor(logprobs[lo:hi], dtype=torch.float32).view(num_positions, width)
+            return (
+                ids[:, 1:].contiguous(),
+                lps[:, 1:].clamp_min(VLLM_LOGPROB_FLOOR).contiguous(),
+            )
+    ids_rows, lps_rows = [], []
+    for position in range(num_positions):
+        entries = {}
+        for i in range(start_indices[position], end_indices[position]):
+            entries.setdefault(int(token_ids[i]), (ranks[i], float(logprobs[i])))
+        head = sorted(entries.items(), key=lambda item: item[1][0])[:top_k]
+        if len(head) != top_k:
+            raise RuntimeError(
+                "vLLM returned fewer than top_k log-probs for a generated position "
+                f"while attaching top-k information: choice_idx={choice_idx}, "
+                f"top_k={top_k}."
+            )
+        ids_rows.append([token_id for token_id, _ in head])
+        lps_rows.append([max(lp, VLLM_LOGPROB_FLOOR) for _, (_, lp) in head])
+    return (
+        torch.tensor(ids_rows, dtype=torch.int32).reshape(-1, top_k),
+        torch.tensor(lps_rows, dtype=torch.float32).reshape(-1, top_k),
+    )
 
 
 def attach_topk_logprobs_to_chat_response_choices(
@@ -523,9 +706,18 @@ def attach_topk_logprobs_to_chat_response_choices(
         output.index: output for output in getattr(final_request_output, "outputs", [])
     }
     for choice in getattr(response, "choices", []):
+        position_logprobs = outputs_by_index[choice.index].logprobs
+        flat = flat_logprobs_lists(position_logprobs)
+        if flat is not None:
+            topk_ids, topk_logprobs = _topk_from_flat_logprobs(
+                flat, top_k=top_k, choice_idx=choice.index
+            )
+            choice.message.generation_topk_ids = topk_ids
+            choice.message.generation_topk_logprobs = topk_logprobs
+            continue
         ranked = [
             sorted(position.items(), key=lambda item: item[1].rank)[:top_k]
-            for position in outputs_by_index[choice.index].logprobs or []
+            for position in position_logprobs or []
         ]
         if any(len(row) != top_k for row in ranked):
             raise RuntimeError(

@@ -964,3 +964,70 @@ def test_pad_and_align_rejects_expert_ids_overflowing_dtype(monkeypatch):
             device=torch.device("cpu"),
             routed_experts_dtype=torch.int8,
         )
+
+
+@pytest.mark.vllm
+def test_flat_topk_capture_matches_the_dict_path():
+    """The widened FlatLogprobs path yields exactly what tkonuk's dict path yields."""
+    pytest.importorskip("vllm")
+    from types import SimpleNamespace
+
+    import numpy as np
+    from vllm.logprobs import FlatLogprobs
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine.logprobs import LogprobsProcessor
+    from vllm.v1.outputs import LogprobsLists
+
+    from nemo_rl.models.generation.vllm.utils import (
+        SAMPLER_TOPK_EXTRA_ARG,
+        attach_token_information_to_chat_response_choices,
+        attach_topk_logprobs_to_chat_response_choices,
+        widen_sampling_params_logprobs,
+    )
+
+    k, num_tokens, vocab = 8, 200, 5000
+    widened = widen_sampling_params_logprobs(SamplingParams(), k)
+    assert widened.logprobs == k and widened.flat_logprobs
+    assert widened.extra_args[SAMPLER_TOPK_EXTRA_ARG] == k
+    dict_proc = LogprobsProcessor.from_new_request(
+        tokenizer=None, request=SimpleNamespace(sampling_params=SamplingParams(logprobs=k))
+    )
+    flat_proc = LogprobsProcessor.from_new_request(
+        tokenizer=None, request=SimpleNamespace(sampling_params=widened)
+    )
+    assert isinstance(flat_proc.logprobs, FlatLogprobs)
+    rng = np.random.default_rng(0)
+    sampled = []
+    for _ in range(num_tokens):
+        head = rng.choice(vocab, size=k, replace=False).astype(np.int64)
+        head_lps = (-np.sort(rng.random(k)) * 5.0).astype(np.float32)
+        if rng.random() < 0.2:  # sampled token outside the head
+            token = int(np.setdiff1d(np.arange(vocab), head)[rng.integers(0, vocab - k)])
+            token_lp, token_rank = np.float32(head_lps[-1] - 1.0), k + 3
+        else:
+            slot = int(rng.integers(0, k))
+            token, token_lp, token_rank = int(head[slot]), head_lps[slot], slot + 1
+        sampled.append(token)
+        step = LogprobsLists(
+            np.concatenate([[token], head])[None, :],
+            np.concatenate([[token_lp], head_lps])[None, :],
+            np.array([token_rank]),
+            None,
+        )
+        dict_proc._update_sample_logprobs(step)
+        flat_proc._update_sample_logprobs(step)
+
+    def attach(logprobs):
+        final = SimpleNamespace(
+            prompt_token_ids=[1, 2],
+            outputs=[SimpleNamespace(index=0, token_ids=list(sampled), logprobs=logprobs)],
+        )
+        response = SimpleNamespace(choices=[SimpleNamespace(index=0, message=SimpleNamespace())])
+        attach_token_information_to_chat_response_choices(response, final)
+        attach_topk_logprobs_to_chat_response_choices(response, final, top_k=k)
+        return response.choices[0].message
+
+    from_dict, from_flat = attach(dict_proc.logprobs), attach(flat_proc.logprobs)
+    assert from_flat.generation_log_probs == from_dict.generation_log_probs
+    assert torch.equal(from_flat.generation_topk_ids, from_dict.generation_topk_ids)
+    assert torch.equal(from_flat.generation_topk_logprobs, from_dict.generation_topk_logprobs)
