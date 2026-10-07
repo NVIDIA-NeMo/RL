@@ -1178,8 +1178,9 @@ class _ScriptedGymEnv:
     """A NemoGym environment whose run_rollouts yields one scripted item list
     per dispatch and records the dispatched row indices."""
 
-    def __init__(self, scripts):
+    def __init__(self, scripts, rollout_settings=None):
         self.scripts = list(scripts)
+        self.rollout_settings = dict(rollout_settings or {})
         self.dispatched = []
         env = self
 
@@ -1203,7 +1204,12 @@ class _ScriptedGymEnv:
 
                 return stream()
 
+        class _RolloutConfig:
+            async def remote(self):
+                return dict(env.rollout_settings)
+
         self.run_rollouts = _RunRollouts()
+        self.rollout_config = _RolloutConfig()
 
 
 def _streamed_gym_result():
@@ -1302,6 +1308,83 @@ def test_nemo_gym_run_rollouts_names_the_infra_failure_when_attempts_run_out():
             )
         )
     assert env.dispatched == [[0, 1]]
+
+
+def _sum_rewards_hook(rows, full_results):
+    """Rollout-metrics hook the SC parity test names by its dotted path.
+
+    Reports what it saw through its returned metrics, because the dotted-path
+    import can hand the test a second module instance whose globals the test
+    cannot read.
+    """
+    assert len(rows) == len(full_results)
+    return {
+        "reward_sum": sum(r.get("reward", 0.0) for r in full_results),
+        "hook_rows_seen": float(sum(1 for row in rows if "_rowidx" in row)),
+    }
+
+
+def test_nemo_gym_sc_path_applies_the_rollout_metrics_hook():
+    """The single-controller path resolves env.nemo_gym.rollout_metrics_hook
+    from the actor's rollout_config and applies it after the built-in metrics,
+    exactly like the driver path."""
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _streamed_gym_result(), None),
+                (1, {"name": "agent"}, _streamed_gym_result(), None),
+            ]
+        ],
+        rollout_settings={
+            "rollout_metrics_hook": (
+                "tests.unit.experience.test_rollout_manager._sum_rewards_hook"
+            )
+        },
+    )
+    impl = _nemo_gym_impl(False)
+    impl._num_generations_per_prompt = 2
+    impl._task_to_env = {"nemo_gym": env}
+
+    _completions, _message_log, metrics = _run(
+        impl._run_rollouts(
+            inputs=[
+                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+            ],
+            timer=Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert metrics["reward_sum"] == 2.0
+    assert metrics["hook_rows_seen"] == 2.0
+
+
+def test_nemo_gym_sc_per_agent_metrics_cover_the_union_of_result_fields():
+    """A numeric field only some completions carry is still aggregated: the
+    per-agent keys are the union over the completions, not the first
+    completion's keys."""
+    impl = _nemo_gym_impl(False)
+    completions = [
+        Completion(
+            message_log=[{"role": "assistant", "token_ids": [1]}],
+            env_extras=extras,
+            truncated=False,
+            reward=reward,
+        )
+        for reward, extras in [
+            (0.0, {"reward": 0.0}),
+            (1.0, {"reward": 1.0, "speedup": 2.0}),
+            (1.0, {"reward": 1.0, "speedup": 4.0}),
+        ]
+    ]
+
+    metrics = impl._compute_rollout_metrics(completions, "agent")
+
+    assert metrics["agent/speedup/mean"] == pytest.approx(6.0 / 3)
+    assert metrics["agent/speedup/max"] == 4.0
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])

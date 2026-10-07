@@ -2329,6 +2329,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     }
     manager._tokenizer = None
     manager._effort_config = None
+    manager._rollout_metrics_hook = None
     manager._results_to_completions = lambda results: (
         [result["value"] for result in results],
         {},
@@ -2470,6 +2471,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
     }
     manager._tokenizer = None
     manager._effort_config = None
+    manager._rollout_metrics_hook = None
 
     with pytest.raises(ValueError, match="duplicate row index 0"):
         asyncio.run(
@@ -2518,6 +2520,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
     }
     manager._tokenizer = None
     manager._effort_config = None
+    manager._rollout_metrics_hook = None
     manager._stats = None
 
     async def fake_stream_rows(
@@ -3340,9 +3343,11 @@ def _postprocess_hook_group(results, hook=None):
     )
 
 
-def test_nemo_gym_group_applies_the_rollout_metrics_hook(caplog):
-    """The configured hook sees the group's full results and its metrics are
-    merged; a hook that raises is reported and cannot fail the rollout."""
+def test_nemo_gym_group_applies_the_rollout_metrics_hook(caplog, monkeypatch):
+    """The configured hook sees the group's rows and aligned full results and
+    its metrics are merged; a hook that raises is reported with its traceback
+    and cannot fail the rollout."""
+    monkeypatch.setattr(rollouts_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
 
     def results():
         return [
@@ -3352,29 +3357,51 @@ def test_nemo_gym_group_applies_the_rollout_metrics_hook(caplog):
 
     seen = []
 
-    def hook(full_results):
-        seen.append(full_results)
+    def hook(rows, full_results):
+        seen.append((rows, full_results))
         return {"reward_sum": sum(r["reward"] for r in full_results)}
 
     metrics = _postprocess_hook_group(results(), hook).rollout_metrics
-    assert seen == [
-        [
-            {"reward": 1.0, "response": {"status": "completed"}},
-            {"reward": 0.0, "response": {"status": "completed"}},
-        ]
+    assert len(seen) == 1
+    seen_rows, seen_results = seen[0]
+    assert [row["agent_ref"]["name"] for row in seen_rows] == ["agent", "agent"]
+    assert seen_results == [
+        {"reward": 1.0, "response": {"status": "completed"}},
+        {"reward": 0.0, "response": {"status": "completed"}},
     ]
     assert metrics["reward_sum"] == 1.0
     # The generic per-agent mean of every numeric field is there regardless.
     assert metrics["agent/reward/mean"] == pytest.approx(0.5)
 
-    def broken(full_results):
+    def broken(rows, full_results):
         raise KeyError("score")
 
     with caplog.at_level(logging.WARNING):
         metrics = _postprocess_hook_group(results(), broken).rollout_metrics
     assert "reward_sum" not in metrics
-    assert any("rollout metrics hook" in r.message for r in caplog.records)
+    assert any(
+        "rollout metrics hook" in r.message and r.exc_info for r in caplog.records
+    )
     assert "reward_sum" not in _postprocess_hook_group(results()).rollout_metrics
+
+
+def test_nemo_gym_rollout_metrics_hook_runs_after_the_per_agent_means(
+    caplog, monkeypatch
+):
+    """The hook runs after every built-in metric writer, so a key it returns
+    survives instead of being reabsorbed by the per-agent means, and the
+    collision is warned once."""
+    monkeypatch.setattr(rollouts_mod, "_ROLLOUT_METRICS_HOOK_COLLISION_WARNED", set())
+
+    def hook(rows, full_results):
+        return {"agent/reward/mean": 99.0}
+
+    with caplog.at_level(logging.WARNING):
+        metrics = _postprocess_hook_group(
+            [_hook_group_result(1.0), _hook_group_result(0.0)], hook
+        ).rollout_metrics
+    assert metrics["agent/reward/mean"] == 99.0
+    assert any("overrides built-in metric key" in r.message for r in caplog.records)
 
 
 def test_nemo_gym_per_agent_metrics_cover_fields_present_on_some_rollouts_only():
@@ -3395,3 +3422,49 @@ def test_nemo_gym_per_agent_metrics_cover_fields_present_on_some_rollouts_only()
     assert metrics["agent/speedup/mean"] == pytest.approx(6.0 / 3)
     assert metrics["agent/speedup/max"] == 4.0
     assert metrics["agent/speedup/histogram"] == [2.0, 4.0]
+
+
+def test_gym_rollout_reads_the_metrics_hook_from_the_actor_config(monkeypatch):
+    """Without an explicit argument the rollout resolves the environment's own
+    rollout_metrics_hook (NemoGym.rollout_config) and hands the callable to
+    the group postprocess; an unset key resolves to None."""
+    captured = []
+
+    def _capture_postprocess(**kwargs):
+        captured.append(kwargs["rollout_metrics_hook"])
+        return _postprocess_stub(**kwargs)
+
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _capture_postprocess
+    )
+    for settings in (
+        {
+            "rollout_metrics_hook": (
+                "nemo_rl.experience.metric_utils.calculate_single_metric"
+            )
+        },
+        {},
+    ):
+        rows = [_gym_row()]
+        actor = _FakeGymActor(
+            scripts=[[(0, {"name": "agent"}, _gym_result(0), None)]],
+            rollout_settings=settings,
+        )
+        asyncio.run(_collect_gym_rollout(actor, rows))
+    assert captured == [calculate_single_metric, None]
+
+
+def test_gym_rollout_rejects_a_bad_metrics_hook_path_before_dispatch(monkeypatch):
+    """An unresolvable hook path fails the rollout at configuration time,
+    before any row is dispatched."""
+    rows = [_gym_row()]
+    actor = _FakeGymActor(
+        scripts=[[(0, {"name": "agent"}, _gym_result(0), None)]],
+        rollout_settings={"rollout_metrics_hook": "no.such.module.function"},
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    with pytest.raises(ModuleNotFoundError):
+        asyncio.run(_collect_gym_rollout(actor, rows))
+    assert actor.dispatched_rows == []

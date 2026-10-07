@@ -325,6 +325,8 @@ def _run_gym_rollouts(
             "_Environment", (), {"run_rollouts": _RunRolloutsRemote(results)}
         )()
     }
+    # Resolved "no hook": the fake environment has no rollout_config to read.
+    impl._rollout_metrics_hook = None
     inputs = [_gym_input(i, prompt) for i in range(len(results))]
     return asyncio.run(
         impl._run_rollouts(

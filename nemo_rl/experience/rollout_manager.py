@@ -82,11 +82,14 @@ from nemo_rl.experience.rollouts import (
     _effort_shaping_metrics,
     _EffortShapingMetrics,
     _find_routed_experts_template,
+    _nemo_gym_rollout_config,
     _tensorize_by_key,
+    apply_nemo_gym_rollout_metrics_hook,
     apply_reward_penalties,
     attach_static_multimodal_payload,
     calculate_rewards,
     compute_reward_penalty_metrics,
+    get_nemo_gym_rollout_metrics_hook,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -921,6 +924,11 @@ class AsyncRolloutImpl:
         return rollout_metrics
 
 
+# Sentinel for a rollout-metrics hook not yet read from the Gym actor's
+# configuration; distinct from None, which is the resolved "no hook" answer.
+_HOOK_UNRESOLVED = object()
+
+
 class AsyncNemoGymRolloutImpl:
     """Manages per-prompt NeMo-Gym rollouts, producing a PromptGroupRecord per call.
 
@@ -969,6 +977,9 @@ class AsyncNemoGymRolloutImpl:
         ).max_gym_row_attempts
         self._stats = stats
         self._effort_config = effort_config
+        # Resolved from the Gym actor's rollout_config on first use, exactly
+        # like the driver path, so both paths apply the same configured hook.
+        self._rollout_metrics_hook: Any = _HOOK_UNRESOLVED
 
         self._validate_init_params()
 
@@ -1412,6 +1423,24 @@ class AsyncNemoGymRolloutImpl:
                     penalty_counts, len(completed_results)
                 )
             )
+            # The configured rollout-metrics hook runs after every built-in
+            # writer, with the same (rows, full_results) contract as the
+            # driver path (see get_nemo_gym_rollout_metrics_hook).
+            hook = await self._resolve_rollout_metrics_hook()
+            if hook is not None:
+                apply_nemo_gym_rollout_metrics_hook(
+                    hook,
+                    sorted(inputs, key=lambda row: row["_rowidx"]),
+                    [
+                        {
+                            k: v
+                            for k, v in (c.env_extras or {}).items()
+                            if k != "ng_receipt"
+                        }
+                        for c in completions
+                    ],
+                    rollout_metrics,
+                )
 
         rollout_metrics.update(env_timing_metrics)
         for handle in shard_set.all_handles:
@@ -1420,6 +1449,18 @@ class AsyncNemoGymRolloutImpl:
         rollout_metrics[f"{timer_prefix}/routing/group_share/{instance_label}"] = 1
 
         return completions, prompt_message_log, rollout_metrics
+
+    async def _resolve_rollout_metrics_hook(self):
+        """The configured ``env.nemo_gym.rollout_metrics_hook``, resolved once.
+
+        Read from the Gym actor's ``rollout_config`` exactly like the driver
+        path, so both paths apply the same configured hook; ``None`` (no hook)
+        is cached the same way.
+        """
+        if self._rollout_metrics_hook is _HOOK_UNRESOLVED:
+            env_config = await _nemo_gym_rollout_config(self._task_to_env["nemo_gym"])
+            self._rollout_metrics_hook = get_nemo_gym_rollout_metrics_hook(env_config)
+        return self._rollout_metrics_hook
 
     def _results_to_completions(
         self, results: list[dict]
@@ -1588,7 +1629,10 @@ class AsyncNemoGymRolloutImpl:
             {k: v for k, v in (c.env_extras or {}).items() if k not in ("ng_receipt",)}
             for c in completions
         ]
-        for key in agent_extras[0].keys():
+        # Union of keys in first-seen order: a field present only on some
+        # rollouts (a masked sample's flag, for example) is still aggregated,
+        # exactly as _postprocess_single_nemo_gym_group aggregates it.
+        for key in dict.fromkeys(key for r in agent_extras for key in r):
             values = [
                 float(r[key])  # type: ignore
                 for r in agent_extras

@@ -2040,15 +2040,61 @@ def get_nemo_gym_max_infra_attempts(env_config: dict[str, Any]) -> int:
     return attempts
 
 
-# A step-metrics hook: takes the full results of one prompt group's rollouts (each
-# agent's ``full_result`` mapping) and returns metrics to merge into the step's
-# rollout metrics.
-RolloutMetricsHook = Callable[[list[dict[str, Any]]], dict[str, float]]
+# A step-metrics hook: takes one rollout group's input rows and, aligned with
+# them, each rollout's ``full_result`` mapping, and returns metrics to merge
+# into the group's rollout metrics after every built-in metric.
+RolloutMetricsHook = Callable[
+    [list[dict[str, Any]], list[dict[str, Any]]], dict[str, float]
+]
 
 # Rollout-metrics hooks that have already failed once in this process, by
 # qualified name; the failure is reported the first time only, since it would
 # otherwise repeat for every prompt group of every step.
 _ROLLOUT_METRICS_HOOK_WARNED: set[str] = set()
+
+# Hooks whose returned keys collided with a built-in metric key, by qualified
+# name; reported once for the same reason.
+_ROLLOUT_METRICS_HOOK_COLLISION_WARNED: set[str] = set()
+
+
+def apply_nemo_gym_rollout_metrics_hook(
+    hook: Optional[RolloutMetricsHook],
+    rows: list[dict[str, Any]],
+    full_results: list[dict[str, Any]],
+    rollout_metrics: dict[str, Any],
+) -> None:
+    """Merge the hook's metrics for one rollout group into ``rollout_metrics``.
+
+    Called after every built-in metric writer on both rollout paths, so on a
+    key collision the hook's value wins and the collision is warned once per
+    hook rather than silently reabsorbed. A failing hook is warned once and
+    can never fail the rollout.
+    """
+    if hook is None:
+        return
+    hook_name = getattr(hook, "__qualname__", repr(hook))
+    try:
+        hook_metrics = hook(rows, full_results)
+    except Exception:
+        if hook_name not in _ROLLOUT_METRICS_HOOK_WARNED:
+            _ROLLOUT_METRICS_HOOK_WARNED.add(hook_name)
+            logger.warning(
+                "NeMo-Gym rollout metrics hook %s raised; its metrics are "
+                "skipped for this and later prompt groups (reported once)",
+                hook_name,
+                exc_info=True,
+            )
+        return
+    collisions = rollout_metrics.keys() & hook_metrics.keys()
+    if collisions and hook_name not in _ROLLOUT_METRICS_HOOK_COLLISION_WARNED:
+        _ROLLOUT_METRICS_HOOK_COLLISION_WARNED.add(hook_name)
+        logger.warning(
+            "NeMo-Gym rollout metrics hook %s overrides built-in metric key(s) "
+            "%s (reported once)",
+            hook_name,
+            sorted(collisions),
+        )
+    rollout_metrics.update(hook_metrics)
 
 
 def get_nemo_gym_rollout_metrics_hook(
@@ -2056,11 +2102,33 @@ def get_nemo_gym_rollout_metrics_hook(
 ) -> Optional[RolloutMetricsHook]:
     """Import the hook ``env.nemo_gym.rollout_metrics_hook`` names, or None when unset.
 
-    The value is the dotted import path of a callable, ``package.module.function``.
+    The value is the dotted import path of a callable,
+    ``package.module.function``, imported in the process that runs the rollout
+    loop (under asynchronous GRPO that is the trajectory collector actor, so
+    the module must be importable there). The hook is called once per rollout
+    group as ``hook(rows, full_results)`` and returns a mapping merged into
+    the group's rollout metrics after every built-in metric
+    (``apply_nemo_gym_rollout_metrics_hook``). Facts a hook author needs:
+
+    - ``rows`` are the group's input rows in rollout order; each carries
+      ``agent_ref["name"]`` and the ``_ng_group_id`` prompt-group key, which
+      is how a hook recovers prompt boundaries and agent identity.
+    - ``full_results`` align with ``rows``: each is that rollout's
+      ``full_result`` mapping, whose ``reward`` is the trained value, already
+      rewritten by effort shaping and reward penalties.
+    - The group differs by caller: one prompt's rollouts under the
+      asynchronous collector and the single-controller path, but the whole
+      step batch (mixed prompts, possibly mixed agents) under
+      ``run_nemo_gym_rollout_sync``.
+    - Under asynchronous GRPO, ``aggregate_rollout_metrics`` averages a
+      returned key over prompt groups with equal weight (``/min``, ``/max``
+      and histogram keys aside), so a per-group value aggregates to a mean of
+      group values.
+
     The per-agent aggregation in ``_postprocess_single_nemo_gym_group`` already
     logs the mean of every numeric result field over all rollouts; the hook is
-    where an environment derives what that cannot express, such as a mean over
-    only the successful rollouts. Raises ``ValueError`` when the path does not
+    where an environment derives what that cannot express, such as pass-at-k
+    over a prompt group. Raises ``ValueError`` when the path does not
     resolve to a callable.
     """
     nemo_gym_config = env_config.get("nemo_gym")
@@ -3432,32 +3500,6 @@ def _postprocess_single_nemo_gym_group(
             # / batch_size,
         }
 
-    # Metrics the configured hook derives from the group's full results (see
-    # get_nemo_gym_rollout_metrics_hook). The per-agent means below cover every
-    # numeric field; the hook covers what a mean over all rollouts cannot
-    # express. A failing hook is reported and cannot fail the rollout.
-    if rollout_metrics_hook is not None:
-        try:
-            rollout_metrics.update(
-                rollout_metrics_hook(
-                    [
-                        r["full_result"]
-                        for r in results
-                        if isinstance(r.get("full_result"), dict)
-                    ]
-                )
-            )
-        except Exception as e:
-            hook_name = getattr(
-                rollout_metrics_hook, "__qualname__", repr(rollout_metrics_hook)
-            )
-            if hook_name not in _ROLLOUT_METRICS_HOOK_WARNED:
-                _ROLLOUT_METRICS_HOOK_WARNED.add(hook_name)
-                logger.warning(
-                    "Error in the NeMo-Gym rollout metrics hook (reported once): %r",
-                    e,
-                )
-
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
@@ -3549,6 +3591,22 @@ def _postprocess_single_nemo_gym_group(
             len(results),
             resolved_reward_penalty_config,
         )
+    )
+
+    # Metrics the configured hook derives from the group's rows and full
+    # results (see get_nemo_gym_rollout_metrics_hook). Applied after every
+    # built-in metric writer above, so a hook key wins a collision and the
+    # collision is warned instead of the per-agent means silently reabsorbing
+    # it. A failing hook is reported and cannot fail the rollout.
+    hook_rows: list[dict[str, Any]] = []
+    hook_full_results: list[dict[str, Any]] = []
+    for nemo_gym_row, result in zip(nemo_gym_rows, results):
+        full_result = result.get("full_result")
+        if isinstance(full_result, dict):
+            hook_rows.append(nemo_gym_row)
+            hook_full_results.append(full_result)
+    apply_nemo_gym_rollout_metrics_hook(
+        rollout_metrics_hook, hook_rows, hook_full_results, rollout_metrics
     )
 
     # Expose per-component rewards as `reward/<name>` batch keys for multi-reward NeMo
