@@ -340,6 +340,19 @@ Verified here:
   them. Lower `AGENTIC_VBENCH_CONCURRENCY` if this recurs; baking Node into the
   task images does not avoid the remote lookup `nvm install 22` performs.
 
+- The identity 256k/32-turn run (job 2167742) completed a full step of 32
+  episodes with real rewards (2 x 1.0, 6 x 0.5, 26 x 0.0; mean 0.147; 14-32
+  calls and 13k-56k generated tokens per episode; prompts up to 80k tokens; no
+  poisoned calls) and entered its first optimizer step, then was cancelled by
+  the cluster service (uid 146504, `svc-hwinf-cs-sched`) at 41 minutes before
+  the step finished. Every multi-node AgenticVBench GRPO job on `batch_long`
+  that lived past 30 minutes has been cancelled by that service, at 30:18,
+  30:59, 39:49, 41:08 and 41:20 (jobs 2165998, 2163336, 2113381, 2104538,
+  2167742), while 2-node evaluation jobs run for hours. Until the cluster team
+  explains or lifts it, a step must finish and checkpoint inside about 25
+  minutes (`SAVE_PERIOD=1`, fewer prompts or turns) and runs continue through
+  chained cycles that resume from the checkpoint and data-plane snapshot.
+
 Not yet verified (requires GPU allocations):
 
 - A two-step compaction smoke and the 20-step paired comparison.
