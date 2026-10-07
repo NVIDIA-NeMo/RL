@@ -331,6 +331,15 @@ Verified here:
   (`...-agentic-vbench-sc-256k.v1.yaml`, prefill chunk 32768) for the 32-turn
   evaluation budget.
 
+- Harbor installs OpenCode inside every task container at trial start (nvm,
+  Node 22, `npm i -g opencode-ai@1.14.39`), so a step with 32 concurrent
+  episodes makes 32 simultaneous requests to nodejs.org. In the identity
+  256k/32-turn run about half of the first wave failed there ("Version '22' not
+  found", i.e. the Node version index could not be fetched) and surfaced as
+  "Missing native verifier reward"; the controller's rollout recovery re-ran
+  them. Lower `AGENTIC_VBENCH_CONCURRENCY` if this recurs; baking Node into the
+  task images does not avoid the remote lookup `nvm install 22` performs.
+
 Not yet verified (requires GPU allocations):
 
 - A two-step compaction smoke and the 20-step paired comparison.
