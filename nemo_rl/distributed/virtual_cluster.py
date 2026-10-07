@@ -380,13 +380,17 @@ def _get_free_consecutive_ports_local(
 def ray_runtime_env_excludes(
     environ: Mapping[str, str] | None = None,
 ) -> list[str]:
-    """Glob patterns Ray leaves out of the working-directory package it ships to workers.
+    """``.gitignore``-style patterns Ray leaves out of the working-directory package.
 
-    Ray packages the working directory for its workers. A launcher whose tree
-    carries data no worker reads, and whose size would exceed Ray's package
-    upload limit, exports ``NRL_RAY_RUNTIME_ENV_EXCLUDES``, a comma-separated
-    list of glob patterns; ``init_ray`` puts them in the runtime environment's
-    ``excludes``. Empty when the variable is unset or blank.
+    Ray packages a ``working_dir`` for its workers only while its ``uv run``
+    hook is active; importing ``nemo_rl`` switches that hook off, so a driver
+    that imports ``ray`` first (``examples/run_grpo_single_controller.py``) is
+    the one that packages its launch directory under ``uv run``. Such a launch
+    whose tree carries data no worker reads, and whose size would exceed Ray's
+    package upload limit, exports ``NRL_RAY_RUNTIME_ENV_EXCLUDES``, a
+    comma-separated list of ``.gitignore``-style patterns; ``init_ray`` puts
+    them in the runtime environment's ``excludes``. Empty when the variable is
+    unset or blank.
     """
     if environ is None:
         environ = os.environ
