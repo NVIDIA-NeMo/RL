@@ -27,10 +27,10 @@ policy:
     kwargs:
       lr: 2.0e-06
   generation:
-    vllm_cfg:
-      enforce_eager: true
     vllm_kwargs:
+      # CUDA graphs (vLLM default FULL_AND_PIECEWISE) instead of enforce_eager: generation/step -48%, wall 224 -> 134 min. backend: eager is required; Inductor kernels failed the gen_kl_error gate. Logprob gates unchanged (same-window A/B on cw_dfw H100, see the rollout-perf skill).
       compilation_config:
+        backend: eager
         custom_ops: ["all", "-rotary_embedding"]
 data:
   train:

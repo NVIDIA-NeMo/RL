@@ -45,7 +45,7 @@ policy:
     max_new_tokens: 2048
     vllm_cfg:
       tensor_parallel_size: 4
-      enforce_eager: true
+      # CUDA graphs (vLLM default FULL_AND_PIECEWISE) instead of enforce_eager: generation/step -60%, wall 59 -> 47 min. Logprob gates unchanged (same-window A/B on cw_dfw H100, see the rollout-perf skill).
       max_model_len: 3072
 data:
   max_input_seq_length: 1024
