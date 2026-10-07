@@ -1524,6 +1524,88 @@ def test_rl_owned_multimodal_rows_reuse_foundation_media_and_cleanup(dp, routes)
     assert dp.list_sample_ids("staging") == []
 
 
+@pytest.mark.parametrize("routes", [False, True])
+def test_shared_image_ancestry_keeps_pixels_and_routes_but_owns_loss_once(dp, routes):
+    from nemo_rl.experience.rollout_reassembler import (
+        ActionOutputFlags,
+        RolloutSelection,
+    )
+
+    image_a = torch.ones(3, 2, 3)
+    image_b = torch.ones(3, 3, 2) * 2
+    root, media = stage(
+        dp, engine_prompt([10, 18, 18, 11], [(Span(1, 2), image_a)]), routes=routes
+    )
+    left, _ = stage(
+        dp,
+        engine_prompt(
+            [10, 18, 18, 11, 31, 2, 12, 18, 18],
+            [(Span(1, 2), image_a), (Span(7, 2), image_b)],
+        ),
+        parent=root,
+        retained=media.items,
+        call_id="left",
+        routes=routes,
+    )
+    right, _ = stage(
+        dp,
+        engine_prompt([10, 18, 18, 11, 31, 2, 13], [(Span(1, 2), image_a)]),
+        parent=root,
+        retained=media.items,
+        call_id="right",
+        routes=routes,
+    )
+    assembler = finalizer(dp, router_replay_enabled=routes)
+    reference = [
+        assembler.finalize_rollout(
+            "r0", receipt(root, leaf), reward=1.0, context_compaction=True
+        )
+        for leaf in (left, right)
+    ]
+    result = assembler.finalize_group(
+        "g",
+        ["r0"],
+        [receipt(root, left, right)],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=3,
+        prompt_idx=0,
+        canonical_sample_ids=["g_g0"],
+        logical_selections=[
+            RolloutSelection(
+                tuple(record.response_id for record in (root, left, right)),
+                (ActionOutputFlags(False, False),) * 3,
+            )
+        ],
+    )
+    assert result.valid_row_count == 2
+    fields = dict(dp.get_samples(result.meta.sample_ids, "train", result.meta.fields))
+    for index, expected in enumerate(reference):
+        assert fields["input_ids"][index].tolist() == expected.token_ids
+        torch.testing.assert_close(
+            fields["generation_logprobs"][index], torch.tensor(expected.logprobs)
+        )
+        if routes:
+            torch.testing.assert_close(
+                fields["routed_experts"][index], expected.routed_experts
+            )
+    assert (
+        fields["token_mask"][0].tolist()
+        == [0.0] * 4 + [1.0] * 2 + [0.0] * 3 + [1.0] * 2
+    )
+    assert fields["token_mask"][1].tolist() == [0.0] * 7 + [1.0] * 2
+    assert sum(tag["num_assistant_messages"] for tag in result.meta.tags) == 3
+    reassemble_packed_multimodal(fields, result.meta.tags)
+    assert fields["imgs_sizes"].as_tensor().tolist() == [[2, 3], [3, 2], [2, 3]]
+    torch.testing.assert_close(
+        fields["pixel_values"].as_tensor(),
+        torch.cat([packed(image_a), packed(image_b), packed(image_a)]),
+        rtol=0,
+        atol=0,
+    )
+    assert dp.list_sample_ids("staging") == []
+
+
 def test_non_gym_adapter_selects_calls_without_defining_segments(dp):
     """An independent harness exposes actions/reward, not Gym CC result types.
 

@@ -306,6 +306,7 @@ class RolloutReassembler:
         reward: float,
         context_compaction: bool = False,
         action_flags: tuple[ActionOutputFlags, ...] | None = None,
+        loss_excluded_call_ids: frozenset[str] = frozenset(),
     ) -> FinalizedRollout:
         """Verify one receipt against its staged rows and linearize the main chain.
 
@@ -476,6 +477,11 @@ class RolloutReassembler:
                 if failure is not None:
                     return rejected(f"route_assembly:{failure}", staging_keys)
 
+        # Shared calls remain exact context, but an earlier row owns their loss.
+        token_mask = list(row.token_mask)
+        for span in row.weight_version_spans:
+            if span.model_call_id in loss_excluded_call_ids:
+                token_mask[span.start : span.end] = [0.0] * (span.end - span.start)
         output_masks = {}
         if action_flags is not None:
             if len(action_flags) != len(row.link_spans) or any(
@@ -490,15 +496,15 @@ class RolloutReassembler:
                 for key in (INVALID_TOOL_CALL_MASK, MALFORMED_THINKING_MASK)
             }
             position = 0
-            for flags, (_, carry_len, generation_len) in zip(
+            for flags, (call_id, carry_len, generation_len) in zip(
                 action_flags, row.link_spans, strict=True
             ):
                 start, end = position + carry_len, position + carry_len + generation_len
                 output_masks[INVALID_TOOL_CALL_MASK][start:end] = [
-                    flags.invalid_tool_call
+                    flags.invalid_tool_call and call_id not in loss_excluded_call_ids
                 ] * generation_len
                 output_masks[MALFORMED_THINKING_MASK][start:end] = [
-                    flags.malformed_thinking
+                    flags.malformed_thinking and call_id not in loss_excluded_call_ids
                 ] * generation_len
                 position = end
         return FinalizedRollout(
@@ -506,7 +512,7 @@ class RolloutReassembler:
             valid=True,
             rejection_reason=None,
             token_ids=row.token_ids,
-            token_mask=row.token_mask,
+            token_mask=token_mask,
             logprobs=row.logprobs,
             prompt_len=row.prompt_len,
             reward=reward,
@@ -1090,7 +1096,7 @@ class RolloutReassembler:
         receipts: list[Optional[dict[str, Any]]],
         selections: list[RolloutSelection],
     ) -> list[list[SegmentReceipt]]:
-        """Group selected continuation chains into context segments inside RL."""
+        """Plan paths to selected leaves using committed capture parents."""
         # Capture wire types are optional outside this finalization path.
         from nemo_gym.token_id_capture.staging.records import (
             CallRecord,
@@ -1128,8 +1134,11 @@ class RolloutReassembler:
                 )
                 continue
             by_response = {record.response_id: record for record in parsed.manifest}
-            if len(by_response) != len(parsed.manifest) or any(
-                response not in by_response for response in selected
+            if (
+                len(by_response) != len(parsed.manifest)
+                or len({record.model_call_id for record in parsed.manifest})
+                != len(parsed.manifest)
+                or any(response not in by_response for response in selected)
             ):
                 raise ValueError(
                     "Selected response is missing or ambiguous in the capture manifest"
@@ -1144,25 +1153,48 @@ class RolloutReassembler:
                 raise ValueError("Selected responses must preserve capture order")
             if by_response[selected[-1]].model_call_id != parsed.terminal_model_call_id:
                 raise ValueError("Selected terminal differs from the scored receipt")
-            chains: list[list[CallRecord]] = []
-            chain_flags: list[list[ActionOutputFlags]] = []
-            for response_id, flags in zip(
-                selected, selection.action_flags, strict=True
-            ):
-                record = by_response[response_id]
+            selected_records = [by_response[response_id] for response_id in selected]
+            by_call = {record.model_call_id: record for record in selected_records}
+            flags_by_call = dict(zip(by_call, selection.action_flags, strict=True))
+            root_positions: dict[str, int] = {}
+            parents: set[str] = set()
+            for record in selected_records:
                 if record.parent_call_id is None:
-                    chains.append([])
-                    chain_flags.append([])
-                elif (
-                    not chains or record.parent_call_id != chains[-1][-1].model_call_id
-                ):
+                    root_positions[record.model_call_id] = positions[record.response_id]
+                elif record.parent_call_id not in root_positions:
+                    # Require selected ancestry and parent-before-child order;
+                    # this also rejects cycles before walking any endpoint.
                     raise ValueError(
                         "Selected continuation must follow its selected predecessor"
                     )
-                chains[-1].append(record)
-                chain_flags[-1].append(flags)
+                else:
+                    root_positions[record.model_call_id] = root_positions[
+                        record.parent_call_id
+                    ]
+                    parents.add(record.parent_call_id)
+            endpoints = sorted(
+                (
+                    record
+                    for record in selected_records
+                    if record.model_call_id not in parents
+                ),
+                key=lambda record: (
+                    root_positions[record.model_call_id],
+                    positions[record.response_id],
+                ),
+            )
             owner_plan = []
-            for chain, flags in zip(chains, chain_flags, strict=True):
+            for endpoint in endpoints:
+                chain: list[CallRecord] = []
+                cursor: CallRecord | None = endpoint
+                while cursor is not None:
+                    chain.append(cursor)
+                    cursor = (
+                        by_call[cursor.parent_call_id]
+                        if cursor.parent_call_id is not None
+                        else None
+                    )
+                chain.reverse()
                 row_receipt = parsed.model_copy(
                     update={
                         "manifest": chain,
@@ -1177,7 +1209,9 @@ class RolloutReassembler:
                         selected_response_ids=tuple(
                             record.response_id for record in chain
                         ),
-                        action_flags=tuple(flags),
+                        action_flags=tuple(
+                            flags_by_call[record.model_call_id] for record in chain
+                        ),
                         truncated=selection.truncated,
                     )
                 )
@@ -1229,6 +1263,10 @@ class RolloutReassembler:
             rebuilt = []
             parsed_receipts = []
             owner_valid = True
+            owner_records = {}
+            owner_flags = {}
+            owner_responses: set[str] = set()
+            owned_responses: list[set[str]] = []
             for ordinal, segment in enumerate(segments):
                 expected_id = rollout_ids[slot]
                 if segment.capture_rollout_id != expected_id:
@@ -1253,6 +1291,7 @@ class RolloutReassembler:
                     reward=reward,
                     context_compaction=True,
                     action_flags=segment.action_flags,
+                    loss_excluded_call_ids=frozenset(owner_records),
                 )
                 selected = segment.selected_response_ids
                 record_by_call = (
@@ -1269,13 +1308,33 @@ class RolloutReassembler:
                     and all(isinstance(item, str) and item for item in selected)
                     and len(set(selected)) == len(selected)
                     and not seen_responses.intersection(selected)
+                    and selected[-1] not in owner_responses
                     and actual == selected
                 )
+                for call_id in row.model_call_ids:
+                    record = record_by_call[call_id]
+                    if (
+                        call_id in owner_records and owner_records[call_id] != record
+                    ) or (
+                        record.response_id in owner_responses
+                        and call_id not in owner_records
+                    ):
+                        selection_valid = False
+                for response_id, flags in zip(selected, segment.action_flags or ()):
+                    if response_id in owner_flags and owner_flags[response_id] != flags:
+                        selection_valid = False
+                    owner_flags[response_id] = flags
+                owned_responses.append(set(selected) - owner_responses)
                 if selection_valid:
-                    seen_responses.update(selected)
+                    owner_responses.update(selected)
+                    owner_records.update(
+                        (call_id, record_by_call[call_id])
+                        for call_id in row.model_call_ids
+                    )
                 owner_valid = owner_valid and row.valid and selection_valid
                 rebuilt.append(row)
                 parsed_receipts.append(parsed)
+            seen_responses.update(owner_responses)
 
             first = rebuilt[0]
             parsed = parsed_receipts[0]
@@ -1349,7 +1408,13 @@ class RolloutReassembler:
                 ]
             for ordinal, row in enumerate(rebuilt):
                 segment = segments[ordinal]
-                flags = segment.action_flags or ()
+                flags = tuple(
+                    flags
+                    for response_id, flags in zip(
+                        segment.selected_response_ids, segment.action_flags or ()
+                    )
+                    if response_id in owned_responses[ordinal]
+                )
                 prepared.rows.append(replace(row, rollout_id=f"{owner_id}_s{ordinal}"))
                 prepared.prompt_ids.append(original_prompt)
                 prepared.mask_sample.append(owner_mask)
@@ -1371,7 +1436,7 @@ class RolloutReassembler:
                         "num_malformed_thinking": sum(
                             flag.malformed_thinking for flag in flags
                         ),
-                        "num_assistant_messages": len(segment.selected_response_ids),
+                        "num_assistant_messages": len(owned_responses[ordinal]),
                     }
                 )
         prepared.staging_keys = list(dict.fromkeys(prepared.staging_keys))
