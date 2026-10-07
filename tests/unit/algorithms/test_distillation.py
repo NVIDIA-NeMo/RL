@@ -1238,6 +1238,9 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
             self.cfg = config
             self.defer_model_load = defer_model_load
             self.dp_openai_server_base_urls = ["http://reserved-vllm"]
+            # The per-job bearer token the real class generates when the
+            # recipe requires one; Gym's model server must receive it.
+            self.http_server_api_key = "k"
             self.load_and_start_called = False
             self.finish_generation_called = False
             self.prepare_refit_info_called = False
@@ -1305,6 +1308,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         tokenizer=tokenizer,
         enable_router_replay=False,
         use_fastokens=False,
+        policy_api_key="k",
     )
     assert master_config.env["nemo_gym"] == nemo_gym_env_before
 

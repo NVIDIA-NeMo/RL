@@ -752,6 +752,49 @@ def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(detected_uv_dir
     )
 
 
+def test_build_nemo_gym_config_keeps_the_policy_api_key_out_of_gyms_config(
+    detected_uv_dirs,
+):
+    """The key is an actor field that Gym's servers receive through their
+    environment at spin-up, never a value in the serialized global config."""
+    cfg = build_nemo_gym_config(
+        _env_configs(),
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        policy_api_key="per-job-key",
+    )
+
+    assert cfg["policy_api_key"] == "per-job-key"
+    assert "policy_api_key" not in cfg["initial_global_config_dict"]
+
+
+@pytest.mark.parametrize(
+    "env_configs", [_env_configs, _shard_env_configs], ids=["unsharded", "sharded"]
+)
+def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
+    detected_uv_dirs, env_configs
+):
+    """Both builders forward the key: a dropped line in either would leave Gym
+    sending the placeholder against workers that enforce the real key."""
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            policy_api_key="per-job-key",
+        )
+
+    assert cluster.actor_configs
+    assert all(cfg["policy_api_key"] == "per-job-key" for cfg in cluster.actor_configs)
+
+
 def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(
     detected_uv_dirs,
 ):

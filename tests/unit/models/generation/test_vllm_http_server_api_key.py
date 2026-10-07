@@ -21,6 +21,7 @@ token on the OpenAI routes: the driver generates one key per job
 NeMo-Gym model server as policy_api_key.
 """
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -43,6 +44,15 @@ def test_no_key_without_the_knob_or_without_the_server():
     # The knob alone does nothing when no HTTP server is exposed.
     config = _config(http_server_api_key_required=True)
     assert http_server_api_key_and_worker_config(config) == (None, config)
+
+
+def test_a_key_set_in_the_configuration_is_refused():
+    """The key is generated per job; a YAML-set key would be enforced by the
+    workers, never reach Gym, and land in the saved configuration."""
+    with pytest.raises(ValueError, match="must not be set in the configuration"):
+        http_server_api_key_and_worker_config(
+            _config(expose_http_server=True, http_server_api_key="x")
+        )
 
 
 def test_key_travels_only_in_the_worker_copy():
