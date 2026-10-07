@@ -81,7 +81,7 @@ from nemo_rl.environments.nemo_gym_shards import (
 )
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.failures import (
-    GymCheckpointParked,
+    GymAdmissionClosed,
     GymTransportError,
     RolloutDataFailure,
     http_status_is_infra,
@@ -310,7 +310,7 @@ def _gym_failure_row_error(
 
     ``run_examples(route_failures_to_sidecar=True)`` resolves a failed ``/run`` to its
     row plus ``_ng_failure_*`` fields instead of an exception that carries no row. That
-    is what lets a ``checkpoint_parked`` refusal name the row it refused while the rest
+    is what lets an ``admission_closed`` refusal name the row it refused while the rest
     of the batch keeps streaming. Every other failure maps to what
     :func:`_typed_gym_failure` returns for the same status, and a failure with no HTTP
     reply is transport-shaped unless the reply arrived but was not JSON.
@@ -343,7 +343,7 @@ def _gym_failure_row_error(
     body = result.get("_ng_failure_response_body")
     message = result.get("_ng_failure_message")
     if status == 409 and _gym_error_code(body) == AdmissionClosedError.code:
-        return GymCheckpointParked(
+        return GymAdmissionClosed(
             f"NeMo-Gym refused /run while a checkpoint has admission closed: {body}",
             row["_rowidx"],
         )
@@ -853,7 +853,7 @@ Depending on your data shape, you may want to change these values."""
         *,
         deadline_ts: float,
     ) -> None:
-        """Discard selected episode attempts from this Gym deployment."""
+        """Retire selected episode attempts from this Gym deployment."""
         await self._require_checkpoint_adapter().retire(
             checkpoint_id,
             episodes,
@@ -983,9 +983,7 @@ Depending on your data shape, you may want to change these values."""
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
         per_prompt: bool = False,
-    ) -> AsyncGenerator[
-        tuple[int, dict, dict, dict | None] | GymCheckpointParked, None
-    ]:
+    ) -> AsyncGenerator[tuple[int, dict, dict, dict | None] | GymAdmissionClosed, None]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete.
 
         A thin span-opening wrapper over :meth:`_stream_rollouts`, which holds
@@ -1017,7 +1015,7 @@ Depending on your data shape, you may want to change these values."""
             example, which is how the caller maps a result to its slot.
             ``timing_metrics`` is ``None`` on every tuple but the last, which
             carries the batch totals. A row Gym refused because a checkpoint
-            had admission closed is yielded as a ``GymCheckpointParked``
+            had admission closed is yielded as a ``GymAdmissionClosed``
             naming its ``rowidx`` instead of a tuple.
         """
         attributes = {"rl.gym.batch_size": len(nemo_gym_examples)}
@@ -1053,9 +1051,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
-    ) -> AsyncGenerator[
-        tuple[int, dict, dict, dict | None] | GymCheckpointParked, None
-    ]:
+    ) -> AsyncGenerator[tuple[int, dict, dict, dict | None] | GymAdmissionClosed, None]:
         """Body of :meth:`run_rollouts`; see there for the tracing wrapper."""
         self._require_spinup()
         if not nemo_gym_examples:
@@ -1111,7 +1107,7 @@ Depending on your data shape, you may want to change these values."""
                 failure = _gym_failure_row_error(nemo_gym_row, nemo_gym_result)
                 # A refusal is expected while a checkpoint is open; only a real
                 # failure is worth its body on stderr.
-                if failure is not None and not isinstance(failure, GymCheckpointParked):
+                if failure is not None and not isinstance(failure, GymAdmissionClosed):
                     print(
                         "EXCEPTION RESULT",
                         nemo_gym_result.get("_ng_failure_response_body"),
@@ -1119,7 +1115,7 @@ Depending on your data shape, you may want to change these values."""
                     )
                     raise failure
 
-            if isinstance(failure, GymCheckpointParked):
+            if isinstance(failure, GymAdmissionClosed):
                 # Yielded, not raised: rows Gym admitted before the checkpoint
                 # closed admission keep streaming, and the caller unwinds this one
                 # row before the checkpoint drains.

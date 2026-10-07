@@ -93,7 +93,7 @@ class GymCheckpointParticipantCommitSummary:
     server_name: str
     kind: GymCheckpointParticipantKind
     phase: str
-    episode_keys: tuple[str, ...]
+    capture_keys: tuple[str, ...]
     manifest: GymCheckpointParticipantManifest
     staging_keys: tuple[str, ...]
 
@@ -296,7 +296,7 @@ class GymCheckpointAdapter:
         )
 
     @staticmethod
-    def _legacy_agent_episode_keys(
+    def _legacy_agent_capture_keys(
         checkpoint_dir: Path,
         *,
         participant: str,
@@ -377,13 +377,13 @@ class GymCheckpointAdapter:
                     "Gym checkpoint commit returned invalid episode_ids for "
                     f"participant {member.server_name!r}"
                 )
-            episode_keys = tuple(sorted(set(exported)))
-            if len(episode_keys) != len(exported):
+            capture_keys = tuple(sorted(set(exported)))
+            if len(capture_keys) != len(exported):
                 raise RuntimeError(
                     "Gym checkpoint commit returned duplicate episode IDs for "
                     f"participant {member.server_name!r}"
                 )
-            unexpected = set(episode_keys) - requested_keys
+            unexpected = set(capture_keys) - requested_keys
             if unexpected:
                 raise RuntimeError(
                     "Gym checkpoint participant exported episodes outside the "
@@ -396,14 +396,14 @@ class GymCheckpointAdapter:
                 kind=member.kind,
                 checkpoint_id=checkpoint_id,
             )
-            if member.kind == "agent" and episode_keys:
-                agent_session_keys.update(episode_keys)
-                legacy_keys = self._legacy_agent_episode_keys(
+            if member.kind == "agent" and capture_keys:
+                agent_session_keys.update(capture_keys)
+                legacy_keys = self._legacy_agent_capture_keys(
                     checkpoint_dir,
                     participant=member.server_name,
                     manifest=manifest,
                 )
-                unreported = legacy_keys - set(episode_keys)
+                unreported = legacy_keys - set(capture_keys)
                 if unreported:
                     raise RuntimeError(
                         "Gym checkpoint agent records name episodes absent from its "
@@ -418,13 +418,13 @@ class GymCheckpointAdapter:
                     )
                 legacy_agent_keys.update(legacy_keys)
             if member.kind == "environment":
-                duplicate_owners = exported_environment_keys.intersection(episode_keys)
+                duplicate_owners = exported_environment_keys.intersection(capture_keys)
                 if duplicate_owners:
                     raise RuntimeError(
                         "Gym checkpoint episode was exported by multiple environment "
                         f"participants: {sorted(duplicate_owners)!r}"
                     )
-                exported_environment_keys.update(episode_keys)
+                exported_environment_keys.update(capture_keys)
 
             participant_keys: tuple[str, ...] = ()
             if member.kind == "model":
@@ -472,7 +472,7 @@ class GymCheckpointAdapter:
                     server_name=member.server_name,
                     kind=member.kind,
                     phase=phase,
-                    episode_keys=episode_keys,
+                    capture_keys=capture_keys,
                     manifest=manifest,
                     staging_keys=participant_keys,
                 )
