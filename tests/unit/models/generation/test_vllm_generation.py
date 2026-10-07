@@ -53,7 +53,9 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
     _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
 )
+from nemo_rl.data.captured_media import MediaCaptureRejected
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    CONTEXT_OVERFLOW_ERROR_MARKERS,
     VllmAsyncGenerationWorkerImpl,
     _AsyncLLMHTTPClient,
 )
@@ -787,7 +789,11 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class VLLMValidationError(ValueError):
+    class VLLMValidationError(Exception):
+        # vLLM 0.29.0's hierarchy is VLLMValidationError -> VLLMClientError ->
+        # VLLMError -> Exception (vllm/exceptions.py); it is NOT a ValueError,
+        # so the fake must not be one either, or a test could pass while the
+        # route catches the class only through the ValueError clause.
         def __init__(self, message, *, parameter=None, value=None):
             super().__init__(message)
             self.parameter = parameter
@@ -994,7 +1000,7 @@ async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
 
 
 def test_vllm_async_http_server_reports_a_context_length_overflow_as_400(monkeypatch):
-    """vLLM raises a plain ValueError from get_max_tokens when the prompt alone fills
+    """vLLM raises a plain ValueError from get_max_tokens when the prompt alone exceeds
     max_model_len. The route must answer HTTP 400 as an OpenAI-style error object
     (`error` with `message`, `type`, and `code`), which is how the Gym model server
     recognizes the overflow (the status plus the "context length" text), while any
@@ -1064,9 +1070,10 @@ def test_served_overflow_refusals_carry_the_gym_context_length_phrase(
     monkeypatch, raise_overflow
 ):
     """The NeMo-Gym model server classifies a context overflow by the substring
-    "context length" in a 400 body (nemo_gym/responses_api_models/vllm_model/
-    app.py). Both overflow sources this server relays must keep that phrase on
-    the wire; a rewording here would silently break Gym's classifier."""
+    "context length" in a 400 body (Gym repository root,
+    responses_api_models/vllm_model/app.py, ``chat_completions``). Both overflow
+    sources this server relays must keep that phrase on the wire; a rewording
+    here would silently break Gym's classifier."""
     import sys
 
     _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
@@ -1101,6 +1108,62 @@ def test_served_overflow_refusals_carry_the_gym_context_length_phrase(
     response = asyncio.run(handler(request, raw_request=None))
     assert response.status_code == 400
     assert "context length" in json.loads(response.body)["error"]["message"]
+
+
+def test_vllm_async_http_server_keeps_media_capture_rejections_as_400(monkeypatch):
+    """MediaCaptureRejected subclasses ValueError and must reach its own
+    handler (HTTP 400 with a stable ``code``), not the context-overflow clause,
+    which would re-raise it as an engine error and serve a 500."""
+    _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "val_temperature": 0.0,
+        "val_top_p": 1.0,
+        "vllm_cfg": {},
+    }
+    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker._http_engine_client = worker.llm
+    worker._capture_calls = {}
+    worker.token_capture = None
+    worker.llm_async_engine_args = MagicMock()
+    worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
+        served_model_name="served-model", model="model-path"
+    )
+
+    app = _FakeFastAPIApp()
+    worker._setup_vllm_openai_api_server(app)
+    handler = dict(app.routes)["/v1/chat/completions"]
+    request = types.SimpleNamespace(top_k=None, top_p=1.0, temperature=1.0)
+
+    async def rejected(request, raw_request):
+        raise MediaCaptureRejected(
+            "Multimodal token capture requires media capture setup"
+        )
+
+    openai_serving_chat.instances[0].create_chat_completion = rejected
+    response = asyncio.run(handler(request, raw_request=None))
+    assert response.status_code == 400
+    error = json.loads(response.body)["error"]
+    assert error["code"] == "media_capture_rejected"
+    assert error["param"] == "messages"
+
+
+@pytest.mark.vllm
+def test_context_overflow_marker_matches_installed_vllm_wording():
+    """A vLLM upgrade that rewords get_max_tokens' refusal would silently turn
+    the served 400 back into a 500; pin the marker to the installed wording."""
+    api_utils = pytest.importorskip("vllm.entrypoints.serve.utils.api_utils")
+
+    with pytest.raises(ValueError) as excinfo:
+        api_utils.get_max_tokens(
+            max_model_len=8, max_tokens=None, input_length=9, default_sampling_params={}
+        )
+    assert any(
+        marker in str(excinfo.value) for marker in CONTEXT_OVERFLOW_ERROR_MARKERS
+    )
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(

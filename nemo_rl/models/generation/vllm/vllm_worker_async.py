@@ -1404,10 +1404,33 @@ class VllmAsyncGenerationWorkerImpl(
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
                 )
+            except MediaCaptureRejected as e:
+                # Matched before the ValueError clause below on purpose:
+                # MediaCaptureRejected subclasses ValueError and must keep its
+                # own 400 code. Raised inside preprocess_chat before begin_call,
+                # so no capture state exists yet and the abort below is a no-op
+                # kept for symmetry. Return a 400 carrying a stable code so Gym
+                # and the worker log can distinguish a retained-media re-tile
+                # from a real engine error (which stays a 500 below).
+                worker_self._abort_request_capture(request, reason=e.code)
+                LOGGER.warning(
+                    "Rejected captured call before inference (%s): %s", e.code, e
+                )
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "param": "messages",
+                            "code": e.code,
+                        }
+                    },
+                    status_code=400,
+                )
             except (VLLMValidationError, ValueError) as e:
                 # vLLM raises VLLMValidationError for prompts exceeding
                 # max_model_len during tokenization and a plain ValueError when
-                # the prompt alone fills the window (see
+                # the prompt alone exceeds the window (see
                 # CONTEXT_OVERFLOW_ERROR_MARKERS). Neither is returned as an
                 # ErrorResponse, so without this they reach the client as HTTP
                 # 500. Convert them to HTTP 400 so the Gym proxy can detect
@@ -1427,27 +1450,6 @@ class VllmAsyncGenerationWorkerImpl(
                             "type": "invalid_request_error",
                             "param": getattr(e, "parameter", None),
                             "code": 400,
-                        }
-                    },
-                    status_code=400,
-                )
-            except MediaCaptureRejected as e:
-                # Raised inside preprocess_chat before begin_call, so no capture
-                # state exists yet and the abort below is a no-op kept for
-                # symmetry. Return a 400 carrying a stable code so Gym and the
-                # worker log can distinguish a retained-media re-tile from a
-                # real engine error (which stays a 500 below).
-                worker_self._abort_request_capture(request, reason=e.code)
-                LOGGER.warning(
-                    "Rejected captured call before inference (%s): %s", e.code, e
-                )
-                return JSONResponse(
-                    content={
-                        "error": {
-                            "message": str(e),
-                            "type": "invalid_request_error",
-                            "param": "messages",
-                            "code": e.code,
                         }
                     },
                     status_code=400,
