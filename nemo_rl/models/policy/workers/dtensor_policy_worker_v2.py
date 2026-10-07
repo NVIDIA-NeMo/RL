@@ -59,7 +59,6 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
-from nemo_rl.models.generation.interfaces import RefitPayloadMode
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -1058,11 +1057,8 @@ class DTensorPolicyWorkerV2Impl(
         return self.model.config
 
     @torch.no_grad()
-    def prepare_refit_info(
-        self, *, refit_payload_mode: RefitPayloadMode = "hf_export"
-    ) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
-        del refit_payload_mode
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):

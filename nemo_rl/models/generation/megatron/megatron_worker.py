@@ -190,6 +190,20 @@ class _MegatronRefitTask:
     def is_mxfp8(self) -> bool:
         return isinstance(self.destination, MXFP8Tensor)
 
+    @property
+    def is_quantized(self) -> bool:
+        # MCore owns detection of TE tensor and grouped-parameter storage.
+        from megatron.core.fp8_utils import (
+            is_float8tensor,
+            is_grouped_tensor_with_quantized_storage,
+        )
+
+        return (
+            self.is_mxfp8
+            or is_float8tensor(self.destination)
+            or is_grouped_tensor_with_quantized_storage(self.destination)
+        )
+
 
 @dataclass
 class _MegatronBulkRefitPiece:
@@ -1570,7 +1584,7 @@ class MegatronGenerationRefitMixin:
                 f"of {piece.task.param_name!r}: expected {tuple(piece.shape)}, "
                 f"got {tuple(tensor.shape)}."
             )
-        if not piece.task.is_mxfp8:
+        if not piece.task.is_quantized:
             assert piece.destination is not None
             piece.spec.select(piece.destination).copy_(tensor)
             return
@@ -1600,17 +1614,12 @@ class MegatronGenerationRefitMixin:
                 raise RuntimeError(
                     f"Duplicate Megatron M-to-N target for {spec.name!r}."
                 )
-            destination = None if task.is_mxfp8 else task.destination
-            # MXFP8 destinations stage through BF16: the wire payload is logical
-            # BF16 by design, and MXFP8Tensor.dtype is optional metadata that is
-            # None until the destination's first successful update. Pin the
-            # staging dtype rather than inferring it from the quantized store.
-            dtype = torch.bfloat16 if task.is_mxfp8 else task.destination.dtype
+            destination = None if task.is_quantized else task.destination
             pieces[spec.name] = _MegatronBulkRefitPiece(
                 task=task,
                 spec=spec,
                 shape=spec.selected_shape(task.expected_shape),
-                dtype=dtype,
+                dtype=torch.bfloat16,
                 device=task.destination.device,
                 destination=destination,
             )
@@ -1673,6 +1682,12 @@ class MegatronGenerationRefitMixin:
         for layer_name in refit_info["layer_names"]:
             for param_info in refit_info["per_layer_params"][layer_name]:
                 name = param_info["name"]
+                wire_dtype = param_info.get("dtype")
+                if wire_dtype not in (torch.bfloat16, "torch.bfloat16"):
+                    raise ValueError(
+                        f"Megatron bulk refit requires BF16 wire dtype for {name!r}, "
+                        f"got {wire_dtype!r}."
+                    )
                 grouped_proj = param_info.get("grouped_expert_proj")
                 if grouped_proj is not None:
                     prefix = name.rsplit(f".{grouped_proj}.weight", 1)[0]
@@ -1695,7 +1710,10 @@ class MegatronGenerationRefitMixin:
                         f"No local Megatron destination maps to M-to-N weight {name!r}."
                     )
                 specs[name] = (
-                    staged_spec(piece) if piece.task.is_mxfp8 else direct_spec(piece)
+                    staged_spec(piece)
+                    if piece.task.is_quantized
+                    or piece.destination.dtype != torch.bfloat16
+                    else direct_spec(piece)
                 )
 
         return HFToLocalParamMap(specs=specs)
@@ -1946,7 +1964,7 @@ class MegatronGenerationRefitMixin:
             )
             if self._generation_m2n_pending:
                 raise RuntimeError(
-                    "Megatron M-to-N refit ended with incomplete fused MXFP8 weights: "
+                    "Megatron M-to-N refit ended with incomplete fused quantized weights: "
                     f"{sorted(self._generation_m2n_pending)}"
                 )
             torch.cuda.empty_cache()
@@ -1982,7 +2000,14 @@ class MegatronGenerationRefitMixin:
                 f"expected {tuple(task.expected_shape)}, got {tuple(converted_weight.shape)}."
             )
 
-        task.destination.copy_(converted_weight)
+        if task.is_quantized and not task.is_mxfp8:
+            # MCore updates both TE value/scale storage and grouped member views
+            # without rebuilding the buffers referenced by inference CUDA graphs.
+            from megatron.core.fp8_utils import copy_tensor_to_quantized_param
+
+            copy_tensor_to_quantized_param(task.destination, converted_weight)
+        else:
+            task.destination.copy_(converted_weight)
 
     def _load_generation_refit_batch(
         self, weights: list[tuple[str, torch.Tensor]]

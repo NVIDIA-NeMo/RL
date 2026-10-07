@@ -85,7 +85,6 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
         # so a stand-in has to answer. Omitting it is how the reshard rebuild went on
         # passing its tests while silently defaulting to "nemo".
         get_collective_sender_spec=lambda: SimpleNamespace(nccl_peer="nemo"),
-        get_refit_payload_mode=lambda: "hf_export",
     )
     for name in (
         "rebuild_collective",
@@ -121,17 +120,11 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
         sync_params_before_refit=lambda: None,
         init_collective=lambda *a, **k: ["train-f"],
         init_nccl_reshard_comm_group=lambda **k: ["train-bulk"],
-        prepare_nccl_reshard_refit_info=lambda tp,
-        gp,
-        tws,
-        iws,
-        *,
-        refit_payload_mode: (
+        prepare_nccl_reshard_refit_info=lambda tp, gp, tws, iws: (
             plan_calls.append(
                 {
                     "train_world_size": tws,
                     "gen_world_size": iws,
-                    "refit_payload_mode": refit_payload_mode,
                 }
             )
             or {"gen_world_size": iws}

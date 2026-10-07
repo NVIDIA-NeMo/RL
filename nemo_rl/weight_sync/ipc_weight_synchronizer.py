@@ -109,9 +109,7 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         return self._stale
 
     def init_communicator(self) -> None:
-        state_dict_info = self._policy.prepare_refit_info(
-            refit_payload_mode=self._generation.get_refit_payload_mode()
-        )
+        state_dict_info = self._policy.prepare_refit_info()
         self._generation.prepare_refit_info(state_dict_info)
 
     def shutdown(self) -> None:

@@ -45,38 +45,35 @@ single `ValueError` listing every violation. The current requirements are:
   configured ETP. An explicitly requested generation-side ETP > 1 with
   `inference_optimized` is rejected by config key name rather than surfacing as
   a raw MCore assert at model build.
-* **Precision** for vLLM supports BF16 train ↔ BF16 gen, blockwise-FP8 train
-  (`fp8_param=true` + blockwise recipe) ↔ FP8 gen, and BF16 train → MXFP8 gen
-  (`vllm_cfg.precision=fp8`, `vllm_cfg.is_mx=true`). Blockwise-FP8 train →
-  MXFP8 gen is not supported.
+* **Bulk precision is independent of source and destination storage.** Supported
+  Transformer Engine blockwise FP8 and MXFP8 training parameters are dequantized
+  using their own quantization metadata. BF16 logical weights are then sent to
+  BF16, blockwise FP8, or MXFP8 destination hooks. The destination derives its
+  own weight scales when requantizing; training-side scales are not a wire format.
+  vLLM blockwise destinations use square blocks with FP32 inverse scales; fused
+  gate/up partitions must align with block boundaries. Refined scale grids and
+  incompatible runtime scale layouts are rejected. Megatron blockwise destinations
+  use Transformer Engine storage, while `inference_optimized` supports MXFP8.
 * Megatron generation accepts BF16 or supported Transformer Engine FP8 training
   parameter storage, including blockwise FP8 and MXFP8 with `fp8_param=true`.
   Quantized sources are materialized as logical BF16 for transport; the
-  destination either stores BF16 or quantizes each complete local weight into
-  MXFP8. Before every refit, an explicit parameter sync materializes optimizer
+  destination either stores the logical weight or quantizes each complete local
+  weight into its supported local FP8 storage. Before every refit, an explicit
+  parameter sync materializes optimizer
   updates that would otherwise wait for the next overlapped all-gather. When
   MXFP8 parameter all-gather reuses the gradient buffer, that aliased allocation
   stays GPU-resident across refit so
   persistent DDP/autograd views remain valid; ordinary gradient buffers and
   optimizer state are offloaded only when
   `policy.generation.mcore_generation_config.offload_policy_before_refit` is true.
-* **The wire format is always BF16, even for MXFP8 train → MXFP8 gen.** This is
-  forced by the upstream API, not a shortcut, and is worth stating because it
-  means an MXFP8 trainer does *not* get a smaller refit (expect ~2x the
-  theoretical MXFP8 wire size, plus a dequantize on the source and a re-quantize
-  on the destination). Three reasons it cannot currently be otherwise:
-  * TE MXFP8 and MCore MXFP8 are not byte-compatible. MCore itself dequantizes
-    and re-quantizes when converting between them, deliberately, "to avoid any
-    numerical differences between TE and mcore MXFP8 formats"
-    (`megatron/core/inference/quantization/utils.py`).
-  * `MXFP8Tensor`'s only data constructor is `from_bf16`; `copy_` delegates to
-    `quantize_`, which calls `from_bf16`. There is no relayout entry point.
-  * MCore stores *swizzled* scales, padded to multiples of 128 rows and 4
-    columns, so a shard of the swizzled scales is not a shard of the logical
-    scales. An alignment-aware MXFP8 transport would have to unswizzle,
-    re-slice, and re-swizzle — most of the cost of a requantize anyway.
-  The benefit of this path is capability (M-to-N reshard into a Megatron
-  engine), not bandwidth.
+* **Every bulk transfer uses canonical HF layout and `torch.bfloat16`.** This
+  contract applies to the source `ctx.buf`, advertised metadata, and receiver
+  buffer, including MXFP8 train → MXFP8 gen. It deliberately trades wire size
+  and repeated dequantization for a stable interface across storage formats.
+  For example, TE and MCore MXFP8 use different representations, and MCore's
+  padded, swizzled scale layout cannot be resharded as logical HF weights.
+  Precision-specific conversion belongs in the hooks. This BF16 requirement
+  does not change the misc path or other refit transports.
 * BF16 FlashInfer TRTLLM MoE is supported through vLLM's native
   layerwise-reload path. Its grouped expert weights must use expert-parallel
   destination sharding with linear expert placement; tensor-sharded expert
@@ -133,12 +130,19 @@ nccl-reshard-refit implementation:
   and EXAONE bridges), so the worker excludes those HF layers when building the
   metadata (`_collect_mtp_hf_layer_names()`).
 * **Misc path** — everything else (embeddings, attention projections, layernorms, the
-  MoE router, `lm_head`, FP8 `_scale_inv` siblings, FP8 KV-cache scales, …). FP8
+  MoE router, `lm_head`, scales belonging to misc weights, FP8 KV-cache scales, …). FP8
   KV-cache scales are supported only by backend combinations that allow an FP8 KV
   cache; BF16 FlashInfer TRTLLM rejects that configuration at setup. These tensors
   ride a packed broadcast (conventional `packed_tensor.py` implementation) over the
   shared `model_update_group` and are loaded on the generation side through the
   backend's regular `load_weights` machinery.
+
+Weight-quantization scale exports associated with bulk weights are excluded from
+misc metadata and transfer. Their source values have already been consumed during
+dequantization; sending them again could overwrite the scales produced by destination
+requantization. The exclusion follows the weights actually selected for bulk transfer,
+not a blanket scale-name filter. Scales for misc weights and KV-cache scales retain
+their existing handling and dtypes.
 
 The feature is integrated into the `nemo_rl/weight_sync/` framework. For vLLM,
 `create_weight_synchronizer(...)` returns an `NcclReshardWeightSynchronizer` directly.
@@ -151,12 +155,10 @@ the inference-engine lifecycle and delegates only the transfer to an
 `NcclReshardWeightSynchronizer.init_communicator()` runs three steps once, before
 training starts:
 
-The generation backend declares whether it needs Bridge's physical export or logical
-weights. The synchronizer passes that payload requirement to the source worker; the
-source worker does not inspect or branch on the destination backend's name. Requesting
-logical weights is a Megatron-inference-specific exception: vLLM keeps the universal
-Bridge-export representation, while Megatron inference requests logical weights because
-its destination storage is built by MCore rather than Bridge. Megatron workers are assigned
+Bulk preparation always describes logical BF16 weights, regardless of the generation
+backend. There is no payload-mode negotiation. Bulk conversion tasks are kept separate
+from the existing misc export tasks so changing the bulk contract does not change
+attention, embedding, router, or other misc payloads. Megatron workers are assigned
 an explicit source or destination refit role and expose the same
 `prepare_refit_info`, `build_hf_to_local_param_map`,
 `prepare_nccl_reshard_refit_info`, and `nccl_reshard_refit` entry points in either
@@ -186,7 +188,8 @@ The derived metadata (`nccl_reshard_refit_info`) contains, per parameter:
 * `name` — the HF parameter name (per-expert MoE weights are grouped into a single
   `...experts.{gate,up,down}_proj.weight` entry of shape `[num_experts, ...]`, tagged
   with `grouped_expert_proj`);
-* `global_shape` and `dtype` of the full, unsharded tensor;
+* `global_shape` in canonical HF layout and `dtype=torch.bfloat16` for the full,
+  unsharded logical tensor;
 * `src_mesh_info` / `src_placements` — the training-side rank mesh (`MeshInfo`) and
   DTensor-style `Shard`/`Replicate` placements, derived from the training parallelism
   (TP/EP/PP; experts live on an EP mesh, everything else on a TP mesh);
@@ -203,16 +206,18 @@ Finally, both sides build their `hf_to_local_param_map`: a mapping from each bul
 parameter name to a `LocalParamSpec(base, pre, post)` describing how that parameter is
 realized **locally**:
 
-* On the **training side**, a direct BF16 parameter's `base` is the live TP/EP-local
-  shard (sent as-is). Quantized sources are dequantized in `pre`, using a per-layer
-  source cache so gate/up views and grouped expert members sharing a training
-  parameter dequantize it only once. The refit loop clears this cache after each
-  layer, including on exceptions. Grouped MoE experts get a `pre` hook that
-  materializes this rank's per-expert specs and stacks them into a
-  `[num_local_experts, ...]` tensor fresh at each refit.
-* On the **generation side**, a direct parameter's `base` is the live vLLM parameter
-  (received into in place). Conventional fused parameters use `pre`/`post` hooks to
-  receive a component and copy it into the appropriate local region. BF16
+* On the **training side**, each `pre(base)` independently reads current local
+  parameter values, dequantizes quantized storage, selects the corresponding HF
+  slice, and produces a contiguous BF16 buffer. Selection follows dequantization
+  so fused gate/up slices use the complete source's quantization metadata.
+  Grouped MoE hooks materialize their ordered expert members and stack them into
+  `[num_local_experts, ...]`. There is no shared source cache or cache lifecycle
+  in the transfer loop; repeated preparation observes parameter updates immediately.
+* On the **generation side**, canonical BF16 storage can receive in place. Other
+  storage uses `pre` to allocate BF16 staging and `post` to cast, assemble, or
+  quantize the received values. Fused gate/up and grouped expert layouts retain
+  the assembly needed to commit complete local weights. Quantized commits update
+  weight values and their associated scales together. BF16
   FlashInfer TRTLLM grouped experts instead receive into canonical EP-local staging
   tensors; `post` loads each logical expert with its global expert ID through vLLM's
   native weight loader.
@@ -222,8 +227,11 @@ realized **locally**:
 Every training step (with in-flight weight updates, concurrently with generation),
 `NcclReshardWeightSynchronizer.sync_weights()` triggers both sides:
 
-* `pre` contains a function that should be executed in-flight before the refit.
-* `post` contains a function that should be executed in-flight after the refit.
+* `base` identifies local storage; it is not necessarily the transfer buffer.
+* `pre(base)` prepares a `RefitCtx` whose `buf` is a canonical HF BF16 shard.
+  Omitting `pre` is valid only when `base` already satisfies that contract.
+* `post(ctx)` commits received values to local storage, including quantization and
+  scale updates. It runs after the transfer on the corresponding CUDA stream.
 
 * The **training side** walks `per_layer_params`, skipping parameters owned by other PP
   stages. For each parameter it resolves the `LocalParamSpec`, runs `pre`
@@ -237,7 +245,7 @@ Every training step (with in-flight weight updates, concurrently with generation
   are distributed across `NRL_REFIT_NUM_STREAMS` CUDA streams so different stages'
   reshards overlap. For each parameter it runs `pre` (receive-buffer allocation), calls
   `xferdtensor(None, ..., dst, ..., group, stream)`, then `post` (copy back into the
-  fused parameter or load staged TRTLLM experts). After every transfer completes, the
+  fused parameter, requantize local storage, or load staged TRTLLM experts). After every transfer completes, the
   TRTLLM path finalizes vLLM's native layerwise reload once to restore the packed runtime
   layout.
 
@@ -245,6 +253,10 @@ Every training step (with in-flight weight updates, concurrently with generation
 
 After the bulk reshard completes, the misc parameters are transferred.
 This part is reusing the same code implementation as the conventional packed_tensor refit.
+Its representation is unchanged. Only source scale entries belonging to BF16 bulk
+weights are removed; the receiver must retain its newly generated scales for those
+weights. This also keeps unrelated weight scales and KV-cache scales on their existing
+load path.
 
 ## Decoupling Backend-Agnostic Parts and Backend-Dependent Parts
 
@@ -274,7 +286,7 @@ generation side maps those HF names onto whatever its own storage layout is.
 * **Training side** (`megatron_policy_worker.py`): producing the HF-named state-dict
   metadata; building `hf_to_local_param_map` — resolving each HF name to the local
   Megatron tensor view and providing `pre` hooks for quantized-source
-  dequantization with a per-layer cache and grouped-MoE stacking; the
+  independent dequantization, BF16 conversion, and grouped-MoE stacking; the
   `init_collective` / `init_nccl_reshard_comm_group` bootstrap methods; the
   `nccl_reshard_refit()` send loop; the misc packed-broadcast producer.
 * **Generation side** (`vllm_backend.py`): building `hf_to_local_param_map` — mapping HF
@@ -286,8 +298,9 @@ generation side maps those HF names onto whatever its own storage layout is.
   backend-specific finalization after all weights arrive.
 * **Megatron generation side** (`megatron_worker.py`): mapping the same canonical
   HF FFN shards to local fused dense/expert views. BF16 destinations receive in
-  place; MXFP8 destinations use short-lived BF16 staging buffers and quantize into
-  their persistent MCore storage. Misc weights continue through Megatron Bridge's
+  place; quantized destinations use short-lived BF16 staging buffers, assemble
+  fused components, and quantize into persistent storage with fresh scales.
+  Misc weights continue through Megatron Bridge's
   packed-broadcast import path.
 
 **To extend to a new backend**, provide a destination map from canonical HF weights
@@ -297,8 +310,9 @@ Everything else follows the fixed transport contract.
 
 **The one backend-specific implementation — `build_hf_to_local_param_map`:** resolve
 each bulk HF name to your local storage as a `LocalParamSpec` — `base` for tensors
-sent/received as-is, and `pre`/`post` hooks wherever your layout requires staging
-(fused/merged tensors, layout conversions, grouped-expert stacking). Backends that
+sent/received as-is only when already canonical BF16, and `pre`/`post` hooks wherever
+the local representation requires staging (quantization, fused/merged tensors, layout
+conversions, grouped-expert stacking). Backends that
 rebuild runtime storage may also need one transport-level finalizer after all specs have
 run. These are the only places the backend's parameter layout is encoded; all cross-mesh
 byte movement is already handled by the shared metadata and `xferdtensor`.

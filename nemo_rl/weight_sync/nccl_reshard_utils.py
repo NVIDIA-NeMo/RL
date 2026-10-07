@@ -68,7 +68,8 @@ class MeshInfo:
 class RefitCtx:
     """Handoff between a param's ``pre`` and ``post`` refit hooks.
 
-    The transfer API (xferdtensor) reads only ``buf``.
+    The transfer API (xferdtensor) reads only ``buf``: bulk weights use
+    canonical HF layout and BF16 dtype, independently of either storage format.
     ``extra`` is provided for flexible, backend-specific state.
 
     Use case:
@@ -680,91 +681,34 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                 "policy.megatron_cfg.account_for_loss_in_pipeline_split must be False."
             )
 
-        # Precision compatibility (train ↔ gen). vLLM supports byte-compatible
-        # BF16/BF16 and blockwise-FP8/FP8, plus receiver-side BF16-to-MXFP8.
-        # Megatron generation sends logical BF16 weights from BF16 or TE-quantized
-        # training storage, then writes BF16 or performs on-receive MXFP8
-        # quantization at the destination.
-        #   BF16 train  ↔ BF16 gen   (default, tested)
-        #   FP8  train  ↔ FP8  gen   (fp8_param=True + blockwise + vllm precision=fp8)
-        #   BF16 storage → MXFP8 gen  (receiver quantizes the resharded BF16 shard)
-        # FP8→BF16 has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
+        # Bulk values always travel as canonical HF BF16. Source storage and
+        # destination precision are independent; destination hooks own quantization.
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
         fp8_param = fp8_cfg.get("fp8_param", False)
-        fp8_recipe = fp8_cfg.get("fp8_recipe", None)
-        trainer_precision = policy.get("precision")
-        gen_precision = vllm_cfg.get("precision", None)
-
-        # The refit byte-copies weights train -> gen, so gen dtype must match
-        # train: BF16 (unset / "auto" / "bf16" / "bfloat16") or FP8 ("fp8").  A
-        # value like "float16"/"float32" would silently mismatch the bf16 train
-        # bytes and deadlock/corrupt the bulk collective; reject anything outside
-        # the supported set up front (this also catches typos such as
-        # "fp8_e4m3" that would otherwise skip the FP8 checks below).
+        if fp8_param and not fp8_cfg.get("enabled", False):
+            violations.append(
+                "policy.megatron_cfg.fp8_cfg.fp8_param=True requires "
+                "policy.megatron_cfg.fp8_cfg.enabled=True."
+            )
         if backend == "vllm":
+            gen_precision = vllm_cfg.get("precision", None)
             if gen_precision not in (
                 None,
                 "auto",
                 "bf16",
                 "bfloat16",
                 "fp8",
+                "half",
+                "float16",
+                "float",
+                "float32",
             ):
                 violations.append(
                     f"policy.generation.vllm_cfg.precision={gen_precision!r} is not "
-                    "supported by nccl_reshard_refit (use 'bf16'/'bfloat16', 'fp8', "
-                    "'auto', or leave unset); the refit byte-copies weights, so the "
-                    "gen dtype must match the train dtype."
-                )
-
-            if gen_precision == "fp8":
-                if fp8_param:
-                    if vllm_cfg.get("is_mx"):
-                        violations.append(
-                            "policy.generation.vllm_cfg.is_mx=True does not support "
-                            "blockwise-FP8 storage from "
-                            "policy.megatron_cfg.fp8_cfg.fp8_param; use BF16 training "
-                            "storage for receiver-side MXFP8 quantization."
-                        )
-                    elif fp8_recipe != "blockwise":
-                        violations.append(
-                            "policy.megatron_cfg.fp8_cfg.fp8_recipe must be 'blockwise' "
-                            f"when fp8_param=True (got {fp8_recipe!r}); other recipes "
-                            "don't produce export-ready scale_inv tensors."
-                        )
-                elif vllm_cfg.get("is_mx"):
-                    # Policy precision uses the canonical NeMo-RL spelling; unlike
-                    # vLLM precision, it does not accept "bf16", "auto", or None.
-                    if trainer_precision != "bfloat16":
-                        violations.append(
-                            "policy.generation.vllm_cfg.is_mx=True with "
-                            "policy.megatron_cfg.fp8_cfg.fp8_param=False requires "
-                            "policy.precision='bfloat16' for receiver-side MXFP8 "
-                            f"quantization (got {trainer_precision!r})."
-                        )
-                else:
-                    violations.append(
-                        "policy.generation.vllm_cfg.precision='fp8' requires "
-                        "policy.megatron_cfg.fp8_cfg.fp8_param=True, or "
-                        "is_mx=True for BF16-to-MXFP8 refit."
-                    )
-            elif fp8_param:
-                violations.append(
-                    "policy.megatron_cfg.fp8_cfg.fp8_param=True requires "
-                    "policy.generation.vllm_cfg.precision='fp8' "
-                    "(FP8 storage on train side has no BF16 gen consumer)."
+                    "supported by nccl_reshard_refit."
                 )
 
         if backend == "megatron":
-            if policy.get("precision") != "bfloat16":
-                violations.append(
-                    "policy.precision must be 'bfloat16' for Megatron-generation "
-                    "nccl_reshard refit."
-                )
-            if fp8_param and not fp8_cfg.get("enabled", False):
-                violations.append(
-                    "policy.megatron_cfg.fp8_cfg.fp8_param=True requires "
-                    "policy.megatron_cfg.fp8_cfg.enabled=True."
-                )
             gen_pp = mcore_generation_cfg.get("pipeline_model_parallel_size", 1)
             if gen_pp != 1:
                 violations.append(
@@ -774,11 +718,14 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                 )
 
             gen_fp8_cfg = mcore_generation_cfg.get("fp8_cfg", {}) or {}
-            if gen_fp8_cfg.get("enabled") and gen_fp8_cfg.get("fp8_recipe") != "mxfp8":
+            if gen_fp8_cfg.get("enabled") and gen_fp8_cfg.get("fp8_recipe") not in (
+                "mxfp8",
+                "blockwise",
+            ):
                 violations.append(
-                    "Megatron-generation nccl_reshard refit supports BF16 or MXFP8 "
+                    "Megatron-generation nccl_reshard refit supports BF16, MXFP8, or blockwise FP8 "
                     "inference weights; policy.generation.mcore_generation_config."
-                    "fp8_cfg.fp8_recipe must be 'mxfp8' when FP8 is enabled."
+                    "fp8_cfg.fp8_recipe must be 'mxfp8' or 'blockwise' when FP8 is enabled."
                 )
 
             # MXFP8 inference quantizes through resolve_mxfp8_backend, which
@@ -793,9 +740,16 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             gemm_backend = mcore_generation_cfg.get(
                 "inference_grouped_gemm_backend", "vllm"
             )
-            if gen_fp8_cfg.get("enabled") and gemm_backend not in (
-                "torch",
-                "flashinfer",
+            if (
+                gen_fp8_cfg.get("enabled")
+                and gen_fp8_cfg.get("fp8_recipe") == "mxfp8"
+                and mcore_generation_cfg.get("transformer_impl")
+                == "inference_optimized"
+                and gemm_backend
+                not in (
+                    "torch",
+                    "flashinfer",
+                )
             ):
                 violations.append(
                     "MXFP8 Megatron generation requires policy.generation."
@@ -804,19 +758,15 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                     "default is 'vllm', so this key must be set explicitly)."
                 )
 
-            # _prepare_mxfp8_refit only installs persistent MXFP8 destinations
-            # for cores whose transformer_impl is 'inference_optimized'. Without
-            # it the refit silently falls back to copying BF16 into TE FP8
-            # params instead of quantizing, so reject the pairing up front.
             if (
                 gen_fp8_cfg.get("enabled")
+                and gen_fp8_cfg.get("fp8_recipe") == "blockwise"
                 and mcore_generation_cfg.get("transformer_impl")
-                != "inference_optimized"
+                == "inference_optimized"
             ):
                 violations.append(
-                    "MXFP8 Megatron generation requires policy.generation."
-                    "mcore_generation_config.transformer_impl='inference_optimized' "
-                    f"(got {mcore_generation_cfg.get('transformer_impl')!r})."
+                    "Blockwise FP8 Megatron destinations require Transformer Engine "
+                    "storage, not transformer_impl='inference_optimized'."
                 )
 
     # Gen-backend restrictions. The reshard supports gen-side TP, DP, EP, and

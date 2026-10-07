@@ -82,7 +82,6 @@ def _mock_generation(**overrides):
     gen.worker_group.workers = [MagicMock(), MagicMock()]
     gen.get_collective_sender_spec.return_value = CollectiveSenderSpec()
     gen.get_inference_world_size.return_value = None
-    gen.get_refit_payload_mode.return_value = "hf_export"
     for k, v in overrides.items():
         setattr(gen, k, v)
     return gen
@@ -195,10 +194,10 @@ class TestIPCWeightSynchronizer:
         sync = IPCWeightSynchronizer(policy, gen)
 
         sync.init_communicator()
-        policy.prepare_refit_info.assert_called_once_with(
-            refit_payload_mode="hf_export"
+        policy.prepare_refit_info.assert_called_once_with()
+        gen.prepare_refit_info.assert_called_once_with(
+            policy.prepare_refit_info.return_value
         )
-        gen.prepare_refit_info.assert_called_once()
 
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
     def test_phase_restoration_on_transfer_failure(self, mock_ray):
@@ -506,10 +505,10 @@ class TestSGLangColocatedWeightSynchronizer:
         sync = SGLangColocatedWeightSynchronizer(policy, gen)
 
         sync.init_communicator()
-        policy.prepare_refit_info.assert_called_once_with(
-            refit_payload_mode="hf_export"
+        policy.prepare_refit_info.assert_called_once_with()
+        gen.prepare_refit_info.assert_called_once_with(
+            policy.prepare_refit_info.return_value
         )
-        gen.prepare_refit_info.assert_called_once()
 
     def test_phase_restoration_on_transfer_failure(self, mock_ray):
         """The engine session and both sides' phases are restored on failure."""
@@ -695,10 +694,10 @@ class TestCollectiveWeightSynchronizer:
         )
         sync.init_communicator()
 
-        policy.prepare_refit_info.assert_called_once_with(
-            refit_payload_mode="hf_export"
+        policy.prepare_refit_info.assert_called_once_with()
+        gen.prepare_refit_info.assert_called_once_with(
+            policy.prepare_refit_info.return_value
         )
-        gen.prepare_refit_info.assert_called_once()
         policy.init_collective.assert_called_once_with(
             "10.0.0.1", 29500, 6, train_world_size=4, nccl_peer="nemo"
         )
@@ -821,7 +820,6 @@ class TestNcclReshardWeightSynchronizer:
             {"tp_size": 4, "ep_size": 1, "etp_size": 4, "pp_size": 1},
             2,
             4,
-            refit_payload_mode="hf_export",
         )
         gen.prepare_nccl_reshard_refit_info.assert_called_once()
         (shipped,), _ = gen.prepare_nccl_reshard_refit_info.call_args

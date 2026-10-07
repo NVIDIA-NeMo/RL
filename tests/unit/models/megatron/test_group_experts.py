@@ -49,9 +49,9 @@ def _group(proj, grouped_name, expert_groups):
 
 def test_group_experts_stacks_in_order():
     prefix = "model.layers.0.mlp.experts"
-    e0 = torch.randn(1536, 4096)
-    e1 = torch.randn(1536, 4096)
-    e2 = torch.randn(1536, 4096)
+    e0 = torch.randn(1536, 4096, dtype=torch.bfloat16)
+    e1 = torch.randn(1536, 4096, dtype=torch.bfloat16)
+    e2 = torch.randn(1536, 4096, dtype=torch.bfloat16)
     groups = {
         (prefix, "gate_proj"): [
             LocalParamSpec(base=e0),
@@ -61,6 +61,7 @@ def test_group_experts_stacks_in_order():
     }
     out = _group("gate_proj", f"{prefix}.gate_proj.weight", groups)
     assert out.shape == (3, 1536, 4096)
+    assert out.dtype == torch.bfloat16
     # Order preserved (expert 0 first).
     assert torch.equal(out[0], e0)
     assert torch.equal(out[1], e1)
@@ -96,10 +97,14 @@ def test_build_hf_to_local_param_map_train_side():
     w._opd_full_teacher_checkpoint_paths = {}
     w._opd_full_lm_head_evicted = False
     prefix = "model.layers.0.mlp.experts"
-    direct = torch.randn(8, 16)  # a dense FFN down_proj local shard view
-    e0 = torch.randn(128, 16)  # this rank's local expert 0 gate_proj
-    e1 = torch.randn(128, 16)  # local expert 1 gate_proj
-    w._iter_local_hf_param_shards = lambda source_cache: [
+    direct = torch.randn(
+        8, 16, dtype=torch.bfloat16
+    )  # a dense FFN down_proj local shard view
+    e0 = torch.randn(
+        128, 16, dtype=torch.bfloat16
+    )  # this rank's local expert 0 gate_proj
+    e1 = torch.randn(128, 16, dtype=torch.bfloat16)  # local expert 1 gate_proj
+    w._iter_local_hf_param_shards = lambda: [
         ("model.layers.0.mlp.down_proj.weight", LocalParamSpec(base=direct)),
         (f"{prefix}.1.gate_proj.weight", LocalParamSpec(base=e1)),
         (f"{prefix}.0.gate_proj.weight", LocalParamSpec(base=e0)),
