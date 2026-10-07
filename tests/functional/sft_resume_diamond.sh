@@ -105,7 +105,7 @@ EOF
 
 # Mcore 1+1 resume with override_opt_param_scheduler: Bridge rewrites the
 # scheduler position on resume only when this flag is on.
-MCORE_OVERRIDE=(policy.dtensor_cfg.enabled=false policy.megatron_cfg.enabled=true
+MCORE_OVERRIDE=(policy.automodel_cfg.enabled=false policy.megatron_cfg.enabled=true
   +policy.megatron_cfg.scheduler.override_opt_param_scheduler=true
   policy.megatron_cfg.scheduler.lr_warmup_init=1.0e-7
   policy.megatron_cfg.scheduler.lr_warmup_iters=10
