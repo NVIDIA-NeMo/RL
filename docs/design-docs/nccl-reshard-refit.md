@@ -50,9 +50,9 @@ single `ValueError` listing every violation. The current requirements are:
   using their own quantization metadata. BF16 logical weights are then sent to
   BF16, blockwise FP8, or MXFP8 destination hooks. The destination derives its
   own weight scales when requantizing; training-side scales are not a wire format.
-  vLLM blockwise destinations use square blocks with FP32 inverse scales; fused
-  gate/up partitions must align with block boundaries. Refined scale grids and
-  incompatible runtime scale layouts are rejected. Megatron blockwise destinations
+  vLLM blockwise destinations use FP32 inverse scales and the destination's effective
+  block grid, including refined MoE grids. Fused gate/up partitions must align with
+  that grid; incompatible runtime scale layouts are rejected. Megatron blockwise destinations
   use Transformer Engine storage, while `inference_optimized` supports MXFP8.
   The unchanged misc path still limits blockwise FP8 parameter storage on the
   training side to blockwise FP8 vLLM destinations (`precision='fp8'`, `is_mx=false`):

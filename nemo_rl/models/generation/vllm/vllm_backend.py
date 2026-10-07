@@ -1986,11 +1986,17 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         raise ValueError(
                             f"Blockwise FP8 target {vllm_name!r} has no owning module"
                         )
-                    block_size = getattr(module, "weight_block_size", None)
+                    # MoE can refine the checkpoint grid to fit TP-local shards.
+                    # Its scale storage and kernel use this realized block shape.
+                    block_size = getattr(
+                        getattr(module, "quant_method", None), "moe_block_shape", None
+                    )
+                    if block_size is None:
+                        block_size = getattr(module, "weight_block_size", None)
                     if block_size is None:
                         block_size = module.quant_method.quant_config.weight_block_size
                     block_size = tuple(block_size)
-                    if len(block_size) != 2 or block_size[0] != block_size[1]:
+                    if len(block_size) != 2 or any(size <= 0 for size in block_size):
                         raise ValueError(
                             f"Unsupported FP8 weight block size {block_size}"
                         )

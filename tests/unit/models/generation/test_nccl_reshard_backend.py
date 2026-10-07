@@ -1353,3 +1353,95 @@ def test_fp8_receiver_does_not_commit_invalid_quantizer_output(monkeypatch):
         spec.post(ctx)
     assert torch.all(weight.float() == 2)
     assert torch.all(scale == 7)
+
+
+@pytest.mark.parametrize("runtime_block_shape", [(64, 64), (64, 128), (128, 64)])
+def test_bf16_receiver_uses_refined_moe_scale_grid(runtime_block_shape, monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    monkeypatch.setattr(fp8, "global_fp8_config", fp8.FP8Config())
+    block_n, block_k = runtime_block_shape
+    experts, intermediate, hidden = 2, block_n, 2 * block_k
+    prefix = "model.layers.0.mlp.experts"
+    param_name = prefix + ".w13_weight"
+    weight = torch.full(
+        (experts, 2 * intermediate, hidden), -1, dtype=torch.float8_e4m3fn
+    )
+    scales = torch.full((experts, 2, 2), 9, dtype=torch.float32)
+    owner = SimpleNamespace(
+        weight_block_size=(128, 128),
+        quant_method=SimpleNamespace(moe_block_shape=runtime_block_shape),
+    )
+    ext = _make_ext({param_name: weight, param_name + "_scale_inv": scales})
+    ext.model_runner.model.named_modules = lambda: [(prefix, owner)]
+    info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": f"{prefix}.{projection}.weight",
+                    "global_shape": [experts, intermediate, hidden],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": projection,
+                }
+                for projection in ("gate_proj", "up_proj")
+            ]
+        },
+    }
+    specs = ext.build_hf_to_local_param_map(info)
+    for cycle in (1, 2):
+        for projection, value in (("gate_proj", 3), ("up_proj", 67)):
+            spec = specs.get(f"{prefix}.{projection}.weight")
+            ctx = spec.pre(spec.base)
+            ctx.buf.fill_(value * cycle)
+            spec.post(ctx)
+        restored = weight.float() * scales.repeat_interleave(
+            block_n, -2
+        ).repeat_interleave(block_k, -1)
+        torch.testing.assert_close(
+            restored[:, :intermediate],
+            torch.full((experts, intermediate, hidden), 3.0 * cycle),
+            rtol=0.07,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            restored[:, intermediate:],
+            torch.full((experts, intermediate, hidden), 67.0 * cycle),
+            rtol=0.07,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize("block_shape", [(64, 128), (128, 64)])
+@pytest.mark.parametrize("shape", [(256, 256), (129, 193)])
+@pytest.mark.parametrize("pow2_scale", [False, True])
+def test_blockwise_quantization_supports_rectangular_blocks(
+    block_shape, shape, pow2_scale, monkeypatch
+):
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    monkeypatch.setattr(
+        fp8, "global_fp8_config", fp8.FP8Config(use_weight_pow2_scale=pow2_scale)
+    )
+    weight = (
+        torch.arange(shape[0] * shape[1], dtype=torch.float32).reshape(shape) % 83 - 41
+    ).to(torch.bfloat16)
+    block_n, block_k = block_shape
+    weight[:block_n, :block_k] = 0
+    value, scale = fp8.cast_tensor_to_fp8_blockwise(weight, block_shape)
+    expected_scale_shape = (
+        (shape[0] + block_n - 1) // block_n,
+        (shape[1] + block_k - 1) // block_k,
+        1,
+    )
+    assert value.shape == weight.shape and value.dtype == torch.float8_e4m3fn
+    assert scale.shape == expected_scale_shape and scale.dtype == torch.float32
+    assert torch.isfinite(scale).all() and (scale > 0).all()
+    restored = (
+        value.float()
+        * scale.squeeze(-1)
+        .repeat_interleave(block_n, 0)
+        .repeat_interleave(block_k, 1)[: shape[0], : shape[1]]
+    )
+    torch.testing.assert_close(restored, weight.float(), rtol=0.07, atol=0)
