@@ -1397,6 +1397,10 @@ class AsyncNemoGymRolloutImpl:
                 rollout_metrics["baseline_groups/distinct_first_prompts"] = int(
                     torch.unique(first_prompts["token_ids"], dim=0).shape[0]
                 )
+                # Each dispatched group is one logical prompt group here, so the
+                # key reads 1; emitted so dashboards see the same key set as the
+                # legacy path, where it counts the batch's prompt groups.
+                rollout_metrics["baseline_groups/logical_groups"] = 1
                 rollout_metrics["baseline_groups/samples"] = len(completed_results)
 
         rollout_metrics.update(env_timing_metrics)

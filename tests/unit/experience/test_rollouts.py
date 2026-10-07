@@ -2346,6 +2346,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         "completion_count": 2,
         "agent": "agent",
         "baseline_groups/distinct_first_prompts": 1,
+        "baseline_groups/logical_groups": 1,
         "baseline_groups/samples": 2,
         "remote_time": 2.0,
         "timing/test/routing/group_share/nemo_gym": 1,
@@ -2671,6 +2672,9 @@ def test_run_async_nemo_gym_rollout(
             "timing/rollout/prepare_for_metrics_calculation": 0.0,
             "timing/rollout/aggregate_metrics": 0.0,
             "timing/rollout/per_agent_misc_metrics": 0.0,
+            "baseline_groups/distinct_first_prompts": 2,
+            "baseline_groups/logical_groups": 2,
+            "baseline_groups/samples": 2,
             "mean_gen_tokens_per_sample": None,
             "turns_per_sample/mean": 2.0,
             "turns_per_sample/max": 2,
@@ -2787,11 +2791,22 @@ def test_run_async_nemo_gym_rollout(
     """
 
 
-def _postprocess_two_rollouts(first_prompts):
-    """Postprocess one two-rollout group whose first prompts are the given token lists."""
-    rows = [{"agent_ref": {"name": "agent"}}, {"agent_ref": {"name": "agent"}}]
+def _postprocess_rollouts(first_prompts, group_ids=None):
+    """Postprocess one group whose first prompts are the given token lists.
+
+    ``group_ids`` mirrors what ``_prepare_nemo_gym_rows`` stamps on each row;
+    ``None`` entries leave the key off, as rows from a direct caller arrive.
+    """
+    if group_ids is None:
+        group_ids = [None] * len(first_prompts)
+    rows = []
+    for group_id in group_ids:
+        row = {"agent_ref": {"name": "agent"}}
+        if group_id is not None:
+            row[rollouts_mod.NEMO_GYM_GROUP_ID_KEY] = group_id
+        rows.append(row)
     results = []
-    for reward, prompt in zip((1.0, 2.0), first_prompts):
+    for index, prompt in enumerate(first_prompts):
         input_message = {
             "role": "user",
             "content": "prompt",
@@ -2809,7 +2824,7 @@ def _postprocess_two_rollouts(first_prompts):
                         "generation_logprobs": torch.tensor([-0.1]),
                     },
                 ],
-                "full_result": {"reward": reward},
+                "full_result": {"reward": float(index + 1)},
             }
         )
     return rollouts_mod._postprocess_single_nemo_gym_group(
@@ -2822,30 +2837,69 @@ def _postprocess_two_rollouts(first_prompts):
             (),
             {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
         )(),
-        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(len(results))}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=False,
     )
 
 
 def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog):
-    """Report distinct prompts and warn conditionally about singleton GRPO groups.
+    """Warn only when prompt-token baselines would split a logical prompt group.
 
-    The same postprocessor serves evaluation and non-GRPO algorithms, so the
-    warning must not claim that every caller actually has zero advantages.
+    The comparison is distinct first prompts against logical prompt groups
+    (``_ng_group_id``), so a validation batch with one rollout per prompt stays
+    silent, and rows without the key form a single group.
     """
-    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
-        shared = _postprocess_two_rollouts([[1, 5, 7], [1, 5, 7]])
-    assert shared.rollout_metrics["baseline_groups/distinct_first_prompts"] == 1
-    assert shared.rollout_metrics["baseline_groups/samples"] == 2
-    assert not [r for r in caplog.records if "distinct first prompts" in r.getMessage()]
 
+    def warnings():
+        return [r for r in caplog.records if "distinct first prompts" in r.getMessage()]
+
+    # One logical group, shared prompt: healthy training layout.
     with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
-        distinct = _postprocess_two_rollouts([[1, 5, 7], [1, 5, 9]])
+        shared = _postprocess_rollouts([[1, 5, 7], [1, 5, 7]])
+    assert shared.rollout_metrics["baseline_groups/distinct_first_prompts"] == 1
+    assert shared.rollout_metrics["baseline_groups/logical_groups"] == 1
+    assert shared.rollout_metrics["baseline_groups/samples"] == 2
+    assert not warnings()
+
+    # One logical group split by per-rollout prompt strings: the failure.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        distinct = _postprocess_rollouts([[1, 5, 7], [1, 5, 9]])
     assert distinct.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
-    [record] = [r for r in caplog.records if "distinct first prompts" in r.getMessage()]
-    assert (
-        record.levelname == "WARNING"
-        and "If these rows remain singleton prompt-token GRPO baseline groups"
-        in record.getMessage()
-    )
+    assert distinct.rollout_metrics["baseline_groups/logical_groups"] == 1
+    [record] = warnings()
+    assert record.levelname == "WARNING"
+    assert "form 1 logical prompt group(s) but have 2 distinct" in record.getMessage()
+    assert "prompt-token GRPO baselines split these groups" in record.getMessage()
+
+    # Validation layout: one rollout per prompt, one group id per row. Distinct
+    # prompts are expected there and must not warn.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        validation = _postprocess_rollouts(
+            [[1, 5, 7], [1, 5, 9]], group_ids=["g0", "g1"]
+        )
+    assert validation.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
+    assert validation.rollout_metrics["baseline_groups/logical_groups"] == 2
+    assert not warnings()
+
+    # Two logical groups with only one of them split: still a failure.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        partial = _postprocess_rollouts(
+            [[1, 5, 10], [1, 5, 11], [1, 6]], group_ids=["a", "a", "b"]
+        )
+    assert partial.rollout_metrics["baseline_groups/distinct_first_prompts"] == 3
+    assert partial.rollout_metrics["baseline_groups/logical_groups"] == 2
+    [record] = warnings()
+    assert "3 NeMo-Gym rollouts form 2 logical prompt group(s)" in record.getMessage()
+
+    # A one-rollout group is trivially distinct and must stay silent.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        single = _postprocess_rollouts([[1, 5, 7]])
+    assert single.rollout_metrics["baseline_groups/distinct_first_prompts"] == 1
+    assert single.rollout_metrics["baseline_groups/logical_groups"] == 1
+    assert single.rollout_metrics["baseline_groups/samples"] == 1
+    assert not warnings()

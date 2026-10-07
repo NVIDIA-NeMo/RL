@@ -3154,18 +3154,24 @@ def _postprocess_single_nemo_gym_group(
     # Prompt-token GRPO baselines compare these first-prompt token rows
     # (calculate_baseline_and_std_per_prompt). Per-rollout identifiers rendered
     # by an agent harness can split a group into singleton baselines with zero
-    # advantages. Report the distinct prompts, but keep the warning conditional:
-    # this postprocessor also serves evaluation and other training algorithms.
+    # advantages. Compare against the logical prompt groups rather than the row
+    # count: validation and distillation batches legitimately hold one rollout
+    # per prompt. _prepare_nemo_gym_rows stamps one group id per logical prompt
+    # group; rows handed in by a direct caller without the key form one group.
     distinct_first_prompts = int(torch.unique(input_ids, dim=0).shape[0])
+    logical_groups = len({row.get(NEMO_GYM_GROUP_ID_KEY) for row in nemo_gym_rows})
     rollout_metrics["baseline_groups/distinct_first_prompts"] = distinct_first_prompts
+    rollout_metrics["baseline_groups/logical_groups"] = logical_groups
     rollout_metrics["baseline_groups/samples"] = len(results)
-    if len(results) > 1 and distinct_first_prompts == len(results):
+    if distinct_first_prompts > logical_groups:
         logger.warning(
-            "All %d NeMo-Gym rollouts in this batch have distinct first prompts. "
-            "If these rows remain singleton prompt-token GRPO baseline groups, "
-            "their advantages will be zero; check that per-rollout identifiers "
-            "are not changing the agent harness prompt.",
+            "%d NeMo-Gym rollouts form %d logical prompt group(s) but have %d "
+            "distinct first prompts; prompt-token GRPO baselines split these "
+            "groups, and a singleton group gets zero advantage. Check that "
+            "per-rollout identifiers are not changing the agent harness prompt.",
             len(results),
+            logical_groups,
+            distinct_first_prompts,
         )
 
     final_batch = BatchedDataDict[DatumSpec](

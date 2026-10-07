@@ -1040,13 +1040,15 @@ def test_nemo_gym_rollout_first_prompt_metrics(
     assert len(completions) == 2
     if distinct_count is None:
         assert "baseline_groups/distinct_first_prompts" not in metrics
+        assert "baseline_groups/logical_groups" not in metrics
         assert "baseline_groups/samples" not in metrics
     else:
         assert metrics["baseline_groups/distinct_first_prompts"] == distinct_count
+        # Each dispatched group is one logical prompt group on this path.
+        assert metrics["baseline_groups/logical_groups"] == 1
         assert metrics["baseline_groups/samples"] == 2
     assert not any(
-        "singleton prompt-token GRPO baseline groups" in record.message
-        for record in caplog.records
+        "distinct first prompts" in record.message for record in caplog.records
     )
 
 
