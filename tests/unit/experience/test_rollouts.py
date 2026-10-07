@@ -1791,6 +1791,125 @@ def test_native_rollout_groups_match_whole_batch(monkeypatch):
     )
 
 
+async def _fake_scored_sample_rollout(sample_idx, initial_sample_state, **kwargs):
+    """One-turn sample rollout whose metadata carries a per-sample score."""
+    final_state = {
+        "message_log": initial_sample_state["message_log"],
+        "extra_env_info": initial_sample_state["extra_env_info"],
+        "task_name": initial_sample_state["task_name"],
+        "total_reward": torch.tensor(0.0),
+        "idx": initial_sample_state["idx"],
+        "metadata": {"score": float(sample_idx)},
+    }
+    sample_metrics = {
+        "turn_count": 1,
+        "total_tokens": 1,
+        "assistant_tokens": 1,
+        "env_tokens": 0,
+        "terminated": True,
+        "truncated": False,
+        "max_turns_reached": False,
+        "total_reward": 0.0,
+        "turn_gen_tokens": [1],
+        "turn_input_tokens": [1],
+        "turn_total_tokens": [2],
+        "max_gen_tokens_per_turn": 1,
+        "per_worker_token_counts": {},
+    }
+    return final_state, sample_metrics
+
+
+def _env_metrics_rollout_kwargs(task_to_env):
+    input_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [{"role": "user", "content": f"prompt-{i}"}] for i in range(4)
+            ],
+            "extra_env_info": [{} for _ in range(4)],
+            "task_name": ["test"] * 4,
+            "idx": [0, 1, 2, 3],
+            "loss_multiplier": torch.ones(4),
+        }
+    )
+    return {
+        "policy_generation": None,
+        "input_batch": input_batch,
+        "tokenizer": None,
+        "task_to_env": task_to_env,
+        "max_seq_len": 128,
+        "max_rollout_turns": 2,
+    }
+
+
+def test_env_metrics_reach_the_whole_batch_and_groups_paths(monkeypatch):
+    """An opted-in environment's hook runs on the whole-batch path and once per
+    prompt group on the groups path, which is the one native path async GRPO
+    uses."""
+
+    class _ScoreEnv:
+        def aggregates_rollout_metadata(self):
+            return True
+
+        def global_post_process_and_metrics(self, batch):
+            scores = [m["score"] for m in batch["metadata"]]
+            return batch, {"mean_score": sum(scores) / len(scores)}
+
+    monkeypatch.setattr(
+        rollouts_mod, "run_sample_multi_turn_rollout", _fake_scored_sample_rollout
+    )
+    rollout_kwargs = _env_metrics_rollout_kwargs({"test": _ScoreEnv()})
+
+    whole_batch, whole_metrics = run_async_multi_turn_rollout(**rollout_kwargs)
+    assert whole_metrics["test/mean_score"] == pytest.approx(1.5)
+    assert whole_batch["metadata"] == [{"score": float(i)} for i in range(4)]
+
+    async def collect_groups():
+        return [
+            group
+            async for group in run_async_multi_turn_rollout_groups(
+                **rollout_kwargs, num_generations=2
+            )
+        ]
+
+    groups = asyncio.run(collect_groups())
+    assert [group.rollout_metrics["test/mean_score"] for group in groups] == [
+        pytest.approx(0.5),
+        pytest.approx(2.5),
+    ]
+
+
+def test_env_metrics_leave_the_batch_layout_alone_without_an_opt_in(monkeypatch):
+    """Without an opted-in environment neither path attaches the metadata
+    column and no env metric key appears, so group batches can extend a
+    replay buffer saved before the column existed."""
+
+    class _PlainEnv:
+        def global_post_process_and_metrics(self, batch):
+            return batch, {"must_not_appear": 1}
+
+    monkeypatch.setattr(
+        rollouts_mod, "run_sample_multi_turn_rollout", _fake_scored_sample_rollout
+    )
+    rollout_kwargs = _env_metrics_rollout_kwargs({"test": _PlainEnv()})
+
+    whole_batch, whole_metrics = run_async_multi_turn_rollout(**rollout_kwargs)
+    assert "metadata" not in whole_batch.keys()
+    assert not any(key.startswith("test/") for key in whole_metrics)
+
+    async def collect_groups():
+        return [
+            group
+            async for group in run_async_multi_turn_rollout_groups(
+                **rollout_kwargs, num_generations=2
+            )
+        ]
+
+    groups = asyncio.run(collect_groups())
+    for group in groups:
+        assert "metadata" not in group.final_batch.keys()
+        assert not any(key.startswith("test/") for key in group.rollout_metrics)
+
+
 def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     """Prompt groups are yielded in completion order using async iteration."""
 
@@ -2812,20 +2931,29 @@ def test_aggregate_env_metrics_calls_every_env_hook_and_reports_a_failure_once(
         def global_post_process_and_metrics(self, batch):
             raise KeyError("rewards")
 
-    class _Upstream:
-        def global_post_process_and_metrics(self, batch):
-            raise AssertionError("an environment without the marker must not be called")
+    class _WithoutMarker:
+        """No ``aggregates_rollout_metadata``: must never be called. Returns
+        metrics rather than raising, because a raise would be swallowed by the
+        hook's own best-effort handling and could not fail the test."""
 
-    env, broken = _Env(), _Broken()
+        def __init__(self):
+            self.calls = 0
+
+        def global_post_process_and_metrics(self, batch):
+            self.calls += 1
+            return batch, {"must_not_appear": 1}
+
+    env, broken, without_marker = _Env(), _Broken(), _WithoutMarker()
     task_names = ["math", "math", "code", "text"]
     metadata = [{"answer": 1}, {"answer": 2}, None, None]
-    task_to_env = {"math": env, "code": broken, "text": _Upstream()}
+    task_to_env = {"math": env, "code": broken, "text": without_marker}
     monkeypatch.setattr(rollouts_mod, "_ENV_METRICS_HOOK_WARNED", set())
     metrics = {}
     with caplog.at_level(logging.WARNING):
         rollouts_mod._aggregate_env_metrics(metrics, task_names, metadata, task_to_env)
         rollouts_mod._aggregate_env_metrics(metrics, task_names, metadata, task_to_env)
     assert metrics == {"math/n": 2}
+    assert without_marker.calls == 0
     assert env.batches[0]["metadata"] == [{"answer": 1}, {"answer": 2}]
     warnings_for_code = [r for r in caplog.records if "'code' env metrics" in r.message]
     assert (
