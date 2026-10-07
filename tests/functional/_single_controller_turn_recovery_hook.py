@@ -17,23 +17,117 @@
 The wrapper does not alter scheduling or checkpoint timing. It records the
 structured recovery identity once each Gym submission is marked dispatched,
 when Gym refuses one at checkpoint admission, and after each completion has
-been sealed in the RL ledger. A two-process functional test can
-therefore prove that a restored episode returns to the same Gym instance under
-``gym_attempt + 1`` without depending on log wording.
+been sealed in the RL ledger. The recovery phases can therefore prove that a
+restored episode returns to the same Gym instance under ``gym_attempt + 1``
+without depending on log wording.
+
+When ``SC_PREFIX_RECOVERY_TRAINING_PAYLOAD`` is set, the hook also materializes
+the finalized TQ rows immediately before training so an uninterrupted run and a
+recovered run can be compared without adding a production debug-data path.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+from _gym_prefix_recovery_parity import (
+    append_training_batch,
+    serialize_training_batch,
+)
+
 from examples import run_grpo_single_controller
 from nemo_rl.experience.rollout_manager import RolloutCompletionCallback
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+
+
+class _TrainingPayloadRecorder:
+    """Test-only TQPolicy wrapper that records the rows sent to training."""
+
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        output_path: Path,
+        initial_train_step: int,
+        staging_partition: str,
+    ) -> None:
+        self._delegate = delegate
+        self._output_path = output_path
+        self._train_step = initial_train_step
+        self._chunk_index = 0
+        self._step_open = False
+        self._staging_partition = staging_partition
+
+    def __getattr__(self, name: str) -> Any:
+        delegate = self.__dict__.get("_delegate")
+        if delegate is None:
+            raise AttributeError(name)
+        return getattr(delegate, name)
+
+    def begin_train_step(self, *args: Any, **kwargs: Any) -> Any:
+        result = self._delegate.begin_train_step(*args, **kwargs)
+        self._train_step += 1
+        self._chunk_index = 0
+        self._step_open = True
+        return result
+
+    def train_microbatches_from_meta(
+        self,
+        meta: Any,
+        timer: Any = None,
+        train_fields: tuple[str, ...] = (),
+    ) -> Any:
+        if not self._step_open:
+            raise RuntimeError(
+                "training payload recorder observed a batch outside a step"
+            )
+        select_fields = list(train_fields)
+        if "total_reward" not in select_fields:
+            select_fields.append("total_reward")
+        data = self._delegate.read_from_dataplane(
+            meta,
+            select_fields=select_fields,
+        )
+        tags = meta.tags
+        if tags is None:
+            raise RuntimeError("training payload recorder requires data-plane tags")
+        staging_sample_ids = self._delegate.dp_client.list_sample_ids(
+            partition_id=self._staging_partition
+        )
+        append_training_batch(
+            self._output_path,
+            serialize_training_batch(
+                train_step=self._train_step,
+                chunk_index=self._chunk_index,
+                sample_ids=meta.sample_ids,
+                tags=tags,
+                data=data,
+                staging_sample_ids=staging_sample_ids,
+            ),
+        )
+        self._chunk_index += 1
+        return self._delegate.train_microbatches_from_meta(
+            meta,
+            timer=timer,
+            train_fields=train_fields,
+        )
+
+    def finish_train_step(self) -> Any:
+        result = self._delegate.finish_train_step()
+        self._step_open = False
+        return result
+
+    def abort_train_step(self) -> Any:
+        try:
+            return self._delegate.abort_train_step()
+        finally:
+            self._step_open = False
 
 
 class _InstrumentedNemoGymRolloutImpl:
@@ -60,8 +154,10 @@ class _InstrumentedNemoGymRolloutImpl:
 
     def _append_event(self, event: str, **fields: Any) -> None:
         self._events_path.parent.mkdir(parents=True, exist_ok=True)
+        # Wall time lets parity reports place each rollout on a per-run timeline.
+        record = {"event": event, "time_s": time.time(), **fields}
         with self._events_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"event": event, **fields}, sort_keys=True) + "\n")
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
 
     def _find_group(self, rollout_ids: list[str]) -> Any:
         rollout_id_set = set(rollout_ids)
@@ -134,6 +230,12 @@ class _InstrumentedNemoGymRolloutImpl:
             )
 
         async def _record_completion(generation_index: int, completion: Any) -> None:
+            # Gym returned the rollout; ``completion`` below marks the ledger seal.
+            self._append_event(
+                "completion_arrived",
+                **common,
+                generation_index=generation_index,
+            )
             await on_completion(generation_index, completion)
             refreshed = self._recovery_ledger.get_group(group.group_id)
             self._append_event(
@@ -200,6 +302,7 @@ _original_setup_single_controller = run_grpo_single_controller.setup_single_cont
 
 def _setup_with_gym_recovery_hook(*args: Any, **kwargs: Any) -> Any:
     actor_args, timing_metrics = _original_setup_single_controller(*args, **kwargs)
+    master_config = args[0] if args else kwargs["master_config"]
     manager = actor_args.rollout_manager
     impl = manager._impl
     events_path = os.environ.get("SC_GYM_RECOVERY_TEST_EVENTS")
@@ -214,6 +317,14 @@ def _setup_with_gym_recovery_hook(*args: Any, **kwargs: Any) -> Any:
     # gates checkpoint admission and Gym recovery on
     # ``isinstance(self._impl, AsyncNemoGymRolloutImpl)``.
     impl.run_rollout = instrumented.run_rollout
+    training_payload_path = os.environ.get("SC_PREFIX_RECOVERY_TRAINING_PAYLOAD")
+    if training_payload_path is not None:
+        actor_args.trainer_handle = _TrainingPayloadRecorder(
+            actor_args.trainer_handle,
+            output_path=Path(training_payload_path),
+            initial_train_step=int(actor_args.save_state.current_step),
+            staging_partition=master_config.token_capture.staging_partition,
+        )
     return actor_args, timing_metrics
 
 
