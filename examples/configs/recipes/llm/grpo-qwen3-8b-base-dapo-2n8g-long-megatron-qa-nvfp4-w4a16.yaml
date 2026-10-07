@@ -59,7 +59,7 @@ policy:
       tensor_parallel_size: 2
       max_model_len: 30720
       gpu_memory_utilization: 0.5
-      enforce_eager: true
+      # CUDA graphs (vLLM default FULL_AND_PIECEWISE) instead of enforce_eager: generation/step -75%, wall 164 -> 55 min. Logprob gates unchanged (same-window A/B on cw_dfw H100, see the rollout-perf skill).
 
 data:
   max_input_seq_length: 2048
@@ -79,7 +79,7 @@ env:
 
 checkpointing:
   checkpoint_dir: checkpoints/grpo-qwen3-8b-base-dapo-2n-long-w4a16
-  checkpoint_must_save_by: 00:03:45:00
+  checkpoint_must_save_by: 00:01:45:00
 
 logger:
   log_dir: logs/grpo-qwen3-8b-base-dapo-2n-long-w4a16
