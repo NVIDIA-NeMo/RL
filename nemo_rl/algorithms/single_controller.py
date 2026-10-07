@@ -185,7 +185,6 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     PromptGroupPhase,
-    RecoveryTargetLevel,
     RolloutRecoveryState,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -544,6 +543,9 @@ class SingleControllerActor:
         # it costs five minutes, not quietly at hour three of a run.
         self._env_handles = actor_args.env_handles
         self._gym_checkpoint_coordinator: Optional[GymCheckpointCoordinator] = None
+        self._generation_prefix_cuts_enabled = (
+            self._master_config.rollout_recovery.generation_prefix_cuts_enabled
+        )
         self._rollout_dispatch_admission_gate: Optional[
             RolloutDispatchAdmissionGate
         ] = None
@@ -1207,10 +1209,10 @@ class SingleControllerActor:
             "recovery_restore"
         ) as cut:
             recovery_ledger.load_state_dict(cut, parsed_state.ledger_state)
-            turn_groups = [
+            gym_state_groups = [
                 group
                 for group in recovery_ledger.groups()
-                if group.restore_level is RecoveryTargetLevel.TURN
+                if group.restore_level.requires_gym_checkpoint
             ]
             restore_id: Optional[str] = None
             restore_coordinator: Optional[GymCheckpointCoordinator] = None
@@ -1219,11 +1221,11 @@ class SingleControllerActor:
             restored_gym_episodes: set[tuple[str, str, int]] = set()
             restored_gym_staging_keys: set[str] = set()
             try:
-                if turn_groups:
+                if gym_state_groups:
                     coordinator = self._gym_checkpoint_coordinator
                     if coordinator is None:
                         raise RuntimeError(
-                            "rollout checkpoint contains turn-level Gym state, but "
+                            "rollout checkpoint contains turn/prefix Gym state, but "
                             "Gym checkpoint coordination is disabled"
                         )
                     manifest_path = (
@@ -1232,7 +1234,7 @@ class SingleControllerActor:
                     )
                     if not manifest_path.is_file():
                         raise FileNotFoundError(
-                            "turn-level rollout recovery requires the matching Gym "
+                            "turn/prefix rollout recovery requires the matching Gym "
                             f"manifest at {manifest_path}"
                         )
                     manifest = await asyncio.to_thread(
@@ -4286,6 +4288,8 @@ class SingleControllerActor:
         self,
         cut: DataPlaneMutationCut,
         checkpoint_path: PathLike,
+        *,
+        additional_expected_staging_keys: Optional[set[str]] = None,
     ) -> _RolloutCheckpointCut:
         """Save TQ and capture matching restart state under the barrier.
 
@@ -4328,6 +4332,7 @@ class SingleControllerActor:
                 cut,
                 replay_metadata=replay_metadata,
                 clear_unreferenced=False,
+                additional_expected_staging_keys=additional_expected_staging_keys,
             )
         tq_save_started = time.monotonic()
         await self._save_data_plane_checkpoint(
@@ -4362,11 +4367,16 @@ class SingleControllerActor:
         gym_commit: GymCheckpointCommitResult | None,
     ) -> _RolloutCheckpointCut:
         """Validate the prepared Gym cut, then capture matching TQ state."""
+        gym_staging_keys: set[str] = set()
         if gym_commit is not None:
-            await self._validate_gym_checkpoint_cut(
+            gym_staging_keys = await self._validate_gym_checkpoint_cut(
                 cut, gym_commit, checkpoint_path=checkpoint_path
             )
-        return await self._capture_rollout_checkpoint_cut(cut, checkpoint_path)
+        return await self._capture_rollout_checkpoint_cut(
+            cut,
+            checkpoint_path,
+            additional_expected_staging_keys=gym_staging_keys,
+        )
 
     def _gym_checkpoint_inventory(
         self, coordinator: GymCheckpointCoordinator
@@ -4488,7 +4498,7 @@ class SingleControllerActor:
         commit: GymCheckpointCommitResult,
         *,
         checkpoint_path: PathLike,
-    ) -> None:
+    ) -> set[str]:
         """Require Gym ownership and referenced staging rows to match this cut.
 
         Gym may have exported episodes RL dropped while it was prepared: it
@@ -4496,6 +4506,9 @@ class SingleControllerActor:
         They and their staged rows are left out of the saved manifest, since
         restore requires it to match RL's inventory and RL no longer continues
         them; a dropped group may already have cleaned those rows up.
+
+        Returns the staging rows the saved manifest keeps. ``commit`` still
+        names the dropped episodes' rows, so callers must use these instead.
         """
         cut.require_live()
         coordinator = self._gym_checkpoint_coordinator
@@ -4538,7 +4551,7 @@ class SingleControllerActor:
 
         expected_staging_keys = {key for keys in staging_keys.values() for key in keys}
         if not expected_staging_keys:
-            return
+            return expected_staging_keys
         actual_staging_keys = set(
             await self._call_dp(
                 "list_sample_ids",
@@ -4551,6 +4564,7 @@ class SingleControllerActor:
                 "Gym checkpoint references staging rows missing from live TQ state: "
                 f"missing={missing[:10]!r} (total={len(missing)})"
             )
+        return expected_staging_keys
 
     @contextlib.asynccontextmanager
     async def _prepared_gym_checkpoint(
@@ -4571,52 +4585,100 @@ class SingleControllerActor:
                 "Gym checkpoint coordinator has no dispatch admission gate"
             )
 
-        async with gate.closed():
-            # Gym parks every live rollout until resume, so the wait must not
-            # count against their deadlines. A separate holder keeps a
-            # colocated engine's own pause intact when this one ends.
-            self._rollout_manager.suspend_request_deadlines(
-                _GYM_CHECKPOINT_DEADLINE_HOLDER
-            )
+        fence_timeout_s: float | None = None
+        fence_started = False
+        if self._generation_prefix_cuts_enabled:
+            fence_timeout_s = self._master_config.token_capture.control_timeout_s
             try:
-                # Gym refuses a retire once a checkpoint is open, so retire while
-                # it is still idle; dispatch is already closed, so nothing new
-                # races in.
-                await self._retire_dropped_gym_episodes(coordinator, checkpoint_id)
-                async with coordinator.prepared(checkpoint_id):
-                    candidates = self._gym_checkpoint_inventory(coordinator)
-                    # A row dropped since that retire is still running in Gym,
-                    # which exports it; naming it keeps the export in scope, and
-                    # the cut leaves it out of the saved manifest.
-                    dropped = self._queued_gym_retirements(coordinator)
-                    scope = {
-                        instance_id: episodes
-                        + tuple(
-                            sorted(
-                                dropped[instance_id] - set(episodes),
-                                key=lambda episode: (
-                                    episode.rollout_id,
-                                    episode.attempt,
-                                ),
-                            )
-                        )
-                        for instance_id, episodes in candidates.items()
-                    }
-                    commit = await coordinator.commit(
-                        checkpoint_id,
-                        Path(checkpoint_path),
-                        scope,
+                await asyncio.to_thread(
+                    self._gen.begin_token_capture_snapshot_fence,
+                    timeout_s=fence_timeout_s,
+                )
+                fence_started = True
+            except BaseException as fence_error:
+                # Fan-out may have fenced a subset of workers before raising.
+                # Always attempt the idempotent release on every worker.
+                try:
+                    await asyncio.to_thread(
+                        self._gen.end_token_capture_snapshot_fence,
+                        timeout_s=fence_timeout_s,
                     )
-                    await self._drain_non_exported_gym_candidates(
-                        coordinator,
-                        candidates,
-                        commit,
+                except BaseException as release_error:
+                    raise BaseExceptionGroup(
+                        "token-capture snapshot fencing failed and partially fenced "
+                        "workers could not be released",
+                        [fence_error, release_error],
                     )
-                    yield commit
-            finally:
-                self._rollout_manager.resume_request_deadlines(
+                raise
+
+        checkpoint_error: BaseException | None = None
+        try:
+            async with gate.closed():
+                # Gym parks every live rollout until resume, so the wait must not
+                # count against their deadlines. A separate holder keeps a
+                # colocated engine's own pause intact when this one ends.
+                self._rollout_manager.suspend_request_deadlines(
                     _GYM_CHECKPOINT_DEADLINE_HOLDER
                 )
+                try:
+                    # Gym refuses a retire once a checkpoint is open, so retire
+                    # while it is still idle; dispatch is already closed, so
+                    # nothing new races in.
+                    await self._retire_dropped_gym_episodes(coordinator, checkpoint_id)
+                    async with coordinator.prepared(checkpoint_id):
+                        candidates = self._gym_checkpoint_inventory(coordinator)
+                        # A row dropped since that retire is still running in
+                        # Gym, which exports it; naming it keeps the export in
+                        # scope, and the cut leaves it out of the saved manifest.
+                        dropped = self._queued_gym_retirements(coordinator)
+                        scope = {
+                            instance_id: episodes
+                            + tuple(
+                                sorted(
+                                    dropped[instance_id] - set(episodes),
+                                    key=lambda episode: (
+                                        episode.rollout_id,
+                                        episode.attempt,
+                                    ),
+                                )
+                            )
+                            for instance_id, episodes in candidates.items()
+                        }
+                        commit = await coordinator.commit(
+                            checkpoint_id,
+                            Path(checkpoint_path),
+                            scope,
+                        )
+                        await self._drain_non_exported_gym_candidates(
+                            coordinator,
+                            candidates,
+                            commit,
+                        )
+                        yield commit
+                finally:
+                    self._rollout_manager.resume_request_deadlines(
+                        _GYM_CHECKPOINT_DEADLINE_HOLDER
+                    )
+        except BaseException as error:
+            checkpoint_error = error
+        finally:
+            if fence_started:
+                assert fence_timeout_s is not None
+                try:
+                    await asyncio.to_thread(
+                        self._gen.end_token_capture_snapshot_fence,
+                        timeout_s=fence_timeout_s,
+                    )
+                except BaseException as release_error:
+                    if checkpoint_error is not None:
+                        raise BaseExceptionGroup(
+                            "Gym checkpoint failed and generation workers could "
+                            "not be released",
+                            [checkpoint_error, release_error],
+                        )
+                    raise
+        if checkpoint_error is not None:
+            raise checkpoint_error
 
     async def _write_rollout_checkpoint_sidecars(
         self,
@@ -4685,6 +4747,12 @@ class SingleControllerActor:
                 not force
                 and self._last_rollout_snapshot_mutation_version
                 == self._data_plane_checkpoint_barrier.mutation_version
+                # Decoding grows a live call's recoverable prefix without
+                # mutating the data plane, so keep cutting while one is active.
+                and not (
+                    self._generation_prefix_cuts_enabled
+                    and self._rollout_recovery_ledger.has_dispatched_generation_prefix()
+                )
             ):
                 return _RolloutCheckpointSaveResult(
                     saved=False,

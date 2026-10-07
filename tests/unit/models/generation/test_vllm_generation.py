@@ -859,6 +859,10 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     )
     make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
     make_module(
+        "vllm.sampling_params",
+        RequestOutputKind=type("RequestOutputKind", (), {"DELTA": "delta"}),
+    )
+    make_module(
         "vllm.reasoning.abs_reasoning_parsers",
         ReasoningParserManager=ReasoningParserManager,
     )
@@ -946,6 +950,7 @@ async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
     worker._http_engine_client = worker.llm
     worker._capture_calls = {}
+    worker._capture_registry_lock = threading.Lock()
     worker.token_capture = None
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(

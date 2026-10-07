@@ -487,6 +487,17 @@ def test_recovery_overrides_may_only_make_the_target_coarser() -> None:
             },
         )
 
+    prefix_config = RolloutRecoveryConfig(
+        target_level=RecoveryTargetLevel.PREFIX,
+        task_source_target_level_overrides={
+            "restart-call": RecoveryTargetLevel.TURN,
+        },
+    )
+    policy = prefix_config.resolve_for_prompt(
+        {"extra_env_info": {"task_source": "restart-call"}}
+    )
+    assert policy.restore_level is RecoveryTargetLevel.TURN
+
 
 @pytest.mark.parametrize(
     ("prompt", "error_fragment"),
@@ -771,7 +782,12 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
     assert retry.siblings[1].current_attempt.status is RolloutAttemptStatus.RESERVED
 
 
-def test_turn_restart_preserves_sealed_sibling_and_restores_other_from_gym() -> None:
+@pytest.mark.parametrize(
+    "restore_level", [RecoveryTargetLevel.PREFIX, RecoveryTargetLevel.TURN]
+)
+def test_gym_state_restart_preserves_sealed_sibling_and_restores_other_from_gym(
+    restore_level: RecoveryTargetLevel,
+) -> None:
     ledger = RolloutRecoveryLedger()
     group = _reserve(
         ledger,
@@ -783,7 +799,7 @@ def test_turn_restart_preserves_sealed_sibling_and_restores_other_from_gym() -> 
         target_step=7,
         start_weight_version=6,
         recovery_granularity=RecoveryGranularity.SIBLING,
-        restore_level=RecoveryTargetLevel.TURN,
+        restore_level=restore_level,
         admitted=True,
     )
     _mutate(
@@ -1383,6 +1399,40 @@ def _dispatched_turn_group(ledger: RolloutRecoveryLedger) -> PromptGroupRecovery
         )
     )
     return group
+
+
+@pytest.mark.parametrize(
+    ("restore_level", "expected"),
+    [(RecoveryTargetLevel.PREFIX, True), (RecoveryTargetLevel.TURN, False)],
+)
+def test_only_a_dispatched_prefix_attempt_grows_a_recoverable_prefix(
+    restore_level: RecoveryTargetLevel, expected: bool
+) -> None:
+    """Decoding advances only dispatched prefix-level attempts between mutations."""
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        restore_level=restore_level,
+        admitted=True,
+    )
+    assert not ledger.has_dispatched_generation_prefix()
+
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g7", gym_instance_id="tools/replica-0"
+        )
+    )
+    assert ledger.has_dispatched_generation_prefix() is expected
+
+    _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
+    assert not ledger.has_dispatched_generation_prefix()
 
 
 def test_refused_fresh_dispatch_keeps_identity_and_leaves_gym_inventory() -> None:
