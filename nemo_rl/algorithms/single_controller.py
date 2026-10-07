@@ -1178,8 +1178,8 @@ class SingleControllerActor:
         if current_reward_settings is not None:
             if parsed_state.reward_settings is None:
                 raise ValueError(
-                    "unsupported legacy capture checkpoint: reward_settings are missing; "
-                    "migration of older capture checkpoints is not supported"
+                    "rollout recovery sidecar was saved with token capture disabled; "
+                    "it cannot be resumed with token capture enabled"
                 )
             parsed_state.reward_settings.require_compatible(current_reward_settings)
         if parsed_state.ledger_state["schema_version"] != expected_schema_version:
@@ -1868,6 +1868,14 @@ class SingleControllerActor:
         ) as cut:
             await self._cleanup_known_finalization_request_unlocked(cut, request)
 
+    async def _discard_committed_group(self, request: "ReassemblyRequest") -> None:
+        """Release a committed group the controller declines to train on."""
+        await self._cleanup_known_finalization_request(request)
+        # The group left the buffer unconsumed, so the post-step release for
+        # consumed groups never reaches its pending metrics and observations.
+        self._finalizer_metrics_by_group.pop(request.group_id, None)
+        self._finalizer_rewards_by_group.pop(request.group_id, None)
+
     async def _finalize_with_actor(
         self, request: "ReassemblyRequest"
     ) -> Optional["FinalizedGroup"]:
@@ -2234,7 +2242,7 @@ class SingleControllerActor:
                             # only the controller can act on: it is the one
                             # component that can source a replacement.
                             try:
-                                await self._cleanup_known_finalization_request(request)
+                                await self._discard_committed_group(request)
                             except BaseException as cleanup_error:
                                 raise RuntimeError(
                                     "finalizer group fell below "
@@ -2906,6 +2914,7 @@ class SingleControllerActor:
                             )
                             for _ in range(evicted):
                                 self._buffer_capacity.release()
+                            self._prune_finalizer_state(step_finalizer_group_ids)
 
                         # Select a batch. Read the target again rather than reusing
                         # the loop condition's value: the awaits above are a window in
@@ -3350,11 +3359,7 @@ class SingleControllerActor:
                         for name, values in step_finalizer_metrics.items()
                         if values
                         and not name.startswith(
-                            (
-                                "finalize/reward_",
-                                "finalize/penalty_count/",
-                                "finalize/effort/",
-                            )
+                            ("finalize/penalty_count/", "finalize/effort/")
                         )
                     }
                 )
@@ -4276,6 +4281,21 @@ class SingleControllerActor:
             flush=True,
         )
         return len(stale_tasks)
+
+    def _prune_finalizer_state(self, selected_group_ids: set[str]) -> None:
+        """Release pending finalizer state for groups evicted before training.
+
+        Eviction reports only a count, so reconcile against the groups that can
+        still be consumed: those in the buffer plus those already selected by
+        the step in progress.
+        """
+        live = set(self._buffer.group_ids) | selected_group_ids
+        for group_id in (
+            self._finalizer_metrics_by_group.keys()
+            | self._finalizer_rewards_by_group.keys()
+        ) - live:
+            self._finalizer_metrics_by_group.pop(group_id, None)
+            self._finalizer_rewards_by_group.pop(group_id, None)
 
     def _capture_reward_settings(self) -> CaptureRewardSettings | None:
         """Save run-scoped settings once, alongside raw captured rewards."""

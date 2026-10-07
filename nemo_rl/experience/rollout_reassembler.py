@@ -626,21 +626,9 @@ class RolloutReassembler:
                 else 0.0
             ),
         }
-        # Sufficient statistics are pooled by the consuming controller once per
-        # committed group; rejected placeholders never enter this population.
-        metrics["finalize/reward_count"] = float(len(valid_rows))
-        if valid_rows:
-            final_rewards = [row.reward for row in valid_rows]
-            metrics.update(
-                {
-                    "finalize/reward_sum": sum(final_rewards),
-                    "finalize/reward_sumsq": sum(
-                        value * value for value in final_rewards
-                    ),
-                    "finalize/reward_min": min(final_rewards),
-                    "finalize/reward_max": max(final_rewards),
-                }
-            )
+        # Per-row counts are pooled by the consuming controller once per
+        # committed group, alongside the retained reward observations;
+        # rejected placeholders never enter this population.
         for row in valid_rows:
             for name, value in row.reward_metrics.items():
                 metrics[name] = metrics.get(name, 0.0) + value

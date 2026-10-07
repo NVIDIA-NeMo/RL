@@ -30,6 +30,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
+from nemo_rl.experience.reward_penalties import FinalizedReward
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 from nemo_rl.experience.route_plan import (
@@ -158,6 +159,42 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
         staging_keys=["group_g0/call"],
     )
     assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
+
+
+def test_below_threshold_group_releases_pending_finalizer_state() -> None:
+    """A committed group dropped for min_valid_fraction_per_group leaves no state."""
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={"finalize/invalid_row_rate": 0.0},
+        reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    request = _request()
+
+    async def _below_threshold_branch() -> None:
+        # The same calls the rollout pump makes when
+        # valid_row_count / total_row_count < min_valid_fraction_per_group.
+        assert await ctrl._finalize_with_actor(request) is result
+        assert "group" in ctrl._finalizer_metrics_by_group
+        assert "group" in ctrl._finalizer_rewards_by_group
+        await ctrl._discard_committed_group(request)
+
+    asyncio.run(_below_threshold_branch())
+
+    ctrl._buffer.abort.assert_called_once_with("group")
+    assert "group" not in ctrl._finalizer_metrics_by_group
+    assert "group" not in ctrl._finalizer_rewards_by_group
 
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:

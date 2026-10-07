@@ -147,16 +147,18 @@ def test_generated_spans_only_including_each_terminal(ids, expected):
     assert counts["unwanted_token"] == int(expected)
 
 
+def _observations(*rewards: float) -> list[FinalizedReward]:
+    return [
+        FinalizedReward(f"sample-{i}", f"attempt-{i}", value, None)
+        for i, value in enumerate(rewards)
+    ]
+
+
 def test_metric_pooling_uses_valid_rollouts_and_legacy_names():
+    # Three groups with 1, 3 and 0 valid rows; rates use rows, not groups.
     metrics = aggregate_capture_reward_metrics(
-        {
-            "finalize/reward_count": [1, 3, 0],
-            "finalize/reward_sum": [0, 6],
-            "finalize/reward_sumsq": [0, 12],
-            "finalize/reward_min": [0, 2],
-            "finalize/reward_max": [0, 2],
-            "finalize/penalty_count/empty_final_answer": [1, 0, 0],
-        }
+        {"finalize/penalty_count/empty_final_answer": [1, 0, 0]},
+        _observations(0.0, 2.0, 2.0, 2.0),
     )
     assert metrics == {
         "finalize/reward_count": 4,
@@ -164,10 +166,12 @@ def test_metric_pooling_uses_valid_rollouts_and_legacy_names():
         "empty_final_answer_rate": 0.25,
         "total_reward/mean": 1.5,
         "total_reward/stddev": 1.0,
-        "total_reward/min": 0,
-        "total_reward/max": 2,
+        "total_reward/min": 0.0,
+        "total_reward/max": 2.0,
+        "total_reward/median": 2.0,
+        "total_reward/histogram": [0.0, 2.0, 2.0, 2.0],
     }
-    assert aggregate_capture_reward_metrics({"finalize/reward_count": [0]}) == {}
+    assert aggregate_capture_reward_metrics({}, []) == {}
 
 
 def _input(*messages):
@@ -268,39 +272,29 @@ def test_active_effort_requires_positive_bound(bound):
 def test_metric_pooling_single_row_reports_nan_stddev_and_no_disabled_keys():
     import math
 
-    metrics = aggregate_capture_reward_metrics(
-        {
-            "finalize/reward_count": [1.0],
-            "finalize/reward_sum": [2.0],
-            "finalize/reward_sumsq": [4.0],
-            "finalize/reward_min": [2.0],
-            "finalize/reward_max": [2.0],
-        }
-    )
+    metrics = aggregate_capture_reward_metrics({}, _observations(2.0))
     assert math.isnan(metrics.pop("total_reward/stddev"))
     assert metrics == {
         "finalize/reward_count": 1.0,
         "total_reward/mean": 2.0,
         "total_reward/min": 2.0,
         "total_reward/max": 2.0,
+        "total_reward/median": 2.0,
+        "total_reward/histogram": [2.0],
     }
 
 
 def test_metric_pooling_mixes_low_and_high_effort_groups():
     metrics = aggregate_capture_reward_metrics(
         {
-            "finalize/reward_count": [2.0, 1.0],
-            "finalize/reward_sum": [3.0, 1.0],
-            "finalize/reward_sumsq": [5.0, 1.0],
-            "finalize/reward_min": [1.0, 1.0],
-            "finalize/reward_max": [2.0, 1.0],
             # Group 0: two low rows (lengths 100, 300); group 1: one high row.
             "finalize/effort/low/100": [1.0],
             "finalize/effort/low/300": [1.0],
             "finalize/effort/high/700": [0.0, 1.0],
             "finalize/effort/length_reward_sum": [1.6],
             "finalize/effort/reward_sum": [3.0],
-        }
+        },
+        _observations(1.0, 2.0, 1.0),
     )
     assert metrics["mean_length_low"] == 200
     assert metrics["median_length_low"] == 200
@@ -339,6 +333,7 @@ def test_reward_settings_normalize_active_tokens_and_nested_extras():
     )
     restored = CaptureRewardSettings.from_state(
         {
+            "version": 1,
             "penalties": {
                 "penalize_unwanted_tokens": True,
                 "token_ids": {"unwanted": [7, 42], "note": "unused"},
@@ -388,6 +383,7 @@ def test_reward_settings_reject_semantic_changes_with_field_names(change, expect
     [
         None,
         {},
+        {"penalties": {}, "effort": None},
         {"version": 1, "penalties": None, "effort": None},
         {"version": 2, "penalties": {}, "effort": None},
         {"version": True, "penalties": {}, "effort": None},
@@ -416,16 +412,7 @@ def test_final_reward_distribution_and_agent_tables_are_pooled_exactly():
         )
         for i, value in enumerate([0.0, 2.0, 2.0, 8.0])
     ]
-    metrics = aggregate_capture_reward_metrics(
-        {
-            "finalize/reward_count": [1.0, 3.0],
-            "finalize/reward_sum": [0.0, 12.0],
-            "finalize/reward_sumsq": [0.0, 72.0],
-            "finalize/reward_min": [0.0, 2.0],
-            "finalize/reward_max": [0.0, 8.0],
-        },
-        observations,
-    )
+    metrics = aggregate_capture_reward_metrics({}, observations)
     assert metrics["total_reward/mean"] == 3.0
     assert metrics["total_reward/median"] == 2.0
     assert metrics["total_reward/histogram"] == [0.0, 2.0, 2.0, 8.0]
@@ -439,6 +426,4 @@ def test_final_reward_distribution_and_agent_tables_are_pooled_exactly():
         "ng_rollout_id": "attempt-0",
         "sample_id": "sample-0",
     }
-    with pytest.raises(ValueError, match="valid-row count"):
-        aggregate_capture_reward_metrics({"finalize/reward_count": [3.0]}, observations)
-    assert aggregate_capture_reward_metrics({"finalize/reward_count": [0.0]}, []) == {}
+    assert aggregate_capture_reward_metrics({}, []) == {}

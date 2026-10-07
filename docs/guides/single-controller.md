@@ -152,9 +152,10 @@ reward settings once per checkpoint. A versioned, validated projection compares
 the active reward rules: irrelevant config extras, inactive parameters and the
 order or duplication of unwanted IDs do not prevent resume. Changes to active
 rules fail before replay and identify the differing settings. Finalized rows
-retain their saved rewards. Recovery schema 6 also preserves pending reward
-observations and optional agent log context. Migration of older capture
-checkpoints is outside scope; missing reward settings are rejected explicitly.
+retain their saved rewards. Recovery schema 3 also preserves pending reward
+observations and optional agent log context. Only the current schema is
+readable; a checkpoint saved with token capture disabled cannot be resumed with
+token capture enabled.
 
 Penalty rates and final reward statistics use valid finalized rows. Reward mean,
 standard deviation, minimum, maximum, exact median and histogram are pooled from

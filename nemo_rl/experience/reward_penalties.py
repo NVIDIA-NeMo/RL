@@ -21,7 +21,6 @@ Optional full-result JSON is retained only when full-result logging is enabled.
 from __future__ import annotations
 
 import json
-import math
 import statistics
 from collections.abc import Callable, Container, Iterable, Sequence
 from dataclasses import asdict, dataclass
@@ -224,23 +223,24 @@ class CaptureRewardSettings:
 
     @classmethod
     def from_state(cls, value: object) -> CaptureRewardSettings:
-        """Validate version 1 or the original unversioned schema-5 settings.
+        """Validate a version-1 record written by ``to_state``.
 
-        Existing model defaults fill absent config fields. A future change to
-        reward semantics must explicitly version/migrate this projection.
+        Sidecars always write version 1; the live config never passes through
+        this path (see ``from_configs``). Existing model defaults fill absent
+        config fields. A future change to reward semantics must explicitly
+        version/migrate this projection.
         """
         # Config modules import this module for the shared calculations.
         from nemo_rl.algorithms.grpo import RewardPenaltyConfig
         from nemo_rl.experience.rollouts import EffortLevelsConfig
 
-        if not isinstance(value, dict) or set(value) not in (
-            {"penalties", "effort"},
-            {"version", "penalties", "effort"},
-        ):
+        if not isinstance(value, dict) or set(value) != {
+            "version",
+            "penalties",
+            "effort",
+        }:
             raise ValueError("invalid capture reward_settings record")
-        if "version" in value and (
-            type(value["version"]) is not int or value["version"] != 1
-        ):
+        if type(value["version"]) is not int or value["version"] != 1:
             raise ValueError(
                 f"unsupported capture reward_settings version={value['version']!r}"
             )
@@ -412,48 +412,36 @@ CAPTURE_PENALTY_METRICS = {spec.name: spec.metric for spec in CAPTURE_PENALTIES}
 
 def aggregate_capture_reward_metrics(
     metrics: dict[str, list[float]],
-    observations: Sequence[FinalizedReward] | None = None,
+    observations: Sequence[FinalizedReward],
 ) -> dict[str, Any]:
-    """Pool finalizer sufficient statistics over valid rows, never group rates."""
-    count = sum(metrics.get("finalize/reward_count", []))
-    if observations is not None and len(observations) != count:
-        raise ValueError("finalized reward observations must match the valid-row count")
+    """Pool per-group finalizer counts and per-row rewards over valid rows.
+
+    ``metrics`` holds the per-group finalizer metrics of the consumed groups;
+    ``observations`` holds one retained reward per valid row of those groups.
+    Rates are computed over valid rows, never averaged across groups.
+    """
+    count = len(observations)
     if not count:
         return {}
-    result = {"finalize/reward_count": count}
+    result: dict[str, Any] = {"finalize/reward_count": float(count)}
     for category, metric in CAPTURE_PENALTY_METRICS.items():
         key = f"finalize/penalty_count/{category}"
         if key in metrics:
             result[key] = sum(metrics[key])
             result[metric] = result[key] / count
-    mean = sum(metrics["finalize/reward_sum"]) / count
-    variance = max(0.0, sum(metrics["finalize/reward_sumsq"]) / count - mean * mean)
     result.update(
-        {
-            "total_reward/mean": mean,
-            "total_reward/stddev": math.sqrt(variance * count / (count - 1))
-            if count > 1
-            else math.nan,
-            "total_reward/min": min(metrics["finalize/reward_min"]),
-            "total_reward/max": max(metrics["finalize/reward_max"]),
-        }
-    )
-    if observations is not None:
-        result.update(
-            calculate_single_metric(
-                [row.reward for row in observations], len(observations), "total_reward"
-            )
+        calculate_single_metric(
+            [row.reward for row in observations], count, "total_reward"
         )
-        agent_rewards: dict[str, list[float]] = {}
-        for row in observations:
-            if row.log_context is not None:
-                agent_rewards.setdefault(row.log_context.agent_name, []).append(
-                    row.reward
-                )
-        for agent_name, values in agent_rewards.items():
-            result.update(
-                calculate_single_metric(values, len(values), f"{agent_name}/reward")
-            )
+    )
+    agent_rewards: dict[str, list[float]] = {}
+    for row in observations:
+        if row.log_context is not None:
+            agent_rewards.setdefault(row.log_context.agent_name, []).append(row.reward)
+    for agent_name, values in agent_rewards.items():
+        result.update(
+            calculate_single_metric(values, len(values), f"{agent_name}/reward")
+        )
     for bucket in ("low", "high"):
         lengths = [
             int(name.rsplit("/", 1)[1])

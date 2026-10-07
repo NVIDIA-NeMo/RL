@@ -350,8 +350,18 @@ def test_checkpoint_parser_rejects_unknown_sidecar_fields() -> None:
         parse_rollout_recovery_state(state)
 
 
-def test_checkpoint_parser_defaults_fields_absent_from_older_state() -> None:
-    parsed = parse_rollout_recovery_state(RolloutRecoveryLedger().state_dict())
+def _sidecar_state(ledger: RolloutRecoveryLedger) -> dict[str, object]:
+    """Ledger state plus the controller-owned keys every sidecar must carry."""
+    return {
+        **ledger.state_dict(),
+        "reward_settings": None,
+        "finalizer_metrics_by_group": {},
+        "finalizer_rewards_by_group": {},
+    }
+
+
+def test_checkpoint_parser_defaults_optional_controller_fields() -> None:
+    parsed = parse_rollout_recovery_state(_sidecar_state(RolloutRecoveryLedger()))
 
     assert parsed.batch_shortfall == {}
     assert parsed.sampler_stamps_target_steps is None
@@ -371,7 +381,7 @@ def test_checkpoint_parser_rejects_malformed_controller_state(
     value: object,
     error_type: type[Exception],
 ) -> None:
-    state: dict[str, object] = dict(RolloutRecoveryLedger().state_dict())
+    state = _sidecar_state(RolloutRecoveryLedger())
     state[field] = value
 
     with pytest.raises(error_type):
@@ -1173,7 +1183,7 @@ def test_reward_checks_seals_and_survives_checkpoint(granularity):
 def test_checkpoint_preserves_pending_finalizer_metrics_independently_of_sealed_groups():
     metrics = {
         "canonical_group": {
-            "finalize/reward_count": 2.0,
+            "finalize/invalid_row_rate": 0.5,
             "finalize/penalty_count/empty_final_answer": 1.0,
         }
     }
@@ -1185,13 +1195,16 @@ def test_checkpoint_preserves_pending_finalizer_metrics_independently_of_sealed_
     )
     parsed = parse_rollout_recovery_state(state)
     assert parsed.finalizer_metrics_by_group == metrics
-    metrics["canonical_group"]["finalize/reward_count"] = 99.0
+    metrics["canonical_group"]["finalize/invalid_row_rate"] = 99.0
     assert (
-        parsed.finalizer_metrics_by_group["canonical_group"]["finalize/reward_count"]
-        == 2.0
+        parsed.finalizer_metrics_by_group["canonical_group"][
+            "finalize/invalid_row_rate"
+        ]
+        == 0.5
     )
     del state["finalizer_metrics_by_group"]
-    assert parse_rollout_recovery_state(state).finalizer_metrics_by_group == {}
+    with pytest.raises(ValueError, match="missing 'finalizer_metrics_by_group'"):
+        parse_rollout_recovery_state(state)
 
 
 @pytest.mark.parametrize(
@@ -1258,8 +1271,8 @@ def test_checkpoint_validates_reward_settings_and_observations():
         reward_settings=settings,
         finalizer_rewards_by_group={"kept": [observation], "stale": [observation]},
         finalizer_metrics_by_group={
-            "kept": {"finalize/reward_count": 1.0},
-            "stale": {"finalize/reward_count": 1.0},
+            "kept": {"finalize/invalid_row_rate": 0.0},
+            "stale": {"finalize/invalid_row_rate": 0.0},
         },
         canonical_group_ids={"kept"},
     )
@@ -1267,18 +1280,29 @@ def test_checkpoint_validates_reward_settings_and_observations():
     assert parsed.reward_settings == settings
     assert parsed.finalizer_rewards_by_group == {"kept": [observation]}
     assert set(parsed.finalizer_metrics_by_group) == {"kept"}
+    saved_row = dict(state["finalizer_rewards_by_group"]["kept"][0])
     state["finalizer_rewards_by_group"]["kept"][0]["reward"] = "bad"
     with pytest.raises(ValueError, match="reward must be numeric"):
         parse_rollout_recovery_state(state)
-    state["finalizer_rewards_by_group"] = {}
-    with pytest.raises(ValueError, match="valid-row count"):
+    state["finalizer_rewards_by_group"] = {"orphan": [saved_row]}
+    with pytest.raises(ValueError, match="matching group metrics"):
         parse_rollout_recovery_state(state)
+    state["finalizer_rewards_by_group"] = {}
     state["reward_settings"]["version"] = 999
     with pytest.raises(ValueError, match="unsupported capture reward_settings"):
         parse_rollout_recovery_state(state)
 
 
-def test_schema_2_noncapture_sidecar_remains_readable():
-    parsed = parse_rollout_recovery_state({"schema_version": 2, "groups": []})
-    assert parsed.reward_settings is None
-    assert parsed.finalizer_rewards_by_group == {}
+@pytest.mark.parametrize(
+    "key",
+    ["reward_settings", "finalizer_metrics_by_group", "finalizer_rewards_by_group"],
+)
+def test_sidecar_requires_every_current_schema_key(key):
+    state = build_rollout_recovery_state(
+        RolloutRecoveryLedger(), batch_shortfall={}, sampler_stamps_target_steps=True
+    )
+    assert state["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
+    assert parse_rollout_recovery_state(state).reward_settings is None
+    del state[key]
+    with pytest.raises(ValueError, match=f"missing {key!r}"):
+        parse_rollout_recovery_state(state)

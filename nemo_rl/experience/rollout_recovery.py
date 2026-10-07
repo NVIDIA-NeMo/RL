@@ -42,8 +42,8 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 6
-SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {2, ROLLOUT_RECOVERY_SCHEMA_VERSION}
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -1283,9 +1283,7 @@ def _validate_batch_shortfall(value: object) -> dict[int, int]:
 
 
 def _validate_finalizer_metrics(value: object) -> dict[str, dict[str, float]]:
-    """Copy checkpoint-owned statistics; old checkpoints have no pending counts."""
-    if value is None:
-        return {}
+    """Copy checkpoint-owned per-group finalizer metrics."""
     if not isinstance(value, dict):
         raise ValueError("finalizer_metrics_by_group must be a mapping")
     result: dict[str, dict[str, float]] = {}
@@ -1302,8 +1300,6 @@ def _validate_finalizer_metrics(value: object) -> dict[str, dict[str, float]]:
 
 def _validate_finalizer_rewards(value: object) -> dict[str, list[FinalizedReward]]:
     """Validate per-group observations without retaining checkpoint aliases."""
-    if value is None:
-        return {}
     if not isinstance(value, dict):
         raise ValueError("finalizer_rewards_by_group must be a mapping")
     result: dict[str, list[FinalizedReward]] = {}
@@ -1336,7 +1332,7 @@ def build_rollout_recovery_state(
     state["batch_shortfall"] = _validate_batch_shortfall(batch_shortfall)
     state["sampler_stamps_target_steps"] = sampler_stamps_target_steps
     state["finalizer_metrics_by_group"] = _validate_finalizer_metrics(
-        finalizer_metrics_by_group
+        finalizer_metrics_by_group or {}
     )
     state["reward_settings"] = (
         reward_settings.to_state() if reward_settings is not None else None
@@ -1399,28 +1395,22 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
         "schema_version": schema_version,
         "groups": groups,
     }
+    for key in (
+        "reward_settings",
+        "finalizer_metrics_by_group",
+        "finalizer_rewards_by_group",
+    ):
+        if key not in state:
+            raise ValueError(f"rollout recovery sidecar is missing {key!r}")
     reward_settings = (
         CaptureRewardSettings.from_state(state["reward_settings"])
-        if state.get("reward_settings") is not None
+        if state["reward_settings"] is not None
         else None
     )
-    finalizer_metrics = _validate_finalizer_metrics(
-        state.get("finalizer_metrics_by_group")
-    )
-    finalizer_rewards = _validate_finalizer_rewards(
-        state.get("finalizer_rewards_by_group")
-    )
-    if reward_settings is not None:
-        if set(finalizer_rewards) - set(finalizer_metrics):
-            raise ValueError(
-                "finalized reward observations require matching group metrics"
-            )
-        for group_id, metrics in finalizer_metrics.items():
-            count = metrics.get("finalize/reward_count")
-            if count is not None and count != len(finalizer_rewards.get(group_id, [])):
-                raise ValueError(
-                    f"finalized reward observations do not match valid-row count for {group_id!r}"
-                )
+    finalizer_metrics = _validate_finalizer_metrics(state["finalizer_metrics_by_group"])
+    finalizer_rewards = _validate_finalizer_rewards(state["finalizer_rewards_by_group"])
+    if set(finalizer_rewards) - set(finalizer_metrics):
+        raise ValueError("finalized reward observations require matching group metrics")
     return ParsedRolloutRecoveryState(
         ledger_state=ledger_state,
         batch_shortfall=_validate_batch_shortfall(state.get("batch_shortfall", {})),

@@ -1662,6 +1662,10 @@ class _EmptyBuffer:
     def __len__(self) -> int:
         return 0
 
+    @property
+    def group_ids(self) -> tuple[str, ...]:
+        return ()
+
     def training_owned_group_ids(self) -> set[str]:
         return set()
 
@@ -2950,22 +2954,12 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
     pending = {
         "group-0": {
-            "finalize/reward_count": 1.0,
-            "finalize/reward_sum": 0.0,
-            "finalize/reward_sumsq": 0.0,
-            "finalize/reward_min": 0.0,
-            "finalize/reward_max": 0.0,
             "finalize/penalty_count/empty_final_answer": 1.0,
             "finalize/effort/low/100": 1.0,
             "finalize/effort/length_reward_sum": 0.9,
             "finalize/effort/reward_sum": 1.9,
         },
         "group-1": {
-            "finalize/reward_count": 3.0,
-            "finalize/reward_sum": 6.0,
-            "finalize/reward_sumsq": 12.0,
-            "finalize/reward_min": 2.0,
-            "finalize/reward_max": 2.0,
             "finalize/penalty_count/empty_final_answer": 0.0,
             "finalize/effort/low/900": 1.0,
             "finalize/effort/low/1000": 1.0,

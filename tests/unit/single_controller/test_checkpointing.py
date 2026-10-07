@@ -308,6 +308,18 @@ class _ExhaustingSampler(_FakeSampler):
         return await super().select(**kwargs)
 
 
+class _EvictOnceSampler(_FakeSampler):
+    """Reports one stale group evicted on the first train step."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.evict_calls = 0
+
+    async def evict(self, *, current_train_weight: int) -> int:
+        self.evict_calls += 1
+        return 1 if self.evict_calls == 1 else 0
+
+
 class _RestoredGroupsSampler(_FakeSampler):
     """Drain the exact groups represented by a restored replay metadata file."""
 
@@ -1405,6 +1417,31 @@ class TestSaveTrigger:
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_2", "step_3"}
 
 
+class TestFinalizerStateRelease:
+    def test_evicted_group_releases_pending_finalizer_state(self, tmp_path: Path):
+        """Staleness eviction returns only a count; the pump prunes both maps."""
+        from nemo_rl.experience.reward_penalties import FinalizedReward
+
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=100)
+
+        def seed(actor) -> None:
+            actor._sampler = _EvictOnceSampler()
+            # A committed, never-consumed group that the sampler evicts as stale.
+            actor._finalizer_metrics_by_group["evicted-group"] = {
+                "finalize/invalid_row_rate": 0.0
+            }
+            actor._finalizer_rewards_by_group["evicted-group"] = [
+                FinalizedReward("evicted-group_g0", "attempt", 1.0, None)
+            ]
+
+        actor = _run_train_pump(mc, _make_actor_args(), seed=seed)
+
+        assert actor._train_steps == 2
+        assert actor._sampler.evict_calls >= 1
+        assert "evicted-group" not in actor._finalizer_metrics_by_group
+        assert "evicted-group" not in actor._finalizer_rewards_by_group
+
+
 class TestPeriodicRolloutCheckpoint:
     def test_restore_mode_rejects_removed_none_value(self):
         with pytest.raises(ValidationError, match="restore_mode"):
@@ -1767,25 +1804,24 @@ class TestPeriodicRolloutCheckpoint:
             / "snapshot_000001"
         )
 
-    def test_restore_rejects_legacy_schema_2_capture_sidecar(self, tmp_path: Path):
-        """A pre-reward-settings (schema 2) sidecar cannot be restored under capture."""
+    def test_restore_rejects_capture_disabled_sidecar_under_capture(
+        self, tmp_path: Path
+    ):
+        """A sidecar saved with capture off carries no reward settings to compare."""
         actor = self._actor(tmp_path)
         snapshot = self._saved_snapshot(actor, tmp_path)
         recovery_path = snapshot / ROLLOUT_RECOVERY_STATE_FILENAME
         state = torch.load(recovery_path, weights_only=True)
-        state["schema_version"] = 2
-        del state["reward_settings"]
-        del state["finalizer_metrics_by_group"]
+        state["reward_settings"] = None
         torch.save(state, recovery_path)
         actor._last_checkpoint_path = str(snapshot)
         actor._data_plane_checkpoint_metadata = {
             **actor._dp_client.save_calls[-1]["metadata"],
-            "rollout_recovery_schema_version": 2,
             "rollout_recovery_payload_sha256": hashlib.sha256(
                 recovery_path.read_bytes()
             ).hexdigest(),
         }
-        with pytest.raises(ValueError, match="unsupported legacy capture checkpoint"):
+        with pytest.raises(ValueError, match="saved with token capture disabled"):
             asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
 
     @pytest.mark.parametrize("checkpoint_kind", ["snapshot", "full"])
