@@ -121,31 +121,17 @@ def _make_real_quant_worker():
 
 
 @requires_weight_folding
-def test_real_quant_conversion_tasks_exclude_quantizer_state(monkeypatch):
-    from megatron.core import distributed
-
+def test_real_quant_conversion_tasks_delegate_discovery_to_bridge(monkeypatch):
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
-
-    class FakeDistributedDataParallel(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
 
     model = nn.Module()
     model.weight = nn.Parameter(torch.ones(1))
     model.quantizers = GroupedQuantizer(TensorQuantizer(), TensorQuantizer())
     model.quantizers[0].amax = torch.tensor(1.0)
-    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
-    worker = object.__new__(worker_cls)
-    worker.model = FakeDistributedDataParallel(model)
-    worker._use_real_quant_refit = lambda: True
-    monkeypatch.setattr(
-        distributed,
-        "DistributedDataParallel",
-        FakeDistributedDataParallel,
-    )
+    worker = _make_real_quant_worker()
+    worker.model = model
 
     def build_conversion_tasks(_self):
         return [
@@ -162,12 +148,16 @@ def test_real_quant_conversion_tasks_exclude_quantizer_state(monkeypatch):
         build_conversion_tasks,
     )
 
-    assert worker._build_refit_conversion_tasks() == ["module.weight"]
-    assert worker._build_refit_conversion_tasks() == ["module.weight"]
-    assert "module.quantizers.0._amax" in dict(worker.model.named_buffers())
+    assert (
+        worker._build_refit_conversion_tasks()
+        is worker.megatron_bridge.plan.conversion_tasks
+    )
+    assert worker._build_refit_conversion_tasks() is worker.refit_conversion_tasks
+    assert worker.megatron_bridge.calls == [("plan", ([model],), {})]
+    assert "quantizers.0._amax" in dict(model.named_buffers())
 
-    worker._use_real_quant_refit = lambda: False
-    assert "module.quantizers.0._amax" in worker._build_refit_conversion_tasks()
+    worker.cfg["generation"]["real_quant"] = False
+    assert "quantizers.0._amax" in worker._build_refit_conversion_tasks()
 
 
 @requires_weight_folding
@@ -346,8 +336,9 @@ def test_real_quant_config_and_stream_reuse_one_megatron_bridge_plan():
     assert worker.megatron_bridge.calls[0] == (
         "plan",
         ([worker.model],),
-        {"conversion_tasks": worker.refit_conversion_tasks},
+        {},
     )
+    assert worker.refit_conversion_tasks is worker.megatron_bridge.plan.conversion_tasks
     _, args, kwargs = worker.megatron_bridge.calls[1]
     assert args == ([worker.model],)
     assert kwargs["cpu"] is True

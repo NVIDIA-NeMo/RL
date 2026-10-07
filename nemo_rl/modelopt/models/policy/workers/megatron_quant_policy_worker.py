@@ -477,23 +477,15 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         if not self._use_real_quant_refit():
             return super()._build_refit_conversion_tasks()
 
-        # ModelOpt exports scales from each owning weight. Its quantizer state
-        # is not an independent HF parameter and must not become a conversion
-        # task when a resumed checkpoint restores quantizers before planning.
-        with self.hide_tensor_quantizers():
-            return super()._build_refit_conversion_tasks()
+        return self._get_modelopt_export_plan().conversion_tasks
 
     def _get_modelopt_export_plan(self):
         plan = getattr(self, "_modelopt_export_plan", None)
         if plan is not None:
             return plan
 
-        if self.refit_conversion_tasks is None:
-            self.refit_conversion_tasks = self._build_refit_conversion_tasks()
-        plan = self.megatron_bridge.build_hf_modelopt_export_plan(
-            [self.model],
-            conversion_tasks=self.refit_conversion_tasks,
-        )
+        plan = self.megatron_bridge.build_hf_modelopt_export_plan([self.model])
+        self.refit_conversion_tasks = plan.conversion_tasks
         self._modelopt_export_plan = plan
         return plan
 
