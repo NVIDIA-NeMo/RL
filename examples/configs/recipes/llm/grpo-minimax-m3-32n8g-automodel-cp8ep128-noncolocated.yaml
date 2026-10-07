@@ -16,7 +16,7 @@ checkpointing:
   checkpoint_dir: results/grpo-minimax-m3-32n8g-automodel-cp8ep128-noncolocated
   keep_top_k: 1
   save_period: 100
-  checkpoint_must_save_by: 00:03:45:00
+  checkpoint_must_save_by: 00:01:45:00
 policy:
   model_name: MiniMaxAI/MiniMax-M3
   hf_config_overrides:
@@ -77,13 +77,15 @@ policy:
   generation:
     max_new_tokens: 6144
     vllm_kwargs:
+      compilation_config:
+        cudagraph_mode: PIECEWISE
       language_model_only: true
       block_size: 128
     vllm_cfg:
       tensor_parallel_size: 16
       expert_parallel_size: 16
       gpu_memory_utilization: 0.8
-      enforce_eager: true
+      # CUDA graphs (PIECEWISE) instead of enforce_eager: generation/step -49%, wall 82 -> 58 min, check_metrics passes, gen_kl_error unchanged. Same-window A/B on cw_dfw H100, see the rollout-perf skill (#4556). token_mult_prob_error spikes went 0/5 -> 2/5, within eager noise (the CI eager run spiked on 1/5). FULL_AND_PIECEWISE was 3% faster in wall time (7% in generation) but raised the median token_mult_prob_error (1.033 vs 1.028).
       max_model_len: 8192
     colocated:
       enabled: false

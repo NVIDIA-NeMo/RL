@@ -93,8 +93,12 @@ dimensions and the separate generation allocation.
 - `policy.generation.vllm_kwargs.language_model_only: true` selects
   language-model-only generation. The AutoModel freeze configuration freezes
   the vision and audio towers.
-- Eager execution (`enforce_eager: true`) remains part of the validated
-  generation configuration. Sequence packing and dynamic batching are disabled.
+- Generation uses vLLM PIECEWISE CUDA graphs
+  (`policy.generation.vllm_kwargs.compilation_config.cudagraph_mode: PIECEWISE`).
+  In a same-window A/B against eager this cut generation time per step by 49%
+  and the 5-step test from 82 to 58 minutes, and `check_metrics` passed. The
+  100-step curves below were produced in eager mode. Sequence packing and
+  dynamic batching are disabled.
 
 ## Reference Training Curves
 
