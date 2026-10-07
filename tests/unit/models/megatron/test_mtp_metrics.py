@@ -82,7 +82,7 @@ def test_get_mtp_metrics_defaults_when_only_loss_tracked(monkeypatch):
 
 @pytest.mark.mcore
 def test_get_mtp_metrics_applies_loss_scale(monkeypatch):
-    """loss_scale multiplies each layer's loss; acceptance (a count ratio) is unscaled.
+    """Legacy trackers still honor loss_scale; acceptance is unscaled.
 
     The MTPLossLoggingHelper accumulates the per-microbatch loss across microbatches
     without dividing, so the worker passes loss_scale=1/num_microbatches to recover the

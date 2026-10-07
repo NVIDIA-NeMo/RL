@@ -73,6 +73,48 @@ pytestmark = pytest.mark.mcore
 WORKER_MOD = "nemo_rl.models.policy.workers.megatron_policy_worker"
 
 
+def test_aux_grad_scale_policy():
+    """The synchronous and split paths select the intended MCore scalers."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    moe_scale, mtp_scale = MegatronPolicyWorkerImpl._decide_aux_grad_scale_funcs(
+        split_step=False,
+        calculate_per_token_loss=True,
+        global_valid_toks=torch.tensor(4.0),
+    )
+    assert moe_scale is not None
+    assert mtp_scale is not None
+    assert moe_scale().item() == pytest.approx(0.25)
+    assert mtp_scale().item() == pytest.approx(0.25)
+
+    moe_scale, mtp_scale = MegatronPolicyWorkerImpl._decide_aux_grad_scale_funcs(
+        split_step=False,
+        calculate_per_token_loss=False,
+    )
+    assert moe_scale is None
+    assert mtp_scale is None
+
+    moe_scale, mtp_scale = MegatronPolicyWorkerImpl._decide_aux_grad_scale_funcs(
+        split_step=True,
+        calculate_per_token_loss=True,
+    )
+    assert moe_scale is not None
+    assert moe_scale() == pytest.approx(1.0)
+    assert mtp_scale is None
+
+    moe_scale, mtp_scale = MegatronPolicyWorkerImpl._decide_aux_grad_scale_funcs(
+        split_step=True,
+        calculate_per_token_loss=False,
+        num_microbatches=3,
+    )
+    assert moe_scale is not None
+    assert mtp_scale is not None
+    assert moe_scale() == pytest.approx(3.0)
+    assert mtp_scale() == pytest.approx(3.0)
+
+
 # ── Mock fabric ──────────────────────────────────────────────────────────
 
 
@@ -139,6 +181,7 @@ def _make_worker(loss_type):
         "train_global_batch_size": 32,
         "train_micro_batch_size": 4,
         "megatron_cfg": {
+            "calculate_per_token_loss": True,
             "empty_unused_memory_level": 0,
             "moe_per_layer_logging": False,
             "use_fused_linear_logprobs": False,
@@ -177,6 +220,7 @@ def _make_worker(loss_type):
     w.delegate_mtp_loss_mask_to_model = False
     w.model_slices_context_parallel_inputs = False
     w.mtp_enabled = False
+    w.calculate_per_token_loss = True
     w._first_train_step_forward_pre_hook_disabled = False
     w._first_train_step_param_sync_func = None
     # Normally set from get_rank_safe() in __init__, which object.__new__ skips.
@@ -773,6 +817,23 @@ class TestFinish:
         # global_valid_toks == 2048 → inv_n = 1/2048
         arg = w.model.scale_gradients.call_args.args[0]
         assert arg == pytest.approx(1.0 / 2048.0, rel=1e-4)
+
+    def test_local_mean_mode_averages_all_step_microbatches(self, mock_module_symbols):
+        """False mode uses one microbatch average across all streamed calls."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.calculate_per_token_loss = False
+        w.cfg["megatron_cfg"]["calculate_per_token_loss"] = False
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        # The mocked iterator exposes two pipeline microbatches per call.
+        w.train_microbatch(_fake_batch())
+        w.train_microbatch(_fake_batch())
+        w.finish_train_step()
+
+        assert w.model.scale_gradients.call_args.args[0] == pytest.approx(1.0 / 4.0)
+        calls = mock_module_symbols["lpp"].call_args_list
+        assert all(call.kwargs["defer_microbatch_average"] is True for call in calls)
 
     def test_picks_global_valid_seqs_for_sequence_level_loss(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
