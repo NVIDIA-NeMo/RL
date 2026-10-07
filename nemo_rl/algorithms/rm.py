@@ -232,17 +232,17 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...")
-    num_nodes = cluster_config["num_nodes"]
-    segment_size = cluster_config.get("segment_size")
+    num_nodes = cluster_config.num_nodes
+    segment_size = cluster_config.segment_size
     node_resource_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="rm_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         max_colocated_worker_groups=1,
-        port_range_low=cluster_config.get("master_port_range_low"),
-        port_range_high=cluster_config.get("master_port_range_high"),
+        port_range_low=cluster_config.master_port_range_low,
+        port_range_high=cluster_config.master_port_range_high,
         segment_size=segment_size,
         node_resource_constraints=node_resource_constraints,
     )
@@ -654,14 +654,6 @@ def rm_train(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_loss --> 'val:validation-default_loss'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -741,8 +733,7 @@ def rm_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus

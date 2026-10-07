@@ -51,7 +51,6 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
-    reject_dtensor_v1,
     resolve_policy_worker_cls,
     validate_fp32_lm_head_config,
 )
@@ -263,7 +262,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
                 )
 
-            reject_dtensor_v1(config["dtensor_cfg"], "policy.dtensor_cfg")
             worker_builder_cls_fqn = resolve_policy_worker_cls(
                 "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
                 config,
@@ -675,6 +673,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
+          "token_mask": only for top-k/top-p filtering; masked out -inf positions.
         """
         with timer.time("get_logprobs/shard_data") if timer else nullcontext():
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
