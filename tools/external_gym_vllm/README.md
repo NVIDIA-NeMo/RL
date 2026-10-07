@@ -16,8 +16,9 @@ vLLM arguments. The wrapper then:
 1. validates every pool and splits hetgroup 1 into disjoint node slices;
 2. starts every replica in its own private Ray cluster;
 3. starts one OpenAI-compatible load balancer per pool;
-4. replaces each pool's URL placeholder and injects an explicit backend-count
-   readiness contract into the NeMo Gym config;
+4. replaces each pool's URL placeholder, and replaces
+   `__EXTERNAL_SERVICE_READINESS__` with an explicit backend-count readiness
+   contract for the NeMo Gym config;
 5. starts `ray.sub` on hetgroup 0 while the external models are still loading;
 6. lets the NeMo Gym actor start its local servers, then waits for every
    external load balancer to report the required healthy backend count; and
@@ -116,7 +117,7 @@ Required variables:
 | Variable | Purpose |
 |---|---|
 | `BASE_LOG_DIR` | Parent under `EXTERNAL_VLLM_SHARED_ROOT` for `<job-id>-logs`. |
-| `COMMAND` | NeMo RL command containing every pool's URL placeholder. |
+| `COMMAND` | NeMo RL command containing every pool's URL placeholder and `__EXTERNAL_SERVICE_READINESS__` among the training script's arguments. The wrapper replaces that token with the `++env.nemo_gym.external_service_readiness=...` override; it is required so the override cannot land after a trailing pipe or comment. |
 | `CONTAINER` | NeMo RL and load-balancer container. |
 | `MOUNTS` | Mount list required by `ray.sub` and `COMMAND`. |
 | `EXTERNAL_VLLM_POOLS` | Ordered pool names; this order determines node slicing. |

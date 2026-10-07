@@ -205,7 +205,12 @@ class NemoGymCompatibleConfig(Protocol):
 
 
 class ExternalServiceReadinessTargetConfig(BaseModel, extra="allow"):
-    """Health endpoint and required backend count for one external service."""
+    """Health endpoint and required backend count for one external service.
+
+    ``url`` must be a ``vllm_pool_lb`` ``/health`` endpoint; see
+    ``_probe_external_service`` for the reply it expects. A plain vLLM
+    ``/health`` returns no backend counts and never reads as ready.
+    """
 
     name: str = Field(min_length=1)
     url: str
@@ -422,7 +427,12 @@ def _probe_external_service(
     *,
     request_timeout_seconds: float,
 ) -> str | None:
-    """Return a readiness problem for one service, or None when it is ready."""
+    """Return a readiness problem for one service, or None when it is ready.
+
+    The URL must be a ``vllm_pool_lb`` ``/health`` endpoint. This reads the
+    ``status``, ``healthy_backends`` and ``total_backends`` fields returned by
+    ``LoadBalancer.handle_health`` in ``tools/external_gym_vllm/vllm_pool_lb.py``.
+    """
     try:
         with urllib.request.urlopen(
             service.url, timeout=request_timeout_seconds

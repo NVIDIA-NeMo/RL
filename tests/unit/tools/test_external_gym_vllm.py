@@ -25,6 +25,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import ClientPayloadError, web
 
+from nemo_rl.environments.nemo_gym import (
+    ExternalServiceReadinessTargetConfig,
+    _probe_external_service,
+)
 from tools.external_gym_vllm.vllm_pool_lb import (
     SHUTDOWN_TIMEOUT_SECONDS,
     Backend,
@@ -345,6 +349,49 @@ async def test_health_reports_backend_counts():
     assert payload["total_backends"] == 2
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("healthy", "override", "expected_backends", "ready"),
+    [
+        (1, {}, 2, False),
+        (2, {}, 2, True),
+        # expected_backends=1 so only the bool guard rejects True (== 1).
+        (2, {"healthy_backends": True}, 1, False),
+        (2, {"total_backends": 1}, 2, False),
+        (2, {"status": "no_healthy_backends"}, 2, False),
+    ],
+    ids=["one-of-two", "two-of-two", "bool-count", "short-total", "status-not-ok"],
+)
+async def test_readiness_probe_reads_load_balancer_health(
+    healthy, override, expected_backends, ready
+):
+    """Tie the Gym readiness probe to the reply this load balancer really sends."""
+    pool = BackendPool("/tmp", "test")
+    for i in range(2):
+        backend = Backend(f"job{i}", f"10.0.0.{i}", 8000)
+        backend.healthy = i < healthy
+        pool.backends[backend.job_id] = backend
+    health = await LoadBalancer(pool, 9213).handle_health(MagicMock(spec=web.Request))
+
+    probe_response = MagicMock(status=health.status)
+    probe_response.read.return_value = json.dumps(
+        {**json.loads(health.body), **override}
+    ).encode()
+    probe_response.__enter__.return_value = probe_response
+    service = ExternalServiceReadinessTargetConfig(
+        name="GENRM",
+        url="http://10.0.0.1:9213/health",
+        expected_backends=expected_backends,
+    )
+    with patch(
+        "nemo_rl.environments.nemo_gym.urllib.request.urlopen",
+        return_value=probe_response,
+    ):
+        problem = _probe_external_service(service, request_timeout_seconds=1)
+
+    assert (problem is None) == ready
+
+
 def test_registry_shell_helpers_add_replace_remove(tmp_path):
     script = REPO_ROOT / "tools/external_gym_vllm/vllm_backend_registry.sh"
     program = textwrap.dedent(
@@ -549,6 +596,46 @@ def test_launcher_rejects_duplicate_url_placeholders():
     assert "Multiple pools use URL placeholder __SHARED_BASE_URL__" in result.stderr
 
 
+def test_launcher_requires_readiness_placeholder():
+    """Without the token the gate has no safe place to go, so refuse to start."""
+    script = REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh"
+    env = {
+        "PATH": os.environ["PATH"],
+        "SLURM_JOB_ID": "123",
+        "SLURM_HET_SIZE": "2",
+        "SLURM_JOB_NODELIST_HET_GROUP_0": "ray[01-02]",
+        "SLURM_JOB_NODELIST_HET_GROUP_1": "genrm01",
+        "SLURM_JOB_ACCOUNT": "account",
+        "SLURM_JOB_PARTITION": "partition",
+        "SLURM_SUBMIT_DIR": str(REPO_ROOT),
+        "BASE_LOG_DIR": "/lustre/logs",
+        "CONTAINER": "training.sqsh",
+        "MOUNTS": "/lustre:/lustre",
+        # A trailing pipe is exactly where an appended override would be lost.
+        "COMMAND": "run __GENRM_BASE_URL__ 2>&1 | tee run.log",
+        "EXTERNAL_VLLM_POOLS": "GENRM",
+        "EXTERNAL_VLLM_TOOLS_DIR_HOST": str(REPO_ROOT / "tools/external_gym_vllm"),
+        "GENRM_CONTAINER": "genrm.sqsh",
+        "GENRM_MODEL": "model-id",
+        "GENRM_VLLM_PYTHON": "/opt/python",
+        "GENRM_REPLICAS": "1",
+        "GENRM_TENSOR_PARALLEL_SIZE": "4",
+        "GENRM_LB_PORT": "9213",
+        "GENRM_URL_PLACEHOLDER": "__GENRM_BASE_URL__",
+        "RAY_SUB": str(REPO_ROOT / "ray.sub"),
+    }
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "Driver command is missing __EXTERNAL_SERVICE_READINESS__" in result.stderr
+
+
 def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     script = REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh"
     source = script.read_text()
@@ -592,6 +679,11 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
         'COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"' in source
     )
     assert "++env.nemo_gym.external_service_readiness" in source
+    assert (
+        'COMMAND="${COMMAND//${EXTERNAL_SERVICE_READINESS_PLACEHOLDER}/${readiness_arg}}"'
+        in source
+    )
+    assert 'COMMAND+=" ++env.nemo_gym' not in source
     assert "expected_backends:${replicas[${pool}]}" in source
     assert "external_service_readiness_json" not in source
     assert source.index('bash "${RAY_SUB}" &') < source.index(
@@ -783,6 +875,7 @@ def test_pool_registration_rejects_partial_nodes_and_unsafe_group_id():
 def test_submission_validation_checks_placeholders_paths_and_node_total():
     script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
     tools_dir = REPO_ROOT / "tools/external_gym_vllm"
+    command = "'run __TEST_URL__ __EXTERNAL_SERVICE_READINESS__'"
     program = textwrap.dedent(
         f"""
         set -euo pipefail
@@ -794,43 +887,35 @@ def test_submission_validation_checks_placeholders_paths_and_node_total():
           --model model --container image --python /opt/python \\
           --replicas 2 --tensor-parallel-size 4 \\
           --lb-port 9213 --url-placeholder __TEST_URL__
-        validate_external_vllm_submission 'run __TEST_URL__' 2
+        validate_external_vllm_submission {command} 2
         """
     )
 
+    def run_with(old: str, new: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", "-c", program.replace(old, new)],
+            capture_output=True,
+            text=True,
+        )
+
     valid = subprocess.run(["bash", "-c", program], capture_output=True, text=True)
-    wrong_nodes = subprocess.run(
-        ["bash", "-c", program.replace("'run __TEST_URL__' 2", "'run __TEST_URL__' 3")],
-        capture_output=True,
-        text=True,
+    wrong_nodes = run_with(f"{command} 2", f"{command} 3")
+    missing_placeholder = run_with(
+        command, "'run without endpoint __EXTERNAL_SERVICE_READINESS__'"
     )
-    missing_placeholder = subprocess.run(
-        [
-            "bash",
-            "-c",
-            program.replace("'run __TEST_URL__' 2", "'run without endpoint' 2"),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    missing_node_count = subprocess.run(
-        [
-            "bash",
-            "-c",
-            program.replace(
-                "validate_external_vllm_submission 'run __TEST_URL__' 2",
-                "validate_external_vllm_submission 'run __TEST_URL__'",
-            ),
-        ],
-        capture_output=True,
-        text=True,
-    )
+    missing_readiness = run_with(command, "'run __TEST_URL__ 2>&1 | tee run.log'")
+    missing_node_count = run_with(f"{command} 2", command)
 
     assert valid.returncode == 0, valid.stderr
     assert wrong_nodes.returncode == 2
     assert "expected 2 from registered pools" in wrong_nodes.stderr
     assert missing_placeholder.returncode == 2
     assert "submission command is missing __TEST_URL__" in missing_placeholder.stderr
+    assert missing_readiness.returncode == 2
+    assert (
+        "submission command is missing __EXTERNAL_SERVICE_READINESS__"
+        in missing_readiness.stderr
+    )
     assert missing_node_count.returncode == 0, missing_node_count.stderr
     assert (
         "skipping external hetgroup node-count validation" in missing_node_count.stderr
@@ -892,6 +977,7 @@ def test_lightning_launcher_dry_run_builds_reference_external_pool_topology():
     assert "NL2Bash:  4 independent TP=4, DP=1 servers" in result.stdout
     assert "base_url=__GENRM_BASE_URL__" in result.stdout
     assert "base_url=__NL2BASH_BASE_URL__" in result.stdout
+    assert "__EXTERNAL_SERVICE_READINESS__" in result.stdout
     assert "--reasoning-parser\n  nemotron_v3" in result.stdout
     assert "--reasoning-parser-plugin" not in result.stdout
     assert "--attention-backend\n  TRITON_ATTN" in result.stdout

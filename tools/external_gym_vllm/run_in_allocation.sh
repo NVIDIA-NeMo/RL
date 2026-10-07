@@ -44,6 +44,11 @@ EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python
 EXTERNAL_VLLM_SHARED_ROOT="${EXTERNAL_VLLM_SHARED_ROOT:-/lustre}"
 EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS="${EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS:-5}"
 EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS="${EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS:-10}"
+# Token in COMMAND that is replaced by the Hydra override gating Gym rollouts on
+# external pool health. A placeholder rather than an append: appended text would
+# bind to whatever ends COMMAND (`| tee log`, `; echo done`, a `# comment`), and
+# training would start without the gate. Keep in sync with pool_config.sh.
+EXTERNAL_SERVICE_READINESS_PLACEHOLDER="__EXTERNAL_SERVICE_READINESS__"
 
 if [[ ! -f "${RAY_SUB}" ]]; then
   echo "[FATAL] ray.sub does not exist: ${RAY_SUB}" >&2
@@ -212,6 +217,10 @@ for pool in "${pool_names[@]}"; do
     max_startup_timeout="${startup_timeouts[${pool}]}"
   fi
 done
+if [[ "${COMMAND}" != *"${EXTERNAL_SERVICE_READINESS_PLACEHOLDER}"* ]]; then
+  echo "[FATAL] Driver command is missing ${EXTERNAL_SERVICE_READINESS_PLACEHOLDER} for the external-service readiness gate" >&2
+  exit 1
+fi
 
 shared_paths=("${BASE_LOG_DIR}" "${EXTERNAL_VLLM_TOOLS_DIR_HOST}")
 for pool in "${pool_names[@]}"; do
@@ -614,7 +623,8 @@ external_service_readiness_override+="${EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SE
 external_service_readiness_override+=',request_timeout_seconds:'
 external_service_readiness_override+="${EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS}"
 external_service_readiness_override+='}'
-COMMAND+=" ++env.nemo_gym.external_service_readiness='${external_service_readiness_override}'"
+readiness_arg="++env.nemo_gym.external_service_readiness='${external_service_readiness_override}'"
+COMMAND="${COMMAND//${EXTERNAL_SERVICE_READINESS_PLACEHOLDER}/${readiness_arg}}"
 export COMMAND
 
 echo "[INFO] Starting NeMo RL while external vLLM pools load"
