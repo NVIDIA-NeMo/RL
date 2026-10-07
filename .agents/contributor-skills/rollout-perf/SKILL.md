@@ -143,9 +143,10 @@ Do not use these:
   time. Nightly budget = NUM_RUNS × NUM_NODES × GPUS_PER_NODE × NUM_MINUTES/60,
   and the total is asserted in `tests/unit/test_recipes_and_test_suites.py`.
 - If the recipe sets `checkpointing.checkpoint_must_save_by` (a `DD:HH:MM:SS`
-  duration from job start, after which training saves and stops, for example
-  `00:03:45:00`), lower it below the new Slurm limit minus the save time.
-  Otherwise Slurm kills the job before the timeout checkpoint is written.
+  duration, for example `00:03:45:00`, after which training saves and stops),
+  lower it below the new Slurm limit. Leave room for the checkpoint save and for
+  Ray startup and setup, which happen before this timer starts. Otherwise Slurm
+  kills the job before the timeout checkpoint is written.
 - In the PR description, give a before/after table: generation per step, step
   time, validation, setup, wall time, gates, container and job IDs.
 
