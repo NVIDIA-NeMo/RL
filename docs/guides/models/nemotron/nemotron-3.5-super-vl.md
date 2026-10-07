@@ -54,14 +54,22 @@ the `fc2_latent_proj` dtype fix
 FSDP mixed-precision policy requires. The submodule pin on this branch includes
 both. vLLM and the rest of the dependencies are the standard NeMo RL pins.
 
-Containers built before this pin need the AutoModel source and a worker-venv
-rebuild:
+Containers built before this pin ship worker venvs whose editable
+`nemo_automodel` still points at the image's older Automodel checkout, and the
+per-job `uv sync` does not re-point it. Check out the submodule and force a
+worker-venv rebuild on the first run (it reinstalls from the image's uv cache,
+about one to two minutes per node, no downloads):
 
 ```bash
 git submodule update --init 3rdparty/Automodel-workspace/Automodel
 export NRL_FORCE_REBUILD_VENVS=true
 export UV_LOCK_TIMEOUT=3600   # multi-node: venv builders share one uv cache lock
 ```
+
+Without the rebuild the policy worker falls back to the generic transformers
+loader and fails at model construction with
+`NemotronH_Omni_Reasoning_V3.__init__() got an unexpected keyword argument
+'num_nextn_predict_layers'`.
 
 > [!NOTE]
 > After rebuilding inside a container you intend to save, regenerate
