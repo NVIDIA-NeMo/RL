@@ -91,6 +91,10 @@ policy:
         image: 64
       mm_processor_cache_gb: 0
       skip_mm_profiling: true
+      # FlashInfer MoE autotune at max_num_batched_tokens ran >20 min with a cold cache
+      # (flashinfer 0.6.18) and the cluster cancels jobs around 30 min; use the
+      # heuristic kernels instead. Re-enable once the autotune cache is warm.
+      enable_flashinfer_autotune: false
     colocated:
       enabled: false
       resources:

@@ -236,6 +236,26 @@ Verified here:
   variant (one layer, not repeated, detached heads) with loss weight 0, so the
   head is refit but not trained and the objective stays plain token-level GRPO.
 
+- The sixth attempt loaded the model (Megatron checkpoint and vLLM weights) and
+  stalled in vLLM's kernel warm-up: FlashInfer MoE autotune at
+  `max_num_batched_tokens` (49152) with a cold cache (flashinfer 0.6.18) had
+  not finished after 20 minutes when the cluster scheduler service cancelled
+  the job at 30 minutes, before any Gym server came up. The recipe now sets
+  `vllm_kwargs.enable_flashinfer_autotune: false` (heuristic kernels; re-enable
+  once a warm `flashinfer_autotune_cache` exists under `VLLM_CACHE_ROOT`).
+- Running `examples/nemo_gym/prefetch_venvs.py` on a CPU node
+  (`scripts/agentic_vbench/prefetch_gym_venvs.sh`) exercised the real Gym config
+  parser and rejected the training config: the Gym PR head requires an
+  environment server in front of every bound agent
+  (`AgentWithoutEnvironmentServerError`). `agentic_vbench_train.yaml` now
+  declares `agentic_vbench_environment_server` (legacy_agent) like the
+  eval-factory benchmark config. Rollout routing is unchanged:
+  rows still carry `agent_ref.name = agentic_vbench_agent`.
+- Startup work moved off the GPU allocation: task images are prebuilt on the
+  backend (`scripts/agentic_vbench/prebuild_task_images.py`) and the Gym server
+  venvs are created ahead of time into `NEMO_GYM_VENV_DIR`, so a job's first
+  rollouts begin as soon as the policy is loaded.
+
 Not yet verified (requires GPU allocations):
 
 - A two-step compaction smoke and the 20-step paired comparison.
