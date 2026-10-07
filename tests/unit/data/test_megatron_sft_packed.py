@@ -782,11 +782,11 @@ def test_packed_preprocessor_cp_pads_each_system_delimited_boundary() -> None:
     )
     assert torch.equal(
         processed["target_ids"],
-        torch.tensor([20, 2, 99, IGNORE_INDEX, 50, 2, 99, 99]),
+        torch.tensor([20, 2, 99, 40, 50, 2, 99, 99]),
     )
     assert torch.equal(
         processed["token_mask"],
-        torch.tensor([1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]),
+        torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0]),
     )
     assert torch.equal(
         processed["position_ids"], torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
@@ -803,7 +803,7 @@ def test_packed_preprocessor_cp_pads_each_system_delimited_boundary() -> None:
         pytest.param(2, [0, 4, 8, 12], id="cp2"),
     ],
 )
-def test_identity_masks_each_internal_packed_conversation_boundary(
+def test_identity_preserves_each_internal_packed_conversation_boundary(
     context_parallel_size: int,
     expected_cu_seqlens: list[int],
 ) -> None:
@@ -846,10 +846,10 @@ def test_identity_masks_each_internal_packed_conversation_boundary(
     internal_boundary_indices = processed["packed_cu_seqlens"][1:-1].long() - 1
     assert torch.equal(
         processed["target_ids"][internal_boundary_indices],
-        torch.full((2,), IGNORE_INDEX, dtype=torch.int64),
+        torch.tensor([40, 70], dtype=torch.int64),
     )
     assert torch.equal(
-        processed["token_mask"][internal_boundary_indices], torch.zeros(2)
+        processed["token_mask"][internal_boundary_indices], torch.ones(2)
     )
 
 

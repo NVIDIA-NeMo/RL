@@ -74,8 +74,7 @@ class MegatronSFTPackedDatumSpec(DatumSpec):
     Attributes:
         input_ids: ``[max_seq_length]`` token ids, ``pack[:-1]``.
         target_ids: ``[max_seq_length]`` labels, ``pack[1:]``. Prompt positions
-            and segment boundaries carry ``IGNORE_INDEX``; trailing padding
-            carries the pad id.
+            carry ``IGNORE_INDEX``; trailing padding carries the pad id.
         token_mask: ``[max_seq_length]`` float mask, ``0.0`` wherever
             ``target_ids`` is padding or ``IGNORE_INDEX``. This is not cosmetic:
             mcore's fused cross-entropy clamps ``IGNORE_INDEX`` before the vocab
@@ -406,9 +405,6 @@ def megatron_sft_packed_preprocessor(
             f"tokens={len(pack_tokens)} targets={len(pack_targets)} "
             f"positions={len(pack_positions)} expected={pack_length + 1}"
         )
-
-    for boundary in cu_seqlens[1:-1]:
-        pack_targets[boundary] = IGNORE_INDEX
 
     input_ids = torch.tensor(pack_tokens[:-1], dtype=torch.int64)
     target_ids = torch.tensor(pack_targets[1:], dtype=torch.int64)
