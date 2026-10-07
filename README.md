@@ -11,6 +11,7 @@
 
 ## 📣 News
 
+* [10/07/2026] We shared the [NeMo-DCR preprint](https://huggingface.co/papers/2610.08430), which presents the delta-compressed refit method used in NeMo RL for fast, bitwise-exact sparse weight synchronization between training and rollout clusters.
 * [08/12/2026] MuseGlimmer RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/muse-glimmer-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/muse-glimmer-support/docs/guides/models/muse-glimmer.md).
 * [08/11/2026] Nemotron-3.5-lightning is released. Trained natively using NeMo RL. Check out [reproducible recipes](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/nemo_gym/nemotron-3.5-lightning).
 * [07/25/2026] [Release v0.7.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.7.0): PPO, MOPD, Cross-tokenizer, Router-replay, CISPO, model support for Qwen3-Omni, Nemotron Nano v3 Omni, Gemma 4, GLM 5.1 and many more!
@@ -137,30 +138,44 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **GB200** - container support for GB200.
 
 ## Table of Contents
-  - [Prerequisites](#prerequisites)
+- [NeMo RL: A Scalable and Efficient Post-Training Library](#nemo-rl-a-scalable-and-efficient-post-training-library)
+  - [📣 News](#-news)
+  - [Overview](#overview)
+    - [Training Backends](#training-backends)
+    - [Generation Backends](#generation-backends)
+  - [Features](#features)
+  - [Table of Contents](#table-of-contents)
   - [Quick Start](#quick-start)
-  - Support Matrix
-
-    <p></p>
-    
-    |Algorithms|Single Node|Multi-node|
-    |-|-|-|
-    |[GRPO](#grpo)|[GRPO Single Node](#grpo-single-node)|[GRPO Multi-node](#grpo-multi-node): [GRPO Qwen2.5-32B](#grpo-qwen25-32b), [GRPO Multi-Turn](#grpo-multi-turn)|
-    |[On-policy Distillation](#on-policy-distillation)|[Distillation Single Node](#on-policy-distillation-single-node)|[Distillation Multi-node](#on-policy-distillation-multi-node)|
-    |[X-Token Off-Policy Distillation](#x-token-off-policy-distillation)|[X-Token Off-Policy Distillation Single Node](#x-token-off-policy-distillation-single-node)|[X-Token Off-Policy Distillation Multi-node](#x-token-off-policy-distillation-multi-node)|
-    |[SFT](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
-    |[DPO](#dpo)|[DPO Single Node](#dpo-single-node)|[DPO Multi-node](#dpo-multi-node)|
-    |[RM](#rm)|[RM Single Node](#rm-single-node)|[RM Multi-node](#rm-multi-node)|
-
-    <p></p>
-
+    - [Bare-Metal Quick Start](#bare-metal-quick-start)
+  - [Prerequisites](#prerequisites)
+  - [GRPO](#grpo)
+    - [GRPO Single Node](#grpo-single-node)
+    - [GRPO Multi-node](#grpo-multi-node)
+      - [GRPO Qwen2.5-32B](#grpo-qwen25-32b)
+      - [GRPO Multi-Turn](#grpo-multi-turn)
+  - [Distillation](#distillation)
+  - [On-policy Distillation](#on-policy-distillation)
+    - [On-policy Distillation Single Node](#on-policy-distillation-single-node)
+    - [On-policy Distillation Multi-node](#on-policy-distillation-multi-node)
+  - [X-Token Off-Policy Distillation](#x-token-off-policy-distillation)
+    - [X-Token Off-Policy Distillation Single Node](#x-token-off-policy-distillation-single-node)
+    - [X-Token Off-Policy Distillation Multi-node](#x-token-off-policy-distillation-multi-node)
+  - [Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)
+    - [SFT Single Node](#sft-single-node)
+    - [SFT Multi-node](#sft-multi-node)
+  - [DPO](#dpo)
+    - [DPO Single Node](#dpo-single-node)
+    - [DPO Multi-node](#dpo-multi-node)
+  - [RM](#rm)
+    - [RM Single Node](#rm-single-node)
+    - [RM Multi-node](#rm-multi-node)
   - [Evaluation](#evaluation)
     - [Convert Model Format (Optional)](#convert-model-format-optional)
     - [Run Evaluation](#run-evaluation)
   - [Set Up Clusters](#set-up-clusters)
   - [Tips and Tricks](#tips-and-tricks)
   - [Citation](#citation)
-  - [Contributing](#contributing)
+  - [Acknowledgement and Contribution Guide](#acknowledgement-and-contribution-guide)
   - [Licenses](#licenses)
 
 ## Quick Start
