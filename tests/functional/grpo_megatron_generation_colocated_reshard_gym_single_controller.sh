@@ -7,11 +7,12 @@
 #
 # Router replay is on under MCore's async scheduler, so the run also covers
 # MInf routing-index capture through the canonical stager, the finalizer's
-# route assembly, and the trainer replaying those routes. That needs MoE routers, which no small
-# pretrained checkpoint provides, so the served model is a tiny random-init
-# Qwen3 MoE built below with Qwen3-0.6B's tokenizer and chat template. Random
-# weights earn no reward; the gates are engine/trainer parity plus route
-# coverage, which hold regardless of what the model has learned.
+# route assembly, and the trainer replaying those routes. That needs MoE
+# routers, which no small pretrained checkpoint provides, so the served model
+# is a tiny random-init Qwen3 MoE built below with Qwen3-0.6B's tokenizer and
+# chat template. Random weights earn no reward; the gates are engine/trainer
+# parity, route coverage, and a positive async scheduling step count, which
+# hold regardless of what the model has learned.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)
