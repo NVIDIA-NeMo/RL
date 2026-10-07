@@ -41,6 +41,71 @@ from transformers import AutoTokenizer
 logger = logging.getLogger(__name__)
 
 
+def _prime_optimizer_state_for_resume(
+    model: nn.Module, optimizer: torch.optim.Optimizer
+) -> None:
+    """Initialize empty optimizer state before DCP loads the saved state into it.
+
+    DCP's ``get_optimizer_state_dict`` primes a fresh optimizer by assigning
+    ``torch.zeros_like(param)`` as the gradient and running a zero-LR step
+    (``_init_optim_state``). ``zeros_like`` follows the *storage* dtype of the
+    local tensor, while autograd validates assigned gradients against the
+    parameter's ``grad_dtype`` (torch>=2.11). The two disagree when a parameter
+    was re-typed after FSDP2 sharding (e.g. the ``_fp32_params`` holders of
+    Mamba models, restored to fp32 while the sharded storage is still bf16),
+    so the resume fails with "attempting to assign a gradient with dtype
+    'c10::BFloat16' to a tensor with grad_dtype 'Float'"
+    (https://github.com/pytorch/pytorch/issues/191918).
+
+    This mirrors ``_init_optim_state`` but allocates the priming gradient in the
+    dtype autograd expects, and reports any parameter where the two differ.
+    It is a no-op when the optimizer already has state or any gradient exists.
+    """
+    if optimizer.state:
+        return
+    for param_group in optimizer.param_groups:
+        for param in param_group["params"]:
+            if param.grad is not None:
+                return
+
+    param_names = {id(p): n for n, p in model.named_parameters()}
+    mismatched: list[str] = []
+    for param_group in optimizer.param_groups:
+        for param in param_group["params"]:
+            if not param.requires_grad:
+                continue
+            grad_dtype = getattr(param, "grad_dtype", None) or param.dtype
+            local = getattr(param, "_local_tensor", param)
+            if grad_dtype != local.dtype or grad_dtype != param.dtype:
+                mismatched.append(
+                    f"{param_names.get(id(param), '<unnamed>')} "
+                    f"(dtype={param.dtype}, local={local.dtype}, grad_dtype={grad_dtype})"
+                )
+            param.grad = torch.zeros_like(param, dtype=grad_dtype)
+    if mismatched:
+        logger.warning(
+            "Priming optimizer state for %d parameter(s) whose grad_dtype differs "
+            "from their storage dtype (first 10): %s",
+            len(mismatched),
+            mismatched[:10],
+        )
+
+    lrs = []
+    for param_group in optimizer.param_groups:
+        if "lr" in param_group:
+            lrs.append(param_group["lr"])
+            param_group["lr"] = (
+                torch.tensor(0.0)
+                if isinstance(param_group["lr"], torch.Tensor)
+                else 0.0
+            )
+    optimizer.step(closure=None)
+    for param_group in optimizer.param_groups:
+        if "lr" in param_group:
+            param_group["lr"] = lrs.pop(0)
+    optimizer.zero_grad(set_to_none=True)
+
+
 def _resolve_lora_adapter_dir(restore_from: str) -> str:
     """Resolve a ``lora_cfg.restore_from`` path to the adapter directory.
 
@@ -454,6 +519,7 @@ class AutomodelCheckpointManager:
 
         # load optimizer
         if optimizer_path and optimizer is not None:
+            _prime_optimizer_state_for_resume(model, optimizer)
             if getattr(optimizer, "master_weights", False):
                 # Check the on-disk dtype before DCP copies into current buffers:
                 # legacy FP32 masters must not be cast into BF16 int16 remainders.
