@@ -2041,3 +2041,56 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
             f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
             f"got {null_resp.status_code}: {null_resp.text}"
         )
+
+
+def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch):
+    """The Gym head server serves the merged global config unredacted and the
+    server commands inline it, so the key must reach Gym's servers as an
+    environment interpolation resolved in each server process, never as a
+    value in the config; without a key the placeholder is sent."""
+    import os
+    from unittest.mock import MagicMock
+
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+    from omegaconf import OmegaConf
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = []
+
+    class _FakeRunHelper:
+        def start(self, *, global_config_dict_parser_config):
+            # Unresolved, as Gym serializes it: reading the DictConfig directly
+            # would resolve the interpolation from this process's environment.
+            started.append(
+                OmegaConf.to_container(
+                    global_config_dict_parser_config.initial_global_config_dict,
+                    resolve=False,
+                )
+            )
+
+    monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
+    monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    monkeypatch.delenv("NEMO_RL_POLICY_API_KEY", raising=False)
+
+    def spin_up(policy_api_key):
+        cfg = {
+            "initial_global_config_dict": {},
+            "model_name": "policy",
+            "base_urls": ["http://127.0.0.1:1/v1"],
+        }
+        if policy_api_key is not None:
+            cfg["policy_api_key"] = policy_api_key
+        NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+        return started[-1]
+
+    with_key = spin_up("per-job-key")
+    assert with_key["policy_api_key"] == "${oc.env:NEMO_RL_POLICY_API_KEY}"
+    assert os.environ["NEMO_RL_POLICY_API_KEY"] == "per-job-key"
+
+    monkeypatch.delenv("NEMO_RL_POLICY_API_KEY", raising=False)
+    without_key = spin_up(None)
+    assert without_key["policy_api_key"] == "dummy_key"
+    assert "NEMO_RL_POLICY_API_KEY" not in os.environ

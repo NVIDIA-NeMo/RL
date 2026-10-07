@@ -540,6 +540,9 @@ def setup(
                     # Distillation does not configure vLLM for router replay.
                     enable_router_replay=False,
                     use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+                    # The workers enforce this key whenever the recipe asks for
+                    # one, so Gym's model server must send the same key.
+                    policy_api_key=deferred_vllm.http_server_api_key,
                 )
                 try:
                     validate_dataset_agent_coverage(

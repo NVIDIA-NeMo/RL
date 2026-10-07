@@ -3311,6 +3311,140 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     )
 
 
+def test_setup_hands_the_vllm_http_server_api_key_to_nemo_gym(monkeypatch) -> None:
+    """The deferred-vLLM branch is the one path that forwards a real key: the
+    workers enforce it, so Gym's model server must send the same one."""
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    repo_root = Path(__file__).resolve().parents[3]
+    register_omegaconf_resolvers()
+    config = OmegaConf.to_container(
+        load_config(repo_root / "examples/configs/grpo_math_1B.yaml"),
+        resolve=True,
+    )
+    config["cluster"].update({"num_nodes": 2, "gpus_per_node": 4})
+    # No validation dataset is handed to setup below.
+    config["grpo"].update({"val_period": 0, "val_at_start": False})
+    generation = config["policy"]["generation"]
+    generation["vllm_cfg"].update(
+        {
+            "async_engine": True,
+            "expose_http_server": True,
+            "http_server_api_key_required": True,
+        }
+    )
+    generation["colocated"] = {
+        "enabled": False,
+        "resources": {"gpus_per_node": 4, "num_nodes": 1},
+    }
+    config["env"]["should_use_nemo_gym"] = True
+    tokenizer = MagicMock()
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    config["policy"]["generation"] = configure_generation_config(generation, tokenizer)
+    master_config = MasterConfig.model_validate(config)
+
+    class DummyCluster:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.num_gpus_per_node = kwargs["num_gpus_per_node"]
+            self.get_placement_groups = MagicMock(return_value=[object()])
+            self.get_master_address_and_port = MagicMock(
+                return_value=("127.0.0.1", 12345)
+            )
+            self.world_size = MagicMock(return_value=4)
+
+    class DummyLoader:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __len__(self):
+            return 1
+
+    class DummyCheckpointer:
+        def get_latest_checkpoint_path(self):
+            return None
+
+        def load_training_info(self, _path):
+            return None
+
+        def get_resume_paths(self, _path):
+            return None, None
+
+    class DummyPolicy:
+        def print_node_ip_and_gpu_id(self):
+            pass
+
+        def init_collective(self, *_args, **_kwargs):
+            return []
+
+        def prepare_refit_info(self, *_args, **_kwargs):
+            return {}
+
+        def offload_after_refit(self):
+            return None
+
+    class DummyVllmGeneration:
+        weight_synchronizer = None
+        dp_openai_server_base_urls = ["http://vllm-worker.example/v1"]
+        # What the real class generates when the recipe requires a key.
+        http_server_api_key = "per-job-key"
+
+        def __init__(self, *, cluster, config, defer_model_load=False):
+            self.cfg = config
+
+        def load_and_start(self):
+            pass
+
+        def finish_generation(self, *_args, **_kwargs):
+            return True
+
+        def init_collective(self, *_args, **_kwargs):
+            return []
+
+        def get_refit_payload_mode(self):
+            return "weights"
+
+        def prepare_refit_info(self, *_args, **_kwargs):
+            return None
+
+    nemo_gym_shard_set = MagicMock(is_sharded=False)
+    build_nemo_gym_actors = MagicMock(return_value=nemo_gym_shard_set)
+    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: MagicMock())
+    monkeypatch.setattr(
+        grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
+    )
+    monkeypatch.setattr(
+        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
+    )
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
+    monkeypatch.setattr(
+        grpo_mod,
+        "get_ray_cluster_topology",
+        lambda: {
+            "train-node": ("nvlink_domain_train", 0),
+            "inference-node": ("nvlink_domain_inference", 1),
+        },
+    )
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
+    monkeypatch.setattr(grpo_mod, "Policy", lambda *_args, **_kwargs: DummyPolicy())
+    monkeypatch.setattr(grpo_mod, "VllmGeneration", DummyVllmGeneration)
+    monkeypatch.setattr(
+        grpo_mod, "create_weight_synchronizer", lambda **_kwargs: MagicMock()
+    )
+    monkeypatch.setattr(grpo_mod, "build_nemo_gym_actors", build_nemo_gym_actors)
+
+    dataset = MagicMock()
+    dataset.__len__.return_value = 2
+    result = setup(master_config, tokenizer, dataset, None)
+
+    assert result[2] is nemo_gym_shard_set
+    build_nemo_gym_actors.assert_called_once()
+    gym_kwargs = build_nemo_gym_actors.call_args.kwargs
+    assert gym_kwargs["base_urls"] == ["http://vllm-worker.example/v1"]
+    assert gym_kwargs["policy_api_key"] == "per-job-key"
+
+
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
     mock_grpo_components,
 ):

@@ -96,6 +96,15 @@ def http_server_api_key_and_worker_config(
         ``(api_key, worker_config)``; ``api_key`` is None when no key is required.
     """
     vllm_cfg = config["vllm_cfg"]
+    if "http_server_api_key" in vllm_cfg:
+        # A key set in the YAML would be enforced by the workers but never
+        # handed to Gym (every call a 401), and would land in the saved and
+        # logged configuration.
+        raise ValueError(
+            "policy.generation.vllm_cfg.http_server_api_key is filled by "
+            "VllmGeneration and must not be set in the configuration; set "
+            "vllm_cfg.http_server_api_key_required: true instead."
+        )
     if not (
         vllm_cfg.get("expose_http_server")
         and vllm_cfg.get("http_server_api_key_required")
