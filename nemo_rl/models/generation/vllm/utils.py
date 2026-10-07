@@ -24,12 +24,12 @@ from nemo_rl.data.multimodal_utils import (
     VLLM_MULTI_MODAL_DATA_KEY,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_FALLBACK_DTYPE,
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationDatumSpec,
 )
+from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.metric_names import (
     FINISHED_REASON_LABEL,
