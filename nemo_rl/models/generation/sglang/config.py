@@ -14,6 +14,14 @@
 
 from typing import Any, Literal, NotRequired, TypedDict
 
+from pydantic import (
+    BaseModel,
+    NonNegativeFloat,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+)
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
@@ -81,6 +89,39 @@ class SGLangRouterConfig(TypedDict):
     use_distributed_post: NotRequired[bool]
     # Per-request timeout (seconds) the router applies before giving up on a backend.
     sglang_router_request_timeout_secs: NotRequired[int]
+    # Managed-router total attempts per request (including the first); positive.
+    # Omitted values retain the pinned router's default of 5.
+    retry_max_retries: NotRequired[int]
+    # Consecutive worker failures before its circuit opens; positive.
+    # Omitted values retain the pinned router's default of 10.
+    cb_failure_threshold: NotRequired[int]
+
+
+class SGLangHttpClientConfig(BaseModel, extra="allow", strict=True):
+    """NeMo-RL HTTP settings, including when the router is externally managed.
+
+    ``max_retries`` counts total POST attempts, including the first attempt.
+    Distributed dispatch and its local fallback each use this same budget.
+    """
+
+    max_retries: PositiveInt = 3
+
+
+class SGLangFaultToleranceConfig(
+    BaseModel, extra="allow", strict=True, allow_inf_nan=False
+):
+    """Serving-health and refit-time recovery settings for SGLang engines.
+
+    Durations are seconds. The first-wait grace may be zero; probe intervals
+    and timeouts must be positive. The restart budget applies per logical
+    engine over the generation object's lifetime; zero disables restarts.
+    """
+
+    use_fault_tolerance: bool = False
+    rollout_health_check_interval: PositiveFloat = 60.0
+    rollout_health_check_timeout: PositiveFloat = 60.0
+    rollout_health_check_first_wait: NonNegativeFloat = 60.0
+    rollout_max_restart_attempts: NonNegativeInt = 3
 
 
 class SglangSpecificArgs(TypedDict):
@@ -94,6 +135,8 @@ class SglangSpecificArgs(TypedDict):
     # sites have a single sglang namespace instead of three sibling fields.
     sglang_server_config: SGLangServerConfig
     sglang_router_config: SGLangRouterConfig
+    sglang_http_client_config: NotRequired[SGLangHttpClientConfig]
+    sglang_fault_tolerance_config: SGLangFaultToleranceConfig
 
     # Weight precision for rollout/refit.
     quantization: SglangQuantizationConfig

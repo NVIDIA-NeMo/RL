@@ -19,7 +19,8 @@ import os
 import threading
 import time
 import warnings
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import fields, is_dataclass, replace
 from typing import Any, Callable, Optional, TypeVar, cast
 
@@ -350,6 +351,60 @@ _OPTIMIZER_DTYPE_KEYS = (
 )
 
 
+@contextmanager
+def _sync_consumed_samples_on_scheduler_load(
+    state: GlobalState, scheduler: Any
+) -> Iterator[None]:
+    """Keep Megatron-Bridge from resetting the LR schedule on resume.
+
+    When override_opt_param_scheduler=True, Megatron-Bridge will override
+    the scheduler step with the checkpointed train_state.consumed_train_samples
+    after loading the scheduler from the checkpoint. Because NeMo-RL doesn't
+    use this counter, older checkpoints have this dummy state set to 0, which
+    then overrides the actual scheduler.num_steps checkpoint value.
+
+    To support forward compatibility matching Megatron, NeMo-RL should begin to
+    checkpoint train_state.consumed_train_samples = scheduler.num_steps to
+    identify / sync these two values when saving a checkpoint.
+
+    To support backward compatibility, this context manager will do the same
+    after checkpoint load to maintain the checkpointed scheduler.num_steps.
+
+    HACK(@cspades): When https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/6321
+    is merged, we should use `checkpoint_state_migration_hook` to implement the
+    backward-compatibility logic given the state_dict and train_state.
+
+    ```
+    load_checkpoint(
+        state,
+        model,
+        optimizer,
+        ...
+        checkpoint_state_migration_hook=checkpoint_compat_hook,
+    )
+    ```
+    """
+    if scheduler is None:
+        # No-op.
+        yield
+        return
+
+    # Override the scheduler state dict load method on instance.
+    load_state_dict = scheduler.load_state_dict
+
+    def load_and_sync(state_dict: dict[str, Any]) -> None:
+        load_state_dict(state_dict)
+        # Synchronize consumed_train_samples and scheduler.num_steps.
+        state.train_state.consumed_train_samples = scheduler.num_steps
+
+    scheduler.load_state_dict = load_and_sync
+    try:
+        yield
+    finally:
+        # Delete the method on instance to fallback to class def.
+        del scheduler.load_state_dict
+
+
 def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, Any]:
     """Resolve optimizer dtype strings, including TE's uint8-backed FP8 moments."""
     resolved = dict(optimizer_cfg)
@@ -401,9 +456,6 @@ def destroy_parallel_state():
     # Also reset the Megatron async calls queue if it exists
     try:
         import megatron.training.async_utils as megatron_async_utils
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
 
         # Clean up any existing async callers first
         old_call_idx = getattr(
@@ -421,8 +473,9 @@ def destroy_parallel_state():
             megatron_async_utils._async_calls_queue.close()
         except:
             pass  # Ignore errors during cleanup
-        # Reset the Megatron global async calls queue as well
-        megatron_async_utils._async_calls_queue = AsyncCallsQueue()
+        # Reset the Megatron global async calls queue as well. Mcore rebuilds it
+        # lazily in _get_async_calls_queue() using flags from the run's args.
+        megatron_async_utils._async_calls_queue = None
         print(
             f"[DEBUG] Reset Megatron async calls queue (old call_idx: {old_call_idx})"
         )
@@ -698,9 +751,9 @@ def _validate_peft_restore_config(
                 "donor to target the same modules; train a new adapter instead."
             )
     # These megatron-bridge LoRA fields change the adapter shape/key layout
-    # for MoE expert layers. NeMo RL never sets them (a run always uses the
-    # bridge defaults), but a native Megatron-Bridge donor checkpoint may
-    # have; a mismatch would restore onto a different adapter layout.
+    # for MoE expert layers. Compare configured values when NeMo RL exposes
+    # them and bridge defaults otherwise; a mismatch would restore onto a
+    # different adapter layout.
     lora_field_defaults = {field.name: field.default for field in fields(LoRA)}
     for key in (
         "normalize_moe_lora",
@@ -1741,21 +1794,11 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.use_fused_weighted_squared_relu = config["megatron_cfg"][
         "use_fused_weighted_squared_relu"
     ]
-    # NeMo-RL can pack multiple expanded Omni examples into one THD tensor.
-    # Flash attention does not support the resulting padded multi-row layout,
-    # so the canonical expanded-sequence contract must use backend dispatch.
     attention_backend = config["megatron_cfg"].get("attention_backend")
     if (
         getattr(model_cfg, "nemotron_omni_contract", None)
         == _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT
     ):
-        if attention_backend == "flash":
-            raise ValueError(
-                "Nemotron Omni's expanded-sequence contract does not support "
-                "attention_backend='flash' in NeMo-RL because packed batches can "
-                "contain multiple padded THD rows. Use attention_backend='auto' "
-                "or omit the setting."
-            )
         if attention_backend is None:
             attention_backend = "auto"
 
@@ -2435,6 +2478,11 @@ def setup_model_and_optimizer(
             a2a_experimental=peft_cfg["a2a_experimental"],
             lora_dtype=peft_cfg["lora_dtype"],
         )
+        if "share_expert_adapters" in peft_cfg:
+            peft = replace(
+                peft,
+                share_expert_adapters=peft_cfg["share_expert_adapters"],
+            )
         # Resolve and validate the warm-start donor checkpoint up front so a
         # bad path or mismatched donor fails before any model construction.
         peft_restore_dir = None
@@ -2569,14 +2617,16 @@ def setup_model_and_optimizer(
     if should_load_checkpoint:
         if pre_load_checkpoint_hook is not None:
             pre_load_checkpoint_hook(state, model)
-        load_checkpoint(
-            state,
-            model,
-            optimizer,
-            scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
-        )
+        with _sync_consumed_samples_on_scheduler_load(state, scheduler):
+            load_checkpoint(
+                state,
+                model,
+                optimizer,
+                scheduler,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and megatron_cfg.dist.use_torch_fsdp2,
+            )
         print("Checkpoint loaded")
 
         # See _force_sync_optimizer_fp32_from_model: required when
@@ -2767,6 +2817,11 @@ def setup_reference_model_state(
             a2a_experimental=peft_cfg["a2a_experimental"],
             lora_dtype=peft_cfg["lora_dtype"],
         )
+        if "share_expert_adapters" in peft_cfg:
+            peft = replace(
+                peft,
+                share_expert_adapters=peft_cfg["share_expert_adapters"],
+            )
     else:
         peft = None
 

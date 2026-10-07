@@ -18,97 +18,25 @@ import traceback
 import warnings
 from datetime import timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, cast
+from typing import TYPE_CHECKING, Any, Iterable, Optional, cast
 
 import torch
 import torch.distributed as dist
 import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoModelForTextToWaveform,
-)
-
-# Try to import nemo_automodel classes, fallback to None if not available
-try:
-    from nemo_automodel._transformers.auto_model import (
-        NeMoAutoModelForCausalLM,
-        NeMoAutoModelForImageTextToText,
-        NeMoAutoModelForTextToWaveform,
-    )
-
-    # Side-effect import: installs the resolver hook that routes FP8-native
-    # Mistral 3.5 configs to Mistral3FP8VLM. Without it, HF's stock FP8Linear
-    # path runs and produces 0-d weight_scale_inv params that FSDP2 rejects.
-    try:
-        import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
-    except ImportError:
-        pass
-
-    NEMO_AUTOMODEL_AVAILABLE = True
-except ImportError:
-    # nemo_automodel is not installed, classes will be None
-    NeMoAutoModelForCausalLM = None  # type: ignore
-    NeMoAutoModelForImageTextToText = None  # type: ignore
-    NeMoAutoModelForTextToWaveform = None  # type: ignore
-    NEMO_AUTOMODEL_AVAILABLE = False
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.vllm.config import (
-    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
     VllmSpecificArgs,
     vllm_nemotron_h_fp32_lm_head_enabled,
 )
+from nemo_rl.models.generation.vllm.patches import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+)
+from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
-
-# Plain Hugging Face classes remain separate from the NeMo AutoModel wrappers so
-# callers that manage distribution can request them when NeMo AutoModel is installed.
-# Add an entry here whenever a model's architecture isn't loadable via
-# AutoModelForCausalLM (e.g. VLMs using ForConditionalGeneration /
-# ForImageTextToText). Unlike AUTOMODEL_FACTORY below, this dict is also read on
-# the ``use_nemo_automodel=False`` path (DTensor V1), where no NeMo custom impl
-# intercepts from_pretrained -- so a model that has a custom NeMo automodel impl
-# still needs an entry here when its parent AutoModel class is not
-# AutoModelForCausalLM. Check MODEL_ARCH_MAPPING in the NeMo automodel registry
-# to see which architectures have custom impls:
-# https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
-HF_AUTOMODEL_FACTORY: Dict[str, Any] = {
-    "qwen2_5_vl": AutoModelForImageTextToText,
-    "qwen2_vl": AutoModelForImageTextToText,
-    "qwen2_5_omni": AutoModelForTextToWaveform,
-    "qwen3_5": AutoModelForImageTextToText,
-    "llava": AutoModelForImageTextToText,
-    "internvl": AutoModelForImageTextToText,
-    "gemma3": AutoModelForImageTextToText,
-    "gemma4": AutoModelForImageTextToText,
-    "gemma4_unified": AutoModelForImageTextToText,
-    "smolvlm": AutoModelForImageTextToText,
-    "mistral3": AutoModelForImageTextToText,
-    "llama4": AutoModelForImageTextToText,
-}
-
-AUTOMODEL_FACTORY: Dict[str, Any] = HF_AUTOMODEL_FACTORY
-
-if NEMO_AUTOMODEL_AVAILABLE:
-    AUTOMODEL_FACTORY = {
-        # NeMo wrappers — keep in sync with the vanilla HF dict above.
-        # See comment above for when to add entries.
-        "qwen2_5_vl": NeMoAutoModelForImageTextToText,
-        "qwen2_vl": NeMoAutoModelForImageTextToText,
-        "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
-        "qwen3_5": NeMoAutoModelForImageTextToText,
-        "llava": NeMoAutoModelForImageTextToText,
-        "internvl": NeMoAutoModelForImageTextToText,
-        "gemma3": NeMoAutoModelForImageTextToText,
-        "gemma4": NeMoAutoModelForImageTextToText,
-        "gemma4_unified": NeMoAutoModelForImageTextToText,
-        "smolvlm": NeMoAutoModelForImageTextToText,
-        "mistral3": NeMoAutoModelForImageTextToText,
-        "llama4": NeMoAutoModelForImageTextToText,
-    }
 
 
 class IPCProtocol(Enum):
@@ -124,7 +52,6 @@ class IPCProtocol(Enum):
 # worker classes.
 POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
-    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker",
     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
 }
 
@@ -274,23 +201,6 @@ def validate_fp32_lm_head_config(
             UserWarning,
             stacklevel=2,
         )
-
-
-def resolve_model_class(
-    model_name: str,
-    *,
-    use_nemo_automodel: bool = True,
-) -> Any:
-    """Resolve the model class for a model type.
-
-    Args:
-        model_name: Model type to resolve.
-        use_nemo_automodel: Whether to prefer NeMo AutoModel wrappers when they
-            are available.
-    """
-    if use_nemo_automodel and NEMO_AUTOMODEL_AVAILABLE:
-        return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
-    return HF_AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
 
 
 def is_vllm_v1_engine_enabled() -> bool:
@@ -707,14 +617,27 @@ def stream_weights_via_ipc_zmq_impl(
         release_staging_buffers()
 
 
+# Positions in ``torch.multiprocessing.reductions.rebuild_cuda_tensor``'s
+# argument tuple (unchanged since torch 1.x; see its signature).
+_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX = 6
+_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX = 7
+
+
 def rebuild_cuda_tensor_from_ipc(
     cuda_ipc_handle: tuple, device_id: int
 ) -> torch.Tensor:
     """Rebuild a CUDA tensor from an IPC handle."""
     func = rebuild_cuda_tensor
     args = cuda_ipc_handle[0]
-    list_args = list(args)
-    list_args[6] = device_id
+    list_args: list[Any] = list(args)
+    list_args[_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX] = device_id
+    # The producer (training venv) may run a newer torch than this consumer;
+    # see nemo_rl.utils.cuda_ipc for the version-byte compatibility rewrite.
+    list_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX] = (
+        normalize_cuda_ipc_handle(
+            list_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX]
+        )
+    )
     return func(*list_args)
 
 
@@ -1204,9 +1127,9 @@ def broadcast_hf_buckets_via_distributed_impl(
     ``dist.broadcast`` per tensor over the NCCL group, then waits for the Ray
     refs to confirm engines finished loading the bucket.
 
-    The rollout-engine lock wraps each bucket's broadcast so concurrent SGLang
-    NCCL operations (e.g. health-check pings) cannot collide with the
-    weight-update broadcast.
+    Trainer rank 0 acquires the rollout-engine lock for each bucket to serialize
+    weight-update broadcasts. The generation side does not acquire it; pausing
+    the health monitor keeps serving probes out of the refit phase.
     """
     import time as _time
 

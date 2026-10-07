@@ -1769,6 +1769,54 @@ def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
     assert worker.mcore_state.cfg.checkpoint.save == "original_path"
 
 
+def test_megatron_save_checkpoint_records_scheduler_position(monkeypatch):
+    """Bridge restores scheduler.num_steps from consumed_train_samples on resume."""
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model = _FakeTrainableModel()
+    worker.model.training = False
+    worker.optimizer = object()
+    worker.scheduler = SimpleNamespace(num_steps=96)
+    worker.optimizer_cpu_offload = False
+    worker.should_disable_forward_pre_hook = False
+    worker.checkpointing_context = None
+    worker.mcore_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(save="original_path", async_save=False)
+        ),
+        train_state=SimpleNamespace(
+            floating_point_operations_so_far=0, consumed_train_samples=0
+        ),
+    )
+    worker.move_model = lambda model, device, move_params, move_grads: model
+    worker.move_optimizer = lambda device: None
+
+    saved_consumed_samples = []
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        worker_module, "maybe_finalize_async_save", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "save_checkpoint",
+        lambda **kwargs: saved_consumed_samples.append(
+            kwargs["state"].train_state.consumed_train_samples
+        ),
+    )
+
+    MegatronPolicyWorkerImpl.save_checkpoint(
+        worker, weights_path="ckpt/weights", optimizer_path="ckpt/optim"
+    )
+
+    assert saved_consumed_samples == [96]
+
+
 @pytest.mark.parametrize("cache_active", [True, False])
 def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
     monkeypatch, cache_active
@@ -1782,7 +1830,6 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         cfg=SimpleNamespace(
             checkpoint=SimpleNamespace(
                 async_save=True,
-                async_strategy="nvrx",
                 use_persistent_ckpt_worker=True,
                 ckpt_assume_constant_structure=True,
                 async_ckpt_use_cpu_shm=False,
@@ -1803,11 +1850,7 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         def cleanup_tensor_caches(cls):
             events.append(("cleanup_tensor_caches", None))
 
-    monkeypatch.setattr(
-        worker_module,
-        "get_async_strategy",
-        lambda strategy: (strategy, {"FileSystemWriterAsync": _Writer}),
-    )
+    monkeypatch.setattr(worker_module, "FileSystemWriterAsync", _Writer)
     monkeypatch.setattr(
         worker_module.gc, "collect", lambda: events.append(("gc_collect", None))
     )

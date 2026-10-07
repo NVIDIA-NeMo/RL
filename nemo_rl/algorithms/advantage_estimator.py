@@ -34,10 +34,11 @@ Reference papers:
 - MOPD: https://arxiv.org/abs/2601.02780
 """
 
-from typing import Literal, Optional
+import math
+from typing import Annotated, Literal, Optional
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
@@ -60,6 +61,13 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     reward_weights: list[float] | None = None
     # Reinforce++ specific
     minus_baseline: bool = True
+    # OPD specific: TROPD proximal-teacher weight alpha in (0, 1]. The advantage
+    # targets the mixture log(alpha * p_teacher + (1 - alpha) * p_student)
+    # instead of the teacher itself; 1.0 is plain MOPD.
+    proximal_teacher_alpha: Annotated[float, Field(gt=0.0, le=1.0)] = 1.0
+    # OPD specific: subtract the mean advantage over every valid token in the
+    # batch the estimator sees (a whole step; see OPDAdvantageEstimator).
+    subtract_global_baseline: bool = False
 
 
 class GAEConfig(BaseModel, extra="allow"):
@@ -640,6 +648,18 @@ class OPDAdvantageEstimator:
     hard gate on the training-to-inference ratio) is handled separately by
     ICE-POP mode in ClippedPGLoss — not here.
 
+    With ``proximal_teacher_alpha < 1`` (TROPD) the student is pulled toward a
+    proximal teacher that stays within a trust region of the student:
+        log π_prox = log(α · π_teacher + (1 − α) · π_student)
+        Â_TROPD,t = sg[log π_prox − log π_student]
+    The advantage is bounded below by log(1 − α), so tokens the teacher
+    strongly rejects cannot dominate the update. α = 1 recovers Â_MOPD exactly.
+
+    ``subtract_global_baseline`` then centers the advantage on the mean over
+    every valid token passed to one ``compute_advantage`` call. That call
+    covers a whole training step on ``run_grpo.py``; the SingleController
+    calls it once per streaming chunk and so requires one chunk per step.
+
     The loss function should be configured with:
         disable_ppo_ratio: true               (REINFORCE, no PPO ratio)
         use_importance_sampling_correction: true
@@ -652,7 +672,11 @@ class OPDAdvantageEstimator:
         prev_logprobs: [B, S] student training-engine log probabilities
     """
 
-    def __init__(self, estimator_config: dict, loss_config: dict):
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        self.proximal_teacher_alpha = estimator_config.proximal_teacher_alpha
+        self.subtract_global_baseline = estimator_config.subtract_global_baseline
         self.last_metrics: dict[str, float] = {}
 
     def compute_advantage(
@@ -681,21 +705,38 @@ class OPDAdvantageEstimator:
         if prev_logprobs is None:
             raise ValueError("OPD requires prev_logprobs")
 
-        # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
-        distill_advantages = (teacher_logprobs - prev_logprobs).detach()
+        # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8). Metrics
+        # report this raw gap even when TROPD changes the training signal.
+        teacher_student_gap = (teacher_logprobs - prev_logprobs).detach()
+
+        if self.proximal_teacher_alpha == 1.0:
+            distill_advantages = teacher_student_gap
+        else:
+            # TROPD: log(α · π_teacher + (1 − α) · π_student), in log space.
+            alpha = self.proximal_teacher_alpha
+            proximal_teacher_logprobs = torch.logaddexp(
+                teacher_logprobs + math.log(alpha),
+                prev_logprobs + math.log1p(-alpha),
+            )
+            distill_advantages = (proximal_teacher_logprobs - prev_logprobs).detach()
+
+        if self.subtract_global_baseline:
+            valid_advantages = torch.masked_select(distill_advantages, mask.bool())
+            if valid_advantages.numel() > 0:
+                distill_advantages = distill_advantages - valid_advantages.mean()
 
         # Apply mask
         advantages = distill_advantages * mask
 
         # Metrics
-        self._compute_metrics(distill_advantages, advantages, mask)
+        self._compute_metrics(teacher_student_gap, advantages, mask)
 
         return advantages
 
-    def _compute_metrics(self, distill_advantages, advantages, mask):
+    def _compute_metrics(self, teacher_student_gap, advantages, mask):
         """Compute OPD logging metrics and store in self.last_metrics."""
         valid_bool = mask.bool()
-        distill_valid = torch.masked_select(distill_advantages, valid_bool)
+        distill_valid = torch.masked_select(teacher_student_gap, valid_bool)
         adv_valid = torch.masked_select(advantages, valid_bool)
 
         distill_mean = distill_valid.mean().item() if distill_valid.numel() > 0 else 0.0

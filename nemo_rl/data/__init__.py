@@ -39,7 +39,11 @@ class ResponseDatasetConfig(TypedDict):
     video_target_num_patches: NotRequired[int | None]
     video_temporal_patch_size: NotRequired[int]
     video_maintain_aspect_ratio: NotRequired[bool]
+    # Zero-pad audio to a multiple of the feature hop length, matching vLLM
+    # models that do this before feature extraction (e.g. Qwen3-Omni).
+    pad_audio_to_hop_length: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
+    max_samples: NotRequired[int | None]
 
 
 class PreferenceDatasetConfig(TypedDict):
@@ -58,6 +62,7 @@ class PreferenceDatasetConfig(TypedDict):
     video_target_num_patches: NotRequired[int | None]
     video_temporal_patch_size: NotRequired[int]
     video_maintain_aspect_ratio: NotRequired[bool]
+    pad_audio_to_hop_length: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
     split_validation_size: NotRequired[float | int]
     legacy_validation_split: NotRequired[bool]
@@ -207,6 +212,7 @@ class MMAUEvalDataConfig(TypedDict):
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
     env_name: NotRequired[str]
+    max_samples: NotRequired[int | None]
 
 
 class DailyOmniEvalDataConfig(TypedDict):
@@ -225,6 +231,8 @@ class DailyOmniEvalDataConfig(TypedDict):
         prompt_file: Optional prompt template path.
         system_prompt_file: Optional system prompt path.
         env_name: Reward/eval environment name (e.g. ``"vlm"``).
+        max_samples: Cap on the number of rows evaluated. None evaluates the
+            whole split.
     """
 
     max_input_seq_length: int
@@ -233,6 +241,7 @@ class DailyOmniEvalDataConfig(TypedDict):
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
     env_name: NotRequired[str]
+    max_samples: NotRequired[int | None]
 
 
 # Union type for all eval dataset configs

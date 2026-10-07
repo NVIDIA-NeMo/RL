@@ -99,10 +99,6 @@ class Value(ValueInterface):
                     "training backend (or value.megatron_cfg.enabled=true for "
                     "Megatron-Core)."
                 )
-            if not config["dtensor_cfg"]["_v2"]:
-                raise ValueError(
-                    "DTensor value models require value.dtensor_cfg._v2=true."
-                )
 
             worker_builder_cls = "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2"
 
@@ -446,9 +442,6 @@ class Value(ValueInterface):
                 tokenizer_path=tokenizer_path,
             )
         else:
-            assert self.cfg["dtensor_cfg"]["_v2"], (
-                "DTensor value models only support DTensor V2 backend."
-            )
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,

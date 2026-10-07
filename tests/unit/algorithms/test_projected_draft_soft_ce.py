@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.loss.draft import (
+    dflash_projected_vocab_parallel_soft_ce,
     projected_streaming_vocab_parallel_soft_ce,
 )
 
@@ -39,6 +40,154 @@ def _dense_projected_stats(
     numerators.scatter_add_(0, bin_ids.reshape(-1), per_token * mask.reshape(-1))
     counts.scatter_add_(0, bin_ids.reshape(-1), mask.reshape(-1).float())
     return numerators, counts
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error", "message"),
+    [
+        ("student_hidden", torch.empty(0, 3), ValueError, "at least one token"),
+        ("student_hidden", torch.zeros(1, 1, 1, 1, 3), ValueError, "four dimensions"),
+        ("output_weight", torch.empty(0, 3), ValueError, "nonempty"),
+        ("output_weight", torch.zeros(7, 2), ValueError, "hidden size"),
+        ("selected_teacher_logits", torch.empty(0, 7), ValueError, "at least one row"),
+        (
+            "selected_teacher_logits",
+            torch.zeros(3, 7),
+            ValueError,
+            "student token dimensions",
+        ),
+        ("mask", torch.ones(3), ValueError, "non-hidden student dimensions"),
+        ("mask", torch.ones(2, device="meta"), ValueError, "share a device"),
+        (
+            "output_weight",
+            torch.zeros(7, 3, dtype=torch.long),
+            TypeError,
+            "floating point",
+        ),
+        (
+            "output_weight",
+            torch.zeros(7, 3, dtype=torch.float64),
+            ValueError,
+            "same dtype",
+        ),
+        ("token_chunk_size", 0, ValueError, "positive"),
+        ("weights", torch.empty(0), ValueError, "nonempty vector"),
+        ("weights", torch.ones(2), ValueError, "bin_ids is required"),
+        ("bin_ids", torch.zeros(3, dtype=torch.long), ValueError, "match mask"),
+        ("bin_ids", torch.zeros(2), TypeError, "torch.long"),
+        (
+            "bin_ids",
+            torch.zeros(2, dtype=torch.long, device="meta"),
+            ValueError,
+            "share a device",
+        ),
+    ],
+)
+def test_projected_soft_ce_rejects_invalid_inputs(
+    field: str,
+    value: torch.Tensor | int,
+    error: type[Exception],
+    message: str,
+) -> None:
+    inputs = {
+        "student_hidden": torch.zeros(2, 3),
+        "output_weight": torch.zeros(7, 3),
+        "selected_teacher_logits": torch.zeros(2, 7),
+        "mask": torch.ones(2),
+        "token_chunk_size": 2,
+        "tp_group": None,
+    }
+    inputs[field] = value
+    with pytest.raises(error, match=message):
+        projected_streaming_vocab_parallel_soft_ce(**inputs)
+
+
+@pytest.mark.parametrize("token_chunk_size", [1, 2])
+@pytest.mark.parametrize("invalid_bin", [-1, 2])
+def test_projected_soft_ce_rejects_out_of_range_bins(
+    token_chunk_size: int, invalid_bin: int
+) -> None:
+    with pytest.raises(ValueError, match=r"bin_ids must lie in \[0, 2\)"):
+        projected_streaming_vocab_parallel_soft_ce(
+            student_hidden=torch.zeros(2, 3),
+            output_weight=torch.zeros(7, 3),
+            selected_teacher_logits=torch.zeros(2, 7),
+            mask=torch.ones(2),
+            bin_ids=torch.tensor([0, invalid_bin]),
+            weights=torch.ones(2),
+            token_chunk_size=token_chunk_size,
+            tp_group=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error", "message"),
+    [
+        ("draft_hidden", torch.zeros(1, 4), ValueError, "draft_hidden must have shape"),
+        (
+            "teacher_logits",
+            torch.zeros(4, 7),
+            ValueError,
+            "teacher_logits must have shape",
+        ),
+        (
+            "sample_rows",
+            torch.zeros(2, dtype=torch.long),
+            ValueError,
+            "sample_rows must have shape",
+        ),
+        (
+            "label_positions",
+            torch.zeros(1, 1, dtype=torch.long),
+            ValueError,
+            "label_positions must match",
+        ),
+        (
+            "loss_mask",
+            torch.ones(1, 1, dtype=torch.bool),
+            ValueError,
+            "loss_mask must match",
+        ),
+        ("sample_rows", torch.zeros(1, dtype=torch.int32), TypeError, "torch.long"),
+        (
+            "label_positions",
+            torch.ones(1, 2, dtype=torch.int32),
+            TypeError,
+            "torch.long",
+        ),
+        ("loss_mask", torch.ones(1, 2), TypeError, "boolean"),
+        (
+            "loss_mask",
+            torch.ones(1, 2, dtype=torch.bool, device="meta"),
+            ValueError,
+            "share a device",
+        ),
+        ("position_decay", 0.0, ValueError, "position_decay"),
+        ("position_decay", -0.5, ValueError, "position_decay"),
+        ("position_decay", 1.1, ValueError, "position_decay"),
+        ("position_decay", float("nan"), ValueError, "position_decay"),
+    ],
+)
+def test_dflash_adapter_rejects_invalid_inputs(
+    field: str,
+    value: torch.Tensor | float,
+    error: type[Exception],
+    message: str,
+) -> None:
+    inputs = {
+        "draft_hidden": torch.zeros(1, 2, 4),
+        "output_weight": torch.zeros(7, 4),
+        "teacher_logits": torch.zeros(1, 2, 7),
+        "sample_rows": torch.zeros(1, dtype=torch.long),
+        "label_positions": torch.tensor([[-1, 1]]),
+        "loss_mask": torch.tensor([[False, True]]),
+        "position_decay": 0.5,
+        "token_chunk_size": 1,
+        "tp_group": None,
+    }
+    inputs[field] = value
+    with pytest.raises(error, match=message):
+        dflash_projected_vocab_parallel_soft_ce(**inputs)
 
 
 @pytest.mark.parametrize(
@@ -276,20 +425,19 @@ def test_projected_soft_ce_casts_full_head_once_per_backward() -> None:
 def test_projected_soft_ce_does_not_retain_full_context_teacher_logits(
     context_length: int,
 ) -> None:
-    """The projected seam accepts and saves only requested teacher rows."""
+    """The DFlash adapter must not retain the full-context teacher storage."""
     generator = torch.Generator().manual_seed(86420)
-    num_tokens, hidden_size, vocab_size = 5, 3, 17
+    num_tokens, hidden_size, vocab_size = 6, 3, 17
     full_teacher_logits = torch.randn(
+        1,
         context_length,
         vocab_size,
         generator=generator,
         dtype=torch.bfloat16,
     )
-    selected_teacher_logits = full_teacher_logits.index_select(
-        0, torch.tensor([1, 7, 42, context_length - 1, 7])
-    )
     full_teacher_storage_bytes = full_teacher_logits.untyped_storage().nbytes()
     student_hidden = torch.randn(
+        1,
         num_tokens,
         hidden_size,
         generator=generator,
@@ -308,11 +456,14 @@ def test_projected_soft_ce_does_not_retain_full_context_teacher_logits(
         return tensor
 
     with torch.autograd.graph.saved_tensors_hooks(record, lambda tensor: tensor):
-        stats = projected_streaming_vocab_parallel_soft_ce(
-            student_hidden=student_hidden,
+        stats = dflash_projected_vocab_parallel_soft_ce(
+            draft_hidden=student_hidden,
             output_weight=output_weight,
-            selected_teacher_logits=selected_teacher_logits,
-            mask=torch.ones(num_tokens),
+            teacher_logits=full_teacher_logits,
+            sample_rows=torch.zeros(1, dtype=torch.long),
+            label_positions=torch.tensor([[0, 2, 8, 43, context_length, 8]]),
+            loss_mask=torch.tensor([[False, True, True, True, True, True]]),
+            position_decay=1.0,
             token_chunk_size=2,
             tp_group=None,
         )
