@@ -175,8 +175,23 @@ def test_quantized_fused_destination_commits_values_and_scales_on_current_stream
         reference = quantizer.quantize(expected)
         for name in storage_names:
             assert getattr(destination, name).data_ptr() == pointers[name]
+            actual_storage = getattr(destination, name)
+            reference_storage = getattr(reference, name)
+            if recipe == "blockwise" and name.endswith("_scale_inv"):
+                # TE pads the scale grid's final dimension to a multiple of four.
+                # Those unused entries are uninitialized; compare every live scale.
+                rows = expected.shape[0] // quantizer.block_len
+                columns = expected.shape[1] // quantizer.block_len
+                if name.startswith("_columnwise"):
+                    rows, columns = columns, rows
+                actual_storage = actual_storage[:rows, :columns]
+                reference_storage = reference_storage[:rows, :columns]
             torch.testing.assert_close(
-                getattr(destination, name), getattr(reference, name), rtol=0, atol=0
+                actual_storage,
+                reference_storage,
+                rtol=0,
+                atol=0,
+                msg=lambda message, name=name: f"{name}: {message}",
             )
         torch.testing.assert_close(
             destination.dequantize().float(), expected.float(), rtol=0.07, atol=0
