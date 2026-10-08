@@ -14,6 +14,7 @@
 
 """Research worker. Native batching/loss logic pinned to main 91077391."""
 
+import gc
 import os
 import warnings
 from contextlib import AbstractContextManager, nullcontext
@@ -95,6 +96,13 @@ class LoGRAWorkerImpl(DTensorPolicyWorkerV2Impl):
             self.scheduler = build_scheduler(self.optimizer, config.get("scheduler"))
         if weights_path:
             self.load_checkpoint(weights_path, optimizer_path)
+        # Setup leaves a large, long-lived Python heap (model, FSDP state,
+        # transformers). The per-step hooks allocate enough short-lived objects
+        # to promote survivors and trigger full collections mid-forward, each
+        # stalling the step by hundreds of milliseconds. Freezing the setup heap
+        # keeps later collections confined to per-step garbage.
+        gc.collect()
+        gc.freeze()
 
     def record_memory(self, metrics):
         # GRPO sums unknown all_mb_metrics fields across workers. Divide by DP
