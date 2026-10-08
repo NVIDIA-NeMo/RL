@@ -9,7 +9,7 @@ import pytest
 pytestmark = pytest.mark.trtllm
 
 
-def test_collective_refit_always_resets_prefix_cache():
+def test_collective_refit_recomputes_active_requests_before_finish():
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
 
     extension = backend.NcclExtension.__new__(backend.NcclExtension)
@@ -50,4 +50,12 @@ def test_collective_refit_always_resets_prefix_cache():
     engine.model_engine.restore_compiled_model_after_refit.assert_called_once_with(
         engine.resource_manager
     )
-    engine.reset_prefix_cache.assert_called_once_with()
+    # Recompute in-flight requests under the new weights, then finish_weight_update
+    # resets the prefix cache.
+    calls = [c[0] for c in engine.method_calls]
+    assert [
+        c for c in calls if c in ("recompute_active_requests", "reset_prefix_cache")
+    ] == [
+        "recompute_active_requests",
+        "reset_prefix_cache",
+    ]

@@ -25,10 +25,10 @@ never branches on backend type.
 Colocated transports (IPC, SGLang colocated) own GPU phase transitions
 internally (offload, prepare_for_generation, restore) as part of their
 sync_weights() implementation. The NCCL collective transport is a pure data
-mover; the orchestrator handles phase transitions externally since policy and
-generation run on separate GPU clusters. The SGLang disaggregated transport
-sits in between: it drives the generation-side phases but leaves the policy
-resident on its own GPUs.
+mover (it can optionally release trainer memory first); the orchestrator handles
+phase transitions externally since policy and generation run on separate GPU
+clusters. The SGLang disaggregated transport sits in between: it drives the
+generation-side phases but leaves the policy resident on its own GPUs.
 
 This interface assumes **global weight updates**: all generation workers
 are updated atomically and are always at the same weight version. Per-worker
@@ -56,8 +56,9 @@ class WeightSynchronizer(ABC):
 
     Colocated transports own phase transitions internally
     (offload_before_refit, prepare_for_generation, offload_after_refit).
-    Non-colocated collective and checkpoint-engine transports are pure data movers;
-    the orchestrator handles phases externally.
+    Non-colocated collective and checkpoint-engine transports are pure data movers
+    (collective can optionally offload the policy first); the orchestrator handles
+    phases externally.
     """
 
     @abstractmethod
@@ -76,9 +77,8 @@ class WeightSynchronizer(ABC):
         4. Verify the transfer succeeded
         5. Restore both sides to their ready state
 
-        Step 1 is skipped by every transport whose policy keeps its own GPUs:
-        the NCCL collective, checkpoint-engine, and SGLang disaggregated
-        transports. Steps 2 and 5 are skipped by the NCCL collective and
+        Step 1 is skipped by default when the policy keeps its own GPUs (NCCL
+        collective can opt in). Steps 2 and 5 are skipped by the NCCL collective and
         checkpoint-engine transports.
 
         Step 4 (verification) is performed explicitly by the IPC and NCCL

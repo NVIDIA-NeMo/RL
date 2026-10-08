@@ -23,6 +23,8 @@ class TrtllmSpecificArgs(TypedDict):
     gpu_memory_utilization: NotRequired[float]
     max_model_len: int
     precision: str
+    # With precision="fp8", use MXFP8 (UE8M0 1x32 scales) instead of 128x128 block-FP8.
+    is_mx: NotRequired[bool]
     max_batch_size: int
     max_num_tokens: int
     expose_http_server: NotRequired[bool]
