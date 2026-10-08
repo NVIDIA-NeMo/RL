@@ -326,3 +326,80 @@ def test_delegated_packing_cannot_silently_drop_router_mask(monkeypatch):
             pad_individual_seqs_to_multiple_of=4,
             create_packed_seq_padding_mask=True,
         )
+
+
+@pytest.mark.parametrize("chunkwise", [False, True])
+def test_prepacked_hybridep_chunkwise_fallback(monkeypatch, caplog, chunkwise):
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.megatron import data as module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_needs_router_padding_mask,
+    )
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                moe_router_enable_expert_bias=True, moe_router_bias_update_rate=0.001
+            )
+            self.expert_bias = torch.zeros(4)
+            self.language_model = SimpleNamespace(
+                decoder=SimpleNamespace(_has_linear_layer_with_chunkwise_cp=chunkwise)
+            )
+
+        def forward(self, input_ids, padding_mask=None):
+            if chunkwise:
+                assert padding_mask is None
+            else:
+                assert padding_mask is not None
+            return input_ids
+
+    model = Model()
+    create_mask = _model_needs_router_padding_mask(
+        model, pack_sequences=True, allow_unmasked_chunkwise_cp=chunkwise
+    )
+    assert len(caplog.records) == int(chunkwise)
+    if chunkwise:
+        assert "Padding tokens will contribute" in caplog.text
+    monkeypatch.setattr(BatchedDataDict, "to", lambda self, device: self)
+    monkeypatch.setattr(module, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        module, "get_context_parallel_world_size", lambda: 2 if chunkwise else 1
+    )
+    cfg = {
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 2 if chunkwise else 1,
+            "sequence_parallel": False,
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+            "moe_router_enable_expert_bias": True,
+        },
+        "sequence_packing": {"enabled": True, "fuse_loss": True},
+        "dynamic_batching": {"enabled": False},
+        "make_sequence_length_divisible_by": 4,
+    }
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[11, 12, 13, 0, 21, 22, 23, 24, 25, 0, 0, 0]]),
+            "input_lengths": torch.tensor([12]),
+            "cu_seqlens": [torch.tensor([0, 3, 8], dtype=torch.int32)],
+            "cu_seqlens_padded": [torch.tensor([0, 4, 12], dtype=torch.int32)],
+        }
+    )
+    iterator, *_ = module.get_microbatch_iterator(
+        batch,
+        cfg,
+        mbs=1,
+        straggler_timer=None,
+        create_router_padding_mask=create_mask,
+        allow_unmasked_chunkwise_cp=chunkwise,
+        model_slices_context_parallel_inputs=True,
+    )
+    processed = next(iterator)
+    model(processed.input_ids_cp_sharded, padding_mask=processed.padding_mask)
+    assert model.config.moe_router_enable_expert_bias
+    assert model.config.moe_router_bias_update_rate == 0.001
+    assert cfg["megatron_cfg"]["moe_flex_dispatcher_backend"] == "hybridep"
+    assert len(caplog.records) == int(chunkwise)

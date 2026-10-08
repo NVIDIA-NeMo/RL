@@ -357,6 +357,7 @@ def get_microbatch_iterator(
     model_slices_context_parallel_inputs: bool = False,
     mtp_enabled: bool = False,
     create_router_padding_mask: bool = False,
+    allow_unmasked_chunkwise_cp: bool = False,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -372,6 +373,8 @@ def get_microbatch_iterator(
         mtp_enabled: Whether the model uses multi-token prediction layers.
         create_router_padding_mask: Exclude padding from expert-bias statistics
             on supported MoE models, for packed and nonpacked inputs alike.
+        allow_unmasked_chunkwise_cp: Suppress router masks for prepacked HybridEP
+            inputs after setup warned about unsupported HybridBlock chunkwise CP.
 
     Returns:
         Tuple containing the iterator and metadata
@@ -464,6 +467,16 @@ def get_microbatch_iterator(
     else:
         raw_iterator = data.make_microbatch_iterator(mbs)
         data_iterator_len = data.size // mbs
+
+    if allow_unmasked_chunkwise_cp:
+        if not prepacked or not uses_hybridep_flex_dispatcher(cfg["megatron_cfg"]):
+            raise ValueError(
+                "Unmasked chunkwise CP requires prepacked HybridEP inputs."
+            )
+        # Override both legacy prepacked expert-bias and dispatcher mask creation.
+        # Remove this fallback when MCore HybridBlock supports chunkwise CP masks.
+        create_packed_seq_padding_mask = False
+        create_router_padding_mask = False
 
     # Wrap the raw iterator with processing
     processed_iterator = make_processed_microbatch_iterator(

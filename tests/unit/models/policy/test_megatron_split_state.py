@@ -175,6 +175,7 @@ def _make_worker(loss_type):
     # packing and CP sharding, no MTP) have to be spelled out here.
     w.delegate_pack_to_model = False
     w.create_router_padding_mask = False
+    w.allow_unmasked_chunkwise_cp = False
     w.delegate_mtp_loss_mask_to_model = False
     w.model_slices_context_parallel_inputs = False
     w.mtp_enabled = False
@@ -441,6 +442,7 @@ class TestTrainMicrobatch:
         w.delegate_pack_to_model = True
         w.delegate_mtp_loss_mask_to_model = True
         w.create_router_padding_mask = create_router_padding_mask
+        w.allow_unmasked_chunkwise_cp = not create_router_padding_mask
         batch = _fake_batch()
 
         with patch(
@@ -451,6 +453,9 @@ class TestTrainMicrobatch:
 
         attach_validity_mask.assert_called_once_with(batch, 42)
         iterator_kwargs = mock_module_symbols["gmi"].call_args.kwargs
+        assert iterator_kwargs["allow_unmasked_chunkwise_cp"] is (
+            not create_router_padding_mask
+        )
         assert iterator_kwargs["delegate_pack_to_model"] is True
         assert iterator_kwargs["delegate_mtp_loss_mask_to_model"] is True
         assert iterator_kwargs["model_slices_context_parallel_inputs"] is False
