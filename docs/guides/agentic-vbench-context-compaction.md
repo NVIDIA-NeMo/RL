@@ -369,6 +369,16 @@ Verified here:
   logging works by exporting `WANDB_API_KEY` (the launcher otherwise falls back
   to offline) with `WANDB_MODE=online`.
 
+- The identity 256k/32-turn rerun with W&B online (job 2173953) collected
+  step 1 (32 episodes, mean reward 0.125, longest row 134,881 tokens) and then
+  failed in the logprob pass: Megatron's `get_ltor_masks_and_position_ids`
+  builds a float32 `[1, 1, L, L]` causal mask (67.8 GiB at 135k tokens) that
+  causal FlashAttention/TE never reads. `NRL_MEGATRON_SKIP_DENSE_ATTENTION_MASK=1`
+  (new in `nemo_rl/models/megatron/data.py`) hands the model
+  `attention_mask=None` with plain position ids on the unpacked path; the 256k
+  launcher exports it. Without it the unpacked path caps trainable rows near
+  100k tokens on 180 GiB GPUs regardless of the model.
+
 Not yet verified (requires GPU allocations):
 
 - A two-step compaction smoke and the 20-step paired comparison.
