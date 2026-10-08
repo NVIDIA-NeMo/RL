@@ -519,6 +519,7 @@ class RolloutReassembler:
         mask_sample: list[bool],
         fallback_weight_version: int,
         prompt_idx: int,
+        rollout_category: str | None = None,
         loss_multiplier: float = 1.0,
         canonical_sample_ids: Optional[list[str]] = None,
     ) -> FinalizedGroup:
@@ -537,6 +538,8 @@ class RolloutReassembler:
         is not carried from the dispatcher -- the receipt path has no real
         tokens to measure it from at dispatch time -- so it is computed here
         instead, from each row's rebuilt length against ``max_seq_len``.
+        ``rollout_category`` carries the prompt's telemetry category onto every
+        canonical row, including masked placeholders.
         """
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
@@ -748,6 +751,7 @@ class RolloutReassembler:
             weight_version=group_min_wv,
             group_id=group_id,
             prompt_idx=prompt_idx,
+            rollout_category=rollout_category,
         )
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0

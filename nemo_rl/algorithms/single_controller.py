@@ -163,6 +163,11 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.metric_utils import (
+    READY_WEIGHT_VERSION_TAG,
+    ROLLOUT_CATEGORY_TAG,
+    calculate_staleness_metrics,
+)
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
@@ -709,6 +714,7 @@ class SingleControllerActor:
         )
 
         self._trainer_version: int = restored_trainer_version
+        self._buffer.set_trainer_version_provider(lambda: self._trainer_version)
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
@@ -3277,6 +3283,33 @@ class SingleControllerActor:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
+                # Use the pre-update trainer clock and one observation per group,
+                # pooled across chunks before cleanup. Canonical tags carry the
+                # same effective start version as the built-in samplers.
+                staleness_metrics = calculate_staleness_metrics(
+                    (
+                        (sample_id, tag["weight_version"])
+                        for meta in consumed_metas
+                        for sample_id, tag in zip(
+                            meta.sample_ids, meta.tags or [], strict=True
+                        )
+                    ),
+                    train_weight_version=version_during_step,
+                    sample_categories={
+                        sample_id: tag.get(ROLLOUT_CATEGORY_TAG)
+                        for meta in consumed_metas
+                        for sample_id, tag in zip(
+                            meta.sample_ids, meta.tags or [], strict=True
+                        )
+                    },
+                    sample_ready_versions={
+                        sample_id: tag.get(READY_WEIGHT_VERSION_TAG)
+                        for meta in consumed_metas
+                        for sample_id, tag in zip(
+                            meta.sample_ids, meta.tags or [], strict=True
+                        )
+                    },
+                )
                 async with self._data_plane_checkpoint_barrier.mutation(
                     "sample_clears"
                 ) as cut:
@@ -3525,6 +3558,7 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
             )
+            self._logger.log_metrics(staleness_metrics, step=self._train_steps)
             # Must precede the step_finished=True log below. That log commits
             # the wandb step, and wandb silently discards anything logged
             # against a step it has already committed -- no exception, no

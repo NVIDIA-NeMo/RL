@@ -46,6 +46,8 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
+    # Optional for compatibility with requests created before category telemetry.
+    rollout_category: str | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             mask_sample=list(request.mask_sample),
             fallback_weight_version=request.fallback_weight_version,
             prompt_idx=request.prompt_idx,
+            rollout_category=request.rollout_category,
             loss_multiplier=request.loss_multiplier,
             canonical_sample_ids=list(request.canonical_sample_ids),
         )

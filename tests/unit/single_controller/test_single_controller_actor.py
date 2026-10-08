@@ -18,6 +18,7 @@ import asyncio
 import json
 import math
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -98,6 +99,10 @@ class _InitBuffer:
 
     def __init__(self) -> None:
         self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
+        self.trainer_version_fn: Callable[[], int] | None = None
+
+    def set_trainer_version_provider(self, provider: Callable[[], int]) -> None:
+        self.trainer_version_fn = provider
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
@@ -199,6 +204,21 @@ def _init_controller(master_config, actor_args):
         actor_args=actor_args,
         setup_timing_metrics=SetupTimingMetrics(),
     )
+
+
+def test_ready_version_provider_uses_live_restored_trainer_clock(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    args = _actor_args_for_init()
+    args.save_state.trainer_version = 7
+    args.save_state.current_step = 5
+    ctrl = _init_controller(_grpo_master_config(tmp_path), args)
+    provider = args.tq_buffer.trainer_version_fn
+    assert provider is not None
+    assert provider() == 7
+    ctrl._trainer_version = 8
+    assert provider() == 8
 
 
 def _one_group_tags(count: int, *, weight_version: int = 0) -> list[dict[str, object]]:
@@ -2214,6 +2234,82 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["evicted_stale_prompt_groups"] == 2
     assert train_metrics["aborted_stale_inflight_groups"] == 1
+
+
+def test_train_pump_logs_group_staleness_before_the_weight_update(monkeypatch):
+    metas = [
+        KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["fresh_g0", "fresh_g1", "fresh_g2"],
+            fields=[],
+            sequence_lengths=[1, 1, 1],
+            tags=[
+                {
+                    "weight_version": 5,
+                    GROUP_ID_TAG: "fresh",
+                    "rollout_category": "ifbench",
+                    "ready_weight_version": 5,
+                }
+            ]
+            * 3,
+        ),
+        KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["old_g0"],
+            fields=[],
+            sequence_lengths=[1],
+            tags=[
+                {
+                    "weight_version": 3,
+                    GROUP_ID_TAG: "old",
+                    "rollout_category": "code",
+                    "ready_weight_version": 4,
+                }
+            ],
+        ),
+    ]
+    ctrl = _train_pump_controller(sampler=_SequenceSampler(metas))
+    ctrl._trainer_version = 5
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    calls = ctrl._logger.log_metrics.call_args_list
+    staleness_calls = [
+        (index, call)
+        for index, call in enumerate(calls)
+        if "staleness/total/mean" in call.args[0]
+    ]
+    assert len(staleness_calls) == 1
+    index, call = staleness_calls[0]
+    metrics = call.args[0]
+    assert call.kwargs == {"step": 1}
+    assert ctrl._trainer_version == 6
+    assert metrics["staleness/total/mean"] == 1
+    assert metrics["staleness/total/variance"] == 1
+    assert metrics["staleness/total/num_groups"] == 2
+    assert metrics["staleness/total/count_0"] == 1
+    assert metrics["staleness/total/count_2"] == 1
+    assert metrics["staleness/category/ifbench/count_0"] == 1
+    assert metrics["staleness/category/ifbench/num_groups"] == 1
+    assert metrics["staleness/category/code/count_2"] == 1
+    assert metrics["staleness/category/code/num_groups"] == 1
+    assert metrics["staleness/pre_queue/count_0"] == 1
+    assert metrics["staleness/pre_queue/count_1"] == 1
+    assert metrics["staleness/in_queue/count_0"] == 1
+    assert metrics["staleness/in_queue/count_1"] == 1
+    assert metrics["staleness/category/code/total/count_2"] == 1
+    assert metrics["staleness/category/code/pre_queue/count_1"] == 1
+    assert metrics["staleness/category/code/in_queue/count_1"] == 1
+    assert metrics["staleness/decomposition/frac_known"] == 1
+    assert not any(key.endswith("/distribution") for key in metrics)
+    assert index < next(
+        i for i, log_call in enumerate(calls) if log_call.kwargs.get("step_finished")
+    )
 
 
 def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(

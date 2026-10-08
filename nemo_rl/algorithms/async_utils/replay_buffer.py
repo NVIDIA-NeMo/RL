@@ -57,6 +57,10 @@ from nemo_rl.experience.interfaces import (
     RETAINED_TASK_INDICES_KEY,
     PromptGroupRecord,
 )
+from nemo_rl.experience.metric_utils import (
+    READY_WEIGHT_VERSION_TAG,
+    resolve_rollout_category,
+)
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
@@ -1131,6 +1135,7 @@ class TQReplayBuffer:
         self._post_write_enricher: Optional[
             Callable[[KVBatchMeta, PromptGroupRecord], Awaitable[KVBatchMeta]]
         ] = None
+        self._trainer_version_fn: Optional[Callable[[], int]] = None
         # Sampler selection removes ready slots from the live replay index but
         # deliberately leaves their rows in TQ until optimizer completion.
         # Retain their metadata here so a periodic checkpoint can make an open
@@ -1163,6 +1168,31 @@ class TQReplayBuffer:
     ) -> None:
         """Install the required enrichment stage run before slots become ready."""
         self._post_write_enricher = enricher
+
+    def set_trainer_version_provider(
+        self, trainer_version_fn: Callable[[], int]
+    ) -> None:
+        """Enable ready-version telemetry using the controller's live clock.
+
+        SingleController binds this after initializing its restored trainer
+        version. Standalone callers without a trainer clock leave decomposition
+        unavailable rather than substituting the generation version.
+        """
+        self._trainer_version_fn = trainer_version_fn
+
+    def _stamp_ready_version(self, meta: KVBatchMeta) -> None:
+        """Stamp replay metadata immediately before publication, without awaits.
+
+        This clock is controller-owned: it is recorded after TQ writes and
+        enrichment/finalization finish, and persists in the replay checkpoint
+        index. It does not require another tensor-store write.
+        """
+        if self._trainer_version_fn is None:
+            return
+        version = self._trainer_version_fn()
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise ValueError(f"Invalid ready trainer version {version!r}")
+        meta.stamp_tags({READY_WEIGHT_VERSION_TAG: [version] * meta.size})
 
     @property
     def group_ids(self) -> tuple[str, ...]:
@@ -1253,6 +1283,10 @@ class TQReplayBuffer:
             weight_version=start_weight_version,
             group_id=group_id,
             prompt_idx=record.prompt_idx,
+            rollout_category=resolve_rollout_category(
+                extra_env_info=record.extra_env_info,
+                task_name=record.metadata.get("task_name"),
+            ),
         )
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
             raise RuntimeError(
@@ -1302,6 +1336,7 @@ class TQReplayBuffer:
                         f"TQReplayBuffer.commit: group {group_id} was evicted "
                         "during the write; rows cleared"
                     ) from None
+                self._stamp_ready_version(meta)
                 self.meta_list[idx] = meta
                 self.end_weight_list[idx] = end_weight_version
                 self.ready_list[idx] = True
@@ -1438,6 +1473,7 @@ class TQReplayBuffer:
                     f"provided={sorted(provided_staging_keys)!r}, "
                     f"planned={sorted(plan_cleanup_keys)!r}"
                 )
+        self._stamp_ready_version(meta)
         self.meta_list[idx] = meta
         self.start_weight_list[idx] = group_min_wv
         self.end_weight_list[idx] = group_max_wv
