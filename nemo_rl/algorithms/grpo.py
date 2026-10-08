@@ -19,7 +19,7 @@ import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Optional, TypeVar, cast
+from typing import Any, Callable, Literal, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -32,6 +32,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    DrGRPOAdvantageEstimator,
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
@@ -376,6 +377,9 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_grpo: AsyncGRPOConfig | None = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
+    # SingleController baseline/std population. ``all_owners`` keeps masked
+    # rollout rewards in the baseline without making those rows trainable.
+    baseline_population: Literal["valid_owners", "all_owners"] = "valid_owners"
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool = False
@@ -2724,6 +2728,9 @@ def _create_advantage_estimator(master_config: MasterConfig):
     if adv_estimator_name == "gdpo":
         adv_estimator = GDPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GDPO advantage estimator (multi-reward)")
+    elif adv_estimator_name == "dr_grpo":
+        adv_estimator = DrGRPOAdvantageEstimator(adv_estimator_config, loss_config)
+        print("  ✓ Using Dr.GRPO advantage estimator (group mean, no std)")
     elif adv_estimator_name == "grpo":
         adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GRPO advantage estimator")

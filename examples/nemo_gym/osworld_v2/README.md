@@ -5,16 +5,23 @@ This directory is the portable launcher for the validated OSWorld training path:
 - NeMo RL v2 `SingleController`
 - `TransferQueue` data plane
 - 4 nodes x 8 GPUs
-- B=8 prompt groups, N=8 generations per prompt, and K=8 groups in flight
-- Molt-aligned REINFORCE group-mean baseline
+- FlashREINFORCE B=8/N=8 smoke and B=17/N=16 production profiles
+- REINFORCE group-mean baseline or Dr.GRPO advantages
 - rewards clipped to `[0, 1]`
-- token-level importance sampling and sequence-mask TIS `[0.99, 1.01]`
+- raw token-level importance sampling with a sampled-token binary-KL sequence
+  gate at `0.01`
+- prompt-mean/token-mean loss aggregation
+- R3/router replay and context-compaction trajectory splitting
 - windowed sampling with maximum staleness 1
 - full step-boundary policy, optimizer, dataloader, sampler, and TransferQueue
   checkpoint/resume
 
-The exact recipe is
-`examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_v2_cc_molt_b8k8_checkpoint.yaml`.
+The default smoke recipe is
+`examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_v2_cc_flash_b8n8_dr_grpo_checkpoint.yaml`.
+The final AgentEnv target is B=17/N=16 (272 logical trajectories per optimizer
+step), available with either Dr.GRPO or the REINFORCE baseline. AgentEnv
+initializes each task once and forks the active N owners from that state; this
+is infrastructure oversampling, not extra trajectories beyond configured N.
 Mid-turn VM snapshots are not part of this release; recovery is at a completed
 optimizer-step boundary.
 
@@ -34,6 +41,9 @@ The validated launcher requires:
   concurrent training VMs (32 for an unsharded evaluation). Every compute node
   must resolve and reach the protected OpenSandbox API; each VM must expose the
   OSWorld control API on port 5000.
+- Alternatively, an AgentEnv deployment with a snapshot-backed OSWorld
+  template, API credential, and pinned TLS CA. The validated template is
+  `osworld-slim-pixel-parity-20261001`.
 - Access to GitHub/Python package indexes the first time NeMo Gym builds its
   shared component environment. The OSWorld dependency is pinned to
   `terrykong/OSWorld@5d8c93592be588ab8e9909bed82f3b480fd4f533`,
@@ -117,6 +127,37 @@ wc -l /shared/data/osworld/eval-361.jsonl
 
 ## 5. Configure the cluster
 
+### Freeze the offline-DAPO RLVR band
+
+Never train directly from the live, periodically refreshed `band_live`
+directory. Freeze it atomically with its upload assets and custom evaluators:
+
+```bash
+python examples/nemo_gym/freeze_osworld_rlvr_band.py \
+  --source /path/to/export/rl_sets/band_live \
+  --output /shared/data/osworld/band-live-flash-v1 \
+  --num-repeats 1
+```
+
+The command enforces `calib_reps == 8` and `0 < passes < 8`, uses
+`manifest.jsonl` as the membership authority, rewrites every upload path into
+the frozen root, and emits `SHA256SUMS`. If delivery assets are inaccessible,
+the strict command fails. A temporary, explicit
+`--quarantine-unreadable-assets` mode records excluded task IDs in
+`quarantine.jsonl`; prefer having the delivery owner repair the assets.
+
+Set:
+
+```text
+OSWORLD_RLVR_SNAPSHOT=/shared/data/osworld/band-live-flash-v1
+OSWORLD_GRPO_TRAIN_DATA=/shared/data/osworld/band-live-flash-v1/train.jsonl
+OSWORLD_RECIPE=flash-b8n8-dr-grpo
+```
+
+The resource server loads only the current task's frozen custom evaluator
+modules. `submit.sh` identity-mounts the snapshot so rewritten host paths are
+valid on every node.
+
 Copy the template to a private location, fill in every required path and
 credential, and restrict its permissions:
 
@@ -132,8 +173,9 @@ Required values are:
 - `NANO_OMNI_MODEL_NAME`
 - `NANO_OMNI_CHAT_TEMPLATE`
 - `OSWORLD_GRPO_TRAIN_DATA`
-- `OPENSANDBOX_DOMAIN` and, when enabled by the service,
-  `OPENSANDBOX_API_KEY`
+- `OSWORLD_SANDBOX_PROVIDER=opensandbox` plus `OPENSANDBOX_DOMAIN` and its API
+  key, or `OSWORLD_SANDBOX_PROVIDER=agentenv` plus `AGENTENV_ENDPOINT`,
+  `AGENTENV_API_KEY`, `AGENTENV_TLS_CA`, and `AGENTENV_TEMPLATE`
 - `SLURM_ACCOUNT` and `SLURM_PARTITION`
 - `OSWORLD_RESULTS_ROOT`
 
@@ -158,6 +200,12 @@ Submit the training job:
 bash examples/nemo_gym/osworld_v2/submit.sh \
   /shared/private/osworld-v2.env
 ```
+
+`OSWORLD_RECIPE` accepts `flash-b8n8-dr-grpo`,
+`flash-b8n8-reinforce`, `flash-b17n16-dr-grpo`, or
+`flash-b17n16-reinforce`. Qualify the B=8/N=8 profile first. The B=17/N=16
+profiles satisfy the strict `>16*16` logical-batch target. Qualify B=8/N=8
+end-to-end before spending a full B=17/N=16 optimizer step.
 
 Before calling `sbatch`, the launcher:
 

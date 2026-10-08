@@ -24,7 +24,9 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    DrGRPOAdvantageEstimator,
     GRPOAdvantageEstimator,
+    ReinforceBaselineAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
@@ -133,8 +135,12 @@ def _controller(meta, data, *, grpo=None, loss=None):
     ctrl._dp_client = _DataPlane(meta, data)
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._advantage_cfg = AdvantageConfig()
-    ctrl._advantage_estimator = GRPOAdvantageEstimator(
-        config.adv_estimator, ClippedPGLossConfig()
+    estimator_type = {
+        "reinforce_baseline": ReinforceBaselineAdvantageEstimator,
+        "dr_grpo": DrGRPOAdvantageEstimator,
+    }.get(config.adv_estimator.name, GRPOAdvantageEstimator)
+    ctrl._advantage_estimator = estimator_type(
+        config.adv_estimator, ClippedPGLossConfig(**(loss or {}))
     )
     ctrl._algo_cfg = config
     ctrl._master_config = SimpleNamespace(loss_fn=ClippedPGLossConfig(**(loss or {})))
@@ -176,7 +182,8 @@ def test_deduplicates_unequal_segments_without_pooling_identical_prompts_across_
     reorder,
 ):
     meta, data = _batch(
-        [("a", [(0.0, 2), (0.0, 1)]), ("b", [(1.0, 3), (1.0, 1)])], padding=True
+        [("a", [(0.0, 2), (2.0, 1)]), ("b", [(10.0, 3), (14.0, 1)])],
+        padding=True,
     )
     if reorder:
         order = [4, 1, 6, 0, 7, 5, 3, 2]
@@ -383,6 +390,125 @@ def test_preserves_existing_grpo_normalization_and_leave_one_out(
     asyncio.run(ctrl._advantage_stage(meta))
     torch.testing.assert_close(data["advantages"], expected[[0, 0, 1, 1, 1, 2]])
 
+
+def _molt_settings():
+    return (
+        {
+            "baseline_population": "all_owners",
+            "adv_estimator": {"name": "reinforce_baseline"},
+        },
+        {
+            "use_importance_sampling_correction": True,
+            "truncated_importance_sampling_type": "seq-mask-tis",
+            "truncated_importance_sampling_ratio_min": 0.99,
+            "truncated_importance_sampling_ratio": 1.01,
+            "force_on_policy_ratio": True,
+        },
+    )
+
+
+def test_molt_whitening_uses_total_owner_tokens_across_unequal_segments():
+    meta, data = _batch([("a", [(1.0, 2), (3.0, 1)])])
+    data["token_mask"] = torch.tensor(
+        [[0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]
+    )
+    grpo, loss = _molt_settings()
+    ctrl = _controller(meta, data, grpo=grpo, loss=loss)
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    expected = torch.tensor([-0.8164966, -0.8164966, 1.2247449])
+    torch.testing.assert_close(data["advantages"][:, 1], expected)
+    eligible = data["token_mask"].bool()
+    torch.testing.assert_close(
+        data["advantages"][eligible].mean(), torch.tensor(0.0), atol=1e-6, rtol=1e-6
+    )
+    torch.testing.assert_close(
+        data["advantages"][eligible].pow(2).mean(),
+        torch.tensor(1.0),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_molt_owner_scalar_is_invariant_to_physical_segment_splitting():
+    split_meta, split_data = _batch([("a", [(1.0, 2), (3.0, 1)])])
+    split_data["token_mask"] = torch.tensor(
+        [[0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]
+    )
+    unsplit_meta, unsplit_data = _batch([("a", [(1.0, 1), (3.0, 1)])])
+    unsplit_data["token_mask"] = torch.tensor(
+        [[0.0, 1.0, 1.0, 1.0], [0.0, 1.0, 1.0, 0.0]]
+    )
+    grpo, loss = _molt_settings()
+
+    asyncio.run(
+        _controller(split_meta, split_data, grpo=grpo, loss=loss)._advantage_stage(
+            split_meta
+        )
+    )
+    asyncio.run(
+        _controller(unsplit_meta, unsplit_data, grpo=grpo, loss=loss)._advantage_stage(
+            unsplit_meta
+        )
+    )
+
+    torch.testing.assert_close(
+        split_data["advantages"][[0, 2], 1],
+        unsplit_data["advantages"][:, 1],
+    )
+
+
+def test_flash_prompt_weights_pool_all_segments_and_rollouts_per_dispatch_group():
+    meta, data = _batch(
+        [("a", [(0.0, 2), (1.0, 1)]), ("b", [(0.0, 3), (1.0, 1)])]
+    )
+    ctrl = _controller(
+        meta,
+        data,
+        grpo={
+            "baseline_population": "all_owners",
+            "adv_estimator": {"name": "dr_grpo"},
+        },
+        loss={
+            "use_importance_sampling_correction": True,
+            "truncated_importance_sampling_type": "seq-mask-tis",
+            "is_correction_gating": "binary_kl",
+            "truncated_importance_sampling_ratio_min": 0.0,
+            "truncated_importance_sampling_ratio": 0.01,
+            "force_on_policy_ratio": True,
+            "loss_agg_mode": "prompt-mean-token-mean",
+        },
+    )
+
+    result, valid = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert valid and "prompt_loss_weight" in result.fields
+    # Every row has two action tokens. Prompt a has 3 rows (6 tokens), prompt b
+    # has 4 rows (8 tokens), T=14 and P=2.
+    torch.testing.assert_close(
+        data["prompt_loss_weight"],
+        torch.tensor([14 / 12] * 3 + [14 / 16] * 4),
+    )
+
+
+def test_reward_clipping_precedes_logical_advantages_and_reward_metrics():
+    meta, data = _batch([("a", [(-2.0, 2), (3.0, 1)])])
+    ctrl = _controller(
+        meta,
+        data,
+        grpo={"reward_clip_low": 0.0, "reward_clip_high": 1.0},
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    torch.testing.assert_close(data["total_reward"], torch.tensor([0.0, 0.0, 1.0]))
+    torch.testing.assert_close(
+        data["advantages"][:, 1], torch.tensor([-0.5, -0.5, 0.5])
+    )
+    torch.testing.assert_close(
+        ctrl._step_log_dict["rewards"][0], torch.tensor([0.0, 1.0])
+    )
 
 @pytest.mark.parametrize("filtering", [False, True])
 def test_overlong_filter_flag_is_respected_for_all_owner_segments(filtering):

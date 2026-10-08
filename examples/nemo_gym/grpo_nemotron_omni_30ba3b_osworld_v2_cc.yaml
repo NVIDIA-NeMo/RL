@@ -164,7 +164,7 @@ env:
       - responses_api_models/vllm_model/configs/vllm_model.yaml
       - responses_api_agents/nemotron_osworld/configs/nemotron_osworld_cc.yaml
       - resources_servers/osworld/configs/osworld.yaml
-      - resources_servers/osworld/configs/opensandbox_osworld.yaml
+      - ${oc.env:OSWORLD_SANDBOX_CONFIG,resources_servers/osworld/configs/opensandbox_osworld.yaml}
     policy_model:
       responses_api_models:
         vllm_model:

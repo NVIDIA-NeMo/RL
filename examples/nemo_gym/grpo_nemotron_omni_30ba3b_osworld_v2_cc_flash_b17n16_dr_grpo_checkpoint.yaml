@@ -1,0 +1,27 @@
+# Final non-AgentEnv target: B=17 prompts x N=16 owners = 272 logical
+# trajectories per optimizer step, strictly greater than 16x16.
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_v2_cc_flash_b8n8_dr_grpo_checkpoint.yaml
+
+grpo:
+  num_prompts_per_step: 17
+  num_generations_per_prompt: 16
+
+policy:
+  train_global_batch_size: 272
+
+async_rl:
+  min_groups_for_streaming_train: 17
+  stage_full_advantage_window: true
+  # Logical batch size does not require 17 simultaneous prompt groups. Keep
+  # the already-qualified OpenSandbox concurrency until AgentEnv is attached.
+  max_inflight_prompts: 8
+  max_buffered_rollouts: 17
+
+checkpointing:
+  # Hold exactly one full optimizer window while publishing a checkpoint.
+  enabled: true
+
+logger:
+  wandb:
+    name: osworld-v2-flash-b17n16-dr-grpo

@@ -17,5 +17,5 @@ fi
 
 exec "$OSWORLD_DRIVER_PYTHON" \
   examples/nemo_gym/launch_osworld_v2_cc.py \
-  --molt-b8k8-checkpoint \
+  --recipe "${OSWORLD_RECIPE:-flash-b8n8-dr-grpo}" \
   "${OVERRIDES[@]}"

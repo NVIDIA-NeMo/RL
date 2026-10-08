@@ -34,6 +34,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
     SamplerConfig,
+    WindowedSamplerConfig,
     required_buffer_capacity_for_config,
 )
 from nemo_rl.algorithms.grpo import (
@@ -496,6 +497,12 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     recompute_kv_cache_after_weight_updates: bool = False
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
+    # Stage complete prompt groups as they arrive, but assemble the whole
+    # optimizer batch before advantage calculation and policy training.
+    stage_full_advantage_window: bool = False
+    # Optional interval for re-probing the latest staged group while waiting
+    # for a long environment tail.
+    staged_policy_probe_interval_s: Optional[PositiveFloat] = None
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
@@ -872,12 +879,10 @@ class MasterConfig(BaseModel, extra="allow"):
 
 
 def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
-    """Keep the initial CC objective identical at startup and before fanout."""
-    if (
-        grpo.adv_estimator.name != "grpo"
-        or not loss.token_level_loss
+    """Allow only qualified CC objectives whose logical-owner semantics are defined."""
+    common_override = (
+        not loss.token_level_loss
         or loss.sequence_level_importance_ratios
-        or loss.truncated_importance_sampling_type == "seq-mask-tis"
         or loss.use_kl_in_reward
         or loss.positive_example_nll_weight != 0
         or grpo.advantage_clip_low is not None
@@ -889,9 +894,52 @@ def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
         or grpo.calculate_advantages_on_gpu
         or grpo.invalid_tool_call_advantage is not None
         or grpo.malformed_thinking_advantage is not None
-    ):
+    )
+    standard_grpo = (
+        grpo.adv_estimator.name == "grpo"
+        and loss.truncated_importance_sampling_type != "seq-mask-tis"
+        and loss.loss_agg_mode == "token-mean"
+        and loss.is_correction_gating == "ratio"
+    )
+    molt_reinforce = (
+        grpo.adv_estimator.name == "reinforce_baseline"
+        and grpo.baseline_population == "all_owners"
+        and loss.use_importance_sampling_correction
+        and loss.truncated_importance_sampling_type == "seq-mask-tis"
+        and loss.is_correction_gating == "ratio"
+        and loss.truncated_importance_sampling_ratio_min is not None
+        and loss.truncated_importance_sampling_ratio is not None
+        and 0
+        < loss.truncated_importance_sampling_ratio_min
+        <= loss.truncated_importance_sampling_ratio
+        and loss.force_on_policy_ratio
+        and not loss.disable_ppo_ratio
+        and not loss.use_cispo
+        and not loss.use_on_policy_kl_approximation
+        and loss.loss_agg_mode == "token-mean"
+    )
+    flash_reinforce = (
+        grpo.adv_estimator.name in ("reinforce_baseline", "dr_grpo")
+        and grpo.baseline_population == "all_owners"
+        and loss.use_importance_sampling_correction
+        and loss.truncated_importance_sampling_type == "seq-mask-tis"
+        and loss.is_correction_gating == "binary_kl"
+        and loss.truncated_importance_sampling_ratio_min is not None
+        and loss.truncated_importance_sampling_ratio is not None
+        and loss.truncated_importance_sampling_ratio_min <= 0
+        < loss.truncated_importance_sampling_ratio
+        and loss.force_on_policy_ratio
+        and not loss.disable_ppo_ratio
+        and not loss.use_cispo
+        and not loss.use_on_policy_kl_approximation
+        and loss.loss_agg_mode == "prompt-mean-token-mean"
+    )
+    if common_override or not (standard_grpo or molt_reinforce or flash_reinforce):
         raise ValueError(
-            "CC requires standard token-level GRPO without advantage overrides"
+            "CC requires either standard token-level GRPO or the qualified Molt "
+            "reinforce_baseline + token-IS + per-row ratio gate, or the qualified "
+            "FlashREINFORCE binary-KL gate + prompt-mean-token-mean objective with "
+            "reinforce_baseline/Dr.GRPO, without advantage/reward overrides"
         )
 
 
@@ -1482,9 +1530,28 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
         )
+    if (
+        async_config.stage_full_advantage_window
+        and not token_capture_config.context_compaction
+    ):
+        raise ValueError(
+            "async_rl.stage_full_advantage_window requires context compaction"
+        )
+    if (
+        async_config.staged_policy_probe_interval_s is not None
+        and not async_config.stage_full_advantage_window
+    ):
+        raise ValueError(
+            "async_rl.staged_policy_probe_interval_s requires "
+            "stage_full_advantage_window=true"
+        )
     if token_capture_config.context_compaction:
-        if master_config.grpo is None:
-            raise ValueError("context compaction requires GRPO")
+        if master_config.grpo is None or not master_config.env.get(
+            "should_use_nemo_gym"
+        ):
+            raise ValueError(
+                "context compaction requires GRPO and the NeMo-Gym rollout path"
+            )
         if not token_capture_config.enabled:
             raise ValueError(
                 "token_capture.context_compaction requires token_capture.enabled=true"
@@ -1502,9 +1569,71 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             )
         if async_config.rollout_failure.min_step_batch_fraction != 1:
             raise ValueError("context compaction requires min_step_batch_fraction=1")
+        failure_config = async_config.rollout_failure
         validate_cc_objective(master_config.grpo, master_config.loss_fn)
-        if master_config.checkpointing["enabled"]:
-            raise ValueError("CC checkpoint/resume is not supported initially")
+        needs_full_advantage_window = (
+            master_config.grpo.adv_estimator.name == "reinforce_baseline"
+            or master_config.loss_fn.loss_agg_mode == "prompt-mean-token-mean"
+        )
+        if needs_full_advantage_window:
+            if (
+                failure_config.max_infra_attempts_per_prompt != 1
+                or failure_config.max_data_attempts_per_prompt != 1
+                or failure_config.max_skipped_prompts != 0
+                or failure_config.max_consecutive_dropped_prompts != 0
+                or failure_config.on_dropped_prompt != "shrink"
+                or failure_config.nemo_gym.max_row_attempts != 1
+            ):
+                raise ValueError(
+                    "CC full-window unfinished-segment redispatch is not supported: "
+                    "configure one infra/data/Gym-row attempt, zero drop budgets, "
+                    "and on_dropped_prompt='shrink'"
+                )
+            if (
+                not isinstance(async_config.sampler, WindowedSamplerConfig)
+                or async_config.sampler.max_staleness_versions != 1
+                or async_config.sampler.sample_freshest_first
+                or async_config.min_groups_for_streaming_train
+                != master_config.grpo.num_prompts_per_step
+                or (
+                    master_config.loss_fn.loss_agg_mode
+                    == "prompt-mean-token-mean"
+                    and not async_config.stage_full_advantage_window
+                )
+                or (
+                    async_config.stage_full_advantage_window
+                    and master_config.policy["generation"]["colocated"]["enabled"]
+                )
+            ):
+                raise ValueError(
+                    "CC full-window objectives require windowed sampling with "
+                    "max_staleness_versions=1, sample_freshest_first=false, and "
+                    "one full prompt-group batch per advantage/optimizer window; "
+                    "prompt-mean-token-mean requires full-window staging; "
+                    "full-window staging is supported only with non-colocated "
+                    "generation"
+                )
+        elif async_config.stage_full_advantage_window:
+            raise ValueError(
+                "async_rl.stage_full_advantage_window is supported only for qualified "
+                "CC full-window objectives"
+            )
+        elif (
+            not isinstance(async_config.sampler, InOrderSamplerConfig)
+            or async_config.sampler.max_lookahead_versions != 0
+            or async_config.sampler.warmup_lookahead_versions is not None
+        ):
+            raise ValueError(
+                "standard CC requires in_order sampling with zero lookahead"
+            )
+        if master_config.checkpointing["enabled"] and not (
+            master_config.checkpointing.get("save_data_plane")
+        ):
+            raise ValueError(
+                "CC checkpoint/resume requires checkpointing.save_data_plane=true "
+                "so token-capture rows, replay ownership, and the dataloader cursor "
+                "are restored from one checkpoint cut"
+            )
         if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
             raise ValueError("CC rollout checkpoint/resume is not supported initially")
         if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
