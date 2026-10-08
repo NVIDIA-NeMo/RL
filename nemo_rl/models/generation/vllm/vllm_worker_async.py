@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import logging
+import os
 import threading
 import time
 import uuid
@@ -272,6 +273,18 @@ class VllmAsyncGenerationWorkerImpl(
 
         self.llm = None
         self.vllm_device_ids = None
+
+    async def start_gpu_profiling(self) -> None:
+        torch.cuda.profiler.start()
+        if self.llm is not None:
+            await self.llm.collective_rpc("start_gpu_profiling", args=tuple())
+
+    async def stop_gpu_profiling(self) -> None:
+        torch.cuda.profiler.stop()
+        if self.llm is not None:
+            await self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
+            if os.environ.get("NRL_NSYS_WORKER_PATTERNS"):
+                await asyncio.sleep(30)
 
     def _return_routed_experts_enabled(self) -> bool:
         engine_args = getattr(self, "llm_async_engine_args", None)
