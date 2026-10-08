@@ -4,6 +4,27 @@ GRPO generates several completions for each prompt. Conventional policy executio
 
 This contribution is opt-in and currently targets text-only Megatron hybrid attention/Mamba models. The dense path remains the default (`mode: disabled`). It does not change the GRPO objective, increase the number of completions or accelerate rollout generation by itself.
 
+## Implementation ownership
+
+Reusable packing is implemented in `megatron.rl`: row/star/forest layouts,
+group subdivision and sharding, execution slots and plans, tensor
+materialization, TP/CP geometry, real-row alignment, and reconstruction within
+dense training bins. NeMo RL translates `BatchedDataDict` fields and policy
+configuration into that API, selects the conventional length-only packer,
+transports metadata, and coordinates worker execution. Existing NeMo packing
+imports delegate to the canonical Megatron implementation.
+
+The matching Megatron package must be available in both the driver and model
+worker environments when shared-prefix planning is enabled. Its pure packing
+modules do not initialize the GPU model or depend on NeMo RL. Standard dense
+NeMo imports do not require the optional Megatron backend. Portable packing
+tests are owned by Megatron; NeMo retains adapter and metadata-transport tests.
+
+This representation also accepts PPO rollout groups. A group with one answer
+per prompt retains its real source row and uses ordinary dense execution.
+Moving the packer does not change the RL objective or add arbitrary-depth
+trajectory-tree execution.
+
 ## Execution contract
 
 - Only rows with the same group identity and exactly identical prompt token IDs share a prefix. Invalid or incompatible rows use conventional packing.

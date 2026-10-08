@@ -11,19 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Estimate shared backbone plus expanded work for group assignment only.
 
-The existing group-coherent sharder can use these integer weights while its
-packing planner continues to receive real sequence lengths. Group sums are
-proportional to physical_weight * star_backbone_tokens + expanded_weight *
-expanded_tokens. This is an estimate: it excludes deeper response-prefix
-sharing, packing padding, attention geometry and communication costs.
+"""Compatibility adapter for :mod:`megatron.rl.shared_prefix_cost`.
+
+The implementation is owned by Megatron. Imports stay lazy so ordinary dense
+NeMo RL backends do not require the optional Megatron installation.
 """
+
+from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from nemo_rl.data.packing.shared_prefix_metadata import SHARED_PREFIX_PROMPT_LENGTHS
+
+__all__ = ["estimate_shared_prefix_row_work", "with_prompt_length_tags"]
 
 
 def estimate_shared_prefix_row_work(
@@ -34,47 +36,18 @@ def estimate_shared_prefix_row_work(
     physical_weight: int = 4,
     expanded_weight: int = 1,
 ) -> list[int]:
-    """Keep both backbone and repeated MTP work in the balancing objective."""
-    if not (len(group_ids) == len(sequence_lengths) == len(prompt_lengths)):
-        raise ValueError("Group, sequence and prefix metadata lengths differ")
-    if not group_ids:
-        raise ValueError("Cannot estimate empty work")
-    if any(type(w) is not int or w < 0 for w in (physical_weight, expanded_weight)):
-        raise ValueError("Work weights must be nonnegative integers")
-    if physical_weight + expanded_weight == 0:
-        raise ValueError("At least one work component must be enabled")
-    groups: dict[str, list[int]] = {}
-    for index, (group, length, prefix) in enumerate(
-        zip(group_ids, sequence_lengths, prompt_lengths, strict=True)
-    ):
-        if not isinstance(group, str) or not group:
-            raise ValueError("Invalid prompt-group identity")
-        if (
-            type(length) is not int
-            or type(prefix) is not int
-            or not 0 <= prefix <= length
-        ):
-            raise ValueError("Prefix must fit within the real sequence")
-        groups.setdefault(group, []).append(index)
-    sizes = {len(indices) for indices in groups.values()}
-    if len(sizes) != 1 or min(sizes) < 2:
-        raise ValueError("Complete equal-size rollout groups are required")
-    size = next(iter(sizes))
-    # Capture may publish masked placeholders with no prompt, or verified rows
-    # with different boundaries. Those groups cannot share a star. Balance their
-    # full dense work while leaving the actual planner metadata untouched.
-    cost_prompt_lengths = list(prompt_lengths)
-    for indices in groups.values():
-        if len({prompt_lengths[index] for index in indices}) != 1:
-            for index in indices:
-                cost_prompt_lengths[index] = 0
-    # Multiply by group size to distribute the shared prefix without rounding.
-    # A common positive factor leaves the existing greedy sharder unchanged.
-    return [
-        size * (physical_weight + expanded_weight) * length
-        - physical_weight * (size - 1) * prefix
-        for length, prefix in zip(sequence_lengths, cost_prompt_lengths, strict=True)
-    ]
+    """Delegate to :func:`megatron.rl.shared_prefix_cost.estimate_shared_prefix_row_work`."""
+    from megatron.rl.shared_prefix_cost import (
+        estimate_shared_prefix_row_work as implementation,
+    )
+
+    return implementation(
+        group_ids=group_ids,
+        sequence_lengths=sequence_lengths,
+        prompt_lengths=prompt_lengths,
+        physical_weight=physical_weight,
+        expanded_weight=expanded_weight,
+    )
 
 
 def with_prompt_length_tags(

@@ -16,10 +16,6 @@ from typing import Any, Literal, NotRequired, TypedDict, Union, cast
 
 from pydantic import BaseModel, StrictBool, StrictInt
 
-from nemo_rl.data.packing.shared_prefix_tensors import (
-    resolve_shared_prefix_parallel_topology,
-    resolve_shared_prefix_physical_padding_multiple,
-)
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
@@ -925,6 +921,11 @@ def validate_shared_prefix_training_config(
         )
 
     try:
+        from megatron.rl.shared_prefix_tensors import (
+            resolve_shared_prefix_parallel_topology,
+            resolve_shared_prefix_physical_padding_multiple,
+        )
+
         tp_size, cp_size, _sequence_parallel = resolve_shared_prefix_parallel_topology(
             tp_size=megatron_config["tensor_model_parallel_size"],
             cp_size=megatron_config["context_parallel_size"],
