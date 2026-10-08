@@ -38,6 +38,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
+    _validate_seq_logprob_error_in_loss,
     GRPOConfig,
     GRPOLoggerConfig,
     RewardPenaltyConfig,
@@ -1264,15 +1265,42 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
 
+def evaluation_only_checkpoints(master_config: MasterConfig) -> bool:
+    """Opt-in weights-only endpoints are for evaluation, never SC recovery."""
+    deferred = getattr(algo_config(master_config), "deferred_evaluation", None)
+    return bool(deferred and deferred.get("enabled") and deferred.get("weights_only"))
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
-        raise ValueError(
-            "loss_fn.seq_logprob_error_in_loss is not supported by SingleController: "
-            "its advantage baselines depend on the pre-training sequence mask. "
-            "Use the non-streaming GRPO trainer."
-        )
+        if is_ppo_run(master_config):
+            raise ValueError(
+                "SingleController in-loss sequence filtering requires GRPO"
+            )
+        # The opt-in path uses legacy GRPO's all-response advantage baselines;
+        # the default SC path retains its pre-training survivor baselines.
+        # Token-capture placeholder rows have no legacy analog and must never
+        # vote in a baseline, so reject the combination instead.
+        if master_config.token_capture.enabled:
+            raise ValueError(
+                "loss_fn.seq_logprob_error_in_loss is not supported with "
+                "token_capture.enabled=true: in-loss filtering uses all-response "
+                "advantage baselines, which would include token-capture "
+                "placeholder rows."
+            )
+        _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
+    if evaluation_only_checkpoints(master_config):
+        if is_ppo_run(master_config):
+            raise ValueError("SingleController deferred evaluation requires GRPO")
+        if not master_config.checkpointing["enabled"] or any(
+            master_config.checkpointing.get(key, False)
+            for key in ("save_optimizer", "save_data_plane")
+        ):
+            raise ValueError(
+                "Deferred evaluation requires enabled weights-only checkpoints"
+            )
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)

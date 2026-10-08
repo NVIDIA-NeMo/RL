@@ -758,9 +758,10 @@ class _AdvantageDataPlane:
 class _MaskRecordingAdvantageEstimator:
     def __init__(self) -> None:
         self.mask: torch.Tensor | None = None
+        self.valid_mask: torch.Tensor | None = None
 
     def compute_advantage(self, *, rewards, mask, **kwargs) -> torch.Tensor:
-        del kwargs
+        self.valid_mask = kwargs.get("valid_mask")
         self.mask = mask.clone()
         return rewards.unsqueeze(-1).expand_as(mask).clone()
 
@@ -804,6 +805,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
@@ -874,7 +876,9 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ],
     ids=["env_mask_only", "overlong_only"],
 )
+@pytest.mark.parametrize("in_loss_filter", [False, True])
 def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
+    in_loss_filter: bool,
     overlong_filtering: bool,
     mask_sample: list[bool],
     truncated: list[bool],
@@ -904,12 +908,13 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
+    ctrl._seq_logprob_error_in_loss = in_loss_filter
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._algo_cfg = GRPOConfig(
-        seq_logprob_error_threshold=None,
+        seq_logprob_error_threshold=2.0 if in_loss_filter else None,
         overlong_filtering=overlong_filtering,
     )
     ctrl._step_log_dict = {
@@ -938,6 +943,11 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
         estimator.mask,
         data["token_mask"] * expected.unsqueeze(-1),
     )
+
+    if in_loss_filter:
+        assert estimator.valid_mask is None
+    else:
+        assert torch.equal(estimator.valid_mask, expected)
 
 
 def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
@@ -969,6 +979,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
@@ -1035,6 +1046,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
@@ -1103,6 +1115,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
@@ -1165,6 +1178,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
@@ -1246,6 +1260,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._advantage_estimator = FakeEstimator()
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
     ctrl._is_ppo = False
@@ -2563,6 +2578,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = True

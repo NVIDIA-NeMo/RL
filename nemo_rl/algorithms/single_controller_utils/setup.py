@@ -66,6 +66,7 @@ from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
+    evaluation_only_checkpoints,
     is_ppo_run,
     validate_single_controller_config,
 )
@@ -1109,8 +1110,10 @@ def setup_single_controller(
         sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
             master_config.async_rl.sampler
         )
-        if sampler_supports_replay_recovery and not master_config.checkpointing.get(
-            "save_data_plane"
+        if (
+            sampler_supports_replay_recovery
+            and not master_config.checkpointing.get("save_data_plane")
+            and not evaluation_only_checkpoints(master_config)
         ):
             error_message = (
                 "SingleController checkpointing with a replay-checkpoint-capable "
@@ -1309,6 +1312,14 @@ def setup_single_controller(
         Optional[dict[str, Any]],
         checkpointer.load_training_info(trainer_checkpoint_path),
     )
+    if (loaded_state and loaded_state.get("evaluation_only")) or (
+        trainer_checkpoint_path is not None
+        and evaluation_only_checkpoints(master_config)
+    ):
+        raise ValueError(
+            "Evaluation-only checkpoints cannot resume SingleController training; "
+            "use a fresh checkpoint_dir or a full recovery checkpoint."
+        )
     save_state = _get_grpo_save_state(loaded_state)
     weights_path, optimizer_path = checkpointer.get_resume_paths(
         trainer_checkpoint_path
@@ -1932,6 +1943,7 @@ def setup_single_controller(
     loss_fn: LossFunction = ClippedPGLossFn(
         master_config.loss_fn,
         opd_full=opd_module.get_opd_full_config(master_config),
+        seq_logprob_error_threshold=algo_cfg.seq_logprob_error_threshold,
     )
     value_loss_fn: Optional[LossFunction] = (
         MseValueLossFn(master_config.value_loss_fn)  # type: ignore

@@ -219,7 +219,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # Evaluate grpo.seq_logprob_error_threshold in the training loss, then
     # normalize accumulated gradients over survivors before the optimizer step.
     # Opt-in; supported only for token-level, force-on-policy Megatron GRPO
-    # with the non-streaming trainer.
+    # with the non-streaming or SingleController split trainer.
     seq_logprob_error_in_loss: bool = False
     # If True, use CISPO (Clipped IS-weight Policy Optimization) from MiniMax-M1.
     use_cispo: bool = False
