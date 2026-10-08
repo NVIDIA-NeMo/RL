@@ -96,8 +96,10 @@ env:
         anyterminal_agent:
           global_agent_timeout: 900
           agent_kwargs:
-            # Keep OpenClaw's rendered prompt below vLLM's hard model limit.
+            # Reserve enough input space for OpenClaw's fixed system prompt in
+            # addition to keeping its boundary below vLLM's hard model limit.
             context_window: ${add:${policy.max_total_sequence_length},-512}
+            max_output_tokens: 4096
     anyterminal_pi:
       responses_api_agents:
         anyterminal_agent:

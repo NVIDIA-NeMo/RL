@@ -101,8 +101,11 @@ env:
         anyterminal_agent:
           global_agent_timeout: 900
           agent_kwargs:
-            # Keep OpenClaw's rendered prompt below vLLM's hard model limit.
+            # The Nano recipe keeps an 8K generation budget for other
+            # harnesses, but OpenClaw's fixed system prompt needs more input
+            # room. Use the same 4K OpenClaw output budget as Super.
             context_window: ${add:${policy.max_total_sequence_length},-512}
+            max_output_tokens: 4096
     anyterminal_pi:
       responses_api_agents:
         anyterminal_agent:

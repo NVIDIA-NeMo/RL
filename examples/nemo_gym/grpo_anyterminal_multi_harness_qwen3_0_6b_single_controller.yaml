@@ -162,9 +162,10 @@ env:
         anyterminal_agent:
           global_agent_timeout: 300
           agent_kwargs:
-            # OpenClaw otherwise advertises the server's full 16K boundary and
-            # can render a prompt with no token left for generation.
+            # Reserve enough input space for OpenClaw's fixed system prompt in
+            # addition to keeping its boundary below vLLM's hard 16K limit.
             context_window: ${add:${policy.max_total_sequence_length},-512}
+            max_output_tokens: 4096
     anyterminal_pi:
       responses_api_agents:
         anyterminal_agent:

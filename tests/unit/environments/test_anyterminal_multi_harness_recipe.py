@@ -86,7 +86,10 @@ def test_anyterminal_multi_harness_recipe_resolves_async_training_contract():
     }
     assert config["env"]["nemo_gym"]["anyterminal_openclaw"][
         "responses_api_agents"
-    ]["anyterminal_agent"]["agent_kwargs"]["context_window"] == 15872
+    ]["anyterminal_agent"]["agent_kwargs"] == {
+        "context_window": 15872,
+        "max_output_tokens": 4096,
+    }
     assert config["logger"]["wandb_enabled"] is True
     assert config["logger"]["wandb"]["log_nemo_gym_full_result_tables"] is True
 
@@ -138,7 +141,10 @@ def test_super_omni_anyterminal_recipe_resolves_training_topology():
     }
     assert config["env"]["nemo_gym"]["anyterminal_openclaw"][
         "responses_api_agents"
-    ]["anyterminal_agent"]["agent_kwargs"]["context_window"] == 15872
+    ]["anyterminal_agent"]["agent_kwargs"] == {
+        "context_window": 15872,
+        "max_output_tokens": 4096,
+    }
     assert config["logger"]["wandb_enabled"] is True
     assert config["logger"]["wandb"]["log_nemo_gym_full_result_tables"] is True
 
@@ -240,6 +246,9 @@ def test_nano_omni_sync_2n_debug_recipe_resolves_multi_harness_topology():
     }
     assert config["env"]["nemo_gym"]["anyterminal_openclaw"][
         "responses_api_agents"
-    ]["anyterminal_agent"]["agent_kwargs"]["context_window"] == 15872
+    ]["anyterminal_agent"]["agent_kwargs"] == {
+        "context_window": 15872,
+        "max_output_tokens": 4096,
+    }
     assert config["logger"]["wandb_enabled"] is True
     assert config["logger"]["wandb"]["log_nemo_gym_full_result_tables"] is True
