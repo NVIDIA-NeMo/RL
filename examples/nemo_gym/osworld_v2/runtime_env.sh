@@ -7,11 +7,42 @@ set -euo pipefail
 : "${OSWORLD_CHECKPOINT_DIR:?}"
 : "${NANO_OMNI_MODEL_NAME:?}"
 : "${NANO_OMNI_CHAT_TEMPLATE:?}"
-: "${OPENSANDBOX_DOMAIN:?}"
+export OSWORLD_SANDBOX_PROVIDER="${OSWORLD_SANDBOX_PROVIDER:-opensandbox}"
+case "$OSWORLD_SANDBOX_PROVIDER" in
+  opensandbox)
+    if [[ -z "${OPENSANDBOX_DOMAIN:-}" && -n "${OPENSANDBOX_BASE_URL:-}" ]]; then
+      opensandbox_host="${OPENSANDBOX_BASE_URL#*://}"
+      export OPENSANDBOX_DOMAIN="${opensandbox_host%%/*}"
+    fi
+    : "${OPENSANDBOX_DOMAIN:?}"
+    export OSWORLD_SANDBOX_CONFIG=resources_servers/osworld/configs/opensandbox_osworld.yaml
+    ;;
+  agentenv)
+    : "${AGENTENV_ENDPOINT:?}"
+    : "${AGENTENV_API_KEY:?}"
+    : "${AGENTENV_TLS_CA:?}"
+    test -r "$AGENTENV_TLS_CA"
+    export AGENTENV_TEMPLATE="${AGENTENV_TEMPLATE:-osworld-slim-pixel-parity-20261001}"
+    export OSWORLD_SANDBOX_CONFIG=nemo_gym/sandbox/providers/agentenv/configs/agentenv.yaml
+    # aiohttp uses Python's default SSL context; the evaluator's local
+    # forwarders load the same pinned CA explicitly.
+    export SSL_CERT_FILE="$AGENTENV_TLS_CA"
+    export NEMO_GYM_PROXY_CA_BUNDLE="$AGENTENV_TLS_CA"
+    ;;
+  *)
+    echo "OSWORLD_SANDBOX_PROVIDER must be opensandbox or agentenv" >&2
+    exit 2
+    ;;
+esac
 if [[ -n "${OSWORLD_EVAL_MODE:-}" ]]; then
   : "${OSWORLD_GRPO_VAL_DATA:?}"
 else
   : "${OSWORLD_GRPO_TRAIN_DATA:?}"
+fi
+if [[ -n "${OSWORLD_RLVR_SNAPSHOT:-}" ]]; then
+  test -d "$OSWORLD_RLVR_SNAPSHOT/tmp_funcs"
+  test -s "$OSWORLD_RLVR_SNAPSHOT/SNAPSHOT.json"
+  export OSWORLD_RLVR_SNAPSHOT
 fi
 
 export OSWORLD_RL_ROOT=/opt/nemo-rl
@@ -64,7 +95,11 @@ export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 export OSWORLD_POOL_REF="${OSWORLD_POOL_REF:-osworld-kvm}"
-export OSWORLD_MAX_STEPS="${OSWORLD_MAX_STEPS:-150}"
+case "${OSWORLD_RECIPE:-flash-b8n8-dr-grpo}" in
+  flash-*) default_osworld_max_steps=200 ;;
+  *) default_osworld_max_steps=150 ;;
+esac
+export OSWORLD_MAX_STEPS="${OSWORLD_MAX_STEPS:-$default_osworld_max_steps}"
 export OSWORLD_MAX_PARALLEL_ROLLOUTS="${OSWORLD_MAX_PARALLEL_ROLLOUTS:-8}"
 export OPENSANDBOX_API_KEY="${OPENSANDBOX_API_KEY:-}"
 

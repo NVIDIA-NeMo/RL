@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import math
 
 import pytest
 import torch
@@ -3180,3 +3181,140 @@ def test_vocab_parallel_gather_columns_tp_sharded(monkeypatch):
     ref[..., idx].float().backward(grad_out)
     torch.testing.assert_close(shards[0].grad, ref.grad[..., :v_local])
     torch.testing.assert_close(shards[1].grad, ref.grad[..., v_local:])
+
+
+def _flash_loss_data(
+    *,
+    token_mask: torch.Tensor,
+    advantages: torch.Tensor,
+    generation_logprobs: torch.Tensor,
+    prompt_loss_weight: torch.Tensor | None = None,
+) -> BatchedDataDict:
+    batch, response_len = advantages.shape
+    full_len = response_len + 1
+    fields = {
+        "input_ids": torch.zeros(batch, full_len, dtype=torch.long),
+        "advantages": torch.nn.functional.pad(advantages, (1, 0)),
+        "generation_logprobs": torch.nn.functional.pad(
+            generation_logprobs, (1, 0)
+        ),
+        "token_mask": torch.nn.functional.pad(token_mask, (1, 0)),
+        "sample_mask": torch.ones(batch),
+    }
+    if prompt_loss_weight is not None:
+        fields["prompt_loss_weight"] = prompt_loss_weight
+    return BatchedDataDict(fields)
+
+
+def test_flash_binary_kl_masks_physical_sequence_and_keeps_token_is():
+    curr = torch.tensor(
+        [[0.0, math.log(0.5)], [math.log(0.5), math.log(0.5)]],
+        requires_grad=True,
+    )
+    generation = torch.tensor(
+        [[math.log(1 / 3), math.log(0.5)], [math.log(0.5), math.log(0.5)]]
+    )
+    data = _flash_loss_data(
+        token_mask=torch.ones(2, 2),
+        advantages=torch.ones(2, 2),
+        generation_logprobs=generation,
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            force_on_policy_ratio=True,
+            use_importance_sampling_correction=True,
+            truncated_importance_sampling_type="seq-mask-tis",
+            is_correction_gating="binary_kl",
+            truncated_importance_sampling_ratio_min=0.0,
+            truncated_importance_sampling_ratio=0.01,
+        )
+    )
+
+    loss, metrics = loss_fn(
+        next_token_logprobs=curr,
+        data=data,
+        global_valid_seqs=torch.tensor(2.0),
+        global_valid_toks=torch.tensor(4.0),
+    )
+
+    # The first row's mean sampled binary KL exceeds 0.01 and is fully masked.
+    # The second survives and retains its raw per-token q/p IS ratio (=1).
+    torch.testing.assert_close(loss, torch.tensor(-0.5))
+    assert metrics["is_oob_ratio"] == pytest.approx(0.5)
+    loss.backward()
+    torch.testing.assert_close(
+        curr.grad, torch.tensor([[0.0, 0.0], [-0.25, -0.25]])
+    )
+
+
+def test_prompt_mean_token_mean_is_prompt_and_microbatch_invariant():
+    token_mask = torch.tensor([[1.0, 1.0], [1.0, 0.0], [1.0, 0.0]])
+    advantages = torch.tensor([[1.0, 2.0], [10.0, 0.0], [4.0, 0.0]])
+    # Prompt a owns rows 0 and 2 (3 tokens); prompt b owns row 1 (1 token).
+    # T/(P*T_prompt) with T=4 and P=2.
+    weights = torch.tensor([4 / 6, 2.0, 4 / 6])
+    data = _flash_loss_data(
+        token_mask=token_mask,
+        advantages=advantages,
+        generation_logprobs=torch.zeros_like(advantages),
+        prompt_loss_weight=weights,
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            force_on_policy_ratio=True,
+            loss_agg_mode="prompt-mean-token-mean",
+        )
+    )
+
+    def run(batch: BatchedDataDict) -> torch.Tensor:
+        response_len = batch["advantages"].shape[1] - 1
+        curr = torch.zeros(batch.size, response_len, requires_grad=True)
+        loss, _ = loss_fn(
+            next_token_logprobs=curr,
+            data=batch,
+            global_valid_seqs=torch.tensor(3.0),
+            global_valid_toks=torch.tensor(4.0),
+        )
+        return loss
+
+    first = BatchedDataDict({key: value[:2] for key, value in data.items()})
+    second = BatchedDataDict({key: value[2:] for key, value in data.items()})
+    whole = run(data)
+    split = run(first) + run(second)
+    expected = -(((1.0 + 2.0 + 4.0) / 3.0 + 10.0) / 2.0)
+    torch.testing.assert_close(whole, torch.tensor(expected))
+    torch.testing.assert_close(split, whole)
+
+
+def test_flash_divergence_gate_and_prompt_mode_validate_inputs():
+    with pytest.raises(ValueError, match="seq-mask-tis"):
+        ClippedPGLossFn(
+            ClippedPGLossConfig(
+                is_correction_gating="binary_kl",
+                use_importance_sampling_correction=True,
+                truncated_importance_sampling_type="tis",
+                truncated_importance_sampling_ratio_min=0.0,
+                truncated_importance_sampling_ratio=0.01,
+            )
+        )
+    with pytest.raises(ValueError, match="prompt_loss_weight"):
+        loss_fn = ClippedPGLossFn(
+            ClippedPGLossConfig(
+                reference_policy_kl_penalty=0.0,
+                force_on_policy_ratio=True,
+                loss_agg_mode="prompt-mean-token-mean",
+            )
+        )
+        data = _flash_loss_data(
+            token_mask=torch.ones(1, 1),
+            advantages=torch.ones(1, 1),
+            generation_logprobs=torch.zeros(1, 1),
+        )
+        loss_fn(
+            next_token_logprobs=torch.zeros(1, 1),
+            data=data,
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(1.0),
+        )

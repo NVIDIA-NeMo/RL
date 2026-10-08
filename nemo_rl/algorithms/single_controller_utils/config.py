@@ -825,7 +825,7 @@ class MasterConfig(BaseModel, extra="allow"):
 
 
 def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
-    """Allow only the initial CC objective or the qualified Molt objective."""
+    """Allow only qualified CC objectives whose logical-owner semantics are defined."""
     common_override = (
         not loss.token_level_loss
         or loss.sequence_level_importance_ratios
@@ -844,12 +844,15 @@ def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
     standard_grpo = (
         grpo.adv_estimator.name == "grpo"
         and loss.truncated_importance_sampling_type != "seq-mask-tis"
+        and loss.loss_agg_mode == "token-mean"
+        and loss.is_correction_gating == "ratio"
     )
     molt_reinforce = (
         grpo.adv_estimator.name == "reinforce_baseline"
         and grpo.baseline_population == "all_owners"
         and loss.use_importance_sampling_correction
         and loss.truncated_importance_sampling_type == "seq-mask-tis"
+        and loss.is_correction_gating == "ratio"
         and loss.truncated_importance_sampling_ratio_min is not None
         and loss.truncated_importance_sampling_ratio is not None
         and 0
@@ -859,12 +862,30 @@ def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
         and not loss.disable_ppo_ratio
         and not loss.use_cispo
         and not loss.use_on_policy_kl_approximation
+        and loss.loss_agg_mode == "token-mean"
     )
-    if common_override or not (standard_grpo or molt_reinforce):
+    flash_reinforce = (
+        grpo.adv_estimator.name in ("reinforce_baseline", "dr_grpo")
+        and grpo.baseline_population == "all_owners"
+        and loss.use_importance_sampling_correction
+        and loss.truncated_importance_sampling_type == "seq-mask-tis"
+        and loss.is_correction_gating == "binary_kl"
+        and loss.truncated_importance_sampling_ratio_min is not None
+        and loss.truncated_importance_sampling_ratio is not None
+        and loss.truncated_importance_sampling_ratio_min <= 0
+        < loss.truncated_importance_sampling_ratio
+        and loss.force_on_policy_ratio
+        and not loss.disable_ppo_ratio
+        and not loss.use_cispo
+        and not loss.use_on_policy_kl_approximation
+        and loss.loss_agg_mode == "prompt-mean-token-mean"
+    )
+    if common_override or not (standard_grpo or molt_reinforce or flash_reinforce):
         raise ValueError(
             "CC requires either standard token-level GRPO or the qualified Molt "
-            "reinforce_baseline + token-IS + per-row seq-mask-tis objective, "
-            "without advantage/reward overrides"
+            "reinforce_baseline + token-IS + per-row ratio gate, or the qualified "
+            "FlashREINFORCE binary-KL gate + prompt-mean-token-mean objective with "
+            "reinforce_baseline/Dr.GRPO, without advantage/reward overrides"
         )
 
 
@@ -1464,8 +1485,11 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError("context compaction requires min_step_batch_fraction=1")
         failure_config = async_config.rollout_failure
         validate_cc_objective(master_config.grpo, master_config.loss_fn)
-        is_molt = master_config.grpo.adv_estimator.name == "reinforce_baseline"
-        if is_molt:
+        needs_full_advantage_window = (
+            master_config.grpo.adv_estimator.name == "reinforce_baseline"
+            or master_config.loss_fn.loss_agg_mode == "prompt-mean-token-mean"
+        )
+        if needs_full_advantage_window:
             if (
                 failure_config.max_infra_attempts_per_prompt != 1
                 or failure_config.max_data_attempts_per_prompt != 1
@@ -1475,7 +1499,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 or failure_config.nemo_gym.max_row_attempts != 1
             ):
                 raise ValueError(
-                    "CC Molt unfinished-segment redispatch is not supported: "
+                    "CC full-window unfinished-segment redispatch is not supported: "
                     "configure one infra/data/Gym-row attempt, zero drop budgets, "
                     "and on_dropped_prompt='shrink'"
                 )
@@ -1486,20 +1510,27 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 or async_config.min_groups_for_streaming_train
                 != master_config.grpo.num_prompts_per_step
                 or (
+                    master_config.loss_fn.loss_agg_mode
+                    == "prompt-mean-token-mean"
+                    and not async_config.stage_full_advantage_window
+                )
+                or (
                     async_config.stage_full_advantage_window
                     and master_config.policy["generation"]["colocated"]["enabled"]
                 )
             ):
                 raise ValueError(
-                    "CC Molt requires windowed sampling with "
+                    "CC full-window objectives require windowed sampling with "
                     "max_staleness_versions=1, sample_freshest_first=false, and "
                     "one full prompt-group batch per advantage/optimizer window; "
+                    "prompt-mean-token-mean requires full-window staging; "
                     "full-window staging is supported only with non-colocated "
                     "generation"
                 )
         elif async_config.stage_full_advantage_window:
             raise ValueError(
-                "async_rl.stage_full_advantage_window is supported only for CC Molt"
+                "async_rl.stage_full_advantage_window is supported only for qualified "
+                "CC full-window objectives"
             )
         elif (
             not isinstance(async_config.sampler, InOrderSamplerConfig)

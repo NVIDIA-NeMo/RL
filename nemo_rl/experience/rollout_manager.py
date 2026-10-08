@@ -51,6 +51,7 @@ from nemo_rl.experience.failures import (
     classify_rollout_failure,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY,
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
@@ -1092,6 +1093,10 @@ class AsyncNemoGymRolloutImpl:
             row[NEMO_GYM_GROUP_ID_KEY] = group_id
             row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempt
             row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
+            # A fork-capable environment can initialize this prompt once and
+            # clone exactly the siblings dispatched in this attempt. Recovery
+            # may dispatch only a subset, so the full configured N is wrong.
+            row[NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY] = list(indices)
             if rollout_ids is not None:
                 # Opaque run-body carrier (Gym's _ng_rollout_id key): the agent
                 # derives the id from the run body and stamps /ng-rollout/<id>

@@ -66,6 +66,7 @@ from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
+    DrGRPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     ReinforceBaselineAdvantageEstimator,
 )
@@ -132,6 +133,7 @@ from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
+    PROMPT_LOSS_WEIGHT,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
 )
@@ -208,14 +210,76 @@ def _train_fields_for_step(
     *,
     policy_logprobs_required: bool,
     reference_logprobs_required: bool,
+    prompt_mean_token_mean: bool = False,
 ) -> tuple[str, ...]:
     """Return only the data-plane columns produced for this train step."""
-    return tuple(
+    fields = tuple(
         field
         for field in DP_TRAIN_FIELDS
         if (policy_logprobs_required or field != "prev_logprobs")
         and (reference_logprobs_required or field != "reference_policy_logprobs")
     )
+    return fields + ((PROMPT_LOSS_WEIGHT,) if prompt_mean_token_mean else ())
+
+
+def _prompt_mean_token_mean_weights(
+    meta: KVBatchMeta,
+    *,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Encode ``T / (P * T_prompt)`` once per physical training row.
+
+    The loss still uses its existing global-token denominator ``T``. Multiplying
+    each prompt's rows by this weight therefore produces a token mean inside the
+    complete prompt population followed by a plain mean over the ``P`` prompts.
+    """
+    if (
+        token_mask.ndim != 2
+        or token_mask.shape[0] != meta.size
+        or sample_mask.shape != (meta.size,)
+    ):
+        raise ValueError("prompt loss weights require row-aligned masks")
+
+    if has_logical_owners(meta):
+        if meta.tags is None or len(meta.tags) != meta.size:
+            raise ValueError("CC prompt loss weights require complete row tags")
+        group_ids = [tag.get("dispatch_group_id") for tag in meta.tags]
+        if any(not isinstance(group_id, str) or not group_id for group_id in group_ids):
+            raise ValueError("CC prompt loss weights require dispatch_group_id")
+    else:
+        group_ids = []
+        for sample_id in meta.sample_ids:
+            group_id = sample_id
+            if "_g" in sample_id:
+                candidate, generation_index = sample_id.rsplit("_g", 1)
+                if candidate and generation_index.isdigit():
+                    group_id = candidate
+            group_ids.append(group_id)
+
+    row_token_counts = (
+        token_mask[:, 1:].float() * sample_mask.float().unsqueeze(-1)
+    ).sum(dim=-1)
+    prompt_token_counts: dict[str, torch.Tensor] = {}
+    for group_id, row_count in zip(group_ids, row_token_counts, strict=True):
+        prompt_token_counts[group_id] = (
+            prompt_token_counts.get(group_id, torch.zeros_like(row_count)) + row_count
+        )
+
+    valid_prompt_counts = {
+        group_id: count for group_id, count in prompt_token_counts.items() if count > 0
+    }
+    total_tokens = row_token_counts.sum()
+    if not valid_prompt_counts or total_tokens <= 0:
+        return torch.zeros_like(sample_mask, dtype=torch.float32)
+
+    prompt_count = len(valid_prompt_counts)
+    weights = torch.zeros_like(sample_mask, dtype=torch.float32)
+    for row, group_id in enumerate(group_ids):
+        prompt_tokens = valid_prompt_counts.get(group_id)
+        if prompt_tokens is not None:
+            weights[row] = total_tokens / (prompt_count * prompt_tokens)
+    return weights
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -290,6 +354,9 @@ class SingleControllerActor:
         self._train_fields = _train_fields_for_step(
             policy_logprobs_required=self._policy_logprobs_required,
             reference_logprobs_required=self._reference_logprobs_required,
+            prompt_mean_token_mean=(
+                master_config.loss_fn.loss_agg_mode == "prompt-mean-token-mean"
+            ),
         )
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
@@ -4419,8 +4486,17 @@ class SingleControllerActor:
 
         logical = has_logical_owners(meta)
         if logical:
-            standard_grpo = self._algo_cfg.adv_estimator.name == "grpo" and isinstance(
-                self._advantage_estimator, GRPOAdvantageEstimator
+            grpo_family = (
+                (
+                    self._algo_cfg.adv_estimator.name == "grpo"
+                    and isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+                )
+                or (
+                    self._algo_cfg.adv_estimator.name == "dr_grpo"
+                    and isinstance(
+                        self._advantage_estimator, DrGRPOAdvantageEstimator
+                    )
+                )
             )
             molt_reinforce = (
                 self._algo_cfg.adv_estimator.name == "reinforce_baseline"
@@ -4431,7 +4507,7 @@ class SingleControllerActor:
             if (
                 self._is_ppo
                 or not isinstance(self._algo_cfg, GRPOConfig)
-                or not (standard_grpo or molt_reinforce)
+                or not (grpo_family or molt_reinforce)
             ):
                 raise ValueError("CC logical owners require a supported GRPO estimator")
             validate_cc_objective(self._algo_cfg, self._master_config.loss_fn)
@@ -4559,28 +4635,30 @@ class SingleControllerActor:
                 )
                 for rows in dispatch_rows.values()
             )
-            prompt_populations: list[list[int]] = []
+            token_prompt_populations: list[list[int]] = []
             for row in representative_rows:
-                for population in prompt_populations:
+                for population in token_prompt_populations:
                     if torch.equal(prompt_ids[population[0]], prompt_ids[row]):
                         population.append(row)
                         break
                 else:
-                    prompt_populations.append([row])
-            mixed_reward_populations = sum(
+                    token_prompt_populations.append([row])
+            mixed_reward_token_populations = sum(
                 len({float(rewards[row]) for row in rows}) > 1
-                for rows in prompt_populations
+                for rows in token_prompt_populations
             )
-            singleton_populations = sum(len(rows) == 1 for rows in prompt_populations)
+            singleton_token_populations = sum(
+                len(rows) == 1 for rows in token_prompt_populations
+            )
             print(
                 "CC advantage populations: "
                 f"owners={len(representative_rows)} "
                 f"dispatch_groups={len(dispatch_rows)} "
                 f"dispatch_mixed_rewards={dispatch_mixed_rewards} "
                 f"dispatch_prompt_mismatches={dispatch_prompt_mismatches} "
-                f"baseline_populations={len(prompt_populations)} "
-                f"singleton_populations={singleton_populations} "
-                f"mixed_reward_populations={mixed_reward_populations}",
+                f"token_prompt_populations={len(token_prompt_populations)} "
+                f"singleton_token_populations={singleton_token_populations} "
+                f"mixed_reward_token_populations={mixed_reward_token_populations}",
                 flush=True,
             )
         mask = token_mask * final_sample_mask.unsqueeze(-1)
@@ -4634,8 +4712,28 @@ class SingleControllerActor:
                 estimator_kwargs["action_token_counts"] = (
                     owner_batch.action_token_counts(mask[:, 1:])
                 )
+            # A dispatch is one optimizer-level prompt population. Token-equal
+            # prompts from separate dispatches must not share a baseline.
+            if meta.tags is None:
+                raise ValueError("CC advantage estimation requires row tags")
+            dispatch_indices: dict[str, int] = {}
+            owner_prompt_ids: list[int] = []
+            for row in rows.tolist():
+                dispatch_group_id = meta.tags[row].get("dispatch_group_id")
+                if not isinstance(dispatch_group_id, str) or not dispatch_group_id:
+                    raise ValueError(
+                        "CC advantage estimation requires dispatch_group_id"
+                    )
+                owner_prompt_ids.append(
+                    dispatch_indices.setdefault(
+                        dispatch_group_id, len(dispatch_indices)
+                    )
+                )
+            estimator_prompt_ids = prompt_ids.new_tensor(
+                owner_prompt_ids
+            ).unsqueeze(-1)
             owner_advantages = self._advantage_estimator.compute_advantage(
-                prompt_ids=prompt_ids[rows],
+                prompt_ids=estimator_prompt_ids,
                 rewards=rewards[rows],
                 mask=owner_batch.valid_mask.unsqueeze(-1),
                 valid_mask=baseline_mask[rows],
@@ -4721,11 +4819,21 @@ class SingleControllerActor:
         )
 
         fields_to_put = {adv_cfg.output_field: advantages}
+        new_fields = [adv_cfg.output_field]
+        if (
+            self._master_config.loss_fn.loss_agg_mode
+            == "prompt-mean-token-mean"
+        ):
+            fields_to_put[PROMPT_LOSS_WEIGHT] = _prompt_mean_token_mean_weights(
+                meta,
+                token_mask=token_mask,
+                sample_mask=final_sample_mask,
+            )
+            new_fields.append(PROMPT_LOSS_WEIGHT)
         if rewards_clipped:
             fields_to_put[adv_cfg.reward_field] = rewards
         if not torch.equal(final_sample_mask, sample_mask):
             fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
-        new_fields = [adv_cfg.output_field]
         if returns is not None:
             fields_to_put[adv_cfg.returns_field] = returns
             new_fields.append(adv_cfg.returns_field)

@@ -16,6 +16,7 @@
 
 This module provides different advantage estimation strategies:
 - GRPOAdvantageEstimator: Standard GRPO advantage with leave-one-out baseline
+- DrGRPOAdvantageEstimator: Prompt-group mean baseline without std normalization
 - GDPOAdvantageEstimator: Multi-reward GDPO (per-component baselines, optional per-reward weights, then normalize)
 - ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward
 - RawRewardAdvantageEstimator: Raw reward as advantage with optional batch normalization (no baseline, no value model)
@@ -54,7 +55,12 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     """Configuration for advantage estimator (GRPO, GDPO, OPD, or Reinforce++)."""
 
     name: Literal[
-        "grpo", "gdpo", "opd", "reinforce_baseline", "reinforce_plus_plus"
+        "grpo",
+        "dr_grpo",
+        "gdpo",
+        "opd",
+        "reinforce_baseline",
+        "reinforce_plus_plus",
     ] = "grpo"
     # GRPO specific
     normalize_rewards: bool = True
@@ -126,6 +132,26 @@ class GRPOAdvantageEstimator:
             )
 
         return advantages.expand(mask.shape)
+
+
+class DrGRPOAdvantageEstimator:
+    """Dr.GRPO prompt-group mean baseline without std normalization or whitening."""
+
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        del estimator_config, loss_config
+
+    def compute_advantage(self, prompt_ids, rewards, mask, valid_mask=None, **kwargs):
+        """Return ``reward - prompt_group_mean`` expanded over response tokens."""
+        del kwargs
+        baseline, _ = calculate_baseline_and_std_per_prompt(
+            prompt_ids,
+            rewards,
+            torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
+            leave_one_out_baseline=False,
+        )
+        return (rewards - baseline).unsqueeze(-1).expand(mask.shape)
 
 
 class ReinforceBaselineAdvantageEstimator:

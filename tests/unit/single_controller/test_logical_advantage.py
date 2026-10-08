@@ -11,6 +11,7 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    DrGRPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     ReinforceBaselineAdvantageEstimator,
 )
@@ -113,11 +114,10 @@ def _controller(meta, data, *, grpo=None, loss=None):
     ctrl._dp_client = _DataPlane(meta, data)
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._advantage_cfg = AdvantageConfig()
-    estimator_type = (
-        ReinforceBaselineAdvantageEstimator
-        if config.adv_estimator.name == "reinforce_baseline"
-        else GRPOAdvantageEstimator
-    )
+    estimator_type = {
+        "reinforce_baseline": ReinforceBaselineAdvantageEstimator,
+        "dr_grpo": DrGRPOAdvantageEstimator,
+    }.get(config.adv_estimator.name, GRPOAdvantageEstimator)
     ctrl._advantage_estimator = estimator_type(
         config.adv_estimator, ClippedPGLossConfig(**(loss or {}))
     )
@@ -137,11 +137,12 @@ def _controller(meta, data, *, grpo=None, loss=None):
 
 @pytest.mark.parametrize("population", ["valid_owners", "all_owners"])
 @pytest.mark.parametrize("reorder", [False, True])
-def test_deduplicates_unequal_segments_and_pools_same_prompt_across_groups(
+def test_deduplicates_segments_and_keeps_dispatch_baselines_independent(
     population, reorder
 ):
     meta, data = _batch(
-        [("a", [(0.0, 2), (0.0, 1)]), ("b", [(1.0, 3), (1.0, 1)])], padding=True
+        [("a", [(0.0, 2), (2.0, 1)]), ("b", [(10.0, 3), (14.0, 1)])],
+        padding=True,
     )
     if reorder:
         order = [4, 1, 6, 0, 7, 5, 3, 2]
@@ -151,12 +152,15 @@ def test_deduplicates_unequal_segments_and_pools_same_prompt_across_groups(
     result, valid = asyncio.run(ctrl._advantage_stage(meta))
     assert valid and "advantages" in result.fields
     assert len(ctrl._dp_client.puts) == 1
-    assert sorted(ctrl._step_log_dict["rewards"][0].tolist()) == [0, 0, 1, 1]
+    assert sorted(ctrl._step_log_dict["rewards"][0].tolist()) == [0, 2, 10, 14]
     assert ctrl._step_log_dict["sample_masks"][0].tolist() == [1, 1, 1, 1]
     for row, sample_id in enumerate(meta.sample_ids):
-        expected = (
-            0.0 if "_pad" in sample_id else (-0.5 if sample_id.startswith("a") else 0.5)
-        )
+        if "_pad" in sample_id:
+            expected = 0.0
+        elif sample_id.startswith("a"):
+            expected = -1.0 if "_g0_" in sample_id else 1.0
+        else:
+            expected = -2.0 if "_g0_" in sample_id else 2.0
         torch.testing.assert_close(data["advantages"][row], torch.full((3,), expected))
 
 
@@ -240,7 +244,7 @@ def test_real_capture_finalizer_rows_feed_sc_at_actual_segment_lengths(
         asyncio.run(harness.ledger.close())
 
 
-def test_original_prompt_lengths_prevent_padding_aliases_without_splitting_equal_prompts():
+def test_prompt_token_aliases_do_not_merge_distinct_dispatches():
     meta, data = _batch(
         [
             ("a", [(0.0, 2), (0.0, 1)]),
@@ -254,9 +258,7 @@ def test_original_prompt_lengths_prevent_padding_aliases_without_splitting_equal
     )
     ctrl = _controller(meta, data)
     asyncio.run(ctrl._advantage_stage(meta))
-    torch.testing.assert_close(
-        data["advantages"][:, 0], torch.tensor([-0.5] * 3 + [0.5] * 3 + [0.0] * 2)
-    )
+    assert data["advantages"].count_nonzero() == 0
 
 
 @pytest.mark.parametrize("normalize", [False, True])
@@ -350,6 +352,39 @@ def test_molt_owner_scalar_is_invariant_to_physical_segment_splitting():
     torch.testing.assert_close(
         split_data["advantages"][[0, 2], 1],
         unsplit_data["advantages"][:, 1],
+    )
+
+
+def test_flash_prompt_weights_pool_all_segments_and_rollouts_per_dispatch_group():
+    meta, data = _batch(
+        [("a", [(0.0, 2), (1.0, 1)]), ("b", [(0.0, 3), (1.0, 1)])]
+    )
+    ctrl = _controller(
+        meta,
+        data,
+        grpo={
+            "baseline_population": "all_owners",
+            "adv_estimator": {"name": "dr_grpo"},
+        },
+        loss={
+            "use_importance_sampling_correction": True,
+            "truncated_importance_sampling_type": "seq-mask-tis",
+            "is_correction_gating": "binary_kl",
+            "truncated_importance_sampling_ratio_min": 0.0,
+            "truncated_importance_sampling_ratio": 0.01,
+            "force_on_policy_ratio": True,
+            "loss_agg_mode": "prompt-mean-token-mean",
+        },
+    )
+
+    result, valid = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert valid and "prompt_loss_weight" in result.fields
+    # Every row has two action tokens. Prompt a has 3 rows (6 tokens), prompt b
+    # has 4 rows (8 tokens), T=14 and P=2.
+    torch.testing.assert_close(
+        data["prompt_loss_weight"],
+        torch.tensor([14 / 12] * 3 + [14 / 16] * 4),
     )
 
 

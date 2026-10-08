@@ -10,7 +10,7 @@ usage() {
 Usage: $0 [ENV_FILE]
 
 ENV_FILE defaults to $SCRIPT_DIR/.env. Start from env.example and keep the
-result outside git because it contains the OpenSandbox API key.
+result outside git because it contains sandbox API credentials.
 EOF
 }
 
@@ -39,7 +39,15 @@ fi
 
 OSWORLD_DRIVER_SCRIPT="${OSWORLD_DRIVER_SCRIPT:-driver.sh}"
 OSWORLD_NUM_NODES="${OSWORLD_NUM_NODES:-4}"
-OSWORLD_JOB_NAME="${OSWORLD_JOB_NAME:-osw-v2-b8k8}"
+OSWORLD_RECIPE="${OSWORLD_RECIPE:-flash-b8n8-dr-grpo}"
+case "$OSWORLD_RECIPE" in
+  molt-b8n8-checkpoint|flash-b8n8-reinforce|flash-b8n8-dr-grpo|flash-b17n16-dr-grpo|flash-b17n16-reinforce) ;;
+  *)
+    echo "Unsupported OSWORLD_RECIPE: $OSWORLD_RECIPE" >&2
+    exit 2
+    ;;
+esac
+OSWORLD_JOB_NAME="${OSWORLD_JOB_NAME:-osw-v2-$OSWORLD_RECIPE}"
 case "$OSWORLD_DRIVER_SCRIPT" in
   driver.sh|eval_driver.sh) ;;
   *)
@@ -51,21 +59,37 @@ if [[ "$OSWORLD_DRIVER_SCRIPT" != "eval_driver.sh" ]]; then
   unset OSWORLD_EVAL_MODE
 fi
 
-if [[ -z "${OPENSANDBOX_DOMAIN:-}" && -n "${OPENSANDBOX_BASE_URL:-}" ]]; then
-  opensandbox_host="${OPENSANDBOX_BASE_URL#*://}"
-  export OPENSANDBOX_DOMAIN="${opensandbox_host%%/*}"
-fi
-export OPENSANDBOX_API_KEY="${OPENSANDBOX_API_KEY:-}"
+export OSWORLD_SANDBOX_PROVIDER="${OSWORLD_SANDBOX_PROVIDER:-opensandbox}"
+case "$OSWORLD_SANDBOX_PROVIDER" in
+  opensandbox)
+    if [[ -z "${OPENSANDBOX_DOMAIN:-}" && -n "${OPENSANDBOX_BASE_URL:-}" ]]; then
+      opensandbox_host="${OPENSANDBOX_BASE_URL#*://}"
+      export OPENSANDBOX_DOMAIN="${opensandbox_host%%/*}"
+    fi
+    export OPENSANDBOX_API_KEY="${OPENSANDBOX_API_KEY:-}"
+    ;;
+  agentenv)
+    export AGENTENV_TEMPLATE="${AGENTENV_TEMPLATE:-osworld-slim-pixel-parity-20261001}"
+    ;;
+  *)
+    echo "OSWORLD_SANDBOX_PROVIDER must be opensandbox or agentenv" >&2
+    exit 2
+    ;;
+esac
 
 required_vars=(
   CONTAINER
   NANO_OMNI_MODEL_NAME
   NANO_OMNI_CHAT_TEMPLATE
-  OPENSANDBOX_DOMAIN
   SLURM_ACCOUNT
   SLURM_PARTITION
   OSWORLD_RESULTS_ROOT
 )
+if [[ "$OSWORLD_SANDBOX_PROVIDER" == "agentenv" ]]; then
+  required_vars+=(AGENTENV_ENDPOINT AGENTENV_API_KEY AGENTENV_TLS_CA AGENTENV_TEMPLATE)
+else
+  required_vars+=(OPENSANDBOX_DOMAIN)
+fi
 if [[ "$OSWORLD_DRIVER_SCRIPT" == "eval_driver.sh" ]]; then
   case "${OSWORLD_EVAL_MODE:-}" in
     sft|checkpoint) ;;
@@ -112,9 +136,19 @@ export NANO_OMNI_MODEL_NAME
 NANO_OMNI_MODEL_NAME="$(canonical_dir "$NANO_OMNI_MODEL_NAME")"
 export NANO_OMNI_CHAT_TEMPLATE
 NANO_OMNI_CHAT_TEMPLATE="$(canonical_file "$NANO_OMNI_CHAT_TEMPLATE")"
+if [[ "$OSWORLD_SANDBOX_PROVIDER" == "agentenv" ]]; then
+  export AGENTENV_TLS_CA
+  AGENTENV_TLS_CA="$(canonical_file "$AGENTENV_TLS_CA")"
+fi
 if [[ "$OSWORLD_DRIVER_SCRIPT" != "eval_driver.sh" ]]; then
   export OSWORLD_GRPO_TRAIN_DATA
   OSWORLD_GRPO_TRAIN_DATA="$(canonical_file "$OSWORLD_GRPO_TRAIN_DATA")"
+fi
+if [[ -n "${OSWORLD_RLVR_SNAPSHOT:-}" ]]; then
+  export OSWORLD_RLVR_SNAPSHOT
+  OSWORLD_RLVR_SNAPSHOT="$(canonical_dir "$OSWORLD_RLVR_SNAPSHOT")"
+  test -s "$OSWORLD_RLVR_SNAPSHOT/SNAPSHOT.json"
+  test -d "$OSWORLD_RLVR_SNAPSHOT/tmp_funcs"
 fi
 if [[ "$OSWORLD_DRIVER_SCRIPT" == "eval_driver.sh" ]]; then
   export OSWORLD_GRPO_VAL_DATA
@@ -161,7 +195,7 @@ OSWORLD_RESULTS_ROOT="$(readlink -f "$OSWORLD_RESULTS_ROOT")"
 export OSWORLD_RESULTS_ROOT
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-run_name="${OSWORLD_RUN_NAME:-${OSWORLD_RUN_PREFIX:-osworld-v2-molt-b8k8}-$timestamp}"
+run_name="${OSWORLD_RUN_NAME:-${OSWORLD_RUN_PREFIX:-osworld-v2-$OSWORLD_RECIPE}-$timestamp}"
 if [[ "$run_name" == */* ]]; then
   echo "OSWORLD_RUN_NAME must not contain '/': $run_name" >&2
   exit 2
@@ -263,8 +297,14 @@ add_identity_mount() {
 
 add_identity_mount "$NANO_OMNI_MODEL_NAME"
 add_identity_mount "$NANO_OMNI_CHAT_TEMPLATE"
+if [[ "$OSWORLD_SANDBOX_PROVIDER" == "agentenv" ]]; then
+  add_identity_mount "$AGENTENV_TLS_CA"
+fi
 if [[ "$OSWORLD_DRIVER_SCRIPT" != "eval_driver.sh" ]]; then
   add_identity_mount "$OSWORLD_GRPO_TRAIN_DATA"
+fi
+if [[ -n "${OSWORLD_RLVR_SNAPSHOT:-}" ]]; then
+  add_identity_mount "$OSWORLD_RLVR_SNAPSHOT"
 fi
 if [[ "$OSWORLD_DRIVER_SCRIPT" == "eval_driver.sh" ]]; then
   add_identity_mount "$OSWORLD_GRPO_VAL_DATA"
@@ -293,7 +333,12 @@ export RAY_CLI="$OSWORLD_DRIVER_VENV/bin/ray"
 export SETUP_COMMAND="bash '$OSWORLD_EXECUTION_ROOT/node_setup.sh'"
 export COMMAND="bash '$OSWORLD_EXECUTION_ROOT/$OSWORLD_DRIVER_SCRIPT'"
 export OSWORLD_POOL_REF="${OSWORLD_POOL_REF:-osworld-kvm}"
-export OSWORLD_MAX_STEPS="${OSWORLD_MAX_STEPS:-150}"
+export OSWORLD_RECIPE
+case "$OSWORLD_RECIPE" in
+  flash-*) default_osworld_max_steps=200 ;;
+  *) default_osworld_max_steps=150 ;;
+esac
+export OSWORLD_MAX_STEPS="${OSWORLD_MAX_STEPS:-$default_osworld_max_steps}"
 export OSWORLD_MAX_PARALLEL_ROLLOUTS="${OSWORLD_MAX_PARALLEL_ROLLOUTS:-8}"
 export OSWORLD_CHECKPOINT_MUST_SAVE_BY="${OSWORLD_CHECKPOINT_MUST_SAVE_BY:-00:03:40:00}"
 export OSWORLD_SEED="${OSWORLD_SEED:-42}"

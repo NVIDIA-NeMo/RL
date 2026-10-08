@@ -32,6 +32,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    DrGRPOAdvantageEstimator,
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
@@ -2517,6 +2518,9 @@ def _create_advantage_estimator(master_config: MasterConfig):
     if adv_estimator_name == "gdpo":
         adv_estimator = GDPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GDPO advantage estimator (multi-reward)")
+    elif adv_estimator_name == "dr_grpo":
+        adv_estimator = DrGRPOAdvantageEstimator(adv_estimator_config, loss_config)
+        print("  ✓ Using Dr.GRPO advantage estimator (group mean, no std)")
     elif adv_estimator_name == "grpo":
         adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GRPO advantage estimator")

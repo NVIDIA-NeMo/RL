@@ -119,6 +119,9 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- Loss type ---
     disable_ppo_ratio: bool = False
     token_level_loss: bool = True
+    # "prompt-mean-token-mean" averages action-token losses within each prompt's
+    # complete rollout population, then gives every prompt equal weight.
+    loss_agg_mode: str = "token-mean"
     # If True, apply the off-policy importance-sampling correction at the
     # sequence level (one weight per generated sample), as in GSPO.
     # If False (default), correction is applied at the token level as in the
@@ -149,8 +152,12 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # Type of truncated importance sampling:
     #   "tis"          – clamp IS weights to [min, max], where min defaults to 0
     #   "icepop"       – zero out tokens with IS weight outside [min, max]
-    #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
+    #   "seq-mask-tis" – zero out sequences by a configured ratio/divergence
+    #                    gate, retaining non-truncated token IS correction
     truncated_importance_sampling_type: Optional[str] = None
+    # Statistic used by seq-mask-tis. "binary_kl" and "tv" are the sampled-token
+    # rollout-vs-train divergences used by FlashREINFORCE.
+    is_correction_gating: str = "ratio"
     truncated_importance_sampling_ratio: Optional[float] = None
     # Lower bound for TIS clipping, ICE-POP filtering, or seq-mask-tis filtering
     truncated_importance_sampling_ratio_min: Optional[float] = None
@@ -158,8 +165,8 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- On-policy ---
     # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
     use_on_policy_kl_approximation: bool = False
-    # If True, force the ratio to 1.0 for truly on-policy behavior,
-    # eliminating any importance sampling effects.
+    # If True, force the PPO optimization ratio to 1.0. The independently
+    # configured actor/rollout importance-sampling correction still applies.
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
@@ -181,6 +188,7 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    prompt_loss_weight: NotRequired[torch.Tensor]
     __extra__: Any
 
 
@@ -262,8 +270,24 @@ class ClippedPGLossFn(LossFunction):
         self.kl_input_clamp_value = cfg.kl_input_clamp_value
         self.kl_output_clamp_value = cfg.kl_output_clamp_value
         self.use_importance_sampling_correction = cfg.use_importance_sampling_correction
+        self.loss_agg_mode = cfg.loss_agg_mode
+        if self.loss_agg_mode not in ("token-mean", "prompt-mean-token-mean"):
+            raise ValueError(
+                "loss_agg_mode must be 'token-mean' or "
+                f"'prompt-mean-token-mean', got {self.loss_agg_mode!r}"
+            )
+        if self.loss_agg_mode == "prompt-mean-token-mean" and not cfg.token_level_loss:
+            raise ValueError(
+                "prompt-mean-token-mean requires token_level_loss=True"
+            )
         # Type of truncated importance sampling: "tis" | "icepop" | "seq-mask-tis"
         self.truncated_importance_sampling_type = cfg.truncated_importance_sampling_type
+        self.is_correction_gating = cfg.is_correction_gating
+        if self.is_correction_gating not in ("ratio", "binary_kl", "tv"):
+            raise ValueError(
+                "is_correction_gating must be 'ratio', 'binary_kl', or 'tv', "
+                f"got {self.is_correction_gating!r}"
+            )
         self.truncated_importance_sampling_ratio = (
             cfg.truncated_importance_sampling_ratio
         )
@@ -339,6 +363,21 @@ class ClippedPGLossFn(LossFunction):
                 assert not self.sequence_level_importance_ratios, (
                     "seq-mask-tis uses token-level IS correction with sequence-level masking, "
                     "and is incompatible with sequence_level_importance_ratios=True"
+                )
+        if self.is_correction_gating != "ratio":
+            if self.truncated_importance_sampling_type != "seq-mask-tis":
+                raise ValueError(
+                    f"is_correction_gating={self.is_correction_gating!r} requires "
+                    "truncated_importance_sampling_type='seq-mask-tis'"
+                )
+            if (
+                self.truncated_importance_sampling_ratio_min is None
+                or self.truncated_importance_sampling_ratio_min > 0
+            ):
+                raise ValueError(
+                    f"is_correction_gating={self.is_correction_gating!r} uses an "
+                    "upper divergence bound; set "
+                    "truncated_importance_sampling_ratio_min=0.0"
                 )
 
         # Advertise, per returned metric, the global denominator it was
@@ -473,6 +512,27 @@ class ClippedPGLossFn(LossFunction):
             )
 
         mask = token_mask * sample_mask.unsqueeze(-1)
+        objective_mask = mask
+        if self.loss_agg_mode == "prompt-mean-token-mean":
+            if "prompt_loss_weight" not in data:
+                raise ValueError(
+                    "prompt-mean-token-mean requires the prompt_loss_weight field"
+                )
+            prompt_loss_weight = data["prompt_loss_weight"]
+            if (
+                prompt_loss_weight.ndim != 1
+                or prompt_loss_weight.shape != sample_mask.shape
+                or not torch.isfinite(prompt_loss_weight).all()
+                or torch.any(prompt_loss_weight < 0)
+            ):
+                raise ValueError(
+                    "prompt_loss_weight must be a finite non-negative row vector"
+                )
+            # SingleController encodes T/(P*T_prompt) per row. The existing
+            # global-token denominator T therefore yields exactly
+            # mean_prompt(sum_prompt(loss)/T_prompt), while remaining invariant
+            # to microbatch, sequence-packing, and DP placement.
+            objective_mask = mask * prompt_loss_weight.unsqueeze(-1)
 
         # For truly on-policy training, use curr_logprobs as prev_logprobs
         # This avoids computing prev_logprobs upstream
@@ -583,7 +643,9 @@ class ClippedPGLossFn(LossFunction):
             # Reduce KL loss
             if self.loss_type == LossType.TOKEN_LEVEL:
                 kl = masked_mean(
-                    kl, mask, global_normalization_factor=global_valid_toks
+                    kl,
+                    objective_mask,
+                    global_normalization_factor=global_valid_toks,
                 )
             else:
                 kl = masked_mean(
@@ -596,8 +658,8 @@ class ClippedPGLossFn(LossFunction):
 
         # Calculate clipped loss function if ppo ratio is enabled.
         if self.force_on_policy_ratio:
-            # Force ratio to 1.0 for truly on-policy behavior
-            # Use curr_logprobs twice so ratio=1 but gradients still flow
+            # Force the PPO ratio to one while retaining its score-function
+            # gradient. Actor/rollout IS is applied independently below.
             log_ratios = curr_logprobs - curr_logprobs.detach()
             ratios = log_ratios.exp()  # = exp(0) = 1.0, but depends on curr_logprobs
             ratios_clamped = ratios
@@ -663,9 +725,9 @@ class ClippedPGLossFn(LossFunction):
         # ---- Truncated Importance Sampling ----
         # "tis"          – clamp IS weights to [min, max], where min defaults to 0
         # "icepop"       – zero out tokens whose IS weight ∉ [min, max]   (ref bounds: 0.5–5)
-        # "seq-mask-tis" – zero out entire sequences whose geometric-mean
-        #                  IS ratio ∉ [min, max]; retained sequences keep
-        #                  raw (non-truncated) token-level IS weights      (ref bounds: 0.999–1.002)
+        # "seq-mask-tis" – zero out entire sequences using the configured
+        #                  ratio/divergence statistic; retained sequences
+        #                  keep raw (non-truncated) token-level IS weights
         #   Blog: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
         # is_oob_ratio: fraction of tokens (tis/icepop) or sequences (seq-mask-tis)
         # whose importance weight falls outside the truncation bounds. Each microbatch
@@ -713,7 +775,7 @@ class ClippedPGLossFn(LossFunction):
                     torch.zeros_like(actor_importance_weights_expanded),
                 )
             elif self.truncated_importance_sampling_type == "seq-mask-tis":
-                # Compute one geometric gate per physical trace/segment row.
+                # Compute one gate per physical trace/segment row.
                 # Logical owner IDs govern rewards and advantages, but must not
                 # couple independent segment validity decisions.
                 log_is_ratio = torch.nan_to_num(
@@ -722,16 +784,41 @@ class ClippedPGLossFn(LossFunction):
                     posinf=30.0,
                     neginf=-30.0,
                 ).clamp(min=-30.0, max=30.0)
-                seq_log_is_ratio_mean = masked_mean(
-                    log_is_ratio, token_mask, dim=-1
-                )  # [B]
-                seq_geomean_is_ratio = torch.exp(seq_log_is_ratio_mean).detach()  # [B]
+                if self.is_correction_gating == "ratio":
+                    seq_gate_stat = torch.exp(
+                        masked_mean(log_is_ratio, token_mask, dim=-1)
+                    ).detach()
+                elif self.is_correction_gating == "binary_kl":
+                    rollout_prob = (
+                        generation_logprobs.float().exp().clamp(1e-6, 1 - 1e-6)
+                    )
+                    train_prob = prev_logprobs.float().exp().clamp(1e-6, 1 - 1e-6)
+                    token_gate_stat = rollout_prob * (
+                        rollout_prob.log() - train_prob.log()
+                    ) + (1 - rollout_prob) * (
+                        (1 - rollout_prob).log() - (1 - train_prob).log()
+                    )
+                    seq_gate_stat = masked_mean(
+                        token_gate_stat, token_mask, dim=-1
+                    ).detach()
+                elif self.is_correction_gating == "tv":
+                    token_gate_stat = (
+                        generation_logprobs.float().exp()
+                        - prev_logprobs.float().exp()
+                    ).abs()
+                    seq_gate_stat = masked_mean(
+                        token_gate_stat, token_mask, dim=-1
+                    ).detach()
+                else:  # guarded in __init__
+                    raise ValueError(
+                        f"Invalid is_correction_gating: {self.is_correction_gating}"
+                    )
                 seq_kept_mask = (
                     (
-                        seq_geomean_is_ratio
+                        seq_gate_stat
                         >= self.truncated_importance_sampling_ratio_min
                     )
-                    & (seq_geomean_is_ratio <= self.truncated_importance_sampling_ratio)
+                    & (seq_gate_stat <= self.truncated_importance_sampling_ratio)
                 ).float()  # [B]
                 _is_filter_metrics = {
                     "is_oob_ratio": masked_mean(
@@ -758,7 +845,7 @@ class ClippedPGLossFn(LossFunction):
         if self.loss_type == LossType.TOKEN_LEVEL:
             actor_loss = masked_mean(
                 importance_weights_to_use * clip_loss,
-                mask,
+                objective_mask,
                 global_normalization_factor=global_valid_toks,
             )
         else:
@@ -803,7 +890,7 @@ class ClippedPGLossFn(LossFunction):
         nll_loss = torch.tensor(0.0, device=mask.device)
         if self.positive_example_nll_weight > 0 and "rewards" in data:
             correct_sample_mask = (data["rewards"] > 0).float()  # [batch]
-            correct_mask = mask * correct_sample_mask.unsqueeze(-1)
+            correct_mask = objective_mask * correct_sample_mask.unsqueeze(-1)
             correct_valid_toks = correct_mask.sum()
             if correct_valid_toks > 0:
                 nll_loss = masked_mean(

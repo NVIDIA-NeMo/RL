@@ -1,0 +1,20 @@
+# FlashREINFORCE smoke recipe: B=8 prompts, N=8 owners, K=8 groups.
+# Inherits RFC0040 iter881 model selection, R3/router replay, trajectory
+# splitting/context compaction, LR=5e-6, and step-boundary checkpointing.
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_v2_cc_molt_b8k8_checkpoint.yaml
+
+loss_fn:
+  # FlashREINFORCE: PPO ratio is forced to one for gradients. Raw per-token
+  # pi_train/pi_rollout IS is retained for surviving sequences.
+  force_on_policy_ratio: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: seq-mask-tis
+  is_correction_gating: binary_kl
+  truncated_importance_sampling_ratio_min: 0.0
+  truncated_importance_sampling_ratio: 0.01
+  loss_agg_mode: prompt-mean-token-mean
+
+logger:
+  wandb:
+    name: osworld-v2-flash-b8n8-reinforce

@@ -52,6 +52,21 @@ MOLT_CONFIG_PATH = Path(__file__).with_name(
 MOLT_CHECKPOINT_CONFIG_PATH = Path(__file__).with_name(
     "grpo_nemotron_omni_30ba3b_osworld_v2_cc_molt_b8k8_checkpoint.yaml"
 )
+RECIPE_CONFIG_PATHS = {
+    "molt-b8n8-checkpoint": MOLT_CHECKPOINT_CONFIG_PATH,
+    "flash-b8n8-reinforce": Path(__file__).with_name(
+        "grpo_nemotron_omni_30ba3b_osworld_v2_cc_flash_b8n8_checkpoint.yaml"
+    ),
+    "flash-b8n8-dr-grpo": Path(__file__).with_name(
+        "grpo_nemotron_omni_30ba3b_osworld_v2_cc_flash_b8n8_dr_grpo_checkpoint.yaml"
+    ),
+    "flash-b17n16-dr-grpo": Path(__file__).with_name(
+        "grpo_nemotron_omni_30ba3b_osworld_v2_cc_flash_b17n16_dr_grpo_checkpoint.yaml"
+    ),
+    "flash-b17n16-reinforce": Path(__file__).with_name(
+        "grpo_nemotron_omni_30ba3b_osworld_v2_cc_flash_b17n16_reinforce_checkpoint.yaml"
+    ),
+}
 
 
 def compose_and_validate_config(
@@ -88,17 +103,25 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         action="store_true",
         help="Use the Molt B8/K8 recipe with full step-boundary checkpointing.",
     )
+    parser.add_argument(
+        "--recipe",
+        choices=sorted(RECIPE_CONFIG_PATHS),
+        help="Select an explicit checkpointed OSWorld recipe.",
+    )
     return parser.parse_known_args()
 
 
 def main() -> None:
     """Validate the dedicated recipe, then optionally run its SC entrypoint."""
     args, overrides = parse_args()
-    if args.molt_b8k8 and args.molt_b8k8_checkpoint:
+    selected_legacy_flags = int(args.molt_b8k8) + int(args.molt_b8k8_checkpoint)
+    if selected_legacy_flags > 1 or (args.recipe and selected_legacy_flags):
         raise ValueError(
-            "--molt-b8k8 and --molt-b8k8-checkpoint are mutually exclusive"
+            "--recipe, --molt-b8k8, and --molt-b8k8-checkpoint are mutually exclusive"
         )
-    if args.molt_b8k8_checkpoint:
+    if args.recipe:
+        config_path = RECIPE_CONFIG_PATHS[args.recipe]
+    elif args.molt_b8k8_checkpoint:
         config_path = MOLT_CHECKPOINT_CONFIG_PATH
     elif args.molt_b8k8:
         config_path = MOLT_CONFIG_PATH

@@ -1,0 +1,13 @@
+# B=17 x N=16 FlashREINFORCE alternative retaining the REINFORCE++-style
+# all-owner group baseline and global action-token whitening.
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_v2_cc_flash_b17n16_dr_grpo_checkpoint.yaml
+
+grpo:
+  baseline_population: all_owners
+  adv_estimator:
+    name: reinforce_baseline
+
+logger:
+  wandb:
+    name: osworld-v2-flash-b17n16-reinforce
