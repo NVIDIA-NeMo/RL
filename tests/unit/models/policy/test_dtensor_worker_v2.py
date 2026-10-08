@@ -184,8 +184,7 @@ def create_test_config(
                 },
             },
         },
-        "dtensor_cfg": {
-            "_v2": True,
+        "automodel_cfg": {
             "enabled": True,
             "checkpoint": {
                 "model_save_format": "safetensors",
@@ -231,7 +230,7 @@ def create_test_config(
         "max_grad_norm": 1.0,
     }
     if automodel_kwargs is not None:
-        config["dtensor_cfg"]["automodel_kwargs"] = automodel_kwargs
+        config["automodel_cfg"]["automodel_kwargs"] = automodel_kwargs
     return config
 
 
@@ -421,6 +420,17 @@ def test_dtensor_v2_mixed_precision_training_and_logprobs(
         # Loss is returned in float32 (reduced in float32 for numerical stability)
         assert loss_tensor.dtype == torch.float32, (
             f"Loss should be float32, got {loss_tensor.dtype}"
+        )
+        num_global_batches = train_data.size // config["train_global_batch_size"]
+        scaled_metric_loss = sum(results["all_mb_metrics"]["loss"])
+        torch.testing.assert_close(
+            loss_tensor.sum(),
+            torch.tensor(
+                scaled_metric_loss * num_global_batches,
+                dtype=loss_tensor.dtype,
+            ),
+            rtol=1e-4,
+            atol=1e-5,
         )
 
         policy.finish_training()
@@ -848,7 +858,7 @@ def _init_v2_worker_mocked(
     config = {
         "model_name": "base-model",
         "tokenizer": {},
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "checkpoint": {
                 "model_save_format": "safetensors",
                 "save_consolidated": "false",

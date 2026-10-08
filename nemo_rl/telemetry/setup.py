@@ -206,7 +206,7 @@ def _build_resource_attributes(
     # Parallelism lives under the active policy backend (megatron vs dtensor).
     tp = _dig(
         master_config, "policy", "megatron_cfg", "tensor_model_parallel_size"
-    ) or _dig(master_config, "policy", "dtensor_cfg", "tensor_parallel_size")
+    ) or _dig(master_config, "policy", "automodel_cfg", "tensor_parallel_size")
     if tp:
         attrs["dl.tensor_parallel.size"] = tp
     pp = _dig(master_config, "policy", "megatron_cfg", "pipeline_model_parallel_size")

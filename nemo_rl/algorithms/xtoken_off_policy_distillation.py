@@ -63,7 +63,6 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.models.policy.utils import reject_dtensor_v1
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -166,7 +165,7 @@ class TeacherConfig(BaseModel, extra="allow"):
     """Per-teacher config for multi-teacher cross-tokenizer distillation.
 
     Carries the full ``PolicyConfig`` content (``model_name``, ``tokenizer``,
-    ``dtensor_cfg``, …) as permitted extras, plus the cross-tokenizer knobs
+    ``automodel_cfg``, …) as permitted extras, plus the cross-tokenizer knobs
     declared below. Use :meth:`policy_config` to recover the plain
     ``PolicyConfig`` dict for ``Policy`` construction.
 
@@ -252,18 +251,12 @@ def setup(
     # the TP=CP=1 multi-teacher prototype, this path supports TP/CP/diff-DP
     # sharding (the loss is parallelism-invariant), so there is deliberately NO
     # tensor/context_parallel_size==1 assert.
-    assert policy_config["dtensor_cfg"]["enabled"], (
-        "xtoken distillation requires policy.dtensor_cfg.enabled=true."
-    )
-    reject_dtensor_v1(
-        policy_config["dtensor_cfg"], "policy.dtensor_cfg", suggest_megatron=False
+    assert (policy_config.get("automodel_cfg") or {}).get("enabled"), (
+        "xtoken distillation requires policy.automodel_cfg.enabled=true."
     )
     for i, tc in enumerate(teacher_configs):
-        assert tc["dtensor_cfg"]["enabled"], (
-            f"xtoken distillation requires teachers.{i}.dtensor_cfg.enabled=true."
-        )
-        reject_dtensor_v1(
-            tc["dtensor_cfg"], f"teachers.{i}.dtensor_cfg", suggest_megatron=False
+        assert (tc.get("automodel_cfg") or {}).get("enabled"), (
+            f"xtoken distillation requires teachers.{i}.automodel_cfg.enabled=true."
         )
 
     # A null projection path marks a same-vocab teacher (direct KL, no
@@ -380,10 +373,10 @@ def setup(
     print("\n▶ Setting up compute cluster...", flush=True)
     cluster = RayVirtualCluster(
         name="xtoken_off_policy_distillation_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-        * cluster_config["num_nodes"],
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node]
+        * cluster_config.num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         # N teacher worker groups + 1 student, colocated and run serially.
         max_colocated_worker_groups=len(teachers) + 1,
     )
@@ -431,8 +424,8 @@ def setup(
     # order) and tile it cleanly into per-DP-rank chunks and whole microbatches.
     # assert_teacher_student_batch_grid checks both (GBS agreement + tiling).
     student_dp = student_policy.data_parallel_size
-    student_tp = policy_config["dtensor_cfg"]["tensor_parallel_size"]
-    student_cp = policy_config["dtensor_cfg"]["context_parallel_size"]
+    student_tp = policy_config["automodel_cfg"]["tensor_parallel_size"]
+    student_cp = policy_config["automodel_cfg"]["context_parallel_size"]
     # Each teacher may differ from the student (and from each other) in
     # DP/MBS/TP/CP, so check the batch grid and node-local IPC layout per
     # teacher. Train and validation share the grid (the student reuses its train
@@ -453,12 +446,12 @@ def setup(
         # share DP and a node-aligned model-parallel group, else a student rank
         # would read teacher shards from another node.
         assert_xtoken_ipc_node_local(
-            num_nodes=cluster_config["num_nodes"],
-            gpus_per_node=cluster_config["gpus_per_node"],
+            num_nodes=cluster_config.num_nodes,
+            gpus_per_node=cluster_config.gpus_per_node,
             student_tp=student_tp,
             student_cp=student_cp,
-            teacher_tp=tc["dtensor_cfg"]["tensor_parallel_size"],
-            teacher_cp=tc["dtensor_cfg"]["context_parallel_size"],
+            teacher_tp=tc["automodel_cfg"]["tensor_parallel_size"],
+            teacher_cp=tc["automodel_cfg"]["context_parallel_size"],
             student_dp=student_dp,
             teacher_dp=teacher_dp,
         )

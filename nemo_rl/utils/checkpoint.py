@@ -167,11 +167,11 @@ class CheckpointingConfig(TypedDict):
     save_data_plane (bool): Whether SingleController checkpoints include the
         native TQ snapshot and replay-buffer metadata. Supported by the simple
         and mooncake_cpu backends; no backend-specific checkpoint switch is needed.
-    load_replay_buffer (bool): Whether async GRPO restores replay-buffer state
-        when resuming from a checkpoint. Defaults to True. When False the
-        buffer starts empty and a frontier-aligned resume regenerates the
-        whole buffered window fresh instead of reusing completed (and
-        therefore short-rollout-biased) groups.
+    load_replay_buffer (bool): Whether async GRPO or SingleController restores
+        replay-buffer state when resuming from a checkpoint. Defaults to True.
+        When False, a frontier-aligned async resume or a SingleController native
+        TQ resume regenerates the buffered prompt groups on the current policy
+        instead of reusing completed groups.
     """
 
     enabled: bool
@@ -186,7 +186,7 @@ class CheckpointingConfig(TypedDict):
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     save_optimizer: NotRequired[bool]  # Default: True
     save_data_plane: NotRequired[bool]
-    load_replay_buffer: NotRequired[bool]  # Default: True (async GRPO only)
+    load_replay_buffer: NotRequired[bool]  # Default: True
 
 
 _AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
@@ -240,7 +240,7 @@ class CheckpointManager:
                 f"checkpointing config: {', '.join(automodel_only_fields)}. "
                 "Configure model_save_format, save_consolidated, "
                 "single_rank_consolidation, and consolidation_timeout_minutes "
-                "under policy.dtensor_cfg (and value.dtensor_cfg for value "
+                "under policy.automodel_cfg (and value.automodel_cfg for value "
                 "models); remove the remaining fields because they are managed "
                 "internally."
             )
