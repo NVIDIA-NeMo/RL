@@ -879,10 +879,9 @@ def test_submission_validation_checks_placeholders_paths_and_node_total():
     )
 
 
-def _run_lightning_launcher(**overrides):
-    launcher = (
-        REPO_ROOT / "examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh"
-    )
+def _run_nemotron_launcher(
+    launcher: str, **overrides: str
+) -> subprocess.CompletedProcess[str]:
     with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temp_dir:
         root = Path(temp_dir)
         gym_source = root / "Gym"
@@ -915,12 +914,62 @@ def _run_lightning_launcher(**overrides):
         }
         env.update(overrides)
         return subprocess.run(
-            ["bash", str(launcher)],
+            [
+                "bash",
+                "-c",
+                # Inspect the actual registered pool environment, not just the
+                # source text. DRY_RUN exits before any Slurm submission.
+                'trap \'printf "\\nGENRM_ENV_VARS:\\n%s\\n" "${GENRM_ENV_VARS-}"\' EXIT\n'
+                'source "$1"',
+                "launcher-test",
+                str(REPO_ROOT / "examples/nemo_gym" / launcher),
+            ],
             cwd=REPO_ROOT,
             env=env,
             capture_output=True,
             text=True,
         )
+
+
+def _run_lightning_launcher(**overrides: str) -> subprocess.CompletedProcess[str]:
+    return _run_nemotron_launcher(
+        "nemotron-3.5-lightning/lightning35_launch.sh", **overrides
+    )
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    [
+        "nemotron-3.5-lightning/lightning35_launch.sh",
+        "nemotron-3-ultra/ultra_launch.sh",
+    ],
+)
+@pytest.mark.parametrize(
+    ("tp", "gpus_per_node", "backend_override", "expected"),
+    [
+        ("8", "4", "", "mnnvl"),
+        ("4", "4", "", "trtllm"),
+        ("8", "8", "", "trtllm"),
+        ("4", "4", "mnnvl", "mnnvl"),
+    ],
+)
+def test_nemotron_external_genrm_allreduce_backend(
+    launcher: str, tp: str, gpus_per_node: str, backend_override: str, expected: str
+) -> None:
+    result = _run_nemotron_launcher(
+        launcher,
+        CONFIG_PATH="examples/nemo_gym/nemotron-3-ultra/student_rlvr1.yaml",
+        EXTERNAL_JUDGES="1",
+        GENRM_TENSOR_PARALLEL_SIZE=tp,
+        GPUS_PER_NODE=gpus_per_node,
+        NL2BASH_TENSOR_PARALLEL_SIZE=gpus_per_node,
+        GENRM_FLASHINFER_ALLREDUCE_BACKEND=backend_override,
+    )
+
+    assert result.returncode == 0, result.stderr
+    pool_env = result.stdout.split("GENRM_ENV_VARS:\n", 1)[1].splitlines()
+    assert f"VLLM_FLASHINFER_ALLREDUCE_BACKEND={expected}" in pool_env
+    assert "VLLM_ALLREDUCE_USE_SYMM_MEM=0" in pool_env
 
 
 def test_lightning_launcher_dry_run_builds_reference_external_pool_topology():
