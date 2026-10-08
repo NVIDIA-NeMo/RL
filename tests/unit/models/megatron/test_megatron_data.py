@@ -314,6 +314,31 @@ class TestProcessMicrobatch:
         # Verify get_ltor_masks_and_position_ids was called
         mock_get_masks.assert_called_once()
 
+    @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
+    def test_process_microbatch_no_packing_skips_dense_mask(self, mock_get_masks, monkeypatch):
+        """NRL_MEGATRON_SKIP_DENSE_ATTENTION_MASK=1 hands the model no [L, L] mask.
+
+        Long unpacked agent rows cannot afford Megatron's dense causal mask (68 GiB
+        at 135k tokens); causal FlashAttention/TE kernels never read it.
+        """
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        monkeypatch.setenv("NRL_MEGATRON_SKIP_DENSE_ATTENTION_MASK", "1")
+        data_dict = MagicMock()
+        input_ids = torch.tensor(
+            [[1, 2, 3, 4, 5, 0, 0, 0, 0, 0], [6, 7, 8, 9, 10, 11, 12, 0, 0, 0]]
+        )
+        data_dict.__getitem__ = MagicMock(return_value=input_ids)
+
+        result = process_microbatch(
+            data_dict, pack_sequences=False, straggler_timer=MagicMock()
+        )
+
+        assert result.attention_mask is None
+        assert torch.equal(result.position_ids, torch.arange(10).unsqueeze(0).expand(2, -1))
+        assert result.packed_seq_params is None
+        mock_get_masks.assert_not_called()
+
     def test_process_microbatch_pads_dense_mxfp8_tokens(self):
         """Dense MXFP8 batches pad all sequence tensors to a 32-token boundary."""
         from nemo_rl.models.megatron import data as megatron_data

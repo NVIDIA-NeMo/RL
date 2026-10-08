@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from math import lcm
 from typing import Any, Iterator, Optional, Tuple
 
+import os
 import torch
 from megatron.bridge.training.utils.packed_seq_utils import (
     get_packed_seq_cp_partition_indices,
@@ -356,6 +357,18 @@ def get_microbatch_iterator(
         seq_dim_size,
         padded_seq_length,
     )
+
+
+def skip_dense_attention_mask() -> bool:
+    """Opt out of the dense [1, 1, L, L] causal mask for unpacked microbatches.
+
+    Set ``NRL_MEGATRON_SKIP_DENSE_ATTENTION_MASK=1`` when every attention layer
+    runs a causal FlashAttention/TE kernel that ignores the mask tensor (the
+    default for the Megatron GPT/hybrid models NeMo-RL trains). The mask costs
+    4 * L^2 bytes while it is built and L^2 bytes afterwards, so rows beyond
+    about 100k tokens cannot be processed with it on a 180 GiB GPU.
+    """
+    return os.environ.get("NRL_MEGATRON_SKIP_DENSE_ATTENTION_MASK", "0").lower() in ("1", "true", "yes")
 
 
 def get_ltor_masks_and_position_ids(*args: Any, **kwargs: Any) -> Any:
@@ -982,15 +995,29 @@ def process_microbatch(
                 cp_rank=get_context_parallel_rank(),
                 cp_size=get_context_parallel_world_size(),
             )
-            attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                data=input_ids,
-                eod_token=0,  # used for loss_mask, which we don't use
-                pad_token=0,  # used for loss_mask, which we don't use
-                reset_position_ids=False,
-                reset_attention_mask=False,
-                eod_mask_loss=False,
-                pad_mask_loss=False,
-            )
+            if skip_dense_attention_mask():
+                # Megatron's helper materializes a float32 [1, 1, L, L] causal mask
+                # before thresholding it: 68 GiB for a 135k-token row, which is
+                # what unpacked long-context agent rows reach. FlashAttention and
+                # TE fused attention with a causal mask type never read that
+                # tensor, and the packed branches above already hand the model
+                # attention_mask=None, so only the position ids are needed.
+                attention_mask = None
+                position_ids = (
+                    torch.arange(input_ids.size(1), device=input_ids.device)
+                    .unsqueeze(0)
+                    .expand(input_ids.size(0), -1)
+                )
+            else:
+                attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
+                    data=input_ids,
+                    eod_token=0,  # used for loss_mask, which we don't use
+                    pad_token=0,  # used for loss_mask, which we don't use
+                    reset_position_ids=False,
+                    reset_attention_mask=False,
+                    eod_mask_loss=False,
+                    pad_mask_loss=False,
+                )
             if "mtp_loss_mask" in data_dict:
                 mtp_loss_mask = data_dict["mtp_loss_mask"]
             # Unpacked: rows still are samples, so the mask is already in the
