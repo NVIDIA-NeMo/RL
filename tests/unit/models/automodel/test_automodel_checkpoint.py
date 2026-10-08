@@ -38,7 +38,6 @@ from nemo_automodel.components.checkpoint.config import SaveConsolidatedMode
 
 from nemo_rl.models.automodel.checkpoint import (
     AutomodelCheckpointManager,
-    _prime_optimizer_state_for_resume,
     build_checkpoint_config,
 )
 
@@ -89,34 +88,6 @@ def test_resume_master_weight_dtype(
 
     # A weights-only warm start does not inspect optimizer state.
     manager.load_checkpoint(model, str(tmp_path))
-
-
-@pytest.mark.automodel
-def test_prime_optimizer_state_for_resume_honors_grad_dtype():
-    """Prime a fresh optimizer with gradients in the parameter's grad_dtype."""
-    if not hasattr(torch.Tensor, "grad_dtype"):
-        pytest.skip("torch.Tensor.grad_dtype requires torch>=2.11")
-    model = torch.nn.Linear(2, 1, dtype=torch.bfloat16)
-    for param in model.parameters():
-        # bf16 storage that accumulates fp32 gradients: DCP's zeros_like priming
-        # would raise "attempting to assign a gradient with dtype 'c10::BFloat16'".
-        param.grad_dtype = torch.float32
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=0.1, weight_decay=0.1, foreach=False
-    )
-    weight_before = model.weight.detach().clone()
-
-    _prime_optimizer_state_for_resume(model, optimizer)
-
-    assert set(optimizer.state) == set(model.parameters())
-    assert all(param.grad is None for param in model.parameters())
-    assert optimizer.param_groups[0]["lr"] == 0.1
-    assert torch.equal(model.weight.detach(), weight_before)
-
-    # Already-initialized state is left untouched.
-    step_before = optimizer.state[model.weight]["step"].clone()
-    _prime_optimizer_state_for_resume(model, optimizer)
-    assert torch.equal(optimizer.state[model.weight]["step"], step_before)
 
 
 @pytest.mark.automodel
