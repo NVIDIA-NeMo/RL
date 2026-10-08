@@ -136,10 +136,9 @@ class AdvantageStageConfig:
                 or algo_cfg.malformed_thinking_advantage is not None
             ),
             shardable=algo_cfg.adv_estimator.name in SHARD_INVARIANT_ESTIMATORS,
-            # logger is still a TypedDict, so this is the same value the
-            # Logger exposes as base_log_dir.
+            # Use the resolved logger config shared by controller and pool.
             train_data_dump_dir=(
-                master_config.logger["log_dir"]
+                master_config.logger.log_dir
                 if master_config.async_rl.log_full_train_data
                 else None
             ),
