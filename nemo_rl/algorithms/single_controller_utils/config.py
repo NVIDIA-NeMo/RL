@@ -1185,7 +1185,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
     # setup_data_plane unconditionally, so a DTensor critic dies in Ray with the
-    # model already on GPU. ppo_math_1B.yaml ships dtensor_cfg.enabled=true.
+    # model already on GPU. ppo_math_1B.yaml ships automodel_cfg.enabled=true.
     value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
     if not value_megatron_cfg.get("enabled"):
         raise ValueError(

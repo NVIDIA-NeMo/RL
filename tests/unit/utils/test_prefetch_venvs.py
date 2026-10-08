@@ -28,7 +28,7 @@ def mock_registry():
     """Create a mock registry with various actor types."""
     return {
         "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": "uv run --group vllm",
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "uv run --group vllm",
+        "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": "uv run --group vllm",
         "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "uv run --group mcore",
         "nemo_rl.environments.math_environment.MathEnvironment": "python",
         "nemo_rl.environments.code_environment.CodeEnvironment": "python",
@@ -67,7 +67,7 @@ class TestPrefetchVenvs:
                 in actor_fqns
             )
             assert (
-                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+                "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker"
                 in actor_fqns
             )
             assert (
@@ -149,7 +149,7 @@ class TestPrefetchVenvs:
         ) as mock_create_venv:
             mock_create_venv.return_value = "/path/to/venv/bin/python"
 
-            # "policy" should match both dtensor_policy_worker and megatron_policy_worker
+            # "policy" should match both automodel_policy_worker and megatron_policy_worker
             prefetch_venvs_func(filters=["policy"])
 
             assert mock_create_venv.call_count == 2 * CALL_MULTIPLIER
@@ -158,7 +158,7 @@ class TestPrefetchVenvs:
             actor_fqns = [args[1] for args in call_args]
 
             assert (
-                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+                "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker"
                 in actor_fqns
             )
             assert (
@@ -224,7 +224,7 @@ class TestPrefetchVenvs:
             assert "Skipped (system Python): 2" in captured.out
             # Verify prefetched env names are listed
             assert "VllmGenerationWorker" in captured.out
-            assert "DTensorPolicyWorker" in captured.out
+            assert "AutomodelPolicyWorker" in captured.out
             assert "MegatronPolicyWorker" in captured.out
             # Verify skipped env names are listed
             assert "MathEnvironment" in captured.out
@@ -249,7 +249,7 @@ class TestPrefetchVenvs:
             # Verify prefetched env name is listed
             assert "VllmGenerationWorker" in captured.out
             # Verify filtered out env names are listed
-            assert "DTensorPolicyWorker" in captured.out
+            assert "AutomodelPolicyWorker" in captured.out
             assert "MegatronPolicyWorker" in captured.out
 
     def test_prefetch_venvs_summary_with_failures(self, prefetch_venvs_func, capsys):

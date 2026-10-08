@@ -25,7 +25,7 @@ cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo_sliding_puzzle.py \
     policy.model_name=Qwen/Qwen2.5-0.5B \
-    policy.dtensor_cfg.enabled=false \
+    policy.automodel_cfg.enabled=false \
     policy.megatron_cfg.enabled=true \
     policy.generation.backend=megatron \
     policy.generation.refit_transport=mcore \
