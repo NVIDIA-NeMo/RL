@@ -93,7 +93,7 @@ model = model_class.from_pretrained(
   `_should_write_hf_metadata(config)`.
 - `save_consolidated` now uses the canonical `"false"`, `"final"`, and `"every"`
   modes ([#2289](https://github.com/NVIDIA-NeMo/Automodel/pull/2289)). NeMo RL
-  exposes these Automodel-only settings under `policy.dtensor_cfg`, delegates
+  exposes these Automodel-only settings under `policy.automodel_cfg`, delegates
   normalization to Automodel, explicitly marks terminal checkpoint saves, and
   supports all three modes. Automodel still accepts legacy booleans, but NeMo RL
   intentionally exposes only canonical strings: use quoted `"false"` instead of

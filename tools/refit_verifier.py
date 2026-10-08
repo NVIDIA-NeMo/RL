@@ -90,6 +90,7 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
 
@@ -200,7 +201,7 @@ def setup_configs(args, tokenizer):
                 "eps": 1e-8,
             },
         },
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "enabled": False,
         },
         "dynamic_batching": {
@@ -722,6 +723,7 @@ def main_sglang():
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
     master_config = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(master_config)
 
     init_ray()
 

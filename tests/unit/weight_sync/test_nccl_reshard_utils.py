@@ -57,7 +57,7 @@ def _valid_nccl_reshard_config() -> SimpleNamespace:
                 "vllm_cfg": {},
             },
             "megatron_cfg": {"enabled": True},
-            "dtensor_cfg": {"enabled": False},
+            "automodel_cfg": {"enabled": False},
         }
     )
 

@@ -22,6 +22,8 @@ from nemo_rl.data.datasets.response_datasets.mmpr_tiny import (
     MMPRTinyDataset,
     format_mmpr_tiny_dataset,
 )
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 
 
 class TestFormatMMPRTinyDataset:
@@ -228,14 +230,15 @@ class TestVLMProcessorMMPRTiny:
     NemotronNanoVLV2Processor placeholder-style code path."""
 
     def test_processor_produces_valid_datum_spec(self, tiny_image_path):
-        result, _ = _run_processor(tiny_image_path)
+        result, processor = _run_processor(tiny_image_path)
 
         assert "message_log" in result
         assert "length" in result
         assert "extra_env_info" in result
         assert "ground_truth" in result["extra_env_info"]
         assert result["extra_env_info"]["ground_truth"] == "A"
-        assert "vllm_content" in result
+        assert result["vllm_content"] == processor.captured_call_text
+        assert result["vllm_content"].count("<image>") == 1
         assert "vllm_multi_modal_data" in result
         assert isinstance(result["vllm_multi_modal_data"]["image"], Image.Image)
         assert result["task_name"] == "mmpr-tiny"
@@ -244,6 +247,27 @@ class TestVLMProcessorMMPRTiny:
         assert user_message["pixel_values"].preprocess_mode == "patchify"
         assert user_message["pixel_values"].preprocess_kwargs == {"patch_dim": 16}
         assert user_message["pixel_values"].as_tensor().dtype == torch.float32
+
+    def test_vllm_receives_raw_prompt_and_learner_keeps_processed_ids(
+        self, tiny_image_path
+    ):
+        result, processor = _run_processor(tiny_image_path)
+        learner_ids = result["message_log"][0]["token_ids"].clone()
+        batch = BatchedDataDict(
+            input_ids=learner_ids.unsqueeze(0),
+            input_lengths=torch.tensor([len(learner_ids)]),
+            vllm_content=[result["vllm_content"]],
+            vllm_multi_modal_data=[result["vllm_multi_modal_data"]],
+        )
+        prompt = format_prompt_for_vllm_generation(batch)[0]
+        assert prompt["prompt"] == processor.captured_call_text
+        assert "prompt_token_ids" not in prompt
+        assert prompt["multi_modal_data"] is not None
+        assert (
+            prompt["multi_modal_data"]["image"]
+            is result["vllm_multi_modal_data"]["image"]
+        )
+        assert torch.equal(batch["input_ids"][0], learner_ids)
 
     def test_text_only_row_preserves_formatted_vllm_content(self):
         from nemo_rl.data.interfaces import TaskDataSpec
@@ -295,6 +319,7 @@ class TestVLMProcessorMMPRTiny:
             max_seq_length=8192,
             idx=0,
         )
+        assert multi["vllm_content"].count("<image>") == 2
         images = multi["vllm_multi_modal_data"]["image"]
         assert isinstance(images, list)
         assert len(images) == 2
@@ -333,7 +358,7 @@ class TestVLMProcessorMMPRTiny:
         result, _ = _run_processor(tiny_image_path, processor=processor)
 
         processor.conversation_preprocessor.assert_called_once()
-        assert result["vllm_content"] is None
+        assert result["vllm_content"] == "preprocessed"
         assert processor.captured_call_text == "preprocessed"
 
     def test_historical_tiled_processor_gets_media_metadata(self, tiny_image_path):
@@ -393,9 +418,8 @@ class TestVLMProcessorMMPRTiny:
 
         # The stub's apply_chat_template joins message parts with spaces,
         # so the captured text passed to __call__ is the chat-templated string.
-        # Verify the apply_chat_template output through captured_call_text below;
-        # placeholder-style processors send expanded token IDs to vLLM.
-        assert result["vllm_content"] is None
+        # vLLM must receive the unexpanded chat-template output.
+        assert result["vllm_content"] == expected_tokenizer_input
 
         # Verify exactly one <image> token in the final output
         assert processor.captured_call_text.count("<image>") == 1

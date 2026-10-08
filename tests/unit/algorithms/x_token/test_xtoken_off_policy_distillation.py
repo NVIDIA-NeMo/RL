@@ -155,9 +155,8 @@ def _make_master_config(
                 "val_at_end": val_at_end,
             },
             "policy": {
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": True,
-                    "_v2": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
                 },
@@ -172,9 +171,8 @@ def _make_master_config(
                     **{
                         "projection_matrix_path": "/tmp/dummy-projection.pt",
                         "weight": 1.0,
-                        "dtensor_cfg": {
+                        "automodel_cfg": {
                             "enabled": True,
-                            "_v2": True,
                             "tensor_parallel_size": 1,
                             "context_parallel_size": 1,
                         },
@@ -325,46 +323,6 @@ def test_empty_teachers_list_rejected_at_config_load():
         e["loc"] == ("teachers",) and e["type"] == "too_short"
         for e in exc_info.value.errors()
     )
-
-
-def test_setup_requires_dtensor_v2_student():
-    cfg = _make_master_config()
-    cfg.policy["dtensor_cfg"]["_v2"] = False
-    with (
-        patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
-        pytest.raises(
-            ValueError,
-            match=r"policy\.dtensor_cfg\._v2=false selects the DTensor v1 backend",
-        ),
-    ):
-        setup(
-            cfg,
-            student_tokenizer=_make_tokenizer(32),
-            teacher_tokenizers=[_make_tokenizer(24)],
-            train_dataset=MagicMock(),
-            val_dataset=None,
-        )
-    assert mock_cluster.call_count == 0
-
-
-def test_setup_requires_dtensor_v2_teacher():
-    cfg = _make_master_config()
-    cfg.teachers[0].dtensor_cfg["_v2"] = False
-    with (
-        patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
-        pytest.raises(
-            ValueError,
-            match=r"teachers\.0\.dtensor_cfg\._v2=false selects the DTensor v1 backend",
-        ),
-    ):
-        setup(
-            cfg,
-            student_tokenizer=_make_tokenizer(32),
-            teacher_tokenizers=[_make_tokenizer(24)],
-            train_dataset=MagicMock(),
-            val_dataset=None,
-        )
-    assert mock_cluster.call_count == 0
 
 
 def test_setup_injects_vocab_sizes_into_loss_config():
@@ -756,9 +714,8 @@ def test_setup_builds_one_policy_per_teacher():
             **{
                 "projection_matrix_path": None,
                 "weight": 0.5,
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": True,
-                    "_v2": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
                 },
