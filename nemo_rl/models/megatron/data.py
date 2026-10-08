@@ -756,12 +756,12 @@ def process_microbatch(
     """
     prepacked = "cu_seqlens" in data_dict
     if (
-        create_packed_seq_padding_mask
+        prepad_packed_seq_for_hybridep
         and model_slices_context_parallel_inputs
         and not prepacked
     ):
         raise NotImplementedError(
-            "HybridEP padding masks are not supported for models that perform "
+            "HybridEP input prepadding is not supported for models that perform "
             "context-parallel input slicing internally."
         )
     if prepad_packed_seq_for_hybridep and delegate_pack_to_model:
@@ -900,6 +900,11 @@ def process_microbatch(
                         )
                 attention_mask = None
             elif delegate_pack_to_model:
+                if create_packed_seq_padding_mask:
+                    raise NotImplementedError(
+                        "Router padding masks require real-token validity through "
+                        "model-owned sequence packing, which is not supported."
+                    )
                 has_mtp_loss_mask = "mtp_loss_mask" in data_dict
                 assert not has_mtp_loss_mask or delegate_mtp_loss_mask_to_model, (
                     "MTP training requires a self-packing VLM that advertises "
