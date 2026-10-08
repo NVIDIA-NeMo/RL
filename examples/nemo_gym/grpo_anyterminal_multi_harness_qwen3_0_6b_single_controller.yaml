@@ -154,13 +154,17 @@ env:
           # context limit. The input ceiling reserves a 4K call plus a
           # 512-token guard; OpenCode compacts before reaching that ceiling.
           agent_kwargs:
-            context_window: ${policy.max_total_sequence_length}
+            context_window: ${add:${policy.max_total_sequence_length},-512}
             max_input_tokens: ${add:${policy.max_total_sequence_length},-4608}
             max_output_tokens: 4096
     anyterminal_openclaw:
       responses_api_agents:
         anyterminal_agent:
           global_agent_timeout: 300
+          agent_kwargs:
+            # OpenClaw otherwise advertises the server's full 16K boundary and
+            # can render a prompt with no token left for generation.
+            context_window: ${add:${policy.max_total_sequence_length},-512}
     anyterminal_pi:
       responses_api_agents:
         anyterminal_agent:
