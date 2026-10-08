@@ -825,3 +825,14 @@ def test_seeded_megatron_rollouts_reject_speculation():
     config.policy["generation"]["mcore_generation_config"]["expose_http_server"] = True
     with pytest.raises(ValueError, match="speculative decoding"):
         validate_single_controller_config(config)
+
+
+def test_seeded_rollouts_reject_replay_regeneration_without_seed_metadata():
+    config = _master_config(seeded_rollouts=True)
+    config.policy["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+    config.checkpointing["load_replay_buffer"] = False
+    with pytest.raises(ValueError, match="load_replay_buffer=true"):
+        validate_single_controller_config(config)

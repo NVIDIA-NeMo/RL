@@ -132,11 +132,8 @@ class AutomodelBackendConfig(TypedDict):
     # MoE expert GEMM backend: "torch" (per-expert loop), "te" (TE GroupedLinear),
     # "gmm" (grouped_gemm.ops.gmm), "torch_mm" (torch._grouped_mm).
     experts: NotRequired[str]
-    # MoE token dispatcher: "torch" (DTensor all-gather/reduce-scatter), "deepep", etc.
+    # MoE token dispatcher: "torch" (DTensor all-gather/reduce-scatter) or "hybridep".
     dispatcher: NotRequired[str]
-    # Enable DeepEP (Deep Expert Parallelism) for MoE models.
-    # Deprecated upstream: use dispatcher="deepep" and experts="gmm"/"torch_mm" instead.
-    enable_deepep: NotRequired[bool]
     # Use fake balanced gate for testing/debugging MoE
     fake_balanced_gate: NotRequired[bool]
     # Enable HuggingFace state dict adapter for checkpoint saving/loading plus refit support for RL
@@ -174,7 +171,7 @@ class AutomodelKwargs(TypedDict):
     force_hf: NotRequired[bool]
 
 
-class DTensorConfigDisabled(TypedDict):
+class AutomodelConfigDisabled(TypedDict):
     enabled: Literal[False]
 
 
@@ -196,10 +193,9 @@ class AutomodelCheckpointConfig(TypedDict, total=False):
     consolidation_timeout_minutes: int
 
 
-class DTensorConfig(TypedDict):
+class AutomodelConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
-    _v2: NotRequired[bool]
     # Distributed parallelism sizes
     # data_parallel_size is derived from world_size / (tp * cp * ep)
     tensor_parallel_size: int
@@ -670,7 +666,7 @@ class PolicyConfig(TypedDict):
     ]  # used in static batched (framework) generation
     precision: str
     reward_model_cfg: NotRequired[RewardModelConfig]
-    dtensor_cfg: DTensorConfig | DTensorConfigDisabled
+    automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
     draft: NotRequired[Eagle3DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]

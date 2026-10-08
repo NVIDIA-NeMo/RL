@@ -450,19 +450,20 @@ def test_every_context_accepting_method_is_dispatched_with_a_carrier():
 
     dispatched: set[str] = set()
     unwired: dict[str, str] = {}
-    for source in _python_sources(_REPO / "nemo_rl"):
-        for node in ast.walk(ast.parse(source.read_text())):
-            if not isinstance(node, ast.Call):
-                continue
-            targets = _dispatch_targets(node, decorated, indirect)
-            if not targets:
-                continue
-            where = f"{source.relative_to(_REPO).as_posix()}:{node.lineno}"
-            for target, sends_carrier in targets:
-                if sends_carrier:
-                    dispatched.add(target)
-                else:
-                    unwired[target] = where
+    for directory in (_REPO / "nemo_rl", _REPO / "examples"):
+        for source in _python_sources(directory):
+            for node in ast.walk(ast.parse(source.read_text())):
+                if not isinstance(node, ast.Call):
+                    continue
+                targets = _dispatch_targets(node, decorated, indirect)
+                if not targets:
+                    continue
+                where = f"{source.relative_to(_REPO).as_posix()}:{node.lineno}"
+                for target, sends_carrier in targets:
+                    if sends_carrier:
+                        dispatched.add(target)
+                    else:
+                        unwired[target] = where
 
     assert not unwired, (
         "methods decorated with @accepts_trace_context whose dispatch site does "

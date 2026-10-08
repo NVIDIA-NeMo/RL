@@ -28,7 +28,10 @@ import torch
 from omegaconf import OmegaConf
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
-from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    OPDAdvantageEstimator,
+)
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     LEGACY_REPLAY_BUFFER_FILENAME,
@@ -88,6 +91,7 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.logger import LoggerConfig, WandbConfig
 
 # Captured at import, before the patched_factories fixture swaps it for a mock.
 _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
@@ -195,7 +199,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
-        logger={"wandb_enabled": False, "wandb": {}},
+        logger=LoggerConfig(log_dir="/tmp/test-logs"),
         cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
@@ -471,6 +475,49 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract(monkeypatch)
     )
 
 
+def test_single_controller_mopd_recipe_builds_tropd_estimator(monkeypatch):
+    """TROPD knobs reach the SC advantage estimator from the recipe YAML."""
+    monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    recipe = repo_root / (
+        "examples/configs/recipes/llm/"
+        "mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller.yaml"
+    )
+    overrides = OmegaConf.from_dotlist(
+        [
+            "grpo.adv_estimator.proximal_teacher_alpha=0.5",
+            "grpo.adv_estimator.subtract_global_baseline=true",
+        ]
+    )
+    resolved = OmegaConf.to_container(
+        OmegaConf.merge(load_config(recipe), overrides), resolve=True
+    )
+
+    assert isinstance(resolved, dict)
+    config = MasterConfig.model_validate(resolved)
+    validate_single_controller_config(config)
+    estimator = sc_setup_mod._build_advantage_estimator(config)
+
+    assert isinstance(estimator, OPDAdvantageEstimator)
+    assert estimator.proximal_teacher_alpha == 0.5
+    assert estimator.subtract_global_baseline is True
+
+
+@pytest.mark.parametrize(
+    "tropd_override",
+    [{"proximal_teacher_alpha": 0.2}, {"subtract_global_baseline": True}],
+)
+def test_fullvocab_recipe_rejects_tropd_before_allocation(tropd_override):
+    """Full-vocab MOPD ignores advantages, so SC rejects TROPD before allocating."""
+    config = _load_fullvocab_master_config()
+    config.grpo.adv_estimator = config.grpo.adv_estimator.model_copy(
+        update=tropd_override
+    )
+    with pytest.raises(ValueError, match="ignores advantages"):
+        validate_single_controller_config(config)
+
+
 def test_single_controller_ppo_recipe_inherits_overlong_filtering():
     """The SC nightly exercises the overlong filtering inherited from its parent."""
     register_omegaconf_resolvers()
@@ -570,7 +617,7 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
     )
     overrides = [
         "policy.model_name=Qwen/Qwen3-0.6B",
-        "policy.dtensor_cfg.enabled=false",
+        "policy.automodel_cfg.enabled=false",
         "policy.megatron_cfg.enabled=true",
         "policy.megatron_cfg.tensor_model_parallel_size=1",
         "policy.megatron_cfg.pipeline_model_parallel_size=1",
@@ -999,7 +1046,6 @@ class TestSetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger["log_dir"] = str(tmp_path / "logs")
         mc.token_capture.enabled = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
@@ -1077,7 +1123,6 @@ class TestSetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger = {"log_dir": str(tmp_path / "logs")}
         mc.token_capture.enabled = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
@@ -1257,6 +1302,32 @@ class TestSetup:
 
         patched_factories["_build_clusters"].assert_not_called()
 
+    def test_mopd_global_baseline_requires_one_streaming_chunk_per_step(
+        self, patched_factories
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.grpo.adv_estimator = AdvEstimatorConfig(
+            name="opd", subtract_global_baseline=True
+        )
+        mc.on_policy_distillation = OnPolicyDistillationConfig(
+            enabled=True,
+            teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+            default_teacher_alias="teacher",
+            non_colocated_teachers={"enabled": True},
+        )
+        # One chunk per step: the estimator's batch is the whole step.
+        validate_single_controller_config(mc)
+
+        mc.async_rl.min_groups_for_streaming_train = mc.grpo.num_prompts_per_step // 2
+        with pytest.raises(ValueError, match="subtract_global_baseline"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_clusters"].assert_not_called()
+
+        # Only the global baseline needs the whole step; plain MOPD may stream.
+        mc.grpo.adv_estimator = AdvEstimatorConfig(name="opd")
+        validate_single_controller_config(mc)
+
     def test_mopd_reserves_before_models_and_initializes_teacher_last(
         self, patched_factories, monkeypatch
     ):
@@ -1334,7 +1405,7 @@ class TestSetup:
                 "must equal policy.train_global_batch_size",
             ),
             ("buffer_capacity", ValueError, "required capacity"),
-            ("megatron_dtensor_trainer", ValueError, "megatron_cfg.enabled"),
+            ("megatron_automodel_trainer", ValueError, "megatron_cfg.enabled"),
             ("megatron_recompute_mismatch", ValueError, "kv_cache_management_mode"),
             ("megatron_fleet_health", NotImplementedError, "generation_fleet_health"),
             (
@@ -1386,7 +1457,7 @@ class TestSetup:
         elif invalid_case == "deferred_routes_without_capture":
             mc = _make_master_config()
             mc.token_capture.defer_routed_experts_to_policy = True
-        elif invalid_case == "megatron_dtensor_trainer":
+        elif invalid_case == "megatron_automodel_trainer":
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=False
             )
@@ -1591,10 +1662,12 @@ class TestSetup:
         patched_factories,
     ):
         mc = _make_master_config()
-        mc.logger = {
-            "wandb_enabled": wandb_enabled,
-            "wandb": {"log_nemo_gym_full_result_tables": table_flag},
-        }
+        mc.logger = LoggerConfig.model_construct(
+            wandb_enabled=wandb_enabled,
+            wandb=WandbConfig.model_construct(
+                log_nemo_gym_full_result_tables=table_flag
+            ),
+        )
 
         with patch.object(sc_setup_mod, "RolloutManager") as mock_rollout_manager:
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -1828,9 +1901,6 @@ class TestSetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        # Extend, don't replace: setup_single_controller also indexes the
-        # wandb keys that _make_master_config populates.
-        mc.logger = {**mc.logger, "log_dir": "/tmp/test-token-capture"}
         mc.token_capture.enabled = True
         mc.token_capture.num_reassembler_workers = 3
         patched_factories["setup_response_data"].return_value = (
@@ -2321,9 +2391,6 @@ class TestSetup:
     def _make_megatron_token_capture_config(self) -> MasterConfig:
         """Gym-on Megatron config with token capture enabled (expose_http_server=true)."""
         mc = self._make_gym_megatron_config()
-        # Extend, don't replace: setup_single_controller also indexes the
-        # wandb keys that _make_master_config populates.
-        mc.logger = {**mc.logger, "log_dir": "/tmp/test-megatron-token-capture"}
         mc.token_capture.enabled = True
         return mc
 
@@ -2550,7 +2617,6 @@ class TestNativeTQRecoverySetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger["log_dir"] = str(tmp_path / "logs")
         mc.token_capture.enabled = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,

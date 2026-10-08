@@ -43,9 +43,8 @@ policy: &POLICY_BASE
 
     offload_optimizer_for_logprob: false
 
-    dtensor_cfg: &DTENSOR_BASE
+    automodel_cfg: &AUTOMODEL_BASE
         enabled: true
-        _v2: true
         checkpoint:
             model_save_format: "safetensors"
             save_consolidated: "false"
@@ -76,7 +75,7 @@ policy: &POLICY_BASE
     # makes the training sequence length divisible by the tensor parallel size
     # this is useful for sequence parallel training
     # must be divisible by 2*cp
-    make_sequence_length_divisible_by: ${mul:${mul:${.dtensor_cfg.tensor_parallel_size}, ${.dtensor_cfg.context_parallel_size}}, 2}
+    make_sequence_length_divisible_by: ${mul:${mul:${.automodel_cfg.tensor_parallel_size}, ${.automodel_cfg.context_parallel_size}}, 2}
     optimizer:
         name: "torch.optim.AdamW"
         kwargs:
@@ -239,8 +238,8 @@ policy: &POLICY_BASE
 teacher:
     <<: *POLICY_BASE
     model_name: "Qwen/Qwen3-4B"
-    dtensor_cfg:
-        <<: *DTENSOR_BASE
+    automodel_cfg:
+        <<: *AUTOMODEL_BASE
         context_parallel_size: 2 
         tensor_parallel_size: 4
 
@@ -276,6 +275,9 @@ logger:
         project: "nemo-distillation"
         name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
         log_nemo_gym_full_result_tables: false
+        entity: null
+        id: null
+        resume: null
     swanlab:
         project: "nemo-distillation"
         name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
@@ -285,6 +287,8 @@ logger:
         experiment_name: "distillation-dev"
         run_name: "distillation-math-cl-logger"
         tracking_uri: "http://localhost:5000"
+        run_id: null
+        artifact_location: null
     gpu_monitoring:
         collection_interval: 10
         flush_interval: 10
