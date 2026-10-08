@@ -41,6 +41,7 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     RewardPenaltyConfig,
     RewardScalingConfig,
+    _apply_agent_loss_weights,
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
@@ -55,6 +56,7 @@ from nemo_rl.algorithms.grpo import (
     _save_async_replay_buffer_checkpoint,
     _shutdown_completed_nemo_gym_startup,
     _startup_pipeline_ready,
+    _validate_agent_loss_weights,
     _validate_multimodal_dedup_capability,
     _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
@@ -369,6 +371,101 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+class TestAgentLossWeights:
+    @staticmethod
+    def _train_data(trained_tokens, sample_mask):
+        width = max(trained_tokens)
+        token_mask = torch.tensor(
+            [[1.0] * n + [0.0] * (width - n) for n in trained_tokens]
+        )
+        return BatchedDataDict(
+            {"token_mask": token_mask, "sample_mask": torch.tensor(sample_mask)}
+        )
+
+    def test_weights_scale_sample_mask_and_report_token_shares(self):
+        # One long multi-turn trace next to two short tool-use rollouts: unweighted,
+        # the short agent is 2 * 25 / 1050 of the trained tokens; x8 lifts it to 400 / 1400.
+        train_data = self._train_data([1000, 25, 25], [1.0, 1.0, 1.0])
+        agent_refs = [
+            {"name": "long_agent"},
+            {"name": "short_agent"},
+            {"name": "short_agent"},
+        ]
+
+        metrics = _apply_agent_loss_weights(
+            train_data, agent_refs, {"short_agent": 8.0}
+        )
+
+        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 8.0, 8.0]))
+        assert metrics["agent_loss_weights/short_agent/weight"] == 8.0
+        assert metrics["agent_loss_weights/long_agent/weight"] == 1.0
+        assert metrics["agent_loss_weights/short_agent/num_samples"] == 2.0
+        assert metrics[
+            "agent_loss_weights/short_agent/token_share_unweighted"
+        ] == pytest.approx(50 / 1050)
+        assert metrics[
+            "agent_loss_weights/short_agent/token_share_weighted"
+        ] == pytest.approx(400 / 1400)
+        assert metrics[
+            "agent_loss_weights/long_agent/token_share_weighted"
+        ] == pytest.approx(1000 / 1400)
+
+    def test_masked_rows_stay_masked_and_do_not_count_tokens(self):
+        train_data = self._train_data([10, 10, 10], [1.0, 0.0, 0.5])
+        agent_refs = [{"name": "a"}, {"name": "a"}, {"name": "b"}]
+
+        metrics = _apply_agent_loss_weights(train_data, agent_refs, {"a": 3.0})
+
+        assert torch.equal(train_data["sample_mask"], torch.tensor([3.0, 0.0, 0.5]))
+        assert metrics["agent_loss_weights/a/token_share_unweighted"] == (
+            pytest.approx(10 / 15)
+        )
+        assert metrics["agent_loss_weights/a/token_share_weighted"] == (
+            pytest.approx(30 / 35)
+        )
+
+    def test_unset_weights_are_a_noop(self):
+        train_data = self._train_data([4, 4], [1.0, 1.0])
+
+        assert _apply_agent_loss_weights(train_data, None, None) == {}
+        assert _apply_agent_loss_weights(train_data, None, {}) == {}
+        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 1.0]))
+
+    def test_missing_or_misaligned_agent_refs_raise(self):
+        train_data = self._train_data([4, 4], [1.0, 1.0])
+
+        with pytest.raises(ValueError, match="agent_ref"):
+            _apply_agent_loss_weights(train_data, None, {"a": 2.0})
+        with pytest.raises(ValueError, match="agent_ref"):
+            _apply_agent_loss_weights(train_data, [{"name": "a"}], {"a": 2.0})
+
+    @pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf")])
+    def test_config_rejects_invalid_weights(self, weight):
+        with pytest.raises(ValueError, match="agent_loss_weights"):
+            GRPOConfig(agent_loss_weights={"a": weight})
+
+    def test_validate_requires_nemo_gym_and_legacy_trainer(self, monkeypatch):
+        config = SimpleNamespace(
+            grpo=SimpleNamespace(agent_loss_weights={"a": 2.0}), data_plane=None
+        )
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.grpo.should_use_nemo_gym", lambda cfg: False
+        )
+        with pytest.raises(ValueError, match="NeMo-Gym"):
+            _validate_agent_loss_weights(config)
+
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.grpo.should_use_nemo_gym", lambda cfg: True
+        )
+        _validate_agent_loss_weights(config)
+        config.data_plane = {"enabled": True}
+        with pytest.raises(NotImplementedError, match="data_plane"):
+            _validate_agent_loss_weights(config)
+
+        config.grpo.agent_loss_weights = None
+        _validate_agent_loss_weights(config)
 
 
 def test_initial_policy_generation_stale() -> None:
@@ -4452,6 +4549,28 @@ def test_grpo_train_clips_advantages_when_configured(
     clipped = policy.train.call_args[0][0]["advantages"]
     assert clipped.min().item() == -2.0
     assert clipped.max().item() == 3.0
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_train_applies_agent_loss_weights(
+    mock_grpo_components, train_func, monkeypatch
+):
+    """grpo.agent_loss_weights scales the sample_mask handed to policy.train."""
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["agent_ref"] = [{"name": "short_agent"}]
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.agent_loss_weights = {"short_agent": 4.0}
+
+    _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch)
+
+    policy = mock_grpo_components["policy"]
+    policy.train.assert_called_once()
+    assert policy.train.call_args[0][0]["sample_mask"].tolist() == [4.0]
+    logged = {}
+    for call in mock_grpo_components["logger"].log_metrics.call_args_list:
+        logged.update(call.args[0])
+    assert logged["agent_loss_weights/short_agent/weight"] == 4.0
+    assert logged["agent_loss_weights/short_agent/num_samples"] == 1.0
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])

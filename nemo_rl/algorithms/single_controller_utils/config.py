@@ -1306,6 +1306,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
 
+    if getattr(algo_cfg, "agent_loss_weights", None):
+        raise NotImplementedError(
+            "grpo.agent_loss_weights is applied by grpo_train and "
+            "async_grpo_train only; SingleController does not support it yet."
+        )
+
     reward_penalties_enabled = any(
         getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
     )
