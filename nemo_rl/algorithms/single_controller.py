@@ -115,6 +115,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     is_ppo_run,
 )
+from nemo_rl.algorithms.single_controller_utils.masking_stats import (
+    new_masking_stats_accumulator,
+    reduce_masking_stats,
+)
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
     ROLLOUT_CHECKPOINT_ATTEMPT_REASONS,
@@ -128,6 +132,11 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ensure_bootstrap_anchor,
     prepare_snapshot_paths,
     prune_bootstrap_snapshots,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
+    merge_accumulator_partial,
+    new_rollout_stats_accumulator,
+    reduce_rollout_stats,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
@@ -719,6 +728,12 @@ class SingleControllerActor:
             "seq_logprob_error_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
+        # Per-sample rollout distributions (generated tokens, assistant turns,
+        # group reward mix, context use) and why rows were masked; filled from
+        # each advantage-stage outcome, see single_controller_utils/rollout_stats.py
+        # and masking_stats.py.
+        self._rollout_stats_acc = new_rollout_stats_accumulator()
+        self._masking_stats_acc = new_masking_stats_accumulator()
         self._opd_gap_sum = 0.0
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
@@ -3294,6 +3309,25 @@ class SingleControllerActor:
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
+                try:
+                    step_metrics.update(
+                        reduce_rollout_stats(
+                            self._rollout_stats_acc,
+                            max_seq_len=self._master_config.policy.get(
+                                "max_total_sequence_length"
+                            ),
+                        )
+                    )
+                except Exception as error:  # metrics must never fail a step
+                    log.warning("Skipping rollout_stats metrics: %s", error)
+                try:
+                    step_metrics.update(reduce_masking_stats(self._masking_stats_acc))
+                except Exception as error:  # metrics must never fail a step
+                    log.warning("Skipping masking_stats metrics: %s", error)
+                try:
+                    step_metrics.update(self._rollout_manager.pop_mask_rule_metrics())
+                except Exception as error:  # metrics must never fail a step
+                    log.warning("Skipping mask_rules metrics: %s", error)
                 per_group_rollout_metrics: dict[str, list[Any]] = {}
                 for group_metrics in selected_rollout_metrics:
                     for metric_name, value in group_metrics.items():
@@ -3310,6 +3344,8 @@ class SingleControllerActor:
                 except RayActorError as error:
                     log.warning("Skipping generation step metrics: %s", error)
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
+                self._rollout_stats_acc = new_rollout_stats_accumulator()
+                self._masking_stats_acc = new_masking_stats_accumulator()
                 step_metrics.update(
                     _pooled_opd_metrics(
                         self._opd_stat_sum,
@@ -5380,6 +5416,17 @@ class SingleControllerActor:
         )
         self._step_log_dict["reward_partials"].append(outcome.reward_partial)
         self._step_log_dict["advantage_partials"].append(outcome.advantage_partial)
+        try:
+            if outcome.rollout_stats_partial is not None:
+                merge_accumulator_partial(
+                    self._rollout_stats_acc, outcome.rollout_stats_partial
+                )
+            if outcome.masking_stats_partial is not None:
+                merge_accumulator_partial(
+                    self._masking_stats_acc, outcome.masking_stats_partial
+                )
+        except Exception as error:  # metrics must never fail a step
+            log.warning("Skipping rollout/masking stats merge: %s", error)
         if outcome.seq_logprob_error_metrics is not None:
             self._step_log_dict["seq_logprob_error_metrics"].append(
                 outcome.seq_logprob_error_metrics

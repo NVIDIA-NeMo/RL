@@ -43,6 +43,14 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     split_meta_by_prompt_group,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.masking_stats import (
+    new_masking_stats_accumulator,
+    reduce_masking_stats,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
+    new_rollout_stats_accumulator,
+    reduce_rollout_stats,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -481,6 +489,10 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         # disk shard-side.
         "train_data_dump_s",
         "train_data_dump_rows",
+        # One entry per row of the call (a few hundred floats), the input of
+        # train/{gen_tokens,turns,seq_len,groups,...} and train/masking/*.
+        "rollout_stats_partial",
+        "masking_stats_partial",
     }
 
 
@@ -588,6 +600,7 @@ def _controller(
     *,
     fail: bool = False,
     dump_dir: str | None = None,
+    masked_sample_rewards_in_baseline: bool = False,
 ):
     """Build the controller stub _advantage_stage needs, and nothing more.
 
@@ -599,6 +612,7 @@ def _controller(
         num_generations_per_prompt=GROUP_SIZE,
         adv_estimator=AdvEstimatorConfig(name=estimator_name),
         seq_logprob_error_threshold=None,
+        masked_sample_rewards_in_baseline=masked_sample_rewards_in_baseline,
     )
     is_opd = estimator_name == "opd"
     estimator = (
@@ -651,6 +665,8 @@ def _controller(
     ctrl._opd_stat_sum = ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
     ctrl._opd_gap_sum = 0.0
+    ctrl._rollout_stats_acc = new_rollout_stats_accumulator()
+    ctrl._masking_stats_acc = new_masking_stats_accumulator()
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -677,6 +693,8 @@ def _run(estimator_name: str, num_actors: int):
         # shard that got them wrong would only show up here.
         seq_logprob_error_metrics=ctrl._step_log_dict["seq_logprob_error_metrics"],
     )
+    metrics.update(reduce_rollout_stats(ctrl._rollout_stats_acc, max_seq_len=SEQ))
+    metrics.update(reduce_masking_stats(ctrl._masking_stats_acc))
     opd = (ctrl._opd_stat_sum, ctrl._opd_stat_sumsq, ctrl._opd_stat_count)
     return ctrl, advantages, metrics, has_valid, opd
 
@@ -695,6 +713,10 @@ def test_sharded_pool_matches_in_process(estimator_name: str) -> None:
     # 6 groups over 3 actors: every actor got exactly 2 whole groups.
     assert [actor.calls for actor in ctrl._advantage_actors] == [[8], [8], [8]]
     torch.testing.assert_close(adv_pool, adv_local)
+    # Includes the rollout_stats and masking_stats breakdowns, merged from
+    # three calls' partials: group ids must not collide across shards.
+    assert metrics_local["groups/count"] == NUM_GROUPS
+    assert metrics_local["masking/groups"] == NUM_GROUPS
     assert metrics_pool == pytest.approx(metrics_local)
     assert valid_pool == valid_local
     assert opd_pool == pytest.approx(opd_local)
@@ -759,3 +781,43 @@ def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:
     assert ctrl._available_advantage_actors.qsize() == 0
     # The mutation cut is released even on failure.
     assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
+
+
+def _incomplete_rows() -> dict[str, dict[str, torch.Tensor]]:
+    """``_rows`` with the first member of every group env-flagged at reward 0."""
+    rows = _rows()
+    for group in range(NUM_GROUPS):
+        for member in range(GROUP_SIZE):
+            row = rows[f"s{group * GROUP_SIZE + member}"]
+            row["total_reward"] = torch.tensor(0.0 if member == 0 else 1.0)
+            row["mask_sample"] = torch.tensor(member == 0)
+    return rows
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_masked_sample_rewards_in_baseline(keep: bool) -> None:
+    """Flagged rows never train; with the switch their 0 reward stays in the baseline.
+
+    Without it each group's surviving rows all scored 1, so their baseline is 1
+    and they carry no advantage. With it the flagged 0 keeps reading as a failure
+    for the group, so the survivors get a positive advantage. The flagged rows
+    themselves are excluded by the loss mask (sample_mask), not by a zero here.
+    """
+    store = _RowStore(_incomplete_rows())
+    ctrl = _controller("grpo", 0, store, masked_sample_rewards_in_baseline=keep)
+    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    advantages = torch.stack(
+        [store.rows[f"s{i}"]["advantages"] for i in range(NUM_GROUPS * GROUP_SIZE)]
+    ).reshape(NUM_GROUPS, GROUP_SIZE, SEQ)
+    sample_masks = torch.stack(
+        [store.rows[f"s{i}"]["sample_mask"] for i in range(NUM_GROUPS * GROUP_SIZE)]
+    ).reshape(NUM_GROUPS, GROUP_SIZE)
+    assert torch.all(sample_masks[:, 0] == 0) and torch.all(sample_masks[:, 1:] == 1)
+    if keep:
+        assert torch.all(advantages[:, 1:] > 0)
+    else:
+        assert torch.all(advantages[:, 1:] == 0)
+    masking = reduce_masking_stats(ctrl._masking_stats_acc)
+    assert masking["masking/env_flag_rows"] == NUM_GROUPS
+    assert masking["masking/trained_rows"] == NUM_GROUPS * (GROUP_SIZE - 1)
+    assert masking["masking/reinstated_rows"] == (NUM_GROUPS if keep else 0)

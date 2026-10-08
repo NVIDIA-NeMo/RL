@@ -20,7 +20,7 @@ import enum
 import json
 import math
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
@@ -63,6 +63,13 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     Completion,
     PromptGroupRecord,
+)
+from nemo_rl.experience.mask_sample_rules import (
+    MaskSampleRule,
+    apply_mask_sample_rules,
+    mask_rule_metrics,
+    mask_rule_step_metrics,
+    matching_rules,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_recovery import (
@@ -937,6 +944,9 @@ class AsyncNemoGymRolloutImpl:
         max_rollout_turns: int,
         generation_config: GenerationConfig,
         mask_env_flagged_samples: bool = True,
+        # Operator-side mask_sample rules over the Gym response (env.mask_sample_rules);
+        # empty means the response is used as-is.
+        mask_sample_rules: Sequence[MaskSampleRule] = (),
         reward_penalty_config: Optional[dict[str, Any]] = None,
         # Optional so direct construction does not have to carry the resiliency wiring;
         # RolloutManager always passes both explicitly.
@@ -958,6 +968,14 @@ class AsyncNemoGymRolloutImpl:
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
+        self._mask_sample_rules = tuple(mask_sample_rules)
+        # Step-level rule hits, drained by pop_mask_rule_metrics() once per
+        # training step (the per-group rollout_metrics do not reach the
+        # controller's logger on the token-capture path).
+        self._mask_rule_step_counts: dict[str, int] = {}
+        self._mask_rule_step_reward_sums: dict[str, float] = {}
+        self._mask_rule_step_any = 0
+        self._mask_rule_step_seen = 0
         self._log_full_result_tables = log_full_result_tables
         self._reward_penalty_config = reward_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
@@ -1362,6 +1380,11 @@ class AsyncNemoGymRolloutImpl:
             _tensorize_by_key(prompt_message_log, "token_ids")
             # Apply penalties before Completion captures each result's reward, while
             # preserving the batch-level counts used by legacy Gym metrics.
+            # Rule hits are counted here, once per group (the streamed per-row
+            # conversion above sees the same results), on the rewards before
+            # penalties, so the masked rows' reward mean is what the env scored.
+            mask_rule_stats = self._mask_rule_stats(completed_results)
+            self._record_mask_rule_step_hits(len(completed_results), mask_rule_stats)
             completions, penalty_counts = self._results_to_completions(
                 completed_results
             )
@@ -1376,6 +1399,18 @@ class AsyncNemoGymRolloutImpl:
             rollout_metrics.update(
                 self._compute_reward_penalty_metrics(
                     penalty_counts, len(completed_results)
+                )
+            )
+            mask_rule_counts, mask_rule_reward_sums, mask_rule_any_count = (
+                mask_rule_stats
+            )
+            rollout_metrics.update(
+                mask_rule_metrics(
+                    mask_rule_counts,
+                    self._mask_sample_rules,
+                    len(completed_results),
+                    reward_sums=mask_rule_reward_sums,
+                    any_count=mask_rule_any_count,
                 )
             )
 
@@ -1415,6 +1450,12 @@ class AsyncNemoGymRolloutImpl:
                 (result["full_result"].get("instance_config") or {}).pop(
                     "mask_sample", None
                 )
+        # Operator rules (env.mask_sample_rules) set the same flag from fields the
+        # Gym response already carries. Applied after the gate so an explicit rule
+        # is honored even when the environment's own flags are dropped. Idempotent:
+        # the streamed per-row conversion and the group conversion see one result.
+        for result in results:
+            apply_mask_sample_rules(result["full_result"], self._mask_sample_rules)
 
         penalty_counts = apply_reward_penalties(
             token_results, self._reward_penalty_config
@@ -1450,6 +1491,61 @@ class AsyncNemoGymRolloutImpl:
                 )
             )
         return completions, penalty_counts
+
+    def _mask_rule_stats(
+        self, results: list[dict]
+    ) -> tuple[dict[str, int], dict[str, float], int]:
+        """Per-rule hit counts and reward sums of ``results``, and how many matched any rule."""
+        if not self._mask_sample_rules:
+            return {}, {}, 0
+        counts: dict[str, int] = {}
+        reward_sums: dict[str, float] = {}
+        any_count = 0
+        for result in results:
+            matched = matching_rules(result["full_result"], self._mask_sample_rules)
+            if not matched:
+                continue
+            any_count += 1
+            reward = float(result["full_result"].get("reward") or 0.0)
+            for rule_name in matched:
+                counts[rule_name] = counts.get(rule_name, 0) + 1
+                reward_sums[rule_name] = reward_sums.get(rule_name, 0.0) + reward
+        return counts, reward_sums, any_count
+
+    def _record_mask_rule_step_hits(
+        self,
+        num_results: int,
+        stats: tuple[dict[str, int], dict[str, float], int],
+    ) -> None:
+        """Add one group's rule hits to the step totals pop_mask_rule_metrics() drains."""
+        if not self._mask_sample_rules:
+            return
+        counts, reward_sums, any_count = stats
+        self._mask_rule_step_seen += num_results
+        self._mask_rule_step_any += any_count
+        for name, count in counts.items():
+            self._mask_rule_step_counts[name] = (
+                self._mask_rule_step_counts.get(name, 0) + count
+            )
+            self._mask_rule_step_reward_sums[name] = (
+                self._mask_rule_step_reward_sums.get(name, 0.0)
+                + reward_sums.get(name, 0.0)
+            )
+
+    def pop_mask_rule_metrics(self) -> dict[str, float]:
+        """Drain the step-level env.mask_sample_rules hits as ``mask_rules/*`` metrics."""
+        out = mask_rule_step_metrics(
+            self._mask_rule_step_counts,
+            self._mask_sample_rules,
+            reward_sums=self._mask_rule_step_reward_sums,
+            any_count=self._mask_rule_step_any,
+            rollouts_seen=self._mask_rule_step_seen,
+        )
+        self._mask_rule_step_counts = {}
+        self._mask_rule_step_reward_sums = {}
+        self._mask_rule_step_any = 0
+        self._mask_rule_step_seen = 0
+        return out
 
     def _compute_reward_penalty_metrics(
         self, penalty_counts: dict[str, int], num_results: int
@@ -1608,6 +1704,7 @@ class RolloutManager:
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
         mask_env_flagged_samples: bool = True,
+        mask_sample_rules: Sequence[MaskSampleRule] = (),
         reward_penalty_config: Optional[dict[str, Any]] = None,
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
@@ -1652,6 +1749,7 @@ class RolloutManager:
             generation_config=generation_config,
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores these.
             mask_env_flagged_samples=mask_env_flagged_samples,
+            mask_sample_rules=mask_sample_rules,
             log_full_result_tables=log_full_result_tables,
             reward_penalty_config=reward_penalty_config,
             # None means "no deadlines", which is what async_rl's own defaults resolve
@@ -1695,6 +1793,11 @@ class RolloutManager:
     def resume_request_deadlines(self) -> None:
         """Resume live request-deadline clocks when a colocated engine exits training mode."""
         self._request_deadlines.resume()
+
+    def pop_mask_rule_metrics(self) -> dict[str, float]:
+        """Step-level ``mask_rules/*`` hits since the last call ({} on the native impl)."""
+        pop = getattr(self._impl, "pop_mask_rule_metrics", None)
+        return pop() if pop is not None else {}
 
     @property
     def recovery_ledger(self) -> RolloutRecoveryLedger:

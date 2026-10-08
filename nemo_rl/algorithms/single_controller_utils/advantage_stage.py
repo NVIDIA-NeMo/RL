@@ -32,6 +32,7 @@ paths cannot drift.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
@@ -44,6 +45,18 @@ from nemo_rl.algorithms.grpo import (
     compute_and_apply_seq_logprob_error_masking,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.masking_stats import (
+    accumulate_masking_stats,
+    new_masking_stats_accumulator,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
+    accumulate_rollout_stats,
+    accumulator_to_partial,
+    new_rollout_stats_accumulator,
+)
+from nemo_rl.algorithms.single_controller_utils.sample_masks import (
+    baseline_valid_mask,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -63,6 +76,7 @@ if TYPE_CHECKING:
     # back through the controller.
     from nemo_rl.algorithms.ppo import PPOConfig
 
+log = logging.getLogger(__name__)
 
 # Estimators whose advantages for a row depend only on that row and the rest
 # of its prompt group, so a whole-group shard produces the same numbers as the
@@ -315,6 +329,10 @@ class AdvantageOutcome:
     # Rows this call wrote to its shard's part file, so the controller's merge
     # can tell a missing part from an empty one.
     train_data_dump_rows: int = 0
+    # This call's rollout_stats / masking_stats accumulators as plain lists
+    # (rollout_stats.accumulator_to_partial); None when accumulation failed.
+    rollout_stats_partial: Optional[dict[str, list[list[Any]]]] = None
+    masking_stats_partial: Optional[dict[str, list[list[Any]]]] = None
 
 
 class AdvantageComputer:
@@ -382,8 +400,13 @@ class AdvantageComputer:
 
         num_mask_sample_filtered = int(mask_sample.sum().item())
         final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
+        # Rows masked for being incomplete (env flag incl. env.mask_sample_rules,
+        # overlong filtering); grpo.masked_sample_rewards_in_baseline decides whether
+        # their reward still counts in the group baseline/std (never a gradient).
+        incomplete_sample = mask_sample.clone()
         if cfg.algo.overlong_filtering:
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
+            incomplete_sample = incomplete_sample | truncated
 
         pre_seq_error_sample_mask = final_sample_mask.clone()
 
@@ -458,6 +481,34 @@ class AdvantageComputer:
         if cfg.is_ppo:
             kwargs["values"] = tensor_field(data, adv_cfg.values_field)
 
+        # Rows whose reward enters the baseline/std; identical to final_sample_mask
+        # unless grpo.masked_sample_rewards_in_baseline reinstates incomplete rows.
+        baseline_mask = baseline_valid_mask(
+            sample_mask=sample_mask,
+            final_sample_mask=final_sample_mask,
+            incomplete=incomplete_sample,
+            keep_incomplete_rewards=bool(
+                getattr(cfg.algo, "masked_sample_rewards_in_baseline", False)
+            ),
+        )
+        masking_stats_partial = None
+        try:
+            masking_acc = new_masking_stats_accumulator()
+            accumulate_masking_stats(
+                masking_acc,
+                prompt_ids=prompt_ids,
+                rewards=rewards,
+                sample_mask=sample_mask,
+                mask_sample=mask_sample,
+                truncated=truncated,
+                overlong_filtering=bool(cfg.algo.overlong_filtering),
+                final_sample_mask=final_sample_mask,
+                baseline_mask=baseline_mask,
+            )
+            masking_stats_partial = accumulator_to_partial(masking_acc)
+        except Exception as error:  # metrics must never fail a step
+            log.warning("Skipping masking_stats accumulation: %s", error)
+
         # Training predicts token t from position t - 1, so token_mask[:, 1:]
         # is the exact mask used when global_valid_toks and the loss are built.
         has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
@@ -473,7 +524,9 @@ class AdvantageComputer:
                 # Real validity (token-capture placeholders carry sample_mask 0,
                 # and mask_sample/overlong/seq-logprob-error rows are folded in
                 # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
+                # With grpo.masked_sample_rewards_in_baseline the incomplete rows
+                # re-enter the baseline/std only; `mask` still zeroes their loss.
+                valid_mask=baseline_mask,
                 **kwargs,
             )
             if cfg.is_ppo:
@@ -506,6 +559,26 @@ class AdvantageComputer:
 
         response_advantages = torch.masked_select(advantages, mask.bool())
         reward_partial = RewardPartial.from_rows(rewards, final_sample_mask)
+        rollout_stats_partial = None
+        try:
+            rollout_acc = new_rollout_stats_accumulator()
+            accumulate_rollout_stats(
+                rollout_acc,
+                prompt_ids=prompt_ids,
+                rewards=rewards,
+                sample_mask=final_sample_mask,
+                token_mask=token_mask,
+                truncated=truncated,
+                # input_lengths, carried on the meta by every producer.
+                seq_lens=(
+                    torch.tensor(meta.sequence_lengths)
+                    if meta.sequence_lengths is not None
+                    else None
+                ),
+            )
+            rollout_stats_partial = accumulator_to_partial(rollout_acc)
+        except Exception as error:  # metrics must never fail a step
+            log.warning("Skipping rollout_stats accumulation: %s", error)
         opd_stat_sum = 0.0
         opd_stat_sumsq = 0.0
         opd_stat_count = 0
@@ -599,4 +672,6 @@ class AdvantageComputer:
             opd_gap_sum=opd_gap_sum,
             train_data_dump_s=train_data_dump_s,
             train_data_dump_rows=train_data_dump_rows,
+            rollout_stats_partial=rollout_stats_partial,
+            masking_stats_partial=masking_stats_partial,
         )
