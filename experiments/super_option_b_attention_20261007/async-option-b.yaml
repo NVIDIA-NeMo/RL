@@ -32,6 +32,7 @@ policy:
   generation:
     refit_transport: nccl_reshard
     vllm_cfg:
+      expert_parallel_size: 4
       num_first_layers_in_bf16: 2
       num_last_layers_in_bf16: 6
 
