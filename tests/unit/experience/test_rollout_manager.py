@@ -1059,6 +1059,29 @@ def test_receipt_completion_drops_mask_flag_when_gate_off():
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
+@pytest.mark.parametrize(
+    ("response", "expected_truncated"),
+    [
+        (
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+            True,
+        ),
+        ({"status": "completed", "incomplete_details": None}, False),
+    ],
+)
+def test_result_to_completion_truncated_on_length_incomplete_response(
+    response, expected_truncated
+):
+    result = _mask_gate_result()
+    result["full_result"]["response"] = response
+    completion = _nemo_gym_impl(True)._results_to_completions([result])[0][0]
+    # Two tokens, far below max_seq_len: only the length cut marks truncation.
+    assert completion.truncated is expected_truncated
+
+
 def test_streamed_receipt_callback_uses_current_completion_conversion():
     class _RunRolloutsRemote:
         def options(self, *, num_returns):
