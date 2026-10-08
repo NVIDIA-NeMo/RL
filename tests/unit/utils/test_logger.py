@@ -425,35 +425,20 @@ class TestWandbLogger:
         )
 
     @patch("nemo_rl.utils.logger.wandb")
-    def test_log_table_appends_each_step_to_one_incremental_table(self, mock_wandb):
-        """Every step's rows land in one table, tagged with their step."""
-        tables = []
-
-        def make_table(columns, log_mode):
-            t = MagicMock()
-            t.columns = columns
-            t.log_mode = log_mode
-            t.rows = []
-            t.add_data.side_effect = lambda *r: t.rows.append(list(r))
-            tables.append(t)
-            return t
-
-        mock_wandb.Table.side_effect = make_table
+    def test_log_table_logs_each_step_with_a_step_column(self, mock_wandb):
+        """Each step logs its own table, its rows tagged with their step."""
         logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
-        run = mock_wandb.init.return_value
 
         logger.log_table(["op", "ms"], [["put", 1.0], ["get", 2.0]], 1, "t")
-        rows_at_flush = []
-        run.log.side_effect = lambda ev: rows_at_flush.append(list(ev["t"].rows))
         logger.log_table(["op", "ms"], [["put", 3.0]], 2, "t")
-        logger.finish()
 
-        assert len(tables) == 1
-        assert tables[0].columns == ["step", "op", "ms"]
-        assert tables[0].log_mode == "INCREMENTAL"
-        # Step 1's event is committed before step 2's rows are added.
-        assert rows_at_flush[0] == [[1, "put", 1.0], [1, "get", 2.0]]
-        assert tables[0].rows == [[1, "put", 1.0], [1, "get", 2.0], [2, "put", 3.0]]
+        assert mock_wandb.Table.call_args_list == [
+            call(
+                columns=["step", "op", "ms"],
+                data=[[1, "put", 1.0], [1, "get", 2.0]],
+            ),
+            call(columns=["step", "op", "ms"], data=[[2, "put", 3.0]]),
+        ]
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics(self, mock_wandb):
