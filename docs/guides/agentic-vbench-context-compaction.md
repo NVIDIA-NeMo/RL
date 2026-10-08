@@ -353,6 +353,22 @@ Verified here:
   minutes (`SAVE_PERIOD=1`, fewer prompts or turns) and runs continue through
   chained cycles that resume from the checkpoint and data-plane snapshot.
 
+- First completed training (job 2169207, identity, 4 x 4 prompts, 12 turns,
+  256k recipe): step 1 trained end to end (1180 s: 886 s generation, 65 s
+  logprobs, 123 s training, 91 s checkpoint; 40 token-in continuations, 8 text
+  roots, 0 poisoned), then the step-2 backward pass ran out of learner memory
+  on one GPU (175 GiB) with 70-80k-token rows. The next cycle resumed from
+  `step_1` (Megatron weights, dataloader, TransferQueue snapshot with 4 replay
+  groups, replay metadata), trained step 2 and saved `step_2`; the third cycle
+  found the run complete. `pipeline_model_parallel_size: 2` is not a remedy on
+  this model: `prepare_refit_info` fails with "Object present on multiple PP
+  ranks: [0, 1]" (NeMo-RL's PP broadcast needs each object on one stage), so the
+  256k recipe stays at PP=1 with `empty_unused_memory_level: 2`.
+- The previous 16-hour backend expired overnight; the 24-hour `backend-cc-3`
+  (job 2173865) replaced it with all task images prebuilt again. W&B online
+  logging works by exporting `WANDB_API_KEY` (the launcher otherwise falls back
+  to offline) with `WANDB_MODE=online`.
+
 Not yet verified (requires GPU allocations):
 
 - A two-step compaction smoke and the 20-step paired comparison.
