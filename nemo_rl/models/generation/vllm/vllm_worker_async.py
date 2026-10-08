@@ -1433,6 +1433,31 @@ class VllmAsyncGenerationWorkerImpl(
                     },
                     status_code=400,
                 )
+            except ValueError as e:
+                # vLLM's get_max_tokens raises a plain ValueError ("Input length
+                # (N) exceeds model's maximum context length (M).") after
+                # preprocess_chat, e.g. when a token-in splice grows the prompt
+                # past max_model_len on a request with no max_tokens to clamp.
+                # Convert only that overflow to the same 400 as above; any other
+                # ValueError is a server bug and stays a 500. Must follow
+                # MediaCaptureRejected, which is also a ValueError.
+                if "maximum context length" not in str(e):
+                    # Re-raising here bypasses the BaseException handler below.
+                    worker_self._abort_request_capture(request, reason="engine_error")
+                    raise
+                LOGGER.warning("Prompt exceeds max_model_len: %s", e)
+                worker_self._abort_request_capture(request, reason="context_length")
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "param": "input_tokens",
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
             except BaseException:
                 worker_self._abort_request_capture(request, reason="engine_error")
                 raise
