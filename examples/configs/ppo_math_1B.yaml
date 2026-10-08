@@ -89,6 +89,8 @@ loss_fn:
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
+  metrics_level: "full"
+  enable_torch_compile: false
 
 value_loss_fn:
   scale: 0.4
@@ -120,7 +122,6 @@ policy:
   offload_optimizer_for_logprob: false
 
   dtensor_cfg:
-    _v2: true
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
@@ -342,7 +343,6 @@ value:
     reward_model_type: "regression"
 
   dtensor_cfg:
-    _v2: true
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
