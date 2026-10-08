@@ -41,6 +41,14 @@ config, SLURM/Ray logs, and W&B metadata under `RESULT_ROOT`.
 The first pair of runs (jobs `3269219` and `3269231`, commit `5db1b4563`)
 failed before step 1 because rollout EP=1 produced an unsupported expert
 `Shard(1)` in the BF16 TRTLLM refit path. Commit `56c8479ccb` sets rollout
-EP=4 for both arms. The EP=4 20-step rerun is not yet validated, so neither
-pair establishes an attention-backend speedup. Compare step 2 onward only
-after both runs finish and have finite KL/reward metrics.
+EP=4 for both arms.
+
+The EP=4 rerun completed 20/20 steps in both arms. The vLLM worker logs
+confirm `FLASHINFER` and `TRITON_ATTN` selection, respectively. Step 2-20
+mean E2E time was 32.56s for [FlashInfer](https://wandb.ai/nvidia/nemo-rl-mxfp8-training/runs/pzvp4a1h)
+and 32.90s for [Triton](https://wandb.ai/nvidia/nemo-rl-mxfp8-training/runs/6ts03ajk).
+Generation throughput was 617.96 versus 602.03 tokens/s/GPU. This is a
+single-run, directional comparison; mean output length differed by 2.7%.
+Triton step 3 logged `NaN` for both `gen_kl_error` and `approx_entropy`
+despite 256 valid samples, so this pair does not yet establish numerical
+correctness or an attention-backend speedup.
