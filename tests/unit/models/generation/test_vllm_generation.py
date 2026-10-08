@@ -494,6 +494,77 @@ async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
     assert calls[2][1:] == (http_loop, http_thread)
 
 
+@pytest.mark.asyncio
+async def test_async_vllm_http_client_snapshots_only_new_route_chunks() -> None:
+    engine_loop = asyncio.get_running_loop()
+    first = torch.tensor([[[1]], [[2]]], dtype=torch.int16)
+    second = torch.tensor([[[3]]], dtype=torch.int16)
+    request_state = types.SimpleNamespace(routed_experts_chunks=[first, second])
+    output_processor = types.SimpleNamespace(
+        external_req_ids={"external-request": ["internal-request"]},
+        request_states={"internal-request": request_state},
+    )
+
+    class FakeEngine:
+        model_config = None
+        renderer = None
+        input_processor = None
+        vllm_config = None
+
+        def __init__(self) -> None:
+            self.output_processor = output_processor
+
+    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
+    chunk_count, chunks = await client.snapshot_new_routed_expert_chunks(
+        "external-request", after_chunk=1
+    )
+
+    assert chunk_count == 2
+    assert len(chunks) == 1
+    assert torch.equal(chunks[0], second)
+    assert chunks[0] is not second
+    with pytest.raises(RuntimeError, match="cursor is outside"):
+        await client.snapshot_new_routed_expert_chunks(
+            "external-request", after_chunk=3
+        )
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_http_client_attaches_active_route_delta() -> None:
+    engine_loop = asyncio.get_running_loop()
+    routed = torch.tensor([[[1]], [[2]]], dtype=torch.int16)
+    request_state = types.SimpleNamespace(routed_experts_chunks=[routed])
+    output_processor = types.SimpleNamespace(
+        external_req_ids={"request": ["internal-request"]},
+        request_states={"internal-request": request_state},
+    )
+    output = types.SimpleNamespace(
+        request_id="request",
+        outputs=[types.SimpleNamespace(finish_reason=None)],
+    )
+
+    class FakeEngine:
+        model_config = None
+        renderer = None
+        input_processor = None
+        vllm_config = None
+
+        def __init__(self) -> None:
+            self.output_processor = output_processor
+
+        async def generate(self, *args, **kwargs):
+            yield output
+
+    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
+    client.enable_active_route_capture()
+
+    (captured,) = [item async for item in client.generate(None, None, "request")]
+
+    assert captured.nemo_rl_routed_expert_chunk_count == 1
+    assert len(captured.nemo_rl_routed_expert_chunks) == 1
+    assert torch.equal(captured.nemo_rl_routed_expert_chunks[0], routed)
+
+
 @pytest.mark.parametrize(
     "abort_error",
     [None, RuntimeError("abort failed")],

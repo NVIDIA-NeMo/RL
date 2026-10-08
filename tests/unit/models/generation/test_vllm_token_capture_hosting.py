@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import threading
 import time
@@ -47,11 +48,17 @@ from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
 )
 from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     CaptureAdmission,
+    StagedCallBaseSnapshot,
     StagedCallRecord,
     StageResult,
 )
 
-from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
+from nemo_rl.data_plane.schema import ROUTE_ENCODING_ENVELOPE  # noqa: E402
+from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
+    ChainPrefixCache,
+    FetchedStagedCall,
+)
+from nemo_rl.experience.route_assembly import RouteFragment  # noqa: E402
 from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
     GenerationPrefixBatchLimits,
     _remaining_generation_limits_after_prefix,
@@ -63,6 +70,10 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
     _classify_restored_prefix_terminal,
     _RequestOutputDeltaAccumulator,
+)
+from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
+    decode_routed_experts,
+    encode_routed_experts,
 )
 
 pytestmark = pytest.mark.nemo_gym
@@ -151,6 +162,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         _staging_source=None,
         _generation_prefix_reader=None,
         _capture_media=False,
+        _http_engine_client=None,
     )
     worker.install_token_capture = lambda capture: setattr(
         worker, "token_capture", capture
@@ -341,6 +353,33 @@ def test_prefix_capture_setup_requires_control_token_and_rejects_media(monkeypat
                 generation_cut_control_token="secret",
             )
         )
+
+
+def test_prefix_capture_enables_active_vllm_routes_for_router_replay(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client",
+        lambda dp_cfg, bootstrap: MagicMock(name="dp_client"),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
+        lambda *args, **kwargs: _MemorySink(),
+    )
+    worker = _fake_worker()
+    worker._return_routed_experts_enabled = lambda: True
+    worker._http_engine_client = MagicMock(name="http_engine_client")
+
+    installed = asyncio.run(
+        VllmAsyncGenerationWorkerImpl.setup_token_capture(
+            worker,
+            {},
+            "rollout_staging",
+            generation_prefix_cuts_enabled=True,
+            generation_cut_control_token="secret",
+        )
+    )
+
+    assert installed is True
+    worker._http_engine_client.enable_active_route_capture.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
@@ -585,6 +624,7 @@ def _worker_with_capture(sink: _MemorySink):
         "_capture_admission",
         "_resolve_admission_prefix",
         "_fetch_generation_cut_chunks",
+        "_generation_cut_route_extras",
         "_rebuild_generation_cut_snapshot",
         "_resolve_generation_cut",
         "_enter_request_prefix",
@@ -594,6 +634,7 @@ def _worker_with_capture(sink: _MemorySink):
         "_abort_request_capture",
         "_finish_request_capture_after_snapshot_fence",
         "_finish_request_capture_with_lifecycle_owned",
+        "_merge_generation_cut_routed_experts",
         "_restore_response_prefix",
         "_checkpoint_active_generation_cut",
         "_require_generation_prefix_batch_limits",
@@ -1354,12 +1395,15 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
         resumed_worker._resolve_generation_cut(bad_digest_admission, [])
 
     with caplog.at_level(logging.INFO):
-        cut = resumed_worker._resolve_generation_cut(admission, [])
+        resolved_cut = resumed_worker._resolve_generation_cut(admission, [])
+    assert resolved_cut is not None
+    cut = resolved_cut.snapshot
     expected_sha = hashlib.sha256(b"12,13").hexdigest()
     assert f"prefix_ids_sha256={expected_sha}" in caplog.text
     resumed_worker._staging_source.calls.clear()
     prefetched_cut = resumed_worker._resolve_generation_cut(admission, [], [cut_record])
-    assert prefetched_cut == cut
+    assert prefetched_cut is not None
+    assert prefetched_cut.snapshot == cut
     assert resumed_worker._staging_source.calls == []
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
         resumed_worker,
@@ -1368,6 +1412,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
         admission=admission,
         prefix_token_ids=[],
         generation_cut=cut,
+        generation_cut_routed_experts=resolved_cut.routed_experts,
         resumed_generation_token_ids=[12, 13],
     )
     tokenizer = MagicMock()
@@ -1442,6 +1487,209 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
         second_receipt.prefixes[0].staging_keys
     )
     assert "generation prefix restored:" in caplog.text
+
+
+def _route_fetched_call(
+    staging_key: str, record: StagedCallRecord
+) -> FetchedStagedCall:
+    extras = dict(record.extras or {})
+    encoded = extras.pop("routed_experts")
+    routes = decode_routed_experts(encoded, torch.int16)
+    snapshot = StagedCallBaseSnapshot.model_validate(
+        record.model_dump(exclude={"extras"})
+    )
+    return FetchedStagedCall(
+        staging_key=staging_key,
+        snapshot=snapshot,
+        routed_len=int(routes.shape[0]),
+        fragment=RouteFragment(
+            routes=routes,
+            encoding=ROUTE_ENCODING_ENVELOPE,
+            extras_metadata_json=json.dumps(
+                extras, sort_keys=True, separators=(",", ":")
+            ).encode(),
+        ),
+        extras=extras,
+    )
+
+
+def test_router_replay_survives_repeated_prefix_cuts_and_resume() -> None:
+    sink = _MemorySink()
+    original_worker = _worker_with_capture(sink)
+    original_worker._return_routed_experts_enabled = lambda: True
+    original_worker.routed_experts_dtype = torch.int16
+    original_worker._rollout_weight_version = 7
+    original_request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": "c1",
+            "mode": "text",
+        },
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        original_worker, original_request, [10, 11]
+    )
+    original_worker._capture_calls[id(original_request)].effective_output_limit = 128
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        original_worker,
+        original_request,
+        SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    token_ids=[12, 13],
+                    logprobs=[
+                        {12: SimpleNamespace(logprob=-0.1)},
+                        {13: SimpleNamespace(logprob=-0.2)},
+                    ],
+                )
+            ],
+        ),
+        routed_expert_chunk_count=1,
+        routed_expert_chunks=[torch.tensor([[[1]], [[2]], [[3]]], dtype=torch.int16)],
+    )
+    prefix = GenerationCutPrefix(
+        ticket_id="ticket-1",
+        rollout_id="r0",
+        attempt_index=0,
+        model_call_id="c1",
+        admitted_at=1.0,
+    )
+    first_receipt = original_worker._checkpoint_generation_cut(
+        GenerationCutInventory.build(
+            checkpoint_id="checkpoint-1",
+            server_name="policy_model",
+            active_prefixes=[prefix],
+        )
+    )
+    assert len(first_receipt.prefixes[0].staging_keys) == 1
+    first_record = sink.generation_prefix_records[-1][1]
+    assert decode_routed_experts(
+        first_record.extras["routed_experts"], torch.int16
+    ).flatten().tolist() == [1, 2, 3, 0]
+
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        original_worker,
+        original_request,
+        SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    token_ids=[14],
+                    logprobs=[{14: SimpleNamespace(logprob=-0.3)}],
+                )
+            ]
+        ),
+        routed_expert_chunk_count=2,
+        routed_expert_chunks=[torch.tensor([[[4]]], dtype=torch.int16)],
+    )
+    second_receipt = original_worker._checkpoint_generation_cut(
+        GenerationCutInventory.build(
+            checkpoint_id="checkpoint-2",
+            server_name="policy_model",
+            active_prefixes=[prefix.model_copy(update={"ticket_id": "ticket-2"})],
+        )
+    )
+    second_record = sink.generation_prefix_records[-1][1]
+    assert decode_routed_experts(
+        second_record.extras["routed_experts"], torch.int16
+    ).flatten().tolist() == [4]
+
+    cut_keys = list(second_receipt.prefixes[0].staging_keys)
+    chunks = [
+        _route_fetched_call(cut_keys[0], first_record),
+        _route_fetched_call(cut_keys[1], second_record),
+    ]
+    resumed_worker = _worker_with_capture(sink)
+    resumed_worker._return_routed_experts_enabled = lambda: True
+    resumed_worker.routed_experts_dtype = torch.int16
+    resumed_worker._rollout_weight_version = 9
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0-a1",
+            "model_call_id": "c2",
+            "mode": "text",
+            "generation_cut": {
+                "source_capture_key": "r0",
+                "source_model_call_id": "c1",
+                "staging_keys": cut_keys,
+                "generation_token_count": 3,
+                "digest": second_receipt.prefixes[0].prefix_digest,
+                "effective_output_limit": 128,
+            },
+        },
+        stream=False,
+    )
+    admission = resumed_worker._capture_admission(request)
+    resolved = resumed_worker._resolve_generation_cut(admission, [], chunks)
+    assert resolved is not None
+    assert resolved.routed_experts is not None
+    assert resolved.routed_experts.flatten().tolist() == [1, 2, 3, 4, 0]
+
+    corrupted = chunks[0]
+    assert corrupted.fragment is not None
+    bad_routes = corrupted.fragment.routes.clone()
+    bad_routes[0, 0, 0] = 99
+    with pytest.raises(RuntimeError, match="failed integrity check"):
+        resumed_worker._resolve_generation_cut(
+            admission,
+            [],
+            [
+                FetchedStagedCall(
+                    staging_key=corrupted.staging_key,
+                    snapshot=corrupted.snapshot,
+                    routed_len=corrupted.routed_len,
+                    fragment=RouteFragment(
+                        routes=bad_routes,
+                        encoding=corrupted.fragment.encoding,
+                        extras_metadata_json=(corrupted.fragment.extras_metadata_json),
+                    ),
+                    extras=corrupted.extras,
+                ),
+                chunks[1],
+            ],
+        )
+
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        resumed_worker,
+        request,
+        [10, 11, 12, 13, 14],
+        admission=admission,
+        prefix_token_ids=[],
+        generation_cut=resolved.snapshot,
+        generation_cut_routed_experts=resolved.routed_experts,
+        resumed_generation_token_ids=[12, 13, 14],
+    )
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        resumed_worker,
+        request,
+        SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    token_ids=[15],
+                    logprobs=[{15: SimpleNamespace(logprob=-0.4)}],
+                )
+            ],
+        ),
+        routed_expert_chunk_count=1,
+        routed_expert_chunks=[
+            torch.tensor([[[90]], [[91]], [[92]], [[93]], [[5]]], dtype=torch.int16)
+        ],
+    )
+    content = _served_content([15], [-0.4])
+    content["choices"][0]["message"]["routed_experts"] = encode_routed_experts(
+        torch.tensor(
+            [[[90]], [[91]], [[92]], [[93]], [[5]], [[0]]],
+            dtype=torch.int16,
+        )
+    )
+    VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        resumed_worker, request, content
+    )
+    final_routes = decode_routed_experts(
+        sink.records[-1].extras["routed_experts"], torch.int16
+    )
+    assert final_routes.flatten().tolist() == [1, 2, 3, 4, 5, 0]
+    assert sink.records[-1].weight_version == 7
 
 
 def test_request_capture_token_in_prev_len_chains():

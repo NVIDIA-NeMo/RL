@@ -1254,10 +1254,6 @@ def setup_single_controller(
             raise NotImplementedError(
                 "generation-prefix recovery does not yet support multimodal capture"
             )
-        if router_replay_enabled(master_config.policy):
-            raise NotImplementedError(
-                "generation-prefix recovery does not yet support router replay"
-            )
     if capture_media:
         if generation_config["backend"] != "vllm":
             raise NotImplementedError(
