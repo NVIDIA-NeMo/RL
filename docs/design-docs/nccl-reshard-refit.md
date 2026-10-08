@@ -262,6 +262,12 @@ weights are removed; the receiver must retain its newly generated scales for tho
 weights. This also keeps unrelated weight scales and KV-cache scales on their existing
 load path.
 
+Quantized destination handling added for BF16 bulk weights stays in the bulk hooks.
+Megatron's packed collective imports, including `refit_transport=null` and misc
+weights, retain their existing destination `copy_` behavior. Likewise, vLLM bulk
+hooks explicitly opt into rectangular FP8 blocks; the shared quantizer keeps its
+square-block default for legacy callers.
+
 ## Decoupling Backend-Agnostic Parts and Backend-Dependent Parts
 
 To facilitate backend extension, the implementation cleanly separates backend-agnostic

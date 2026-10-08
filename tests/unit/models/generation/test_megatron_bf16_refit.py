@@ -14,8 +14,10 @@
 
 """Canonical BF16 receive hooks for Megatron inference storage."""
 
+from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -37,10 +39,10 @@ class _LocalSpec:
     part: int
 
     def select(self, tensor):
-        return tensor.chunk(2, dim=0)[self.part]
+        return tensor.chunk(2, dim=-2)[self.part]
 
     def selected_shape(self, shape):
-        return torch.Size((shape[0] // 2, *shape[1:]))
+        return torch.Size((*shape[:-2], shape[-2] // 2, shape[-1]))
 
 
 def _make_map(destination):
@@ -50,7 +52,7 @@ def _make_map(destination):
         hf_param_names=(GATE, UP),
         local_hf_param_specs=lambda: local_specs,
         combine_local_hf_weights=lambda values: torch.cat(
-            [values[GATE], values[UP]], dim=0
+            [values[GATE], values[UP]], dim=-2
         ),
     )
     task = _MegatronRefitTask(conversion, destination, id(destination))
@@ -113,13 +115,94 @@ def test_destination_rejects_non_bf16_wire_metadata():
         worker._build_destination_hf_to_local_param_map(info, [])
 
 
+@pytest.mark.parametrize("storage", ["bf16", "te", "grouped"])
+def test_packed_refit_preserves_destination_copy(
+    storage: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from megatron.core import fp8_utils
+
+    destination = SimpleNamespace(shape=(8, 4), copy_=MagicMock())
+    monkeypatch.setattr(fp8_utils, "is_float8tensor", lambda _: storage == "te")
+    monkeypatch.setattr(
+        fp8_utils,
+        "is_grouped_tensor_with_quantized_storage",
+        lambda _: storage == "grouped",
+    )
+    quantized_copy = MagicMock()
+    monkeypatch.setattr(fp8_utils, "copy_tensor_to_quantized_param", quantized_copy)
+    conversion = SimpleNamespace(
+        param_name="linear_fc1.weight", hf_param_names=(GATE, UP)
+    )
+    task = _MegatronRefitTask(conversion, destination, id(destination))
+    assert task.is_quantized == (storage != "bf16")
+    gate = torch.full((4, 4), 3, dtype=torch.bfloat16)
+    up = torch.full((4, 4), 67, dtype=torch.bfloat16)
+    converted = torch.cat((gate, up))
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    worker._generation_refit_tasks = [task]
+    worker._generation_refit_task_index = 0
+    worker._generation_refit_model_chunks = []
+    worker._generation_refit_pending_weights = {}
+    worker._generation_refit_pending_streams = {}
+    worker._generation_refit_remaining_dependencies = Counter(task.dependencies)
+    worker.megatron_bridge = SimpleNamespace(
+        stream_weights_hf_to_megatron=MagicMock(
+            return_value=iter([SimpleNamespace(weight=converted)])
+        )
+    )
+
+    # This is the packed collective/null loader, also used by NCCL misc weights.
+    worker._load_generation_refit_batch([(GATE, gate)])
+    destination.copy_.assert_not_called()
+    worker._load_generation_refit_batch([(UP, up)])
+    destination.copy_.assert_called_once_with(converted)
+    quantized_copy.assert_not_called()
+    assert worker._generation_refit_task_index == 1
+    assert worker._generation_refit_pending_weights == {}
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_bulk_quantized_writer_waits_for_complete_fused_weight(
+    grouped: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from megatron.core import fp8_utils
+
+    destination = torch.zeros((2, 8, 4) if grouped else (8, 4), dtype=torch.bfloat16)
+    monkeypatch.setattr(fp8_utils, "is_float8tensor", lambda _: not grouped)
+    monkeypatch.setattr(
+        fp8_utils, "is_grouped_tensor_with_quantized_storage", lambda _: grouped
+    )
+    quantized_copy = MagicMock()
+    monkeypatch.setattr(fp8_utils, "copy_tensor_to_quantized_param", quantized_copy)
+    worker, specs = _make_map(destination)
+    worker._write_generation_refit_weight = MagicMock()
+    for cycle in (1, 2):
+        expected = torch.empty_like(destination)
+        expected.chunk(2, dim=-2)[0].fill_(3 * cycle)
+        expected.chunk(2, dim=-2)[1].fill_(67 * cycle)
+        for index, name in enumerate((GATE, UP)):
+            spec = specs.get(name)
+            ctx = spec.pre(spec.base)
+            ctx.buf.copy_(expected.chunk(2, dim=-2)[index])
+            spec.post(ctx)
+            assert quantized_copy.call_count == cycle - 1 + index
+        actual_destination, assembled = quantized_copy.call_args.args
+        assert actual_destination is destination
+        torch.testing.assert_close(assembled, expected)
+        assert worker._generation_m2n_pending == {}
+    worker._write_generation_refit_weight.assert_not_called()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="TE quantization requires CUDA"
 )
 @pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
 def test_quantized_fused_destination_commits_values_and_scales_on_current_stream(
     recipe,
+    monkeypatch,
 ):
+    from megatron.core import fp8_utils
+
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
         Float8BlockQuantizer,
@@ -142,14 +225,15 @@ def test_quantized_fused_destination_commits_values_and_scales_on_current_stream
     old_data = destination._rowwise_data.clone()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    commit = worker._write_generation_refit_weight
+    commit = fp8_utils.copy_tensor_to_quantized_param
     observed_streams = []
 
-    def record_commit(task, received):
+    def record_commit(target, received):
+        assert target is destination
         observed_streams.append(torch.cuda.current_stream())
-        commit(task, received)
+        commit(target, received)
 
-    worker._write_generation_refit_weight = record_commit
+    monkeypatch.setattr(fp8_utils, "copy_tensor_to_quantized_param", record_commit)
     for cycle in (1, 2):
         expected = torch.cat(
             (

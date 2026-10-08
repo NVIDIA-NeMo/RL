@@ -1598,7 +1598,20 @@ class MegatronGenerationRefitMixin:
             logical_weight = piece.task.conversion_task.combine_local_hf_weights(
                 pending
             )
-            self._write_generation_refit_weight(piece.task, logical_weight)
+            if piece.task.is_mxfp8:
+                self._write_generation_refit_weight(piece.task, logical_weight)
+            else:
+                if logical_weight.shape != piece.task.expected_shape:
+                    raise ValueError(
+                        f"Shape mismatch for Megatron parameter {piece.task.param_name!r}: "
+                        f"expected {tuple(piece.task.expected_shape)}, "
+                        f"got {tuple(logical_weight.shape)}."
+                    )
+                # Only BF16 bulk hooks use MCore's TE/grouped quantized writer.
+                # Keep this optional API out of the packed collective/misc path.
+                from megatron.core.fp8_utils import copy_tensor_to_quantized_param
+
+                copy_tensor_to_quantized_param(piece.task.destination, logical_weight)
             del self._generation_m2n_pending[piece.task.target_id]
 
     def _build_destination_hf_to_local_param_map(
@@ -2000,14 +2013,7 @@ class MegatronGenerationRefitMixin:
                 f"expected {tuple(task.expected_shape)}, got {tuple(converted_weight.shape)}."
             )
 
-        if task.is_quantized and not task.is_mxfp8:
-            # MCore updates both TE value/scale storage and grouped member views
-            # without rebuilding the buffers referenced by inference CUDA graphs.
-            from megatron.core.fp8_utils import copy_tensor_to_quantized_param
-
-            copy_tensor_to_quantized_param(task.destination, converted_weight)
-        else:
-            task.destination.copy_(converted_weight)
+        task.destination.copy_(converted_weight)
 
     def _load_generation_refit_batch(
         self, weights: list[tuple[str, torch.Tensor]]

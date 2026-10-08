@@ -1429,7 +1429,12 @@ def test_blockwise_quantization_supports_rectangular_blocks(
     ).to(torch.bfloat16)
     block_n, block_k = block_shape
     weight[:block_n, :block_k] = 0
-    value, scale = fp8.cast_tensor_to_fp8_blockwise(weight, block_shape)
+    # The shared quantizer keeps the legacy/null path's square-block contract.
+    with pytest.raises(AssertionError):
+        fp8.cast_tensor_to_fp8_blockwise(weight, block_shape)
+    value, scale = fp8.cast_tensor_to_fp8_blockwise(
+        weight, block_shape, allow_rectangular=True
+    )
     expected_scale_shape = (
         (shape[0] + block_n - 1) // block_n,
         (shape[1] + block_k - 1) // block_k,

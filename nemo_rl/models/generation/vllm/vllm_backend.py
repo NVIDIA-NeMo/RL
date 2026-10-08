@@ -1886,14 +1886,16 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 if block_size is None:
                     value, scale = fp8.quantize_mxfp8_weight(ctx.buf)
                 elif ctx.buf.ndim == 2:
-                    value, scale = fp8.cast_tensor_to_fp8_blockwise(ctx.buf, block_size)
+                    value, scale = fp8.cast_tensor_to_fp8_blockwise(
+                        ctx.buf, block_size, allow_rectangular=True
+                    )
                     scale = scale.squeeze(-1)
                 else:
                     value = torch.empty_like(ctx.buf, dtype=value_param.dtype)
                     scale = torch.empty_like(ctx.extra["scale_region"])
                     for expert, weight in enumerate(ctx.buf.unbind(0)):
                         expert_value, expert_scale = fp8.cast_tensor_to_fp8_blockwise(
-                            weight, block_size
+                            weight, block_size, allow_rectangular=True
                         )
                         value[expert].copy_(expert_value)
                         scale[expert].copy_(expert_scale.squeeze(-1))

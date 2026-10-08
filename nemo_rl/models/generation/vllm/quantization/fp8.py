@@ -632,8 +632,10 @@ def load_weights(
 def cast_tensor_to_fp8_blockwise(
     data_hp,
     weight_block_size,
+    *,
+    allow_rectangular: bool = False,
 ):
-    """Quantize a matrix with independent output/input block dimensions."""
+    """Quantize a matrix, optionally using the bulk refit's rectangular blocks."""
     assert len(data_hp.shape) == 2, "Only 2d input tensor is supported"
 
     block_size1 = weight_block_size[1]
@@ -664,6 +666,8 @@ def cast_tensor_to_fp8_blockwise(
     original_shape = data_hp.shape
     blk_m, blk_n = data_hp.shape[0] // block_size0, data_hp.shape[1] // block_size1
 
+    if not allow_rectangular:
+        assert block_size1 == block_size0
     data_hp = data_hp.reshape(blk_m, block_size0, blk_n, block_size1)
 
     # Permute to (BLK_M, BLK_N, BLOCK_SIZE_M, BLOCK_SIZE_N)
