@@ -18,6 +18,8 @@ import os
 import subprocess
 import sys
 import threading
+import time
+import uuid
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
@@ -93,6 +95,7 @@ from nemo_rl.telemetry.setup import (
     shutdown_telemetry,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils.rollout_timing import log_rollout_timing
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
@@ -867,6 +870,11 @@ Depending on your data shape, you may want to change these values."""
 
         timer = Timer()
         timer.start("_run_rollouts_total")
+        # Per-rollout timing is opt-in; log_rollout_timing is a no-op when unset.
+        timing_file = os.environ.get("NRL_ROLLOUT_TIMING_FILE")
+        batch_id = uuid.uuid4().hex[:8]
+        t0 = time.perf_counter()
+        t0_wall = time.time()
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
         )
@@ -914,6 +922,33 @@ Depending on your data shape, you may want to change these values."""
                     if _has_nan_generation_logprobs(nemo_rl_result):
                         raise RuntimeError("Generation logprobs contain NaN")
             num_results += 1
+            if timing_file:
+                msgs = nemo_rl_result.get("message_log") or []
+                gen_toks = sum(
+                    len(m["token_ids"])
+                    for m in msgs
+                    if m.get("role") == "assistant" and "token_ids" in m
+                )
+                log_rollout_timing(
+                    {
+                        "type": "rollout",
+                        "batch_id": batch_id,
+                        "batch_start_wall": t0_wall,
+                        "batch_size": len(nemo_gym_examples),
+                        "n_done": num_results,
+                        "rowidx": nemo_gym_row["_rowidx"],
+                        "group_id": nemo_gym_row.get("_ng_group_id"),
+                        "group_attempt": nemo_gym_row.get("_ng_group_attempt"),
+                        "agent": nemo_gym_row["agent_ref"]["name"],
+                        "t_done_s": time.perf_counter() - t0,
+                        "gen_tokens": gen_toks,
+                        "num_turns": sum(
+                            1 for m in msgs if m.get("role") == "assistant"
+                        ),
+                        "reward": nemo_gym_result.get("reward"),
+                        "agent_timing": nemo_gym_result.get("agent_timing"),
+                    }
+                )
             timing_metrics = None
             if num_results == len(nemo_gym_examples):
                 timer.stop("_run_rollouts_total")

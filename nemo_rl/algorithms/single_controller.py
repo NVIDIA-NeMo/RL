@@ -202,6 +202,7 @@ from nemo_rl.utils.checkpoint import (
     PathLike,
 )
 from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, Logger
+from nemo_rl.utils.rollout_timing import log_rollout_timing
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
 
@@ -2976,6 +2977,14 @@ class SingleControllerActor:
 
                         selected_rollout_metrics.extend(
                             train_meta.extra_info.pop(ROLLOUT_METRICS, [])
+                        )
+                        log_rollout_timing(
+                            {
+                                "type": "consume",
+                                "step": self._train_steps,
+                                "trainer_version": version_during_step,
+                                "group_ids": list(selected_group_ids),
+                            }
                         )
 
                     if groups_dispatched == 0:

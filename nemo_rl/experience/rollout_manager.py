@@ -96,6 +96,7 @@ from nemo_rl.telemetry.instrumentation import (
     dispatch_with_trace_context,
     in_per_prompt_scope,
 )
+from nemo_rl.utils.rollout_timing import log_rollout_timing
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
 
@@ -1096,6 +1097,15 @@ class AsyncNemoGymRolloutImpl:
             )
         group_id = template_row.get(NEMO_GYM_GROUP_ID_KEY) or uuid.uuid4().hex
         group_attempt = template_row.get(NEMO_GYM_GROUP_ATTEMPT_KEY, 0)
+        log_rollout_timing(
+            {
+                "type": "group",
+                "group_id": group_id,
+                "group_attempt": group_attempt,
+                "prompt_idx": input_sample.get("idx"),
+                "agent": (template_row.get("agent_ref") or {}).get("name"),
+            }
+        )
         if (
             not isinstance(group_attempt, int)
             or isinstance(group_attempt, bool)
@@ -1974,6 +1984,16 @@ class RolloutManager:
                     record,
                     start_weight_version=start_version,
                     end_weight_version=end_version,
+                )
+                log_rollout_timing(
+                    {
+                        "type": "commit",
+                        "tq_group_id": tq_group_id,
+                        "prompt_idx": input_sample.get("idx"),
+                        "start_weight_version": start_version,
+                        "end_weight_version": end_version,
+                        "target_step": target_step,
+                    }
                 )
             except Exception as error:
                 # A failed rollout must not leave an unready slot that can block an
