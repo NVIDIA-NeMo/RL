@@ -15,9 +15,13 @@
 """Unit tests for the profile_band multiplier and group relative-length
 scaling algorithms in nemo_rl/utils/length_penalty.py."""
 
+import logging
+
 import pytest
 
+import nemo_rl.utils.length_penalty as length_penalty_mod
 from nemo_rl.utils.length_penalty import (
+    LengthPenaltyConfig,
     _band_multiplier,
     apply_group_length_penalties,
 )
@@ -56,6 +60,16 @@ def make_config(default=None, profile_band=None, num_gens=2):
             "length_penalty": length_penalty,
         }
     }
+
+
+def apply(results, cfg, tokenizer=None):
+    """Call the hook the way rollouts.py does: block + group size, not master config."""
+    return apply_group_length_penalties(
+        results,
+        cfg["grpo"]["length_penalty"],
+        cfg["grpo"]["num_generations_per_prompt"],
+        tokenizer=tokenizer,
+    )
 
 
 def rewards_of(results):
@@ -100,7 +114,7 @@ class TestProfileBandPerRow:
             make_result("1234567890", "1234567890", 1.0, band=band),  # 20 -> x0.5
         ]
         cfg = make_config(default={"enabled": True, "profile_band_total": True})
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 0.5])
 
     def test_zero_reward_rollouts_untouched(self):
@@ -110,7 +124,7 @@ class TestProfileBandPerRow:
             make_result("1234567890", "1234567890", 1.0, band=band),
         ]
         cfg = make_config(default={"enabled": True, "profile_band_total": True})
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([0.0, 0.5])
 
     def test_reasoning_channel_ignores_answer_length(self):
@@ -121,7 +135,7 @@ class TestProfileBandPerRow:
             make_result("123456789012345", long_answer, 1.0, band=band),  # 15 -> x0.75
         ]
         cfg = make_config(default={"enabled": True, "profile_band_reasoning": True})
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 0.75])
 
     def test_missing_row_band_is_noop(self):
@@ -130,7 +144,7 @@ class TestProfileBandPerRow:
             make_result("1234567890123456789012345", "12345", 1.0),
         ]
         cfg = make_config(default={"enabled": True, "profile_band_total": True})
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
 
     def test_channel_not_enabled_in_config_is_noop(self):
@@ -140,7 +154,7 @@ class TestProfileBandPerRow:
             make_result("12345", "12345", 1.0, band=band),
         ]
         cfg = make_config(default={"enabled": True})  # no profile_band_* flag
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
 
 
@@ -159,7 +173,7 @@ class TestProfileBandGlobalDefaults:
             make_result("12345", "12345", 1.0),  # total 10 -> x1.0
             make_result("1234567890123456789012345", "12345", 1.0),  # 30 -> x0.5
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 0.5])
 
     def test_global_works_without_default_block(self):
@@ -176,7 +190,7 @@ class TestProfileBandGlobalDefaults:
             make_result("123456789012345", "xx", 1.0),  # reasoning 15 -> x0.75
             make_result("12345", "xx", 1.0),  # 5 -> x1.0
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([0.75, 1.0])
 
     def test_row_band_wins_over_global(self):
@@ -192,7 +206,7 @@ class TestProfileBandGlobalDefaults:
             make_result("12345", "12345", 1.0, band=generous),
             make_result("1234567890123456789012345", "12345", 1.0, band=generous),
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
 
     def test_disabled_block_is_noop(self):
@@ -207,23 +221,17 @@ class TestProfileBandGlobalDefaults:
             make_result("1234567890123456789012345", "12345", 1.0),
             make_result("12345", "12345", 1.0),
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
 
-    def test_malformed_global_channel_ignored(self):
-        cfg = make_config(
-            default={"enabled": True},
-            profile_band={
-                "enabled": True,
-                "defaults": {"total": {"a": 20, "b": 10, "f": 0.5}},  # b <= a
-            },
-        )
-        results = [
-            make_result("1234567890123456789012345", "12345", 1.0),
-            make_result("12345", "12345", 1.0),
-        ]
-        apply_group_length_penalties(results, cfg)
-        assert rewards_of(results) == pytest.approx([1.0, 1.0])
+    def test_malformed_global_channel_rejected(self):
+        # b <= a and f outside [0, 1] are config errors, caught at validation
+        # rather than silently ignoring the channel at rollout time.
+        for channel in ({"a": 20, "b": 10, "f": 0.5}, {"a": 10, "b": 20, "f": 1.5}):
+            with pytest.raises(ValueError):
+                LengthPenaltyConfig.model_validate(
+                    {"profile_band": {"enabled": True, "defaults": {"total": channel}}}
+                )
 
 
 class TestGroupRelativeLengthScaling:
@@ -238,7 +246,7 @@ class TestGroupRelativeLengthScaling:
             make_result("12345", "12345", 1.0),  # total 10 -> +0.05
             make_result("1234567890123456789012345", "12345", 1.0),  # 30 -> -0.05
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.05, 0.95])
 
     def test_three_rollouts_zero_centered(self):
@@ -252,7 +260,7 @@ class TestGroupRelativeLengthScaling:
             make_result("1234567890", "1234567890", 1.0),  # 20
             make_result("123456789012345", "123456789012345", 1.0),  # 30
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.05, 1.0, 0.95])
         # Zero-centered: the group's mean reward is unchanged by the adjustment.
         assert sum(rewards_of(results)) == pytest.approx(3.0)
@@ -265,7 +273,7 @@ class TestGroupRelativeLengthScaling:
             make_result("12345", "12345", 1.0),
             make_result("12345", "12345", 1.0),
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
 
     def test_only_positive_rollouts_participate(self):
@@ -280,7 +288,7 @@ class TestGroupRelativeLengthScaling:
             make_result("1" * 1000, "1" * 1000, 0.0),  # untouched, excluded
             make_result("1234567890123456789012345", "12345", 1.0),  # 30 -> -0.05
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.05, 0.0, 0.95])
 
     def test_reasoning_channel_uses_reasoning_length_only(self):
@@ -293,7 +301,7 @@ class TestGroupRelativeLengthScaling:
             make_result("12345", "123456789012345", 1.0),  # reasoning 5 -> +0.05
             make_result("123456789012345", "12345", 1.0),  # reasoning 15 -> -0.05
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.05, 0.95])
 
     def test_zero_coefficient_is_noop(self):
@@ -304,7 +312,7 @@ class TestGroupRelativeLengthScaling:
             make_result("12345", "12345", 1.0),
             make_result("1234567890123456789012345", "12345", 1.0),
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
 
     def test_agent_override_disables_for_agent(self):
@@ -316,7 +324,7 @@ class TestGroupRelativeLengthScaling:
             make_result("12345", "12345", 1.0),
             make_result("1234567890123456789012345", "12345", 1.0),
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
 
 
@@ -349,7 +357,7 @@ class TestProfiledLengthPenalty:
                 "1234567890", "1234567890", 1.0, p_rewards, p_lengths
             ),  # 20 >= thr
         ]
-        apply_group_length_penalties(results, self.cfg())
+        apply(results, self.cfg())
         assert rewards_of(results) == pytest.approx([1.0, 0.7])
         # The failing profiled length (100) must not have entered the threshold:
         # with it, mean+std would exceed 20 and nothing would be penalized.
@@ -362,7 +370,7 @@ class TestProfiledLengthPenalty:
             self.make_profiled("1234567890", "1234567890", 1.0, p_rewards, p_lengths),
             self.make_profiled("1" * 50, "1" * 50, 1.0, p_rewards, p_lengths),
         ]
-        apply_group_length_penalties(results, self.cfg())
+        apply(results, self.cfg())
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
 
     def test_zero_passes_no_penalty(self):
@@ -371,7 +379,7 @@ class TestProfiledLengthPenalty:
             self.make_profiled("1234567890", "1234567890", 1.0, p_rewards, p_lengths),
             self.make_profiled("1" * 50, "1" * 50, 1.0, p_rewards, p_lengths),
         ]
-        apply_group_length_penalties(results, self.cfg())
+        apply(results, self.cfg())
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
 
     def test_one_pass_allowed_when_min_samples_is_one(self):
@@ -383,7 +391,7 @@ class TestProfiledLengthPenalty:
                 "1234567890", "1234567890", 1.0, p_rewards, p_lengths
             ),  # 20 >= 10
         ]
-        apply_group_length_penalties(results, self.cfg(min_samples=1))
+        apply(results, self.cfg(min_samples=1))
         assert rewards_of(results) == pytest.approx([1.0, 0.7])
 
 
@@ -402,7 +410,7 @@ class TestPassRateLengthPenalty:
             make_result("12345", "12345", 1.0),  # total 10 -> -0.1
             make_result("1234567890", "1234567890", 1.0),  # total 20 -> -0.2
         ]
-        apply_group_length_penalties(results, self.cfg(w=0.2))
+        apply(results, self.cfg(w=0.2))
         assert rewards_of(results) == pytest.approx([0.9, 0.8])
 
     def test_pass_rate_scales_penalty(self):
@@ -412,7 +420,7 @@ class TestPassRateLengthPenalty:
             make_result("1234567890", "1234567890", 1.0),  # l_max contributor
             make_result("12345", "12345", 0.0),
         ]
-        apply_group_length_penalties(results, self.cfg(w=0.2))
+        apply(results, self.cfg(w=0.2))
         assert rewards_of(results) == pytest.approx([0.9, 0.0])
 
     def test_all_wrong_group_gets_zero_penalty(self):
@@ -421,7 +429,7 @@ class TestPassRateLengthPenalty:
             make_result("12345", "12345", 0.0),
             make_result("1234567890", "1234567890", 0.0),
         ]
-        apply_group_length_penalties(results, self.cfg(w=0.2))
+        apply(results, self.cfg(w=0.2))
         assert rewards_of(results) == pytest.approx([0.0, 0.0])
 
     def test_zero_weight_is_noop(self):
@@ -429,7 +437,7 @@ class TestPassRateLengthPenalty:
             make_result("12345", "12345", 1.0),
             make_result("1234567890", "1234567890", 1.0),
         ]
-        apply_group_length_penalties(results, self.cfg(w=0.0))
+        apply(results, self.cfg(w=0.0))
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
 
     def test_wrong_rollout_length_does_not_set_normalizer(self):
@@ -441,7 +449,7 @@ class TestPassRateLengthPenalty:
             make_result("1234567890", "1234567890", 1.0),
             make_result("1" * 20, "1" * 20, 0.0),
         ]
-        apply_group_length_penalties(results, self.cfg(w=0.2))
+        apply(results, self.cfg(w=0.2))
         assert rewards_of(results) == pytest.approx([1.0 - 0.2 * 0.5, 0.0])
 
 
@@ -459,7 +467,7 @@ class TestReviewFixes:
             r["profiled_rewards"] = [1, 1]
             r["profiled_output_lengths"] = [10, 10]
         cfg = make_config(default={"enabled": True, "profiled_length_penalty": 1.5})
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 0.0])
 
     def test_negative_env_reward_group_skipped(self):
@@ -472,7 +480,7 @@ class TestReviewFixes:
             make_result("12345", "12345", -1.0),
             make_result("1234567890", "1234567890", 1.0),
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([-1.0, 1.0])
 
     def test_graded_rewards_group_skipped(self):
@@ -484,7 +492,7 @@ class TestReviewFixes:
             make_result("12345", "12345", 0.5),
             make_result("1234567890", "1234567890", 1.0),
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([0.5, 1.0])
 
     def test_all_wrong_group_stays_variance_free(self):
@@ -499,7 +507,7 @@ class TestReviewFixes:
             r["profiled_rewards"] = [1, 1]
             r["profiled_output_lengths"] = [10, 10]
         cfg = make_config(default={"enabled": True, "profiled_length_penalty": 0.3})
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([0.0, 0.0])
 
     def test_band_multiplier_never_rewards_length_on_penalized_base(self):
@@ -521,7 +529,7 @@ class TestReviewFixes:
                 "profile_band_total": True,
             }
         )
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         r_short, r_long = rewards_of(results)
         assert r_short == pytest.approx(0.0)
         assert r_long == pytest.approx(0.0)
@@ -539,7 +547,7 @@ class TestReviewFixes:
             make_result("1234567890123456789012345", "12345", 1.0),  # total 30
             make_result("12345", "12345", 1.0),
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
 
     def test_default_block_without_enabled_is_active(self):
@@ -551,7 +559,7 @@ class TestReviewFixes:
             make_result("12345", "12345", 1.0),
             make_result("1234567890123456789012345", "12345", 1.0),
         ]
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.1, 0.9])
 
     def test_behavior_independent_of_empty_agent_overrides(self):
@@ -568,19 +576,44 @@ class TestReviewFixes:
                 make_result("12345", "12345", 1.0),
                 make_result("1234567890123456789012345", "12345", 1.0),
             ]
-            apply_group_length_penalties(results, cfg)
+            apply(results, cfg)
             outs.append(rewards_of(results))
         assert outs[0] == pytest.approx(outs[1])
 
     def test_unknown_key_raises(self):
         cfg = make_config(default={"enabled": True, "group_total_length_coeff": 0.1})
         results = [make_result("12345", "12345", 1.0), make_result("123", "123", 1.0)]
-        try:
-            apply_group_length_penalties(results, cfg)
-        except ValueError as e:
-            assert "group_total_length_coeff" in str(e)
-        else:
-            raise AssertionError("expected ValueError for unknown config key")
+        with pytest.raises(ValueError, match="group_total_length_coeff"):
+            apply(results, cfg)
+
+    def test_invalid_literal_values_rejected(self):
+        # Typos in Literal-typed keys used to change behavior silently
+        # (`token` counted characters; a misspelled gate channel closed the
+        # gate on every group).
+        for bad in (
+            {"length_type": "token"},
+            {"group_length_penalty_profile_gate_channel": "totl"},
+            {"group_length_penalty_profile_gate_field": "x"},
+        ):
+            with pytest.raises(ValueError):
+                LengthPenaltyConfig.model_validate({"default": bad})
+
+    def test_agent_override_replaces_only_set_keys(self):
+        # An override that sets one key inherits every other value from
+        # `default` (merge uses model_dump(exclude_unset=True)), including
+        # non-default ones like length_type: chars.
+        cfg = make_config(
+            default={"enabled": True, "group_total_length_penalty_coeff": 0.2}
+        )
+        cfg["grpo"]["length_penalty"]["agent_overrides"] = {
+            AGENT: {"group_total_length_penalty_coeff": 0.1}
+        }
+        results = [
+            make_result("12345", "12345", 1.0),
+            make_result("1234567890123456789012345", "12345", 1.0),
+        ]
+        apply(results, cfg)
+        assert rewards_of(results) == pytest.approx([1.05, 0.95])
 
     def test_longest_penalty_under_binary_rewards(self):
         # Under binary rewards all correct rollouts tie at the top score, so
@@ -591,5 +624,181 @@ class TestReviewFixes:
             make_result("1234567890", "1234567890", 1.0),
         ]
         cfg = make_config(default={"enabled": True, "longest_total_penalty": 0.2})
-        apply_group_length_penalties(results, cfg)
+        apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 0.8])
+
+    def test_disabled_graded_agent_is_skipped_without_warning(
+        self, caplog, monkeypatch
+    ):
+        monkeypatch.setattr(length_penalty_mod, "_NON_BINARY_WARNED_AGENTS", set())
+        results = [make_result("r", "a", 0.7), make_result("r", "aaaa", 0.3)]
+        cfg = make_config(
+            default={"enabled": True, "group_total_length_penalty_coeff": 0.1}
+        )
+        cfg["grpo"]["length_penalty"]["agent_overrides"] = {AGENT: {"enabled": False}}
+        with caplog.at_level(logging.WARNING, logger=length_penalty_mod.__name__):
+            apply(results, cfg)
+        assert rewards_of(results) == [0.7, 0.3]
+        assert "non-binary" not in caplog.text
+
+    def test_multi_reward_group_skipped(self):
+        # A multi-reward result must keep reward == sum(reward_components);
+        # adjusting only the scalar would trip the rollout's
+        # validate_reward_components_match_scalar check.
+        cfg = make_config(
+            default={"enabled": True, "group_total_length_penalty_coeff": 0.1}
+        )
+        results = [
+            make_result("12345", "12345", 1.0),
+            make_result("1234567890", "1234567890", 1.0),
+        ]
+        for r in results:
+            r["full_result"]["reward_components"] = {"correct": 1.0, "format": 0.0}
+        metrics = apply(results, cfg)
+        assert rewards_of(results) == pytest.approx([1.0, 1.0])
+        assert metrics["length_penalty/skipped_non_binary_frac"] == 1.0
+
+    def test_env_observation_messages_not_counted(self):
+        # Gym's gymnasium_agent appends env observations to response.output as
+        # user-role messages; only model output may drive the answer length.
+        cfg = make_config(
+            default={"enabled": True, "group_answer_length_penalty_coeff": 0.2}
+        )
+        results = []
+        for obs_len in (10, 200, 400, 800):
+            r = make_result("think", "same answer", 1.0)
+            r["full_result"]["response"]["output"].insert(
+                1,
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"text": "o" * obs_len}],
+                },
+            )
+            results.append(r)
+        cfg["grpo"]["num_generations_per_prompt"] = 4
+        apply(results, cfg)
+        assert rewards_of(results) == pytest.approx([1.0, 1.0, 1.0, 1.0])
+
+    def test_returns_rollout_metrics(self):
+        # total 10 / 20 / 20 with profiled threshold 10: rows 1-2 lose 1.5
+        # each and clamp to 0; row 3 is wrong and untouched.
+        cfg = make_config(
+            default={"enabled": True, "profiled_length_penalty": 1.5}, num_gens=4
+        )
+        results = [
+            make_result("1234", "1234", 1.0),
+            make_result("1234567890", "1234567890", 1.0),
+            make_result("1234567890", "1234567890", 1.0),
+            make_result("1234567890", "1234567890", 0.0),
+        ]
+        for r in results:
+            r["profiled_rewards"] = [1, 1]
+            r["profiled_output_lengths"] = [10, 10]
+        metrics = apply(results, cfg)
+        assert rewards_of(results) == pytest.approx([1.0, 0.0, 0.0, 0.0])
+        assert metrics["length_penalty/env_reward_mean"] == pytest.approx(0.75)
+        assert metrics["length_penalty/reward_delta_mean"] == pytest.approx(-0.5)
+        assert metrics["length_penalty/wiped_correct_frac"] == pytest.approx(2 / 3)
+        assert metrics["length_penalty/adjusted_frac"] == pytest.approx(0.5)
+        assert metrics["length_penalty/skipped_non_binary_frac"] == 0.0
+
+    def test_nothing_enabled_returns_no_metrics(self):
+        cfg = make_config(default={"enabled": False})
+        results = [make_result("12345", "12345", 1.0), make_result("123", "123", 1.0)]
+        assert apply(results, cfg) == {}
+        assert rewards_of(results) == [1.0, 1.0]
+
+
+class TestNemoGymPostprocessHook:
+    """grpo.length_penalty applied by rollouts._postprocess_single_nemo_gym_group.
+
+    Needs torch (imported lazily) -- the rest of this file is torch-free.
+    """
+
+    @staticmethod
+    def postprocess(rows, texts, grpo_config, reward_penalty_config=None):
+        from types import SimpleNamespace
+
+        torch = pytest.importorskip("torch")
+
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.experience.rollouts import _postprocess_single_nemo_gym_group
+        from nemo_rl.utils.timer import Timer
+
+        prompt = {"role": "user", "content": "q", "token_ids": torch.tensor([1])}
+        reply = {"role": "assistant", "content": "a", "token_ids": torch.tensor([2])}
+        results = [
+            {
+                "full_result": make_result(reasoning, answer, 1.0)["full_result"],
+                "input_message_log": [prompt],
+                "message_log": [prompt, reply],
+            }
+            for reasoning, answer in texts
+        ]
+        rollout_result = _postprocess_single_nemo_gym_group(
+            nemo_gym_rows=rows,
+            results=results,
+            timer=Timer(),
+            timer_prefix="timing/test",
+            policy_generation=SimpleNamespace(cfg={"max_total_sequence_length": 128}),
+            input_batch=BatchedDataDict({"loss_multiplier": torch.ones(len(rows))}),
+            tokenizer=SimpleNamespace(pad_token_id=0),
+            log_full_result_tables=False,
+            reward_penalty_config=reward_penalty_config,
+            length_penalty_config=grpo_config["length_penalty"],
+            group_size=grpo_config["num_generations_per_prompt"],
+        )
+        return rollout_result
+
+    def test_each_prompt_group_uses_its_own_rows(self):
+        # Two prompt groups in one call (the legacy sync batch). Totals 10/20
+        # vs profiled threshold 12: the long rollout loses 0.3 (AGENT) or 0.6
+        # (code_agent override), then its own row band scales the rest:
+        # x0.5 at b=20 (group 0), x0.75 halfway to b=30 (group 1).
+        rows = [
+            {
+                "agent_ref": {"name": agent},
+                "profiled_rewards": [1, 1],
+                "profiled_output_lengths": [12, 12],
+                "profile_band": {"total": {"a": 10, "b": b, "f": 0.5}},
+            }
+            for agent, b in ((AGENT, 20), ("code_agent", 30))
+            for _ in range(2)
+        ]
+        grpo_config = make_config(
+            default={"profiled_length_penalty": 0.3, "profile_band_total": True}
+        )["grpo"]
+        grpo_config["length_penalty"]["agent_overrides"] = {
+            AGENT: {},
+            "code_agent": {"profiled_length_penalty": 0.6},
+        }
+        texts = [("12345", "12345"), ("1234567890", "1234567890")] * 2
+        rollout_result = self.postprocess(rows, texts, grpo_config)
+        rewards = rollout_result.final_batch["total_reward"].tolist()
+        assert rewards == pytest.approx([1.0, 0.35, 1.0, 0.3])
+        # The pre-hook env reward survives as its own column, and the hook
+        # reports its metrics next to the other reward shapers.
+        assert rollout_result.final_batch["env_reward"].tolist() == [1.0] * 4
+        metrics = rollout_result.rollout_metrics
+        assert metrics["length_penalty/env_reward_mean"] == pytest.approx(1.0)
+        assert metrics["length_penalty/reward_delta_mean"] == pytest.approx(
+            (0.35 - 1.0 + 0.3 - 1.0) / 4
+        )
+
+    def test_runs_after_reward_penalties(self):
+        # The duplicated-reasoning penalty zeroes row 2 first, so it drops out
+        # of the positive set: rows 0/1 (totals 10/30) get exactly +/-0.05.
+        rollout_result = self.postprocess(
+            [{"agent_ref": {"name": AGENT}} for _ in range(3)],
+            [("1234", "123456"), ("1" * 20, "1" * 10), ("x" * 50, "x" * 50)],
+            make_config(default={"group_total_length_penalty_coeff": 0.1}, num_gens=3)[
+                "grpo"
+            ],
+            reward_penalty_config={"penalize_duplicated_reasoning": True},
+        )
+        rewards = rollout_result.final_batch["total_reward"].tolist()
+        assert rewards == pytest.approx([1.05, 0.95, 0.0])
+        # env_reward is the reward as handed to the length hook, i.e. after the
+        # reward penalties already zeroed row 2.
+        assert rollout_result.final_batch["env_reward"].tolist() == [1.0, 1.0, 0.0]

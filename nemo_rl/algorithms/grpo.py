@@ -160,6 +160,7 @@ from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
 )
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
@@ -395,12 +396,9 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Emit exact-boundary and logical-vs-physical payload metrics.
     debug_payload_metrics: bool = False
     # Optional per-prompt-group length penalties/bonuses applied to NeMo-Gym
-    # rollout rewards (binary-reward envs only). Keys: ``default``,
-    # ``agent_overrides``, ``profile_band``, ``verbose``; see
-    # docs/guides/length-penalty.md. Validated by
-    # nemo_rl.utils.length_penalty.apply_group_length_penalties, which rejects
-    # unknown keys. None/absent disables the feature.
-    length_penalty: dict[str, Any] | None = None
+    # training rollout rewards (binary single-reward envs only); see
+    # docs/guides/length-penalty.md. None/absent disables the feature.
+    length_penalty: Optional[LengthPenaltyConfig] = None
 
 
 @dataclass
@@ -2747,13 +2745,17 @@ def _log_mixed_rewards_and_advantages_information(
     metrics: dict[str, Any],
     baseline: torch.Tensor,
     advantages: torch.Tensor,
+    env_baseline: Optional[torch.Tensor] = None,
 ) -> None:
     # The histograms that are logged are logged with a prefix "train/" to the name, since that is what the remaining metrics will be logged with.
     logger.log_histogram(
         baseline.numpy(), total_steps + 1, "train/baseline_reward/histogram"
     )
-    metrics["baseline_reward/pct_0"] = 100 * (baseline == 0).float().mean().item()
-    metrics["baseline_reward/pct_1"] = 100 * (baseline == 1).float().mean().item()
+    # The pct_* diagnostics assume binary rewards. When grpo.length_penalty
+    # rewrote total_reward, read them off the env-reward baseline instead.
+    pct_baseline = env_baseline if env_baseline is not None else baseline
+    metrics["baseline_reward/pct_0"] = 100 * (pct_baseline == 0).float().mean().item()
+    metrics["baseline_reward/pct_1"] = 100 * (pct_baseline == 1).float().mean().item()
     metrics["baseline_reward/pct_mixed"] = (
         100 - metrics["baseline_reward/pct_0"] - metrics["baseline_reward/pct_1"]
     )
@@ -3289,7 +3291,7 @@ def _grpo_train_impl(
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
                             reward_penalty_config=master_config.reward_penalties,
-                            length_penalty_config=master_config.grpo.model_dump(),
+                            length_penalty_config=master_config.grpo.length_penalty,
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                             mask_env_flagged_samples=should_mask_flagged_samples(
                                 master_config.env
@@ -3428,6 +3430,18 @@ def _grpo_train_impl(
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                             std_rewards=std_rewards,
                         )
+                    if "env_reward" in repeated_batch:
+                        # grpo.length_penalty rewrote total_reward; keep a
+                        # baseline of the env reward for the pct_* diagnostics.
+                        # Stored on the batch so dynamic sampling filters it.
+                        repeated_batch["env_baseline"], _, _ = (
+                            calculate_baseline_and_std_per_prompt(
+                                input_ids,
+                                repeated_batch["env_reward"],
+                                torch.ones_like(rewards),
+                                leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                            )
+                        )
 
                     # Apply dynamic sampling to filter prompts with non-zero std (DAPO algorithm)
                     repeated_batch, is_batch_complete, batch_cache, ds_metrics = (
@@ -3467,6 +3481,11 @@ def _grpo_train_impl(
 
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
+                    env_baseline_for_log = (
+                        repeated_batch["env_baseline"].clone()
+                        if "env_baseline" in repeated_batch
+                        else None
+                    )
 
                     # Must precede prompt extraction: it reuses the same message
                     # dicts, so this also protects the prompt flatten below.
@@ -3697,8 +3716,9 @@ def _grpo_train_impl(
                         metrics=metrics,
                         baseline=baseline_for_log,
                         advantages=train_data["advantages"],
+                        env_baseline=env_baseline_for_log,
                     )
-                    del baseline_for_log
+                    del baseline_for_log, env_baseline_for_log
 
                     penalty_metrics = (
                         _apply_configured_message_level_advantage_penalties(

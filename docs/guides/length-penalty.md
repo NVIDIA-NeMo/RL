@@ -3,23 +3,32 @@
 This guide documents the length-penalty and length-bonus algorithms implemented in
 `nemo_rl/utils/length_penalty.py`.
 
-They apply to the NeMo-Gym GRPO rollout paths (`run_nemo_gym_rollout_sync` and the
-async `AsyncTrajectoryCollector`); the SingleController path does not apply them yet.
+They apply to NeMo-Gym GRPO **training** rollouts on the legacy driver (`grpo_train`), the
+data-plane driver (`grpo_train_sync`, `data_plane.enabled: true`) and the async
+`AsyncTrajectoryCollector`. Validation rollouts never apply them, so validation metrics stay on
+the raw environment reward. The SingleController path does not apply length penalties yet;
+support there is planned as a follow-up.
 
-Configure `grpo.length_penalty`. The length adjustments mutate `full_result["reward"]` in
-place during rollout postprocessing.
+Configure `grpo.length_penalty`. The block is typed (`LengthPenaltyConfig` in
+`nemo_rl/utils/length_penalty.py`): unknown keys, misspelled `length_type` / gate values, a
+`profile_band` channel with `b <= a` or `f` outside `[0, 1]` are all rejected when the config is
+loaded, before the first rollout. The length adjustments mutate `full_result["reward"]` in place
+during rollout postprocessing; the reward as handed to the hook is kept on the batch as
+`env_reward` (see [Metrics](#metrics)).
 
 All algorithms are resolved per prompt group. Unless otherwise stated, only rollouts with
 `reward > 0` participate in length comparisons and receive length-based adjustments.
 
 ## Binary Rewards Requirement
 
-Length adjustments are defined for **binary (0/1) environment rewards** only. Every algorithm
-and the final clamp assume it. At rollout time each prompt group's rewards are checked: a group
-containing any graded or negative reward is skipped entirely — no adjustment, no clamp, rewards
-pass through untouched — and a warning is logged once per agent. To silence the warning for a
-deliberately graded agent (e.g. a genrm judge), disable it explicitly under `agent_overrides`
-with `enabled: false`.
+Length adjustments are defined for **binary (0/1), single-reward environment rewards** only.
+Every algorithm and the final clamp assume it, and a multi-reward verifier must keep
+`reward == sum(reward_components)`, which an adjustment to the scalar alone would break. At
+rollout time each prompt group's rewards are checked: a group containing any graded or negative
+reward, or any `reward_components`, is skipped entirely — no adjustment, no clamp, rewards pass
+through untouched — and a warning is logged once per agent. An agent disabled under
+`agent_overrides` with `enabled: false` is skipped before this check, so a deliberately graded
+agent (e.g. a genrm judge) produces no warning.
 
 Consequences of binariness worth knowing:
 
@@ -77,9 +86,14 @@ grpo:
 `length_type` may be:
 
 - `tokens`: lengths are tokenizer token counts.
-- anything else: lengths fall back to character counts.
+- `chars`: lengths are character counts.
 
-`agent_overrides` can override any supported parameter per agent. If an agent is missing from
+Lengths count the model's own output only: `reasoning` items and `message` items with role
+`assistant` (or no role). Environment observations that some agents append to the response as
+`user`-role messages are ignored.
+
+`agent_overrides` can override any supported parameter per agent; only the keys set under an
+agent replace the `default` value, everything else is inherited. If an agent is missing from
 `agent_overrides`, the implementation falls back to `default`. To disable length adjustments for
 a specific environment or agent while keeping the default enabled, set `enabled: false` for that
 agent:
@@ -105,7 +119,7 @@ grpo:
 | `default` | Default length-adjustment config used for agents without an override. |
 | `agent_overrides` | Per-agent config overrides keyed by agent name. |
 | `enabled` | Enables length adjustment for this config block. |
-| `length_type` | Selects length unit: `tokens` uses tokenizer counts; other values use character counts. |
+| `length_type` | Selects length unit: `tokens` (tokenizer counts) or `chars` (character counts). |
 | `top_percentile` | Fraction of positive scorers treated as top scorers for longest-penalty selection. |
 | `reasoning_bonus` | Flat bonus for the shortest positive/top-scoring reasoning trace in a prompt group. |
 | `answer_bonus` | Flat bonus for the shortest positive/top-scoring answer in a prompt group. |
@@ -136,34 +150,18 @@ grpo:
 
 ## Per-Prompt Data Format
 
-Some algorithms depend on metadata stored on each training-data row. The rollout code copies
-these fields from `extra_env_info` into each rollout result before applying length adjustments.
-
-At minimum, a row still looks like a normal NeMo-Gym training example. The length-related fields
-are extra keys:
+Some algorithms depend on per-prompt metadata stored on each training-data row. NeMo-RL carries
+each NeMo-Gym JSONL row as `extra_env_info`, and the rollout code reads these fields from the
+row's **top level** (next to `responses_create_params` and `agent_ref`), then copies them onto
+each rollout result before applying length adjustments. Do not nest them under an
+`extra_env_info` key: nested fields are never read, so per-row profiled-length and profile-band
+adjustments are silently skipped and a profile gate without a global band stays closed.
 
 ```json
 {
-  "problem": "Solve ...",
+  "responses_create_params": {"input": [{"role": "user", "content": "Solve ..."}]},
+  "agent_ref": {"name": "math_with_judge_simple_agent"},
   "expected_answer": "42",
-  "agent_name": "math_with_judge_simple_agent",
-  "extra_env_info": {
-    "profiled_rewards": [1, 1, 0, 1, 0, 1, 1, 1],
-    "profiled_output_lengths": [18342, 17110, 32768, 19004, 28991, 16820, 17455, 18101],
-    "profile_band": {
-      "total": {"a": 18138.6667, "b": 23756.0123, "f": 0.9},
-      "reasoning": {"a": 17686.3333, "b": 23111.0123, "f": 0.9},
-      "answer": {"a": 452.3333, "b": 1097.3333, "f": 0.9}
-    }
-  }
-}
-```
-
-Some data files store these fields at top level instead of inside `extra_env_info`; the important
-part is that by rollout time the result has:
-
-```json
-{
   "profiled_rewards": [1, 1, 0, 1, 0, 1, 1, 1],
   "profiled_output_lengths": [18342, 17110, 32768, 19004, 28991, 16820, 17455, 18101],
   "profile_band": {
@@ -471,7 +469,8 @@ Semantics:
   global `reasoning`/`answer` blocks if those are configured).
 - The global band also feeds profile-gated group-relative penalties
   (`group_length_penalty_profile_gate`) when rows lack metadata.
-- A malformed channel block (missing `a`/`b`/`f`, or `b <= a`) is ignored with a warning.
+- A malformed channel block (missing `a`/`b`/`f`, `b <= a`, or `f` outside `[0, 1]`) is a
+  config error and is rejected when the config is loaded.
 
 ### 7. Profile-Gated Group Relative-Length Scaling
 
@@ -571,6 +570,25 @@ grpo:
       enabled: true
       pass_rate_length_penalty_weight: 0.2
 ```
+
+## Metrics
+
+When `grpo.length_penalty` is set, the rollout postprocessor reports, next to the other reward
+shapers' metrics (logged under `train/`):
+
+| Metric | Meaning |
+| --- | --- |
+| `length_penalty/env_reward_mean` | Mean environment reward before length adjustments (the pass rate for binary envs). |
+| `length_penalty/reward_delta_mean` | Mean `adjusted - env` reward over the rollouts. |
+| `length_penalty/wiped_correct_frac` | Fraction of correct rollouts whose reward the penalties clamped to 0. |
+| `length_penalty/adjusted_frac` | Fraction of rollouts whose reward changed. |
+| `length_penalty/skipped_non_binary_frac` | Fraction of rollouts in groups skipped for non-binary or multi-component rewards. |
+
+`total_reward` and the per-agent `<agent>/reward/*` metrics carry the adjusted reward. The reward
+as handed to the length hook (after effort shaping and reward penalties) is kept on the rollout
+batch as `env_reward`, and the `baseline_reward/pct_0` / `pct_1` / `pct_mixed` diagnostics are
+computed from it so they keep reporting the environment's all-wrong / all-correct / mixed prompt
+fractions.
 
 ## Practical Notes
 

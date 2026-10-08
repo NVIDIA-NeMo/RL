@@ -6503,6 +6503,42 @@ def test_single_forward_sync_dataplane_skips_logprob_dispatch(mock_grpo_componen
     policy.train_from_meta.assert_called_once()
 
 
+def test_grpo_train_sync_applies_length_penalty_to_training_rollouts(
+    mock_grpo_components,
+):
+    """Training rollouts opt in to grpo.length_penalty via rollout_to_tq."""
+    import nemo_rl.algorithms.grpo_sync as grpo_sync_module
+
+    config = mock_grpo_components["master_config"]
+    config.data_plane = {"enabled": True}
+    config.grpo.max_num_steps = 1
+    config.grpo.val_period = 0
+    config.grpo.val_at_start = False
+    config.grpo.val_at_end = False
+    policy = mock_grpo_components["policy"]
+    with mock_sync_grpo_infrastructure(policy):
+        grpo_train_sync(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            config,
+        )
+        rollout_actor = (
+            grpo_sync_module.SyncRolloutActor.options.return_value.remote.return_value
+        )
+    calls = rollout_actor.rollout_to_tq.remote.call_args_list
+    assert calls
+    assert all(call.kwargs["apply_length_penalty"] is True for call in calls)
+
+
 def test_in_loss_threshold_skips_policy_forward_without_disabling_threshold():
     config = _cfg(force=True, threshold=2.0, skip_ref=True, kl_penalty=0)
     config.loss_fn.seq_logprob_error_in_loss = True

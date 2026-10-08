@@ -67,6 +67,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     _warn_unsupported_in_flight_refit_pause_once,
 )
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
 
 
@@ -3317,7 +3318,9 @@ class TestAsyncTrajectoryCollector:
                 "low_string": "{reasoning effort: efficient}",
             }
         }
-        length_penalty_cfg = {"default": {"total_bonus": 0.1, "top_percentile": 0.5}}
+        length_penalty_cfg = LengthPenaltyConfig.model_validate(
+            {"default": {"total_bonus": 0.1, "top_percentile": 0.5}}
+        )
         collector.master_config.grpo.length_penalty = length_penalty_cfg
         target_weight = 15
         collector._generating_targets.add(target_weight)
@@ -3352,11 +3355,8 @@ class TestAsyncTrajectoryCollector:
                 low_ub=15_000,
                 low_string="{reasoning effort: efficient}",
             )
-            # The collector forwards the whole grpo block; the rollout
-            # postprocessor reads grpo.length_penalty from it.
-            assert kwargs["length_penalty_config"]["length_penalty"] == (
-                length_penalty_cfg
-            )
+            # The collector forwards the typed grpo.length_penalty block.
+            assert kwargs["length_penalty_config"] is length_penalty_cfg
             rollout_calls += 1
             task_indices = [
                 row["_ng_task_index"] for row in kwargs["input_batch"]["extra_env_info"]

@@ -33,68 +33,112 @@ from __future__ import annotations
 
 import logging
 import statistics
-from typing import Any
+from typing import Any, Literal, Optional
+
+from pydantic import BaseModel, Field, model_validator
 
 logger = logging.getLogger(__name__)
 
 # MAD/median floor for zMAD (fixed; matches ``flag_reasoning_length_outliers`` default).
 _ZMAD_MIN_MAD_REL = 0.015
 
-_PARAM_KEYS = (
-    "enabled",
-    "reasoning_bonus",
-    "answer_bonus",
-    "total_bonus",
-    "longest_reasoning_penalty",
-    "longest_answer_penalty",
-    "longest_total_penalty",
-    "top_percentile",
-    "group_reasoning_length_penalty_coeff",
-    "group_answer_length_penalty_coeff",
-    "group_total_length_penalty_coeff",
-    "length_type",
-    "reasoning_zmad_threshold",
-    "reasoning_zmad_penalty",
-    "answer_zmad_threshold",
-    "answer_zmad_penalty",
-    "total_zmad_threshold",
-    "total_zmad_penalty",
-    "profiled_length_penalty",
-    "profiled_length_n_std",
-    "profiled_length_min_samples",
-    "pass_rate_length_penalty_weight",
-    "profile_band_total",
-    "profile_band_reasoning",
-    "profile_band_answer",
-    "group_length_penalty_profile_gate",
-    "group_length_penalty_profile_gate_channel",
-    "group_length_penalty_profile_gate_field",
-    "group_length_penalty_profile_gate_positive_only",
+ProfileBandChannelName = Literal["total", "reasoning", "answer"]
+_PROFILE_BAND_CHANNELS: tuple[ProfileBandChannelName, ...] = (
+    "total",
+    "reasoning",
+    "answer",
 )
 
-# Param keys that should be merged as bools rather than floats.
-_BOOL_PARAM_KEYS = frozenset(
-    {
-        "enabled",
-        "profile_band_total",
-        "profile_band_reasoning",
-        "profile_band_answer",
-        "group_length_penalty_profile_gate",
-        "group_length_penalty_profile_gate_positive_only",
-    }
-)
 
-_STR_PARAM_KEYS = frozenset(
-    {
-        "length_type",
-        "group_length_penalty_profile_gate_channel",
-        "group_length_penalty_profile_gate_field",
-    }
-)
+class LengthPenaltyParams(BaseModel, extra="forbid"):
+    """Length-adjustment parameters for one agent.
 
-# Length adjustments are defined for binary (0/1) env rewards only. Agents
-# already warned about non-binary rewards (warn once per agent, then skip
-# their prompt groups).
+    Used for ``grpo.length_penalty.default`` and for each entry under
+    ``grpo.length_penalty.agent_overrides``. Only the keys a user sets in an
+    override replace the corresponding ``default`` value. Unknown keys are
+    forbidden because a misspelled parameter would silently leave a penalty
+    off. See docs/guides/length-penalty.md for the per-key semantics.
+    """
+
+    enabled: bool = True
+    length_type: Literal["tokens", "chars"] = "tokens"
+    top_percentile: float = 0.5
+    reasoning_bonus: float = 0.0
+    answer_bonus: float = 0.0
+    total_bonus: float = 0.0
+    longest_reasoning_penalty: float = 0.0
+    longest_answer_penalty: float = 0.0
+    longest_total_penalty: float = 0.0
+    group_reasoning_length_penalty_coeff: float = 0.0
+    group_answer_length_penalty_coeff: float = 0.0
+    group_total_length_penalty_coeff: float = 0.0
+    reasoning_zmad_threshold: float = 0.0
+    reasoning_zmad_penalty: float = 0.0
+    answer_zmad_threshold: float = 0.0
+    answer_zmad_penalty: float = 0.0
+    total_zmad_threshold: float = 0.0
+    total_zmad_penalty: float = 0.0
+    profiled_length_penalty: float = 0.0
+    profiled_length_n_std: float = 1.0
+    profiled_length_min_samples: int = 2
+    pass_rate_length_penalty_weight: float = 0.0
+    profile_band_total: bool = False
+    profile_band_reasoning: bool = False
+    profile_band_answer: bool = False
+    group_length_penalty_profile_gate: bool = False
+    group_length_penalty_profile_gate_channel: ProfileBandChannelName = "total"
+    group_length_penalty_profile_gate_field: Literal["a", "b", "f"] = "a"
+    group_length_penalty_profile_gate_positive_only: bool = True
+
+
+class ProfileBandChannel(BaseModel, extra="forbid"):
+    """One ``{a, b, f}`` band: multiplier 1.0 up to ``a``, linear to ``f`` at ``b``.
+
+    ``f`` is bounded to [0, 1]: a value outside it would make rewards negative
+    or larger for longer rollouts.
+    """
+
+    a: float
+    b: float
+    f: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_b_gt_a(self) -> "ProfileBandChannel":
+        if self.b <= self.a:
+            raise ValueError(f"profile band requires b > a, got a={self.a}, b={self.b}")
+        return self
+
+
+class ProfileBandDefaults(BaseModel, extra="forbid"):
+    total: Optional[ProfileBandChannel] = None
+    reasoning: Optional[ProfileBandChannel] = None
+    answer: Optional[ProfileBandChannel] = None
+
+
+class ProfileBandConfig(BaseModel, extra="forbid"):
+    """Global ``{a, b, f}`` bands for datasets without per-row ``profile_band``."""
+
+    enabled: bool = False
+    defaults: ProfileBandDefaults = Field(default_factory=ProfileBandDefaults)
+
+
+class LengthPenaltyConfig(BaseModel, extra="forbid"):
+    """``grpo.length_penalty``: per-prompt-group length penalties for NeMo-Gym rollouts.
+
+    ``agent_overrides.<agent>`` may be ``null`` to keep ``default`` for that
+    agent. Channels listed under ``profile_band.defaults`` are implicitly
+    enabled unless ``default`` sets the matching ``profile_band_*`` flag.
+    """
+
+    verbose: bool = False
+    default: LengthPenaltyParams = Field(default_factory=LengthPenaltyParams)
+    agent_overrides: Optional[dict[str, Optional[LengthPenaltyParams]]] = None
+    profile_band: Optional[ProfileBandConfig] = None
+
+
+# Length adjustments are defined for binary (0/1) single-reward env rewards
+# only. Agents already warned about non-binary or multi-component rewards
+# (warn once per agent, then skip their prompt groups).
 _NON_BINARY_WARNED_AGENTS: set[str] = set()
 _BINARY_REWARD_TOL = 1e-6
 
@@ -132,6 +176,15 @@ def _extract_reasoning_and_answer_text(result: dict[str, Any]) -> tuple[str, str
                 t = s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")
                 reasoning_text += t
         elif item_type == "message":
+            role = (
+                item.get("role")
+                if isinstance(item, dict)
+                else getattr(item, "role", None)
+            )
+            # Some agents (e.g. Gym's gymnasium_agent) append env observations
+            # to response.output as user-role messages; count model output only.
+            if role not in (None, "assistant"):
+                continue
             content = (
                 item.get("content", [])
                 if isinstance(item, dict)
@@ -151,107 +204,57 @@ def _extract_reasoning_and_answer_text(result: dict[str, Any]) -> tuple[str, str
     return reasoning_text, answer_text
 
 
-_TOP_LEVEL_LENGTH_PENALTY_KEYS = frozenset(
-    {"verbose", "default", "agent_overrides", "profile_band"}
-)
-_PROFILE_BAND_BLOCK_KEYS = frozenset({"enabled", "defaults"})
-_PROFILE_BAND_CHANNELS = frozenset({"total", "reasoning", "answer"})
-
-
-def _reject_unknown_length_penalty_keys(length_cfg: dict[str, Any]) -> None:
-    """Raise on unknown config keys instead of silently ignoring them."""
-
-    def _check(block: Any, allowed: frozenset, where: str) -> None:
-        if not isinstance(block, dict):
-            return
-        unknown = sorted(set(block) - allowed)
-        if unknown:
-            raise ValueError(
-                f"Unknown key(s) {unknown} in {where}; allowed: {sorted(allowed)}"
-            )
-
-    _check(length_cfg, _TOP_LEVEL_LENGTH_PENALTY_KEYS, "grpo.length_penalty")
-    _check(
-        length_cfg.get("default"), frozenset(_PARAM_KEYS), "grpo.length_penalty.default"
-    )
-    agents_cfg = length_cfg.get("agent_overrides")
-    if isinstance(agents_cfg, dict):
-        for agent_name, overrides in agents_cfg.items():
-            _check(
-                overrides,
-                frozenset(_PARAM_KEYS),
-                f"grpo.length_penalty.agent_overrides.{agent_name}",
-            )
-    pb_cfg = length_cfg.get("profile_band")
-    if isinstance(pb_cfg, dict):
-        _check(pb_cfg, _PROFILE_BAND_BLOCK_KEYS, "grpo.length_penalty.profile_band")
-        _check(
-            pb_cfg.get("defaults"),
-            _PROFILE_BAND_CHANNELS,
-            "grpo.length_penalty.profile_band.defaults",
-        )
-
-
 def apply_group_length_penalties(
     results: list[dict[str, Any]],
-    master_config: dict[str, Any],
+    length_penalty_config: LengthPenaltyConfig | dict[str, Any],
+    group_size: int,
     tokenizer: Any = None,
-) -> None:
+) -> dict[str, float]:
     """Apply per-prompt-group length bonuses/penalties.
 
-    Reads ``grpo.length_penalty`` for configuration and mutates
-    ``full_result["reward"]`` in place. No-ops when no length-adjustment
-    feature is enabled.
+    Mutates ``full_result["reward"]`` in place. No-ops when no
+    length-adjustment feature is enabled.
 
     Args:
-        results: List of per-generation result dicts.
-        master_config: Full training config dict.
+        results: List of per-generation result dicts, ``group_size`` contiguous
+            rows per prompt group.
+        length_penalty_config: The ``grpo.length_penalty`` block (a dict is
+            validated into :class:`LengthPenaltyConfig`).
+        group_size: Number of contiguous rows per prompt group.
         tokenizer: Tokenizer for computing reasoning/answer token counts.
-    """
-    grpo_config = master_config.get("grpo", {})
-    length_cfg = dict(grpo_config.get("length_penalty", {}) or {})
-    if not length_cfg:
-        return
 
-    _reject_unknown_length_penalty_keys(length_cfg)
-    default_cfg = length_cfg.get("default", {})
-    agents_cfg = length_cfg.get("agent_overrides")
-    global_band = _resolve_global_profile_band(length_cfg.get("profile_band"))
-    verbose = bool(length_cfg.get("verbose", False))
+    Returns:
+        ``length_penalty/*`` rollout metrics: the pre-adjustment env reward
+        mean, the mean reward delta, the fraction of correct rollouts whose
+        reward was wiped to 0, the fraction of rows adjusted, and the fraction
+        of rows in groups skipped for non-binary or multi-component rewards.
+        Empty when the block enables nothing.
+    """
+    cfg = (
+        length_penalty_config
+        if isinstance(length_penalty_config, LengthPenaltyConfig)
+        else LengthPenaltyConfig.model_validate(length_penalty_config)
+    )
+    agents_cfg = cfg.agent_overrides
+    global_band = _resolve_global_profile_band(cfg.profile_band)
+    verbose = cfg.verbose
     # `enabled` defaults True here AND in the per-group param resolution: a
     # configured `default:` block is intent-to-enable; omitting `enabled` must
     # not silently no-op (and must not depend on unrelated keys being present).
-    if not default_cfg.get("enabled", True) and not agents_cfg and not global_band:
-        return
+    if not cfg.default.enabled and not agents_cfg and not global_band:
+        return {}
+    if not results:
+        return {}
+    if group_size <= 0:
+        raise ValueError("group_size must be greater than zero")
 
-    num_gens = master_config["grpo"]["num_generations_per_prompt"]
-    defaults: dict[str, Any] = {}
-    for k in _PARAM_KEYS:
-        if k == "length_type":
-            defaults[k] = default_cfg.get(k, "tokens")
-        elif k == "group_length_penalty_profile_gate_channel":
-            defaults[k] = default_cfg.get(k, "total")
-        elif k == "group_length_penalty_profile_gate_field":
-            defaults[k] = default_cfg.get(k, "a")
-        elif k == "enabled":
-            defaults[k] = default_cfg.get(k, True)
-        elif k == "group_length_penalty_profile_gate_positive_only":
-            defaults[k] = default_cfg.get(k, True)
-        elif k in _BOOL_PARAM_KEYS:
-            defaults[k] = default_cfg.get(k, False)
-        elif k == "profiled_length_min_samples":
-            defaults[k] = default_cfg.get(k, 2)
-        elif k == "profiled_length_n_std":
-            defaults[k] = default_cfg.get(k, 1.0)
-        elif k == "top_percentile":
-            defaults[k] = default_cfg.get(k, 0.5)
-        else:
-            defaults[k] = default_cfg.get(k, 0.0)
+    num_gens = group_size
+    defaults: dict[str, Any] = cfg.default.model_dump()
     # Channels listed under length_penalty.profile_band.defaults are implicitly
     # enabled — unless the user explicitly configured the channel flag, which
     # always wins (e.g. profile_band_total: false stays false).
     for _ch in global_band:
-        if f"profile_band_{_ch}" not in default_cfg:
+        if f"profile_band_{_ch}" not in cfg.default.model_fields_set:
             defaults[f"profile_band_{_ch}"] = True
 
     n = len(results)
@@ -287,32 +290,39 @@ def apply_group_length_penalties(
     # Rows whose group passed the binary-rewards check; all other rows are
     # left completely untouched (no adjustment, no clamp, no reward writeback).
     binary_ok = [False] * n
+    skipped_non_binary_rows = 0
 
     for g in range(0, n, num_gens):
         agent_name = agent_names[g]
         group_size = min(num_gens, n - g)
-        # Length adjustments are defined for binary (0/1) env rewards only:
-        # every algorithm and the phase-3 clamp assume it. Skip (and warn once
-        # per agent) on graded or negative rewards.
+        # Resolve `enabled` first so a disabled agent is skipped silently.
+        params = _resolve_agent_params(agent_name, agents_cfg, defaults)
+        if params is None:
+            continue
+        if not params.pop("enabled", True):
+            continue
+        # Length adjustments are defined for binary (0/1) single-reward env
+        # rewards only: every algorithm and the phase-3 clamp assume it, and a
+        # multi-reward row must keep reward == sum(reward_components). Skip
+        # (and warn once per agent) on graded, negative, or component rewards.
         if any(
-            not _is_binary_reward(original_rewards[g + k]) for k in range(group_size)
+            not _is_binary_reward(original_rewards[g + k])
+            or results[g + k]["full_result"].get("reward_components")
+            for k in range(group_size)
         ):
+            skipped_non_binary_rows += group_size
             if agent_name not in _NON_BINARY_WARNED_AGENTS:
                 _NON_BINARY_WARNED_AGENTS.add(agent_name)
                 logger.warning(
-                    f"length penalties require binary (0/1) env rewards; agent "
-                    f"{agent_name} produced non-binary rewards — skipping length "
-                    f"penalties for its prompt groups"
+                    f"length penalties require binary (0/1) single-reward env "
+                    f"rewards; agent {agent_name} produced non-binary or "
+                    f"multi-component rewards — skipping length penalties for "
+                    f"its prompt groups"
                 )
             continue
         for k in range(group_size):
             binary_ok[g + k] = True
         if any(results[g + k].get("low_effort_applied") for k in range(group_size)):
-            continue
-        params = _resolve_agent_params(agent_name, agents_cfg, defaults)
-        if params is None:
-            continue
-        if not params.pop("enabled", True):
             continue
 
         group_lt = params.pop("length_type", "tokens")
@@ -594,33 +604,44 @@ def apply_group_length_penalties(
         binary_ok=binary_ok,
     )
 
+    # Rollout metrics: the env reward is overwritten above, so these are the
+    # only record of the pass rate and of how far the rewards moved.
+    final_rewards = [r["full_result"]["reward"] for r in results]
+    correct = [i for i in range(n) if binary_ok[i] and original_rewards[i] > 0]
+    return {
+        "length_penalty/env_reward_mean": sum(original_rewards) / n,
+        "length_penalty/reward_delta_mean": sum(
+            f - o for f, o in zip(final_rewards, original_rewards)
+        )
+        / n,
+        "length_penalty/wiped_correct_frac": (
+            sum(1 for i in correct if final_rewards[i] <= 0.0) / len(correct)
+            if correct
+            else 0.0
+        ),
+        "length_penalty/adjusted_frac": sum(
+            1 for f, o in zip(final_rewards, original_rewards) if f != o
+        )
+        / n,
+        "length_penalty/skipped_non_binary_frac": skipped_non_binary_rows / n,
+    }
 
-def _resolve_global_profile_band(pb_cfg: Any) -> dict[str, dict[str, Any]]:
+
+def _resolve_global_profile_band(
+    pb_cfg: ProfileBandConfig | None,
+) -> dict[str, dict[str, Any]]:
     """Parse ``length_penalty.profile_band`` into per-channel {a, b, f} blocks.
 
-    Returns only channels ("total", "reasoning", "answer") present under
-    ``defaults`` with a complete, well-formed block. Empty dict when the
-    section is absent or disabled.
+    Returns only the channels ("total", "reasoning", "answer") present under
+    ``defaults``. Empty dict when the section is absent or disabled.
     """
-    if not isinstance(pb_cfg, dict) or not pb_cfg.get("enabled", False):
+    if pb_cfg is None or not pb_cfg.enabled:
         return {}
-    pb_defaults = pb_cfg.get("defaults")
-    if not isinstance(pb_defaults, dict):
-        return {}
-    band: dict[str, dict[str, Any]] = {}
-    for ch in ("total", "reasoning", "answer"):
-        ch_cfg = pb_defaults.get(ch)
-        if not isinstance(ch_cfg, dict):
-            continue
-        a, b, f = ch_cfg.get("a"), ch_cfg.get("b"), ch_cfg.get("f")
-        if a is None or b is None or f is None or b <= a:
-            logger.warning(
-                f"length_penalty.profile_band.defaults.{ch} is malformed "
-                f"(a={a}, b={b}, f={f}); ignoring this channel"
-            )
-            continue
-        band[ch] = {"a": a, "b": b, "f": f}
-    return band
+    return {
+        ch: block.model_dump()
+        for ch in _PROFILE_BAND_CHANNELS
+        if (block := getattr(pb_cfg.defaults, ch)) is not None
+    }
 
 
 def _merged_profile_band(
@@ -645,7 +666,7 @@ def _apply_profile_band_multipliers(
     reasoning_lengths: list[int],
     answer_lengths: list[int],
     agent_names: list[str],
-    agents_cfg: dict[str, Any] | None,
+    agents_cfg: dict[str, LengthPenaltyParams | None] | None,
     defaults: dict[str, Any],
     num_gens: int,
     global_band: dict[str, dict[str, Any]] | None = None,
@@ -819,7 +840,7 @@ def _profile_band_numeric_value(
 
 def _resolve_agent_params(
     agent_name: str,
-    agents_cfg: dict[str, Any] | None,
+    agents_cfg: dict[str, LengthPenaltyParams | None] | None,
     defaults: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Resolve length bonus parameters for a given agent."""
@@ -838,15 +859,9 @@ def _resolve_agent_params(
     if overrides is None:
         return dict(defaults)
 
+    # Only keys the user set under the override replace ``default``.
     merged = dict(defaults)
-    for key in _PARAM_KEYS:
-        if key in overrides:
-            if key in _STR_PARAM_KEYS:
-                merged[key] = overrides[key]
-            elif key in _BOOL_PARAM_KEYS:
-                merged[key] = bool(overrides[key])
-            else:
-                merged[key] = float(overrides[key])
+    merged.update(overrides.model_dump(exclude_unset=True))
     return merged
 
 

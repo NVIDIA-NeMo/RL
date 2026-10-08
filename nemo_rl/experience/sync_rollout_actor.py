@@ -149,6 +149,7 @@ class SyncRolloutActor:
         finish_generation: bool = True,
         task_to_env_override: Optional[dict[str, EnvironmentInterface]] = None,
         carry_keys: Optional[list[str]] = None,
+        apply_length_penalty: bool = False,
     ) -> tuple[
         KVBatchMeta,
         dict[str, Any],
@@ -207,6 +208,10 @@ class SyncRolloutActor:
                 (training uses this). Validation passes a slim list
                 (e.g. ``["total_reward"]``) to avoid wasting Ray transfer
                 on fields it doesn't consume.
+            apply_length_penalty: Forward ``grpo.length_penalty`` to the
+                NeMo-Gym rollout so training rewards get the per-prompt-group
+                length adjustments. Training passes ``True``; validation
+                keeps the default so val metrics stay on the raw env reward.
 
         Returns:
             ``(meta, driver_carry, rollout_metrics, generation_logger_metrics)``
@@ -267,6 +272,9 @@ class SyncRolloutActor:
                 and cfg.env["nemo_gym"].get("effort_levels") is not None
                 else None,
                 reward_penalty_config=cfg.reward_penalties,
+                length_penalty_config=(
+                    cfg.grpo.length_penalty if apply_length_penalty else None
+                ),
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
                 deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
                 debug_payload_metrics=cfg.grpo.debug_payload_metrics,
@@ -382,6 +390,10 @@ class SyncRolloutActor:
             # apply_reward_shaping on the driver without a TQ fetch.
             "response_token_lengths": decomposed["response_token_lengths"],
         }
+        # Pre-length-penalty env reward (present only when grpo.length_penalty
+        # ran); feeds the driver's baseline_reward/pct_* diagnostics.
+        if "env_reward" in fb:
+            driver_carry["env_reward"] = fb["env_reward"]
         # GDPO multi-reward components: scale_rewards iterates these
         # keys driver-side and the GDPO advantage estimator reads them
         # from ``adv_inputs``. Plumb them through ``driver_carry``
