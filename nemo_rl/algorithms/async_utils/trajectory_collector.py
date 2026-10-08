@@ -20,7 +20,7 @@ import functools
 import threading as _threading
 import time
 from collections import defaultdict, deque
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import Any, Optional, cast
 
 import ray
@@ -81,7 +81,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 from nemo_rl.utils.timer import ThreadSafeTimer
 
 
-def _prefix_caching_may_be_enabled(generation_cfg: dict[str, Any]) -> bool:
+def _prefix_caching_may_be_enabled(generation_cfg: Mapping[str, Any]) -> bool:
     """Whether the vLLM prefix cache is (or defaults to) enabled.
 
     ``vllm_cfg.enable_prefix_caching`` unset resolves to True on Ampere+ GPUs in
