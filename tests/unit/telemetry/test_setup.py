@@ -80,7 +80,7 @@ def test_campaign_stage_is_tagged_on_driver_and_worker():
     assert _worker_resource_attributes(None, None)["nv.dl.campaign.stage"] == "RL"
 
 
-def test_build_resource_attributes_dtensor_tp():
+def test_build_resource_attributes_automodel_tp():
     cfg = _FakeMasterConfig(
         policy={
             "model_name": "org/Model-1B",
@@ -157,12 +157,12 @@ def test_training_target_drops_a_non_positive_step_count():
 
 
 def test_training_config_reads_either_backends_optimizer_spelling():
-    # megatron names the algorithm, dtensor names the class.
+    # megatron names the algorithm, automodel names the class.
     megatron = {"policy": {"megatron_cfg": {"optimizer": {"optimizer": "adam"}}}}
-    dtensor = {"policy": {"optimizer": {"name": "torch.optim.AdamW"}}}
+    automodel = {"policy": {"optimizer": {"name": "torch.optim.AdamW"}}}
     key = "nv.dl.training.config.optimizer"
     assert _training_config_attributes(megatron, "grpo")[key] == "adam"
-    assert _training_config_attributes(dtensor, "grpo")[key] == "torch.optim.AdamW"
+    assert _training_config_attributes(automodel, "grpo")[key] == "torch.optim.AdamW"
 
 
 def test_recompute_granularity_is_reported_only_when_recompute_is_on():

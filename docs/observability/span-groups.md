@@ -50,7 +50,7 @@ One consequence worth knowing: registration is an *import side effect*, so a gro
 |---|---|---|
 | `job` | base | the whole-run root span (`rl.<algo>.job`) |
 | `setup` | RL | startup, before the first step: `rl.startup` and the `rl.setup.*` phases under it |
-| `checkpoint` | base | `rl.<algo>.checkpointing` |
+| `checkpoint` | base | `rl.<algo>.checkpointing` — staging, which is what blocks the loop; `rl.checkpoint.finalize` — the asynchronous tail, open until the checkpoint is durable. See [Checkpoint spans](#a-checkpoint-takes-two-spans) |
 | `evaluate` | base | `rl.<algo>.evaluate` |
 | `model_init` | base | `rl.vllm.load_model` (generation worker), `rl.policy.load_model` / `rl.value.load_model` (training workers) |
 | `step` | base | `rl.<algo>.step` (one per training step) |
@@ -127,6 +127,7 @@ These are set on spans for filtering — they answer "which one?" / "what kind?"
 | `rl.num_prompt_groups` | async rollout batch width, so a gap-filling batch is not read as an unexplained speed-up |
 | `rl.gym.batch_size` | how many examples one `rl.gym.run_rollouts` span covers — the NeMo-Gym counterpart to `rl.num_prompt_groups` |
 | `rl.idle.polls` | how many retries one `rl.idle.buffer_starvation` span covers on the single-controller path, where the span is coalesced over a poll loop. Read it against the duration: the same ten seconds is two thousand clean 5 ms polls or two hundred polls whose selection ran long, which are opposite diagnoses |
+| `rl.checkpoint.async_save` | whether bytes were still being written when the loop resumed. `true` means `rl.checkpoint.finalize` spans a real wait on the writer processes; `false` means the write finished inside the staging span and the finalize span is just a rename. Both shapes emit the same span, so without this a near-zero duration is ambiguous between the two |
 | `rl.rollout.attempt` | SingleController dispatch attempt: `0` is a first try, `> 0` a substitution after a skipped group, whose tokens were discarded |
 | `rl.target_step` | the training step an `rl.sc.generate_and_push` dispatch is aimed at; omitted when the dispatch is unstamped |
 | `rl.critic_epochs` | critic epochs covered by one `rl.sc.value_training` span |
@@ -167,6 +168,65 @@ calls and coroutines but not raw threads or other processes. Worker-side spans
 such as `rl.policy.load_model` are therefore unstamped; they are model init, not
 step work, so they sit outside any step regardless.
 
+`rl.checkpoint.finalize` is the one place the scope would have been both
+unreachable *and* wrong, so it sets `rl.iteration` itself — see below.
+
+### A checkpoint takes two spans
+
+An async save returns as soon as the weights are staged off the GPU; the writer
+processes keep going in the background and the checkpoint is not resumable
+until they finish and `tmp_step_N` is renamed to `step_N`. One span cannot
+describe both facts, so there are two.
+
+| Span | Opens | Closes | Answers |
+|---|---|---|---|
+| `rl.<algo>.checkpointing` | when the step decides to save | when the loop is released | how long checkpointing **cost** the step |
+| `rl.checkpoint.finalize` | when `begin_finalization` hands off | when the rename lands | when the checkpoint became **durable** |
+
+`rl.checkpoint.finalize` is a **child** of the staging span, not a sibling: the
+trace context is captured inside `rl.<algo>.checkpointing` and handed to the
+thread, which keeps the pair navigable as one unit. A child that ends after its
+parent is unusual but legal, and it is the honest shape — so a trace viewer
+shows step 7's subtree still open during step 9:
+
+```
+step 7                                   step 8                step 9
+└─ rl.grpo.checkpointing ──┤
+   (stage, blocking)       │
+   └─ rl.checkpoint.finalize ──────────────────────────┤
+      rl.iteration = 7                                │
+      (writers drain, then rename)                    ┘
+```
+
+Three consequences follow from that overlap:
+
+- **Step 7's span subtree extends past step 7.** A rollup that sums span
+  durations under a step span will attribute the finalize wait to the step that
+  triggered it, which is the right answer for "when did step 7 become durable"
+  and the wrong one for "how long did step 7 take". Read step cost off
+  `rl.<algo>.step` and the buckets below, not off the subtree.
+
+- **`rl.checkpoint.finalize` carries no `rl.bucket`.** It runs concurrently with
+  the next step's productive spans, so tagging it `overhead` would charge one
+  stretch of wall clock to two buckets at once and push the goodput denominator
+  past the wall clock. Same reasoning as the collector-side `efficiency`
+  categories. The staging span it follows *is* `overhead`, because that one
+  genuinely blocks.
+- **Its `rl.iteration` is the step that triggered the save**, not the step
+  running when the rename lands. The work happens on a daemon thread that the
+  enclosing `iteration_scope` cannot reach, so the step is read back from the
+  `tmp_step_N` directory name and set on the span explicitly. `rl.iteration = 7`
+  therefore selects the save of step 7's weights however late it completed.
+
+A finalization that fails — a writer rank dying, a rename onto a full disk —
+ends the span with an error status, and the same error is re-raised from the
+next `finalize_pending()`. Both spans are in the `checkpoint` group, so one
+group switch turns the pair on or off together.
+
+The reverse never happens: failing to *open* the finalize span is warned about
+and the finalization proceeds untraced. Instrumentation does not get to decide
+whether a checkpoint becomes resumable.
+
 ### Span group → `rl.bucket`
 
 Leaf groups are tagged automatically when using
@@ -180,7 +240,7 @@ so the call site shows which of the two it is — see
 |---|---|
 | `job`, `step`, `rollout`, `model_init`, `evaluate`, `setup`, `per_prompt` (aliased `U_JOB`, `U_STEP`, …) | *(none — umbrella)* |
 | `generation`, `reward`, `policy_update` | `productive` |
-| `data_processing`, `data_plane`, `checkpoint`, `logprob`, `advantage` | `overhead` |
+| `data_processing`, `data_plane`, `checkpoint`, `logprob`, `advantage` | `overhead` — except `rl.checkpoint.finalize`, which is unbucketed because it overlaps the next step (see below) |
 | `efficiency` | `idle` for the two driver-side phases; *none* for the two collector-side ones (see below) |
 
 Rolled-up `rl.goodput` is **monitor-derived**, not emitted by NeMo-RL.
