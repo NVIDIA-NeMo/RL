@@ -21,9 +21,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
+import nemo_rl.experience.rollouts as rollouts
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
-import nemo_rl.experience.rollouts as rollouts
 
 
 class Tokenizer:
