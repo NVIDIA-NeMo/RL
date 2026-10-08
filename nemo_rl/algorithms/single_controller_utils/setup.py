@@ -821,8 +821,21 @@ def _clamp_max_num_steps(
     )
 
 
-def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
-    """Set train_iters from max_num_steps after its dataloader clamp."""
+def _megatron_train_iters(
+    master_config: MasterConfig,
+) -> tuple[Optional[int], Optional[int]]:
+    """Return the Megatron train_iters that the current max_num_steps implies.
+
+    Pure: reads the config without writing it, so it is safe to call while a
+    trainer build on another thread reads the same config.
+
+    Args:
+        master_config: The run config.
+
+    Returns:
+        A tuple of (policy train_iters, value train_iters). Each is None when that
+        model does not train with Megatron; the value entry is also None outside PPO.
+    """
     algo_cfg = algo_config(master_config)
     ppo_config = master_config.ppo if is_ppo_run(master_config) else None
     # train_iters is a scheduler-tick budget. Policy and value need separate
@@ -834,23 +847,28 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
             policy_training_steps - ppo_config.policy_training_start_step,
             0,
         )
-    # Megatron-Bridge requires a positive scheduler horizon at setup. A PPO
-    # policy scheduler is never advanced when critic warmup spans the whole run.
-    policy_train_iters = max(policy_training_steps * policy_epochs, 1)
 
-    # policy
-    policy_config = master_config.policy
-    if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        policy_config["megatron_cfg"]["train_iters"] = policy_train_iters
+    policy_train_iters = None
+    if master_config.policy.get("megatron_cfg", {}).get("enabled", False):
+        # Megatron-Bridge requires a positive scheduler horizon at setup. A PPO
+        # policy scheduler is never advanced when critic warmup spans the whole run.
+        policy_train_iters = max(policy_training_steps * policy_epochs, 1)
 
-    # value
-    if ppo_config is None:
-        return
-    value_config = master_config.value
-    if value_config.get("megatron_cfg", {}).get("enabled", False):
-        value_config["megatron_cfg"]["train_iters"] = (  # type: ignore[index]
-            algo_cfg.max_num_steps * ppo_config.critic_ppo_epochs
-        )
+    value_train_iters = None
+    if ppo_config is not None and master_config.value.get("megatron_cfg", {}).get(
+        "enabled", False
+    ):
+        value_train_iters = algo_cfg.max_num_steps * ppo_config.critic_ppo_epochs
+    return policy_train_iters, value_train_iters
+
+
+def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
+    """Set train_iters from max_num_steps after its dataloader clamp."""
+    policy_train_iters, value_train_iters = _megatron_train_iters(master_config)
+    if policy_train_iters is not None:
+        master_config.policy["megatron_cfg"]["train_iters"] = policy_train_iters
+    if value_train_iters is not None:
+        master_config.value["megatron_cfg"]["train_iters"] = value_train_iters  # type: ignore[index]
 
 
 def _maybe_attach_fleet_health(
@@ -1470,45 +1488,86 @@ def setup_single_controller(
         )
     # Backend settings checks are pure config: run them before anything builds.
     resolve_generation_class(generation_config).validate_settings(master_config)
-    if use_nemo_gym:
-        # NeMo-Gym creates the env actor outside setup_response_data; we wire
-        # it in after generation is up (it needs the OpenAI server URLs).
-        response_data = setup_response_data(
-            data_tokenizer, data_config, env_configs=None, is_vlm=is_vlm
-        )
-        assert len(response_data) == 2
-        dataset, _val_dataset = response_data
-        env_handles: dict[str, EnvironmentInterface] = {}
-    else:
-        response_data = setup_response_data(
-            data_tokenizer,
-            data_config,
-            env_configs=master_config.env,
-            is_vlm=is_vlm,
-        )
-        assert len(response_data) == 4
-        dataset, _val_dataset, env_handles, _val_env_handles = response_data
-    dataloader = StatefulDataLoader(
-        dataset,
-        batch_size=algo_cfg.num_prompts_per_step,
-        shuffle=data_config["shuffle"],
-        collate_fn=rl_collate_fn,
-        drop_last=True,
-        num_workers=data_config["num_workers"],
-    )
-    if recovery_checkpoint_path is not None:
-        print(
-            f"📦 Restoring dataloader state from checkpoint: {recovery_checkpoint_path}"
-        )
-        dataloader_load_started = time.monotonic()
-        load_dataloader_state(dataloader, recovery_checkpoint_path, data_config)
-        if rollout_checkpoint_load_metrics is not None:
-            rollout_checkpoint_load_metrics["dataloader_load_seconds"] = (
-                time.monotonic() - dataloader_load_started
-            )
 
-    _clamp_max_num_steps(master_config, dataloader)
-    _maybe_inject_megatron_train_iters(master_config)
+    def _load_training_data() -> tuple[
+        Any, Any, dict[str, EnvironmentInterface], StatefulDataLoader
+    ]:
+        """Load the datasets, build the dataloader, and clamp max_num_steps to it.
+
+        Megatron's train_iters is left to the caller: on the overlapped path a
+        trainer build on another thread is reading that config while this runs.
+
+        Returns:
+            A tuple of (training dataset, validation dataset, env handles,
+            training dataloader).
+        """
+        if use_nemo_gym:
+            # NeMo-Gym creates the env actor outside setup_response_data; we wire
+            # it in after generation is up (it needs the OpenAI server URLs).
+            response_data = setup_response_data(
+                data_tokenizer, data_config, env_configs=None, is_vlm=is_vlm
+            )
+            assert len(response_data) == 2
+            train_dataset, val_dataset = response_data
+            train_env_handles: dict[str, EnvironmentInterface] = {}
+        else:
+            response_data = setup_response_data(
+                data_tokenizer,
+                data_config,
+                env_configs=master_config.env,
+                is_vlm=is_vlm,
+            )
+            assert len(response_data) == 4
+            train_dataset, val_dataset, train_env_handles, _val_env_handles = (
+                response_data
+            )
+        train_dataloader = StatefulDataLoader(
+            train_dataset,
+            batch_size=algo_cfg.num_prompts_per_step,
+            shuffle=data_config["shuffle"],
+            collate_fn=rl_collate_fn,
+            drop_last=True,
+            num_workers=data_config["num_workers"],
+        )
+        if recovery_checkpoint_path is not None:
+            print(
+                f"📦 Restoring dataloader state from checkpoint: {recovery_checkpoint_path}"
+            )
+            dataloader_load_started = time.monotonic()
+            load_dataloader_state(
+                train_dataloader, recovery_checkpoint_path, data_config
+            )
+            if rollout_checkpoint_load_metrics is not None:
+                rollout_checkpoint_load_metrics["dataloader_load_seconds"] = (
+                    time.monotonic() - dataloader_load_started
+                )
+
+        _clamp_max_num_steps(master_config, train_dataloader)
+        return train_dataset, val_dataset, train_env_handles, train_dataloader
+
+    # Loading a large dataset is minutes of single-threaded parsing on the driver,
+    # and on the NeMo-Gym + vLLM + non-colocated path no worker build needs it:
+    # generation and Gym need only URLs and the tokenizer, and the trainer needs only
+    # Megatron's train_iters. That is max_num_steps clamped to max_num_epochs *
+    # len(dataloader), and the clamp only binds when a run asks for more steps than
+    # its data holds. So on that path the trainer is built with the unclamped value,
+    # the dataset loads while all three build, and the trainer is rebuilt if the
+    # clamp changed train_iters. Every other path keeps the original order.
+    overlap_dataset_load = (
+        use_nemo_gym
+        and generation_config["backend"] == "vllm"
+        and not generation_config["colocated"]["enabled"]
+    )
+    preloaded_training_data: Optional[
+        tuple[Any, Any, dict[str, EnvironmentInterface], StatefulDataLoader]
+    ] = None
+    speculative_train_iters: Optional[tuple[Optional[int], Optional[int]]] = None
+    if overlap_dataset_load:
+        _maybe_inject_megatron_train_iters(master_config)
+        speculative_train_iters = _megatron_train_iters(master_config)
+    else:
+        preloaded_training_data = _load_training_data()
+        _maybe_inject_megatron_train_iters(master_config)
 
     # ==========================
     # Setup Clusters & Workers
@@ -1776,6 +1835,37 @@ def setup_single_controller(
     try:
         with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
             submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
+            if preloaded_training_data is not None:
+                dataset, _val_dataset, env_handles, dataloader = preloaded_training_data
+            else:
+                # Generation, Gym and the trainer are building; load the dataset
+                # meanwhile. train_iters is not written here: the trainer build is
+                # reading that config.
+                t0 = time.perf_counter()
+                dataset, _val_dataset, env_handles, dataloader = _load_training_data()
+                print(
+                    f"  ✓ Dataset and dataloader ready in {time.perf_counter() - t0:.1f}s "
+                    "(overlapped with generation, NeMo-Gym and trainer spin-up)",
+                    flush=True,
+                )
+                final_train_iters = _megatron_train_iters(master_config)
+                if final_train_iters != speculative_train_iters:
+                    # Correct but slow: the speculative trainer has the wrong
+                    # scheduler horizon, so it is replaced.
+                    print(
+                        f"  ⚠ max_num_steps clamped to {algo_cfg.max_num_steps} by the "
+                        f"dataset; Megatron train_iters {speculative_train_iters} -> "
+                        f"{final_train_iters} (policy, value). Rebuilding the trainer. "
+                        "Set max_num_steps <= max_num_epochs * steps per epoch to "
+                        "avoid this.",
+                        flush=True,
+                    )
+                    stale_trainer, stale_value, _ = submitted["trainer"].result()
+                    if stale_value is not None:
+                        stale_value.shutdown()
+                    stale_trainer.shutdown()
+                    _maybe_inject_megatron_train_iters(master_config)
+                    submitted["trainer"] = executor.submit(_build_trainer_and_value)
             if "generation_trainer" in submitted:
                 generation, trainer, value, time_metrics = submitted[
                     "generation_trainer"
