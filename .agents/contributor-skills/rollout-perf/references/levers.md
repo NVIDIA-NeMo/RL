@@ -21,6 +21,45 @@ Evidence sources:
   It compared vLLM 0.20/0.25, SGLang, TRT-LLM 1.3.0rc21/rc24, Megatron
   inference and Dynamo, with 3–5 runs per profile unless noted.
 
+## Applying a lever to any engine
+
+Every lever below is an engine-independent mechanism. The knob names in the
+per-lever tables are only where that mechanism surfaces in today's backends.
+To apply a lever to a backend not listed here, or after an engine upgrade
+renames its knobs:
+
+1. **Confirm the signal first**, using engine-independent evidence: NeMo-RL
+   timing, the token shape, generation length vs. the cap, and GPU
+   utilization (`logger.monitor_gpus`). A lever whose signal is absent will
+   not pay off on any engine.
+2. **Find the knob by concept, not by name.** Search the engine's arguments
+   and docs for the concept terms in the table below.
+3. **Write down its semantics** before choosing a value:
+   - Is it per iteration or per request?
+   - Does it cover prefill only, decode only, or both?
+   - Is it per replica or per process?
+   - Does the cache survive weight refit?
+
+   Equal numbers rarely mean the same thing across engines.
+4. **Find the proof**, meaning the log line or metric that shows the
+   engine's effective value. If the engine prints none, record that the
+   value is unproven rather than assuming the default.
+5. **A/B it on that engine and topology.** Never port another engine's value.
+   For example, a 4× larger token budget gained 44% on TRT-LLM, while a 2×
+   larger one cost 15% on vLLM at a different topology.
+
+| Lever | Mechanism (engine-independent) | Signal that it applies | Concept to look for in any engine | What differs across engines | Proof it took effect |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| 1. CUDA graphs | Replay captured kernel sequences instead of launching each kernel | Decode-tail-bound; small per-replica batch; long generations | "cuda graph", "eager", "capture sizes/batch sizes", "piecewise/full", prefill vs. decode graphs | Which phases are captured (decode only, prefill too); padding; capture-size list; compile backend | Engine graph-mode/capture log lines |
+| 2. Scheduler token budget | Bound the tokens processed per engine iteration; chunk long prefills | Long or multi-turn prompts; requests waiting; timeouts | "max batched tokens", "max num tokens", "chunked prefill", "prefill chunk size" | Per-iteration vs. per-prefill limits; whether it also caps context; activation memory | Effective budget and chunked-prefill line |
+| 3. Prefix/KV reuse and affinity | Skip prefill for a prefix already in cache, and route the next turn to the replica that holds it | Many generations per prompt, multi-turn, or a high raw prefill:generated ratio | "prefix caching", "radix cache", "block reuse", "KV-aware routing", "session affinity" | Cache scope (request, conversation, global); eviction; reset on refit or sleep; hybrid-state support | Cache-hit or cached-token counters; the routing policy on the request path |
+| 4. Parallel layout | Trade per-replica latency against replica count and communication | Tail-bound decode; large models or MoE | "tensor/expert/data parallel size", "attention DP", replicas | Whether MoE layout is separate from dense TP; cross-node limits | Engine topology line; number of serving endpoints |
+| 5. Admission cap and memory | Hold the known per-replica load without preemption, waste, or startup failure | Requests waiting or preempted; KV near full; hybrid models | "max running requests/seqs/batch size", "memory fraction/utilization", "KV blocks" | What counts toward memory (weights, graphs, activations); hybrid state slots | KV capacity or max-concurrency line vs. per-replica load |
+| 6. Kernels and collectives | Choose faster attention, MoE and all-reduce implementations for the hardware | Profile shows kernel or collective time; new GPU type | "attention backend", "MoE backend", "all-reduce strategy", "custom all-reduce", "NVLS/MNNVL" | Hardware availability; silent fallbacks; refit compatibility | Selected-backend log lines; no fallback warnings |
+| 7. Frontend, tokenizer, harness | Keep the engine fed: HTTP workers, tokenization, agent CPU and placement | GPUs idle, nothing waiting, low KV use | "workers", "tokenizer", HTTP server replicas, router mode | Token-ID vs. text interfaces; router fan-in | Worker processes started; requests spread across replicas |
+| 8. Speculative decoding | Draft several tokens and verify them in one pass | Decode-bound at small batch | "speculative", "draft", "MTP", "EAGLE" | Whether the drafter is refit with the policy | Acceptance rate over the whole run |
+| 9. Startup | Load weights and build kernels in parallel, ahead of time | Setup is a large share of wall time | "parallel load", "prefetch", precompiled kernels/caches | Refit safety of fast-load paths | Setup timing |
+
 ## 1. CUDA graphs
 
 **Why.** In eager mode every decode step pays kernel-launch overhead for

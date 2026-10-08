@@ -42,10 +42,12 @@ Seven rules:
    harness patches.
 6. **Report distributions and tails**, not only means. In a synchronous step,
    the slowest sample sets the step time.
-7. **Re-measure version-specific rules.** One engine version's optimum, or its
-   bug workaround, does not carry over. "PIECEWISE only" was a vLLM 0.20
-   accuracy workaround. A token budget that won on one engine regressed on
-   another topology.
+7. **Transfer mechanisms, not values.** Each lever is an engine-independent
+   mechanism. Map it onto an engine by concept, check its semantics there,
+   and re-measure. Values and version-specific rules don't carry over:
+   - "PIECEWISE only" was a vLLM 0.20 accuracy workaround;
+   - a token budget that won on TRT-LLM regressed on vLLM at another
+     topology.
 
 ## 1. Characterize the workload
 
@@ -127,6 +129,13 @@ replica.
 
 Ranked by measured payoff. Each row links to its section in
 [levers.md](references/levers.md), which has the knob in every backend.
+
+For a backend or engine version not covered there, follow
+[Applying a lever to any engine](references/levers.md#applying-a-lever-to-any-engine):
+1. Confirm the engine-independent signal.
+2. Find the knob by concept.
+3. Record its semantics and the proof line.
+4. A/B it on that engine.
 
 | # | Lever | Best measured effect (grade) | Regime |
 | --: | :-- | :-- | :-- |

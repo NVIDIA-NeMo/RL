@@ -179,10 +179,13 @@ engine-bound from feeder-bound directly; use GPU telemetry
 - **Proof.**
   - `Initialized persistent inference engine`;
   - `Coordinator started` / `Starting HTTP Server`;
-  - `mcore async scheduling steps (cumul): N` (async scheduling ran).
+  - `mcore async scheduling steps (cumul): N` (async scheduling ran);
+  - MCore's `[graph i/N] [T]: P P + D D` lines (N graphs, the largest
+    covering T tokens) and `> built cuda graph(s) in S sec`.
 
-  The CUDA-graph capture count is not logged; check the observed prefill and
-  decode shapes if graph coverage matters.
+  MCore does not log the effective prefix-caching, token-budget or
+  admission settings. Treat the resolved `mcore_generation_config` values as
+  requested only.
 - **Metrics.** None.
 - **Landmines.**
   - `cuda_graph_impl` and `inference_cuda_graph_scope` must be paired;

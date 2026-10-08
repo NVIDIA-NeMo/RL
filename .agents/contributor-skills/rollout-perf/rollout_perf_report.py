@@ -106,6 +106,9 @@ ENGINE_PATTERNS: dict[str, dict[str, str]] = {
     "megatron": {
         "engine": r"(Initialized persistent inference engine)",
         "async_sched_steps": r"mcore async scheduling steps \(cumul\): (\d+)",
+        "graph_count": r"\[graph \d+/(\d+)\]",
+        "largest_graph_tokens": r"\[graph 1/\d+\] \[(\d+)\]",
+        "graph_build_seconds": r"> built cuda graph\(s\) in ([\d.]+) sec",
     },
     "dynamo": {
         "worker_argv": r"\[Dynamo:[^\]]*\] launching argv=(.{0,200})",
@@ -122,12 +125,102 @@ ENGINE_ANCHORS = {
     "megatron": ("Initialized persistent inference engine", "mcore async scheduling"),
     "dynamo": ("[Dynamo",),
 }
+# Running totals: keep the last value instead of the first.
+LAST_VALUE = {"async_sched_steps"}
 # Last-seen values from vLLM's periodic engine stats line.
 VLLM_STATS = re.compile(
     r"Running: (\d+) reqs, Waiting: (\d+) reqs, GPU KV cache usage: ([\d.]+)%"
     r"(?:, Prefix cache hit rate: ([\d.]+)%)?"
 )
-CONFIG_PATTERNS = {"max_new_tokens": r"'max_new_tokens': (\d+)"}
+# Requested values from the driver's config echo (not proof of what ran).
+CONFIG_PATTERNS = {
+    "max_new_tokens": r"'max_new_tokens': (\d+)",
+    "backend": r"'generation': \{'backend': '(\w+)'",
+}
+
+# Engine-neutral view of the effective settings. Each lever maps to the
+# per-backend fields above; a value is "on"/"off" or a number, and the source
+# says which engine line proved it. Fields that a backend does not log stay
+# unproven (see references/engines.md).
+GRAPH_KNOB = {
+    "vllm": "vllm_cfg.enforce_eager / vllm_kwargs.compilation_config.cudagraph_mode",
+    "dynamo": "vllm_cfg.enforce_eager / vllm_kwargs.compilation_config",
+    "sglang": "sglang_cfg.disable_cuda_graph",
+    "trtllm": "trtllm_kwargs.cuda_graph_config",
+    "megatron": "mcore_generation_config.cuda_graph_impl",
+}
+REUSE_KNOB = {
+    "vllm": "vllm_cfg.enable_prefix_caching",
+    "dynamo": "vllm_kwargs.enable_prefix_caching",
+    "sglang": "radix cache (sglang_cfg.disable_radix_cache is not forwarded today)",
+    "trtllm": "trtllm_kwargs.kv_cache_config.enable_block_reuse",
+    "megatron": "mcore_generation_config.enable_prefix_caching",
+}
+
+
+def normalize(log: dict[str, dict[str, str]]) -> dict[str, tuple[str, str]]:
+    """Map per-engine log fields onto engine-neutral levers."""
+    vllm, sglang, trtllm = (log.get(e, {}) for e in ("vllm", "sglang", "trtllm"))
+    out: dict[str, tuple[str, str]] = {}
+
+    def put(field: str, value: str | None, source: str) -> None:
+        if value is not None and field not in out:
+            out[field] = (value, source)
+
+    if vllm.get("enforce_eager") == "True" or vllm.get("cudagraph_mode") == "NONE":
+        put("cuda_graphs", "off", "vllm")
+    elif "cudagraph_mode" in vllm:
+        put("cuda_graphs", f"on ({vllm['cudagraph_mode']})", "vllm")
+    megatron = log.get("megatron", {})
+    if "graph_count" in megatron:
+        put(
+            "cuda_graphs",
+            f"on ({megatron['graph_count']} graphs, up to "
+            f"{megatron.get('largest_graph_tokens', '?')} tokens)",
+            "megatron",
+        )
+    # No `[graph` lines is not proof of eager mode: Ray log deduplication or
+    # the MCore log level can hide them, so leave the field unproven.
+    if "disable_cuda_graph" in sglang:
+        put(
+            "cuda_graphs",
+            "off" if sglang["disable_cuda_graph"] == "True" else "on",
+            "sglang",
+        )
+    on_off = {"True": "on", "False": "off"}
+    put("prefix_reuse", on_off.get(vllm.get("enable_prefix_caching", "")), "vllm")
+    if "disable_radix_cache" in sglang:
+        put(
+            "prefix_reuse",
+            "off" if sglang["disable_radix_cache"] == "True" else "on",
+            "sglang",
+        )
+    put("prefix_reuse", on_off.get(trtllm.get("enable_block_reuse", "")), "trtllm")
+    put("token_budget", vllm.get("max_num_batched_tokens"), "vllm")
+    put("token_budget", sglang.get("chunked_prefill_size"), "sglang")
+    put("token_budget", trtllm.get("max_num_tokens"), "trtllm")
+    if "max_num_batched_tokens" in vllm:
+        put("chunked_prefill", "on", "vllm")
+    put(
+        "chunked_prefill",
+        on_off.get(trtllm.get("enable_chunked_prefill", "")),
+        "trtllm",
+    )
+    if "chunked_prefill_size" in sglang:
+        put(
+            "chunked_prefill",
+            "off" if sglang["chunked_prefill_size"] == "-1" else "on",
+            "sglang",
+        )
+    cap = sglang.get("max_running_requests")
+    put("admission_cap", "auto" if cap == "None" else cap, "sglang")
+    put("admission_cap", trtllm.get("max_batch_size"), "trtllm")
+    put("memory_fraction", sglang.get("mem_fraction_static"), "sglang")
+    put("memory_fraction", trtllm.get("free_gpu_memory_fraction"), "trtllm")
+    put("kv_capacity", vllm.get("max_concurrency"), "vllm")
+    if "max_total_num_tokens" in sglang:
+        put("kv_capacity", f"{sglang['max_total_num_tokens']} tokens", "sglang")
+    return out
 
 
 def series(metrics: dict, key: str) -> dict[int, float]:
@@ -176,7 +269,9 @@ def scan_log(path: Path) -> dict[str, dict[str, str]]:
             for engine, patterns in ENGINE_PATTERNS.items():
                 seen = found.setdefault(engine, {})
                 for name, pattern in patterns.items():
-                    if name in seen or not (match := re.search(pattern, line)):
+                    if (name in seen and name not in LAST_VALUE) or not (
+                        match := re.search(pattern, line)
+                    ):
                         continue
                     if name == "max_concurrency":
                         seen[name] = (
@@ -213,7 +308,9 @@ def diagnose(
     metrics: dict, log: dict[str, dict[str, str]], max_new_tokens: int | None
 ) -> None:
     step = series(metrics, STEP)
+    is_async = not series(metrics, GEN)
     gen = series(metrics, GEN) or series(metrics, PHASES["exposed generation (async)"])
+    gen_label = "Exposed (non-overlapped) generation" if is_async else "Generation"
     steps = sorted(s for s in set(gen) & set(step) if step[s] > 0)
     print(f"steps with timing: {len(steps)}")
     share = med(gen[s] / step[s] for s in steps)
@@ -227,7 +324,7 @@ def diagnose(
         iqr = (quartiles[2] - quartiles[0]) / gen_med if gen_med > 0 else math.nan
         print(f"total step time, median: {med(step[s] for s in steps):.1f} s")
         print(
-            f"generation per step: median {gen_med:.1f} s, max {max(gen_vals):.1f} s "
+            f"{gen_label.lower()} per step: median {gen_med:.1f} s, max {max(gen_vals):.1f} s "
             f"(interquartile spread {iqr:.0%})"
         )
         print("step breakdown (median share of total_step_time):")
@@ -266,12 +363,39 @@ def diagnose(
     if max_gen and cap:
         hits = sum(v >= cap for v in max_gen.values()) / len(max_gen)
         print(f"steps whose longest sample hit max_new_tokens={cap}: {hits:.0%}")
+    tok_s = series(metrics, "performance/generation_tokens_per_sec")
+    if tok_s:
+        print(
+            f"generation tokens/s, median: {med(tok_s.values()):.0f} "
+            "(NeMo-RL counts prompt + generated tokens)"
+        )
+    engines = [e for e in log if not e.startswith("_")]
+    # Dynamo runs also show vLLM worker lines; prefer the more specific backend.
+    backend = config.get("backend") or (
+        "dynamo" if "dynamo" in engines else next(iter(engines), None)
+    )
+    if backend:
+        print(f"generation backend: {backend}")
     for engine, values in log.items():
         if engine.startswith("_"):
             continue
         for name, value in values.items():
             if not name.startswith("_"):
                 print(f"log [{engine}]: {name} = {value}")
+    norm = normalize(log)
+    if log:
+        print("engine-neutral settings (from engine log lines):")
+        for field in (
+            "cuda_graphs",
+            "prefix_reuse",
+            "token_budget",
+            "chunked_prefill",
+            "admission_cap",
+            "memory_fraction",
+            "kv_capacity",
+        ):
+            value, source = norm.get(field, ("unproven", "-"))
+            print(f"  {field:<16} {value:<24} [{source}]")
 
     print("\ndiagnosis:")
     if math.isnan(share):
@@ -287,31 +411,57 @@ def diagnose(
         )
     if share < 0.5:
         print(
-            f"- Generation is {share:.0%} of step time, which bounds what rollout tuning can save; "
-            "look at the other phases too."
+            f"- {gen_label} is {share:.0%} of step time, which bounds what rollout tuning can "
+            "save; look at the other phases too."
         )
     else:
-        print(f"- Generation-bound ({share:.0%} of step time).")
+        print(f"- Generation-bound ({gen_label.lower()} is {share:.0%} of step time).")
     if hits is not None and hits >= 0.8 and not iqr >= 0.1:
         print(
             "- Decode-tail-bound: the longest response sets the step. Levers: CUDA graphs, "
             "more and smaller replicas, kernel backend."
         )
-    if (prompt and mean_gen and med(prompt.values()) > 4 * med(mean_gen.values())) or (
-        turns and med(turns.values()) > 1.5
-    ):
+    prefill_heavy = bool(
+        prompt and mean_gen and med(prompt.values()) > 4 * med(mean_gen.values())
+    ) or bool(turns and med(turns.values()) > 1.5)
+    if prefill_heavy:
         print(
             "- Prefill-heavy or multi-turn: check the scheduler token budget, prefix/KV reuse "
             "and session affinity."
         )
-    vllm, sglang = log.get("vllm", {}), log.get("sglang", {})
-    if vllm.get("enforce_eager") == "True" or vllm.get("cudagraph_mode") == "NONE":
-        print(
-            "- vLLM runs eager: enable CUDA graphs and A/B the graph mode "
-            "(default FULL_AND_PIECEWISE vs PIECEWISE)."
+    graphs = norm.get("cuda_graphs", ("unproven", ""))[0]
+    reuse = norm.get("prefix_reuse", ("unproven", ""))[0]
+    if graphs == "off":
+        hint = (
+            " and A/B the graph mode (default FULL_AND_PIECEWISE vs PIECEWISE)"
+            if backend in ("vllm", "dynamo")
+            else ""
         )
-    if sglang.get("disable_cuda_graph") == "True":
-        print("- SGLang runs without CUDA graphs: A/B enabling them.")
+        print(
+            f"- {backend or 'The engine'} runs without CUDA graphs: A/B enabling them "
+            f"({GRAPH_KNOB.get(backend or '', 'see references/engines.md')}){hint}."
+        )
+    elif graphs == "unproven" and backend:
+        print(
+            f"- CUDA-graph state is not proven from the {backend} log; check "
+            f"{GRAPH_KNOB.get(backend, 'the engine config')} and references/engines.md."
+        )
+    if prefill_heavy and reuse != "on":
+        print(
+            f"- Prefix/KV reuse is {reuse}: for repeated prefixes, A/B it "
+            f"({REUSE_KNOB.get(backend or '', 'see references/levers.md §3')})."
+        )
+    unproven = [
+        field
+        for field in ("cuda_graphs", "prefix_reuse", "token_budget", "admission_cap")
+        if field not in norm
+    ]
+    if backend and len(unproven) > ("cuda_graphs" in unproven):
+        print(
+            f"- The {backend} log does not prove: {', '.join(unproven)}. Treat the resolved "
+            "config values as requested only (references/engines.md)."
+        )
+    vllm = log.get("vllm", {})
     if "max_concurrency" in vllm:
         print(
             f"- vLLM KV capacity per replica: {vllm['max_concurrency']}; memory knobs only help "
