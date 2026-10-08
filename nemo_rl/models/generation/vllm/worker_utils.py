@@ -23,9 +23,10 @@ def configure_refit_runtime(
 ) -> None:
     """Forward NeMo-RL refit options through vLLM's worker config."""
     additional_config = dict(vllm_kwargs.get("additional_config") or {})
-    additional_config[_REFIT_CACHE_LOADER_ROUTES_KEY] = vllm_cfg.get(
-        "refit_cache_loader_routes", False
-    )
+    if "refit_cache_loader_routes" in vllm_cfg:
+        additional_config[_REFIT_CACHE_LOADER_ROUTES_KEY] = vllm_cfg[
+            "refit_cache_loader_routes"
+        ]
     vllm_kwargs["additional_config"] = additional_config
 
 

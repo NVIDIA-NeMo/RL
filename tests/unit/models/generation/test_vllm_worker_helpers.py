@@ -46,6 +46,7 @@ def test_refit_loader_cache_defaults_to_disabled():
 
     configure_refit_runtime({}, vllm_kwargs)
 
+    assert "nemo_rl_refit_cache_loader_routes" not in vllm_kwargs["additional_config"]
     vllm_config = SimpleNamespace(additional_config=vllm_kwargs["additional_config"])
     assert refit_cache_loader_routes_enabled(vllm_config) is False
 

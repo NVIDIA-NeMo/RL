@@ -493,6 +493,7 @@ policy:
       precision: ${policy.precision}
       # MXFP8 + Megatron only: quantize on trainer and stream E4M3 values plus scales.
       refit_prequantize: false
+      refit_cache_loader_routes: false # Replay stable vLLM loader routes across refits.
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
       fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute Nemotron-H logits with an fp32 LM head.

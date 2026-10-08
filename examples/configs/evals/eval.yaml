@@ -31,6 +31,7 @@ generation:
     enforce_eager: False
     # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
     refit_with_reload_api: false
+    refit_cache_loader_routes: false # Replay stable vLLM loader routes across refits.
   colocated:
     # true: generation shares training GPUs
     # false: uses dedicated generation resources

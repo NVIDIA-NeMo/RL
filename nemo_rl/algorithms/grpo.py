@@ -2704,15 +2704,11 @@ def refit_policy_generation(
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl (vLLM) or megatron reshard
-            if isinstance(policy_generation, MegatronGeneration):
-                futures_train = policy.swap_weights_via_reshard(is_source=True)
-                futures_inference = policy_generation.update_weights_from_collective()
-            else:
-                futures_train = policy.broadcast_weights_for_collective(
-                    kv_scales=kv_scales,
-                )
-                futures_inference = policy_generation.update_weights_from_collective()
+            # update weights through collective transport
+            futures_train = policy.broadcast_weights_for_collective(
+                kv_scales=kv_scales,
+            )
+            futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
