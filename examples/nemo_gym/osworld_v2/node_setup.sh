@@ -6,6 +6,7 @@ source "$SCRIPT_DIR/runtime_env.sh"
 
 test -f "$OSWORLD_RL_ROOT/examples/nemo_gym/launch_osworld_v2_cc.py"
 test -f "$OSWORLD_RL_ROOT/examples/run_grpo.py"
+test -f "nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py"
 test -f "$OSWORLD_GYM_ROOT/resources_servers/osworld/app.py"
 test -f "$OSWORLD_GYM_ROOT/responses_api_agents/osworld_agent/app.py"
 test -x "$OSWORLD_GYM_ROOT/responses_api_agents/osworld_agent/install_optional_runtime_deps.sh"

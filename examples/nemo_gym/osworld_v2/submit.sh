@@ -332,6 +332,7 @@ export NUM_NODES="$OSWORLD_NUM_NODES"
 export OSWORLD_EXECUTION_ROOT=/opt/nemo-rl/examples/nemo_gym/osworld_v2
 export OSWORLD_DRIVER_VENV="${OSWORLD_DRIVER_VENV:-/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker}"
 export RAY_CLI="$OSWORLD_DRIVER_VENV/bin/ray"
+export CONTAINER_WORKDIR="${OSWORLD_CONTAINER_WORKDIR:-/opt/nemo-rl}"
 export SETUP_COMMAND="bash '$OSWORLD_EXECUTION_ROOT/node_setup.sh'"
 export COMMAND="bash '$OSWORLD_EXECUTION_ROOT/$OSWORLD_DRIVER_SCRIPT'"
 export OSWORLD_POOL_REF="${OSWORLD_POOL_REF:-osworld-kvm}"
