@@ -101,3 +101,26 @@ def test_sgd_matches_explicit_reconstruction_and_clipping():
     torch.testing.assert_close(
         net[0].weight, before - 0.01 * expected * min(1.0, 0.1 / (norm.item() + 1e-6))
     )
+
+
+def test_backward_leaves_no_cyclic_garbage():
+    """Sketch accumulation must be freed by reference counting alone.
+
+    Objects that only the cyclic collector can reclaim accumulate across steps
+    and trigger full collections that stall training for hundreds of ms.
+    """
+    import gc
+
+    net = model()
+    install_sketches(net, LoGRAConfig(rank=3, target_modules=["0", "2"]))
+    x = torch.randn(4, 7, requires_grad=True)
+    net(x).square().sum().backward()  # warm up any one-time caches
+    gc.collect()
+    gc.disable()
+    try:
+        for _ in range(3):
+            net(x).square().sum().backward()
+        unreachable = gc.collect()
+    finally:
+        gc.enable()
+    assert unreachable == 0

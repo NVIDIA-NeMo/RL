@@ -118,7 +118,8 @@ class SketchState:
     projection: Tensor
     sketch: Tensor
     handle: RemovableHandle | None
-    # Projection cast to the activation dtype, reused until the next refresh.
+    # Persistent copy of the projection in the activation dtype. Allocated on
+    # first use and refreshed in place, so forward hooks never allocate.
     projection_cast: Tensor | None = None
 
     def projection_as(self, dtype: torch.dtype) -> Tensor:
@@ -127,6 +128,11 @@ class SketchState:
         if self.projection_cast is None or self.projection_cast.dtype != dtype:
             self.projection_cast = self.projection.to(dtype)
         return self.projection_cast
+
+    def refresh_cast(self) -> None:
+        """Mirror a refreshed ``projection`` into the low-precision buffer."""
+        if self.projection_cast is not None:
+            self.projection_cast.copy_(self.projection)
 
     def forward_hook(
         self, module: nn.Module, inputs: tuple[Tensor, ...], output: Tensor
