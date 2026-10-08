@@ -44,6 +44,7 @@ from nemo_rl.algorithms.grpo import (
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
+    _baseline_valid_mask,
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
@@ -369,6 +370,68 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+class TestBaselineValidMask:
+    def test_excludes_mask_sample_and_zero_loss_multiplier_rows(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "mask_sample": torch.tensor([False, True, False, False, True]),
+                "loss_multiplier": torch.tensor([1.0, 1.0, 0.0, 0.5, 0.0]),
+            }
+        )
+
+        valid_mask = _baseline_valid_mask(repeated_batch, torch.zeros(5))
+
+        assert torch.equal(valid_mask, torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0]))
+
+    def test_list_valued_flags(self):
+        repeated_batch = BatchedDataDict(
+            {"mask_sample": [True, False, False], "loss_multiplier": [1.0, 0.0, 1.0]}
+        )
+
+        valid_mask = _baseline_valid_mask(repeated_batch, torch.zeros(3))
+
+        assert torch.equal(valid_mask, torch.tensor([0.0, 0.0, 1.0]))
+
+    def test_missing_keys_keep_every_row(self):
+        valid_mask = _baseline_valid_mask(BatchedDataDict({}), torch.zeros(3))
+
+        assert torch.equal(valid_mask, torch.ones(3))
+
+    def test_masked_row_does_not_count_as_group_variance(self):
+        # One prompt group: three real failures and one masked row whose
+        # (synthetic) reward happens to be 1.
+        prompts = torch.zeros(4, 1, dtype=torch.long)
+        rewards = torch.tensor([0.0, 0.0, 0.0, 1.0])
+        repeated_batch = BatchedDataDict(
+            {
+                "mask_sample": torch.tensor([False, False, False, True]),
+                "loss_multiplier": torch.ones(4),
+            }
+        )
+        valid_mask = _baseline_valid_mask(repeated_batch, rewards)
+
+        baseline, std, _ = calculate_baseline_and_std_per_prompt(
+            prompts, rewards, valid_mask, leave_one_out_baseline=True
+        )
+        assert torch.equal(baseline[:3], torch.zeros(3))
+        assert torch.equal(std[:3], torch.zeros(3))
+        assert calculate_trivial_reward_distributions(
+            prompts, rewards, valid_mask
+        ).all()
+
+        # Without the mask the masked reward shifted the baseline and made the
+        # group look non-uniform to dynamic sampling.
+        all_valid = torch.ones_like(rewards)
+        unmasked_baseline, unmasked_std, _ = calculate_baseline_and_std_per_prompt(
+            prompts, rewards, all_valid, leave_one_out_baseline=True
+        )
+        assert torch.all(unmasked_baseline[:3] > 0)
+        assert torch.all(unmasked_std[:3] > 0)
+        assert not calculate_trivial_reward_distributions(
+            prompts, rewards, all_valid
+        ).any()
 
 
 def test_initial_policy_generation_stale() -> None:
@@ -2693,6 +2756,79 @@ def test_grpo_train_dynamic_sampling_with_loo_keeps_prompt_group_intact(
     torch.testing.assert_close(captured_rewards[0], expected_training_rewards)
 
 
+def test_grpo_train_dynamic_sampling_std_excludes_masked_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_grpo_components: dict[str, Any],
+) -> None:
+    """A masked row's reward must not make its group look non-uniform."""
+    rollout_metrics = {"mean_gen_tokens_per_sample": 1.0}
+
+    def fake_rollout(*_args: Any, **kwargs: Any) -> tuple[BatchedDataDict, dict]:
+        rollout_batch = kwargs["input_batch"]
+        for message_log in rollout_batch["message_log"]:
+            message_log.append(
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "token_ids": torch.tensor([4]),
+                }
+            )
+        rollout_batch["total_reward"] = torch.tensor([0.0, 0.0, 0.0, 1.0])
+        rollout_batch["mask_sample"] = torch.tensor([False, False, False, True])
+        return rollout_batch, rollout_metrics
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def capture_trivial(prompts, rewards, valid_mask):
+        captured["valid_mask"] = valid_mask.clone()
+        captured["is_trivial"] = calculate_trivial_reward_distributions(
+            prompts, rewards, valid_mask
+        )
+        raise RuntimeError("captured dynamic-sampling inputs")
+
+    monkeypatch.setattr(
+        grpo_mod, "should_use_async_rollouts", lambda *_args, **_kwargs: False
+    )
+    monkeypatch.setattr(grpo_mod, "run_multi_turn_rollout", fake_rollout)
+    monkeypatch.setattr(
+        grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        grpo_mod, "calculate_trivial_reward_distributions", capture_trivial
+    )
+    monkeypatch.setattr(grpo_mod, "MemoryTracker", MagicMock)
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.num_prompts_per_step = 1
+    master_config.grpo.num_generations_per_prompt = 4
+    master_config.grpo.dynamic_sampling_max_gen_batches = 2
+    master_config.grpo.use_dynamic_sampling = True
+
+    with pytest.raises(RuntimeError, match="captured dynamic-sampling inputs"):
+        grpo_mod.grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert torch.equal(captured["valid_mask"], torch.tensor([1.0, 1.0, 1.0, 0.0]))
+    assert captured["is_trivial"].all()
+
+
 def test_dapo_dynamic_sampling_preserves_mask_sample_alignment(mock_grpo_components):
     """mask_sample should follow rows through dynamic-sampling filter and slice."""
     batch_size = 9
@@ -4477,6 +4613,41 @@ def test_grpo_train_preserves_advantages_when_clipping_disabled(
     policy.train.assert_called_once()
     advantages = policy.train.call_args[0][0]["advantages"]
     assert torch.equal(advantages, extreme_advantages)
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+@pytest.mark.parametrize(
+    ("mask_sample", "loss_multiplier", "expected_valid"),
+    [
+        pytest.param(False, 1.0, 1.0, id="valid"),
+        pytest.param(True, 1.0, 0.0, id="mask_sample"),
+        pytest.param(False, 0.0, 0.0, id="zero_loss_multiplier"),
+    ],
+)
+def test_grpo_train_passes_baseline_valid_mask_to_advantage_estimator(
+    mock_grpo_components,
+    train_func,
+    monkeypatch,
+    mask_sample,
+    loss_multiplier,
+    expected_valid,
+):
+    """Masked rows are excluded from the baseline via compute_advantage(valid_mask=...)."""
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["mask_sample"] = torch.tensor([mask_sample])
+    mock_batch["loss_multiplier"] = torch.tensor([loss_multiplier])
+    mock_adv_estimator = MagicMock()
+    mock_adv_estimator.compute_advantage.return_value = torch.zeros(1, 2)
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.grpo._create_advantage_estimator",
+        lambda _cfg: mock_adv_estimator,
+    )
+
+    _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch)
+
+    mock_adv_estimator.compute_advantage.assert_called_once()
+    valid_mask = mock_adv_estimator.compute_advantage.call_args.kwargs["valid_mask"]
+    assert torch.equal(valid_mask, torch.tensor([expected_valid]))
 
 
 def test_clip_grpo_advantages_respects_config_bounds():
