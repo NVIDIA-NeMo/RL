@@ -129,10 +129,11 @@ Key hyperparameters (sized for 4 × 8 × H100/H200 80 GB):
 | Learning rate | 1e-6 |
 | Reward | format (0.2) + exact_alnum (0.8) |
 
-The Qwen3-Omni recipe has two model-specific gotchas baked into the yaml:
+The Qwen3-Omni recipe has three model-specific gotchas baked into the yaml:
 
 - **Thinker-only training.** The Megatron `Qwen3OmniBridge` only converts the thinker (LLM + audio + vision encoders); talker / code2wav modules emit a one-line `talker/code2wav audio-output is not supported yet` warning at convert time and stay frozen at the original HF weights, so checkpoint conversion in §3 needs `--no-strict`.
 - **vLLM `tensor_parallel_size: 4`, not 1.** With TP=1 + EP > 1, NeMo RL's `VllmGenerationWorker` enters the `else` branch in `vllm_worker.py:431` (no `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`, no `VLLM_RAY_PER_WORKER_GPUS`); vLLM then auto-picks `RayDistributedExecutor` (because the worker actor itself runs inside a Ray actor) and `_init_workers_ray` blocks forever in `ray.get` waiting for a Ray sub-worker that has no GPU bundle to land on. TP=4 enters the `if model_parallel_size > 1` branch, which sets the per-worker GPU fraction so the sub-workers can co-tenant the parent actor's GPU bundle. TP must also divide the audio tower's 20 attention heads, which rules out TP=8.
+- **`data.default.pad_audio_to_hop_length: true`.** vLLM's Qwen3-Omni processor zero-pads each audio clip to a multiple of the feature extractor's `hop_length` before computing features ([vLLM v0.29.0](https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/model_executor/models/qwen3_omni_moe_thinker.py#L1216-L1245)). This flag makes NeMo RL pad the same way, so the learner and vLLM see the same audio. Not needed for Qwen2.5-Omni, whose vLLM processor does not pad.
 
 ## 3. Convert checkpoint (Megatron → HF)
 

@@ -1127,6 +1127,78 @@ def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     assert ("agent/full_result" in metrics) is log_full_result_tables
 
 
+def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
+    completions = [
+        Completion(
+            message_log=[
+                {"role": "user", "token_ids": [1, 2]},
+                {"role": "assistant", "token_ids": [3]},
+            ],
+            env_extras={
+                "reward": 0.0,
+                "total_tokens_per_sample": 1000,
+                "gen_tokens_per_sample": 1000,
+            },
+            truncated=False,
+            reward=0.0,
+        ),
+        Completion(
+            message_log=[
+                {"role": "user", "token_ids": [1]},
+                {"role": "assistant", "token_ids": [2, 3, 4]},
+            ],
+            env_extras={
+                "reward": 1.0,
+                "total_tokens_per_sample": 1000,
+                "gen_tokens_per_sample": 1000,
+            },
+            truncated=True,
+            reward=1.0,
+        ),
+    ]
+
+    metrics = _nemo_gym_impl(True)._compute_rollout_metrics(completions, "agent")
+
+    assert metrics["truncation_rate"] == pytest.approx(0.5)
+    assert metrics["agent/truncation_rate"] == pytest.approx(0.5)
+    # Live token counts win over similarly named env_extras (1000).
+    assert metrics["agent/total_tokens_per_sample/mean"] == pytest.approx(3.5)
+    assert metrics["agent/total_tokens_per_sample/max"] == 4
+    assert metrics["agent/total_tokens_per_sample/histogram"] == [3, 4]
+    assert metrics["agent/gen_tokens_per_sample/mean"] == pytest.approx(2.0)
+    assert metrics["agent/gen_tokens_per_sample/max"] == 3
+    assert metrics["agent/gen_tokens_per_sample/histogram"] == [1, 3]
+
+
+def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics():
+    def _receipt_completion(manifest, truncated):
+        return Completion(
+            message_log=[],
+            env_extras={
+                "reward": 0.5,
+                "ng_receipt": {"rollout_id": "r", "manifest": manifest},
+            },
+            truncated=truncated,
+            reward=0.5,
+        )
+
+    completions = [
+        _receipt_completion(
+            [{"cum_len": 5, "delta_len": 2}, {"cum_len": 9, "delta_len": 3}],
+            truncated=False,
+        ),
+        _receipt_completion([{"cum_len": 4, "delta_len": 4}], truncated=True),
+    ]
+
+    metrics = _nemo_gym_impl(True)._compute_rollout_metrics(completions, "agent")
+
+    assert metrics["agent/truncation_rate"] == pytest.approx(0.5)
+    assert metrics["agent/total_tokens_per_sample/histogram"] == [9, 4]
+    assert metrics["agent/total_tokens_per_sample/mean"] == pytest.approx(6.5)
+    assert metrics["agent/gen_tokens_per_sample/histogram"] == [5, 4]
+    assert metrics["agent/gen_tokens_per_sample/mean"] == pytest.approx(4.5)
+
+
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
     assistant_message = {
         "role": "assistant",

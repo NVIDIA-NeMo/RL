@@ -41,7 +41,8 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 
 
-def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch):
+@pytest.mark.parametrize("top_k", [None, 1])
+def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch, top_k):
     """Prepacked rows keep their layout and shift targets per source."""
     input_ids = torch.tensor([[10, 11, 12, 0, 20, 21, 0, 0]])
     data = BatchedDataDict(
@@ -57,6 +58,8 @@ def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch):
     cu_seqlens_cpu = to_cpu_int_tuple(data["cu_seqlens"][0])
     cu_seqlens_padded_cpu = to_cpu_int_tuple(data["cu_seqlens_padded"][0])
     expected = torch.arange(7, dtype=torch.float32).unsqueeze(0)
+    if top_k is not None:
+        expected[0, 1] = -float("inf")  # index 1 predicts token position 2
     call = {}
 
     def fake_logprobs(logits, target, padded_boundaries, unpacked_seqlen, **kwargs):
@@ -66,7 +69,7 @@ def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch):
             unpacked_seqlen=unpacked_seqlen,
             kwargs=kwargs,
         )
-        return expected
+        return expected.clone()
 
     monkeypatch.setattr(
         "nemo_rl.algorithms.loss.loss_input."
@@ -82,10 +85,24 @@ def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch):
         cu_seqlens_q_padded=cu_seqlens_padded_cpu,
         vocab_parallel_rank=0,
         vocab_parallel_group=object(),
+        sampling_params=TrainingSamplingParams(top_k=top_k),
     )
 
     assert prepared_data is data
-    assert torch.equal(loss_input["next_token_logprobs"], expected)
+    if top_k is None:
+        assert torch.equal(loss_input["next_token_logprobs"], expected)
+        assert torch.equal(
+            prepared_data["token_mask"], torch.tensor([[0, 1, 1, 0, 0, 1, 0, 0]])
+        )
+    else:
+        # mask_out_neg_inf_logprobs zeroes logprobs outside token_mask * finite_mask
+        assert torch.equal(
+            loss_input["next_token_logprobs"],
+            torch.tensor([[0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0]]),
+        )
+        assert torch.equal(
+            prepared_data["token_mask"], torch.tensor([[0, 1, 0, 0, 0, 1, 0, 0]])
+        )
     assert torch.equal(call["target"], input_ids)
     assert call["padded_boundaries"] == cu_seqlens_padded_cpu
     assert call["unpacked_seqlen"] == input_ids.shape[1]

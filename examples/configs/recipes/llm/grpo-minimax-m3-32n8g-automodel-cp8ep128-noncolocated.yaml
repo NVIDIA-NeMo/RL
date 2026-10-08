@@ -49,7 +49,7 @@ policy:
       total_iters: 10000000000
   - milestones:
     - 10
-  dtensor_cfg:
+  automodel_cfg:
     context_parallel_size: 8
     expert_parallel_size: 128
     activation_checkpointing: true

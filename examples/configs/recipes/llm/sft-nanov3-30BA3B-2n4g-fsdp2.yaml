@@ -7,7 +7,7 @@ logger:
   mlflow:
     run_name: sft-nanov3-30BA3B-2n4g-fsdp2
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     expert_parallel_size: 4
 cluster:
   gpus_per_node: 4

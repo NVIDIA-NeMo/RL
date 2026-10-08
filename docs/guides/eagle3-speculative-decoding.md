@@ -42,7 +42,7 @@ This enables Eagle3 in vLLM, but the trainer does not own or update the draft mo
 policy:
   megatron_cfg:
     enabled: true
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
 
   draft:
@@ -64,7 +64,7 @@ policy:
 ```
 
 > [!NOTE]
-> Online draft training currently requires the Megatron backend and does not support context parallelism yet. Set `policy.megatron_cfg.enabled=true`, `policy.dtensor_cfg.enabled=false`, and `policy.megatron_cfg.context_parallel_size=1`. Sequence packing (`policy.sequence_packing.enabled=true`) is supported.
+> Online draft training currently requires the Megatron backend and does not support context parallelism yet. Set `policy.megatron_cfg.enabled=true`, `policy.automodel_cfg.enabled=false`, and `policy.megatron_cfg.context_parallel_size=1`. Sequence packing (`policy.sequence_packing.enabled=true`) is supported.
 
 ## How It Works
 
