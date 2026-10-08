@@ -66,7 +66,7 @@ unset NRL_IGNORE_VERSION_MISMATCH PYTHONOPTIMIZE
 
 args=(--nodes=32 --exclusive --mem=0 --account="$account" --partition=gb200
   --qos=user-restrictions --time=04:00:00 --segment=8
-  --job-name="${account}.${name}" --output="${run_root}/slurm-%j.out")
+  --job-name="${account}-mxfp8.${name}" --output="${run_root}/slurm-%j.out")
 if [[ "$action" == test-only ]]; then
   args+=(--test-only)
 fi
