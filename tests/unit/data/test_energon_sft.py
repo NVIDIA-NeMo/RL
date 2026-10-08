@@ -564,7 +564,7 @@ def test_identity_pins_the_whole_loader_config_and_component_selection():
         }
     )
 
-    assert _identity()["loader"] == generic.model_dump(mode="json")
+    assert _identity()["loader"] == generic.model_dump(mode="json", by_alias=True)
     assert _identity()["registries"]
     assert _identity()["state_format_version"] == 2
 
