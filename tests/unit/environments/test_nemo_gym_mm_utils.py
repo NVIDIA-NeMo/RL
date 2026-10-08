@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
+
+import pytest
 from PIL import Image
 
 from nemo_rl.data.multimodal_utils import (
@@ -20,9 +23,99 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.environments.nemo_gym_multimodal import (
     _extract_input_images_from_message,
+    _extract_static_video_messages,
     _index_per_turn_images,
+    _inject_vllm_mm_processor_kwargs,
+    _make_overlength_filtered_video_example,
+    _remove_vllm_mm_processor_kwargs,
+    _strip_local_media_metadata,
     _without_initial_media_sources,
+    normalize_media_in_examples,
 )
+from nemo_rl.environments.nemo_gym_request import _metadata_extra_body
+from nemo_rl.environments.nemo_gym_task import get_nemo_gym_task_input
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_media_normalization_preserves_task_envelope(tmp_path, native):
+    image_path = tmp_path / "input.png"
+    Image.new("RGB", (2, 3)).save(image_path)
+    task_input = {
+        "responses_create_params": {"input": [_user(str(image_path))]},
+        "task_data": {"media_ref": str(image_path)},
+    }
+    row = (
+        {
+            "task_id": {"taskset": "vision:train", "task_id": "image-1"},
+            "task_input": task_input,
+        }
+        if native
+        else task_input
+    )
+    original = deepcopy(row)
+
+    normalize_media_in_examples([row])
+
+    converted = get_nemo_gym_task_input(row)
+    source = converted["responses_create_params"]["input"][0]["content"][0]["image_url"]
+    assert source.startswith("data:image/")
+    assert converted["task_data"] == {"media_ref": str(image_path)}
+    if native:
+        assert row["task_id"] == original["task_id"]
+        assert "responses_create_params" not in row
+
+
+def test_native_video_preprocessing_updates_nested_request_only(tmp_path):
+    video_path = tmp_path / "input.mp4"
+    video_path.write_bytes(b"video placeholder")
+    row = {
+        "task_id": {"taskset": "video:train", "task_id": "video-1"},
+        "task_input": {
+            "responses_create_params": {
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_video",
+                                "video_url": str(video_path),
+                                "_video_source": str(video_path),
+                            }
+                        ],
+                    }
+                ],
+                "metadata": {"extra_body": '{"seed": 11}'},
+            },
+            "task_data": {"verifier": "opaque"},
+        },
+        "_rowidx": 3,
+    }
+    messages, resolved_path = _extract_static_video_messages(row)
+    assert resolved_path == str(video_path)
+    assert messages[0]["content"][0]["type"] == "video"
+
+    _inject_vllm_mm_processor_kwargs(row, {"video_as_images": True, "max_num_tiles": 1})
+    _remove_vllm_mm_processor_kwargs(row, {"max_num_tiles"})
+    _strip_local_media_metadata(row)
+    assert _metadata_extra_body(row) == {
+        "seed": 11,
+        "mm_processor_kwargs": {"video_as_images": True},
+    }
+    part = row["task_input"]["responses_create_params"]["input"][0]["content"][0]
+    assert "_video_source" not in part
+
+    filtered = _make_overlength_filtered_video_example(row)
+    assert filtered["task_id"] == row["task_id"]
+    assert filtered["_rowidx"] == 3
+    assert filtered["task_input"]["task_data"] == {"verifier": "opaque"}
+    assert "responses_create_params" not in filtered
+    assert (
+        filtered["task_input"]["responses_create_params"]["input"][0]["content"][0][
+            "type"
+        ]
+        == "input_text"
+    )
+    assert part["type"] == "input_video"
 
 
 def _image(size: tuple[int, int]) -> str:

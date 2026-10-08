@@ -44,6 +44,7 @@ from nemo_rl.environments.nemo_gym_request import (
     _deep_merge_dict,
     _json_mapping,
 )
+from nemo_rl.environments.nemo_gym_task import get_nemo_gym_task_input
 from nemo_rl.environments.nemotron_utils import (
     NEMOTRON_VIDEO_PROCESSOR_NAMES,
     process_nemotron_video_frames,
@@ -74,7 +75,11 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
         tuple[dict, tuple[str, str, str], str, str, bool, Any, str]
     ] = []
     for example in nemo_gym_examples:
-        input_items = example.get("responses_create_params", {}).get("input", [])
+        input_items = (
+            get_nemo_gym_task_input(example)
+            .get("responses_create_params", {})
+            .get("input", [])
+        )
         if not isinstance(input_items, list):
             continue
         for item in input_items:
@@ -365,8 +370,10 @@ def _extract_static_video_messages(
     sequence of cached ``input_image`` parts carrying ``_is_video_frame``. The
     latter is the on-disk frame-cache format used by the video Gym recipes.
     """
-    response_input = nemo_gym_example.get("responses_create_params", {}).get(
-        "input", []
+    response_input = (
+        get_nemo_gym_task_input(nemo_gym_example)
+        .get("responses_create_params", {})
+        .get("input", [])
     )
     if isinstance(response_input, str):
         return None
@@ -482,7 +489,9 @@ def _inject_vllm_mm_processor_kwargs(
     nemo_gym_example: dict[str, Any],
     mm_processor_kwargs: dict[str, Any],
 ) -> None:
-    params = nemo_gym_example.setdefault("responses_create_params", {})
+    params = get_nemo_gym_task_input(nemo_gym_example).setdefault(
+        "responses_create_params", {}
+    )
     if not isinstance(params, dict):
         raise TypeError("responses_create_params must be a dict")
     metadata = params.setdefault("metadata", {})
@@ -502,7 +511,9 @@ def _inject_vllm_mm_processor_kwargs(
 def _remove_vllm_mm_processor_kwargs(
     nemo_gym_example: dict[str, Any], names: set[str]
 ) -> None:
-    params = nemo_gym_example.get("responses_create_params", {})
+    params = get_nemo_gym_task_input(nemo_gym_example).get(
+        "responses_create_params", {}
+    )
     if not isinstance(params, dict):
         return
     metadata = params.get("metadata", {})
@@ -527,7 +538,11 @@ def _replace_cached_video_frames_with_native_video(
     nemo_gym_example: dict[str, Any],
 ) -> None:
     """Replace cached image parts with one lossless native-video manifest."""
-    input_items = nemo_gym_example.get("responses_create_params", {}).get("input", [])
+    input_items = (
+        get_nemo_gym_task_input(nemo_gym_example)
+        .get("responses_create_params", {})
+        .get("input", [])
+    )
     if not isinstance(input_items, list):
         raise TypeError("responses_create_params.input must be a list")
 
@@ -590,7 +605,11 @@ def _replace_cached_video_frames_with_native_video(
 
 
 def _strip_local_media_metadata(nemo_gym_example: dict[str, Any]) -> None:
-    input_items = nemo_gym_example.get("responses_create_params", {}).get("input", [])
+    input_items = (
+        get_nemo_gym_task_input(nemo_gym_example)
+        .get("responses_create_params", {})
+        .get("input", [])
+    )
     if not isinstance(input_items, list):
         return
     for item in input_items:
@@ -678,7 +697,7 @@ def _make_overlength_filtered_video_example(
     nemo_gym_example: dict[str, Any],
 ) -> dict[str, Any]:
     filtered = copy.deepcopy(nemo_gym_example)
-    params = filtered.setdefault("responses_create_params", {})
+    params = get_nemo_gym_task_input(filtered).setdefault("responses_create_params", {})
     params["input"] = [
         {
             "role": "user",
