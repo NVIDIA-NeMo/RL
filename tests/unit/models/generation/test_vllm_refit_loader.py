@@ -333,7 +333,7 @@ def test_refit_loader_cache_invalidates_replaced_parameter(monkeypatch):
     model.local.weight_loader = make_loader("replacement")
 
     assert load_weights_maybe_cached(
-        model, [("expert", second)], cache_loader_routes=True
+        model, iter([("expert", second)]), cache_loader_routes=True
     ) == {"expert"}
 
     assert model.load_calls == [["expert"], ["expert"]]

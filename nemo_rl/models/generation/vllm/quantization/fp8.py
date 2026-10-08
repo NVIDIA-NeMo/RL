@@ -721,7 +721,7 @@ def load_weights(
 
     load_weights_maybe_cached(
         model_runner.model,
-        list(quantized_weights),
+        quantized_weights,
         cache_loader_routes=refit_cache_loader_routes_enabled(model_runner.vllm_config),
     )
 

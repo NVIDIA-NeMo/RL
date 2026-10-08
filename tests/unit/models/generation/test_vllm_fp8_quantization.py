@@ -61,6 +61,41 @@ def fp8_module():
                 os.environ[key] = value
 
 
+def test_fp8_load_weights_without_callback_streams_to_cache_loader(
+    fp8_module, monkeypatch
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    fp8 = fp8_module
+    source_weights = [("source", torch.ones(1))]
+    quantized_weights = [("quantized", torch.ones(1))]
+    produced = 0
+    received = []
+
+    def quantize(weights, model_runner, *, refit_with_reload_api):
+        nonlocal produced
+        assert weights is source_weights
+        assert refit_with_reload_api is False
+        for weight in quantized_weights:
+            produced += 1
+            yield weight
+
+    def load(model, weights, *, cache_loader_routes):
+        assert produced == 0
+        assert cache_loader_routes is False
+        received.extend(weights)
+
+    monkeypatch.setattr(fp8, "get_quantized_weight_iterator", quantize)
+    monkeypatch.setattr(fp8, "refit_cache_loader_routes_enabled", lambda _: False)
+    monkeypatch.setattr(vllm_backend, "load_weights_maybe_cached", load)
+
+    fp8.load_weights(
+        source_weights, types.SimpleNamespace(model=object(), vllm_config=object())
+    )
+
+    assert received == quantized_weights
+
+
 @pytest.mark.parametrize("async_engine", [False, True])
 @pytest.mark.parametrize("refit_with_reload_api", [False, True])
 def test_init_fp8_uses_mxfp8_quantization_config(

@@ -369,7 +369,7 @@ def _record_loader_calls(
 
 def load_weights_maybe_cached(
     model: Any,
-    weights: list[tuple[str, torch.Tensor]],
+    weights: Iterable[tuple[str, torch.Tensor]],
     *,
     cache_loader_routes: bool,
 ) -> set[str]:
@@ -383,6 +383,7 @@ def load_weights_maybe_cached(
     if not cache_loader_routes:
         return model.load_weights(weights=weights)
 
+    weights = list(weights)
     cache = getattr(model, "_nrl_refit_loader_cache", None)
     if cache is None:
         cache = _RefitLoaderCache()
@@ -586,7 +587,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if not getattr(self, "_nrl_layerwise_reload_active", False):
             return load_weights_maybe_cached(
                 self.model_runner.model,
-                list(weights),
+                weights,
                 cache_loader_routes=refit_cache_loader_routes_enabled(
                     self.model_runner.vllm_config
                 ),

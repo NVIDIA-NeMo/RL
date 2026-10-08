@@ -588,8 +588,11 @@ def test_fp8_layerwise_reload_passes_entire_quantized_generator(
     from nemo_rl.models.generation.vllm.quantization import fp8
 
     received_weights = []
+    produced_weights = 0
 
     def model_load_weights(*, weights):
+        if not cache_loader_routes:
+            assert produced_weights == 0
         received_weights.extend(weights)
         return {name for name, _ in received_weights}
 
@@ -607,10 +610,13 @@ def test_fp8_layerwise_reload_passes_entire_quantized_generator(
     ]
 
     def get_quantized_weight_iterator(weights, model_runner, *, refit_with_reload_api):
+        nonlocal produced_weights
         assert weights is source_weights
         assert model_runner is ext.model_runner
         assert refit_with_reload_api is False
-        yield from quantized_weights
+        for weight in quantized_weights:
+            produced_weights += 1
+            yield weight
 
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
     monkeypatch.setattr(
