@@ -112,7 +112,10 @@ def _controller(actor: object) -> Any:
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
-        token_capture=SimpleNamespace(staging_partition="staging"),
+        token_capture=SimpleNamespace(
+            staging_partition="staging",
+            min_valid_fraction_per_group=None,
+        ),
         grpo=SimpleNamespace(num_prompts_per_step=1),
     )
     ctrl._trainer_version = 3
@@ -228,6 +231,54 @@ def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
     ]
     ctrl._buffer.abort.assert_called_once_with("group")
     ctrl._buffer.commit_finalized.assert_not_awaited()
+    assert "group" not in ctrl._finalizer_metrics_by_group
+    assert ctrl._available_finalizers.get_nowait() is actor
+
+
+def test_low_valid_fraction_never_becomes_replay_ready() -> None:
+    """Reject and clear a partial group before the train pump can select it."""
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={"finalize/group_ms": 1.0},
+        valid_row_count=1,
+        total_row_count=2,
+    )
+    actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+    ctrl = _controller(actor)
+    ctrl._master_config.token_capture.min_valid_fraction_per_group = 1.0
+    clear_calls: list[dict[str, Any]] = []
+
+    async def _clear(method_name: str, **kwargs: Any) -> None:
+        assert method_name == "clear_samples"
+        clear_calls.append(kwargs)
+
+    # This regression is about the atomic replay transition. Bypass the
+    # helper's thread offload so it remains independent of the login node's
+    # executor limits; production TransferQueue clients are synchronous.
+    ctrl._call_dp = _clear
+
+    finalized = asyncio.run(ctrl._finalize_with_actor(_request()))
+
+    # The caller still receives the counts so it can source a replacement,
+    # but no ready replay entry is ever exposed between publication and cleanup.
+    assert finalized is result
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+    assert clear_calls == [
+        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+    ]
+    ctrl._buffer.abort.assert_called_once_with("group")
     assert "group" not in ctrl._finalizer_metrics_by_group
     assert ctrl._available_finalizers.get_nowait() is actor
 

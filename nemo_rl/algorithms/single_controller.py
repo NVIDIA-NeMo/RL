@@ -1747,13 +1747,17 @@ class SingleControllerActor:
     ) -> Optional["FinalizedGroup"]:
         """Finalize and index one group atomically with respect to TQ saves.
 
-        Returns the committed FinalizedGroup once the group is committed to
-        the replay buffer (callers may read valid_row_count/total_row_count
-        off it to decide whether the group is worth keeping), or None when
-        the finalizer itself dropped it as a structural outcome (ownership
-        already cleaned up; the caller credits the step short). A low
-        valid-row fraction is no longer a finalizer-side drop -- the caller
-        decides that, since only the caller can source a replacement.
+        Returns the FinalizedGroup when it is either committed or rejected by
+        ``min_valid_fraction_per_group``. In the latter case its canonical and
+        staging rows are cleared and its replay slot is aborted before this
+        method returns; the caller only decides whether to source a replacement.
+        Returns None when the finalizer itself dropped the group as a structural
+        outcome (ownership is likewise already cleaned up).
+
+        The validity decision must happen inside the same mutation cut as
+        publication. Marking a low-validity group ready and checking the
+        threshold afterwards lets the train pump claim it before cleanup; its
+        metadata then names rows which no longer exist in TQ.
         """
         self._finalizer_waiters += 1
         queue_depth = max(
@@ -1774,6 +1778,8 @@ class SingleControllerActor:
         finalize_start = time.perf_counter()
         rpc_submitted = False
         actor_reusable = False
+        committed = False
+        below_valid_fraction = False
         try:
             # The actor publishes canonical rows before returning metadata. Keep
             # the remote write, local replay-index update, and lineage hand-off in
@@ -1802,6 +1808,16 @@ class SingleControllerActor:
                     raise
                 else:
                     actor_reusable = True
+
+                min_valid_fraction = (
+                    self._master_config.token_capture.min_valid_fraction_per_group
+                )
+                below_valid_fraction = (
+                    min_valid_fraction is not None
+                    and finalized.total_row_count > 0
+                    and finalized.valid_row_count / finalized.total_row_count
+                    < min_valid_fraction
+                )
 
                 if finalized.dropped:
                     try:
@@ -1833,6 +1849,18 @@ class SingleControllerActor:
                         "finalizer returned no metadata for non-dropped group "
                         f"{request.group_id}"
                     )
+                elif below_valid_fraction:
+                    try:
+                        await self._cleanup_known_finalization_request_unlocked(
+                            cut, request
+                        )
+                    except BaseException as cleanup_error:
+                        raise RuntimeError(
+                            "finalizer group fell below "
+                            "min_valid_fraction_per_group and known-key cleanup "
+                            f"failed for group {request.group_id}"
+                        ) from cleanup_error
+                    committed = False
                 else:
                     try:
                         await self._buffer.commit_finalized(
@@ -1867,17 +1895,18 @@ class SingleControllerActor:
             if actor_reusable or not rpc_submitted:
                 self._available_finalizers.put_nowait(actor)
         finalize_total_ms = (time.perf_counter() - finalize_start) * 1000.0
-        if not committed:
+        if not committed and not below_valid_fraction:
             return None
-        finalized.metrics.update(
-            {
-                "finalize/queue_wait_ms": queue_wait_ms,
-                "finalize/total_ms": finalize_total_ms,
-                "finalize/queue_depth": float(queue_depth),
-                "finalize/active_actor_count": float(active_actor_count),
-            }
-        )
-        self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
+        if committed:
+            finalized.metrics.update(
+                {
+                    "finalize/queue_wait_ms": queue_wait_ms,
+                    "finalize/total_ms": finalize_total_ms,
+                    "finalize/queue_depth": float(queue_depth),
+                    "finalize/active_actor_count": float(active_actor_count),
+                }
+            )
+            self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
         return finalized
 
     async def _cleanup_consumed_metas_unlocked(
@@ -2096,20 +2125,10 @@ class SingleControllerActor:
                                 self._rollout_manager.stats.committed += 1
                                 ownership_transferred = True
                                 break
-                            # Enough rows verified to publish, but too few to
-                            # be worth training on. Unlike the finalizer's own
-                            # structural drops above, this is a policy call
-                            # only the controller can act on: it is the one
-                            # component that can source a replacement.
-                            try:
-                                await self._cleanup_known_finalization_request(request)
-                            except BaseException as cleanup_error:
-                                raise RuntimeError(
-                                    "finalizer group fell below "
-                                    "min_valid_fraction_per_group and "
-                                    "known-key cleanup failed for group "
-                                    f"{request.group_id}"
-                                ) from cleanup_error
+                            # Enough rows verified to form a result, but too few
+                            # to train on. _finalize_with_actor already rejected
+                            # it atomically before the replay slot became ready;
+                            # only this controller can source a replacement.
                             print(
                                 f"  finalize: group {request.group_id} below "
                                 "min_valid_fraction_per_group "
