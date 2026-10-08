@@ -64,7 +64,11 @@ from nemo_rl.experience.interfaces import (
     Completion,
     PromptGroupRecord,
 )
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.metric_utils import (
+    calculate_single_metric,
+    pct,
+    rpc_safe_rollout_metrics,
+)
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     PromptGroupStatus,
@@ -1470,37 +1474,23 @@ class AsyncNemoGymRolloutImpl:
         completions: list[Completion],
         agent_name: str,
     ) -> dict[str, Any]:
-        """Aggregate per-sample and per-agent metrics."""
+        """Aggregate per-sample and per-agent metrics.
+
+        Token-capture receipts carry no tokens, so a receipt group reports
+        only its reward and agent metrics here. The finalizer measures the
+        canonical rows and publishes the token, turn and truncation metrics
+        under the same names (``RolloutReassembler.finalize_group``).
+        """
         # Prepare lists of values for each metric.
         total_reward = [c.reward for c in completions]
         receipt_mode = bool(completions) and "ng_receipt" in (
             completions[0].env_extras or {}
         )
-        if receipt_mode:
-            # Token-free receipts: token accounting comes from the manifest
-            # (cum_len of the deepest chain; delta sums as the generation
-            # proxy) instead of a message_log walk.
-            manifests = [
-                (((c.env_extras or {}).get("ng_receipt") or {}).get("manifest") or [])
-                for c in completions
-            ]
-            # .get with 0: _assemble_receipt ships raw ledger rows unvalidated
-            # when CallRecord validation fails (it only stamps
-            # capture_poisoned), so a malformed row must degrade a metric, not
-            # fail the group as a deterministic data failure.
-            turn_count = [len(m) for m in manifests]
-            total_tokens = [
-                max((entry.get("cum_len", 0) for entry in m), default=0)
-                for m in manifests
-            ]
-            assistant_tokens = [
-                sum(entry.get("delta_len", 0) for entry in m) for m in manifests
-            ]
-            max_gen_tokens_per_turn = [
-                max((entry.get("delta_len", 0) for entry in m), default=0)
-                for m in manifests
-            ]
-        else:
+        n = len(completions)
+        rollout_metrics: dict[str, Any] = calculate_single_metric(
+            total_reward, n, "total_reward"
+        )
+        if not receipt_mode:
             turn_count = [
                 sum(1 for m in c.message_log if m["role"] == "user")
                 for c in completions
@@ -1529,30 +1519,34 @@ class AsyncNemoGymRolloutImpl:
                 )
                 for c in completions
             ]
-        # truncated metrics
-        truncated = [c.truncated for c in completions]
-
-        # Aggregate metrics across all samples.
-        n = len(completions)
-        truncation_rate = sum(truncated) / n
-        rollout_metrics: dict[str, Any] = {
-            **calculate_single_metric(total_reward, n, "total_reward"),
-            # turn metrics
-            **calculate_single_metric(turn_count, n, "turns_per_sample"),
-            "turns_per_sample/p95": pct(turn_count, 95),
-            "turns_per_sample/p99": pct(turn_count, 99),
-            # token metrics
-            **calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
-            **calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
-            **calculate_single_metric(
-                max_gen_tokens_per_turn, n, "max_gen_tokens_per_turn"
-            ),
-            "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
             # truncated metrics
-            "natural_termination_rate": sum(not t for t in truncated) / n,
-            "truncation_rate": truncation_rate,
-            f"{agent_name}/truncation_rate": truncation_rate,
-        }
+            truncated = [c.truncated for c in completions]
+
+            # Aggregate metrics across all samples.
+            truncation_rate = sum(truncated) / n
+            rollout_metrics.update(
+                {
+                    # turn metrics
+                    **calculate_single_metric(turn_count, n, "turns_per_sample"),
+                    "turns_per_sample/p95": pct(turn_count, 95),
+                    "turns_per_sample/p99": pct(turn_count, 99),
+                    # token metrics
+                    **calculate_single_metric(
+                        total_tokens, n, "total_tokens_per_sample"
+                    ),
+                    **calculate_single_metric(
+                        assistant_tokens, n, "gen_tokens_per_sample"
+                    ),
+                    **calculate_single_metric(
+                        max_gen_tokens_per_turn, n, "max_gen_tokens_per_turn"
+                    ),
+                    "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
+                    # truncated metrics
+                    "natural_termination_rate": sum(not t for t in truncated) / n,
+                    "truncation_rate": truncation_rate,
+                    f"{agent_name}/truncation_rate": truncation_rate,
+                }
+            )
 
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
@@ -1571,29 +1565,30 @@ class AsyncNemoGymRolloutImpl:
                     calculate_single_metric(values, n, f"{agent_name}/{key}")
                 )
 
-        # Emit authoritative live token metrics after full-result metrics so
-        # similarly named environment metadata cannot overwrite them. In receipt
-        # mode these come from the manifest-derived token counts above.
-        rollout_metrics.update(
-            calculate_single_metric(
-                total_tokens, n, f"{agent_name}/total_tokens_per_sample"
+        if not receipt_mode:
+            # Emit authoritative live token metrics after full-result metrics
+            # so similarly named environment metadata cannot overwrite them.
+            rollout_metrics.update(
+                calculate_single_metric(
+                    total_tokens, n, f"{agent_name}/total_tokens_per_sample"
+                )
             )
-        )
-        rollout_metrics.update(
-            calculate_single_metric(
-                assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
+            rollout_metrics.update(
+                calculate_single_metric(
+                    assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
+                )
             )
-        )
         if self._log_full_result_tables:
             rollout_metrics[f"{agent_name}/full_result"] = Table(
                 data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
                 columns=["Full result"],
             )
 
-        # Necessary for downstream nemo rl logging/printing.
-        rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
-            "gen_tokens_per_sample/mean"
-        ]
+        if not receipt_mode:
+            # Necessary for downstream nemo rl logging/printing.
+            rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
+                "gen_tokens_per_sample/mean"
+            ]
         return rollout_metrics
 
 
@@ -2361,6 +2356,10 @@ class RolloutManager:
                 current_task = asyncio.current_task()
                 assert current_task is not None
                 inflight_registry[group_id] = (current_task, start_version)
+            # Gym-side metrics of this dispatch (agent results, rollout
+            # timing). None when every sibling was sealed before a restart:
+            # nothing is regenerated, and the finalizer still measures rows.
+            record: Optional[PromptGroupRecord] = None
             try:
                 if pending_indices:
                     async with self._recovery_mutation() as cut:
@@ -2369,7 +2368,7 @@ class RolloutManager:
                             group_id,
                             generation_indices=pending_indices,
                         )
-                    await self.run_rollout(
+                    record = await self.run_rollout(
                         attempt_input_sample,
                         rollout_ids=list(rollout_ids),
                         generation_indices=pending_indices,
@@ -2399,6 +2398,11 @@ class RolloutManager:
                 resolved_agent_name=self._recovery_ledger.get_group(
                     group_id
                 ).resolved_agent_name,
+                rollout_metrics=(
+                    rpc_safe_rollout_metrics(record.rollout_metrics)
+                    if record is not None
+                    else {}
+                ),
             )
             assert_metadata_only(request)
             return request

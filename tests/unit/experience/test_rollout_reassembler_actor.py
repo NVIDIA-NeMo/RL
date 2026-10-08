@@ -95,7 +95,12 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         drop_reason="test",
     )
     actor._finalizer.finalize_group.return_value = result
-    request = replace(_request(), loss_multiplier=0.25)
+    request = replace(
+        _request(),
+        loss_multiplier=0.25,
+        resolved_agent_name="agent",
+        rollout_metrics={"agent/reward/mean": 0.5, "agent/reward/histogram": [0.5]},
+    )
 
     assert actor.finalize(request) is result
     actor._finalizer.finalize_group.assert_called_once_with(
@@ -108,6 +113,8 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         prompt_idx=17,
         loss_multiplier=0.25,
         canonical_sample_ids=["group_g0"],
+        rollout_metrics={"agent/reward/mean": 0.5, "agent/reward/histogram": [0.5]},
+        metrics_namespace="agent",
     )
 
 
@@ -184,6 +191,9 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "mask_sample",
         "loss_multiplier",
         "resolved_agent_name",
+        # Per-group metric scalars and short histograms (one value per
+        # generation); rpc_safe_rollout_metrics keeps them numeric.
+        "rollout_metrics",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",
