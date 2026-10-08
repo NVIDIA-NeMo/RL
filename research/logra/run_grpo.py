@@ -52,7 +52,7 @@ def main():
         raise ValueError(
             "Initial research support is native synchronous GRPO without the data plane"
         )
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
     register_actor_environments()
     init_ray()
     tokenizer = get_tokenizer(config.policy["tokenizer"])
