@@ -31,7 +31,7 @@ def test_nightly_notification_reports_all_direct_job_results() -> None:
     assert step["uses"] == ACTION
     assert step["with"] == {
         "needs-json": "${{ toJSON(needs) }}",
-        "webhook": "${{ secrets.SLACK_TEAM_CHANNEL_WEBHOOK }}",
+        "webhook": "${{ secrets.SLACK_GITHUB_CI_WEBHOOK }}",
     }
     # No failed-run checkout, hand-built payload, or unchecked curl remains.
     assert "run" not in step
