@@ -100,6 +100,8 @@ CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
 SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray.
+# Seconds the head srun may outlive the driver before the job is ended anyway (0 disables).
+DRIVER_EXIT_GRACE_S=${DRIVER_EXIT_GRACE_S:-180}
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-1301}
@@ -858,6 +860,8 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
   set +e
   bash "$DRIVER_COMMAND_FILE" > "$LOG_DIR/ray-driver.log" 2>&1
   exit_code=\$?
+  # Tells the submit host the driver is done (see the dead-driver watchdog there).
+  echo "\$exit_code" > "$LOG_DIR/DRIVER_EXITED" 2>/dev/null || true
   set -e
   exit \$exit_code
 else
@@ -1118,7 +1122,13 @@ if [[ -n "$COMMAND" ]]; then
   # during bringup (e.g. a failed node), signal ENDED and stop promptly instead of
   # stalling until the head's 30-min worker deadline. check_srun_processes isn't used
   # here because it also watches the head, whose exit is the normal success path.
+  #
+  # Dead-driver watchdog: once the driver has exited, the head srun normally ends
+  # within seconds. If it is still running DRIVER_EXIT_GRACE_S later (e.g. teardown
+  # blocked on a hung filesystem), end the job with the driver's exit code instead
+  # of holding the allocation until the time limit.
   set +e
+  _driver_exited_at=""
   while kill -0 "${SRUN_PIDS["ray-head"]}" 2>/dev/null; do
     for _name in ray-workers sandbox; do
       _pid="${SRUN_PIDS[$_name]:-}"
@@ -1128,6 +1138,16 @@ if [[ -n "$COMMAND" ]]; then
         break 2
       fi
     done
+    if (( DRIVER_EXIT_GRACE_S > 0 )) && [[ -f "$LOG_DIR/DRIVER_EXITED" ]]; then
+      _driver_exited_at=${_driver_exited_at:-$SECONDS}
+      if (( SECONDS - _driver_exited_at >= DRIVER_EXIT_GRACE_S )); then
+        _driver_exit_code=$(cat "$LOG_DIR/DRIVER_EXITED" 2>/dev/null)
+        [[ "$_driver_exit_code" =~ ^[0-9]+$ ]] || _driver_exit_code=1
+        echo "[WARN] The driver exited (exit_code=$_driver_exit_code) but the head srun is still running after ${DRIVER_EXIT_GRACE_S}s; ending the job." >&2
+        touch "$LOG_DIR/ENDED"
+        exit "$_driver_exit_code"
+      fi
+    fi
     sleep 2
   done
   wait "${SRUN_PIDS["ray-head"]}"

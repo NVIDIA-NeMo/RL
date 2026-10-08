@@ -172,6 +172,12 @@ sbatch ray.sub \
     **Watch segment divisibility.** With topology-aware placement the allocation
     becomes `--nodes=N+1`, which can trip the "`SEGMENT_SIZE` must evenly divide
     `NUM_NODES`" check in `tools/launch`.
+* - `DRIVER_EXIT_GRACE_S=180`
+  - Only used when `COMMAND` is set. After the driver exits, the head srun
+    normally ends within seconds. If it is still running this many seconds
+    later (for example, teardown blocked on an unresponsive filesystem),
+    `ray.sub` exits with the driver's exit code, which ends the job instead of
+    holding the allocation until the time limit. Set to `0` to disable.
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
 * - `NODE_MANAGER_PORT=1301`
