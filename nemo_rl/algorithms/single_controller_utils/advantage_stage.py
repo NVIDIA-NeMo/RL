@@ -38,12 +38,17 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+    build_logical_owner_batch,
+    has_logical_owners,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -351,13 +356,24 @@ class AdvantageComputer:
         meta = request.meta
         cfg = self._config
         adv_cfg = cfg.advantage
+        logical = has_logical_owners(meta)
+        if logical and (
+            cfg.is_ppo
+            or not isinstance(cfg.algo, GRPOConfig)
+            or cfg.algo.adv_estimator.name != "grpo"
+            or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+        ):
+            raise ValueError("CC logical owners require the standard GRPO estimator")
+        input_fields = cfg.input_fields()
+        if logical and adv_cfg.prompt_ids_field not in input_fields:
+            input_fields.append(adv_cfg.prompt_ids_field)
 
         data = await call_data_plane(
             self._dp_client,
             "get_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
-            select_fields=cfg.input_fields(),
+            select_fields=input_fields,
         )
 
         # Group by the group a row was generated in, not by its prompt tokens.
@@ -365,7 +381,17 @@ class AdvantageComputer:
         # each prompt 100 times -- and the token key gave them one shared
         # baseline whenever they landed in the same call, so the result moved
         # with chunk boundaries and with how the shards fell.
-        prompt_ids = group_index_column(row_group_ids(meta))
+        group_ids = row_group_ids(meta)
+        if logical:
+            assert meta.tags is not None
+            if any(
+                group_id != tag.get("dispatch_group_id")
+                for group_id, tag in zip(group_ids, meta.tags, strict=True)
+            ):
+                raise ValueError(
+                    "CC dispatch identity disagrees with the prompt-group tag"
+                )
+        prompt_ids = group_index_column(group_ids)
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
@@ -428,6 +454,30 @@ class AdvantageComputer:
             seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
 
+        owner_batch = None
+        if logical:
+            original_prompts = tensor_field(data, adv_cfg.prompt_ids_field)
+            # Preserve equality when padding would alias [x] and [x, 0].
+            prompt_lengths = original_prompts.new_tensor(
+                [row.numel() for row in data[adv_cfg.prompt_ids_field].unbind()]
+            )
+            original_prompts = torch.cat(
+                (prompt_lengths.unsqueeze(-1), original_prompts), dim=1
+            )
+            owner_batch = build_logical_owner_batch(
+                meta,
+                prompt_ids=original_prompts,
+                rewards=rewards,
+                sample_mask=final_sample_mask,
+                expected_group_size=cfg.algo.num_generations_per_prompt,
+            )
+            # Any flagged segment filters its owner; padding has no owner.
+            num_mask_sample_filtered = (
+                owner_batch.row_owner[mask_sample & (owner_batch.row_owner >= 0)]
+                .unique()
+                .numel()
+            )
+            final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
@@ -464,7 +514,23 @@ class AdvantageComputer:
         # Value-model estimators (GAE) hand back the regression target alongside
         # the advantages; the group-relative ones return a bare tensor.
         returns: Optional[torch.Tensor] = None
-        if has_valid_training_tokens:
+        if has_valid_training_tokens and owner_batch is not None:
+            rows = owner_batch.representative_rows
+            owner_advantages = self._advantage_estimator.compute_advantage(
+                prompt_ids=owner_batch.group_ids,
+                rewards=rewards[rows],
+                mask=owner_batch.valid_mask.unsqueeze(-1),
+                valid_mask=owner_batch.valid_mask,
+            )
+            if (
+                owner_advantages.shape != (len(rows), 1)
+                or not torch.isfinite(owner_advantages).all()
+            ):
+                raise ValueError("GRPO must return one finite advantage per CC owner")
+            advantages = (
+                owner_batch.fanout(owner_advantages[:, 0]).unsqueeze(-1).expand_as(mask)
+            )
+        elif has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
@@ -505,7 +571,12 @@ class AdvantageComputer:
             )
 
         response_advantages = torch.masked_select(advantages, mask.bool())
-        reward_partial = RewardPartial.from_rows(rewards, final_sample_mask)
+        metric_rows = (
+            owner_batch.representative_rows if owner_batch is not None else slice(None)
+        )
+        reward_partial = RewardPartial.from_rows(
+            rewards[metric_rows], final_sample_mask[metric_rows]
+        )
         opd_stat_sum = 0.0
         opd_stat_sumsq = 0.0
         opd_stat_count = 0

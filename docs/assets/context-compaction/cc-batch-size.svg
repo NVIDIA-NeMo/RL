@@ -1,0 +1,169 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="792" viewBox="0 0 960 792" role="img" aria-labelledby="title desc">
+<!-- Adapted from https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-cc-batch-size.html
+     Behavior checked against NVIDIA-NeMo/RL e81d5438148683a663dc405d301ed078c18abc7e and NVIDIA-NeMo/Gym b27e0db8faefee7e4760b5b1bfbfed713f528360.
+     Editable SVG source; examples are illustrative, not measurements. -->
+<title id="title">Logical batch size stays fixed while physical training rows vary</title><desc id="desc">Worked example: three prompt groups with two rollouts each produce thirteen real rows plus three padding rows. Four data-parallel ranks process sixteen rows and perform one optimizer step.</desc>
+<style>:root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2128;--border:#30363d;--text:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--orange:#d29922;--red:#f85149;--purple:#bc8cff;}
+svg .call{fill:var(--surface);stroke:var(--accent);stroke-width:1.5}
+svg .root{fill:var(--accent);fill-opacity:.2;stroke:var(--accent);stroke-width:1.8}
+svg .dead{fill:var(--surface);stroke:var(--dim);stroke-width:1.3;stroke-dasharray:4 3}
+svg .row{fill:var(--purple);fill-opacity:.16;stroke:var(--purple);stroke-width:1.5}
+svg .lane{fill:none;stroke:var(--border);stroke-width:1;stroke-dasharray:2 3}
+svg .lbl{fill:var(--text);font:12px -apple-system,sans-serif}
+svg .lbl-b{fill:var(--text);font:bold 13.5px -apple-system,sans-serif}
+svg .cid{fill:var(--text);font:bold 12px ui-monospace,Menlo,monospace}
+svg .mono{fill:var(--text);font:10.5px ui-monospace,Menlo,monospace}
+svg .note{fill:var(--dim);font:11.5px -apple-system,sans-serif}
+svg .hdr{fill:var(--accent);font:bold 12.5px -apple-system,sans-serif}
+svg .edge{stroke:var(--accent);stroke-width:1.5;fill:none;marker-end:url(#ah)}
+svg .edge-dead{stroke:var(--dim);stroke-width:1.2;fill:none;stroke-dasharray:4 3}
+svg .walk{stroke:var(--orange);stroke-width:2;fill:none;marker-end:url(#aw)}
+svg .cut{stroke:var(--red);stroke-width:2;stroke-dasharray:5 4}
+svg .cut-lbl{fill:var(--red);font:bold 11px -apple-system,sans-serif}
+svg .walk-lbl{fill:var(--orange);font:bold 11px -apple-system,sans-serif}
+svg .ah{fill:var(--accent)}
+svg .aw{fill:var(--orange)}
+svg a text{text-decoration:underline;fill:var(--accent);font:10.5px ui-monospace,Menlo,monospace}
+svg .ga{fill:var(--accent);fill-opacity:.22;stroke:var(--accent);stroke-width:1.3}
+svg .gb{fill:var(--green);fill-opacity:.22;stroke:var(--green);stroke-width:1.3}
+svg .gc{fill:var(--purple);fill-opacity:.22;stroke:var(--purple);stroke-width:1.3}
+svg .pad{fill:none;stroke:var(--dim);stroke-width:1.2;stroke-dasharray:4 3}
+svg .rank{fill:var(--surface);stroke:var(--border);stroke-width:1}
+svg .ok{fill:var(--green);fill-opacity:.1;stroke:var(--green);stroke-width:1.5}</style>
+<rect width="100%" height="100%" fill="#0d1117" rx="10"/>
+<text x="16" y="27" fill="#e6edf3" font-family="Arial, sans-serif" font-size="18" font-weight="700">Logical batch size stays fixed while physical training rows vary</text>
+<g aria-label="Label legend">
+<rect x="16" y="43" width="928" height="64" rx="6" fill="#161b22" stroke="#30363d"/>
+<text class="lbl" x="28" y="62"><tspan font-weight="bold">g = prompt group</tspan> (rollouts sampled for the same prompt)</text>
+<text class="lbl" x="28" y="80"><tspan font-weight="bold">r = rollout</tspan> within that group; <tspan font-weight="bold">s = reconstructed training segment</tspan> (row) within that rollout</text>
+<text class="note" x="28" y="98">Example: g1 · r0 · s1 = group g1, rollout r0, its second segment. Colors distinguish prompt groups.</text>
+</g>
+<g transform="translate(0 124)">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<text class="hdr" x="16" y="22">Ordinary GRPO: one row per rollout (logical-count comparison)</text>
+<rect class="ga" x="16" y="34" width="56" height="24" rx="4"/>
+<text class="mono" x="22" y="50">g0·r0</text>
+<rect class="ga" x="78" y="34" width="56" height="24" rx="4"/>
+<text class="mono" x="84" y="50">g0·r1</text>
+<rect class="gb" x="140" y="34" width="56" height="24" rx="4"/>
+<text class="mono" x="146" y="50">g1·r0</text>
+<rect class="gb" x="202" y="34" width="56" height="24" rx="4"/>
+<text class="mono" x="208" y="50">g1·r1</text>
+<rect class="gc" x="264" y="34" width="56" height="24" rx="4"/>
+<text class="mono" x="270" y="50">g2·r0</text>
+<rect class="gc" x="326" y="34" width="56" height="24" rx="4"/>
+<text class="mono" x="332" y="50">g2·r1</text>
+<text class="lbl" x="396" y="51">3 prompts × 2 generations = 6 rollouts = 6 rows = <tspan class="mono">train_global_batch_size</tspan></text>
+<text class="hdr" x="16" y="96">CC reconstruction: one rollout can produce several rows; the logical count is unchanged</text>
+<text class="cid" x="16" y="124">g0</text>
+<rect class="ga" x="50" y="108" width="56" height="24" rx="4"/>
+<text class="mono" x="56" y="124">r0·s0</text>
+<rect class="ga" x="110" y="108" width="56" height="24" rx="4"/>
+<text class="mono" x="116" y="124">r1·s0</text>
+<rect class="ga" x="170" y="108" width="56" height="24" rx="4"/>
+<text class="mono" x="176" y="124">r1·s1</text>
+<rect class="ga" x="230" y="108" width="56" height="24" rx="4"/>
+<text class="mono" x="236" y="124">r1·s2</text>
+<text class="lbl" x="546" y="124">1 + 3 = 4 rows, +0 pad → 4</text>
+<text class="cid" x="16" y="158">g1</text>
+<rect class="gb" x="50" y="142" width="56" height="24" rx="4"/>
+<text class="mono" x="56" y="158">r0·s0</text>
+<rect class="gb" x="110" y="142" width="56" height="24" rx="4"/>
+<text class="mono" x="116" y="158">r0·s1</text>
+<rect class="gb" x="170" y="142" width="56" height="24" rx="4"/>
+<text class="mono" x="176" y="158">r1·s0</text>
+<rect class="gb" x="230" y="142" width="56" height="24" rx="4"/>
+<text class="mono" x="236" y="158">r1·s1</text>
+<rect class="gb" x="290" y="142" width="56" height="24" rx="4"/>
+<text class="mono" x="296" y="158">r1·s2</text>
+<rect class="gb" x="350" y="142" width="56" height="24" rx="4"/>
+<text class="mono" x="356" y="158">r1·s3</text>
+<rect class="gb" x="410" y="142" width="56" height="24" rx="4"/>
+<text class="mono" x="416" y="158">r1·s4</text>
+<rect class="pad" x="470" y="142" width="56" height="24" rx="4"/>
+<text class="mono" x="476" y="158">pad</text>
+<text class="lbl" x="546" y="158">2 + 5 = 7 rows, +1 pad → 8</text>
+<text class="cid" x="16" y="192">g2</text>
+<rect class="gc" x="50" y="176" width="56" height="24" rx="4"/>
+<text class="mono" x="56" y="192">r0·s0</text>
+<rect class="gc" x="110" y="176" width="56" height="24" rx="4"/>
+<text class="mono" x="116" y="192">r1·s0</text>
+<rect class="pad" x="170" y="176" width="56" height="24" rx="4"/>
+<text class="mono" x="176" y="192">pad</text>
+<rect class="pad" x="230" y="176" width="56" height="24" rx="4"/>
+<text class="mono" x="236" y="192">pad</text>
+<text class="lbl" x="546" y="192">1 + 1 = 2 rows, +2 pad → 4</text>
+<text class="note" x="16" y="218">Q = DP size × lcm(train microbatch size, required logprob microbatch size). Here Q = 4 × lcm(1,1) = 4.</text>
+<text class="note" x="16" y="234">Execution padding copies a valid input layout. It has zero loss, zero advantage and no logical owner.</text>
+
+
+<path class="edge" d="M480 260 L480 282"/>
+<text class="note" x="490" y="276">13 real rows + 3 pad = 16 rows for 6 rollouts</text>
+<text class="hdr" x="16" y="300">Four data-parallel ranks: equal numbers of microbatches; TP/PP GPUs do not multiply the row count</text>
+<rect class="rank" x="16" y="312" width="220" height="154" rx="8"/>
+<text class="lbl-b" x="26" y="332">DP rank 0</text>
+<rect class="ga" x="26" y="342" width="56" height="24" rx="4"/>
+<text class="mono" x="32" y="358">r0·s0</text>
+<text class="note" x="90" y="358">g0 · micro batch 1</text>
+<rect class="gb" x="26" y="372" width="56" height="24" rx="4"/>
+<text class="mono" x="32" y="388">r0·s0</text>
+<text class="note" x="90" y="388">g1 · micro batch 2</text>
+<rect class="gb" x="26" y="402" width="56" height="24" rx="4"/>
+<text class="mono" x="32" y="418">r0·s1</text>
+<text class="note" x="90" y="418">g1 · micro batch 3</text>
+<rect class="gc" x="26" y="432" width="56" height="24" rx="4"/>
+<text class="mono" x="32" y="448">r0·s0</text>
+<text class="note" x="90" y="448">g2 · micro batch 4</text>
+<rect class="rank" x="252" y="312" width="220" height="154" rx="8"/>
+<text class="lbl-b" x="262" y="332">DP rank 1</text>
+<rect class="ga" x="262" y="342" width="56" height="24" rx="4"/>
+<text class="mono" x="268" y="358">r1·s0</text>
+<text class="note" x="326" y="358">g0 · micro batch 1</text>
+<rect class="gb" x="262" y="372" width="56" height="24" rx="4"/>
+<text class="mono" x="268" y="388">r1·s0</text>
+<text class="note" x="326" y="388">g1 · micro batch 2</text>
+<rect class="gb" x="262" y="402" width="56" height="24" rx="4"/>
+<text class="mono" x="268" y="418">r1·s1</text>
+<text class="note" x="326" y="418">g1 · micro batch 3</text>
+<rect class="gc" x="262" y="432" width="56" height="24" rx="4"/>
+<text class="mono" x="268" y="448">r1·s0</text>
+<text class="note" x="326" y="448">g2 · micro batch 4</text>
+<rect class="rank" x="488" y="312" width="220" height="154" rx="8"/>
+<text class="lbl-b" x="498" y="332">DP rank 2</text>
+<rect class="ga" x="498" y="342" width="56" height="24" rx="4"/>
+<text class="mono" x="504" y="358">r1·s1</text>
+<text class="note" x="562" y="358">g0 · micro batch 1</text>
+<rect class="gb" x="498" y="372" width="56" height="24" rx="4"/>
+<text class="mono" x="504" y="388">r1·s2</text>
+<text class="note" x="562" y="388">g1 · micro batch 2</text>
+<rect class="gb" x="498" y="402" width="56" height="24" rx="4"/>
+<text class="mono" x="504" y="418">r1·s3</text>
+<text class="note" x="562" y="418">g1 · micro batch 3</text>
+<rect class="pad" x="498" y="432" width="56" height="24" rx="4"/>
+<text class="mono" x="504" y="448">pad</text>
+<text class="note" x="562" y="448">g2 · micro batch 4</text>
+<rect class="rank" x="724" y="312" width="220" height="154" rx="8"/>
+<text class="lbl-b" x="734" y="332">DP rank 3</text>
+<rect class="ga" x="734" y="342" width="56" height="24" rx="4"/>
+<text class="mono" x="740" y="358">r1·s2</text>
+<text class="note" x="798" y="358">g0 · micro batch 1</text>
+<rect class="gb" x="734" y="372" width="56" height="24" rx="4"/>
+<text class="mono" x="740" y="388">r1·s4</text>
+<text class="note" x="798" y="388">g1 · micro batch 2</text>
+<rect class="pad" x="734" y="402" width="56" height="24" rx="4"/>
+<text class="mono" x="740" y="418">pad</text>
+<text class="note" x="798" y="418">g1 · micro batch 3</text>
+<rect class="pad" x="734" y="432" width="56" height="24" rx="4"/>
+<text class="mono" x="740" y="448">pad</text>
+<text class="note" x="798" y="448">g2 · micro batch 4</text>
+<text class="note" x="16" y="476">Illustrative rank assignment. Each rank has four microbatches; actual row placement may differ.</text>
+<path class="edge" d="M480 486 L480 508"/>
+<rect class="ok" x="16" y="512" width="928" height="66" rx="8"/>
+<text class="lbl-b" x="30" y="534">One optimizer step: normalize accumulated gradients by the global valid loss-token count N.</text>
+<text class="lbl" x="30" y="554">One advantage per logical rollout, copied to its rows. Padding contributes no loss tokens.</text>
+
+
+<text class="note" x="16" y="600">13 real rows + 3 padding rows still represent six logical rollouts, not 16 independent reward samples.</text>
+<text class="note" x="16" y="618">Compute depends on row lengths, padding and repeated context. More rows alone does not imply greater total compute.</text></g>
+<text x="16" y="776" fill="#8b949e" font-family="Arial, sans-serif" font-size="10">Adapted from Terry Kong’s PR #4124 review figures; updated for the current context-compaction implementation.</text>
+</svg>

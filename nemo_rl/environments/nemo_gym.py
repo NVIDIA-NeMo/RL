@@ -147,6 +147,15 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
 
+def _normalize_gym_validity(result: dict) -> dict:
+    """Project CC verifier masks into the existing downstream masking contract."""
+    normalized = dict(result)
+    config = dict(result.get("instance_config") or {})
+    config["mask_sample"] = bool(result.get("mask_sample") or config.get("mask_sample"))
+    normalized["instance_config"] = config
+    return normalized
+
+
 def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
     """Fail readably when Gym did not stamp an agent_ref onto every row.
 
@@ -351,6 +360,25 @@ _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
+# How long a terminal manifest read waits for an in-flight capture call to
+# resolve, and the poll interval. The bound must cover one full generation
+# (the engine finishes a disconnected call before its ledger row lands).
+_CAPTURE_DRAIN_TIMEOUT_S = 300.0
+_CAPTURE_DRAIN_POLL_S = 5.0
+
+
+def _mask_undrained_receipt(receipt: dict) -> dict:
+    """Mask incomplete capture without claiming its pending writes stopped.
+
+    The seal accepts poisoned receipts with pending IDs and excludes those
+    IDs from cleanup. A timeout or failure row is not a write acknowledgement.
+    """
+    if receipt.get("pending_call_ids"):
+        receipt.update(
+            capture_poisoned=True,
+            failure_reason=receipt.get("failure_reason") or "capture_incomplete",
+        )
+    return receipt
 
 
 def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
@@ -466,6 +494,12 @@ class NemoGym(EnvironmentInterface):
         if is_span_group_enabled(RLSpanGroup.PER_PROMPT):
             instrument_aiohttp_client()
         self.cfg = cfg
+        capture_config = cfg.get("token_capture")
+        self._context_compaction = bool(
+            capture_config and capture_config.get("context_compaction")
+        )
+        if self._context_compaction and not capture_config.get("enabled"):
+            raise ValueError("context compaction requires external token capture")
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -636,6 +670,7 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
                 "external_staging_backend": _external_staging_backend(token_capture),
+                "framework_owned_context": self._context_compaction,
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
@@ -868,7 +903,9 @@ Depending on your data shape, you may want to change these values."""
         timer = Timer()
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples, head_server_config=self.head_server_config
+            examples=nemo_gym_examples,
+            head_server_config=self.head_server_config,
+            **({"retry_requests": False} if self._context_compaction else {}),
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
@@ -896,7 +933,7 @@ Depending on your data shape, you may want to change these values."""
                     raise
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                if self._token_capture_enabled:
+                if self._context_compaction or self._token_capture_enabled:
                     # Receipt mode: fetch the ledger manifest and assemble the
                     # receipt locally; token-free result. The canonical row is
                     # rebuilt by the finalizer, so no message_log walk (and no
@@ -951,6 +988,46 @@ Depending on your data shape, you may want to change these values."""
                 timing_metrics,
             )
 
+    async def _drained_manifest(self, rollout_id: str) -> dict:
+        """Fetch the terminal ledger manifest, draining in-flight capture calls.
+
+        Ending a session at its budget can leave its final call still
+        executing: the streaming dispatch makes one non-streaming engine
+        call, so the client's disconnect is not observed until the
+        synthesized stream is written, and the engine call runs to
+        completion after the harness declared the rollout terminal. Such a
+        call is an intent with no commit and no failure row, and a receipt
+        that still carries it must be masked. Poll until outstanding calls
+        resolve, a failure is recorded for each, or the drain budget lapses.
+        Preserve pending IDs even when a failure ends the wait: the worker
+        may still stage data, so those IDs cannot transfer to cleanup.
+        """
+        deadline = monotonic() + _CAPTURE_DRAIN_TIMEOUT_S
+        while True:
+            manifest = await self._control(
+                "GET",
+                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/manifest",
+            )
+            failed = {
+                failure.get("model_call_id")
+                for failure in manifest.get("failures") or []
+            }
+            unresolved = [
+                call_id
+                for call_id in manifest.get("pending_call_ids") or []
+                if call_id not in failed
+            ]
+            if not unresolved:
+                return manifest
+            if monotonic() >= deadline:
+                print(
+                    f"capture drain for {rollout_id} timed out; "
+                    f"unresolved calls: {unresolved}",
+                    flush=True,
+                )
+                return manifest
+            await asyncio.sleep(_CAPTURE_DRAIN_POLL_S)
+
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict
     ) -> dict:
@@ -965,6 +1042,10 @@ Depending on your data shape, you may want to change these values."""
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
+        if self._context_compaction:
+            return await self._postprocess_captured_history(
+                nemo_gym_row, _normalize_gym_validity(nemo_gym_result)
+            )
         rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
         # Gym's TERMINAL_RESPONSE_ID_KEY: the served response envelope id the
         # harness kept (``response.id``), not the logical-request header.
@@ -979,16 +1060,15 @@ Depending on your data shape, you may want to change these values."""
             scored_response = None
         receipt = None
         try:
-            manifest = await self._control(
-                "GET",
-                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/manifest",
-            )
-            receipt = self._assemble_receipt(
-                rollout_id,
-                manifest,
-                terminal_response_id=terminal_response_id,
-                scored_response=scored_response,
-                reward=float(nemo_gym_result.get("reward") or 0.0),
+            manifest = await self._drained_manifest(rollout_id)
+            receipt = _mask_undrained_receipt(
+                self._assemble_receipt(
+                    rollout_id,
+                    manifest,
+                    terminal_response_id=terminal_response_id,
+                    scored_response=scored_response,
+                    reward=float(nemo_gym_result.get("reward") or 0.0),
+                )
             )
         except (RuntimeError, OSError) as error:
             # An unfetchable manifest finalizes as a placeholder row.
@@ -999,6 +1079,109 @@ Depending on your data shape, you may want to change these values."""
             "full_result": nemo_gym_result,
             "rollout_id": rollout_id,
             "receipt": receipt,
+        }
+
+    async def _postprocess_captured_history(self, row: dict, result: dict) -> dict:
+        """Recover accepted chains from common output and shared capture evidence."""
+        # Optional Gym dependencies remain confined to the Gym adapter.
+        from nemo_gym.token_id_capture.staging.records import RolloutManifest
+
+        from nemo_rl.environments.gym_selection import select_captured_calls
+        from nemo_rl.experience.rollout_reassembler import (
+            ActionOutputFlags,
+            RolloutSelection,
+        )
+
+        owner = row[_NG_ROLLOUT_ID_BODY_KEY]
+        reward = result.get("reward")
+        if (
+            isinstance(reward, bool)
+            or not isinstance(reward, (int, float))
+            or not math.isfinite(reward)
+        ):
+            raise ValueError(
+                "Captured history requires an explicit finite verifier reward"
+            )
+        manifest = await self._drained_manifest(owner)
+        parsed = RolloutManifest.model_validate(manifest)
+        if parsed.rollout_id != owner:
+            raise ValueError("Capture manifest belongs to another dispatched attempt")
+        # A finished agent may have cancelled or lost its final model call. Its
+        # attempt is untrainable, not a controller failure. Keep pending IDs in
+        # the receipt: their writes may still arrive and must not be cleaned here.
+        capture_failed = bool(parsed.pending_call_ids or parsed.failures)
+        selected = []
+        if not capture_failed:
+            try:
+                selected = select_captured_calls(parsed.records, result)
+            except ValueError as error:
+                raise ValueError(f"Rollout {owner!r}: {error}") from error
+        if any(
+            r.response_status not in ("completed", "incomplete", "failed")
+            for r in selected
+        ):
+            raise ValueError("Selected capture is missing completion metadata")
+        if any(
+            r.response_status == "incomplete" and not r.finish_reason for r in selected
+        ):
+            raise ValueError("Incomplete capture is missing its finish reason")
+        if any(r.last_output_item is None for r in selected):
+            raise ValueError("Selected capture is missing output validation evidence")
+        truncated = any(
+            r.finish_reason in ("length", "max_tokens", "max_output_tokens")
+            for r in selected
+        )
+        receipt = self._assemble_receipt(
+            owner,
+            manifest,
+            terminal_response_id=selected[-1].response_id if selected else None,
+            reward=float(reward),
+        )
+        if capture_failed:
+            receipt.update(capture_poisoned=True, failure_reason="capture_incomplete")
+        elif any(
+            r.response_status == "failed"
+            or (
+                r.response_status == "incomplete"
+                and r.finish_reason not in ("length", "max_tokens", "max_output_tokens")
+            )
+            for r in selected
+        ):
+            receipt.update(
+                capture_poisoned=True, failure_reason="logical_execution_failure"
+            )
+        selection = RolloutSelection(
+            response_ids=tuple(r.response_id for r in selected),
+            action_flags=tuple(
+                ActionOutputFlags(
+                    *_detect_invalid_tool_call_and_malformed_thinking(
+                        r.last_output_item or {},
+                        invalid_tool_call_patterns=self.cfg.get(
+                            "invalid_tool_call_patterns"
+                        ),
+                        thinking_tags=self.cfg.get("thinking_tags"),
+                    )
+                )
+                for r in selected
+            ),
+            truncated=truncated,
+        )
+        full_result: dict[str, Any] = {
+            key: value
+            for key, value in result.items()
+            if isinstance(value, (str, int, float, bool))
+        }
+        full_result["instance_config"] = {
+            "mask_sample": result["instance_config"]["mask_sample"]
+        }
+        return {
+            "message_log": [],
+            "input_message_log": [],
+            "full_result": full_result,
+            "rollout_id": owner,
+            "receipt": receipt,
+            "logical_selection": selection,
+            "truncated": truncated,
         }
 
     @staticmethod
@@ -1048,14 +1231,20 @@ Depending on your data shape, you may want to change these values."""
         that never returned a completion (the ledger commit precedes the
         response leaving the server) and can never be a lineage parent (an
         uncommitted call has no row to resolve against) — e.g. the doomed
-        final call of a rollout that exhausted the model's context window.
-        Such rows are structurally off-chain and do not poison; if the
-        *terminal* request itself died this way, the missing-terminal-row
-        check below still masks the rollout. Every other failure reason
-        (for example ``worker_capture_failed``,
+        final call of a rollout that exhausted the model's context window,
+        or a call cancelled mid-flight when the harness ends the session at
+        its budget. Such rows are structurally off-chain and do not poison;
+        if the *terminal* request itself died this way, the
+        missing-terminal-row check below still masks the rollout. Every
+        other failure reason (for example ``worker_capture_failed``,
         ``invalid_worker_commit_coordinates``, or ``unresolved_parent``; a
         reason-less failure row poisons as ``capture_failed``) marks a call
         whose completion WAS served — a hole in the chain — and poisons.
+
+        Pending IDs remain authoritative even beside a failure row: a
+        worker may still write or its acknowledgement may have been lost.
+        The caller masks such receipts; sealing excludes unresolved writes
+        from cleanup ownership.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
@@ -1122,6 +1311,8 @@ Depending on your data shape, you may want to change these values."""
         return {
             "rollout_id": rollout_id,
             "reward": reward,
+            "attempted_call_ids": manifest.get("attempted_call_ids", []),
+            "pending_call_ids": manifest.get("pending_call_ids", []),
             "terminal_model_call_id": (
                 terminal_record.get("model_call_id")
                 if terminal_record is not None

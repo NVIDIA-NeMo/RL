@@ -1,0 +1,149 @@
+# Context compaction with framework-owned training rows
+
+This opt-in SingleController GRPO path lets a harness rewrite its semantic history while NeMo-RL owns the resulting training rows. It builds on the ordinary worker token/media capture path. It does not patch upstream vLLM.
+
+The editable SVG figures below are adapted from Terry Kong’s review illustrations: [data flow](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-data-flow.html), [calls to rows](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-calls-to-rows.html), [compaction guards](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-dropped-group.html), and [batch size](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-cc-batch-size.html). The reference figures retain his layout and visual conventions, updated for the implementation described here; the three introductory figures expand the same example step by step. Token IDs and row counts in the figures are illustrative.
+
+## Ownership and request flow
+
+The walkthrough follows one rollout from its second model call through storage and final reconstruction. `P` is the initial task, `A1` and `A2` are generated answers, and `O2` is the observation supplied before call 2. `c1`, `c2`, and so on identify captured model calls. TransferQueue (TQ) stores their tensors.
+
+### 1. Serving the next call
+
+Call 1 has already answered the task. The harness supplies the chosen messages for call 2; Gym proposes a predecessor, and RL verifies that it can reuse the predecessor’s exact tokens.
+
+![Serving call 2 using the exact captured history of call 1 plus a new observation.](../assets/context-compaction/serving-next-call.svg)
+
+The result is answer A2 generated from the verified historical tokens plus the new observation. This text-only example leaves media out for clarity; the image-processing and retained-media checks are described below.
+
+### 2. Storing the captured contribution
+
+Call 2 has finished. Its record points to call 1 and stores only the new observation and answer. TQ holds the tensors; Gym’s ledger records identities and the inherited (`prev_len`), new (`delta_len`), and total (`cum_len`) token counts shown by the brackets.
+
+![Root and delta records, capture length fields, and the resulting training row with context and loss tokens distinguished.](../assets/context-compaction/storing-call-deltas.svg)
+
+If both calls are accepted, their two records reconstruct one training row. The mask in the illustration shows token loss eligibility; rejected calls and invalid rollouts do not become trainable merely because they were captured. Actual captures also include generated logprobs and any required routes/media.
+
+### 3. Selecting and reconstructing training rows
+
+Now the harness rewrites its next context before call 3, then rejects call 4 and accepts retry call 5 with the same observation O4. Its returned accepted history still includes the accepted calls from before compaction.
+
+![Complete capture graph, accepted-history selection, backward endpoint walks and two reconstructed training rows.](../assets/context-compaction/selecting-training-rows.svg)
+
+RL selects calls using the returned history, finds endpoints in that selected graph, and reconstructs two rows. Those rows belong to one logical rollout with one reward and advantage. The rewritten prompt is conditioning context, not a newly generated span eligible for loss in call 3.
+
+### Detailed ownership and validation rules
+
+The Gym integration accepts ordinary rollout output through shared capture. A harness retains its semantic message/image history, applies its own compaction policy, and sends its chosen context through the supported sequential Responses or Chat capture route. Responses clients may request buffered SSE: Gym captures one non-streaming upstream response before emitting its events; incremental engine streaming remains unsupported. It does not supply tokens, segment IDs, TQ parent decisions, or a processed-image arena. The included `simple_agent_with_compaction` uses a recency policy; another harness can choose a different policy.
+
+1. Gym's existing capture middleware assigns the attempt/call identity. The native client sends no parent header. Shared capture matches the current request against existing source-prefix evidence, including an older accepted call after a rejected attempt. It prefers the longest compatible prefix, uses echoed native identities to disambiguate equal matches, and rejects unresolved ambiguity. The optional `x-nemo-gym-capture-parent` header remains a protocol facility, not a harness requirement. The ledger forwards a **candidate**, with a versioned digest and item count covering ordered source history. RL makes the final continuity decision. Capture records a call intent before inference; a separate check of the observed ledger head rejects concurrent or stale admissions under the same ledger lock.
+2. RL's `decide_capture_input` compares those source facts and rendering options before selecting a serving prefix. A known source rewrite renders fresh. An unchanged source prefix with appended user/tool observations can restore the candidate's exact captured tokens. Missing source/render evidence raises an error. If the supplied history is complete but its suffix roles or converted-message boundary cannot support an exact splice, RL renders a fresh root instead. A fingerprint miss alone is not a rewrite rule. Exposed reasoning is part of the source comparison, even if conversion later removes it.
+3. The existing RL vLLM renderer processes all supplied media, resolves any serving prefix from TQ, applies the ordinary token splice, and checks/remaps every retained media occurrence. It captures the actual tokens, generated logprobs, routes, and processed pixels.
+4. **A continuation stores a parent-linked delta.** RL commits the verified predecessor using the existing `token_in` record shape. The initial request, each context rewrite, and a complete request whose continuation shape cannot be spliced use a parentless `text` root. `candidate` is admission-only; missing evidence and retained-media mismatches still fail explicitly.
+5. Gym accepts the worker-selected root or admitted predecessor, validates the returned coordinates, and records exposed output identities/content fingerprints and completion metadata centrally. The harness returns its ordinary rollout output and verifier reward; it defines no segments and need not return `LogicalCCResult`.
+6. RL's shared Gym ingestion identifies accepted whole generations from that ordinary output, then combines the selection with the complete attempt receipt. It validates selected ancestry and builds paths backward from endpoints in the selected forest. A selected call with only discarded children is still a selected endpoint. Twenty calls without compaction produce one trace; one compaction after turn 10 produces two. Twenty staged call records remain small deltas within those chains. Sequential interleaving can resume an earlier chain without creating an extra trace.
+7. Every selected generated span contributes loss exactly once across the owner's traces. Shared ancestors remain exact context in every path, but only the first deterministic path owns their loss and action counts. Added observations, summaries and quoted answers have zero loss. Existing logical-owner GRPO supplies one reward/advantage per rollout, independent of segment count, and excludes execution padding. The advantage stage validates complete owners, computes one advantage per owner, and broadcasts it to their physical rows; whole-prompt-group sharding preserves that calculation. Agent-specific reward attribution is separate work, not a property inferred from a path or leaf.
+
+![Worked examples of selected calls forming one continuous row, two rows after a rewrite, and two paths with a shared ancestor.](../assets/context-compaction/calls-to-rows.svg)
+
+The endpoints belong to the selected graph. Rejected calls contribute no loss; shared selected ancestors remain context in every path but contribute loss only once.
+
+Without a rewrite, the four accepted calls form one continuous chain and one training row. With this rewrite, the two rows keep their own exact conditioning. They still belong to one logical rollout with one reward.
+
+CC finalization separately authenticates each call's occurrence metadata against its existing extras commitment. It checks media-presence/frame flags, ordered spans entirely inside the new prompt tokens, exact token IDs, per-occurrence H/W, and video frame counts before publication. One bad selected segment invalidates the whole logical rollout. The worker authenticates retained descriptors before using their offsets as well. This reuses the capture descriptors and shared integrity helpers; it does not add a new media store or authenticate pixel contents cryptographically.
+
+The common Gym path accepts `response.output`, ordered `responses`, transition snapshots, or existing `ng_trajectory.turns[].model_calls` references. Native response/item identities constrain whole-generation content matching; synthetic exporter IDs are not treated as native capture identities. Reasoning and function calls are included. Existing trajectory references can select calls directly when no output is supplied; when both are supplied, they must agree. Missing, contradictory, duplicated, reordered, or ambiguous evidence raises an error. RL does not fall back to selecting a graph leaf for this path.
+
+Compaction of the next model input must not erase accepted history from the returned training output. Missing calls inside a selected continuation chain are detected because the predecessor must also be selected. A completely omitted independent chain cannot always be distinguished from a rejected call using capture alone. Capture records what ran, not what the harness accepted. Thus this implementation does not promise compatibility with every exporter: it requires complete accepted history or references and a supported capture route. Stock OpenCode is not qualified by tests of a custom fork. Sequential interleaving and shared selected ancestors are supported within one capture owner; concurrent capture and multiple-session aggregation need separate qualification. Returned evidence must retain global capture order, and the scored terminal must remain the last selected call.
+
+`RolloutSelection` is internal to RL's reconstruction; it is not a new object required from Gym harnesses. The current capture protocol types remain in the shared Gym staging package; moving that package is not part of this ownership change.
+
+The small non-Gym adapter test translates an independent episode's action IDs and score into `RolloutSelection` plus an attempt receipt, then exercises actual finalization and cleanup. It supplies no segment IDs or Gym `LogicalCCResult`. This proves the local adapter contract; it does not qualify another harness's HTTP transport or capture gateway.
+
+## Images and TQ
+
+Suppose call 1 sees image A, call 2 sees retained A plus new B, and a policy rewrite makes call 3 see only B. The harness sends A on call 2 because A remains in its semantic history; it does not ask vLLM to fetch raw A from TQ. Normal vLLM processing produces that call's pixels. TQ supplies historical exact tokens and media descriptors when a serving splice is requested.
+
+The staged records contain A for call 1, only new B for continuing call 2, and B in full for rewritten call 3. Finalization publishes two traces: calls 1–2 with A+B, and call 3 with B. Training uses captured processor outputs through the foundation `PackedTensor` path. No CC-specific image preprocessing or `MediaArena` is needed.
+
+Retained geometry includes patch dimensions, token count, placeholder coordinates and embedding spans. RL also compares the current retained processor tensors to existing TQ media bundles before omitting them from a delta. Geometry, token or pixel changes on a continuation fail explicitly before inference; they do not silently create additional segments. A genuine rewrite captures its current geometry and pixels in the new root.
+
+Within a context, each continuation stores only its new token/media delta. A rewrite starts a new root and captures its complete current input, so content retained across a rewrite can appear in both segments. Repeated full per-call storage is not the production baseline.
+
+## Measurement and lifecycle
+
+Each completed call stores one `ReplaySummary`: normalization version, source-item count, ordered source digest, and render-option digest. RL hashes the corresponding prefix of the next request and compares that summary before reusing captured tokens; suffix-role and converted-assistant-boundary checks still apply. Reasoning, image references, item order, and qualified tool-argument normalization retain their existing semantics.
+
+Candidate admission reconstructs staging ancestry from existing call parent links. The framework-owned route does not persist the full ancestor-key list on every call. Durable metadata therefore grows approximately linearly with call count. Full current-request item comparisons, manifest traversal, transient ancestor lists, and historical-media validation reads still have history-dependent cost; this change does not make total rollout processing linear. Ordinary capture keeps its existing lookup-chain representation.
+
+`/context/{attempt}/measure` uses the same Responses conversion, candidate admission, RL preprocessing and splice decision as generation. It returns a count and an explicit feature acknowledgement, never tokens. It creates no call intent, staged record, or capture acknowledgement. Model/template/processor configuration must remain fixed during an attempt.
+
+The existing ledger tracks exact attempted call IDs. A missing worker acknowledgement remains pending, even if the HTTP request has ended, because the worker may still have written or be writing. After the agent returns, RL waits up to 300 seconds for pending calls without recorded failures to resolve. A recorded failure ends the wait for that call without acknowledging its writes. If capture remains incomplete, RL masks that entire logical rollout, including any partial history; a first-call failure needs no accepted-response witness. Healthy siblings can still train. A group with no valid input layout is dropped. Pending calls are excluded from immediate cleanup, and their possible late writes remain isolated under the original attempt ID until staging-partition teardown. They cannot become a parent or be reused by a fresh attempt. Repeated ambiguous failures can therefore retain staging storage until teardown.
+
+![Native recency-agent scheduling and token-guard outcomes, including early chunk closure and current failure handling.](../assets/context-compaction/compaction-trigger.svg)
+
+This figure describes the native recency client. Other harnesses choose their own compaction policies. The uncaught guard-rejection path shown here is a current limitation, not a recommended recovery policy.
+
+Set `async_rl.rollout_failure.nemo_gym.rollout_timeout_s` as a backstop for a hung prompt-group stream; it is not a per-model-call deadline or an acknowledgement that the remote engine stopped. A timeout or transport failure that prevents an agent result drops the prompt group. **CC currently requires every prompt group in a step: a dropped group stops training even when the run-level drop budget permits it.** It does not train a smaller batch. CC also does not redispatch failed groups because selected-response metadata is request-local; retry support is tracked in [#4557](https://github.com/NVIDIA-NeMo/RL/issues/4557). This differs from masking an invalid sibling while retaining the complete group, which is supported. Data-integrity errors still raise, and operator cancellation still propagates.
+
+Completed attempt receipts retain unselected records for cleanup. Before publication, the fixed selection determines exact canonical row and padding IDs. A lost canonical-write acknowledgement preserves source staging; the controller owns the exact publication cleanup keys. Foreign scope and invalid trainable selection fail before publication.
+
+`select_response` may reject a definite completed response and resample within `max_response_retries` and `max_model_calls`. The client retries the same semantic request; rejected output never enters its history or selected-action result. Shared candidate inference can recover the earlier accepted prefix without a client parent hint. RL alone decides whether a rewritten request needs a new root. Measurement uses the same candidate inference without writing an intent. Unresolved candidate ambiguity fails before generation. Transport/read ambiguity closes the client and is never retried automatically.
+
+## Configuration and supported scope
+
+Enable `token_capture.enabled: true` and `token_capture.context_compaction: true` on the SingleController GRPO configuration. For the included example, select Gym's `simple_agent_with_compaction` and configure its `context_history` policy/guards. Other harnesses use their existing ordinary output through the same ingestion path, subject to the evidence and capture constraints above. RL sets Gym's internal `framework_owned_context: true` with external `vllm_worker` staging and `rebuild_response: false`.
+
+For a SingleController configuration that otherwise supports Gym token capture, set these overrides together:
+
+```yaml
+token_capture:
+  enabled: true
+  context_compaction: true
+  defer_routed_experts_to_policy: false
+policy:
+  megatron_cfg:
+    enabled: true
+  dtensor_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+grpo:
+  calculate_advantages_on_gpu: false
+loss_fn:
+  token_level_loss: true
+  sequence_level_importance_ratios: false
+async_rl:
+  rollout_failure:
+    min_step_batch_fraction: 1
+checkpointing:
+  enabled: false
+rollout_checkpointing:
+  snapshot_attempt_interval_s: null
+```
+
+The learner must use fixed-batch, non-interleaved Megatron. Train and logprob microbatch sizes must be positive integers. Setup checks the actual loaded model before any rollout runs: dense models pass; MoE models must use supported dropless per-token routing without auxiliary losses, capacity limits or active router-bias updates. These restrictions keep padding and borrowed inputs from changing real tokens' routing or gradients.
+
+![Six logical rollouts produce thirteen real training rows and three padding rows across four data-parallel ranks.](../assets/context-compaction/cc-batch-size.svg)
+
+`g` labels the prompt group, `r` a rollout within that group, and `s` a reconstructed training segment (physical row) within that rollout. For example, `g1·r0·s1` is the second segment of rollout `r0` in prompt group `g1`.
+
+Padding is computed per prompt group using data-parallel size and compatible microbatch sizes. Logical rewards and advantages remain per rollout; padding has no reward vote or loss.
+
+Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping and message-level advantage overrides remain unsupported for CC.
+
+Checkpoint/resume is separate work in [#4200](https://github.com/NVIDIA-NeMo/RL/pull/4200), tracked by [#4558](https://github.com/NVIDIA-NeMo/RL/issues/4558). The current path rejects trainer checkpoints and rollout snapshots rather than resuming without the accepted-call selection metadata.
+
+The first implementation supports sequential full-history Responses calls, bounded resampling of definite responses, ordinary text/images supported by the foundation processor path, token-level GRPO, and direct route assembly. It retains existing CC guards on checkpoint/resume, rollout snapshots, deferred route assembly, incompatible objectives, message-level advantage overrides, partial step batches and non-unit dataset loss multipliers. Buffered Responses SSE is supported through a non-streaming upstream call. Incremental engine streaming, provider-managed conversation state, assistant prefill, engine prompt truncation and concurrent model calls are rejected. Ordinary capture keeps its existing path with the option disabled.
+
+Both repositories must use the paired capture schema v3 revision, including the `ReplaySummary` representation on this route. Earlier experimental v3 ledgers that persisted `ReplayContext.items` are rejected, as are prior v2 staged checkpoints; there is no automatic migration or CC resume. Source normalization and token/media digest versions are unchanged by the summary representation.
+
+## Validation
+
+CPU tests cover semantic context management, captured-call selection, forest reconstruction, exact-once loss ownership, media commitments, invalid owners, padding, and sharded logical advantages. They use synthetic generations and in-memory storage. An order-sensitive recurrent-model oracle checks loss and gradients against independently recorded per-call inputs. These tests do not establish distributed model or processor numerical agreement.
+
+The L1 functional entry point is `tests/functional/grpo_async_gym_single_controller_context_compaction.sh`. It reuses the ordinary SingleController/Gym launcher with Qwen3-0.6B, retains the full workplace tool set within a 16,384-token context, enables reasoning, and drops historical reasoning before each subsequent model call. Its checks require ten optimizer-step metric records, more valid physical rows than the eight logical rollouts in at least one step, positive reward, finalizer activity, maximum generation KL error below 0.05, and maximum token multiplicative probability error below 1.05. A run that never creates a context boundary fails the row-count check. Aggregate logprob agreement is a numerical regression signal, not proof that every tensor is identical.
+
+The functional test requires the native context-management client from Gym #3368 as well as the shared capture infrastructure from Gym #4128. External harnesses that own compaction require only the shared infrastructure. The dependency and lockfile are not changed here; CI must use a compatible upstream Gym revision after the Gym changes merge. A paired-checkout GPU run passed all ten steps and the functional checks, including multiple training segments, with maximum token multiplicative probability error 1.02487. This validates the functional recipe in that runtime; it does not establish compatibility with the currently pinned CI environment.

@@ -24,6 +24,8 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/environments/gym_selection.py",
+  "nemo_rl/algorithms/single_controller_utils/logical_advantage.py",
   "nemo_rl/data/captured_media.py",
   # TODO: enable these once we have 100 correctness
   #"nemo_rl/**/*.py",
@@ -240,6 +242,7 @@ project-includes = [
   "nemo_rl/models/generation/megatron/token_capture.py",
   "nemo_rl/models/generation/megatron/utils.py",
   "nemo_rl/models/generation/openai_server_utils.py",
+  "nemo_rl/models/generation/capture_context.py",
   "nemo_rl/models/generation/sglang/config.py",
   "nemo_rl/models/generation/sglang/utils/http_utils.py",
   "nemo_rl/models/generation/sglang/utils/ip_port_utils.py",
