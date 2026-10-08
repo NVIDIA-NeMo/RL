@@ -42,7 +42,6 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
-    RefitPayloadMode,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.draft_config import coerce_draft_config
@@ -1151,19 +1150,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
-    def prepare_refit_info(
-        self,
-        *,
-        refit_payload_mode: RefitPayloadMode,
-    ) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare the info for refit.
 
         Returns:
             dict: A dictionary containing the info for refit.
         """
-        futures = self.worker_group.run_all_workers_single_data(
-            "prepare_refit_info", refit_payload_mode=refit_payload_mode
-        )
+        futures = self.worker_group.run_all_workers_single_data("prepare_refit_info")
         results = ray.get(futures)
         # Only get the first worker's info since all workers will have the same result
         return results[0]
@@ -1380,8 +1373,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         gen_parallelism: dict[str, Any],
         train_world_size: int,
         gen_world_size: int,
-        *,
-        refit_payload_mode: RefitPayloadMode,
     ) -> dict[str, Any]:
         """Prepare per-layer param metadata for nccl_reshard refit."""
         futures = self.worker_group.run_all_workers_single_data(
@@ -1390,7 +1381,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             gen_parallelism=gen_parallelism,
             train_world_size=train_world_size,
             gen_world_size=gen_world_size,
-            refit_payload_mode=refit_payload_mode,
         )
         results = ray.get(futures)
         return results[0]

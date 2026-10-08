@@ -13,6 +13,7 @@
 # limitations under the License.
 import ast
 import asyncio
+import math
 import os
 import tempfile
 import time
@@ -181,7 +182,7 @@ def test_mcore_nccl_m2n_builds_hybrid_group_and_copy_service(
     )
 
 
-def test_megatron_fp8_refit_tasks_match_payload_mode() -> None:
+def test_megatron_fp8_refit_tasks_preserve_backend_export() -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -196,13 +197,16 @@ def test_megatron_fp8_refit_tasks_match_payload_mode() -> None:
         get_conversion_tasks=MagicMock(return_value=logical_tasks),
     )
 
-    worker.refit_payload_mode = "logical_weights"
+    worker.cfg = {"generation": {"backend": "megatron"}}
     assert worker._build_refit_conversion_tasks() == logical_tasks[1:]
     worker.megatron_bridge.get_export_fp8_tasks.assert_not_called()
 
-    worker.refit_payload_mode = "hf_export"
+    worker.cfg = {"generation": {"backend": "vllm"}}
     assert worker._build_refit_conversion_tasks() == physical_tasks
     worker.megatron_bridge.get_export_fp8_tasks.assert_called_once_with(worker.model)
+    # Bulk refit always starts from standard mappings, even when the general
+    # export still needs physical FP8 data and scales.
+    assert worker._build_bulk_refit_conversion_tasks() == logical_tasks[1:]
 
 
 def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
@@ -241,7 +245,6 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     )
 
     worker.cfg = {"generation": {"backend": "vllm"}}
-    worker.refit_payload_mode = "hf_export"
     list(worker._iter_params_with_optional_kv_scales())
     forwarded = worker.megatron_bridge.export_hf_weights.call_args.kwargs[
         "conversion_tasks"
@@ -251,7 +254,6 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     assert forwarded[0].param_weight.dtype == torch.float8_e4m3fn
 
     worker.cfg = {"generation": {"backend": "megatron"}}
-    worker.refit_payload_mode = "logical_weights"
     list(worker._iter_params_with_optional_kv_scales())
     megatron_forwarded = worker.megatron_bridge.export_hf_weights.call_args.kwargs[
         "conversion_tasks"
@@ -260,14 +262,18 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     assert not isinstance(megatron_forwarded, list)
 
 
-def test_local_hf_shards_follow_bridge_specs() -> None:
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_local_hf_shards_follow_bridge_specs(dtype: torch.dtype) -> None:
     from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
 
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
+        _materialize_refit_spec,
     )
 
-    fused = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
+    fused = torch.nn.Parameter(
+        torch.arange(8, dtype=dtype).reshape(4, 2), requires_grad=False
+    )
     task = SimpleNamespace(
         param_weight=fused,
         megatron_module=None,
@@ -279,14 +285,29 @@ def test_local_hf_shards_follow_bridge_specs() -> None:
         ),
     )
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.refit_conversion_tasks = [task]
+    worker._bulk_refit_conversion_tasks = [task]
 
     shards = dict(worker._iter_local_hf_param_shards())
 
-    assert torch.equal(shards["model.layers.0.mlp.gate_proj.weight"].base, fused[:2])
-    assert torch.equal(shards["model.layers.0.mlp.up_proj.weight"].base, fused[2:])
+    for index, name in enumerate(("gate", "up")):
+        spec = shards[f"model.layers.0.mlp.{name}_proj.weight"]
+        assert spec.base is fused and spec.pre is not None and spec.post is None
+        result = _materialize_refit_spec(spec).buf
+        assert result.dtype == torch.bfloat16 and result.is_contiguous()
+        assert torch.equal(
+            result, fused[index * 2 : (index + 1) * 2].to(torch.bfloat16)
+        )
     fused[0, 0] = 99
-    assert shards["model.layers.0.mlp.gate_proj.weight"].base[0, 0] == 99
+    assert (
+        _materialize_refit_spec(shards["model.layers.0.mlp.gate_proj.weight"]).buf[0, 0]
+        == 99
+    )
+    fused.data = torch.full_like(fused, 23)
+    for spec in shards.values():
+        assert torch.equal(
+            _materialize_refit_spec(spec).buf,
+            torch.full((2, 2), 23, dtype=torch.bfloat16),
+        )
 
 
 def test_local_refit_names_require_safe_views_from_every_grouped_task() -> None:
@@ -389,6 +410,11 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
     )
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.refit_conversion_tasks = [task]
+    worker.model = object()
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=MagicMock(return_value=iter(()))
+    )
+    worker._build_bulk_refit_conversion_tasks = MagicMock(return_value=[task])
     worker._calculate_refit_param_info = MagicMock(return_value={})
     worker._iter_params_with_optional_kv_scales = MagicMock(
         return_value=iter([(misc_name, torch.empty(2, 2))])
@@ -409,6 +435,101 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
     assert worker.hf_to_local_param_map.specs == {}
     assert worker._misc_conversion_tasks == [task]
     worker._build_layer_to_pp_stage.assert_not_called()
+
+
+def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only scales for selected bulk weights disappear from the misc stream."""
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    bulk_name = "model.layers.0.mlp.gate_proj.weight"
+    misc_weight = "model.layers.0.self_attn.q_proj.weight"
+    unsafe_weight = "model.layers.0.mlp.down_proj.weight"
+    logical_bulk = torch.empty(4, 2, dtype=torch.float32)
+    values = {
+        bulk_name: torch.empty(4, 2, dtype=torch.float8_e4m3fn),
+        bulk_name + "_scale_inv": torch.full((1,), 3.0),
+        bulk_name + "_scale": torch.full((1,), 4.0),
+        misc_weight: torch.empty(4, 2, dtype=torch.float8_e4m3fn),
+        misc_weight + "_scale_inv": torch.full((1,), 5.0),
+        unsafe_weight: torch.empty(4, 2, dtype=torch.float8_e4m3fn),
+        unsafe_weight + "_scale_inv": torch.full((1,), 6.0),
+        "model.layers.0.self_attn.k_scale": torch.full((1,), 7.0),
+        "model.layers.0.self_attn.v_scale": torch.full((1,), 8.0),
+        "model.layers.0.input_layernorm.weight": torch.ones(2, dtype=torch.float32),
+    }
+
+    def task(name: str, safe: bool = False) -> SimpleNamespace:
+        return SimpleNamespace(
+            global_param_name=name,
+            hf_param_names=(name,),
+            mapping=SimpleNamespace(hf_param=name),
+            local_hf_param_specs=lambda: (object(),) if safe else (),
+        )
+
+    bulk_task = task(bulk_name, safe=True)
+    export_tasks = [task(name) for name in values]
+    compound_task = SimpleNamespace(
+        global_param_name="decoder.layers.0.compound.weight",
+        mapping=SimpleNamespace(hf_param={"first": bulk_name, "second": misc_weight}),
+    )
+    export_tasks.append(compound_task)
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.model = object()
+    worker.model_update_group = object()
+    worker.refit_conversion_tasks = export_tasks
+    worker._calculate_refit_param_info = MagicMock(return_value=[])
+    worker._build_bulk_refit_conversion_tasks = MagicMock(
+        return_value=[bulk_task, task(unsafe_weight)]
+    )
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=MagicMock(
+            return_value=iter(
+                [(bulk_name, logical_bulk), (unsafe_weight, logical_bulk)]
+            )
+        )
+    )
+    worker._iter_params_with_optional_kv_scales = MagicMock(
+        side_effect=lambda **kwargs: iter(values.items())
+    )
+    worker.build_hf_to_local_param_map = MagicMock(return_value=HFToLocalParamMap())
+    info = worker.prepare_nccl_reshard_refit_info(
+        train_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": 1},
+        gen_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": 1},
+        train_world_size=1,
+        gen_world_size=1,
+    )
+
+    bulk_meta = info["per_layer_params"]["model.layers.0"][0]
+    assert bulk_meta["name"] == bulk_name
+    assert bulk_meta["dtype"] == "torch.bfloat16"
+    assert bulk_meta["global_shape"] == (4, 2)
+    expected_misc = {
+        name: tensor
+        for name, tensor in values.items()
+        if name not in {bulk_name, bulk_name + "_scale_inv", bulk_name + "_scale"}
+    }
+    assert list(info["misc_meta"]) == list(expected_misc)
+    assert all(
+        info["misc_meta"][name]["dtype"] == str(tensor.dtype)
+        for name, tensor in expected_misc.items()
+    )
+    assert compound_task in worker._misc_conversion_tasks
+
+    received = []
+    monkeypatch.setattr(
+        worker_module,
+        "packed_broadcast_producer",
+        lambda *, iterator, **kwargs: received.extend(iterator),
+    )
+    worker._broadcast_misc_params_packed(kv_scales={"unused": 1.0})
+    assert [name for name, _ in received] == list(expected_misc)
+    assert all(tensor is expected_misc[name] for name, tensor in received)
+    worker._iter_params_with_optional_kv_scales.assert_called_with(
+        kv_scales={"unused": 1.0},
+        conversion_tasks=worker._misc_conversion_tasks,
+    )
 
 
 def test_refit_destination_uses_common_worker_interface(
@@ -575,8 +696,8 @@ def test_megatron_m2n_stages_fused_mxfp8_weight_until_complete() -> None:
         "layer_names": ["model.layers.0"],
         "per_layer_params": {
             "model.layers.0": [
-                {"name": gate_name},
-                {"name": up_name},
+                {"name": gate_name, "dtype": "torch.bfloat16"},
+                {"name": up_name, "dtype": "torch.bfloat16"},
             ]
         },
     }
@@ -633,8 +754,16 @@ def test_megatron_m2n_unstacks_grouped_experts_into_local_weights() -> None:
         "layer_names": ["model.layers.0"],
         "per_layer_params": {
             "model.layers.0": [
-                {"name": grouped_gate, "grouped_expert_proj": "gate_proj"},
-                {"name": grouped_up, "grouped_expert_proj": "up_proj"},
+                {
+                    "name": grouped_gate,
+                    "grouped_expert_proj": "gate_proj",
+                    "dtype": "torch.bfloat16",
+                },
+                {
+                    "name": grouped_up,
+                    "grouped_expert_proj": "up_proj",
+                    "dtype": "torch.bfloat16",
+                },
             ]
         },
     }
@@ -681,7 +810,9 @@ def test_megatron_m2n_resolves_direct_destination_after_parameter_rebind() -> No
     )
     refit_info = {
         "layer_names": ["model.layers.0"],
-        "per_layer_params": {"model.layers.0": [{"name": gate_name}]},
+        "per_layer_params": {
+            "model.layers.0": [{"name": gate_name, "dtype": "torch.bfloat16"}]
+        },
     }
     worker = object.__new__(MegatronGenerationRefitMixin)
     param_map = worker._build_destination_hf_to_local_param_map(refit_info, [task])
@@ -703,13 +834,14 @@ def test_megatron_m2n_resolves_direct_destination_after_parameter_rebind() -> No
     ("param_info", "expected_message"),
     [
         (
-            {"name": "model.layers.0.mlp.gate_proj.weight"},
+            {"name": "model.layers.0.mlp.gate_proj.weight", "dtype": "torch.bfloat16"},
             "No local Megatron destination maps",
         ),
         (
             {
                 "name": "model.layers.0.mlp.experts.gate_proj.weight",
                 "grouped_expert_proj": "gate_proj",
+                "dtype": "torch.bfloat16",
             },
             "No local Megatron experts map",
         ),
@@ -1364,7 +1496,57 @@ def test_megatron_refit_bridge_tasks_export_logical_quantized_weights(
     assert dequantize.call_args_list == [call(quantized_source), call(bf16_source)]
 
 
-def test_megatron_refit_quantized_source_dequantizes_once_per_layer(
+@pytest.mark.parametrize("grouped_storage", [False, True])
+def test_refit_dequantizes_with_metadata_before_selecting_hf_view(
+    monkeypatch: pytest.MonkeyPatch, grouped_storage: bool
+) -> None:
+    from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
+    from megatron.core import fp8_utils
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    # Stand in for TE storage plus its scaling metadata. The decoder accepts
+    # only complete source members, so slicing encoded bytes before decoding
+    # fails this test. Non-unit row scales also distinguish decoding from a cast.
+    shape = (2, 4, 4) if grouped_storage else (4, 4)
+    source = torch.arange(math.prod(shape), dtype=torch.uint8).reshape(shape)
+    members = list(source.unbind(0)) if grouped_storage else [source]
+    scales = torch.tensor([2.0, 4.0, 8.0, 16.0]).reshape(4, 1)
+    decoded_members = []
+
+    def decode(member: torch.Tensor) -> torch.Tensor:
+        assert any(member is original for original in members)
+        assert member.shape == (4, 4)
+        decoded_members.append(member)
+        return (member.to(torch.float32) * scales).to(torch.bfloat16)
+
+    monkeypatch.setattr(
+        fp8_utils,
+        "is_grouped_tensor_with_quantized_storage",
+        lambda tensor: grouped_storage and tensor is source,
+    )
+    monkeypatch.setattr(fp8_utils, "is_float8tensor", lambda tensor: tensor is source)
+    member_views = MagicMock(return_value=members)
+    monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", member_views)
+    monkeypatch.setattr(fp8_utils, "dequantize_fp8_tensor", decode)
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    spec = worker._local_refit_source_spec(source, LocalHFParamSpec("gate", -2, 0, 2))
+
+    for _ in range(2):
+        result = worker_module._materialize_refit_spec(spec).buf
+        expected = (source.to(torch.float32) * scales).to(torch.bfloat16)
+        assert result.dtype == torch.bfloat16 and result.is_contiguous()
+        assert torch.equal(result, expected[..., :2, :])
+        source.add_(1)
+        scales.mul_(2)
+    assert len(decoded_members) == 2 * len(members)
+    if grouped_storage:
+        assert member_views.call_args_list == [call(source, create_if_missing=True)] * 2
+    else:
+        member_views.assert_not_called()
+
+
+def test_megatron_refit_quantized_hooks_read_current_fused_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
@@ -1372,9 +1554,9 @@ def test_megatron_refit_quantized_source_dequantizes_once_per_layer(
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
 
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
-    quantized_source = torch.zeros((2, 4, 2), dtype=torch.uint8)
-    logical_weight = torch.arange(16, dtype=torch.bfloat16).reshape(2, 4, 2)
-    dequantize = MagicMock(return_value=logical_weight)
+    quantized_source = torch.arange(16, dtype=torch.uint8).reshape(2, 4, 2)
+    logical_weight = quantized_source.to(torch.bfloat16)
+    dequantize = MagicMock(side_effect=lambda tensor: tensor.to(torch.bfloat16))
     monkeypatch.setattr(
         worker_module,
         "_is_quantized_refit_source",
@@ -1388,20 +1570,232 @@ def test_megatron_refit_quantized_source_dequantizes_once_per_layer(
     up_spec = worker._local_refit_source_spec(
         quantized_source, LocalHFParamSpec("up", -2, 1, 2)
     )
-    grouped_spec = worker_module.LocalParamSpec(
-        base=worker_module._GroupedRefitSource((gate_spec, up_spec))
+    prefix = "model.layers.0.mlp.experts"
+    grouped_spec = worker._group_experts(
+        "gate_proj",
+        f"{prefix}.gate_proj.weight",
+        {(prefix, "gate_proj"): [gate_spec, up_spec]},
     )
-    logical_source_cache = {}
+    assert gate_spec.base is quantized_source and gate_spec.pre is not None
+    assert up_spec.base is quantized_source and up_spec.pre is not None
+    dequantize.assert_not_called()
 
-    gate = worker._materialize_local_refit_spec(gate_spec, logical_source_cache).buf
-    grouped = worker._materialize_local_refit_spec(
-        grouped_spec, logical_source_cache
-    ).buf
+    gate = worker_module._materialize_refit_spec(gate_spec).buf
+    up = worker_module._materialize_refit_spec(up_spec).buf
+    grouped = worker_module._materialize_refit_spec(grouped_spec).buf
 
+    assert not logical_weight[:, :2].is_contiguous()
     assert gate.is_contiguous()
+    assert up.is_contiguous()
+    assert grouped.shape == (2, 2, 2, 2)
+    assert torch.equal(gate, logical_weight[:, :2])
+    assert torch.equal(up, logical_weight[:, 2:])
     assert torch.equal(grouped[0], logical_weight[:, :2])
     assert torch.equal(grouped[1], logical_weight[:, 2:])
-    dequantize.assert_called_once_with(quantized_source)
+    assert dequantize.call_args_list == [call(quantized_source)] * 4
+
+    quantized_source.add_(16)
+    refreshed = worker_module._materialize_refit_spec(grouped_spec).buf
+    assert torch.equal(refreshed[0], quantized_source[:, :2].to(torch.bfloat16))
+    assert torch.equal(refreshed[1], quantized_source[:, 2:].to(torch.bfloat16))
+    assert not torch.equal(refreshed, grouped)
+    assert dequantize.call_args_list == [call(quantized_source)] * 6
+
+
+@pytest.mark.parametrize("failure_stage", [None, "pre", "transfer", "post"])
+def test_megatron_refit_hooks_refresh_after_updates_and_failures(
+    monkeypatch: pytest.MonkeyPatch, failure_stage: str | None
+) -> None:
+    # Keep the optional Megatron/NCCL imports local to this mcore test.
+    from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    import nemo_rl.weight_sync.xferdtensor as transfer_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.my_pp_stage = 0
+    worker.pp_comm_group = object()
+    worker._broadcast_misc_params_packed = MagicMock()
+    quantized_source = torch.arange(8, dtype=torch.uint8).reshape(4, 2)
+    layer_names = ["model.layers.0", "model.layers.1"]
+    worker.nccl_reshard_refit_info = {
+        "layer_names": layer_names,
+        "per_layer_params": {
+            layer: [
+                {
+                    "name": f"{layer}.mlp.{proj}_proj.weight",
+                    "global_shape": [2, 2],
+                    "src_mesh_info": object(),
+                    "src_placements": (),
+                    "dst_mesh_info": object(),
+                    "dst_placements": (),
+                }
+                for proj in ("gate", "up")
+            ]
+            for layer in layer_names
+        },
+    }
+    current_stream = object()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(torch.cuda, "empty_cache", MagicMock())
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(
+        "nemo_rl.distributed.refit_watchdog.sync_stream_within", MagicMock()
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_is_quantized_refit_source",
+        lambda tensor: tensor is quantized_source,
+    )
+    materialized_sources = []
+    transferred = []
+    completed = []
+
+    def dequantize(tensor: torch.Tensor) -> torch.Tensor:
+        # Each HF view reads the current full source independently.
+        assert torch.cuda.current_stream() is current_stream
+        logical = tensor.to(torch.bfloat16)
+        materialized_sources.append(logical.clone())
+        return logical
+
+    monkeypatch.setattr(worker_module, "_dequantize_refit_source", dequantize)
+
+    def iter_shards():
+        for layer in layer_names:
+            for split_index, proj in enumerate(("gate", "up")):
+                name = f"{layer}.mlp.{proj}_proj.weight"
+                yield (
+                    name,
+                    worker._local_refit_source_spec(
+                        quantized_source,
+                        LocalHFParamSpec(name, -2, split_index, 2),
+                    ),
+                )
+
+    worker._iter_local_hf_param_shards = iter_shards
+    worker.hf_to_local_param_map = worker._build_source_hf_to_local_param_map(
+        worker.nccl_reshard_refit_info
+    )
+    first_spec = worker.hf_to_local_param_map.get(
+        f"{layer_names[0]}.mlp.gate_proj.weight"
+    )
+    materialize_first = first_spec.pre
+
+    def pre(base: torch.Tensor) -> worker_module.RefitCtx:
+        ctx = materialize_first(base)
+        if failure_stage == "pre":
+            raise RuntimeError("injected pre failure")
+        return ctx
+
+    def post(ctx: worker_module.RefitCtx) -> None:
+        if failure_stage == "post":
+            raise RuntimeError("injected post failure")
+        completed.append(ctx.buf.clone())
+
+    first_spec.pre = pre
+    first_spec.post = post
+
+    def transfer(src, *args) -> None:
+        assert args[-2] is worker.pp_comm_group
+        assert args[-1] is current_stream
+        if failure_stage == "transfer":
+            raise RuntimeError("injected transfer failure")
+        transferred.append(src._local_tensor.clone())
+
+    monkeypatch.setattr(transfer_module, "xferdtensor", transfer)
+
+    if failure_stage is not None:
+        with pytest.raises(RuntimeError, match=f"injected {failure_stage} failure"):
+            worker._nccl_reshard_refit()
+        assert len(materialized_sources) == 1
+        assert completed == []
+        worker._broadcast_misc_params_packed.assert_not_called()
+        failure_stage = None
+        materialized_sources.clear()
+        transferred.clear()
+        quantized_source.add_(10)
+
+    for _ in range(2):
+        expected = quantized_source.to(torch.bfloat16)
+        worker._nccl_reshard_refit()
+        assert len(materialized_sources) == 4
+        assert all(torch.equal(logical, expected) for logical in materialized_sources)
+        assert len(transferred) == 4
+        for offset in (0, 2):
+            assert torch.equal(transferred[offset], expected[:2])
+            assert torch.equal(transferred[offset + 1], expected[2:])
+        assert len(completed) == 1 and torch.equal(completed[0], expected[:2])
+        materialized_sources.clear()
+        transferred.clear()
+        completed.clear()
+        quantized_source.add_(10)
+
+    assert worker._broadcast_misc_params_packed.call_count == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA streams")
+def test_megatron_refit_pre_hooks_use_current_cuda_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Keep the optional Megatron imports local to this mcore test.
+    from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        quantized_source = torch.arange(16, device="cuda", dtype=torch.uint8).reshape(
+            2, 4, 2
+        )
+
+        def dequantize(tensor: torch.Tensor) -> torch.Tensor:
+            assert torch.cuda.current_stream() == stream
+            return tensor.to(torch.bfloat16)
+
+        monkeypatch.setattr(
+            worker_module,
+            "_is_quantized_refit_source",
+            lambda tensor: tensor is quantized_source,
+        )
+        monkeypatch.setattr(worker_module, "_dequantize_refit_source", dequantize)
+        member = worker._local_refit_source_spec(
+            quantized_source, LocalHFParamSpec("gate", -2, 0, 2)
+        )
+        prefix = "model.layers.0.mlp.experts"
+        grouped = worker._group_experts(
+            "gate_proj",
+            f"{prefix}.gate_proj.weight",
+            {(prefix, "gate_proj"): [member, member]},
+        )
+        stack = torch.stack
+
+        def stack_on_current_stream(tensors: list[torch.Tensor]) -> torch.Tensor:
+            assert torch.cuda.current_stream() == stream
+            return stack(tensors)
+
+        with monkeypatch.context() as hooks:
+            hooks.setattr(torch, "stack", stack_on_current_stream)
+            hooks.setattr(
+                torch.cuda,
+                "stream",
+                MagicMock(side_effect=AssertionError("pre must not switch streams")),
+            )
+            hooks.setattr(
+                torch.cuda,
+                "set_stream",
+                MagicMock(side_effect=AssertionError("pre must not switch streams")),
+            )
+            hooks.setattr(
+                torch.cuda,
+                "synchronize",
+                MagicMock(side_effect=AssertionError("pre must not synchronize CUDA")),
+            )
+            output = worker_module._materialize_refit_spec(grouped).buf
+        expected = quantized_source[:, :2].to(torch.bfloat16)
+    stream.synchronize()
+    assert output.is_contiguous()
+    assert torch.equal(output[0], expected) and torch.equal(output[1], expected)
 
 
 def test_qwen3vl_type_fallback_still_delegates_packing():

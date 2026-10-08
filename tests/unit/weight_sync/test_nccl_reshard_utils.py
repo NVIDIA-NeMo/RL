@@ -100,62 +100,61 @@ def test_check_nccl_reshard_refit_support_accepts_bf16_to_mxfp8() -> None:
     check_nccl_reshard_refit_support(config)
 
 
-@pytest.mark.parametrize("trainer_precision", ["float16", "float32", "bf16", None])
-def test_check_nccl_reshard_refit_support_rejects_non_bf16_to_mxfp8(
-    trainer_precision: str | None,
+@pytest.mark.parametrize("trainer_precision", ["float16", "float32", "bfloat16"])
+@pytest.mark.parametrize("gen_precision", ["float16", "float32", "bfloat16", "fp8"])
+@pytest.mark.parametrize("source_recipe", [None, "mxfp8"])
+@pytest.mark.parametrize("is_mx", [False, True])
+def test_check_nccl_reshard_accepts_independent_storage_precisions(
+    trainer_precision, gen_precision, source_recipe, is_mx
 ) -> None:
     config = _valid_nccl_reshard_config()
     config.policy["precision"] = trainer_precision
-    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
-
-    with pytest.raises(ValueError, match="requires policy.precision='bfloat16'"):
-        check_nccl_reshard_refit_support(config)
-
-
-def test_check_nccl_reshard_refit_support_keeps_matching_blockwise_fp8() -> None:
-    config = _valid_nccl_reshard_config()
-    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
+    config.policy["generation"]["vllm_cfg"].update(
+        {"precision": gen_precision, "is_mx": is_mx}
+    )
     config.policy["megatron_cfg"]["fp8_cfg"] = {
-        "fp8_param": True,
-        "fp8_recipe": "blockwise",
+        "enabled": source_recipe is not None,
+        "fp8_param": source_recipe is not None,
+        "fp8_recipe": source_recipe,
     }
-
     check_nccl_reshard_refit_support(config)
 
 
-@pytest.mark.parametrize("fp8_recipe", ["tensorwise", "mxfp8", None])
-def test_check_nccl_reshard_refit_support_rejects_non_blockwise_fp8_storage(
-    fp8_recipe: str | None,
-) -> None:
+@pytest.mark.parametrize(
+    "gen_precision",
+    [None, "auto", "bf16", "bfloat16", "half", "float16", "float", "float32", "fp8"],
+)
+@pytest.mark.parametrize("is_mx", [False, True])
+def test_blockwise_physical_misc_requires_matching_vllm_storage(gen_precision, is_mx):
     config = _valid_nccl_reshard_config()
-    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
     config.policy["megatron_cfg"]["fp8_cfg"] = {
-        "fp8_param": True,
-        "fp8_recipe": fp8_recipe,
-    }
-
-    with pytest.raises(ValueError, match="fp8_recipe must be 'blockwise'"):
-        check_nccl_reshard_refit_support(config)
-
-
-def test_check_nccl_reshard_refit_support_rejects_bf16_to_blockwise_fp8() -> None:
-    config = _valid_nccl_reshard_config()
-    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
-
-    with pytest.raises(ValueError, match="is_mx=True for BF16-to-MXFP8 refit"):
-        check_nccl_reshard_refit_support(config)
-
-
-def test_check_nccl_reshard_refit_support_rejects_blockwise_fp8_to_mxfp8() -> None:
-    config = _valid_nccl_reshard_config()
-    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
-    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
         "fp8_param": True,
         "fp8_recipe": "blockwise",
     }
-
-    with pytest.raises(ValueError, match="does not support blockwise-FP8 storage"):
+    config.policy["generation"]["vllm_cfg"].update(
+        {"precision": gen_precision, "is_mx": is_mx}
+    )
+    if gen_precision == "fp8" and not is_mx:
         check_nccl_reshard_refit_support(config)
+    else:
+        with pytest.raises(ValueError, match="unchanged misc refit stream"):
+            check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("gen_precision", ["bfloat16", "float16", "float32", "fp8"])
+@pytest.mark.parametrize("is_mx", [False, True])
+def test_blockwise_compute_without_fp8_storage_keeps_logical_misc(gen_precision, is_mx):
+    config = _valid_nccl_reshard_config()
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_param": False,
+        "fp8_recipe": "blockwise",
+    }
+    config.policy["generation"]["vllm_cfg"].update(
+        {"precision": gen_precision, "is_mx": is_mx}
+    )
+    check_nccl_reshard_refit_support(config)
 
 
 @pytest.mark.parametrize(
@@ -279,6 +278,7 @@ def test_check_nccl_reshard_rejects_mxfp8_with_unsupported_grouped_gemm_backend(
             "pipeline_model_parallel_size": 1,
             "inference_grouped_gemm_backend": "vllm",
             "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+            "transformer_impl": "inference_optimized",
         },
     }
 
@@ -322,6 +322,7 @@ def test_check_nccl_reshard_rejects_mxfp8_with_omitted_grouped_gemm_backend() ->
         "mcore_generation_config": {
             "pipeline_model_parallel_size": 1,
             "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+            "transformer_impl": "inference_optimized",
         },
     }
 
@@ -354,30 +355,25 @@ def _megatron_gen_config(*, policy_updates=None, **mcore_generation_config):
             {"pipeline_model_parallel_size": 2},
             "pipeline_model_parallel_size must be 1",
         ),
-        # The transport materializes logical BF16; a non-BF16 trainer would
-        # silently ship the wrong dtype.
-        ({"precision": "float32"}, {}, "policy.precision must be 'bfloat16'"),
         # fp8_param without fp8_cfg.enabled is a half-configured trainer.
         (
             {"megatron_cfg": {"enabled": True, "fp8_cfg": {"fp8_param": True}}},
             {},
             "fp8_cfg.enabled=True",
         ),
-        # Megatron inference weights are BF16 or MXFP8 only.
+        # Other destination quantization recipes are not covered by this path.
         (
             None,
-            {"fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"}},
-            "fp8_recipe must be 'mxfp8'",
+            {"fp8_cfg": {"enabled": True, "fp8_recipe": "delayed"}},
+            "fp8_recipe must be 'mxfp8' or 'blockwise'",
         ),
-        # Without inference_optimized, _prepare_mxfp8_refit installs no MXFP8
-        # destination and the refit silently copies BF16 into TE FP8 params.
         (
             None,
             {
-                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
-                "inference_grouped_gemm_backend": "torch",
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"},
+                "transformer_impl": "inference_optimized",
             },
-            "transformer_impl='inference_optimized'",
+            "Blockwise FP8 Megatron destinations require Transformer Engine",
         ),
     ],
 )
@@ -1014,3 +1010,12 @@ def test_wire_safe_pickle_is_independent_of_a_patched_storage_loader(monkeypatch
 
     assert b"dummy_unpickler_module" in pickle.dumps(info)
     assert b"dummy_unpickler_module" not in pickle.dumps(wire)
+
+
+@pytest.mark.parametrize("recipe", ["mxfp8", "blockwise"])
+def test_check_nccl_reshard_accepts_te_quantized_megatron_destination(recipe):
+    config = _megatron_gen_config(
+        transformer_impl="transformer_engine",
+        fp8_cfg={"enabled": True, "fp8_recipe": recipe, "fp8_param": True},
+    )
+    check_nccl_reshard_refit_support(config)

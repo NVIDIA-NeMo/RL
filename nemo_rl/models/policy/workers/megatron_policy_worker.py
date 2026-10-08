@@ -20,7 +20,7 @@ import time
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
@@ -67,7 +67,7 @@ from nemo_rl.data.multimodal_utils import (
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.generation.interfaces import GenerationDatumSpec, RefitPayloadMode
+from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
@@ -322,19 +322,9 @@ def _get_refit_task_source(task: Any) -> Optional[torch.Tensor]:
     return source
 
 
-@dataclass(frozen=True)
-class _QuantizedRefitSource:
-    """A live quantized parameter plus the Bridge view to transfer."""
-
-    tensor: torch.Tensor
-    spec: Any
-
-
-@dataclass(frozen=True)
-class _GroupedRefitSource:
-    """Local expert source specs that must be stacked before transfer."""
-
-    specs: tuple[LocalParamSpec, ...]
+def _materialize_refit_spec(spec: LocalParamSpec) -> RefitCtx:
+    """Run a spec's pre hook or transfer its base as-is, as the receivers do."""
+    return spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
 
 
 def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
@@ -463,7 +453,6 @@ class MegatronPolicyWorkerImpl(
     # Tests and extension classes that bypass __init__ retain the historical
     # training/source behavior unless they explicitly select destination.
     is_refit_destination: bool = False
-    refit_payload_mode: RefitPayloadMode = "hf_export"
     # Holds the split-API train-step state between begin/finish or
     # begin/abort; None when no step is open. Declared at class level so
     # ``self._train_step_state = None`` after finish/abort type-checks.
@@ -594,7 +583,7 @@ class MegatronPolicyWorkerImpl(
     ):
         """Initialize the MegatronPolicyWorker."""
         self.is_refit_destination = is_refit_destination
-        self.refit_payload_mode: RefitPayloadMode = "hf_export"
+        self._bulk_refit_conversion_tasks: list[Any] = []
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
         # not initialize a CUDA context ahead of the set_device below.
         log_gpu_memory_diagnostics(
@@ -2950,12 +2939,8 @@ class MegatronPolicyWorkerImpl(
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
-    def _prepare_source_refit_info(
-        self,
-        refit_payload_mode: RefitPayloadMode,
-    ) -> dict[str, tuple[torch.Size, torch.dtype]]:
+    def _prepare_source_refit_info(self) -> dict[str, tuple[torch.Size, torch.dtype]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
-        self.refit_payload_mode = refit_payload_mode
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         # Collect tensor metadata for refit / hf side info.
@@ -2968,8 +2953,6 @@ class MegatronPolicyWorkerImpl(
     def prepare_refit_info(
         self,
         state_dict_info: Optional[dict[str, Any]] = None,
-        *,
-        refit_payload_mode: RefitPayloadMode = "hf_export",
     ) -> Optional[dict[str, tuple[torch.Size, torch.dtype]]]:
         """Prepare refit state for this worker's explicit source/destination role."""
         if self.is_refit_destination:
@@ -2979,7 +2962,7 @@ class MegatronPolicyWorkerImpl(
             return None
         if state_dict_info is not None:
             raise ValueError("Source refit does not accept state_dict_info.")
-        return self._prepare_source_refit_info(refit_payload_mode)
+        return self._prepare_source_refit_info()
 
     async def update_weights_from_collective(
         self, refit_timeout_s: Optional[float] = None
@@ -3161,17 +3144,29 @@ class MegatronPolicyWorkerImpl(
         )
 
     def _build_refit_conversion_tasks(self) -> list:
-        """Build the conversion-task list driving refit (BF16 or FP8 export).
-
-        A destination that requests logical weights consumes standard Bridge
-        tasks. Otherwise, keep Bridge's physical FP8 data and scale tasks.
-        """
+        """Keep the general/misc export format expected by each backend."""
         # Deferred import to avoid circular import issues.
         from nemo_rl.models.megatron.draft import draft_model_detached
 
         with draft_model_detached([self.model]):
-            if self._is_fp8_export() and self.refit_payload_mode != "logical_weights":
+            if self._is_fp8_export() and not self._generation_needs_logical_weights():
                 return self.megatron_bridge.get_export_fp8_tasks(self.model)
+            return [
+                task
+                for task in self.megatron_bridge.get_conversion_tasks([self.model])
+                if task is not None
+            ]
+
+    def _generation_needs_logical_weights(self) -> bool:
+        """Megatron's existing non-bulk export consumes logical model weights."""
+        return (self.cfg.get("generation") or {}).get("backend") == "megatron"
+
+    def _build_bulk_refit_conversion_tasks(self) -> list[Any]:
+        """Use standard Bridge mappings and live parameters for BF16 bulk refit."""
+        # Defer the optional draft-model helper until building export tasks.
+        from nemo_rl.models.megatron.draft import draft_model_detached
+
+        with draft_model_detached([self.model]):
             return [
                 task
                 for task in self.megatron_bridge.get_conversion_tasks([self.model])
@@ -3290,7 +3285,7 @@ class MegatronPolicyWorkerImpl(
         # native refit wire format; Bridge's training FP8 is not inference MXFP8.
         # Other backends keep Bridge's physical FP8 payload and scale_inv sibling;
         # mixing that scale with BF16 would corrupt the imported weight.
-        if self.refit_payload_mode == "logical_weights":
+        if self._generation_needs_logical_weights():
             conversion_tasks = self._iter_logical_refit_conversion_tasks(
                 conversion_tasks
             )
@@ -3351,40 +3346,13 @@ class MegatronPolicyWorkerImpl(
     def _local_refit_source_spec(
         self, tensor: torch.Tensor, spec: Any
     ) -> LocalParamSpec:
-        """Build a live source spec for a BF16 or TE-quantized parameter."""
-        if not _is_quantized_refit_source(tensor):
-            return LocalParamSpec(base=spec.select(tensor))
+        """Convert the current full parameter to logical weights before HF slicing."""
 
-        return LocalParamSpec(base=_QuantizedRefitSource(tensor, spec))
+        def pre(base: torch.Tensor) -> RefitCtx:
+            logical = _dequantize_refit_source(base)
+            return RefitCtx(buf=spec.select(logical).to(torch.bfloat16).contiguous())
 
-    def _materialize_local_refit_spec(
-        self,
-        spec: LocalParamSpec,
-        logical_source_cache: dict[int, torch.Tensor],
-    ) -> RefitCtx:
-        """Materialize one local source, reusing quantized-source dequantization within a layer."""
-        base = spec.base
-        if isinstance(base, _QuantizedRefitSource):
-            source_id = id(base.tensor)
-            logical = logical_source_cache.get(source_id)
-            if logical is None:
-                logical = _dequantize_refit_source(base.tensor)
-                logical_source_cache[source_id] = logical
-            return RefitCtx(buf=base.spec.select(logical).contiguous())
-        if isinstance(base, _GroupedRefitSource):
-            return RefitCtx(
-                buf=torch.stack(
-                    [
-                        self._materialize_local_refit_spec(
-                            expert_spec, logical_source_cache
-                        ).buf
-                        for expert_spec in base.specs
-                    ]
-                )
-            )
-        if spec.pre is not None:
-            return spec.pre(base)
-        return RefitCtx(buf=base)
+        return LocalParamSpec(base=tensor, pre=pre)
 
     def _iter_local_hf_param_shards(self) -> Iterator[tuple[str, LocalParamSpec]]:
         """Yield (hf_name, local_tp_shard) for this rank's locally owned FFN params.
@@ -3396,22 +3364,13 @@ class MegatronPolicyWorkerImpl(
 
         Unlike ``_iter_params_with_optional_kv_scales`` (PP broadcast + TP gather
         via ``export_hf_weights``), this yields TP-local source specs directly
-        from the Megatron params — no collectives. BF16 specs retain live tensor
-        views; quantized specs materialize logical BF16 during each refit. EP:
-        ``refit_conversion_tasks`` already holds only this rank's local experts;
+        from the Megatron params — no collectives. Every pre hook independently
+        materializes the current parameter as canonical HF BF16. EP:
+        ``_bulk_refit_conversion_tasks`` holds only this rank's local experts;
         PP non-local params have ``param_weight is None``.
-
-        Only a Megatron destination gets the logical-BF16 materialization. Every
-        other backend keeps Bridge's payload verbatim, which for an FP8 export
-        task is the physical fp8 view its ``_scale_inv`` sibling describes;
-        dequantizing it here would ship BF16 bytes under an fp8 scale.
         """
-        uses_logical_payload = self.refit_payload_mode == "logical_weights"
-        for task in self.refit_conversion_tasks:
-            if uses_logical_payload:
-                local_tensor = _get_refit_task_source(task)
-            else:
-                local_tensor = task.param_weight
+        for task in self._bulk_refit_conversion_tasks:
+            local_tensor = _get_refit_task_source(task)
             if local_tensor is None:
                 continue  # Non-local PP rank.
             # An FP8 export task's scale sibling must not enter the bulk map.
@@ -3764,7 +3723,6 @@ class MegatronPolicyWorkerImpl(
         gen_parallelism,
         train_world_size,
         gen_world_size,
-        refit_payload_mode: RefitPayloadMode,
     ):
         """Prepare per-layer parameter metadata for nccl_reshard-based refit.
 
@@ -3773,12 +3731,8 @@ class MegatronPolicyWorkerImpl(
         its own fused layout (e.g., vLLM w13/w2) gen-side, so this train worker
         stays agnostic to any gen backend's MoE-fusion layout.
         """
-        self.refit_payload_mode = refit_payload_mode
         self.refit_param_info_mcore = self._calculate_refit_param_info()
-
-        # Single pass over Bridge's stream: classify each param as major
-        # (xferdtensor) or misc (packed_broadcast), preserve yield order so
-        # producer/consumer agree on the packed-broadcast iteration.
+        self._bulk_refit_conversion_tasks = self._build_bulk_refit_conversion_tasks()
 
         # Only the FFN gate/up/down weights take the bulk
         # xferdtensor path (>97% of payload for the large models this targets);
@@ -3788,47 +3742,62 @@ class MegatronPolicyWorkerImpl(
         misc_meta = OrderedDict()
         _xfer_bytes = _bcast_bytes = 0  # full-tensor payload routed to each path
 
-        # Iterates all the params to construct the state_dict_metadata (xferdtensor path)
-        # state_dict_metadata[hf_name] -> [shape, dtype]
-        # At the same time, filter the params to the misc subset (packed_broadcast path).
-        # misc_meta[hf_name] -> [shape, dtype]
         # HF layers whose weights come from Megatron's MTP module. The prefix
         # gate inside is_nccl_reshard_param only catches families whose HF
         # names keep the bare ``mtp.`` prefix (NemotronH, Qwen3.5); DeepSeek
         # exports MTP as trailing ``model.layers.N`` indices, so provenance is
         # the only reliable signal. vLLM keeps the MTP drafter separate from
         # the main model and updates it through load_weights -> misc path.
-        mtp_hf_layers_names = _collect_mtp_hf_layer_names(self.refit_conversion_tasks)
+        mtp_hf_layers_names = _collect_mtp_hf_layer_names(
+            self._bulk_refit_conversion_tasks
+        )
         local_refit_hf_names = _collect_local_refit_hf_names(
-            self.refit_conversion_tasks
+            self._bulk_refit_conversion_tasks
         )
 
         layer_prefix = None
         with _meta_tensor_alloc_context():
-            for name, tensor in self._iter_params_with_optional_kv_scales():
-                meta = {
-                    "shape": list(tensor.shape),
-                    "dtype": str(tensor.dtype),
-                }
-                _nbytes = tensor.numel() * tensor.element_size()
-                # Downsized whitelist: only FFN gate/up/down weights take the bulk
-                # nccl-reshard path; everything else -> misc (packed_broadcast).
+            # Standard Bridge tasks describe logical HF weights, independent of
+            # the physical FP8 data/scale tasks used by other transports.
+            for name, tensor in self.megatron_bridge.export_hf_weights(
+                [self.model],
+                show_progress=False,
+                conversion_tasks=self._iter_logical_refit_conversion_tasks(
+                    self._bulk_refit_conversion_tasks
+                ),
+            ):
                 if (
                     is_nccl_reshard_param(name)
                     and name in local_refit_hf_names
                     and _extract_layer_name(name) not in mtp_hf_layers_names
                 ):
-                    state_dict_metadata[name] = meta
-                    _xfer_bytes += _nbytes
+                    state_dict_metadata[name] = {
+                        "shape": list(tensor.shape),
+                        "dtype": str(torch.bfloat16),
+                    }
+                    _xfer_bytes += tensor.numel() * 2
                     if layer_prefix is not None:
                         assert layer_prefix == _extract_layer_prefix(name), (
                             f"layer_prefix mismatch: {layer_prefix} != {_extract_layer_prefix(name)}"
                         )
                     else:  # first param layer_prefix=None
                         layer_prefix = _extract_layer_prefix(name)
-                else:
-                    misc_meta[name] = meta
-                    _bcast_bytes += _nbytes
+
+            # Preserve the existing export dtype/order of unrelated weights and
+            # KV scales. A bulk weight is BF16 on the wire; its training-format
+            # scale must not overwrite scales computed by a destination post hook.
+            for name, tensor in self._iter_params_with_optional_kv_scales():
+                if name in state_dict_metadata or any(
+                    name.endswith(suffix)
+                    and name.removesuffix(suffix) in state_dict_metadata
+                    for suffix in ("_scale_inv", "_scale")
+                ):
+                    continue
+                misc_meta[name] = {
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                }
+                _bcast_bytes += tensor.numel() * tensor.element_size()
 
         _gib = 1024**3
         _tot = _xfer_bytes + _bcast_bytes
@@ -3872,15 +3841,13 @@ class MegatronPolicyWorkerImpl(
         _misc_names = set(misc_meta.keys())
 
         def _task_is_misc(task) -> bool:
-            # FP8 scale siblings carry the suffix on global_param_name and are
-            # always misc (packed_broadcast).
-            if task.global_param_name.endswith("_scale_inv"):
+            # Scale mappings wrap their underlying weight's HF names. Keep the
+            # task here, then filter the actual exported names by misc_meta.
+            if task.global_param_name.endswith(("_scale_inv", "_scale")):
                 return True
-            # Compound mappings (QKV/GatedMLP) export homogeneous sub-params
-            # (all nccl-reshard or all misc), so the first HF name is representative.
             hf = task.mapping.hf_param
-            name = next(iter(hf.values())) if isinstance(hf, dict) else str(hf)
-            return name in _misc_names
+            names = hf.values() if isinstance(hf, dict) else (str(hf),)
+            return any(name in _misc_names for name in names)
 
         self._misc_conversion_tasks = [
             task
@@ -3898,7 +3865,6 @@ class MegatronPolicyWorkerImpl(
         gen_world_size: Optional[int] = None,
         *,
         refit_info: Optional[dict[str, Any]] = None,
-        refit_payload_mode: RefitPayloadMode = "hf_export",
     ) -> Optional[dict[str, Any]]:
         """Prepare NCCL-reshard state for the worker's explicit refit role."""
         if self.is_refit_destination:
@@ -3935,14 +3901,14 @@ class MegatronPolicyWorkerImpl(
             gen_parallelism,
             train_world_size,
             gen_world_size,
-            refit_payload_mode,
         )
 
     def _build_expert_groups(self, param_map):
         """Group this rank's local expert params into stack-ready source specs.
 
         Keyed by (prefix, proj_type) and resolved to ordered ``param_map``
-        specs ready for per-refit materialization and ``torch.stack``.
+        specs ready for materialization and ``torch.stack`` in the group's
+        ``pre`` hook at each refit.
 
         Megatron exposes each expert's projection as a separate param; this bins
         them so ``_group_experts`` can stack a layer's experts into one grouped
@@ -3979,21 +3945,35 @@ class MegatronPolicyWorkerImpl(
                 index_groups.setdefault((m.group(1), m.group(3)), []).append(
                     (int(m.group(2)), name)
                 )
-        # Sort by expert index, then resolve each name to its param_map view once.
+        # Sort by expert index, then resolve each name to its live source spec once.
         return {
             key: [param_map[n] for _, n in sorted(idx_names)]
             for key, idx_names in index_groups.items()
         }
 
-    def _group_experts(self, proj, grouped_name, expert_groups):
-        """Describe local experts that must be stacked into ``[E_local, ...]``."""
+    def _group_experts(
+        self,
+        proj: str,
+        grouped_name: str,
+        expert_groups: dict[tuple[str, str], list[LocalParamSpec]],
+    ) -> LocalParamSpec:
+        """Build a pre hook that stacks local experts into ``[E_local, ...]``."""
         prefix = grouped_name.rsplit(f".{proj}.weight", 1)[0]
         expert_specs = expert_groups.get((prefix, proj))
         assert expert_specs, (
             f"no local experts for {grouped_name!r} (proj={proj!r}); "
             "PP-filter / expert-group-metadata inconsistency"
         )
-        return _GroupedRefitSource(tuple(expert_specs))
+        members = tuple(expert_specs)
+
+        def pre(base: Any) -> RefitCtx:
+            return RefitCtx(
+                buf=torch.stack(
+                    [_materialize_refit_spec(member).buf for member in members]
+                )
+            )
+
+        return LocalParamSpec(base=None, pre=pre)
 
     def _build_source_hf_to_local_param_map(
         self, refit_info: dict[str, Any]
@@ -4001,20 +3981,13 @@ class MegatronPolicyWorkerImpl(
         """Build the Megatron-backend ``hf_to_local_param_map`` (HFToLocalParamMap).
 
         Wraps this rank's local Megatron shards into ``LocalParamSpec``s:
-        - direct: ``base`` is sharded local tensor view, sent as-is.
-        - quantized: ``base`` defers logical view materialization until refit.
-        - grouped MoE expert: ``base`` holds the ordered per-expert specs, which
-          are materialized and stacked into ``[E_local, ...]`` each refit.
+        - local weight: ``base`` is the live parameter; ``pre`` dequantizes if
+          necessary, selects the HF view, and converts it to BF16.
+        - grouped MoE expert: ``pre`` materializes the ordered per-expert specs
+          and stacks them into ``[E_local, ...]`` each refit.
         """
-        # This rank's local TP/EP HF param shards (live views), and the
-        # per-expert views grouped for torch.stack.  Build-time only.
         param_map = dict(self._iter_local_hf_param_shards())
         expert_groups = self._build_expert_groups(param_map)
-
-        def _expert_spec(proj, grouped_name):
-            return LocalParamSpec(
-                base=self._group_experts(proj, grouped_name, expert_groups)
-            )
 
         mapping = {}
         for layer_name in refit_info["layer_names"]:
@@ -4023,7 +3996,9 @@ class MegatronPolicyWorkerImpl(
                     continue
                 name = p["name"]
                 if p.get("grouped_expert_proj"):
-                    mapping[name] = _expert_spec(p["grouped_expert_proj"], name)
+                    mapping[name] = self._group_experts(
+                        p["grouped_expert_proj"], name, expert_groups
+                    )
                 else:
                     spec = param_map.get(name)
                     if spec is None:
@@ -4140,54 +4115,47 @@ class MegatronPolicyWorkerImpl(
         # Keep this local because xferdtensor probes optional NCCL M-to-N bindings.
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
-        # MXFP8 source dequantization, grouped-MoE stacking, and spec.post enqueue
-        # on this worker's current stream; xferdtensor uses the same stream.
+        # Source pre hooks and spec.post enqueue on this worker's current stream;
+        # xferdtensor uses the same stream.
         nccl_reshard_stream = torch.cuda.current_stream()
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
-            # Gate/up and grouped expert specs in one logical layer can share a
-            # training parameter. Keep those materializations only until every
-            # parameter in the layer has been enqueued, rather than retaining a
-            # model-sized BF16 cache for the full refit.
-            logical_source_cache: dict[int, torch.Tensor] = {}
-            try:
-                for param_info in self.nccl_reshard_refit_info["per_layer_params"][
-                    layer_name
-                ]:
-                    # Each train worker handles only its own PP stage's params
-                    # (non-PP = every param is in pp_stage 0).
-                    if param_info.get("pp_stage", 0) != self.my_pp_stage:
-                        continue
-                    group = self.pp_comm_group
+            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
+                layer_name
+            ]:
+                # Each train worker handles only its own PP stage's params
+                # (non-PP = every param is in pp_stage 0).
+                if param_info.get("pp_stage", 0) != self.my_pp_stage:
+                    continue
+                group = self.pp_comm_group
 
-                    spec = self.hf_to_local_param_map.get(param_info["name"])
-                    assert spec is not None, (
-                        f"no spec for {param_info['name']!r} in hf_to_local_param_map"
-                    )
-                    ctx = self._materialize_local_refit_spec(spec, logical_source_cache)
-                    assert ctx.buf is not None, (
-                        f"no local tensor for {param_info['name']!r}"
-                    )
-                    src_tensor = DTensorRef(
-                        local_tensor=ctx.buf, global_shape=param_info["global_shape"]
-                    )
-                    xferdtensor(
-                        src_tensor,
-                        param_info["src_mesh_info"],
-                        param_info["src_placements"],
-                        None,
-                        param_info["dst_mesh_info"],
-                        param_info["dst_placements"],
-                        group,
-                        nccl_reshard_stream,
-                    )
-                    if spec.post is not None:
-                        spec.post(ctx)
-                    # Drop refs to per-param views and grouped tensors promptly.
-                    del ctx, src_tensor
-            finally:
-                # Never retain stale BF16 materializations across layers or
-                # optimizer steps.
-                logical_source_cache.clear()
+                spec = self.hf_to_local_param_map.get(param_info["name"])
+                assert spec is not None, (
+                    f"no spec for {param_info['name']!r} in hf_to_local_param_map"
+                )
+                ctx = _materialize_refit_spec(spec)
+                assert ctx.buf is not None, (
+                    f"no local tensor for {param_info['name']!r}"
+                )
+                assert ctx.buf.dtype == torch.bfloat16, (
+                    f"bulk refit source {param_info['name']!r} must be BF16"
+                )
+                src_tensor = DTensorRef(
+                    local_tensor=ctx.buf, global_shape=param_info["global_shape"]
+                )
+                xferdtensor(
+                    src_tensor,
+                    param_info["src_mesh_info"],
+                    param_info["src_placements"],
+                    None,
+                    param_info["dst_mesh_info"],
+                    param_info["dst_placements"],
+                    group,
+                    nccl_reshard_stream,
+                )
+                if spec.post is not None:
+                    spec.post(ctx)
+                # Drop refs to per-param views and grouped tensors promptly.
+                del ctx, src_tensor
 
         sync_stream_within(
             nccl_reshard_stream, refit_timeout_s, "the bulk parameter transfer"
@@ -4212,9 +4180,13 @@ class MegatronPolicyWorkerImpl(
         if not misc_meta:
             return
 
-        misc_iter = self._iter_params_with_optional_kv_scales(
-            kv_scales=kv_scales,
-            conversion_tasks=self._misc_conversion_tasks,
+        misc_iter = (
+            (name, tensor)
+            for name, tensor in self._iter_params_with_optional_kv_scales(
+                kv_scales=kv_scales,
+                conversion_tasks=self._misc_conversion_tasks,
+            )
+            if name in misc_meta
         )
 
         packed_broadcast_producer(

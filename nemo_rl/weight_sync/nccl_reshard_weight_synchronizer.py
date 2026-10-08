@@ -351,7 +351,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             gen_parallelism,
             train_world_size,
             inference_world_size,
-            refit_payload_mode=self._generation.get_refit_payload_mode(),
         )
 
         # nccl_reshard_refit_info holds MeshInfo rank tensors created under
