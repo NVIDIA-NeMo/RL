@@ -2162,6 +2162,47 @@ class TestLogger:
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
+    def test_log_plot_token_mult_prob_error_skips_samples_without_loss_tokens(
+        self, mock_tb_logger, mock_wandb_logger, temp_dir
+    ):
+        """A filtered-out sample (0/0 = NaN error) must not be picked as the worst sample."""
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            tensorboard_enabled=False,
+            mlflow_enabled=False,
+            swanlab_enabled=False,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            log_dir=temp_dir,
+        )
+        logger = Logger(cfg)
+        generation_logprobs = torch.zeros((2, 10))
+        generation_logprobs[1, 5] = -20.0  # large error in the kept sample
+        data = {
+            "token_mask": torch.ones((2, 10)),
+            "sample_mask": torch.tensor([0.0, 1.0]),
+            "generation_logprobs": generation_logprobs,
+            "prev_logprobs": torch.zeros((2, 10)),
+            "prompt_lengths": torch.tensor([2, 2]),
+            "full_lengths": torch.tensor([8, 8]),
+        }
+
+        logger.log_plot_token_mult_prob_error(data, 1, "test_plot")
+
+        fig = mock_wandb_logger.return_value.log_plot.call_args[0][0]
+        legend_texts = [t.get_text() for t in fig.axes[0].get_legend().get_texts()]
+        assert not any("nan" in text for text in legend_texts)
+        assert any("Max abs error: 20.0000" in text for text in legend_texts)
+
+        # With no loss token in any sample there is nothing to plot.
+        mock_wandb_logger.return_value.log_plot.reset_mock()
+        logger.log_plot_token_mult_prob_error(
+            {**data, "sample_mask": torch.zeros(2)}, 2, "test_plot"
+        )
+        mock_wandb_logger.return_value.log_plot.assert_not_called()
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
     @patch("nemo_rl.utils.logger.MLflowLogger")
     def test_init_mlflow_only(
         self, mock_mlflow_logger, mock_tb_logger, mock_wandb_logger, temp_dir
