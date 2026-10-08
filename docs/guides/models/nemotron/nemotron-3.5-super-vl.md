@@ -32,8 +32,9 @@ Nemotron 3.5 Super VL is **Functionally Ready** for text (DAPO) post-training.
 Notes:
 
 - **Training** runs on the AutoModel (DTensor) backend with FSDP2 over all
-  parameters and expert parallelism (DeepEP) for the routed experts. The
-  Megatron backend for this model lives on the `super-v3.5-posttraining` branch
+  parameters and expert parallelism (HybridEP dispatcher) for the routed
+  experts. The Megatron backend for this model lives on the
+  `super-v3.5-posttraining` branch
   (Megatron-Bridge `3961f399` or later registers `NemotronH_Omni_Reasoning_V3`)
   and is not covered here.
 - **Generation** uses the pinned stock vLLM, which registers
@@ -49,10 +50,10 @@ Notes:
 AutoModel support for this model landed in the `r0.6.0` branch with
 [#3874](https://github.com/NVIDIA-NeMo/Automodel/pull/3874) (cherry-pick of
 [#3801](https://github.com/NVIDIA-NeMo/Automodel/pull/3801)); it also carries
-the `fc2_latent_proj` dtype fix
-([#3828](https://github.com/NVIDIA-NeMo/Automodel/pull/3828)) that NeMo RL's
-FSDP mixed-precision policy requires. The submodule pin on this branch includes
-both. vLLM and the rest of the dependencies are the standard NeMo RL pins.
+the `fc2_latent_proj` dtype fix (part of the same #3801 squash) that NeMo RL's
+FSDP mixed-precision policy requires. The Automodel submodule pin on NeMo RL
+`main` (`4066772c9`) includes both. vLLM and the rest of the dependencies are
+the standard NeMo RL pins.
 
 Containers built before this pin ship worker venvs whose editable
 `nemo_automodel` still points at the image's older Automodel checkout, and the
@@ -104,20 +105,23 @@ These are set in the recipe and are required for this model:
 | Setting | Value | Why |
 |---|---|---|
 | `policy.hf_config_overrides.num_nextn_predict_layers` | `0` | The checkpoint ships one MTP layer (`mtp.*` tensors). AutoModel builds it by default; this drops it on the training side. Keep `generation.vllm_kwargs.speculative_config` unset for the same reason. |
-| `policy.generation.vllm_cfg.skip_tokenizer_init` | `false` | vLLM's multimodal encoder budget calls the tokenizer during engine init for this architecture; the text-only default (`true`) fails with `You cannot pass text prompts when skip_tokenizer_init=True`. |
 | `policy.generation.vllm_kwargs.skip_mm_profiling` | `true` | No images are ever sent; skip vLLM's multimodal profiling pass and its encoder-cache reservation. |
+| `policy.generation.vllm_kwargs.mm_processor_cache_gb` | `0` | Drop vLLM's default 4 GiB host-side multimodal processor cache; host memory is the tight resource for this recipe. |
+| `policy.generation.vllm_kwargs.limit_mm_per_prompt.image` | `1` | vLLM sizes the encoder budget from this limit, and an unset modality defaults to 999 images per prompt. |
 | `policy.generation.vllm_kwargs.mamba_ssm_cache_dtype` | `float32` | Matches the checkpoint's `mamba_ssm_cache_dtype`. |
+| `policy.generation.vllm_cfg.skip_tokenizer_init` | (automatic) | vLLM's multimodal encoder budget calls the tokenizer during engine init for this architecture. `NemotronH_Omni_Reasoning_V3` is listed in `TOKENIZER_REQUIRED_ARCHITECTURES`, so NeMo RL keeps the tokenizer regardless of the text-only default. |
 | `policy.dtensor_cfg.automodel_kwargs.force_hf` | unset | The custom AutoModel implementation and its state-dict adapter are required for EP and per-tensor refit. |
 | `policy.dtensor_cfg.env_vars.PYTORCH_CUDA_ALLOC_CONF` | unset | See [Known Issues](#known-issues): `expandable_segments:True` breaks the colocated IPC refit on some clusters. |
 
 ### Parallelism
 
-- **Training EP must not exceed the GPUs per node.** The AutoModel DeepEP
-  dispatcher (V1 `Buffer` API) assumes an expert-parallel group of up to 8 ranks
-  is intranode and exchanges CUDA IPC memory handles. If the group spans nodes
-  (for example EP=8 on 4-GPU GB200 nodes), `Buffer` initialization fails with
-  `CUDA error ... deep_ep.cpp 'invalid resource handle'`. The recipe uses
-  `expert_parallel_size: 4` for 4-GPU nodes.
+- **Training EP stays within a node.** The recipe uses `expert_parallel_size: 4`
+  on 4-GPU GB200 nodes with the HybridEP dispatcher
+  (`policy.dtensor_cfg.automodel_kwargs.backend.dispatcher: hybridep`), which
+  requires `make_sequence_length_divisible_by: 64`. The DeepEP dispatcher also
+  works at EP=4 but its V1 `Buffer` API assumes an expert-parallel group of up to
+  8 ranks is intranode; EP=8 on 4-GPU nodes fails with
+  `CUDA error ... deep_ep.cpp 'invalid resource handle'`.
 - **vLLM TP and EP live on the same GPUs.** `expert_parallel_size ==
   tensor_parallel_size` runs one engine per node with dense layers TP-sharded
   and experts EP-sharded (`enable_expert_parallel`). Set both to the GPUs per
@@ -174,20 +178,20 @@ resume. The chain resumed across five jobs.
   `pidfd_getfd: Bad file descriptor` and every key is reported missing. The
   recipe deliberately leaves `PYTORCH_CUDA_ALLOC_CONF` unset (default allocator,
   legacy `cudaIpcMemHandle` sharing).
-- **Training EP across nodes is limited by DeepEP V1's 8-peer intranode
-  assumption.** Larger EP on 4-GPU nodes needs the `hybridep` or `torch`
-  dispatcher (`policy.dtensor_cfg.automodel_kwargs.backend.dispatcher`) or a
-  DeepEP build with MNNVL enabled; not validated here.
+- **Training EP larger than the GPUs per node is not validated.** The recipe
+  keeps EP=4 on 4-GPU nodes; cross-node EP with HybridEP has not been tested
+  for this model.
 - **Host memory is the limit for node counts below 16.** Per 4-GPU GB200 node
   (942 GB) the colocated run holds the pinned vLLM sleep-mode weight backups
   (~88 GiB per TP worker) plus, while the trainer is offloaded for generation,
   the sharded params + optimizer state of 4 ranks; the checkpoint save adds
   staging on top. On 8 nodes the first checkpoint save is OOM-killed on the
   host; 16 nodes peak at ~840-920 GB including the save.
-- **Sequence packing and dynamic batching are not validated for this model.**
-  The recipe keeps both disabled (`train_micro_batch_size: 1`). Sequence packing
-  on AutoModel-native models currently loses packed-sequence boundaries
-  (NeMo RL [#4167](https://github.com/NVIDIA-NeMo/RL/issues/4167)); keep it off.
+- **Sequence packing is not validated for this model.** The recipe keeps it
+  disabled; sequence packing on AutoModel-native models currently loses
+  packed-sequence boundaries (NeMo RL
+  [#4167](https://github.com/NVIDIA-NeMo/RL/issues/4167)). Dynamic batching is
+  enabled with the inherited 9216-token microbatch budget.
 - **Image post-training is out of scope for this pin.** Vision-weight refit and
   the Blackwell vision-encoder attention path need vLLM changes that are not in
-  the pinned release; only the text path is supported from this branch.
+  the pinned release; only the text path is supported on NeMo RL `main`.

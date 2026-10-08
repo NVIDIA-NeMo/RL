@@ -8,7 +8,7 @@ defaults: ../../grpo_math_1B.yaml
 #
 # Requirements:
 #   - Automodel r0.6.0 @ 4066772c9 or later (Nemotron 3.5 Super VL support,
-#     Automodel #3801 / #3874), the submodule pin of this branch.
+#     Automodel #3801 / #3874), the Automodel submodule pin on main.
 #   - Stock vLLM 0.29.0 (pyproject pin): it registers NemotronH_Omni_Reasoning_V3
 #     and loads the checkpoint's RADIO weights for the (unused) vision tower.
 #
@@ -23,13 +23,13 @@ defaults: ../../grpo_math_1B.yaml
 #   - dtensor_cfg.automodel_kwargs.force_hf must NOT be set (the custom
 #     NemotronOmni implementation + state-dict adapter are required for EP and
 #     per-tensor refit).
-#   - moe_parallelizer.ignore_router_for_ac is required with activation
-#     checkpointing: bf16 router top-k is nondeterministic, and recomputed expert
-#     permutation buffers can change shape and crash backward (CheckpointError).
-#   - dtensor_cfg.expert_parallel_size must not exceed gpus_per_node: DeepEP
-#     assumes EP groups of <= 8 ranks are intranode (CUDA IPC) and fails with
-#     "invalid resource handle" when the group spans nodes (e.g. EP8 on 4-GPU
-#     GB200 nodes). On 4-GPU nodes use expert_parallel_size=4 and vLLM TP/EP=4.
+#   - moe_parallelizer.ignore_router_for_ac (the Automodel default, kept
+#     explicit) is needed with activation checkpointing: bf16 router top-k is
+#     nondeterministic, and recomputed expert permutation buffers can change
+#     shape and crash backward (CheckpointError).
+#   - dtensor_cfg.expert_parallel_size=4 keeps the EP group within one 4-GPU
+#     node (vLLM TP/EP=4 so an engine fits one node). The experts use the
+#     HybridEP dispatcher, which needs make_sequence_length_divisible_by=64.
 #   - Do not set dtensor_cfg.env_vars.PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #     here (see the dtensor_cfg comment): it breaks the IPC refit on some clusters.
 #   - Validated on 16 x 4-GPU GB200 nodes (AIME-2024 0.53 -> 0.79 over 50
@@ -56,7 +56,7 @@ loss_fn:
   ratio_clip_max: 0.28
   ratio_clip_c: 10
 checkpointing:
-  checkpoint_dir: results/dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel
+  checkpoint_dir: results/dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel
   # 4h partition limit; steps take 15-18 min (~30 min on validation steps), so
   # leave >= 40 min so the timeout save + exit never straddles the wall clock.
   checkpoint_must_save_by: 00:03:20:00
@@ -71,7 +71,7 @@ policy:
   logprob_batch_size: 1
   logprob_chunk_size: 2048
   max_total_sequence_length: 9216
-  make_sequence_length_divisible_by: 8
+  make_sequence_length_divisible_by: 64
   optimizer:
     name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
@@ -111,7 +111,7 @@ policy:
         linear: te
         rms_norm: torch_fp32
         experts: gmm
-        dispatcher: deepep
+        dispatcher: hybridep
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
@@ -126,14 +126,13 @@ policy:
       expert_parallel_size: 4
       gpu_memory_utilization: 0.5
       enforce_eager: true
-      # vLLM's multimodal encoder budget (NemotronH_Nano_VL_V2 processor info)
-      # needs the tokenizer at engine init even for text-only prompts; the
-      # text-only default (true) fails with "You cannot pass text prompts when
-      # skip_tokenizer_init=True".
-      skip_tokenizer_init: false
     vllm_kwargs:
       moe_backend: triton
       mamba_ssm_cache_dtype: float32
+      # No images are ever sent, but vLLM still builds the multimodal encoder
+      # budget for this architecture: skip the profiling pass, drop the default
+      # 4 GiB host-side processor cache, and bound the per-prompt image limit
+      # (unset means 999) so the encoder budget stays small.
       skip_mm_profiling: true
       mm_processor_cache_gb: 0
       limit_mm_per_prompt:
@@ -155,7 +154,7 @@ logger:
   tensorboard_enabled: true
   wandb:
     project: nemo-rl-super-3.5
-    name: dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel
+    name: dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel
 cluster:
   gpus_per_node: 4
   num_nodes: 16

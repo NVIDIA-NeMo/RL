@@ -44,6 +44,10 @@ from nemo_rl.models.generation.vllm.worker_utils import (
                 "Mistral3ForConditionalGeneration",
             ],
         ),
+        (
+            ["NemotronH_Omni_Reasoning_V3"],
+            ["NemotronH_Omni_Reasoning_V3"],
+        ),
     ],
 )
 def test_find_tokenizer_required_architectures(architectures, expected):
