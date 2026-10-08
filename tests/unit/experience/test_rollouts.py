@@ -848,7 +848,9 @@ def test_async_vlm_multiturn_drops_stale_vllm_content(
                 "vllm_content": "<image> initial prompt",
                 "vllm_multi_modal_data": {"image": image},
             },
-            policy_generation=object(),
+            policy_generation=SimpleNamespace(
+                supports_native_generation_retries=lambda: False
+            ),
             tokenizer=_DummyTokenizer(),
             task_to_env={},
             max_seq_len=32,

@@ -1615,7 +1615,12 @@ def test_async_rollout_manager_matches_original(
         return key
 
     new_metrics = record.rollout_metrics
+    # Native rollout retries belong to the legacy helper, not RolloutManager.
+    # This successful parity run must not have retried any generation calls.
+    assert original_metrics["generation_retries"] == 0
     for key in original_metrics.keys():
+        if key == "generation_retries":
+            continue
         if key.startswith("timing/") or key.startswith("histogram/"):
             continue
 

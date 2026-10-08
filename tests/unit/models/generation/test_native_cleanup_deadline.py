@@ -93,7 +93,7 @@ def test_cleanup_interruption_is_fatal(monkeypatch, backend, phase, interrupt):
             generation = object.__new__(MegatronGeneration)
             generation._owns_policy = False
             worker = MagicMock()
-            worker.generate_async.options.return_value.remote.return_value = Stream()
+            worker.generate_async._remote.return_value = Stream()
             generation._policy = SimpleNamespace(
                 worker_group=SimpleNamespace(workers=[worker])
             )
