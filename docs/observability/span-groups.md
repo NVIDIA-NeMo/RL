@@ -671,7 +671,7 @@ blanks today, so an empty trace is not read as a broken exporter:
 
 ## Resource attributes (process tags)
 
-Stable-for-the-run values, set once at init and attached to every span/metric: `nv.dl.campaign.stage` (always `RL`), `rl.algorithm`, `rl.model`, `nemo.precision`, `nv.dl.provider.name`, the `nv.dl.topology.size.*` parallelism sizes, the `nv.dl.training.config.*` / `nv.dl.training.target.*` settings, the `nv.dl.software.*` versions, plus `nv.dl.rank` / `nv.dl.world_size` / `nv.dl.local_rank`. See [Configuration — Resource attributes](configuration.md#resource-attributes) for the full table and where each value comes from.
+Stable-for-the-run values, set once at init and attached to every span/metric: `nv.dl.campaign.stage` (`SFT`, `RM` or `RL`, depending on the algorithm), `rl.algorithm`, `rl.model`, `nemo.precision`, `nv.dl.provider.name`, the `nv.dl.topology.size.*` parallelism sizes, the `nv.dl.training.config.*` / `nv.dl.training.target.*` settings, the `nv.dl.software.*` versions, plus `nv.dl.rank` / `nv.dl.world_size` / `nv.dl.local_rank`. See [Configuration — Resource attributes](configuration.md#resource-attributes) for the full table and where each value comes from.
 
 ## Granularity guidance
 

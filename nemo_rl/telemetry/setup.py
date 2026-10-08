@@ -419,7 +419,7 @@ def _process_attributes(rank: int, world_size: int, run_id: str = "") -> dict[st
     Called by both entry points, since a resource is per process and neither
     path sees the other's.
     """
-    from nemo.lens.resources.slurm import derive_nv_dl_run_uuid
+    from nemo.lens import derive_nv_dl_run_uuid
     from nemo.lens.semconv import (
         NV_DL_LOCAL_RANK,
         NV_DL_PROVIDER_NAME,
