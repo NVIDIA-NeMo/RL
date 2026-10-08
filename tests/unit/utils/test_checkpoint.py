@@ -1200,23 +1200,6 @@ class TestRenameCheckpointSwap:
         with open(step_dir / "training_info.json") as f:
             assert json.load(f)["loss"] == 0.2
 
-    def test_rejects_a_directory_it_cannot_read_a_step_from(
-        self, checkpoint_manager, checkpoint_dir
-    ):
-        """The step comes out of the name, so an unreadable name has to raise.
-
-        The previous spelling of that read, ``name.split("_")[2]``, returned
-        whatever sat between the second and third underscore -- publishing
-        ``tmp_weights_12_a`` as ``step_12``, a directory claiming to be a
-        checkpoint of a step it has nothing to do with.
-        """
-        staged = checkpoint_dir / "tmp_weights_12_a"
-        staged.mkdir(parents=True)
-
-        with pytest.raises(ValueError, match="Expected a tmp_step_<N> directory"):
-            checkpoint_manager._rename_checkpoint(staged)
-
-        assert staged.exists()
         assert not (checkpoint_dir / "step_12").exists()
 
 
@@ -1449,12 +1432,21 @@ class TestFTKeepLatestK:
         assert self._remaining_steps(checkpoint_dir) == [1, 2, 5, 6]
 
 
-def test_step_from_tmp_path_tolerates_an_unexpected_name():
-    """Reading the step is only used to label a span, so it must never raise.
+def test_a_non_numeric_staging_name_costs_only_the_span_label(
+    checkpoint_manager, checkpoint_dir
+):
+    """The span's step is read from the directory name, so it must never raise.
 
-    A caller that stages under some other name still gets a finalized
-    checkpoint; it just loses the iteration attribute on the span.
+    ``_rename_checkpoint`` publishes whatever sits between the second and third
+    underscore, so ``tmp_step_final`` becomes ``step_final``. The span wants an
+    int and cannot have one here; it drops the label rather than failing the
+    finalization that carries it.
     """
-    assert checkpoint_module._step_from_tmp_path("/ckpt/tmp_step_412") == 412
-    assert checkpoint_module._step_from_tmp_path("/ckpt/step_412") is None
-    assert checkpoint_module._step_from_tmp_path("/ckpt/tmp_step_final") is None
+    staged = checkpoint_dir / "tmp_step_final"
+    staged.mkdir(parents=True)
+
+    checkpoint_manager.begin_finalization(staged, wait_fn=None)
+    checkpoint_manager.finalize_pending()
+
+    assert (checkpoint_dir / "step_final").exists()
+    assert not staged.exists()

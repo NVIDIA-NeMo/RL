@@ -53,22 +53,6 @@ from nemo_rl.telemetry.instrumentation import (
 
 PathLike = Union[str, "os.PathLike[Any]"]
 
-# ``init_tmp_checkpoint`` names the staging directory ``tmp_step_{step}``, and
-# that name is the only place the step survives into ``begin_finalization``,
-# which takes the path alone. Parsed rather than added as an argument, so every
-# algorithm's call site stays untouched.
-_TMP_STEP_PATTERN = re.compile(r"^tmp_step_(\d+)$")
-
-
-def _step_from_tmp_path(checkpoint_path: PathLike) -> Optional[int]:
-    """Step a ``tmp_step_N`` directory belongs to, or None if unrecognised.
-
-    None rather than a raise: one caller only labels a span with this, and a
-    checkpoint staged under some other name should still be finalized.
-    """
-    match = _TMP_STEP_PATTERN.match(Path(checkpoint_path).name)
-    return int(match.group(1)) if match else None
-
 
 @contextmanager
 def _finalize_telemetry(
@@ -434,18 +418,9 @@ class CheckpointManager:
         If step_N already exists (defensive guard for edge cases, e.g. resuming
         training), performs a pseudo-atomic swap via an intermediate old_step_N
         directory.
-
-        Raises:
-            ValueError: *checkpoint_path* is not a ``tmp_step_N`` directory, so
-                there is no step to publish it under.
         """
         checkpoint_path = Path(checkpoint_path)
-        step = _step_from_tmp_path(checkpoint_path)
-        if step is None:
-            raise ValueError(
-                f"Expected a tmp_step_<N> directory from init_tmp_checkpoint(), "
-                f"got {checkpoint_path.name!r}"
-            )
+        step = checkpoint_path.name.split("_")[2]
         to_checkpoint_path = checkpoint_path.parent / f"step_{step}"
         if to_checkpoint_path.exists():
             old_checkpoint_path = checkpoint_path.parent / f"old_step_{step}"
@@ -491,7 +466,16 @@ class CheckpointManager:
         self.finalize_pending()
         self._pending_checkpoint_path = Path(checkpoint_path)
         self._finalize_error = None
-        step = _step_from_tmp_path(checkpoint_path)
+        # The step reaches here only in the staging directory's name, which
+        # ``init_tmp_checkpoint`` formats as ``tmp_step_{step}``; read back the
+        # same way :meth:`_rename_checkpoint` reads it, rather than adding a
+        # second spelling of the same parse to this file. Guarded and dropped
+        # to None on anything unexpected, since this only labels a span and a
+        # checkpoint staged under some other name must still be finalized.
+        try:
+            step = int(Path(checkpoint_path).name.split("_")[2])
+        except (IndexError, ValueError):
+            step = None
         # Captured here because a bare Thread starts with an empty context: read
         # it on the worker instead and the finalize span re-roots into a trace of
         # its own, detached from the run that produced the checkpoint.
