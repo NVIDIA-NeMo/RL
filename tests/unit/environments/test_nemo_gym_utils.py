@@ -258,6 +258,23 @@ def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs
     assert "port_range_high" not in cfg["initial_global_config_dict"]
 
 
+@pytest.mark.parametrize("configured", [None, False, True])
+def test_build_nemo_gym_config_moves_mask_unusable_rollouts_to_actor_field(
+    detected_uv_dirs, configured
+):
+    extra = {} if configured is None else {"mask_unusable_rollouts": configured}
+    cfg = build_nemo_gym_config(
+        _env_configs(**extra),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )
+
+    assert cfg["mask_unusable_rollouts"] is bool(configured)
+    assert "mask_unusable_rollouts" not in cfg["initial_global_config_dict"]
+
+
 def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(detected_uv_dirs):
     cfg = build_nemo_gym_config(
         _env_configs(),

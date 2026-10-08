@@ -1889,6 +1889,110 @@ def test_nemo_gym_postprocess_no_generation_data_chat_template_failure():
     assert "['reasoning']" in msg
 
 
+class _UnusableRolloutTokenizer:
+    eos_token_id = 2
+    pad_token_id = 0
+
+    def apply_chat_template(self, input_messages, tokenize=True):
+        return list(range(1234))
+
+    def encode(self, text, add_special_tokens=False):
+        assert not add_special_tokens
+        return [100 + i for i, _ in enumerate(text.split())]
+
+    def batch_decode(self, token_id_lists):
+        return [" ".join(str(t) for t in ids) for ids in token_id_lists]
+
+
+class _MaskUnusableRolloutsSelf:
+    cfg = {"mask_unusable_rollouts": True}
+
+
+def test_nemo_gym_postprocess_no_generation_data_masked_when_enabled():
+    nemo_gym_result = {
+        "reward": 1.0,
+        "response": {"output": [{"type": "reasoning"}, {"type": "function_call"}]},
+        "responses_create_params": {
+            "input": [{"role": "user", "content": "three word prompt"}]
+        },
+    }
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MaskUnusableRolloutsSelf(),
+            {},
+            nemo_gym_result,
+            _UnusableRolloutTokenizer(),
+        )
+    )
+
+    user, assistant = result["message_log"]
+    assert user["role"] == "user"
+    # The start of the input text, padded with EOS to a fixed length.
+    assert user["token_ids"].tolist() == [100, 101, 102] + [2] * 125
+    assert assistant["role"] == "assistant"
+    assert assistant["token_ids"].tolist() == [2]
+    assert assistant["generation_logprobs"].tolist() == [0.0]
+    assert result["input_message_log"] == [user]
+    full_result = result["full_result"]
+    assert full_result["mask_sample"] is True
+    assert full_result["_ng_unusable_rollout"] == "no_generation_data"
+
+
+def _trainable_item(prompt_token_ids, generation_token_ids):
+    return {
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "prompt_token_ids": prompt_token_ids,
+        "generation_token_ids": generation_token_ids,
+        "generation_log_probs": [-0.5] * len(generation_token_ids),
+    }
+
+
+def _non_contiguous_result():
+    return {
+        "reward": 1.0,
+        "response": {
+            "output": [
+                _trainable_item([1, 2], [3, 4]),
+                # The history was rewritten: [1, 2, 3, 4] is not a prefix.
+                _trainable_item([1, 9, 3, 4, 5], [6]),
+            ]
+        },
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+
+def test_nemo_gym_postprocess_non_contiguous_chain_raises_by_default():
+    class _MockSelf:
+        cfg = {}
+
+    with pytest.raises(AssertionError, match="Non-contiguous messages found"):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), {}, _non_contiguous_result(), _UnusableRolloutTokenizer()
+        )
+
+
+def test_nemo_gym_postprocess_non_contiguous_chain_masked_when_enabled():
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MaskUnusableRolloutsSelf(),
+            {},
+            _non_contiguous_result(),
+            _UnusableRolloutTokenizer(),
+        )
+    )
+
+    # The contiguous prefix (the first turn) is kept.
+    assert [m["role"] for m in result["message_log"]] == ["user", "assistant"]
+    assert result["message_log"][0]["token_ids"].tolist() == [1, 2]
+    assert result["message_log"][1]["token_ids"].tolist() == [3, 4]
+    full_result = result["full_result"]
+    assert full_result["mask_sample"] is True
+    assert full_result["_ng_unusable_rollout"] == "non_contiguous_token_chain"
+
+
 @pytest.mark.nemo_gym
 def test_nemo_gym_sanity(
     nemo_gym,

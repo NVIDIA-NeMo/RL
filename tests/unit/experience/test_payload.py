@@ -22,7 +22,11 @@ from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
 )
-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_UNUSABLE_ROLLOUT_KEY,
+    Completion,
+    PromptGroupRecord,
+)
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 
 
@@ -477,3 +481,18 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
             "num_routed_experts_backfilled": 1,
         },
     ]
+
+
+def test_record_to_train_batch_zeroes_unusable_rollout_sample_mask() -> None:
+    """Unusable-rollout placeholders carry no loss weight even with masking off."""
+    unusable = _completion(route_start=30, reward=1.0, with_routes=False)
+    unusable.env_extras = {NEMO_GYM_UNUSABLE_ROLLOUT_KEY: "no_generation_data"}
+    completions = [_completion(route_start=10, reward=1.0, with_routes=False), unusable]
+
+    train_batch = record_to_train_batch(
+        _record(completions, loss_multiplier=0.5),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+
+    assert train_batch["sample_mask"].tolist() == [0.5, 0.0]

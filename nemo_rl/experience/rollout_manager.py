@@ -40,7 +40,6 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import VLLM_CONTENT_KEY, VLLM_PROMPT_KEYS
-from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
@@ -77,9 +76,11 @@ from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
+    _drop_env_mask_sample_flag,
     _dummy_routed_experts_for_tokens,
     _effort_shaping_metrics,
     _EffortShapingMetrics,
+    _env_mask_sample_flag,
     _find_routed_experts_template,
     _tensorize_by_key,
     apply_reward_penalties,
@@ -1412,9 +1413,7 @@ class AsyncNemoGymRolloutImpl:
         # from the completion's env_extras.
         if not self._mask_env_flagged_samples:
             for result in results:
-                (result["full_result"].get("instance_config") or {}).pop(
-                    "mask_sample", None
-                )
+                _drop_env_mask_sample_flag(result["full_result"])
 
         penalty_counts = apply_reward_penalties(
             token_results, self._reward_penalty_config
@@ -2297,13 +2296,7 @@ class RolloutManager:
                     f"receipt={receipt.get('rollout_id')!r}, "
                     f"expected={gate_rollout_id!r}"
                 )
-            mask_sample = bool(
-                (
-                    ((completion.env_extras or {}).get("instance_config") or {}).get(
-                        MASK_SAMPLE, False
-                    )
-                )
-            )
+            mask_sample = _env_mask_sample_flag(completion.env_extras)
 
             if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                 result = SiblingSealResult(
