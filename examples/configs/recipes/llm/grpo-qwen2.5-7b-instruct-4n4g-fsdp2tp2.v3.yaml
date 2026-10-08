@@ -11,7 +11,7 @@ policy:
     name: Qwen/Qwen2.5-7B-Instruct
   train_micro_batch_size: 1
   max_total_sequence_length: 4096
-  dtensor_cfg:
+  automodel_cfg:
     tensor_parallel_size: 2
   dynamic_batching:
     enabled: true

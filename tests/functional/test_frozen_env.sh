@@ -180,21 +180,21 @@ else
 fi
 
 echo
-echo "Test 3b: python-DTensorPolicyWorkerV2 should have nemo_automodel but not megatron.core"
+echo "Test 3b: python-AutomodelPolicyWorker should have nemo_automodel but not megatron.core"
 
-echo -n "  Testing python-DTensorPolicyWorkerV2 can import nemo_automodel ... "
-if python-DTensorPolicyWorkerV2 -c "import nemo_automodel" 2>/dev/null; then
+echo -n "  Testing python-AutomodelPolicyWorker can import nemo_automodel ... "
+if python-AutomodelPolicyWorker -c "import nemo_automodel" 2>/dev/null; then
     echo "✓ OK"
 else
     echo "✗ FAILED"
-    echo "ERROR: python-DTensorPolicyWorkerV2 cannot import nemo_automodel"
+    echo "ERROR: python-AutomodelPolicyWorker cannot import nemo_automodel"
     exit 1
 fi
 
-echo -n "  Testing python-DTensorPolicyWorkerV2 cannot import megatron.core ... "
-if python-DTensorPolicyWorkerV2 -c "import megatron.core" 2>/dev/null; then
+echo -n "  Testing python-AutomodelPolicyWorker cannot import megatron.core ... "
+if python-AutomodelPolicyWorker -c "import megatron.core" 2>/dev/null; then
     echo "✗ FAILED"
-    echo "ERROR: python-DTensorPolicyWorkerV2 can import megatron.core (should fail)"
+    echo "ERROR: python-AutomodelPolicyWorker can import megatron.core (should fail)"
     exit 1
 else
     echo "✓ OK (import failed as expected)"

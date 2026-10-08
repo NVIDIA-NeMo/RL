@@ -163,7 +163,7 @@ def test_context_parallel_rejected_for_dtensor_rm():
     config = MasterConfig.model_construct(
         **{
             "policy": {
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": True,
                     "context_parallel_size": 2,
                     "tensor_parallel_size": 1,
@@ -197,7 +197,7 @@ def test_context_parallel_allowed_when_one():
     config = MasterConfig.model_construct(
         **{
             "policy": {
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": True,
                     "context_parallel_size": 1,
                     "tensor_parallel_size": 1,

@@ -26,6 +26,7 @@ checkpointing:
   # Without a validation loop there is no val:accuracy to select on, and SC
   # rejects any metric_name outside the train: namespace.
   metric_name: null
+  save_data_plane: true
 
 policy:
   # The only thing on the SC path that takes the policy optimizer off the GPU,

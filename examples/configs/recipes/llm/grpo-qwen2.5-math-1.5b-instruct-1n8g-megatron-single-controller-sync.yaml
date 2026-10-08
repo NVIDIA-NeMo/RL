@@ -35,7 +35,7 @@ async_rl:
   max_buffered_rollouts: 32
 
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true
