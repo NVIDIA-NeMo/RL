@@ -699,9 +699,40 @@ class TestReviewFixes:
         assert rewards_of(results) == pytest.approx([1.0, 0.0, 0.0, 0.0])
         assert metrics["length_penalty/env_reward_mean"] == pytest.approx(0.75)
         assert metrics["length_penalty/reward_delta_mean"] == pytest.approx(-0.5)
-        assert metrics["length_penalty/wiped_correct_frac"] == pytest.approx(2 / 3)
+        assert metrics["length_penalty/wiped_correct_frac"] == pytest.approx(0.5)
         assert metrics["length_penalty/adjusted_frac"] == pytest.approx(0.5)
         assert metrics["length_penalty/skipped_non_binary_frac"] == 0.0
+
+    def test_metrics_match_batched_and_per_group(self):
+        # The async path applies the hook once per prompt group and averages
+        # the per-group metrics; the batched paths apply it once per batch.
+        # Every metric is a per-row mean so the two agree: here an all-wrong
+        # group plus a group with one wiped correct rollout.
+        def make_groups():
+            wrong = [make_result("1234567890", "1234567890", 0.0) for _ in range(4)]
+            mixed = [
+                make_result("1234", "1234", 1.0),
+                make_result("1234567890", "1234567890", 1.0),  # wiped
+                make_result("1234", "1234", 0.0),
+                make_result("1234", "1234", 0.0),
+            ]
+            for r in wrong + mixed:
+                r["profiled_rewards"] = [1, 1]
+                r["profiled_output_lengths"] = [10, 10]
+            return wrong, mixed
+
+        cfg = make_config(
+            default={"enabled": True, "profiled_length_penalty": 1.5}, num_gens=4
+        )
+        wrong, mixed = make_groups()
+        batched = apply(wrong + mixed, cfg)
+        wrong, mixed = make_groups()
+        per_group = [apply(wrong, cfg), apply(mixed, cfg)]
+        averaged = {
+            k: sum(m[k] for m in per_group) / len(per_group) for k in per_group[0]
+        }
+        assert batched == pytest.approx(averaged)
+        assert batched["length_penalty/wiped_correct_frac"] == pytest.approx(1 / 8)
 
     def test_nothing_enabled_returns_no_metrics(self):
         cfg = make_config(default={"enabled": False})

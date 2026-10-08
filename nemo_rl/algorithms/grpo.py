@@ -882,6 +882,9 @@ def setup(
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
+    _raise_if_length_penalty_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=enable_nemo_gym
+    )
     nemo_gym_actor = None
 
     def _spinup_nemo_gym(base_urls, model_name):
@@ -2288,6 +2291,26 @@ def _raise_if_reward_penalties_enabled_without_nemo_gym(
     raise ValueError(
         "reward_penalties require the NeMo-Gym path "
         "(env.should_use_nemo_gym=true); they are not supported with the native "
+        "generation path."
+    )
+
+
+def _raise_if_length_penalty_enabled_without_nemo_gym(
+    master_config: MasterConfig,
+    *,
+    enable_nemo_gym: bool,
+) -> None:
+    """Validate grpo.length_penalty is only used with NeMo-Gym.
+
+    The hook lives in the NeMo-Gym rollout postprocessor, so a native-path run
+    with the block set would train on unadjusted rewards without any error.
+    """
+    if enable_nemo_gym or master_config.grpo.length_penalty is None:
+        return
+
+    raise ValueError(
+        "grpo.length_penalty requires the NeMo-Gym path "
+        "(env.should_use_nemo_gym=true); it is not supported with the native "
         "generation path."
     )
 

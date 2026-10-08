@@ -224,10 +224,12 @@ def apply_group_length_penalties(
         tokenizer: Tokenizer for computing reasoning/answer token counts.
 
     Returns:
-        ``length_penalty/*`` rollout metrics: the pre-adjustment env reward
-        mean, the mean reward delta, the fraction of correct rollouts whose
-        reward was wiped to 0, the fraction of rows adjusted, and the fraction
-        of rows in groups skipped for non-binary or multi-component rewards.
+        ``length_penalty/*`` rollout metrics, all per-row means over
+        ``results`` (pre-adjustment env reward, reward delta, rollouts whose
+        correct reward was wiped to 0, rollouts adjusted, rollouts in groups
+        skipped for non-binary or multi-component rewards). Per-row so the
+        async path, which calls this once per prompt group and averages the
+        per-group values, reports the same numbers as the batched paths.
         Empty when the block enables nothing.
     """
     cfg = (
@@ -607,18 +609,18 @@ def apply_group_length_penalties(
     # Rollout metrics: the env reward is overwritten above, so these are the
     # only record of the pass rate and of how far the rewards moved.
     final_rewards = [r["full_result"]["reward"] for r in results]
-    correct = [i for i in range(n) if binary_ok[i] and original_rewards[i] > 0]
     return {
         "length_penalty/env_reward_mean": sum(original_rewards) / n,
         "length_penalty/reward_delta_mean": sum(
             f - o for f, o in zip(final_rewards, original_rewards)
         )
         / n,
-        "length_penalty/wiped_correct_frac": (
-            sum(1 for i in correct if final_rewards[i] <= 0.0) / len(correct)
-            if correct
-            else 0.0
-        ),
+        "length_penalty/wiped_correct_frac": sum(
+            1
+            for i in range(n)
+            if binary_ok[i] and original_rewards[i] > 0 and final_rewards[i] <= 0.0
+        )
+        / n,
         "length_penalty/adjusted_frac": sum(
             1 for f, o in zip(final_rewards, original_rewards) if f != o
         )

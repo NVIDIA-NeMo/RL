@@ -49,6 +49,7 @@ from nemo_rl.algorithms.grpo import (
     _initial_policy_generation_stale,
     _maybe_restore_async_replay_buffer_checkpoint,
     _needs_hf_refit_handshake,
+    _raise_if_length_penalty_enabled_without_nemo_gym,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
@@ -103,6 +104,7 @@ from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig, WandbConfig
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
@@ -916,6 +918,44 @@ def test_raise_if_reward_penalties_enabled_without_nemo_gym_allows_nemo_gym(
     )
 
     _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=True
+    )
+
+
+def test_raise_if_length_penalty_enabled_without_nemo_gym_noops_when_unset(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.length_penalty = None
+
+    _raise_if_length_penalty_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=False
+    )
+
+
+def test_raise_if_length_penalty_enabled_without_nemo_gym_raises(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.length_penalty = LengthPenaltyConfig.model_validate(
+        {"default": {"total_bonus": 0.1}}
+    )
+
+    with pytest.raises(ValueError, match="grpo.length_penalty requires the NeMo-Gym"):
+        _raise_if_length_penalty_enabled_without_nemo_gym(
+            master_config, enable_nemo_gym=False
+        )
+
+
+def test_raise_if_length_penalty_enabled_without_nemo_gym_allows_nemo_gym(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.length_penalty = LengthPenaltyConfig.model_validate(
+        {"default": {"total_bonus": 0.1}}
+    )
+
+    _raise_if_length_penalty_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=True
     )
 

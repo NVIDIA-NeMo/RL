@@ -1120,6 +1120,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
             ("reward_scaling", algo_cfg.reward_scaling.enabled),
             ("reward_shaping", algo_cfg.reward_shaping.enabled),
+            # getattr: PPO's config has no length_penalty field.
+            ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
         )
         if enabled
     ]

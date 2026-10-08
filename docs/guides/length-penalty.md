@@ -6,8 +6,11 @@ This guide documents the length-penalty and length-bonus algorithms implemented 
 They apply to NeMo-Gym GRPO **training** rollouts on the legacy driver (`grpo_train`), the
 data-plane driver (`grpo_train_sync`, `data_plane.enabled: true`) and the async
 `AsyncTrajectoryCollector`. Validation rollouts never apply them, so validation metrics stay on
-the raw environment reward. The SingleController path does not apply length penalties yet;
-support there is planned as a follow-up.
+the raw environment reward. The SingleController path does not apply length penalties yet:
+until that follow-up lands, a SingleController run with `grpo.length_penalty` set fails at
+startup with `NotImplementedError` (alongside the other unsupported shapers) rather than
+training on unadjusted rewards. Likewise the block requires the NeMo-Gym path: a run with
+`grpo.length_penalty` set and `env.should_use_nemo_gym` false is rejected at setup.
 
 Configure `grpo.length_penalty`. The block is typed (`LengthPenaltyConfig` in
 `nemo_rl/utils/length_penalty.py`): unknown keys, misspelled `length_type` / gate values, a
@@ -580,9 +583,13 @@ shapers' metrics (logged under `train/`):
 | --- | --- |
 | `length_penalty/env_reward_mean` | Mean environment reward before length adjustments (the pass rate for binary envs). |
 | `length_penalty/reward_delta_mean` | Mean `adjusted - env` reward over the rollouts. |
-| `length_penalty/wiped_correct_frac` | Fraction of correct rollouts whose reward the penalties clamped to 0. |
+| `length_penalty/wiped_correct_frac` | Fraction of rollouts that were correct and whose reward the penalties clamped to 0. |
 | `length_penalty/adjusted_frac` | Fraction of rollouts whose reward changed. |
 | `length_penalty/skipped_non_binary_frac` | Fraction of rollouts in groups skipped for non-binary or multi-component rewards. |
+
+All five are per-rollout means, so they read the same whether the hook sees the whole batch at
+once (legacy and data-plane drivers) or one prompt group at a time (async collector, whose
+per-group values are averaged).
 
 `total_reward` and the per-agent `<agent>/reward/*` metrics carry the adjusted reward. The reward
 as handed to the length hook (after effort shaping and reward penalties) is kept on the rollout
