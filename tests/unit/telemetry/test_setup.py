@@ -249,7 +249,7 @@ def test_process_attributes_name_the_provider_and_the_run(monkeypatch):
     id under this key would look populated and match nothing.
     """
     pytest.importorskip("nemo.lens")
-    from nemo.lens.resources.slurm import derive_nv_dl_run_uuid
+    from nemo.lens import derive_nv_dl_run_uuid
 
     monkeypatch.delenv("LOCAL_RANK", raising=False)
     attrs = _process_attributes(rank=0, world_size=1, run_id="job-7")
