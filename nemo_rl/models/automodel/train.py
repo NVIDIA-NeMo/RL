@@ -62,6 +62,7 @@ from nemo_rl.models.automodel.data import (
     filter_multimodal_kwargs_for_model,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 
 # Union type for any post-processing function
 PostProcessingFunction = Union[
@@ -386,7 +387,11 @@ def forward_with_post_processing_fn(
             sequence_dim=sequence_dim,
         )
         if isinstance(post_processing_fn, LogprobsPostProcessor):
-            metrics = {"logprobs": result}
+            logprobs_result, updated_token_mask = result
+            result = logprobs_result
+            metrics = {"logprobs": logprobs_result}
+            if updated_token_mask is not None:
+                metrics["token_mask"] = updated_token_mask
         else:
             vals, idx = result
             metrics = {"topk_logits": vals, "topk_indices": idx}
@@ -648,11 +653,14 @@ class LossPostProcessor:
         )
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
+            cu_seqlens_q_cpu = to_cpu_int_tuple(
+                processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            )
             loss_fn = SequencePackingLossWrapper(
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_loss_input_wrapped,
-                cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
-                cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
+                cu_seqlens_q=cu_seqlens_q_cpu,
+                cu_seqlens_q_padded=cu_seqlens_q_cpu,
             )
             loss, loss_metrics = loss_fn(
                 logits,
@@ -705,7 +713,7 @@ class LogprobsPostProcessor:
         *,
         cp_sharder: Optional[ContextParallelSharder],
         sequence_dim: int = 1,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Compute token log probabilities from logits.
 
         Args:
@@ -719,7 +727,9 @@ class LogprobsPostProcessor:
             sequence_dim: Sequence dimension
 
         Returns:
-            Token log probabilities tensor [batch_size, seq_length]
+            (token log probabilities tensor [batch_size, seq_length],
+             updated token_mask [batch_size, seq_length] with -inf positions zeroed,
+             or None when top-k/top-p filtering is disabled).
         """
         input_lengths = data_dict["input_lengths"]
 
@@ -767,11 +777,14 @@ class LogprobsPostProcessor:
                 dtype=token_logprobs.dtype,
                 device=token_logprobs.device,
             )
-            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            cu_seqlens_cpu = to_cpu_int_tuple(
+                processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            )
+            input_lengths_cpu = to_cpu_int_tuple(input_lengths)
             for i in range(original_batch_size):
-                start = cu_seqlens[i].item() + 1
-                end = cu_seqlens[i + 1].item()
-                seq_len_actual = input_lengths[i].item()
+                start = cu_seqlens_cpu[i] + 1
+                end = cu_seqlens_cpu[i + 1]
+                seq_len_actual = input_lengths_cpu[i]
                 unpacked_logprobs[i, 1:seq_len_actual] = token_logprobs[0, start:end]
             token_logprobs = unpacked_logprobs
         else:
@@ -788,13 +801,17 @@ class LogprobsPostProcessor:
             token_logprobs = token_logprobs * post_attention_mask
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
+        updated_token_mask: Optional[torch.Tensor] = None
         if need_top_k_or_top_p_filtering(self.sampling_params):
             mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
-            token_logprobs = mask_out_neg_inf_logprobs(
+            token_logprobs, finite_mask = mask_out_neg_inf_logprobs(
                 token_logprobs, mask, "prev_logprobs"
             )
+            updated_token_mask = (data_dict["token_mask"] * finite_mask).to(
+                data_dict["token_mask"].dtype
+            )
 
-        return token_logprobs
+        return token_logprobs, updated_token_mask
 
     def _compute_local_logprobs(
         self,
@@ -976,12 +993,15 @@ class TopkLogitsPostProcessor:
                 device=idx.device,
             )
 
-            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            cu_seqlens_cpu = to_cpu_int_tuple(
+                processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            )
+            input_lengths_cpu = to_cpu_int_tuple(input_lengths)
 
             for i in range(original_batch_size):
-                start = cu_seqlens[i].item()
-                end = cu_seqlens[i + 1].item()
-                seq_len_actual = input_lengths[i].item()
+                start = cu_seqlens_cpu[i]
+                end = cu_seqlens_cpu[i + 1]
+                seq_len_actual = input_lengths_cpu[i]
 
                 # Extract the corresponding portion from packed results
                 # Note: vals and idx are [1, packed_seq_len, k] due to packing
@@ -1066,7 +1086,7 @@ class FullLogitsPostProcessor:
                     "teacher context parallel size, but got "
                     f"sequence_length={full_seq_len}, cp_size={self.cp_size}. "
                     "Set the teacher's make_sequence_length_divisible_by to a "
-                    "multiple of its dtensor_cfg.context_parallel_size."
+                    "multiple of its automodel_cfg.context_parallel_size."
                 )
             local_len = full_seq_len // self.cp_size
             cp_rank = torch.distributed.get_rank(self.cp_mesh.get_group())
