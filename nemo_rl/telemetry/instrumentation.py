@@ -54,6 +54,9 @@ from nemo.lens import (
 from nemo.lens import (
     safe_set_span_attributes as _safe_set_span_attributes,
 )
+from nemo.lens import (
+    span_attributes as _span_attributes,
+)
 
 from nemo_rl.telemetry.span_groups import UMBRELLA_GROUP_VALUES, RLSpanGroup
 from nemo_rl.telemetry.vocabulary import (
@@ -72,6 +75,11 @@ RL_BUCKET_ATTR = "rl.bucket"
 # Raw efficiency-category label, so consumers can group idle time by cause
 # without parsing it back out of the span name.
 RL_EFFICIENCY_CATEGORY_ATTR = "rl.efficiency.category"
+
+# Training step the span belongs to, 1-based and counted across the whole run
+# rather than reset per epoch. Set once per step by :func:`iteration_scope`, so
+# a leaf does not have to be threaded the counter to be filterable by step.
+RL_ITERATION_ATTR = "rl.iteration"
 
 # Retry count for a wait that one span covers rather than one span per poll.
 # Without it the coalesced span's duration is unreadable: the same ten seconds
@@ -102,6 +110,7 @@ __all__ = [
     "accepts_trace_context",
     "TRACE_CARRIER_KWARG",
     "bucket_scope",
+    "iteration_scope",
     "per_prompt_scope",
     "in_per_prompt_scope",
     "efficiency_span",
@@ -111,6 +120,7 @@ __all__ = [
     "evaluate_span",
     "RL_EFFICIENCY_CATEGORY_ATTR",
     "RL_IDLE_POLLS_ATTR",
+    "RL_ITERATION_ATTR",
 ]
 
 
@@ -309,6 +319,31 @@ def bucket_scope(bucket: Bucket) -> Iterator[None]:
         yield
     finally:
         _BUCKET_OVERRIDE.reset(token)
+
+
+@contextmanager
+def iteration_scope(iteration: int) -> Iterator[None]:
+    """Stamp :data:`RL_ITERATION_ATTR` on every span opened inside this block.
+
+    Wrap a training step once and its whole subtree -- leaves, checkpointing,
+    rollout and generation spans -- becomes filterable by step. Threading the
+    counter into each call site instead leaves the answer to "what else was
+    happening in step 412" dependent on which sites remembered to pass it, and
+    silently excludes every span added afterwards.
+
+    A span that passes the attribute itself keeps its own value: lens applies
+    the scope in a span processor that skips keys already set. ``evaluate_span``
+    relies on that, since validation also runs once before training and reports
+    iteration 0 there.
+
+    Only spans from the provider lens builds are stamped, which is every span
+    NeMo-RL opens. Propagates like any :class:`~contextvars.ContextVar`: to
+    nested calls and to coroutines started inside the block, but not to raw
+    threads or other processes -- a worker's ``rl.policy.load_model`` is a root
+    span in another process and is outside any step besides.
+    """
+    with _span_attributes({RL_ITERATION_ATTR: iteration}):
+        yield
 
 
 # Marks a region as per-prompt work, for spans opened below the caller.

@@ -25,6 +25,7 @@ from nemo_rl.telemetry.instrumentation import (
     RL_BUCKET_ATTR,
     RL_EFFICIENCY_CATEGORY_ATTR,
     RL_IDLE_POLLS_ATTR,
+    RL_ITERATION_ATTR,
     TRACE_CARRIER_KWARG,
     UMBRELLA_GROUPS,
     Bucket,
@@ -37,12 +38,14 @@ from nemo_rl.telemetry.instrumentation import (
     efficiency_span,
     goodput_span_attributes,
     in_per_prompt_scope,
+    iteration_scope,
     managed_span,
     per_prompt_scope,
     remote_trace_context,
     start_efficiency_span,
     trace_context_kwargs,
     trace_fn,
+    umbrella_span,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 
@@ -1131,3 +1134,78 @@ def test_step_nests_under_job():
     step, job = spans["rl.grpo.step"], spans["rl.grpo.job"]
     assert step.parent is not None
     assert step.parent.span_id == job.context.span_id
+
+
+@requires_lens
+def test_iteration_scope_reaches_leaf_and_checkpoint_spans():
+    """The point of the scope: one filter selects a whole step.
+
+    Threading the counter per call site is what left the checkpoint spans and
+    most leaves untagged, so the assertion is deliberately about the spans that
+    never passed it themselves rather than about the step umbrella.
+    """
+    handle, exporter = _setup("all")
+    with iteration_scope(412):
+        with umbrella_span(RLSpanGroup.U_STEP, "rl.grpo.step", tracer=handle.tracer):
+            with managed_span(
+                RLSpanGroup.POLICY_UPDATE,
+                "rl.grpo.policy_training",
+                tracer=handle.tracer,
+            ):
+                pass
+            with managed_span(
+                RLSpanGroup.CHECKPOINT,
+                "rl.grpo.checkpointing",
+                tracer=handle.tracer,
+            ):
+                pass
+    handle.shutdown()
+
+    emitted = {s.name: s for s in exporter.get_finished_spans()}
+    assert set(emitted) == {
+        "rl.grpo.step",
+        "rl.grpo.policy_training",
+        "rl.grpo.checkpointing",
+    }
+    for span in emitted.values():
+        assert span.attributes[RL_ITERATION_ATTR] == 412
+
+
+@requires_lens
+def test_iteration_scope_does_not_override_an_explicit_value():
+    """``rl.<algo>.evaluate`` depends on this.
+
+    Validation also runs once before training, where it reports iteration 0. If
+    the scope overwrote what a span passed, a baseline validation that happened
+    to be called from inside a step would be renumbered into that step.
+    """
+    handle, exporter = _setup("all")
+    with iteration_scope(412):
+        with managed_span(
+            RLSpanGroup.CHECKPOINT,
+            "rl.grpo.checkpointing",
+            tracer=handle.tracer,
+            **{RL_ITERATION_ATTR: 0},
+        ):
+            pass
+    handle.shutdown()
+
+    (emitted,) = exporter.get_finished_spans()
+    assert emitted.attributes[RL_ITERATION_ATTR] == 0
+
+
+@requires_lens
+def test_iteration_scope_does_not_leak_past_the_step():
+    """``rl.<algo>.job`` outlives every step, so it must stay unstamped."""
+    handle, exporter = _setup("all")
+    with umbrella_span(RLSpanGroup.U_JOB, "rl.grpo.job", tracer=handle.tracer):
+        with iteration_scope(1):
+            pass
+        with managed_span(
+            RLSpanGroup.CHECKPOINT, "rl.grpo.checkpointing", tracer=handle.tracer
+        ):
+            pass
+    handle.shutdown()
+
+    for span in exporter.get_finished_spans():
+        assert RL_ITERATION_ATTR not in span.attributes

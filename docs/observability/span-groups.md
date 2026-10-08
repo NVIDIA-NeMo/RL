@@ -120,9 +120,8 @@ These are set on spans for filtering — they answer "which one?" / "what kind?"
 
 | Tag | Meaning |
 |---|---|
-| `rl.iteration` | training iteration index |
+| `rl.iteration` | training step index, 1-based and counted across the whole run rather than reset per epoch. Set once per step, so every span inside that step carries it — see [below](#rliteration-is-set-once-per-step) |
 | `rl.epoch` | epoch index (omitted on `rl.sc.step` — see below) |
-| `rl.step` | step index |
 | `rl.num_generations_per_prompt` | GRPO group size |
 | `rl.weight_version` / `rl.target_weight_version` | async rollout batch: the weights it generated from, and the training step it targets |
 | `rl.num_prompt_groups` | async rollout batch width, so a gap-filling batch is not read as an unexplained speed-up |
@@ -143,6 +142,30 @@ In the SingleController the rollout pump advances the epoch on its own clock, so
 the epoch counter at the time a train step runs describes how far *generation*
 has read into the dataset — not the epoch this step's batch came from. Use the
 rollout-side spans for that.
+
+### `rl.iteration` is set once per step
+
+Each algorithm opens its step inside
+`nemo_rl.telemetry.instrumentation.iteration_scope`, which stamps
+`rl.iteration` on every span started within it. So the step umbrella, the leaves
+under it, the checkpoint span and the rollout and generation spans all carry the
+same value, and `rl.iteration = 412` selects everything that happened in that
+step rather than the step span alone.
+
+A span that passes `rl.iteration` itself keeps its own value — the scope is
+applied by a span processor that skips keys already set. `rl.<algo>.evaluate`
+does exactly that, because validation also runs once before training starts,
+where it reports `rl.iteration = 0`: a sentinel for "no step has run yet".
+
+Two kinds of span are deliberately outside the scope. `rl.<algo>.job` wraps the
+whole run and belongs to no single step. `rl.sc.generate_and_push` runs on the
+rollout pump's own clock rather than the training loop's, so it carries
+`rl.target_step` — the step it is generating *for* — instead.
+
+The scope travels on a `ContextVar`, which reaches nested
+calls and coroutines but not raw threads or other processes. Worker-side spans
+such as `rl.policy.load_model` are therefore unstamped; they are model init, not
+step work, so they sit outside any step regardless.
 
 ### Span group → `rl.bucket`
 
