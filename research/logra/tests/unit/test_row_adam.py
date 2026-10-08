@@ -28,3 +28,16 @@ def test_first_step_scale_invariance_without_norm_restoration():
         sketch * 1e-3, torch.zeros(2, 1), step=1, beta2=0.95, epsilon=1e-12
     )
     torch.testing.assert_close(a, b)
+
+
+def test_inplace_direction_matches_out_of_place_and_reuses_storage():
+    sketch = torch.tensor([[1.0, 3.0], [2.0, 4.0], [0.5, -1.0]])
+    expected = row_adam_direction(
+        sketch.clone(), torch.zeros(3, 1), step=3, beta2=0.9, epsilon=1e-8
+    )
+    moment = torch.zeros(3, 1)
+    actual = row_adam_direction(
+        sketch, moment, step=3, beta2=0.9, epsilon=1e-8, inplace=True
+    )
+    assert actual is sketch
+    torch.testing.assert_close(actual, expected)

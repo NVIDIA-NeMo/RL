@@ -106,13 +106,27 @@ class _AccumulateSketch(torch.autograd.Function):
 
 @dataclass
 class SketchState:
-    """Per-layer state stored outside autograd and explicitly reduced by the trainer."""
+    """Per-layer state stored outside autograd and explicitly reduced by the trainer.
+
+    ``sketch`` is a ``[out_features, rank]`` view into one buffer shared by all
+    layers (see ``install_sketches``) so the trainer can reduce, scale and zero
+    every sketch with a single kernel or collective.
+    """
 
     name: str
     module: nn.Linear
     projection: Tensor
     sketch: Tensor
     handle: RemovableHandle | None
+    # Projection cast to the activation dtype, reused until the next refresh.
+    projection_cast: Tensor | None = None
+
+    def projection_as(self, dtype: torch.dtype) -> Tensor:
+        if dtype == self.projection.dtype:
+            return self.projection
+        if self.projection_cast is None or self.projection_cast.dtype != dtype:
+            self.projection_cast = self.projection.to(dtype)
+        return self.projection_cast
 
     def forward_hook(
         self, module: nn.Module, inputs: tuple[Tensor, ...], output: Tensor
@@ -125,7 +139,7 @@ class SketchState:
             activation = inputs[0]
             projected = (
                 activation.reshape(-1, activation.shape[-1])
-                @ self.projection.to(activation.dtype).T
+                @ self.projection_as(activation.dtype).T
             )
 
         return _AccumulateSketch.apply(output, projected, self.sketch)
@@ -137,6 +151,10 @@ def install_sketches(model: nn.Module, config: LoGRAConfig) -> list[SketchState]
     Supported initial scope is dense Hugging Face linear layers and non-reentrant
     activation checkpointing. Call before freezing unrelated parameters. A frozen
     embedding output must be made differentiable by the training integration.
+
+    All sketches live in one ``[total_out_features, rank]`` buffer; each layer's
+    ``sketch`` is a row-block view of it. The buffer is returned by
+    ``sketch_buffer`` for whole-buffer reductions.
     """
     selected = [
         (name, module)
@@ -150,33 +168,38 @@ def install_sketches(model: nn.Module, config: LoGRAConfig) -> list[SketchState]
             raise TypeError(
                 f"LoGRA requires nn.Linear targets, got {name}: {type(module)}"
             )
+    device = selected[0][1].weight.device
+    total_rows = sum(module.out_features for _, module in selected)
+    buffer = torch.zeros(total_rows, config.rank, device=device, dtype=torch.float32)
     states = []
+    row = 0
     for name, module in selected:
         weight = module.weight
+        if weight.device != device:
+            raise ValueError("LoGRA targets must share one device")
         projection = make_projection(
             config.rank,
             module.in_features,
             projection_seed(config.seed, 0, name),
-            device=weight.device,
+            device=device,
             dtype=torch.float32,
             distribution=config.distribution,
         )
         state = SketchState(
-            name,
-            module,
-            projection,
-            torch.zeros(
-                module.out_features,
-                config.rank,
-                device=weight.device,
-                dtype=torch.float32,
-            ),
-            None,
+            name, module, projection, buffer[row : row + module.out_features], None
         )
+        row += module.out_features
         weight.requires_grad_(False)
         state.handle = module.register_forward_hook(state.forward_hook)
         states.append(state)
     return states
+
+
+def sketch_buffer(states: list[SketchState]) -> Tensor:
+    """Return the shared buffer that every ``SketchState.sketch`` is a view of."""
+    base = states[0].sketch
+    total_rows = sum(state.sketch.shape[0] for state in states)
+    return base.as_strided((total_rows, base.shape[1]), base.stride())
 
 
 def local_weight_rows(weight: Tensor) -> tuple[Tensor, int]:

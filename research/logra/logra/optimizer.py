@@ -25,6 +25,7 @@ from logra.compression import (
     install_sketches,
     local_weight_rows,
     projection_seed,
+    sketch_buffer,
 )
 from logra.config import LoGRAConfig
 from logra.row_adam import row_adam_direction
@@ -68,20 +69,38 @@ class LoGRAOptimizer(torch.optim.Optimizer):
         self.update_count = 0
         self.ready = False
         self.projections_verified = False
+        # Every sketch is a row block of this buffer: one reduction, one scale,
+        # one zero per step regardless of the number of target layers.
+        self.sketches = sketch_buffer(self.layers)
+        # Shard geometry is fixed for the model's lifetime; resolve it once.
+        self.local_rows = [
+            local_weight_rows(layer.module.weight)[1] for layer in self.layers
+        ]
         super().__init__(
             [layer.module.weight for layer in self.layers],
             dict(lr=group["lr"], weight_decay=group["weight_decay"]),
         )
-        for layer in self.layers:
-            if config.optimizer == "row_adam":
-                self.state[layer.module.weight]["row_second_moment"] = torch.zeros(
-                    layer.module.out_features,
-                    1,
-                    device=layer.sketch.device,
-                    dtype=torch.float32,
-                )
+        self.row_second_moment: torch.Tensor | None = None
+        if config.optimizer == "row_adam":
+            # One moment per sketch row, laid out like the sketch buffer so the
+            # whole RowAdam update is a handful of row-wise kernels.
+            self.row_second_moment = torch.zeros(
+                self.sketches.shape[0], 1, device=self.sketches.device
+            )
+            self._link_row_moments()
         # The scheduler sees both groups; native AdamW retains its own parameter list.
         self.param_groups.extend(native.param_groups)
+
+    def _link_row_moments(self) -> None:
+        """Expose each layer's slice of the flat moments through the optimizer state."""
+        assert self.row_second_moment is not None
+        row = 0
+        for layer in self.layers:
+            rows = layer.module.out_features
+            self.state[layer.module.weight]["row_second_moment"] = (
+                self.row_second_moment[row : row + rows]
+            )
+            row += rows
 
     @staticmethod
     def _anchor(module, inputs, output):
@@ -92,8 +111,7 @@ class LoGRAOptimizer(torch.optim.Optimizer):
     def zero_grad(self, set_to_none: bool = True):
         super().zero_grad(set_to_none=set_to_none)
         self.native.zero_grad(set_to_none=set_to_none)
-        for layer in self.layers:
-            layer.sketch.zero_()
+        self.sketches.zero_()
         self.ready = False
 
     @torch.no_grad()
@@ -104,39 +122,39 @@ class LoGRAOptimizer(torch.optim.Optimizer):
         world = dist.get_world_size(process_group) if dist.is_initialized() else 1
         if world > 1 and not self.projections_verified:
             self._verify_shared_projections(process_group)
-        norm2 = torch.zeros(
-            (), device=self.layers[0].sketch.device, dtype=torch.float64
-        )
-        for layer in self.layers:
-            if world > 1:
-                dist.all_reduce(layer.sketch, group=process_group)
-                layer.sketch.div_(world)
-            local, offset = local_weight_rows(layer.module.weight)
-            # Bounded workspace rather than a full reconstructed gradient.
-            for start in range(0, local.shape[0], 256):
-                rows = layer.sketch[
-                    offset + start : offset + min(start + 256, local.shape[0])
-                ]
-                reconstructed = rows @ layer.projection
-                norm2.add_(reconstructed.double().square().sum())
-        for group in self.native.param_groups:
-            for parameter in group["params"]:
-                if parameter.grad is not None:
-                    grad, _ = local_weight_rows(parameter.grad)
-                    norm2.add_(grad.double().square().sum())
+        if world > 1:
+            dist.all_reduce(self.sketches, group=process_group)
+            self.sketches.div_(world)
+        # ||S A||^2 = <S (A A^T), S>: a rank x rank Gram matrix per layer instead
+        # of materialising the reconstructed gradient row block by row block.
+        partial = []
+        for layer, offset in zip(self.layers, self.local_rows):
+            local, _ = local_weight_rows(layer.module.weight)
+            rows = layer.sketch[offset : offset + local.shape[0]]
+            gram = layer.projection @ layer.projection.T
+            partial.append(((rows @ gram) * rows).sum())
+        native_grads = [
+            local_weight_rows(parameter.grad)[0]
+            for group in self.native.param_groups
+            for parameter in group["params"]
+            if parameter.grad is not None
+        ]
+        if native_grads:
+            partial.extend(torch._foreach_norm(native_grads))
+            partial[len(partial) - len(native_grads) :] = [
+                n.square() for n in partial[len(partial) - len(native_grads) :]
+            ]
+        norm2 = torch.stack(partial).sum()
         if world > 1:
             dist.all_reduce(norm2, group=process_group)
         norm = norm2.sqrt()
         if not torch.isfinite(norm):
             raise FloatingPointError("Nonfinite LoGRA gradient")
         if max_norm is not None:
-            scale = (max_norm / (norm + 1e-6)).clamp(max=1).float()
-            for layer in self.layers:
-                layer.sketch.mul_(scale)
-            for group in self.native.param_groups:
-                for parameter in group["params"]:
-                    if parameter.grad is not None:
-                        parameter.grad.mul_(scale)
+            scale = (max_norm / (norm + 1e-6)).clamp(max=1)
+            self.sketches.mul_(scale)
+            if native_grads:
+                torch._foreach_mul_(native_grads, scale)
         self.ready = True
         return norm.item()
 
@@ -169,25 +187,27 @@ class LoGRAOptimizer(torch.optim.Optimizer):
                 "Call synchronize_and_clip before step; closures are unsupported"
             )
         group = self.param_groups[0]
-        for layer in self.layers:
-            direction = layer.sketch
-            if self.config.optimizer == "row_adam":
-                moment = self.state[layer.module.weight]["row_second_moment"]
-                direction = row_adam_direction(
-                    direction,
-                    moment,
-                    step=self.update_count + 1,
-                    beta2=self.config.beta2,
-                    epsilon=self.config.epsilon,
-                )
-            local, offset = local_weight_rows(layer.module.weight)
-            local.mul_(1 - group["lr"] * group["weight_decay"])
-            for start in range(0, local.shape[0], 256):
-                stop = min(start + 256, local.shape[0])
-                local[start:stop].add_(
-                    direction[offset + start : offset + stop] @ layer.projection,
-                    alpha=-group["lr"],
-                )
+        if self.row_second_moment is not None:
+            # The sketch buffer is not needed after this step, so the direction
+            # overwrites it: one row-wise pass over every layer at once.
+            row_adam_direction(
+                self.sketches,
+                self.row_second_moment,
+                step=self.update_count + 1,
+                beta2=self.config.beta2,
+                epsilon=self.config.epsilon,
+                inplace=True,
+            )
+        decay = 1 - group["lr"] * group["weight_decay"]
+        for layer, offset in zip(self.layers, self.local_rows):
+            local, _ = local_weight_rows(layer.module.weight)
+            # W <- decay * W - lr * D_local @ A, written straight into the shard.
+            local.addmm_(
+                layer.sketch[offset : offset + local.shape[0]],
+                layer.projection,
+                beta=decay,
+                alpha=-group["lr"],
+            )
         self.native.step()
         self.update_count += 1
         self.ready = False
@@ -201,6 +221,7 @@ class LoGRAOptimizer(torch.optim.Optimizer):
                 projection_seed(self.config.seed, update, layer.name),
                 distribution=self.config.distribution,
             )
+            layer.projection_cast = None
 
     def state_dict(self) -> dict[str, Any]:
         return dict(
@@ -215,6 +236,17 @@ class LoGRAOptimizer(torch.optim.Optimizer):
         if state["config"] != self.config.model_dump():
             raise ValueError("LoGRA checkpoint configuration differs")
         super().load_state_dict(state["sketch_optimizer"])
+        if self.row_second_moment is not None:
+            # torch.optim replaces state tensors with copies; move the restored
+            # moments back into the flat buffer and re-expose the views.
+            for layer in self.layers:
+                restored = self.state[layer.module.weight]["row_second_moment"]
+                row = sum(
+                    other.module.out_features
+                    for other in self.layers[: self.layers.index(layer)]
+                )
+                self.row_second_moment[row : row + restored.shape[0]].copy_(restored)
+            self._link_row_moments()
         self.native.load_state_dict(state["native"])
         self.param_groups[1:] = self.native.param_groups
         self.update_count = state["update_count"]
