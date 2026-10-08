@@ -272,14 +272,6 @@ def validate_cross_tokenizer_mopd(master_config: Any) -> None:
     if not is_cross_tokenizer_mopd_enabled(master_config):
         return
 
-    if not is_opd_enabled(master_config):
-        raise ValueError(
-            "cross-tokenizer MOPD requires on_policy_distillation.enabled=true"
-        )
-    if not is_non_colocated_teachers_enabled(master_config):
-        raise ValueError(
-            "cross-tokenizer MOPD requires non_colocated_teachers.enabled=true"
-        )
     grpo_cfg = getattr(master_config, "grpo", None)
     async_cfg = getattr(grpo_cfg, "async_grpo", None)
     if async_cfg is None or not bool(getattr(async_cfg, "enabled", False)):
