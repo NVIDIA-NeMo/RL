@@ -13,7 +13,7 @@ ACTION = (
     "631c404d00a9e60afc591cd071d35d2e18f82fc6"
 )
 JOB_ID = "notify-nightly-failure"
-WEBHOOK = "SLACK_TEAM_CHANNEL_WEBHOOK"
+WEBHOOK = "SLACK_GITHUB_CI_WEBHOOK"
 EXPECTED_NEEDS = {
     "pre-flight",
     "ephemeral-runner-routing",
