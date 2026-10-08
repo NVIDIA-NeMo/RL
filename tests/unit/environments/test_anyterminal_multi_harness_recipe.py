@@ -129,7 +129,7 @@ def test_super_omni_anyterminal_recipe_resolves_training_topology():
     assert config["env"]["nemo_gym"]["anyterminal_opencode"][
         "responses_api_agents"
     ]["anyterminal_agent"]["agent_kwargs"] == {
-        "context_window": 16384,
+        "context_window": 15872,
         "max_input_tokens": 11776,
         "max_output_tokens": 4096,
     }
@@ -228,7 +228,7 @@ def test_nano_omni_sync_2n_debug_recipe_resolves_multi_harness_topology():
     assert config["env"]["nemo_gym"]["anyterminal_opencode"][
         "responses_api_agents"
     ]["anyterminal_agent"]["agent_kwargs"] == {
-        "context_window": 16384,
+        "context_window": 15872,
         "max_input_tokens": 7680,
         "max_output_tokens": 8192,
     }
