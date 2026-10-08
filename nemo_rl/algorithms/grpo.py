@@ -2455,6 +2455,88 @@ def _build_async_grpo_train_data(
     return train_data
 
 
+def _baseline_valid_mask(
+    repeated_batch: BatchedDataDict[DatumSpec], rewards: torch.Tensor
+) -> torch.Tensor:
+    """Return a ``[B]`` mask of the rows whose reward may vote in the group baseline/std.
+
+    Rows the environment flags with ``mask_sample`` and rows that already carry
+    ``loss_multiplier == 0`` contribute no loss, and their reward is not a valid
+    measurement of the policy. Counting them would bias their siblings' baseline
+    and make a group whose only reward variance comes from such a row look
+    non-uniform to dynamic sampling.
+
+    Call this before overlong filtering rewrites ``loss_multiplier`` so that
+    truncated (but otherwise valid) rollouts keep voting, as before.
+    """
+    valid_mask = torch.ones_like(rewards)
+    if "mask_sample" in repeated_batch:
+        mask_sample = repeated_batch["mask_sample"]
+        if isinstance(mask_sample, list):
+            mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
+        valid_mask[mask_sample.bool().to(valid_mask.device)] = 0
+    if "loss_multiplier" in repeated_batch:
+        loss_multiplier = repeated_batch["loss_multiplier"]
+        if isinstance(loss_multiplier, list):
+            loss_multiplier = torch.tensor(loss_multiplier)
+        valid_mask[(loss_multiplier == 0).to(valid_mask.device)] = 0
+    return valid_mask
+
+
+# Batch key carrying the ``[B, 1]`` prompt-group id of every row (see
+# ``_prompt_group_ids``). Kept in the batch so it follows rows through the
+# dynamic-sampling filter and cache.
+PROMPT_GROUP_IDS_KEY = "prompt_group_ids"
+
+# Stride between the group ids of consecutive generation batches of one step, so
+# groups cached by dynamic sampling never collide with groups of a later batch.
+_GROUP_ID_BATCH_STRIDE = 1 << 24
+
+
+def _prompt_group_ids(
+    num_rows: int, num_generations_per_prompt: int, batch_ordinal: int
+) -> torch.Tensor:
+    """Return a ``[B, 1]`` long tensor naming the prompt group of every row.
+
+    The repeated batch is ``batch.repeat_interleave(num_generations_per_prompt)``,
+    so rows ``[p * G, (p + 1) * G)`` were all generated from prompt ``p``, and
+    every rollout path returns rows in input order. Grouping by this position,
+    rather than by the prompt tokens read back from the rollout, keeps a group
+    intact when a multi-turn rollout returns a first message that differs from
+    its siblings' (e.g. agent harnesses that rewrite or compact the history).
+    Such a row used to become a singleton group with advantage 0 and shrink its
+    real group. ``batch_ordinal`` keeps the ids of different generation batches
+    of one step disjoint.
+    """
+    if num_generations_per_prompt <= 0 or num_rows % num_generations_per_prompt:
+        raise ValueError(
+            f"repeated batch of {num_rows} rows is not a whole number of prompt "
+            f"groups of {num_generations_per_prompt}"
+        )
+    num_prompts = num_rows // num_generations_per_prompt
+    return (
+        (batch_ordinal * _GROUP_ID_BATCH_STRIDE + torch.arange(num_prompts))
+        .repeat_interleave(num_generations_per_prompt)
+        .view(-1, 1)
+    )
+
+
+def _trajectory_group_ids(trajectories: list[dict[str, Any]]) -> torch.Tensor:
+    """Return a ``[B, 1]`` group id per row of concatenated per-prompt trajectories.
+
+    Each async replay-buffer entry holds the rollouts of exactly one prompt, so
+    the entry's position names its group without looking at prompt tokens.
+    """
+    if not trajectories:
+        return torch.empty((0, 1), dtype=torch.long)
+    return torch.cat(
+        [
+            torch.full((trajectory["batch"].size, 1), position, dtype=torch.long)
+            for position, trajectory in enumerate(trajectories)
+        ]
+    )
+
+
 def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
     """Zero loss_multiplier where mask_sample is True and return the count."""
     if "mask_sample" not in repeated_batch:
@@ -3169,6 +3251,13 @@ def _grpo_train_impl(
                             enabled=master_config.grpo.debug_payload_metrics,
                         )
                     )
+                    # Fix every row's prompt group before rollouts can rewrite
+                    # the first message; attached to the rollout batch below.
+                    prompt_group_ids = _prompt_group_ids(
+                        repeated_batch.size,
+                        master_config.grpo.num_generations_per_prompt,
+                        batch_ordinal=dynamic_sampling_num_gen_batches,
+                    )
                     # Convert LLMMessageLogType to FlatMessagesType for generation
                     batched_flat, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
@@ -3332,6 +3421,13 @@ def _grpo_train_impl(
                                 master_config.grpo.deduplicate_multimodal_data
                             ),
                         )
+                    # Every rollout path returns rows in input order.
+                    assert prompt_group_ids.shape[0] == repeated_batch.size, (
+                        f"rollout batch has {repeated_batch.size} rows but "
+                        f"{prompt_group_ids.shape[0]} prompt group ids were prepared"
+                    )
+                    repeated_batch[PROMPT_GROUP_IDS_KEY] = prompt_group_ids
+                    del prompt_group_ids
                     policy_generation.finish_generation()
                     # Collect generation logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each worker
@@ -3365,6 +3461,8 @@ def _grpo_train_impl(
                 ):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
+                    # Masked rows must not vote in the group baseline/std.
+                    valid_mask = _baseline_valid_mask(repeated_batch, rewards)
 
                     print("▶ Computing advantages...", flush=True)
                     # For DAPO with reward shaping, compute std on the raw
@@ -3380,9 +3478,9 @@ def _grpo_train_impl(
                     )
                     is_trivial_prompt_distribution = (
                         calculate_trivial_reward_distributions(
-                            input_ids,
+                            repeated_batch[PROMPT_GROUP_IDS_KEY],
                             std_rewards if std_rewards is not None else rewards,
-                            torch.ones_like(rewards),
+                            valid_mask,
                         )
                         if master_config.grpo.use_dynamic_sampling
                         else None
@@ -3396,9 +3494,9 @@ def _grpo_train_impl(
                             std,
                             _,
                         ) = calculate_baseline_and_std_per_prompt(
-                            input_ids.cuda(device_id),
+                            repeated_batch[PROMPT_GROUP_IDS_KEY].cuda(device_id),
                             rewards.cuda(device_id),
-                            torch.ones_like(rewards).cuda(device_id),
+                            valid_mask.cuda(device_id),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                             std_rewards=(
                                 std_rewards.cuda(device_id)
@@ -3414,9 +3512,9 @@ def _grpo_train_impl(
                             std,
                             _,
                         ) = calculate_baseline_and_std_per_prompt(
-                            input_ids,
+                            repeated_batch[PROMPT_GROUP_IDS_KEY],
                             rewards,
-                            torch.ones_like(rewards),
+                            valid_mask,
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                             std_rewards=std_rewards,
                         )
@@ -3460,23 +3558,17 @@ def _grpo_train_impl(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Must precede prompt extraction: it reuses the same message
-                    # dicts, so this also protects the prompt flatten below.
+                    # Must precede the training flatten below: it reuses the same
+                    # message dicts.
                     backfill_missing_routed_experts(repeated_batch["message_log"])
 
-                    # Extract original prompt messages using the length field
-                    # This correctly handles multi-turn prompts that contain assistant messages
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
-                    )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
+                    # Group advantages by prompt group (carried through the
+                    # dynamic-sampling filter/cache), not by prompt tokens.
+                    prompt_ids_for_adv = repeated_batch[PROMPT_GROUP_IDS_KEY]
+                    # Recompute on the (possibly dynamic-sampling filtered) batch,
+                    # before overlong filtering rewrites loss_multiplier.
+                    baseline_valid_mask = _baseline_valid_mask(repeated_batch, rewards)
+                    del valid_mask
                     del input_ids
                     del baseline
                     del std
@@ -3679,8 +3771,10 @@ def _grpo_train_impl(
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
+                        valid_mask=baseline_valid_mask,
                     )
                     del prompt_ids_for_adv
+                    del baseline_valid_mask
 
                     # Log rewards and advantages information
                     _log_mixed_rewards_and_advantages_information(
@@ -5291,26 +5385,22 @@ def async_grpo_train(
                         RLSpanGroup.REWARD, "rl.grpo.reward_calculation", tracer=_tracer
                     ),
                 ):
-                    # Must precede prompt extraction: it reuses the same message
-                    # dicts, so this also protects the prompt flatten below.
+                    # Must precede the training flatten below: it reuses the same
+                    # message dicts.
                     backfill_missing_routed_experts(repeated_batch["message_log"])
 
-                    # Extract original prompt messages using the length field
-                    # This correctly handles multi-turn prompts that contain assistant messages
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
+                    # One buffer entry is one prompt group: group advantages by
+                    # entry, not by prompt tokens.
+                    prompt_ids_for_adv = _trajectory_group_ids(trajectories)
+                    assert prompt_ids_for_adv.shape[0] == repeated_batch.size, (
+                        f"training batch has {repeated_batch.size} rows but the "
+                        f"sampled groups account for {prompt_ids_for_adv.shape[0]}"
                     )
-
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
+                    # Masked rows must not vote in the group baseline. Taken
+                    # before overlong filtering rewrites loss_multiplier.
+                    baseline_valid_mask = _baseline_valid_mask(repeated_batch, rewards)
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
@@ -5484,6 +5574,7 @@ def async_grpo_train(
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
+                        valid_mask=baseline_valid_mask,
                         # OPD kwargs (ignored by non-OPD estimators via **kwargs)
                         teacher_logprobs=trajectory_teacher_logprobs.to(
                             train_data["prev_logprobs"].device
@@ -5500,6 +5591,7 @@ def async_grpo_train(
                     ):
                         rollout_metrics.update(adv_estimator.last_metrics)
                     del prompt_ids_for_adv
+                    del baseline_valid_mask
 
                     # Log advantages stats
                     # Note: For GRPOAdvantageEstimator with normalize_rewards=True, these are
