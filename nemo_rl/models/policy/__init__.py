@@ -16,6 +16,10 @@ from typing import Any, Literal, NotRequired, TypedDict, Union, cast
 
 from pydantic import BaseModel, StrictBool, StrictInt
 
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
@@ -276,7 +280,7 @@ class SharedPrefixTrainingConfig(BaseModel, extra="allow"):
     preserve_training_prefixes_during_alignment: StrictBool = False
     """Experimental shared reconstruction of expanded-budget training splits."""
     bypass_evaluation_mtp: StrictBool = False
-    """Skip HybridModel MTP uniformly in policy logprobs; restore for training."""
+    """Skip HybridModel MTP in logprobs; requires shared execution or dense control."""
     uniform_router_gating: StrictBool = False
     """Use MCore's fixed router row blocks in all policy forwards and backwards.
 
@@ -865,12 +869,35 @@ def validate_shared_prefix_training_config(
         raise ValueError(
             "uniform_router_gating requires logprobs or train mode, or explicit dense control"
         )
+    if (
+        shared_prefix_config.bypass_evaluation_mtp
+        and shared_prefix_config.mode != "dense"
+        and not shared_prefix_config.enabled_for(stage="logprobs")
+    ):
+        raise ValueError(
+            "bypass_evaluation_mtp requires logprobs or train mode, or explicit dense control"
+        )
     if shared_prefix_config.mode == "dense":
         megatron_config = config.get("megatron_cfg")
         if megatron_config is None or not megatron_config["enabled"]:
             raise ValueError("dense comparison control requires the Megatron backend")
     if not shared_prefix_config.enabled_for(stage="logprobs"):
         return shared_prefix_config
+
+    generation_config = config.get("generation")
+    if generation_config is not None and need_top_k_or_top_p_filtering(
+        TrainingSamplingParams(
+            top_k=generation_config["top_k"],
+            top_p=generation_config["top_p"],
+            temperature=generation_config["temperature"],
+        )
+    ):
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} "
+            "does not support top-k/top-p filtering. Set "
+            "policy.generation.top_p=1.0 and policy.generation.top_k to "
+            "null, 0, or -1; temperature scaling remains supported."
+        )
 
     if (
         shared_prefix_config.preserve_training_prefixes_during_alignment

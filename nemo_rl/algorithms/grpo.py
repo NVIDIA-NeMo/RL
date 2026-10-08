@@ -141,7 +141,7 @@ from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import PolicyConfig, get_shared_prefix_training_config
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -588,6 +588,17 @@ def setup(
             logger, checkpointer, grpo_save_state, master_config,
             teacher_worker_groups, alias_to_group_alias.
     """
+    if get_shared_prefix_training_config(master_config.policy).enabled_for(
+        stage="logprobs"
+    ):
+        raise ValueError(
+            "Shared-prefix execution requires the SingleController GRPO path "
+            "with data_plane.enabled=true and token_capture.enabled=true. "
+            "The standard GRPO setup does not produce shared-prefix group IDs "
+            "or prompt lengths. Use examples/run_grpo_single_controller.py or set "
+            "policy.shared_prefix_training.mode=disabled."
+        )
+
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
 
