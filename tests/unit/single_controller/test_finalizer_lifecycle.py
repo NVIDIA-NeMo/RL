@@ -32,7 +32,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.opd import TQTeacherLogprobCoordinator
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 from nemo_rl.experience.route_plan import (
@@ -171,12 +171,15 @@ def test_captured_group_waits_for_teacher_before_readiness_or_cleanup(
     """Exercise the real controller -> buffer -> teacher coordinator boundary."""
 
     async def exercise() -> None:
+        # The finalizer publishes the group's rollout metrics on its meta.
+        group_metrics = {"total_tokens_per_sample/mean": 3.0, "truncation_rate": 0.0}
         meta = KVBatchMeta(
             partition_id="canonical",
             task_name="train",
             sample_ids=["group_g0"],
             fields=["input_ids", "input_lengths"],
             sequence_lengths=[3],
+            extra_info={ROLLOUT_METRICS: [group_metrics]},
             tags=[{"weight_version": 3}],
         )
         result = FinalizedGroup(
@@ -259,6 +262,8 @@ def test_captured_group_waits_for_teacher_before_readiness_or_cleanup(
                     *meta.fields,
                     "teacher_reference_logprobs",
                 ]
+                # Teacher enrichment keeps them for the train pump's step metrics.
+                assert committed_meta.extra_info[ROLLOUT_METRICS] == [group_metrics]
                 assert teacher_writes == ["group_g0"]
                 assert ctrl._dp_client.clear_calls == []
                 ctrl._rollout_recovery_ledger.discard_group.assert_called_once()

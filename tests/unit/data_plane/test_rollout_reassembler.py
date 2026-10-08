@@ -44,6 +44,7 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
 )
 
 from nemo_rl.data_plane.schema import (  # noqa: E402
+    ROLLOUT_METRICS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
 )
@@ -379,6 +380,98 @@ def test_finalize_group_reports_valid_and_total_row_counts(tq_client, partitions
     rows = _fetch_rows(tq_client, rollout_ids)
     sample_mask = torch.as_tensor(rows["sample_mask"]).flatten()
     assert sample_mask.tolist() == [0.0, 0.0]  # published as placeholders, not dropped
+
+
+def test_finalize_group_publishes_canonical_rollout_metrics(tq_client, partitions):
+    """Token, turn and truncation metrics are measured on the canonical rows.
+
+    worked_example is a two-call chain (7 tokens, 4 generated, 2 per call),
+    single_call one call (4 tokens, 2 generated); the third rollout lost its
+    receipt. max_seq_len is pinned to the two-call row's length, so that row
+    is the truncated one.
+    """
+    group_id = "grp_metrics"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1", f"{group_id}_g2"]
+    two_call, two_call_row = _stage_fixture(
+        tq_client, "worked_example", rollout_id=rollout_ids[0]
+    )
+    one_call, one_call_row = _stage_fixture(
+        tq_client, "single_call", rollout_id=rollout_ids[1]
+    )
+    assert (len(two_call_row.token_ids), sum(two_call_row.token_mask)) == (7, 4)
+    assert (len(one_call_row.token_ids), sum(one_call_row.token_mask)) == (4, 2)
+    finalizer = _finalizer(tq_client, max_seq_len=len(two_call_row.token_ids))
+
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        [two_call, one_call, None],
+        [1.0, 0.5, 0.0],
+        mask_sample=[False] * 3,
+        fallback_weight_version=3,
+        prompt_idx=17,
+        rollout_metrics={
+            "agent/pass_rate/mean": 0.75,
+            "timing/rollout/total": 2.0,
+            # A dispatcher value for a row-measured key loses to the rows.
+            "total_tokens_per_sample/mean": 999.0,
+        },
+        metrics_namespace="agent",
+    )
+
+    assert finalized.meta is not None
+    [metrics] = finalized.meta.extra_info[ROLLOUT_METRICS]
+    # Rewards cover every rollout, the placeholder included.
+    assert metrics["total_reward/histogram"] == [1.0, 0.5, 0.0]
+    assert metrics["total_reward/mean"] == pytest.approx(0.5)
+    # Rows that verified: turns are model calls on the trained chain.
+    assert metrics["turns_per_sample/histogram"] == [2, 1]
+    assert metrics["turns_per_sample/mean"] == pytest.approx(1.5)
+    assert metrics["total_tokens_per_sample/histogram"] == [7, 4]
+    assert metrics["total_tokens_per_sample/mean"] == pytest.approx(5.5)
+    assert metrics["gen_tokens_per_sample/histogram"] == [4, 2]
+    assert metrics["gen_tokens_per_sample/mean"] == pytest.approx(3.0)
+    assert metrics["mean_gen_tokens_per_sample"] == pytest.approx(3.0)
+    assert metrics["max_gen_tokens_per_turn/histogram"] == [2, 2]
+    assert metrics["truncation_rate"] == pytest.approx(0.5)
+    assert metrics["natural_termination_rate"] == pytest.approx(0.5)
+    assert metrics["agent/truncation_rate"] == pytest.approx(0.5)
+    assert metrics["agent/total_tokens_per_sample/mean"] == pytest.approx(5.5)
+    assert metrics["agent/gen_tokens_per_sample/mean"] == pytest.approx(3.0)
+    # Dispatcher metrics ride along.
+    assert metrics["agent/pass_rate/mean"] == pytest.approx(0.75)
+    assert metrics["timing/rollout/total"] == pytest.approx(2.0)
+    # The truncation metric agrees with the published column on valid rows.
+    rows = _fetch_rows(tq_client, rollout_ids)
+    assert torch.as_tensor(rows["truncated"]).flatten().tolist() == [
+        True,
+        False,
+        False,
+    ]
+
+
+def test_all_placeholder_group_reports_rewards_only(tq_client, partitions):
+    group_id = "grp_metrics_empty"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+
+    finalized = _finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [None, None],
+        [0.0, 1.0],
+        mask_sample=[False] * 2,
+        fallback_weight_version=3,
+        prompt_idx=17,
+        rollout_metrics={"timing/rollout/total": 2.0},
+        metrics_namespace="agent",
+    )
+
+    assert finalized.meta is not None
+    [metrics] = finalized.meta.extra_info[ROLLOUT_METRICS]
+    assert metrics["total_reward/mean"] == pytest.approx(0.5)
+    assert metrics["timing/rollout/total"] == pytest.approx(2.0)
+    assert not [key for key in metrics if "tokens" in key or "truncation" in key]
+    assert "turns_per_sample/mean" not in metrics
 
 
 # ---------------------------------------------------------------------------
