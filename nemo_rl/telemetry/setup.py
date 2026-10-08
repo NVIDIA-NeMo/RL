@@ -40,6 +40,7 @@ the import path of modules that never emit anything.
 from __future__ import annotations
 
 import functools
+import importlib.metadata
 import logging
 import os
 import threading
@@ -101,6 +102,19 @@ _CAMPAIGN_STAGE_ENV = f"{_OTEL_PREFIX}_CAMPAIGN_STAGE"
 def _campaign_stage(algorithm: str) -> str:
     """Lifecycle stage for *algorithm*; :data:`_DEFAULT_CAMPAIGN_STAGE` if unknown."""
     return _CAMPAIGN_STAGE_BY_ALGORITHM.get(algorithm, _DEFAULT_CAMPAIGN_STAGE)
+
+
+# An algorithm whose settings live under a differently named config section.
+# ``run_sft_v2.py`` reports itself as ``sft_v2`` while reading ``master_config
+# .sft``, so looking its settings up by algorithm name finds nothing. Mapped
+# rather than renamed because the name is also reported as ``rl.algorithm``,
+# where the two implementations do need telling apart.
+_CONFIG_SECTION_BY_ALGORITHM = {"sft_v2": "sft"}
+
+
+def _config_section(algorithm: str) -> str:
+    """Config section holding *algorithm*'s settings; its own name by default."""
+    return _CONFIG_SECTION_BY_ALGORITHM.get(algorithm, algorithm)
 
 
 # TelemetryConfig field -> NEMO_RL_OTEL_* env var. ``service_name`` maps to the
@@ -220,71 +234,57 @@ def _build_resource_attributes(
     return attrs
 
 
+def _megatron_enabled(master_config: Any) -> bool:
+    """Whether the policy trains on Megatron rather than Automodel.
+
+    Every example config carries both backend blocks fully populated, and only
+    the enabled one describes the run. So the other's values have to be ignored
+    rather than read as a fallback: ``dpo.yaml`` ships a disabled
+    ``megatron_cfg`` saying tp 2 beside the Automodel tp 1 it actually uses.
+    """
+    return bool(_dig(master_config, "policy", "megatron_cfg", "enabled"))
+
+
 def _topology_attributes(master_config: Any) -> dict[str, Any]:
     """Parallelism sizes, under lens's resource-scoped topology keys.
 
-    ``nv.dl.topology.size.*`` rather than the ``dl.tensor_parallel.size`` family:
-    only the former is in lens's ``DL_RESOURCE_TYPES``, which is the registry
-    ``normalize_resource_attributes`` types a resource attribute against. The
-    ``dl.*`` spelling is the span and metric one.
+    ``nv.dl.topology.size.*`` rather than the ``dl.tensor_parallel.size``
+    family: only the former is in lens's ``DL_RESOURCE_TYPES``, which feeds the
+    ``RESOURCE_TYPES`` table ``normalize_resource_attributes`` consults. A key
+    outside that table is passed through rather than rejected, so the ``dl.*``
+    spelling would survive but arrive as an untyped string -- it is the span
+    and metric spelling, not the resource one.
 
-    Each size lives under whichever policy backend is active, so each is looked
-    up under both megatron and automodel. Only the current spelling of the
-    latter: ``check_outdated_config`` rejects a config still saying
-    ``dtensor_cfg`` before a run reaches here.
+    Read from the enabled backend alone, under that backend's own spelling: the
+    two disagree on names as well as values, and Automodel has no pipeline
+    dimension to report at all.
+
+    No ``nv.dl.topology.size.dp``, though lens defines it. RL configures no
+    data-parallel size, so it could only be derived from the cluster's GPU
+    count, and that assumes the policy owns every one of them. A reward model,
+    distillation teachers, expert parallelism and non-colocated generation each
+    break the assumption in a way that reports a dp too high rather than
+    failing, so there is nothing to report instead of a plausible wrong number.
     """
-    from nemo.lens.semconv import (
-        NV_DL_TOPOLOGY_SIZE_DP,
-        NV_DL_TOPOLOGY_SIZE_PP,
-        NV_DL_TOPOLOGY_SIZE_TP,
-    )
+    from nemo.lens.semconv import NV_DL_TOPOLOGY_SIZE_PP, NV_DL_TOPOLOGY_SIZE_TP
 
-    tp = _dig(
-        master_config, "policy", "megatron_cfg", "tensor_model_parallel_size"
-    ) or _dig(master_config, "policy", "automodel_cfg", "tensor_parallel_size")
-    pp = _dig(master_config, "policy", "megatron_cfg", "pipeline_model_parallel_size")
-    cp = _dig(master_config, "policy", "megatron_cfg", "context_parallel_size") or _dig(
-        master_config, "policy", "automodel_cfg", "context_parallel_size"
-    )
+    if _megatron_enabled(master_config):
+        tp = _dig(master_config, "policy", "megatron_cfg", "tensor_model_parallel_size")
+        pp = _dig(
+            master_config, "policy", "megatron_cfg", "pipeline_model_parallel_size"
+        )
+    else:
+        # Only the current spelling: ``check_outdated_config`` rejects a config
+        # still saying ``dtensor_cfg`` before a run reaches here.
+        tp = _dig(master_config, "policy", "automodel_cfg", "tensor_parallel_size")
+        pp = None
 
     attrs: dict[str, Any] = {}
     if tp:
         attrs[NV_DL_TOPOLOGY_SIZE_TP] = tp
     if pp:
         attrs[NV_DL_TOPOLOGY_SIZE_PP] = pp
-    dp = _data_parallel_size(master_config, tp=tp or 1, pp=pp or 1, cp=cp or 1)
-    if dp:
-        attrs[NV_DL_TOPOLOGY_SIZE_DP] = dp
     return attrs
-
-
-def _data_parallel_size(
-    master_config: Any, *, tp: int, pp: int, cp: int
-) -> Optional[int]:
-    """The ranks left for data parallelism once tp, pp and cp have claimed theirs.
-
-    Derived rather than read: RL configures no dp size. Training spans the
-    cluster's GPUs and dp is whatever the other dimensions leave over.
-
-    That identity breaks when generation runs on dedicated GPUs, because the
-    cluster then holds ranks the policy does not have. Returns ``None`` there,
-    rather than reporting a dp size for a group that is smaller than the
-    arithmetic says. Also ``None`` when the product does not divide the world
-    size, which the policy worker rejects with a far better message than a
-    resource attribute could carry.
-    """
-    if _dig(master_config, "policy", "generation", "colocated", "enabled") is False:
-        return None
-    nodes = _dig(master_config, "cluster", "num_nodes")
-    gpus_per_node = _dig(master_config, "cluster", "gpus_per_node")
-    if not nodes or not gpus_per_node:
-        return None
-
-    world_size = nodes * gpus_per_node
-    model_parallel_size = tp * pp * cp
-    if world_size % model_parallel_size:
-        return None
-    return world_size // model_parallel_size
 
 
 def _training_config_attributes(master_config: Any, algorithm: str) -> dict[str, Any]:
@@ -312,29 +312,32 @@ def _training_config_attributes(master_config: Any, algorithm: str) -> dict[str,
         if value:
             attrs[key] = value
 
-    # Two spellings, one per backend: megatron names the algorithm ("adam"),
-    # dtensor names the class ("torch.optim.AdamW").
-    optimizer = _dig(
-        master_config, "policy", "megatron_cfg", "optimizer", "optimizer"
-    ) or _dig(master_config, "policy", "optimizer", "name")
+    # Each backend keeps its optimizer somewhere else and spells it differently:
+    # megatron names the algorithm ("adam") inside its own block, Automodel
+    # names the class ("torch.optim.AdamW") in the policy's. Reading whichever
+    # is non-empty would report the disabled backend's answer.
+    if _megatron_enabled(master_config):
+        optimizer = _dig(
+            master_config, "policy", "megatron_cfg", "optimizer", "optimizer"
+        )
+        # Gated on activation checkpointing because megatron ignores the
+        # granularity without it, so reporting it would describe recompute that
+        # is not happening.
+        if _dig(master_config, "policy", "megatron_cfg", "activation_checkpointing"):
+            granularity = _dig(
+                master_config, "policy", "megatron_cfg", "recompute_granularity"
+            )
+            if granularity:
+                attrs[NV_DL_TRAINING_CONFIG_RECOMPUTE_GRANULARITY] = granularity
+    else:
+        optimizer = _dig(master_config, "policy", "optimizer", "name")
     if optimizer:
         attrs[NV_DL_TRAINING_CONFIG_OPTIMIZER] = optimizer
 
-    # Gated on activation checkpointing because megatron ignores the
-    # granularity without it, so reporting it would describe recompute that is
-    # not happening.
-    if _dig(master_config, "policy", "megatron_cfg", "activation_checkpointing"):
-        granularity = _dig(
-            master_config, "policy", "megatron_cfg", "recompute_granularity"
-        )
-        if granularity:
-            attrs[NV_DL_TRAINING_CONFIG_RECOMPUTE_GRANULARITY] = granularity
-
-    # The algorithm's own config section is named after it (``grpo:``, ``sft:``).
     # Non-positive values are dropped rather than reported: ``rm`` spells "train
     # for one epoch" as ``max_num_steps: -1``, which downstream would otherwise
     # read as a target of -1 iterations.
-    max_num_steps = _dig(master_config, algorithm, "max_num_steps")
+    max_num_steps = _dig(master_config, _config_section(algorithm), "max_num_steps")
     if isinstance(max_num_steps, int) and max_num_steps > 0:
         attrs[NV_DL_TRAINING_TARGET_TRAIN_ITERS] = max_num_steps
     return attrs
@@ -344,9 +347,12 @@ def _software_versions() -> dict[str, Any]:
     """Library versions as actually loaded in this process.
 
     The lockfile says what was meant to be installed; these say what the run
-    imported, which is the pair worth comparing when a run regresses after an
-    image rebuild. Every lookup is optional: CUDA and NCCL are absent from a
-    CPU-only build, and transformer-engine is not installed for every backend.
+    actually has, which is the pair worth comparing when a run regresses after
+    an image rebuild. Torch and what it was built against are read from the
+    imported module, transformer-engine from its distribution metadata -- see
+    below for why that one is not imported. Every lookup is optional: CUDA and
+    NCCL are absent from a CPU-only build, and transformer-engine is not
+    installed for every backend.
     """
     from nemo.lens.semconv import (
         NV_DL_SOFTWARE_CUDA,
@@ -375,14 +381,17 @@ def _software_versions() -> dict[str, Any]:
     else:
         attrs[NV_DL_SOFTWARE_NCCL] = ".".join(str(part) for part in nccl_version)
 
+    # Read from the installed distribution's metadata rather than by importing
+    # the package. Importing transformer-engine pulls in its PyTorch extension,
+    # which is seconds of work and a chunk of memory in every process that sets
+    # up telemetry, and which raises ``OSError`` rather than ``ImportError``
+    # when the shared library will not load against the driver present.
     try:
-        import transformer_engine
-    except ImportError:
+        te_version = importlib.metadata.version("transformer-engine")
+    except importlib.metadata.PackageNotFoundError:
         pass
     else:
-        te_version = getattr(transformer_engine, "__version__", "")
-        if te_version:
-            attrs[NV_DL_SOFTWARE_TRANSFORMER_ENGINE] = str(te_version)
+        attrs[NV_DL_SOFTWARE_TRANSFORMER_ENGINE] = te_version
     return attrs
 
 
@@ -398,13 +407,16 @@ def _process_attributes(rank: int, world_size: int, run_id: str = "") -> dict[st
 
     Passing rank at all is what keeps that filter available; lens warns when
     ``nv.dl.rank`` is missing, because without it a process cannot be told
-    apart from its peers downstream. ``nv.dl.local_rank`` narrows that to a
-    device on one node, which is what a reader has when the complaint came from
-    ``nvidia-smi`` rather than from the job.
+    apart from its peers downstream. ``nv.dl.local_rank`` adds its position
+    within its own node, which is what groups a job's processes by the host
+    they share. It is not a physical device index: Ray gives each worker its
+    own ``CUDA_VISIBLE_DEVICES``, so local rank 0 is whichever GPU that worker
+    was placed on.
 
     Called by both entry points, since a resource is per process and neither
     path sees the other's.
     """
+    from nemo.lens.resources.slurm import derive_nv_dl_run_uuid
     from nemo.lens.semconv import (
         NV_DL_LOCAL_RANK,
         NV_DL_PROVIDER_NAME,
@@ -423,11 +435,15 @@ def _process_attributes(rank: int, world_size: int, run_id: str = "") -> dict[st
     local_rank = os.environ.get("LOCAL_RANK", "").strip()
     if local_rank.isdigit():
         attrs[NV_DL_LOCAL_RANK] = int(local_rank)
-    # Duplicates lens's own ``nemo.run.id`` by design: the two namespaces are
-    # read by different consumers, and a backend joining RL runs to Megatron
-    # ones groups on the ``nv.dl.*`` spelling.
-    if run_id:
-        attrs[NV_DL_RUN_UUID] = run_id
+    # Derived rather than set to ``run_id`` itself, which is already reported
+    # as lens's ``nemo.run.id``. ``nv.dl.run.uuid`` is a uuid5 over the
+    # scheduler's identity for this attempt, and a backend grouping RL runs
+    # with Megatron ones joins on that; a raw run id in the same key would
+    # match nothing. Returns None off a scheduler with no run id to fall back
+    # on, which cannot happen here but is handled rather than asserted.
+    run_uuid = derive_nv_dl_run_uuid(run_id=run_id) if run_id else None
+    if run_uuid:
+        attrs[NV_DL_RUN_UUID] = run_uuid
     attrs.update(_software_versions())
     return attrs
 

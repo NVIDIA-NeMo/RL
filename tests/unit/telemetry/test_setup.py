@@ -16,7 +16,6 @@ from pydantic import ValidationError
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.setup import (
     _build_resource_attributes,
-    _data_parallel_size,
     _dig,
     _process_attributes,
     _training_config_attributes,
@@ -39,6 +38,7 @@ class _FakeMasterConfig:
             "model_name": "org/Model-1B",
             "precision": "bfloat16",
             "megatron_cfg": {
+                "enabled": True,
                 "tensor_model_parallel_size": 2,
                 "pipeline_model_parallel_size": 1,
             },
@@ -85,7 +85,7 @@ def test_build_resource_attributes_automodel_tp():
         policy={
             "model_name": "org/Model-1B",
             "precision": "bfloat16",
-            "automodel_cfg": {"tensor_parallel_size": 4},
+            "automodel_cfg": {"enabled": True, "tensor_parallel_size": 4},
         }
     )
     attrs = _build_resource_attributes(cfg, "grpo")
@@ -93,13 +93,60 @@ def test_build_resource_attributes_automodel_tp():
     assert "nv.dl.topology.size.pp" not in attrs
 
 
+def test_the_disabled_backends_settings_are_never_reported():
+    """Every example config carries both backend blocks fully populated.
+
+    ``dpo.yaml`` is the live case: a disabled ``megatron_cfg`` saying tp 2 and
+    optimizer adam, beside the Automodel tp 1 and AdamW the run really uses.
+    Reading whichever value is non-empty picks the disabled block, and the
+    result is wrong rather than missing -- a plausible topology nobody ran.
+    """
+    cfg = _FakeMasterConfig(
+        policy={
+            "automodel_cfg": {"enabled": True, "tensor_parallel_size": 1},
+            "optimizer": {"name": "torch.optim.AdamW"},
+            "megatron_cfg": {
+                "enabled": False,
+                "tensor_model_parallel_size": 2,
+                "pipeline_model_parallel_size": 4,
+                "activation_checkpointing": True,
+                "recompute_granularity": "full",
+                "optimizer": {"optimizer": "adam"},
+            },
+        }
+    )
+    attrs = _build_resource_attributes(cfg, "dpo")
+    assert attrs["nv.dl.topology.size.tp"] == 1
+    assert attrs["nv.dl.training.config.optimizer"] == "torch.optim.AdamW"
+    # Automodel has no pipeline dimension, and recompute granularity is a
+    # megatron setting, so neither has anything to report here.
+    assert "nv.dl.topology.size.pp" not in attrs
+    assert "nv.dl.training.config.recompute_granularity" not in attrs
+
+
+def test_the_data_parallel_size_is_not_reported():
+    """Though lens defines ``nv.dl.topology.size.dp``.
+
+    RL configures no dp size, so it could only come from dividing the cluster's
+    GPU count by the model-parallel sizes, and that assumes the policy owns
+    every GPU in the cluster. A reward model with its own resources
+    (``grpo_rm_1B.yaml``), distillation teachers, expert parallelism and
+    non-colocated generation each leave the policy fewer, and the division is
+    too high rather than failing. No attribute beats a plausible wrong one.
+    """
+    cfg = _FakeMasterConfig()
+    cfg.cluster = {"num_nodes": 2, "gpus_per_node": 8}
+    assert "nv.dl.topology.size.dp" not in _build_resource_attributes(cfg, "grpo")
+
+
 def test_parallelism_sizes_use_the_resource_scoped_spelling():
     """``nv.dl.topology.size.*``, not the ``dl.tensor_parallel.*`` family.
 
     Both spell the same quantity, but only the topology one is in lens's
-    ``DL_RESOURCE_TYPES`` -- the registry ``normalize_resource_attributes``
-    types a resource attribute against. The ``dl.*`` spelling is the span and
-    metric one, so setting it here puts the value outside that typing.
+    ``DL_RESOURCE_TYPES``, which feeds the table
+    ``normalize_resource_attributes`` consults. Keys outside it are passed
+    through untyped rather than rejected, so the ``dl.*`` spelling would reach
+    the backend as a string -- it is the span and metric spelling.
     """
     pytest.importorskip("nemo.lens")
     from nemo.lens.semconv.resources import DL_RESOURCE_TYPES
@@ -109,38 +156,6 @@ def test_parallelism_sizes_use_the_resource_scoped_spelling():
     assert "dl.pipeline_parallel.size" not in attrs
     assert "nv.dl.topology.size.tp" in DL_RESOURCE_TYPES
     assert "dl.tensor_parallel.size" not in DL_RESOURCE_TYPES
-
-
-def test_data_parallel_size_is_derived_from_the_cluster():
-    # RL configures no dp size: training spans the cluster's GPUs and dp is
-    # whatever tp/pp/cp leave over.
-    cfg = {"cluster": {"num_nodes": 2, "gpus_per_node": 8}}
-    assert _data_parallel_size(cfg, tp=2, pp=1, cp=1) == 8
-    assert _data_parallel_size(cfg, tp=2, pp=2, cp=2) == 2
-
-
-def test_data_parallel_size_is_omitted_for_dedicated_generation_gpus():
-    """The cluster then holds ranks the policy does not have.
-
-    Reporting the cluster's arithmetic would describe a training group larger
-    than the one that exists, so this reports nothing instead.
-    """
-    cfg = {
-        "cluster": {"num_nodes": 2, "gpus_per_node": 8},
-        "policy": {"generation": {"colocated": {"enabled": False}}},
-    }
-    assert _data_parallel_size(cfg, tp=1, pp=1, cp=1) is None
-
-
-def test_data_parallel_size_is_omitted_when_it_does_not_divide_evenly():
-    # A misconfiguration the policy worker rejects with a far better message
-    # than a resource attribute could carry.
-    cfg = {"cluster": {"num_nodes": 1, "gpus_per_node": 8}}
-    assert _data_parallel_size(cfg, tp=3, pp=1, cp=1) is None
-
-
-def test_data_parallel_size_is_omitted_without_a_cluster_block():
-    assert _data_parallel_size({}, tp=1, pp=1, cp=1) is None
 
 
 def test_training_target_drops_a_non_positive_step_count():
@@ -156,9 +171,25 @@ def test_training_target_drops_a_non_positive_step_count():
     assert attrs["nv.dl.training.target.train_iters"] == 150
 
 
+def test_sft_v2_finds_its_step_target_under_the_sft_section():
+    """``run_sft_v2.py`` reports ``sft_v2`` but reads ``master_config.sft``.
+
+    Looking the settings up by algorithm name finds no section at all, so the
+    whole of sft_v2 silently reports no training target.
+    """
+    cfg = {"sft": {"max_num_steps": 60}}
+    attrs = _training_config_attributes(cfg, "sft_v2")
+    assert attrs["nv.dl.training.target.train_iters"] == 60
+
+
 def test_training_config_reads_either_backends_optimizer_spelling():
-    # megatron names the algorithm, automodel names the class.
-    megatron = {"policy": {"megatron_cfg": {"optimizer": {"optimizer": "adam"}}}}
+    # megatron names the algorithm and keeps it in its own block, automodel
+    # names the class and keeps it in the policy's.
+    megatron = {
+        "policy": {
+            "megatron_cfg": {"enabled": True, "optimizer": {"optimizer": "adam"}}
+        }
+    }
     automodel = {"policy": {"optimizer": {"name": "torch.optim.AdamW"}}}
     key = "nv.dl.training.config.optimizer"
     assert _training_config_attributes(megatron, "grpo")[key] == "adam"
@@ -172,6 +203,7 @@ def test_recompute_granularity_is_reported_only_when_recompute_is_on():
     off = {
         "policy": {
             "megatron_cfg": {
+                "enabled": True,
                 "activation_checkpointing": False,
                 "recompute_granularity": "full",
             }
@@ -182,6 +214,7 @@ def test_recompute_granularity_is_reported_only_when_recompute_is_on():
     on = {
         "policy": {
             "megatron_cfg": {
+                "enabled": True,
                 "activation_checkpointing": True,
                 "recompute_granularity": "full",
             }
@@ -195,10 +228,10 @@ def test_process_attributes_report_the_local_rank_when_the_launcher_set_one(
 ):
     """``RayWorkerGroup`` exports ``LOCAL_RANK`` beside ``RANK``.
 
-    It identifies a device on one node, which is what a reader has when the
-    complaint came from ``nvidia-smi`` rather than from the job. The driver owns
-    no device, so a process without the variable reports no local rank rather
-    than defaulting to zero and claiming one.
+    It places a process within its own node, which is what groups a job's
+    processes by the host they share. The driver owns no device, so a process
+    without the variable reports no local rank rather than defaulting to zero
+    and claiming one.
     """
     pytest.importorskip("nemo.lens")
     monkeypatch.setenv("LOCAL_RANK", "3")
@@ -209,14 +242,20 @@ def test_process_attributes_report_the_local_rank_when_the_launcher_set_one(
 
 
 def test_process_attributes_name_the_provider_and_the_run(monkeypatch):
-    # nv.dl.run.uuid duplicates lens's own nemo.run.id by design: the two
-    # namespaces are read by different consumers, and a backend joining RL runs
-    # to Megatron ones groups on the nv.dl.* spelling.
+    """``nv.dl.run.uuid`` is lens's derived uuid5, not the raw run id.
+
+    The raw id is already reported as ``nemo.run.id``. A backend grouping RL
+    runs with Megatron ones joins on the derived value, so publishing the run
+    id under this key would look populated and match nothing.
+    """
     pytest.importorskip("nemo.lens")
+    from nemo.lens.resources.slurm import derive_nv_dl_run_uuid
+
     monkeypatch.delenv("LOCAL_RANK", raising=False)
     attrs = _process_attributes(rank=0, world_size=1, run_id="job-7")
     assert attrs["nv.dl.provider.name"] == "nemo-rl"
-    assert attrs["nv.dl.run.uuid"] == "job-7"
+    assert attrs["nv.dl.run.uuid"] == derive_nv_dl_run_uuid(run_id="job-7")
+    assert attrs["nv.dl.run.uuid"] != "job-7"
     assert "nv.dl.run.uuid" not in _process_attributes(rank=0, world_size=1)
 
 
