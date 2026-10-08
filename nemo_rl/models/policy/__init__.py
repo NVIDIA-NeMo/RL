@@ -171,7 +171,7 @@ class AutomodelKwargs(TypedDict):
     force_hf: NotRequired[bool]
 
 
-class DTensorConfigDisabled(TypedDict):
+class AutomodelConfigDisabled(TypedDict):
     enabled: Literal[False]
 
 
@@ -193,7 +193,7 @@ class AutomodelCheckpointConfig(TypedDict, total=False):
     consolidation_timeout_minutes: int
 
 
-class DTensorConfig(TypedDict):
+class AutomodelConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
     # Distributed parallelism sizes
@@ -666,7 +666,7 @@ class PolicyConfig(TypedDict):
     ]  # used in static batched (framework) generation
     precision: str
     reward_model_cfg: NotRequired[RewardModelConfig]
-    dtensor_cfg: DTensorConfig | DTensorConfigDisabled
+    automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
     draft: NotRequired[Eagle3DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]

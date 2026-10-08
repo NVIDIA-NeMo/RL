@@ -11,7 +11,7 @@ checkpointing:
   checkpoint_dir: checkpoints/distillation-qwen3-32b-to-4b-base-seqpack
 policy:
   model_name: Qwen/Qwen3-4B-Base
-  dtensor_cfg:
+  automodel_cfg:
     context_parallel_size: 1
   dynamic_batching:
     enabled: false
@@ -20,7 +20,7 @@ policy:
   make_sequence_length_divisible_by: 2
 teacher:
   model_name: Qwen/Qwen3-32B
-  dtensor_cfg:
+  automodel_cfg:
     tensor_parallel_size: 8
     context_parallel_size: 1
   dynamic_batching:
