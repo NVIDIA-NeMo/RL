@@ -167,6 +167,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
+        if not megatron_enable and not dtensor_enable:
+            raise ValueError(
+                "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
+                "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
+            )
         if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enable:
             raise ValueError(
                 "generation.nvfp4_pertoken_rollout requires the Megatron "
@@ -197,103 +202,90 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "reserved_http_server_ports is only supported by the Megatron "
                 "worker (policy.megatron_cfg.enabled=true)."
             )
-        draft_algo = draft_config.speculator_type if draft_enabled else None
-        dtensor_cfg = config.get("dtensor_cfg", {})
-        # DTensor is always the v2 (Automodel) backend now (DTensor v1 and
-        # its dtensor_cfg._v2 toggle have been removed upstream), so
-        # dtensor_enable alone identifies the DTensor v2 path.
-        if draft_enabled and draft_algo == "eagle3":
-            # eagle3 runs on the Megatron backend (single-step distillation)
-            # or the DTensor v2 backend (TTT training); DTensor v1 (removed)
-            # never had draft support.
-            if not megatron_enable and not dtensor_enable:
-                raise ValueError(
-                    "policy.draft.speculator_type=eagle3 requires the Megatron "
-                    "backend (policy.megatron_cfg.enabled=true) or the DTensor "
-                    "backend (policy.dtensor_cfg.enabled=true)."
-                )
-        if draft_enabled and draft_algo in BLOCK_DRAFT_ALGOS:
-            if megatron_enable or not dtensor_enable:
+        if draft_enabled:
+            # Both-enabled and neither-enabled are already rejected above, so
+            # exactly one of megatron_enable/dtensor_enable is true below.
+            draft_algo = draft_config.speculator_type
+            if draft_algo in BLOCK_DRAFT_ALGOS and not dtensor_enable:
                 raise ValueError(
                     f"policy.draft.speculator_type={draft_algo} requires the "
                     "DTensor backend (policy.dtensor_cfg.enabled=true)."
                 )
-        if draft_enabled and (
-            draft_algo in BLOCK_DRAFT_ALGOS
-            or (draft_algo == "eagle3" and dtensor_enable)
-        ):
-            if draft_config.model_name is None:
-                raise ValueError(
-                    f"policy.draft.speculator_type={draft_algo} requires a "
-                    "pretrained draft checkpoint; set policy.draft.model_name "
-                    "(from-scratch draft init is not supported)."
-                )
-            unsupported = {
-                # Under sequence parallelism the layer outputs seen by the
-                # hidden-capture hooks are bare sequence-sharded local tensors
-                # (no DTensor wrapper), which cannot be detected or gathered.
-                "sequence_parallel": bool(dtensor_cfg.get("sequence_parallel", False)),
-                "lora_cfg.enabled": bool(
-                    dtensor_cfg.get("lora_cfg", {}).get("enabled", False)
-                ),
-            }
-            enabled_unsupported = [name for name, on in unsupported.items() if on]
-            if enabled_unsupported:
-                raise ValueError(
-                    f"policy.draft.speculator_type={draft_algo} does not support: "
-                    f"{', '.join(enabled_unsupported)}. Disable these options to "
-                    "co-train a draft."
-                )
-        if megatron_enable and draft_enabled:
-            # These three guards are Megatron-specific (main #3463): the
-            # DTensor-v2 draft path enforces its own sequence-packing
-            # restriction separately (automodel/train.py's
-            # LossPostProcessor.__init__), so scope these to
-            # megatron_enable rather than draft_enabled alone -- megatron_cfg
-            # is NotRequired in PolicyConfig and DTensor-v2 draft configs
-            # don't carry one.
-            if config["megatron_cfg"]["context_parallel_size"] > 1:
-                # Sequence packing itself is supported with the draft; CP is
-                # not: the hidden-state capture and the per-segment shifts
-                # assume each packed sequence lives whole on one rank.
-                raise ValueError(
-                    "policy.draft.enabled=true does not support context "
-                    "parallelism yet. Set "
-                    "policy.megatron_cfg.context_parallel_size=1 or disable "
-                    "policy.draft."
-                )
-            if (
-                # sequence_packing is NotRequired in PolicyConfig, so
-                # tolerate its absence.
-                bool(config.get("sequence_packing", {}).get("enabled", False))
-                and config["megatron_cfg"]["pipeline_model_parallel_size"] > 1
-            ):
-                # The packed draft path re-embeds the per-segment-shifted
-                # token ids via the model's embedding, which MCore
-                # constructs only on the first pipeline stage while the
-                # draft runs on the last.
-                raise ValueError(
-                    "policy.draft.enabled=true with sequence packing does "
-                    "not support pipeline parallelism yet. Set "
-                    "policy.megatron_cfg.pipeline_model_parallel_size=1, or "
-                    "disable policy.sequence_packing or policy.draft."
-                )
-            if bool(
-                # use_fused_linear_logprobs is NotRequired in MegatronConfig.
-                config["megatron_cfg"].get("use_fused_linear_logprobs", False)
-            ):
-                # The fused path returns per-token logprobs and never
-                # materializes the full next-token logits the draft's
-                # teacher distribution needs, in either the packed or the
-                # unpacked layout.
-                raise ValueError(
-                    "policy.draft.enabled=true is not supported with "
-                    "policy.megatron_cfg.use_fused_linear_logprobs=true: "
-                    "draft training needs the full next-token logits for "
-                    "the teacher, which the fused path never materializes. "
-                    "Disable one of the two."
-                )
-        if draft_enabled:
+            if megatron_enable:
+                # Megatron-specific guards (main #3463).
+                if config["megatron_cfg"]["context_parallel_size"] > 1:
+                    # Sequence packing itself is supported with the draft; CP
+                    # is not: the hidden-state capture and the per-segment
+                    # shifts assume each packed sequence lives whole on one
+                    # rank.
+                    raise ValueError(
+                        "policy.draft.enabled=true does not support context "
+                        "parallelism yet. Set "
+                        "policy.megatron_cfg.context_parallel_size=1 or disable "
+                        "policy.draft."
+                    )
+                if (
+                    # sequence_packing is NotRequired in PolicyConfig, so
+                    # tolerate its absence.
+                    bool(config.get("sequence_packing", {}).get("enabled", False))
+                    and config["megatron_cfg"]["pipeline_model_parallel_size"] > 1
+                ):
+                    # The packed draft path re-embeds the per-segment-shifted
+                    # token ids via the model's embedding, which MCore
+                    # constructs only on the first pipeline stage while the
+                    # draft runs on the last.
+                    raise ValueError(
+                        "policy.draft.enabled=true with sequence packing does "
+                        "not support pipeline parallelism yet. Set "
+                        "policy.megatron_cfg.pipeline_model_parallel_size=1, or "
+                        "disable policy.sequence_packing or policy.draft."
+                    )
+                if bool(
+                    # use_fused_linear_logprobs is NotRequired in MegatronConfig.
+                    config["megatron_cfg"].get("use_fused_linear_logprobs", False)
+                ):
+                    # The fused path returns per-token logprobs and never
+                    # materializes the full next-token logits the draft's
+                    # teacher distribution needs, in either the packed or the
+                    # unpacked layout.
+                    raise ValueError(
+                        "policy.draft.enabled=true is not supported with "
+                        "policy.megatron_cfg.use_fused_linear_logprobs=true: "
+                        "draft training needs the full next-token logits for "
+                        "the teacher, which the fused path never materializes. "
+                        "Disable one of the two."
+                    )
+            else:
+                # Automodel draft (eagle3 TTT, dspark, dflash).
+                dtensor_cfg = config["dtensor_cfg"]
+                if draft_config.model_name is None:
+                    raise ValueError(
+                        f"policy.draft.speculator_type={draft_algo} requires a "
+                        "pretrained draft checkpoint; set policy.draft.model_name "
+                        "(from-scratch draft init is not supported)."
+                    )
+                unsupported = {
+                    # Under sequence parallelism the layer outputs seen by the
+                    # hidden-capture hooks are bare sequence-sharded local tensors
+                    # (no DTensor wrapper), which cannot be detected or gathered.
+                    "sequence_parallel": bool(
+                        dtensor_cfg.get("sequence_parallel", False)
+                    ),
+                    "lora_cfg.enabled": bool(
+                        dtensor_cfg.get("lora_cfg", {}).get("enabled", False)
+                    ),
+                    "sequence_packing.enabled": bool(
+                        config.get("sequence_packing", {}).get("enabled", False)
+                    ),
+                }
+                enabled_unsupported = [name for name, on in unsupported.items() if on]
+                if enabled_unsupported:
+                    raise ValueError(
+                        f"policy.draft.speculator_type={draft_algo} does not "
+                        f"support: {', '.join(enabled_unsupported)}. Disable "
+                        "these options to co-train a draft."
+                    )
+
             # Draft co-training streams draft.* keys only through the full-param
             # refit paths (colocated CUDA-IPC, collective broadcast, and
             # checkpoint-engine). The sparse transports bypass the extension's
@@ -333,12 +325,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
 
         else:
-            if not dtensor_enable:
-                raise ValueError(
-                    "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
-                    "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
-                )
-
+            # dtensor_enable is guaranteed here: both-enabled and
+            # neither-enabled are already rejected above.
             worker_builder_cls_fqn = resolve_policy_worker_cls(
                 "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
                 config,

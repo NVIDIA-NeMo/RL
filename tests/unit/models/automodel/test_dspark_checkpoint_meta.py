@@ -19,7 +19,7 @@ try:
 except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
-from nemo_rl.models.automodel.draft.integration import (
+from nemo_rl.models.automodel.draft.checkpoint import (
     validate_dspark_checkpoint_meta,
 )
 
@@ -74,7 +74,7 @@ def test_draft_checkpoint_dir_is_sibling_of_weights_tree():
     """The draft DCP entry must not live under the policy weights directory:
     detect_checkpoint_format walks weights_path recursively and would
     mis-detect the safetensors policy as DCP after seeing .distcp files."""
-    from nemo_rl.models.automodel.draft.integration import draft_checkpoint_dir
+    from nemo_rl.models.automodel.draft.checkpoint import draft_checkpoint_dir
 
     weights = "/ckpt/step_3/policy/weights"
     draft_dir = draft_checkpoint_dir(weights)
@@ -158,7 +158,7 @@ def test_eagle3_meta_rejects_ttt_steps_mismatch():
 def test_eagle3_meta_record_requires_and_records_ttt_steps():
     from types import SimpleNamespace
 
-    from nemo_rl.models.automodel.draft.integration import draft_meta_record
+    from nemo_rl.models.automodel.draft.checkpoint import draft_meta_record
 
     draft_model = SimpleNamespace(
         config=SimpleNamespace(target_layer_ids=[1, 17, 33], draft_vocab_size=32000)
@@ -190,20 +190,19 @@ def test_weights_only_load_does_not_enforce_optimizer_layout(monkeypatch):
     a layout record, or with a different optimizer grouping, remain loadable
     when optimizer state is not being restored."""
     from unittest.mock import MagicMock
+    from types import SimpleNamespace
 
     import torch
     from torch import nn
 
-    from nemo_rl.models.automodel.draft import integration
+    from nemo_rl.models.automodel.draft import checkpoint
 
     captured = {}
 
     def fake_load_draft_checkpoint(draft_model, weights_path, expected_meta):
         captured["expected_meta"] = expected_meta
 
-    monkeypatch.setattr(
-        integration, "load_draft_checkpoint", fake_load_draft_checkpoint
-    )
+    monkeypatch.setattr(checkpoint, "load_draft_checkpoint", fake_load_draft_checkpoint)
     draft = nn.Linear(4, 4, bias=False)
     draft.config = type(
         "Cfg", (), {"block_size": 7, "mask_token_id": 0, "target_layer_ids": [0]}
@@ -214,6 +213,11 @@ def test_weights_only_load_does_not_enforce_optimizer_layout(monkeypatch):
             {"name": "draft", "params": list(draft.parameters()), "lr": 1e-4},
         ]
     )
+    draft_config = SimpleNamespace(
+        model_name="test/draft",
+        speculator_type="dspark",
+        train_embed_and_head=True,
+    )
     common = dict(
         checkpoint_manager=MagicMock(),
         model=MagicMock(),
@@ -222,12 +226,11 @@ def test_weights_only_load_does_not_enforce_optimizer_layout(monkeypatch):
         optimizer=optimizer,
         scheduler=None,
         weights_path="/ckpt/step_1/policy/weights",
-        model_name="test/draft",
-        algo="dspark",
+        draft_config=draft_config,
     )
 
-    integration.load_dspark_checkpoint(optimizer_path=None, **common)
+    checkpoint.load_checkpoint_with_draft(optimizer_path=None, **common)
     assert captured["expected_meta"]["optimizer_layout"] is None
 
-    integration.load_dspark_checkpoint(optimizer_path="/ckpt/optim", **common)
+    checkpoint.load_checkpoint_with_draft(optimizer_path="/ckpt/optim", **common)
     assert captured["expected_meta"]["optimizer_layout"] is not None

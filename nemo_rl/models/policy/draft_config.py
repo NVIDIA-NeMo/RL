@@ -25,7 +25,7 @@ import difflib
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal, Self, Union
 
-from pydantic import BaseModel, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, Discriminator, Field, Tag, TypeAdapter, model_validator
 
 
 class DraftOptimizerConfig(BaseModel, extra="forbid"):
@@ -150,9 +150,27 @@ class DFlashDraftConfig(_BlockDraftConfig):
     confidence_loss_alpha: float = 0.0
 
 
+def _speculator_type(v: Any) -> str:
+    """Discriminator callback: default a missing tag to eagle3.
+
+    A plain ``speculator_type: Literal[...]`` discriminator requires every
+    ``policy.draft`` block to carry the tag, even a disabled one that never
+    cared which family it would have been (``MasterConfig`` validation then
+    fails with ``union_tag_not_found``). Mirrors the pre-union implicit-
+    eagle3-only default.
+    """
+    if isinstance(v, Mapping):
+        return v.get("speculator_type", "eagle3")
+    return getattr(v, "speculator_type", "eagle3")
+
+
 DraftConfig = Annotated[
-    Union[Eagle3DraftConfig, DSparkDraftConfig, DFlashDraftConfig],
-    Field(discriminator="speculator_type"),
+    Union[
+        Annotated[Eagle3DraftConfig, Tag("eagle3")],
+        Annotated[DSparkDraftConfig, Tag("dspark")],
+        Annotated[DFlashDraftConfig, Tag("dflash")],
+    ],
+    Discriminator(_speculator_type),
 ]
 
 _DRAFT_CONFIG_ADAPTER: TypeAdapter[Any] = TypeAdapter(DraftConfig)
@@ -170,13 +188,6 @@ def coerce_draft_config(
         config, (Eagle3DraftConfig, DSparkDraftConfig, DFlashDraftConfig)
     ):
         return config
-    # Hand-built PolicyConfig dicts (e.g. test fixtures, callers that predate
-    # this discriminated union) commonly omit the discriminator entirely --
-    # most often on a disabled draft block, which never cared which family it
-    # would have been. Default to eagle3, mirroring the pre-union implicit-
-    # eagle3-only behavior.
-    if "speculator_type" not in config:
-        config = {**config, "speculator_type": "eagle3"}
     return _DRAFT_CONFIG_ADAPTER.validate_python(config)
 
 

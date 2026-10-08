@@ -72,15 +72,10 @@ def make_policy_factory(
     if cfg is None or not data_plane_enabled(cfg):
         return None
 
-    # Rebind to a local: type checkers don't propagate the `cfg is not None`
-    # narrowing above into the closure below, since a nested function could
-    # in general run after the enclosing scope's binding changes.
-    dp_cfg: DataPlaneConfig = cfg
-
     from nemo_rl.models.policy.tq_policy import TQPolicy
 
     def _make_policy(**kwargs: Any) -> TQPolicy:
-        return TQPolicy(**kwargs, dp_cfg=dp_cfg)
+        return TQPolicy(**kwargs, dp_cfg=cfg)
 
     return _make_policy
 

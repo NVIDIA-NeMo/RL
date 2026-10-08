@@ -90,7 +90,11 @@ class ModelAndOptimizerState(NamedTuple):
     model_config: Any
     peft_config: Optional[PeftConfig]
     autocast_enabled: bool
-    # DSpark draft co-training (DTensor v2 only): the draft model sharing the
-    # policy's optimizer, and the composite module used for optimizer state I/O.
+    # Draft co-training (eagle3/dspark/dflash, DTensor v2 only): the draft
+    # model sharing the policy's optimizer, and the composite module used
+    # for optimizer state I/O.
     draft_model: Optional[torch.nn.Module] = None
     composite_model: Optional[torch.nn.Module] = None
+    # Draft co-training runtime (loss, hidden capture, grad-norm reporting);
+    # built alongside draft_model, None when draft co-training is disabled.
+    draft_runtime: Optional[Any] = None

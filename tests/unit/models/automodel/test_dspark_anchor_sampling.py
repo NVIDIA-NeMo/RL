@@ -116,7 +116,7 @@ def test_anchor_sampling_is_pure_function_of_generator_seed():
 
 
 def test_anchor_sampling_seed_varies_over_rank_step_and_microbatch():
-    from nemo_rl.models.automodel.draft.integration import anchor_sampling_seed
+    from nemo_rl.models.automodel.draft.runtime import anchor_sampling_seed
 
     base = anchor_sampling_seed(0, 1, 1)
     assert anchor_sampling_seed(0, 1, 1) == base  # deterministic

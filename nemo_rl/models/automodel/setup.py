@@ -979,9 +979,11 @@ def setup_model_and_optimizer(
     draft_enabled = draft_config is not None and draft_config.enabled
     draft_model = None
     composite_model = None
+    draft_runtime = None
     if draft_enabled:
         draft_algo = draft_config.speculator_type
-        from nemo_rl.models.automodel.draft.integration import (
+        from nemo_rl.models.automodel.draft.runtime import build_draft_runtime
+        from nemo_rl.models.automodel.draft.setup import (
             PolicyWithDraft,
             build_dspark_draft_model,
             build_eagle3_draft_model,
@@ -1005,8 +1007,6 @@ def setup_model_and_optimizer(
                 target_num_hidden_layers=target_text_config.num_hidden_layers,
                 policy_model=model,
             )
-            draft_learning_rate = float(draft_config.learning_rate)
-            draft_ttt_steps = int(draft_config.ttt_steps)
         else:
             draft_model = build_dspark_draft_model(
                 model_name=draft_config.model_name,
@@ -1015,9 +1015,16 @@ def setup_model_and_optimizer(
                 mesh=device_mesh["dp_cp"],
                 algo=draft_algo,
             )
-            draft_learning_rate = float(draft_config.learning_rate)
-            draft_ttt_steps = None
         composite_model = PolicyWithDraft(policy=model, draft=draft_model)
+        draft_runtime = build_draft_runtime(
+            draft_model=draft_model,
+            draft_config=draft_config,
+            policy_model=model,
+            policy_config=config,
+            dp_group=device_mesh["dp"].get_group(),
+            tp_group=device_mesh["tp"].get_group(),
+            cp_group=device_mesh["cp"].get_group() if cp_size > 1 else None,
+        )
 
     # Initialize optimizer
     optimizer = None
@@ -1034,21 +1041,16 @@ def setup_model_and_optimizer(
             # draft group carries its own learning rate: the policy's RL lr is
             # orders of magnitude below the draft's native training lr, and a
             # shared lr leaves the draft unable to track policy drift.
-            optimizer = optimizer_cls(
-                [
-                    {
-                        "name": "policy",
-                        "params": [p for p in model.parameters() if p.requires_grad],
-                    },
-                    {
-                        "name": "draft",
-                        "params": [
-                            p for p in draft_model.parameters() if p.requires_grad
-                        ],
-                        "lr": draft_learning_rate,
-                    },
-                ],
-                **optimizer_kwargs,
+            from nemo_rl.models.automodel.draft.setup import (
+                build_policy_and_draft_optimizer,
+            )
+
+            optimizer = build_policy_and_draft_optimizer(
+                optimizer_cls,
+                optimizer_kwargs,
+                model=model,
+                draft_model=draft_model,
+                draft_config=draft_config,
             )
         else:
             optimizer = optimizer_cls(
@@ -1090,11 +1092,11 @@ def setup_model_and_optimizer(
     # Load NeMo RL checkpoint if provided
     if weights_path:
         if draft_model is not None:
-            from nemo_rl.models.automodel.draft.integration import (
-                load_dspark_checkpoint,
+            from nemo_rl.models.automodel.draft.checkpoint import (
+                load_checkpoint_with_draft,
             )
 
-            load_dspark_checkpoint(
+            load_checkpoint_with_draft(
                 checkpoint_manager,
                 model=model,
                 draft_model=draft_model,
@@ -1103,9 +1105,7 @@ def setup_model_and_optimizer(
                 scheduler=scheduler,
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
-                model_name=draft_config.model_name,
-                algo=draft_algo,
-                ttt_steps=draft_ttt_steps,
+                draft_config=draft_config,
             )
         else:
             checkpoint_manager.load_checkpoint(
@@ -1147,4 +1147,5 @@ def setup_model_and_optimizer(
         autocast_enabled=autocast_enabled,
         draft_model=draft_model,
         composite_model=composite_model,
+        draft_runtime=draft_runtime,
     )

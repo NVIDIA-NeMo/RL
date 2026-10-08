@@ -26,7 +26,7 @@ try:
 except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
-from nemo_rl.models.automodel.draft.integration import (
+from nemo_rl.models.automodel.draft.setup import (
     _adapt_speculators_dspark_config,
     _adapt_speculators_eagle3_config,
     default_eagle3_aux_layer_ids_vllm,

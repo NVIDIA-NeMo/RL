@@ -68,12 +68,22 @@ def _assert_draft_stream(params: dict[str, torch.Tensor]):
 
 
 def test_refit_params_generator_appends_typed_draft_keys():
-    params = _collect(_make_worker()._refit_params_generator())
+    worker = _make_worker()
+    params = _collect(
+        worker_mod.dtensor_params_generator(
+            worker.model, worker.dtype, draft_model=worker.draft_model
+        )
+    )
     _assert_draft_stream(params)
 
 
 def test_refit_params_generator_without_draft_has_no_draft_keys():
-    params = _collect(_make_worker(with_draft=False)._refit_params_generator())
+    worker = _make_worker(with_draft=False)
+    params = _collect(
+        worker_mod.dtensor_params_generator(
+            worker.model, worker.dtype, draft_model=worker.draft_model
+        )
+    )
     assert not any(name.startswith("draft.") for name in params)
 
 

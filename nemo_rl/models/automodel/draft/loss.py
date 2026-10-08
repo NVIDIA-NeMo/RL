@@ -404,8 +404,10 @@ def compute_dspark_loss(
         has_confidence=has_confidence,
     )
     if return_terms:
-        # The losses are already-normalized scalars, so they are logged as a
-        # window mean. The acceptance diagnostics are returned as unreduced
+        # The losses are already-normalized (DP-global-denominator) scalars;
+        # the caller divides them by the microbatch-slot count to match the
+        # backward value before logging (see DSparkRuntime._terms_to_metrics).
+        # The acceptance diagnostics are returned as unreduced
         # (num, den) sums instead: the recipe reduces both across the window and
         # the DP group and divides once, giving the exact global ratio (and a
         # tau that never dips below its definitional floor of 1).

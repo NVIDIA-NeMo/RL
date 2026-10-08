@@ -16,7 +16,7 @@ DTensor-v2 drafters and their config surface. For GRPO fundamentals, see the
 
 | `policy.draft.speculator_type` | Drafter family | Checkpoint examples | Requires |
 | --- | --- | --- | --- |
-| `"dspark"` | DSpark block drafter (multi-token block proposal) | `deepseek-ai/dspark_qwen3_8b_block7` | `policy.dtensor_cfg.enabled=true`, `policy.dtensor_cfg._v2=true` |
+| `"dspark"` | DSpark block drafter (multi-token block proposal) | `deepseek-ai/dspark_qwen3_8b_block7` | `policy.dtensor_cfg.enabled=true` |
 | `"dflash"` | DFlash block drafter (markov-free, confidence-free variant of DSpark) | `RedHatAI/*-speculator.dflash` | same as `dspark` |
 | `"eagle3"` | EAGLE3 TTT (test-time-training) drafter | `RedHatAI/*-speculator.eagle3`, SGLang SpecForge native-flat checkpoints (e.g. `lmsys/SGLang-EAGLE3-*`) | DTensor v2 (this guide) **or** Megatron (see the [Eagle3 guide](eagle3-speculative-decoding.md)) |
 
@@ -29,13 +29,12 @@ vLLM on every refit so the next rollout speculates with the freshest drafter.
 
 ### Usage
 
-Draft co-training requires the DTensor v2 backend:
+Draft co-training requires the Automodel backend:
 
 ```yaml
 policy:
   dtensor_cfg:
     enabled: true
-    _v2: true
 ```
 
 #### DSpark
@@ -134,7 +133,7 @@ Shared across all three:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `num_anchors` | `64` | Anchor blocks sampled per sequence each training forward. Draft-side transient memory scales with `num_anchors * block_size * vocab`; co-training shares the GPU with the full policy, so raise this only after confirming headroom (shipped recipes use `32` for larger/MoE runs, `64` for single-node dense runs). |
+| `num_anchors` | `64` | Anchor blocks sampled per sequence each training forward. Draft-side transient memory scales with `num_anchors * block_size * vocab`; co-training shares the GPU with the full policy, so raise this only after confirming headroom (the shipped Qwen3-8B dspark/dflash recipes use `32`). |
 | `learning_rate` | `1e-4` | Draft param-group learning rate -- needs to be well above the policy's RL learning rate to track policy drift. |
 | `ce_loss_alpha` | `0.1` | Cross-entropy weight against the rollout tokens. |
 | `l1_loss_alpha` | `0.9` | Total-variation distillation weight against the policy's raw logits. |
@@ -191,10 +190,11 @@ term and captures already-computed intermediate policy tensors along the way.
 ### Automodel Reuse Boundary
 
 `nemo_rl/models/automodel/draft/` is a thin extension layer over
-`nemo_automodel.components.speculative.*` (Automodel r0.6.0). Model
-architectures, attention masks, and core loss math for all three drafters
-are imported unchanged -- deterministic, teacher-agnostic computations that
-give identical results whether called from a pretraining trainer or NeMo RL.
+`nemo_automodel.components.speculative.*` (Automodel r0.6.0). Attention masks
+and the unchanged helpers are imported from there; the DSpark/DFlash model and
+loss are local copies whose RL deltas are listed in each file's header, and
+EAGLE3's per-position KL, loss mask and accuracy counting follow speculators'
+`kl_div_loss` / `align_for_step`.
 EAGLE3's network (attention, decoder layer, embedding, `fc`, `lm_head`) is a
 direct subclass of Automodel's `LlamaEagle3DraftModel`; NeMo RL does not
 reimplement the attention math.
@@ -206,10 +206,10 @@ What stays local to NeMo RL, and why:
   sampling respects RL rollout response boundaries instead of
   pretraining-corpus document boundaries, and loss normalization matches
   NeMo RL's gradient-accumulation/context-parallel conventions.
-- **Training-loop and distributed-topology glue** (`draft/integration.py`):
-  hooking into the policy's own forward pass to capture teacher
-  hidden states/logits, keeping gradient scaling consistent across
-  microbatches and context parallelism, deterministic anchor sampling
+- **Training-loop and distributed-topology glue** (`draft/{setup,hidden_capture,
+  runtime,checkpoint}.py`): hooking into the policy's own forward pass to
+  capture teacher hidden states/logits, keeping gradient scaling consistent
+  across microbatches and context parallelism, deterministic anchor sampling
   across TP replicas, coupled policy+draft checkpointing, and adapting
   third-party checkpoint formats (speculators, SGLang SpecForge).
 - **Wiring the RL main loop** (`nemo_rl/models/automodel/{setup,train}.py`,

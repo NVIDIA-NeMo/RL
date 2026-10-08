@@ -49,6 +49,10 @@ from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
 )
+from nemo_rl.models.generation.vllm.draft_utils import (
+    DRAFT_DISABLE_MODULE_SHARING_ENV,
+    draft_module_sharing_disable_required,
+)
 from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
@@ -320,6 +324,15 @@ class VllmGeneration(GenerationInterface):
         # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
         if self.ep_size > self.tp_size:
             env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
+
+        # Set via runtime_env (not a later os.environ mutation in __init__)
+        # because this actor's own vLLM engine spawns further Ray actors for
+        # each TP rank when tensor_parallel_size > 1 (e.g. RayWorkerProc); a
+        # parent actor's runtime os.environ changes are invisible to those
+        # child actors, but runtime_env.env_vars set here (via
+        # RayWorkerGroup(env_vars=...) below) is inherited by them.
+        if draft_module_sharing_disable_required(self.cfg):
+            env_vars[DRAFT_DISABLE_MODULE_SHARING_ENV] = "1"
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:

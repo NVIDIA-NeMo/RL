@@ -1,28 +1,8 @@
 defaults: grpo-qwen3-8b-4n8g-automodel.yaml
 # Qwen3-30B-A3B-Instruct-2507 GRPO math baseline (NO speculative decoding),
-# automodel (DTensor v2) backend, 4 nodes x 8 GPUs, 10240-token context
-# (2048 prompt + 8192 response). MoE sibling of the Qwen3-8B baseline:
-# identical data / GRPO knobs / optimizer; model, chat template, and
-# parallelism differ, and context is trimmed from this repo's usual 20480
-# to 10240 to stay comparable to the eagle3 sibling
-# (grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel-eagle3.yaml) at the same
-# sequence length (that recipe's drafter OOMs at 20480 on this layout).
-#
-# Parallelism:
-# - Training: EP=32 shards the 128 experts across all GPUs via HybridEP
-#   dispatch + grouped-GEMM experts; dtensor TP stays 1 (A3B active params
-#   are small -- FSDP handles the non-expert weights).
-# - Generation: vLLM TP=4, two engines per node (8 DP replicas).
-#
-# checkpointing.is_async was previously forced to false here to work around
-# a Gloo rendezvous hang (RuntimeError: Connection closed by peer / 30-min
-# timeout) hit on every async checkpoint save on this 4-node/32-rank layout.
-# NVIDIA-NeMo/RL#3935 ("align checkpoint lifecycle with consolidated save
-# modes") removed is_async from the user-configurable top-level checkpointing
-# schema and rewrote the Automodel async save path to wait for staging and
-# background writes to finish before promoting -- which is exactly the class
-# of race this recipe used to work around, so re-verify the hang is actually
-# gone before assuming this is safe on a multi-node EP32 layout again.
+# automodel (DTensor v2) backend, 4 nodes x 8 GPUs. MoE sibling of the
+# Qwen3-8B baseline: EP=32 shards the 128 experts across all GPUs via
+# HybridEP dispatch + grouped-GEMM experts; dtensor TP stays 1.
 grpo:
   val_period: 10
 checkpointing:
@@ -31,7 +11,12 @@ checkpointing:
   keep_top_k: 5
 policy:
   model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
+  # Trimmed from this repo's usual 20480 to stay comparable to the eagle3
+  # sibling (grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel-eagle3.yaml),
+  # whose drafter OOMs at 20480 on this EP32 layout.
   max_total_sequence_length: 10240
+  # HybridEP requires the padded input width to be a multiple of 64.
+  make_sequence_length_divisible_by: 64
   tokenizer:
     # Instruct-2507 is a non-thinking checkpoint (no <think> toggle in its
     # chat template, unlike the base Qwen3-30B-A3B); drop the inherited

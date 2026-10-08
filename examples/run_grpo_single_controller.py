@@ -178,6 +178,8 @@ def main() -> None:
                     tokenizer,
                     has_refit_draft_weights=has_refit_draft_weights,
                     trains_mtp=trains_mtp,
+                    # Only used by Automodel draft co-training; SC supports only the
+                    # Megatron train backend today, so this is always False here.
                     draft_full_refit=draft_full_refit_enabled(config.policy),
                 )
 

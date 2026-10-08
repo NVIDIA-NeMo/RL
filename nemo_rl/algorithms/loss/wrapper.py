@@ -501,4 +501,12 @@ class DraftRuntimeLossWrapper:
         draft_loss, draft_metrics = self.draft_runtime.compute_loss(prepared_data)
         combined_loss = policy_loss + self.draft_runtime.loss_weight * draft_loss
         metrics.update(draft_metrics)
+        # Mirrors DraftLossWrapper (Megatron path): draft_metrics["draft_loss"]
+        # is already divided to match the backward value (see
+        # DSparkRuntime/Eagle3Runtime.compute_loss), so this sums cleanly with
+        # the policy's own "loss" metric.
+        metrics["total_loss"] = (
+            metrics["loss"]
+            + self.draft_runtime.loss_weight * draft_metrics["draft_loss"]
+        )
         return combined_loss, metrics

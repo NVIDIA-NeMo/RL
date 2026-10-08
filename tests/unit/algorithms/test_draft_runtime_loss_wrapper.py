@@ -36,7 +36,9 @@ def _fake_prepare_fn(next_token_logits, data, loss_fn):
 def _make_policy_loss_fn(policy_param: torch.Tensor):
     def loss_fn(*, data, global_valid_seqs, global_valid_toks, logprobs):
         loss = (logprobs.sum() * policy_param).sum()
-        return loss, {"policy_loss": loss.detach().clone()}
+        # Real loss functions key their metric "loss" (see loss_functions.py);
+        # DraftRuntimeLossWrapper reads it directly to compute total_loss.
+        return loss, {"loss": loss.detach().clone()}
 
     return loss_fn
 
@@ -57,7 +59,10 @@ def test_combined_loss_composition_and_metrics_merge():
 
     expected_policy = logits.sum() * 2.0
     assert torch.isclose(combined, expected_policy + 0.5 * draft_loss)
-    assert "policy_loss" in metrics and "draft_loss" in metrics
+    assert "loss" in metrics and "draft_loss" in metrics
+    assert torch.isclose(
+        torch.as_tensor(metrics["total_loss"]), expected_policy + 0.5 * draft_loss
+    )
     assert runtime.seen_prepared_data == {"x": 1}
 
 

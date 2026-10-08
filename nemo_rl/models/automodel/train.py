@@ -234,7 +234,7 @@ def extract_logits(
         return outputs.logits
 
 
-def will_scale_temperature(
+def need_temperature_scaling(
     sampling_params: Optional[TrainingSamplingParams],
 ) -> bool:
     """Whether apply_temperature_scaling will mutate the logits in place."""
@@ -253,7 +253,7 @@ def apply_temperature_scaling(
     Returns:
         torch.Tensor: Temperature-scaled logits
     """
-    if will_scale_temperature(sampling_params):
+    if need_temperature_scaling(sampling_params):
         logits.div_(sampling_params.temperature)
     return logits
 
@@ -364,7 +364,7 @@ def forward_with_post_processing_fn(
         and post_processing_fn.draft_runtime is not None
     ):
         post_processing_fn.draft_runtime.stash_teacher_logits(
-            logits, will_scale_inplace=will_scale_temperature(sampling_params)
+            logits, need_clone=need_temperature_scaling(sampling_params)
         )
 
     # Apply temperature scaling only for sampling-oriented post-processors
@@ -495,74 +495,96 @@ def automodel_forward_backward(
     """
     results = []
 
-    for mb_idx, processed_mb in enumerate(data_iterator):
-        # Call optional callback at start of microbatch
-        if on_microbatch_start is not None:
-            on_microbatch_start(mb_idx)
+    # Draft co-training's per-batch hooks live here (not in the worker) so
+    # they bracket exactly the microbatches this call runs, the same way
+    # Megatron enables capture inside its forward step (megatron/train.py).
+    draft_runtime = (
+        post_processing_fn.draft_runtime
+        if isinstance(post_processing_fn, LossPostProcessor)
+        else None
+    )
+    if draft_runtime is not None:
+        from nemo_rl.models.automodel.draft.runtime import draft_capture_ctx
 
-        prepared = prepare_model_forward(
-            model,
-            processed_mb.processed_inputs,
-            device_mesh=device_mesh,
-            cp_size=cp_size,
-            padding_token_id=padding_token_id,
-            is_reward_model=is_reward_model,
-            allow_flash_attn_args=allow_flash_attn_args,
+        assert num_valid_microbatches is not None, (
+            "draft co-training requires num_valid_microbatches (the worker's "
+            "iterator_len) to average the per-slot draft losses."
         )
+        draft_runtime.begin_global_batch(num_valid_microbatches)
+        capture_ctx: AbstractContextManager[Any] = draft_capture_ctx(draft_runtime)
+    else:
+        capture_ctx = nullcontext()
 
-        with prepared.model_context_factory(), autocast_context_factory():
-            # Forward pass with post-processing
-            result, metrics, _ = forward_with_post_processing_fn(
-                model=model,
-                prepared=prepared,
-                post_processing_fn=post_processing_fn,
-                processed_mb=processed_mb,
-                global_valid_seqs=global_valid_seqs,
-                global_valid_toks=global_valid_toks,
-                sampling_params=sampling_params,
-                sequence_dim=sequence_dim,
+    with capture_ctx:
+        for mb_idx, processed_mb in enumerate(data_iterator):
+            # Call optional callback at start of microbatch
+            if on_microbatch_start is not None:
+                on_microbatch_start(mb_idx)
+
+            prepared = prepare_model_forward(
+                model,
+                processed_mb.processed_inputs,
+                device_mesh=device_mesh,
+                cp_size=cp_size,
+                padding_token_id=padding_token_id,
+                is_reward_model=is_reward_model,
+                allow_flash_attn_args=allow_flash_attn_args,
             )
 
-            # Check if this is a dummy batch
-            is_dummy = (
-                num_valid_microbatches is not None and mb_idx >= num_valid_microbatches
-            )
+            with prepared.model_context_factory(), autocast_context_factory():
+                # Forward pass with post-processing
+                result, metrics, _ = forward_with_post_processing_fn(
+                    model=model,
+                    prepared=prepared,
+                    post_processing_fn=post_processing_fn,
+                    processed_mb=processed_mb,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    sampling_params=sampling_params,
+                    sequence_dim=sequence_dim,
+                )
 
-            # Scale metrics for aggregation (only for loss)
-            if isinstance(post_processing_fn, LossPostProcessor):
-                # skip the update for dummy batches
-                if not is_dummy:
-                    ## scale by the number of global batches so we get the correct
-                    ## value when summing metrics across all microbatches
-                    for k in metrics.keys():
-                        if "_min" in k or "_max" in k:
-                            continue
+                # Check if this is a dummy batch
+                is_dummy = (
+                    num_valid_microbatches is not None
+                    and mb_idx >= num_valid_microbatches
+                )
 
-                        metrics[k] /= num_global_batches
-                else:
-                    # Zero out loss for dummy batches
-                    result = result * 0
+                # Scale metrics for aggregation (only for loss)
+                if isinstance(post_processing_fn, LossPostProcessor):
+                    # skip the update for dummy batches
+                    if not is_dummy:
+                        ## scale by the number of global batches so we get the correct
+                        ## value when summing metrics across all microbatches
+                        for k in metrics.keys():
+                            if "_min" in k or "_max" in k:
+                                continue
 
-                # Backward pass if training
-                if not forward_only:
-                    ## NOTE: invalid samples should be multiplied
-                    ## by zero in the loss function to prevent them
-                    ## from affecting the gradient calculation
+                            metrics[k] /= num_global_batches
+                    else:
+                        # Zero out loss for dummy batches
+                        result = result * 0
 
-                    # FSDP averages gradients over its DP mesh (dp_size * cp_size),
-                    # while loss normalization expects their sum, so cancel that
-                    # average here. Replicated CP losses send each local model
-                    # contribution to cp_size loss consumers; divide by that fanout
-                    # to avoid overcounting. Partitioned losses have a fanout of 1.
-                    loss = (
-                        result
-                        * dp_size
-                        * cp_size
-                        / post_processing_fn.cp_gradient_fanout
-                    )
-                    loss.backward()
+                    # Backward pass if training
+                    if not forward_only:
+                        ## NOTE: invalid samples should be multiplied
+                        ## by zero in the loss function to prevent them
+                        ## from affecting the gradient calculation
 
-        results.append((result, metrics))
+                        # FSDP averages gradients over its DP mesh (dp_size * cp_size),
+                        # while loss normalization expects their sum, so cancel that
+                        # average here. Replicated CP losses send each local model
+                        # contribution to cp_size loss consumers; divide by that fanout
+                        # to avoid overcounting. Partitioned losses have a fanout of 1.
+                        loss = (
+                            result
+                            * dp_size
+                            * cp_size
+                            / post_processing_fn.cp_gradient_fanout
+                        )
+                        loss.backward()
+
+            results.append((result, metrics))
 
     return results
 
@@ -606,8 +628,6 @@ class LossPostProcessor:
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
         self.draft_runtime = draft_runtime
-        if draft_runtime is not None and enable_seq_packing:
-            raise ValueError("Draft co-training does not support sequence packing.")
         self._cp_gradient_fanout = (
             cp_size
             if cp_size > 1

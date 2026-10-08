@@ -19,6 +19,8 @@ table and the lm_head receive gradients from the TTT loss; when frozen,
 neither does (while the rest of the drafter still trains).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -125,7 +127,7 @@ def test_next_token_position_mask_targets_label_positions():
     positions (position t supervises token t+1). The shift must supervise the
     last-prompt-token position (label = FIRST response token, where drafting
     starts) and zero the tail position (no next-token label)."""
-    from nemo_rl.models.automodel.draft.integration import next_token_position_mask
+    from nemo_rl.models.automodel.draft.runtime import next_token_position_mask
 
     # prompt = positions 0..2, response tokens = positions 3..5 (T = 6).
     token_mask = torch.tensor([[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]])
@@ -385,3 +387,97 @@ def test_flash_attention_2_packing_matches_eager_dense_mask():
     grad_fa2 = model_fa2.model.fc.weight.grad
     assert grad_eager is not None and grad_fa2 is not None
     assert torch.allclose(grad_eager, grad_fa2, atol=2e-2)
+
+
+class _StubCapture:
+    """Stand-in for DSparkHiddenCapture: active, with a fixed collect() result."""
+
+    def __init__(self, fused_hidden: torch.Tensor):
+        self.active = True
+        self._fused_hidden = fused_hidden
+
+    def collect(self) -> torch.Tensor:
+        return self._fused_hidden
+
+    def clear(self) -> None:
+        pass
+
+
+class _StubEagle3DraftModel:
+    """Stand-in for Eagle3DraftModel: records compute_loss's call kwargs."""
+
+    def __init__(self, d2t_target_ids: torch.Tensor, ttt_steps: int):
+        self._d2t_target_ids = d2t_target_ids
+        self._ttt_steps = ttt_steps
+        self.calls: list[dict] = []
+
+    def get_d2t_target_ids(self) -> torch.Tensor:
+        return self._d2t_target_ids
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        ones = [torch.tensor(1.0) for _ in range(self._ttt_steps)]
+        zeros = [torch.tensor(0.0) for _ in range(self._ttt_steps)]
+        return SimpleNamespace(
+            loss_nums=ones,
+            loss_dens=ones,
+            full_acc_nums=zeros,
+            full_acc_dens=ones,
+            cond_acc_nums=zeros,
+            cond_acc_dens=ones,
+        )
+
+
+def test_eagle3_runtime_compute_loss_applies_the_proposer_shift():
+    """vLLM's eagle proposer feeds h[t] + token[t + 1] and predicts token[t + 2]
+    (llm_base_proposer.py's "Shift the input ids by one token"); Eagle3Runtime
+    .compute_loss must shift input_ids, teacher_logits and loss_mask by one
+    position to match that contract before calling the draft model. Nothing
+    else calling compute_loss directly exercises this, so a regression in the
+    b9f6a38 alignment fix would go undetected.
+    """
+    from nemo_rl.models.automodel.draft.runtime import Eagle3Runtime
+    from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+
+    batch_size, seq_len, hidden_size, vocab_size = 1, 6, 4, 5
+    ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+    logits = torch.arange(
+        batch_size * seq_len * vocab_size, dtype=torch.float32
+    ).reshape(batch_size, seq_len, vocab_size)
+    fused_hidden = torch.randn(batch_size, seq_len, hidden_size)
+    token_mask = torch.tensor([[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]])
+
+    draft_model = _StubEagle3DraftModel(
+        d2t_target_ids=torch.arange(vocab_size), ttt_steps=1
+    )
+    runtime = Eagle3Runtime(
+        draft_model=draft_model,
+        eagle3_options=Eagle3DraftConfig(
+            enabled=True, ttt_steps=1, ttt_step_loss_decay=1.0
+        ),
+        loss_weight=1.0,
+        dp_group=None,
+    )
+    runtime.capture = _StubCapture(fused_hidden)
+    runtime.stash_teacher_logits(logits, need_clone=False)
+    runtime.begin_global_batch(1)
+
+    data_dict = {
+        "input_ids": ids,
+        "input_lengths": torch.tensor([seq_len]),
+        "token_mask": token_mask,
+    }
+    runtime.compute_loss(data_dict)
+
+    assert len(draft_model.calls) == 1
+    kwargs = draft_model.calls[0]
+    seen_input_ids = kwargs["input_ids"].reshape(batch_size, seq_len)
+    seen_teacher_logits = kwargs["teacher_logits"].reshape(
+        batch_size, seq_len, vocab_size
+    )
+    seen_loss_mask = kwargs["loss_mask"].reshape(batch_size, seq_len).float()
+
+    for t in range(seq_len - 1):
+        assert seen_input_ids[0, t] == ids[0, t + 1]
+        assert torch.equal(seen_teacher_logits[0, t], logits[0, t + 1])
+    assert torch.equal(seen_loss_mask, torch.tensor([[0.0, 1.0, 1.0, 1.0, 0.0, 0.0]]))

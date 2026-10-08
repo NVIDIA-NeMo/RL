@@ -1158,7 +1158,7 @@ _DRAFT_RATIO_NUM_RE = re.compile(r"^(draft_.*)_num(@\d+)?$")
 def finalize_draft_ratio_metrics(metrics: dict[str, Any]) -> None:
     """Turn summed ``draft_*_num``/``draft_*_den`` metric pairs back into ratios, in place.
 
-    DSparkRuntime/Eagle3Runtime (``nemo_rl/models/automodel/draft/integration.py``)
+    DSparkRuntime/Eagle3Runtime (``nemo_rl/models/automodel/draft/runtime.py``)
     emit per-microbatch accuracy/rate metrics as raw num/den pairs instead of
     pre-divided ratios, because the training loop's default per-key metric
     reduction sums every metric not on its small mean-reduction allowlist

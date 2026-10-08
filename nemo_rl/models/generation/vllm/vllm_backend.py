@@ -29,6 +29,15 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     resolve_rollout_rank,
 )
 from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
+from nemo_rl.models.generation.vllm.draft_utils import (
+    DRAFT_DISABLE_MODULE_SHARING_ENV,
+    _assert_drafter_owns_modules,
+    _draft_owns_speculator,
+    _is_full_draft_stream,
+    _validate_draft_refit_info,
+    disable_draft_module_sharing,
+)
+from nemo_rl.models.generation.vllm.utils import _format_refit_key_error
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -64,106 +73,9 @@ WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]
 UnsupportedNativeRefitTransport = Literal["checkpoint_engine", "sparse_delta"]
 WeightUpdateFinalizer = Callable[[], None]
 
-# Speculative methods whose drafter is co-trained by the trainer and refit
-# through the ``draft.*`` weight stream (dspark/dflash block drafters and the
-# eagle3 TTT drafter). MTP is co-trained too but streams without the prefix.
-COTRAINED_SPECULATIVE_METHODS = ("dspark", "dflash", "eagle3")
-
-# Env flag that requests disable_draft_module_sharing() at import time in
-# every process that resolves this module (the driver actor and any spawned
-# vLLM executor workers, which import it for worker_extension_cls before
-# loading the model).
-DRAFT_DISABLE_MODULE_SHARING_ENV = "NRL_DRAFT_DISABLE_MODULE_SHARING"
-
-
-def disable_draft_module_sharing() -> None:
-    """Keep the drafter's embed_tokens/lm_head separate from the target's.
-
-    The pinned vLLM's ``load_dspark_model`` / ``load_dflash_model`` /
-    ``load_eagle_model`` alias the drafter's embed_tokens and lm_head modules
-    to the target model's whenever the drafter's ``load_weights`` has not
-    marked them as owned — which is always the case under
-    ``load_format="dummy"``, where no checkpoint weights are read at startup.
-    With draft co-training the refit stream carries trained
-    ``draft.embed_tokens`` / ``draft.lm_head`` weights, and loading them through
-    the aliased modules silently replaces the POLICY model's serving embed and
-    lm_head with the draft's. Forcing ``_should_share`` to False makes the
-    drafter keep the modules it built in ``__init__``; refit fills them before
-    the first generation, and CUDA graphs capture drafter-owned storage.
-
-    ``_should_share`` is defined in the eagle utils module and imported by
-    value into the dspark/dflash utils modules, so each module's global must
-    be rebound individually.
-
-    A second, independent embed_tokens-sharing decision lives in
-    ``SpecDecodeBaseProposer._maybe_share_embeddings`` (used by the eagle3
-    proposer): it shares whenever ``self.model.has_own_embed_tokens`` is
-    falsy, a flag only ever set (to True) by ``process_eagle_weight`` when a
-    weight literally named "embed_tokens" is loaded -- which never happens
-    under ``load_format="dummy"``. This is not reachable through
-    ``_should_share`` at all, so it needs its own no-op patch; skipping it
-    entirely leaves each drafter holding the embed_tokens it built in
-    ``__init__``, matching the ``_should_share`` override above.
-
-    Must run before engine creation (drafter load and CUDA-graph capture).
-    """
-    from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
-    from vllm.v1.worker.gpu.spec_decode.dflash import utils as dflash_utils
-    from vllm.v1.worker.gpu.spec_decode.dspark import utils as dspark_utils
-    from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
-
-    def _never_share(*args: Any, **kwargs: Any) -> bool:
-        return False
-
-    def _never_share_embeddings(self: Any, target_language_model: Any) -> None:
-        return None
-
-    eagle_utils._should_share = _never_share
-    dspark_utils._should_share = _never_share
-    dflash_utils._should_share = _never_share
-    SpecDecodeBaseProposer._maybe_share_embeddings = _never_share_embeddings
-
 
 if os.environ.get(DRAFT_DISABLE_MODULE_SHARING_ENV) == "1":
     disable_draft_module_sharing()
-
-# Incoming draft stream keys each drafter's loader intentionally skips. They
-# are tolerated as extras in the refit manifest and excluded from the required
-# key set. dspark/dflash: mask_embedding is a placeholder param, the
-# confidence head is not wired into inference (dflash drafts never have one),
-# and t2d is training-only. eagle3: t2d is training-only.
-_DRAFT_SKIPPED_KEY_SUBSTRINGS = {
-    "dspark": ("mask_embedding", "confidence_head", "t2d"),
-    "dflash": ("mask_embedding", "confidence_head", "t2d"),
-    "eagle3": ("t2d",),
-}
-
-
-def _is_full_draft_stream(draft_keys: "set[str] | list[str]") -> bool:
-    """Whether a ``draft.*`` stream is the DTensor-v2 FULL drafter.
-
-    The DTensor-v2 co-training path streams the vendored model's entire
-    state_dict (always including ``embed_tokens``), regardless of method
-    (dspark/dflash/eagle3). A megatron co-training exporter may instead
-    stream a PARTIAL drafter -- the megatron eagle3 exporter intentionally
-    omits ``embed_tokens`` and aliases its single collapsed layer as
-    ``midlayer.*`` instead of ``layers.0.*``, relying on drafter module
-    sharing at serve time -- and future megatron block drafters
-    (dspark/dflash) may do the same, so this checks for that unambiguous
-    partial-stream signature rather than inferring partialness from a
-    missing ``embed_tokens`` key: a FULL stream can also be missing that one
-    required key (e.g. a misconfigured trainer export), and keying off its
-    absence would then wrongly wave the stream through as "partial" instead
-    of flagging the missing key.
-    """
-    return not any("midlayer." in key for key in draft_keys)
-
-
-def _format_refit_key_error(label: str, keys: set[str]) -> str:
-    """Format a bounded refit-key diagnostic."""
-    ordered = sorted(keys)
-    suffix = " ..." if len(ordered) > 8 else ""
-    return f"{label} ({len(ordered)}): {ordered[:8]}{suffix}"
 
 
 class IPCWeightManifestError(RuntimeError):
@@ -807,52 +719,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
-    def draft_refit_preflight_report(self) -> dict[str, Any]:
-        """JSON-safe snapshot of the drafter refit surface for preflight checks.
-
-        Invoked via ``collective_rpc`` to validate, inside the serving
-        container, that the drafter loaded, its expected ``draft.*`` key set
-        matches the trainer's stream, integer/bool buffers keep their dtype,
-        and no embed/lm_head storage is aliased to the target model.
-        """
-        method = self._speculative_method()
-        draft_model = self._get_drafter_model()
-        report: dict[str, Any] = {
-            "method": method,
-            "owns_speculator": self._draft_owns_speculator(),
-            "has_drafter": draft_model is not None,
-        }
-        if draft_model is None:
-            return report
-        report["expected_draft_keys"] = sorted(self._expected_draft_keys())
-        report["param_dtypes"] = {
-            name: str(param.dtype) for name, param in draft_model.named_parameters()
-        }
-
-        target_model = self.model_runner.model
-        target_lm = (
-            target_model.get_language_model()
-            if hasattr(target_model, "get_language_model")
-            else target_model
-        )
-
-        def _ptr(module: Any) -> Optional[int]:
-            return module.weight.data_ptr() if module is not None else None
-
-        draft_embed = _ptr(
-            getattr(getattr(draft_model, "model", None), "embed_tokens", None)
-        )
-        target_embed = _ptr(
-            getattr(getattr(target_lm, "model", None), "embed_tokens", None)
-        )
-        draft_head = _ptr(getattr(draft_model, "lm_head", None))
-        target_head = _ptr(getattr(target_lm, "lm_head", None))
-        report["embed_tokens_aliased"] = (
-            draft_embed is not None and draft_embed == target_embed
-        )
-        report["lm_head_aliased"] = draft_head is not None and draft_head == target_head
-        return report
-
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming.
 
@@ -875,7 +741,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """
         self._validate_native_layerwise_refit()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
-        self._validate_draft_refit_info(state_dict_info)
+        _validate_draft_refit_info(
+            self.model_runner,
+            self._get_drafter_model(),
+            self._speculative_method(),
+            state_dict_info,
+        )
 
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
@@ -979,126 +850,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
         return getattr(spec_config, "method", None) if spec_config else None
 
-    def _draft_owns_speculator(self) -> bool:
-        """Whether this rank should own the co-trained speculator.
-
-        vLLM keeps the drafter on the last pipeline stage, so earlier stages
-        legitimately have no speculator and must skip draft payloads; every
-        rank owns it in single-stage layouts.
-        """
-        if self._speculative_method() not in COTRAINED_SPECULATIVE_METHODS:
-            return False
-        try:
-            return bool(get_pp_group().is_last_rank)
-        except AssertionError:
-            # No initialized PP group (single-process layouts, unit tests).
-            return True
-
-    def _expected_draft_keys(self) -> set[str]:
-        """Expected incoming ``draft.*`` keys derived from the drafter's layout.
-
-        Inverts the drafter ``load_weights`` name handling shared by
-        ``Qwen3DSparkForCausalLM`` / ``DFlashQwen3ForCausalLM`` /
-        ``Eagle3Qwen3ForCausalLM``: trainer names are prefixed with ``model.``
-        (except ``lm_head.*``, and ``d2t`` which maps to
-        ``draft_id_to_target_id``), and fused parameters load from their
-        stacked components (qkv_proj <- q/k/v_proj, gate_up_proj <-
-        gate/up_proj). Parameters the loader never feeds from the stream (see
-        _DRAFT_SKIPPED_KEY_SUBSTRINGS) are excluded.
-        """
-        draft_model = self._get_drafter_model()
-        if draft_model is None:
-            raise RuntimeError(
-                "[draft] Draft refit validation requires the drafter model, but "
-                "none was found at model_runner.drafter.model or "
-                "model_runner.speculator.model on a speculator-owning rank."
-            )
-        fused_expansions = {
-            "qkv_proj": ("q_proj", "k_proj", "v_proj"),
-            "gate_up_proj": ("gate_proj", "up_proj"),
-        }
-        method = self._speculative_method()
-        if method is None:
-            raise RuntimeError(
-                "[draft] Expected draft keys require an active "
-                "speculative_config method, but none is configured."
-            )
-        skipped = _DRAFT_SKIPPED_KEY_SUBSTRINGS[method]
-        expected: set[str] = set()
-        for name, _ in draft_model.named_parameters():
-            if any(s in name for s in skipped):
-                continue
-            if name == "draft_id_to_target_id":
-                expected.add("draft.d2t")
-                continue
-            trainer_name = name.removeprefix("model.")
-            segments = trainer_name.split(".")
-            fused = next((s for s in segments if s in fused_expansions), None)
-            if fused is None:
-                expected.add(f"draft.{trainer_name}")
-            else:
-                for part in fused_expansions[fused]:
-                    expected.add(
-                        "draft." + ".".join(part if s == fused else s for s in segments)
-                    )
-        return expected
-
-    def _validate_draft_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Hard-error when the trainer's ``draft.*`` manifest mismatches the drafter.
-
-        Owning ranks require exactly the drafter's loadable key set (plus keys
-        the loader intentionally skips); non-owning ranks ignore draft payloads
-        entirely and are never required to have a drafter.
-        """
-        method = self._speculative_method()
-        if method is None or method not in COTRAINED_SPECULATIVE_METHODS:
-            return
-        if not self._draft_owns_speculator():
-            return
-        provided = {k for k in state_dict_info if k.startswith("draft.")}
-        if not provided:
-            if os.environ.get(DRAFT_DISABLE_MODULE_SHARING_ENV) == "1":
-                # The generation worker sets this env exactly when full-draft
-                # co-training refit is enabled (dummy-loaded drafter waiting
-                # for streamed weights). An empty draft manifest here means the
-                # trainer failed to export the draft — serving would silently
-                # run a stale (dummy-initialized) drafter forever.
-                raise RuntimeError(
-                    f"[draft] {method} co-training refit is enabled "
-                    f"({DRAFT_DISABLE_MODULE_SHARING_ENV}=1) but the refit "
-                    "manifest carries no draft.* keys; the trainer-side draft "
-                    "export is missing or misconfigured."
-                )
-            # Static-drafter mode: with policy.draft.enabled=false the drafter
-            # is loaded from its checkpoint at startup and refits legitimately
-            # carry only policy weights. Exact-key validation applies only when
-            # the trainer co-trains (and therefore streams) the draft.
-            return
-        if not _is_full_draft_stream(provided):
-            # Megatron co-training (eagle3 today; block drafters may follow)
-            # can stream a PARTIAL drafter (no embed_tokens, e.g. eagle3's
-            # midlayer.* alias for the single layer) and relies on the
-            # drafter sharing the target's embedding; exact-key validation
-            # against the vLLM parameter layout only applies to the
-            # DTensor-v2 full stream.
-            return
-        expected = self._expected_draft_keys()
-        skipped = _DRAFT_SKIPPED_KEY_SUBSTRINGS[method]
-        missing = expected - provided
-        unexpected = {
-            key for key in provided - expected if not any(s in key for s in skipped)
-        }
-        errors = []
-        if missing:
-            errors.append(_format_refit_key_error("missing draft keys", missing))
-        if unexpected:
-            errors.append(_format_refit_key_error("unexpected draft keys", unexpected))
-        if errors:
-            raise RuntimeError(
-                f"[draft] {method} refit manifest does not match the vLLM "
-                "drafter layout: " + "; ".join(errors)
-            )
-
     def _get_drafter_model(self) -> Any:
         """Return the vLLM drafter's underlying model, or None if absent.
 
@@ -1137,7 +888,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         draft_model = self._get_drafter_model()
         if draft_model is None:
             if strict_cotraining:
-                if self._draft_owns_speculator():
+                if _draft_owns_speculator(self.model_runner, method):
                     # Draft co-training streams every draft weight on each
                     # refit; an owning rank without a speculator would silently
                     # generate with stale draft weights.
@@ -1155,60 +906,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
             return
         if strict_cotraining:
-            self._assert_drafter_owns_modules(draft_model, draft_weights)
+            _assert_drafter_owns_modules(self.model_runner, draft_model, draft_weights)
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         draft_model.load_weights(weights=draft_weights)
-
-    def _assert_drafter_owns_modules(
-        self, draft_model: Any, draft_weights: list[tuple[str, torch.Tensor]]
-    ) -> None:
-        """Refuse to load draft embed/lm_head through target-shared modules.
-
-        vLLM's drafter loaders may alias the drafter's embed_tokens and
-        lm_head to the target model's modules as a weight-sharing optimization;
-        loading refit draft weights through such an alias would overwrite the
-        policy's serving weights with the draft's (see
-        ``disable_draft_module_sharing``). Guard every refit so any path
-        that reintroduces the sharing fails loudly instead of silently
-        corrupting generation.
-        """
-        target_model = self.model_runner.model
-        target_lm = (
-            target_model.get_language_model()
-            if hasattr(target_model, "get_language_model")
-            else target_model
-        )
-        refits_embed = any("embed_tokens" in name for name, _ in draft_weights)
-        refits_lm_head = any("lm_head" in name for name, _ in draft_weights)
-
-        def _shares_weight(draft_module: Any, target_module: Any) -> bool:
-            return (
-                draft_module is not None
-                and target_module is not None
-                and draft_module.weight.data_ptr() == target_module.weight.data_ptr()
-            )
-
-        shared = []
-        if refits_embed and _shares_weight(
-            getattr(getattr(draft_model, "model", None), "embed_tokens", None),
-            getattr(getattr(target_lm, "model", None), "embed_tokens", None),
-        ):
-            shared.append("embed_tokens")
-        if refits_lm_head and _shares_weight(
-            getattr(draft_model, "lm_head", None),
-            getattr(target_lm, "lm_head", None),
-        ):
-            shared.append("lm_head")
-        if shared:
-            raise RuntimeError(
-                "[draft] The drafter's "
-                + "/".join(shared)
-                + " share storage with the target model; loading refit draft "
-                "weights through the alias would overwrite the policy's serving "
-                "weights. Ensure disable_draft_module_sharing() ran "
-                "before engine creation "
-                f"({DRAFT_DISABLE_MODULE_SHARING_ENV}=1)."
-            )
 
     def _mtp_drafter_refit_enabled(self) -> bool:
         """Whether MTP drafter weights should be refreshed from the refit stream.
