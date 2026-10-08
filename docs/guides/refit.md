@@ -67,6 +67,14 @@ workers can send weights. Sparse delta is currently limited to GRPO. NIXL is
 initialized by the GRPO and distillation setup paths; PPO currently requires
 colocated generation.
 
+### Draft Weights with Context Parallel Training
+
+With `refit_transport: nccl_reshard`, a Megatron trainer can send draft weights
+from its TP, PP, and CP lanes to vLLM. The vLLM generation layout must use CP1.
+This transport support does not, by itself, enable a draft-training layout;
+configure a supported training path separately. The vLLM reload API does not
+support trainer-owned draft weights.
+
 ## Minimal Configuration
 
 Colocated vLLM and SGLang refit need no transport configuration:
