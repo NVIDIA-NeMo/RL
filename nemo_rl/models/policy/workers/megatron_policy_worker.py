@@ -53,7 +53,6 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
-    need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
@@ -2329,7 +2328,6 @@ class MegatronPolicyWorkerImpl(
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
-          "token_mask": only for top-k/top-p filtering; masked out -inf positions.
         """
         self.timer.start("get_logprobs")
         no_grad = torch.no_grad()
@@ -2397,24 +2395,14 @@ class MegatronPolicyWorkerImpl(
                 router_replay_train=False,
             )
 
-        # Taken from config; every PP rank must build the same mask for the broadcast below.
-        has_token_mask = need_top_k_or_top_p_filtering(self.sampling_params)
-
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             tensors: dict[str, Optional[torch.Tensor]] = {
                 "logprobs": pad_and_concat(
                     [l["logprobs"] for l in list_of_logprobs], target_len=seq_length
                 )
             }
-            if has_token_mask:
-                # Pad token_mask with 0 so padded positions are excluded from the loss.
-                tensors["token_mask"] = pad_and_concat(
-                    [l["token_mask"] for l in list_of_logprobs], target_len=seq_length
-                )
         else:
             tensors = {"logprobs": None}
-            if has_token_mask:
-                tensors["token_mask"] = None
         broadcasted = broadcast_tensors_from_last_stage(tensors)
         logprobs = broadcasted["logprobs"]
 
@@ -2429,8 +2417,6 @@ class MegatronPolicyWorkerImpl(
         )
         cpu_logprobs.copy_(logprobs, non_blocking=False)
         result = BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
-        if has_token_mask:
-            result["token_mask"] = broadcasted["token_mask"].to("cpu")
         return result
 
     def _resolve_output_layer_owner(self) -> Optional[Any]:

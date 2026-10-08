@@ -664,7 +664,7 @@ class TestLogprobsPostProcessor:
             vlm_kwargs={},
         )
 
-        result, output_token_mask = processor(
+        result = processor(
             logits=logits,
             data_dict=data_dict,
             processed_inputs=processed_inputs,
@@ -675,7 +675,6 @@ class TestLogprobsPostProcessor:
 
         assert result.shape == (batch_size, seq_len)
         assert torch.isfinite(result).all()
-        assert output_token_mask is None
 
     def test_logprobs_with_chunking(
         self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
@@ -703,7 +702,7 @@ class TestLogprobsPostProcessor:
             vlm_kwargs={},
         )
 
-        result, _ = processor(
+        result = processor(
             logits=logits,
             data_dict=data_dict,
             processed_inputs=processed_inputs,
@@ -1816,7 +1815,7 @@ class TestLogprobsPostProcessorSeqPacking:
         with patch.object(
             torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
         ):
-            result, _ = processor(
+            result = processor(
                 logits=logits,
                 data_dict=data_dict,
                 processed_inputs=processed_inputs,
@@ -1863,7 +1862,7 @@ class TestLogprobsPostProcessorSeqPacking:
             vlm_kwargs={},
         )
 
-        result, _ = processor(
+        result = processor(
             logits=logits,
             data_dict=data_dict,
             processed_inputs=processed_inputs,

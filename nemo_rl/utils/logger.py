@@ -46,6 +46,7 @@ from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.metric_utils import is_histogram_metric
 from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+from nemo_rl.utils.train_data_dump import json_safe_nonfinite
 
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
@@ -1378,7 +1379,14 @@ class Logger(LoggerInterface):
                     elif isinstance(value, np.ndarray):
                         sample[key] = value.tolist()
                 # default=str is a fallback for non-JSON-serializable types (e.g., datetime, custom objects)
-                f.write(json.dumps({**sample, "idx": i}, default=str) + "\n")
+                f.write(
+                    json.dumps(
+                        json_safe_nonfinite({**sample, "idx": i}),
+                        default=str,
+                        allow_nan=False,
+                    )
+                    + "\n"
+                )
 
         print(f"Logged data to {filepath}")
 
@@ -1516,7 +1524,7 @@ class Logger(LoggerInterface):
             logger.log_plot(figure, step, name)
 
     def log_plot_token_mult_prob_error(
-        self, data: dict[str, Any], step: int, name: str
+        self, data: dict[str, Any], step: int, name: str, *, filtering_on: bool = False
     ) -> None:
         """Log a plot of log probability errors in samples.
 
@@ -1535,10 +1543,23 @@ class Logger(LoggerInterface):
         prev_logprobs = data["prev_logprobs"][:, 1:]
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        diff = (generation_logprobs - prev_logprobs).abs() * token_mask
-        mask = token_mask * sample_mask.unsqueeze(-1)
-
-        mult_prob_error = (torch.exp(diff) * mask).sum(dim=-1) / mask.sum(dim=-1)
+        valid = mask.bool()
+        if filtering_on:
+            valid = (
+                valid
+                & ~torch.isneginf(generation_logprobs)
+                & ~torch.isneginf(prev_logprobs)
+            )
+        counts = valid.sum(dim=-1)
+        if not counts.any():
+            return
+        generation_logprobs = torch.where(valid, generation_logprobs, 0.0)
+        prev_logprobs = torch.where(valid, prev_logprobs, 0.0)
+        diff = (generation_logprobs - prev_logprobs).abs()
+        mult_prob_error = torch.where(valid, torch.exp(diff), 0.0).sum(
+            dim=-1
+        ) / counts.clamp_min(1)
+        mult_prob_error = mult_prob_error.masked_fill(counts == 0, -torch.inf)
 
         sample_idx = torch.argmax(mult_prob_error)
         sample_error = mult_prob_error[sample_idx]
@@ -1559,23 +1580,30 @@ class Logger(LoggerInterface):
         generation_logprob = generation_logprobs[
             sample_idx, int(generation_start_idx) : int(generation_end_idx)
         ]
-        prev_logprob = (
-            prev_logprobs[
-                sample_idx, int(generation_start_idx) : int(generation_end_idx)
-            ]
-            * mask[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
-        )
+        prev_logprob = prev_logprobs[
+            sample_idx, int(generation_start_idx) : int(generation_end_idx)
+        ]
+        valid_i = valid[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
+        if not valid_i.any():
+            return
         diff_i = diff[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
+        diff_i = diff_i.masked_fill(~valid_i, float("nan"))
+        generation_logprob = generation_logprob.masked_fill(~valid_i, float("nan"))
+        prev_logprob = prev_logprob.masked_fill(~valid_i, float("nan"))
 
         # Find max absolute error token
-        max_abs_error_idx = torch.argmax(diff_i).item()
+        max_abs_error_idx = torch.argmax(
+            diff_i.masked_fill(~valid_i, -torch.inf)
+        ).item()
         max_abs_error = diff_i[max_abs_error_idx].item()
 
         # Find max relative error token (ratio of probabilities)
         gen_prob = torch.exp(generation_logprob)
         prev_prob = torch.exp(prev_logprob)
         relative_error = torch.abs((gen_prob - prev_prob) / gen_prob)
-        max_rel_error_idx = torch.argmax(relative_error).item()
+        max_rel_error_idx = torch.argmax(
+            relative_error.masked_fill(~valid_i, -torch.inf)
+        ).item()
         max_rel_error = relative_error[max_rel_error_idx].item()
 
         fig = plt.figure()

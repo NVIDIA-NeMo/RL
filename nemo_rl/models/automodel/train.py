@@ -387,11 +387,7 @@ def forward_with_post_processing_fn(
             sequence_dim=sequence_dim,
         )
         if isinstance(post_processing_fn, LogprobsPostProcessor):
-            logprobs_result, updated_token_mask = result
-            result = logprobs_result
-            metrics = {"logprobs": logprobs_result}
-            if updated_token_mask is not None:
-                metrics["token_mask"] = updated_token_mask
+            metrics = {"logprobs": result}
         else:
             vals, idx = result
             metrics = {"topk_logits": vals, "topk_indices": idx}
@@ -713,7 +709,7 @@ class LogprobsPostProcessor:
         *,
         cp_sharder: Optional[ContextParallelSharder],
         sequence_dim: int = 1,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> torch.Tensor:
         """Compute token log probabilities from logits.
 
         Args:
@@ -727,9 +723,8 @@ class LogprobsPostProcessor:
             sequence_dim: Sequence dimension
 
         Returns:
-            (token log probabilities tensor [batch_size, seq_length],
-             optional token_mask). Filtering preserves the input mask and leaves
-             policy support information in logprobs for the actor loss.
+            Token log probabilities [batch_size, seq_length]. Filtering leaves
+            policy support information in logprobs for the actor loss.
         """
         input_lengths = data_dict["input_lengths"]
 
@@ -803,13 +798,11 @@ class LogprobsPostProcessor:
 
         # Preserve -inf only on valid tokens outside the policy support. The
         # actor loss excludes these positions before sanitizing logprobs.
-        output_token_mask = None
         if need_top_k_or_top_p_filtering(self.sampling_params):
             mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
             token_logprobs = mask_filtered_logprobs_outside_tokens(token_logprobs, mask)
-            output_token_mask = data_dict["token_mask"]
 
-        return token_logprobs, output_token_mask
+        return token_logprobs
 
     def _compute_local_logprobs(
         self,

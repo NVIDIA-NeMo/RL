@@ -26,10 +26,6 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.logits_sampling_utils import (
-    TrainingSamplingParams,
-    need_top_k_or_top_p_filtering,
-)
 from nemo_rl.algorithms.advantage_estimator import (
     GAEConfig,
     GeneralizedAdvantageEstimator,
@@ -42,6 +38,10 @@ from nemo_rl.algorithms.grpo import (
     extract_initial_prompt_messages,
     refit_policy_generation,
     scale_rewards,
+)
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
@@ -1669,9 +1669,6 @@ def ppo_train(
                     )
                     prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
                     train_data["prev_logprobs"] = prev_lp_result["logprobs"]
-                    # Propagate the top-k/top-p neginf mask so the loss skips these positions.
-                    if "token_mask" in prev_lp_result:
-                        train_data["token_mask"] = prev_lp_result["token_mask"]
 
                     if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
@@ -2699,9 +2696,6 @@ def async_ppo_train(
                     )
                     prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
                     train_data["prev_logprobs"] = prev_lp_result["logprobs"]
-                    # Propagate the top-k/top-p neginf mask so the loss skips these positions.
-                    if "token_mask" in prev_lp_result:
-                        train_data["token_mask"] = prev_lp_result["token_mask"]
                     if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
                             policy.get_reference_policy_logprobs(
@@ -3105,6 +3099,12 @@ def async_ppo_train(
                     },
                     step + 1,
                     name="train/token_mult_prob_error_plot_sample",
+                    filtering_on=need_top_k_or_top_p_filtering(
+                        TrainingSamplingParams(
+                            top_k=master_config.policy["generation"]["top_k"],
+                            top_p=master_config.policy["generation"]["top_p"],
+                        )
+                    ),
                 )
             del train_data
 

@@ -2445,3 +2445,48 @@ def test_print_message_log_samples(capsys):
     assert "What is 2+2?" in captured.out
     assert "2+2 = 4" in captured.out
     assert "Sample 1 | Reward: 1.0000" in captured.out
+
+
+@pytest.mark.parametrize("all_excluded", [False, True])
+def test_filtered_plot_ignores_unsupported_and_masked_rows(all_excluded):
+    logger = object.__new__(Logger)
+    logger.gpu_monitor = None
+    logger.log_plot = MagicMock()
+    data = {
+        "token_mask": torch.ones(3, 3),
+        "sample_mask": torch.tensor([1, 1, 0]),
+        "generation_logprobs": torch.zeros(3, 3),
+        "prev_logprobs": torch.tensor(
+            [[0.0, -torch.inf, -torch.inf], [0.0, -1.0, -2.0], [0.0, -99.0, -99.0]]
+        ),
+        "prompt_lengths": torch.ones(3, dtype=torch.long),
+        "full_lengths": torch.full((3,), 3),
+    }
+    if all_excluded:
+        data["sample_mask"][1] = 0
+    logger.log_plot_token_mult_prob_error(data, 1, "support", filtering_on=True)
+    if all_excluded:
+        logger.log_plot.assert_not_called()
+    else:
+        logger.log_plot.assert_called_once()
+        figure = logger.log_plot.call_args.args[0]
+        assert list(figure.axes[0].lines[1].get_ydata()) == [-1.0, -2.0]
+
+
+def test_legacy_train_dump_serializes_unsupported_logprobs_as_null(tmp_path):
+    import json
+
+    logger = object.__new__(Logger)
+    logger.gpu_monitor = None
+    logger.base_log_dir = str(tmp_path)
+    values = torch.tensor([[0.0, -torch.inf]])
+    logger.log_batched_dict_as_jsonl({"prev_logprobs": values}, "train.jsonl")
+
+    def reject_nonfinite(value):
+        raise AssertionError(value)
+
+    row = json.loads(
+        (tmp_path / "train.jsonl").read_text(), parse_constant=reject_nonfinite
+    )
+    assert row["prev_logprobs"] == [[0.0, None]]
+    assert torch.isneginf(values[0, 1])

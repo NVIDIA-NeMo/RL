@@ -46,11 +46,6 @@ import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-# Re-imports from grpo so this file is a thin trainer-only fork.
-from nemo_rl.algorithms.logits_sampling_utils import (
-    TrainingSamplingParams,
-    need_top_k_or_top_p_filtering,
-)
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     MasterConfig,
@@ -66,6 +61,12 @@ from nemo_rl.algorithms.grpo import (
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
     scale_rewards,
+)
+
+# Re-imports from grpo so this file is a thin trainer-only fork.
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
@@ -1402,6 +1403,12 @@ def grpo_train_sync(
                     },
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
+                    filtering_on=need_top_k_or_top_p_filtering(
+                        TrainingSamplingParams(
+                            top_k=master_config.policy["generation"]["top_k"],
+                            top_p=master_config.policy["generation"]["top_p"],
+                        )
+                    ),
                 )
             if (
                 master_config.policy["generation"]

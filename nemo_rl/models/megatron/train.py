@@ -960,10 +960,6 @@ class LogprobsPostProcessor:
 
             token_logprobs = token_logprobs[:, :original_seq_length]
             result_dict = {"logprobs": token_logprobs}
-            if need_top_k_or_top_p_filtering(self.sampling_params):
-                result_dict["token_mask"] = data_dict["token_mask"][
-                    :, :original_seq_length
-                ]
 
             return torch.tensor(0.0, device=token_logprobs.device), result_dict
 

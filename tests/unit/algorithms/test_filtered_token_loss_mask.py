@@ -241,7 +241,7 @@ def test_automodel_prev_logprobs_keep_support_only_on_valid_tokens():
         }
     )
 
-    logprobs, updated_token_mask = processor(
+    logprobs = processor(
         logits,
         data,
         ProcessedInputs(input_ids=input_ids, seq_len=4),
@@ -253,7 +253,6 @@ def test_automodel_prev_logprobs_keep_support_only_on_valid_tokens():
     # Prompt (row 0, pos 1) and padding (row 1, pos 3) are zeroed instead of
     # carrying -inf/NaN; valid out-of-support tokens keep -inf for the loss.
     expected = torch.tensor([[0.0, 0.0, 0.0, -torch.inf], [0.0, 0.0, -torch.inf, 0.0]])
-    torch.testing.assert_close(updated_token_mask, data["token_mask"])
     torch.testing.assert_close(logprobs, expected, rtol=0, atol=0)
 
 
@@ -373,10 +372,7 @@ def test_megatron_prev_logprobs_preserve_shared_mask(monkeypatch, top_k):
     )
     _, result = processor(data, data["input_ids"], None, 3)(torch.zeros(1, 4, 3))
     assert torch.isneginf(result["logprobs"][0, 1])
-    if top_k is not None:
-        torch.testing.assert_close(result["token_mask"], data["token_mask"][:, :3])
-    else:
-        assert "token_mask" not in result
+    assert "token_mask" not in result
 
 
 @pytest.mark.parametrize("driver", ["grpo", "grpo_sync", "ppo"])

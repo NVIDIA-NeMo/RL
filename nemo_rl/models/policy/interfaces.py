@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, Optional, TypedDict
+from typing import Any, Optional, TypedDict
 
 import ray
 import torch
@@ -24,16 +24,9 @@ from nemo_rl.utils.timer import Timer
 
 
 class LogprobOutputSpec(TypedDict):
-    """logprobs: Tensor of log probabilities.
-
-    token_mask: Optional backend-provided validity mask. Callers write this back
-    to training data or the transfer queue. Filtered policy support is preserved
-    as -inf in logprobs and excluded by the actor loss without narrowing the
-    shared mask used by unfiltered reference KL.
-    """
+    """Token log probabilities; filtered unsupported tokens retain -inf."""
 
     logprobs: torch.Tensor
-    token_mask: NotRequired[torch.Tensor]
 
 
 class ReferenceLogprobOutputSpec(TypedDict):
@@ -87,7 +80,6 @@ class PolicyInterface(ABC):
         Returns:
             BatchedDataDict containing:
                 - ``logprobs``: Tensor of logprobs of actions
-                - ``token_mask``: only for top-k/top-p filtering; masked out -inf positions.
         """
         pass
 

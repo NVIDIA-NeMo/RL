@@ -3609,10 +3609,6 @@ def _grpo_train_impl(
                     if not skip_prev_logprobs:
                         prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
                         train_data["prev_logprobs"] = prev_lp_result["logprobs"]
-                        # When top-k/top-p filtering is enabled, the worker returns a mask that has
-                        # -inf positions zeroed. Propagate it so the loss reduction skips them.
-                        if "token_mask" in prev_lp_result:
-                            train_data["token_mask"] = prev_lp_result["token_mask"]
                     else:
                         print(
                             "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
@@ -4074,6 +4070,12 @@ def _grpo_train_impl(
                     },
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
+                    filtering_on=need_top_k_or_top_p_filtering(
+                        TrainingSamplingParams(
+                            top_k=master_config.policy["generation"]["top_k"],
+                            top_p=master_config.policy["generation"]["top_p"],
+                        )
+                    ),
                 )
             del train_data
             if (
@@ -5422,9 +5424,6 @@ def async_grpo_train(
                     if not skip_prev_logprobs:
                         prev_lp_result = policy.get_logprobs(train_data, timer=timer)
                         train_data["prev_logprobs"] = prev_lp_result["logprobs"]
-                        # Propagate the top-k/top-p neginf token mask.
-                        if "token_mask" in prev_lp_result:
-                            train_data["token_mask"] = prev_lp_result["token_mask"]
                     else:
                         train_data["prev_logprobs"] = torch.zeros_like(
                             train_data["generation_logprobs"]
