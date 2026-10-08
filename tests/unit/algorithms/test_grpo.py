@@ -5716,7 +5716,7 @@ class TestValidateFunction:
             logged_data["data"] = data
             logged_data["filename"] = filename
 
-        mock_logger.log_batched_dict_as_jsonl = MagicMock(side_effect=capture_log)
+        mock_logger.log_batched_dict_as_trace = MagicMock(side_effect=capture_log)
 
         # Mock config
         mock_config = mock_grpo_components["master_config"]
@@ -5745,11 +5745,11 @@ class TestValidateFunction:
                             logger=mock_logger,
                         )
 
-        # Verify log_batched_dict_as_jsonl was called
-        mock_logger.log_batched_dict_as_jsonl.assert_called_once()
+        # Verify log_batched_dict_as_trace was called
+        mock_logger.log_batched_dict_as_trace.assert_called_once()
 
-        # Verify the filename
-        assert logged_data["filename"] == "val_data_step5.jsonl"
+        # Verify the filename (the extension comes from logger.trace_format)
+        assert logged_data["filename"] == "val_data_step5"
 
         # Verify the data structure
         assert "content" in logged_data["data"]
