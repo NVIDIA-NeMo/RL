@@ -593,8 +593,12 @@ class MegatronGeneration(GenerationInterface):
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate asynchronously, yielding `(index, batch)` tuples as they complete."""
         worker = self._policy.worker_group.workers[0]
-        futures = worker.generate_async.options(num_returns="streaming").remote(
-            data=data, greedy=greedy
+        # Not .options(num_returns="streaming"): this process cannot unpickle the
+        # Megatron worker class (no Megatron here), so Ray gives the handle a
+        # placeholder class whose methods are not generators. Ray >= 2.58 checks
+        # that in .options() and raises; _remote() skips the check.
+        futures = worker.generate_async._remote(
+            kwargs={"data": data, "greedy": greedy}, num_returns="streaming"
         )
         async for result_ref in futures:
             index, result_batch = await result_ref
@@ -635,9 +639,18 @@ class MegatronGeneration(GenerationInterface):
         return True
 
     def setup_token_capture(
-        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
     ) -> None:
         """Install MInf's canonical prompt and completion capture hooks."""
+        if capture_media:
+            raise NotImplementedError(
+                "Media token capture is only implemented for the vLLM generation "
+                "backend; the MInf stager writes text-only rows"
+            )
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(
                 "Megatron token capture requires mcore_generation_config."
