@@ -68,7 +68,10 @@ jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/da
 
 # Tiny random-init Qwen3 MoE (2 layers, 4 experts, top-2) sharing Qwen3-0.6B's
 # tokenizer. Sized so TP2 training and TP1 inference both divide evenly and
-# TE grouped GEMM alignment holds.
+# TE grouped GEMM alignment holds. MCore rejects MoE training under TP without
+# sequence parallelism, so the run enables it. Its KV blocks are tiny (128 KiB),
+# so the recipe's 10 GB inference buffer would default max_requests to ~82k,
+# past max_tokens (16384), which MCore asserts against; 1 GB keeps it at ~8k.
 MODEL_DIR=$DATA_DIR/tiny_qwen3_moe
 uv run python - "$MODEL_DIR" <<'PY'
 import sys
@@ -117,13 +120,14 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.megatron_cfg.pipeline_model_parallel_size=1 \
     policy.megatron_cfg.expert_model_parallel_size=1 \
     policy.megatron_cfg.context_parallel_size=1 \
-    policy.megatron_cfg.sequence_parallel=false \
+    policy.megatron_cfg.sequence_parallel=true \
     policy.generation.backend=megatron \
     +policy.generation.refit_transport=mcore \
     policy.generation.mcore_generation_config.expose_http_server=true \
     ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized \
     ++policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
     policy.generation.mcore_generation_config.refit_backend=nccl \
+    ++policy.generation.mcore_generation_config.buffer_size_gb=1 \
     ++policy.generation.mcore_generation_config.async_sched_mode=async \
     policy.generation.max_new_tokens=128 \
     policy.max_total_sequence_length=512 \
