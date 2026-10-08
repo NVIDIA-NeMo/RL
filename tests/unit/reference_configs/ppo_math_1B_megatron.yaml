@@ -86,6 +86,8 @@ loss_fn:
   use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
+  metrics_level: "full"
+  enable_torch_compile: false
 
 value_loss_fn:
   scale: 0.4
@@ -116,7 +118,7 @@ policy:
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
     checkpoint:
       model_save_format: "safetensors"
@@ -316,7 +318,7 @@ value:
     enabled: false
     reward_model_type: "regression"
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
     checkpoint:
       model_save_format: "safetensors"

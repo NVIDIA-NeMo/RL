@@ -13,12 +13,13 @@
 # limitations under the License.
 
 
+from pathlib import Path
 from typing import Any, Callable
 
 import pytest
 import torch
 from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
@@ -638,6 +639,175 @@ def test_formatted_message_log_empty_message():
             _validate_tensor_consistency(
                 [flat_result[i][k] for i in range(len(flat_result))]
             )
+
+
+def test_formatted_message_log_preapplied_template_for_text_parts() -> None:
+    class RawTokenizer:
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            assert not add_special_tokens
+            return [ord(character) for character in text]
+
+    result = get_formatted_message_log(
+        [
+            {"role": "user", "content": "ab"},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "cd"}],
+            },
+        ],
+        RawTokenizer(),  # type: ignore[arg-type]
+        TaskDataSpec(task_name="test"),
+        chat_template_preapplied=True,
+    )
+
+    assert [message["content"] for message in result] == ["ab", "cd"]
+    assert torch.equal(result[0]["token_ids"], torch.tensor([97, 98]))
+    assert torch.equal(result[1]["token_ids"], torch.tensor([99, 100]))
+
+
+@pytest.fixture(scope="module")
+def preapplied_tokenizer() -> PreTrainedTokenizerBase:
+    return AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+
+
+@pytest.mark.parametrize(
+    "turns",
+    [
+        ["A: ", "Paris"],
+        ["Q: France?\nA: ", "Paris\n", "Q: Spain?\nA: ", "Madrid\n"],
+        ["\n  ", "  \n", "xx \n", "a"],
+    ],
+)
+def test_preapplied_template_preserves_turn_tokens_and_loss(
+    preapplied_tokenizer: PreTrainedTokenizerBase, turns: list[str]
+) -> None:
+    messages = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": turn}
+        for i, turn in enumerate(turns)
+    ]
+    result = get_formatted_message_log(
+        messages,
+        preapplied_tokenizer,
+        TaskDataSpec(),
+        chat_template_preapplied=True,
+    )
+    assert [message["content"] for message in result] == turns
+    assert all("token_ids" not in message for message in messages)
+    for message, turn in zip(result, turns, strict=True):
+        assert message["token_ids"].tolist() == preapplied_tokenizer.encode(
+            turn, add_special_tokens=False
+        )
+        assert preapplied_tokenizer.decode(message["token_ids"]) == turn
+    add_loss_mask_to_message_log([result], roles_to_train_on=["assistant"])
+    for message in result:
+        mask = message["token_loss_mask"]
+        assert mask.numel() > 0
+        assert torch.all(mask == (1 if message["role"] == "assistant" else 0))
+
+
+@pytest.mark.parametrize("content", ["", []])
+def test_preapplied_template_empty_turn_uses_integer_tokens(
+    preapplied_tokenizer: PreTrainedTokenizerBase, content: Any
+) -> None:
+    result = get_formatted_message_log(
+        [{"role": "assistant", "content": content}],
+        preapplied_tokenizer,
+        TaskDataSpec(),
+        chat_template_preapplied=True,
+    )
+    assert result[0]["content"] == ""
+    assert result[0]["token_ids"].numel() == 0
+    assert result[0]["token_ids"].dtype == torch.long
+    assert (
+        get_formatted_message_log(
+            [], preapplied_tokenizer, TaskDataSpec(), chat_template_preapplied=True
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        None,
+        42,
+        [{"type": "image", "image": None}],
+        [{"type": "audio"}],
+        [{"type": "video"}],
+        ["text"],
+        {"type": "text", "text": "answer"},
+    ],
+)
+def test_preapplied_template_rejects_non_text(
+    preapplied_tokenizer: PreTrainedTokenizerBase, content: Any
+) -> None:
+    with pytest.raises(ValueError, match="text-only"):
+        get_formatted_message_log(
+            [{"role": "user", "content": content}],
+            preapplied_tokenizer,
+            TaskDataSpec(),
+            chat_template_preapplied=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"add_generation_prompt": True}, "add_generation_prompt"),
+        ({"tools": []}, "tools"),
+    ],
+)
+def test_preapplied_template_rejects_template_options(
+    preapplied_tokenizer: PreTrainedTokenizerBase, kwargs: dict[str, Any], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        get_formatted_message_log(
+            [{"role": "user", "content": "A: "}],
+            preapplied_tokenizer,
+            TaskDataSpec(),
+            chat_template_preapplied=True,
+            **kwargs,
+        )
+
+
+def test_preapplied_template_rejects_task_prompt(
+    preapplied_tokenizer: PreTrainedTokenizerBase, tmp_path: Path
+) -> None:
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Question: {}")
+    with pytest.raises(ValueError, match="task_data_spec prompt"):
+        get_formatted_message_log(
+            [{"role": "user", "content": "A: "}],
+            preapplied_tokenizer,
+            TaskDataSpec(prompt_file=prompt),
+            chat_template_preapplied=True,
+        )
+
+
+def test_preapplied_template_preserves_special_tokens(
+    preapplied_tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    turns = [
+        "<|im_start|>user\nA: <|im_end|>\n",
+        "<|im_start|>assistant\nParis<|im_end|>\n",
+    ]
+    messages = [
+        {"role": role, "content": turn}
+        for role, turn in zip(["user", "assistant"], turns, strict=True)
+    ]
+    for add_bos_eos in [False, True]:
+        result = get_formatted_message_log(
+            messages,
+            preapplied_tokenizer,
+            TaskDataSpec(),
+            add_bos_token=add_bos_eos,
+            add_eos_token=add_bos_eos,
+            chat_template_preapplied=True,
+        )
+        assert [m["token_ids"].tolist() for m in result] == [
+            preapplied_tokenizer.encode(turn, add_special_tokens=False)
+            for turn in turns
+        ]
 
 
 def test_add_loss_mask_to_chat_message_log(

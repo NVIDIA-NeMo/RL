@@ -3,7 +3,7 @@ checkpointing:
   checkpoint_dir: results/clevr_grpo
 policy:
   max_total_sequence_length: 3072
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   dynamic_batching:
     enabled: false
