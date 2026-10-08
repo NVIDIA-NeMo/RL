@@ -353,6 +353,13 @@ class RolloutRecoveryLedger:
         # Gym instance. In memory only: they belong to this process's Gym
         # executions and must be retired before the next checkpoint commit.
         self._gym_retirements: dict[str, set[tuple[str, int]]] = {}
+        # Gym refuses every request of a retired rollout until RL forgets it.
+        # Group of each rollout queued for retire, and, once Gym retired it,
+        # its instance and the round it was retired in. Rounds count the
+        # retires sent before checkpoints. In memory only, like Gym's marks.
+        self._gym_retired_groups: dict[str, str] = {}
+        self._gym_forgets: dict[str, dict[str, int]] = {}
+        self._gym_forget_round = 0
 
     def groups(self) -> list[PromptGroupRecoveryRecord]:
         return [self._copy_group(group) for group in self._groups.values()]
@@ -625,9 +632,11 @@ class RolloutRecoveryLedger:
             )
             if not holds_gym_state or attempt.gym_instance_id is None:
                 continue
+            rollout_id, gym_attempt = record.gym_episode(sibling.generation_index)
             self._gym_retirements.setdefault(attempt.gym_instance_id, set()).add(
-                record.gym_episode(sibling.generation_index)
+                (rollout_id, gym_attempt)
             )
+            self._gym_retired_groups[rollout_id] = record.group_id
 
     def gym_checkpoint_retirements(
         self,
@@ -652,9 +661,58 @@ class RolloutRecoveryLedger:
             pending = self._gym_retirements.get(instance_id)
             if pending is None:
                 continue
+            episodes = set(episodes)
             pending.difference_update(episodes)
             if not pending:
                 del self._gym_retirements[instance_id]
+            marks = self._gym_forgets.setdefault(instance_id, {})
+            for rollout_id, _ in episodes:
+                marks[rollout_id] = self._gym_forget_round
+
+    def advance_gym_forget_round(self) -> None:
+        """Start a new retire round once this one's retires are sent."""
+        self._gym_forget_round += 1
+
+    def gym_checkpoint_forgets(
+        self,
+        instance_ids: set[str] | frozenset[str],
+    ) -> dict[str, tuple[str, ...]]:
+        """Return retired rollouts Gym can stop refusing.
+
+        RL never dispatches a rollout again once its group has left the
+        ledger, and a request sent before its retire has had a whole round to
+        arrive and be refused.
+        """
+        unknown = set(self._gym_forgets) - set(instance_ids)
+        if unknown:
+            raise RuntimeError(
+                f"retired rollouts reference unavailable Gym instances {sorted(unknown)!r}"
+            )
+        return {
+            instance_id: tuple(
+                sorted(
+                    rollout_id
+                    for rollout_id, retired_round in self._gym_forgets.get(
+                        instance_id, {}
+                    ).items()
+                    if retired_round < self._gym_forget_round
+                    and self._gym_retired_groups.get(rollout_id) not in self._groups
+                )
+            )
+            for instance_id in instance_ids
+        }
+
+    def mark_gym_forgotten(self, forgotten: Mapping[str, Iterable[str]]) -> None:
+        """Drop rollouts Gym has forgotten; ones that became ready meanwhile stay."""
+        for instance_id, rollout_ids in forgotten.items():
+            marks = self._gym_forgets.get(instance_id)
+            if marks is None:
+                continue
+            for rollout_id in rollout_ids:
+                if marks.pop(rollout_id, None) is not None:
+                    self._gym_retired_groups.pop(rollout_id, None)
+            if not marks:
+                del self._gym_forgets[instance_id]
 
     def prepare_incomplete_retry(
         self,

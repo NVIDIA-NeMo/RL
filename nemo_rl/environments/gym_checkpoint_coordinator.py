@@ -435,6 +435,32 @@ class GymCheckpointCoordinator:
             },
         )
 
+    async def forget(
+        self,
+        checkpoint_id: str,
+        rollout_ids_by_instance: Mapping[str, tuple[str, ...]],
+    ) -> None:
+        """Let Gym stop refusing retired rollouts RL will never dispatch again."""
+        unknown = set(rollout_ids_by_instance) - set(self._handles)
+        if unknown:
+            raise ValueError(
+                "Gym forget names instances outside the live actor topology: "
+                f"unknown={sorted(unknown)!r}"
+            )
+        deadline_ts = self._deadline()
+        await self._collect(
+            "forget",
+            {
+                instance_id: self._handles[instance_id].checkpoint_forget.remote(
+                    checkpoint_id,
+                    rollout_ids,
+                    deadline_ts=deadline_ts,
+                )
+                for instance_id, rollout_ids in rollout_ids_by_instance.items()
+                if rollout_ids
+            },
+        )
+
     async def retire_restored(
         self,
         restore_id: str,

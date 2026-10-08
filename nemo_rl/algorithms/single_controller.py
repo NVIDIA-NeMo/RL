@@ -166,6 +166,7 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     GYM_CHECKPOINT_MANIFEST_FILENAME,
     GymCheckpointCommitResult,
     GymCheckpointCoordinator,
+    GymCheckpointOperationError,
     load_gym_checkpoint_manifest,
     staging_keys_of,
     write_gym_checkpoint_manifest,
@@ -4392,6 +4393,31 @@ class SingleControllerActor:
         # Only what was retired: a drop recorded meanwhile stays for next time.
         ledger.mark_gym_retired(raw)
 
+    async def _forget_retired_gym_rollouts(
+        self,
+        coordinator: GymCheckpointCoordinator,
+        checkpoint_id: str,
+    ) -> None:
+        """Let Gym stop refusing retired rollouts RL will never dispatch again.
+
+        Best effort: until forgotten, Gym only keeps refusing them, so a
+        failure leaves them for the next checkpoint instead of failing this one.
+        """
+        ledger = self._rollout_recovery_ledger
+        forgets = ledger.gym_checkpoint_forgets(coordinator.instance_ids)
+        if not any(forgets.values()):
+            return
+        try:
+            await coordinator.forget(checkpoint_id, forgets)
+        except GymCheckpointOperationError as error:
+            log.warning("Gym forget failed; retrying at the next checkpoint: %s", error)
+            forgets = {
+                instance_id: rollout_ids
+                for instance_id, rollout_ids in forgets.items()
+                if instance_id not in error.failures
+            }
+        ledger.mark_gym_forgotten(forgets)
+
     async def _drain_non_exported_gym_candidates(
         self,
         coordinator: GymCheckpointCoordinator,
@@ -4528,9 +4554,13 @@ class SingleControllerActor:
             )
 
         async with gate.closed():
-            # Gym refuses a retire once a checkpoint is open, so retire while it
-            # is still idle; dispatch is already closed, so nothing new races in.
+            # Gym refuses a retire or forget once a checkpoint is open, so send
+            # them while it is still idle; dispatch is already closed, so
+            # nothing new races in.
             await self._retire_dropped_gym_episodes(coordinator, checkpoint_id)
+            await self._forget_retired_gym_rollouts(coordinator, checkpoint_id)
+            # What this round retired is forgotten no earlier than the next.
+            self._rollout_recovery_ledger.advance_gym_forget_round()
             async with coordinator.prepared(checkpoint_id):
                 candidates = self._gym_checkpoint_inventory(coordinator)
                 # A row dropped since that retire is still running in Gym, which

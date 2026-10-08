@@ -253,7 +253,11 @@ policy weights live at redispatch.
 Turn recovery coordinates Gym and RL as one checkpoint cut. Each prompt group
 is pinned to the Gym shard replica that accepted it. SC first closes its narrow
 `/run` dispatch admission gate; already-submitted requests, completion callbacks,
-finalization, and TQ writes remain live. Gym parks its participants and commits
+finalization, and TQ writes remain live. While Gym is still idle, SC retires the
+episodes of groups it dropped, and Gym refuses their late requests until SC
+forgets them. SC forgets a rollout one checkpoint after retiring it, once its
+group has left the ledger; a failed forget only delays this cleanup to the next
+checkpoint. Gym parks its participants and commits
 the subset of candidate episodes it still owns into the checkpoint's
 `gym-instances/` tree. Candidate replies already on the wire drain through the
 ordinary RL/TQ completion path. SC then acquires the exclusive data-plane

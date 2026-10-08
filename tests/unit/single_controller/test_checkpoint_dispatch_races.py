@@ -65,6 +65,7 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     GYM_CHECKPOINT_SCHEMA_VERSION,
     GymCheckpointCommitResult,
     GymCheckpointManifest,
+    GymCheckpointOperationError,
     load_gym_checkpoint_manifest,
     staging_keys_of,
     write_gym_checkpoint_manifest,
@@ -383,9 +384,12 @@ class _LiveSessionGymCoordinator(_SavingGymCoordinator):
     coordinator rejects one that is outside RL's candidate set.
     """
 
-    def __init__(self, live: set[GymCheckpointEpisode]) -> None:
+    def __init__(
+        self, live: set[GymCheckpointEpisode], *, forget_failures: int = 0
+    ) -> None:
         super().__init__()
         self.live = set(live)
+        self.forget_failures = forget_failures
 
     async def retire(
         self,
@@ -408,6 +412,30 @@ class _LiveSessionGymCoordinator(_SavingGymCoordinator):
         )
         for episodes in episodes_by_instance.values():
             self.live.difference_update(episodes)
+
+    async def forget(
+        self,
+        checkpoint_id: str,
+        rollout_ids_by_instance: dict[str, tuple[str, ...]],
+    ) -> None:
+        if self.checkpoint_open:
+            raise RuntimeError("cannot forget while a checkpoint is open; resume first")
+        if self.forget_failures:
+            self.forget_failures -= 1
+            raise GymCheckpointOperationError(
+                "forget", {"tools/replica-0": TimeoutError("deadline passed")}
+            )
+        self.events.append(
+            (
+                "forget",
+                checkpoint_id,
+                {
+                    instance_id: frozenset(rollout_ids)
+                    for instance_id, rollout_ids in rollout_ids_by_instance.items()
+                    if rollout_ids
+                },
+            )
+        )
 
     async def commit(
         self,
@@ -1087,17 +1115,17 @@ def test_turn_checkpoint_fails_fast_on_parked_session_without_an_owner(
 
 
 def _dispatched_two_sibling_group(
-    ledger: RolloutRecoveryLedger, cut: DataPlaneMutationCut
+    ledger: RolloutRecoveryLedger, cut: DataPlaneMutationCut, *, batch: int = 7
 ) -> PromptGroupRecoveryRecord:
     group = ledger.reserve_group(
         cut,
-        group_id="batch-7-prompt-0",
-        admission_id="batch-7",
-        prompt_id="70",
-        prompt_payload={"idx": 70, "message_log": []},
+        group_id=f"batch-{batch}-prompt-0",
+        admission_id=f"batch-{batch}",
+        prompt_id=f"{batch}0",
+        prompt_payload={"idx": batch * 10, "message_log": []},
         expected_generations=2,
-        target_step=7,
-        start_weight_version=7,
+        target_step=batch,
+        start_weight_version=batch,
         restore_level=RecoveryTargetLevel.TURN,
         admitted=True,
     )
@@ -1201,6 +1229,142 @@ def test_turn_checkpoint_retires_only_the_abandoned_attempts_of_a_retried_group(
         assert coordinator.events[0][0] == "retire"
         assert coordinator.events[0][2] == {"tools/replica-0": frozenset(abandoned)}
         assert coordinator.live == replacements
+
+    asyncio.run(exercise())
+
+
+def _rollout_ids(group: PromptGroupRecoveryRecord) -> frozenset[str]:
+    return frozenset(episode.rollout_id for episode in _gym_episodes(group))
+
+
+def test_turn_checkpoint_forgets_a_retired_rollout_once_its_group_is_gone(
+    tmp_path: Path,
+) -> None:
+    """Gym refuses a retired rollout's attempts until RL forgets it.
+
+    RL forgets a rollout only once it cannot dispatch it again (its group has
+    left the ledger) and only one checkpoint after retiring it, so a request
+    already on the wire when Gym retired it is still refused. Gym accepts a
+    forget only while idle, so it goes out with the retire, before prepare.
+    """
+
+    async def exercise() -> None:
+        barrier = DataPlaneCheckpointBarrier()
+        ledger = RolloutRecoveryLedger()
+        async with barrier.mutation() as cut:
+            group = _dispatched_two_sibling_group(ledger, cut)
+            ledger.abandon_unsealed(cut, group.group_id)
+        coordinator = _LiveSessionGymCoordinator(live=_gym_episodes(group))
+        controller = _controller_for(coordinator, ledger)
+
+        async with controller._prepared_gym_checkpoint(
+            tmp_path, checkpoint_id="save-1"
+        ):
+            pass
+        # Retired, but the group may still retry the rollout: nothing to forget.
+        assert [event[0] for event in coordinator.events] == [
+            "retire",
+            "prepare",
+            "commit",
+            "resume",
+        ]
+
+        async with barrier.mutation() as cut:
+            ledger.discard_group(cut, group.group_id)
+            later = _dispatched_two_sibling_group(ledger, cut, batch=8)
+            ledger.discard_group(cut, later.group_id)
+        coordinator.live |= _gym_episodes(later)
+        coordinator.events.clear()
+
+        async with controller._prepared_gym_checkpoint(
+            tmp_path, checkpoint_id="save-2"
+        ):
+            pass
+        # The later group is retired now and forgotten only at the next checkpoint.
+        assert [event[0] for event in coordinator.events] == [
+            "retire",
+            "forget",
+            "prepare",
+            "commit",
+            "resume",
+        ]
+        assert coordinator.events[0][2] == {
+            "tools/replica-0": frozenset(_gym_episodes(later))
+        }
+        assert coordinator.events[1][1:] == (
+            "save-2",
+            {"tools/replica-0": _rollout_ids(group)},
+        )
+
+        coordinator.events.clear()
+        async with controller._prepared_gym_checkpoint(
+            tmp_path, checkpoint_id="save-3"
+        ):
+            pass
+        assert [event[0] for event in coordinator.events] == [
+            "forget",
+            "prepare",
+            "commit",
+            "resume",
+        ]
+        assert coordinator.events[0][2] == {"tools/replica-0": _rollout_ids(later)}
+
+        coordinator.events.clear()
+        async with controller._prepared_gym_checkpoint(
+            tmp_path, checkpoint_id="save-4"
+        ):
+            pass
+        assert [event[0] for event in coordinator.events] == [
+            "prepare",
+            "commit",
+            "resume",
+        ]
+
+    asyncio.run(exercise())
+
+
+def test_turn_checkpoint_keeps_rollouts_to_forget_when_gym_forget_fails(
+    tmp_path: Path,
+) -> None:
+    """A failed forget only delays Gym's cleanup; the checkpoint still commits."""
+
+    async def exercise() -> None:
+        barrier = DataPlaneCheckpointBarrier()
+        ledger = RolloutRecoveryLedger()
+        async with barrier.mutation() as cut:
+            group = _dispatched_two_sibling_group(ledger, cut)
+            ledger.discard_group(cut, group.group_id)
+        coordinator = _LiveSessionGymCoordinator(
+            live=_gym_episodes(group), forget_failures=1
+        )
+        controller = _controller_for(coordinator, ledger)
+
+        async with controller._prepared_gym_checkpoint(
+            tmp_path, checkpoint_id="save-1"
+        ):
+            pass
+        coordinator.events.clear()
+
+        async with controller._prepared_gym_checkpoint(
+            tmp_path, checkpoint_id="save-2"
+        ) as gym_commit:
+            assert gym_commit is not None
+        assert [event[0] for event in coordinator.events] == [
+            "prepare",
+            "commit",
+            "resume",
+        ]
+
+        coordinator.events.clear()
+        async with controller._prepared_gym_checkpoint(
+            tmp_path, checkpoint_id="save-3"
+        ):
+            pass
+        assert coordinator.events[0] == (
+            "forget",
+            "save-3",
+            {"tools/replica-0": _rollout_ids(group)},
+        )
 
     asyncio.run(exercise())
 

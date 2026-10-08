@@ -1573,3 +1573,121 @@ def test_mark_gym_retired_keeps_drops_recorded_after_the_retire_was_sent() -> No
         first.gym_episode(0)
         not in ledger.gym_checkpoint_retirements({"tools/replica-0"})["tools/replica-0"]
     )
+
+
+def _rollout_ids(group: PromptGroupRecoveryRecord) -> tuple[str, ...]:
+    return tuple(sorted(group.gym_episode(index)[0] for index in (0, 1)))
+
+
+def _retire_queued(ledger: RolloutRecoveryLedger) -> None:
+    """What the pre-prepare retire does once Gym acknowledges it."""
+    ledger.mark_gym_retired(ledger.gym_checkpoint_retirements({"tools/replica-0"}))
+
+
+class TestGymForget:
+    """Gym refuses a retired attempt's requests until RL forgets its rollout.
+
+    Forgetting too early reopens the window a late request needs, and never
+    forgetting leaves one entry per retired rollout on every Gym server.
+    """
+
+    def test_a_retired_rollout_waits_until_its_group_leaves_the_ledger(self) -> None:
+        ledger = RolloutRecoveryLedger()
+        group = _dispatched_turn_group(ledger)
+        _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
+        _retire_queued(ledger)
+        ledger.advance_gym_forget_round()
+
+        # The group may still re-send under fresh rollout IDs; nothing is final.
+        assert ledger.gym_checkpoint_forgets({"tools/replica-0"}) == {
+            "tools/replica-0": ()
+        }
+
+        _mutate(lambda cut: ledger.discard_group(cut, "g7"))
+
+        assert ledger.gym_checkpoint_forgets({"tools/replica-0"}) == {
+            "tools/replica-0": _rollout_ids(group)
+        }
+
+    def test_a_rollout_retired_this_round_waits_for_the_next(self) -> None:
+        """A request sent just before the retire may still be on its way."""
+        ledger = RolloutRecoveryLedger()
+        group = _dispatched_turn_group(ledger)
+        # Discarding a dispatched group queues its retire; the group is already gone.
+        _mutate(lambda cut: ledger.discard_group(cut, "g7"))
+        _retire_queued(ledger)
+
+        assert ledger.gym_checkpoint_forgets({"tools/replica-0"}) == {
+            "tools/replica-0": ()
+        }
+
+        ledger.advance_gym_forget_round()
+
+        assert ledger.gym_checkpoint_forgets({"tools/replica-0"}) == {
+            "tools/replica-0": _rollout_ids(group)
+        }
+
+    def test_an_unretired_drop_is_not_forgotten(self) -> None:
+        """Only what Gym has acknowledged retiring carries a mark to forget."""
+        ledger = RolloutRecoveryLedger()
+        _dispatched_turn_group(ledger)
+        _mutate(lambda cut: ledger.discard_group(cut, "g7"))
+        ledger.advance_gym_forget_round()
+
+        assert ledger.gym_checkpoint_forgets({"tools/replica-0"}) == {
+            "tools/replica-0": ()
+        }
+
+    def test_mark_gym_forgotten_keeps_rollouts_that_became_ready_meanwhile(
+        self,
+    ) -> None:
+        ledger = RolloutRecoveryLedger()
+        first = _dispatched_turn_group(ledger)
+        _mutate(lambda cut: ledger.discard_group(cut, "g7"))
+        _retire_queued(ledger)
+        ledger.advance_gym_forget_round()
+        sent = ledger.gym_checkpoint_forgets({"tools/replica-0"})
+
+        _reserve(
+            ledger,
+            group_id="g8",
+            admission_id="batch-8",
+            prompt_id="8",
+            prompt_payload=_prompt(8),
+            expected_generations=2,
+            target_step=8,
+            start_weight_version=7,
+            recovery_granularity=RecoveryGranularity.SIBLING,
+            restore_level=RecoveryTargetLevel.TURN,
+            admitted=True,
+        )
+        _mutate(
+            lambda cut: ledger.mark_group_dispatched(
+                cut, "g8", gym_instance_id="tools/replica-0"
+            )
+        )
+        later = ledger.get_group("g8")
+        _mutate(lambda cut: ledger.discard_group(cut, "g8"))
+        _retire_queued(ledger)
+        ledger.advance_gym_forget_round()
+
+        ledger.mark_gym_forgotten(sent)
+
+        assert sent == {"tools/replica-0": _rollout_ids(first)}
+        assert ledger.gym_checkpoint_forgets({"tools/replica-0"}) == {
+            "tools/replica-0": _rollout_ids(later)
+        }
+
+    def test_forget_bookkeeping_is_not_persisted(self) -> None:
+        """Gym's marks live in its processes, which restart with this one."""
+        ledger = RolloutRecoveryLedger()
+        _dispatched_turn_group(ledger)
+        _mutate(lambda cut: ledger.discard_group(cut, "g7"))
+        _retire_queued(ledger)
+        ledger.advance_gym_forget_round()
+
+        reloaded = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+
+        assert reloaded.gym_checkpoint_forgets({"tools/replica-0"}) == {
+            "tools/replica-0": ()
+        }

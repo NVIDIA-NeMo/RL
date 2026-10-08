@@ -64,6 +64,7 @@ class _FakeGymActor:
         self.checkpoint_prepare = _RemoteMethod(self._prepare)
         self.checkpoint_renew = _RemoteMethod(self._renew)
         self.checkpoint_retire = _RemoteMethod(self._retire)
+        self.checkpoint_forget = _RemoteMethod(self._forget)
         self.checkpoint_commit = _RemoteMethod(self._commit)
         self.checkpoint_restore = _RemoteMethod(self._restore)
         self.checkpoint_resume = _RemoteMethod(self._resume)
@@ -94,6 +95,9 @@ class _FakeGymActor:
 
     async def _retire(self, *args, **kwargs) -> None:
         self.calls.append(("retire", args, kwargs))
+
+    async def _forget(self, *args, **kwargs) -> None:
+        self.calls.append(("forget", args, kwargs))
 
     async def _restore(self, *args, **kwargs) -> None:
         self.calls.append(("restore", args, kwargs))
@@ -342,3 +346,29 @@ def test_restore_failure_discards_every_actor_under_uncertain_outcome() -> None:
 
     assert [call[0] for call in restored.calls] == ["restore", "retire", "resume"]
     assert [call[0] for call in failed.calls] == ["restore", "retire", "resume"]
+
+
+def test_forget_sends_one_batch_to_each_deployment_with_rollouts_to_forget() -> None:
+    first = _FakeGymActor()
+    second = _FakeGymActor()
+    coordinator = _coordinator(first, second)
+
+    asyncio.run(
+        coordinator.forget(
+            "save-1",
+            {"tools/replica-0": ("rollout-1", "rollout-0"), "tools/replica-1": ()},
+        )
+    )
+
+    [(operation, args, kwargs)] = first.calls
+    assert operation == "forget"
+    assert args == ("save-1", ("rollout-1", "rollout-0"))
+    assert set(kwargs) == {"deadline_ts"}
+    assert second.calls == []
+
+
+def test_forget_rejects_rollouts_for_the_wrong_actor_topology() -> None:
+    coordinator = _coordinator(_FakeGymActor())
+
+    with pytest.raises(ValueError, match="live actor topology"):
+        asyncio.run(coordinator.forget("save-1", {"other/replica-0": ("rollout-0",)}))

@@ -743,3 +743,29 @@ def test_adapter_rejects_operations_before_discovery() -> None:
 
     with pytest.raises(RuntimeError, match="has not discovered"):
         asyncio.run(adapter.prepare("save-1", deadline_ts=10.0))
+
+
+def test_adapter_forgets_rollouts_through_gym_coordination(monkeypatch) -> None:
+    from nemo_gym._checkpoint import coordination
+
+    client = object()
+    participants = _participants(client, "actor-a")
+    monkeypatch.setattr(coordination, "discover", AsyncMock(return_value=participants))
+    forget = AsyncMock()
+    monkeypatch.setattr(coordination, "forget", forget)
+    adapter = GymCheckpointAdapter(
+        instance=GymCheckpointInstance("actor-a", 0),
+        client=client,
+        auth_token="secret",
+    )
+
+    async def exercise() -> None:
+        await adapter.discover()
+        await adapter.forget("save-1", ("rollout-1", "rollout-0"), deadline_ts=10.0)
+
+    asyncio.run(exercise())
+
+    forget.assert_awaited_once()
+    assert forget.await_args.args[:2] == (participants, "save-1")
+    assert sorted(forget.await_args.args[2]) == ["rollout-0", "rollout-1"]
+    assert forget.await_args.kwargs == {"deadline_ts": 10.0}
