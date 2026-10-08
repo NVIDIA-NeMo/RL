@@ -90,7 +90,10 @@ env:
         anyterminal_agent:
           global_agent_timeout: 900
           agent_kwargs:
-            context_window: ${policy.max_total_sequence_length}
+            # OpenCode can compact with a prompt at its advertised context
+            # boundary. Keep that boundary below vLLM's hard model limit so
+            # the compaction call always has room for at least one token.
+            context_window: ${add:${policy.max_total_sequence_length},-512}
             max_input_tokens: ${add:${policy.max_total_sequence_length},-8704}
             max_output_tokens: 8192
     anyterminal_openclaw:
