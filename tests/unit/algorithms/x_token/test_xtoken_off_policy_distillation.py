@@ -925,9 +925,8 @@ def test_setup_preserves_aligner_config_across_interleaved_teacher_types():
                     "drop_first_assistant_chunk_kl": True,
                 },
                 "weight": 0.25,
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": True,
-                    "_v2": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
                 },
