@@ -218,7 +218,7 @@ class RewardModelEnvironment(EnvironmentInterface):
             pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
         )
 
-        # Create data in the format expected by DTensorRewardModelWorker
+        # Create data in the format expected by AutomodelPolicyWorker with is_reward_model=True
         reward_data = BatchedDataDict[GenerationDatumSpec](
             {
                 "input_ids": cat_and_padded["token_ids"],
