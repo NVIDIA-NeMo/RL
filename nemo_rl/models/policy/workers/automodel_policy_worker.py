@@ -28,7 +28,10 @@ from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_n
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -73,7 +76,7 @@ from nemo_rl.models.policy.utils import (
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.checkpoint_engine import (
-    DTensorCheckpointEngineSendMixin,
+    AutomodelCheckpointEngineSendMixin,
     PolicyCheckpointEngineMixin,
     maybe_preinit_nixl_checkpoint_engine,
 )
@@ -87,6 +90,7 @@ from nemo_rl.telemetry.setup import (
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
 
 
@@ -102,7 +106,7 @@ def _refit_tensor_dtype(
     return default_dtype
 
 
-def dtensor_params_generator(
+def automodel_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
@@ -189,9 +193,9 @@ def _maybe_adapt_tensor_to_hf(
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
-class DTensorPolicyWorkerV2Impl(
+class AutomodelPolicyWorkerImpl(
     TQWorkerMixin,
-    DTensorCheckpointEngineSendMixin,
+    AutomodelCheckpointEngineSendMixin,
     PolicyCheckpointEngineMixin,
     AbstractPolicyWorker,
     ColocatablePolicyInterface,
@@ -216,7 +220,7 @@ class DTensorPolicyWorkerV2Impl(
             "context_parallel": self.device_mesh["cp"].get_local_rank(),
         }
 
-    @traced_worker_init("rl.policy.load_model", **{"rl.backend": "dtensor_v2"})
+    @traced_worker_init("rl.policy.load_model", **{"rl.backend": "automodel"})
     def __init__(
         self,
         config: PolicyConfig,
@@ -226,7 +230,7 @@ class DTensorPolicyWorkerV2Impl(
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
-        """Initialize the DTensorPolicyWorkerV2."""
+        """Initialize the AutomodelPolicyWorker."""
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
 
@@ -259,10 +263,10 @@ class DTensorPolicyWorkerV2Impl(
             self.processor = None
         self.is_vlm = self.processor is not None
         self.lora_enabled = (
-            config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
+            config["automodel_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
 
-        print(f"Initializing DTensorPolicyWorkerV2 with is_vlm={self.is_vlm}")
+        print(f"Initializing AutomodelPolicyWorker with is_vlm={self.is_vlm}")
 
         # Initialize checkpoint manager
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
@@ -291,7 +295,7 @@ class DTensorPolicyWorkerV2Impl(
         )
         # Set instance attributes from distributed context
         self.rank = torch.distributed.get_rank()
-        self.timer = Timer(context={"worker": "dtensor_policy_v2", "rank": self.rank})
+        self.timer = Timer(context={"worker": "automodel_policy", "rank": self.rank})
         self.device_mesh = distributed_context.device_mesh
         self.dp_mesh = self.device_mesh["dp"]
         self.tp_mesh = self.device_mesh["tp"]
@@ -306,9 +310,9 @@ class DTensorPolicyWorkerV2Impl(
         requires_synchronous_checkpoint = (
             getattr(runtime_config.model_config, "model_type", None) == "deepseek_v4"
         )
-        dtensor_cfg = config["dtensor_cfg"]
+        automodel_cfg = config["automodel_cfg"]
         checkpoint_config = build_checkpoint_config(
-            dtensor_cfg,
+            automodel_cfg,
             model_repo_id=config["model_name"],
             dequantize_base_checkpoint=config.get("dequantize_base_checkpoint", False),
             is_peft=self.lora_enabled,
@@ -405,7 +409,7 @@ class DTensorPolicyWorkerV2Impl(
         """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
         self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
+    @wrap_with_nvtx_name("automodel_policy_worker/train")
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -455,7 +459,7 @@ class DTensorPolicyWorkerV2Impl(
         )
 
         # Setup cache clearing callback if configured
-        empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
+        empty_cache_steps = self.cfg.get("automodel_cfg", {}).get(
             "clear_cache_every_n_steps"
         )
         if empty_cache_steps:
@@ -532,7 +536,10 @@ class DTensorPolicyWorkerV2Impl(
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
 
                         if num_valid_samples > 0:
-                            mb_losses.append(loss.item())
+                            # Metrics were materialized together by the loss;
+                            # undo this worker's per-global-batch scaling without
+                            # synchronizing the loss tensor again.
+                            mb_losses.append(loss_metrics["loss"] * num_global_batches)
                             all_mb_metrics.append(loss_metrics)
 
                 grad_norm: Optional[float | torch.Tensor] = None
@@ -585,7 +592,7 @@ class DTensorPolicyWorkerV2Impl(
             self.timer.stop("train")
             return metrics
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
+    @wrap_with_nvtx_name("automodel_policy_worker/get_logprobs")
     def get_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[LogprobOutputSpec]:
@@ -600,6 +607,7 @@ class DTensorPolicyWorkerV2Impl(
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
+          "token_mask": only for top-k/top-p filtering; masked out -inf positions.
         """
         self.timer.start("get_logprobs")
         logprob_batch_size = (
@@ -612,6 +620,7 @@ class DTensorPolicyWorkerV2Impl(
         sequence_dim, seq_dim_size = check_sequence_dim(data)
 
         all_log_probs = []
+        all_token_masks: list[torch.Tensor] = []
         self.model.eval()
 
         # Create logprobs post-processor
@@ -660,24 +669,26 @@ class DTensorPolicyWorkerV2Impl(
                     continue
 
                 all_log_probs.append(token_logprobs)
+                if "token_mask" in _metrics:
+                    all_token_masks.append(_metrics["token_mask"])
 
         # Concatenate all batches
         return_data = BatchedDataDict[LogprobOutputSpec]()
 
-        all_log_probs_padded = []
-        for lp in all_log_probs:
-            padding_needed = seq_dim_size - lp.shape[1]
-            if padding_needed > 0:
-                lp = torch.nn.functional.pad(
-                    lp, (0, padding_needed), mode="constant", value=0.0
-                )
-            all_log_probs_padded.append(lp)
-        return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
+        return_data["logprobs"] = pad_and_concat(
+            all_log_probs, target_len=seq_dim_size
+        ).cpu()
+        # Taken from config so every DP rank emits the same keys.
+        if need_top_k_or_top_p_filtering(self.sampling_params):
+            # Pad token_mask with 0 so padded positions are excluded from the loss.
+            return_data["token_mask"] = pad_and_concat(
+                all_token_masks, target_len=seq_dim_size
+            ).cpu()
 
         self.timer.stop("get_logprobs")
         return return_data
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/score")
+    @wrap_with_nvtx_name("automodel_policy_worker/score")
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
@@ -740,7 +751,7 @@ class DTensorPolicyWorkerV2Impl(
         )
         return return_data
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_topk_logits")
+    @wrap_with_nvtx_name("automodel_policy_worker/get_topk_logits")
     def get_topk_logits(
         self,
         data: BatchedDataDict[Any],
@@ -823,31 +834,11 @@ class DTensorPolicyWorkerV2Impl(
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
-        all_topk_vals_padded = []
-        all_topk_idx_padded = []
-        target_seq_len = seq_dim_size
-        for vals, idx in zip(out_topk_vals, out_topk_idx):
-            pad_needed = target_seq_len - vals.shape[1]
-            if pad_needed > 0:
-                # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
-                vals = torch.nn.functional.pad(
-                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
-                )
-                idx = torch.nn.functional.pad(
-                    idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0
-                )
-            all_topk_vals_padded.append(vals)
-            all_topk_idx_padded.append(idx)
-
-        ret["topk_logits"] = (
-            torch.cat(all_topk_vals_padded, dim=0)
-            if len(all_topk_vals_padded) > 1
-            else all_topk_vals_padded[0]
+        ret["topk_logits"] = pad_and_concat(
+            out_topk_vals, target_len=seq_dim_size
         ).cpu()
-        ret["topk_indices"] = (
-            torch.cat(all_topk_idx_padded, dim=0)
-            if len(all_topk_idx_padded) > 1
-            else all_topk_idx_padded[0]
+        ret["topk_indices"] = pad_and_concat(
+            out_topk_idx, target_len=seq_dim_size
         ).cpu()
         return ret
 
@@ -1093,13 +1084,13 @@ class DTensorPolicyWorkerV2Impl(
         margin: float = 1.05,
         include_q: bool = False,
     ) -> dict[str, Any]:
-        """Placeholder for FP8 Q/K/V scale calibration, not implemented for DTensorPolicyWorkerV2."""
+        """Placeholder for FP8 Q/K/V scale calibration, not implemented for AutomodelPolicyWorker."""
         raise NotImplementedError(
-            "calibrate_qkv_fp8_scales is not implemented for DTensorPolicyWorkerV2"
+            "calibrate_qkv_fp8_scales is not implemented for AutomodelPolicyWorker"
         )
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_ipc_zmq")
+    @wrap_with_nvtx_name("automodel_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(
         self,
         buffer_size_bytes: int = 0,
@@ -1120,7 +1111,7 @@ class DTensorPolicyWorkerV2Impl(
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(self.model, self.dtype),
+            params_generator=automodel_params_generator(self.model, self.dtype),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -1128,7 +1119,7 @@ class DTensorPolicyWorkerV2Impl(
         )
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/update_weights_to_sglang_colocated")
+    @wrap_with_nvtx_name("automodel_policy_worker/update_weights_to_sglang_colocated")
     def update_weights_to_sglang_colocated(
         self,
         *,
@@ -1161,7 +1152,7 @@ class DTensorPolicyWorkerV2Impl(
         )
 
         bucket_iter = iter_named_tensor_buckets(
-            dtensor_params_generator(self.model, self.dtype),
+            automodel_params_generator(self.model, self.dtype),
             buffer_size_bytes=buffer_size_bytes,
         )
         send_hf_buckets_via_ipc_actor_impl(
@@ -1173,7 +1164,7 @@ class DTensorPolicyWorkerV2Impl(
     def _checkpoint_engine_params(
         self,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        return dtensor_params_generator(self.model, self.dtype)
+        return automodel_params_generator(self.model, self.dtype)
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
@@ -1230,13 +1221,13 @@ class DTensorPolicyWorkerV2Impl(
             self.model = self.move_to_cuda(self.model)
 
         # param_iterator will return (name, tensor), we only need tensor
-        dtensor_post_iter_func = lambda x: x[1]
+        automodel_post_iter_func = lambda x: x[1]
 
         packed_broadcast_producer(
-            iterator=dtensor_params_generator(self.model, self.dtype),
+            iterator=automodel_params_generator(self.model, self.dtype),
             group=self.model_update_group,
             src=0,
-            post_iter_func=dtensor_post_iter_func,
+            post_iter_func=automodel_post_iter_func,
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
         )
@@ -1246,7 +1237,7 @@ class DTensorPolicyWorkerV2Impl(
         if self.cpu_offload:
             self.model = self.move_to_cpu(self.model)
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_lp_inference")
+    @wrap_with_nvtx_name("automodel_policy_worker/prepare_for_lp_inference")
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         """Put the model in eval mode for logprob inference.
 
@@ -1277,7 +1268,7 @@ class DTensorPolicyWorkerV2Impl(
         gc.collect()
         torch.cuda.empty_cache()
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
+    @wrap_with_nvtx_name("automodel_policy_worker/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
         # onload models and optimizer state to cuda
         if not self.cpu_offload:
@@ -1305,7 +1296,7 @@ class DTensorPolicyWorkerV2Impl(
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")
+    @wrap_with_nvtx_name("automodel_policy_worker/offload_before_refit")
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
         torch.randn(1).cuda()  # wake up torch allocator
@@ -1316,7 +1307,7 @@ class DTensorPolicyWorkerV2Impl(
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_after_refit")
+    @wrap_with_nvtx_name("automodel_policy_worker/offload_after_refit")
     def offload_after_refit(self) -> None:
         """Offload as much as possible on the CPU."""
         self.model = self.move_to_cpu(self.model)
@@ -1435,7 +1426,7 @@ class DTensorPolicyWorkerV2Impl(
 
 
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+    runtime_env=get_runtime_env_for_policy_worker("automodel_policy_worker")
 )  # pragma: no cover
-class DTensorPolicyWorkerV2(DTensorPolicyWorkerV2Impl):
+class AutomodelPolicyWorker(AutomodelPolicyWorkerImpl):
     pass

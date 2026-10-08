@@ -82,7 +82,7 @@ def test_build_resource_attributes_dtensor_tp():
         policy={
             "model_name": "org/Model-1B",
             "precision": "bfloat16",
-            "dtensor_cfg": {"tensor_parallel_size": 4},
+            "automodel_cfg": {"tensor_parallel_size": 4},
         }
     )
     attrs = _build_resource_attributes(cfg, "grpo")

@@ -28,6 +28,7 @@ checkpointing:
   save_period: 5
   checkpoint_must_save_by: 00:03:45:00
 policy:
+  make_sequence_length_divisible_by: 64
   model_name: MiniMaxAI/MiniMax-M2.7
   hf_config_overrides:
     router_aux_loss_coef: 0
@@ -53,7 +54,7 @@ policy:
       total_iters: 10000000000
   - milestones:
     - 5
-  dtensor_cfg:
+  automodel_cfg:
     expert_parallel_size: 64
     activation_checkpointing: true
     env_vars:
@@ -64,7 +65,8 @@ policy:
         attn: te
         linear: te
         rms_norm: te
-        enable_deepep: true
+        experts: torch_mm
+        dispatcher: hybridep
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true

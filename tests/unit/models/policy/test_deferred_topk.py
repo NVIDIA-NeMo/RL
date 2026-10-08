@@ -177,3 +177,17 @@ def test_policy_worker_defers_topk_payload_with_ray_put(monkeypatch) -> None:
 
     assert result.payload_ref is payload_ref
     put.assert_called_once_with(data)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "expected"),
+    [(4, [[0, 1, 4, 5], [2, 3, 6, 7]]), (8, [[0, 1, 2, 3], [4, 5, 6, 7]])],
+)
+def test_deferred_training_indices_match_actual_dp_rows(
+    batch_size: int, expected: list[list[int]]
+) -> None:
+    policy = _make_policy_for_deferred_check(dp_size=2)
+    data = BatchedDataDict({"input_ids": torch.arange(8).reshape(8, 1)})
+    shards, indices = policy._shard_for_train_and_indices(data, batch_size)
+    assert indices == expected
+    assert [shard["input_ids"].flatten().tolist() for shard in shards] == expected
