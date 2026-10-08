@@ -179,6 +179,7 @@ def test_environment_identity_survives_payload_packing() -> None:
     expected_tag = {
         "weight_version": 0,
         "prompt_idx": 17,
+        "group_id": "g",
         "rollout_environment": "swe",
         "num_invalid_tool_calls": 0,
         "num_malformed_thinking": 0,

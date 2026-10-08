@@ -1596,7 +1596,7 @@ class RolloutRecoveryLedger:
                                     "gym_instance_id": attempt.gym_instance_id,
                                     "gym_attempt": attempt.gym_attempt,
                                     "telemetry": (
-                                        dataclasses.asdict(attempt.telemetry)
+                                        attempt.telemetry.to_state()
                                         if attempt.telemetry is not None
                                         else None
                                     ),

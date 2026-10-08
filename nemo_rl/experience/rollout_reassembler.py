@@ -62,6 +62,8 @@ from nemo_rl.data_plane.schema import (
     LogicalRowTag,
     forest_row_ids,
     forest_segment_id,
+    ROLLOUT_ENVIRONMENT_TAG,
+    UNKNOWN_ROLLOUT_ENVIRONMENT,
 )
 from nemo_rl.data_plane.tq_token_sink import (
     FetchedStagedCall,
@@ -831,7 +833,7 @@ class RolloutReassembler:
         fallback_weight_version: int,
         prompt_idx: int,
         loss_multiplier: float = 1.0,
-        rollout_environment: str = "unknown",
+        rollout_environment: str = UNKNOWN_ROLLOUT_ENVIRONMENT,
         canonical_sample_ids: Optional[list[str]] = None,
         logical_selections: Optional[list[RolloutSelection]] = None,
         execution_row_multiple: int = 1,
@@ -1282,7 +1284,7 @@ class RolloutReassembler:
             "sample_mask": sample_mask,
             "prompt_ids_for_adv": prompt_ids_for_adv,
             "total_reward": rewards_t,
-            "rollout_environment": rollout_environment,
+            ROLLOUT_ENVIRONMENT_TAG: rollout_environment,
             MASK_SAMPLE: torch.tensor(mask_sample, dtype=torch.bool),
             TRUNCATED: torch.tensor(
                 self._truncated_flags(rows, logical), dtype=torch.bool
