@@ -160,6 +160,12 @@ selective_mounts+=",${code_dir}/tools:/opt/nemo-rl/tools"
 selective_mounts+=",${code_dir}/scripts:/opt/nemo-rl/scripts"
 selective_mounts+=",${code_dir}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 selective_mounts+=",${code_dir}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+# The mounts above shadow the image's copies: an uninitialized submodule would hide
+# the installed Gym or Megatron-Bridge/Megatron-LM (ModuleNotFoundError: megatron.bridge
+# at worker creation, after the GPUs are allocated). Fail here instead.
+for sub in 3rdparty/Gym-workspace/Gym 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM; do
+  [[ -n "$(ls -A "${code_dir}/${sub}" 2>/dev/null)" ]] || { echo "ERROR: ${sub} is empty; run: git submodule update --init --recursive ${sub%%/3rdparty/Megatron-LM}" >&2; exit 1; }
+done
 export MOUNTS="${base_mounts},${selective_mounts}${EXTRA_MOUNTS:+,${EXTRA_MOUNTS}}"
 export CONTAINER="${container}"
 export BASE_LOG_DIR="${slurm_log_dir}"

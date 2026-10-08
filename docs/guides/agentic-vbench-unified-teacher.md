@@ -61,6 +61,17 @@ default. `validate_single_controller_config` accepts the V2 recipe in it.
 
 ## Running
 
+Initialize the submodules the launcher mounts over the image first (a fresh
+worktree has them empty, which hides the installed `megatron.bridge` and
+`megatron.core` and fails at worker creation):
+
+```bash
+git submodule update --init --depth 1 3rdparty/Gym-workspace/Gym
+git submodule update --init --recursive --depth 1 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
+```
+
+The launcher's preflight now refuses to submit while any of them is empty.
+
 ```bash
 AGENTIC_VBENCH_BACKEND_DIR=$PWD/data/agentic_vbench/backend-cc-3 bash scripts/agentic_vbench/submit_backend.sh   # if no backend is up
 python3 scripts/agentic_vbench/prebuild_task_images.py --benchmark-root data/agentic_vbench/agentic-vbench \
