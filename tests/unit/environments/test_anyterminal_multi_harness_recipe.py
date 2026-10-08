@@ -195,6 +195,8 @@ def test_nano_omni_sync_2n_debug_recipe_resolves_multi_harness_topology():
     assert config["policy"]["model_name"] == (
         "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
     )
+    assert config["policy"]["max_total_sequence_length"] == 16384
+    assert config["policy"]["generation"]["max_new_tokens"] == 8192
     assert config["cluster"]["num_nodes"] == 2
     assert config["policy"]["generation"]["colocated"] == {
         "enabled": False,
@@ -206,6 +208,9 @@ def test_nano_omni_sync_2n_debug_recipe_resolves_multi_harness_topology():
     assert config["policy"]["generation"]["vllm_cfg"][
         "http_server_serving_chat_kwargs"
     ]["reasoning_parser"] == "nano_v3"
+    assert config["policy"]["generation"]["vllm_kwargs"]["kernel_config"] == {
+        "enable_flashinfer_autotune": False,
+    }
     assert config["env"]["nemo_gym"]["fan_out"] == {
         "anyterminal_multi_harness": [
             "anyterminal_opencode",
@@ -223,9 +228,9 @@ def test_nano_omni_sync_2n_debug_recipe_resolves_multi_harness_topology():
     assert config["env"]["nemo_gym"]["anyterminal_opencode"][
         "responses_api_agents"
     ]["anyterminal_agent"]["agent_kwargs"] == {
-        "context_window": 8192,
-        "max_input_tokens": 3584,
-        "max_output_tokens": 4096,
+        "context_window": 16384,
+        "max_input_tokens": 7680,
+        "max_output_tokens": 8192,
     }
     assert config["logger"]["wandb_enabled"] is True
     assert config["logger"]["wandb"]["log_nemo_gym_full_result_tables"] is True
