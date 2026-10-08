@@ -623,9 +623,6 @@ class MegatronPolicyWorkerImpl(
 
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
-        # Staging-buffer cache for refit weight streaming; only populated when
-        # cfg["refit_persistent_ipc_buffers"] is enabled.
-        self._refit_ipc_buffer_cache: dict[str, Any] = {}
         # HF param names to MXFP8-quantize on the trainer during refit; set via
         # enable_refit_prequantize() when vllm_cfg.refit_prequantize is on.
         self._refit_prequant_names: set[str] = set()
@@ -3733,11 +3730,6 @@ class MegatronPolicyWorkerImpl(
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
-            buffer_cache=(
-                self._refit_ipc_buffer_cache
-                if self.cfg.get("refit_persistent_ipc_buffers")
-                else None
-            ),
         )
 
     @torch.no_grad()

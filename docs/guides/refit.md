@@ -77,7 +77,6 @@ refit workload.
 | `policy.generation.vllm_cfg.refit_prequantize` | Megatron policy with MXFP8 vLLM rollout | Quantizes supported weights before transfer. See [Optional trainer-side MXFP8 refit](../fp8.md#optional-trainer-side-mxfp8-refit) for requirements and exclusions. |
 | `policy.generation.vllm_cfg.refit_cache_loader_routes` | vLLM refit | Reuses validated weight-loader routes after the first refit. The default is `false`. |
 | `policy.refit_buffer_size_gb` | Refit paths that stage weights in buffers | Sets a fixed buffer size in GiB. NCCL broadcast uses the same size on both sides to keep chunk boundaries equal. |
-| `policy.refit_persistent_ipc_buffers` | Colocated CUDA IPC refit | Reuses two trainer staging buffers. Set `refit_buffer_size_gb` to keep their size fixed. |
 | `policy.megatron_cfg.refit_slim_offload_after` | Colocated Megatron refit | Skips repeated gradient-buffer offload and a second allocator cleanup after transfer. |
 
 `policy.megatron_cfg.pinned_reference_swap` does not change weight refit.
