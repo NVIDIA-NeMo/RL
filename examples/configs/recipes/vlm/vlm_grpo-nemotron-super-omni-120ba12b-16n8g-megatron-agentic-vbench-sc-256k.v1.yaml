@@ -14,12 +14,15 @@ policy:
   # runs out of memory on the longest rows.
   max_total_sequence_length: 262144
   megatron_cfg:
-    # The identity fast run (2026-10-07) trained step 1 at PP=1 and then ran out of
-    # learner memory in the step-2 backward pass with rows of 70-80k tokens
-    # (175 GiB in use on one GPU); 32-turn episodes reach 118k-token prompts.
-    # Two pipeline stages halve the per-GPU layer count; TP8 x PP2 x DP2 keeps
-    # EP16 valid on 32 training GPUs.
-    pipeline_model_parallel_size: 2
+    # The identity fast run (2026-10-07) trained step 1 and then ran out of learner
+    # memory in the step-2 backward pass with 70-80k-token rows (175 GiB on one
+    # GPU). Two pipeline stages are not an option: NeMo-RL's refit broadcast
+    # requires every object on exactly one PP rank and this model has one on both
+    # ("Object present on multiple PP ranks: [0, 1]"). Release cached memory more
+    # aggressively between phases instead; rows are already micro batch 1 with
+    # full recomputation and chunked fp32 logprobs.
+    pipeline_model_parallel_size: 1
+    empty_unused_memory_level: 2
   generation:
     vllm_kwargs:
       # Do not size the prefill chunk to the whole window: vLLM profiles and
