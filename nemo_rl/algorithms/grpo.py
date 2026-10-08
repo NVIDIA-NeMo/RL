@@ -283,6 +283,10 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: bool = False
+    # Computes prev-policy logprobs for each step's groups as they arrive,
+    # while the step waits for its last groups. Requires non-colocated
+    # generation.
+    overlap_logprobs: bool = False
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
@@ -502,6 +506,46 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
         )
 
 
+def _validate_overlap_logprobs(master_config: MasterConfig) -> None:
+    """Reject grpo.async_grpo.overlap_logprobs where it cannot work."""
+    async_config = master_config.grpo.async_grpo
+    if async_config is None or not async_config.overlap_logprobs:
+        return
+    if not async_config.enabled:
+        raise ValueError(
+            "grpo.async_grpo.overlap_logprobs requires grpo.async_grpo.enabled=true."
+        )
+    generation_config = master_config.policy["generation"]
+    if generation_config["colocated"]["enabled"]:
+        raise ValueError(
+            "grpo.async_grpo.overlap_logprobs requires "
+            "policy.generation.colocated.enabled=false: a colocated engine holds "
+            "the policy's GPUs while the step waits for its groups."
+        )
+    if opd_module._skip_prev_logprobs(master_config):
+        raise ValueError(
+            "grpo.async_grpo.overlap_logprobs has no effect when prev-policy "
+            "logprobs are skipped (loss_fn.force_on_policy_ratio=true without "
+            "grpo.seq_logprob_error_threshold)."
+        )
+    if need_top_k_or_top_p_filtering(
+        TrainingSamplingParams(
+            top_k=generation_config["top_k"],
+            top_p=generation_config["top_p"],
+        )
+    ):
+        raise ValueError(
+            "grpo.async_grpo.overlap_logprobs does not support top-k/top-p "
+            "filtering: it reuses logprobs only, not the filtering token mask."
+        )
+    if router_replay_enabled(master_config.policy):
+        raise ValueError(
+            "grpo.async_grpo.overlap_logprobs does not support "
+            "policy.router_replay.enabled=true: rows are matched by tokens, "
+            "which do not identify their routed experts."
+        )
+
+
 def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
     """Reject configurations whose media transfer path is not qualified."""
     if not master_config.grpo.deduplicate_multimodal_data:
@@ -628,6 +672,7 @@ def setup(
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
+    _validate_overlap_logprobs(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -4661,7 +4706,11 @@ def async_grpo_train(
             )
 
     # Import async utilities only when needed
-    from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
+    from nemo_rl.algorithms.async_utils import (
+        AsyncTrajectoryCollector,
+        OverlappedLogprobs,
+        ReplayBuffer,
+    )
 
     timer = Timer(context={"worker": "driver"})
     _telemetry = get_telemetry_handle()
@@ -4744,6 +4793,31 @@ def async_grpo_train(
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
         max_size=optimal_buffer_size,
         drop_incomplete_targets_on_restore=False,
+    )
+
+    def build_logprob_batch(rows: BatchedDataDict) -> BatchedDataDict:
+        """Build a logprob input batch the same way as the training batch."""
+        add_grpo_token_loss_masks_and_generation_logprobs(rows["message_log"])
+        flat_messages, input_lengths = batched_message_log_to_flat_message(
+            rows["message_log"],
+            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+            make_sequence_length_divisible_by=master_config.policy[
+                "make_sequence_length_divisible_by"
+            ],
+        )
+        if flat_messages.get_multimodal_dict(as_tensors=False):
+            raise NotImplementedError(
+                "grpo.async_grpo.overlap_logprobs does not support multimodal data."
+            )
+        return _build_async_grpo_train_data(
+            flat_messages, input_lengths, rows, master_config.policy
+        )
+
+    # overlap_logprobs: prev-policy logprobs computed while a step waits.
+    overlapped_logprobs = (
+        OverlappedLogprobs(policy, replay_buffer, build_logprob_batch)
+        if master_config.grpo.async_grpo.overlap_logprobs
+        else None
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
@@ -5199,6 +5273,19 @@ def async_grpo_train(
                             action="continue",
                         )
 
+                        if overlapped_logprobs is not None:
+                            # The policy is idle while the step waits: compute
+                            # logprobs for the groups that have arrived.
+                            with (
+                                timer.time("overlapped_logprobs"),
+                                managed_span(
+                                    RLSpanGroup.LOGPROB,
+                                    "rl.grpo.overlapped_logprobs",
+                                    tracer=_tracer,
+                                ),
+                            ):
+                                overlapped_logprobs.compute_arrived(weight_version)
+
                         with (
                             timer.time("idle/buffer_starvation"),
                             efficiency_span("idle/buffer_starvation", tracer=_tracer),
@@ -5405,7 +5492,14 @@ def async_grpo_train(
                         tracer=_tracer,
                     ),
                 ):
-                    if not skip_prev_logprobs:
+                    num_overlapped_rows: Optional[int] = None
+                    if not skip_prev_logprobs and overlapped_logprobs is not None:
+                        # Top-k/top-p filtering, the only source of a returned
+                        # token_mask, is rejected with overlap_logprobs.
+                        train_data["prev_logprobs"], num_overlapped_rows = (
+                            overlapped_logprobs.get_logprobs(train_data, timer=timer)
+                        )
+                    elif not skip_prev_logprobs:
                         prev_lp_result = policy.get_logprobs(train_data, timer=timer)
                         train_data["prev_logprobs"] = prev_lp_result["logprobs"]
                         # Propagate the top-k/top-p neginf token mask.
@@ -5792,6 +5886,12 @@ def async_grpo_train(
 
                 # Always log sequence-level error metrics (useful for deciding threshold)
                 metrics.update(seq_logprob_error_metrics)
+                if num_overlapped_rows is not None:
+                    # Prev-policy logprob rows computed during and after the wait.
+                    metrics["logprob_rows_overlapped"] = num_overlapped_rows
+                    metrics["logprob_rows_critical_path"] = (
+                        train_data.size - num_overlapped_rows
+                    )
 
                 # Speculative-decoding (MTP) acceptance metrics for this step.
                 if hasattr(policy_generation, "get_step_metrics"):

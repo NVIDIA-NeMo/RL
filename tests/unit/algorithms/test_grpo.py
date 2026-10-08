@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import math
 import os
 from concurrent.futures import Future
@@ -56,6 +57,7 @@ from nemo_rl.algorithms.grpo import (
     _shutdown_completed_nemo_gym_startup,
     _startup_pipeline_ready,
     _validate_multimodal_dedup_capability,
+    _validate_overlap_logprobs,
     _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
@@ -5161,6 +5163,151 @@ def test_async_grpo_exit_on_max_epochs(mock_grpo_components, tmp_path):
     cycling_dataloader_cls.assert_called_once_with(
         mock_grpo_components["train_dataloader"]
     )
+
+
+class _StallingReplayBuffer(StubReplayBuffer):
+    """Stalls each step once, so the wait loop runs, then serves the step."""
+
+    def __init__(self, num_groups, **kwargs):
+        super().__init__(**kwargs)
+        self._num_groups = num_groups
+        self._stalled_versions: set[int] = set()
+
+    def _groups(self):
+        return [
+            {"batch": self._mock_batch, "rollout_metrics": self._mock_rollout_metrics}
+            for _ in range(self._num_groups)
+        ]
+
+    @property
+    def sample(self):
+        serve = super().sample.remote
+
+        def _sample(num_prompt_groups, current_weight_version, max_age_steps):
+            if current_weight_version not in self._stalled_versions:
+                self._stalled_versions.add(current_weight_version)
+                return None
+            return serve(num_prompt_groups, current_weight_version, max_age_steps)
+
+        return MagicMock(remote=MagicMock(side_effect=_sample))
+
+    @property
+    def peek(self):
+        def _peek(current_weight_version, start=0):
+            # Like a Ray actor call, peek hands back copies.
+            return copy.deepcopy(self._groups()[start:])
+
+        return MagicMock(remote=MagicMock(side_effect=_peek))
+
+
+def test_async_grpo_overlap_logprobs_computes_rows_during_the_wait(
+    mock_grpo_components,
+):
+    """With overlap_logprobs, prev-policy logprobs are computed while a step waits."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 2
+    master_config.grpo.async_grpo.overlap_logprobs = True
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    policy = mock_grpo_components["policy"]
+    policy.get_logprobs.side_effect = lambda data, timer=None: {
+        "logprobs": data["input_ids"].float()
+    }
+    logger = mock_grpo_components["logger"]
+    num_groups = master_config.grpo.num_prompts_per_step
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    stalling_buffer = _StallingReplayBuffer(
+        num_groups,
+        initial_size=10,
+        mock_batch=mock_batch,
+        mock_rollout_metrics=mock_rollout_metrics,
+    )
+    buffer_cls = MagicMock()
+    buffer_cls.options.return_value.remote.return_value = stalling_buffer
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics)
+        )
+        stack.enter_context(
+            patch("nemo_rl.algorithms.async_utils.ReplayBuffer", buffer_cls)
+        )
+        stack.enter_context(patch("nemo_rl.algorithms.grpo.torch.save"))
+        async_grpo_train(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            logger,
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    # One logprob call per step, during the wait; none after it.
+    assert [call.args[0].size for call in policy.get_logprobs.call_args_list] == [
+        num_groups
+    ] * 2
+    for call in policy.train.call_args_list:
+        train_data = call.args[0]
+        assert torch.equal(train_data["prev_logprobs"], train_data["input_ids"].float())
+    train_logs = [
+        call.args[0]
+        for call in logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ]
+    assert [
+        (m["logprob_rows_overlapped"], m["logprob_rows_critical_path"])
+        for m in train_logs
+    ] == [(num_groups, 0)] * 2
+    timing_logs = [
+        call.args[0]
+        for call in logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "timing/train"
+    ]
+    assert all("overlapped_logprobs" in timings for timings in timing_logs)
+
+
+@pytest.mark.parametrize(
+    "override, message",
+    [
+        ("async_disabled", "async_grpo.enabled"),
+        ("colocated", "colocated"),
+        ("skip_prev_logprobs", "skipped"),
+        ("top_k", "top-k"),
+        ("router_replay", "router_replay"),
+    ],
+)
+def test_overlap_logprobs_rejects_unsupported_configs(
+    mock_grpo_components, override, message
+):
+    config = mock_grpo_components["master_config"]
+    config.grpo.async_grpo.enabled = True
+    config.grpo.async_grpo.overlap_logprobs = True
+    config.policy["generation"]["colocated"]["enabled"] = False
+    _validate_overlap_logprobs(config)
+
+    if override == "async_disabled":
+        config.grpo.async_grpo.enabled = False
+    elif override == "colocated":
+        config.policy["generation"]["colocated"]["enabled"] = True
+    elif override == "skip_prev_logprobs":
+        config.loss_fn.force_on_policy_ratio = True
+    elif override == "top_k":
+        config.policy["generation"]["top_k"] = 20
+    elif override == "router_replay":
+        config.policy["router_replay"] = {"enabled": True}
+    with pytest.raises(ValueError, match=message):
+        _validate_overlap_logprobs(config)
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
