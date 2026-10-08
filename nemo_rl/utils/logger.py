@@ -56,7 +56,18 @@ _rich_logging_configured = False
 # Metric axes are registered by exact name when a key is first logged. A
 # catch-all ``*`` definition is intentionally avoided because wandb-core does
 # not deterministically resolve overlapping glob definitions.
-WANDB_CALLER_STEP_METRIC = "nemo_rl/step"
+#
+# Dev-branch change (upstream value: "nemo_rl/step"): the value "step" stands
+# for W&B's own step instead of a custom axis, so trainer charts line up with
+# runs from before #3925, which plotted against W&B's Step. Where it is "step",
+# trainer rows are logged with run.log(..., step=trainer_step) and carry no
+# extra field, and custom-axis events (rollout telemetry, GPU monitoring) use
+# commit=False so they never advance W&B's step: each joins W&B's current row
+# (the last trainer step logged), so only the last value of each key per
+# trainer step is kept. Trainer steps must then be logged in nondecreasing
+# order, which the SingleController and legacy drivers do. Any other value
+# keeps upstream's custom-axis behavior.
+WANDB_CALLER_STEP_METRIC = "step"
 TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
 
 
@@ -269,7 +280,8 @@ class WandbLogger(LoggerInterface):
         }
         self._pending_step: Optional[int] = None
         self._pending_metrics: dict[str, Any] = {}
-        self.run.define_metric(WANDB_CALLER_STEP_METRIC, hidden=True)
+        if WANDB_CALLER_STEP_METRIC != "step":
+            self.run.define_metric(WANDB_CALLER_STEP_METRIC, hidden=True)
         # Most training entrypoints run W&B in the driver process and do not
         # own an explicit logger teardown today. Register after wandb.init so
         # our Python-side row buffer drains before W&B's own atexit handlers.
@@ -525,8 +537,11 @@ class WandbLogger(LoggerInterface):
         if self._pending_step is None:
             return
         event_metrics = dict(self._pending_metrics)
-        event_metrics[WANDB_CALLER_STEP_METRIC] = self._pending_step
-        self.run.log(event_metrics)
+        if WANDB_CALLER_STEP_METRIC == "step":
+            self.run.log(event_metrics, step=self._pending_step)
+        else:
+            event_metrics[WANDB_CALLER_STEP_METRIC] = self._pending_step
+            self.run.log(event_metrics)
         self._pending_step = None
         self._pending_metrics = {}
 
@@ -546,7 +561,11 @@ class WandbLogger(LoggerInterface):
         for metric_name in metrics:
             self._define_exact_metric_locked(
                 metric_name,
-                step_metric=WANDB_CALLER_STEP_METRIC,
+                step_metric=(
+                    None
+                    if WANDB_CALLER_STEP_METRIC == "step"
+                    else WANDB_CALLER_STEP_METRIC
+                ),
             )
         self._pending_metrics.update(metrics)
         if step_finished:
@@ -589,7 +608,10 @@ class WandbLogger(LoggerInterface):
                 )
                 # Custom-axis streams (rollout telemetry, GPU monitoring) are
                 # independent events and must not carry nemo_rl/step.
-                self.run.log(dict(metrics))
+                if WANDB_CALLER_STEP_METRIC == "step":
+                    self.run.log(dict(metrics), commit=False)
+                else:
+                    self.run.log(dict(metrics))
                 return
 
             self._buffer_step_metrics_locked(
