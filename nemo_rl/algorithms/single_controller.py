@@ -309,6 +309,39 @@ def _train_fields_for_step(
     )
 
 
+def _required_ppo_group_multiple(
+    *,
+    data_parallel_size: int,
+    micro_batch_size: int,
+    generations_per_prompt: int,
+    sequence_packing_enabled: bool,
+    dynamic_batching_enabled: bool,
+) -> int:
+    sample_multiple = data_parallel_size
+    if not sequence_packing_enabled and not dynamic_batching_enabled:
+        sample_multiple *= micro_batch_size
+    return sample_multiple // math.gcd(sample_multiple, generations_per_prompt)
+
+
+def _validate_ppo_chunk_groups(
+    *,
+    group_multiple: int,
+    num_prompts_per_step: int,
+    min_groups_for_streaming_train: int,
+) -> None:
+    if num_prompts_per_step % group_multiple:
+        raise ValueError(
+            "PPO num_prompts_per_step must be divisible by the policy/value "
+            f"group multiple ({group_multiple}) to avoid an incomplete final chunk"
+        )
+    if min_groups_for_streaming_train < group_multiple:
+        raise ValueError(
+            "PPO min_groups_for_streaming_train must be at least the "
+            f"policy/value group multiple ({group_multiple}) so each chunk "
+            "contains complete microbatches on every DP rank"
+        )
+
+
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
 class SingleControllerActor:
     """CPU-only Ray actor that orchestrates the RL training loop.
@@ -595,16 +628,52 @@ class SingleControllerActor:
             min_groups_for_streaming_train=self._async_cfg.min_groups_for_streaming_train,
         )
         if self._is_ppo:
-            if not isinstance(self._sampler, InOrderSampler) or self._value is None:
-                raise TypeError("PPO requires an in-order sampler and value worker")
+            if (
+                not isinstance(self._sampler, (InOrderSampler, ReadyFirstSampler))
+                or self._value is None
+            ):
+                raise TypeError(
+                    "PPO requires an in-order or ready-first sampler and value worker"
+                )
             generations_per_prompt = self._algo_cfg.num_generations_per_prompt
             policy_dp = self._trainer.sharding_annotations.get_axis_size(
                 "data_parallel"
             )
             value_dp = self._value.sharding_annotations.get_axis_size("data_parallel")
+            policy_config = self._master_config.policy
+            value_config = self._master_config.value
+            if value_config is None:
+                raise ValueError("PPO requires a value model configuration")
             group_multiple = math.lcm(
-                policy_dp // math.gcd(policy_dp, generations_per_prompt),
-                value_dp // math.gcd(value_dp, generations_per_prompt),
+                _required_ppo_group_multiple(
+                    data_parallel_size=policy_dp,
+                    micro_batch_size=policy_config["train_micro_batch_size"],
+                    generations_per_prompt=generations_per_prompt,
+                    sequence_packing_enabled=(
+                        "sequence_packing" in policy_config
+                        and policy_config["sequence_packing"]["enabled"]
+                    ),
+                    dynamic_batching_enabled=policy_config["dynamic_batching"][
+                        "enabled"
+                    ],
+                ),
+                _required_ppo_group_multiple(
+                    data_parallel_size=value_dp,
+                    micro_batch_size=value_config["train_micro_batch_size"],
+                    generations_per_prompt=generations_per_prompt,
+                    sequence_packing_enabled=(
+                        "sequence_packing" in value_config
+                        and value_config["sequence_packing"]["enabled"]
+                    ),
+                    dynamic_batching_enabled=value_config["dynamic_batching"][
+                        "enabled"
+                    ],
+                ),
+            )
+            _validate_ppo_chunk_groups(
+                group_multiple=group_multiple,
+                num_prompts_per_step=num_prompts_per_step,
+                min_groups_for_streaming_train=self._async_cfg.min_groups_for_streaming_train,
             )
             self._sampler.set_group_multiple(group_multiple)
         restored_dispatch_index = actor_args.save_state.sampler_dispatch_index

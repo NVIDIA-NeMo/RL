@@ -50,6 +50,8 @@ from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     _pooled_opd_metrics,
+    _required_ppo_group_multiple,
+    _validate_ppo_chunk_groups,
 )
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
@@ -198,6 +200,66 @@ def _init_controller(master_config, actor_args):
         master_config=master_config,
         actor_args=actor_args,
         setup_timing_metrics=SetupTimingMetrics(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("sequence_packing_enabled", "dynamic_batching_enabled", "expected_groups"),
+    [(False, False, 2), (True, False, 1), (False, True, 1)],
+)
+def test_ppo_group_multiple_requires_complete_microbatches(
+    sequence_packing_enabled: bool, dynamic_batching_enabled: bool, expected_groups: int
+) -> None:
+    assert (
+        _required_ppo_group_multiple(
+            data_parallel_size=8,
+            micro_batch_size=4,
+            generations_per_prompt=16,
+            sequence_packing_enabled=sequence_packing_enabled,
+            dynamic_batching_enabled=dynamic_batching_enabled,
+        )
+        == expected_groups
+    )
+
+
+def test_ppo_group_multiple_combines_policy_and_value_requirements() -> None:
+    policy_groups = _required_ppo_group_multiple(
+        data_parallel_size=8,
+        micro_batch_size=4,
+        generations_per_prompt=16,
+        sequence_packing_enabled=False,
+        dynamic_batching_enabled=False,
+    )
+    value_groups = _required_ppo_group_multiple(
+        data_parallel_size=8,
+        micro_batch_size=1,
+        generations_per_prompt=16,
+        sequence_packing_enabled=True,
+        dynamic_batching_enabled=False,
+    )
+    assert math.lcm(policy_groups, value_groups) == 2
+
+
+@pytest.mark.parametrize(
+    ("num_prompts_per_step", "min_groups", "error"),
+    [(32, 1, "min_groups_for_streaming_train"), (3, 2, "num_prompts_per_step")],
+)
+def test_ppo_chunk_validation_rejects_incomplete_chunks(
+    num_prompts_per_step: int, min_groups: int, error: str
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        _validate_ppo_chunk_groups(
+            group_multiple=2,
+            num_prompts_per_step=num_prompts_per_step,
+            min_groups_for_streaming_train=min_groups,
+        )
+
+
+def test_ppo_chunk_validation_accepts_complete_chunks() -> None:
+    _validate_ppo_chunk_groups(
+        group_multiple=2,
+        num_prompts_per_step=32,
+        min_groups_for_streaming_train=2,
     )
 
 
