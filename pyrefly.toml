@@ -25,6 +25,7 @@ replace-imports-with-any = [
 ]
 project-includes = [
   "nemo_rl/data/captured_media.py",
+  "nemo_rl/models/four_phase_profiling.py",
   # TODO: enable these once we have 100 correctness
   #"nemo_rl/**/*.py",
   #"examples/**/*.py",
@@ -213,6 +214,7 @@ project-includes = [
   "nemo_rl/modelopt/models/policy/workers/__init__.py",
   "nemo_rl/modelopt/models/policy/workers/automodel_quant_policy_worker.py",
   "nemo_rl/models/__init__.py",
+  "nemo_rl/models/profiling.py",
   "nemo_rl/models/automodel/__init__.py",
   "nemo_rl/models/automodel/convert.py",
   "nemo_rl/models/automodel/utils.py",
@@ -235,6 +237,7 @@ project-includes = [
   "nemo_rl/models/generation/fleet_health.py",
   "nemo_rl/models/generation/generation_router.py",
   "nemo_rl/models/generation/interfaces.py",
+  "nemo_rl/models/generation/profiling.py",
   "nemo_rl/models/generation/megatron/__init__.py",
   "nemo_rl/models/generation/megatron/config.py",
   "nemo_rl/models/generation/megatron/token_capture.py",
@@ -284,6 +287,7 @@ project-includes = [
   "nemo_rl/models/policy/__init__.py",
   "nemo_rl/models/policy/draft_config.py",
   "nemo_rl/models/policy/interfaces.py",
+  "nemo_rl/models/policy/profiling.py",
   "nemo_rl/models/policy/tq_policy.py",
   "nemo_rl/models/policy/utils.py",
   "nemo_rl/models/policy/workers/__init__.py",

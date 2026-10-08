@@ -2863,7 +2863,11 @@ async def run_async_nemo_gym_rollout(
         if stream_finished:
             break
         if group_to_yield is not None:
-            yield group_to_yield
+            try:
+                yield group_to_yield
+            except (asyncio.CancelledError, GeneratorExit):
+                await rollout_iterator.aclose()
+                raise
 
     with timer.time(total_timer_label):
         accumulator.finish()
