@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 from pathlib import Path
 
@@ -75,9 +89,7 @@ def test_freeze_band_copies_and_rewrites_complete_gym_snapshot(tmp_path):
     assert (output / "SHA256SUMS").is_file()
 
     task = json.loads((output / "tasks" / "task_001.json").read_text())
-    frozen_asset = Path(
-        task["config"][0]["parameters"]["files"][0]["local_path"]
-    )
+    frozen_asset = Path(task["config"][0]["parameters"]["files"][0]["local_path"])
     assert frozen_asset.is_relative_to(output)
     assert frozen_asset.read_text() == "portable asset\n"
     assert all(
@@ -86,8 +98,7 @@ def test_freeze_band_copies_and_rewrites_complete_gym_snapshot(tmp_path):
     )
 
     rows = [
-        json.loads(line)
-        for line in (output / "train.jsonl").read_text().splitlines()
+        json.loads(line) for line in (output / "train.jsonl").read_text().splitlines()
     ]
     assert len(rows) == 2
     assert rows[0]["agent_ref"]["name"] == "nemotron_osworld"

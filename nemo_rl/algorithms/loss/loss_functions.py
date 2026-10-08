@@ -277,9 +277,7 @@ class ClippedPGLossFn(LossFunction):
                 f"'prompt-mean-token-mean', got {self.loss_agg_mode!r}"
             )
         if self.loss_agg_mode == "prompt-mean-token-mean" and not cfg.token_level_loss:
-            raise ValueError(
-                "prompt-mean-token-mean requires token_level_loss=True"
-            )
+            raise ValueError("prompt-mean-token-mean requires token_level_loss=True")
         # Type of truncated importance sampling: "tis" | "icepop" | "seq-mask-tis"
         self.truncated_importance_sampling_type = cfg.truncated_importance_sampling_type
         self.is_correction_gating = cfg.is_correction_gating
@@ -803,8 +801,7 @@ class ClippedPGLossFn(LossFunction):
                     ).detach()
                 elif self.is_correction_gating == "tv":
                     token_gate_stat = (
-                        generation_logprobs.float().exp()
-                        - prev_logprobs.float().exp()
+                        generation_logprobs.float().exp() - prev_logprobs.float().exp()
                     ).abs()
                     seq_gate_stat = masked_mean(
                         token_gate_stat, token_mask, dim=-1
@@ -814,10 +811,7 @@ class ClippedPGLossFn(LossFunction):
                         f"Invalid is_correction_gating: {self.is_correction_gating}"
                     )
                 seq_kept_mask = (
-                    (
-                        seq_gate_stat
-                        >= self.truncated_importance_sampling_ratio_min
-                    )
+                    (seq_gate_stat >= self.truncated_importance_sampling_ratio_min)
                     & (seq_gate_stat <= self.truncated_importance_sampling_ratio)
                 ).float()  # [B]
                 _is_filter_metrics = {

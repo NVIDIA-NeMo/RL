@@ -252,7 +252,7 @@ for library in libopenblas.so.0 libgfortran.so.5 libquadmath.so.0 libgcc_s.so.1;
   copy_runtime_lib "$library"
 done
 
-EXPECTED_CONTAINER_SHA256="1b4edcdeac017210e6abe25885372e025ac111c45aeb038bda334659436eb74e"
+EXPECTED_CONTAINER_SHA256="1b4edcdeac017210e6abe25885372e025ac111c45aeb038bda334659436eb74e"  # pragma: allowlist secret
 if [[ "${OSWORLD_VERIFY_CONTAINER_SHA256:-1}" == "1" ]]; then
   actual_container_sha256="$(sha256sum "$CONTAINER" | awk '{print $1}')"
   if [[ "$actual_container_sha256" != "$EXPECTED_CONTAINER_SHA256" ]]; then

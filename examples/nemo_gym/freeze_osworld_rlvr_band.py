@@ -25,9 +25,7 @@ from typing import Any
 def _read_manifest(path: Path) -> tuple[bytes, list[dict[str, Any]]]:
     raw = path.read_bytes()
     rows = [
-        json.loads(line)
-        for line in raw.decode("utf-8").splitlines()
-        if line.strip()
+        json.loads(line) for line in raw.decode("utf-8").splitlines() if line.strip()
     ]
     if not rows:
         raise ValueError(f"empty manifest: {path}")
@@ -107,9 +105,7 @@ def _copy_task_assets(
         if destination is None:
             digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
             destination = (
-                Path("assets")
-                / task_id
-                / f"{len(copied):03d}-{digest}-{source.name}"
+                Path("assets") / task_id / f"{len(copied):03d}-{digest}-{source.name}"
             )
             target = stage / destination
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -134,13 +130,15 @@ def _rewrite_function_provenance(
             continue
         path = Path(value)
         role = next(
-            (candidate for candidate in ("getters", "metrics") if candidate in path.parts),
+            (
+                candidate
+                for candidate in ("getters", "metrics")
+                if candidate in path.parts
+            ),
             None,
         )
         if role is not None:
-            rewritten.append(
-                str(final / "tmp_funcs" / task_id / role / path.name)
-            )
+            rewritten.append(str(final / "tmp_funcs" / task_id / role / path.name))
     metadata["new_functions_paths"] = rewritten
 
 
@@ -159,9 +157,7 @@ def _gym_row(task: dict[str, Any], repeat_index: int) -> dict[str, Any]:
             "name": "nemotron_osworld",
         },
         "context_compaction_task_id": task_id,
-        "context_compaction_group_id": (
-            f"rlvr-band:{task_id}:repeat:{repeat_index}"
-        ),
+        "context_compaction_group_id": (f"rlvr-band:{task_id}:repeat:{repeat_index}"),
     }
 
 
@@ -178,7 +174,9 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> int:
 
 def _write_checksums(root: Path) -> str:
     records: list[str] = []
-    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+    for path in sorted(
+        candidate for candidate in root.rglob("*") if candidate.is_file()
+    ):
         if path.name == "SHA256SUMS":
             continue
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -205,9 +203,7 @@ def freeze_band(
 
     manifest_path = source / "manifest.jsonl"
     manifest_before, manifest_rows = _read_manifest(manifest_path)
-    stage = Path(
-        tempfile.mkdtemp(prefix=f".{output.name}.tmp-", dir=output.parent)
-    )
+    stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.tmp-", dir=output.parent))
     try:
         (stage / "tasks").mkdir()
         (stage / "tmp_funcs").mkdir()
@@ -226,10 +222,13 @@ def freeze_band(
             metadata = task.get("metadata", {})
             if metadata.get("calib_reps") != manifest_row["calib_reps"]:
                 raise ValueError(f"{task_id}: task/manifest calib_reps mismatch")
-            if abs(
-                float(metadata.get("calib_pass_rate", -1))
-                - float(manifest_row["calib_pass_rate"])
-            ) > 1e-9:
+            if (
+                abs(
+                    float(metadata.get("calib_pass_rate", -1))
+                    - float(manifest_row["calib_pass_rate"])
+                )
+                > 1e-9
+            ):
                 raise ValueError(f"{task_id}: task/manifest pass rate mismatch")
 
             asset_failures = _unreadable_upload_assets(task)

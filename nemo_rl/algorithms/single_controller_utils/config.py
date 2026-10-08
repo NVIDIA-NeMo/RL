@@ -872,7 +872,8 @@ def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
         and loss.is_correction_gating == "binary_kl"
         and loss.truncated_importance_sampling_ratio_min is not None
         and loss.truncated_importance_sampling_ratio is not None
-        and loss.truncated_importance_sampling_ratio_min <= 0
+        and loss.truncated_importance_sampling_ratio_min
+        <= 0
         < loss.truncated_importance_sampling_ratio
         and loss.force_on_policy_ratio
         and not loss.disable_ppo_ratio
@@ -1510,8 +1511,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 or async_config.min_groups_for_streaming_train
                 != master_config.grpo.num_prompts_per_step
                 or (
-                    master_config.loss_fn.loss_agg_mode
-                    == "prompt-mean-token-mean"
+                    master_config.loss_fn.loss_agg_mode == "prompt-mean-token-mean"
                     and not async_config.stage_full_advantage_window
                 )
                 or (

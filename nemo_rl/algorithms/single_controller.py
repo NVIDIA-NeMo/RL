@@ -4487,16 +4487,11 @@ class SingleControllerActor:
         logical = has_logical_owners(meta)
         if logical:
             grpo_family = (
-                (
-                    self._algo_cfg.adv_estimator.name == "grpo"
-                    and isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
-                )
-                or (
-                    self._algo_cfg.adv_estimator.name == "dr_grpo"
-                    and isinstance(
-                        self._advantage_estimator, DrGRPOAdvantageEstimator
-                    )
-                )
+                self._algo_cfg.adv_estimator.name == "grpo"
+                and isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+            ) or (
+                self._algo_cfg.adv_estimator.name == "dr_grpo"
+                and isinstance(self._advantage_estimator, DrGRPOAdvantageEstimator)
             )
             molt_reinforce = (
                 self._algo_cfg.adv_estimator.name == "reinforce_baseline"
@@ -4729,9 +4724,7 @@ class SingleControllerActor:
                         dispatch_group_id, len(dispatch_indices)
                     )
                 )
-            estimator_prompt_ids = prompt_ids.new_tensor(
-                owner_prompt_ids
-            ).unsqueeze(-1)
+            estimator_prompt_ids = prompt_ids.new_tensor(owner_prompt_ids).unsqueeze(-1)
             owner_advantages = self._advantage_estimator.compute_advantage(
                 prompt_ids=estimator_prompt_ids,
                 rewards=rewards[rows],
@@ -4820,10 +4813,7 @@ class SingleControllerActor:
 
         fields_to_put = {adv_cfg.output_field: advantages}
         new_fields = [adv_cfg.output_field]
-        if (
-            self._master_config.loss_fn.loss_agg_mode
-            == "prompt-mean-token-mean"
-        ):
+        if self._master_config.loss_fn.loss_agg_mode == "prompt-mean-token-mean":
             fields_to_put[PROMPT_LOSS_WEIGHT] = _prompt_mean_token_mean_weights(
                 meta,
                 token_mask=token_mask,

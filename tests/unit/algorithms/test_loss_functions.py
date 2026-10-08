@@ -3195,9 +3195,7 @@ def _flash_loss_data(
     fields = {
         "input_ids": torch.zeros(batch, full_len, dtype=torch.long),
         "advantages": torch.nn.functional.pad(advantages, (1, 0)),
-        "generation_logprobs": torch.nn.functional.pad(
-            generation_logprobs, (1, 0)
-        ),
+        "generation_logprobs": torch.nn.functional.pad(generation_logprobs, (1, 0)),
         "token_mask": torch.nn.functional.pad(token_mask, (1, 0)),
         "sample_mask": torch.ones(batch),
     }
@@ -3243,9 +3241,7 @@ def test_flash_binary_kl_masks_physical_sequence_and_keeps_token_is():
     torch.testing.assert_close(loss, torch.tensor(-0.5))
     assert metrics["is_oob_ratio"] == pytest.approx(0.5)
     loss.backward()
-    torch.testing.assert_close(
-        curr.grad, torch.tensor([[0.0, 0.0], [-0.25, -0.25]])
-    )
+    torch.testing.assert_close(curr.grad, torch.tensor([[0.0, 0.0], [-0.25, -0.25]]))
 
 
 def test_prompt_mean_token_mean_is_prompt_and_microbatch_invariant():

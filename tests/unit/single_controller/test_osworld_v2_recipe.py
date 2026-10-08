@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import sys
 
 import pytest
@@ -197,8 +211,14 @@ def test_osworld_v2_recipe_selects_agentenv_fork_oversampling(monkeypatch):
     )
 
     assert config.env["nemo_gym"]["config_paths"][-1].endswith("agentenv.yaml")
-    assert gym_config.sandbox.agentenv.create.template == "osworld-slim-pixel-parity-20261001"
-    assert gym_config.osworld_resources_server.resources_servers.osworld.fork_oversampling is True
+    assert (
+        gym_config.sandbox.agentenv.create.template
+        == "osworld-slim-pixel-parity-20261001"
+    )
+    assert (
+        gym_config.osworld_resources_server.resources_servers.osworld.fork_oversampling
+        is True
+    )
 
 
 def test_osworld_v2_molt_b8k8_recipe_composes_and_validates(monkeypatch):
@@ -399,9 +419,7 @@ def test_flash_recipes_compose_and_validate(
     monkeypatch.setenv("OSWORLD_GRPO_TRAIN_DATA", "/data/rlvr-band/train.jsonl")
     monkeypatch.setenv("OSWORLD_CHECKPOINT_DIR", "/checkpoints/osworld-v2")
 
-    config = compose_and_validate_config(
-        [], config_path=RECIPE_CONFIG_PATHS[recipe]
-    )
+    config = compose_and_validate_config([], config_path=RECIPE_CONFIG_PATHS[recipe])
 
     assert config.grpo.num_prompts_per_step == prompts
     assert config.grpo.num_generations_per_prompt == generations
