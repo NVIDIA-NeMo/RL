@@ -40,7 +40,9 @@ from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
     evaluate_span,
+    iteration_scope,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
@@ -468,7 +470,7 @@ def validate_one_dataset(
     timer = Timer()
     with (
         timer.time("total_validation_time"),
-        evaluate_span("dpo", **{"rl.step": step}),
+        evaluate_span("dpo", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
@@ -658,12 +660,13 @@ def dpo_train(
             val_metrics, validation_timings = None, None
 
             with (
+                iteration_scope(total_steps + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.dpo.step",
                     tracer=_tracer,
-                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                    **{"rl.epoch": current_epoch + 1},
                 ),
             ):
                 print("▶ Taking a training step...")
@@ -673,7 +676,6 @@ def dpo_train(
                         RLSpanGroup.POLICY_UPDATE,
                         "rl.dpo.policy_training",
                         tracer=_tracer,
-                        **{"rl.iteration": total_steps + 1},
                     ),
                 ):
                     train_results = policy.train(

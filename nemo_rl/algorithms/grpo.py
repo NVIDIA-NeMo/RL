@@ -147,9 +147,11 @@ from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
     current_trace_carrier,
     efficiency_span,
     evaluate_span,
+    iteration_scope,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
@@ -3126,12 +3128,13 @@ def _grpo_train_impl(
             val_metrics, validation_timings = None, None
 
             with (
+                iteration_scope(total_steps + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.grpo.step",
                     tracer=_tracer,
-                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                    **{"rl.epoch": current_epoch + 1},
                 ),
             ):
                 # Prepare batch
@@ -3716,7 +3719,6 @@ def _grpo_train_impl(
                         RLSpanGroup.POLICY_UPDATE,
                         "rl.grpo.policy_training",
                         tracer=_tracer,
-                        **{"rl.iteration": total_steps + 1},
                     ),
                 ):
                     train_results = policy.train(
@@ -4260,7 +4262,7 @@ def validate(
     timer = Timer(context={"worker": "validator"})
     with (
         timer.time("total_validation_time"),
-        evaluate_span("grpo", **{"rl.step": step}),
+        evaluate_span("grpo", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
         # >= 1 is validated in setup().
@@ -5099,12 +5101,12 @@ def async_grpo_train(
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
             with (
+                iteration_scope(step + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.grpo.step",
                     tracer=_tracer,
-                    **{"rl.iteration": step + 1},
                 ),
             ):
                 num_mask_sample_filtered = 0
@@ -5537,7 +5539,6 @@ def async_grpo_train(
                         RLSpanGroup.POLICY_UPDATE,
                         "rl.grpo.policy_training",
                         tracer=_tracer,
-                        **{"rl.iteration": step + 1},
                     ),
                 ):
                     train_results = policy.train(

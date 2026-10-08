@@ -161,13 +161,17 @@ For a hot path where you want minimal cost when the group is disabled:
 
 ```python
 with umbrella_span(RLSpanGroup.U_ROLLOUT, "rl.grpo.generation",
-                   **{"rl.iteration": iteration}) as span:
+                   **{"rl.num_prompt_groups": n_groups}) as span:
     result = collect()
     if span is not None:
         span.set_attribute("rl.num_generations_per_prompt", n)
 ```
 
 Both yield `None` when the group is disabled; the body still runs, so guard attribute-setting with `if span is not None`.
+
+Do not pass `rl.iteration` here. The training loops set it once per step with
+`iteration_scope`, so any span opened inside a step already carries it — see
+[`rl.iteration` is set once per step](span-groups.md#rliteration-is-set-once-per-step).
 
 ### Always-on block — `span_cm`
 

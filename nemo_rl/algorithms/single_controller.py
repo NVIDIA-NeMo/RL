@@ -186,6 +186,7 @@ from nemo_rl.telemetry.instrumentation import (
     RL_IDLE_POLLS_ATTR,
     efficiency_span,
     is_span_group_enabled,
+    iteration_scope,
     managed_span,
     per_prompt_scope,
     safe_set_span_attributes,
@@ -2813,6 +2814,11 @@ class SingleControllerActor:
             step_finalizer_metrics: dict[str, list[float]] = {}
 
             with (
+                # Pinned here rather than read per span: _train_steps is
+                # incremented part-way through the step, so a later read would
+                # tag the checkpoint spans with a different value than the
+                # step they belong to.
+                iteration_scope(self._train_steps + 1),
                 self._timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
@@ -2821,10 +2827,7 @@ class SingleControllerActor:
                     # No rl.epoch: the rollout pump advances the epoch on its own
                     # clock, so its value here would describe whichever epoch that
                     # pump had reached, not the one this step's data came from.
-                    **{
-                        "rl.iteration": self._train_steps + 1,
-                        "rl.weight_version": version_during_step,
-                    },
+                    **{"rl.weight_version": version_during_step},
                 ),
             ):
                 # One span per starvation episode, not per 5ms poll.
@@ -3464,7 +3467,6 @@ class SingleControllerActor:
                             RLSpanGroup.CHECKPOINT,
                             "rl.sc.checkpointing",
                             tracer=self._tracer,
-                            **{"rl.step": self._train_steps},
                         ),
                     ):
                         await self._save_checkpoint(

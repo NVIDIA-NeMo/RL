@@ -41,7 +41,9 @@ from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
     evaluate_span,
+    iteration_scope,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
@@ -375,7 +377,7 @@ def validate_one_dataset(
     timer = Timer()
     with (
         timer.time("total_validation_time"),
-        evaluate_span("rm"),
+        evaluate_span("rm", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
@@ -548,12 +550,12 @@ def rm_train(
             val_metrics, validation_timings = None, None
 
             with (
+                iteration_scope(total_steps + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.rm.step",
                     tracer=_tracer,
-                    **{"rl.iteration": total_steps + 1},
                 ),
             ):
                 # Prepare batch and generate responses
