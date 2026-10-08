@@ -12,7 +12,7 @@ Tests are organized into levels of increasing scope and cost:
 | **L0** | Doctests + unit tests (3 parallel suites: Generation, Policy, Other) | `CI:L0` label |
 | **L1** | Doctests + unit tests + functional tests (GPU) | `CI:L1` label, push to main/merge-group |
 | **L2** | Full suite including convergence tests | `CI:L2` label |
-| **Lfast** | Fast unit + functional tests, reuses pre-built main container (skips build) | `CI:Lfast` label |
+| **Lfast** | Fast unit + functional tests, reuses pre-built main container (skips build); PRs to a release branch (e.g. `r0.8.0`) reuse that branch's container, published by its `CI:L0`+ builds, so the first Lfast after a release branch is cut needs an L0+ build first | `CI:Lfast` label |
 
 **Defaults:**
 - PRs do not run tests unless a CI label is applied.
