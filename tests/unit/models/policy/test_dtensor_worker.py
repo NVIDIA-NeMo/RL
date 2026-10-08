@@ -66,8 +66,7 @@ def create_test_config(
                 },
             },
         },
-        "dtensor_cfg": {
-            "_v2": True,
+        "automodel_cfg": {
             "checkpoint": {
                 "model_save_format": "safetensors",
                 "save_consolidated": "false",
@@ -136,10 +135,9 @@ def update_lora_config(
     use_triton: bool = True,
 ):
     if enabled:
-        config["dtensor_cfg"]["_v2"] = True
-        config["dtensor_cfg"]["checkpoint"]["model_save_format"] = "safetensors"
+        config["automodel_cfg"]["checkpoint"]["model_save_format"] = "safetensors"
 
-    config["dtensor_cfg"]["lora"].update(
+    config["automodel_cfg"]["lora"].update(
         {
             "enabled": enabled,
             "target_modules": target_modules,

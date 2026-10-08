@@ -17,7 +17,7 @@ policy:
   logprob_chunk_size: 2048
   max_total_sequence_length: 8192
   make_sequence_length_divisible_by: 8
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     # HybridEP settings
