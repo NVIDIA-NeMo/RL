@@ -242,9 +242,7 @@ Qwen3-30B-A3B-2507-Instruct (EP32) EAGLE3 example, live under
 
 The Qwen3-8B dspark/dflash/eagle3 recipes run nightly
 (`tests/test_suites/llm/grpo-qwen3-8b-4n8g-automodel-{dspark,dflash,eagle3}.sh`,
-registered in `tests/test_suites/nightly.txt`), asserting on `draft_loss`
-staying finite and improving, and on `spec_acceptance_length` reaching a
-minimum bar.
+registered in `tests/test_suites/nightly.txt`).
 
 ### Results
 

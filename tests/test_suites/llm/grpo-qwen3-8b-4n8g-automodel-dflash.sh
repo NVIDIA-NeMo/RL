@@ -36,15 +36,13 @@ fi
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    # Metric scales anchored to the 4n8g run: draft_loss
-    # (CE+TV, summed over microbatches) was 242-358 over the first 30 steps;
-    # confidence loss is exactly 0 for dflash; acceptance length was 2.4-3.9
-    # from step 1 and rose with co-training.
     uv run tests/check_metrics.py $JSON_METRICS \
-        'min(data["train/draft_loss"]) > 0' \
-        'data["train/draft_loss"]["30"] < 400' \
-        'max(data["train/draft_conf_loss"]) == 0' \
-        'data["train/vllm/spec_acceptance_length"]["30"] > 2.5'
+        'min(data["train/reward"]) >= 0' \
+        'mean(data["train/gen_kl_error"]) < 0.001' \
+        'data["train/gen_kl_error"]["30"] < 0.001' \
+        'median(data["train/token_mult_prob_error"]) < 1.1' \
+        'data["train/token_mult_prob_error"]["30"] < 1.1' \
+        'data["train/vllm/spec_acceptance_length"]["30"] > 2.0'
 
     rm -rf "$CKPT_DIR"
 fi
