@@ -1059,6 +1059,24 @@ def test_receipt_completion_drops_mask_flag_when_gate_off():
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
+@pytest.mark.parametrize("receipt", [False, True])
+def test_result_to_completion_top_level_mask_flag_follows_gate(receipt):
+    # NeMo-Gym writes mask_sample at the top level of the /run result; the
+    # gate must keep or drop it there just like the instance_config flag.
+    def _result():
+        result = _mask_gate_receipt_result() if receipt else _mask_gate_result()
+        result["full_result"]["mask_sample"] = True
+        return result
+
+    kept = _nemo_gym_impl(True)._results_to_completions([_result()])[0][0]
+    assert kept.env_extras["mask_sample"] is True
+
+    dropped = _nemo_gym_impl(False)._results_to_completions([_result()])[0][0]
+    assert "mask_sample" not in dropped.env_extras
+    assert "mask_sample" not in dropped.env_extras["instance_config"]
+    assert dropped.env_extras["instance_config"]["other_key"] == "kept"
+
+
 def test_streamed_receipt_callback_uses_current_completion_conversion():
     class _RunRolloutsRemote:
         def options(self, *, num_returns):
@@ -1909,9 +1927,15 @@ class _FakeCaptureBuffer(_FakeBuffer):
 
 
 def _receipt_record(
-    rollout_ids, receipts, instance_configs=None, *, loss_multiplier=1.0
+    rollout_ids,
+    receipts,
+    instance_configs=None,
+    *,
+    loss_multiplier=1.0,
+    top_level_mask_sample=None,
 ):
     instance_configs = instance_configs or [None] * len(rollout_ids)
+    top_level_mask_sample = top_level_mask_sample or [None] * len(rollout_ids)
     completions = [
         Completion(
             message_log=[],
@@ -1920,11 +1944,14 @@ def _receipt_record(
                 "ng_receipt": receipt,
                 "ng_rollout_id": rid,
                 **({"instance_config": cfg} if cfg is not None else {}),
+                **({"mask_sample": mask} if mask is not None else {}),
             },
             truncated=False,
             reward=0.5,
         )
-        for rid, receipt, cfg in zip(rollout_ids, receipts, instance_configs)
+        for rid, receipt, cfg, mask in zip(
+            rollout_ids, receipts, instance_configs, top_level_mask_sample
+        )
     ]
     return PromptGroupRecord(
         prompt_idx=0,
@@ -1944,6 +1971,7 @@ def _make_capture_manager(
     num_generations=2,
     retry_policy: RolloutRetryPolicy | None = None,
     instance_configs=None,
+    top_level_mask_sample=None,
     recovery_config: RolloutRecoveryConfig | None = None,
 ):
     mgr = object.__new__(RolloutManager)
@@ -2001,11 +2029,17 @@ def _make_capture_manager(
                 }
                 for rollout_id in selected_ids
             ]
+            selected_masks = (
+                [top_level_mask_sample[index] for index in indices]
+                if top_level_mask_sample is not None
+                else None
+            )
             record = _receipt_record(
                 selected_ids,
                 receipts,
                 instance_configs=selected_configs,
                 loss_multiplier=float(_sample.get("loss_multiplier", 1.0)),
+                top_level_mask_sample=selected_masks,
             )
             if on_completion is not None:
                 for generation_index, completion in zip(indices, record.completions):
@@ -2030,6 +2064,15 @@ class TestGenerateForFinalizationFlow:
         # the dispatcher has no real tokens to measure it from; the finalizer
         # computes it from each row's rebuilt length instead.
         assert request.mask_sample == (True, False)
+
+    def test_request_carries_top_level_env_mask_flags(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf, top_level_mask_sample=[False, True])
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+
+        # NeMo-Gym puts mask_sample at the top level of the /run result.
+        assert request.mask_sample == (False, True)
 
     def test_mints_ids_and_returns_metadata_request(self):
         buf = _FakeCaptureBuffer()

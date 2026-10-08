@@ -299,13 +299,32 @@ def _add_r3_fallback_metrics(
     )
 
 
+def _env_mask_sample_flag(extra: dict[str, Any] | None) -> bool:
+    """Return True if one environment result asks GRPO to mask it from loss.
+
+    NeMo-Gym puts ``mask_sample`` at the top level of a ``/run`` result
+    (``BaseVerifyResponse.mask_sample``, also set by token-id capture when a
+    captured chain is unusable). Some agent servers put it inside
+    ``instance_config`` instead. Either location masks the sample.
+    """
+    extra = extra or {}
+    if extra.get(MASK_SAMPLE, False):
+        return True
+    return bool((extra.get("instance_config") or {}).get(MASK_SAMPLE, False))
+
+
+def _drop_env_mask_sample_flag(extra: dict[str, Any] | None) -> None:
+    """Remove ``mask_sample`` from both locations ``_env_mask_sample_flag`` reads."""
+    if not extra:
+        return
+    extra.pop(MASK_SAMPLE, None)
+    (extra.get("instance_config") or {}).pop(MASK_SAMPLE, None)
+
+
 def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
     """Return True for samples the environment asks GRPO to mask from loss."""
     return torch.tensor(
-        [
-            bool(((extra or {}).get("instance_config") or {}).get(MASK_SAMPLE, False))
-            for extra in extras
-        ],
+        [_env_mask_sample_flag(extra) for extra in extras],
         dtype=torch.bool,
     )
 
