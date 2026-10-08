@@ -55,6 +55,11 @@ on:
         default: ""
         description: Prefix for the TRT-LLM wheel cache image tag; the target architecture and a hash of the effective base image are appended automatically. Empty disables the cache.
         type: string
+      trtllm-cache-scope:
+        required: false
+        default: ""
+        description: Optional scope (e.g. a release branch name such as r0.8.0) inserted into the TRT-LLM cache image tags so a branch that pins a different TRT-LLM ref does not share caches with main. Also publishes the image under a `<scope>` tag for PR builds. Empty keeps the unscoped tags.
+        type: string
       dockerfile:
         required: true
         description: Path to the Dockerfile.
@@ -135,6 +140,7 @@ jobs:
           BUILD_ARGS: ${{ inputs.build-args }}
           CCACHE_TAG_PREFIX: ${{ inputs.trtllm-ccache-tag }}
           WHEEL_TAG_PREFIX: ${{ inputs.trtllm-wheel-cache-tag }}
+          CACHE_SCOPE: ${{ inputs.trtllm-cache-scope }}
           DOCKERFILE: ${{ inputs.dockerfile }}
           PLATFORM: ${{ inputs.platform }}
         run: |
@@ -172,6 +178,15 @@ jobs:
           fi
 
           CACHE_KEY=$(printf '%s' "$BASE_IMAGE" | sha256sum | cut -c1-12)
+          # Scoped caches (release branches) get their own image tags; the unscoped tags stay main's.
+          if [[ -n "$CACHE_SCOPE" ]]; then
+            if [[ ! "$CACHE_SCOPE" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "Invalid TRT-LLM cache scope: $CACHE_SCOPE" >&2
+              exit 1
+            fi
+            CCACHE_TAG_PREFIX="${CCACHE_TAG_PREFIX:+${CCACHE_TAG_PREFIX}-${CACHE_SCOPE}}"
+            WHEEL_TAG_PREFIX="${WHEEL_TAG_PREFIX:+${WHEEL_TAG_PREFIX}-${CACHE_SCOPE}}"
+          fi
           {
             echo "arch=$ARCH"
             if [[ -n "$CCACHE_TAG_PREFIX" ]]; then
@@ -181,7 +196,7 @@ jobs:
               echo "wheel_tag=${WHEEL_TAG_PREFIX}-${ARCH}-${CACHE_KEY}"
             fi
           } >> "$GITHUB_OUTPUT"
-          echo "TRT-LLM caches use $BASE_IMAGE on $ARCH (key $CACHE_KEY)"
+          echo "TRT-LLM caches use $BASE_IMAGE on $ARCH (key $CACHE_KEY${CACHE_SCOPE:+, scope $CACHE_SCOPE})"
 
       - name: Resolve TRT-LLM cache seeds
         id: trtllm_cache_seed
@@ -295,6 +310,8 @@ jobs:
       - name: Compute build metadata
         id: build_meta
         shell: bash
+        env:
+          CACHE_SCOPE: ${{ inputs.trtllm-cache-scope }}
         run: |
           set -euo pipefail
 
@@ -310,6 +327,10 @@ jobs:
           elif [[ -n "$PR_NUMBER" ]]; then
             CACHE_KEY="$PR_NUMBER"
             TAGS+=("$REGISTRY/$IMAGE_NAME:$PR_NUMBER")
+            # Release-branch PRs also publish the branch tag that their Lfast runs reuse.
+            if [[ -n "$CACHE_SCOPE" ]]; then
+              TAGS+=("$REGISTRY/$IMAGE_NAME:$CACHE_SCOPE")
+            fi
           else
             CACHE_KEY=$(printf '%s' "${GITHUB_REF_NAME:-$RUN_ID}" | tr '/' '-' | tr -cd '[:alnum:]._-')
             if [[ -z "$CACHE_KEY" ]]; then
