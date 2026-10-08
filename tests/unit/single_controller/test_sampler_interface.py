@@ -647,6 +647,34 @@ class TestWeightFifoSelect:
 
 
 class TestReadyFirstSelect:
+    def test_select_waits_for_complete_dp_multiple(self):
+        buffer = FakeBuffer()
+        for group_index in range(3):
+            buffer.add(f"g{group_index}", weight=0)
+        sampler = ReadyFirstSampler(buffer, max_staleness_versions=1)
+        sampler.set_group_multiple(2)
+
+        first_meta, first_count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=2,
+                max_prompt_groups=4,
+            )
+        )
+        assert first_count == 2
+        assert len(first_meta.sample_ids) == 2
+        assert len(buffer.meta_list) == 1
+
+        waiting_meta, waiting_count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=2,
+                max_prompt_groups=4,
+            )
+        )
+        assert waiting_meta is None
+        assert waiting_count == 0
+
     def test_mixes_ready_weight_versions_in_buffer_order(self):
         buf = FakeBuffer()
         buf.add("old", weight=1)

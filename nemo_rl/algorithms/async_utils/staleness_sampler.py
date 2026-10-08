@@ -419,7 +419,13 @@ class _GatedSampler(BaseSampler):
     def __init__(self, buffer: TQReplayBuffer, *, gate_window: int) -> None:
         super().__init__(buffer)
         self._gate_window = 0
+        self._group_multiple = 1
         self.set_gate_window(gate_window)
+
+    def set_group_multiple(self, group_multiple: int) -> None:
+        if group_multiple < 1:
+            raise ValueError("group_multiple must be positive")
+        self._group_multiple = group_multiple
 
     def set_gate_window(self, gate_window: int) -> None:
         if gate_window < 0:
@@ -498,7 +504,10 @@ class ReadyFirstSampler(_GatedSampler):
             if weight <= current_train_weight and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            group_multiple=self._group_multiple,
         )
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -577,12 +586,6 @@ class InOrderSampler(_GatedSampler):
         super().__init__(buffer, gate_window=max_lookahead_versions)
         self.max_lookahead_versions = max_lookahead_versions
         self.warmup_lookahead_versions = warmup_lookahead_versions
-        self._group_multiple = 1
-
-    def set_group_multiple(self, group_multiple: int) -> None:
-        if group_multiple < 1:
-            raise ValueError("group_multiple must be positive")
-        self._group_multiple = group_multiple
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         # Sized for the peak window: otherwise the buffer, not the gate, bounds
