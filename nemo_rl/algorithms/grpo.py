@@ -1607,7 +1607,7 @@ def setup(
                 "FP8 KV cache can only be used together with FP8 model weights."
             )
         if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
-            assert policy_config["dtensor_cfg"]["enabled"] == False, (
+            assert not (policy_config.get("automodel_cfg") or {}).get("enabled"), (
                 "DTensor backend is not supported with kv cache fp8 enabled."
             )
             assert not should_use_async_rollouts(generation_config), (
@@ -3947,14 +3947,6 @@ def _grpo_train_impl(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_reward --> 'val:reward'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -5831,14 +5823,6 @@ def async_grpo_train(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_reward --> 'val:accuracy'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
