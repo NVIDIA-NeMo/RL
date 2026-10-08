@@ -18,7 +18,11 @@ import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.megatron import data as megatron_data
+
+pytest.importorskip("megatron.core")
+pytest.importorskip("megatron.bridge")
+
+from nemo_rl.models.megatron import data as megatron_data  # noqa: E402
 
 pytestmark = pytest.mark.mcore
 
@@ -57,7 +61,7 @@ def test_direct_packed_metadata_accepts_cp_aligned_row() -> None:
         ("input_ids", torch.zeros(2, 8), "exactly one row"),
         ("target_ids", torch.zeros(1, 7), "target_ids must have shape"),
         ("sample_mask", torch.ones(2), "sample_mask must have shape"),
-        ("packed_max_seqlen", torch.tensor([4, 4]), "shape (1,)"),
+        ("packed_max_seqlen", torch.tensor([4, 4]), r"shape \(1,\)"),
         ("packed_cu_seqlens_lengths", torch.tensor([4]), "lengths is invalid"),
         (
             "packed_cu_seqlens",
