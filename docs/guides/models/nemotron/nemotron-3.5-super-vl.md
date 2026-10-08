@@ -8,7 +8,7 @@ settings that are specific to this model.
 
 > [!IMPORTANT]
 > **Early access.** The text DAPO recipe runs end-to-end on 16 x 4-GPU nodes
-> with checkpoint resume and reaches 0.79 AIME-2024 accuracy by step 50 (see
+> with checkpoint resume and reaches 0.76 AIME-2024 accuracy by step 40 (see
 > [Reference Results](#reference-results)). No run has been taken to full
 > convergence yet, and fewer than 16 nodes is not supported; see
 > [Known Issues](#known-issues). Image (VLM) post-training for this model needs
@@ -154,20 +154,21 @@ TP4/EP4) with the AutoModel (DTensor) backend and colocated vLLM generation,
 chained as 4-hour Slurm jobs that resume from the latest checkpoint. Curves are
 wandb exports; the x axis is the training step.
 
-**Text DAPO, DAPO-Math-17K / AIME-2024** — 50 steps, `max_new_tokens: 8192`,
-on a text-SFT early-access checkpoint of the model.
+**Text DAPO, DAPO-Math-17K / AIME-2024** — 43 steps, `max_new_tokens: 8192`,
+on a GA-candidate checkpoint of the model.
 
 ![Nemotron 3.5 Super VL text DAPO training curves](../../../assets/nemotron/nemotron-3.5-super-vl-text-dapo-16n4g.png)
 
-AIME-2024 validation accuracy climbs from 0.53 at step 0 to **0.79 at step 50**
-(0.55 at step 20, 0.69 at step 40) while the mean validation response length
-falls from ~5,700 to ~4,600 tokens and `truncation_rate` drops from ~0.28 to
-~0.15: the policy gets both more accurate and more concise. Training reward
-rises from around -0.2 to a noisy 0.4-0.7 band. `gen_kl_error` stays in the
-0.003-0.004 range and `token_mult_prob_error` in 1.03-1.04 throughout, so the
-trainer and vLLM stay in agreement across the refits; the isolated
-`token_mult_prob_error` spike at step 49 coincides with a job boundary and
-resume. The chain resumed across five jobs.
+AIME-2024 validation accuracy climbs from 0.41 at step 0 to **0.76 at step 40**
+(0.45 at step 10, 0.48 at step 20, 0.59 at step 30) while the mean validation
+response length falls from ~6,450 to ~4,600 tokens and `truncation_rate` drops
+from ~0.40 to ~0.15: the policy gets both more accurate and more concise.
+Training reward rises from a noisy -0.6 to -0.1 band to 0.2-0.6 after step 20.
+`gen_kl_error` drifts slowly from ~0.003 to ~0.0045 as the policy sharpens, the
+same order as the drift documented for other models; the isolated
+`token_mult_prob_error` spikes (steps 20, 32, 38) are single-step outliers and
+`token_mult_prob_error` returns to ~1.03 on the next step. The chain ran as five
+4-hour Slurm jobs that resumed from the latest checkpoint.
 
 ## Known Issues
 
