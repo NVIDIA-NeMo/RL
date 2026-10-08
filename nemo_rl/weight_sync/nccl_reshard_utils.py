@@ -625,6 +625,25 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             "vLLM's reload_weights API)."
         )
 
+    # Draft co-training speculators are refit through the coverage-aware
+    # finalize(); nccl_reshard_refit finalizes the target only and loads its misc
+    # params without a coverage object, so the drafter would never run
+    # process_weights_after_loading. MTP is unaffected: it finalizes through
+    # _mtp_drafter_refit_enabled, not the draft manifest.
+    speculative_config = vllm_kwargs.get("speculative_config")
+    speculative_method = (
+        speculative_config.get("method")
+        if isinstance(speculative_config, dict)
+        else None
+    )
+    if speculative_method in ("eagle3", "dflash", "dspark"):
+        violations.append(
+            "policy.generation.vllm_kwargs.speculative_config.method must not be "
+            f"{speculative_method!r} "
+            "(nccl_reshard_refit finalizes the target model only; co-trained "
+            "drafter weights would stay partially finalized after every refit)."
+        )
+
     # ModelOpt real-quant rollout holds NVFP4-packed vLLM params and refits
     # through vLLM's layerwise-reload weight loaders; the bulk xferdtensor
     # path writes directly into param storage, bypassing both.
