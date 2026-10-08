@@ -1,6 +1,6 @@
 defaults: ./grpo-gemma3-27b-it-8n8g-fsdp2tp8-actckpt-long.yaml
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     tensor_parallel_size: 4
   make_sequence_length_divisible_by: 4
   generation:
