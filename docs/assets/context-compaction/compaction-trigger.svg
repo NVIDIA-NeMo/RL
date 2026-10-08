@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="975" height="652" viewBox="0 0 975 652" role="img" aria-labelledby="title desc">
+<!-- Adapted from https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-dropped-group.html
+     Behavior checked against NVIDIA-NeMo/RL e81d5438148683a663dc405d301ed078c18abc7e and NVIDIA-NeMo/Gym b27e0db8faefee7e4760b5b1bfbfed713f528360.
+     Editable SVG source; examples are illustrative, not measurements. -->
+<title id="title">Native recency policy: scheduling, guards and failure outcomes</title><desc id="desc">The native client prepares context, measures enabled guards, and may close a chunk and remeasure. An uncaught guard rejection currently drops a group and stops CC training. This is not a universal harness policy.</desc>
+<style>:root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2128;--border:#30363d;--text:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--orange:#d29922;--red:#f85149;--purple:#bc8cff;}
+svg .box{fill:var(--surface);stroke:var(--border);stroke-width:1.3}
+svg .ok{fill:var(--green);fill-opacity:.12;stroke:var(--green);stroke-width:1.5}
+svg .bad{fill:var(--red);fill-opacity:.12;stroke:var(--red);stroke-width:1.5}
+svg .lbl{fill:var(--text);font:12px -apple-system,sans-serif}
+svg .lbl-b{fill:var(--text);font:bold 13px -apple-system,sans-serif}
+svg .mono{fill:var(--text);font:11px ui-monospace,Menlo,monospace}
+svg .note{fill:var(--dim);font:11.5px -apple-system,sans-serif}
+svg .hdr-ok{fill:var(--green);font:bold 13.5px -apple-system,sans-serif}
+svg .hdr-bad{fill:var(--red);font:bold 13.5px -apple-system,sans-serif}
+svg .arrow{stroke:var(--dim);stroke-width:1.5;fill:none;marker-end:url(#ah2)}
+svg .ahead{fill:var(--dim)}
+svg a text{text-decoration:underline;fill:var(--accent);font:11px ui-monospace,Menlo,monospace}</style>
+<rect width="100%" height="100%" fill="#0d1117" rx="10"/>
+<text x="16" y="27" fill="#e6edf3" font-family="Arial, sans-serif" font-size="18" font-weight="700">Native recency policy: scheduling, guards and failure outcomes</text>
+<g transform="translate(0 44)">
+  <defs><marker id="ah2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path class="ahead" d="M0,0 L8,4 L0,8 z"/></marker></defs>
+  <rect class="box" x="16" y="10" width="939" height="62" rx="8"/>
+  <text class="lbl" x="28" y="30"><tspan font-weight='bold'>Native recency agent, before each call:</tspan> apply the configured image/reasoning policy</text>
+  <text class="lbl" x="28" y="47">on its schedule: rolling recency or every K actions. This policy rewrites history without a summarizer model.</text>
+
+  <path class="arrow" d="M240 74 L240 96"/>
+  <path class="arrow" d="M725 74 L725 96"/>
+  <text class="hdr-ok" x="16" y="112">Token guard enabled: measure before generation</text>
+  <text class="hdr-bad" x="500" y="112">No token guard: the model server enforces its limit</text>
+  <rect class="box" x="16" y="122" width="455" height="44" rx="8"/>
+  <text class="lbl" x="28" y="142">Count the prompt tokens. Is prompt + reserved output</text>
+  <text class="lbl" x="28" y="159">(default 0) ≤ guards.max_total_tokens?</text>
+  <rect class="box" x="500" y="122" width="455" height="44" rx="8"/>
+  <text class="lbl" x="512" y="142">Send the scheduled context to vLLM.</text>
+  <text class="lbl" x="512" y="159"></text>
+  <path class="arrow" d="M120 168 L120 190"/>
+  <path class="arrow" d="M360 168 L360 190"/>
+  <text class="note" x="128" y="184">fits</text>
+  <text class="note" x="368" y="184">too long</text>
+  <rect class="ok" x="16" y="192" width="210" height="44" rx="8"/>
+  <text class="lbl" x="28" y="212">Send the call.</text>
+  <text class="lbl" x="28" y="229">The normal case.</text>
+  <rect class="box" x="238" y="192" width="233" height="62" rx="8"/>
+  <text class="lbl" x="250" y="212">If possible, close the chunk early</text>
+  <text class="lbl" x="250" y="229">now, then count again.</text>
+
+  <path class="arrow" d="M580 168 L580 190"/>
+  <path class="arrow" d="M850 168 L850 190"/>
+  <text class="note" x="588" y="184">fits</text>
+  <text class="note" x="858" y="184">too long (400)</text>
+  <rect class="ok" x="500" y="192" width="210" height="44" rx="8"/>
+  <text class="lbl" x="512" y="212">vLLM runs it.</text>
+  <text class="lbl" x="512" y="229">The normal case.</text>
+  <rect class="box" x="722" y="192" width="233" height="96" rx="8"/>
+  <text class="lbl" x="734" y="212">No extra compaction. Gym returns</text>
+  <text class="lbl" x="734" y="229">an empty response with reason</text>
+  <text class="lbl" x="734" y="246">"length" on prompt-overflow 400.</text>
+  <text class="lbl" x="734" y="263"></text>
+
+  <path class="arrow" d="M290 256 L290 278"/>
+  <path class="arrow" d="M420 256 L420 278"/>
+  <text class="note" x="298" y="272">fits</text>
+  <text class="note" x="428" y="272">still too long</text>
+  <rect class="ok" x="16" y="280" width="290" height="44" rx="8"/>
+  <text class="lbl" x="28" y="300">Send the call. Compaction was</text>
+  <text class="lbl" x="28" y="317">triggered by the length.</text>
+  <rect class="bad" x="316" y="280" width="155" height="96" rx="8"/>
+  <text class="lbl" x="328" y="300">Refuse the call.</text>
+  <text class="lbl" x="328" y="317">The agent crashes:</text>
+  <text class="lbl" x="328" y="334">HTTP 500, group</text>
+  <text class="lbl" x="328" y="351">dropped; run stops.</text>
+  <path class="arrow" d="M850 290 L850 312"/>
+  <rect class="box" x="722" y="314" width="233" height="70" rx="8"/>
+  <text class="lbl" x="734" y="334">Capture failure masks this rollout;</text>
+  <text class="lbl" x="734" y="351">healthy siblings can still train.</text>
+  <text class="lbl" x="734" y="368">No valid layout → drop the group.</text>
+  <rect class="box" x="16" y="392" width="939" height="80" rx="8"/>
+  <text class="lbl" x="28" y="412"><tspan font-weight='bold'>Once a call is sent, both lanes:</tspan> RL caps the reply to the room left (max_model_len minus the prompt). The guard does</text>
+  <text class="lbl" x="28" y="429">not reserve reply space unless reserved_generation_tokens is set. A generation that reaches its limit stops with reason "length":</text>
+  <text class="lbl" x="28" y="446">a normal truncated reply, not an error. RL then marks the rollout truncated; with overlong_filtering the whole rollout is masked.</text>
+
+  <text class="note" x="16" y="490">Recency removal can be insufficient: retained text, tool outputs or user messages can still exceed the budget.</text>
+  <text class="note" x="16" y="508">Early retry requires a closable turn-chunked schedule; otherwise the guard rejects immediately.</text>
+  <text class="note" x="16" y="526">Other harnesses own their policies, including summarization; they must preserve accepted output and use supported capture.</text>
+  <text class="note" x="16" y="546">Current behavior: no CC group redispatch or partial step. Proposed recovery fixes are not shown as implemented.</text></g>
+<text x="16" y="636" fill="#8b949e" font-family="Arial, sans-serif" font-size="10">Adapted from Terry Kong’s PR #4124 review figures; updated for the current context-compaction implementation.</text>
+</svg>
