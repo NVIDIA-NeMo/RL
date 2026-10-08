@@ -434,8 +434,10 @@ def test_native_collator_rejects_configured_history_truncation(flags):
 
 
 def test_native_functional_config_loads_exact_tokenizers_and_dataset(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The functional config's chat_template paths are relative to the repo root.
+    monkeypatch.chdir(ROOT)
     data_path = tmp_path / "native_chat.jsonl"
     write_dataset(data_path)
     register_omegaconf_resolvers()
