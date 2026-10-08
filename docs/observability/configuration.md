@@ -90,12 +90,25 @@ Each process sets stable-for-the-run values on its OTel `Resource` — `init_tel
 | `rl.algorithm` | the `algorithm="<algo>"` passed to `init_telemetry_driver` |
 | `rl.model` | `policy.model_name` |
 | `nemo.precision` | `policy.precision` |
-| `dl.tensor_parallel.size` | `policy.megatron_cfg` / `automodel_cfg` TP size |
-| `dl.pipeline_parallel.size` | `policy.megatron_cfg` PP size |
+| `nv.dl.provider.name` | always the literal `nemo-rl`: which training framework produced the telemetry, for a backend collecting several. Separate from the service name, which a user may rename |
+| `nv.dl.run.uuid` | the same run id as `nemo.run.id`. Duplicated on purpose — a backend joining RL runs to Megatron ones groups on the `nv.dl.*` spelling |
+| `nv.dl.topology.size.tp` | `policy.megatron_cfg` / `automodel_cfg` TP size |
+| `nv.dl.topology.size.pp` | `policy.megatron_cfg` PP size |
+| `nv.dl.topology.size.dp` | derived: `cluster.num_nodes × cluster.gpus_per_node ÷ (TP × PP × CP)`. Omitted when `policy.generation.colocated.enabled` is false, because generation then holds ranks the policy does not have, and when the product does not divide the world size |
+| `nv.dl.training.config.global_batch_size` | `policy.train_global_batch_size` |
+| `nv.dl.training.config.micro_batch_size` | `policy.train_micro_batch_size` |
+| `nv.dl.training.config.sequence_length` | `policy.max_total_sequence_length` |
+| `nv.dl.training.config.optimizer` | `policy.megatron_cfg.optimizer.optimizer` (`adam`), else `policy.optimizer.name` (`torch.optim.AdamW`) — the two backends spell it differently |
+| `nv.dl.training.config.recompute_granularity` | `policy.megatron_cfg.recompute_granularity`, only when `activation_checkpointing` is on. Megatron ignores the granularity otherwise, so reporting it would describe recompute that is not happening |
+| `nv.dl.training.target.train_iters` | `<algo>.max_num_steps`, when positive. `rm` spells "train for one epoch" as `-1`, which is omitted rather than reported as a target |
+| `nv.dl.software.torch`, `.cuda`, `.nccl`, `.transformer_engine` | versions as loaded in this process, not as pinned in the lockfile. Each is omitted when unavailable — CUDA and NCCL on a CPU-only build, transformer-engine when it is not installed |
 | `nv.dl.rank`, `nv.dl.world_size` | this process's rank and group size (`RANK` / `WORLD_SIZE`, or `0` / `1` for the driver and singleton actors) |
+| `nv.dl.local_rank` | worker processes only: `LOCAL_RANK`, which `RayWorkerGroup` exports beside `RANK`. Identifies a device on one node, which is what you have when the complaint came from `nvidia-smi` rather than from the job |
 | `rl.worker_group` | worker processes only: the worker group's `name_prefix` (`lm_policy`, `vllm_policy`, ...), from `NRL_WORKER_GROUP`. The `NemoGym` actor reports the literal `nemo_gym` — it is built from the environment registry rather than by `RayWorkerGroup`, so nothing sets the env var for it |
 
-Attribute construction is best-effort: a missing config key simply omits that attribute; it never raises. Plus auto-detected host / GPU / SLURM / Kubernetes attributes from lens's resource detection.
+The config-derived rows are driver-only: a worker is handed the propagated environment, not the `MasterConfig`. Attribute construction is best-effort: a missing config key simply omits that attribute; it never raises. Plus auto-detected host / GPU / SLURM / Kubernetes attributes from lens's resource detection.
+
+Every key above that lens declares is taken from `nemo.lens.semconv` rather than written as a string, so a typo is an `ImportError` instead of silent data loss. Note the two spellings of the parallelism sizes: `nv.dl.topology.size.*` is the resource-scoped one lens types through its `DL_RESOURCE_TYPES` registry, while the `dl.tensor_parallel.*` family is for span and metric attributes.
 
 ## Typical configurations
 

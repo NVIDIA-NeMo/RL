@@ -211,7 +211,7 @@ The one rule that trips people up. Classify each value before you emit it:
 |---|---|---|
 | **Metric** | numerical value that changes over time | per-category efficiency seconds → `rl.efficiency.seconds` |
 | **Span tag** | categorical per-span context for filtering | `rl.iteration`, `rl.bucket`, `rl.num_generations_per_prompt`, `rl.weight_version` |
-| **Resource attribute** | stable for the whole run | `rl.algorithm`, `rl.model`, `dl.tensor_parallel.size` |
+| **Resource attribute** | stable for the whole run | `rl.algorithm`, `rl.model`, `nv.dl.topology.size.tp` |
 
 Do **not** put a time-series number (loss, reward) on a span attribute — it produces no useful series in your backend and wastes storage. Do **not** put a per-step categorical (iteration number) on a metric label — that is unbounded cardinality. See [lens: metrics — metric vs span attribute vs resource attribute](https://github.com/NVIDIA-NeMo/Lens).
 
