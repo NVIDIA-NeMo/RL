@@ -37,7 +37,7 @@ policy:
   max_total_sequence_length: 32768
 
   # Don't use dtensor. optimizer and scheduler are dtensor only (mcore has its own version of these)
-  dtensor_cfg:
+  automodel_cfg:
     enabled: False
   optimizer: null
   scheduler: null

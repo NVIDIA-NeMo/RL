@@ -1603,7 +1603,7 @@ def setup(
                 "FP8 KV cache can only be used together with FP8 model weights."
             )
         if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
-            assert policy_config["dtensor_cfg"]["enabled"] == False, (
+            assert not (policy_config.get("automodel_cfg") or {}).get("enabled"), (
                 "DTensor backend is not supported with kv cache fp8 enabled."
             )
             assert not should_use_async_rollouts(generation_config), (
@@ -3599,9 +3599,12 @@ def _grpo_train_impl(
                     )
 
                     if not skip_prev_logprobs:
-                        train_data["prev_logprobs"] = policy.get_logprobs(
-                            logprob_data, timer=timer
-                        )["logprobs"]
+                        prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
+                        train_data["prev_logprobs"] = prev_lp_result["logprobs"]
+                        # When top-k/top-p filtering is enabled, the worker returns a mask that has
+                        # -inf positions zeroed. Propagate it so the loss reduction skips them.
+                        if "token_mask" in prev_lp_result:
+                            train_data["token_mask"] = prev_lp_result["token_mask"]
                     else:
                         print(
                             "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
@@ -3923,14 +3926,6 @@ def _grpo_train_impl(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_reward --> 'val:reward'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -4086,7 +4081,15 @@ def _grpo_train_impl(
             print(f"  • Loss: {metrics['loss']:.4f}")
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
-            print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
+            generation_kl_error = metrics.get("gen_kl_error")
+            print(
+                "  • Generation KL Error: "
+                + (
+                    f"{generation_kl_error:.4f}"
+                    if generation_kl_error is not None
+                    else "not reported"
+                )
+            )
             if master_config.grpo.use_dynamic_sampling:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
@@ -4908,7 +4911,7 @@ def async_grpo_train(
 
             traceback.print_exc()
             _flush_collector_telemetry()
-            return
+            raise
     else:
         print("🔄 Preparing policy generation for inference...")
         try:
@@ -4920,13 +4923,13 @@ def async_grpo_train(
 
             traceback.print_exc()
             _flush_collector_telemetry()
-            return
+            raise
 
     # Generation must hold the policy's real weights before any backend starts
     # collecting. In particular, vLLM and Dynamo start with dummy weights when
     # the first refit supplies model parameters.
     ray.get(trajectory_collector.set_weight_version.remote(weight_version))
-    trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader))
+    ray.get(trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader)))
     print("📦 Started continuous background trajectory collection")
 
     print("✅ Policy generation setup complete, proceeding to validation...")
@@ -5028,7 +5031,8 @@ def async_grpo_train(
 
             print(
                 f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
-                f"step {step} ready={current_step_ready}"
+                f"step {step} ready={current_step_ready}",
+                flush=True,
             )
 
             collector_status = ray.get(trajectory_collector.get_status.remote())
@@ -5110,7 +5114,8 @@ def async_grpo_train(
                 with timer.time("exposed_generation"):
                     buffer_size_current = ray.get(replay_buffer.size.remote())
                     print(
-                        f"📊 Step coordination: training_step={step}, max_age={max_trajectory_age_steps}, buffer_size={buffer_size_current}"
+                        f"📊 Step coordination: training_step={step}, max_age={max_trajectory_age_steps}, buffer_size={buffer_size_current}",
+                        flush=True,
                     )
 
                     # Sample the required number of per-prompt groups.
@@ -5401,9 +5406,11 @@ def async_grpo_train(
                     ),
                 ):
                     if not skip_prev_logprobs:
-                        train_data["prev_logprobs"] = policy.get_logprobs(
-                            train_data, timer=timer
-                        )["logprobs"]
+                        prev_lp_result = policy.get_logprobs(train_data, timer=timer)
+                        train_data["prev_logprobs"] = prev_lp_result["logprobs"]
+                        # Propagate the top-k/top-p neginf token mask.
+                        if "token_mask" in prev_lp_result:
+                            train_data["token_mask"] = prev_lp_result["token_mask"]
                     else:
                         train_data["prev_logprobs"] = torch.zeros_like(
                             train_data["generation_logprobs"]
@@ -5806,14 +5813,6 @@ def async_grpo_train(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_reward --> 'val:accuracy'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -5999,7 +5998,15 @@ def async_grpo_train(
             print(f"  • Loss: {metrics['loss']:.4f}")
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
-            print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
+            generation_kl_error = metrics.get("gen_kl_error")
+            print(
+                "  • Generation KL Error: "
+                + (
+                    f"{generation_kl_error:.4f}"
+                    if generation_kl_error is not None
+                    else "not reported"
+                )
+            )
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(f"  • Buffer Size: {buffer_size_current}")
             print(f"  • Avg Trajectory Age: {avg_trajectory_age:.2f} steps")

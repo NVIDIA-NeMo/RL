@@ -197,7 +197,7 @@ policy:
   # Without it the critic's forward and train stages run on top of it.
   offload_optimizer_for_logprob: true
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true

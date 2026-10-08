@@ -1272,11 +1272,6 @@ def grpo_train_sync(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -1414,7 +1409,15 @@ def grpo_train_sync(
             print(f"  • Loss: {metrics['loss']:.4f}")
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
-            print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
+            generation_kl_error = metrics.get("gen_kl_error")
+            print(
+                "  • Generation KL Error: "
+                + (
+                    f"{generation_kl_error:.4f}"
+                    if generation_kl_error is not None
+                    else "not reported"
+                )
+            )
             if master_config.grpo.use_dynamic_sampling:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
