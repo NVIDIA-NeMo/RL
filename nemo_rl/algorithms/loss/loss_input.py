@@ -286,6 +286,8 @@ def prepare_loss_input(
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
+        if need_top_k_or_top_p_filtering(sampling_params):
+            loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
 
     elif loss_fn.input_type == LossInputType.OPD_FULL:
         loss_input = _prepare_opd_full_loss_input(
@@ -561,4 +563,7 @@ def prepare_packed_loss_input(
                 )
             )
 
-    return {"next_token_logprobs": logprobs}, data
+    loss_input = {"next_token_logprobs": logprobs}
+    if need_top_k_or_top_p_filtering(sampling_params):
+        loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
+    return loss_input, data

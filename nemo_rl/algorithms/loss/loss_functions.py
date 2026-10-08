@@ -475,6 +475,7 @@ class ClippedPGLossFn(LossFunction):
                 else MetricNormalizer.TOKENS
             ),
             # Raw count — the downstream per-microbatch sum IS the value.
+            "policy_support_excluded_tokens": MetricNormalizer.NONE,
             "num_valid_samples": MetricNormalizer.NONE,
             "seq_logprob_error_valid_tokens": MetricNormalizer.NONE,
             "seq_logprob_error_valid_seqs": MetricNormalizer.NONE,
@@ -493,6 +494,7 @@ class ClippedPGLossFn(LossFunction):
                 "loss",
                 "kl_penalty",
                 "num_valid_samples",
+                "policy_support_excluded_tokens",
                 "positive_nll_loss",
                 "token_mult_prob_error",
             }
@@ -556,6 +558,7 @@ class ClippedPGLossFn(LossFunction):
         opd_full_divergence: Optional[Tensor] = None,
         opd_full_entropy: Optional[Tensor] = None,
         opd_full_cross_entropy: Optional[Tensor] = None,
+        policy_support_mask: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
 
@@ -568,6 +571,8 @@ class ClippedPGLossFn(LossFunction):
             data: Microbatch with masks, advantages, and prior log-probabilities.
             global_valid_seqs: Global valid-sequence count for normalization.
             global_valid_toks: Global valid-token count for normalization.
+            policy_support_mask: Current top-k/top-p support, supplied only with filtering.
+                Negative infinity in other policy logprobs is also excluded.
             opd_full_divergence: Per-token reverse KL ``[B, S - 1]``, required on
                 the ``opd_full`` branch.
             opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
@@ -622,12 +627,23 @@ class ClippedPGLossFn(LossFunction):
         if self.force_on_policy_ratio:
             prev_logprobs = curr_logprobs.detach()
 
+        # Only top-k/top-p can mark -inf as an expected support mismatch.
+        # Keep NaN/+inf observable, and preserve strict checks without filtering.
+        if policy_support_mask is not None:
+            policy_support_mask = (
+                policy_support_mask
+                & ~torch.isneginf(prev_logprobs)
+                & ~torch.isneginf(generation_logprobs)
+            )
+        seq_error_token_mask = token_mask
+        if policy_support_mask is not None:
+            seq_error_token_mask = token_mask * policy_support_mask.to(token_mask.dtype)
         seq_error_metrics = {}
         if self.seq_logprob_error_in_loss:
             errors, _ = compute_seq_logprob_errors(
                 policy_logprobs=curr_logprobs.detach(),
                 generation_logprobs=generation_logprobs,
-                token_mask=token_mask,
+                token_mask=seq_error_token_mask,
                 sample_mask=sample_mask,
             )
             filtered_sample_mask = sample_mask * (
@@ -664,13 +680,11 @@ class ClippedPGLossFn(LossFunction):
         # Keep support information until all three policy distributions are
         # available. Replacing -inf with zero earlier turns an impossible token
         # into log-probability one in token/sequence importance ratios.
-        policy_valid = (
-            torch.isfinite(curr_logprobs)
-            & torch.isfinite(prev_logprobs)
-            & torch.isfinite(generation_logprobs)
-        )
-        token_mask = token_mask * policy_valid.to(token_mask.dtype)
-        sample_mask = sample_mask * token_mask.bool().any(dim=-1).to(sample_mask.dtype)
+        if policy_support_mask is not None:
+            token_mask = token_mask * policy_support_mask.to(token_mask.dtype)
+            sample_mask = sample_mask * token_mask.bool().any(dim=-1).to(
+                sample_mask.dtype
+            )
         mask = token_mask * sample_mask.unsqueeze(-1)
         curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
         prev_logprobs = torch.where(mask.bool(), prev_logprobs, 0.0)
@@ -955,6 +969,7 @@ class ClippedPGLossFn(LossFunction):
                 **_is_filter_metrics,
             }
         )
+        metric_tensors["policy_support_excluded_tokens"] = (kl_mask - mask).sum()
         return loss, {
             **materialize_scalar_metrics(metric_tensors, loss.dtype),
             **seq_error_metrics,

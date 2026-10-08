@@ -999,7 +999,8 @@ def test_grpo_sync_seq_logprob_error_helper_accepts_dict_result(monkeypatch):
         "masked_correct_pct": 0.5,
     }
 
-    def fake_masking(train_data, rewards, seq_logprob_error_threshold):
+    def fake_masking(train_data, rewards, seq_logprob_error_threshold, *, filtering_on):
+        assert filtering_on is False
         assert seq_logprob_error_threshold == 1.2
         assert rewards.tolist() == [1.0, 0.0]
         train_data["sample_mask"] = torch.tensor([1.0, 0.0])

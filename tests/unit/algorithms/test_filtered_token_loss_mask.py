@@ -92,7 +92,11 @@ def test_invalid_policy_tokens_match_explicit_actor_exclusion(
         loss.backward()
         assert torch.isfinite(loss)
         assert torch.isfinite(logits.grad).all()
-        return loss.detach(), logits.grad
+        excluded = metrics.pop("policy_support_excluded_tokens")
+        assert excluded == (
+            0 if explicit_mask else (2 if invalid_source == "all" else 1)
+        )
+        return loss.detach(), logits.grad, metrics
 
     actual = run(False)
     expected = run(True)
@@ -138,6 +142,7 @@ def test_actor_support_exclusion_preserves_unfiltered_reference_kl(
         )
         loss, _ = fn(
             next_token_logprobs=current,
+            policy_support_mask=~torch.isneginf(current),
             data=data,
             global_valid_seqs=torch.tensor(1.0),
             global_valid_toks=torch.tensor(2.0),
@@ -372,3 +377,150 @@ def test_megatron_prev_logprobs_preserve_shared_mask(monkeypatch, top_k):
         torch.testing.assert_close(result["token_mask"], data["token_mask"][:, :3])
     else:
         assert "token_mask" not in result
+
+
+@pytest.mark.parametrize("driver", ["grpo", "grpo_sync", "ppo"])
+@pytest.mark.parametrize("filtering_on", [False, True])
+@pytest.mark.parametrize("bad_logprob", [-torch.inf, torch.inf, torch.nan])
+def test_sequence_rejection_ignores_only_filtered_negative_infinity(
+    filtering_on, bad_logprob, driver
+):
+    from nemo_rl.algorithms.grpo import compute_and_apply_seq_logprob_error_masking
+
+    token_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0, 1.0]])
+    data = BatchedDataDict(
+        {
+            "token_mask": token_mask.clone(),
+            "sample_mask": torch.ones(1),
+            "prev_logprobs": torch.tensor([[0.0, -0.4, -0.9, bad_logprob, -0.5]]),
+            "generation_logprobs": torch.tensor([[0.0, -0.3, -0.9, -2.0, -0.5]]),
+        }
+    )
+    if driver == "grpo":
+        metrics = compute_and_apply_seq_logprob_error_masking(
+            data, torch.ones(1), 2.0, filtering_on=filtering_on
+        )
+        masked = metrics["num_masked_seqs"]
+    elif driver == "grpo_sync":
+        from nemo_rl.algorithms.grpo_sync import _compute_seq_logprob_error_metrics
+
+        data["sample_mask"], metrics = _compute_seq_logprob_error_metrics(
+            **data,
+            rewards=torch.ones(1),
+            seq_logprob_error_threshold=2.0,
+            filtering_on=filtering_on,
+        )
+        masked = metrics["num_masked_seqs_by_logprob_error"]
+    else:
+        from nemo_rl.algorithms.ppo import _apply_ppo_seq_logprob_error_masking
+
+        if not (filtering_on and bad_logprob == -torch.inf):
+            with pytest.raises(RuntimeError, match="PPO has no valid response tokens"):
+                _apply_ppo_seq_logprob_error_masking(
+                    data, torch.ones(1), 2.0, filtering_on=filtering_on
+                )
+            assert data["sample_mask"].item() == 0
+            torch.testing.assert_close(data["token_mask"], token_mask)
+            return
+        _, metrics = _apply_ppo_seq_logprob_error_masking(
+            data, torch.ones(1), 2.0, filtering_on=filtering_on
+        )
+        masked = metrics["num_masked_seqs_by_logprob_error"]
+    retained = filtering_on and bad_logprob == -torch.inf
+    assert data["sample_mask"].item() == int(retained)
+    assert masked == int(not retained)
+    torch.testing.assert_close(data["token_mask"], token_mask)
+    if retained:
+        assert metrics["mean_seq_mult_prob_error"] == pytest.approx(
+            (math.exp(0.1) + 2) / 3
+        )
+
+
+@pytest.mark.parametrize("sequence_level", [False, True])
+def test_loss_sequence_rejection_retains_supported_tokens_and_reference_kl(
+    sequence_level,
+):
+    def run(check_sequence_error):
+        fn = ClippedPGLossFn(
+            ClippedPGLossConfig(
+                reference_policy_kl_penalty=0.1,
+                force_on_policy_ratio=True,
+                seq_logprob_error_in_loss=check_sequence_error,
+            ),
+            seq_logprob_error_threshold=2.0,
+        )
+        current = torch.tensor([[-0.4, -0.9, -torch.inf, -0.5]], requires_grad=True)
+        unfiltered = torch.tensor([[-0.4, -0.9, -2.0, -0.5]], requires_grad=True)
+        data = BatchedDataDict(
+            {
+                "token_mask": torch.tensor([[0.0, 1.0, 1.0, 1.0, 1.0]]),
+                "sample_mask": torch.ones(1),
+                "advantages": torch.ones(1, 5),
+                "generation_logprobs": torch.tensor([[0.0, -0.3, -0.9, -2.0, -0.5]]),
+                "reference_policy_logprobs": torch.tensor(
+                    [[0.0, -0.6, -1.0, -2.5, -0.7]]
+                ),
+                "curr_logprobs_unfiltered": unfiltered,
+            }
+        )
+        loss, metrics = fn(
+            current,
+            data,
+            torch.tensor(1.0),
+            torch.tensor(4.0),
+            policy_support_mask=~torch.isneginf(current),
+        )
+        loss.backward()
+        assert metrics["policy_support_excluded_tokens"] == 1
+        assert metrics["num_valid_samples"] == 1
+        assert unfiltered.grad[0, 2] != 0
+        if check_sequence_error:
+            assert metrics["num_masked_seqs_by_logprob_error"] == 0
+        return loss.detach(), current.grad, unfiltered.grad
+
+    for actual, expected in zip(run(True), run(False)):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("sequence_level", [False, True])
+@pytest.mark.parametrize("metrics_level", ["full", "minimal"])
+def test_fully_unsupported_response_matches_explicit_sample_exclusion(
+    sequence_level, metrics_level
+):
+    fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            sequence_level_importance_ratios=sequence_level,
+            token_level_loss=not sequence_level,
+            metrics_level=metrics_level,
+        )
+    )
+
+    def run(explicit):
+        current = torch.tensor(
+            [[-torch.inf, -torch.inf], [-0.5, -0.6]], requires_grad=True
+        )
+        data = BatchedDataDict(
+            {
+                "token_mask": torch.tensor([[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]),
+                "sample_mask": torch.tensor([0.0 if explicit else 1.0, 1.0]),
+                "advantages": torch.ones(2, 3),
+                "prev_logprobs": torch.tensor([[0.0, -0.5, -0.6], [0.0, -0.5, -0.6]]),
+                "generation_logprobs": torch.tensor(
+                    [[0.0, -0.5, -0.6], [0.0, -0.5, -0.6]]
+                ),
+            }
+        )
+        loss, metrics = fn(
+            current,
+            data,
+            torch.tensor(2.0),
+            torch.tensor(4.0),
+            policy_support_mask=~torch.isneginf(current),
+        )
+        loss.backward()
+        assert metrics.pop("policy_support_excluded_tokens") == (0 if explicit else 2)
+        return loss.detach(), current.grad, metrics
+
+    actual, expected = run(False), run(True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

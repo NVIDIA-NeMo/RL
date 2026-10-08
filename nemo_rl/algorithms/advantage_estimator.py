@@ -315,7 +315,7 @@ class ReinforcePlusPlusAdvantageEstimator:
             )
             # Tokens outside the filtered policy support are excluded from the
             # actor loss; keep their -inf logprobs from poisoning the batch.
-            kl = torch.where(torch.isfinite(logprobs_policy), kl, 0.0)
+            kl = torch.where(~torch.isneginf(logprobs_policy), kl, 0.0)
             adv = adv - self.kl_coef * kl
 
         # global normalization across the batch
@@ -453,7 +453,7 @@ class GeneralizedAdvantageEstimator:
             kl = calculate_kl(logprobs_policy, logprobs_reference, self.kl_type)
             # Tokens outside the filtered policy support are excluded from the
             # actor loss; keep their -inf logprobs from poisoning the rewards.
-            kl = torch.where(torch.isfinite(logprobs_policy), kl, 0.0)
+            kl = torch.where(~torch.isneginf(logprobs_policy), kl, 0.0)
             token_level_rewards = token_level_rewards - self.kl_coef * kl
 
         # Place terminal reward at the last response token (last mask=1
@@ -728,7 +728,7 @@ class OPDAdvantageEstimator:
 
         # Exclude unsupported student tokens from the baseline and metrics as
         # well as the actor signal, including when using a proximal teacher.
-        student_support = torch.isfinite(prev_logprobs)
+        student_support = ~torch.isneginf(prev_logprobs)
         mask = mask * student_support.to(mask.dtype)
         teacher_student_gap = torch.where(student_support, teacher_student_gap, 0.0)
         distill_advantages = torch.where(student_support, distill_advantages, 0.0)
