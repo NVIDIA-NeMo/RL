@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -22,6 +23,13 @@ import ray
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, UNKNOWN_ROLLOUT_ENVIRONMENT
+from nemo_rl.experience.metric_utils import (
+    Metric,
+    RolloutTelemetry,
+    distribution,
+    rollout_environment_metric_component,
+)
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.venvs import make_actor_runtime_env
@@ -46,6 +54,8 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
+    rollout_environment: str = UNKNOWN_ROLLOUT_ENVIRONMENT
+    telemetry: tuple[Optional[RolloutTelemetry], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -76,6 +86,7 @@ class RolloutReassemblerActor:  # pragma: no cover
         dp_config: DataPlaneConfig,
         config: RolloutReassemblerActorConfig,
     ) -> None:
+        self._max_seq_len = config.max_seq_len
         dp_client = build_data_plane_client(dp_config, bootstrap=False)
         self._finalizer = RolloutReassembler(
             dp_client,
@@ -107,6 +118,15 @@ class RolloutReassemblerActor:  # pragma: no cover
     def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
         """Finalize one request without allowing tensor payloads across Ray RPC."""
         assert_metadata_only(request)
+        if request.telemetry and len(request.telemetry) != len(request.rollout_ids):
+            raise ValueError("Finalizer telemetry must align with logical siblings")
+        if any(
+            snapshot is not None
+            and rollout_environment_metric_component(snapshot.environment)
+            != request.rollout_environment
+            for snapshot in request.telemetry
+        ):
+            raise ValueError("Finalizer telemetry environment mismatch")
         if not (
             len(request.rollout_ids)
             == len(request.canonical_sample_ids)
@@ -127,8 +147,43 @@ class RolloutReassemblerActor:  # pragma: no cover
             fallback_weight_version=request.fallback_weight_version,
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
+            rollout_environment=request.rollout_environment,
             canonical_sample_ids=list(request.canonical_sample_ids),
         )
+        if result.meta is not None:
+            if request.telemetry and all(s is not None for s in request.telemetry):
+                selected_metrics = []
+                lengths = result.meta.sequence_lengths
+                assert lengths is not None, "Finalized canonical rows require lengths"
+                for snapshot, length in zip(request.telemetry, lengths, strict=True):
+                    assert snapshot is not None
+                    metrics = snapshot.to_metrics()
+                    # Receipts have no token payload: their producer uses a
+                    # placeholder False for truncated. Match the finalizer's
+                    # actual length-cap flag, never log that placeholder.
+                    truncated = int(length == self._max_seq_len)
+                    prefix = f"environment/{request.rollout_environment}"
+                    metrics.update(distribution(f"{prefix}/truncated", [truncated]))
+                    for scope in ("", f"{prefix}/"):
+                        metrics[f"{scope}truncation_rate"] = Metric([truncated], "mean")
+                        metrics[f"{scope}natural_termination_rate"] = Metric(
+                            [1 - truncated], "mean"
+                        )
+                    # Preserve the producer's raw agent alias as well as the
+                    # sanitized environment namespace, including names with '/'.
+                    metrics[f"{snapshot.environment}/truncation_rate"] = Metric(
+                        [truncated], "mean"
+                    )
+                    selected_metrics.append(metrics)
+                result.meta.extra_info[ROLLOUT_METRICS] = selected_metrics
+            else:
+                # Older recovery sidecars do not contain observations. Do not
+                # present a partial sibling population as a complete distribution.
+                logging.getLogger(__name__).warning(
+                    "Group %s lacks complete rollout telemetry; omitting producer "
+                    "distributions, retaining selected-row validity accounting",
+                    request.group_id,
+                )
         assert_metadata_only(result)
         return result
 

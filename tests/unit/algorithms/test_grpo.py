@@ -6380,6 +6380,27 @@ class TestComputeAndApplySeqLogprobErrorMasking:
 class TestAggregateRolloutMetrics:
     """Tests for aggregate_rollout_metrics which aggregates per-group metrics by semantic type."""
 
+    @pytest.fixture(autouse=True)
+    def reset_env_calls(self):
+        """Pure reductions do not need the module's Ray actors."""
+
+    def test_pr_does_not_change_v1_group_means_or_worker_payloads(self):
+        workers = [{0: 3}, {0: 7}]
+        result = aggregate_rollout_metrics(
+            {
+                "per_worker_token_counts": workers,
+                "environment/swe/sample_count": [2, 4],
+                "environment/swe/total_turns": [2, 8],
+                "environment/swe/x/median": [10, 40],
+                "environment/swe/x/histogram": [[10], [20, 40, 90]],
+            }
+        )
+        assert result["per_worker_token_counts"] == workers
+        assert result["environment/swe/sample_count"] == 3
+        assert result["environment/swe/total_turns"] == 5
+        assert result["environment/swe/x/median"] == 25
+        assert "environment/swe/x/p50" not in result
+
     def test_min_metrics_take_minimum(self):
         metrics = {
             "gen_tokens/min": [10, 5, 8],

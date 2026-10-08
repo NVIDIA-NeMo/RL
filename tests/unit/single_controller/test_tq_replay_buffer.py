@@ -1472,7 +1472,8 @@ class TestTQReplayBufferStateDict:
             ],
             "agent",
         )
-        assert isinstance(rollout_metrics["agent/full_result"], Table)
+        assert rollout_metrics["agent/full_result"].reduce == "concat"
+        assert isinstance(rollout_metrics["agent/full_result"].values[0], Table)
 
         buf = _make_buffer(FakeDataPlaneClient())
         _add_group(buf, weight=1, rollout_metrics=rollout_metrics)
@@ -1484,9 +1485,12 @@ class TestTQReplayBufferStateDict:
 
         restored_buf = _make_buffer(FakeDataPlaneClient())
         assert _load(restored_buf, restored_state) == 1
-        restored_table = restored_buf.meta_list[0].extra_info[ROLLOUT_METRICS][0][
+        restored_metric = restored_buf.meta_list[0].extra_info[ROLLOUT_METRICS][0][
             "agent/full_result"
         ]
+        assert type(restored_metric) is type(rollout_metrics["agent/full_result"])
+        assert restored_metric.reduce == "concat"
+        restored_table = restored_metric.values[0]
         assert isinstance(restored_table, Table)
         assert restored_table.columns == ["Full result"]
         assert restored_table.data == [['{"reward":1.0,"status":"completed"}']]

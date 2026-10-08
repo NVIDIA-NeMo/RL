@@ -4464,6 +4464,7 @@ def aggregate_rollout_metrics(
     - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
     - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
     - "total_turns": summed
+    - "trajectory_duration_s": mean, with separate max and discrete p95 summaries
     - Non-numeric values: passed through as-is
     - All other numeric metrics: averaged
 
@@ -4471,7 +4472,7 @@ def aggregate_rollout_metrics(
         per_group_metrics: A dict mapping metric names to lists of per-group values.
 
     Returns:
-        A dict mapping metric names to their aggregated scalar values.
+        A dict mapping metric names to their aggregated values, including lists.
     """
     aggregated = {}
     for k, v in per_group_metrics.items():

@@ -29,6 +29,12 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.experience.metric_utils import (
+    Metric,
+    RolloutTelemetry,
+    distribution,
+    reduce_step,
+)
 from nemo_rl.experience.rollout_recovery import (
     _ATTEMPT_STATE_FIELDS,
     _GROUP_STATE_FIELDS,
@@ -831,8 +837,94 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     assert rewards == [0.0, 1.0]
     assert mask_sample == [True, False]
 
-    state["schema_version"] = 3
+    state["schema_version"] = ROLLOUT_RECOVERY_SCHEMA_VERSION + 1
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_sealed_telemetry_roundtrip_and_duplicate_seal(granularity, tmp_path):
+    state = _sealed_attempt_state()
+    snapshot = RolloutTelemetry.from_metrics(
+        "swe",
+        {
+            **distribution("environment/swe/turns_per_sample", [3]),
+            "environment/swe/sample_count": Metric([1], "sum"),
+            "effort/length_reward/mean": Metric([0.5], "mean"),
+            "swe/full_result": Metric([object()], "concat"),
+        },
+    )
+    assert "swe/full_result" not in snapshot.metrics
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    state["groups"][0]["status"] = "generating"
+    state["groups"][0]["recovery_granularity"] = granularity.value
+    attempt.update(
+        status="dispatched",
+        receipt=None,
+        reward=None,
+        mask_sample=None,
+        staging_keys=[],
+        telemetry=None,
+    )
+    ledger = RolloutRecoveryLedger.from_state_dict(state)
+    _bind(ledger, "g7", _prompt())
+    group = ledger.get_group("g7")
+    result = SiblingSealResult(group.gate_rollout_id(0), None, 1.0, True, snapshot)
+    if granularity is RecoveryGranularity.PROMPT_GROUP:
+        _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", {0: result}))
+    else:
+        for _ in range(2):
+            _mutate(
+                lambda cut: ledger.mark_sibling_sealed(
+                    cut,
+                    "g7",
+                    generation_index=0,
+                    gate_rollout_id=result.gate_rollout_id,
+                    receipt=None,
+                    reward=1.0,
+                    mask_sample=True,
+                    telemetry=snapshot,
+                )
+            )
+    checkpoint = ledger.state_dict()
+    path = tmp_path / "rollout_recovery.pt"
+    torch.save(checkpoint, path)
+    checkpoint = torch.load(path, weights_only=True)
+    restored = RolloutRecoveryLedger.from_state_dict(checkpoint)
+    saved = restored.get_group("g7").siblings[0].current_attempt.telemetry
+    assert saved == snapshot
+    assert reduce_step([saved.to_metrics()])[
+        "environment/swe/turns_per_sample/histogram"
+    ] == [3.0]
+    snapshot.metrics["environment/swe/turns_per_sample"].values[0] = 99
+    assert saved.metrics["environment/swe/turns_per_sample"].values == [3]
+
+
+def test_version_two_restore_does_not_fabricate_telemetry():
+    state = _sealed_attempt_state()
+    state["schema_version"] = 2
+    del state["groups"][0]["siblings"][0]["attempts"][0]["telemetry"]
+    ledger = RolloutRecoveryLedger.from_state_dict(state)
+    assert ledger.get_group("g7").siblings[0].current_attempt.telemetry is None
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"environment": "swe", "observations": {"turns": [1, 2]}, "scalars": {}},
+        {
+            "environment": "swe",
+            "observations": {},
+            "scalars": {"tokens": torch.ones(2)},
+        },
+        {"environment": "", "observations": {}, "scalars": {}},
+        {"environment": "swe", "observations": {}, "scalars": {}, "token_ids": [1]},
+    ],
+)
+def test_restore_rejects_non_numeric_telemetry(bad):
+    state = _sealed_attempt_state()
+    state["groups"][0]["siblings"][0]["attempts"][0]["telemetry"] = bad
+    with pytest.raises(ValueError, match="[Tt]elemetry"):
         RolloutRecoveryLedger.from_state_dict(state)
 
 

@@ -48,6 +48,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
     apply_message_level_advantage_penalties,
+    environment_sample_counts,
     fields_for_put,
     squeeze_trailing_unit_dim,
     tensor_field,
@@ -302,6 +303,7 @@ class AdvantageOutcome:
     num_mask_sample_filtered: int
     reward_partial: RewardPartial
     advantage_partial: AdvantagePartial
+    environment_counts: dict[str, float]
     seq_logprob_error_metrics: Optional[dict[str, float]] = None
     # OPD's running moments, as this call's contribution rather than a total.
     opd_stat_sum: float = 0.0
@@ -429,6 +431,12 @@ class AdvantageComputer:
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
+        environment_counts = environment_sample_counts(
+            meta.tags,
+            mask_sample=mask_sample,
+            final_sample_mask=final_sample_mask,
+            final_token_mask=mask,
+        )
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
@@ -592,6 +600,7 @@ class AdvantageComputer:
             num_mask_sample_filtered=num_mask_sample_filtered,
             reward_partial=reward_partial,
             advantage_partial=advantage_partial,
+            environment_counts=environment_counts,
             seq_logprob_error_metrics=seq_error_metrics,
             opd_stat_sum=opd_stat_sum,
             opd_stat_sumsq=opd_stat_sumsq,

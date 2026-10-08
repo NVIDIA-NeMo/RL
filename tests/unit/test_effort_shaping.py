@@ -20,6 +20,7 @@ import pytest
 
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.experience.interfaces import Completion
+from nemo_rl.experience.metric_utils import Metric, reduce_step
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutManager,
@@ -355,7 +356,7 @@ def test_rollout_manager_forwards_effort_config():
 
 def test_run_rollouts_shapes_completion_reward_and_emits_low_metrics():
     """The Completion carries the shaped reward, not the env's raw reward."""
-    completions, _, metrics = _run_gym_rollouts(
+    completions, _, declared = _run_gym_rollouts(
         _LOW_EFFORT_CONFIG,
         "<budget> be concise",
         [_gym_result(reward=1.0, response_tokens=100)],
@@ -363,6 +364,12 @@ def test_run_rollouts_shapes_completion_reward_and_emits_low_metrics():
 
     # length_reward = min(1, 1.0 * (1 - 100/1000)) = 0.9 -> 1.0 + 1.0 * 0.9 = 1.9
     assert completions[0].reward == pytest.approx(1.9)
+    assert declared["total_reward/mean"] == Metric([1.9], "mean")
+    assert declared["mean_length_reward_low"] == Metric([0.9], "mean")
+    assert declared["mean_reward_low"] == Metric([1.9], "mean")
+    assert declared["mean_length_low"] == Metric([100], "mean")
+    assert declared["median_length_low"] == Metric([100], "median")
+    metrics = reduce_step([declared])
     # Downstream reward metrics are computed from the shaped Completion.
     assert metrics["total_reward/mean"] == pytest.approx(1.9)
     assert metrics["mean_length_reward_low"] == pytest.approx(0.9)
@@ -403,13 +410,16 @@ def test_streamed_completion_is_shaped_before_recovery_callback() -> None:
 
 def test_run_rollouts_leaves_high_effort_prompt_reward_untouched():
     """A prompt without low_string is only counted, never re-scored."""
-    completions, _, metrics = _run_gym_rollouts(
+    completions, _, declared = _run_gym_rollouts(
         _LOW_EFFORT_CONFIG,
         "explain everything in detail",
         [_gym_result(reward=1.0, response_tokens=200)],
     )
 
     assert completions[0].reward == pytest.approx(1.0)
+    assert declared["mean_length_high"] == Metric([200], "mean")
+    assert declared["median_length_high"] == Metric([200], "median")
+    metrics = reduce_step([declared])
     assert metrics["mean_length_high"] == pytest.approx(200)
     assert metrics["median_length_high"] == pytest.approx(200.0)
     assert "mean_length_low" not in metrics

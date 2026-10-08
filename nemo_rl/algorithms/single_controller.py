@@ -94,7 +94,6 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _write_latest_checkpoint_status,
-    aggregate_rollout_metrics,
 )
 from nemo_rl.algorithms.metric_utils import (
     SETUP_TIMING_PREFIX,
@@ -163,11 +162,13 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.metric_utils import Metric, reduce_step
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS,
     PromptGroupPhase,
     RolloutRecoveryState,
     build_rollout_recovery_state,
@@ -711,10 +712,12 @@ class SingleControllerActor:
         self._trainer_version: int = restored_trainer_version
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
+        self._legacy_rollout_metrics_warned = False
         self._step_log_dict: dict[str, list] = {
             "reward_partials": [],
             "advantage_partials": [],
             "num_mask_sample_filtered": [],
+            "environment_counts": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
@@ -1116,12 +1119,13 @@ class SingleControllerActor:
         expected_schema_version = metadata.get("rollout_recovery_schema_version")
         if (
             isinstance(expected_schema_version, bool)
-            or expected_schema_version != ROLLOUT_RECOVERY_SCHEMA_VERSION
+            or not isinstance(expected_schema_version, int)
+            or expected_schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
                 "native TQ checkpoint rollout recovery schema mismatch: "
                 f"checkpoint={expected_schema_version!r}, "
-                f"expected={ROLLOUT_RECOVERY_SCHEMA_VERSION}"
+                f"supported={sorted(SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
             )
         expected_group_count = metadata.get("rollout_recovery_group_count")
         if (
@@ -1153,6 +1157,10 @@ class SingleControllerActor:
             weights_only=True,
         )
         parsed_state = parse_rollout_recovery_state(state)
+        if parsed_state.ledger_state["schema_version"] != expected_schema_version:
+            raise ValueError(
+                "Rollout recovery sidecar schema does not match native TQ metadata"
+            )
         if len(parsed_state.ledger_state["groups"]) != expected_group_count:
             raise ValueError(
                 "rollout recovery sidecar group count does not match native "
@@ -3294,15 +3302,25 @@ class SingleControllerActor:
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
-                per_group_rollout_metrics: dict[str, list[Any]] = {}
+                declared_rollout_metrics: list[dict[str, Metric]] = []
                 for group_metrics in selected_rollout_metrics:
-                    for metric_name, value in group_metrics.items():
-                        per_group_rollout_metrics.setdefault(metric_name, []).append(
-                            value
-                        )
-                step_metrics.update(
-                    aggregate_rollout_metrics(per_group_rollout_metrics)
-                )
+                    declared = [
+                        isinstance(value, Metric) for value in group_metrics.values()
+                    ]
+                    if not all(declared):
+                        if any(declared):
+                            raise ValueError(
+                                "Rollout group mixes declared and plain metrics"
+                            )
+                        if not self._legacy_rollout_metrics_warned:
+                            log.warning(
+                                "Omitting legacy replay rollout metrics without declared "
+                                "reductions; selected-row validity accounting is retained"
+                            )
+                            self._legacy_rollout_metrics_warned = True
+                        continue
+                    declared_rollout_metrics.append(group_metrics)
+                step_metrics.update(reduce_step(declared_rollout_metrics))
                 try:
                     step_metrics.update(
                         await asyncio.to_thread(self._gen.get_step_metrics)
@@ -5380,6 +5398,9 @@ class SingleControllerActor:
         )
         self._step_log_dict["reward_partials"].append(outcome.reward_partial)
         self._step_log_dict["advantage_partials"].append(outcome.advantage_partial)
+        self._step_log_dict.setdefault("environment_counts", []).append(
+            outcome.environment_counts
+        )
         if outcome.seq_logprob_error_metrics is not None:
             self._step_log_dict["seq_logprob_error_metrics"].append(
                 outcome.seq_logprob_error_metrics

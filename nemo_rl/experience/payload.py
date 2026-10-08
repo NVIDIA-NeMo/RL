@@ -33,8 +33,10 @@ from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
+    ROLLOUT_ENVIRONMENT_TAG,
     ROUTED_EXPERTS_FIELD,
     TRUNCATED,
+    UNKNOWN_ROLLOUT_ENVIRONMENT,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
@@ -177,6 +179,9 @@ def record_to_train_batch(
         TRUNCATED: truncated,
         "total_reward": total_reward,
         _VIOLATION_COUNTS_KEY: violation_counts,
+        ROLLOUT_ENVIRONMENT_TAG: record.metadata.get(
+            ROLLOUT_ENVIRONMENT_TAG, UNKNOWN_ROLLOUT_ENVIRONMENT
+        ),
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
@@ -238,6 +243,12 @@ def pack_payload(
             # and parsing it back out of "{group_id}_g{i}" would make the
             # numerics depend on a naming convention.
             GROUP_ID_TAG: group_id,
+            **(
+                {ROLLOUT_ENVIRONMENT_TAG: train_batch[ROLLOUT_ENVIRONMENT_TAG]}
+                if train_batch.get(ROLLOUT_ENVIRONMENT_TAG, UNKNOWN_ROLLOUT_ENVIRONMENT)
+                != UNKNOWN_ROLLOUT_ENVIRONMENT
+                else {}
+            ),
             **violations[i],
             **multimodal_tags[i],
         }

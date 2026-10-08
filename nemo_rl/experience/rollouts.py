@@ -553,8 +553,8 @@ def _apply_effort_shaping(
 def _effort_shaping_metrics(shaping: _EffortShapingMetrics) -> dict[str, float]:
     """Build the rollout-metric entries for one group's effort-shaping lists.
 
-    Shared by the batched v1 path and the SingleController rollout manager so the
-    two cannot drift apart.
+    Used by the batched V1 path. The single controller uses the same shaping
+    inputs but retains raw lengths for its once-per-step median calculation.
 
     Args:
         shaping: Per-sample tracking lists returned by ``_apply_effort_shaping``.

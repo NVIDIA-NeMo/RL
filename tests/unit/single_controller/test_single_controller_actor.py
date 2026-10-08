@@ -70,6 +70,7 @@ from nemo_rl.data_plane.schema import (
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS, STAGING_FIELDS
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.metric_utils import Metric, distribution, optional_distributions
 from nemo_rl.experience.rollout_reassembler_actor import RolloutReassemblerActor
 from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -933,6 +934,12 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
         tags=_one_group_tags(batch_size),
     )
 
+    meta.tags = [
+        {**tag, "rollout_environment": name}
+        for tag, name in zip(
+            _one_group_tags(batch_size), ("swe", "swe", "math", "math"), strict=True
+        )
+    ]
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
     capsys.readouterr()
 
@@ -958,6 +965,13 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     assert estimator.mask[0].all()
     assert estimator.mask[1:].count_nonzero() == 0
     assert ctrl._step_log_dict["num_mask_sample_filtered"] == [1]
+    counts = ctrl._step_log_dict["environment_counts"][0]
+    assert counts["environment/swe/num_mask_sample_filtered"] == 1
+    assert counts["environment/swe/num_valid_samples"] == 1
+    assert counts["environment/swe/num_valid_tokens"] == 4
+    assert counts["environment/math/num_mask_sample_filtered"] == 0
+    assert counts["environment/math/num_valid_samples"] == 0
+    assert counts["environment/math/num_valid_tokens"] == 0
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
     assert metrics[0]["num_masked_seqs_by_logprob_error"] == 1
@@ -1835,6 +1849,7 @@ class _NoOpDataPlane:
 def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._legacy_rollout_metrics_warned = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=2,
@@ -2233,20 +2248,22 @@ def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
         for index, metrics in enumerate(
             [
                 {
-                    "gen_tokens/min": 7,
-                    "gen_tokens/max": 10,
-                    "total_turns": 2,
-                    "accuracy": 0.25,
-                    "trajectory_duration_s": 1.0,
-                    "histogram/gen_tokens_length": [7, 10],
+                    "gen_tokens/min": Metric([7], "min"),
+                    "gen_tokens/max": Metric([10], "max"),
+                    "total_turns": Metric([2], "sum"),
+                    "accuracy": Metric([0.25], "mean"),
+                    "trajectory_duration_s": Metric([1.0], "mean"),
+                    **distribution("latency", [1.0]),
+                    "histogram/gen_tokens_length": Metric([7, 10], "concat"),
                 },
                 {
-                    "gen_tokens/min": 3,
-                    "gen_tokens/max": 20,
-                    "total_turns": 5,
-                    "accuracy": 0.75,
-                    "trajectory_duration_s": 3.0,
-                    "histogram/gen_tokens_length": [3, 20],
+                    "gen_tokens/min": Metric([3], "min"),
+                    "gen_tokens/max": Metric([20], "max"),
+                    "total_turns": Metric([5], "sum"),
+                    "accuracy": Metric([0.75], "mean"),
+                    "trajectory_duration_s": Metric([3.0], "mean"),
+                    **distribution("latency", [3.0]),
+                    "histogram/gen_tokens_length": Metric([3, 20], "concat"),
                 },
             ]
         )
@@ -2265,12 +2282,43 @@ def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
     assert train_metrics["total_turns"] == 7
     assert train_metrics["accuracy"] == pytest.approx(0.5)
     assert train_metrics["trajectory_duration_s"] == pytest.approx(2.0)
-    assert train_metrics["trajectory_duration_s/max"] == 3.0
-    assert train_metrics["trajectory_duration_s/p95"] == 3.0
+    assert train_metrics["latency/max"] == 3.0
+    assert train_metrics["latency/p95"] == 3.0
     assert train_metrics["histogram/gen_tokens_length"] == [7, 10, 3, 20]
     assert train_call.kwargs == {"step": 1, "prefix": "train"}
     assert all(ROLLOUT_METRICS not in meta.extra_info for meta in metas)
     assert "histogram/gen_tokens_length" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("old_has_score", [False, True])
+def test_train_pump_omits_old_replay_metrics_with_one_warning(
+    monkeypatch, caplog, old_has_score
+):
+    old = {"swe/score/mean": 0.0} if old_has_score else {"old_only": 99}
+    metrics = [old, dict(old), optional_distributions("swe", [{"score": 10}, {}])]
+    metas = [
+        KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"sample-{index}"],
+            fields=[],
+            sequence_lengths=[1],
+            extra_info={ROLLOUT_METRICS: [group]},
+            tags=_one_group_tags(1),
+        )
+        for index, group in enumerate(metrics)
+    ]
+    ctrl = _train_pump_controller(sampler=_SequenceSampler(metas))
+    ctrl._algo_cfg.num_prompts_per_step = 3
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+    result = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert result["swe/score/mean"] == 5.0
+    assert "old_only" not in result
+    assert caplog.text.count("Omitting legacy replay rollout metrics") == 1
+    assert all(ROLLOUT_METRICS not in meta.extra_info for meta in metas)
 
 
 @pytest.mark.parametrize("dies_in", [None, "snapshot_step_metrics", "get_step_metrics"])
