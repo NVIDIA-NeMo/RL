@@ -155,7 +155,7 @@ chained as 4-hour Slurm jobs that resume from the latest checkpoint. Curves are
 wandb exports; the x axis is the training step.
 
 **Text DAPO, DAPO-Math-17K / AIME-2024** — 43 steps, `max_new_tokens: 8192`,
-on a GA-candidate checkpoint of the model.
+starting from `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`.
 
 ![Nemotron 3.5 Super VL text DAPO training curves](../../../assets/nemotron/nemotron-3.5-super-vl-text-dapo-16n4g.png)
 
