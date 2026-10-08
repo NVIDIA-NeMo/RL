@@ -49,6 +49,8 @@ mean E2E time was 32.56s for [FlashInfer](https://wandb.ai/nvidia/nemo-rl-mxfp8-
 and 32.90s for [Triton](https://wandb.ai/nvidia/nemo-rl-mxfp8-training/runs/6ts03ajk).
 Generation throughput was 617.96 versus 602.03 tokens/s/GPU. This is a
 single-run, directional comparison; mean output length differed by 2.7%.
-Triton step 3 logged `NaN` for both `gen_kl_error` and `approx_entropy`
-despite 256 valid samples, so this pair does not yet establish numerical
-correctness or an attention-backend speedup.
+Triton step 3 logged `NaN` for `gen_kl_error`, `policy_kl_error`,
+`js_divergence_error`, and `approx_entropy` despite 256 valid samples and
+a finite loss. FlashInfer logged finite values for all four in steps 2-20.
+This pair does not yet establish Triton numerical correctness or an
+attention-backend speedup.
