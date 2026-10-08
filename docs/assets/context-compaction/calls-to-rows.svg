@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="834" viewBox="0 0 960 834" role="img" aria-labelledby="title desc">
+<!-- Adapted from https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-calls-to-rows.html
+     Behavior checked against NVIDIA-NeMo/RL e81d5438148683a663dc405d301ed078c18abc7e and NVIDIA-NeMo/Gym b27e0db8faefee7e4760b5b1bfbfed713f528360.
+     Editable SVG source; examples are illustrative, not measurements. -->
+<title id="title">Accepted calls → selected forest → exact training rows</title><desc id="desc">Two worked examples with an excluded retry: no rewrite makes one row; a rewrite makes two. A shared-ancestor example shows copied context with loss only on its first deterministic path.</desc>
+<style>:root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2128;--border:#30363d;--text:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--orange:#d29922;--red:#f85149;--purple:#bc8cff;}
+svg .call{fill:var(--surface);stroke:var(--accent);stroke-width:1.5}
+svg .root{fill:var(--accent);fill-opacity:.2;stroke:var(--accent);stroke-width:1.8}
+svg .dead{fill:var(--surface);stroke:var(--dim);stroke-width:1.3;stroke-dasharray:4 3}
+svg .row{fill:var(--purple);fill-opacity:.16;stroke:var(--purple);stroke-width:1.5}
+svg .lane{fill:none;stroke:var(--border);stroke-width:1;stroke-dasharray:2 3}
+svg .lbl{fill:var(--text);font:12px -apple-system,sans-serif}
+svg .lbl-b{fill:var(--text);font:bold 13.5px -apple-system,sans-serif}
+svg .cid{fill:var(--text);font:bold 12px ui-monospace,Menlo,monospace}
+svg .mono{fill:var(--text);font:10.5px ui-monospace,Menlo,monospace}
+svg .note{fill:var(--dim);font:11.5px -apple-system,sans-serif}
+svg .hdr{fill:var(--accent);font:bold 12.5px -apple-system,sans-serif}
+svg .edge{stroke:var(--accent);stroke-width:1.5;fill:none;marker-end:url(#ah)}
+svg .edge-dead{stroke:var(--dim);stroke-width:1.2;fill:none;stroke-dasharray:4 3}
+svg .walk{stroke:var(--orange);stroke-width:2;fill:none;marker-end:url(#aw)}
+svg .cut{stroke:var(--red);stroke-width:2;stroke-dasharray:5 4}
+svg .cut-lbl{fill:var(--red);font:bold 11px -apple-system,sans-serif}
+svg .walk-lbl{fill:var(--orange);font:bold 11px -apple-system,sans-serif}
+svg .ah{fill:var(--accent)}
+svg .aw{fill:var(--orange)}
+svg a text{text-decoration:underline;fill:var(--accent);font:10.5px ui-monospace,Menlo,monospace}</style>
+<rect width="100%" height="100%" fill="#0d1117" rx="10"/>
+<text x="16" y="27" fill="#e6edf3" font-family="Arial, sans-serif" font-size="18" font-weight="700">Accepted calls → selected forest → exact training rows</text>
+<g transform="translate(0 44)">
+  <defs>
+    <marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path class="ah" d="M0,0 L8,4 L0,8 z"/></marker>
+    <marker id="aw" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path class="aw" d="M0,0 L8,4 L0,8 z"/></marker>
+  </defs>
+  <text class="note" x="16" y="18">one rollout · 5 model calls · the agent rejects call 4 and asks again (call 5) · each call here generates 1 token</text>
+
+  <!-- LEFT lane -->
+  <rect class="lane" x="8" y="30" width="460" height="420" rx="8"/>
+  <text class="lbl-b" x="20" y="52">No rewrite · one selected path</text>
+  <!-- calls -->
+  <rect class="root" x="30" y="72" width="64" height="34" rx="6"/><text class="cid" x="47" y="94">c1</text>
+  <rect class="call" x="130" y="72" width="64" height="34" rx="6"/><text class="cid" x="147" y="94">c2</text>
+  <rect class="call" x="230" y="72" width="64" height="34" rx="6"/><text class="cid" x="247" y="94">c3</text>
+  <rect class="dead" x="340" y="60" width="64" height="30" rx="6"/><text class="cid" x="357" y="80">c4</text>
+  <text class="note" x="410" y="80">✗ rejected</text>
+  <rect class="call" x="340" y="100" width="64" height="34" rx="6"/><text class="cid" x="357" y="122">c5</text>
+  <text class="note" x="410" y="122">leaf</text>
+  <path class="edge" d="M94 89 L128 89"/><path class="edge" d="M194 89 L228 89"/>
+  <path class="edge-dead" d="M294 84 L338 76"/><path class="edge" d="M294 94 L338 114"/>
+  <text class="mono" x="30" y="150">cum_len 3 → 6 → 9 → 12 (c4 and c5 both 12)</text>
+  <!-- walk -->
+  <text class="walk-lbl" x="30" y="182">1. returned history selects c1, c2, c3, c5</text>
+  <text class="walk-lbl" x="30" y="200">2. selected endpoint c5 → walk c5, c3, c2, c1</text>
+
+
+  <text class="walk-lbl" x="30" y="244">3. join each call's stored tokens, root first</text>
+  <text class="mono" x="30" y="264">c1 [10,11,1001] + c2 [20,21,1002]</text>
+  <text class="mono" x="30" y="280">+ c3 [30,31,1003] + c5 [50,51,1005]</text>
+
+  <!-- one row -->
+  <rect class="row" x="30" y="318" width="420" height="58" rx="7"/>
+  <text class="lbl-b" x="42" y="338">1 row · 12 tokens · 4 tokens eligible for loss</text>
+  <text class="mono" x="42" y="358">[10,11,1001,20,21,1002,30,31,1003,50,51,1005]</text>
+  <text class="note" x="30" y="400">c4 is captured but unselected; it contributes no loss.</text>
+  <text class="note" x="30" y="418">Both panels use the CC-capable selected-forest path.</text>
+  <text class="note" x="30" y="434">A rollout without a rewrite still produces just one row.</text>
+
+  <!-- RIGHT lane -->
+  <rect class="lane" x="490" y="30" width="462" height="420" rx="8"/>
+  <text class="lbl-b" x="502" y="52">With rewrite · two selected paths</text>
+  <rect class="root" x="510" y="72" width="64" height="34" rx="6"/><text class="cid" x="527" y="94">c1</text>
+  <rect class="call" x="600" y="72" width="64" height="34" rx="6"/><text class="cid" x="617" y="94">c2</text>
+  <path class="cut" d="M684 64 L684 140"/><text class="cut-lbl" x="660" y="154">rewrite</text>
+  <rect class="root" x="700" y="72" width="64" height="34" rx="6"/><text class="cid" x="717" y="94">c3</text>
+  <rect class="dead" x="800" y="60" width="64" height="30" rx="6"/><text class="cid" x="817" y="80">c4</text>
+  <text class="note" x="870" y="80">✗ rejected</text>
+  <rect class="call" x="800" y="100" width="64" height="34" rx="6"/><text class="cid" x="817" y="122">c5</text><text class="mono" x="512" y="120">parent: –</text><text class="mono" x="602" y="120">parent: c1</text><text class="mono" x="702" y="120">parent: –</text><text class="mono" x="802" y="148">parent: c3</text>
+  <path class="edge" d="M574 89 L598 89"/>
+  <path class="edge-dead" d="M764 84 L798 76"/><path class="edge" d="M764 94 L798 114"/>
+
+  <!-- select + cut -->
+  <text class="walk-lbl" x="510" y="182">1. match full accepted output or call references</text>
+  <text class="mono" x="510" y="200">selected = [c1, c2, c3, c5]; c4 is excluded</text>
+
+  <text class="walk-lbl" x="510" y="242">2. find endpoints in the selected graph</text>
+  <text class="mono" x="510" y="260">selected parents = {c1,c3}; endpoints = {c2,c5}</text><text class="mono" x="510" y="276">walk c2 → c1; walk c5 → c3; reverse each path</text>
+
+  <text class="walk-lbl" x="510" y="310">3. validate tokens/media; assign loss ownership; publish</text>
+  <!-- two rows -->
+  <rect class="row" x="510" y="318" width="210" height="58" rx="7"/>
+  <text class="lbl-b" x="520" y="338">group_g0_s0 · 6 tok</text>
+  <text class="mono" x="520" y="358">[10,11,1001,20,21,1002]</text>
+  <rect class="row" x="732" y="318" width="210" height="58" rx="7"/>
+  <text class="lbl-b" x="742" y="338">group_g0_s1 · 6 tok</text>
+  <text class="mono" x="742" y="358">[10,11,1003,50,51,1005]</text>
+  <text class="note" x="510" y="400">One reward and advantage per rollout, copied to both rows.</text>
+  <text class="note" x="510" y="418">Each selected generated span contributes loss once.</text>
+
+
+  <!-- legend -->
+  <rect class="root" x="16" y="472" width="18" height="12" rx="3"/><text class="note" x="40" y="483">root (no parent; stores its whole prompt)</text>
+  <rect class="call" x="300" y="472" width="18" height="12" rx="3"/><text class="note" x="324" y="483">continues its parent (stores new tokens only)</text>
+  <rect class="dead" x="616" y="472" width="18" height="12" rx="3"/><text class="note" x="640" y="483">unselected call; no loss</text>
+  <rect class="row" x="16" y="496" width="18" height="12" rx="3"/><text class="note" x="40" y="507">training row</text>
+  <path class="walk" d="M140 502 L170 502"/><text class="note" x="176" y="507">what RL does, in order</text>
+  <text class="note" x="16" y="536">Toy token IDs illustrate storage. Roots contain complete current prompts; continuing calls contain only new deltas.</text>
+  <text class="note" x="16" y="552">A root need not mean compaction: a complete request that cannot be spliced can also start a new root.</text>
+
+<rect class="lane" x="8" y="574" width="944" height="168" rx="8"/>
+<text class="lbl-b" x="20" y="598">Shared selected ancestors: reuse context, count loss once</text>
+<rect class="root" x="28" y="625" width="56" height="30" rx="6"/><text class="cid" x="49" y="645">A</text>
+<rect class="call" x="135" y="611" width="56" height="30" rx="6"/><text class="cid" x="156" y="631">B</text>
+<rect class="call" x="135" y="657" width="56" height="30" rx="6"/><text class="cid" x="156" y="677">C</text>
+<path class="edge" d="M84 635 L133 626"/><path class="edge" d="M84 645 L133 672"/>
+<text class="lbl" x="220" y="633">History selects A, B and C. Endpoints: B and C.</text>
+<text class="mono" x="220" y="657">Row 1: A → B · loss on A and B</text>
+<text class="mono" x="220" y="678">Row 2: A → C · A remains context; loss on C only</text>
+<text class="note" x="20" y="718">Endpoints are computed after selection. A selected node with only unselected children remains an endpoint.</text>
+<text class="note" x="20" y="735">Sequential capture within one owner; this example does not claim concurrent multi-agent or per-agent reward support.</text>
+</g>
+<text x="16" y="818" fill="#8b949e" font-family="Arial, sans-serif" font-size="10">Adapted from Terry Kong’s PR #4124 review figures; updated for the current context-compaction implementation.</text>
+</svg>
