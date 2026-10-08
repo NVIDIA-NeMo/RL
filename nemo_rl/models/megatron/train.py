@@ -264,14 +264,19 @@ def model_forward(
             SharedPrefixLayout as MCoreSharedPrefixLayout,
         )
 
+        # Read the canonical parent-linked descriptor. The lowering guard
+        # rejects deeper trees before they can reach the current star kernels.
+        tree = shared_prefix.tensor_bin.layout.tree_layout
         roots = tuple(
             MCoreSharedPrefixLayout(
-                prefix_len=root.prompt_length,
-                completion_lens=root.physical_completion_lengths,
-                logical_completion_lens=root.completion_lengths,
+                prefix_len=tree.node_len[root],
+                completion_lens=tuple(tree.node_len[child] for child in children),
+                logical_completion_lens=tuple(
+                    tree.logical_node_len[child] for child in children
+                ),
                 padding_multiple=shared_prefix.padding_multiple,
             )
-            for _, root in shared_prefix.tensor_bin.layout.iter_roots()
+            for root, children in tree.iter_star_roots()
         )
         if len(roots) == 1:
             additional_kwargs["shared_prefix_layout"] = roots[0]

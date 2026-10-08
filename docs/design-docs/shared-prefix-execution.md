@@ -6,7 +6,7 @@ This contribution is opt-in and currently targets text-only Megatron hybrid atte
 
 ## Implementation ownership
 
-Reusable packing is implemented in `megatron.rl`: row/star/forest layouts,
+Reusable packing is implemented in `megatron.rl`: parent-linked multi-level tree layouts,
 group subdivision and sharding, execution slots and plans, tensor
 materialization, TP/CP geometry, real-row alignment, and reconstruction within
 dense training bins. NeMo RL translates `BatchedDataDict` fields and policy
@@ -19,6 +19,14 @@ worker environments when shared-prefix planning is enabled. Its pure packing
 modules do not initialize the GPU model or depend on NeMo RL. Standard dense
 NeMo imports do not require the optional Megatron backend. Portable packing
 tests are owned by Megatron; NeMo retains adapter and metadata-transport tests.
+
+The canonical `PackedTreeLayout` stores physical token spans, logical lengths,
+and parent node indices. Current packing emits stars/forests and uses that
+descriptor for positions, predecessors, reference attention and model-input
+lowering. The descriptor and reference mask support deeper trees; the current
+fused attention/Mamba backend explicitly rejects them. Source-row and loss
+mappings stay in the star/forest packing wrappers until generalized execution
+is implemented.
 
 This representation also accepts PPO rollout groups. A group with one answer
 per prompt retains its real source row and uses ordinary dense execution.
