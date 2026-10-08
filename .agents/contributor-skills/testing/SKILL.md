@@ -43,10 +43,14 @@ Append the driver script path (relative to `tests/test_suites/`) to @tests/test_
 
 ### 4. Check rollout performance
 
-If the test generates with vLLM, follow the `rollout-perf` skill
-(@.agents/contributor-skills/rollout-perf/SKILL.md). Diagnose the first run,
-check whether CUDA graphs are on, and set `NUM_MINUTES` from the measured wall
-time instead of copying the 240-minute template value.
+Every test that generates (vLLM, SGLang, TRT-LLM, Megatron inference or
+Dynamo) goes through the `rollout-perf` skill
+(@.agents/contributor-skills/rollout-perf/SKILL.md):
+1. Diagnose the first run.
+2. Prove the effective engine settings from the engine log, for example that
+   CUDA graphs are on.
+3. Set `NUM_MINUTES` from the measured wall time instead of copying the
+   240-minute template value.
 
 ## Recipe Naming Rules
 
