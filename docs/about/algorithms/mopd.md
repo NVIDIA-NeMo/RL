@@ -271,8 +271,9 @@ policy and generation nodes.
 ### Runtime support matrix
 
 Cross-tokenizer support is deliberately narrower than same-token MOPD v1.
-Unsupported combinations fail during setup, before teacher workers are
-allocated.
+Unsupported runtime modes fail during setup, before teacher workers are
+allocated. Multimodal payloads are rejected later, when the first affected
+rollout is scored.
 
 | Mode | Legacy async GRPO + NeMo Gym | Single-Controller |
 |---|---:|---:|
