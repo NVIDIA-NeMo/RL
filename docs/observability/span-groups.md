@@ -148,10 +148,10 @@ rollout-side spans for that.
 
 Each algorithm opens its step inside
 `nemo_rl.telemetry.instrumentation.iteration_scope`, which stamps
-`rl.iteration` on every span started within it. So the step umbrella, the leaves
-under it, the checkpoint span and the rollout and generation spans all carry the
-same value, and `rl.iteration = 412` selects everything that happened in that
-step rather than the step span alone.
+`rl.iteration` on every span started within it **in the driver process**. So
+the step umbrella, the leaves under it and the checkpoint span all carry the
+same value, and `rl.iteration = 412` selects the driver's whole step rather
+than the step span alone.
 
 A span that passes `rl.iteration` itself keeps its own value — the scope is
 applied by a span processor that skips keys already set. `rl.<algo>.evaluate`
@@ -163,10 +163,22 @@ whole run and belongs to no single step. `rl.sc.generate_and_push` runs on the
 rollout pump's own clock rather than the training loop's, so it carries
 `rl.target_step` — the step it is generating *for* — instead.
 
-The scope travels on a `ContextVar`, which reaches nested
-calls and coroutines but not raw threads or other processes. Worker-side spans
-such as `rl.policy.load_model` are therefore unstamped; they are model init, not
-step work, so they sit outside any step regardless.
+The scope travels on a `ContextVar`, which reaches nested calls and coroutines
+but not raw threads or other processes. Only the trace parent crosses a Ray
+boundary, so a span opened inside an actor is correctly placed in the trace but
+carries no `rl.iteration` of its own. That covers more than worker internals:
+
+| Unstamped span | Runs in |
+| --- | --- |
+| `rl.policy.load_model` and the other worker-side leaves | the policy workers |
+| `rl.gym.run_rollouts` | the `NemoGym` actor |
+| `rl.sft_v2.read_batch`, `rl.sft_v2.prepare_batch` | the Energon SFT worker |
+| the async-GRPO collector's rollout spans | the collector actor |
+
+To scope those to a step, walk up to the driver-side ancestor that is stamped,
+or filter on the trace rather than the attribute. `rl.policy.load_model` is the
+one case where nothing is lost: it is model init, not step work, so it sits
+outside any step regardless.
 
 `rl.checkpoint.finalize` is the one place the scope would have been both
 unreachable *and* wrong, so it sets `rl.iteration` itself — see below.
