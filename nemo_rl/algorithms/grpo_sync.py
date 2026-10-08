@@ -758,6 +758,7 @@ def grpo_train_sync(
                             partition_id=policy.tq_partition_id,
                             group_size=master_config.grpo.num_generations_per_prompt,
                             first_iter=(dynamic_sampling_num_gen_batches == 1),
+                            allow_straggler_cutoff=True,
                         )
                     )
 

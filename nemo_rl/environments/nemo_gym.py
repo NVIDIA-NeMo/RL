@@ -281,6 +281,330 @@ def _typed_gym_failure(error: Exception) -> Optional[Exception]:
     return RolloutDataFailure(detail)
 
 
+########################################
+# Batch-level straggler cutoff (synchronous rollouts)
+########################################
+#
+# A synchronous step waits for the slowest rollout of its batch. With long agentic
+# sessions the tail is long: one rollout that runs to its harness timeout holds every
+# GPU of the step idle after the rest of the batch is back. The opt-in cutoff
+# (``env.nemo_gym.straggler_cutoff``) arms once ``done_fraction`` of the rows one
+# ``run_rollouts`` call carries are back (and ``min_elapsed_s`` has passed), waits
+# ``grace_s`` more, then cancels the rollouts still in flight; ``max_wall_s`` is an
+# absolute cap. A cut rollout comes back as a masked, zero-reward placeholder.
+
+# Marks a placeholder result's ``full_result`` for a rollout the cutoff cancelled.
+STRAGGLER_CUT_KEY = "_ng_straggler_cut"
+
+_STRAGGLER_CUTOFF_KEYS = frozenset(
+    {"enabled", "done_fraction", "grace_s", "min_elapsed_s", "max_wall_s"}
+)
+
+
+@dataclass(frozen=True)
+class StragglerCutoffConfig:
+    """Resolved ``env.nemo_gym.straggler_cutoff`` settings. See _parse_straggler_cutoff."""
+
+    done_fraction: float = 0.9
+    grace_s: float = 300.0
+    min_elapsed_s: float = 0.0
+    max_wall_s: Optional[float] = None
+
+
+def _parse_straggler_cutoff(raw: Any) -> Optional[StragglerCutoffConfig]:
+    """Validate ``env.nemo_gym.straggler_cutoff``; ``None`` (off) unless ``enabled`` is true.
+
+    Raises:
+        ValueError: On an unknown key or an out-of-range value, so a typo cannot
+            silently leave the cutoff off or misconfigured.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError(
+            f"env.nemo_gym.straggler_cutoff must be a mapping, got {type(raw).__name__}"
+        )
+    unknown = sorted(set(raw) - _STRAGGLER_CUTOFF_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Unknown env.nemo_gym.straggler_cutoff keys {unknown}; expected a subset "
+            f"of {sorted(_STRAGGLER_CUTOFF_KEYS)}"
+        )
+    if not raw.get("enabled", False):
+        return None
+    defaults = StragglerCutoffConfig()
+    max_wall_s = raw.get("max_wall_s")
+    cutoff = StragglerCutoffConfig(
+        done_fraction=float(raw.get("done_fraction", defaults.done_fraction)),
+        grace_s=float(raw.get("grace_s", defaults.grace_s)),
+        min_elapsed_s=float(raw.get("min_elapsed_s", defaults.min_elapsed_s)),
+        max_wall_s=float(max_wall_s) if max_wall_s is not None else None,
+    )
+    if not 0.0 < cutoff.done_fraction <= 1.0:
+        raise ValueError(
+            "env.nemo_gym.straggler_cutoff.done_fraction must be in (0, 1], got "
+            f"{cutoff.done_fraction}"
+        )
+    if cutoff.grace_s < 0 or cutoff.min_elapsed_s < 0:
+        raise ValueError(
+            "env.nemo_gym.straggler_cutoff.grace_s and min_elapsed_s must be >= 0"
+        )
+    if cutoff.max_wall_s is not None and cutoff.max_wall_s <= 0:
+        raise ValueError(
+            "env.nemo_gym.straggler_cutoff.max_wall_s must be > 0 or null, got "
+            f"{cutoff.max_wall_s}"
+        )
+    return cutoff
+
+
+def _straggler_cutoff_decision(
+    cutoff: StragglerCutoffConfig,
+    *,
+    elapsed_s: float,
+    done: int,
+    total: int,
+    armed_at_s: Optional[float],
+) -> tuple[Optional[float], Optional[str]]:
+    """One cutoff check: ``(armed_at_s, reason)``, reason ``None``, ``"grace"`` or ``"max_wall"``.
+
+    Times are seconds since the batch was dispatched. The cutoff arms the first time
+    ``done / total >= done_fraction`` with ``elapsed_s >= min_elapsed_s`` and fires
+    ``grace_s`` after arming. ``max_wall_s`` fires at that elapsed time regardless.
+    """
+    if cutoff.max_wall_s is not None and elapsed_s >= cutoff.max_wall_s:
+        return armed_at_s, "max_wall"
+    if elapsed_s < cutoff.min_elapsed_s:
+        return armed_at_s, None
+    if armed_at_s is None and total > 0 and done / total >= cutoff.done_fraction:
+        armed_at_s = elapsed_s
+    if armed_at_s is not None and elapsed_s - armed_at_s >= cutoff.grace_s:
+        return armed_at_s, "grace"
+    return armed_at_s, None
+
+
+def _straggler_cutoff_wait_s(
+    cutoff: StragglerCutoffConfig,
+    *,
+    elapsed_s: float,
+    done: int,
+    total: int,
+    armed_at_s: Optional[float],
+) -> Optional[float]:
+    """Seconds until the decision can next change without a completion; ``None`` = never."""
+    deadlines = []
+    if cutoff.max_wall_s is not None:
+        deadlines.append(cutoff.max_wall_s)
+    if armed_at_s is not None:
+        deadlines.append(armed_at_s + cutoff.grace_s)
+    elif total > 0 and done / total >= cutoff.done_fraction:
+        # Enough rows are back, but min_elapsed_s has not passed yet.
+        deadlines.append(cutoff.min_elapsed_s)
+    if not deadlines:
+        return None
+    return max(0.0, min(deadlines) - elapsed_s)
+
+
+def _raise_typed_gym_failure(error: Exception) -> None:
+    """Re-raise a failed ``/run`` as a picklable typed failure when it carries a status."""
+    if hasattr(error, "response_content"):
+        print("EXCEPTION RESULT", error.response_content, file=sys.stderr)
+    typed = _typed_gym_failure(error)
+    if typed is not None:
+        # `from None`, deliberately: chaining the original would put the
+        # unpicklable exception back on the wire as __cause__ and undo
+        # the whole point. The status and message are already in `detail`.
+        raise typed from None
+    raise error
+
+
+async def _iter_gym_results(
+    completions: Any, timer: Timer, timer_prefix: str
+) -> AsyncGenerator[tuple[dict, Optional[dict], bool], None]:
+    """Await Gym's completion-ordered awaitables one by one; nothing is ever cut."""
+    for task in completions:
+        with timer.time(label=f"{timer_prefix}/await_results"):
+            try:
+                row, result = await task
+            except Exception as error:
+                _raise_typed_gym_failure(error)
+        yield row, result, False
+
+
+async def _iter_gym_results_with_straggler_cutoff(
+    completions: Any,
+    rows: list[dict],
+    cutoff: StragglerCutoffConfig,
+    timer: Timer,
+    timer_prefix: str,
+    stats: dict[str, float],
+) -> AsyncGenerator[tuple[dict, Optional[dict], bool], None]:
+    """Yield ``(row, result, was_cut)`` as rollouts finish; cancel the tail when the cutoff fires.
+
+    ``completions`` is what Gym's ``run_examples`` returned and must have ``aclose()``.
+    Cut rows are yielded after every finished one, in input order, with ``result=None``.
+    ``stats`` receives the batch-level ``straggler_cutoff/*`` metrics.
+    """
+    total = len(rows)
+    finished_ids: set[int] = set()
+    started = monotonic()
+    armed_at_s: Optional[float] = None
+    next_completion: Optional[asyncio.Future] = None
+    stats.update(
+        {
+            "straggler_cutoff/num_cut": 0.0,
+            "straggler_cutoff/armed": 0.0,
+            "straggler_cutoff/cut_by_max_wall": 0.0,
+        }
+    )
+    try:
+        while len(finished_ids) < total:
+            if next_completion is None:
+                next_completion = asyncio.ensure_future(next(completions))
+            wait_s = _straggler_cutoff_wait_s(
+                cutoff,
+                elapsed_s=monotonic() - started,
+                done=len(finished_ids),
+                total=total,
+                armed_at_s=armed_at_s,
+            )
+            with timer.time(label=f"{timer_prefix}/await_results"):
+                done, _ = await asyncio.wait({next_completion}, timeout=wait_s)
+            if done:
+                completed, next_completion = next_completion, None
+                try:
+                    row, result = completed.result()
+                except Exception as error:
+                    _raise_typed_gym_failure(error)
+                finished_ids.add(row["_rowidx"])
+                yield row, result, False
+                if len(finished_ids) == total:
+                    break
+
+            elapsed_s = monotonic() - started
+            was_armed = armed_at_s is not None
+            armed_at_s, reason = _straggler_cutoff_decision(
+                cutoff,
+                elapsed_s=elapsed_s,
+                done=len(finished_ids),
+                total=total,
+                armed_at_s=armed_at_s,
+            )
+            if armed_at_s is not None and not was_armed:
+                stats["straggler_cutoff/armed"] = 1.0
+                stats["straggler_cutoff/armed_at_s"] = armed_at_s
+                print(
+                    f"[nemo_gym] straggler cutoff armed: {len(finished_ids)}/{total} "
+                    f"rollouts done after {elapsed_s:.0f}s; cancelling the rest in "
+                    f"{cutoff.grace_s:.0f}s",
+                    flush=True,
+                )
+            if reason is None:
+                continue
+
+            if next_completion is not None:
+                next_completion.cancel()
+            # Cancels every rollout still running, which closes its /run request.
+            await completions.aclose()
+            if next_completion is not None:
+                await asyncio.gather(next_completion, return_exceptions=True)
+                next_completion = None
+            cut_rows = [row for row in rows if row["_rowidx"] not in finished_ids]
+            stats["straggler_cutoff/num_cut"] = float(len(cut_rows))
+            stats["straggler_cutoff/cut_at_s"] = elapsed_s
+            stats["straggler_cutoff/done_fraction_at_cut"] = len(finished_ids) / total
+            stats["straggler_cutoff/cut_by_max_wall"] = float(reason == "max_wall")
+            print(
+                f"[nemo_gym] straggler cutoff ({reason}): cancelled {len(cut_rows)}/"
+                f"{total} rollouts after {elapsed_s:.0f}s",
+                flush=True,
+            )
+            for row in cut_rows:
+                yield row, None, True
+            return
+    finally:
+        if next_completion is not None:
+            next_completion.cancel()
+
+
+def _text_only_messages(input_messages: Any) -> list[dict[str, str]]:
+    """``role``/``content`` text messages from a Responses-style input, media dropped."""
+    if isinstance(input_messages, str):
+        return [{"role": "user", "content": input_messages}]
+    messages = []
+    for item in input_messages if isinstance(input_messages, list) else []:
+        if not isinstance(item, Mapping) or not isinstance(item.get("role"), str):
+            continue
+        content = item.get("content")
+        if isinstance(content, list):
+            content = "\n".join(
+                part["text"]
+                for part in content
+                if isinstance(part, Mapping) and isinstance(part.get("text"), str)
+            )
+        if isinstance(content, str):
+            messages.append({"role": item["role"], "content": content})
+    return messages
+
+
+def _straggler_cut_placeholder(row: dict, tokenizer: PreTrainedTokenizerBase) -> dict:
+    """A masked, zero-reward result standing in for a rollout the cutoff cancelled.
+
+    The prompt is the row's input rendered as text (media dropped, so no image
+    placeholder tokens appear without pixel data) and the generation is one EOS token
+    with logprob 0, so the row has an ordinary shape for batching. The batch builder
+    zeroes its loss multiplier (see ``STRAGGLER_CUT_KEY``); it never trains.
+    """
+    responses_create_params = row.get("responses_create_params") or {}
+    messages = _text_only_messages(responses_create_params.get("input"))
+    filler_token_id = tokenizer.eos_token_id
+    if filler_token_id is None:
+        filler_token_id = tokenizer.pad_token_id
+    if filler_token_id is None:
+        filler_token_id = 0
+    prompt_token_ids: list[int] = []
+    if messages:
+        try:
+            rendered = tokenizer.apply_chat_template(messages, tokenize=True)
+            if isinstance(rendered, Mapping):
+                rendered = rendered["input_ids"]
+            prompt_token_ids = [int(token_id) for token_id in rendered]
+        except Exception:
+            prompt_token_ids = [
+                int(token_id)
+                for token_id in tokenizer.encode(
+                    "\n".join(message["content"] for message in messages),
+                    add_special_tokens=False,
+                )
+            ]
+    if not prompt_token_ids:
+        prompt_token_ids = [int(filler_token_id)]
+    message_log = [
+        {
+            "role": "user",
+            "content": "",
+            "token_ids": torch.tensor(prompt_token_ids, dtype=torch.long),
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "token_ids": torch.tensor([int(filler_token_id)], dtype=torch.long),
+            "generation_logprobs": torch.tensor([0.0]),
+            "is_invalid_tool_call": False,
+            "has_malformed_thinking": False,
+        },
+    ]
+    return {
+        "message_log": message_log,
+        "input_message_log": message_log[:1],
+        "full_result": {
+            "reward": 0.0,
+            STRAGGLER_CUT_KEY: True,
+            "responses_create_params": responses_create_params,
+            "response": {"output": []},
+        },
+    }
+
+
 def get_nemo_gym_uv_cache_dir() -> str | None:
     """Return the uv cache directory inside a container, or None outside one.
 
@@ -341,6 +665,9 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+    # Batch-level straggler cutoff for synchronous rollouts (NeMo-RL-only, never
+    # forwarded to Gym). Off unless ``enabled: true``; see _parse_straggler_cutoff.
+    straggler_cutoff: NotRequired[Dict[str, Any] | None]
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -481,6 +808,8 @@ class NemoGym(EnvironmentInterface):
         # _spinup replaces this from cfg. Keep restarted/unspun actors internally
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
+        self._straggler_cutoff = _parse_straggler_cutoff(cfg.get("straggler_cutoff"))
+        self._warned_straggler_cutoff_unavailable = False
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -554,6 +883,7 @@ class NemoGym(EnvironmentInterface):
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
         initial_global_config_dict.pop("effort_levels", None)
         initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
+        initial_global_config_dict.pop("straggler_cutoff", None)
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
@@ -779,6 +1109,7 @@ Depending on your data shape, you may want to change these values."""
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
         per_prompt: bool = False,
+        allow_straggler_cutoff: bool = False,
     ) -> AsyncGenerator[tuple[int, dict, dict, dict | None], None]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete.
 
@@ -803,6 +1134,10 @@ Depending on your data shape, you may want to change these values."""
                 Ray actor. On the single-controller path a step issues one of
                 these per prompt, so the span belongs in ``per_prompt`` rather
                 than ``per_step``, whose count is meant to scale with steps.
+            allow_straggler_cutoff: Whether this call may apply
+                ``env.nemo_gym.straggler_cutoff``. Only synchronous training
+                rollouts, where one call carries a whole step's rows, pass True;
+                validation, async GRPO and the single-controller path never do.
 
         Yields:
             One ``(rowidx, resolved_agent_ref, result, timing_metrics)`` tuple
@@ -828,6 +1163,7 @@ Depending on your data shape, you may want to change these values."""
                 nemo_gym_examples,
                 timer_prefix,
                 deduplicate_multimodal_data,
+                allow_straggler_cutoff,
             )
             try:
                 while True:
@@ -845,6 +1181,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
+        allow_straggler_cutoff: bool = False,
     ) -> AsyncGenerator[tuple[int, dict, dict, dict | None], None]:
         """Body of :meth:`run_rollouts`; see there for the tracing wrapper."""
         self._require_spinup()
@@ -875,28 +1212,40 @@ Depending on your data shape, you may want to change these values."""
         _require_resolved_agent_refs(nemo_gym_examples)
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
-        num_results = 0
-        for task in nemo_gym_result_iterator:
-            with timer.time(label=f"{timer_prefix}/await_results"):
-                try:
-                    nemo_gym_row, nemo_gym_result = await task
-                except Exception as error:
-                    if hasattr(error, "response_content"):
-                        print(
-                            "EXCEPTION RESULT",
-                            error.response_content,
-                            file=sys.stderr,
-                        )
-                    typed = _typed_gym_failure(error)
-                    if typed is not None:
-                        # `from None`, deliberately: chaining the original would put the
-                        # unpicklable exception back on the wire as __cause__ and undo
-                        # the whole point. The status and message are already in `detail`.
-                        raise typed from None
-                    raise
+        cutoff = self._straggler_cutoff if allow_straggler_cutoff else None
+        if cutoff is not None and not hasattr(nemo_gym_result_iterator, "aclose"):
+            # Gym releases whose run_examples cannot cancel in-flight rollouts.
+            if not self._warned_straggler_cutoff_unavailable:
+                print(
+                    "[nemo_gym] env.nemo_gym.straggler_cutoff is enabled, but this "
+                    "NeMo-Gym's run_examples cannot cancel in-flight rollouts (no "
+                    "aclose()); running without the cutoff.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._warned_straggler_cutoff_unavailable = True
+            cutoff = None
+        cutoff_stats: dict[str, float] = {}
+        if cutoff is not None:
+            result_stream = _iter_gym_results_with_straggler_cutoff(
+                nemo_gym_result_iterator,
+                nemo_gym_examples,
+                cutoff,
+                timer,
+                timer_prefix,
+                cutoff_stats,
+            )
+        else:
+            result_stream = _iter_gym_results(
+                nemo_gym_result_iterator, timer, timer_prefix
+            )
 
+        num_results = 0
+        async for nemo_gym_row, nemo_gym_result, was_cut in result_stream:
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                if self._token_capture_enabled:
+                if was_cut:
+                    nemo_rl_result = _straggler_cut_placeholder(nemo_gym_row, tokenizer)
+                elif self._token_capture_enabled:
                     # Receipt mode: fetch the ledger manifest and assemble the
                     # receipt locally; token-free result. The canonical row is
                     # rebuilt by the finalizer, so no message_log walk (and no
@@ -924,6 +1273,7 @@ Depending on your data shape, you may want to change these values."""
                     * timing_metrics[f"{timer_prefix}/postprocess_results"]
                     / total_time
                 )
+                timing_metrics.update(cutoff_stats)
 
             agent_name = nemo_gym_row["agent_ref"]["name"]
             counts_left[agent_name] -= 1
@@ -1624,6 +1974,9 @@ def _build_gym_actor_config(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    straggler_cutoff = nemo_gym_dict.pop("straggler_cutoff", None)
+    # Validate on the driver so a bad block fails at setup, not inside the actor.
+    _parse_straggler_cutoff(straggler_cutoff)
     port_range = {
         key: value
         for key in ("port_range_low", "port_range_high")
@@ -1664,6 +2017,7 @@ def _build_gym_actor_config(
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
+        straggler_cutoff=straggler_cutoff,
         **port_range,
         **multimodal_flags,
     )
