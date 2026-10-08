@@ -63,4 +63,4 @@ code_snapshots*/
 /tests/test_suites/**/metrics.json
 
 # Agentic-VBench shared inputs, backends and prepared datasets (linked or prepared per checkout).
-data/agentic_vbench/
+data/agentic_vbench
