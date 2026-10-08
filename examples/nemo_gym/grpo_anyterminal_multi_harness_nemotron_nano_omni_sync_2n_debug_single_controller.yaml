@@ -19,8 +19,17 @@ grpo:
 
 policy:
   train_global_batch_size: 8
+  # Terminal agents carry much larger tool schemas than the one-turn VLM task
+  # in the base recipe. 8K leaves OpenCode no generation token after rendering
+  # its tools, so keep enough room for both the harness prompt and reasoning.
+  max_total_sequence_length: 16384
   generation:
-    max_new_tokens: 4096
+    max_new_tokens: 8192
+    # Interactive validation should reach rollouts quickly. Production recipes
+    # can retain vLLM's one-time FlashInfer autotuning for peak throughput.
+    vllm_kwargs:
+      kernel_config:
+        enable_flashinfer_autotune: false
     colocated:
       enabled: false
       resources:
@@ -82,8 +91,8 @@ env:
           global_agent_timeout: 900
           agent_kwargs:
             context_window: ${policy.max_total_sequence_length}
-            max_input_tokens: ${add:${policy.max_total_sequence_length},-4608}
-            max_output_tokens: 4096
+            max_input_tokens: ${add:${policy.max_total_sequence_length},-8704}
+            max_output_tokens: 8192
     anyterminal_openclaw:
       responses_api_agents:
         anyterminal_agent:
