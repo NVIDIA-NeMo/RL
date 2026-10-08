@@ -1393,6 +1393,14 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "token_capture.defer_routed_experts_to_policy requires "
             "token_capture.enabled=true"
         )
+    policy_config = master_config.policy
+    if token_capture_config.defer_routed_experts_to_policy and not (
+        "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
+    ):
+        raise NotImplementedError(
+            "token_capture.defer_routed_experts_to_policy is only wired for the Megatron "
+            "policy; the automodel (DTensor) worker does not assemble deferred routes."
+        )
     if (
         token_capture_config.enabled
         and token_capture_config.num_reassembler_workers
