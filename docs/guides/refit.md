@@ -71,9 +71,10 @@ colocated generation.
 
 TRT-LLM supports online block-FP8 refit for MoE rollouts. Policy
 training remains in BF16, and this setting does not change optimizer-state
-precision. During each refit, NeMo RL converts only the routed-expert weights
-to E4M3 with 128x128 blocks and FP32 scales; attention, routers, shared experts,
-embeddings, and the output head remain in BF16.
+precision. During each refit, NeMo RL converts weights to E4M3 with 128x128
+blocks and FP32 scales. By default only the routed-expert weights are converted;
+attention, routers, shared experts, embeddings, and the output head remain in
+BF16 (see [Quantized scope](#quantized-scope) to change this).
 
 This path starts from a BF16 policy checkpoint. Direct loading of a
 pre-quantized ModelOpt FP8 checkpoint is outside its scope.
@@ -89,16 +90,38 @@ policy:
 
 The path is not gated on model type. It quantizes routed-expert weights, either
 fused (`mlp.experts.gate_up_proj` / `down_proj`, the Qwen3.5 layout) or per-expert
-(`mlp.experts.{i}.{gate,up,down}_proj.weight`, the Qwen3 MoE layout). Setup fails
-if no routed-expert weight is found, or if the model has dense MLP weights that
-would stay BF16.
+(`mlp.experts.{i}.{gate,up,down}_proj.weight`, the Qwen3 MoE layout). With the
+default scope, setup fails if no routed-expert weight is found, or if the model
+has dense MLP weights that would stay BF16.
+
+#### Quantized scope
+
+Set `quantization_ignore_patterns` under `trtllm_cfg` (the same key as
+`vllm_cfg`) to choose which modules stay BF16. Patterns are matched against
+module names with `fnmatch` or a `re:` regex, and a module is ignored if it or any
+ancestor matches. A list replaces the default scope: every 2-D linear weight and
+routed expert that is not ignored is quantized. `lm_head` and embeddings always
+stay BF16.
+
+```yaml
+policy:
+  generation:
+    trtllm_cfg:
+      precision: fp8
+      quantization_ignore_patterns:
+        - model.layers.*.mlp.gate  # keep the router in BF16
+```
+
+This quantizes attention and the experts of a Qwen3 MoE model. List routers,
+shared experts, linear attention, and vision or MTP modules explicitly for models
+that have them. Setup fails if the patterns ignore every weight.
 
 Tested models:
 
 | Model | Status |
 | --- | --- |
 | Qwen3.5 MoE | Verified |
-| Qwen3 MoE | Verified (Qwen3-30B-A3B, block-FP8 and MXFP8) |
+| Qwen3 MoE | Verified (Qwen3-30B-A3B, block-FP8 and MXFP8; attention + experts scope with block-FP8) |
 
 NeMo RL initializes the TRT-LLM model with `load_format` set
 to `dummy`, then populates it from the first BF16 policy refit. By default

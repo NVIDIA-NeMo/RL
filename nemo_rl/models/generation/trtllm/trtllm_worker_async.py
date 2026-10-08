@@ -224,6 +224,13 @@ class TrtllmAsyncGenerationWorkerImpl:
 
         if trtllm_cfg.get("is_mx") and trtllm_cfg["precision"] != "fp8":
             raise ValueError("trtllm_cfg.is_mx=True requires precision='fp8'")
+        if (
+            trtllm_cfg.get("quantization_ignore_patterns") is not None
+            and trtllm_cfg["precision"] != "fp8"
+        ):
+            raise ValueError(
+                "trtllm_cfg.quantization_ignore_patterns requires precision='fp8'"
+            )
 
         if trtllm_cfg["precision"] == "fp8":
             # Imported here: TRT-LLM is an optional dependency.
@@ -235,7 +242,11 @@ class TrtllmAsyncGenerationWorkerImpl:
             )
 
             is_mx = bool(trtllm_cfg.get("is_mx"))
-            configure_fp8_llm_kwargs(llm_kwargs, is_mx=is_mx)
+            configure_fp8_llm_kwargs(
+                llm_kwargs,
+                is_mx=is_mx,
+                ignore_patterns=trtllm_cfg.get("quantization_ignore_patterns"),
+            )
 
             # Block-FP8 needs the TRTLLM MoE backend (DeepGEMM would resmooth to
             # E8M0); MXFP8 uses CUTLASS or CuTe DSL. Other MoeConfig fields kept.
@@ -359,7 +370,11 @@ class TrtllmAsyncGenerationWorkerImpl:
 
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         assert self.llm is not None
-        await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        patterns = self.cfg["trtllm_cfg"].get("quantization_ignore_patterns")
+        kwargs = {} if patterns is None else {"quantization_ignore_patterns": patterns}
+        await self.llm.collective_rpc(
+            "prepare_refit_info", args=(state_dict_info,), kwargs=kwargs
+        )
 
     async def update_weights_from_collective_async(
         self, *, drain: bool = True, recompute_kv: bool = False

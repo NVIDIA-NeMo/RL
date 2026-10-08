@@ -361,3 +361,50 @@ def test_zmq_address_and_cleanup_are_per_gpu_and_idempotent():
 
     socket.close.assert_called_once()
     context.destroy.assert_called_once()
+
+
+@pytest.mark.parametrize("patterns", [None, ["model.layers.*.mlp.gate"]])
+def test_quantization_ignore_patterns_set_the_refit_scope(monkeypatch, patterns):
+    from nemo_rl.models.generation.trtllm import trtllm_backend as backend
+
+    extension, _, model, model_loader, _ = _extension(backend)
+    # The engine's exclude list holds the configured patterns plus its own.
+    exclude = [
+        "lm_head",
+        "*embed_tokens*",
+        *(patterns or ["model.layers.*.self_attn*"]),
+    ]
+    model.model_config = SimpleNamespace(
+        quant_config=SimpleNamespace(exclude_modules=exclude)
+    )
+    monkeypatch.setattr(backend.fp8_quantization, "is_fp8_model", lambda _: True)
+    quantized = {
+        "model.layers.0.mlp.experts.0.down_proj.weight": torch.randn(128, 128),
+    }
+    attention = {"model.layers.0.self_attn.q_proj.weight": torch.randn(128, 128)}
+    kept = {
+        "model.layers.0.mlp.gate.weight": torch.randn(4, 128),
+        "lm_head.weight": torch.randn(128, 128),
+        "model.embed_tokens.weight": torch.randn(128, 128),
+    }
+    incoming = {**quantized, **attention, **kept}
+    info = {name: (t.shape, t.dtype) for name, t in incoming.items()}
+
+    extension.prepare_refit_info(info, quantization_ignore_patterns=patterns)
+    extension.state_dict_info = info
+
+    def packed_consumer(*, post_unpack_func, **_):
+        post_unpack_func(list(incoming.items()))
+
+    monkeypatch.setattr(backend, "packed_broadcast_consumer", packed_consumer)
+    monkeypatch.setattr(backend.torch.cuda, "synchronize", lambda: None)
+    assert extension.update_weights_from_collective() is True
+
+    sent = model_loader.reload.call_args.args[1]
+    fp8 = torch.float8_e4m3fn
+    assert all(sent[name].dtype == fp8 for name in quantized)
+    # Attention is quantized only when the patterns do not ignore it.
+    assert all(
+        (sent[name].dtype == fp8) == (patterns is not None) for name in attention
+    )
+    assert all(sent[name] is incoming[name] for name in kept)

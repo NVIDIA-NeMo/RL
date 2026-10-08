@@ -123,11 +123,32 @@ class NcclExtension(WorkerExtension):
     #  Refit metadata (weight name → (shape, dtype) mapping)
     # ------------------------------------------------------------------ #
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self,
+        state_dict_info: dict[str, Any],
+        quantization_ignore_patterns: list[str] | None = None,
+    ) -> None:
         self.state_dict_info = state_dict_info
         model = self.engine.model_engine.model
-        if fp8_quantization.is_quantized_expert_refit(model.model_config.quant_config):
-            fp8_quantization.validate_routed_experts(state_dict_info)
+        quant_config = model.model_config.quant_config
+        if fp8_quantization.is_quantized_expert_refit(quant_config):
+            # None: routed experts only. Otherwise quantize whatever the engine does
+            # not exclude (its exclude_modules also holds TRT-LLM's own defaults).
+            self._fp8_ignore_patterns = (
+                None
+                if quantization_ignore_patterns is None
+                else list(
+                    dict.fromkeys(
+                        [
+                            *quantization_ignore_patterns,
+                            *(getattr(quant_config, "exclude_modules", None) or []),
+                        ]
+                    )
+                )
+            )
+            fp8_quantization.validate_routed_experts(
+                state_dict_info, ignore_patterns=self._fp8_ignore_patterns
+            )
             _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
 
     def _ensure_refit_usable(self) -> None:
@@ -198,6 +219,7 @@ class NcclExtension(WorkerExtension):
                     is_mx=fp8_quantization.is_mxfp8_model(
                         model.model_config.quant_config
                     ),
+                    ignore_patterns=getattr(self, "_fp8_ignore_patterns", None),
                 )
             else:
                 weights = dict(weight_list)
@@ -314,6 +336,7 @@ class NcclExtension(WorkerExtension):
                         is_mx=fp8_quantization.is_mxfp8_model(
                             model.model_config.quant_config
                         ),
+                        ignore_patterns=getattr(self, "_fp8_ignore_patterns", None),
                     )
                     # The mapper may retain split QKVZ/BA views across IPC chunks;
                     # detach them before ACK lets the trainer reuse the buffer.
