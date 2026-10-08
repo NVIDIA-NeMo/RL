@@ -75,6 +75,10 @@ class ReassemblyRequest:
     # (field, sum, count) of the numeric Gym result fields of the group's
     # rollouts that reached this process (per-label result/<field> means).
     result_stats: tuple[tuple[str, float, int], ...] = ()
+    # Gym's resolved ``agent_ref`` mapping of the group (at least ``name``), so
+    # the controller can route the finalized rows to an on-policy-distillation
+    # teacher. None when neither the attempt nor the prompt row carries one.
+    agent_ref: Optional[dict[str, Any]] = None
 
 
 @dataclass(frozen=True)

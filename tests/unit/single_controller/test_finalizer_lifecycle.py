@@ -155,6 +155,7 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
         3,
         3,
         staging_keys=["group_g0/call"],
+        record=ANY,
     )
     assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
 

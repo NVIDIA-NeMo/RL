@@ -22,6 +22,7 @@ import threading
 from typing import Any, cast
 
 import pytest
+from types import SimpleNamespace
 import torch
 from wandb import Table
 
@@ -202,6 +203,7 @@ async def _commit_finalized(
     group_max_wv: int,
     *,
     staging_keys: list[str] | None = None,
+    record: object | None = None,
 ) -> KVBatchMeta:
     barrier = buffer._data_plane_checkpoint_barrier
     assert barrier is not None
@@ -213,6 +215,7 @@ async def _commit_finalized(
             group_min_wv,
             group_max_wv,
             staging_keys=staging_keys,
+            record=record,
         )
 
 
@@ -1808,6 +1811,56 @@ class TestTQReplayBufferTokenCaptureMode:
         )
         with pytest.raises(ValueError, match="no live slot"):
             _run(_commit_finalized(buf, "ghost", meta, 0, 0))
+
+    def test_commit_finalized_enriches_before_slot_becomes_ready(self):
+        # Token-capture groups skip commit(); the OPD teacher column must still be
+        # written before the slot is ready, routed on the request's agent_ref.
+        buf = self._make_capture_buffer(MultiPartitionFakeDataPlaneClient())
+        observations = []
+
+        async def enrich(meta, record):
+            observations.append(
+                (record.extra_env_info["agent_ref"]["name"], list(buf.ready_list))
+            )
+            return meta.with_fields(["teacher_reference_logprobs"])
+
+        buf.set_post_write_enricher(enrich)
+        group_id = buf.reserve(weight_version=4, rollout_ids=["r0"])
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name=None,
+            sample_ids=[f"{group_id}_g0"],
+            fields=["input_ids"],
+        )
+        routing = SimpleNamespace(extra_env_info={"agent_ref": {"name": "swe_agent"}})
+        committed = _run(
+            _commit_finalized(
+                buf, group_id, meta, group_min_wv=3, group_max_wv=3, record=routing
+            )
+        )
+        assert observations == [("swe_agent", [False])]
+        assert "teacher_reference_logprobs" in committed.fields
+        assert buf.meta_list[0] is committed
+        assert buf.ready_list == [True]
+
+    def test_commit_finalized_raises_when_enrichment_fails(self):
+        buf = self._make_capture_buffer(MultiPartitionFakeDataPlaneClient())
+
+        async def fail_enrichment(meta, record):
+            del meta, record
+            raise RuntimeError("teacher unavailable")
+
+        buf.set_post_write_enricher(fail_enrichment)
+        group_id = buf.reserve(weight_version=4, rollout_ids=["r0"])
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name=None,
+            sample_ids=[f"{group_id}_g0"],
+            fields=["input_ids"],
+        )
+        with pytest.raises(PostWriteEnrichmentError, match="post-write enrichment"):
+            _run(_commit_finalized(buf, group_id, meta, group_min_wv=3, group_max_wv=3))
+        assert buf.ready_list == [False]
 
     def test_commit_finalized_verifies_full_plan_manifest_ownership(self):
         dp = MultiPartitionFakeDataPlaneClient()

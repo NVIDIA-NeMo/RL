@@ -1827,6 +1827,27 @@ class RolloutManager:
         except ValueError:
             return None
 
+    @staticmethod
+    def _group_agent_ref(
+        record: Optional[PromptGroupRecord], input_sample: DatumSpec
+    ) -> Optional[dict[str, Any]]:
+        """The group's Gym ``agent_ref`` mapping, for OPD teacher routing.
+
+        Gym's resolved ``agent_ref`` when this attempt dispatched rows, else the
+        prompt row's own ``agent_ref`` (a group restored with every sibling
+        sealed). ``None`` when neither carries a named one.
+        """
+        for source in (
+            getattr(record, "extra_env_info", None),
+            input_sample.get("extra_env_info"),
+        ):
+            if not isinstance(source, Mapping):
+                continue
+            agent_ref = source.get("agent_ref")
+            if isinstance(agent_ref, Mapping) and agent_ref.get("name"):
+                return {str(key): value for key, value in agent_ref.items()}
+        return None
+
     async def _group_metric_labels(
         self,
         group_id: str,
@@ -2563,6 +2584,7 @@ class RolloutManager:
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
                 group_labels=group_labels,
                 result_stats=result_stats,
+                agent_ref=self._group_agent_ref(record, input_sample),
             )
             from nemo_rl.experience.rollout_reassembler_actor import (
                 assert_metadata_only,

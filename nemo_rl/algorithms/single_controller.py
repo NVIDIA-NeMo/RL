@@ -219,6 +219,18 @@ _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
 
 
 @dataclass(frozen=True)
+class _FinalizedGroupRouting:
+    """The slice of a prompt-group record the post-write enricher reads.
+
+    Token-capture groups reach the controller as a metadata-only
+    ``ReassemblyRequest`` instead of a ``PromptGroupRecord``; the OPD teacher
+    coordinator routes on ``extra_env_info["agent_ref"]`` alone.
+    """
+
+    extra_env_info: dict[str, object]
+
+
+@dataclass(frozen=True)
 class _RolloutCheckpointSaveResult:
     """Outcome returned by one rollout checkpoint save attempt."""
 
@@ -1778,6 +1790,16 @@ class SingleControllerActor:
                         f"{request.group_id}"
                     )
                 else:
+                    # The post-write enricher (OPD teacher logprobs) routes on the
+                    # group's agent_ref, which the request carries as metadata.
+                    agent_ref = getattr(request, "agent_ref", None)
+                    routing = _FinalizedGroupRouting(
+                        extra_env_info=(
+                            {"agent_ref": dict(agent_ref)}
+                            if isinstance(agent_ref, dict)
+                            else {}
+                        )
+                    )
                     try:
                         await self._buffer.commit_finalized(
                             cut,
@@ -1786,6 +1808,7 @@ class SingleControllerActor:
                             finalized.group_min_wv,
                             finalized.group_max_wv,
                             staging_keys=finalized.staging_keys,
+                            record=routing,
                         )
                     except BaseException as commit_error:
                         try:

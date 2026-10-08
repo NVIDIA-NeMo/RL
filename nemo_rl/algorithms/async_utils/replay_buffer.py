@@ -1385,11 +1385,14 @@ class TQReplayBuffer:
         group_max_wv: int,
         *,
         staging_keys: Optional[list[str]] = None,
+        record: object | None = None,
     ) -> KVBatchMeta:
         """Mark a slot ready from finalizer output (token-capture mode).
 
         Unlike :meth:`commit`, the canonical rows are already in TQ — the
-        finalizer tensorized and put them — so this only fills the slot.
+        finalizer tensorized and put them — so this only fills the slot, after
+        running the post-write enricher when one is installed (the rows exist,
+        so OPD teacher logprobs can be added before the slot becomes ready).
         The slot's effective version is the group's OLDEST call version
         (``group_min_wv``): staleness accounting stays conservative when a
         rollout straddles a refit.
@@ -1402,9 +1405,15 @@ class TQReplayBuffer:
             group_max_wv: Newest weight version any call in the group used.
             staging_keys: The group's staged delta keys, recorded so
                 :meth:`remove` can clear the staging partition too.
+            record: The group's routing record for the post-write enricher
+                (it reads ``extra_env_info["agent_ref"]``); needed only when
+                an enricher is installed.
 
         Raises:
-            ValueError: group_id has no live slot (removed or never reserved).
+            ValueError: group_id has no live slot (removed or never reserved,
+                or evicted while the enricher ran).
+            PostWriteEnrichmentError: the installed enricher failed; the slot
+                stays unready and the caller owns the row cleanup.
         """
         cut.require_live()
         try:
@@ -1438,6 +1447,25 @@ class TQReplayBuffer:
                     f"provided={sorted(provided_staging_keys)!r}, "
                     f"planned={sorted(plan_cleanup_keys)!r}"
                 )
+        # Token-capture groups never pass through :meth:`commit`, so the
+        # post-write enrichment (OPD teacher logprobs) runs here, between the
+        # finalizer's publication and the slot becoming ready. The await can
+        # race an eviction, so the slot is looked up again afterwards, as
+        # :meth:`commit` does.
+        if self._post_write_enricher is not None:
+            try:
+                meta = await self._post_write_enricher(meta, record)
+            except Exception as error:
+                raise PostWriteEnrichmentError(
+                    f"post-write enrichment failed for group_id={group_id!r}"
+                ) from error
+            try:
+                idx = self._group_ids.index(group_id)
+            except ValueError:
+                raise ValueError(
+                    f"TQReplayBuffer.commit_finalized: group {group_id} was "
+                    "evicted during post-write enrichment"
+                ) from None
         self.meta_list[idx] = meta
         self.start_weight_list[idx] = group_min_wv
         self.end_weight_list[idx] = group_max_wv
