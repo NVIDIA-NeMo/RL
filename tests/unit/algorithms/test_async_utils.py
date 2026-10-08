@@ -3892,6 +3892,41 @@ class TestPromptExtraction:
         assert initial_prompt_log[2]["role"] == "user"
         assert generated_message not in initial_prompt_log
 
+    def test_prompt_extraction_can_project_token_ids_without_copying_payloads(self):
+        from nemo_rl.data.llm_message_utils import (
+            batched_message_log_to_flat_message,
+        )
+
+        prompt_token_ids = torch.tensor([1, 2, 3])
+        prompt = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": prompt_token_ids,
+            "dsa_topk_indices": torch.zeros(3, 1, 4, dtype=torch.int16),
+            "routed_experts": torch.zeros(3, 1, 2, dtype=torch.uint8),
+        }
+        generated = {
+            "role": "assistant",
+            "content": "answer",
+            "token_ids": torch.tensor([4]),
+        }
+
+        projected = extract_initial_prompt_messages(
+            [[prompt, generated]],
+            torch.tensor([3]),
+            keys_to_keep=["token_ids"],
+        )
+
+        assert set(projected[0][0]) == {"token_ids"}
+        assert projected[0][0]["token_ids"] is prompt_token_ids
+        assert "dsa_topk_indices" in prompt  # The training message is untouched.
+        prompt_flat, _ = batched_message_log_to_flat_message(
+            projected,
+            pad_value_dict={"token_ids": 0},
+        )
+        assert set(prompt_flat) == {"token_ids"}
+        assert torch.equal(prompt_flat["token_ids"], prompt_token_ids.unsqueeze(0))
+
     def test_prompt_extraction_with_single_turn(self):
         """Test that prompt extraction works correctly for single-turn prompts (regression test)."""
         original_prompt_messages = [

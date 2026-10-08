@@ -326,11 +326,35 @@ def _attach_routed_experts_to_message_log_prefix(
     return cursor
 
 
+def _attach_dsa_topk_to_message_log_prefix(
+    message_log: list[dict],
+    dsa_topk_indices: torch.Tensor,
+) -> int:
+    """Attach token-aligned DSA selector rows to the existing prefix."""
+    cursor = 0
+    for msg in message_log:
+        token_ids = msg.get("token_ids")
+        if not isinstance(token_ids, torch.Tensor):
+            continue
+        msg_len = int(token_ids.shape[0])
+        msg["dsa_topk_indices"] = dsa_topk_indices[cursor : cursor + msg_len]
+        cursor += msg_len
+    return cursor
+
+
 def _find_routed_experts_template(message_log: list[dict]) -> Optional[torch.Tensor]:
     for msg in message_log:
         routed_experts = msg.get("routed_experts")
         if isinstance(routed_experts, torch.Tensor):
             return routed_experts
+    return None
+
+
+def _find_dsa_topk_template(message_log: list[dict]) -> Optional[torch.Tensor]:
+    for msg in message_log:
+        indices = msg.get("dsa_topk_indices")
+        if isinstance(indices, torch.Tensor):
+            return indices
     return None
 
 
@@ -398,6 +422,41 @@ def backfill_missing_routed_experts(
             msg["routed_experts"] = torch.full(
                 (int(token_ids.shape[0]), template.shape[1], template.shape[2]),
                 ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+                dtype=template.dtype,
+                device=template.device,
+            )
+            backfilled_counts[log_index] += 1
+    return backfilled_counts
+
+
+def backfill_missing_dsa_topk_indices(
+    message_logs: Sequence[list[dict]],
+) -> list[int]:
+    """Sentinel-fill tokenized messages not covered by a DSA capture."""
+    backfilled_counts = [0] * len(message_logs)
+    template = None
+    for message_log in message_logs:
+        template = _find_dsa_topk_template(message_log)
+        if template is not None:
+            break
+    if template is None:
+        return backfilled_counts
+    if template.dim() != 3:
+        raise ValueError(
+            "dsa_topk_indices messages must have shape [tokens, layers, topk], "
+            f"got {tuple(template.shape)}"
+        )
+
+    for log_index, message_log in enumerate(message_logs):
+        for msg in message_log:
+            token_ids = msg.get("token_ids")
+            if not isinstance(token_ids, torch.Tensor):
+                continue
+            if isinstance(msg.get("dsa_topk_indices"), torch.Tensor):
+                continue
+            msg["dsa_topk_indices"] = torch.full(
+                (int(token_ids.shape[0]), template.shape[1], template.shape[2]),
+                -1,
                 dtype=template.dtype,
                 device=template.device,
             )
@@ -650,6 +709,19 @@ def generate_responses(
             assistant_message["routed_experts"] = routed_experts[
                 input_length:total_length
             ]
+        if "dsa_topk_indices" in generation_outputs:
+            dsa_topk_indices = generation_outputs["dsa_topk_indices"][i]
+            prefix_length = _attach_dsa_topk_to_message_log_prefix(
+                batch["message_log"][i], dsa_topk_indices
+            )
+            if prefix_length != int(input_length.item()):
+                raise RuntimeError(
+                    "message_log token length does not match generation input_length "
+                    f"({prefix_length} != {int(input_length.item())}) for DSA replay."
+                )
+            assistant_message["dsa_topk_indices"] = dsa_topk_indices[
+                input_length:total_length
+            ]
 
         batch["message_log"][i].append(assistant_message)
 
@@ -789,6 +861,19 @@ async def generate_responses_async(
                     f"({prefix_length} != {int(input_length.item())})."
                 )
             assistant_message["routed_experts"] = routed_experts[
+                input_length:total_length
+            ]
+        if "dsa_topk_indices" in generation_outputs:
+            dsa_topk_indices = generation_outputs["dsa_topk_indices"][i]
+            prefix_length = _attach_dsa_topk_to_message_log_prefix(
+                batch["message_log"][i], dsa_topk_indices
+            )
+            if prefix_length != int(input_length.item()):
+                raise RuntimeError(
+                    "message_log token length does not match generation input_length "
+                    f"({prefix_length} != {int(input_length.item())}) for DSA replay."
+                )
+            assistant_message["dsa_topk_indices"] = dsa_topk_indices[
                 input_length:total_length
             ]
 
@@ -1454,6 +1539,18 @@ async def run_sample_multi_turn_rollout(
         if routed_template is not None:
             env_message["routed_experts"] = _dummy_routed_experts_for_tokens(
                 tokenized_obs, routed_template
+            )
+        dsa_topk_template = _find_dsa_topk_template(current_message_log)
+        if dsa_topk_template is not None:
+            env_message["dsa_topk_indices"] = torch.full(
+                (
+                    int(tokenized_obs.shape[0]),
+                    dsa_topk_template.shape[1],
+                    dsa_topk_template.shape[2],
+                ),
+                -1,
+                dtype=dsa_topk_template.dtype,
+                device=dsa_topk_template.device,
             )
         current_message_log.append(env_message)
 

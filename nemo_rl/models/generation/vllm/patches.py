@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 # calls _apply_vllm_patches in serving containers that do not install NeMo RL.
 
 VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
+VLLM_DSA_TOPK_CAPTURE_ENV_VAR = "NRL_VLLM_DSA_TOPK_CAPTURE"
+VLLM_DSA_TOPK_LAYER_IDS_ENV_VAR = "NRL_VLLM_DSA_TOPK_LAYER_IDS"
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -653,6 +655,632 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
     logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
 
 
+def _patch_vllm_dsa_topk_capturer(logger, *, required: bool = False) -> bool:
+    """Reuse vLLM's routed-experts transport for GLM DSA top-k indices.
+
+    vLLM already has the hard part of replay capture: a per-forward device
+    buffer plus a scheduler-side buffer keyed by physical KV-cache slots. In
+    DSA mode this patch changes that channel's shape and binder so it carries
+    one ``index_topk`` vector for each selected DSA *compute* layer instead of
+    MoE expert ids. The selected layer ids are compacted to contiguous slots,
+    which avoids allocating entries for DSA skip layers.
+
+    The patch is runtime-gated by ``NRL_VLLM_DSA_TOPK_CAPTURE`` inside the
+    installed vLLM source. Applying it is therefore harmless for ordinary MoE
+    router replay. When DSA capture is requested all anchors are required: a
+    partial patch would silently return plausible but incorrect routes.
+    """
+    try:
+        file_to_patch = _get_vllm_file(
+            "model_executor/layers/fused_moe/routed_experts_capturer.py"
+        )
+    except RuntimeError:
+        message = (
+            "Could not locate routed_experts_capturer.py for the DSA top-k "
+            "capture patch."
+        )
+        if required:
+            raise RuntimeError(message) from None
+        logger.warning(message)
+        return False
+
+    marker = "NeMo-RL patch (DSA top-k capture transport)"
+    import_old_snippet = "import logging\nfrom collections.abc import Callable\n"
+    import_new_snippet = (
+        "import logging\nimport os\nfrom collections.abc import Callable\n"
+    )
+    shape_old_snippet = """def _get_routed_experts_shape(vllm_config: VllmConfig) -> tuple[int, int, int]:
+    model_config = vllm_config.model_config
+    num_layers = model_config.get_total_num_hidden_layers()
+    num_experts = model_config.get_num_experts()
+    num_experts_per_tok = model_config.get_num_experts_per_tok()
+    if num_layers <= 0 or num_experts <= 0 or num_experts_per_tok <= 0:
+        raise ValueError(
+            "Routed-experts capture requires positive layer, expert, and "
+            "experts-per-token counts, got "
+            f"{num_layers=}, {num_experts=}, {num_experts_per_tok=}."
+        )
+    return num_layers, num_experts, num_experts_per_tok
+"""
+    shape_new_snippet = '''# NeMo-RL patch (DSA top-k capture transport): use the routed-experts
+# slot-indexed transport for per-layer DSA top-k indices when explicitly enabled.
+_NRL_DSA_TOPK_CAPTURE_ENV_VAR = "NRL_VLLM_DSA_TOPK_CAPTURE"
+_NRL_DSA_TOPK_LAYER_IDS_ENV_VAR = "NRL_VLLM_DSA_TOPK_LAYER_IDS"
+
+
+def _nrl_dsa_topk_dtype(max_model_len: int):
+    if max_model_len <= 0:
+        raise ValueError(
+            "DSA top-k capture requires a positive max_model_len, got "
+            f"{max_model_len}."
+        )
+    # Key ids are in [0, max_model_len - 1], plus the -1 missing-key sentinel.
+    return np.int16 if max_model_len <= 32768 else np.int32
+
+
+def _nrl_dsa_topk_torch_dtype(max_model_len: int) -> torch.dtype:
+    return (
+        torch.int16
+        if _nrl_dsa_topk_dtype(max_model_len) is np.int16
+        else torch.int32
+    )
+
+
+class _NRLDSASparseSlotBuffer:
+    """Lazily allocate DSA replay rows one physical KV block at a time."""
+
+    def __init__(
+        self,
+        *,
+        max_num_slots: int,
+        block_size: int,
+        num_layers: int,
+        top_k: int,
+        dtype,
+    ) -> None:
+        if (
+            max_num_slots <= 0
+            or block_size <= 0
+            or max_num_slots % block_size != 0
+            or num_layers <= 0
+            or top_k <= 0
+        ):
+            raise ValueError(
+                "Invalid DSA sparse slot-buffer shape: "
+                f"{max_num_slots=}, {block_size=}, {num_layers=}, {top_k=}."
+            )
+        self.shape = (max_num_slots, num_layers, top_k)
+        self.dtype = np.dtype(dtype)
+        if self.dtype not in (np.dtype(np.int16), np.dtype(np.int32)):
+            raise TypeError(f"DSA sparse slot-buffer dtype must be signed, got {dtype}.")
+        self._block_size = block_size
+        self._row_shape = (num_layers, top_k)
+        self._blocks: dict[int, np.ndarray] = {}
+
+    @property
+    def nbytes(self) -> int:
+        block_elements = self._block_size * self._row_shape[0] * self._row_shape[1]
+        return len(self._blocks) * block_elements * self.dtype.itemsize
+
+    def _normalize_slots(self, slot_mapping) -> np.ndarray:
+        slots = np.asarray(slot_mapping)
+        if not np.issubdtype(slots.dtype, np.integer):
+            raise TypeError(
+                "DSA sparse slot mappings must contain integers, got "
+                f"dtype={slots.dtype}."
+            )
+        slots = slots.astype(np.int64, copy=False)
+        if slots.size:
+            min_slot = int(slots.min())
+            max_slot = int(slots.max())
+            if min_slot < 0 or max_slot >= self.shape[0]:
+                raise IndexError(
+                    "DSA sparse slot mapping is out of range: expected slots in "
+                    f"[0, {self.shape[0]}), got min={min_slot}, max={max_slot}."
+                )
+        return slots
+
+    def __getitem__(self, slot_mapping) -> np.ndarray:
+        slots = self._normalize_slots(slot_mapping)
+        result = np.full(slots.shape + self._row_shape, -1, dtype=self.dtype)
+        flat_slots = slots.reshape(-1)
+        flat_result = result.reshape((-1, *self._row_shape))
+        block_ids = flat_slots // self._block_size
+        for block_id in np.unique(block_ids):
+            block = self._blocks.get(int(block_id))
+            if block is None:
+                continue
+            positions = np.flatnonzero(block_ids == block_id)
+            offsets = flat_slots[positions] % self._block_size
+            flat_result[positions] = block[offsets]
+        return result
+
+    def __setitem__(self, slot_mapping, data) -> None:
+        slots = self._normalize_slots(slot_mapping)
+        values = np.asarray(data)
+        expected_shape = slots.shape + self._row_shape
+        if values.shape != expected_shape:
+            raise ValueError(
+                "DSA sparse slot-buffer assignment shape mismatch: expected "
+                f"{expected_shape}, got {values.shape}."
+            )
+        if not np.issubdtype(values.dtype, np.integer):
+            raise TypeError(
+                "DSA sparse slot-buffer values must be integers, got "
+                f"dtype={values.dtype}."
+            )
+        if values.size:
+            min_value = int(values.min())
+            max_value = int(values.max())
+            max_stored_value = int(np.iinfo(self.dtype).max)
+            if min_value < -1 or max_value > max_stored_value:
+                raise ValueError(
+                    "DSA sparse slot-buffer values are out of range: expected "
+                    f"[-1, {max_stored_value}], got min={min_value}, "
+                    f"max={max_value}."
+                )
+
+        flat_slots = slots.reshape(-1)
+        flat_values = values.reshape((-1, *self._row_shape))
+        block_ids = flat_slots // self._block_size
+        for block_id_value in np.unique(block_ids):
+            block_id = int(block_id_value)
+            positions = np.flatnonzero(block_ids == block_id_value)
+            offsets = flat_slots[positions] % self._block_size
+            # NumPy's repeated advanced-index assignment semantics should not
+            # decide replay correctness. Select each slot's last input row.
+            _, first_from_end = np.unique(offsets[::-1], return_index=True)
+            last_positions = positions[offsets.size - 1 - first_from_end]
+            block = self._blocks.get(block_id)
+            if block is None:
+                block = np.full(
+                    (self._block_size, *self._row_shape), -1, dtype=self.dtype
+                )
+                self._blocks[block_id] = block
+            block_offsets = flat_slots[last_positions] % self._block_size
+            block[block_offsets] = flat_values[last_positions]
+
+
+def _nrl_dsa_topk_capture_enabled() -> bool:
+    return os.environ.get(_NRL_DSA_TOPK_CAPTURE_ENV_VAR) == "1"
+
+
+def _nrl_dsa_topk_layer_ids(vllm_config: VllmConfig) -> list[int]:
+    config = vllm_config.model_config.hf_text_config
+    num_hidden_layers = int(getattr(config, "num_hidden_layers", 0))
+    if num_hidden_layers <= 0:
+        raise ValueError(
+            "DSA top-k capture requires a positive num_hidden_layers, got "
+            f"{num_hidden_layers}."
+        )
+
+    index_topk_freq = int(getattr(config, "index_topk_freq", 1))
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    index_skip_topk_offset = int(getattr(config, "index_skip_topk_offset", 2))
+    if index_topk_freq <= 0:
+        raise ValueError(
+            "DSA top-k capture requires a positive index_topk_freq, got "
+            f"{index_topk_freq}."
+        )
+
+    compute_layer_ids = []
+    for layer_id in range(num_hidden_layers):
+        if index_topk_pattern is None:
+            skip_topk = (
+                max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
+            )
+        elif layer_id < len(index_topk_pattern):
+            skip_topk = index_topk_pattern[layer_id] == "S"
+        else:
+            skip_topk = False
+        if not skip_topk:
+            compute_layer_ids.append(layer_id)
+
+    raw_layer_ids = os.environ.get(_NRL_DSA_TOPK_LAYER_IDS_ENV_VAR, "").strip()
+    if not raw_layer_ids:
+        selected_layer_ids = compute_layer_ids
+    else:
+        fields = raw_layer_ids.split(",")
+        if any(not field.strip() for field in fields):
+            raise ValueError(
+                "NRL_VLLM_DSA_TOPK_LAYER_IDS must be a comma-separated list "
+                f"of integers, got {raw_layer_ids!r}."
+            )
+        try:
+            selected_layer_ids = [int(field) for field in fields]
+        except ValueError as exc:
+            raise ValueError(
+                "NRL_VLLM_DSA_TOPK_LAYER_IDS must be a comma-separated list "
+                f"of integers, got {raw_layer_ids!r}."
+            ) from exc
+        if len(set(selected_layer_ids)) != len(selected_layer_ids):
+            raise ValueError(
+                "NRL_VLLM_DSA_TOPK_LAYER_IDS contains duplicate layer ids: "
+                f"{selected_layer_ids}."
+            )
+        invalid_layer_ids = sorted(set(selected_layer_ids) - set(compute_layer_ids))
+        if invalid_layer_ids:
+            raise ValueError(
+                "DSA top-k capture can only select non-MTP compute layers; "
+                f"invalid layer ids are {invalid_layer_ids}, available compute "
+                f"layers are {compute_layer_ids}."
+            )
+
+    if not selected_layer_ids:
+        raise ValueError("DSA top-k capture selected no compute layers.")
+    return selected_layer_ids
+
+
+def _get_routed_experts_shape(vllm_config: VllmConfig) -> tuple[int, int, int]:
+    model_config = vllm_config.model_config
+    if _nrl_dsa_topk_capture_enabled():
+        layer_ids = _nrl_dsa_topk_layer_ids(vllm_config)
+        max_model_len = int(model_config.max_model_len)
+        index_topk = int(getattr(model_config.hf_text_config, "index_topk", 0))
+        if max_model_len <= 0 or index_topk <= 0:
+            raise ValueError(
+                "DSA top-k capture requires positive max_model_len and index_topk, "
+                f"got {max_model_len=}, {index_topk=}."
+            )
+        return len(layer_ids), max_model_len, index_topk
+
+    num_layers = model_config.get_total_num_hidden_layers()
+    num_experts = model_config.get_num_experts()
+    num_experts_per_tok = model_config.get_num_experts_per_tok()
+    if num_layers <= 0 or num_experts <= 0 or num_experts_per_tok <= 0:
+        raise ValueError(
+            "Routed-experts capture requires positive layer, expert, and "
+            "experts-per-token counts, got "
+            f"{num_layers=}, {num_experts=}, {num_experts_per_tok=}."
+        )
+    return num_layers, num_experts, num_experts_per_tok
+'''
+    init_old_snippet = (
+        "        num_layers, _, num_experts_per_tok = "
+        "_get_routed_experts_shape(vllm_config)\n"
+        "        logger.info(\n"
+    )
+    init_new_snippet = (
+        "        num_layers, _, num_experts_per_tok = "
+        "_get_routed_experts_shape(vllm_config)\n"
+        "        nrl_dsa_topk_capture = _nrl_dsa_topk_capture_enabled()\n"
+        "        self._nrl_dsa_topk_layer_ids = (\n"
+        "            _nrl_dsa_topk_layer_ids(vllm_config)\n"
+        "            if nrl_dsa_topk_capture\n"
+        "            else None\n"
+        "        )\n"
+        "        nrl_dsa_topk_dtype = (\n"
+        "            _nrl_dsa_topk_torch_dtype(\n"
+        "                int(vllm_config.model_config.max_model_len)\n"
+        "            )\n"
+        "            if nrl_dsa_topk_capture\n"
+        "            else None\n"
+        "        )\n"
+        "        logger.info(\n"
+    )
+    device_buffer_old_snippet = """        self.device_buffer = torch.zeros(
+            (
+                max_num_batched_tokens,
+                num_layers,
+                num_experts_per_tok,
+            ),
+            # Use int32 for the device / host transit buffers: it
+            # matches the router's native topk_ids dtype, is universally
+            # supported by NCCL (uint8/uint16 are version-dependent),
+            # and the extra bytes are small (few MB per worker). The
+            # big scheduler-side slot buffer stays narrow.
+            dtype=torch.int32,
+            device=current_platform.device_type,
+        )
+"""
+    device_buffer_new_snippet = """        self.device_buffer = torch.full(
+            (
+                max_num_batched_tokens,
+                num_layers,
+                num_experts_per_tok,
+            ),
+            # Missing DSA rows must remain distinguishable from key 0. MoE
+            # capture retains its historical zero initialization.
+            fill_value=-1 if nrl_dsa_topk_capture else 0,
+            # DSA narrows only this destination buffer. Any TP all-gather in
+            # capture() has already run on the indexer's native int32 source,
+            # while D2H and numpy conversion preserve signed int16 directly.
+            dtype=nrl_dsa_topk_dtype or torch.int32,
+            device=current_platform.device_type,
+        )
+"""
+    binder_old_snippet = '''    """Attach capture callbacks to the target model's MoE routers."""
+    from vllm.model_executor.layers.fused_moe.layer import MoERunner
+'''
+    binder_new_snippet = '''    """Attach capture callbacks to MoE routers or selected DSA layers."""
+    if _nrl_dsa_topk_capture_enabled():
+        from vllm.model_executor.models.utils import extract_layer_index
+        from vllm.models.deepseek_v32.attention import DeepseekV32Attention
+
+        selected_layer_ids = capturer._nrl_dsa_topk_layer_ids
+        if selected_layer_ids is None:
+            raise ValueError("DSA top-k capturer was not initialized in DSA mode.")
+        compact_slot_by_layer = {
+            layer_id: slot for slot, layer_id in enumerate(selected_layer_ids)
+        }
+        bound_layer_ids = []
+        for module in model.modules():
+            if not isinstance(module, DeepseekV32Attention):
+                continue
+            layer_id = extract_layer_index(module.layer_name)
+            compact_slot = compact_slot_by_layer.get(layer_id)
+            if compact_slot is None or module.indexer is None:
+                continue
+            if layer_id in bound_layer_ids:
+                raise ValueError(
+                    f"Found duplicate DeepseekV32Attention for DSA layer {layer_id}."
+                )
+            module._nrl_dsa_topk_capture_fn = partial(
+                capturer.capture, compact_slot
+            )
+            bound_layer_ids.append(layer_id)
+
+        missing_layer_ids = sorted(set(selected_layer_ids) - set(bound_layer_ids))
+        if missing_layer_ids:
+            raise ValueError(
+                "Could not bind DSA top-k capture for selected compute layers "
+                f"{missing_layer_ids}; bound layers were {sorted(bound_layer_ids)}."
+            )
+        return
+
+    from vllm.model_executor.layers.fused_moe.layer import MoERunner
+'''
+    manager_old_snippet = """        expert_id_dtype = np.uint8 if num_experts <= 256 else np.uint16
+        self.routed_experts_by_slot = np.zeros(
+            (
+                max_num_slots,
+                num_layers,
+                num_experts_per_tok,
+            ),
+            dtype=expert_id_dtype,
+        )
+"""
+    manager_new_snippet = """        self._nrl_copy_step_outputs = _nrl_dsa_topk_capture_enabled()
+        if self._nrl_copy_step_outputs:
+            # DSA uses -1 for absent/padded key ids. Allocate only physical KV
+            # blocks that receive rows; a full slot-pool ndarray is prohibitive
+            # for many layers and index_topk=2048.
+            expert_id_dtype = _nrl_dsa_topk_dtype(num_experts)
+            self.routed_experts_by_slot = _NRLDSASparseSlotBuffer(
+                max_num_slots=max_num_slots,
+                block_size=self.block_size,
+                num_layers=num_layers,
+                top_k=num_experts_per_tok,
+                dtype=expert_id_dtype,
+            )
+        else:
+            expert_id_dtype = np.uint8 if num_experts <= 256 else np.uint16
+            self.routed_experts_by_slot = np.zeros(
+                (
+                    max_num_slots,
+                    num_layers,
+                    num_experts_per_tok,
+                ),
+                dtype=expert_id_dtype,
+            )
+"""
+
+    edits = (
+        ("import", import_old_snippet, import_new_snippet),
+        ("shape", shape_old_snippet, shape_new_snippet),
+        ("capturer init", init_old_snippet, init_new_snippet),
+        ("device buffer", device_buffer_old_snippet, device_buffer_new_snippet),
+        ("binder", binder_old_snippet, binder_new_snippet),
+        ("manager buffer", manager_old_snippet, manager_new_snippet),
+    )
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("vLLM DSA top-k capturer patch already applied.")
+            return True
+        invalid_anchors = [name for name, old, _ in edits if content.count(old) != 1]
+        if invalid_anchors:
+            message = (
+                "Could not apply vLLM DSA top-k capturer patch: expected "
+                f"exactly one of each source anchor {invalid_anchors} in "
+                f"{file_to_patch}. The vLLM version may have changed."
+            )
+            if required:
+                raise RuntimeError(message)
+            logger.warning(message)
+            return False
+        for _, old, new in edits:
+            content = content.replace(old, new, 1)
+        write_back(content)
+
+    logger.info("Successfully patched vLLM routed-experts transport for DSA top-k.")
+    return True
+
+
+def _patch_vllm_dsa_topk_scheduler(logger, *, required: bool = False) -> bool:
+    """Keep legacy-runner DSA decode rows alive across scheduler steps.
+
+    vLLM's synchronous legacy model runner exposes a NumPy view over a reused
+    pinned CPU buffer.  The scheduler normally keeps that view for per-request
+    decode output because routed-expert transit and storage dtypes differ.  DSA
+    intentionally uses the same signed dtype on both sides, so ``astype`` would
+    retain the reused view and a later D2H could overwrite earlier token rows.
+    """
+    try:
+        file_to_patch = _get_vllm_file("v1/core/sched/scheduler.py")
+    except RuntimeError:
+        message = "Could not locate scheduler.py for the DSA top-k copy patch."
+        if required:
+            raise RuntimeError(message) from None
+        logger.warning(message)
+        return False
+
+    marker = "NeMo-RL patch (retain DSA decode routes across steps)"
+    old_snippet = """            routing_data = re.routing_data.astype(
+                self.routed_experts_mgr.routed_experts_by_slot.dtype,
+                copy=False,
+            )
+"""
+    new_snippet = """            # NeMo-RL patch (retain DSA decode routes across steps): the legacy
+            # synchronous model runner returns a view into a reused pinned CPU
+            # buffer. DSA transit/storage dtypes can match, so force a private
+            # scheduler copy before per-request slices outlive this step.
+            routing_data = re.routing_data.astype(
+                self.routed_experts_mgr.routed_experts_by_slot.dtype,
+                copy=getattr(
+                    self.routed_experts_mgr, "_nrl_copy_step_outputs", False
+                ),
+            )
+"""
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("vLLM DSA top-k scheduler copy patch already applied.")
+            return True
+        if content.count(old_snippet) != 1:
+            message = (
+                "Could not apply vLLM DSA top-k scheduler copy patch: expected "
+                f"exactly one source anchor in {file_to_patch}. The vLLM "
+                "version may have changed."
+            )
+            if required:
+                raise RuntimeError(message)
+            logger.warning(message)
+            return False
+        write_back(content.replace(old_snippet, new_snippet, 1))
+
+    logger.info("Successfully patched vLLM scheduler for stable DSA decode rows.")
+    return True
+
+
+def _patch_vllm_dsa_topk_attention(logger, *, required: bool = False) -> bool:
+    """Capture each DSA compute layer before its shared top-k buffer is reused."""
+    try:
+        file_to_patch = _get_vllm_file("models/deepseek_v32/attention.py")
+    except RuntimeError:
+        message = "Could not locate DeepSeek V3.2 attention.py for DSA top-k capture."
+        if required:
+            raise RuntimeError(message) from None
+        logger.warning(message)
+        return False
+
+    marker = "NeMo-RL patch (capture DSA top-k before shared-buffer reuse)"
+    import_old_snippet = "from vllm.config import CacheConfig, VllmConfig\n"
+    import_new_snippet = (
+        "from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig\n"
+    )
+    capture_old_snippet = """        num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
+        if num_actual == 0:
+            output.zero_()
+            return
+
+        if self._use_sparse_mha(attn_metadata):
+"""
+    capture_new_snippet = """        num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
+        if num_actual == 0:
+            output.zero_()
+            return
+
+        use_mha = self._use_sparse_mha(attn_metadata)
+        capture_fn = getattr(self, "_nrl_dsa_topk_capture_fn", None)
+        if capture_fn is not None:
+            # NeMo-RL patch (capture DSA top-k before shared-buffer reuse): every
+            # compute layer writes the same model-level buffer, so copy it into
+            # the slot-indexed capturer before the next layer overwrites it. For
+            # dense prefill, capture the key set actually consumed by attention,
+            # rather than stale or unused scorer output.
+            assert self.indexer is not None
+            assert self.topk_indices_buffer is not None
+            prefill_metadata = getattr(attn_metadata, "prefill", None)
+            num_decode_tokens = getattr(attn_metadata, "num_decode_tokens", -1)
+            dense_prefill = use_mha and getattr(
+                prefill_metadata, "use_dense_mha", False
+            )
+            scoring_was_skipped = (
+                get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL
+                and bool(self._dense_mha_metadata_layer_name)
+                and getattr(prefill_metadata, "use_dense_mha", False)
+                and num_decode_tokens == 0
+                and not torch.cuda.is_current_stream_capturing()
+            )
+            if scoring_was_skipped and not dense_prefill:
+                raise RuntimeError(
+                    "DSA indexer scoring was skipped for a batch that did not "
+                    "take the dense-prefill attention route."
+                )
+
+            topk = self.indexer.topk_tokens
+            scored_topk = self.topk_indices_buffer[:num_actual, :topk]
+            if dense_prefill:
+                # forward_impl partitions a mixed batch as sparse decode rows
+                # followed by dense-MHA prefill rows. Masked MHA is different:
+                # it consumes the scorer top-k as a mask and therefore does not
+                # enter this branch (use_dense_mha is false).
+                if not 0 <= num_decode_tokens <= num_actual:
+                    raise RuntimeError(
+                        "Invalid DSA decode/prefill partition for top-k capture: "
+                        f"num_decode_tokens={num_decode_tokens}, "
+                        f"num_actual_tokens={num_actual}."
+                    )
+                dense_positions = positions[num_decode_tokens:num_actual].to(
+                    device=self.topk_indices_buffer.device, dtype=torch.int64
+                )
+                if bool(torch.any((dense_positions < 0) | (dense_positions >= topk))):
+                    raise RuntimeError(
+                        "Dense DSA top-k capture cannot represent all causal keys: "
+                        f"positions must be in [0, {topk}), got "
+                        f"min={int(dense_positions.min().item())}, "
+                        f"max={int(dense_positions.max().item())}."
+                    )
+                key_ids = torch.arange(
+                    topk,
+                    dtype=self.topk_indices_buffer.dtype,
+                    device=self.topk_indices_buffer.device,
+                ).unsqueeze(0)
+                dense_topk = key_ids.expand(
+                    num_actual - num_decode_tokens, -1
+                ).clone()
+                dense_topk.masked_fill_(key_ids > dense_positions.unsqueeze(1), -1)
+                if num_decode_tokens:
+                    effective_topk = scored_topk.clone()
+                    effective_topk[num_decode_tokens:] = dense_topk
+                else:
+                    # Avoid reading the shared buffer when the pure-dense fast
+                    # path deliberately skipped scoring and left it stale.
+                    effective_topk = dense_topk
+                capture_fn(effective_topk)
+            else:
+                capture_fn(scored_topk)
+
+        if use_mha:
+"""
+
+    edits = (
+        ("CUDAGraphMode import", import_old_snippet, import_new_snippet),
+        ("capture", capture_old_snippet, capture_new_snippet),
+    )
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("vLLM DSA top-k attention capture patch already applied.")
+            return True
+        invalid_anchors = [name for name, old, _ in edits if content.count(old) != 1]
+        if invalid_anchors:
+            message = (
+                "Could not apply vLLM DSA top-k attention capture patch: expected "
+                f"exactly one of each source anchor {invalid_anchors} in "
+                f"{file_to_patch}. The vLLM version may have changed."
+            )
+            if required:
+                raise RuntimeError(message)
+            logger.warning(message)
+            return False
+        for _, old, new in edits:
+            content = content.replace(old, new, 1)
+        write_back(content)
+
+    logger.info("Successfully patched vLLM attention for DSA top-k capture.")
+    return True
+
+
 def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) -> bool:
     """Fire the routed-experts capture hook on the monolithic fused-MoE path.
 
@@ -1034,12 +1662,47 @@ def _apply_vllm_patches(
     extra_env_vars: list[str] | None = None,
     nemotron_h_fp32_lm_head: bool | None = None,
     require_moe_routed_experts_capture: bool = False,
+    require_dsa_topk_capture: bool = False,
+    dsa_topk_layer_ids: list[int] | None = None,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
     import vllm.envs as envs
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
+    if require_moe_routed_experts_capture and require_dsa_topk_capture:
+        raise ValueError(
+            "MoE router replay and DSA top-k replay cannot both use vLLM's "
+            "routed-experts capture channel."
+        )
+    if dsa_topk_layer_ids is not None and not require_dsa_topk_capture:
+        raise ValueError(
+            "dsa_topk_layer_ids was provided while DSA top-k capture is disabled."
+        )
+
+    if require_dsa_topk_capture:
+        selected_layer_ids = dsa_topk_layer_ids or []
+        if any(layer_id < 0 for layer_id in selected_layer_ids):
+            raise ValueError(
+                f"DSA top-k layer ids must be non-negative, got {selected_layer_ids}."
+            )
+        if len(set(selected_layer_ids)) != len(selected_layer_ids):
+            raise ValueError(
+                f"DSA top-k layer ids must be unique, got {selected_layer_ids}."
+            )
+        os.environ[VLLM_DSA_TOPK_CAPTURE_ENV_VAR] = "1"
+        os.environ[VLLM_DSA_TOPK_LAYER_IDS_ENV_VAR] = ",".join(
+            str(layer_id) for layer_id in selected_layer_ids
+        )
+        extra_env_vars = [
+            *(extra_env_vars or []),
+            VLLM_DSA_TOPK_CAPTURE_ENV_VAR,
+            VLLM_DSA_TOPK_LAYER_IDS_ENV_VAR,
+        ]
+    else:
+        os.environ.pop(VLLM_DSA_TOPK_CAPTURE_ENV_VAR, None)
+        os.environ.pop(VLLM_DSA_TOPK_LAYER_IDS_ENV_VAR, None)
+
     nemotron_h_fp32_lm_head_enabled = bool(nemotron_h_fp32_lm_head)
     if nemotron_h_fp32_lm_head_enabled:
         os.environ[VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] = "1"
@@ -1101,9 +1764,14 @@ def _apply_vllm_patches(
             "could not be applied. Disable the flag or update the patch anchors "
             "for this vLLM version."
         )
-    _patch_vllm_moe_routed_experts_capture(
-        patch_logger, required=require_moe_routed_experts_capture
-    )
-    _patch_vllm_routed_experts_capture_router_fallback(
-        patch_logger, required=require_moe_routed_experts_capture
-    )
+    if require_dsa_topk_capture:
+        _patch_vllm_dsa_topk_capturer(patch_logger, required=True)
+        _patch_vllm_dsa_topk_scheduler(patch_logger, required=True)
+        _patch_vllm_dsa_topk_attention(patch_logger, required=True)
+    else:
+        _patch_vllm_moe_routed_experts_capture(
+            patch_logger, required=require_moe_routed_experts_capture
+        )
+        _patch_vllm_routed_experts_capture_router_fallback(
+            patch_logger, required=require_moe_routed_experts_capture
+        )

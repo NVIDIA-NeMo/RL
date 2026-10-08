@@ -21,6 +21,8 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
+    DSA_TOPK_FALLBACK_DTYPE,
+    DSA_TOPK_MISSING_INDEX_SENTINEL,
     ROUTED_EXPERTS_FALLBACK_DTYPE,
     get_num_routed_experts,
     resolve_routed_experts_dtype,
@@ -36,6 +38,7 @@ from nemo_rl.models.generation.vllm.utils import (
     encode_counter_key,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
+    pad_and_align_dsa_topk_indices,
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
@@ -468,6 +471,103 @@ def test_normalize_routed_experts_strict_mode_rejects_surplus_routes():
             padded_length=3,
             device=torch.device("cpu"),
             require_complete_routed_experts=True,
+        )
+
+
+def test_pad_and_align_dsa_topk_concatenates_prompt_and_decode():
+    prompt = torch.tensor(
+        [
+            [[0, -1], [0, -1]],
+            [[1, 0], [0, 1]],
+        ],
+        dtype=torch.int32,
+    )
+    decode = torch.tensor(
+        [
+            [[2, 0], [1, 2]],
+            [[3, 1], [2, 0]],
+            # vLLM may return one surplus row for the final sampled token.
+            [[4, 3], [4, 2]],
+        ],
+        dtype=torch.int32,
+    )
+
+    aligned = pad_and_align_dsa_topk_indices(
+        SimpleNamespace(prompt_routed_experts=prompt),
+        SimpleNamespace(routed_experts=decode),
+        valid_length=5,
+        padded_length=7,
+        device=torch.device("cpu"),
+        required=True,
+    )
+
+    assert aligned is not None
+    assert aligned.shape == (7, 2, 2)
+    assert aligned.dtype == DSA_TOPK_FALLBACK_DTYPE
+    assert torch.equal(aligned[:2], prompt.to(DSA_TOPK_FALLBACK_DTYPE))
+    assert torch.equal(aligned[2:4], decode[:2].to(DSA_TOPK_FALLBACK_DTYPE))
+    assert torch.equal(
+        aligned[4:],
+        torch.full(
+            (3, 2, 2),
+            DSA_TOPK_MISSING_INDEX_SENTINEL,
+            dtype=DSA_TOPK_FALLBACK_DTYPE,
+        ),
+    )
+
+
+def test_pad_and_align_dsa_topk_rejects_incomplete_capture():
+    captured = torch.tensor(
+        [
+            [[0, -1]],
+            [[1, 0]],
+            [[2, 1]],
+        ],
+        dtype=torch.int32,
+    )
+
+    with pytest.raises(ValueError, match="incomplete DSA top-k capture"):
+        pad_and_align_dsa_topk_indices(
+            SimpleNamespace(),
+            SimpleNamespace(routed_experts=captured),
+            valid_length=5,
+            padded_length=5,
+            device=torch.device("cpu"),
+            required=True,
+        )
+
+
+def test_pad_and_align_dsa_topk_rejects_noncausal_key():
+    captured = torch.tensor([[[1]], [[0]]], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="non-causal DSA key index"):
+        pad_and_align_dsa_topk_indices(
+            SimpleNamespace(),
+            SimpleNamespace(routed_experts=captured),
+            valid_length=3,
+            padded_length=3,
+            device=torch.device("cpu"),
+            required=True,
+        )
+
+
+def test_pad_and_align_dsa_topk_rejects_missing_effective_layer_row():
+    captured = torch.tensor(
+        [
+            [[0, -1], [0, -1]],
+            [[1, 0], [-1, -1]],
+        ],
+        dtype=torch.int32,
+    )
+
+    with pytest.raises(ValueError, match="empty DSA top-k capture row"):
+        pad_and_align_dsa_topk_indices(
+            SimpleNamespace(),
+            SimpleNamespace(routed_experts=captured),
+            valid_length=3,
+            padded_length=3,
+            device=torch.device("cpu"),
+            required=True,
         )
 
 

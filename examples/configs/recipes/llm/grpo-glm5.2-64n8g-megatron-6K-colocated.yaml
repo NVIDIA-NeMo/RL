@@ -31,6 +31,10 @@ checkpointing:
 
 policy:
   model_name: zai-org/GLM-5.2
+  # Experimental correctness/debug path. Full 6K capture is very large; use
+  # layer_ids (zero-based vLLM transformer layers) for focused validation.
+  dsa_topk_replay:
+    enabled: false
   # TODO: Remove this workaround after upgrading Transformers to a version that
   # preserves GLM-5.2's qk_rope_head_dim when loading its config.
   hf_config_overrides:

@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict, Union
+from collections.abc import Mapping
+from typing import Annotated, Any, Literal, NotRequired, Self, TypedDict, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, TypeAdapter, model_validator
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
@@ -629,6 +630,62 @@ class RouterReplayConfig(TypedDict):
     enabled: Literal[True]
 
 
+class DSATopKReplayConfigDisabled(BaseModel, extra="allow"):
+    """Disabled DSA top-k replay configuration."""
+
+    enabled: Literal[False] = False
+
+
+class DSATopKReplayConfig(BaseModel, extra="allow"):
+    """Replay vLLM's DSA selector output in the Megatron policy.
+
+    ``layer_ids`` uses vLLM's zero-based transformer-layer numbering. ``None``
+    captures every layer that computes DSA top-k; a list can be used to keep a
+    diagnostic run's capture/transport footprint manageable.
+    """
+
+    enabled: Literal[True] = True
+    layer_ids: (
+        Annotated[
+            list[Annotated[int, Field(strict=True, ge=0)]],
+            Field(min_length=1),
+        ]
+        | None
+    )
+
+    @model_validator(mode="after")
+    def validate_unique_layer_ids(self) -> Self:
+        """Reject ambiguous payload layouts caused by duplicate layer ids."""
+        layer_ids = self.layer_ids
+        if layer_ids is not None and len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("layer_ids must not contain duplicates")
+        return self
+
+
+DSATopKReplayConfigUnion = Annotated[
+    Union[DSATopKReplayConfig, DSATopKReplayConfigDisabled],
+    Field(discriminator="enabled"),
+]
+_DSA_TOPK_REPLAY_CONFIG_ADAPTER = TypeAdapter(DSATopKReplayConfigUnion)
+
+
+def coerce_dsa_topk_replay_config(
+    config: (
+        DSATopKReplayConfig | DSATopKReplayConfigDisabled | Mapping[str, Any] | None
+    ),
+) -> DSATopKReplayConfig | DSATopKReplayConfigDisabled | None:
+    """Validate hand-built policy configs at their runtime boundary.
+
+    ``MasterConfig`` normally performs this conversion, but ``PolicyConfig`` is
+    still a ``TypedDict`` and tests or library callers may construct it directly.
+    """
+    if config is None or isinstance(
+        config, (DSATopKReplayConfig, DSATopKReplayConfigDisabled)
+    ):
+        return config
+    return _DSA_TOPK_REPLAY_CONFIG_ADAPTER.validate_python(config)
+
+
 class OnPolicyDistillationFullTransport(TypedDict):
     """Resolved full-vocabulary MOPD settings carried to the policy workers.
 
@@ -677,6 +734,7 @@ class PolicyConfig(TypedDict):
     # deepcopy) to the teacher group. Absent means full-vocabulary MOPD is off.
     on_policy_distillation_full: NotRequired[OnPolicyDistillationFullTransport]
     router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
+    dsa_topk_replay: NotRequired[DSATopKReplayConfigUnion]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]

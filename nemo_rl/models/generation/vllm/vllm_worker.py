@@ -32,10 +32,12 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
+    DSA_TOPK_FALLBACK_DTYPE,
     ROUTED_EXPERTS_FALLBACK_DTYPE,
     GenerationDatumSpec,
     GenerationOutputSpec,
     get_num_routed_experts,
+    resolve_dsa_topk_dtype,
     resolve_routed_experts_dtype,
     verify_right_padding,
 )
@@ -57,6 +59,7 @@ from nemo_rl.models.generation.vllm.utils import (
     HISTOGRAM_SUM_PART,
     encode_counter_key,
     format_prompt_for_vllm_generation,
+    pad_and_align_dsa_topk_indices,
     pad_and_align_routed_expert_indices,
     validate_rollout_prompt,
 )
@@ -484,6 +487,10 @@ class BaseVllmGenerationWorker:
         self.model_name = self.cfg["model_name"]
         # Refined from the model's expert count in _load_model.
         self.routed_experts_dtype = ROUTED_EXPERTS_FALLBACK_DTYPE
+        self.dsa_topk_dtype = DSA_TOPK_FALLBACK_DTYPE
+        self._dsa_topk_replay_enabled = bool(
+            self.cfg.get("_dsa_topk_replay_enabled", False)
+        )
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.expert_parallel_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -506,7 +513,10 @@ class BaseVllmGenerationWorker:
                 (self.cfg.get("vllm_kwargs") or {}).get(
                     "enable_return_routed_experts", False
                 )
-            ),
+            )
+            and not self._dsa_topk_replay_enabled,
+            require_dsa_topk_capture=self._dsa_topk_replay_enabled,
+            dsa_topk_layer_ids=self.cfg.get("_dsa_topk_replay_layer_ids"),
         )
 
         # Skip model loading if we're not the model owner
@@ -687,6 +697,9 @@ class BaseVllmGenerationWorker:
         hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
         self.routed_experts_dtype = resolve_routed_experts_dtype(
             get_num_routed_experts(hf_config)
+        )
+        self.dsa_topk_dtype = resolve_dsa_topk_dtype(
+            int(self.cfg["vllm_cfg"]["max_model_len"])
         )
         if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
             validate_nvfp4_pertoken_model(hf_config)
@@ -1172,6 +1185,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         output_ids_list = []
         logprobs_list = []
         routed_experts_list = []
+        dsa_topk_indices_list = []
         r3_missing_routes = []
         r3_expected_routes = []
         r3_actual_routes = []
@@ -1179,8 +1193,13 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         unpadded_sequence_lengths = []
         truncated_list = []  # Track if response was truncated (hit max_tokens)
         max_length = 0
-        return_routed_experts = bool(
-            self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
+        return_routed_experts = (
+            bool(
+                self.cfg.get("vllm_kwargs", {}).get(
+                    "enable_return_routed_experts", False
+                )
+            )
+            and not self._dsa_topk_replay_enabled
         )
         for output in outputs:
             max_length = max(max_length, len(output.outputs[0].token_ids))
@@ -1231,27 +1250,40 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             logprobs_list.append(full_logprobs)
 
             response_length = sequence_length + len(generated_tokens)
-            full_routed_experts, r3_stats = pad_and_align_routed_expert_indices(
-                output,
-                generation,
-                valid_length=response_length,
-                padded_length=total_length,
-                device=input_ids.device,
-                require_complete_routed_experts=return_routed_experts,
-                return_stats=True,
-                routed_experts_dtype=self.routed_experts_dtype,
-            )
-            if return_routed_experts and full_routed_experts is None:
-                raise RuntimeError(
-                    "vLLM was asked to return routed experts but the generation output "
-                    "did not include routed_experts."
+            if self._dsa_topk_replay_enabled:
+                dsa_topk_indices = pad_and_align_dsa_topk_indices(
+                    output,
+                    generation,
+                    valid_length=response_length,
+                    padded_length=total_length,
+                    device=input_ids.device,
+                    required=True,
+                    dtype=self.dsa_topk_dtype,
                 )
-            if return_routed_experts:
-                r3_missing_routes.append(r3_stats["missing_routes"])
-                r3_expected_routes.append(r3_stats["expected_routes"])
-                r3_actual_routes.append(r3_stats["actual_routes"])
-            if full_routed_experts is not None:
-                routed_experts_list.append(full_routed_experts)
+                assert dsa_topk_indices is not None
+                dsa_topk_indices_list.append(dsa_topk_indices)
+            else:
+                full_routed_experts, r3_stats = pad_and_align_routed_expert_indices(
+                    output,
+                    generation,
+                    valid_length=response_length,
+                    padded_length=total_length,
+                    device=input_ids.device,
+                    require_complete_routed_experts=return_routed_experts,
+                    return_stats=True,
+                    routed_experts_dtype=self.routed_experts_dtype,
+                )
+                if return_routed_experts and full_routed_experts is None:
+                    raise RuntimeError(
+                        "vLLM was asked to return routed experts but the generation "
+                        "output did not include routed_experts."
+                    )
+                if return_routed_experts:
+                    r3_missing_routes.append(r3_stats["missing_routes"])
+                    r3_expected_routes.append(r3_stats["expected_routes"])
+                    r3_actual_routes.append(r3_stats["actual_routes"])
+                if full_routed_experts is not None:
+                    routed_experts_list.append(full_routed_experts)
 
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
@@ -1300,6 +1332,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         )
         if routed_experts_list:
             return_data["routed_experts"] = torch.stack(routed_experts_list)
+        if dsa_topk_indices_list:
+            return_data["dsa_topk_indices"] = torch.stack(dsa_topk_indices_list)
         if r3_missing_routes:
             return_data["r3_routed_experts_missing_routes"] = torch.tensor(
                 r3_missing_routes, dtype=torch.long

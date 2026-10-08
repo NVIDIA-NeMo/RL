@@ -346,6 +346,21 @@ def test_build_generation_passes_sglang_config():
     generation.finish_generation.assert_called_once_with()
 
 
+def test_build_generation_rejects_dsa_topk_replay_tq_transport():
+    master_config = _make_master_config(backend="vllm")
+    master_config.policy["model_name"] = "test-model"
+    master_config.policy["dsa_topk_replay"] = {
+        "enabled": True,
+        "layer_ids": None,
+    }
+
+    with pytest.raises(ValueError, match="SingleController/TQ transport"):
+        sc_setup_mod._build_generation(
+            MagicMock(name="inference_cluster"),
+            master_config,
+        )
+
+
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
     master_config = _make_master_config(colocated=False, backend="trtllm")

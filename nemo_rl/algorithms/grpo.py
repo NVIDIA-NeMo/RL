@@ -112,6 +112,7 @@ from nemo_rl.experience.metric_utils import is_histogram_metric
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
+    backfill_missing_dsa_topk_indices,
     backfill_missing_routed_experts,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
@@ -136,6 +137,11 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
+)
+from nemo_rl.models.megatron.dsa_topk_replay import (
+    configure_vllm_for_dsa_topk_replay,
+    dsa_topk_replay_enabled,
+    validate_dsa_topk_replay_static_config,
 )
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
@@ -601,6 +607,27 @@ def setup(
     logger_config = master_config.logger
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
+
+    # Validate before backend dispatch or cluster allocation.  The Megatron
+    # worker repeats this check when it installs the runtime selector patch.
+    validate_dsa_topk_replay_static_config(policy_config)
+
+    if (
+        dsa_topk_replay_enabled(policy_config)
+        and grpo_config.async_grpo is not None
+        and grpo_config.async_grpo.enabled
+    ):
+        raise ValueError(
+            "dsa_topk_replay currently supports synchronous GRPO only; set "
+            "grpo.async_grpo.enabled=false."
+        )
+    if dsa_topk_replay_enabled(policy_config) and (master_config.data_plane or {}).get(
+        "enabled", False
+    ):
+        raise ValueError(
+            "dsa_topk_replay currently supports the legacy in-process data path "
+            "only; set data_plane.enabled=false."
+        )
 
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
@@ -1614,6 +1641,12 @@ def setup(
             )
 
         configure_vllm_for_router_replay(policy_config)
+        configure_vllm_for_dsa_topk_replay(policy_config)
+        if dsa_topk_replay_enabled(policy_config) and enable_nemo_gym:
+            raise ValueError(
+                "dsa_topk_replay currently requires native synchronous rollouts; "
+                "the NeMo-Gym/OpenAI response transport does not carry DSA indices."
+            )
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
 
         ## make vllm hf overrides match the training policy
@@ -2180,6 +2213,8 @@ def scale_rewards(
 def extract_initial_prompt_messages(
     message_logs: list,
     original_prompt_lengths: torch.Tensor,
+    *,
+    keys_to_keep: Optional[list[str]] = None,
 ) -> list:
     """Extract the original prompt messages from message logs using token length.
 
@@ -2189,6 +2224,9 @@ def extract_initial_prompt_messages(
     Args:
         message_logs: List of message logs, where each log is a list of messages.
         original_prompt_lengths: Tensor of original prompt token lengths per sample.
+        keys_to_keep: Optional projection applied to each selected message. Tensor
+            values are referenced, not copied. Use this before prompt-only
+            flattening to avoid materializing unrelated token-aligned payloads.
 
     Returns:
         List of message logs containing only the original prompt messages.
@@ -2205,6 +2243,10 @@ def extract_initial_prompt_messages(
             initial_prompt_log.append(message)
             cumulative_length += len(message["token_ids"])
 
+        if keys_to_keep is not None:
+            initial_prompt_log = get_keys_from_message_log(
+                initial_prompt_log, keys_to_keep
+            )
         initial_prompt_message_logs.append(initial_prompt_log)
 
     return initial_prompt_message_logs
@@ -2229,6 +2271,7 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
             ``generation_logprobs`` are treated as rollout-generated messages.
     """
     backfill_missing_routed_experts(message_logs)
+    backfill_missing_dsa_topk_indices(message_logs)
     for message_log in message_logs:
         for message in message_log:
             role = cast(str, message["role"])
@@ -2425,6 +2468,16 @@ def _preserve_router_replay_routed_experts(
         target["routed_experts"] = flat_messages["routed_experts"]
 
 
+def _preserve_dsa_topk_replay_indices(
+    target: BatchedDataDict,
+    flat_messages: BatchedDataDict,
+    policy_config: PolicyConfig,
+) -> None:
+    """Carry rollout-recorded DSA selections into Megatron worker inputs."""
+    if dsa_topk_replay_enabled(policy_config) and "dsa_topk_indices" in flat_messages:
+        target["dsa_topk_indices"] = flat_messages["dsa_topk_indices"]
+
+
 def _policy_dtype(policy_config: PolicyConfig) -> torch.dtype:
     """Resolve the configured policy precision to its matching torch dtype."""
     return getattr(torch, policy_config["precision"])
@@ -2447,6 +2500,7 @@ def _build_async_grpo_train_data(
         }
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
+    _preserve_dsa_topk_replay_indices(train_data, flat_messages, policy_config)
     # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(
         as_tensors=False, pixel_dtype=_policy_dtype(policy_config)
@@ -3460,15 +3514,12 @@ def _grpo_train_impl(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Must precede prompt extraction: it reuses the same message
-                    # dicts, so this also protects the prompt flatten below.
-                    backfill_missing_routed_experts(repeated_batch["message_log"])
-
                     # Extract original prompt messages using the length field
                     # This correctly handles multi-turn prompts that contain assistant messages
                     initial_prompt_message_logs = extract_initial_prompt_messages(
                         repeated_batch["message_log"],
                         repeated_batch["length"],
+                        keys_to_keep=["token_ids"],
                     )
                     prompt_batched_flat, _ = batched_message_log_to_flat_message(
                         initial_prompt_message_logs,
@@ -3551,6 +3602,9 @@ def _grpo_train_impl(
                     _preserve_router_replay_routed_experts(
                         train_data, flat_messages, master_config.policy
                     )
+                    _preserve_dsa_topk_replay_indices(
+                        train_data, flat_messages, master_config.policy
+                    )
                     train_data.to("cpu")
 
                     metrics_logging_data["content"] = flat_messages["content"]
@@ -3595,6 +3649,9 @@ def _grpo_train_impl(
                     # =False short-circuits before the field is read), so a
                     # present-but-unused field here is safe.
                     _preserve_router_replay_routed_experts(
+                        logprob_data, flat_messages, master_config.policy
+                    )
+                    _preserve_dsa_topk_replay_indices(
                         logprob_data, flat_messages, master_config.policy
                     )
 
@@ -5280,15 +5337,12 @@ def async_grpo_train(
                         RLSpanGroup.REWARD, "rl.grpo.reward_calculation", tracer=_tracer
                     ),
                 ):
-                    # Must precede prompt extraction: it reuses the same message
-                    # dicts, so this also protects the prompt flatten below.
-                    backfill_missing_routed_experts(repeated_batch["message_log"])
-
                     # Extract original prompt messages using the length field
                     # This correctly handles multi-turn prompts that contain assistant messages
                     initial_prompt_message_logs = extract_initial_prompt_messages(
                         repeated_batch["message_log"],
                         repeated_batch["length"],
+                        keys_to_keep=["token_ids"],
                     )
 
                     prompt_batched_flat, _ = batched_message_log_to_flat_message(

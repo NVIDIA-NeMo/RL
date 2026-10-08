@@ -144,6 +144,9 @@ def test_sync_rollout_actor_prompt_extraction_and_masks_match_grpo() -> None:
                 "content": "generated",
                 "token_ids": torch.tensor([6, 7]),
                 "generation_logprobs": torch.tensor([0.1, 0.2]),
+                "dsa_topk_indices": torch.tensor(
+                    [[[0, -1]], [[1, 0]]], dtype=torch.int16
+                ),
             },
         ]
     ]
@@ -156,6 +159,9 @@ def test_sync_rollout_actor_prompt_extraction_and_masks_match_grpo() -> None:
     )
 
     assert torch.equal(prompt_flat["token_ids"], torch.tensor([[1, 2, 3, 4, 5]]))
+    assert set(prompt_flat) == {"token_ids"}
+    assert "dsa_topk_indices" in flat
+    assert flat["dsa_topk_indices"].shape == (1, 7, 1, 2)
     assert torch.equal(
         flat["token_loss_mask"],
         torch.tensor([[0, 0, 0, 0, 0, 1, 1]]),

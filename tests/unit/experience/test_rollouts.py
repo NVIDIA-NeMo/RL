@@ -62,6 +62,8 @@ from nemo_rl.experience.rollouts import (
     _add_multimodal_generation_payload,
     _reattach_original_multimodal_payloads,
     async_generate_response_for_sample_turn,
+    backfill_missing_dsa_topk_indices,
+    generate_responses,
     generate_responses_async,
     run_async_multi_turn_rollout,
     run_async_multi_turn_rollout_groups,
@@ -545,6 +547,73 @@ class _DummyTokenizer:
 
     def batch_decode(self, generated_ids, skip_special_tokens=True):
         return ["ok" for _ in generated_ids]
+
+
+def test_generate_responses_splits_full_sequence_dsa_capture_across_messages():
+    class _Generation:
+        def generate(self, data, greedy=False):
+            del data, greedy
+            indices = torch.arange(5 * 2 * 2, dtype=torch.int16).reshape(1, 5, 2, 2)
+            return BatchedDataDict(
+                {
+                    "output_ids": torch.tensor([[10, 11, 12, 20, 21]]),
+                    "generation_lengths": torch.tensor([2]),
+                    "unpadded_sequence_lengths": torch.tensor([5]),
+                    "logprobs": torch.zeros(1, 5),
+                    "dsa_topk_indices": indices,
+                }
+            )
+
+    message_log = [
+        {"role": "user", "content": "prompt", "token_ids": torch.tensor([10, 11])},
+        {"role": "assistant", "content": "prior", "token_ids": torch.tensor([12])},
+    ]
+    batch = BatchedDataDict({"message_log": [message_log]})
+    generation_input = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[10, 11, 12]]),
+            "input_lengths": torch.tensor([3]),
+        }
+    )
+
+    updated, _, _ = generate_responses(
+        _Generation(),
+        generation_input,
+        batch,
+        _DummyTokenizer(),
+        input_lengths=generation_input["input_lengths"],
+    )
+
+    capture = torch.arange(5 * 2 * 2, dtype=torch.int16).reshape(5, 2, 2)
+    messages = updated["message_log"][0]
+    assert torch.equal(messages[0]["dsa_topk_indices"], capture[:2])
+    assert torch.equal(messages[1]["dsa_topk_indices"], capture[2:3])
+    assert torch.equal(messages[2]["dsa_topk_indices"], capture[3:5])
+
+
+def test_backfill_missing_dsa_topk_indices_uses_full_row_sentinel():
+    captured = torch.arange(2 * 2 * 2, dtype=torch.int16).reshape(2, 2, 2)
+    message_logs = [
+        [
+            {"role": "user", "token_ids": torch.tensor([1])},
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([2, 3]),
+                "dsa_topk_indices": captured,
+            },
+        ],
+        [{"role": "user", "token_ids": torch.tensor([4, 5, 6])}],
+    ]
+
+    counts = backfill_missing_dsa_topk_indices(message_logs)
+
+    assert counts == [1, 1]
+    assert torch.equal(message_logs[0][1]["dsa_topk_indices"], captured)
+    for message in (message_logs[0][0], message_logs[1][0]):
+        backfilled = message["dsa_topk_indices"]
+        assert backfilled.shape == (len(message["token_ids"]), 2, 2)
+        assert backfilled.dtype == captured.dtype
+        assert torch.all(backfilled == -1)
 
 
 class _DummySGLangGeneration:

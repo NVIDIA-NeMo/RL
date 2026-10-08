@@ -205,6 +205,10 @@ class VllmRefitConfig(BaseModel, extra="allow"):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    # Internal settings materialized from policy.dsa_topk_replay before the
+    # generation worker starts. They are not forwarded to vLLM's LLM kwargs.
+    _dsa_topk_replay_enabled: NotRequired[bool]
+    _dsa_topk_replay_layer_ids: NotRequired[list[int] | None]
     # Per-token NVFP4 W4A4 rollout (TE-training flow; no ModelOpt training).
     # Mutually exclusive with quant_cfg/real_quant below. Defaults and validation
     # live in NvFp4PerTokenRolloutConfig.

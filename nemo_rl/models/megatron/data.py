@@ -63,6 +63,8 @@ class ProcessedInputs:
     padding_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
+    dsa_topk_indices: Optional[torch.Tensor] = None
+    dsa_topk_indices_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
     media_token_validity_mask: Optional[torch.Tensor] = None
 
@@ -91,6 +93,8 @@ class ProcessedMicrobatch:
         padding_mask: Packed-sequence padding mask for MoE routing.
         routed_experts: Optional token-aligned routed expert ids
         routed_experts_cp_sharded: Context-parallel sharded routed expert ids
+        dsa_topk_indices: Optional token-aligned DSA key selections
+        dsa_topk_indices_cp_sharded: Context-parallel sharded DSA selections
         media_token_validity_mask: Which media-token positions actually anchor a
             projected feature, in the model's own token layout. None when the
             batch needs no correction and the model should derive its own.
@@ -107,6 +111,8 @@ class ProcessedMicrobatch:
     padding_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
+    dsa_topk_indices: Optional[torch.Tensor] = None
+    dsa_topk_indices_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
     media_token_validity_mask: Optional[torch.Tensor] = None
 
@@ -182,6 +188,8 @@ def make_processed_microbatch_iterator(
             padding_mask=processed_inputs.padding_mask,
             routed_experts=processed_inputs.routed_experts,
             routed_experts_cp_sharded=processed_inputs.routed_experts_cp_sharded,
+            dsa_topk_indices=processed_inputs.dsa_topk_indices,
+            dsa_topk_indices_cp_sharded=(processed_inputs.dsa_topk_indices_cp_sharded),
             original_seq_length=processed_inputs.original_seq_length,
             media_token_validity_mask=processed_inputs.media_token_validity_mask,
         )
@@ -550,6 +558,7 @@ def process_microbatch(
         routed_experts = (
             data_dict["routed_experts"] if "routed_experts" in data_dict else None
         )
+        dsa_topk_indices = data_dict.get("dsa_topk_indices")
         token_identity_cp_sharded = None
         if routed_experts is not None and routed_experts.dim() != 4:
             raise ValueError(
@@ -557,6 +566,13 @@ def process_microbatch(
                 f"before Megatron packing; got {tuple(routed_experts.shape)}"
             )
         routed_experts_cp_sharded = routed_experts
+        if dsa_topk_indices is not None and dsa_topk_indices.dim() != 4:
+            raise ValueError(
+                "dsa_topk_indices must have shape "
+                "[batch, seq, num_source_layers, topk] before Megatron packing; "
+                f"got {tuple(dsa_topk_indices.shape)}"
+            )
+        dsa_topk_indices_cp_sharded = dsa_topk_indices
 
         original_batch_size = input_ids.shape[0]
         seq_lengths = None  # Will be set if using packed sequences
@@ -580,6 +596,12 @@ def process_microbatch(
 
             prepacked = "cu_seqlens" in data_dict
             if prepacked:
+                if dsa_topk_indices is not None:
+                    raise NotImplementedError(
+                        "DSA top-k replay does not support prepacked input yet; "
+                        "request-local key indices need an explicit source-to-packed "
+                        "position map."
+                    )
                 if delegate_pack_to_model:
                     raise ValueError("Prepacked input cannot use model-owned packing.")
                 (
@@ -650,6 +672,12 @@ def process_microbatch(
                     raise NotImplementedError(
                         "Router replay (routed_experts) is not supported with "
                         "models that pack and context-parallel shard internally "
+                        "(delegate_pack_to_model=True)."
+                    )
+                if dsa_topk_indices is not None:
+                    raise NotImplementedError(
+                        "DSA top-k replay is not supported with models that pack "
+                        "and context-parallel shard internally "
                         "(delegate_pack_to_model=True)."
                     )
                 (
@@ -813,6 +841,29 @@ def process_microbatch(
                                     1, cp_partition_indices
                                 ).contiguous()
                             )
+                if dsa_topk_indices is not None:
+                    (
+                        dsa_topk_indices,
+                        dsa_topk_indices_cp_sharded,
+                    ) = _shard_dsa_topk_indices_for_cp(
+                        dsa_topk_indices,
+                        seq_lengths,
+                        cu_seqlens,
+                        cu_seqlens_padded,
+                        get_context_parallel_rank(),
+                        get_context_parallel_world_size(),
+                    )
+                    if model_slices_context_parallel_inputs:
+                        cp_partition_indices = get_packed_seq_cp_partition_indices(
+                            packed_seq_params,
+                            total_tokens=input_ids.shape[1],
+                            cp_size=get_context_parallel_world_size(),
+                            cp_rank=get_context_parallel_rank(),
+                            device=input_ids.device,
+                        )
+                        dsa_topk_indices_cp_sharded = dsa_topk_indices.index_select(
+                            1, cp_partition_indices
+                        ).contiguous()
                 if (
                     routed_experts_cp_sharded is not None
                     and routed_experts_cp_sharded.dim() != 4
@@ -821,6 +872,15 @@ def process_microbatch(
                         "CP-sharded routed_experts must have shape [1, tokens, "
                         "num_moe_layers, topk] after Megatron packing; got "
                         f"{tuple(routed_experts_cp_sharded.shape)}"
+                    )
+                if (
+                    dsa_topk_indices_cp_sharded is not None
+                    and dsa_topk_indices_cp_sharded.dim() != 4
+                ):
+                    raise ValueError(
+                        "CP-sharded dsa_topk_indices must have shape [1, tokens, "
+                        "num_source_layers, topk] after Megatron packing; got "
+                        f"{tuple(dsa_topk_indices_cp_sharded.shape)}"
                     )
                 verified_token_count = _verify_r3_trace_cp_token_alignment(
                     source_input_ids=data_dict["input_ids"],
@@ -966,6 +1026,17 @@ def process_microbatch(
                         input_ids,
                         data_dict["input_lengths"],
                     )
+            if dsa_topk_indices is not None:
+                if "input_lengths" not in data_dict:
+                    raise ValueError(
+                        "dsa_topk_indices requires input_lengths when sequence "
+                        "packing is disabled so padding rows can be marked missing."
+                    )
+                dsa_topk_indices = _fill_dsa_topk_padding(
+                    dsa_topk_indices,
+                    data_dict["input_lengths"],
+                )
+                dsa_topk_indices_cp_sharded = dsa_topk_indices
             input_ids_cp_sharded = input_ids
             verified_token_count = _verify_r3_trace_cp_token_alignment(
                 source_input_ids=data_dict["input_ids"],
@@ -1010,6 +1081,8 @@ def process_microbatch(
         padding_mask=padding_mask,
         routed_experts=routed_experts,
         routed_experts_cp_sharded=routed_experts_cp_sharded,
+        dsa_topk_indices=dsa_topk_indices,
+        dsa_topk_indices_cp_sharded=dsa_topk_indices_cp_sharded,
         original_seq_length=original_seq_length,
         media_token_validity_mask=media_token_validity_mask,
     )
@@ -1162,6 +1235,34 @@ def _fill_routed_experts_padding(
     ).view(1, 1, 1, routed_experts.shape[-1])
     default_routes = default_route.expand_as(repaired)
     repaired[padding_mask] = default_routes[padding_mask]
+    return repaired
+
+
+def _fill_dsa_topk_padding(
+    dsa_topk_indices: torch.Tensor,
+    seq_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Mark materialized jagged padding as missing DSA selector rows."""
+    if dsa_topk_indices.dim() != 4:
+        raise ValueError(
+            "dsa_topk_indices must have shape [batch, seq, layers, topk]; "
+            f"got {tuple(dsa_topk_indices.shape)}"
+        )
+    if seq_lengths.shape != (dsa_topk_indices.shape[0],):
+        raise ValueError(
+            "seq_lengths must have one entry per dsa_topk_indices row; "
+            f"got {tuple(seq_lengths.shape)} for batch={dsa_topk_indices.shape[0]}"
+        )
+
+    lengths = seq_lengths.to(device=dsa_topk_indices.device, dtype=torch.long)
+    positions = torch.arange(
+        dsa_topk_indices.shape[1], device=dsa_topk_indices.device
+    ).unsqueeze(0)
+    padding_mask = positions >= lengths.unsqueeze(1)
+    if not bool(padding_mask.any().item()):
+        return dsa_topk_indices
+    repaired = dsa_topk_indices.clone()
+    repaired[padding_mask] = -1
     return repaired
 
 
@@ -1644,6 +1745,71 @@ def _shard_routed_experts_for_cp(
         else None
     )
     return routed_packed, routed_cp_sharded, identity_packed, identity_cp_sharded
+
+
+def _shard_dsa_topk_indices_for_cp(
+    dsa_topk_indices: torch.Tensor,  # [B, S, L, K]
+    seq_lengths: torch.Tensor,  # [B]
+    cu_seqlens: torch.Tensor,  # [B+1]
+    cu_seqlens_padded: Optional[torch.Tensor],  # [B+1]
+    cp_rank: int,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack DSA rows and translate request-local keys to packed positions.
+
+    Query rows follow the same per-sequence zigzag CP partition as input_ids.
+    Values on the top-k axis remain global packed key positions and therefore
+    are never CP-sharded.
+    """
+    if dsa_topk_indices.dim() != 4:
+        raise ValueError(
+            "dsa_topk_indices must have shape [batch, seq, layers, topk]; "
+            f"got {tuple(dsa_topk_indices.shape)}"
+        )
+    if seq_lengths.shape != (dsa_topk_indices.shape[0],):
+        raise ValueError(
+            "seq_lengths must have one entry per dsa_topk_indices row; "
+            f"got {tuple(seq_lengths.shape)} for batch={dsa_topk_indices.shape[0]}"
+        )
+
+    all_rows = []
+    cp_rows = []
+    boundaries = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+    for batch_idx in range(int(seq_lengths.shape[0])):
+        seq_len = int(seq_lengths[batch_idx])
+        packed_start = int(boundaries[batch_idx])
+        padded_len = int(boundaries[batch_idx + 1] - boundaries[batch_idx])
+        source_rows = dsa_topk_indices[batch_idx, :seq_len]
+        # Request-local indices may fit in int16 while their packed positions do
+        # not: ``packed_start`` accumulates every preceding sequence (and its
+        # padding).  Promote before adding that offset so the in-place update
+        # cannot wrap at 32767.
+        rows = (
+            source_rows.clone()
+            if source_rows.dtype == torch.int32
+            else source_rows.to(dtype=torch.int32)
+        )
+        valid = rows.ge(0)
+        rows[valid] += packed_start
+
+        if padded_len > seq_len:
+            padding = torch.full(
+                (padded_len - seq_len, rows.shape[1], rows.shape[2]),
+                -1,
+                dtype=rows.dtype,
+                device=rows.device,
+            )
+            rows = torch.cat((rows, padding), dim=0)
+        all_rows.append(rows)
+        cp_rows.append(
+            _get_tokens_on_this_cp_rank(rows, cp_rank, cp_size, seq_dim=0)
+            if cp_size > 1
+            else rows
+        )
+
+    packed = torch.cat(all_rows, dim=0).unsqueeze(0).contiguous()
+    cp_sharded = torch.cat(cp_rows, dim=0).unsqueeze(0).contiguous()
+    return packed, cp_sharded
 
 
 def _get_pack_sequence_parameters_for_megatron(

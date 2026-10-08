@@ -1701,6 +1701,7 @@ def ppo_train(
                     initial_prompt_message_logs = extract_initial_prompt_messages(
                         repeated_batch["message_log"],
                         repeated_batch["length"],
+                        keys_to_keep=["token_ids"],
                     )
                     prompt_batched_flat, _ = batched_message_log_to_flat_message(
                         initial_prompt_message_logs,
@@ -2710,6 +2711,7 @@ def async_ppo_train(
                     initial_prompt_message_logs = extract_initial_prompt_messages(
                         repeated_batch["message_log"],
                         repeated_batch["length"],
+                        keys_to_keep=["token_ids"],
                     )
                     prompt_batched_flat, _ = batched_message_log_to_flat_message(
                         initial_prompt_message_logs,

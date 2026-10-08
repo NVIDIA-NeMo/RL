@@ -126,6 +126,7 @@ def record_to_train_batch(
     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
     from nemo_rl.experience.rollouts import (
         _mask_sample_flags,
+        backfill_missing_dsa_topk_indices,
         backfill_missing_routed_experts,
     )
 
@@ -144,10 +145,15 @@ def record_to_train_batch(
     # backfilling here also covers the prompt flatten below. Doing it only inside
     # add_grpo_token_loss_masks_and_generation_logprobs would be too late.
     routed_experts_backfilled = backfill_missing_routed_experts(message_logs)
+    backfill_missing_dsa_topk_indices(message_logs)
     for counts, backfilled in zip(violation_counts, routed_experts_backfilled):
         counts["num_routed_experts_backfilled"] = backfilled
 
-    prompt_message_logs = extract_initial_prompt_messages(message_logs, prompt_lengths)
+    prompt_message_logs = extract_initial_prompt_messages(
+        message_logs,
+        prompt_lengths,
+        keys_to_keep=["token_ids"],
+    )
     prompt_flat, _ = batched_message_log_to_flat_message(
         prompt_message_logs,
         pad_value_dict=dict(pad_value_dict),  # type: ignore

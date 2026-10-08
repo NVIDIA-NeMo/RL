@@ -92,6 +92,7 @@ from nemo_rl.models.megatron.draft.step_state import (
     DraftStepPayload,
     DraftStepState,
 )
+from nemo_rl.models.megatron.dsa_topk_replay import should_use_dsa_topk_replay
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -121,7 +122,11 @@ from nemo_rl.models.megatron.train import (
     aggregate_training_statistics,
     megatron_forward_backward,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import (
+    DSATopKReplayConfig,
+    PolicyConfig,
+    coerce_dsa_topk_replay_config,
+)
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -619,6 +624,17 @@ class MegatronPolicyWorkerImpl(
 
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
+        dsa_topk_replay_config = coerce_dsa_topk_replay_config(
+            config.get("dsa_topk_replay")
+        )
+        if dsa_topk_replay_config is not None:
+            config["dsa_topk_replay"] = dsa_topk_replay_config
+        if isinstance(dsa_topk_replay_config, DSATopKReplayConfig):
+            self._dsa_topk_replay_enabled = True
+            self._dsa_topk_replay_layer_ids = dsa_topk_replay_config.layer_ids
+        else:
+            self._dsa_topk_replay_enabled = False
+            self._dsa_topk_replay_layer_ids = None
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
@@ -1220,6 +1236,12 @@ class MegatronPolicyWorkerImpl(
                         stage="train",
                         require=True,
                     )
+                    use_dsa_topk_replay = should_use_dsa_topk_replay(
+                        enabled=self._dsa_topk_replay_enabled,
+                        data=batch,
+                        stage="train",
+                        require=True,
+                    )
                     with maybe_r3_trace_stage("train", enabled=use_router_replay):
                         losses_reduced = megatron_forward_backward(
                             model=self.model,
@@ -1242,6 +1264,9 @@ class MegatronPolicyWorkerImpl(
                             ),
                             use_router_replay=use_router_replay,
                             router_replay_train=not eval_mode,
+                            use_dsa_topk_replay=use_dsa_topk_replay,
+                            dsa_topk_replay_train=not eval_mode,
+                            dsa_topk_replay_layer_ids=self._dsa_topk_replay_layer_ids,
                         )
 
                 # Clear mtp_grad_scale_func after the forward-backward pass so
@@ -1478,6 +1503,7 @@ class MegatronPolicyWorkerImpl(
                 data=data,
                 micro_batch_size=micro_batch_size,
                 require_router_replay=False,
+                require_dsa_topk_replay=False,
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
@@ -1872,6 +1898,12 @@ class MegatronPolicyWorkerImpl(
             stage="train",
             require=True,
         )
+        use_dsa_topk_replay = should_use_dsa_topk_replay(
+            enabled=self._dsa_topk_replay_enabled,
+            data=data,
+            stage="train",
+            require=True,
+        )
 
         # The critical wrap: hooks fire (accumulate main_grad) but the
         # per-call reduce dispatch is gated off.
@@ -1902,6 +1934,9 @@ class MegatronPolicyWorkerImpl(
                     ),
                     use_router_replay=use_router_replay,
                     router_replay_train=True,
+                    use_dsa_topk_replay=use_dsa_topk_replay,
+                    dsa_topk_replay_train=True,
+                    dsa_topk_replay_layer_ids=self._dsa_topk_replay_layer_ids,
                 )
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -2286,6 +2321,7 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
         require_router_replay: bool = True,
+        require_dsa_topk_replay: bool = True,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
@@ -2347,6 +2383,12 @@ class MegatronPolicyWorkerImpl(
             stage="prev-logprob",
             require=require_router_replay,
         )
+        use_dsa_topk_replay = should_use_dsa_topk_replay(
+            enabled=self._dsa_topk_replay_enabled,
+            data=data,
+            stage="prev-logprob",
+            require=require_dsa_topk_replay,
+        )
 
         with maybe_r3_trace_stage("prev-logprob", enabled=use_router_replay):
             list_of_logprobs = megatron_forward_backward(
@@ -2364,6 +2406,9 @@ class MegatronPolicyWorkerImpl(
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
                 use_router_replay=use_router_replay,
                 router_replay_train=False,
+                use_dsa_topk_replay=use_dsa_topk_replay,
+                dsa_topk_replay_train=False,
+                dsa_topk_replay_layer_ids=self._dsa_topk_replay_layer_ids,
             )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
@@ -4937,6 +4982,7 @@ class MegatronPolicyWorkerImpl(
                 data=data,
                 micro_batch_size=micro_batch_size,
                 require_router_replay=False,
+                require_dsa_topk_replay=False,
             )
         finally:
             for h in hook_handles:

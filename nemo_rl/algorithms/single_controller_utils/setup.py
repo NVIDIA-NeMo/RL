@@ -132,6 +132,7 @@ from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.megatron.dsa_topk_replay import dsa_topk_replay_enabled
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -610,6 +611,11 @@ def _build_generation(
             master_config.policy.get("hf_config_overrides", {})
         )
         configure_vllm_for_router_replay(master_config.policy)
+        if dsa_topk_replay_enabled(master_config.policy):
+            raise ValueError(
+                "dsa_topk_replay currently supports the legacy synchronous GRPO "
+                "data path only; SingleController/TQ transport is not implemented."
+            )
         gen = VllmGeneration(
             cluster=inference_cluster,
             config=vllm_config,

@@ -994,7 +994,11 @@ class VllmGeneration(GenerationInterface):
 
         # Combine results from all tied worker groups
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
-            results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]}
+            results,
+            pad_value_dict={
+                "output_ids": self.cfg["_pad_token_id"],
+                "dsa_topk_indices": -1,
+            },
         )
 
         # Verify the output has all required fields

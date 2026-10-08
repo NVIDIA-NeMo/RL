@@ -32,15 +32,21 @@ source-sensitive compatibility patches:
 * ``modelopt_moe_amax_aliases`` adapts nested ModelOpt buffers to vLLM's
   MoE refit loader. Its lifecycle and installed-loader compatibility are
   checked here, alongside the source patches.
+* DSA top-k replay repurposes routed-experts capture in vLLM 0.29. Its two
+  fail-closed source edits are pinned because a missed layer or stale shared
+  top-k buffer would produce a valid-looking but incorrect replay payload.
 """
 
 import ast
 import logging
 import os
 import sys
+import textwrap
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -149,6 +155,49 @@ _CAPTURER_PATCH_FN = "_patch_vllm_routed_experts_capture_router_fallback"
 _CAPTURER_MARKER = (
     "NeMo-RL patch (router fallback for monolithic routed-experts capture)"
 )
+_DSA_CAPTURER_PATCH_FN = "_patch_vllm_dsa_topk_capturer"
+_DSA_CAPTURER_MARKER = "NeMo-RL patch (DSA top-k capture transport)"
+_DSA_SCHEDULER_SOURCE = "v1/core/sched/scheduler.py"
+_DSA_SCHEDULER_PATCH_FN = "_patch_vllm_dsa_topk_scheduler"
+_DSA_SCHEDULER_MARKER = "NeMo-RL patch (retain DSA decode routes across steps)"
+_DSA_ATTN_SOURCE = "models/deepseek_v32/attention.py"
+_DSA_ATTN_PATCH_FN = "_patch_vllm_dsa_topk_attention"
+_DSA_ATTN_MARKER = "NeMo-RL patch (capture DSA top-k before shared-buffer reuse)"
+_DSA_CAPTURER_SNIPPETS = (
+    ("import_old_snippet", "import_new_snippet"),
+    ("shape_old_snippet", "shape_new_snippet"),
+    ("init_old_snippet", "init_new_snippet"),
+    ("device_buffer_old_snippet", "device_buffer_new_snippet"),
+    ("binder_old_snippet", "binder_new_snippet"),
+    ("manager_old_snippet", "manager_new_snippet"),
+)
+_DSA_ATTN_SNIPPETS = (
+    ("import_old_snippet", "import_new_snippet"),
+    ("capture_old_snippet", "capture_new_snippet"),
+)
+
+
+def _write_unpatched_multi_edit_copy(
+    relative_source: str,
+    patch_fn_name: str,
+    snippet_names: tuple[tuple[str, str], ...],
+    destination: Path,
+) -> Path:
+    """Copy installed source and reverse every edit from a multi-anchor patch."""
+    content = Path(patches._get_vllm_file(relative_source)).read_text()
+    for old_name, new_name in snippet_names:
+        old_snippet, new_snippet = patch_snippets(
+            patch_fn_name, old_name=old_name, new_name=new_name
+        )
+        if new_snippet in content:
+            content = content.replace(new_snippet, old_snippet, 1)
+        assert new_snippet not in content
+        assert old_snippet in content, (
+            f"{relative_source} contains neither form of {old_name}/{new_name}; "
+            "the installed vLLM source has changed"
+        )
+    destination.write_text(content)
+    return destination
 
 
 @pytest.fixture
@@ -538,6 +587,53 @@ def patched_capturer_source(tmp_path, monkeypatch):
     return copied
 
 
+@pytest.fixture
+def patched_dsa_capturer_source(tmp_path, monkeypatch):
+    copied = _write_unpatched_multi_edit_copy(
+        _CAPTURER_SOURCE,
+        _DSA_CAPTURER_PATCH_FN,
+        _DSA_CAPTURER_SNIPPETS,
+        tmp_path / "routed_experts_capturer.py",
+    )
+    with monkeypatch.context() as patch_context:
+        patch_context.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+        assert patches._patch_vllm_dsa_topk_capturer(
+            logging.getLogger(__name__), required=True
+        )
+    return copied
+
+
+@pytest.fixture
+def patched_dsa_attention_source(tmp_path, monkeypatch):
+    copied = _write_unpatched_multi_edit_copy(
+        _DSA_ATTN_SOURCE,
+        _DSA_ATTN_PATCH_FN,
+        _DSA_ATTN_SNIPPETS,
+        tmp_path / "attention.py",
+    )
+    with monkeypatch.context() as patch_context:
+        patch_context.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+        assert patches._patch_vllm_dsa_topk_attention(
+            logging.getLogger(__name__), required=True
+        )
+    return copied
+
+
+@pytest.fixture
+def patched_dsa_scheduler_source(tmp_path, monkeypatch):
+    copied = write_unpatched_copy(
+        _DSA_SCHEDULER_SOURCE,
+        _DSA_SCHEDULER_PATCH_FN,
+        tmp_path / "scheduler.py",
+    )
+    with monkeypatch.context() as patch_context:
+        patch_context.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+        assert patches._patch_vllm_dsa_topk_scheduler(
+            logging.getLogger(__name__), required=True
+        )
+    return copied
+
+
 @pytest.mark.vllm
 def test_capture_router_fallback_patch_anchor_still_matches_installed_vllm(
     patched_capturer_source,
@@ -647,6 +743,406 @@ def test_capture_router_fallback_patch_binds_router_for_unsupported_kernel(
     module = SimpleNamespace(router=object())
     with pytest.raises(ValueError, match="not supported with monolithic"):
         namespace["bind"](module, quant_method, kernel, capture_fn, Monolithic, Router)
+
+
+@pytest.mark.vllm
+def test_dsa_topk_source_patch_anchors_match_installed_vllm(
+    patched_dsa_capturer_source,
+    patched_dsa_scheduler_source,
+    patched_dsa_attention_source,
+):
+    capturer_source = patched_dsa_capturer_source.read_text()
+    scheduler_source = patched_dsa_scheduler_source.read_text()
+    attention_source = patched_dsa_attention_source.read_text()
+
+    assert _DSA_CAPTURER_MARKER in capturer_source
+    assert "class _NRLDSASparseSlotBuffer" in capturer_source
+    assert "expert_id_dtype = _nrl_dsa_topk_dtype(num_experts)" in capturer_source
+    assert "dtype=nrl_dsa_topk_dtype or torch.int32" in capturer_source
+    assert "self._nrl_copy_step_outputs = _nrl_dsa_topk_capture_enabled()" in (
+        capturer_source
+    )
+    assert "compact_slot_by_layer" in capturer_source
+    assert _DSA_SCHEDULER_MARKER in scheduler_source
+    assert '"_nrl_copy_step_outputs", False' in scheduler_source
+    assert _DSA_ATTN_MARKER in attention_source
+    assert "capture_fn(scored_topk)" in attention_source
+    assert "effective_topk[num_decode_tokens:] = dense_topk" in attention_source
+    assert "dense_topk.masked_fill_" in attention_source
+    assert (
+        "from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig"
+        in attention_source
+    )
+    assert attention_source.index(_DSA_ATTN_MARKER) < attention_source.index(
+        "if scoring_was_skipped:"
+    )
+    ast.parse(capturer_source)
+    ast.parse(scheduler_source)
+    ast.parse(attention_source)
+
+
+@pytest.mark.vllm
+def test_dsa_topk_source_patches_are_idempotent(
+    patched_dsa_capturer_source,
+    patched_dsa_scheduler_source,
+    patched_dsa_attention_source,
+    monkeypatch,
+):
+    capturer_before = patched_dsa_capturer_source.read_text()
+    scheduler_before = patched_dsa_scheduler_source.read_text()
+    attention_before = patched_dsa_attention_source.read_text()
+
+    def get_source(relative_path):
+        if relative_path == _CAPTURER_SOURCE:
+            return str(patched_dsa_capturer_source)
+        if relative_path == _DSA_SCHEDULER_SOURCE:
+            return str(patched_dsa_scheduler_source)
+        if relative_path == _DSA_ATTN_SOURCE:
+            return str(patched_dsa_attention_source)
+        raise AssertionError(relative_path)
+
+    monkeypatch.setattr(patches, "_get_vllm_file", get_source)
+    assert patches._patch_vllm_dsa_topk_capturer(
+        logging.getLogger(__name__), required=True
+    )
+    assert patches._patch_vllm_dsa_topk_scheduler(
+        logging.getLogger(__name__), required=True
+    )
+    assert patches._patch_vllm_dsa_topk_attention(
+        logging.getLogger(__name__), required=True
+    )
+    assert patched_dsa_capturer_source.read_text() == capturer_before
+    assert patched_dsa_scheduler_source.read_text() == scheduler_before
+    assert patched_dsa_attention_source.read_text() == attention_before
+
+
+@pytest.mark.parametrize(
+    ("patch_fn", "filename"),
+    [
+        (patches._patch_vllm_dsa_topk_capturer, "routed_experts_capturer.py"),
+        (patches._patch_vllm_dsa_topk_scheduler, "scheduler.py"),
+        (patches._patch_vllm_dsa_topk_attention, "attention.py"),
+    ],
+)
+def test_dsa_topk_source_patches_fail_closed_when_required(
+    patch_fn, filename, monkeypatch, tmp_path
+):
+    source = tmp_path / filename
+    source.write_text("# unexpected vLLM source\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+
+    with pytest.raises(RuntimeError, match="Could not apply vLLM DSA top-k"):
+        patch_fn(logging.getLogger(__name__), required=True)
+    assert source.read_text() == "# unexpected vLLM source\n"
+
+
+def test_dsa_topk_attention_patch_fails_closed_when_import_anchor_changes(
+    monkeypatch, tmp_path
+):
+    capture_old_snippet, _capture_new_snippet = patch_snippets(
+        _DSA_ATTN_PATCH_FN,
+        old_name="capture_old_snippet",
+        new_name="capture_new_snippet",
+    )
+    source = tmp_path / "attention.py"
+    original = (
+        "from vllm.config import CacheConfig as RenamedCacheConfig, VllmConfig\n"
+        + capture_old_snippet
+    )
+    source.write_text(original)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+
+    with pytest.raises(RuntimeError, match="CUDAGraphMode import"):
+        patches._patch_vllm_dsa_topk_attention(
+            logging.getLogger(__name__), required=True
+        )
+    assert source.read_text() == original
+
+
+def test_dsa_topk_capturer_compacts_compute_layers_and_validates_selection(
+    monkeypatch,
+):
+    _old_snippet, shape_source = patch_snippets(
+        _DSA_CAPTURER_PATCH_FN,
+        old_name="shape_old_snippet",
+        new_name="shape_new_snippet",
+    )
+    tree = ast.parse(shape_source)
+    wanted_names = {
+        "_NRL_DSA_TOPK_CAPTURE_ENV_VAR",
+        "_NRL_DSA_TOPK_LAYER_IDS_ENV_VAR",
+    }
+    body = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id in wanted_names
+                for target in node.targets
+            )
+        )
+        or (
+            isinstance(node, ast.FunctionDef)
+            and node.name
+            in {
+                "_nrl_dsa_topk_capture_enabled",
+                "_nrl_dsa_topk_layer_ids",
+                "_get_routed_experts_shape",
+            }
+        )
+    ]
+    namespace = {"os": os, "VllmConfig": object}
+    exec(
+        compile(ast.Module(body=body, type_ignores=[]), "<dsa-capturer>", "exec"),
+        namespace,
+    )
+
+    hf_config = SimpleNamespace(
+        num_hidden_layers=8,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        index_topk_pattern=None,
+        index_topk=128,
+    )
+    model_config = SimpleNamespace(
+        hf_text_config=hf_config,
+        max_model_len=6144,
+        get_total_num_hidden_layers=lambda: 8,
+        get_num_experts=lambda: 256,
+        get_num_experts_per_tok=lambda: 8,
+    )
+    vllm_config = SimpleNamespace(model_config=model_config)
+    monkeypatch.setenv(patches.VLLM_DSA_TOPK_CAPTURE_ENV_VAR, "1")
+    monkeypatch.delenv(patches.VLLM_DSA_TOPK_LAYER_IDS_ENV_VAR, raising=False)
+
+    assert namespace["_nrl_dsa_topk_layer_ids"](vllm_config) == [0, 1, 2, 6]
+    assert namespace["_get_routed_experts_shape"](vllm_config) == (4, 6144, 128)
+
+    monkeypatch.setenv(patches.VLLM_DSA_TOPK_LAYER_IDS_ENV_VAR, "2,6")
+    assert namespace["_nrl_dsa_topk_layer_ids"](vllm_config) == [2, 6]
+    assert namespace["_get_routed_experts_shape"](vllm_config) == (2, 6144, 128)
+
+    monkeypatch.setenv(patches.VLLM_DSA_TOPK_LAYER_IDS_ENV_VAR, "3")
+    with pytest.raises(ValueError, match="only select non-MTP compute layers"):
+        namespace["_nrl_dsa_topk_layer_ids"](vllm_config)
+
+
+def _dsa_topk_transport_namespace() -> dict:
+    _old_snippet, source = patch_snippets(
+        _DSA_CAPTURER_PATCH_FN,
+        old_name="shape_old_snippet",
+        new_name="shape_new_snippet",
+    )
+    namespace = {"np": np, "os": os, "torch": torch, "VllmConfig": object}
+    exec(compile(source, "<dsa-topk-transport>", "exec"), namespace)
+    return namespace
+
+
+def test_dsa_topk_sparse_slot_buffer_is_lazy_and_round_trips_by_block():
+    namespace = _dsa_topk_transport_namespace()
+    buffer_cls = namespace["_NRLDSASparseSlotBuffer"]
+    buffer = buffer_cls(
+        max_num_slots=12,
+        block_size=4,
+        num_layers=2,
+        top_k=3,
+        dtype=np.int16,
+    )
+
+    assert buffer.shape == (12, 2, 3)
+    assert buffer.dtype.name == "int16"
+    assert buffer.nbytes == 0
+    np.testing.assert_array_equal(
+        buffer[np.array([0, 5, 11], dtype=np.int64)],
+        np.full((3, 2, 3), -1, dtype=np.int16),
+    )
+    assert buffer.nbytes == 0  # Missing reads do not allocate blocks.
+
+    slots = np.array([1, 5, 1, 6], dtype=np.int64)
+    values = np.arange(4 * 2 * 3, dtype=np.int32).reshape(4, 2, 3)
+    buffer[slots] = values
+
+    # Only physical blocks 0 and 1 were touched. Repeated slot 1 keeps the
+    # final input row, independent of numpy's repeated fancy-index behavior.
+    assert buffer.nbytes == 2 * 4 * 2 * 3 * np.dtype(np.int16).itemsize
+    np.testing.assert_array_equal(
+        buffer[np.array([1, 5, 6, 3], dtype=np.int64)],
+        np.stack(
+            [
+                values[2],
+                values[1],
+                values[3],
+                np.full((2, 3), -1, dtype=np.int32),
+            ]
+        ).astype(np.int16),
+    )
+
+    replacement = np.full((1, 2, 3), 77, dtype=np.int16)
+    buffer[np.array([5], dtype=np.int64)] = replacement
+    np.testing.assert_array_equal(buffer[np.array([5])], replacement)
+
+
+def test_dsa_topk_sparse_slot_buffer_fails_fast_on_bad_indices_and_shape():
+    buffer_cls = _dsa_topk_transport_namespace()["_NRLDSASparseSlotBuffer"]
+    buffer = buffer_cls(
+        max_num_slots=8,
+        block_size=4,
+        num_layers=2,
+        top_k=3,
+        dtype=np.int16,
+    )
+    values = np.zeros((1, 2, 3), dtype=np.int16)
+
+    for bad_slot in (-1, 8):
+        slots = np.array([bad_slot], dtype=np.int64)
+        with pytest.raises(IndexError, match="out of range"):
+            buffer[slots]
+        with pytest.raises(IndexError, match="out of range"):
+            buffer[slots] = values
+    with pytest.raises(ValueError, match="shape mismatch"):
+        buffer[np.array([0, 1], dtype=np.int64)] = values
+    with pytest.raises(TypeError, match="must contain integers"):
+        buffer[np.array([0.0])]
+    for bad_value in (-2, np.iinfo(np.int16).max + 1):
+        out_of_range = np.full((1, 2, 3), bad_value, dtype=np.int32)
+        with pytest.raises(ValueError, match="values are out of range"):
+            buffer[np.array([0], dtype=np.int64)] = out_of_range
+    assert buffer.nbytes == 0
+
+
+def test_dsa_topk_transport_uses_narrow_signed_dtype_when_safe():
+    namespace = _dsa_topk_transport_namespace()
+    numpy_dtype = namespace["_nrl_dsa_topk_dtype"]
+    torch_dtype = namespace["_nrl_dsa_topk_torch_dtype"]
+
+    assert numpy_dtype(32768) is np.int16
+    assert torch_dtype(32768) is torch.int16
+    assert numpy_dtype(32769) is np.int32
+    assert torch_dtype(32769) is torch.int32
+    with pytest.raises(ValueError, match="positive max_model_len"):
+        numpy_dtype(0)
+
+
+@pytest.mark.parametrize("force_copy", [False, True])
+def test_dsa_topk_scheduler_copy_flag_controls_step_buffer_aliasing(force_copy):
+    _old_snippet, new_snippet = patch_snippets(_DSA_SCHEDULER_PATCH_FN)
+    source = (
+        "def convert(self, re):\n"
+        + textwrap.indent(textwrap.dedent(new_snippet), "    ")
+        + "    return routing_data\n"
+    )
+    namespace: dict = {}
+    exec(compile(source, "<dsa-scheduler-copy>", "exec"), namespace)
+
+    transit = np.array([[[1, 0]]], dtype=np.int16)
+    manager = SimpleNamespace(
+        routed_experts_by_slot=SimpleNamespace(dtype=np.dtype(np.int16)),
+        _nrl_copy_step_outputs=force_copy,
+    )
+    converted = namespace["convert"](
+        SimpleNamespace(routed_experts_mgr=manager),
+        SimpleNamespace(routing_data=transit),
+    )
+    transit[...] = 7
+
+    expected = 1 if force_copy else 7
+    assert int(converted[0, 0, 0]) == expected
+
+
+def test_dsa_topk_attention_capture_matches_effective_attention_routes(monkeypatch):
+    _old_snippet, new_snippet = patch_snippets(
+        _DSA_ATTN_PATCH_FN,
+        old_name="capture_old_snippet",
+        new_name="capture_new_snippet",
+    )
+    source = (
+        "def capture_block(self, positions, attn_metadata, output, torch):\n"
+        + textwrap.indent(textwrap.dedent(new_snippet), "    ")
+        + "        pass\n"
+    )
+
+    class CUDAGraphMode:
+        FULL = object()
+
+    forward_context = SimpleNamespace(cudagraph_runtime_mode=object())
+    namespace = {
+        "CUDAGraphMode": CUDAGraphMode,
+        "get_forward_context": lambda: forward_context,
+    }
+    exec(compile(source, "<dsa-attention-capture>", "exec"), namespace)
+    capture_block = namespace["capture_block"]
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    captured = []
+    attention = SimpleNamespace(
+        indexer=SimpleNamespace(topk_tokens=4),
+        topk_indices_buffer=torch.tensor(
+            [[3, 2, 1, 0], [2, 1, 0, -1]], dtype=torch.int32
+        ),
+        _nrl_dsa_topk_capture_fn=lambda value: captured.append(value.clone()),
+        _use_sparse_mha=lambda _metadata: False,
+        _dense_mha_metadata_layer_name="model.layers.0.self_attn.attn",
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        num_decode_tokens=0,
+        prefill=SimpleNamespace(use_dense_mha=False),
+    )
+    capture_block(attention, torch.tensor([0, 2]), metadata, torch.empty(2), torch)
+    torch.testing.assert_close(captured.pop(), attention.topk_indices_buffer)
+
+    # Masked MHA consumes the scorer top-k as a mask, so it must replay the
+    # scorer result even though _use_sparse_mha selects forward_impl.
+    attention._use_sparse_mha = lambda _metadata: True
+    metadata.prefill.use_dense_mha = False
+    capture_block(attention, torch.tensor([0, 2]), metadata, torch.empty(2), torch)
+    torch.testing.assert_close(captured.pop(), attention.topk_indices_buffer)
+
+    dense_expected = torch.tensor([[0, -1, -1, -1], [0, 1, 2, -1]], dtype=torch.int32)
+    metadata.prefill.use_dense_mha = True
+    capture_block(attention, torch.tensor([0, 2]), metadata, torch.empty(2), torch)
+    torch.testing.assert_close(captured.pop(), dense_expected)
+
+    # Mixed batches use scorer top-k for the decode prefix and causal dense keys
+    # for the prefill suffix. A decode position can exceed K without error.
+    metadata.num_decode_tokens = 1
+    capture_block(attention, torch.tensor([9, 2]), metadata, torch.empty(2), torch)
+    torch.testing.assert_close(
+        captured.pop(),
+        torch.tensor([[3, 2, 1, 0], [0, 1, 2, -1]], dtype=torch.int32),
+    )
+
+    # Whether scoring happened is separate from which key set dense attention
+    # consumed. These variants still replay dense causal keys.
+    metadata.num_decode_tokens = 0
+    forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
+    capture_block(attention, torch.tensor([0, 2]), metadata, torch.empty(2), torch)
+    torch.testing.assert_close(captured.pop(), dense_expected)
+
+    forward_context.cudagraph_runtime_mode = object()
+    attention._dense_mha_metadata_layer_name = ""
+    capture_block(attention, torch.tensor([0, 2]), metadata, torch.empty(2), torch)
+    torch.testing.assert_close(captured.pop(), dense_expected)
+
+    attention._dense_mha_metadata_layer_name = "model.layers.0.self_attn.attn"
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    capture_block(attention, torch.tensor([0, 2]), metadata, torch.empty(2), torch)
+    torch.testing.assert_close(captured.pop(), dense_expected)
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    attention._use_sparse_mha = lambda _metadata: False
+    with pytest.raises(RuntimeError, match="scoring was skipped"):
+        capture_block(attention, torch.tensor([0, 2]), metadata, torch.empty(2), torch)
+
+    attention._use_sparse_mha = lambda _metadata: True
+    metadata.num_decode_tokens = 3
+    with pytest.raises(RuntimeError, match="Invalid DSA decode/prefill partition"):
+        capture_block(attention, torch.tensor([0, 2]), metadata, torch.empty(2), torch)
+
+    metadata.num_decode_tokens = 0
+    with pytest.raises(RuntimeError, match="cannot represent all causal keys"):
+        capture_block(attention, torch.tensor([0, 4]), metadata, torch.empty(2), torch)
 
 
 @pytest.mark.parametrize(
@@ -795,6 +1291,21 @@ def _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars):
         "_patch_vllm_routed_experts_capture_router_fallback",
         lambda _logger, *, required=False: True,
     )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_dsa_topk_capturer",
+        lambda _logger, *, required=False: True,
+    )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_dsa_topk_scheduler",
+        lambda _logger, *, required=False: True,
+    )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_dsa_topk_attention",
+        lambda _logger, *, required=False: True,
+    )
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -844,6 +1355,108 @@ def test_apply_vllm_patches_gates_nemotron_h_fp32_lm_head(
     else:
         assert patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR not in os.environ
         assert captured_extra_env_vars == [["USER_VAR"]]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_apply_vllm_patches_gates_and_propagates_dsa_topk_capture(monkeypatch, enabled):
+    _install_fake_vllm_modules(monkeypatch)
+    monkeypatch.setenv(patches.VLLM_DSA_TOPK_CAPTURE_ENV_VAR, "ambient")
+    monkeypatch.setenv(patches.VLLM_DSA_TOPK_LAYER_IDS_ENV_VAR, "99")
+    captured_extra_env_vars = []
+    dsa_capturer_requirements = []
+    dsa_scheduler_requirements = []
+    dsa_attention_requirements = []
+    moe_requirements = []
+    fallback_requirements = []
+    _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars)
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_dsa_topk_capturer",
+        lambda _logger, *, required: dsa_capturer_requirements.append(required) or True,
+    )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_dsa_topk_scheduler",
+        lambda _logger, *, required: dsa_scheduler_requirements.append(required)
+        or True,
+    )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_dsa_topk_attention",
+        lambda _logger, *, required: dsa_attention_requirements.append(required)
+        or True,
+    )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_moe_routed_experts_capture",
+        lambda _logger, *, required: moe_requirements.append(required) or True,
+    )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_routed_experts_capture_router_fallback",
+        lambda _logger, *, required: fallback_requirements.append(required) or True,
+    )
+
+    patches._apply_vllm_patches(
+        "py",
+        extra_env_vars=["USER_VAR"],
+        require_dsa_topk_capture=enabled,
+        dsa_topk_layer_ids=[2, 6] if enabled else None,
+    )
+
+    if enabled:
+        assert os.environ[patches.VLLM_DSA_TOPK_CAPTURE_ENV_VAR] == "1"
+        assert os.environ[patches.VLLM_DSA_TOPK_LAYER_IDS_ENV_VAR] == "2,6"
+        assert captured_extra_env_vars == [
+            [
+                "USER_VAR",
+                patches.VLLM_DSA_TOPK_CAPTURE_ENV_VAR,
+                patches.VLLM_DSA_TOPK_LAYER_IDS_ENV_VAR,
+            ]
+        ]
+        assert dsa_capturer_requirements == [True]
+        assert dsa_scheduler_requirements == [True]
+        assert dsa_attention_requirements == [True]
+        assert moe_requirements == []
+        assert fallback_requirements == []
+    else:
+        assert patches.VLLM_DSA_TOPK_CAPTURE_ENV_VAR not in os.environ
+        assert patches.VLLM_DSA_TOPK_LAYER_IDS_ENV_VAR not in os.environ
+        assert captured_extra_env_vars == [["USER_VAR"]]
+        assert dsa_capturer_requirements == []
+        assert dsa_scheduler_requirements == []
+        assert dsa_attention_requirements == []
+        assert moe_requirements == [False]
+        assert fallback_requirements == [False]
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        (
+            {
+                "require_moe_routed_experts_capture": True,
+                "require_dsa_topk_capture": True,
+            },
+            "cannot both use",
+        ),
+        ({"dsa_topk_layer_ids": [0]}, "while DSA top-k capture is disabled"),
+        (
+            {"require_dsa_topk_capture": True, "dsa_topk_layer_ids": [-1]},
+            "must be non-negative",
+        ),
+        (
+            {"require_dsa_topk_capture": True, "dsa_topk_layer_ids": [1, 1]},
+            "must be unique",
+        ),
+    ],
+)
+def test_apply_vllm_patches_rejects_invalid_dsa_capture_configuration(
+    monkeypatch, kwargs, match
+):
+    _install_fake_vllm_modules(monkeypatch)
+    with pytest.raises(ValueError, match=match):
+        patches._apply_vllm_patches("py", **kwargs)
 
 
 def test_apply_vllm_patches_ignores_ambient_fp32_lm_head_env_toggle(monkeypatch):
@@ -911,12 +1524,16 @@ def test_vllm_worker_threads_nemotron_h_fp32_lm_head_cfg_into_source_patches(
         *,
         extra_env_vars,
         nemotron_h_fp32_lm_head,
-        require_moe_routed_experts_capture: patch_calls.append(
+        require_moe_routed_experts_capture,
+        require_dsa_topk_capture=False,
+        dsa_topk_layer_ids=None: patch_calls.append(
             {
                 "py": py,
                 "extra_env_vars": extra_env_vars,
                 "nemotron_h_fp32_lm_head": nemotron_h_fp32_lm_head,
                 "require_moe_routed_experts_capture": require_moe_routed_experts_capture,
+                "require_dsa_topk_capture": require_dsa_topk_capture,
+                "dsa_topk_layer_ids": dsa_topk_layer_ids,
             }
         ),
     )
@@ -943,6 +1560,8 @@ def test_vllm_worker_threads_nemotron_h_fp32_lm_head_cfg_into_source_patches(
             "extra_env_vars": ["EXPLICIT_VAR"],
             "nemotron_h_fp32_lm_head": expected_nemotron_h_fp32_lm_head,
             "require_moe_routed_experts_capture": require_capture,
+            "require_dsa_topk_capture": False,
+            "dsa_topk_layer_ids": None,
         }
     ]
 

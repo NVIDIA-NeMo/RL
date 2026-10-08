@@ -318,6 +318,7 @@ from nemo_rl.models.megatron.draft.utils import (
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
+from nemo_rl.models.megatron.dsa_topk_replay import validate_dsa_topk_replay_config
 from nemo_rl.models.megatron.hybridep import (
     configure_hybridep_packed_input_padding,
 )
@@ -921,6 +922,7 @@ def setup_model_config(
     pretrained_ckpt = config.get("pretrained_checkpoint")
     fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else None
     validate_router_replay_config(config)
+    validate_dsa_topk_replay_config(config)
 
     derive_provider_from_hf = fmt == "megatron_lm" or (
         skip_weight_load and fmt != "megatron_bridge"

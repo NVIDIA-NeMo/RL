@@ -84,15 +84,12 @@ def _flatten_rollout_message_log_for_tq(
         extract_initial_prompt_messages,
     )
     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-    from nemo_rl.experience.rollouts import backfill_missing_routed_experts
 
     pad = {"pad_value_dict": {"token_ids": pad_token_id}}
-    # Must precede the prompt extraction: it reuses the same message dicts, so
-    # backfilling here also covers the prompt flatten below.
-    backfill_missing_routed_experts(message_logs)
     prompt_message_logs = extract_initial_prompt_messages(
         message_logs,
         prompt_lengths,
+        keys_to_keep=["token_ids"],
     )
     prompt_flat, _ = batched_message_log_to_flat_message(
         prompt_message_logs,

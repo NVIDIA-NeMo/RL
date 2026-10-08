@@ -42,6 +42,7 @@ from nemo_rl.distributed.batched_data_dict import (
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.policy import DSATopKReplayConfigDisabled
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 
@@ -180,6 +181,8 @@ class TeacherWorkerGroup:
         # TQ fetch does not carry routed_experts, so replay must stay off.
         if "router_replay" in cfg:
             cfg["router_replay"]["enabled"] = False
+        if "dsa_topk_replay" in cfg:
+            cfg["dsa_topk_replay"] = DSATopKReplayConfigDisabled()
         # A student `pretrained_checkpoint` rides along on the copied config and
         # would be loaded as the teacher's own weights. Resume keeps student
         # weights out of the config for the same reason (`weights_path=None`

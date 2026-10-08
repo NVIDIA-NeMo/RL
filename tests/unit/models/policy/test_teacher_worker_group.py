@@ -95,9 +95,10 @@ def test_create_teacher_configs_deduplicates():
     assert len(configs) == 2
 
 
-def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
-    """Frozen teachers do not require rollout-to-training route consistency."""
+def test_teacher_worker_group_disables_student_replay_features(monkeypatch):
+    """Frozen teachers do not consume rollout-to-training replay payloads."""
     import nemo_rl.distributed.worker_groups as worker_groups
+    from nemo_rl.models.policy import DSATopKReplayConfigDisabled
     from nemo_rl.models.policy.teacher_worker_group import (
         TeacherConfig,
         TeacherWorkerGroup,
@@ -125,6 +126,7 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
         "router_replay": {"enabled": True},
+        "dsa_topk_replay": {"enabled": True, "layer_ids": [0]},
     }
     teacher_config = TeacherConfig(
         alias="teacher",
@@ -149,8 +151,12 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
     )
 
     assert captured["cfg"]["router_replay"]["enabled"] is False
+    assert isinstance(captured["cfg"]["dsa_topk_replay"], DSATopKReplayConfigDisabled)
+    assert captured["cfg"]["dsa_topk_replay"].enabled is False
     assert teacher.cfg["router_replay"]["enabled"] is False
+    assert teacher.cfg["dsa_topk_replay"].enabled is False
     assert policy_config["router_replay"]["enabled"] is True
+    assert policy_config["dsa_topk_replay"]["enabled"] is True
 
 
 def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatch):

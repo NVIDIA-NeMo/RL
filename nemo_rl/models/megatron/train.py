@@ -65,6 +65,11 @@ from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from nemo_rl.models.megatron.draft.hidden_capture import (
     get_capture_context,
 )
+from nemo_rl.models.megatron.dsa_topk_replay import (
+    clear_dsa_topk_replay,
+    set_dsa_topk_replay_backward,
+    set_dsa_topk_replay_forward,
+)
 from nemo_rl.models.megatron.opd_full_capture import get_opd_full_capture_context
 from nemo_rl.models.megatron.router_replay import (
     clear_router_replay,
@@ -287,6 +292,9 @@ def forward_with_post_processing_fn(
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
+    use_dsa_topk_replay: bool = False,
+    dsa_topk_replay_train: bool = False,
+    dsa_topk_replay_layer_ids: Optional[list[int]] = None,
     model_slices_context_parallel_inputs: bool = False,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
@@ -329,6 +337,7 @@ def forward_with_post_processing_fn(
     mtp_loss_mask = processed_mb.mtp_loss_mask
     padding_mask = processed_mb.padding_mask
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
+    dsa_topk_indices_cp_sharded = processed_mb.dsa_topk_indices_cp_sharded
     original_seq_length = processed_mb.original_seq_length
     media_token_validity_mask = processed_mb.media_token_validity_mask
 
@@ -338,6 +347,17 @@ def forward_with_post_processing_fn(
                 "Router replay is enabled but routed_experts is missing from the microbatch."
             )
         set_router_replay_forward(model, routed_experts_cp_sharded)
+    if use_dsa_topk_replay:
+        if dsa_topk_indices_cp_sharded is None:
+            raise RuntimeError(
+                "DSA top-k replay is enabled but dsa_topk_indices is missing "
+                "from the microbatch."
+            )
+        set_dsa_topk_replay_forward(
+            model,
+            dsa_topk_indices_cp_sharded,
+            layer_ids=dsa_topk_replay_layer_ids,
+        )
 
     # Insert hook to capture hidden states and embeddings for draft model training if draft_model is provided
     #
@@ -374,6 +394,8 @@ def forward_with_post_processing_fn(
         # leak into the next microbatch, then re-raise the original error unchanged.
         if use_router_replay:
             clear_router_replay(model)
+        if use_dsa_topk_replay:
+            clear_dsa_topk_replay(model)
         raise
 
     if use_router_replay:
@@ -381,6 +403,11 @@ def forward_with_post_processing_fn(
             set_router_replay_backward(model)
         else:
             clear_router_replay(model)
+    if use_dsa_topk_replay:
+        if dsa_topk_replay_train:
+            set_dsa_topk_replay_backward(model)
+        else:
+            clear_dsa_topk_replay(model)
 
     if capture is not None:
         from megatron.core.transformer.multi_token_prediction import roll_tensor
@@ -496,6 +523,9 @@ def megatron_forward_backward(
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
+    use_dsa_topk_replay: bool = False,
+    dsa_topk_replay_train: bool = False,
+    dsa_topk_replay_layer_ids: Optional[list[int]] = None,
     model_slices_context_parallel_inputs: bool = False,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
@@ -540,11 +570,16 @@ def megatron_forward_backward(
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         use_router_replay=use_router_replay,
         router_replay_train=router_replay_train,
+        use_dsa_topk_replay=use_dsa_topk_replay,
+        dsa_topk_replay_train=dsa_topk_replay_train,
+        dsa_topk_replay_layer_ids=dsa_topk_replay_layer_ids,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
     )
     forward_backward_func = get_forward_backward_func()
     if use_router_replay:
         clear_router_replay(model)
+    if use_dsa_topk_replay:
+        clear_dsa_topk_replay(model)
     with suspend_activation_offload_for_forward_only(model, forward_only):
         try:
             return forward_backward_func(
@@ -560,6 +595,8 @@ def megatron_forward_backward(
         finally:
             if use_router_replay:
                 clear_router_replay(model)
+            if use_dsa_topk_replay:
+                clear_dsa_topk_replay(model)
 
 
 class LossPostProcessor:

@@ -2216,6 +2216,112 @@ def test_shard_routed_experts_for_cp_matches_input_ids_zigzag(cp_size):
             assert torch.equal(routed_packed[0, pad_pos, layer], expected_route)
 
 
+@pytest.mark.mcore
+def test_fill_dsa_topk_padding_marks_only_jagged_padding_missing():
+    from nemo_rl.models.megatron.data import _fill_dsa_topk_padding
+
+    indices = torch.arange(2 * 4 * 2 * 2, dtype=torch.int32).reshape(2, 4, 2, 2)
+    original = indices.clone()
+
+    repaired = _fill_dsa_topk_padding(indices, torch.tensor([2, 3]))
+
+    assert torch.equal(repaired[0, :2], original[0, :2])
+    assert torch.equal(repaired[1, :3], original[1, :3])
+    assert torch.equal(repaired[0, 2:], torch.full_like(repaired[0, 2:], -1))
+    assert torch.equal(repaired[1, 3:], torch.full_like(repaired[1, 3:], -1))
+    assert torch.equal(indices, original)
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("cp_rank", "selected_rows"),
+    [
+        (0, [0, 3, 4, 5, 10, 11]),
+        (1, [1, 2, 6, 7, 8, 9]),
+    ],
+)
+def test_shard_dsa_topk_indices_offsets_keys_and_shards_query_rows(
+    cp_rank, selected_rows
+):
+    from nemo_rl.models.megatron.data import _shard_dsa_topk_indices_for_cp
+
+    # Two request-local sequences of lengths 3 and 5 are padded independently
+    # to 4 and 8 tokens for CP=2. The second sequence's key ids must therefore
+    # be translated by its packed start (4), including across padding gaps.
+    indices = torch.full((2, 5, 1, 2), -1, dtype=torch.int32)
+    for batch_idx, seq_len in enumerate((3, 5)):
+        for token_idx in range(seq_len):
+            indices[batch_idx, token_idx, 0, 0] = token_idx
+            if token_idx > 0:
+                indices[batch_idx, token_idx, 0, 1] = token_idx - 1
+
+    packed, cp_sharded = _shard_dsa_topk_indices_for_cp(
+        indices,
+        seq_lengths=torch.tensor([3, 5], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 3, 8], dtype=torch.int32),
+        cu_seqlens_padded=torch.tensor([0, 4, 12], dtype=torch.int32),
+        cp_rank=cp_rank,
+        cp_size=2,
+    )
+
+    expected = torch.tensor(
+        [
+            [0, -1],
+            [1, 0],
+            [2, 1],
+            [-1, -1],
+            [4, -1],
+            [5, 4],
+            [6, 5],
+            [7, 6],
+            [8, 7],
+            [-1, -1],
+            [-1, -1],
+            [-1, -1],
+        ],
+        dtype=torch.int32,
+    ).view(1, 12, 1, 2)
+    assert torch.equal(packed, expected)
+    assert torch.equal(cp_sharded, expected[:, selected_rows])
+
+
+@pytest.mark.mcore
+def test_shard_dsa_topk_indices_promotes_before_large_packed_offset():
+    from nemo_rl.models.megatron.data import _shard_dsa_topk_indices_for_cp
+
+    # Each request-local key fits in int16, but the second request begins close
+    # enough to 32767 that translating its later keys into the packed layout
+    # would overflow if the addition happened in the carry dtype.
+    first_length = 32_760
+    second_length = 16
+    indices = torch.full((2, first_length, 1, 1), -1, dtype=torch.int16)
+    indices[1, :second_length, 0, 0] = torch.arange(second_length, dtype=torch.int16)
+
+    packed, cp_sharded = _shard_dsa_topk_indices_for_cp(
+        indices,
+        seq_lengths=torch.tensor([first_length, second_length], dtype=torch.int32),
+        cu_seqlens=torch.tensor(
+            [0, first_length, first_length + second_length], dtype=torch.int32
+        ),
+        cu_seqlens_padded=None,
+        cp_rank=0,
+        cp_size=1,
+    )
+
+    expected_second_keys = torch.arange(
+        first_length,
+        first_length + second_length,
+        dtype=torch.int32,
+    )
+    assert packed.dtype == torch.int32
+    assert cp_sharded.dtype == torch.int32
+    assert torch.equal(
+        packed[0, first_length:, 0, 0],
+        expected_second_keys,
+    )
+    assert torch.equal(cp_sharded, packed)
+
+
 GET_PACK_SEQUENCE_PARAMETERS_TEST_ACTOR_FQN = f"{GetPackSequenceParametersTestActor.__module__}.GetPackSequenceParametersTestActor"
 
 

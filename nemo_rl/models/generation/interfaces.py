@@ -45,6 +45,12 @@ ROUTED_EXPERTS_FALLBACK_DTYPE = torch.int16
 # own router for those rows. Partially-negative rows are rejected as corruption.
 ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL = -1
 
+# DSA top-k values are request-local token positions. ``-1`` marks an unused
+# top-k slot (common near the start of a causal sequence) and every row for
+# padding/final tokens that never ran a rollout forward.
+DSA_TOPK_MISSING_INDEX_SENTINEL = -1
+DSA_TOPK_FALLBACK_DTYPE = torch.int16
+
 _ROUTED_EXPERTS_DTYPE_NAMES = {
     torch.int8: "int8",
     torch.int16: "int16",
@@ -85,6 +91,15 @@ def resolve_routed_experts_dtype(num_experts: Optional[int]) -> torch.dtype:
     if num_experts - 1 <= torch.iinfo(torch.int8).max:
         return torch.int8
     if num_experts - 1 <= torch.iinfo(torch.int16).max:
+        return torch.int16
+    return torch.int32
+
+
+def resolve_dsa_topk_dtype(max_model_len: int) -> torch.dtype:
+    """Return the narrowest signed carry dtype for DSA key positions."""
+    if max_model_len <= 0:
+        raise ValueError(f"max_model_len must be positive, got {max_model_len}")
+    if max_model_len - 1 <= torch.iinfo(torch.int16).max:
         return torch.int16
     return torch.int32
 
@@ -393,6 +408,7 @@ class GenerationOutputSpec(TypedDict):
     )  # Length of full valid sequence (input + generated response)
     logprobs: torch.Tensor
     routed_experts: NotRequired[torch.Tensor]
+    dsa_topk_indices: NotRequired[torch.Tensor]
     r3_routed_experts_missing_routes: NotRequired[torch.Tensor]
     r3_routed_experts_expected_routes: NotRequired[torch.Tensor]
     r3_routed_experts_actual_routes: NotRequired[torch.Tensor]

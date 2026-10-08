@@ -23,6 +23,8 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
+    DSA_TOPK_FALLBACK_DTYPE,
+    DSA_TOPK_MISSING_INDEX_SENTINEL,
     ROUTED_EXPERTS_FALLBACK_DTYPE,
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationDatumSpec,
@@ -350,6 +352,120 @@ def pad_and_align_routed_expert_indices(
     if stats["missing_routes"] > 0:
         full[routes_to_copy:expected_routes] = R3_MISSING_ROUTE_SENTINEL
     return (full, stats) if return_stats else full
+
+
+def _as_dsa_topk_tensor(
+    value: Any, *, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Convert vLLM's DSA indices without allowing a narrowing overflow."""
+    tensor = torch.as_tensor(value, device=device)
+    if tensor.numel() == 0:
+        return tensor.to(dtype=dtype)
+
+    min_index = int(tensor.min().item())
+    max_index = int(tensor.max().item())
+    dtype_limit = torch.iinfo(dtype).max
+    if min_index < DSA_TOPK_MISSING_INDEX_SENTINEL or max_index > dtype_limit:
+        raise ValueError(
+            "vLLM DSA top-k indices do not fit the resolved carry dtype: "
+            f"min={min_index}, max={max_index}, dtype={dtype}, "
+            f"dtype_max={dtype_limit}."
+        )
+    return tensor.to(dtype=dtype)
+
+
+def pad_and_align_dsa_topk_indices(
+    request_output: Any,
+    completion_output: Any,
+    *,
+    valid_length: int,
+    padded_length: int,
+    device: torch.device,
+    required: bool = False,
+    dtype: torch.dtype = DSA_TOPK_FALLBACK_DTYPE,
+) -> Optional[torch.Tensor]:
+    """Return request-aligned DSA indices as ``[S, source_layers, topk]``.
+
+    vLLM exposes the payload through its routed-experts side channel internally,
+    but the values are causal key positions rather than expert ids. A request of
+    length ``S`` has selector results for exactly ``S - 1`` tokens: the final
+    sampled token has not itself gone through a model forward.
+    """
+    valid_length = int(valid_length)
+    padded_length = int(padded_length)
+    captured = getattr(completion_output, "routed_experts", None)
+    prompt_captured = getattr(request_output, "prompt_routed_experts", None)
+
+    if prompt_captured is not None:
+        prompt_captured = _as_dsa_topk_tensor(
+            prompt_captured, device=device, dtype=dtype
+        )
+    if captured is not None:
+        captured = _as_dsa_topk_tensor(captured, device=device, dtype=dtype)
+
+    if prompt_captured is not None and captured is not None:
+        captured = torch.cat((prompt_captured, captured), dim=0)
+    elif prompt_captured is not None:
+        captured = prompt_captured
+
+    expected_rows = min(max(valid_length - 1, 0), padded_length)
+    if captured is None:
+        if required:
+            raise RuntimeError(
+                "vLLM was asked to capture DSA top-k indices but returned no "
+                "capture payload."
+            )
+        return None
+    if captured.dim() != 3:
+        raise ValueError(
+            "vLLM DSA top-k payload must have shape "
+            "[tokens, source_layers, topk], "
+            f"got {tuple(captured.shape)}"
+        )
+    if required and captured.shape[0] < expected_rows:
+        raise ValueError(
+            "vLLM returned incomplete DSA top-k capture: "
+            f"rows={captured.shape[0]}, expected={expected_rows}, "
+            f"valid_length={valid_length}, padded_length={padded_length}."
+        )
+    if required and captured.shape[0] > expected_rows + 1:
+        raise ValueError(
+            "vLLM returned too many DSA top-k rows: "
+            f"rows={captured.shape[0]}, expected={expected_rows}, "
+            f"max_allowed={expected_rows + 1}."
+        )
+
+    rows_to_copy = min(expected_rows, int(captured.shape[0]))
+    full = torch.full(
+        (padded_length, captured.shape[1], captured.shape[2]),
+        DSA_TOPK_MISSING_INDEX_SENTINEL,
+        dtype=dtype,
+        device=device,
+    )
+    if rows_to_copy > 0:
+        selected = captured[:rows_to_copy]
+        valid = selected.ge(0)
+        if required:
+            missing_rows = ~valid.any(dim=-1)
+            if bool(missing_rows.any().item()):
+                bad_token, bad_layer = missing_rows.nonzero()[0].tolist()
+                raise ValueError(
+                    "vLLM returned an empty DSA top-k capture row for an "
+                    f"effective token/layer: token={bad_token}, "
+                    f"source_layer={bad_layer}. This usually means the "
+                    "selected layer was not captured or its KV slot was missing."
+                )
+        row_ids = torch.arange(
+            rows_to_copy, device=selected.device, dtype=selected.dtype
+        ).view(-1, 1, 1)
+        if bool((valid & selected.gt(row_ids)).any().item()):
+            bad = (valid & selected.gt(row_ids)).nonzero()[0].tolist()
+            raise ValueError(
+                "vLLM returned a non-causal DSA key index: "
+                f"location={bad}, value={int(selected[tuple(bad)].item())}."
+            )
+        full[:rows_to_copy] = selected
+    return full
 
 
 def attach_routed_experts_to_chat_response_choices(
