@@ -44,8 +44,7 @@ basic_env_config: RewardModelEnvironmentConfig = {
         "enabled": True,
         "reward_model_type": "bradley_terry",
     },
-    "dtensor_cfg": {
-        "_v2": True,
+    "automodel_cfg": {
         "checkpoint": {
             "model_save_format": "safetensors",
             "save_consolidated": "false",

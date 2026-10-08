@@ -265,10 +265,10 @@ class LoadBalancer:
         self._proxy_session: aiohttp.ClientSession | None = None
 
     async def start(self) -> None:
-        # limit=5000: enough for 26 backends × ~50 concurrent reqs, but capped
-        # to prevent unbounded memory growth that caused OOM at 31GB with limit=0.
+        # Keep a bounded total connection pool while allowing each backend to
+        # use as much of that pool as load balancing requires.
         self._proxy_session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=5000, limit_per_host=150),
+            connector=aiohttp.TCPConnector(limit=5000, limit_per_host=0),
             timeout=aiohttp.ClientTimeout(total=1800),
         )
         await self.pool.start()

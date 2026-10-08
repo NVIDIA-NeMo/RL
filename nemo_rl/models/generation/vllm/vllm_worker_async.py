@@ -62,6 +62,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
+    validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
 )
@@ -1433,6 +1434,31 @@ class VllmAsyncGenerationWorkerImpl(
                     },
                     status_code=400,
                 )
+            except ValueError as e:
+                # vLLM's get_max_tokens raises a plain ValueError ("Input length
+                # (N) exceeds model's maximum context length (M).") after
+                # preprocess_chat, e.g. when a token-in splice grows the prompt
+                # past max_model_len on a request with no max_tokens to clamp.
+                # Convert only that overflow to the same 400 as above; any other
+                # ValueError is a server bug and stays a 500. Must follow
+                # MediaCaptureRejected, which is also a ValueError.
+                if "maximum context length" not in str(e):
+                    # Re-raising here bypasses the BaseException handler below.
+                    worker_self._abort_request_capture(request, reason="engine_error")
+                    raise
+                LOGGER.warning("Prompt exceeds max_model_len: %s", e)
+                worker_self._abort_request_capture(request, reason="context_length")
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "param": "input_tokens",
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
             except BaseException:
                 worker_self._abort_request_capture(request, reason="engine_error")
                 raise
@@ -1697,6 +1723,7 @@ class VllmAsyncGenerationWorkerImpl(
             """Process a single sample and return the result."""
             current_input_actual_length = input_lengths_batch[sample_idx].item()
             prompt = format_prompt_for_vllm_generation(data, sample_idx)
+            prompt = self._tokenize_prompt_with_bos(prompt)
 
             per_sample_stop_strings = None
             if batch_specific_stop_strings_list and sample_idx < len(
@@ -1789,6 +1816,11 @@ class VllmAsyncGenerationWorkerImpl(
 
             if final_request_output is None:
                 raise RuntimeError(f"No output received for request {request_id}")
+
+            validate_rollout_prompt(
+                input_ids_batch[sample_idx, :current_input_actual_length].tolist(),
+                final_request_output.prompt_token_ids,
+            )
 
             # Process the output
             generation_details = final_request_output.outputs[0]
@@ -1981,7 +2013,7 @@ class VllmAsyncGenerationWorkerImpl(
 
         async def process_single_prompt(prompt_idx):
             """Process a single prompt and return the result."""
-            prompt = prompts[prompt_idx]
+            prompt = self._tokenize_prompt_with_bos(prompts[prompt_idx])
 
             # Get stop strings for this specific prompt
             per_prompt_stop_strings = None

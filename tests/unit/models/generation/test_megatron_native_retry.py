@@ -61,7 +61,7 @@ def _backend(stream):
     backend = object.__new__(MegatronGeneration)
     backend._owns_policy = False
     worker = MagicMock()
-    worker.generate_async.options.return_value.remote.return_value = stream
+    worker.generate_async._remote.return_value = stream
     backend._policy = SimpleNamespace(worker_group=SimpleNamespace(workers=[worker]))
     return backend
 

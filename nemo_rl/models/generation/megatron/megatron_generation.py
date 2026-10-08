@@ -606,8 +606,13 @@ class MegatronGeneration(GenerationInterface):
         """
         timeout = float(os.environ.get("NRL_MEGATRON_ASYNC_TIMEOUT_SECONDS", "900"))
         worker = self._policy.worker_group.workers[0]
-        futures = worker.generate_async.options(num_returns="streaming").remote(
-            data=data, greedy=greedy
+        # Not .options(num_returns="streaming"): this process cannot unpickle the
+        # Megatron worker class (no Megatron here), so Ray gives the handle a
+        # placeholder class whose methods are not generators. Ray >= 2.58 checks
+        # that in .options() and raises; _remote() skips the check.
+        # NOTE(@cspades): https://github.com/ray-project/ray/pull/64749
+        futures = worker.generate_async._remote(
+            kwargs={"data": data, "greedy": greedy}, num_returns="streaming"
         )
         from nemo_rl.experience.failures import RolloutDataFailure
 
