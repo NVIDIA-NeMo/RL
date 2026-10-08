@@ -29,6 +29,7 @@ from nemo_rl.algorithms.sft_v2 import (
     _max_train_steps,
 )
 from nemo_rl.data.energon.sft_types import StepEnvelope
+from nemo_rl.data.energon.config import EnergonLoaderConfig
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.instrumentation import TRACE_CARRIER_KWARG
@@ -92,7 +93,7 @@ def _valid_setup_config(
         "backend": "energon",
         "validation": None,
         "max_input_seq_length": 128,
-        "energon": SimpleNamespace(packing_buffer_size=None),
+        "energon": SimpleNamespace(task_encoder=SimpleNamespace(packing=None)),
     }
     data.update(data_overrides or {})
     policy = {
@@ -400,7 +401,17 @@ def test_setup_rejects_invalid_energon_packing_config(
     config = _valid_setup_config(
         data_overrides={
             "max_input_seq_length": max_sequence_length,
-            "energon": SimpleNamespace(packing_buffer_size=64),
+            "energon": SimpleNamespace(
+                task_encoder=SimpleNamespace(
+                    packing=SimpleNamespace(
+                        name=sequence_packing.get("algorithm", "greedy_knapsack"),
+                        options=SimpleNamespace(
+                            max_sequence_length=max_sequence_length,
+                            sequence_length_pad_multiple=pad_multiple,
+                        ),
+                    )
+                )
+            ),
         },
         policy_overrides={
             "megatron_cfg": megatron_overrides,
@@ -414,12 +425,77 @@ def test_setup_rejects_invalid_energon_packing_config(
         setup_sft_v2(config, MagicMock())
 
 
-def test_setup_loaders_enables_packing_from_energon_buffer() -> None:
+@pytest.mark.parametrize(
+    "options,message",
+    [
+        (
+            {"sequence_length_pad_multiple": 4},
+            "sequence_length_pad_multiple must match",
+        ),
+        ({"max_sequence_length": 64}, "pack capacity must match"),
+    ],
+)
+def test_setup_validates_nested_packing_options(
+    options: dict[str, int], message: str
+) -> None:
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    config = _valid_setup_config(
+        data_overrides={
+            "energon": EnergonLoaderConfig(
+                model_family="qwen",
+                task_encoder={
+                    "packing": {
+                        "name": "balanced_greedy_knapsack",
+                        "buffer_size": 64,
+                        "options": {
+                            "max_sequence_length": 128,
+                            "sequence_length_pad_multiple": 8,
+                            **options,
+                        },
+                    }
+                },
+            ),
+        },
+        policy_overrides={
+            "sequence_packing": {
+                "enabled": True,
+                "fuse_loss": True,
+                # The nested task encoder selects the packer, not this legacy key.
+                "algorithm": "unknown",
+            }
+        },
+    )
+    config.policy["make_sequence_length_divisible_by"] = 8
+    with pytest.raises(ValueError, match=message):
+        setup_sft_v2(config, MagicMock())
+
+
+@pytest.mark.parametrize("restored", [False, True])
+def test_setup_loaders_uses_nested_packing_without_obsolete_kwargs(
+    restored: bool,
+) -> None:
+
+    loader_config = EnergonLoaderConfig(
+        model_family="qwen",
+        task_encoder={
+            "packing": {
+                "name": "balanced_greedy_knapsack",
+                "buffer_size": 64,
+                "options": {
+                    "max_sequence_length": 128,
+                    "sequence_length_pad_multiple": 8,
+                    "max_sequences_per_bin": 16,
+                    "balanced_knapsack_delta": 2,
+                },
+            }
+        },
+    )
     controller = object.__new__(_ACTOR_CLS)
     controller._master_config = SimpleNamespace(
         data={
             "max_input_seq_length": 128,
-            "energon": SimpleNamespace(packing_buffer_size=64),
+            "energon": loader_config,
         },
         policy={
             "train_global_batch_size": 4,
@@ -435,19 +511,33 @@ def test_setup_loaders_enables_packing_from_energon_buffer() -> None:
         logical_world_size=2,
         placement_hash="placement",
     )
-    controller._loader_states = None
+    controller._loader_states = [{"shard": 0}, {"shard": 1}] if restored else None
     controller._trainer = MagicMock()
     futures = [object(), object()]
     controller._trainer.worker_group.run_all_workers_single_data.return_value = futures
+    controller._trainer.worker_group.run_all_workers_multiple_data.return_value = (
+        futures
+    )
 
     with patch("nemo_rl.algorithms.sft_v2.ray.get", return_value=[True, True]):
         controller._setup_loaders()
 
-    kwargs = (
-        controller._trainer.worker_group.run_all_workers_single_data.call_args.kwargs
+    if restored:
+        call_kwargs = controller._trainer.worker_group.run_all_workers_multiple_data.call_args.kwargs
+        assert call_kwargs["restored_state"] == controller._loader_states
+        kwargs = call_kwargs["common_kwargs"]
+    else:
+        kwargs = controller._trainer.worker_group.run_all_workers_single_data.call_args.kwargs
+    assert kwargs["data_config"]["energon"] is loader_config
+    assert kwargs["batch_size"] == 2
+    assert (
+        not {
+            "packing_algorithm",
+            "max_sequences_per_bin",
+            "sequence_length_pad_multiple",
+        }
+        & kwargs.keys()
     )
-    assert kwargs["packing_algorithm"] == "balanced_greedy_knapsack"
-    assert kwargs["max_sequences_per_bin"] == 16
 
 
 @pytest.mark.parametrize(
@@ -477,7 +567,17 @@ def test_setup_rejects_unsupported_energon_packing_layouts(
     config = _valid_setup_config(
         data_overrides={
             "max_input_seq_length": 130,
-            "energon": SimpleNamespace(packing_buffer_size=64),
+            "energon": SimpleNamespace(
+                task_encoder=SimpleNamespace(
+                    packing=SimpleNamespace(
+                        name="greedy_knapsack",
+                        options=SimpleNamespace(
+                            max_sequence_length=130,
+                            sequence_length_pad_multiple=policy_multiple,
+                        ),
+                    )
+                )
+            ),
         },
         policy_overrides={
             "megatron_cfg": megatron_overrides,

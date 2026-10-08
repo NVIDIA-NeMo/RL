@@ -260,14 +260,14 @@ def _loader_config(value: Any) -> EnergonLoaderConfig:
     TASK_ENCODER_REGISTRY.resolve_configured_for_model_family(
         name=config.task_encoder.name,
         python_file=config.task_encoder.python_file,
-        object_name=config.task_encoder.object,
+        object_name=config.task_encoder.object_name,
         model_family=config.model_family,
     )
     for cooker in config.cookers:
         COOKER_REGISTRY.resolve_configured_for_model_family(
             name=cooker.name,
             python_file=cooker.python_file,
-            object_name=cooker.object,
+            object_name=cooker.object_name,
             model_family=config.model_family,
         )
     return config
@@ -310,7 +310,8 @@ def _loader_identity(
     """Describe what a restored loader must still agree with."""
     identity = {
         "source": source.model_dump(mode="json"),
-        "loader": loader_config.model_dump(mode="json"),
+        # Preserve the serialized plugin names used in existing loader identities.
+        "loader": loader_config.model_dump(mode="json", by_alias=True),
         "adapter": adapter_fingerprint,
         "split_role": split_role,
         # Energon rescales a restored worker offset only when it can find a
@@ -377,7 +378,7 @@ def _task_encoder(
             COOKER_REGISTRY.resolve_configured(
                 name=cooker_config.name,
                 python_file=cooker_config.python_file,
-                object_name=cooker_config.object,
+                object_name=cooker_config.object_name,
             ),
         )
         if cooker_config.options:
@@ -393,7 +394,7 @@ def _task_encoder(
         TASK_ENCODER_REGISTRY.resolve_configured(
             name=loader_config.task_encoder.name,
             python_file=loader_config.task_encoder.python_file,
-            object_name=loader_config.task_encoder.object,
+            object_name=loader_config.task_encoder.object_name,
         ),
     )
     encoder_options = loader_config.task_encoder.options
@@ -411,6 +412,7 @@ def _task_encoder(
         packer = get_packer(
             packing.name,
             packing.options.max_sequence_length,
+            max_sequences_per_bin=packing.options.max_sequences_per_bin,
             balanced_knapsack_delta=packing.options.balanced_knapsack_delta,
         )
         sequence_length_pad_multiple = packing.options.sequence_length_pad_multiple
@@ -548,7 +550,9 @@ def build_energon_sft_loader(
                 logical_world_size=logical_world_size,
             ),
             packing_algorithm=None if packing is None else packing.name,
-            max_sequences_per_bin=None,
+            max_sequences_per_bin=(
+                None if packing is None else packing.options.max_sequences_per_bin
+            ),
             sequence_length_pad_multiple=(
                 1 if packing is None else packing.options.sequence_length_pad_multiple
             ),

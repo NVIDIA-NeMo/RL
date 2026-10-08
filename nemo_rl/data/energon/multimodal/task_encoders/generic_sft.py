@@ -275,6 +275,22 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         only_unmask_final: bool = False,
         loss_mask_mode: str | None = None,
     ) -> None:
+        """Configure conversation encoding and optional sequence packing.
+
+        Args:
+            adapter: Processor adapter that encodes each conversation.
+            cooker_functions: Cookers that produce canonical SFT samples.
+            include_source_ids: Include source identifiers in each batch.
+            packer: Sequence packer, or None to batch individual conversations.
+            tokenizer: Tokenizer used to pad packed batches.
+            sequence_length_pad_multiple: Alignment for each source in a pack.
+            only_unmask_final: Train only on the final assistant turn in default mode.
+            loss_mask_mode: None builds assistant-role loss masks. "precomputed"
+                preserves each message's token_loss_mask, which must be a binary
+                one-dimensional tensor matching token_ids. Precomputed masks do
+                not support only_unmask_final=True. Both modes support packed
+                and unpacked conversations.
+        """
         super().__init__(cooker_functions=cooker_functions)
         self.adapter = adapter
         self.include_source_ids = include_source_ids
