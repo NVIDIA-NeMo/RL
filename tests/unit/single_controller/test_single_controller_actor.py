@@ -4431,9 +4431,8 @@ def test_advantage_stage_placeholders_never_vote(
         ctrl._step_log_dict = {
             key: []
             for key in (
-                "rewards",
-                "sample_masks",
-                "masked_advantages",
+                "reward_partials",
+                "advantage_partials",
                 "sequence_lengths",
                 "num_mask_sample_filtered",
                 "seq_logprob_error_metrics",
@@ -4446,7 +4445,10 @@ def test_advantage_stage_placeholders_never_vote(
             sample_ids=[f"sample-{i}" for i in range(n)],
             fields=list(data.keys()),
             sequence_lengths=[3] * n,
-            tags=[{GROUP_ID_TAG: "real" if i < 4 else f"invalid-{(i - 4) // 2}"} for i in range(n)],
+            tags=[
+                {GROUP_ID_TAG: "real" if i < 4 else f"invalid-{(i - 4) // 2}"}
+                for i in range(n)
+            ],
         )
         _, trainable = asyncio.run(ctrl._advantage_stage(meta))
         assert trainable
@@ -4456,6 +4458,7 @@ def test_advantage_stage_placeholders_never_vote(
             torch.tensor([1.0, 1.0] + [0.0] * (n - 2)),
         )
         assert torch.isfinite(plane.written_fields["advantages"]).all()
-        return plane.written_fields["advantages"][:2]
+        written = plane.written_fields["advantages"]
+        return torch.stack(written.unbind()[:2])
 
     torch.testing.assert_close(compute(placeholders=True), compute(placeholders=False))
