@@ -36,7 +36,6 @@ step batch in one call.
 
 from __future__ import annotations
 
-import time
 import uuid
 from typing import Any, Optional
 
@@ -50,8 +49,8 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
-from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
@@ -71,9 +70,6 @@ from nemo_rl.utils.r3_trace import trace_rollout_payload
 # the training/dynamic-sampling path only handles tensors/lists. Validation
 # requests them explicitly to print per-sample message logs.
 OPT_IN_CARRY_KEYS: tuple[str, ...] = ("turn_roles", "turn_contents")
-# rollout_metrics keys carrying rollout_to_tq per-phase seconds (plus the
-# actor's wall_start / wall_end epoch); callers pop them before logging.
-ACTOR_TIMING_PREFIX = "actor_timing/"
 
 
 def _flatten_rollout_message_log_for_tq(
@@ -227,16 +223,6 @@ class SyncRolloutActor:
         from nemo_rl.environments.nemo_gym import should_use_nemo_gym
         from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 
-        actor_wall_start = time.time()
-        phase_s: dict[str, float] = {}
-        last = time.perf_counter()
-
-        def mark(phase: str) -> None:
-            nonlocal last
-            now = time.perf_counter()
-            phase_s[phase] = now - last
-            last = now
-
         # Per-step generation-side metric hooks: snapshot once on the
         # first DS iter so backends with per-step deltas have a stable
         # anchor; clear accumulators before every rollout. Mirrors
@@ -245,7 +231,6 @@ class SyncRolloutActor:
             if first_iter and hasattr(self.policy_generation, "snapshot_step_metrics"):
                 self.policy_generation.snapshot_step_metrics()
             self.policy_generation.clear_logger_metrics()
-        mark("metrics_reset")
 
         cfg = self.master_config
         task_to_env = (
@@ -297,10 +282,8 @@ class SyncRolloutActor:
                 max_rollout_turns=cfg.grpo.max_rollout_turns,
                 deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
             )
-        mark("rollout")
         fb = final_batch.to("cpu")
         del final_batch
-        mark("to_cpu")
 
         # Flatten message_log → bulk tensors + extract original prompt ids.
         # GRPO masks only generated assistant turns, even if the dataset
@@ -313,7 +296,6 @@ class SyncRolloutActor:
                 "make_sequence_length_divisible_by"
             ],
         )
-        mark("flatten")
 
         router_replay_enabled = bool(
             (cfg.policy.get("router_replay") or {}).get("enabled", False)
@@ -356,12 +338,10 @@ class SyncRolloutActor:
         # (kv_first_write wraps it via NonTensorStack).
         if "content" in flat:
             bulk_batch["content"] = np.asarray(flat["content"], dtype=object)
-        mark("build_bulk")
 
         # Decomposed only for ``driver_carry``; turn_* and the non-tensor fb
         # columns are not written to TQ (no reader fetches them).
         decomposed = decompose_message_log(fb["message_log"])
-        mark("decompose_message_log")
 
         # Slice — only what the driver can't derive from a TQ slice fetch
         # (anything containing `message_log` or per-token data would
@@ -417,7 +397,6 @@ class SyncRolloutActor:
         uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
         sample_ids = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
         trace_rollout_payload(keys=sample_ids, data=bulk_batch)
-        mark("carry_and_ids")
         meta = kv_first_write(
             bulk_batch,
             sample_ids=sample_ids,
@@ -433,25 +412,19 @@ class SyncRolloutActor:
                 cfg.policy.get("make_sequence_length_divisible_by") or 1
             ),
         )
-        mark("kv_first_write")
 
         if self.policy_generation is not None:
             if finish_generation:
                 self.policy_generation.finish_generation()
-                mark("finish_generation")
             gen_metrics = self.policy_generation.get_logger_metrics()
-            mark("get_logger_metrics")
         else:
             gen_metrics = None
-        # Added after kv_first_write so the timings never ride the TQ payload.
-        phase_s.update(wall_start=actor_wall_start, wall_end=time.time())
-        rollout_metrics.update(
-            {f"{ACTOR_TIMING_PREFIX}{k}": v for k, v in phase_s.items()}
-        )
         return meta, BatchedDataDict(driver_carry), rollout_metrics, gen_metrics
 
-    # Same contract as the policy workers' (reads ``self._dp_client``).
-    get_data_plane_snapshot = TQWorkerMixin.get_data_plane_snapshot
+    def get_data_plane_snapshot(self) -> "dict[str, Any] | None":
+        if not is_metrics_client(self._dp_client):
+            return None
+        return self._dp_client.snapshot(reset_step_window=True)
 
     def shutdown(self) -> None:
         try:
