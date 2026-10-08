@@ -11,6 +11,9 @@ from typing import Any
 
 import pytest
 import torch
+
+pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
+
 from responses_api_models.vllm_model.tests import test_framework_context as gym
 
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
@@ -23,6 +26,8 @@ from nemo_rl.experience.rollout_reassembler import (
 )
 from nemo_rl.models.generation.capture_context import decide_capture_input
 from tests.unit.experience.test_logical_owner_finalization import PublicationDataPlane
+
+pytestmark = pytest.mark.nemo_gym
 
 
 @dataclass
@@ -410,8 +415,8 @@ def test_one_corrupt_shared_path_masks_entire_owner(
 def test_shared_plan_and_masks_survive_selection_serialization(
     forest: ForestCapture,
 ) -> None:
-    from dataclasses import asdict
     import json
+    from dataclasses import asdict
 
     records, _ = forest.capture([None, 0, 0, None, 3])
     selected = selection(records)

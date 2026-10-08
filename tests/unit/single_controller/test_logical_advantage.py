@@ -192,6 +192,32 @@ def test_deduplicates_unequal_segments_without_pooling_identical_prompts_across_
     assert data["advantages"].count_nonzero() == 0
 
 
+@pytest.mark.parametrize("padding", [False, True])
+@pytest.mark.parametrize(
+    "flagged_rows,expected_count",
+    [((), 0), ((0,), 1), ((2,), 1), ((0, 1, 2), 1), ((0, 3), 2)],
+)
+def test_filter_metric_counts_owners_not_segments_or_padding(
+    padding: bool, flagged_rows: tuple[int, ...], expected_count: int
+) -> None:
+    meta, data = _batch([("a", [(0.0, 3), (1.0, 1)])], padding=padding)
+    for row in flagged_rows:
+        data["mask_sample"][row] = True
+    if padding:
+        # Match the finalizer's environment-mask field on execution padding.
+        data["mask_sample"][-1] = True
+    ctrl = _controller(meta, data)
+    asyncio.run(ctrl._advantage_stage(meta))
+    assert ctrl._step_log_dict["num_mask_sample_filtered"] == [expected_count]
+    assert (
+        data["sample_mask"][:3].tolist()
+        == [float(not any(row < 3 for row in flagged_rows))] * 3
+    )
+    assert data["sample_mask"][3].item() == float(3 not in flagged_rows)
+    if padding:
+        assert data["sample_mask"][-1].item() == 0
+
+
 @pytest.mark.parametrize("mask_owner", [False, True])
 def test_logical_advantages_match_through_sharded_stage(mask_owner: bool) -> None:
     meta, data = _batch([("a", [(0.0, 3), (2.0, 1)]), ("b", [(1.0, 1), (5.0, 4)])])
@@ -218,6 +244,7 @@ def test_logical_advantages_match_through_sharded_stage(mask_owner: bool) -> Non
             ctrl._available_advantage_actors.put_nowait(actor)
         _, valid = asyncio.run(ctrl._advantage_stage(meta))
         assert valid
+        assert sum(ctrl._step_log_dict["num_mask_sample_filtered"]) == int(mask_owner)
         if actor_count:
             assert sorted(
                 n for actor in ctrl._advantage_actors for n in actor.calls
@@ -405,6 +432,9 @@ def test_masked_owner_is_excluded_from_baseline_and_loss(filter_field, ordinary)
     ctrl = _controller(meta, data, grpo={"overlong_filtering": True})
     _, valid = asyncio.run(ctrl._advantage_stage(meta))
     assert valid
+    assert ctrl._step_log_dict["num_mask_sample_filtered"] == [
+        int(filter_field == "mask_sample")
+    ]
     torch.testing.assert_close(data["advantages"][0], torch.full((3,), expected[0]))
     torch.testing.assert_close(
         data["advantages"][counts[0]], torch.full((3,), expected[1])

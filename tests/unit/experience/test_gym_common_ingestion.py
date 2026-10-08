@@ -12,6 +12,9 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+
+pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
+
 from nemo_gym.base_resources_server import BaseRunRequest
 from nemo_gym.token_id_capture.completion import (
     completion_metadata,

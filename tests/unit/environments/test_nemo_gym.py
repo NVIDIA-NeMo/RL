@@ -1706,7 +1706,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         assert postprocess_calls == [
             (
                 nemo_gym_row,
-                nemo_gym_result | {"instance_config": {"mask_sample": False}},
+                nemo_gym_result,
                 tokenizer,
                 True,
             )

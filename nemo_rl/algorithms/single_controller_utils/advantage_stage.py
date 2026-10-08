@@ -471,6 +471,12 @@ class AdvantageComputer:
                 sample_mask=final_sample_mask,
                 expected_group_size=cfg.algo.num_generations_per_prompt,
             )
+            # Any flagged segment filters its owner; padding has no owner.
+            num_mask_sample_filtered = (
+                owner_batch.row_owner[mask_sample & (owner_batch.row_owner >= 0)]
+                .unique()
+                .numel()
+            )
             final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
