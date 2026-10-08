@@ -183,6 +183,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "prompt_idx",
         "mask_sample",
         "loss_multiplier",
+        "resolved_agent_name",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",
