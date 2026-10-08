@@ -92,6 +92,14 @@ RL_ITERATION_ATTR = "rl.iteration"
 # work ran long, which are opposite diagnoses.
 RL_IDLE_POLLS_ATTR = "rl.idle.polls"
 
+# Whether a checkpoint's bytes were still being written when the training loop
+# moved on. Distinguishes the two shapes ``rl.checkpoint.finalize`` can take:
+# with async save it spans a real wait on the writer processes, with sync save
+# the write already finished inside the staging span and this is just a rename.
+# Same span either way, so without this a near-zero duration is ambiguous
+# between "sync save" and "async save that had already landed".
+RL_CHECKPOINT_ASYNC_ATTR = "rl.checkpoint.async_save"
+
 __all__ = [
     "NO_SPAN",
     "managed_span",
@@ -123,7 +131,9 @@ __all__ = [
     "startup_span",
     "setup_span",
     "evaluate_span",
+    "checkpoint_finalize_span",
     "RL_ALGORITHM",
+    "RL_CHECKPOINT_ASYNC_ATTR",
     "RL_EFFICIENCY_CATEGORY_ATTR",
     "RL_IDLE_POLLS_ATTR",
     "RL_ITERATION_ATTR",
@@ -953,6 +963,57 @@ def evaluate_span(
         ) as span,
         bucket_scope(Bucket.OVERHEAD),
     ):
+        yield span
+
+
+@contextmanager
+def checkpoint_finalize_span(
+    iteration: Optional[int],
+    *,
+    async_save: bool,
+    tracer: Optional[Tracer] = None,
+    **attributes: Any,
+) -> Iterator[Any]:
+    """The asynchronous tail of a checkpoint, named ``rl.checkpoint.finalize``.
+
+    Closes when the checkpoint is durable -- every rank's writer has flushed and
+    ``tmp_step_N`` has been renamed to ``step_N`` -- which is the moment a
+    checkpoint can actually be resumed from. ``rl.<algo>.checkpointing`` cannot
+    answer that: it ends when the training loop is released, which with async
+    save is after D2H staging only, with the bytes still in flight.
+
+    *iteration* is passed rather than inherited, and that is the point of the
+    helper. The work runs on a daemon thread spawned by ``begin_finalization``
+    and routinely outlives the step that triggered it, so the enclosing
+    :func:`iteration_scope` is both unreachable (a raw thread starts with an
+    empty context) and wrong by the time the span closes (the loop has moved
+    on). Stamping it explicitly keeps the span filed under the step whose
+    weights it holds, not whichever step happened to be running at the rename.
+    Set directly rather than left to the scope because lens's span processor
+    skips keys already present, so an explicit value wins over an inherited one.
+
+    Unbucketed, like the collector's waits and for the same reason: it overlaps
+    the next step's productive spans, so an ``overhead`` tag here would charge
+    one stretch of wall clock to two buckets at once. Reached through
+    ``_managed_span`` rather than :func:`managed_span` to get that -- the group
+    stays ``checkpoint`` so one group switch still turns every checkpoint span
+    on or off together.
+
+    Args:
+        iteration: Step the checkpoint was triggered at, or None when it cannot
+            be recovered from the directory name.
+        async_save: Whether the caller handed a wait function, i.e. whether
+            bytes were still being written when the training loop resumed.
+    """
+    attrs: dict[str, Any] = {RL_CHECKPOINT_ASYNC_ATTR: async_save, **attributes}
+    if iteration is not None:
+        attrs[RL_ITERATION_ATTR] = iteration
+    with _managed_span(
+        RLSpanGroup.CHECKPOINT,
+        "rl.checkpoint.finalize",
+        tracer=tracer,
+        **attrs,
+    ) as span:
         yield span
 
 

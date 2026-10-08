@@ -26,10 +26,12 @@ import threading
 import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import (
     Any,
     Callable,
+    Iterator,
     Literal,
     Mapping,
     NotRequired,
@@ -43,7 +45,65 @@ import torch
 import yaml
 from pydantic import BaseModel
 
+from nemo_rl.telemetry.instrumentation import (
+    checkpoint_finalize_span,
+    current_trace_carrier,
+    remote_trace_context,
+)
+
 PathLike = Union[str, "os.PathLike[Any]"]
+
+# ``init_tmp_checkpoint`` names the staging directory ``tmp_step_{step}``, and
+# that name is the only place the step survives into ``begin_finalization``,
+# which takes the path alone. Parsed rather than added as an argument, so every
+# algorithm's call site stays untouched.
+_TMP_STEP_PATTERN = re.compile(r"^tmp_step_(\d+)$")
+
+
+def _step_from_tmp_path(checkpoint_path: PathLike) -> Optional[int]:
+    """Step a ``tmp_step_N`` directory belongs to, or None if unrecognised.
+
+    None rather than a raise: one caller only labels a span with this, and a
+    checkpoint staged under some other name should still be finalized.
+    """
+    match = _TMP_STEP_PATTERN.match(Path(checkpoint_path).name)
+    return int(match.group(1)) if match else None
+
+
+@contextmanager
+def _finalize_telemetry(
+    carrier: Mapping[str, str], step: Optional[int], *, async_save: bool
+) -> Iterator[None]:
+    """Open ``rl.checkpoint.finalize``, or carry on without it if that fails.
+
+    Guarded because the block it wraps performs the rename that makes a
+    checkpoint resumable, and nothing in this package lets observability decide
+    whether that happens -- the same stance :meth:`_warn_on_delete_failure`
+    takes for pruning. Unguarded, a lens incompatibility would surface as a
+    failed save: the exception reaches ``finalize_pending`` as
+    ``_finalize_error``, so the run dies reporting a checkpoint failure *and*
+    skips the rename.
+
+    Only entering is guarded. A failure inside the block is the checkpoint's
+    own and must still reach both the span and the caller.
+    """
+    stack = ExitStack()
+    try:
+        stack.enter_context(remote_trace_context(carrier))
+        stack.enter_context(checkpoint_finalize_span(step, async_save=async_save))
+    # Deliberately broad: the point is that no failure from the telemetry stack,
+    # whatever it is, reaches the caller from here.
+    except Exception as e:
+        stack.close()
+        warnings.warn(
+            f"Could not open the checkpoint finalization span: {e!r}. "
+            "Finalization continues untraced; the checkpoint is unaffected.",
+            stacklevel=2,
+        )
+        yield
+    else:
+        with stack:
+            yield
 
 
 def _load_megatron_common_state_dict(iteration_dir: Path) -> dict[str, Any]:
@@ -374,9 +434,18 @@ class CheckpointManager:
         If step_N already exists (defensive guard for edge cases, e.g. resuming
         training), performs a pseudo-atomic swap via an intermediate old_step_N
         directory.
+
+        Raises:
+            ValueError: *checkpoint_path* is not a ``tmp_step_N`` directory, so
+                there is no step to publish it under.
         """
         checkpoint_path = Path(checkpoint_path)
-        step = checkpoint_path.name.split("_")[2]
+        step = _step_from_tmp_path(checkpoint_path)
+        if step is None:
+            raise ValueError(
+                f"Expected a tmp_step_<N> directory from init_tmp_checkpoint(), "
+                f"got {checkpoint_path.name!r}"
+            )
         to_checkpoint_path = checkpoint_path.parent / f"step_{step}"
         if to_checkpoint_path.exists():
             old_checkpoint_path = checkpoint_path.parent / f"old_step_{step}"
@@ -422,19 +491,29 @@ class CheckpointManager:
         self.finalize_pending()
         self._pending_checkpoint_path = Path(checkpoint_path)
         self._finalize_error = None
+        step = _step_from_tmp_path(checkpoint_path)
+        # Captured here because a bare Thread starts with an empty context: read
+        # it on the worker instead and the finalize span re-roots into a trace of
+        # its own, detached from the run that produced the checkpoint.
+        carrier = current_trace_carrier()
 
         def _finalize():
+            # The work is inside the span so a failed wait or rename is recorded
+            # on it, and the span is entered through a guard so the reverse
+            # cannot happen: telemetry must not be what skips the rename.
             try:
-                if wait_fn is not None:
-                    wait_fn()
-                self._rename_checkpoint(checkpoint_path)
-                # Prune old checkpoints off the critical path. Surface any
-                # failure via a done-callback so a broken delete is not silently
-                # swallowed (the discarded Future would otherwise hide it).
-                delete_future = self._delete_executor.submit(
-                    self.remove_old_checkpoints
-                )
-                delete_future.add_done_callback(self._warn_on_delete_failure)
+                with _finalize_telemetry(carrier, step, async_save=wait_fn is not None):
+                    if wait_fn is not None:
+                        wait_fn()
+                    self._rename_checkpoint(checkpoint_path)
+                    # Prune old checkpoints off the critical path. Surface any
+                    # failure via a done-callback so a broken delete is not
+                    # silently swallowed (the discarded Future would otherwise
+                    # hide it).
+                    delete_future = self._delete_executor.submit(
+                        self.remove_old_checkpoints
+                    )
+                    delete_future.add_done_callback(self._warn_on_delete_failure)
             except Exception as e:
                 self._finalize_error = e
             finally:
