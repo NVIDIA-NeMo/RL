@@ -26,81 +26,55 @@ from nemo_rl.data.packing.algorithms import (
 from nemo_rl.data.packing.metrics import PackingMetrics
 
 
-__all__ = [
-    "BalancedGreedyKnapsackPacker",
-    "PackingAlgorithm",
-    "SequencePacker",
-    "ConcatenativePacker",
-    "FirstFitDecreasingPacker",
-    "FirstFitShufflePacker",
-    "GreedyKnapsackPacker",
-    "FixedExecutionSlotPlan",
-    "GroupCoherentShardPlan",
-    "ModifiedFirstFitDecreasingPacker",
-    "get_packer",
-    "PackingMetrics",
-    "SharedPrefixFallback",
-    "SharedPrefixFallbackReason",
-    "SharedPrefixContextParallelShard",
-    "SharedPrefixForestLayout",
-    "SharedPrefixLayout",
-    "SharedPrefixPlan",
-    "SharedPrefixRow",
-    "SharedPrefixTensorBin",
-    "SharedPrefixTensorIndices",
-    "SharedPrefixTensorPlan",
-    "SHARED_PREFIX_EXECUTION_SLOT",
-    "build_shared_prefix_layout",
-    "build_shared_prefix_tensor_plan",
-    "build_star_attention_allow_mask",
-    "get_shared_prefix_context_parallel_indices",
-    "get_shared_prefix_physical_alignment",
-    "materialize_shared_prefix_layout",
-    "materialize_shared_prefix_token_aligned_tensor",
-    "plan_fixed_execution_slots",
-    "plan_group_coherent_shards",
-    "plan_shared_prefix_bins",
-    "resolve_shared_prefix_parallel_topology",
-    "resolve_shared_prefix_physical_padding_multiple",
-    "shard_shared_prefix_tensor_bin_for_context_parallel",
-]
-
-
+# One ordered registry preserves both public export order and lazy ownership.
 _SHARED_PREFIX_EXPORTS = {
+    "BalancedGreedyKnapsackPacker": None,
+    "PackingAlgorithm": None,
+    "SequencePacker": None,
+    "ConcatenativePacker": None,
+    "FirstFitDecreasingPacker": None,
+    "FirstFitShufflePacker": None,
+    "GreedyKnapsackPacker": None,
+    "FixedExecutionSlotPlan": "nemo_rl.data.packing.shared_prefix_metadata",
+    "GroupCoherentShardPlan": "nemo_rl.data.packing.shared_prefix_metadata",
+    "ModifiedFirstFitDecreasingPacker": None,
+    "get_packer": None,
+    "PackingMetrics": None,
     "SharedPrefixFallback": "nemo_rl.data.packing.shared_prefix",
     "SharedPrefixFallbackReason": "nemo_rl.data.packing.shared_prefix",
+    "SharedPrefixContextParallelShard": "nemo_rl.data.packing.shared_prefix_tensors",
     "SharedPrefixForestLayout": "nemo_rl.data.packing.shared_prefix",
     "SharedPrefixLayout": "nemo_rl.data.packing.shared_prefix",
     "SharedPrefixPlan": "nemo_rl.data.packing.shared_prefix",
     "SharedPrefixRow": "nemo_rl.data.packing.shared_prefix",
-    "build_shared_prefix_layout": "nemo_rl.data.packing.shared_prefix",
-    "plan_shared_prefix_bins": "nemo_rl.data.packing.shared_prefix",
-    "SHARED_PREFIX_EXECUTION_SLOT": "nemo_rl.data.packing.shared_prefix_metadata",
-    "FixedExecutionSlotPlan": "nemo_rl.data.packing.shared_prefix_metadata",
-    "GroupCoherentShardPlan": "nemo_rl.data.packing.shared_prefix_metadata",
-    "plan_fixed_execution_slots": "nemo_rl.data.packing.shared_prefix_metadata",
-    "plan_group_coherent_shards": "nemo_rl.data.packing.shared_prefix_metadata",
-    "SharedPrefixContextParallelShard": "nemo_rl.data.packing.shared_prefix_tensors",
     "SharedPrefixTensorBin": "nemo_rl.data.packing.shared_prefix_tensors",
     "SharedPrefixTensorIndices": "nemo_rl.data.packing.shared_prefix_tensors",
     "SharedPrefixTensorPlan": "nemo_rl.data.packing.shared_prefix_tensors",
+    "SHARED_PREFIX_EXECUTION_SLOT": "nemo_rl.data.packing.shared_prefix_metadata",
+    "build_shared_prefix_layout": "nemo_rl.data.packing.shared_prefix",
     "build_shared_prefix_tensor_plan": "nemo_rl.data.packing.shared_prefix_tensors",
     "build_star_attention_allow_mask": "nemo_rl.data.packing.shared_prefix_tensors",
     "get_shared_prefix_context_parallel_indices": "nemo_rl.data.packing.shared_prefix_tensors",
     "get_shared_prefix_physical_alignment": "nemo_rl.data.packing.shared_prefix_tensors",
     "materialize_shared_prefix_layout": "nemo_rl.data.packing.shared_prefix_tensors",
     "materialize_shared_prefix_token_aligned_tensor": "nemo_rl.data.packing.shared_prefix_tensors",
+    "plan_fixed_execution_slots": "nemo_rl.data.packing.shared_prefix_metadata",
+    "plan_group_coherent_shards": "nemo_rl.data.packing.shared_prefix_metadata",
+    "plan_shared_prefix_bins": "nemo_rl.data.packing.shared_prefix",
     "resolve_shared_prefix_parallel_topology": "nemo_rl.data.packing.shared_prefix_tensors",
     "resolve_shared_prefix_physical_padding_multiple": "nemo_rl.data.packing.shared_prefix_tensors",
     "shard_shared_prefix_tensor_bin_for_context_parallel": "nemo_rl.data.packing.shared_prefix_tensors",
 }
 
+__all__ = list(_SHARED_PREFIX_EXPORTS)
+
 
 def __getattr__(name: str):
-    if name not in _SHARED_PREFIX_EXPORTS:
+    module = _SHARED_PREFIX_EXPORTS.get(name)
+    if module is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     from importlib import import_module
 
-    value = getattr(import_module(_SHARED_PREFIX_EXPORTS[name]), name)
+    value = getattr(import_module(module), name)
     globals()[name] = value
     return value

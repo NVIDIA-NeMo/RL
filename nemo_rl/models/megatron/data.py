@@ -452,14 +452,15 @@ def get_microbatch_iterator(
         ) = _resolve_shared_prefix_execution_topology(cfg)
         raw_iterator = iter((working_data,))
         if shared_prefix_execution_units is None:
-            execution_plan = _get_shared_prefix_execution_shape(
-                working_data,
-                cfg=cfg,
-                bin_capacity=shared_prefix_bin_capacity,
-                padding_multiple=shared_prefix_padding_multiple,
-                forward_only=shared_prefix_stage == "logprobs",
+            shared_prefix_execution_units = (
+                _plan_prescribed_shared_prefix_execution_units(
+                    working_data,
+                    cfg=cfg,
+                    bin_capacity=shared_prefix_bin_capacity,
+                    padding_multiple=shared_prefix_padding_multiple,
+                    forward_only=shared_prefix_stage == "logprobs",
+                )
             )
-            shared_prefix_execution_units = execution_plan.units
         else:
             # ``working_data`` keeps the caller's row order, so units planned on
             # ``data`` address it directly; only guard against a plan for a
@@ -468,9 +469,7 @@ def get_microbatch_iterator(
                 shared_prefix_execution_units,
                 batch_size=data.size,
             )
-            execution_plan = SharedPrefixExecutionPlan(
-                units=shared_prefix_execution_units
-            )
+        execution_plan = SharedPrefixExecutionPlan(units=shared_prefix_execution_units)
         data_iterator_len = execution_plan.num_units
         max_execution_length = execution_plan.max_physical_length
         (
@@ -880,30 +879,6 @@ def _plan_prescribed_shared_prefix_execution_units(
     )
 
 
-def _get_shared_prefix_execution_shape(
-    data_dict: BatchedDataDict[Any],
-    *,
-    cfg: PolicyConfig,
-    bin_capacity: int,
-    padding_multiple: Optional[int] = None,
-    forward_only: bool = False,
-) -> SharedPrefixExecutionPlan:
-    """Plan once and return count, maximum physical length, and the units.
-
-    The units are returned alongside the shape so callers can hand them back to
-    :func:`get_microbatch_iterator` / :func:`process_shared_prefix_microbatch`
-    instead of planning the same batch a second time.
-    """
-    units = _plan_prescribed_shared_prefix_execution_units(
-        data_dict,
-        cfg=cfg,
-        bin_capacity=bin_capacity,
-        padding_multiple=padding_multiple,
-        forward_only=forward_only,
-    )
-    return SharedPrefixExecutionPlan(units=units)
-
-
 def plan_shared_prefix_execution_units(
     data: BatchedDataDict[Any],
     *,
@@ -927,13 +902,13 @@ def plan_shared_prefix_execution_units(
     """
     normalized_data = _normalize_shared_prefix_group_ids(data)
     *_topology, padding_multiple = _resolve_shared_prefix_execution_topology(cfg)
-    return _get_shared_prefix_execution_shape(
+    return _plan_prescribed_shared_prefix_execution_units(
         normalized_data,
         cfg=cfg,
         bin_capacity=bin_capacity,
         padding_multiple=padding_multiple,
         forward_only=forward_only,
-    ).units
+    )
 
 
 def process_shared_prefix_microbatch(

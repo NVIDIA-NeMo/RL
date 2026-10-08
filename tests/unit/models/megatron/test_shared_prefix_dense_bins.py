@@ -20,7 +20,10 @@ import torch
 from pydantic import ValidationError
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.megatron.data import _SharedPrefixExecutionUnit
+from nemo_rl.models.megatron.data import (
+    _SharedPrefixExecutionUnit,
+    plan_shared_prefix_execution_units,
+)
 from nemo_rl.models.megatron.shared_prefix_alignment import materialize_alignment
 from nemo_rl.models.megatron.shared_prefix_dense_bins import (
     plan_dense_training_bins,
@@ -55,6 +58,21 @@ def batch(tokens, prompts, groups):
 
 
 class TestSharedPrefixDenseBins(unittest.TestCase):
+    def test_public_plan_rejects_empty_batch(self):
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.empty((0, 1), dtype=torch.long),
+                "input_lengths": torch.empty(0, dtype=torch.long),
+                "shared_prefix_prompt_lengths": torch.empty(0, dtype=torch.long),
+                "shared_prefix_group_id": [],
+                "_shared_prefix_execution_slot": [],
+            }
+        )
+        with self.assertRaisesRegex(
+            ValueError, "^shared-prefix train mode received an empty local batch$"
+        ):
+            plan_shared_prefix_execution_units(data, cfg=config(), bin_capacity=1)
+
     def test_mixed_roots_preserve_causal_rows_and_one_mtp_group(self):
         data = batch(
             [[1, 2, 3, 8], [4, 5, 6, 9], [1, 2, 3, 10]], [3, 3, 3], ["a", "b", "a"]
