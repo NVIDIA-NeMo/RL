@@ -15,7 +15,7 @@ policy:
     chat_template: default
   train_global_batch_size: 512
   max_total_sequence_length: 4096
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true

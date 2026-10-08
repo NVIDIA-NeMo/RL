@@ -133,7 +133,7 @@ sbatch ray.sub \
   - Explanation
 * - `UV_CACHE_DIR_OVERRIDE`
   - By default, this variable does not need to be set. If unset, `ray.sub` uses the 
-    `UV_CACHE_DIR` defined within the container (defaulting to `/root/.cache/uv`). 
+    `UV_CACHE_DIR` defined within the container (`/opt/nemo_rl_cache/uv` in images built from `docker/Dockerfile`; set `CONTAINER_UV_CACHE_DIR` for a container that uses another path). 
     `ray.sub` intentionally avoids using the `UV_CACHE_DIR` from the user's host 
     environment to prevent the host's cache from interfering with the container's cache. 
     Set `UV_CACHE_DIR_OVERRIDE` if you have a customized `uv` environment (e.g., 
@@ -172,6 +172,20 @@ sbatch ray.sub \
     **Watch segment divisibility.** With topology-aware placement the allocation
     becomes `--nodes=N+1`, which can trip the "`SEGMENT_SIZE` must evenly divide
     `NUM_NODES`" check in `tools/launch`.
+* - `NRL_MOUNT_HOST_ENROOT`
+  - Unset by default; set to `1` to bind-mount the compute node's own enroot
+    installation (every `/usr/bin/enroot*` file and the enroot library, share
+    and configuration directories that exist) into the training container, so a
+    process inside it, such as a NeMo Gym agent server that runs each agent in
+    its own sandbox, can start containers. Any value other than unset, `0` or
+    `1` is rejected when the batch script starts on the first allocated node.
+    pyxis validates every mount source on each node where a step starts and
+    fails with `pyxis: --container-mounts: source path does not exist`, so every
+    allocated node needs the same enroot layout. Only enroot's own files are
+    mounted: the training container must still provide the tools enroot's
+    subcommands invoke (`unsquashfs` for `enroot create`, `squashfuse` and
+    `fuse-overlayfs` for starting a `.sqsh` image directly). With
+    `tools/launch`, pass the variable through `EXTRA_ENV`.
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
 * - `NODE_MANAGER_PORT=1301`

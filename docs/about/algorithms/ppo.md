@@ -23,7 +23,7 @@ uv run examples/run_ppo.py \
 
 > [!NOTE]
 > `ppo_math_1B.yaml` runs the DTensor backend because it sets
-> `policy.dtensor_cfg.enabled=true` (and `policy.megatron_cfg.enabled=false`).
+> `policy.automodel_cfg.enabled=true` (and `policy.megatron_cfg.enabled=false`).
 > To use the Megatron-Core backend, pass `--config examples/configs/ppo_math_1B_megatron.yaml` instead.
 
 ## PPO Multi-node
