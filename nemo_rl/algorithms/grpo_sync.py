@@ -319,7 +319,6 @@ def validate_sync(
         max_batches = (
             master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
         )
-        # Resets the persistent val workers primed in setup().
         with timer.time("dataloader_iter"):
             val_iter = iter(val_dataloader)
         for _ in range(max_batches):

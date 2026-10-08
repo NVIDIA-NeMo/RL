@@ -790,12 +790,7 @@ def setup(
             shuffle=False,
             collate_fn=rl_collate_fn,
             num_workers=data_config["num_workers"],
-            persistent_workers=data_config["num_workers"] > 0,
         )
-        # Fork val workers now, before the data plane pins its large RDMA segment
-        # on the driver; forking afterwards copies the pinned pages on every
-        # validation. Persistent workers are reset, not re-forked, on later iter().
-        iter(val_dataloader)
         print(
             f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples",
             flush=True,
