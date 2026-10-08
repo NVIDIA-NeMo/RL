@@ -455,8 +455,9 @@ class MegatronConfig(TypedDict):
     inference_grouped_gemm_backend: NotRequired[str]
     # Fixed decode row capacity for the FlashInfer routed-MXFP8 MoE path. Without it
     # every decode step processes the full NVLS dispatcher buffer
-    # (round_up(max_tokens) / TP * EP rows). MCore applies it only when
-    # max_requests * EP <= capacity. FlashInfer's TRT-LLM MXFP8 MoE also needs enough
+    # (round_up(max_tokens) / TP * EP rows). MCore applies it only to decode-only
+    # steps when max_requests * (num_speculative_tokens + 1) * EP <= capacity.
+    # FlashInfer's TRT-LLM MXFP8 MoE also needs enough
     # rows for the local expert count (Nano-30B: >=256 rows at 16 local experts,
     # >=1024 at 64); smaller capacities fail CUDA-graph capture.
     inference_flashinfer_mxfp8_token_capacity: NotRequired[int | None]
