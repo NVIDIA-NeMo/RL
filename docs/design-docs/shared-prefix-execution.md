@@ -47,7 +47,9 @@ policy:
   quant_cfg: null
 ```
 
-The single-controller token-capture integration also requires `token_capture.enabled: true` in its existing algorithm configuration. Prompt boundaries are captured from the rollout rather than inferred from padded tokens. Workers must use the matching MCore shared-prefix implementation and its capability checks.
+Shared execution requires the single-controller GRPO launcher with `data_plane.enabled: true` and `token_capture.enabled: true` in its existing algorithm configuration. Standard GRPO setup rejects `train` and `logprobs` modes because it does not produce group identities or prompt boundaries. Prompt boundaries are captured from the rollout rather than inferred from padded tokens. Workers must use the matching MCore shared-prefix implementation and its capability checks.
+
+Set `policy.generation.top_p: 1.0` and disable `policy.generation.top_k` (`null`, `0`, or `-1`). Shared next-token logprob extraction does not support top-k/top-p filtering, and configuration validation rejects it before policy workers are allocated. Temperature scaling remains supported. `bypass_evaluation_mtp` is accepted only in `dense`, `logprobs`, or `train` mode; disable it when switching to `disabled` or `observe`.
 
 For the ragged Mamba implementation studied in the experiments, set `NRL_SP_MAMBA_IMPL=ragged_state_fork` in worker environments. The backend's default `state_fork` is a different implementation. Other `NRL_SP_*` switches are experimental/diagnostic controls, not a supported tuning API. Their presence does not mean those variants were measured or qualified; do not enable them when reproducing the default configuration.
 
@@ -57,4 +59,6 @@ The first scope is the guarded hybrid model path, PP=1, supported TP/SP and CP l
 
 The contribution carries planner, metadata, materialization, causal-mask and alignment tests. Before merge it also needs distributed GPU tests covering the dense default, shared logprob extraction, matched own-logprob/training forwards, Mamba state backward, router logical multiplicity and MTP normalization.
 
-Within-shared forward consistency and long-run evaluation quality answer different questions from dense/shared backbone-gradient agreement. The production investigation retains a controlled cross-implementation gradient discrepancy (13.9305% relative L2 versus roughly 1% repeat variation). The current-main port is not automatically qualified by production results. Keep this feature experimental until its numerical contract and distributed regression gates are resolved.
+Within-shared forward consistency and long-run evaluation quality answer different questions from dense/shared backbone-gradient agreement. A historical comparison with matched rows/bins and a common output cotangent measured a 13.9305% sampled, size-weighted relative L2 gradient difference, versus roughly 1% repeat variation. Relative L2 measures the norm of the gradient difference relative to the dense gradient norm; it is not a measure of accuracy loss or a percentage of incorrect parameters.
+
+This leaves cross-implementation numerical agreement unverified; it does not establish a backward bug or worse training quality. Reduced-precision execution and different packing shapes can change numerical results, and bitwise dense/shared identity is not the acceptance criterion. The intended tolerance and training-quality evidence need maintainer agreement. The current-main port still needs its own distributed regression qualification and remains experimental.
