@@ -60,13 +60,17 @@ _rich_logging_configured = False
 # Dev-branch change (upstream value: "nemo_rl/step"): the value "step" stands
 # for W&B's own step instead of a custom axis, so trainer charts line up with
 # runs from before #3925, which plotted against W&B's Step. Where it is "step",
-# trainer rows are logged with run.log(..., step=trainer_step) and carry no
-# extra field, and custom-axis events (rollout telemetry, GPU monitoring) use
-# commit=False so they never advance W&B's step: each joins W&B's current row
-# (the last trainer step logged), so only the last value of each key per
-# trainer step is kept. Trainer steps must then be logged in nondecreasing
-# order, which the SingleController and legacy drivers do. Any other value
-# keeps upstream's custom-axis behavior.
+# trainer rows are logged with run.log(..., step=trainer_step, commit=True) and
+# carry no extra field. commit=True uploads each row as soon as its step is
+# finished; with an explicit step W&B defaults to commit=False and holds the
+# row until a later step is logged, which left the dashboard a step behind and
+# lost the last row when a job was killed. Custom-axis events (rollout
+# telemetry, GPU monitoring) use commit=False so they never advance W&B's step:
+# each joins W&B's current row (the next trainer step), so only the last value
+# of each key per trainer step is kept. Trainer steps must then be logged in
+# increasing order, and nothing logged for a step after its row is committed
+# (W&B drops it), which the SingleController and legacy drivers do. Any other
+# value keeps upstream's custom-axis behavior.
 WANDB_CALLER_STEP_METRIC = "step"
 TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
 
@@ -538,7 +542,7 @@ class WandbLogger(LoggerInterface):
             return
         event_metrics = dict(self._pending_metrics)
         if WANDB_CALLER_STEP_METRIC == "step":
-            self.run.log(event_metrics, step=self._pending_step)
+            self.run.log(event_metrics, step=self._pending_step, commit=True)
         else:
             event_metrics[WANDB_CALLER_STEP_METRIC] = self._pending_step
             self.run.log(event_metrics)

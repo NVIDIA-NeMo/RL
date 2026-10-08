@@ -392,6 +392,20 @@ class TestTensorboardLogger:
         assert calls["torch_1elem"] == pytest.approx(6.0)
 
 
+def _trainer_row_call(metrics: dict, step: int):
+    """The run.log call that commits one trainer row in this branch's W&B mode."""
+    if WANDB_CALLER_STEP_METRIC == "step":
+        return call(metrics, step=step, commit=True)
+    return call({**metrics, WANDB_CALLER_STEP_METRIC: step})
+
+
+def _event_call(metrics: dict):
+    """The run.log call for one independent custom-axis event."""
+    if WANDB_CALLER_STEP_METRIC == "step":
+        return call(metrics, commit=False)
+    return call(metrics)
+
+
 class TestWandbLogger:
     """Test the WandbLogger class."""
 
@@ -434,11 +448,9 @@ class TestWandbLogger:
         step = 10
         logger.log_metrics(metrics, step, step_finished=True)
 
-        # W&B's internal row step is implicit; the caller step is a custom axis.
+        # One committed row per finished trainer step.
         mock_run = mock_wandb.init.return_value
-        mock_run.log.assert_called_once_with(
-            {**metrics, WANDB_CALLER_STEP_METRIC: step}
-        )
+        assert mock_run.log.call_args_list == [_trainer_row_call(metrics, step)]
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_prefix(self, mock_wandb):
@@ -451,14 +463,35 @@ class TestWandbLogger:
         prefix = "train"
         logger.log_metrics(metrics, step, prefix, step_finished=True)
 
-        # Check that prefixed metrics retain the caller step as a custom axis.
+        # Prefixed metrics land in the same committed trainer row.
         mock_run = mock_wandb.init.return_value
-        expected_metrics = {
-            "train/loss": 0.5,
-            "train/accuracy": 0.8,
-            WANDB_CALLER_STEP_METRIC: step,
-        }
-        mock_run.log.assert_called_once_with(expected_metrics)
+        expected_metrics = {"train/loss": 0.5, "train/accuracy": 0.8}
+        assert mock_run.log.call_args_list == [
+            _trainer_row_call(expected_metrics, step)
+        ]
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_finished_step_is_committed_without_waiting_for_the_next(self, mock_wandb):
+        """A finished trainer step reaches W&B at once, not one step later.
+
+        With an explicit step, W&B defaults to commit=False and holds the row
+        until a later step is logged: the dashboard trailed the trainer by a
+        step, and a killed job lost its last row.
+        """
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
+        logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
+
+        mock_run = mock_wandb.init.return_value
+        mock_run.log.assert_not_called()  # the step is still open
+        logger.log_metrics(
+            {"seconds": 1.0}, step=7, prefix="timing/train", step_finished=True
+        )
+
+        [logged] = mock_run.log.call_args_list
+        assert logged == _trainer_row_call(
+            {"train/loss": 0.5, "timing/train/seconds": 1.0}, 7
+        )
+        assert logged.kwargs.get("commit", True) is True
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_step_metric(self, mock_wandb):
@@ -478,7 +511,7 @@ class TestWandbLogger:
         # The requested custom metric supplies the series x-axis. Independent
         # event streams must not also carry the trainer-step axis.
         mock_run = mock_wandb.init.return_value
-        mock_run.log.assert_called_once_with(metrics)
+        assert mock_run.log.call_args_list == [_event_call(metrics)]
         mock_run.define_metric.assert_any_call("loss", step_metric="iteration")
         mock_run.define_metric.assert_any_call("accuracy", step_metric="iteration")
 
@@ -505,7 +538,7 @@ class TestWandbLogger:
             "train/accuracy": 0.8,
             "train/iteration": 15,
         }
-        mock_run.log.assert_called_once_with(expected_metrics)
+        assert mock_run.log.call_args_list == [_event_call(expected_metrics)]
         mock_run.define_metric.assert_any_call(
             "train/loss", step_metric="train/iteration"
         )
@@ -533,23 +566,24 @@ class TestWandbLogger:
 
         mock_run = mock_wandb.init.return_value
         assert mock_run.log.call_args_list == [
-            call(
+            _event_call(
                 {
                     TELEMETRY_WALL_TIME_METRIC: 30.0,
                     "rollout/throughput/tokens_per_second": 10.0,
                 }
             ),
-            call(
+            _trainer_row_call(
                 {
                     "train/loss": 1.0,
                     "timing/train/seconds": 5.0,
                     "performance/tokens_per_second": 20.0,
-                    WANDB_CALLER_STEP_METRIC: 1,
-                }
+                },
+                1,
             ),
-            call({"train/loss": 0.5, WANDB_CALLER_STEP_METRIC: 2}),
+            _trainer_row_call({"train/loss": 0.5}, 2),
         ]
-        assert all("step" not in kwargs for _, kwargs in mock_run.log.call_args_list)
+        # The telemetry event never sets or advances W&B's step.
+        assert "step" not in mock_run.log.call_args_list[0].kwargs
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric(self, mock_wandb):
@@ -663,9 +697,9 @@ class TestWandbLogger:
         callback()
 
         mock_run = mock_wandb.init.return_value
-        mock_run.log.assert_called_once_with(
-            {"train/loss": 0.5, WANDB_CALLER_STEP_METRIC: 7}
-        )
+        assert mock_run.log.call_args_list == [
+            _trainer_row_call({"train/loss": 0.5}, 7)
+        ]
         mock_run.finish.assert_called_once_with()
 
     @patch("nemo_rl.utils.logger.wandb")
@@ -678,9 +712,9 @@ class TestWandbLogger:
         mock_run.log.assert_not_called()
         logger.finish()
 
-        mock_run.log.assert_called_once_with(
-            {"train/loss": 0.5, WANDB_CALLER_STEP_METRIC: 7}
-        )
+        assert mock_run.log.call_args_list == [
+            _trainer_row_call({"train/loss": 0.5}, 7)
+        ]
         mock_run.finish.assert_called_once_with()
 
     @patch("nemo_rl.utils.logger.wandb")
@@ -701,14 +735,16 @@ class TestWandbLogger:
         mock_run.log.assert_not_called()
         logger.finish()
 
-        mock_run.log.assert_called_once_with(
-            {
-                "train/loss": 0.5,
-                "train/reward_histogram": histogram_value,
-                "train/reward_plot": plot_value,
-                WANDB_CALLER_STEP_METRIC: 7,
-            }
-        )
+        assert mock_run.log.call_args_list == [
+            _trainer_row_call(
+                {
+                    "train/loss": 0.5,
+                    "train/reward_histogram": histogram_value,
+                    "train/reward_plot": plot_value,
+                },
+                7,
+            )
+        ]
         mock_run.finish.assert_called_once_with()
 
     @patch("nemo_rl.utils.logger.wandb")
