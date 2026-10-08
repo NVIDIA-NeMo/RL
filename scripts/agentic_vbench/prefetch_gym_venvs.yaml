@@ -1,0 +1,16 @@
+# Prefetch config for examples/nemo_gym/prefetch_venvs.py: creates the Gym server
+# venvs (policy model server, Agentic-VBench agent) under NEMO_GYM_VENV_DIR so the
+# first training job does not spend GPU time building them. Only env.nemo_gym is
+# read (dry-run NemoGym._spinup); the dummy policy values satisfy interpolations.
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    policy_model_name: dummy-model
+    policy_base_url: http://localhost:8000/v1
+    policy_api_key: dummy
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/agentic_vbench_agent/configs/agentic_vbench_train.yaml

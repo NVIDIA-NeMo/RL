@@ -1,0 +1,252 @@
+# Agentic-VBench GRPO on Nemotron Super Omni through the SingleController path
+# (V2 config format: async_rl + data_plane + token_capture, as in
+# configs/examples/recipes/vlm/vlm_grpo-supervl3p5-unified-teachers-ready-first-32n4g.yaml).
+# Harness: gym-native eval-factory agent (upstream Harbor 0.6.6, stock OpenCode
+# 1.14.39, pinned 100-task benchmark, remote rootless Podman backend); token
+# capture is the ordinary one-row-per-rollout kind on this branch, so OpenCode's
+# compaction and pruning stay off and the agent answers OpenCode's step-cap turn
+# locally (see responses_api_agents/agentic_vbench_agent/configs/agentic_vbench_train.yaml).
+# Launch with scripts/agentic_vbench/run_sc.sh (preflight + Slurm) or directly:
+#   uv run --no-sync examples/run_grpo_single_controller.py \
+#     --config examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-8n8g-megatron-agentic-vbench-sc.v2.yaml
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+
+grpo:
+  # SC requires num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size.
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_epochs: 1000
+  max_num_steps: 20
+  # SC has no validation loop.
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  # SC reads async_rl instead; the entrypoint raises if this block is set.
+  async_grpo: null
+  advantage_clip_low: -50
+  advantage_clip_high: 50
+  seq_logprob_error_threshold: 2
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+  calculate_advantages_on_gpu: false
+  use_dynamic_sampling: false
+  zero_variance_prompt_filtering: false
+  deduplicate_multimodal_data: true
+  overlong_filtering: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  use_kl_in_reward: false
+  positive_example_nll_weight: 0
+
+checkpointing:
+  checkpoint_dir: results/agentic-vbench-sc
+  save_period: 1
+  keep_top_k: 2
+  # No validation, so no validation metric to rank checkpoints by.
+  metric_name: null
+  save_optimizer: true
+  save_replay_buffer: false
+  # SingleController checkpointing with the built-in samplers requires the
+  # TransferQueue snapshot so completed, unconsumed rollouts survive a restart.
+  save_data_plane: true
+  # Force a checkpoint before the Slurm limit (DD:HH:MM:SS); the launcher overrides it.
+  checkpoint_must_save_by: null
+
+policy:
+  model_name: ${oc.env:MODEL_PATH}
+  is_vlm: true
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  # Agent rows: 32 OpenCode turns with inline image reads reach 135k tokens.
+  # Sequence packing (allowed without framework-owned compaction) keeps the
+  # learner's memory bounded by tokens per microbatch rather than by row length,
+  # and passes attention_mask=None so no dense [L, L] causal mask is built.
+  max_total_sequence_length: 262144
+  sequence_packing:
+    enabled: true
+    algorithm: modified_first_fit_decreasing
+    fuse_loss: false
+    train_mb_tokens: 262144
+    logprob_mb_tokens: 262144
+    sequence_length_round: 64
+  dynamic_batching:
+    enabled: false
+  offload_optimizer_for_logprob: true
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  megatron_cfg:
+    # Packing allows context parallelism; CP=2 halves per-GPU activation memory on
+    # the longest packed microbatches.
+    context_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    recompute_granularity: full
+    checkpoint:
+      async_save: false
+    # The checkpoint ships one MTP block and Megatron-Bridge maps it into the
+    # layer pattern (mtp_num_layers: 0 is rejected); carry it detached with zero
+    # loss weight so it is refit into vLLM but not trained.
+    mtp_num_layers: 1
+    mtp_use_repeated_layer: false
+    mtp_detach_heads: true
+    mtp_loss_scaling_factor: 0.0
+    # Frozen router: no load balancing, no bias updates (as in the derisk V1 overrides).
+    freeze_moe_router: true
+    moe_router_load_balancing_type: none
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+    moe_router_bias_update_rate: 0.0
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    optimizer:
+      lr: 3.0e-6
+      min_lr: 5.0e-7
+      adam_beta2: 0.99
+    scheduler:
+      lr_decay_style: cosine
+      lr_decay_iters: 60
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-8
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      # SC drives rollouts through the disaggregated async engine.
+      async_engine: true
+      max_model_len: ${policy.max_total_sequence_length}
+      reasoning_parser_plugin: /opt/nemo-rl/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+    vllm_kwargs:
+      # OpenCode's read tool sends images inline (base64 data URLs).
+      limit_mm_per_prompt:
+        image: 64
+      mm_processor_cache_gb: 0
+      skip_mm_profiling: true
+      # Prefill chunk: do not size it to the whole 256k window.
+      max_num_batched_tokens: 32768
+      # FlashInfer MoE autotune with a cold cache took >20 min at 49k tokens.
+      enable_flashinfer_autotune: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 4
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  num_workers: 0
+  shuffle: false
+  train:
+    data_path: ${oc.env:TRAIN_PATH}
+  validation:
+    data_path: ${oc.env:VAL_PATH}
+
+# TransferQueue is mandatory for the SingleController path and hosts the
+# per-call staged token deltas written by the vLLM workers.
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+    storage_capacity: 1000000
+
+# Ledger-authoritative token capture via NeMo-Gym (ordinary capture: one
+# training row per rollout; the agent returns the served assistant output and
+# the finalizer publishes rows from the capture receipts).
+token_capture:
+  enabled: true
+  generation_backend: vllm
+  staging_partition: rollout_staging
+  min_valid_fraction_per_group: 1.0
+  # null derives a directory under the run's log dir; the launcher sets it explicitly.
+  capture_dir: null
+  num_reassembler_workers: 2
+  defer_routed_experts_to_policy: false
+  control_timeout_s: 60.0
+
+rollout_recovery:
+  default_granularity: sibling
+
+async_rl:
+  diagnostics: false
+  sampler:
+    # ready_first consumes whichever prompt groups finish first, up to two policy
+    # versions old: long agent episodes (10-25 min) otherwise leave the learner
+    # idle until the slowest group of the step lands (timing/train/exposed_generation).
+    name: ready_first
+    max_staleness_versions: 2
+  recompute_kv_cache_after_weight_updates: false
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  # Three steps of prompt groups in flight so generation stays ahead of training.
+  max_inflight_prompts: ${mul:${grpo.num_prompts_per_step}, 3}
+  max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 3}
+  rollout_failure:
+    min_step_batch_fraction: 1.0
+    max_data_attempts_per_prompt: 2
+    max_infra_attempts_per_prompt: 5
+    max_consecutive_dropped_prompts: 0
+    max_skipped_prompts: 0
+    # ready_first stamps no target step, so a dropped prompt can never leave a
+    # step short; 'replace' would do nothing here (validate_single_controller_config).
+    on_dropped_prompt: shrink
+    backoff_base_s: 1.0
+    max_backoff_s: 30.0
+    nemo_gym:
+      max_row_attempts: 3
+      # Backstop for a hung prompt-group stream (Harbor build + 32-turn episode).
+      rollout_timeout_s: 7200
+  stall_watchdog:
+    interval_s: 30.0
+    gym_subprocess_check: true
+    # Must exceed rollout_timeout_s: a slow Harbor episode is not a stalled controller.
+    stall_timeout_s: 10800
+    stall_action: warn
+
+env:
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    pad_dynamic_image_shapes: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/agentic_vbench_agent/configs/agentic_vbench_train.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          # OpenCode sends chat requests without sampling params; the NeMo-RL vLLM
+          # server rejects an unset top_p. Pin the policy's own training sampling on
+          # every engine request so the external agent stays on-policy by construction.
+          sampling_overrides:
+            temperature: ${policy.generation.temperature}
+            top_p: ${policy.generation.top_p}
+          extra_body:
+            mm_processor_kwargs:
+              max_num_tiles: 1
+            chat_template_kwargs:
+              enable_thinking: true
+              truncate_history_thinking: false
+
+logger:
+  log_dir: logs/agentic-vbench-sc
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: megatron-omni-v3
+    name: agentic-vbench-sc
+
+cluster:
+  num_nodes: 8
+  gpus_per_node: 8

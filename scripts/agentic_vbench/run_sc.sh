@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Preflight the gym-native Agentic-VBench inputs (pinned benchmark checkout, Harbor
+# runtime, Docker client, task-container backend, judge credentials) and submit
+# SingleController GRPO with token capture. Hydra overrides pass through.
+#   CONTEXT_COMPACTION=true AGENTIC_VBENCH_BACKEND_DIR=... bash scripts/agentic_vbench/run_sc.sh [overrides]
+set -euo pipefail
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+code_dir=$(cd "$script_dir/../.." && pwd)
+gym_dir=$code_dir/3rdparty/Gym-workspace/Gym
+export AVB_DATA_ROOT=${AVB_DATA_ROOT:-$code_dir/data/agentic_vbench}
+export AGENTIC_VBENCH_ROOT=${AGENTIC_VBENCH_ROOT:-$AVB_DATA_ROOT/agentic-vbench}
+export AGENTIC_VBENCH_HARBOR_PYTHON=${AGENTIC_VBENCH_HARBOR_PYTHON:-$AVB_DATA_ROOT/harbor-venv/bin/python}
+export AGENTIC_VBENCH_DOCKER_CLI_DIR=${AGENTIC_VBENCH_DOCKER_CLI_DIR:-$AVB_DATA_ROOT/docker-client}
+export AGENTIC_VBENCH_BACKEND=${AGENTIC_VBENCH_BACKEND:-remote}
+export AGENTIC_VBENCH_JUDGE_PROTOCOL=${AGENTIC_VBENCH_JUDGE_PROTOCOL-nvinference-hybrid}
+credentials_file=${AGENTIC_VBENCH_CREDENTIALS_FILE:-$HOME/.config/agentic-vbench/nvinference.env}
+tasks=${AGENTIC_VBENCH_TASKS:-all}
+train_repeats=${TRAIN_REPEATS:-1}
+train_limit=${TRAIN_LIMIT:-}
+
+expected_revision=$(python3 -c "import sys; sys.path.insert(0, '$gym_dir'); from responses_api_agents.agentic_vbench_agent.core import REVISION; print(REVISION)")
+[[ -d $AGENTIC_VBENCH_ROOT/.git ]] || { echo "Missing pinned benchmark checkout at $AGENTIC_VBENCH_ROOT (link_shared_assets.sh --benchmark ...)" >&2; exit 1; }
+revision=$(git -C "$AGENTIC_VBENCH_ROOT" rev-parse HEAD)
+[[ $revision == "$expected_revision" ]] || { echo "Benchmark checkout is at $revision, expected $expected_revision" >&2; exit 1; }
+[[ -x $AGENTIC_VBENCH_HARBOR_PYTHON ]] || { echo "Missing Harbor Python at $AGENTIC_VBENCH_HARBOR_PYTHON (setup_harbor.sh or link_shared_assets.sh)" >&2; exit 1; }
+"$AGENTIC_VBENCH_HARBOR_PYTHON" -c 'import importlib.metadata as m, dotenv; assert m.version("harbor") == "0.6.6", m.version("harbor")'
+[[ -x $AGENTIC_VBENCH_DOCKER_CLI_DIR/docker && -x $AGENTIC_VBENCH_DOCKER_CLI_DIR/cli-plugins/docker-compose ]] || { echo "Docker client missing under $AGENTIC_VBENCH_DOCKER_CLI_DIR" >&2; exit 1; }
+if [[ -n $AGENTIC_VBENCH_JUDGE_PROTOCOL ]]; then
+  # Repurpose verifiers judge through NVIDIA Inference Hub. The key travels in the job
+  # environment (judge_api_key reads NVINFERENCE_API_KEY); the file itself is not needed
+  # inside the container and is never echoed.
+  if [[ -s $credentials_file ]]; then
+    set -a; source "$credentials_file"; set +a
+  fi
+  [[ -n ${NVINFERENCE_API_KEY:-${INFERENCE_API_KEY:-}} ]] || { echo "Judge protocol $AGENTIC_VBENCH_JUDGE_PROTOCOL needs NVINFERENCE_API_KEY (or $credentials_file)" >&2; exit 1; }
+  export AGENTIC_VBENCH_CREDENTIALS_FILE=""
+fi
+if [[ ${DRY_RUN:-0} != 1 ]]; then
+  : "${AGENTIC_VBENCH_BACKEND_DIR:?Set AGENTIC_VBENCH_BACKEND_DIR to the directory where serve_rootless_backend.sh publishes client.env}"
+  [[ -s $AGENTIC_VBENCH_BACKEND_DIR/client.env ]] || { echo "No task backend yet: $AGENTIC_VBENCH_BACKEND_DIR/client.env (submit_backend.sh)" >&2; exit 1; }
+  (
+    set -a; source "$AGENTIC_VBENCH_BACKEND_DIR/client.env"; set +a
+    export DOCKER_CERT_PATH=$AGENTIC_VBENCH_BACKEND_DIR PATH=$AGENTIC_VBENCH_DOCKER_CLI_DIR:$PATH DOCKER_CONFIG=$AGENTIC_VBENCH_DOCKER_CLI_DIR
+    docker info --format '{{.ServerVersion}}' >/dev/null || { echo 'Task backend is unreachable from this host' >&2; exit 1; }
+  )
+fi
+export AGENTIC_VBENCH_BACKEND_DIR=${AGENTIC_VBENCH_BACKEND_DIR:-}
+train_name=${tasks// /_}
+export TRAIN_PATH=${TRAIN_PATH:-$AVB_DATA_ROOT/train/${train_name}${train_limit:+_first${train_limit}}_x${train_repeats}.jsonl}
+export VAL_PATH=${VAL_PATH:-$TRAIN_PATH}
+if [[ ! -s $TRAIN_PATH ]]; then
+  python3 "$script_dir/build_train_dataset.py" --benchmark-root "$AGENTIC_VBENCH_ROOT" --tasks "$tasks" \
+    ${train_limit:+--limit "$train_limit"} --repeats "$train_repeats" --output "$TRAIN_PATH"
+fi
+export TRAINING_DEPS_SETUP_SCRIPT=/opt/nemo-rl/tools/ensure_agentic_vbench_deps.sh
+export GYM_VENV_DIR=${GYM_VENV_DIR:-$AVB_DATA_ROOT/gym_venvs}
+export BASE_NAME=${BASE_NAME:-agentic_vbench_sc_$(date -u +%Y%m%d-%H%M%S)}
+export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$BASE_NAME}
+exec bash "$script_dir/launch_sc.sh" "$@"
