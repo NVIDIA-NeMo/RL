@@ -566,18 +566,14 @@ class DFlashBody(_ShardedModule):
                 device=self.fc.weight.device,
             )
             gathered_metadata = torch.empty(
-                self.tensor_parallel_size * local_metadata.numel(),
+                (self.tensor_parallel_size, local_metadata.numel()),
                 dtype=local_metadata.dtype,
                 device=local_metadata.device,
             )
-            torch.distributed.all_gather_into_tensor(
-                gathered_metadata,
+            torch.distributed.all_gather(
+                list(gathered_metadata.unbind(0)),
                 local_metadata,
                 group=self.tp_group,
-            )
-            gathered_metadata = gathered_metadata.view(
-                self.tensor_parallel_size,
-                local_metadata.numel(),
             )
             synchronized_error = gathered_metadata[:, 0].amin()
             shapes_match = torch.all(

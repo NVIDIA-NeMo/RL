@@ -482,6 +482,39 @@ def test_constructor_rejects_sequence_parallel_config_without_mutating_it() -> N
     assert parallel_config.sequence_parallel is True
 
 
+def test_tensor_parallel_input_metadata_uses_rank_ordered_all_gather(
+    monkeypatch,
+) -> None:
+    body = DFlashBody(
+        _tiny_config(num_hidden_layers=1),
+        parallel_config=_fp32_parallel_config(),
+    )
+    body.tensor_parallel_size = 2
+    body.tp_group = object()
+    plan = _plan(torch.ones((1, 4), dtype=torch.bool), gamma=2)
+    calls = []
+
+    def all_gather(outputs, local, *, group):
+        assert group is body.tp_group
+        assert len(outputs) == 2
+        assert all(
+            output.shape == local.shape and output.is_contiguous() for output in outputs
+        )
+        for output in outputs:
+            output.copy_(local)
+        calls.append(tuple(output.data_ptr() for output in outputs))
+
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+    body._validate_inputs(
+        target_taps=torch.randn(1, 4, 2, 8),
+        block_embeddings=torch.randn(1, plan.block_size, 8),
+        plan=plan,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] != calls[0][1]
+
+
 def test_constructor_rejects_context_parallel_config_without_mutating_it() -> None:
     parallel_config = _fp32_parallel_config(
         tensor_parallel_size=2,
