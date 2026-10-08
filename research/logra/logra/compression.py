@@ -37,6 +37,30 @@ def projection_seed(base_seed: int, update: int, name: str) -> int:
     return (base_seed * 1_000_003 + update * 7_919 + digest) & ((1 << 62) - 1)
 
 
+def fill_projection_(out: Tensor, seed: int, *, distribution: str) -> Tensor:
+    """Overwrite ``out`` with a fresh projection drawn on its own device.
+
+    Drawing on the device keeps the host out of the per-step refresh: no CPU
+    random stream, no temporaries, no host-to-device copy. Every data-parallel
+    rank draws from the same seed on identical hardware and therefore holds the
+    same matrix; ``LoGRAOptimizer`` verifies that once before the first update.
+    """
+    rank = out.shape[0]
+    if rank <= 0 or out.shape[1] <= 0:
+        raise ValueError("Projection dimensions must be positive")
+    generator = torch.Generator(device=out.device).manual_seed(seed & ((1 << 62) - 1))
+    scale = 1 / math.sqrt(rank)
+    if distribution == "rademacher":
+        # {0, 1} drawn in place, then mapped to {-scale, +scale}.
+        out.random_(0, 2, generator=generator)
+        out.mul_(2 * scale).sub_(scale)
+    elif distribution == "gaussian":
+        out.normal_(0.0, scale, generator=generator)
+    else:
+        raise ValueError(f"Unsupported projection distribution: {distribution}")
+    return out
+
+
 def make_projection(
     rank: int,
     width: int,
@@ -46,21 +70,14 @@ def make_projection(
     dtype: torch.dtype,
     distribution: str,
 ) -> Tensor:
-    """Draw on CPU so the same seed describes the same matrix on every device."""
+    """Allocate a ``[rank, width]`` projection and fill it on ``device``."""
     if rank <= 0 or width <= 0:
         raise ValueError("Projection dimensions must be positive")
-    generator = torch.Generator(device="cpu").manual_seed(seed & ((1 << 62) - 1))
-    if distribution == "rademacher":
-        bits = torch.randint(
-            0, 2, (rank, width), generator=generator, dtype=torch.uint8
-        )
-        result = bits.to(dtype).mul_(2).sub_(1).mul_(1 / math.sqrt(rank))
-    elif distribution == "gaussian":
-        result = torch.randn(rank, width, generator=generator, dtype=torch.float64)
-        result = result.mul_(1 / math.sqrt(rank)).to(dtype)
-    else:
-        raise ValueError(f"Unsupported projection distribution: {distribution}")
-    return result.to(device)
+    return fill_projection_(
+        torch.empty(rank, width, device=device, dtype=dtype),
+        seed,
+        distribution=distribution,
+    )
 
 
 class _AccumulateSketch(torch.autograd.Function):

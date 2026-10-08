@@ -21,9 +21,9 @@ import torch.distributed as dist
 from torch import nn
 
 from logra.compression import (
+    fill_projection_,
     install_sketches,
     local_weight_rows,
-    make_projection,
     projection_seed,
 )
 from logra.config import LoGRAConfig
@@ -67,6 +67,7 @@ class LoGRAOptimizer(torch.optim.Optimizer):
         )
         self.update_count = 0
         self.ready = False
+        self.projections_verified = False
         super().__init__(
             [layer.module.weight for layer in self.layers],
             dict(lr=group["lr"], weight_decay=group["weight_decay"]),
@@ -101,6 +102,8 @@ class LoGRAOptimizer(torch.optim.Optimizer):
         if self.ready:
             raise RuntimeError("Sketches have already been synchronized")
         world = dist.get_world_size(process_group) if dist.is_initialized() else 1
+        if world > 1 and not self.projections_verified:
+            self._verify_shared_projections(process_group)
         norm2 = torch.zeros(
             (), device=self.layers[0].sketch.device, dtype=torch.float64
         )
@@ -138,6 +141,28 @@ class LoGRAOptimizer(torch.optim.Optimizer):
         return norm.item()
 
     @torch.no_grad()
+    def _verify_shared_projections(self, process_group):
+        """Fail loudly if ranks drew different projections from the shared seed.
+
+        Projections are drawn on each device from the same seed, which yields
+        identical matrices on identical hardware. A heterogeneous data-parallel
+        group would otherwise average sketches taken against different bases
+        and silently corrupt every update.
+        """
+        fingerprint = torch.stack(
+            [layer.projection.double().sum() for layer in self.layers]
+        )
+        lowest, highest = fingerprint.clone(), fingerprint.clone()
+        dist.all_reduce(lowest, op=dist.ReduceOp.MIN, group=process_group)
+        dist.all_reduce(highest, op=dist.ReduceOp.MAX, group=process_group)
+        if not torch.equal(lowest, highest):
+            raise RuntimeError(
+                "LoGRA projections differ across data-parallel ranks; the ranks "
+                "must run identical hardware so a shared seed draws one matrix"
+            )
+        self.projections_verified = True
+
+    @torch.no_grad()
     def step(self, closure=None) -> Any:
         if closure is not None or not self.ready:
             raise RuntimeError(
@@ -171,15 +196,10 @@ class LoGRAOptimizer(torch.optim.Optimizer):
     def refresh_projection(self):
         update = self.update_count if self.config.refresh else 0
         for layer in self.layers:
-            layer.projection.copy_(
-                make_projection(
-                    self.config.rank,
-                    layer.module.in_features,
-                    projection_seed(self.config.seed, update, layer.name),
-                    device=layer.projection.device,
-                    dtype=layer.projection.dtype,
-                    distribution=self.config.distribution,
-                )
+            fill_projection_(
+                layer.projection,
+                projection_seed(self.config.seed, update, layer.name),
+                distribution=self.config.distribution,
             )
 
     def state_dict(self) -> dict[str, Any]:
