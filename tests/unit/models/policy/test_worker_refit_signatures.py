@@ -25,7 +25,7 @@ until a GPU test caught it. Nothing in between could: there is no shared declara
 diverge from, since ``broadcast_weights_for_collective`` is defined independently on each
 worker.
 
-Read from the AST rather than by importing, deliberately: ``dtensor_policy_worker_v2``
+Read from the AST rather than by importing, deliberately: ``automodel_policy_worker``
 imports ``nemo_automodel``, which lives in a per-worker venv and is absent from the base
 one, so an import-based check would skip on precisely the worker that regressed.
 """
@@ -43,7 +43,7 @@ FANOUT_METHODS = [
     (
         "broadcast_weights_for_collective",
         [
-            "workers/dtensor_policy_worker_v2.py",
+            "workers/automodel_policy_worker.py",
             "workers/megatron_policy_worker.py",
             "interfaces.py",
         ],
