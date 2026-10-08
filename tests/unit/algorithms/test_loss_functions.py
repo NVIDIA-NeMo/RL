@@ -17,6 +17,7 @@ import pickle
 import pytest
 import torch
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
@@ -942,8 +943,22 @@ def test_calculate_kl_output_clamp_includes_importance_sampling_weight():
 
 
 # Simplified KL Penalty Test using original Loss
-def test_clipped_pg_loss_kl_penalty():
-    """Tests KL penalty calculations directly."""
+@pytest.mark.parametrize(
+    "top_k, kept_positions, expected_token_mask, expected_loss_value",
+    [
+        # No filtering: every position contributes to the KL mean.
+        (None, [0, 1, 2], [[0, 1, 1, 1]], 0.0362),
+        # top_k=1 keeps only the argmax token
+        # _create_exact_logits puts the target at logit 0 and one distractor at log(exp(-lp) - 1),
+        # so the target is the argmax only where lp > log(0.5): position 0 (lp=0) survives,
+        # positions 1 (lp=-1) and 2 (lp=-2) become -inf and are dropped from token_mask.
+        (1, [0], [[0, 1, 0, 0]], 0.0368),
+    ],
+)
+def test_clipped_pg_loss_kl_penalty(
+    top_k, kept_positions, expected_token_mask, expected_loss_value
+):
+    """Tests KL penalty calculations directly, with and without top-k filtering."""
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
 
@@ -953,6 +968,7 @@ def test_clipped_pg_loss_kl_penalty():
     # --- Test Setup ---
     cfg = ClippedPGLossConfig(reference_policy_kl_penalty=0.1)
     loss_fn = ClippedPGLossFn(cfg)
+    sampling_params = TrainingSamplingParams(top_k=top_k)
 
     adv_masked = torch.tensor([[0.0, 0.0, 0.0]], device=device)
     curr_lp_masked = torch.tensor([[0.0, -1.0, -2.0]], device=device)
@@ -965,7 +981,7 @@ def test_clipped_pg_loss_kl_penalty():
     data["_test_curr_logprobs"] = curr_lp_masked
 
     # --- Hand Calculation ---
-    # Actor loss is 0. Total loss = kl_beta * mean(kl_term)
+    # Actor loss is 0. Total loss = kl_beta * mean(kl_term over the kept positions)
     # kl_term = exp(ref - curr) - (ref - curr) - 1
     r = ref_lp_masked - curr_lp_masked  # [-1.0, 0.0, 1.0]
     assert torch.allclose(r, torch.tensor([[-1.0, 0.0, 1.0]], device=device), rtol=1e-3)
@@ -975,19 +991,25 @@ def test_clipped_pg_loss_kl_penalty():
         kl_term_per_token, torch.tensor([[0.368, 0.0, 0.718]], device=device), rtol=1e-3
     )
 
-    expected_kl_mean = torch.mean(kl_term_per_token)  # 0.362
+    # KL mean 0.362 over all positions or 0.368 over position 0 alone -> loss 0.0362 / 0.0368
+    expected_kl_mean = torch.mean(kl_term_per_token[0, kept_positions])
+    expected_loss = cfg.reference_policy_kl_penalty * expected_kl_mean
     assert torch.allclose(
-        expected_kl_mean, torch.tensor(0.362, device=device), rtol=1e-3
+        expected_loss, torch.tensor(expected_loss_value, device=device), rtol=1e-3
     )
-
-    expected_loss = cfg.reference_policy_kl_penalty * expected_kl_mean  # 0.0362
-    assert torch.allclose(expected_loss, torch.tensor(0.0362, device=device), rtol=1e-3)
 
     input_ids = data["input_ids"]
     dummy_logits = _create_exact_logits(
         curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
     )
-    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
+    loss_input, data = prepare_loss_input(
+        dummy_logits, data, loss_fn, sampling_params=sampling_params
+    )
+    # Filtering narrows token_mask where the sampled token left the top-k set, so the
+    # -inf positions drop out of the KL reduction and of global_valid_toks below.
+    assert torch.equal(
+        data["token_mask"], torch.tensor(expected_token_mask, device=device)
+    )
 
     actual_loss, _ = loss_fn(
         data=data,

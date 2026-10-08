@@ -122,6 +122,11 @@ def pad_w13_intermediate(
     intermediate_size = input_tensor.shape[1] // 2
     if intermediate_size == padded_intermediate_size:
         return input_tensor
+    if intermediate_size > padded_intermediate_size:
+        raise ValueError(
+            "Cannot pad gated MXFP8 W13 intermediate dimension from "
+            f"{intermediate_size} to {padded_intermediate_size}."
+        )
     sharded = input_tensor.reshape(
         input_tensor.shape[0],
         2,

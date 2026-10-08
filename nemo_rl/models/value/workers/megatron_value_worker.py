@@ -91,6 +91,7 @@ from nemo_rl.telemetry.setup import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
+from nemo_rl.utils.tensor_ops import pad_and_concat
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -810,18 +811,9 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             )
 
         if is_pipeline_last_stage(ignore_virtual=True):
-            all_values_padded = []
-            all_values = [v["values"] for v in list_of_values]
-            for val in all_values:
-                padding_needed = seq_length - val.shape[1]
-                if padding_needed > 0:
-                    # For [B, S] tensors, pad along seq dim (dim 1)
-                    val = torch.nn.functional.pad(
-                        val, (0, padding_needed), mode="constant", value=0.0
-                    )
-                all_values_padded.append(val)
-
-            values_tensor = torch.cat(all_values_padded, dim=0)
+            values_tensor = pad_and_concat(
+                [v["values"] for v in list_of_values], target_len=seq_length
+            )
             broadcast_tensor(values_tensor, torch.distributed.get_rank(), pp_grp)
         else:
             values_tensor = broadcast_tensor(
@@ -962,6 +954,14 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
             if self.should_disable_forward_pre_hook:
                 self.disable_forward_pre_hook()
+            if self.scheduler is not None:
+                # Megatron-Bridge copies consumed_train_samples into scheduler.num_steps
+                # on checkpoint resume (override_opt_param_scheduler). This is defined
+                # as RL steps x GBS, where GBS is consistent with Bridge thus this
+                # normalizes the warmup and decay to RL steps instead of samples.
+                self.mcore_state.train_state.consumed_train_samples = (
+                    self.scheduler.num_steps
+                )
 
             # Save Megatron backbone checkpoint
             save_checkpoint(
@@ -1009,10 +1009,10 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
     def finish_training(self) -> None:
         """Offload model, gradients, and optimizer to CPU after training."""
+        self.model.eval()
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True
         )
-        self.model.eval()
 
         if (
             hasattr(self, "optimizer")

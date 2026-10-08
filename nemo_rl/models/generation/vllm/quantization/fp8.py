@@ -627,9 +627,8 @@ def get_quantized_weight_iterator(
             continue
 
         # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix.
-        # vLLM's grouped loader cannot load receiver-quantized per-block scales,
-        # so BF16 blockwise inputs use per-expert checkpoint entries. Trainer-side
-        # prequantized MXFP8 inputs stay fused and route their scales above.
+        # Prequantized MXFP8 slabs stay fused; BF16 slabs are quantized into
+        # per-expert entries so vLLM can load their scales.
         if is_grouped_moe_expert_weight_name(k):
             # Quantize only if vLLM built this layer's experts as FP8. Experts
             # covered by ``ignored_layers`` (num_{first,last}_layers_in_bf16 /
@@ -649,11 +648,11 @@ def get_quantized_weight_iterator(
                     yield k, v
                     continue
                 if global_fp8_config.is_mx:
-                    raise NotImplementedError(
-                        "MXFP8 refit does not support quantizing grouped MoE "
-                        "expert weights on the fly; enable refit_prequantize."
+                    yield from _expand_grouped_moe_expert_to_mxfp8(
+                        k, v, refit_with_reload_api=refit_with_reload_api
                     )
-                yield from _expand_grouped_moe_expert_to_fp8(k, v)
+                else:
+                    yield from _expand_grouped_moe_expert_to_fp8(k, v)
             else:
                 yield k, v
             continue
@@ -860,6 +859,24 @@ def _quantize_grouped_experts_blockwise(grouped_moe_expert):
     return weight_fp8, scale_inv
 
 
+def _split_grouped_moe_shards(
+    key: str, weight: torch.Tensor
+) -> tuple[str, tuple[tuple[str, torch.Tensor], ...]]:
+    """Split one grouped expert slab into vLLM projection shards."""
+    base, proj = key.rsplit(".", 1)
+    if proj == "gate_up_proj":
+        intermediate = weight.shape[1] // 2
+        shards = (
+            ("gate_proj", weight[:, :intermediate, :]),
+            ("up_proj", weight[:, intermediate:, :]),
+        )
+    elif proj == "down_proj":
+        shards = (("down_proj", weight),)
+    else:
+        raise ValueError(f"Unsupported grouped MoE projection {proj!r} in {key!r}")
+    return base, shards
+
+
 def _expand_grouped_moe_expert_to_fp8(key, weight):
     """Expand a grouped Qwen3.5 MoE expert slab into per-expert FP8 weights.
 
@@ -885,15 +902,7 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
         A list of ``(name, tensor)`` pairs: for every expert, the FP8 weight and
         its ``_scale_inv`` for each unfused projection.
     """
-    base, proj = key.rsplit(".", 1)
-    if proj == "gate_up_proj":
-        intermediate = weight.shape[1] // 2
-        shards = (
-            ("gate_proj", weight[:, :intermediate, :]),
-            ("up_proj", weight[:, intermediate:, :]),
-        )
-    else:
-        shards = (("down_proj", weight),)
+    base, shards = _split_grouped_moe_shards(key, weight)
 
     entries = []
     # gate/up are dim-1 slices; feed the views directly — per-expert rows stay
@@ -948,6 +957,23 @@ def _reroute_grouped_moe_expert_scale(
         )
         for expert_id, expert_scale in enumerate(grouped_scale.unbind(0))
     ]
+
+
+def _expand_grouped_moe_expert_to_mxfp8(
+    key: str, weight: torch.Tensor, *, refit_with_reload_api: bool
+) -> list[tuple[str, torch.Tensor]]:
+    """Expand a grouped Qwen3.5 MoE slab into per-expert MXFP8 entries."""
+    base, shards = _split_grouped_moe_shards(key, weight)
+
+    entries = []
+    scale_suffix = "_scale" if refit_with_reload_api else "_scale_from_checkpoint"
+    for shard_name, grouped_moe_expert in shards:
+        for expert_id, expert_weight in enumerate(grouped_moe_expert):
+            value, scale = quantize_mxfp8_weight(expert_weight.contiguous())
+            name = f"{base}.{expert_id}.{shard_name}.weight"
+            entries.append((name, value))
+            entries.append((name + scale_suffix, scale))
+    return entries
 
 
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
@@ -1309,8 +1335,6 @@ def process_weights_after_loading_moe(self, layer) -> None:
         from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
 
         assert self.experts_cls is not None
-        # vLLM 0.28 dropped the `layer` kwarg (0.25 forwarded it only to the
-        # FlashInfer TRTLLM experts); routing tables still come from the layer.
         self.moe_kernel = make_fp8_moe_kernel(
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
