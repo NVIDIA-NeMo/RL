@@ -552,6 +552,9 @@ class _FakeRolloutManager:
         if self._events is not None:
             self._events.append("resume_deadlines")
 
+    def pop_mask_rule_metrics(self) -> dict[str, float]:
+        return {}
+
     def telemetry_snapshot(self) -> dict[str, int]:
         return dict(self.telemetry)
 

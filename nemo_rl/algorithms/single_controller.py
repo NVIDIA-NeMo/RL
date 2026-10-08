@@ -115,6 +115,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     is_ppo_run,
 )
+from nemo_rl.algorithms.single_controller_utils.masking_stats import (
+    new_masking_stats_accumulator,
+    reduce_masking_stats,
+)
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
     ROLLOUT_CHECKPOINT_ATTEMPT_REASONS,
@@ -128,6 +132,11 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ensure_bootstrap_anchor,
     prepare_snapshot_paths,
     prune_bootstrap_snapshots,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
+    merge_stats_accumulator,
+    new_rollout_stats_accumulator,
+    reduce_rollout_stats,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
@@ -719,6 +728,17 @@ class SingleControllerActor:
             "seq_logprob_error_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
+        # Per-row masking reasons and rollout distributions (generated tokens,
+        # assistant turns, group reward mix, context use), merged from every
+        # advantage call and reduced once per step; see
+        # single_controller_utils/{masking_stats,rollout_stats}.py.
+        self._masking_stats_acc = new_masking_stats_accumulator()
+        self._rollout_stats_acc = new_rollout_stats_accumulator()
+        # Only the rollout_stats context-use metric reads it; without it that one
+        # metric is skipped rather than failing controller construction.
+        self._max_total_sequence_length = master_config.policy.get(
+            "max_total_sequence_length"
+        )
         self._opd_gap_sum = 0.0
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
@@ -3303,6 +3323,18 @@ class SingleControllerActor:
                 step_metrics.update(
                     aggregate_rollout_metrics(per_group_rollout_metrics)
                 )
+                step_metrics.update(reduce_masking_stats(self._masking_stats_acc))
+                step_metrics.update(
+                    reduce_rollout_stats(
+                        self._rollout_stats_acc,
+                        max_seq_len=self._max_total_sequence_length,
+                    )
+                )
+                # After the per-group aggregate, so the step-pooled
+                # mask_rules/<name>_reward_mean is the value that is logged.
+                step_metrics.update(self._rollout_manager.pop_mask_rule_metrics())
+                self._masking_stats_acc = new_masking_stats_accumulator()
+                self._rollout_stats_acc = new_rollout_stats_accumulator()
                 try:
                     step_metrics.update(
                         await asyncio.to_thread(self._gen.get_step_metrics)
@@ -5380,6 +5412,10 @@ class SingleControllerActor:
         )
         self._step_log_dict["reward_partials"].append(outcome.reward_partial)
         self._step_log_dict["advantage_partials"].append(outcome.advantage_partial)
+        if outcome.masking_stats is not None:
+            merge_stats_accumulator(self._masking_stats_acc, outcome.masking_stats)
+        if outcome.rollout_stats is not None:
+            merge_stats_accumulator(self._rollout_stats_acc, outcome.rollout_stats)
         if outcome.seq_logprob_error_metrics is not None:
             self._step_log_dict["seq_logprob_error_metrics"].append(
                 outcome.seq_logprob_error_metrics

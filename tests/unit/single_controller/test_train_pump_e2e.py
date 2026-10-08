@@ -323,6 +323,7 @@ def test_train_pump_drives_mcore_training_step(
             ),
             suspend_request_deadlines=lambda: None,
             resume_request_deadlines=lambda: None,
+            pop_mask_rule_metrics=lambda: {},
         )
 
         master_config = MasterConfig.model_construct(

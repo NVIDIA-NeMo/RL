@@ -553,6 +553,7 @@ def _make_gym_impl(
     impl._stats = stats if stats is not None else RolloutStats()
     # Upstream default; this fixture is about re-dispatch, not sample masking.
     impl._mask_env_flagged_samples = True
+    impl._mask_sample_rules = ()
     # Full-result tables are likewise opt-in in the real constructor.
     impl._log_full_result_tables = False
     # Reward penalties are off; direct construction must still satisfy the impl contract.

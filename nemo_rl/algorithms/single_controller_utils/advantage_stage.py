@@ -44,6 +44,18 @@ from nemo_rl.algorithms.grpo import (
     compute_and_apply_seq_logprob_error_masking,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.masking_stats import (
+    accumulate_masking_stats,
+    new_masking_stats_accumulator,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
+    accumulate_rollout_stats,
+    new_rollout_stats_accumulator,
+    stats_accumulator_to_rpc,
+)
+from nemo_rl.algorithms.single_controller_utils.sample_masks import (
+    baseline_valid_mask,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -155,6 +167,8 @@ class AdvantageStageConfig:
             *adv_cfg.repeated_batch_fields,
             adv_cfg.mask_sample_field,
             adv_cfg.truncated_field,
+            # Sequence lengths for the per-step rollout_stats (context use).
+            INPUT_LENGTHS,
         ]
         if self.message_level_advantage_penalties_enabled:
             fields.extend(
@@ -315,6 +329,13 @@ class AdvantageOutcome:
     # Rows this call wrote to its shard's part file, so the controller's merge
     # can tell a missing part from an empty one.
     train_data_dump_rows: int = 0
+    # Per-row masking and rollout statistics for this call, as plain lists (one
+    # scalar per row, no token dimension; see masking_stats.py /
+    # rollout_stats.py). Percentiles and per-group stats need the rows, so they
+    # cannot be pre-reduced like reward_partial. The controller merges them
+    # across calls and reduces them once per step.
+    masking_stats: Optional[dict[str, list[list[Any]]]] = None
+    rollout_stats: Optional[dict[str, list[list[Any]]]] = None
 
 
 class AdvantageComputer:
@@ -382,8 +403,14 @@ class AdvantageComputer:
 
         num_mask_sample_filtered = int(mask_sample.sum().item())
         final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
+        # Rows masked for being incomplete (env flag incl. env.mask_sample_rules,
+        # overlong filtering); grpo.masked_sample_rewards_in_baseline decides
+        # whether their reward still counts in the group baseline/std (never a
+        # gradient).
+        incomplete_sample = mask_sample.clone()
         if cfg.algo.overlong_filtering:
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
+            incomplete_sample = incomplete_sample | truncated
 
         pre_seq_error_sample_mask = final_sample_mask.clone()
 
@@ -458,6 +485,20 @@ class AdvantageComputer:
         if cfg.is_ppo:
             kwargs["values"] = tensor_field(data, adv_cfg.values_field)
 
+        # Rows whose reward enters the baseline/std; identical to
+        # final_sample_mask unless grpo.masked_sample_rewards_in_baseline
+        # reinstates incomplete rows. The option is GRPO-only (PPO's critic
+        # baseline has no group statistics), so PPO always keeps the default.
+        baseline_mask = baseline_valid_mask(
+            sample_mask=sample_mask,
+            final_sample_mask=final_sample_mask,
+            incomplete=incomplete_sample,
+            keep_incomplete_rewards=(
+                isinstance(cfg.algo, GRPOConfig)
+                and cfg.algo.masked_sample_rewards_in_baseline
+            ),
+        )
+
         # Training predicts token t from position t - 1, so token_mask[:, 1:]
         # is the exact mask used when global_valid_toks and the loss are built.
         has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
@@ -473,7 +514,10 @@ class AdvantageComputer:
                 # Real validity (token-capture placeholders carry sample_mask 0,
                 # and mask_sample/overlong/seq-logprob-error rows are folded in
                 # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
+                # With grpo.masked_sample_rewards_in_baseline the incomplete
+                # rows re-enter the baseline/std only; `mask` still zeroes
+                # their loss.
+                valid_mask=baseline_mask,
                 **kwargs,
             )
             if cfg.is_ppo:
@@ -506,6 +550,29 @@ class AdvantageComputer:
 
         response_advantages = torch.masked_select(advantages, mask.bool())
         reward_partial = RewardPartial.from_rows(rewards, final_sample_mask)
+        masking_stats = new_masking_stats_accumulator()
+        accumulate_masking_stats(
+            masking_stats,
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            sample_mask=sample_mask,
+            mask_sample=mask_sample,
+            truncated=truncated,
+            overlong_filtering=bool(cfg.algo.overlong_filtering),
+            final_sample_mask=final_sample_mask,
+            baseline_mask=baseline_mask,
+        )
+        rollout_stats = new_rollout_stats_accumulator()
+        accumulate_rollout_stats(
+            rollout_stats,
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            sample_mask=final_sample_mask,
+            token_mask=token_mask,
+            truncated=truncated,
+            seq_lens=tensor_field(data, INPUT_LENGTHS),
+            baseline_mask=baseline_mask,
+        )
         opd_stat_sum = 0.0
         opd_stat_sumsq = 0.0
         opd_stat_count = 0
@@ -599,4 +666,6 @@ class AdvantageComputer:
             opd_gap_sum=opd_gap_sum,
             train_data_dump_s=train_data_dump_s,
             train_data_dump_rows=train_data_dump_rows,
+            masking_stats=stats_accumulator_to_rpc(masking_stats),
+            rollout_stats=stats_accumulator_to_rpc(rollout_stats),
         )

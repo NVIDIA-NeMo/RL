@@ -106,6 +106,7 @@ from nemo_rl.environments.nemo_gym import (
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
 )
+from nemo_rl.experience.mask_sample_rules import parse_mask_sample_rules
 from nemo_rl.experience.rollout_manager import (
     RolloutManager,
     RolloutRetryPolicy,
@@ -1461,6 +1462,14 @@ def setup_single_controller(
     # ==========================
     # TODO: add validate dataset wiring.
     use_nemo_gym = should_use_nemo_gym(master_config)
+    mask_sample_rules = parse_mask_sample_rules(master_config.env)
+    if mask_sample_rules and not use_nemo_gym:
+        # The rules read fields of the NeMo-Gym response; the native rollout
+        # path has none, so they would silently mask nothing.
+        raise ValueError(
+            "env.mask_sample_rules requires the NeMo-Gym rollout path "
+            "(env.should_use_nemo_gym=true)."
+        )
     data_tokenizer = processor if processor is not None else tokenizer
     is_vlm = processor is not None
     if use_nemo_gym and generation_config["backend"] not in ("vllm", "megatron"):
@@ -2039,6 +2048,7 @@ def setup_single_controller(
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
+        mask_sample_rules=mask_sample_rules,
         log_full_result_tables=should_log_nemo_gym_full_result_tables(
             wandb_enabled=master_config.logger.wandb_enabled,
             wandb_config=master_config.logger.wandb,
