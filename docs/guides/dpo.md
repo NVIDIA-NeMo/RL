@@ -199,7 +199,7 @@ parent directory to `PYTHONPATH` before launching training.
 
 Please note:
 - If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
-- If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.
+- If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `val:validation-<NameOfValidationDataset1>_loss`.
 
 ## DPO-Specific Parameters
 

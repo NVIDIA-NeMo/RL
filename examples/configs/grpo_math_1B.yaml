@@ -41,6 +41,8 @@ grpo:
     normalize_rewards: ${grpo.normalize_rewards}
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+    proximal_teacher_alpha: 1.0  # OPD-specific: TROPD proximal-teacher weight in (0, 1]; 1.0 is plain MOPD
+    subtract_global_baseline: false  # OPD-specific: center advantages on the step's mean over valid tokens
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -112,6 +114,9 @@ loss_fn:
   # VAPO positive-example NLL loss weight: L = L_PPO + mu * L_NLL(correct samples).
   # 0.0 disables it. VAPO paper recommends 0.1.
   positive_example_nll_weight: 0.0
+  # Keep full diagnostics; use "minimal" to skip diagnostic-only kernels.
+  metrics_level: "full"
+  enable_torch_compile: false
 
 checkpointing:
   enabled: true
@@ -150,7 +155,6 @@ policy:
   worker_extension_cls_fqn: null # optional registered policy-worker subclass; mutually exclusive with quant_cfg
 
   dtensor_cfg:
-    _v2: true
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
