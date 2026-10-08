@@ -451,6 +451,16 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Only newly introduced occurrences are staged. vLLM-specific `media_spans`
   extras retain placeholder positions and token hashes for multi-turn prefix
   replacement, including video's timestamp-separated visual-token spans.
+  With `rollout_recovery.target_level: prefix`, the first durable prefix row
+  for a model call carries that call's new media metadata and packed tensors;
+  later token chunks refer to the same row instead of rewriting the pixels.
+  Recovery fetches the prefix rows and media in batches, reprocesses the
+  reissued request, verifies its metadata and tensor values against the durable
+  copy, and keeps the durable copy for the eventual canonical terminal row.
+  The original image or video must therefore still be resolvable by vLLM when
+  the request is reissued. The packed learner tensors are not vLLM
+  processor-native inputs, so this path does not provide source-free media
+  prefill if the original media has disappeared.
   Capture requests use vLLM's `skip_mm_cache=True` path to obtain concrete
   processor tensors. vLLM can still reuse its processor-only cache; this does
   not guarantee fresh preprocessing. vLLM tiles images from a dummy prompt, so
