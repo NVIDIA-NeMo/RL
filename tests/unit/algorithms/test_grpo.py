@@ -56,6 +56,7 @@ from nemo_rl.algorithms.grpo import (
     _shutdown_completed_nemo_gym_startup,
     _startup_pipeline_ready,
     _validate_multimodal_dedup_capability,
+    _validate_overlap_validation,
     _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
@@ -4875,6 +4876,140 @@ def test_early_stop_saves_final_checkpoint(mock_grpo_components, train_func, tmp
         is True
     )
     assert checkpointer.shutdown.called
+
+
+def test_async_grpo_overlap_validation_scores_pending_checkpoints(
+    mock_grpo_components, tmp_path
+):
+    """Background validations mark checkpoints pending and record them later."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.val_at_end = True
+    master_config.grpo.async_grpo.overlap_validation = True
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["save_period"] = 2
+    master_config.checkpointing["metric_name"] = "val:accuracy"
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
+    checkpointer.checkpoint_dir = tmp_path
+    logger = mock_grpo_components["logger"]
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics)
+        )
+        stack.enter_context(patch("nemo_rl.algorithms.grpo.torch.save"))
+        mock_validate = stack.enter_context(
+            patch(
+                "nemo_rl.algorithms.grpo.validate",
+                return_value=({"accuracy": 0.25}, {"total_validation_time": 1.0}),
+            )
+        )
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            logger,
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert sorted(call.kwargs["step"] for call in mock_validate.call_args_list) == [
+        2,
+        4,
+        5,
+    ]
+    # Every checkpoint was saved before its validation finished...
+    saved = {
+        call.args[0]: call.args[1]
+        for call in checkpointer.init_tmp_checkpoint.call_args_list
+    }
+    assert sorted(saved) == [2, 4, 5]
+    for info in saved.values():
+        assert info["val_status"] == "pending"
+        assert info["val_end_step"] is None
+        assert "val:accuracy" not in info
+    # ...and is scored once it does; training waited for the last one.
+    recorded = {
+        call.args[0]: call.args
+        for call in checkpointer.record_validation.call_args_list
+    }
+    assert sorted(recorded) == [2, 4, 5]
+    for val_step, (_, end_step, val_info) in recorded.items():
+        assert end_step >= val_step
+        assert val_info == {"val_reward": 0.25, "val:accuracy": 0.25}
+    # Results are logged at the step they are collected at, on the trainer-step
+    # axis, with the step validation started at.
+    validation_logs = [
+        (call.args[0], call.args[1])
+        for call in logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "validation"
+    ]
+    assert sorted(metrics["start_step"] for metrics, _ in validation_logs) == [2, 4, 5]
+    for metrics, log_step in validation_logs:
+        assert metrics["accuracy"] == 0.25
+        assert log_step >= metrics["start_step"]
+    timing_logs = [
+        call.args[0]
+        for call in logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "timing/validation"
+    ]
+    assert [timings["total_validation_time"] for timings in timing_logs] == [1.0] * 3
+
+
+@pytest.mark.parametrize(
+    "override, message",
+    [
+        ({"async_grpo": {"enabled": False}}, "async_grpo.enabled"),
+        ({"async_grpo": {"in_flight_weight_updates": False}}, "in_flight"),
+        ({"colocated": True}, "colocated"),
+        ({"grpo": {"debug_payload_metrics": True}}, "debug_payload_metrics"),
+    ],
+)
+def test_overlap_validation_rejects_unsupported_configs(
+    mock_grpo_components, override, message
+):
+    config = mock_grpo_components["master_config"]
+    config.grpo.async_grpo.enabled = True
+    config.grpo.async_grpo.in_flight_weight_updates = True
+    config.grpo.async_grpo.overlap_validation = True
+    config.policy["generation"]["colocated"]["enabled"] = False
+    _validate_overlap_validation(config)
+
+    for key, value in override.get("async_grpo", {}).items():
+        setattr(config.grpo.async_grpo, key, value)
+    for key, value in override.get("grpo", {}).items():
+        setattr(config.grpo, key, value)
+    if "colocated" in override:
+        config.policy["generation"]["colocated"]["enabled"] = override["colocated"]
+    with pytest.raises(ValueError, match=message):
+        _validate_overlap_validation(config)
+
+
+def test_overlap_validation_requires_vllm(mock_grpo_components):
+    config = mock_grpo_components["master_config"]
+    config.grpo.async_grpo.enabled = True
+    config.grpo.async_grpo.in_flight_weight_updates = True
+    config.grpo.async_grpo.overlap_validation = True
+    config.policy["generation"]["colocated"]["enabled"] = False
+    config.policy["generation"]["backend"] = "sglang"
+    with pytest.raises(NotImplementedError, match="backend=vllm"):
+        _validate_overlap_validation(config)
 
 
 def test_training_stops_on_configured_pass_k_metric(mock_grpo_components):

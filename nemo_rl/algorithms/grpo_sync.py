@@ -97,6 +97,7 @@ from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
+    ValStatus,
 )
 from nemo_rl.utils.logger import Logger, print_message_log_samples
 from nemo_rl.utils.memory_tracker import MemoryTracker
@@ -1264,10 +1265,16 @@ def grpo_train_sync(
                     grpo_save_state.total_steps = total_steps + 1
                     grpo_save_state.current_epoch = current_epoch
                     grpo_save_state.total_valid_tokens = total_valid_tokens
+                    # Checkpoint-only metadata, not restored on resume.
+                    val_status: ValStatus
+                    val_end_step: Optional[int]
                     if val_metrics is not None:
                         grpo_save_state.val_reward = val_metrics["accuracy"]
-                    elif hasattr(grpo_save_state, "val_reward"):
-                        delattr(grpo_save_state, "val_reward")
+                        val_status, val_end_step = "finished", total_steps + 1
+                    else:
+                        if hasattr(grpo_save_state, "val_reward"):
+                            delattr(grpo_save_state, "val_reward")
+                        val_status, val_end_step = "skipped", None
                     grpo_save_state.consumed_samples = consumed_samples
 
                     full_metric_name = master_config.checkpointing["metric_name"]
@@ -1298,7 +1305,13 @@ def grpo_train_sync(
                             flush=True,
                         )
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, vars(grpo_save_state), master_config
+                            total_steps + 1,
+                            {
+                                **vars(grpo_save_state),
+                                "val_status": val_status,
+                                "val_end_step": val_end_step,
+                            },
+                            master_config,
                         )
                         policy.save_checkpoint(
                             weights_path=os.path.join(

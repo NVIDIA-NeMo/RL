@@ -252,6 +252,96 @@ def test_remove_old_checkpoints_topk_most_missing_val_metric(
     assert sorted(remaining_steps) == sorted(expected_steps)
 
 
+@pytest.fixture
+def val_checkpoint_manager(checkpoint_config):
+    return CheckpointManager(
+        {**checkpoint_config, "metric_name": "val:accuracy", "higher_is_better": True}
+    )
+
+
+def _save_checkpoints(checkpoint_manager, infos_by_step):
+    for step, training_info in infos_by_step.items():
+        tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
+        checkpoint_manager.finalize_checkpoint(tmp_dir)
+
+
+def _remaining_steps(checkpoint_dir):
+    return sorted(int(d.name.split("_")[1]) for d in checkpoint_dir.glob("step_*"))
+
+
+def _finished(accuracy):
+    return {"val:accuracy": accuracy, "val_status": "finished"}
+
+
+def test_pending_validation_kept_until_recorded(val_checkpoint_manager, checkpoint_dir):
+    pending = {"val_status": "pending", "val_end_step": None}
+    _save_checkpoints(
+        val_checkpoint_manager,
+        {
+            1: _finished(0.5),
+            2: pending,
+            3: _finished(0.9),
+            4: _finished(0.6),
+            5: _finished(0.8),
+            6: _finished(0.1),  # latest
+        },
+    )
+    # Pending step 2 is kept and takes no top-3 slot.
+    assert _remaining_steps(checkpoint_dir) == [2, 3, 4, 5, 6]
+
+    val_checkpoint_manager.record_validation(2, 4, {"val:accuracy": 0.95})
+    # The record runs on the background deletion worker.
+    val_checkpoint_manager.shutdown()
+
+    info = val_checkpoint_manager.load_training_info(checkpoint_dir / "step_2")
+    assert info == {"val:accuracy": 0.95, "val_status": "finished", "val_end_step": 4}
+    # Step 2 now ranks first, pushing step 4 out of the top 3.
+    assert _remaining_steps(checkpoint_dir) == [2, 3, 5, 6]
+
+
+def test_record_validation_waits_for_pending_finalization(
+    val_checkpoint_manager, checkpoint_dir
+):
+    tmp_dir = val_checkpoint_manager.init_tmp_checkpoint(
+        1, {"val_status": "pending", "val_end_step": None}
+    )
+    release = threading.Event()
+    val_checkpoint_manager.begin_finalization(tmp_dir, wait_fn=release.wait)
+    threading.Timer(0.1, release.set).start()
+
+    val_checkpoint_manager.record_validation(1, 3, {"val:accuracy": 0.7})
+    val_checkpoint_manager.shutdown()
+
+    info = val_checkpoint_manager.load_training_info(checkpoint_dir / "step_1")
+    assert info == {"val:accuracy": 0.7, "val_status": "finished", "val_end_step": 3}
+
+
+def test_record_validation_skips_deleted_checkpoint(
+    val_checkpoint_manager, checkpoint_dir
+):
+    checkpoint_dir.mkdir(parents=True)
+
+    val_checkpoint_manager.record_validation(1, 3, {"val:accuracy": 0.7})
+    val_checkpoint_manager.shutdown()
+
+    assert _remaining_steps(checkpoint_dir) == []
+
+
+def test_clear_stale_pending_validations(val_checkpoint_manager, checkpoint_dir):
+    _save_checkpoints(
+        val_checkpoint_manager,
+        {1: {"val_status": "pending", "val_end_step": None}, 2: _finished(0.3)},
+    )
+
+    val_checkpoint_manager.clear_stale_pending_validations()
+
+    info = val_checkpoint_manager.load_training_info(checkpoint_dir / "step_1")
+    assert info == {"val_status": "skipped", "val_end_step": None}
+    assert val_checkpoint_manager.load_training_info(checkpoint_dir / "step_2") == (
+        _finished(0.3)
+    )
+
+
 def test_get_best_checkpoint_path(checkpoint_manager, checkpoint_dir):
     # Create multiple checkpoints with different loss values
     steps = [1, 2, 3]
