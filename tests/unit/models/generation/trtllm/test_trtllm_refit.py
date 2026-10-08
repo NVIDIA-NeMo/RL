@@ -9,7 +9,10 @@ import pytest
 pytestmark = pytest.mark.trtllm
 
 
-def test_collective_refit_recomputes_active_requests_before_finish():
+@pytest.mark.parametrize("recompute_kv", [False, True])
+def test_collective_refit_recomputes_active_requests_only_when_requested(
+    recompute_kv,
+):
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
 
     extension = backend.NcclExtension.__new__(backend.NcclExtension)
@@ -39,7 +42,7 @@ def test_collective_refit_recomputes_active_requests_before_finish():
     ):
         result = extension.update_weights_from_collective(
             drain=False,
-            recompute_kv=False,
+            recompute_kv=recompute_kv,
         )
 
     assert result is True
@@ -50,12 +53,12 @@ def test_collective_refit_recomputes_active_requests_before_finish():
     engine.model_engine.restore_compiled_model_after_refit.assert_called_once_with(
         engine.resource_manager
     )
-    # Recompute in-flight requests under the new weights, then finish_weight_update
-    # resets the prefix cache.
+    # finish_weight_update always resets the prefix cache; recompute_kv adds a
+    # recompute of in-flight requests before it.
     calls = [c[0] for c in engine.method_calls]
     assert [
         c for c in calls if c in ("recompute_active_requests", "reset_prefix_cache")
     ] == [
-        "recompute_active_requests",
+        *(["recompute_active_requests"] if recompute_kv else []),
         "reset_prefix_cache",
     ]

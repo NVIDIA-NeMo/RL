@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen3.5 routed-expert block-FP8 refit support for TRT-LLM."""
+"""Routed-expert block-FP8 / MXFP8 refit support for TRT-LLM (MoE models)."""
 
 import math
 import re
@@ -68,18 +68,22 @@ MXFP8_BLOCK_QUANT_KWARGS: dict[str, Any] = {
 }
 
 
-_QWEN35_PREFIX = (
+_EXPERT_PREFIX = (
     r"(?:"
     r"(?:(?:model\.)?(?:language_model\.)?)layers\.\d+"
     r"|mtp\.layers\.\d+"
     r")\.mlp\.experts"
 )
 _FUSED_EXPERT_RE = re.compile(
-    rf"^(?P<prefix>{_QWEN35_PREFIX})\."
+    rf"^(?P<prefix>{_EXPERT_PREFIX})\."
     r"(?P<projection>gate_up_proj|down_proj)$"
 )
 _SPLIT_EXPERT_RE = re.compile(
-    rf"^(?P<prefix>{_QWEN35_PREFIX})\.\d+\."
+    rf"^(?P<prefix>{_EXPERT_PREFIX})\.\d+\."
+    r"(?:gate_proj|up_proj|down_proj)\.weight$"
+)
+_DENSE_MLP_RE = re.compile(
+    r"^(?:(?:model\.)?(?:language_model\.)?)layers\.\d+\.mlp\."
     r"(?:gate_proj|up_proj|down_proj)\.weight$"
 )
 _SPLIT_LINEAR_ATTN_RE = re.compile(
@@ -131,22 +135,40 @@ def validate_fused_expert_layout(
             )
 
 
+def validate_routed_experts(state_dict_info: dict[str, Any]) -> None:
+    """Fail setup unless the FP8 filter will quantize routed experts correctly.
+
+    Routed experts are either fused (``mlp.experts.{gate_up,down}_proj``, Qwen3.5)
+    or per-expert (``mlp.experts.{i}.{gate,up,down}_proj.weight``, Qwen3 MoE).
+    """
+    names = [str(name) for name in state_dict_info]
+    has_fused = any(_FUSED_EXPERT_RE.fullmatch(name) for name in names)
+    has_split = any(_SPLIT_EXPERT_RE.fullmatch(name) for name in names)
+    if not (has_fused or has_split):
+        raise ValueError(
+            "precision='fp8' found no routed-expert weights to quantize; expected "
+            "mlp.experts.{gate_up_proj,down_proj} or "
+            "mlp.experts.{i}.{gate,up,down}_proj.weight"
+        )
+    dense = [name for name in names if _DENSE_MLP_RE.fullmatch(name)]
+    if dense:
+        raise ValueError(
+            "precision='fp8' quantizes only routed experts, but the model has dense "
+            f"MLP weights that would stay BF16 (e.g. {dense[0]})"
+        )
+    if has_fused:
+        validate_fused_expert_layout(state_dict_info)
+
+
 def configure_fp8_llm_kwargs(
     llm_kwargs: dict[str, Any],
     *,
-    model_type: str,
     is_mx: bool = False,
 ) -> None:
     """Apply the experts-only block-FP8 / MXFP8 contract to TRT-LLM args.
 
     Conflicting quantization or load-format overrides raise at setup.
     """
-    if model_type != "qwen3_5_moe":
-        raise ValueError(
-            "precision='fp8' currently supports only Qwen3.5 MoE, got "
-            f"model_type={model_type!r}"
-        )
-
     base_kwargs = MXFP8_BLOCK_QUANT_KWARGS if is_mx else FP8_BLOCK_QUANT_KWARGS
     label = "MXFP8" if is_mx else "block-FP8"
 
@@ -154,7 +176,7 @@ def configure_fp8_llm_kwargs(
     existing_quant_config = model_kwargs.get("quantization_config")
     if existing_quant_config is not None and dict(existing_quant_config) != base_kwargs:
         raise ValueError(
-            "precision='fp8' requires NeMo-RL's Qwen3.5 routed-experts-only "
+            "precision='fp8' requires NeMo-RL's routed-experts-only "
             f"{label} quantization_config"
         )
 
@@ -464,10 +486,10 @@ def load_weights(
     *,
     is_mx: bool = False,
 ) -> dict[str, torch.Tensor]:
-    """Convert only Qwen3.5 routed experts from BF16 to block-FP8 or MXFP8.
+    """Convert only routed experts from BF16 to block-FP8 or MXFP8.
 
-    Fused expert tensors are expanded to per-expert HF names; other weights
-    pass through unchanged.
+    Fused expert tensors (Qwen3.5) are expanded to per-expert HF names;
+    per-expert tensors are quantized in place; other weights pass through.
     """
     output: dict[str, torch.Tensor] = {}
     for name, tensor in weight_list:

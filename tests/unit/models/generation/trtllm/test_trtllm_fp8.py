@@ -27,6 +27,7 @@ from nemo_rl.models.generation.trtllm.quantization.fp8 import (
     configure_fp8_moe_backend,
     load_weights,
     validate_fused_expert_layout,
+    validate_routed_experts,
 )
 
 pytestmark = pytest.mark.trtllm
@@ -73,7 +74,7 @@ def test_fp8_config_preserves_overrides():
         "model_kwargs": {"pretrained_config": {"num_hidden_layers": 4}},
     }
 
-    configure_fp8_llm_kwargs(llm_kwargs, model_type="qwen3_5_moe")
+    configure_fp8_llm_kwargs(llm_kwargs)
 
     assert llm_kwargs["dtype"] == "bfloat16"
     assert llm_kwargs["load_format"] == "dummy"
@@ -83,19 +84,15 @@ def test_fp8_config_preserves_overrides():
 
 
 @pytest.mark.parametrize(
-    ("llm_kwargs", "model_type"),
+    "llm_kwargs",
     [
-        ({"load_format": "auto"}, "qwen3_5_moe"),
-        (
-            {"model_kwargs": {"quantization_config": {"quant_method": "modelopt"}}},
-            "qwen3_5_moe",
-        ),
-        ({}, "qwen3_moe"),
+        {"load_format": "auto"},
+        {"model_kwargs": {"quantization_config": {"quant_method": "modelopt"}}},
     ],
 )
-def test_configure_fp8_llm_kwargs_rejects_unsupported_contract(llm_kwargs, model_type):
+def test_configure_fp8_llm_kwargs_rejects_unsupported_contract(llm_kwargs):
     with pytest.raises(ValueError, match="precision='fp8'"):
-        configure_fp8_llm_kwargs(llm_kwargs, model_type=model_type)
+        configure_fp8_llm_kwargs(llm_kwargs)
 
 
 class _MoeConfig:
@@ -190,7 +187,7 @@ def test_configure_fp8_moe_backend_mxfp8_rejects_other_backends(moe_config):
 def test_mxfp8_llm_kwargs_use_the_mx_quant_contract():
     llm_kwargs = {}
 
-    configure_fp8_llm_kwargs(llm_kwargs, model_type="qwen3_5_moe", is_mx=True)
+    configure_fp8_llm_kwargs(llm_kwargs, is_mx=True)
 
     quant = llm_kwargs["model_kwargs"]["quantization_config"]
     assert quant["quant_method"] == "mxfp8"
@@ -316,3 +313,48 @@ def test_routed_expert_conversion():
     for name, tensor in passthrough.items():
         assert converted[name] is tensor
         assert name.removesuffix(".weight") + ".weight_scale_inv" not in converted
+
+
+def test_qwen3_moe_per_expert_weights_are_quantized():
+    prefix = "model.layers.1.mlp.experts"
+    experts = {
+        f"{prefix}.{i}.{proj}.weight": torch.randn(128, 128, dtype=torch.bfloat16)
+        for i in range(2)
+        for proj in ("gate_proj", "up_proj", "down_proj")
+    }
+    passthrough = {
+        "model.layers.1.self_attn.q_proj.weight": torch.randn(128, 128),
+        "model.layers.1.mlp.gate.weight": torch.randn(2, 128),
+    }
+    validate_routed_experts(
+        {name: (tensor.shape, tensor.dtype) for name, tensor in experts.items()}
+    )
+
+    converted = load_weights([*experts.items(), *passthrough.items()])
+
+    for name in experts:
+        assert converted[name].dtype == torch.float8_e4m3fn
+        scale = converted[name.removesuffix(".weight") + ".weight_scale_inv"]
+        assert scale.dtype == torch.float32
+    for name, tensor in passthrough.items():
+        assert converted[name] is tensor
+
+
+@pytest.mark.parametrize(
+    ("names", "match"),
+    [
+        (["model.layers.0.self_attn.q_proj.weight"], "no routed-expert weights"),
+        (
+            [
+                "model.layers.0.mlp.experts.0.down_proj.weight",
+                "model.layers.1.mlp.down_proj.weight",
+            ],
+            "dense MLP weights",
+        ),
+    ],
+)
+def test_validate_routed_experts_rejects_unquantizable_models(names, match):
+    state_dict_info = {name: (torch.Size([128, 128]), torch.bfloat16) for name in names}
+
+    with pytest.raises(ValueError, match=match):
+        validate_routed_experts(state_dict_info)

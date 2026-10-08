@@ -174,13 +174,13 @@ def test_collective_refit_runs_at_async_engine_boundary(
         "finalize",
         "process",
         "post",
-        "recompute",
+        *(["recompute"] if recompute_kv else []),
         "reset_prefix",
         "cuda_sync",
         "restore",
     ]
     model_loader.abort_update_weights.assert_not_called()
-    engine.recompute_active_requests.assert_called_once_with()
+    assert engine.recompute_active_requests.call_count == int(recompute_kv)
     engine.reset_prefix_cache.assert_called_once_with()
 
 
@@ -271,7 +271,7 @@ def test_ipc_zmq_streams_chunk_and_reloads_with_aligned_offsets(monkeypatch, fp8
     model_loader.finalize_update_weights.assert_called_once_with()
     model_loader.abort_update_weights.assert_not_called()
     assert convert.call_count == int(fp8)
-    engine.recompute_active_requests.assert_called_once_with()
+    engine.recompute_active_requests.assert_not_called()
     engine.reset_prefix_cache.assert_called_once_with()
     # COMPLETE is ACKed after the final chunk.
     assert extension.zmq_socket.send.call_count == 2

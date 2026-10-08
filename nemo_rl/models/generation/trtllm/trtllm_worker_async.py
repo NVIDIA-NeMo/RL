@@ -228,22 +228,14 @@ class TrtllmAsyncGenerationWorkerImpl:
         if trtllm_cfg["precision"] == "fp8":
             # Imported here: TRT-LLM is an optional dependency.
             from tensorrt_llm.llmapi.llm_args import MoeConfig
-            from transformers import AutoConfig
 
             from nemo_rl.models.generation.trtllm.quantization.fp8 import (
                 configure_fp8_llm_kwargs,
                 configure_fp8_moe_backend,
             )
 
-            hf_config = AutoConfig.from_pretrained(
-                self.model_name, trust_remote_code=True
-            )
             is_mx = bool(trtllm_cfg.get("is_mx"))
-            configure_fp8_llm_kwargs(
-                llm_kwargs,
-                model_type=hf_config.model_type,
-                is_mx=is_mx,
-            )
+            configure_fp8_llm_kwargs(llm_kwargs, is_mx=is_mx)
 
             # Block-FP8 needs the TRTLLM MoE backend (DeepGEMM would resmooth to
             # E8M0); MXFP8 uses CUTLASS or CuTe DSL. Other MoeConfig fields kept.
@@ -379,9 +371,10 @@ class TrtllmAsyncGenerationWorkerImpl:
                 without draining in-flight requests (in-flight weight
                 update). Default True preserves the original drain-first
                 behavior.
-            recompute_kv: If True (and ``drain=False``), preempt all
-                in-flight requests after the refit so the scheduler
-                re-prefills them under the new weights.
+            recompute_kv: If True, re-prefill in-flight requests under the new
+                weights and reset the prefix cache after the refit
+                (``recompute_kv_cache_after_weight_updates``). If False,
+                in-flight requests keep their current KV cache.
         """
         assert self.llm is not None
         try:

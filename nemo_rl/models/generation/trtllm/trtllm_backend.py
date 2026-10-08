@@ -49,7 +49,7 @@ os.environ.setdefault("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", "True")
 
 
 def _require_fp8_refit_hooks(model_loader: Any) -> None:
-    """Require TRT-LLM hooks for transactional Qwen3.5 FP8 refits."""
+    """Require TRT-LLM hooks for transactional FP8 refits."""
     required_hooks = (
         "begin_update_weights",
         "finalize_update_weights",
@@ -62,7 +62,7 @@ def _require_fp8_refit_hooks(model_loader: Any) -> None:
     ]
     if missing_hooks:
         raise RuntimeError(
-            "Qwen3.5 FP8 refit requires TRT-LLM weight-update hooks. "
+            "FP8 refit requires TRT-LLM weight-update hooks. "
             f"Missing APIs: {missing_hooks}."
         )
 
@@ -127,7 +127,7 @@ class NcclExtension(WorkerExtension):
         self.state_dict_info = state_dict_info
         model = self.engine.model_engine.model
         if fp8_quantization.is_quantized_expert_refit(model.model_config.quant_config):
-            fp8_quantization.validate_fused_expert_layout(state_dict_info)
+            fp8_quantization.validate_routed_experts(state_dict_info)
             _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
 
     def _ensure_refit_usable(self) -> None:
@@ -152,7 +152,7 @@ class NcclExtension(WorkerExtension):
         finally:
             if fp8_refit_failed:
                 raise RuntimeError(
-                    "Partial Qwen3.5 FP8 refit failed after runtime weights may have "
+                    "Partial FP8 refit failed after runtime weights may have "
                     "been modified. The TRT-LLM worker is poisoned and must be "
                     "restarted."
                 ) from error
@@ -175,10 +175,12 @@ class NcclExtension(WorkerExtension):
                 If False, the swap happens at a scheduler step boundary
                 with in-flight requests still in the engine (in-flight
                 weight update).
-            recompute_kv: Only meaningful with ``drain=False``. If True,
-                preempt in-flight requests so they re-prefill under the new weights.
-                Otherwise, they keep decoding with their current KV cache. The
-                reusable prefix cache is cleared after every weight update.
+            recompute_kv: If True, call ``recompute_active_requests()`` after
+                the refit: in-flight requests are re-prefilled under the new
+                weights and the prefix cache is reset. If False, in-flight
+                requests keep decoding with their current KV cache. With
+                ``drain=True`` there are no in-flight requests, so True reduces
+                to a prefix-cache reset.
         """
         assert hasattr(self, "state_dict_info") and self.state_dict_info is not None, (
             "state_dict_info not set — call prepare_refit_info first"
@@ -222,9 +224,10 @@ class NcclExtension(WorkerExtension):
                     post_unpack_func=load_model_weight_func,
                 )
                 self.finalize_weight_update()
-                # Re-prefill in-flight requests under the new weights. This also
-                # resets the prefix cache (NVIDIA/TensorRT-LLM#17937).
-                self.engine.recompute_active_requests()
+                if recompute_kv:
+                    # Re-prefill in-flight requests under the new weights; this
+                    # also resets the prefix cache (NVIDIA/TensorRT-LLM#17937).
+                    self.engine.recompute_active_requests()
                 self.finish_weight_update()
             except Exception as e:
                 self._abort_weight_update_after_failure(
@@ -331,9 +334,6 @@ class NcclExtension(WorkerExtension):
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
             self.finalize_weight_update()
-            # Re-prefill in-flight requests under the new weights. This also
-            # resets the prefix cache (NVIDIA/TensorRT-LLM#17937).
-            self.engine.recompute_active_requests()
             self.finish_weight_update()
             gc.collect()
             torch.cuda.empty_cache()
