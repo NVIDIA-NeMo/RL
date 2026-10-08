@@ -908,3 +908,42 @@ def test_native_qwen3_rollout_without_body_is_fully_masked(
         )
         == expected_teacher_text
     )
+
+
+def test_scorer_emits_every_counter_on_clean_batch() -> None:
+    """Rollout metrics are averaged per key over only the groups that report it."""
+    import ast
+    import inspect
+
+    scorer = scoring.build_mopd_teacher_scorer(
+        student_tokenizer=_PieceTokenizer(["q", "a", "b", "c", "d"]),
+        teacher_group=_TeacherGroup(logprobs=torch.tensor([[-7.0, -2.0, -3.0]])),
+        cross_tokenizer_config=_cross_tokenizer_config(),
+        teacher_tokenizer=_PieceTokenizer(["q", "ab", "cd"]),
+    )
+    result = scorer.score(
+        input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
+        message_logs=[
+            [
+                {"role": "user", "content": "q", "token_ids": [1]},
+                {
+                    "role": "assistant",
+                    "content": "abcd",
+                    "token_ids": [2, 3, 4, 5],
+                    "generation_logprobs": [0.0] * 4,
+                },
+            ]
+        ],
+    )
+    counters = {
+        node.slice.value
+        for node in ast.walk(ast.parse(inspect.getsource(scoring)))
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "metrics"
+        and isinstance(node.slice, ast.Constant)
+    }
+    assert result.valid_mask.any()
+    missing = sorted(name for name in counters if f"mopd/{name}" not in result.metrics)
+    assert not missing, f"clean batch omits counters: {missing}"
+

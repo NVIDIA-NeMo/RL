@@ -1455,6 +1455,28 @@ class MOPDTeacherScorer:
             "malformed_structure_masked",
             "teacher_transcripts_too_long",
             "projection_bounds_failures",
+            "sample_prepare_failures",
+            "causal_suffix_masked",
+            "missing_think_close_detected",
+            "open_state_preserved",
+            "transcripts_recovered",
+            "transcript_recovery_fallbacks",
+            "structured_transcripts_failed_closed",
+            "think_char_mapping_failures",
+            "teacher_offset_fallbacks",
+            "teacher_open_render_failures",
+            "teacher_open_span_failures",
+            "teacher_message_mapping_failures",
+            "teacher_message_boundary_failures",
+            "teacher_span_not_found",
+            "teacher_local_span_failures",
+            "assistant_eot_expected",
+            "assistant_eot_aligned",
+            "template_provenance_turns_proven",
+            "template_provenance_turns_unproven",
+            "template_only_teacher_tokens_identified",
+            "template_mixed_teacher_tokens_retained",
+            "template_only_chunks_adjusted",
         ):
             metrics[metric_name] = 0
         metrics["samples"] = batch_size
@@ -1490,7 +1512,6 @@ class MOPDTeacherScorer:
                 # Isolation at the sample boundary is required: an unprovable
                 # transcript is masked, while the rest of the group is scored.
                 metrics["sample_prepare_failures"] += 1
-                metrics[f"sample_prepare_failure/{type(error).__name__}"] += 1
                 sample = _PreparedSample(teacher_ids=(0,), turns=())
             prepared.append(sample)
 
