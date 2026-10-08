@@ -38,6 +38,11 @@ __all__ = [
     "plan_fixed_execution_slots",
     "plan_group_coherent_shards",
     "make_repeated_group_ids",
+    "SHARED_PREFIX_GROUP_ID",
+    "SHARED_PREFIX_PROMPT_LENGTHS",
+    "SHARED_PREFIX_EXECUTION_SLOT",
+    "stamp_repeated_group_ids",
+    "group_id_from_sample_id",
 ]
 
 

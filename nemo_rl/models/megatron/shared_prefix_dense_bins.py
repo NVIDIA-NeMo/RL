@@ -56,7 +56,9 @@ def plan_dense_training_bins(
         max_sequences_per_bin=packing.get("max_sequences_per_bin"),
     )
     return plan_dense_bins(
-        costs=costs, bin_capacity=bin_capacity, dense_packer=packer.pack
+        costs=costs,
+        bin_capacity=bin_capacity,
+        dense_packer=lambda row_costs: packer.pack(list(row_costs)),
     )
 
 
