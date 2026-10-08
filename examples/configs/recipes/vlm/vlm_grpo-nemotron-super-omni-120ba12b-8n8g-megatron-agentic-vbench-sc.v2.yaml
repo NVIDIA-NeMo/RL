@@ -166,6 +166,10 @@ data_plane:
 # the finalizer publishes rows from the capture receipts).
 token_capture:
   enabled: true
+  # Ordinary capture only: this recipe uses sequence packing, CP=2 and advantage
+  # clipping, which the framework-owned compaction objective forbids. Use
+  # ...-agentic-vbench-sc-256k.v1.yaml for CONTEXT_COMPACTION=true.
+  context_compaction: false
   generation_backend: vllm
   staging_partition: rollout_staging
   min_valid_fraction_per_group: 1.0
