@@ -19,8 +19,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-
 from megatron.core.inference.sampling_params import SamplingParams
+
 from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
 
 
