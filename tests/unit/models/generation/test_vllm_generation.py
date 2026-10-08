@@ -35,6 +35,7 @@ from pydantic import ValidationError
 from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data.captured_media import MediaCaptureRejected
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
@@ -787,7 +788,10 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class VLLMValidationError(ValueError):
+    # Not a ValueError, matching vLLM 0.29 (VLLMValidationError -> VLLMClientError
+    # -> VLLMError -> Exception). A ValueError fake would fall into the handler's
+    # plain-ValueError overflow branch and mask a missing VLLMValidationError clause.
+    class VLLMValidationError(Exception):
         def __init__(self, message, *, parameter=None, value=None):
             super().__init__(message)
             self.parameter = parameter
@@ -930,9 +934,8 @@ def _nemo_gym_recognizes_context_overflow(
     )
 
 
-@pytest.mark.asyncio
-async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
-    """Overflow from _clamp_max_tokens must be HTTP 400 that NeMo Gym recognizes."""
+def _setup_fake_vllm_chat_handler(monkeypatch):
+    """Build the /v1/chat/completions handler against the fake vLLM modules."""
     _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
@@ -954,30 +957,44 @@ async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
 
     app = _FakeFastAPIApp()
     worker._setup_vllm_openai_api_server(app)
-
-    max_model_len = 128
-    renderer = openai_serving_chat.instances[0].kwargs["online_renderer"]
-    renderer.model_config = types.SimpleNamespace(max_model_len=max_model_len)
-    serving_chat = openai_serving_chat.instances[0]
     chat_handler = next(
         handler for path, handler in app.routes if path == "/v1/chat/completions"
     )
+    return worker, openai_serving_chat.instances[0], chat_handler
+
+
+def _fake_chat_request():
+    return types.SimpleNamespace(
+        top_k=-1,
+        top_p=1.0,
+        temperature=1.0,
+        max_tokens=1,
+        max_completion_tokens=None,
+    )
+
+
+def _track_request_capture(worker, request):
+    """Register in-flight capture state for request; return the fake capture sink."""
+    worker._capture_calls[id(request)] = types.SimpleNamespace(call="call")
+    worker.token_capture = MagicMock()
+    return worker.token_capture
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
+    """Overflow from _clamp_max_tokens must be HTTP 400 that NeMo Gym recognizes."""
+    _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+
+    max_model_len = 128
+    renderer = serving_chat.kwargs["online_renderer"]
+    renderer.model_config = types.SimpleNamespace(max_model_len=max_model_len)
     overflow_prompt = [0] * max_model_len
 
     async def create_chat_completion(request, _raw_request):
         renderer._clamp_max_tokens(request, request.max_tokens, overflow_prompt)
 
     serving_chat.create_chat_completion = create_chat_completion
-    response = await chat_handler(
-        types.SimpleNamespace(
-            top_k=-1,
-            top_p=1.0,
-            temperature=1.0,
-            max_tokens=1,
-            max_completion_tokens=None,
-        ),
-        MagicMock(),
-    )
+    response = await chat_handler(_fake_chat_request(), MagicMock())
 
     response_content = response.body.decode()
     assert response.status_code == 400
@@ -991,6 +1008,71 @@ async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
     assert error["type"] == "invalid_request_error"
     assert error["param"] == "input_tokens"
     assert error["code"] == 400
+
+
+@pytest.mark.asyncio
+async def test_plain_value_error_context_overflow_returns_http_400(monkeypatch):
+    """vLLM's get_max_tokens overflow is a plain ValueError; it must still be a 400."""
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    # Verbatim from vllm/entrypoints/serve/utils/api_utils.py::get_max_tokens.
+    message = "Input length (196609) exceeds model's maximum context length (196608)."
+
+    async def create_chat_completion(_request, _raw_request):
+        raise ValueError(message)
+
+    serving_chat.create_chat_completion = create_chat_completion
+    request = _fake_chat_request()
+    token_capture = _track_request_capture(worker, request)
+    response = await chat_handler(request, MagicMock())
+
+    response_content = response.body.decode()
+    assert response.status_code == 400
+    assert _nemo_gym_recognizes_context_overflow(
+        status=response.status_code,
+        response_content=response_content,
+    )
+    assert json.loads(response_content)["error"] == {
+        "message": message,
+        "type": "invalid_request_error",
+        "param": "input_tokens",
+        "code": 400,
+    }
+    token_capture.fail_call.assert_called_once_with("call", reason="context_length")
+
+
+@pytest.mark.asyncio
+async def test_unrelated_value_error_is_reraised(monkeypatch):
+    """Only context overflow is a client error; other ValueErrors stay loud."""
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+
+    async def create_chat_completion(_request, _raw_request):
+        raise ValueError("unexpected internal failure")
+
+    serving_chat.create_chat_completion = create_chat_completion
+    request = _fake_chat_request()
+    token_capture = _track_request_capture(worker, request)
+    with pytest.raises(ValueError, match="unexpected internal failure"):
+        await chat_handler(request, MagicMock())
+    token_capture.fail_call.assert_called_once_with("call", reason="engine_error")
+
+
+@pytest.mark.asyncio
+async def test_media_capture_rejected_keeps_its_own_code(monkeypatch):
+    """MediaCaptureRejected is a ValueError; the overflow handler must not shadow it."""
+    _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+
+    async def create_chat_completion(_request, _raw_request):
+        raise MediaCaptureRejected(
+            "retained image was re-tiled", code="retained_media_changed"
+        )
+
+    serving_chat.create_chat_completion = create_chat_completion
+    response = await chat_handler(_fake_chat_request(), MagicMock())
+
+    assert response.status_code == 400
+    error = json.loads(response.body)["error"]
+    assert error["code"] == "retained_media_changed"
+    assert error["param"] == "messages"
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
