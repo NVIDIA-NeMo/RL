@@ -97,8 +97,9 @@ def is_module_ignored(module_name: str, patterns: Sequence[str]) -> bool:
 
     Mirrors TRT-LLM's ``exclude_modules`` matching: ``fnmatch`` or ``re:`` regex.
     """
-    candidate = module_name
-    while True:
+    parts = module_name.split(".")
+    for end in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:end])
         for pattern in patterns:
             if pattern.startswith("re:"):
                 if re.fullmatch(pattern[3:], candidate):
@@ -107,12 +108,10 @@ def is_module_ignored(module_name: str, patterns: Sequence[str]) -> bool:
                 return True
             elif pattern.endswith(".*") and candidate == pattern[:-2]:
                 return True
-        if "." not in candidate:
-            return False
-        candidate = candidate.rsplit(".", 1)[0]
+    return False
 
 
-_EXPERT_PREFIX = (
+_EXPERT_PREFIX: str = (
     r"(?:"
     r"(?:(?:model\.)?(?:language_model\.)?)layers\.\d+"
     r"|mtp\.layers\.\d+"
@@ -584,17 +583,8 @@ def load_weights(
                 f"TRT-LLM refit weight names must be strings, got {type(name).__name__}"
             )
         weight_name = str(name)
-        fused_match = (
-            _FUSED_EXPERT_RE.fullmatch(  # pyrefly: ignore[no-matching-overload]
-                weight_name
-            )
-        )
-        is_split_expert = (
-            _SPLIT_EXPERT_RE.fullmatch(  # pyrefly: ignore[no-matching-overload]
-                weight_name
-            )
-            is not None
-        )
+        fused_match = _FUSED_EXPERT_RE.fullmatch(weight_name)
+        is_split_expert = _SPLIT_EXPERT_RE.fullmatch(weight_name) is not None
         if ignore_patterns is not None and not _is_quantized_weight(
             weight_name, tensor.dim(), ignore_patterns
         ):
