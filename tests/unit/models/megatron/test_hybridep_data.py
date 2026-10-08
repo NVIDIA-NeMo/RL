@@ -307,8 +307,8 @@ def test_hybridep_padding_mask_preserves_existing_cp_local_layout(
 
 
 @pytest.mark.mcore
-def test_hybridep_padding_mask_rejects_model_owned_cp_slicing():
-    """Do not silently drop the mask in models that own CP input slicing."""
+def test_hybridep_prepadding_rejects_model_owned_cp_slicing():
+    """Prepadding assumes CP-local inputs, unlike an ordinary router mask."""
     from nemo_rl.models.megatron.data import process_microbatch
 
     with pytest.raises(
@@ -320,4 +320,5 @@ def test_hybridep_padding_mask_rejects_model_owned_cp_slicing():
             pack_sequences=True,
             model_slices_context_parallel_inputs=True,
             create_packed_seq_padding_mask=True,
+            prepad_packed_seq_for_hybridep=True,
         )

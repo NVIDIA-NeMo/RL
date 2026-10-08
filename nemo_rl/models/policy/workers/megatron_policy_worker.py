@@ -247,7 +247,9 @@ def _unwrapped_chunks(model: Any) -> list[Any]:
     return list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
 
 
-def _model_needs_router_padding_mask(model: Any) -> bool:
+def _model_needs_router_padding_mask(
+    model: Any, *, pack_sequences: bool = False
+) -> bool:
     """Resolve masks once for nonzero, unfrozen expert-bias updates."""
     chunks = _unwrapped_chunks(model)
     # Training/eval mode is transient at setup; rate and frozen buffers define
@@ -263,16 +265,25 @@ def _model_needs_router_padding_mask(model: Any) -> bool:
         for chunk in chunks
     ):
         return False
+    if pack_sequences and _model_self_packs_for_cp(model):
+        raise ValueError(
+            "Expert-bias padding masks are unsupported with model-owned sequence "
+            "packing. Disable sequence packing or expert-bias updates; the model "
+            "does not preserve real-token validity through delegated packing."
+        )
     for chunk in chunks:
         if "padding_mask" not in inspect.signature(chunk.forward).parameters:
             raise ValueError(
                 "Expert-bias padding masks require a model forward that "
                 f"explicitly accepts padding_mask; got {type(chunk).__name__}."
             )
-        if getattr(
-            getattr(chunk, "decoder", None),
-            "_has_linear_layer_with_chunkwise_cp",
-            False,
+        if any(
+            getattr(
+                getattr(owner, "decoder", None),
+                "_has_linear_layer_with_chunkwise_cp",
+                False,
+            )
+            for owner in (chunk, getattr(chunk, "language_model", None))
         ):
             raise ValueError(
                 "Expert-bias padding masks are unsupported for "
@@ -834,7 +845,9 @@ class MegatronPolicyWorkerImpl(
         # (mbridge VLM wrappers like Qwen3VL). If so, NeMo-RL must hand it an
         # unpacked [B, S] batch rather than pre-packing + CP-sharding itself.
         self.delegate_pack_to_model = _model_self_packs_for_cp(self.model)
-        self.create_router_padding_mask = _model_needs_router_padding_mask(self.model)
+        self.create_router_padding_mask = _model_needs_router_padding_mask(
+            self.model, pack_sequences=self.cfg["sequence_packing"]["enabled"]
+        )
         self.delegate_mtp_loss_mask_to_model = _model_self_packs_mtp_loss_mask(
             self.model
         )

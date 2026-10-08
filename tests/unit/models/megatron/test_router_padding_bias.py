@@ -213,7 +213,10 @@ def test_packed_padding_does_not_change_expert_bias(monkeypatch, multiple):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_packed_router_mask_with_alltoall_dispatcher(monkeypatch, enabled):
+@pytest.mark.parametrize("model_slices_cp", [False, True])
+def test_packed_router_mask_with_alltoall_dispatcher(
+    monkeypatch, enabled, model_slices_cp
+):
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
     from nemo_rl.models.megatron import data as module
 
@@ -226,10 +229,10 @@ def test_packed_router_mask_with_alltoall_dispatcher(monkeypatch, enabled):
     batch.micro_batch_lengths = [[8]]
     cfg = {
         "megatron_cfg": {
-            "tensor_model_parallel_size": 1,
+            "tensor_model_parallel_size": 2,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 1,
-            "sequence_parallel": False,
+            "sequence_parallel": True,
             "moe_token_dispatcher_type": "alltoall",
             "moe_hybridep_prepad_packed_inputs": True,
         },
@@ -244,6 +247,7 @@ def test_packed_router_mask_with_alltoall_dispatcher(monkeypatch, enabled):
         straggler_timer=None,
         seq_length_key="input_lengths",
         create_router_padding_mask=enabled,
+        model_slices_context_parallel_inputs=model_slices_cp,
     )
     processed = next(iterator)
     if enabled:
@@ -253,3 +257,72 @@ def test_packed_router_mask_with_alltoall_dispatcher(monkeypatch, enabled):
         assert processed.input_ids.shape[1] == 12
     else:
         assert processed.padding_mask is None
+
+
+@pytest.mark.parametrize("chunkwise", [False, True])
+def test_nested_language_decoder_router_mask(chunkwise):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_needs_router_padding_mask,
+    )
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                moe_router_enable_expert_bias=True, moe_router_bias_update_rate=0.001
+            )
+            self.expert_bias = torch.zeros(4)
+            self.language_model = SimpleNamespace(
+                decoder=SimpleNamespace(_has_linear_layer_with_chunkwise_cp=chunkwise)
+            )
+
+        def forward(self, input_ids, padding_mask=None):
+            return input_ids
+
+    if chunkwise:
+        with pytest.raises(ValueError, match="chunkwise context parallelism"):
+            _model_needs_router_padding_mask(Model())
+    else:
+        assert _model_needs_router_padding_mask(Model())
+
+
+@pytest.mark.parametrize("packing", [False, True])
+def test_self_packing_expert_bias_rejected_at_setup(packing):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_needs_router_padding_mask,
+    )
+
+    class Model(torch.nn.Module):
+        model_owns_packing = True
+
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                moe_router_enable_expert_bias=True, moe_router_bias_update_rate=0.001
+            )
+            self.expert_bias = torch.zeros(4)
+
+        def forward(self, input_ids, padding_mask=None):
+            return input_ids
+
+    if packing:
+        with pytest.raises(ValueError, match="model-owned sequence packing"):
+            _model_needs_router_padding_mask(Model(), pack_sequences=packing)
+    else:
+        assert _model_needs_router_padding_mask(Model(), pack_sequences=packing)
+
+
+def test_delegated_packing_cannot_silently_drop_router_mask(monkeypatch):
+    from nemo_rl.models.megatron import data as module
+
+    monkeypatch.setattr(module, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(module, "get_context_parallel_world_size", lambda: 1)
+    with pytest.raises(NotImplementedError, match="real-token validity"):
+        module.process_microbatch(
+            _packed_batch(),
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            delegate_pack_to_model=True,
+            pad_individual_seqs_to_multiple_of=4,
+            create_packed_seq_padding_mask=True,
+        )
