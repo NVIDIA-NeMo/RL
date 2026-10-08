@@ -22,8 +22,8 @@ from collections.abc import Sequence
 from copy import copy, deepcopy
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import unquote
 from typing import TYPE_CHECKING, Any, Optional, Union
+from urllib.parse import unquote
 
 import requests
 import torch
@@ -1931,23 +1931,20 @@ def image_counts_by_row(batch: Any, num_rows: int) -> Optional[list[int]]:
 
 
 def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) -> None:
-    """Mark media tokens that do not anchor input media.
+    """Attach a ``[B, S]`` mask of media-token positions that anchor media features.
 
     Builds the mask while rows still are samples. Sequence packing later
     concatenates those rows into one THD sequence, after which no per-row
-    question can be asked, so the packing step carries this through the same
-    transform as ``input_ids`` rather than deriving it downstream.
+    information can be recovered, so the packing step carries this through
+    the same transform as ``input_ids`` rather than deriving it downstream.
 
-    ``token_mask`` is deliberately not used as media provenance. It is a loss
-    mask, and runs 7310230/7311217 proved that intersecting it with media-token
-    IDs can invalidate one complete 176-feature input-media block. Exact
-    message-owned provenance, when present, wins. The fallback only corrects the
-    unambiguous legacy case: media-token IDs in rows with no attached media.
-
-    The batch is duck-typed rather than annotated as ``BatchedDataDict``:
-    that module imports this one, so naming it here would be circular.
+    Args:
+        batch: Batch with ``[B, S]`` ``input_ids``.
+        media_token_id: Media placeholder token ID, or None if the model does not
+            accept the mask, in which case any existing mask is removed.
     """
-    if media_token_id is None:
+    if media_token_id is None:  # if _model_accepts_media_token_validity_mask
+        batch.pop("media_token_validity_mask", None)
         return
     input_ids = batch.get("input_ids", None)
     if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:

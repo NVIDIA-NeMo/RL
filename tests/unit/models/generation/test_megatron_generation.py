@@ -29,6 +29,8 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.megatron import MegatronGeneration, megatron_generation
 from nemo_rl.models.generation.megatron.config import (
+    MediaPromptSpecOverrides,
+    MultimodalPromptConfigOverrides,
     dedicated_inference_megatron_cfg,
     merged_inference_megatron_cfg,
     resolve_refit_execution_batch_bytes,
@@ -101,6 +103,27 @@ def test_nemotron_video_style_accepts_explicit_megatron_prompt_contract() -> Non
     assert config["generation"]["mcore_generation_config"]["multimodal_prompt_config"][
         "video_spec"
     ] == {"expansion_mode": "single"}
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("overrides_cls", "mcore_cls_name"),
+    [
+        (MediaPromptSpecOverrides, "MediaPromptSpec"),
+        (MultimodalPromptConfigOverrides, "MultimodalPromptConfig"),
+    ],
+)
+def test_prompt_config_overrides_match_mcore_fields(
+    overrides_cls: type, mcore_cls_name: str
+) -> None:
+    import dataclasses
+
+    import megatron.core.inference.config as mcore_inference_config
+
+    mcore_cls = getattr(mcore_inference_config, mcore_cls_name)
+    assert set(overrides_cls.__annotations__) == {
+        field.name for field in dataclasses.fields(mcore_cls)
+    }
 
 
 @pytest.mark.mcore
@@ -556,7 +579,8 @@ def test_bridge_refit_converts_external_state_through_streaming_api() -> None:
 
 @pytest.mark.parametrize(
     ("ignore_eos", "expected_termination_id"),
-    [(False, 42), (True, None)],
+    # MCore replaces a None termination_id with the tokenizer's EOS; -1 disables it.
+    [(False, 42), (True, -1)],
 )
 def test_sampling_params_can_ignore_eos(
     monkeypatch, ignore_eos, expected_termination_id
@@ -579,7 +603,7 @@ def test_sampling_params_can_ignore_eos(
 
     params = worker._build_sampling_params(greedy=False, stop_words=None)
 
-    assert params["termination_id"] is expected_termination_id
+    assert params["termination_id"] == expected_termination_id
 
 
 @pytest.mark.mcore

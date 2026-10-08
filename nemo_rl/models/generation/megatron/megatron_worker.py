@@ -1084,7 +1084,7 @@ class MegatronGenerationMixin:
             return_log_probs=True,
             num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"],
             termination_id=(
-                None
+                -1
                 if self.cfg["generation"].get("ignore_eos", False)
                 else self.megatron_tokenizer.eod
             ),

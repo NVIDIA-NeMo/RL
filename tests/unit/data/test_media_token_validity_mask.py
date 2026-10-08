@@ -162,6 +162,16 @@ def test_attach_is_a_noop_without_a_media_token_id():
     assert "media_token_validity_mask" not in batch
 
 
+def test_attach_drops_a_transported_mask_without_a_media_token_id():
+    """GRPO attaches masks to every multimodal batch; unsupported models drop them."""
+    batch = {
+        "input_ids": torch.tensor([[TXT, IMG]]),
+        "media_token_validity_mask": torch.tensor([[True, True]]),
+    }
+    attach_media_token_validity_mask(batch, None)
+    assert "media_token_validity_mask" not in batch
+
+
 def test_attach_is_a_noop_when_nothing_needs_masking():
     """No key at all, so the model keeps deriving its own."""
     packed = PackedTensor([torch.ones(1, 3, 2, 2)], dim_to_pack=0)

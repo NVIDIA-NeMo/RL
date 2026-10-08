@@ -334,14 +334,21 @@ data:
     video_sampling_style: nemotron_vl
 ```
 
-NeMo-RL then automatically materializes the required video prompt contract:
+This setting controls NeMo-RL's video preprocessing only. It does not change the
+Megatron inference prompt, which comes from the selected
+`megatron_inference_wrapper`. The Nemotron Omni wrapper already defaults to
+timestamped temporal-patch video prompts. For other wrappers, or to change these
+values, set them explicitly:
 
 ```yaml
-multimodal_prompt_config:
-  video_spec:
-    content_part_separator: "\n"
-    expansion_mode: temporal_patch
-    include_frame_timestamps_for_nemotron_vl: true
+policy:
+  generation:
+    mcore_generation_config:
+      multimodal_prompt_config:
+        video_spec:
+          content_part_separator: "\n"
+          expansion_mode: temporal_patch
+          include_frame_timestamps_for_nemotron_vl: true
 ```
 
 The current engine has one prompt contract for all requests. Supporting

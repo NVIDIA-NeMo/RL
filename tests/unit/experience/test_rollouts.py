@@ -319,6 +319,33 @@ def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():
     assert "media_token_validity_mask" not in generated_assistant
 
 
+@pytest.mark.parametrize("has_target_mask", [True, False])
+def test_reattach_keeps_target_mask_when_source_is_untokenized(has_target_mask):
+    """Deduplicated generic Gym prompts carry an empty mask on empty token_ids."""
+    image = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    target_mask = torch.tensor([False, True, False])
+    target = {"role": "user", "content": "", "token_ids": torch.tensor([7, 8, 9])}
+    if has_target_mask:
+        target["media_token_validity_mask"] = target_mask
+    source = {
+        "role": "user",
+        "content": "",
+        "token_ids": torch.tensor([], dtype=torch.long),
+        "media_token_validity_mask": torch.tensor([], dtype=torch.bool),
+        "pixel_values": image,
+    }
+    results = [{"_initial_multimodal_data_omitted": True, "message_log": [target]}]
+
+    _reattach_original_multimodal_payloads(results, [[source]])
+
+    assert target["pixel_values"] is image
+    if has_target_mask:
+        assert target["media_token_validity_mask"] is target_mask
+    else:
+        # Left to the GRPO fallback, which derives the mask from attached media.
+        assert "media_token_validity_mask" not in target
+
+
 @pytest.mark.parametrize("omission_marker", [False, None])
 def test_reattach_keeps_authoritative_changed_gym_media(omission_marker):
     original_media = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)

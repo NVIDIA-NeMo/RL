@@ -31,6 +31,26 @@ def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
     return configured_bytes
 
 
+class MediaPromptSpecOverrides(TypedDict):
+    """Partial MCore `MediaPromptSpec`. Omitted fields keep the wrapper's defaults."""
+
+    model_token: NotRequired[str]
+    prefix: NotRequired[str]
+    suffix: NotRequired[str]
+    input_marker: NotRequired[str | None]
+    content_part_separator: NotRequired[str]
+    expansion_mode: NotRequired[Literal["single", "temporal_patch"]]
+    include_frame_timestamps_for_nemotron_vl: NotRequired[bool]
+
+
+class MultimodalPromptConfigOverrides(TypedDict):
+    """Partial MCore `MultimodalPromptConfig`. Omitted fields keep the wrapper's defaults."""
+
+    image_spec: NotRequired[MediaPromptSpecOverrides]
+    video_spec: NotRequired[MediaPromptSpecOverrides]
+    content_part_order: NotRequired[Literal["preserve", "media_first"]]
+
+
 class MCoreGenerationSpecificArgs(TypedDict):
     """Megatron fields related only to inference.
 
@@ -143,7 +163,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
     megatron_inference_wrapper: NotRequired[str]
     # Partial MultimodalPromptConfig overrides applied on top of the wrapper's
     # default image/video prompt contracts.
-    multimodal_prompt_config: NotRequired[dict[str, Any]]
+    multimodal_prompt_config: NotRequired[MultimodalPromptConfigOverrides]
 
     # KV cache lifecycle across suspend/resume:
     # - "persist": cache stays allocated; CUDA graphs remain valid (default)
