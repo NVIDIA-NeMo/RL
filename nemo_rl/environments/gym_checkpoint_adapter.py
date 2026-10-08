@@ -524,6 +524,22 @@ class GymCheckpointAdapter:
             deadline_ts=deadline_ts,
         )
 
+    async def forget(
+        self,
+        checkpoint_id: str,
+        rollout_ids: Iterable[str],
+        *,
+        deadline_ts: float,
+    ) -> None:
+        from nemo_gym._checkpoint.coordination import forget
+
+        await forget(
+            self._require_participants(),
+            checkpoint_id,
+            list(rollout_ids),
+            deadline_ts=deadline_ts,
+        )
+
     async def commit(
         self,
         checkpoint_id: str,

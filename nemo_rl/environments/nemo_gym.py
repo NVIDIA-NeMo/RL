@@ -860,6 +860,20 @@ Depending on your data shape, you may want to change these values."""
             deadline_ts=deadline_ts,
         )
 
+    async def checkpoint_forget(
+        self,
+        checkpoint_id: str,
+        rollout_ids: tuple[str, ...],
+        *,
+        deadline_ts: float,
+    ) -> None:
+        """Stop refusing requests of these retired rollouts."""
+        await self._require_checkpoint_adapter().forget(
+            checkpoint_id,
+            rollout_ids,
+            deadline_ts=deadline_ts,
+        )
+
     async def checkpoint_commit(
         self,
         checkpoint_id: str,
