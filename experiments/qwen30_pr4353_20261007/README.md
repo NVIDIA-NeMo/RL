@@ -38,3 +38,48 @@ script changes; set `LAUNCH_COMMIT` to the pushed launcher commit in that case.
 Compare the BF16/BF16 attention A/B to measure backend overhead. The
 FlashInfer-attention MXFP8 runs have nonfinite generation logprobs, so their
 timing is diagnostic rather than an accuracy-qualified speed comparison.
+
+## Reproduce the reported comparison
+
+The shared integration branch is `sna/mxfp8-perf` in NVIDIA-NeMo/RL. It
+contains the Qwen3-30B-A3B recipes, launcher, TE routed-expert scope, and
+MXFP8 refit code on top of current `main`. The published [W&B report](<https://wandb.ai/nvidia/nemo-rl-mxfp8-training/reports/Qwen3-30B-A3B:-BF16-vs-MXFP8-Training-and-Rollout-(Option-B,-GB200)--VmlldzoxODA3Mzg2NA==>)
+covers six successful 20-step jobs. Those measurements used frozen runtime
+source `15fc687fb7aaf342128bc4f10c91e622cc1f4079`, with launcher changes
+through `27346dfd600e9e27e3db419c585ae10e2ee5aaaf`. The later merge from
+`main` has not yet been remeasured, so do not attribute the published numbers
+to the new branch head.
+
+On OCI-HSG, check out the branch under `/home` and initialize submodules:
+
+```bash
+git fetch origin sna/mxfp8-perf
+git switch --track origin/sna/mxfp8-perf
+git submodule update --init --recursive
+```
+
+Prepare an immutable source archive containing the checked-out commit **and
+its initialized submodule contents**; a plain `git archive` omits submodule
+files. Use a validated vLLM 0.29 image with the matching NeMo-RL actor
+environments. The original runs used
+`nemo_rl_main_aligned_20261007_7776525.sqsh`. Stage the source archive and
+image on cluster storage, keep the checkout in `/home`, and let the launcher
+place caches under node-local `/raid/scratch`. Then set `CONTAINER`,
+`SOURCE_ARCHIVE`, `SOURCE_COMMIT` (the archive's commit), `RESULT_ROOT`, and
+`WANDB_API_KEY`. `LAUNCH_COMMIT` defaults to `SOURCE_COMMIT`; set it separately
+only when replaying the original frozen source with a newer launcher.
+
+```bash
+export VLLM_ATTENTION_BACKEND=TRITON_ATTN
+bash experiments/qwen30_pr4353_20261007/submit.sh bf16-bf16 test-only
+bash experiments/qwen30_pr4353_20261007/submit.sh bf16-mxfp8 test-only
+bash experiments/qwen30_pr4353_20261007/submit.sh mxfp8-option-b test-only
+bash experiments/qwen30_pr4353_20261007/submit.sh mxfp8-option-b-param-false test-only
+```
+
+After the Slurm dry runs pass, submit the same arms without `test-only`.
+The launcher defaults to 20 steps and `coreai_dlalgo_nemorl`; override
+`SLURM_ACCOUNT` when needed. The two `mxfp8-default`/`mxfp8-param-false`
+arms provide the Option B ablation. Compare only matched 20-step runs using
+steps 2-20, both logprobs, finite generation KL, and logged throughput
+metrics. `exposed_generation` is an Async wait, not full generation latency.
