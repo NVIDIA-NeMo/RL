@@ -429,6 +429,35 @@ def _routes_for_delta(call_idx: int, n_tokens: int) -> list:
     ]
 
 
+def _staged_routes_for(call_idx: int, record: StagedCallRecord) -> list:
+    """Routes as the vLLM worker stages them for one call.
+
+    A child call leads with one extra row: the real route of its parent's last
+    sampled token (value ``call*1000 + 900``, distinct from every delta row).
+    """
+    routes = _routes_for_delta(call_idx, len(record.token_ids_delta))
+    if record.prev_len > 0:
+        boundary_row = [[call_idx * 1000 + 900, call_idx * 1000 + 900]] * 2
+        routes = [boundary_row] + routes
+    return routes
+
+
+def _assembled_routes(call_ids: list[str], routes_by_call: dict) -> list:
+    """Expected training routes for a linear chain of staged calls.
+
+    Each call contributes its delta rows; each child's leading boundary row
+    replaces the parent's last row (vLLM's placeholder for the last sampled token).
+    """
+    assembled: list = []
+    for index, call_id in enumerate(call_ids):
+        staged = routes_by_call[call_id]
+        if index > 0:
+            assembled[-1] = staged[0]
+            staged = staged[1:]
+        assembled.extend(staged)
+    return assembled
+
+
 def _record_with_routes(record: StagedCallRecord, routes: list) -> StagedCallRecord:
     extras = {"routed_experts": routes}
     extras_digest = compute_extras_digest(extras)
@@ -484,7 +513,7 @@ def _stage_fixture_with_routes(tq_client, name: str, *, rollout_id: str):
     routes_by_call = {}
     staged_records = []
     for idx, record in enumerate(records):
-        routes = _routes_for_delta(idx, len(record.token_ids_delta))
+        routes = _staged_routes_for(idx, record)
         routes_by_call[record.model_call_id] = routes
         staged = _record_with_routes(record, routes)
         staged_records.append(staged)
@@ -527,13 +556,10 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
         partition_id=_R3_PARTITION,
         select_fields=["routed_experts", "input_lengths"],
     )
-    # Valid row: the delivered chain's staged extras, concatenated in chain
-    # order (the golden fixture is a single linear chain).
-    expected_routes = [
-        row_routes
-        for call_id in expected.call_ids
-        for row_routes in routes_by_call[call_id]
-    ]
+    # Valid row: the delivered chain's staged extras in chain order, with each
+    # turn's last token carrying the next call's route (the golden fixture is
+    # a single linear chain).
+    expected_routes = _assembled_routes(expected.call_ids, routes_by_call)
     valid_len = len(expected.token_ids)
     assert len(expected_routes) == valid_len
     published = torch.as_tensor(rows["routed_experts"][0]).reshape(-1, 2, 2)
@@ -622,7 +648,7 @@ def _stage_deferred_fixture(tq_client, *, rollout_id: str):
     routes_by_call = {}
     staged_records = []
     for idx, record in enumerate(records):
-        routes = _routes_for_delta(idx, len(record.token_ids_delta))
+        routes = _staged_routes_for(idx, record)
         routes_by_call[record.model_call_id] = routes
         staged = _record_with_routes(record, routes)
         staged_records.append(staged)
@@ -690,9 +716,7 @@ def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
         worker_meta,
         dp_aligned_seq_len=False,
     )
-    expected_routes = [
-        route for call_id in expected.call_ids for route in routes_by_call[call_id]
-    ]
+    expected_routes = _assembled_routes(expected.call_ids, routes_by_call)
     valid_len = len(expected.token_ids)
     assert materialized["routed_experts"][0, :valid_len].tolist() == expected_routes
     assert bool(materialized["routed_experts"][1].eq(-1).all())
