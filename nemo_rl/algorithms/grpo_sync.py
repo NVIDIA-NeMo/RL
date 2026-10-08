@@ -52,9 +52,9 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     _advantage_valid_mask,
     _apply_mask_sample_filter,
-    _dynamic_sampling_valid_mask,
     _clip_grpo_advantages,
     _create_advantage_estimator,
+    _dynamic_sampling_valid_mask,
     _initial_policy_generation_stale,
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
@@ -819,7 +819,9 @@ def grpo_train_sync(
                             calculate_trivial_reward_distributions(
                                 driver_carry["prompt_ids_for_adv"],
                                 dynamic_sampling_rewards,
-                                _dynamic_sampling_valid_mask(driver_carry, master_config.grpo),
+                                _dynamic_sampling_valid_mask(
+                                    driver_carry, master_config.grpo
+                                ),
                             )
                         )
                         tags["is_trivial_prompt_distribution"] = (

@@ -34,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 
@@ -430,7 +430,10 @@ class AdvantageComputer:
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
         advantage_valid_mask = final_sample_mask
-        if not cfg.is_ppo and cfg.algo.masked_reward_policy == "include":
+        if (
+            not cfg.is_ppo
+            and cast(GRPOConfig, cfg.algo).masked_reward_policy == "include"
+        ):
             # Preserve data-plane validity: token-capture placeholders never vote.
             advantage_valid_mask = sample_mask
 
