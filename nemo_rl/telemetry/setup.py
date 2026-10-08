@@ -407,11 +407,14 @@ def _process_attributes(rank: int, world_size: int, run_id: str = "") -> dict[st
 
     Passing rank at all is what keeps that filter available; lens warns when
     ``nv.dl.rank`` is missing, because without it a process cannot be told
-    apart from its peers downstream. ``nv.dl.local_rank`` adds its position
-    within its own node, which is what groups a job's processes by the host
-    they share. It is not a physical device index: Ray gives each worker its
-    own ``CUDA_VISIBLE_DEVICES``, so local rank 0 is whichever GPU that worker
-    was placed on.
+    apart from its peers downstream. ``nv.dl.local_rank`` adds the worker's
+    bundle index within its placement group, which ``RayWorkerGroup`` exports
+    as ``LOCAL_RANK``. That is node-local only when each node has its own
+    placement group: a generation backend that spans nodes asks for a single
+    unified one instead -- SGLang always, vLLM, TRT-LLM and Megatron when
+    their parallelism crosses nodes -- and the index then runs across every
+    node in the group. Nor is it a physical device index, since Ray gives each
+    worker its own ``CUDA_VISIBLE_DEVICES``.
 
     Called by both entry points, since a resource is per process and neither
     path sees the other's.

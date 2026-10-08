@@ -228,10 +228,10 @@ def test_process_attributes_report_the_local_rank_when_the_launcher_set_one(
 ):
     """``RayWorkerGroup`` exports ``LOCAL_RANK`` beside ``RANK``.
 
-    It places a process within its own node, which is what groups a job's
-    processes by the host they share. The driver owns no device, so a process
-    without the variable reports no local rank rather than defaulting to zero
-    and claiming one.
+    It is the worker's bundle index in its placement group, which is node-local
+    only when each node has one of its own. The driver owns no device, so a
+    process without the variable reports no local rank rather than defaulting
+    to zero and claiming one.
     """
     pytest.importorskip("nemo.lens")
     monkeypatch.setenv("LOCAL_RANK", "3")
