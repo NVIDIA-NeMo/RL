@@ -142,6 +142,44 @@ parameters retain native AdamW and remain trainable unless explicitly frozen.
 Thus the comparison measures native GRPO before and after enabling LoGRA,
 including its row-wise optimizer; it is not an equivalence claim about dense Adam.
 
+## Performance
+
+The training step is measured on a standalone 4-GPU FSDP2 harness (Qwen2.5-Math-7B,
+fp32 parameters with bf16 autocast, two microbatches of one 2,048-token sequence per
+rank, no Ray or vLLM) so that the optimizer can be profiled in isolation. Medians of
+steady-state iterations, rank 0, CUDA-synchronized, on B300 GPUs:
+
+| Variant | forward | backward | sync + clip | step | iteration | peak memory |
+|---|---:|---:|---:|---:|---:|---:|
+| Dense AdamW | 146 ms | 278 ms | 50 ms | 25 ms | 500 ms | 65.0 GiB |
+| LoGRA, initial implementation | 282 ms | 205 ms | 130 ms | 1,169 ms | 1,788 ms | 45.5 GiB |
+| LoGRA, current | 156 ms | 180 ms | 19 ms | 29 ms | 384 ms | 45.7 GiB |
+
+![Policy training step time, dense versus LoGRA before and after](assets/perf/logra_step_time_before_after.png)
+
+LoGRA's backward pass is shorter than dense because the selected weights have no
+gradient buffers to compute or reduce-scatter. The remaining work is kept off the
+critical path as follows:
+
+- Projections are drawn on the GPU, in place, from a per-layer seed. All ranks hold the
+  same matrix; the optimizer checks this once with a fingerprint before the first
+  update. Regenerating them on the CPU every step used to cost 1.1 s with the GPU idle.
+- All sketches live in one `[total_rows, rank]` buffer, so synchronization, clipping
+  and zeroing are one collective or kernel each instead of one per layer.
+- The clipping norm uses `||S A||^2 = <S (A A^T), S>` with a `rank x rank` Gram matrix
+  per layer; the dense gradient is never reconstructed.
+- RowAdam runs once over the flat buffer in place, and each weight shard is updated with
+  a single `addmm_` that also applies weight decay.
+- Forward hooks reuse a persistent low-precision copy of each projection.
+- The worker freezes the Python heap after setup (`gc.freeze()`). Without it a full
+  collection fires inside the forward pass every few steps and stalls it by about 200 ms.
+
+![Per-iteration wall time with and without gc.freeze](assets/perf/logra_iteration_wall_gc.png)
+
+In the end-to-end smoke configuration (`configs/grpo_logra_smoke.yaml`, 4 training and
+4 rollout GPUs), `timing/train/policy_training` at step 2 is 0.45 s for LoGRA against
+0.51 s for the dense control; the initial implementation took 2.23 s.
+
 ## Configuration and code map
 
 | File | Responsibility |
