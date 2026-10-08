@@ -155,7 +155,13 @@ def _as_routed_experts_tensor(
     global G_ROUTED_EXPERTS_RANGE_CHECKED
     tensor = torch.as_tensor(value, device=device)
     if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
-        max_id = int(tensor.max())
+        # vLLM stores expert ids as uint16 once a model has more than 256
+        # experts, and torch implements no reductions for uint16 (or the
+        # wider unsigned types), so take the max in int64.
+        if tensor.dtype in (torch.uint16, torch.uint32, torch.uint64):
+            max_id = int(tensor.to(torch.int64).max())
+        else:
+            max_id = int(tensor.max())
         limit = torch.iinfo(dtype).max
         if max_id > limit:
             raise ValueError(

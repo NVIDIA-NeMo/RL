@@ -16,6 +16,7 @@ import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
@@ -1144,6 +1145,56 @@ def test_pad_and_align_rejects_expert_ids_overflowing_dtype(monkeypatch):
     request_output = Output()
     completion_output = Output()
     completion_output.routed_experts = torch.full((2, 1, 2), 200)
+
+    with pytest.raises(ValueError, match="exceeds the resolved carry dtype"):
+        pad_and_align_routed_expert_indices(
+            request_output,
+            completion_output,
+            valid_length=3,
+            padded_length=3,
+            device=torch.device("cpu"),
+            routed_experts_dtype=torch.int8,
+        )
+
+
+@pytest.mark.parametrize("as_numpy", [True, False])
+def test_pad_and_align_converts_uint16_expert_ids(monkeypatch, as_numpy):
+    """vLLM returns uint16 expert ids for models with more than 256 experts.
+
+    torch has no max for uint16, so the range check must not reduce in it.
+    """
+    monkeypatch.setattr(vllm_utils, "G_ROUTED_EXPERTS_RANGE_CHECKED", False)
+
+    class Output:
+        pass
+
+    ids = np.arange(4 * 3 * 2, dtype=np.uint16).reshape(4, 3, 2) * 21
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = ids if as_numpy else torch.from_numpy(ids)
+
+    routed_experts = pad_and_align_routed_expert_indices(
+        request_output,
+        completion_output,
+        valid_length=5,
+        padded_length=5,
+        device=torch.device("cpu"),
+        routed_experts_dtype=torch.int16,
+    )
+
+    assert routed_experts.dtype == torch.int16
+    assert torch.equal(routed_experts[:4], torch.from_numpy(ids.astype(np.int16)))
+
+
+def test_pad_and_align_rejects_uint16_expert_ids_overflowing_dtype(monkeypatch):
+    monkeypatch.setattr(vllm_utils, "G_ROUTED_EXPERTS_RANGE_CHECKED", False)
+
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = np.full((2, 1, 2), 300, dtype=np.uint16)
 
     with pytest.raises(ValueError, match="exceeds the resolved carry dtype"):
         pad_and_align_routed_expert_indices(
