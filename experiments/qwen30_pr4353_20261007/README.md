@@ -83,3 +83,8 @@ The launcher defaults to 20 steps and `coreai_dlalgo_nemorl`; override
 arms provide the Option B ablation. Compare only matched 20-step runs using
 steps 2-20, both logprobs, finite generation KL, and logged throughput
 metrics. `exposed_generation` is an Async wait, not full generation latency.
+In Async, `generation_tokens_per_sec_per_gpu` uses policy + logprob + exposed
+wait in its denominator, so it is a training-coupled worker-group proxy,
+not standalone vLLM decode throughput. The earlier MXFP8 run with default
+FlashInfer attention had NaN generation KL and a large reward shift; its raw
+time must not be quoted as a valid MXFP8 speedup.
