@@ -67,9 +67,9 @@ workers can send weights. Sparse delta is currently limited to GRPO. NIXL is
 initialized by the GRPO and distillation setup paths; PPO currently requires
 colocated generation.
 
-### TRT-LLM Routed-Expert FP8
+### TensorRT-LLM Routed-Expert FP8
 
-TRT-LLM supports online block-FP8 refit for MoE rollouts. Policy
+TensorRT-LLM supports online block-FP8 refit for MoE rollouts. Policy
 training remains in BF16, and this setting does not change optimizer-state
 precision. During each refit, NeMo RL converts weights to E4M3 with 128x128
 blocks and FP32 scales. By default only the routed-expert weights are converted;
@@ -123,10 +123,10 @@ Tested models:
 | Qwen3.5 MoE | Verified |
 | Qwen3 MoE | Verified (Qwen3-30B-A3B, block-FP8 and MXFP8; attention + experts scope with block-FP8) |
 
-NeMo RL initializes the TRT-LLM model with `load_format` set
+NeMo RL initializes the TensorRT-LLM model with `load_format` set
 to `dummy`, then populates it from the first BF16 policy refit. By default
-(`is_mx: false`), the TRTLLM MoE backend is required to preserve FP32 block
-scales; MXFP8/E8M0 scales are not used.
+(`is_mx: false`), the TensorRT-LLM MoE backend (`moe_config.backend: TRTLLM`)
+is required to preserve FP32 block scales; MXFP8/E8M0 scales are not used.
 
 #### MXFP8 variant
 
@@ -142,12 +142,13 @@ policy:
 ```
 
 This selects the CUTLASS MoE backend (the default) or the CuTe DSL backend
-(`moe_config.backend: CUTEDSL`, for Rubin) instead of TRTLLM; any other backend
-fails at setup. MXFP8 also constrains which GPUs it can run on: TRT-LLM's
+(`moe_config.backend: CUTEDSL`, for Rubin) instead of the `TRTLLM` backend that
+block-FP8 uses; any other backend fails at setup. MXFP8 also constrains which
+GPUs it can run on: TensorRT-LLM's
 CUTLASS MoE gates `QuantAlgo.MXFP8` on `sm_constraint in {100, 103}`, so it does
 not run everywhere the default block-FP8 path does.
 
-The installed TRT-LLM must provide the incremental-refit lifecycle APIs
+The installed TensorRT-LLM must provide the incremental-refit lifecycle APIs
 `begin_update_weights`, `finalize_update_weights`, `abort_update_weights`, and
 `WorkerExtension.finalize_weight_update`. NeMo RL fails during setup if any of
 the three model-loader hooks is missing; `finalize_weight_update` is called
@@ -209,7 +210,7 @@ policy:
 ```
 
 This option requires the Megatron policy backend and applies only to non-colocated
-vLLM or TRT-LLM generation with the default NCCL collective transport or
+vLLM or TensorRT-LLM generation with the default NCCL collective transport or
 `nccl_reshard`. Unsupported
 combinations fail during synchronizer setup. It is disabled by default because
 CPU offload adds transfer overhead when the export already fits in trainer GPU
