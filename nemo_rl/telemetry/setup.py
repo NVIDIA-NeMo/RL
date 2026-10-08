@@ -67,6 +67,11 @@ _RUN_ID_ENV = f"{_OTEL_PREFIX}_RUN_ID"
 # Set per worker by ``RayWorkerGroup`` from the group's ``name_prefix``.
 _WORKER_GROUP_ENV = "NRL_WORKER_GROUP"
 
+# Reported as ``nv.dl.provider.name``: which training framework produced this
+# telemetry, for a backend collecting several of them. Spelled like the default
+# service name, but separate from it -- a user is free to rename the service.
+_PROVIDER_NAME = "nemo-rl"
+
 # Which stage of a model's lifecycle (pretrain -> SFT -> RL) produced this
 # telemetry. A backend collecting several NeMo products selects a stage on this
 # rather than on service names, which differ per launcher. Seeded into both the
@@ -186,13 +191,20 @@ def _build_resource_attributes(
     """Build process-lifetime resource attributes (Jaeger "Process" tags).
 
     Only stable-for-the-run values belong here (algorithm, model, precision,
-    parallelism). Per-step values are span tags; time-series values are metrics.
+    parallelism, batch and optimizer settings). Per-step values are span tags;
+    time-series values are metrics.
+
+    Driver-only, all of it: a worker is handed the propagated environment rather
+    than the ``MasterConfig``, so nothing here is reachable from one.
     Best-effort: a missing key simply omits that attribute — never raises.
-    Rank identity comes from :func:`_rank_attributes`, which the callers merge in.
+    Process identity comes from :func:`_process_attributes`, which the callers
+    merge in.
     """
+    from nemo.lens.semconv import RL_ALGORITHM
+
     attrs: dict[str, Any] = {
         _CAMPAIGN_STAGE_ATTR: _campaign_stage(algorithm),
-        "rl.algorithm": algorithm,
+        RL_ALGORITHM: algorithm,
     }
 
     model = _dig(master_config, "policy", "model_name")
@@ -203,21 +215,179 @@ def _build_resource_attributes(
     if precision:
         attrs["nemo.precision"] = precision
 
-    # Parallelism lives under the active policy backend (megatron vs dtensor).
-    tp = _dig(
-        master_config, "policy", "megatron_cfg", "tensor_model_parallel_size"
-    ) or _dig(master_config, "policy", "automodel_cfg", "tensor_parallel_size")
-    if tp:
-        attrs["dl.tensor_parallel.size"] = tp
-    pp = _dig(master_config, "policy", "megatron_cfg", "pipeline_model_parallel_size")
-    if pp:
-        attrs["dl.pipeline_parallel.size"] = pp
-
+    attrs.update(_topology_attributes(master_config))
+    attrs.update(_training_config_attributes(master_config, algorithm))
     return attrs
 
 
-def _rank_attributes(rank: int, world_size: int) -> dict[str, Any]:
-    """Resource attributes identifying this process within its group.
+def _topology_attributes(master_config: Any) -> dict[str, Any]:
+    """Parallelism sizes, under lens's resource-scoped topology keys.
+
+    ``nv.dl.topology.size.*`` rather than the ``dl.tensor_parallel.size`` family:
+    only the former is in lens's ``DL_RESOURCE_TYPES``, which is the registry
+    ``normalize_resource_attributes`` types a resource attribute against. The
+    ``dl.*`` spelling is the span and metric one.
+
+    Each size lives under whichever policy backend is active, so each is looked
+    up under both megatron and automodel. Only the current spelling of the
+    latter: ``check_outdated_config`` rejects a config still saying
+    ``dtensor_cfg`` before a run reaches here.
+    """
+    from nemo.lens.semconv import (
+        NV_DL_TOPOLOGY_SIZE_DP,
+        NV_DL_TOPOLOGY_SIZE_PP,
+        NV_DL_TOPOLOGY_SIZE_TP,
+    )
+
+    tp = _dig(
+        master_config, "policy", "megatron_cfg", "tensor_model_parallel_size"
+    ) or _dig(master_config, "policy", "automodel_cfg", "tensor_parallel_size")
+    pp = _dig(master_config, "policy", "megatron_cfg", "pipeline_model_parallel_size")
+    cp = _dig(master_config, "policy", "megatron_cfg", "context_parallel_size") or _dig(
+        master_config, "policy", "automodel_cfg", "context_parallel_size"
+    )
+
+    attrs: dict[str, Any] = {}
+    if tp:
+        attrs[NV_DL_TOPOLOGY_SIZE_TP] = tp
+    if pp:
+        attrs[NV_DL_TOPOLOGY_SIZE_PP] = pp
+    dp = _data_parallel_size(master_config, tp=tp or 1, pp=pp or 1, cp=cp or 1)
+    if dp:
+        attrs[NV_DL_TOPOLOGY_SIZE_DP] = dp
+    return attrs
+
+
+def _data_parallel_size(
+    master_config: Any, *, tp: int, pp: int, cp: int
+) -> Optional[int]:
+    """The ranks left for data parallelism once tp, pp and cp have claimed theirs.
+
+    Derived rather than read: RL configures no dp size. Training spans the
+    cluster's GPUs and dp is whatever the other dimensions leave over.
+
+    That identity breaks when generation runs on dedicated GPUs, because the
+    cluster then holds ranks the policy does not have. Returns ``None`` there,
+    rather than reporting a dp size for a group that is smaller than the
+    arithmetic says. Also ``None`` when the product does not divide the world
+    size, which the policy worker rejects with a far better message than a
+    resource attribute could carry.
+    """
+    if _dig(master_config, "policy", "generation", "colocated", "enabled") is False:
+        return None
+    nodes = _dig(master_config, "cluster", "num_nodes")
+    gpus_per_node = _dig(master_config, "cluster", "gpus_per_node")
+    if not nodes or not gpus_per_node:
+        return None
+
+    world_size = nodes * gpus_per_node
+    model_parallel_size = tp * pp * cp
+    if world_size % model_parallel_size:
+        return None
+    return world_size // model_parallel_size
+
+
+def _training_config_attributes(master_config: Any, algorithm: str) -> dict[str, Any]:
+    """Batch, sequence and optimizer settings, plus the configured step target.
+
+    These are the knobs a reader compares two runs on, and lens types them so
+    that a backend can select on them numerically. All best-effort.
+    """
+    from nemo.lens.semconv import (
+        NV_DL_TRAINING_CONFIG_GLOBAL_BATCH_SIZE,
+        NV_DL_TRAINING_CONFIG_MICRO_BATCH_SIZE,
+        NV_DL_TRAINING_CONFIG_OPTIMIZER,
+        NV_DL_TRAINING_CONFIG_RECOMPUTE_GRANULARITY,
+        NV_DL_TRAINING_CONFIG_SEQUENCE_LENGTH,
+        NV_DL_TRAINING_TARGET_TRAIN_ITERS,
+    )
+
+    attrs: dict[str, Any] = {}
+    for key, path in (
+        (NV_DL_TRAINING_CONFIG_GLOBAL_BATCH_SIZE, ("train_global_batch_size",)),
+        (NV_DL_TRAINING_CONFIG_MICRO_BATCH_SIZE, ("train_micro_batch_size",)),
+        (NV_DL_TRAINING_CONFIG_SEQUENCE_LENGTH, ("max_total_sequence_length",)),
+    ):
+        value = _dig(master_config, "policy", *path)
+        if value:
+            attrs[key] = value
+
+    # Two spellings, one per backend: megatron names the algorithm ("adam"),
+    # dtensor names the class ("torch.optim.AdamW").
+    optimizer = _dig(
+        master_config, "policy", "megatron_cfg", "optimizer", "optimizer"
+    ) or _dig(master_config, "policy", "optimizer", "name")
+    if optimizer:
+        attrs[NV_DL_TRAINING_CONFIG_OPTIMIZER] = optimizer
+
+    # Gated on activation checkpointing because megatron ignores the
+    # granularity without it, so reporting it would describe recompute that is
+    # not happening.
+    if _dig(master_config, "policy", "megatron_cfg", "activation_checkpointing"):
+        granularity = _dig(
+            master_config, "policy", "megatron_cfg", "recompute_granularity"
+        )
+        if granularity:
+            attrs[NV_DL_TRAINING_CONFIG_RECOMPUTE_GRANULARITY] = granularity
+
+    # The algorithm's own config section is named after it (``grpo:``, ``sft:``).
+    # Non-positive values are dropped rather than reported: ``rm`` spells "train
+    # for one epoch" as ``max_num_steps: -1``, which downstream would otherwise
+    # read as a target of -1 iterations.
+    max_num_steps = _dig(master_config, algorithm, "max_num_steps")
+    if isinstance(max_num_steps, int) and max_num_steps > 0:
+        attrs[NV_DL_TRAINING_TARGET_TRAIN_ITERS] = max_num_steps
+    return attrs
+
+
+def _software_versions() -> dict[str, Any]:
+    """Library versions as actually loaded in this process.
+
+    The lockfile says what was meant to be installed; these say what the run
+    imported, which is the pair worth comparing when a run regresses after an
+    image rebuild. Every lookup is optional: CUDA and NCCL are absent from a
+    CPU-only build, and transformer-engine is not installed for every backend.
+    """
+    from nemo.lens.semconv import (
+        NV_DL_SOFTWARE_CUDA,
+        NV_DL_SOFTWARE_NCCL,
+        NV_DL_SOFTWARE_TORCH,
+        NV_DL_SOFTWARE_TRANSFORMER_ENGINE,
+    )
+
+    attrs: dict[str, Any] = {}
+    try:
+        import torch
+    except ImportError:
+        return attrs
+
+    attrs[NV_DL_SOFTWARE_TORCH] = str(torch.__version__)
+    if torch.version.cuda:
+        attrs[NV_DL_SOFTWARE_CUDA] = str(torch.version.cuda)
+
+    # Deliberately broad: the NCCL version is read out of the loaded extension,
+    # which raises differently depending on how torch was built, and no spelling
+    # of that failure is worth risking the driver's setup over.
+    try:
+        nccl_version = torch.cuda.nccl.version()
+    except Exception:
+        pass
+    else:
+        attrs[NV_DL_SOFTWARE_NCCL] = ".".join(str(part) for part in nccl_version)
+
+    try:
+        import transformer_engine
+    except ImportError:
+        pass
+    else:
+        te_version = getattr(transformer_engine, "__version__", "")
+        if te_version:
+            attrs[NV_DL_SOFTWARE_TRANSFORMER_ENGINE] = str(te_version)
+    return attrs
+
+
+def _process_attributes(rank: int, world_size: int, run_id: str = "") -> dict[str, Any]:
+    """Resource attributes identifying this process and the stack it loaded.
 
     Lens has no notion of rank: it neither filters nor samples on one, so every
     process that sets up telemetry exports. Rank is recorded as a resource
@@ -228,11 +398,38 @@ def _rank_attributes(rank: int, world_size: int) -> dict[str, Any]:
 
     Passing rank at all is what keeps that filter available; lens warns when
     ``nv.dl.rank`` is missing, because without it a process cannot be told
-    apart from its peers downstream.
-    """
-    from nemo.lens.semconv import NV_DL_RANK, NV_DL_WORLD_SIZE
+    apart from its peers downstream. ``nv.dl.local_rank`` narrows that to a
+    device on one node, which is what a reader has when the complaint came from
+    ``nvidia-smi`` rather than from the job.
 
-    return {NV_DL_RANK: rank, NV_DL_WORLD_SIZE: world_size}
+    Called by both entry points, since a resource is per process and neither
+    path sees the other's.
+    """
+    from nemo.lens.semconv import (
+        NV_DL_LOCAL_RANK,
+        NV_DL_PROVIDER_NAME,
+        NV_DL_RANK,
+        NV_DL_RUN_UUID,
+        NV_DL_WORLD_SIZE,
+    )
+
+    attrs: dict[str, Any] = {
+        NV_DL_RANK: rank,
+        NV_DL_WORLD_SIZE: world_size,
+        NV_DL_PROVIDER_NAME: _PROVIDER_NAME,
+    }
+    # Exported next to RANK by ``RayWorkerGroup``; absent on the driver, which
+    # owns no device.
+    local_rank = os.environ.get("LOCAL_RANK", "").strip()
+    if local_rank.isdigit():
+        attrs[NV_DL_LOCAL_RANK] = int(local_rank)
+    # Duplicates lens's own ``nemo.run.id`` by design: the two namespaces are
+    # read by different consumers, and a backend joining RL runs to Megatron
+    # ones groups on the ``nv.dl.*`` spelling.
+    if run_id:
+        attrs[NV_DL_RUN_UUID] = run_id
+    attrs.update(_software_versions())
+    return attrs
 
 
 def init_telemetry_driver(
@@ -296,7 +493,9 @@ def init_telemetry_driver(
     # The driver is a singleton, not a member of a distributed group. Rank 0 of
     # 1 is the honest description, and stating it silences lens's warning about
     # a process that cannot be identified by rank downstream.
-    resource_attrs.update(_rank_attributes(rank=0, world_size=1))
+    resource_attrs.update(
+        _process_attributes(rank=0, world_size=1, run_id=config.run_id)
+    )
 
     handle = setup_telemetry(config, resource_attributes=resource_attrs)
     # Only now, past everything that can raise: setting the guard earlier would
@@ -425,7 +624,9 @@ def init_telemetry_worker(
             return None
 
         attrs = _worker_resource_attributes(worker_group, resource_attributes)
-        attrs.update(_rank_attributes(rank=rank, world_size=world_size))
+        attrs.update(
+            _process_attributes(rank=rank, world_size=world_size, run_id=config.run_id)
+        )
 
         handle = setup_telemetry(config, resource_attributes=attrs)
         logger.info(

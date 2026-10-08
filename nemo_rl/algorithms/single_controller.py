@@ -183,6 +183,7 @@ from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.telemetry.instrumentation import (
     NO_SPAN,
+    RL_ALGORITHM,
     RL_IDLE_POLLS_ATTR,
     efficiency_span,
     is_span_group_enabled,
@@ -755,7 +756,7 @@ class SingleControllerActor:
                 RLSpanGroup.U_JOB,
                 "rl.sc.job",
                 tracer=self._tracer,
-                **{"rl.algorithm": "ppo" if self._is_ppo else "grpo"},
+                **{RL_ALGORITHM: "ppo" if self._is_ppo else "grpo"},
             ):
                 result = await self._run_pumps()
         finally:

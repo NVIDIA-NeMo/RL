@@ -58,6 +58,11 @@ from nemo.lens import (
     span_attributes as _span_attributes,
 )
 
+# Span-attribute key lens declares itself. Re-exported so call sites take every
+# ``rl.*`` key from this one module, and so a rename lands in lens's semconv
+# instead of in a string literal scattered across the algorithms.
+from nemo.lens.semconv import RL_ALGORITHM
+
 from nemo_rl.telemetry.span_groups import UMBRELLA_GROUP_VALUES, RLSpanGroup
 from nemo_rl.telemetry.vocabulary import (
     INIT_TOTAL_CATEGORY,
@@ -118,6 +123,7 @@ __all__ = [
     "startup_span",
     "setup_span",
     "evaluate_span",
+    "RL_ALGORITHM",
     "RL_EFFICIENCY_CATEGORY_ATTR",
     "RL_IDLE_POLLS_ATTR",
     "RL_ITERATION_ATTR",
