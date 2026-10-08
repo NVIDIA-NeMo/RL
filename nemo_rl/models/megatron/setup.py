@@ -332,6 +332,7 @@ from nemo_rl.models.megatron.zero_train_gen_mismatch import (
     configure_zero_train_gen_mismatch,
     enable_batch_invariant_kernels,
     validate_batch_invariant_mode,
+    validate_zero_train_gen_model_provider,
 )
 from nemo_rl.models.policy import (
     Fp4Config,
@@ -471,7 +472,7 @@ def enable_zero_train_gen_kl(
     """Resolve zero_train_gen_mismatch into sub-knobs and enable batch-invariant mode.
 
     Applies the zero train/gen KL defaults below. A recipe value that differs is
-    overridden with a warning. Generation may be colocated or not and may use
+    overridden with a warning. Generation must be non-colocated and may use
     either ``transformer_engine`` or ``inference_optimized``. Call with
     ``apply_kernels=True`` before CUDA initialization so Megatron-Core
     batch-invariant kernels are active for the worker lifetime.
@@ -1185,6 +1186,10 @@ def setup_model_config(
     # __post_init__ to finalize(); megatron_cfg.validate() may call it again.
     if derive_provider_from_hf or model_overrides:
         model_cfg.finalize()
+
+    # The architecture comes from the HF config / checkpoint through the Bridge
+    # provider, so it can only be checked once the final provider is built.
+    validate_zero_train_gen_model_provider(config, model_cfg)
 
     # Create final megatron config
     megatron_cfg = _create_megatron_config(

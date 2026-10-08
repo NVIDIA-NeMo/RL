@@ -275,6 +275,13 @@ def test_validate_rejects_a_non_megatron_generation_backend():
     assert any("generation.backend must be 'megatron'" in v for v in result.violations)
 
 
+def test_validate_rejects_colocated_generation():
+    config = _resolved_config()
+    config["generation"]["colocated"] = {"enabled": True}
+    result = _validate(config)
+    assert any("does not support colocated generation" in v for v in result.violations)
+
+
 def test_validate_rejects_missing_generation_block():
     config = _resolved_config()
     del config["generation"]
@@ -310,18 +317,28 @@ def test_validate_requires_flash_attention_4(version):
     assert any("flash_attention_version=4" in v for v in result.violations)
 
 
-@pytest.mark.parametrize("key", ["multi_latent_attention", "use_mla"])
-def test_validate_rejects_mla(key):
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("multi_latent_attention", True),
+        ("hybrid_layer_pattern", "M*L"),
+        ("experimental_attention_variant", "some_variant"),
+    ],
+)
+def test_validate_provider_rejects_unsupported_architecture(key, value):
     config = _resolved_config()
-    config["megatron_cfg"][key] = True
-    assert any("MLA" in v for v in _validate(config).violations)
+    model_cfg = types.SimpleNamespace(**{key: value})
+
+    with pytest.raises(ValueError, match=key):
+        zgm.validate_zero_train_gen_model_provider(config, model_cfg)
 
 
-@pytest.mark.parametrize("key", ["hybrid_attention_ratio", "mamba_num_heads"])
-def test_validate_rejects_linear_attention_hybrids(key):
+def test_validate_provider_is_noop_when_the_preset_is_off():
     config = _resolved_config()
-    config["megatron_cfg"][key] = 0.5
-    assert any(key in v for v in _validate(config).violations)
+    config["megatron_cfg"]["zero_train_gen_mismatch"] = False
+    model_cfg = types.SimpleNamespace(multi_latent_attention=True)
+
+    zgm.validate_zero_train_gen_model_provider(config, model_cfg)
 
 
 def test_validate_rejects_non_bf16_precision():

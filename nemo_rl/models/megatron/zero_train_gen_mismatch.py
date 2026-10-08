@@ -23,7 +23,7 @@ import os
 import warnings
 from dataclasses import dataclass, field, fields
 from importlib.metadata import PackageNotFoundError, version
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any
 
 from packaging.version import Version
 
@@ -123,7 +123,6 @@ def validate_zero_train_gen_mismatch(
     _validate_platform(config, out, check_device=check_platform)
     if check_packages:
         _validate_packages(out)
-    _validate_model_architecture(config, out)
     _validate_precision(config, out)
     return out
 
@@ -309,6 +308,12 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
         )
         return
 
+    if (generation.get("colocated") or {}).get("enabled", False):
+        out.violations.append(
+            "zero_train_gen_mismatch does not support colocated generation; set "
+            "policy.generation.colocated.enabled=false."
+        )
+
     from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
 
     inference_cfg = merged_inference_megatron_cfg(config)
@@ -425,33 +430,26 @@ def _validate_packages(out: ZeroTrainGenValidation) -> None:
         )
 
 
-def _validate_model_architecture(
-    config: PolicyConfig, out: ZeroTrainGenValidation
+def validate_zero_train_gen_model_provider(
+    config: PolicyConfig, model_cfg: Any
 ) -> None:
-    megatron_cfg = config["megatron_cfg"]
-    _deny_if_true(megatron_cfg, out, "multi_latent_attention", "MLA")
-    _deny_if_true(megatron_cfg, out, "use_mla", "MLA")
-    for key in (
-        "hybrid_attention_ratio",
-        "mamba_num_heads",
-        "linear_attention",
-    ):
-        if megatron_cfg.get(key):
-            out.violations.append(
-                f"zero_train_gen_mismatch does not support linear-attention / "
-                f"SSM hybrid config {key!r} yet."
-            )
+    """Reject unsupported architectures using the resolved Bridge provider."""
+    if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
+        return
 
-
-def _deny_if_true(
-    megatron_cfg: Mapping[str, Any],
-    out: ZeroTrainGenValidation,
-    key: str,
-    label: str,
-) -> None:
-    if megatron_cfg.get(key):
-        out.violations.append(
-            f"zero_train_gen_mismatch does not support {label} ({key}=true)."
+    unsupported_fields = [
+        field_name
+        for field_name in (
+            "multi_latent_attention",
+            "hybrid_layer_pattern",
+            "experimental_attention_variant",
+        )
+        if getattr(model_cfg, field_name, None)
+    ]
+    if unsupported_fields:
+        raise ValueError(
+            "zero_train_gen_mismatch does not support the resolved model "
+            f"architecture fields: {', '.join(unsupported_fields)}."
         )
 
 

@@ -3794,6 +3794,77 @@ class TestSetupModelConfig:
             rope_scaling={"rope_type": "yarn", "factor": 4.0},
         )
 
+    @pytest.mark.parametrize(
+        ("field_name", "field_value"),
+        [
+            ("multi_latent_attention", True),
+            ("hybrid_layer_pattern", "M*-"),
+            ("experimental_attention_variant", "gated_delta_net"),
+        ],
+    )
+    def test_zero_kl_rejects_unsupported_architecture_from_provider(
+        self, request, field_name, field_value
+    ):
+        """The architecture lives on the HF-derived provider, not in megatron_cfg."""
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        model_cfg = self._make_model_cfg_mock()
+        model_cfg.multi_latent_attention = False
+        model_cfg.hybrid_layer_pattern = None
+        model_cfg.experimental_attention_variant = None
+        setattr(model_cfg, field_name, field_value)
+        bridge = MagicMock()
+        bridge.to_megatron_provider.return_value = model_cfg
+        config = {
+            "pretrained_checkpoint": {"format": "megatron_lm", "path": "/ckpt"},
+            "megatron_cfg": {"zero_train_gen_mismatch": True},
+        }
+
+        with (
+            patch("transformers.AutoConfig.from_pretrained"),
+            patch("nemo_rl.models.megatron.setup.AutoBridge") as mock_auto_bridge,
+            pytest.raises(ValueError, match=field_name),
+        ):
+            mock_auto_bridge.from_hf_config.return_value = bridge
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path="/ckpt/iter_0005000",
+            )
+
+    def test_zero_kl_accepts_supported_provider(self, request):
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        model_cfg = self._make_model_cfg_mock()
+        model_cfg.multi_latent_attention = False
+        model_cfg.hybrid_layer_pattern = None
+        model_cfg.experimental_attention_variant = None
+        bridge = MagicMock()
+        bridge.to_megatron_provider.return_value = model_cfg
+        config = {
+            "pretrained_checkpoint": {"format": "megatron_lm", "path": "/ckpt"},
+            "megatron_cfg": {"zero_train_gen_mismatch": True},
+        }
+
+        with (
+            patch("transformers.AutoConfig.from_pretrained"),
+            patch("nemo_rl.models.megatron.setup.AutoBridge") as mock_auto_bridge,
+        ):
+            mock_auto_bridge.from_hf_config.return_value = bridge
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path="/ckpt/iter_0005000",
+            )
+
     @pytest.mark.parametrize("fmt", [None, "megatron_bridge"])
     def test_skip_weight_load_has_no_pretrained_checkpoint_dependency(
         self, tmp_path, request, fmt
