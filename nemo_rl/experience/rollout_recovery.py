@@ -957,7 +957,7 @@ class RolloutRecoveryLedger:
                                     else None,
                                     "staging_keys": list(attempt.staging_keys),
                                     "telemetry": (
-                                        dataclasses.asdict(attempt.telemetry)
+                                        attempt.telemetry.to_state()
                                         if attempt.telemetry is not None
                                         else None
                                     ),

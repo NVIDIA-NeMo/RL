@@ -34,6 +34,8 @@ ROLLOUT_METRICS = "rollout_metrics"
 # in. The group-relative estimators key their baseline on this rather than on
 # prompt tokens, which two distinct groups can share.
 GROUP_ID_TAG = "group_id"
+ROLLOUT_ENVIRONMENT_TAG = "rollout_environment"
+UNKNOWN_ROLLOUT_ENVIRONMENT = "unknown"
 
 # The per-token members of `tq_token_sink.STAGING_FIELDS` (Gym's
 # `StagedCallRecord` deltas, under the names `stage()` renames them to). Named

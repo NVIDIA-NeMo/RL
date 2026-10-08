@@ -44,7 +44,13 @@ import torch
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
+from nemo_rl.data_plane.schema import (
+    MASK_SAMPLE,
+    ROLLOUT_ENVIRONMENT_TAG,
+    ROUTE_PLAN_TAG,
+    TRUNCATED,
+    UNKNOWN_ROLLOUT_ENVIRONMENT,
+)
 from nemo_rl.data_plane.tq_token_sink import (
     FetchedStagedCall,
     StagedMediaTensors,
@@ -599,7 +605,7 @@ class RolloutReassembler:
         fallback_weight_version: int,
         prompt_idx: int,
         loss_multiplier: float = 1.0,
-        rollout_environment: str = "unknown",
+        rollout_environment: str = UNKNOWN_ROLLOUT_ENVIRONMENT,
         canonical_sample_ids: Optional[list[str]] = None,
         reward_checks: Optional[list[RewardChecks | None]] = None,
         reward_log_contexts: Optional[list[RewardLogContext | None]] = None,
@@ -816,7 +822,7 @@ class RolloutReassembler:
             "sample_mask": sample_mask,
             "prompt_ids_for_adv": prompt_ids_for_adv,
             "total_reward": rewards_t,
-            "rollout_environment": rollout_environment,
+            ROLLOUT_ENVIRONMENT_TAG: rollout_environment,
             MASK_SAMPLE: torch.tensor(mask_sample, dtype=torch.bool),
             TRUNCATED: torch.tensor(
                 [seq_len == self._max_seq_len for seq_len in seq_lens],
