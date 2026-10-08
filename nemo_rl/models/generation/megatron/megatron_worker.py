@@ -560,16 +560,10 @@ class MegatronGenerationMixin:
             torch.float16,
             torch.bfloat16,
         )
-        # It also does not produce the same bits as the RoPE a policy forward
-        # runs, so it is incompatible with the parity batch-invariant mode
-        # promises. MCore raises on an explicit True there rather than quietly
-        # overriding it, which is the right call but means the choice has to be
-        # made here -- passing None instead would hand MCore the decision and
-        # lose the dtype guard above.
+        # Batch-invariant mode needs the policy's RoPE bits, and MCore rejects
+        # an explicit True there.
         if getattr(model_config, "batch_invariant_mode", False):
             use_flashinfer_fused_rope = False
-            # Batch-invariant decode calls FA4; allow an installed flash-attn-4
-            # below MCore's version gate (see allow_installed_flash_attn_4).
             allow_installed_flash_attn_4()
 
         image_preprocessing_config = self._build_image_preprocessing_config(
@@ -606,9 +600,7 @@ class MegatronGenerationMixin:
                 0.1 + 0.1 * num_speculative_tokens if is_hybrid_model else None
             ),
             "num_speculative_tokens": num_speculative_tokens,
-            # Sampling parameters control token selection, but batch-invariant
-            # generation reports raw model logprobs. Policy scoring mirrors this
-            # contract so parity is independent of temperature/top-k/top-p.
+            # Batch-invariant generation reports raw logprobs, like policy scoring.
             "logprobs_mode": (
                 "raw_logprobs"
                 if self.cfg["megatron_cfg"].get("batch_invariant_mode")

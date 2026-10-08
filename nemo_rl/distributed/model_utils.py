@@ -826,13 +826,6 @@ def _tp_target_logprobs(
     Returns:
         Log probabilities with shape [B, S].
     """
-    # A singleton TP group owns the full vocabulary. Treat it as local so this
-    # uses the same fused log-softmax as Megatron Inference. Running the
-    # distributed max/exp/sum/log decomposition on one rank is mathematically
-    # equivalent, but not bitwise equivalent to fused log-softmax.
-    if tp_group is not None and torch.distributed.get_world_size(tp_group) == 1:
-        tp_group = None
-
     if tp_group is not None:
         if need_top_k_or_top_p_filtering(sampling_params):
             if chunk_size is not None:
@@ -1005,16 +998,46 @@ def from_parallel_logits_to_logprobs(
     cp_rank = torch.distributed.get_rank(cp_group)
     target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
 
-    logprobs = _tp_target_logprobs(
-        vocab_parallel_logits,
-        target,
-        vocab_start_index=vocab_start_index,
-        vocab_end_index=vocab_end_index,
-        tp_group=tp_group,
-        chunk_size=chunk_size,
-        sampling_params=sampling_params,
-        inference_only=inference_only,
-    )
+    if need_top_k_or_top_p_filtering(sampling_params):
+        if chunk_size is not None:
+            logprobs: torch.Tensor = ChunkedDistributedLogprobWithSampling.apply(  # type: ignore
+                vocab_parallel_logits,
+                target,
+                tp_group,
+                sampling_params.top_k,
+                sampling_params.top_p,
+                chunk_size,
+                inference_only,
+            ).contiguous()
+        else:
+            logprobs: torch.Tensor = DistributedLogprobWithSampling.apply(  # type: ignore
+                vocab_parallel_logits,
+                target,
+                tp_group,
+                sampling_params.top_k,
+                sampling_params.top_p,
+                inference_only,
+            ).contiguous()
+    else:
+        if chunk_size is not None:
+            logprobs: torch.Tensor = ChunkedDistributedLogprob.apply(  # type: ignore
+                vocab_parallel_logits,
+                target,
+                vocab_start_index,
+                vocab_end_index,
+                chunk_size,
+                tp_group,
+                inference_only,
+            ).contiguous()
+        else:
+            logprobs: torch.Tensor = DistributedLogprob.apply(  # type: ignore
+                vocab_parallel_logits,
+                target,
+                vocab_start_index,
+                vocab_end_index,
+                tp_group,
+                inference_only,
+            ).contiguous()
 
     if cp_size > 1:
         # we need to gather the logits by context parallelism

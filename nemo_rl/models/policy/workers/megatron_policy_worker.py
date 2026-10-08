@@ -609,7 +609,7 @@ class MegatronPolicyWorkerImpl(
         local_rank = int(gpu_ids[0])
         os.environ["LOCAL_RANK"] = str(local_rank)
         # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
-        if config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
+        if config["megatron_cfg"].get("zero_train_gen_mismatch"):
             enable_zero_train_gen_kl(config)
         else:
             enable_batch_invariant_mode(config)

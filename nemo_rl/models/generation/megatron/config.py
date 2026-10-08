@@ -61,9 +61,6 @@ class MCoreGenerationSpecificArgs(TypedDict):
     ]
     # Token ceiling for captured prefill/mixed CUDA graphs. MCore default: 512.
     cuda_graph_max_tokens: NotRequired[int]
-    # Layer spec used by Megatron generation.
-    # Options are "transformer_engine" and "inference_optimized".
-    transformer_impl: NotRequired[Literal["transformer_engine", "inference_optimized"]]
     # Inference CUDA-graph scope. Options:
     # - 'none': inference runs in eager mode (no CUDA graphs).
     # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).
@@ -99,11 +96,6 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # refit when extra GPU headroom is needed for transfer staging. The
     # recommended default is False.
     offload_policy_before_refit: bool
-
-    # Generation log-probs: "processed_logprobs" (sampling-filtered, default)
-    # or "raw_logprobs" (F.log_softmax of model logits). Zero-KL forces raw.
-    logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
-
     num_speculative_tokens: int
 
     mamba_inference_ssm_states_dtype: NotRequired[str]

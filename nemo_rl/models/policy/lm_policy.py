@@ -255,22 +255,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 config["megatron_cfg"].get("batch_invariant_mode")
                 or config["megatron_cfg"].get("zero_train_gen_mismatch")
             ) and not config["sequence_packing"]["enabled"]:
-                # Native TE kernels are invariant when eager policy scoring uses
-                # the same aligned token dimension as MCore generation buckets.
-                # Sequence packing is rejected by batch-invariant validation.
-                # Also key off zero_train_gen_mismatch: the driver constructs
-                # Policy before workers call enable_zero_train_gen_kl().
+                # Align policy token dims with MCore generation buckets. Also
+                # keyed on zero_train_gen_mismatch: Policy is built before the
+                # workers resolve it into batch_invariant_mode.
                 tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
                 config["make_sequence_length_divisible_by"] = (
                     batch_invariant_token_multiple(
-                        config["make_sequence_length_divisible_by"], tp_size
+                        config["make_sequence_length_divisible_by"], tp_size=tp_size
                     )
                 )
                 if config["dynamic_batching"]["enabled"]:
                     config["dynamic_batching"]["sequence_length_round"] = (
                         batch_invariant_token_multiple(
                             config["dynamic_batching"]["sequence_length_round"],
-                            tp_size,
+                            tp_size=tp_size,
                         )
                     )
 
@@ -283,10 +281,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
             env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
-            # te_native / zero-KL invariance needs workspace-free cuBLASLt and
-            # PyTorch cuBLAS algos. Set in the actor env before CUDA init:
-            # importing the Megatron worker can initialize CUDA before __init__
-            # calls enable_batch_invariant_mode().
+            # Workspace-free cuBLAS for te_native / zero-KL; must be set before
+            # CUDA init in the actor.
             if (
                 config["megatron_cfg"].get("batch_invariant_mode")
                 and config["megatron_cfg"].get("batch_invariant_backend") == "te_native"

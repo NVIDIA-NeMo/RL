@@ -566,22 +566,13 @@ class MegatronConfig(TypedDict):
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.
     freeze_config: NotRequired[dict[str, Any]]
-    # Enable Megatron-Core's batch-invariant kernels for bitwise-identical
-    # train/generation numerics.
+    # Megatron-Core batch-invariant kernels (bitwise train/generation parity).
     batch_invariant_mode: NotRequired[bool]
-    # Megatron-Core kernel backend used by batch_invariant_mode. "te_native"
-    # is the performant default; "triton" and "deepgemm" are legacy options.
     batch_invariant_backend: NotRequired[Literal["deepgemm", "te_native", "triton"]]
-    # Cross-rank EP combine. "ordered" is portable; "multimem" uses NVLS.
+    # Cross-rank EP combine: "ordered" is portable, "multimem" uses NVLS.
     batch_invariant_collective: NotRequired[Literal["multimem", "ordered"]]
-    # Pin the FlashAttention generation used by both training and inference.
-    # batch_invariant_mode requires version 3 or 4.
+    # FlashAttention generation (3 or 4 under batch_invariant_mode).
     flash_attention_version: NotRequired[Literal[2, 3, 4] | None]
-    # Mamba/SSM layers only. True (MCore's default) is the memory-efficient
-    # fused mamba_split_conv1d_scan_combined; False takes the unfused
-    # mamba_chunk_scan_combined path, which costs activation memory and rejects
-    # packed sequences. Both are allowed under batch_invariant_mode.
-    use_mamba_mem_eff_path: NotRequired[bool]
     # flag to enable zero train/gen KL with generation.backend='megatron'.
     zero_train_gen_mismatch: NotRequired[bool]
 

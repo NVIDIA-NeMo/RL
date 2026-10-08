@@ -25,14 +25,15 @@ from dataclasses import dataclass, field, fields
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
 
+import torch
 from packaging.version import Version
+
+from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
 
 # TransformerConfig fields the installed Megatron-Core must define for this mode.
-# Probed instead of pinning a commit: the vendored checkout can be shallow (no
-# ancestry to walk) and the container may not trust its git directory.
 MEGATRON_CORE_REQUIRED_CONFIG_FIELDS = (
     "batch_invariant_mode",
     "batch_invariant_backend",
@@ -79,7 +80,7 @@ class ZeroTrainGenValidation:
 
 def resolve_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     """Apply zero-KL defaults; warn when overriding user recipe values."""
-    if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
+    if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return
 
     mc = config["megatron_cfg"]
@@ -116,7 +117,7 @@ def validate_zero_train_gen_mismatch(
 ) -> ZeroTrainGenValidation:
     """Run all zero-KL gates; return violations and non-fatal warnings."""
     out = ZeroTrainGenValidation()
-    if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
+    if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return out
 
     _validate_backend(config, out)
@@ -129,8 +130,6 @@ def validate_zero_train_gen_mismatch(
 
 def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidation:
     """Checks for ``batch_invariant_mode=True`` without enabling MCore kernels."""
-    from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
-
     out = ZeroTrainGenValidation()
     megatron_cfg = config["megatron_cfg"]
     if not megatron_cfg.get("batch_invariant_mode"):
@@ -158,7 +157,7 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             "batch_invariant_mode=True currently requires training context "
             "parallel size 1."
         )
-    if (config.get("sequence_packing") or {}).get("enabled"):
+    if config["sequence_packing"]["enabled"]:
         out.violations.append(
             "batch_invariant_mode=True requires sequence_packing.enabled=False: "
             "packing changes microbatch composition and the packed log-prob path "
@@ -222,24 +221,65 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
 
 
 def allow_installed_flash_attn_4() -> None:
-    """Make MCore use an installed ``flash-attn-4`` older than its version gate.
+    """Enable MCore's FA4 path for the pinned ``flash-attn-4`` b19.
 
-    ``megatron.core.transformer.attention`` only sets ``HAVE_FA4`` for
-    ``flash-attn-4>=4.0.0b20``, but the pinned mcore extra ships b19 (b20+ need
-    ``apache-tvm-ffi>=0.1.12``). The FA4 call signature is identical, so when the
-    distribution is installed but gated out, flip the module flags here instead
-    of requiring a Megatron-LM change. The flags are read at call time.
+    MCore gates ``HAVE_FA4`` on ``>=4.0.0b20``, which needs a newer
+    ``apache-tvm-ffi`` than we pin. The call signature is identical.
     """
+    # Deferred: Megatron-Core exists only in worker venvs.
     import megatron.core.transformer.attention as mcore_attention
 
     if getattr(mcore_attention, "HAVE_FA4", False):
         return
     if _first_package_version(("flash-attn-4", "flash_attn_4")) is None:
         return
+    # Deferred: optional dependency, checked above.
     from flash_attn.cute import flash_attn_varlen_func
 
     mcore_attention.flash_attn4_varlen_func = flash_attn_varlen_func
     mcore_attention.HAVE_FA4 = True
+
+
+class _Tp1LocalLogprob:
+    """At TP size 1, use the log-softmax Megatron Inference uses (bitwise)."""
+
+    def __init__(self, original: Any, *, chunked: bool) -> None:
+        self._original = original
+        self._chunked = chunked
+
+    def apply(self, *args: Any) -> Any:
+        # Deferred: model_utils is heavy and only needed once the shim is installed.
+        from nemo_rl.distributed import model_utils
+
+        if self._chunked:
+            logits, target, start, end, chunk_size, group, inference_only = args
+        else:
+            logits, target, start, end, group, inference_only = args
+            chunk_size = None
+        if group is None or torch.distributed.get_world_size(group) != 1:
+            return self._original.apply(*args)
+        return model_utils._tp_target_logprobs(
+            logits,
+            target,
+            vocab_start_index=start,
+            vocab_end_index=end,
+            tp_group=None,
+            chunk_size=chunk_size,
+            inference_only=inference_only,
+        )
+
+
+def _use_fused_log_softmax_at_tp1() -> None:
+    # Deferred: model_utils is heavy and only needed once the shim is installed.
+    from nemo_rl.distributed import model_utils
+
+    for name, chunked in (
+        ("DistributedLogprob", False),
+        ("ChunkedDistributedLogprob", True),
+    ):
+        current = getattr(model_utils, name)
+        if not isinstance(current, _Tp1LocalLogprob):
+            setattr(model_utils, name, _Tp1LocalLogprob(current, chunked=chunked))
 
 
 def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
@@ -248,6 +288,7 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     allow_installed_flash_attn_4()
     collective = megatron_cfg["batch_invariant_collective"]
 
+    # Deferred: Megatron-Core exists only in worker venvs.
     from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
         assert_te_supports_batch_invariant_attention,
     )
@@ -259,6 +300,7 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     enable_mcore_batch_invariant_mode(
         backend=megatron_cfg["batch_invariant_backend"], collective=collective
     )
+    _use_fused_log_softmax_at_tp1()
     print(
         "[zero_train_gen_mismatch] batch-invariant kernels enabled: "
         f"backend={megatron_cfg['batch_invariant_backend']} "
@@ -275,7 +317,7 @@ def configure_zero_train_gen_mismatch(
     apply_kernels: bool,
 ) -> None:
     """Resolve, validate, and optionally enable batch-invariant kernels."""
-    if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
+    if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return
 
     resolve_zero_train_gen_mismatch(config)
@@ -308,26 +350,17 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
         )
         return
 
-    if (generation.get("colocated") or {}).get("enabled", False):
+    if generation["colocated"]["enabled"]:
         out.violations.append(
             "zero_train_gen_mismatch does not support colocated generation; set "
             "policy.generation.colocated.enabled=false."
         )
 
-    from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
-
     inference_cfg = merged_inference_megatron_cfg(config)
     impl = inference_cfg.get("transformer_impl")
-    if impl not in ("inference_optimized", "transformer_engine"):
+    if impl != "inference_optimized":
         out.violations.append(
-            "generation transformer_impl must be 'inference_optimized' or "
-            f"'transformer_engine' (got {impl!r})."
-        )
-    elif impl == "transformer_engine":
-        out.warnings.append(
-            "zero_train_gen_mismatch: generation uses transformer_impl="
-            "'transformer_engine'; use 'inference_optimized' on the generation "
-            "worker for better performance."
+            f"generation transformer_impl must be 'inference_optimized' (got {impl!r})."
         )
 
 
@@ -348,14 +381,9 @@ def _validate_platform(
     if not check_device:
         return
 
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return
-        major, _minor = torch.cuda.get_device_capability()
-    except ImportError:
+    if not torch.cuda.is_available():
         return
+    major, _minor = torch.cuda.get_device_capability()
 
     if major == 9:
         out.violations.append(
@@ -370,6 +398,7 @@ def _validate_platform(
 
 def _validate_megatron_core_features(out: ZeroTrainGenValidation) -> None:
     try:
+        # Deferred: Megatron-Core exists only in worker venvs.
         from megatron.core.transformer.transformer_config import TransformerConfig
     except ImportError:
         out.violations.append(
@@ -434,7 +463,7 @@ def validate_zero_train_gen_model_provider(
     config: PolicyConfig, model_cfg: Any
 ) -> None:
     """Reject unsupported architectures using the resolved Bridge provider."""
-    if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
+    if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return
 
     unsupported_fields = [
@@ -461,16 +490,12 @@ def _validate_precision(config: PolicyConfig, out: ZeroTrainGenValidation) -> No
             f"(got {config.get('precision')!r})."
         )
 
-    from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
-
     sides = [("policy.megatron_cfg", config["megatron_cfg"])]
     generation = config.get("generation")
-    # A missing or non-megatron generation backend is already reported by
-    # _validate_backend; there is no inference config to inspect in that case.
     if generation is not None and generation.get("backend") == "megatron":
         sides.append(("generation", merged_inference_megatron_cfg(config)))
     for label, cfg in sides:
-        if (cfg.get("fp8_cfg") or {}).get("enabled"):
+        if cfg.get("fp8_cfg") and cfg["fp8_cfg"].get("enabled"):
             out.violations.append(
                 f"zero_train_gen_mismatch does not support FP8 ({label}.fp8_cfg.enabled=true)."
             )

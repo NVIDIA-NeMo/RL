@@ -14,18 +14,17 @@
 
 import math
 
+# Mirrors megatron.core.inference.batch_dimensions_utils.TOKEN_ROUNDER; the driver
+# venv has no Megatron-Core, so it cannot be imported here.
+MCORE_TOKEN_ROUNDER = 64
 
-def batch_invariant_token_multiple(configured_multiple: int, tp_size: int) -> int:
+
+def batch_invariant_token_multiple(configured_multiple: int, *, tp_size: int) -> int:
     """Return a token multiple compatible with batch-invariant MCore inference."""
     if configured_multiple < 1:
         raise ValueError("configured_multiple must be positive.")
     if tp_size < 1:
         raise ValueError("tp_size must be positive.")
 
-    # Import lazily so non-Megatron policy drivers do not import Megatron-Core.
-    # TOKEN_ROUNDER is MCore's single source of truth for eager and graphed
-    # batch-invariant inference token alignment.
-    from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER
-
-    inference_multiple = ((TOKEN_ROUNDER + tp_size - 1) // tp_size) * tp_size
+    inference_multiple = ((MCORE_TOKEN_ROUNDER + tp_size - 1) // tp_size) * tp_size
     return math.lcm(configured_multiple, inference_multiple)

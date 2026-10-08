@@ -52,6 +52,7 @@ def _policy_config() -> dict[str, Any]:
         },
         "generation": {
             "backend": "megatron",
+            "colocated": {"enabled": False},
             "mcore_generation_config": {"transformer_impl": "inference_optimized"},
         },
     }
@@ -289,21 +290,13 @@ def test_validate_rejects_missing_generation_block():
     assert any("generation.backend must be 'megatron'" in v for v in result.violations)
 
 
-def test_validate_rejects_an_unknown_generation_transformer_impl():
-    config = _resolved_config()
-    config["generation"]["mcore_generation_config"]["transformer_impl"] = "local"
-    result = _validate(config)
-    assert any("transformer_impl must be" in v for v in result.violations)
-
-
-def test_validate_only_warns_for_transformer_engine_generation():
+def test_validate_rejects_a_non_inference_optimized_generation_transformer_impl():
     config = _resolved_config()
     config["generation"]["mcore_generation_config"]["transformer_impl"] = (
         "transformer_engine"
     )
     result = _validate(config)
-    assert result.violations == []
-    assert any("inference_optimized" in w for w in result.warnings)
+    assert any("transformer_impl must be" in v for v in result.violations)
 
 
 @pytest.mark.parametrize("version", [None, 3, 2])
@@ -566,13 +559,18 @@ def _fake_batch_invariant_kernels(
 def test_enable_batch_invariant_kernels_passes_the_resolved_settings(monkeypatch):
     calls = _fake_batch_invariant_kernels(monkeypatch)
     opened: list[bool] = []
+    shimmed: list[bool] = []
     monkeypatch.setattr(
         zgm, "allow_installed_flash_attn_4", lambda: opened.append(True)
+    )
+    monkeypatch.setattr(
+        zgm, "_use_fused_log_softmax_at_tp1", lambda: shimmed.append(True)
     )
 
     zgm.enable_batch_invariant_kernels(_resolved_config())
 
     assert opened == [True]
+    assert shimmed == [True]
     assert calls == [
         ("assert_te", (), {}),
         ("enable", (), {"backend": "te_native", "collective": "ordered"}),
@@ -663,3 +661,47 @@ def test_shipped_recipes_train_and_generate_with_the_same_tp(name):
         == policy["megatron_cfg"]["tensor_model_parallel_size"]
     )
     assert inference["context_parallel_size"] == 1
+
+
+def test_token_rounder_matches_megatron_core():
+    batch_dimensions_utils = pytest.importorskip(
+        "megatron.core.inference.batch_dimensions_utils"
+    )
+    from nemo_rl.models.megatron.batch_invariant import MCORE_TOKEN_ROUNDER
+
+    assert MCORE_TOKEN_ROUNDER == batch_dimensions_utils.TOKEN_ROUNDER
+
+
+def test_tp1_logprob_shim_only_replaces_size_one_groups(monkeypatch):
+    import torch
+
+    from nemo_rl.distributed import model_utils
+
+    for name in ("DistributedLogprob", "ChunkedDistributedLogprob"):
+        monkeypatch.setattr(model_utils, name, getattr(model_utils, name))
+    zgm._use_fused_log_softmax_at_tp1()
+    zgm._use_fused_log_softmax_at_tp1()  # idempotent: must not wrap twice
+
+    sizes = {"tp1": 1, "tp2": 2}
+    monkeypatch.setattr(
+        torch.distributed, "get_world_size", lambda group: sizes[group]
+    )
+    logits = torch.randn(2, 5, 16, dtype=torch.bfloat16)
+    target = torch.randint(0, 16, (2, 5))
+    expected = (
+        torch.log_softmax(logits.float(), dim=-1)
+        .gather(-1, target.unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+    shim = model_utils.DistributedLogprob
+    assert isinstance(shim, zgm._Tp1LocalLogprob)
+    assert not isinstance(shim._original, zgm._Tp1LocalLogprob)
+    assert torch.equal(shim.apply(logits, target, 0, 16, "tp1", True), expected)
+
+    chunked = model_utils.ChunkedDistributedLogprob
+    assert torch.equal(chunked.apply(logits, target, 0, 16, 2, "tp1", True), expected)
+
+    original = types.SimpleNamespace(apply=lambda *a: "orig")
+    monkeypatch.setattr(shim, "_original", original)
+    assert shim.apply(logits, target, 0, 16, "tp2", True) == "orig"
