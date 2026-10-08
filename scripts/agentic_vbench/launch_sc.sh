@@ -25,7 +25,11 @@ if [[ -z "${WANDB_API_KEY:-}" ]]; then
   export WANDB_MODE=offline
 fi
 
-container="${CONTAINER:-/lustre/fsw/portfolios/nemotron/users/arushig/containers/nemo-rl.nightly-gym.20260930.sqsh}"
+# The unified-teacher base ran in containers/nemo-rl.nightly-gym.20260930.sqsh, an
+# aarch64 image (GB200, 4 GPUs/node) that cannot start on the x86 B200 nodes here;
+# the base lockfile differs from cc-pr4200's only in Ray (2.56.1 vs 2.58.0, and
+# this Gym accepts >=2.56.1), so the x86 cc-pr4200 image is the equivalent.
+container="${CONTAINER:-/lustre/fsw/portfolios/nemotron/users/arushig/images/nemo-rl-cc-pr4200.sqsh}"
 config_in_container="${CONFIG_IN_CONTAINER:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-8n8g-megatron-agentic-vbench-sc.v2.yaml}"
 model_path="${MODEL_PATH:-/lustre/fsw/portfolios/nemotron/users/arushig/workspace/output/stage2_text_rl_with_r3_step120}"
 export MODEL_PATH="${model_path}"
