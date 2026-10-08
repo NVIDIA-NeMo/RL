@@ -331,15 +331,6 @@ def generated_think_tool_marker_error(
     return error
 
 
-def validate_generated_think_tool_markers(
-    text: str,
-    *,
-    initial_state: ThinkingState,
-) -> bool:
-    """Return whether sampled thinking/tool markers are structurally safe."""
-    return generated_think_tool_marker_error(text, initial_state=initial_state) is None
-
-
 def render_teacher_open_thinking_prefix(
     tokenizer: Any,
     messages: Sequence[dict[str, str]],
@@ -718,28 +709,6 @@ def qwen3_leading_think_prefix_len(content: str) -> int:
     return position
 
 
-def trim_outer_whitespace_tokens_for_alignment(
-    tokenizer: PreTrainedTokenizerBase,
-    token_ids: Sequence[int],
-    text: str,
-) -> tuple[list[int], int, int, str] | None:
-    """Trim outer whitespace only when it falls on clean token boundaries."""
-    prepared = trim_outer_whitespace_with_offsets_for_alignment(
-        tokenizer,
-        token_ids,
-        text,
-    )
-    if prepared is None:
-        return None
-    trimmed_ids, dropped_prefix, dropped_suffix, stripped_text, _ = prepared
-    try:
-        if tokenizer.decode(trimmed_ids, skip_special_tokens=True) != stripped_text:
-            return None
-    except (TypeError, ValueError, RuntimeError):
-        return None
-    return trimmed_ids, dropped_prefix, dropped_suffix, stripped_text
-
-
 def trim_outer_whitespace_with_offsets_for_alignment(
     tokenizer: PreTrainedTokenizerBase,
     token_ids: Sequence[int],
@@ -922,63 +891,7 @@ def build_char_mapping(original: str, transformed: str) -> list[int] | None:
         if all(char.isspace() for char in transformed[transformed_index:]):
             return mapping
 
-    marker = "</think>"
-    first_close = original.find(marker)
-    last_close = original.rfind(marker)
-    expected_transform, had_think = qwen3_assistant_content_transform(original)
-    if (
-        not had_think
-        or first_close < 0
-        or last_close == first_close
-        or expected_transform != transformed
-    ):
-        return None
-
-    reasoning_start = 0
-    reasoning_end = first_close
-    while reasoning_end > reasoning_start and original[reasoning_end - 1] == "\n":
-        reasoning_end -= 1
-    open_marker = original.rfind("<think>", reasoning_start, reasoning_end)
-    if open_marker >= 0:
-        reasoning_start = open_marker + len("<think>")
-    while reasoning_start < reasoning_end and original[reasoning_start] == "\n":
-        reasoning_start += 1
-
-    body_start = last_close + len(marker)
-    while body_start < len(original) and original[body_start] == "\n":
-        body_start += 1
-
-    reasoning = original[reasoning_start:reasoning_end]
-    body = original[body_start:]
-    transformed_close_start = len(reasoning) + 1
-    transformed_body_start = transformed_close_start + len(marker) + 2
-    retained_segments = [
-        (reasoning_start, reasoning_end, 0),
-        (first_close, first_close + len(marker), transformed_close_start),
-        (body_start, len(original), transformed_body_start),
-    ]
-    if any(
-        original[source_start:source_end]
-        != transformed[target_start : target_start + source_end - source_start]
-        for source_start, source_end, target_start in retained_segments
-    ):
-        return None
-
-    retained_char_positions: dict[int, int] = {}
-    for source_start, source_end, target_start in retained_segments:
-        for source_position in range(source_start, source_end):
-            retained_char_positions[source_position] = (
-                target_start + source_position - source_start
-            )
-
-    mapping = [0] * (len(original) + 1)
-    next_retained_position = len(transformed)
-    for source_position in range(len(original) - 1, -1, -1):
-        if source_position in retained_char_positions:
-            next_retained_position = retained_char_positions[source_position]
-        mapping[source_position] = next_retained_position
-    mapping[-1] = len(transformed)
-    return mapping
+    return None
 
 
 def proven_template_only_teacher_token_indices(
