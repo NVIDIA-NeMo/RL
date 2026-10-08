@@ -97,9 +97,11 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     """
 
     global_segment_size: int = 68719476736  # 64 GiB per client process
-    # The staging pool is carved out of this buffer: must be >= 4 x
-    # staging_buffer_size while reuse_registered_buffers is on.
-    local_buffer_size: int = 2147483648  # 2 GiB = 4 x 512 MiB slots
+    # The staging pool is carved out of this buffer, one staging_buffer_size
+    # slot per TQ transfer thread (MAX_BATCH_WORKER_THREADS = 4; per process,
+    # not per GPU): must be >= 4 x staging_buffer_size while
+    # reuse_registered_buffers is on.
+    local_buffer_size: int = 2147483648  # 2 GiB = 4 TQ threads x 512 MiB
     reuse_registered_buffers: bool = True
     # A payload above this is registered per transfer instead of pooled.
     staging_buffer_size: int = 536870912  # 512 MiB per pool slot

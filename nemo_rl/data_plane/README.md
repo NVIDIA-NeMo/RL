@@ -432,7 +432,7 @@ data_plane:
     storage_unit_placement: null       # all, or cluster names like [inference]; null = TQ SPREAD
   mooncake_cpu:
     global_segment_size: 68719476736   # 64 GiB/process (ignored when storage units are on)
-    local_buffer_size:   2147483648    # 2 GiB/process = 4 x staging slot
+    local_buffer_size:   2147483648    # 2 GiB/process = 4 TQ transfer threads x 512 MiB slot
     reuse_registered_buffers: true     # reuse RDMA-registered buffers
     staging_buffer_size:  536870912    # 512 MiB/pool slot; bigger payloads register per transfer
     use_gdr: false                      # GPU-memory RDMA staging in CUDA clients
@@ -916,7 +916,7 @@ bootstrap.
 |---|---|---|
 | `storage_unit_segment_size` | unit memory | peak data-plane bytes ÷ number of units, plus headroom. Larger is cheap to set up; it is pinned for the whole run. |
 | `num_storage_units` | save parallelism | more units = more parallel shard writers, one CPU each. Keep the count fixed between save and resume. |
-| `local_buffer_size` | client transfer memory | the staging pool lives inside it: must be ≥ `4 × staging_buffer_size` (checked at the first transfer). |
+| `local_buffer_size` | client transfer memory | the staging pool lives inside it: one `staging_buffer_size` slot per TQ transfer thread (`MAX_BATCH_WORKER_THREADS`, 4 at the pin; per process, not per GPU), so it must be ≥ `4 × staging_buffer_size` (checked at the first transfer). |
 | `staging_buffer_size` | largest pooled transfer | ≥ 2 × the largest single object. An object bigger than the whole pool is registered for that one transfer instead. |
 
 Registered memory is pinned once per RDMA NIC, so per-process buffers add up

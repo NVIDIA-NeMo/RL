@@ -618,7 +618,7 @@ data_plane:
   mooncake_cpu:
     # Per client process — see MooncakeCpuConfig before raising these.
     global_segment_size: 68719476736 # 64 GiB/process
-    local_buffer_size:    2147483648 # 2 GiB/process = 4 x staging slot
+    local_buffer_size:    2147483648 # 2 GiB/process = 4 TQ transfer threads x 512 MiB slot
     reuse_registered_buffers: true   # reuse RDMA-registered buffers
     staging_buffer_size:   536870912 # 512 MiB/pool slot; bigger payloads register per transfer
     storage_unit_segment_size: 0     # >0: CPU storage units own all memory (bytes each)
