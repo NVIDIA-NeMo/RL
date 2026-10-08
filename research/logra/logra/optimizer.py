@@ -93,13 +93,14 @@ class LoGRAOptimizer(torch.optim.Optimizer):
 
     def _link_row_moments(self) -> None:
         """Expose each layer's slice of the flat moments through the optimizer state."""
-        assert self.row_second_moment is not None
+        moments = self.row_second_moment
+        assert moments is not None
         row = 0
         for layer in self.layers:
             rows = layer.module.out_features
-            self.state[layer.module.weight]["row_second_moment"] = (
-                self.row_second_moment[row : row + rows]
-            )
+            self.state[layer.module.weight]["row_second_moment"] = moments[
+                row : row + rows
+            ]
             row += rows
 
     @staticmethod
@@ -236,16 +237,15 @@ class LoGRAOptimizer(torch.optim.Optimizer):
         if state["config"] != self.config.model_dump():
             raise ValueError("LoGRA checkpoint configuration differs")
         super().load_state_dict(state["sketch_optimizer"])
-        if self.row_second_moment is not None:
+        moments = self.row_second_moment
+        if moments is not None:
             # torch.optim replaces state tensors with copies; move the restored
             # moments back into the flat buffer and re-expose the views.
+            row = 0
             for layer in self.layers:
                 restored = self.state[layer.module.weight]["row_second_moment"]
-                row = sum(
-                    other.module.out_features
-                    for other in self.layers[: self.layers.index(layer)]
-                )
-                self.row_second_moment[row : row + restored.shape[0]].copy_(restored)
+                moments[row : row + restored.shape[0]].copy_(restored)
+                row += restored.shape[0]
             self._link_row_moments()
         self.native.load_state_dict(state["native"])
         self.param_groups[1:] = self.native.param_groups
