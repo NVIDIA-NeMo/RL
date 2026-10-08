@@ -56,9 +56,8 @@ teachers:
   precision: bfloat16
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
-    _v2: true
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
