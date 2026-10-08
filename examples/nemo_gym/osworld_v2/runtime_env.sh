@@ -52,12 +52,21 @@ OSWORLD_BRIDGE_ROOT="$OSWORLD_RL_ROOT/3rdparty/Megatron-Bridge-workspace/Megatro
 
 export OSWORLD_DRIVER_VENV="${OSWORLD_DRIVER_VENV:-/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker}"
 export OSWORLD_DRIVER_PYTHON="$OSWORLD_DRIVER_VENV/bin/python"
+OSWORLD_MANAGED_PYTHON_ROOT=""
+for candidate_root in \
+  /opt/uv/python \
+  /root/.local/share/uv/python; do
+  if [[ -x "$candidate_root/cpython-3.13.14-linux-x86_64-gnu/bin/python3" ]]; then
+    OSWORLD_MANAGED_PYTHON_ROOT="$candidate_root"
+    break
+  fi
+done
 if [[ -z "${OSWORLD_COMPONENT_PYTHON:-}" ]]; then
   for candidate in \
-    /root/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/bin/python3 \
+    "${OSWORLD_MANAGED_PYTHON_ROOT:+$OSWORLD_MANAGED_PYTHON_ROOT/cpython-3.13.14-linux-x86_64-gnu/bin/python3}" \
     /opt/nemo_rl_venv/bin/python \
     "$OSWORLD_DRIVER_PYTHON"; do
-    if [[ -x "$candidate" ]]; then
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
       export OSWORLD_COMPONENT_PYTHON="$candidate"
       break
     fi
@@ -69,8 +78,8 @@ export PATH="$OSWORLD_DRIVER_VENV/bin:$PATH"
 export PYTHONPATH="$OSWORLD_RL_ROOT:$OSWORLD_GYM_ROOT:$OSWORLD_BRIDGE_ROOT/src:$OSWORLD_BRIDGE_ROOT/3rdparty/Megatron-LM"
 export NEMO_GYM_PYTHON="$OSWORLD_COMPONENT_PYTHON"
 unset UV_PYTHON
-if [[ -x /root/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/bin/python3 ]]; then
-  export UV_PYTHON_INSTALL_DIR=/root/.local/share/uv/python
+if [[ -n "$OSWORLD_MANAGED_PYTHON_ROOT" ]]; then
+  export UV_PYTHON_INSTALL_DIR="$OSWORLD_MANAGED_PYTHON_ROOT"
   export UV_PYTHON_PREFERENCE=only-managed
 else
   unset UV_PYTHON_INSTALL_DIR

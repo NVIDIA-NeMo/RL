@@ -20,6 +20,9 @@ esac
 
 "$OSWORLD_COMPONENT_PYTHON" -c \
   'import sys; assert sys.version_info[:3] == (3, 13, 14), sys.version'
+resolved_uv_python="$(uv python find 3.13.14)"
+"$resolved_uv_python" -c \
+  'import sys; assert sys.version_info[:3] == (3, 13, 14), sys.version'
 
 "$OSWORLD_DRIVER_PYTHON" - <<'PY'
 import os
