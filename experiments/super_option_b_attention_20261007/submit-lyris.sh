@@ -44,8 +44,18 @@ export GPUS_PER_NODE=4 CPUS_PER_WORKER=144 DEDICATED_RAY_HEAD=0
 export CONTAINER_REMAP_ROOT=1 BASE_LOG_DIR="$run_root" RAY_TMPDIR=/tmp
 export MOUNTS="/lustre:/lustre,/home:/home,/raid/scratch:/raid/scratch"
 export SETUP_COMMAND="set -euo pipefail
-mkdir -p ${source_root} ${model_root}/hf/hub/${model_cache} ${local_root}/uv ${local_root}/vllm ${local_root}/inductor ${local_root}/triton
-tar -xf ${SOURCE_ARCHIVE} -C ${source_root}
+mkdir -p ${model_root}/hf/hub/${model_cache} ${local_root}/uv ${local_root}/vllm ${local_root}/inductor ${local_root}/triton
+if [[ ! -f ${source_root}/.source-ready ]]; then
+  rm -rf ${source_root}
+  mkdir -p ${source_root}
+  tar -xf ${SOURCE_ARCHIVE} -C ${source_root}
+  for module in Automodel-workspace/Automodel Gym-workspace/Gym Megatron-Bridge-workspace/Megatron-Bridge; do
+    test -d /opt/nemo-rl/3rdparty/\${module}
+    rmdir ${source_root}/3rdparty/\${module}
+    ln -s /opt/nemo-rl/3rdparty/\${module} ${source_root}/3rdparty/\${module}
+  done
+  touch ${source_root}/.source-ready
+fi
 if [[ ! -f ${model_root}/hf/.super-cache-ready ]]; then
   rsync -a --ignore-existing ${hf_source}/hub/${model_cache}/ ${model_root}/hf/hub/${model_cache}/
   touch ${model_root}/hf/.super-cache-ready
