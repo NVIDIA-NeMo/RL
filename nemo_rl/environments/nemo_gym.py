@@ -148,7 +148,7 @@ DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
 
 def _normalize_gym_validity(result: dict) -> dict:
-    """Project ordinary masks into the existing downstream masking contract."""
+    """Project CC verifier masks into the existing downstream masking contract."""
     normalized = dict(result)
     config = dict(result.get("instance_config") or {})
     config["mask_sample"] = bool(result.get("mask_sample") or config.get("mask_sample"))
@@ -933,7 +933,6 @@ Depending on your data shape, you may want to change these values."""
                     raise
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                nemo_gym_result = _normalize_gym_validity(nemo_gym_result)
                 if self._context_compaction or self._token_capture_enabled:
                     # Receipt mode: fetch the ledger manifest and assemble the
                     # receipt locally; token-free result. The canonical row is
@@ -1043,10 +1042,9 @@ Depending on your data shape, you may want to change these values."""
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
-        nemo_gym_result = _normalize_gym_validity(nemo_gym_result)
         if self._context_compaction:
             return await self._postprocess_captured_history(
-                nemo_gym_row, nemo_gym_result
+                nemo_gym_row, _normalize_gym_validity(nemo_gym_result)
             )
         rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
         # Gym's TERMINAL_RESPONSE_ID_KEY: the served response envelope id the

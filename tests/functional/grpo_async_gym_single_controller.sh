@@ -10,7 +10,7 @@ git config --global --add safe.directory $PROJECT_ROOT
 
 set -eou pipefail
 
-EXP_NAME=$(basename $0 .sh)
+EXP_NAME=${SC_TEST_EXP_NAME:-$(basename $0 .sh)}
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
 JSON_METRICS=$EXP_DIR/metrics.json
@@ -48,13 +48,44 @@ uv run ng_prepare_data "+config_paths=[resources_servers/workplace_assistant/con
     +data_source=huggingface
 cd -
 
-# This trimming of the workplace assistant dataset is necessary b/c with all the tools the first prompt is >4000 tokens
-# which will cause vllm to return nothing on the first prompt and crash RL. Since we want to keep this test short to
-# smoke test, we trim all but the first tool
+# The ordinary smoke uses a small context and only the first tool. The CC test
+# retains the full tool set so the agent can execute tasks across model calls.
 TRAIN_PATH=$DATA_DIR/workplace_assistant_train.jsonl
 VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl
-jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl > $TRAIN_PATH
-jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl > $VALIDATION_PATH
+DATA_FILTER='.responses_create_params.tools |= (.[0:1])'
+CC_OVERRIDES=()
+if [[ "${SC_TEST_CONTEXT_COMPACTION:-0}" == "1" ]]; then
+    # Keep accepted history while dropping earlier reasoning from the next input.
+    DATA_FILTER='del(.task_source) | .agent_ref = {type: "responses_api_agents", name: "simple_agent_with_compaction"}'
+    CC_OVERRIDES=(
+        ++token_capture.enabled=true
+        ++token_capture.context_compaction=true
+        ++async_rl.rollout_failure.min_step_batch_fraction=1
+        policy.sequence_packing.enabled=false
+        policy.dynamic_batching.enabled=false
+        policy.logprob_batch_size=1
+        policy.max_total_sequence_length=16384
+        grpo.calculate_advantages_on_gpu=false
+        loss_fn.token_level_loss=true
+        loss_fn.sequence_level_importance_ratios=false
+        ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser=deepseek_r1
+        env.nemo_gym.policy_model.responses_api_models.vllm_model.uses_reasoning_parser=true
+        env.nemo_gym.policy_model.responses_api_models.vllm_model.extra_body.chat_template_kwargs.enable_thinking=true
+        'env.nemo_gym.config_paths=[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/workplace_assistant/configs/workplace_assistant.yaml,responses_api_agents/simple_agent_with_compaction/configs/simple_agent_with_compaction.yaml]'
+        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.resources_server.name=workplace_assistant
+        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.max_steps=6
+        ++env.nemo_gym.simple_agent_with_compaction_environment_server.environment_servers.legacy_agent.entrypoint=app.py
+        ++env.nemo_gym.simple_agent_with_compaction_environment_server.environment_servers.legacy_agent.agent_server.type=responses_api_agents
+        ++env.nemo_gym.simple_agent_with_compaction_environment_server.environment_servers.legacy_agent.agent_server.name=simple_agent_with_compaction
+        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.context_history.policy.type=recency
+        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.context_history.policy.config.reasoning.enabled=true
+        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.context_history.policy.config.reasoning.keep_last_blocks=0
+        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.context_history.schedule.type=turn_chunked_recency
+        ++env.nemo_gym.simple_agent_with_compaction.responses_api_agents.simple_agent_with_compaction.context_history.schedule.actions_per_chunk=1
+    )
+fi
+jq -c "$DATA_FILTER" 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl > "$TRAIN_PATH"
+jq -c "$DATA_FILTER" 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl > "$VALIDATION_PATH"
 
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $SC_ENTRYPOINT \
@@ -103,7 +134,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     ++async_rl.min_groups_for_streaming_train=4 \
     ++async_rl.max_inflight_prompts=4 \
     ++async_rl.max_buffered_rollouts=4 \
-    $@ \
+    ${CC_OVERRIDES[@]+"${CC_OVERRIDES[@]}"} \
+    "$@" \
     2>&1 | tee $RUN_LOG
 
 if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
@@ -115,9 +147,21 @@ if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
         EXTRA_CHECKS+=('max(data["train/finalize/total_ms"]) > 0')
     fi
 
+    if [[ "${SC_TEST_CONTEXT_COMPACTION:-0}" == "1" ]]; then
+        # Eight logical rollouts per step. More valid rows requires a context
+        # boundary; padding rows have zero sample_mask and cannot satisfy it.
+        EXTRA_CHECKS+=(
+            'max(data["train/finalize/total_ms"]) > 0'
+            'max(data["train/global_valid_seqs"]) > 8'
+            'max(data["train/gen_kl_error"]) < 0.05'
+            'max(data["train/token_mult_prob_error"]) < 1.05'
+            'len(data["train/token_mult_prob_error"]) == 10'
+        )
+    fi
+
     # Observed to be between 0.8-1.3
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/gen_kl_error"]) < 1.3' \
         'max(data["train/reward"]) > 0' \
-        "${EXTRA_CHECKS[@]}"
+        ${EXTRA_CHECKS[@]+"${EXTRA_CHECKS[@]}"}
 fi

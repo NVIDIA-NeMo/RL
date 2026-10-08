@@ -22,6 +22,9 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
+
+pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
+
 from nemo_gym import openai_utils, rollout_observability
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.config_types import ModelServerRef

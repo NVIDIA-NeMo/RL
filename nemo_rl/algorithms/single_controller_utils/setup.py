@@ -2033,6 +2033,14 @@ def setup_single_controller(
             advantage_estimator,
             num_workers=master_config.async_rl.num_advantage_workers,
         )
+    if token_capture_cfg.context_compaction:
+        # Padding or borrowed inputs may appear in any step. Validate the loaded
+        # model before admitting rollouts, even if the first batch needs neither.
+        ray.get(
+            trainer.worker_group.run_all_workers_single_data(
+                "validate_cc_execution_padding"
+            )
+        )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,

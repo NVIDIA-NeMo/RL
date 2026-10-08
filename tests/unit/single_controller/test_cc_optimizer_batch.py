@@ -125,52 +125,15 @@ def _setup(
 
 @pytest.mark.parametrize("padding", [False, True])
 @pytest.mark.parametrize("logprobs", [False, True])
-@pytest.mark.parametrize("supported", [False, True])
-def test_padding_guard_precedes_every_forward_and_only_checks_dummy_batches(
-    monkeypatch, padding, logprobs, supported
-):
+def test_train_pump_reuses_setup_router_validation(monkeypatch, padding, logprobs):
     ctrl, _ = _setup(monkeypatch, padding=padding)
     ctrl._policy_logprobs_required = logprobs
     ctrl._reference_logprobs_required = logprobs
-    group = ctrl._trainer.worker_group
-    capability = group.run_all_workers_single_data.return_value
-    checks = []
-
-    def await_capability(refs):
-        assert refs is capability
-        checks.append(len(checks) + 1)
-        if not supported:
-            raise ValueError("unsafe router")
-
-    monkeypatch.setattr(
-        "nemo_rl.algorithms.single_controller.ray.get", await_capability
-    )
-    if padding and not supported:
-        with pytest.raises(ValueError, match="unsafe router"):
-            asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
-        for method in (
-            "prepare_for_lp_inference",
-            "get_logprobs_from_meta",
-            "get_reference_policy_logprobs_from_meta",
-            "begin_train_step",
-            "train_microbatches_from_meta",
-            "finish_train_step",
-        ):
-            getattr(ctrl._trainer, method).assert_not_called()
-        ctrl._sync_weights.assert_not_awaited()
-        assert checks == [1]
-    else:
-        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
-        assert checks == ([1, 2] if padding else [])
-        assert ctrl._trainer.train_microbatches_from_meta.call_count == 2
-        assert ctrl._trainer.get_logprobs_from_meta.call_count == (2 if logprobs else 0)
-        ctrl._trainer.finish_train_step.assert_called_once()
-    if padding:
-        group.run_all_workers_single_data.assert_called_with(
-            "validate_cc_execution_padding"
-        )
-    else:
-        group.run_all_workers_single_data.assert_not_called()
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+    ctrl._trainer.worker_group.run_all_workers_single_data.assert_not_called()
+    assert ctrl._trainer.train_microbatches_from_meta.call_count == 2
+    assert ctrl._trainer.get_logprobs_from_meta.call_count == (2 if logprobs else 0)
+    ctrl._trainer.finish_train_step.assert_called_once()
 
 
 @pytest.mark.parametrize("flag", [None, 0, "false"])

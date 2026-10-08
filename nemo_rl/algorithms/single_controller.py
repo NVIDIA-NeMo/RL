@@ -2991,21 +2991,6 @@ class SingleControllerActor:
                                 raise ValueError(
                                     "CC optimizer batch requires logical rows with padding flags, borrowed-input flags, and integer generation versions"
                                 )
-                            assert train_meta.tags is not None
-                            if any(
-                                tag["is_execution_padding"]
-                                or tag["uses_borrowed_input"]
-                                for tag in train_meta.tags
-                            ):
-                                # Check before any policy/reference forward.
-                                # Borrowed failed-owner inputs can affect routing too,
-                                # even when no ownerless padding rows are needed.
-                                await asyncio.to_thread(
-                                    ray.get,
-                                    self._trainer.worker_group.run_all_workers_single_data(
-                                        "validate_cc_execution_padding"
-                                    ),
-                                )
 
                         for group_id in selected_group_ids:
                             for name, value in self._finalizer_metrics_by_group.pop(

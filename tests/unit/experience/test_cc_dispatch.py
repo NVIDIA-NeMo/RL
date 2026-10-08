@@ -3,6 +3,8 @@
 """Preserve original CC actor replay guards under RL-owned selection."""
 
 import asyncio
+from copy import deepcopy
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -200,3 +202,61 @@ def test_actor_creation_preserves_foundation_no_replay_defaults(monkeypatch, cc)
     options.assert_called_once_with(**expected)
     actor._spinup.remote.assert_called_once()
     actor.set_tokenizer.remote.assert_called_once_with(None)
+
+
+@pytest.mark.parametrize("mode", ["legacy", "capture", "cc"])
+@pytest.mark.parametrize("top,nested", [(True, False), (False, True), (False, False)])
+def test_validity_normalization_is_confined_to_cc(
+    mode: str, top: bool, nested: bool
+) -> None:
+    """Ordinary streams preserve verifier output; CC projects its combined mask."""
+    row = {
+        "_rowidx": 0,
+        "_ng_rollout_id": "owner",
+        "agent_ref": {"name": "agent"},
+        "responses_create_params": {"input": []},
+    }
+    raw = {
+        "response": {"output": []},
+        "mask_sample": top,
+        "instance_config": {"mask_sample": nested},
+    }
+
+    class Helper:
+        def run_examples(
+            self, examples: list[dict], head_server_config: object, **kwargs: Any
+        ) -> list[Any]:
+            async def done() -> tuple[dict, dict]:
+                return row, deepcopy(raw)
+
+            return [done()]
+
+    cls = NemoGym.__ray_metadata__.modified_class
+    env = object.__new__(cls)
+    env.cfg = {}
+    env.rch = Helper()
+    env.head_server_config = object()
+    env._tokenizer = object()
+    env._token_capture_enabled = mode != "legacy"
+    env._context_compaction = mode == "cc"
+    env._require_spinup = lambda: None
+    # Token decoding and storage are irrelevant to verifier-field propagation.
+    env._postprocess_nemo_gym_to_nemo_rl_result = lambda row, result, tokenizer, **kw: {
+        "message_log": [],
+        "full_result": result,
+    }
+    env._postprocess_captured_history = AsyncMock(
+        side_effect=lambda row, result: {"message_log": [], "full_result": result}
+    )
+    env._drained_manifest = AsyncMock(side_effect=OSError("storage unavailable"))
+
+    async def run() -> list:
+        return [item async for item in env.run_rollouts([row], "test")]
+
+    actual = asyncio.run(run())[0][2]["full_result"]
+    assert actual["instance_config"]["mask_sample"] == (
+        top or nested if mode == "cc" else nested
+    )
+    if mode != "cc":
+        assert actual == raw
+    assert raw["instance_config"]["mask_sample"] == nested

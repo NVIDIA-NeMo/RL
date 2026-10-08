@@ -5,12 +5,17 @@
 from typing import Any
 
 import pytest
+
+pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
+
 from responses_api_models.vllm_model.tests import test_framework_context as gym_harness
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.codec import stack_or_nest
 from nemo_rl.experience.rollout_reassembler import ActionOutputFlags, RolloutSelection
 from nemo_rl.models.generation.capture_context import decide_capture_input
+
+pytestmark = pytest.mark.nemo_gym
 
 
 class MemoryDataPlane:

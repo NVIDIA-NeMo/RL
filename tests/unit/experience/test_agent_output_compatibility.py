@@ -16,17 +16,15 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
+
 from nemo_gym.context_management import ContextManagedResponsesClient
 from nemo_gym.openai_utils import (
     NeMoGymAsyncOpenAI,
     NeMoGymResponseCreateParamsNonStreaming,
 )
 from nemo_gym.server_utils import ServerClient
-from responses_api_agents.aviary_agent.app import (
-    AviaryAgent,
-    AviaryAgentConfig,
-    AviaryAgentRunRequest,
-)
 from responses_api_agents.browsecomp_agent.app import BrowsecompAgent
 from responses_api_agents.browsecomp_agent.tests.test_progress_tracking import (
     _make_config,
@@ -266,6 +264,14 @@ def test_simple_actual_run_returns_common_history(
     "snapshots", [False, True], ids=["flat", "transition_snapshots"]
 )
 def test_aviary_actual_run_modes(captured: Any, compact: bool, snapshots: bool) -> None:
+    # Aviary needs optional tenacity; other exporters do not.
+    pytest.importorskip("tenacity", reason="Aviary requires the sandbox extra")
+    from responses_api_agents.aviary_agent.app import (
+        AviaryAgent,
+        AviaryAgentConfig,
+        AviaryAgentRunRequest,
+    )
+
     captured.queue.extend(
         [tool_message(1), tool_message(2), {"role": "assistant", "content": "done"}]
     )
@@ -406,7 +412,10 @@ def test_browsecomp_progress_recovery_is_not_sampled_output(
             "messages",
             {"messages": [{"role": "user", "content": "task"}], "max_tokens": 10},
         ),
-        ("responses", {"input": "task", "stream": True}),
+        (
+            "responses",
+            {"input": "task", "stream": True, "previous_response_id": "opaque"},
+        ),
     ],
 )
 def test_existing_framework_capture_protocol_gap(

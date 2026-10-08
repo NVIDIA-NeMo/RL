@@ -2508,6 +2508,71 @@ class TestSetup:
             sc_setup_mod._maybe_attach_fleet_health(generation, mc)
 
 
+@pytest.mark.parametrize("cc", [False, True])
+@pytest.mark.parametrize("supported_router", [False, True])
+def test_cc_router_is_validated_before_rollout_manager(
+    patched_factories, cc: bool, supported_router: bool
+) -> None:
+    mc = _make_master_config(megatron_enabled=True)
+    mc.policy.update(
+        sequence_packing={"enabled": False},
+        dynamic_batching={"enabled": False},
+        train_micro_batch_size=1,
+        logprob_batch_size=1,
+    )
+    mc.policy["generation"].update(
+        model_name="test-model",
+        stop_strings=None,
+        stop_token_ids=None,
+        top_k=None,
+        vllm_cfg={"async_engine": True},
+    )
+    mc.token_capture = TokenCaptureConfig(enabled=True, context_compaction=cc)
+    mc.async_rl.rollout_failure.min_step_batch_fraction = 1
+    trainer = patched_factories["fake_policy"]
+    trainer.cfg = mc.policy
+    trainer.sharding_annotations.get_axis_size.return_value = 1
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    capability = trainer.worker_group.run_all_workers_single_data.return_value
+    events = []
+
+    def check(refs):
+        assert refs is capability
+        events.append("validate_loaded_model")
+        if not supported_router:
+            raise ValueError("unsafe router")
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()),
+        patch.object(sc_setup_mod.ray, "get", side_effect=check),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[],
+        ),
+        patch.object(
+            sc_setup_mod,
+            "RolloutManager",
+            side_effect=lambda **kw: events.append("rollout_manager"),
+        ),
+    ):
+        if cc and not supported_router:
+            with pytest.raises(ValueError, match="unsafe router"):
+                setup_single_controller(mc, MagicMock(pad_token_id=0))
+            assert events == ["validate_loaded_model"]
+        else:
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+            assert events == (["validate_loaded_model"] if cc else []) + [
+                "rollout_manager"
+            ]
+    if cc:
+        trainer.worker_group.run_all_workers_single_data.assert_called_once_with(
+            "validate_cc_execution_padding"
+        )
+    else:
+        trainer.worker_group.run_all_workers_single_data.assert_not_called()
+
+
 class TestNativeTQRecoverySetup:
     def test_simple_storage_setup_loads_tq_before_creating_controller_client(
         self, tmp_path, patched_factories

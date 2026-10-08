@@ -7,11 +7,16 @@ import logging
 from copy import deepcopy
 
 import pytest
+
+pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
+
 from nemo_gym.token_id_capture.replay import replay_context, summarize_replay
 from nemo_gym.token_id_capture.staging.records import CaptureAdmission
 from pydantic import ValidationError
 
 from nemo_rl.models.generation.capture_context import decide_capture_input
+
+pytestmark = pytest.mark.nemo_gym
 
 HISTORY = [
     {"role": "user", "content": "original question"},
