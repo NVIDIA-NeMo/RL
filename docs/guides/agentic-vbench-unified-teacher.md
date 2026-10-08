@@ -6,6 +6,35 @@ train Nemotron Super Omni on AgenticVBench through the SingleController path.
 The full history of the environment, its validation and the context-compaction
 work lives on the `cc-pr4200` branch; this page records only what differs here.
 
+## Context compaction merged (2026-10-08)
+
+After the first validated smoke the branch also absorbed `cc-pr4200` (merge
+commit 6d9a282a6), so it now carries NeMo-RL PR #4200's framework-owned
+context capture and the full cc-pr4200 AgenticVBench history alongside the
+unified-teacher changes. Consequences:
+
+- `CONTEXT_COMPACTION=true` works again through `launch_sc.sh`; the compaction
+  arm uses `...-agentic-vbench-sc-256k.v1.yaml` (unpacked, CP=1, dense mask
+  skipped), while the V2 recipe stays identity-only (packing, CP=2) and declares
+  `context_compaction: false`.
+- The Gym submodule is `cc-pr3368-unified`: the cc-pr3368 Gym (framework-owned
+  route, environment-server layer, AgenticVBench agent) plus the two
+  unified-teacher Gym commits (prefill boundary routes in captured extras,
+  image-tools capture path) plus the optional proxy step-cap reply
+  (`local_step_cap_reply`, default false here because the framework-owned route
+  roots that turn as a segment). Its venvs live in
+  `data/agentic_vbench/gym_venvs_cc_unified`.
+- Merge resolutions: `route_assembly.py` keeps both route backpatch paths (the
+  unified-teacher `routed_experts_prefix_boundary` and the CC
+  `predecessor_tail_route`), the token-capture hosting test keeps both branches'
+  cases, and the launcher is the cc one with this branch's defaults and guard.
+- Known: one `image_tools_agent` test fails on the merged Gym ("Unexpected call:
+  policy_model /v1/responses"); it does not involve the AgenticVBench path and
+  needs a look by the image-tools owner.
+
+The sections below describe the state before that merge and remain accurate
+for the identity path.
+
 ## What is on this branch and not on the base
 
 | Area | Change |
