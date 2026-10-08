@@ -161,38 +161,11 @@ env:
     is_trajectory_collection: false
     skip_venv_if_present: true
     config_paths:
-      - responses_api_models/vllm_model/configs/vllm_model.yaml
-      - responses_api_agents/nemotron_osworld/configs/nemotron_osworld_cc.yaml
-      - resources_servers/osworld/configs/osworld.yaml
-      - ${oc.env:OSWORLD_SANDBOX_CONFIG,resources_servers/osworld/configs/opensandbox_osworld.yaml}
+      - ${oc.env:OSWORLD_SANDBOX_CONFIG,benchmarks/osworld/configs/osworld_nemo_rl_opensandbox.yaml}
     policy_model:
       responses_api_models:
         vllm_model:
           return_token_id_information: false
-    nemotron_osworld:
-      responses_api_agents:
-        nemotron_osworld:
-          max_steps: ${oc.decode:${oc.env:OSWORLD_MAX_STEPS,3}}
-          max_parallel_rollouts: ${oc.decode:${oc.env:OSWORLD_MAX_PARALLEL_ROLLOUTS,2}}
-          temperature: ${policy.generation.temperature}
-          top_p: ${policy.generation.top_p}
-          max_tokens: ${policy.generation.max_new_tokens}
-          context_history:
-            enabled: true
-            policy:
-              type: recency
-              config:
-                images:
-                  enabled: true
-                  protect_initial_context: true
-                  keep_last_groups: ${oc.decode:${oc.env:OSWORLD_CC_KEEP_LAST_IMAGE_GROUPS,1}}
-            schedule:
-              type: turn_chunked_recency
-              actions_per_chunk: 2
-            guards:
-              max_total_tokens: ${policy.max_total_sequence_length}
-              reserved_generation_tokens: ${policy.generation.max_new_tokens}
-            max_response_retries: 0
 
 token_capture:
   enabled: true

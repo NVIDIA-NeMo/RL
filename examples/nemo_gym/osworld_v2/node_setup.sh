@@ -7,7 +7,7 @@ source "$SCRIPT_DIR/runtime_env.sh"
 test -f "$OSWORLD_RL_ROOT/examples/nemo_gym/launch_osworld_v2_cc.py"
 test -f "$OSWORLD_RL_ROOT/examples/run_grpo.py"
 test -f "$OSWORLD_GYM_ROOT/resources_servers/osworld/app.py"
-test -f "$OSWORLD_GYM_ROOT/responses_api_agents/nemotron_osworld/cc_app.py"
+test -f "$OSWORLD_GYM_ROOT/responses_api_agents/osworld_agent/app.py"
 test -x "$OSWORLD_GYM_ROOT/responses_api_agents/osworld_agent/install_optional_runtime_deps.sh"
 
 case "$OSWORLD_COMPONENT_PYTHON" in
@@ -42,15 +42,17 @@ for module, root in expected:
     if not source.is_relative_to(root):
         raise RuntimeError(f"{module.__name__} imported from unexpected path: {source}")
 
-if ray.__version__ != "2.56.1":
-    raise RuntimeError(f"Expected Ray 2.56.1, found {ray.__version__}")
+ray_version = tuple(int(part) for part in ray.__version__.split(".")[:2])
+if ray_version < (2, 58):
+    raise RuntimeError(f"Expected Ray >=2.58, found {ray.__version__}")
 
 if os.environ.get("OSWORLD_SANDBOX_PROVIDER") == "agentenv":
-    assert get_provider_class("agentenv").name == "agentenv"
+    assert get_provider_class("e2b").name == "e2b"
     context = ssl.create_default_context()
-    context.load_verify_locations(cafile=os.environ["AGENTENV_TLS_CA"])
+    if os.environ.get("AGENTENV_TLS_CA"):
+        context.load_verify_locations(cafile=os.environ["AGENTENV_TLS_CA"])
     request = urllib.request.Request(
-        os.environ["AGENTENV_ENDPOINT"].rstrip("/") + "/health",
+        os.environ["AGENTENV_URL"].rstrip("/") + "/health",
         headers={"X-API-Key": os.environ["AGENTENV_API_KEY"]},
     )
     with urllib.request.urlopen(request, timeout=30, context=context) as response:

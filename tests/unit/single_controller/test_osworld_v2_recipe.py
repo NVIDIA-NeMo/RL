@@ -11,6 +11,34 @@ from examples.nemo_gym.launch_osworld_v2_cc import (
     compose_and_validate_config,
     parse_args,
 )
+from nemo_rl.algorithms.single_controller_utils.config import (
+    cc_execution_row_multiple,
+)
+
+
+@pytest.fixture(autouse=True)
+def _osworld_gym_environment(monkeypatch):
+    monkeypatch.setenv("OSWORLD_CACHE_ROOT", "/cache/osworld")
+    monkeypatch.setenv("OPENSANDBOX_BASE_URL", "opensandbox.example")
+    monkeypatch.setenv("OPENSANDBOX_API_KEY", "test-key")
+
+
+def _resolve_gym_config(config):
+    return GlobalConfigDictParser().parse(
+        GlobalConfigDictParserConfig(
+            initial_global_config_dict=OmegaConf.create(
+                config.env["nemo_gym"]
+                | {
+                    "policy_base_url": "http://unused.invalid/v1",
+                    "policy_api_key": "test-key",
+                    "policy_model_name": config.policy["model_name"],
+                }
+            ),
+            skip_load_from_cli=True,
+            skip_load_from_dotenv=True,
+            offline=True,
+        )
+    )
 
 
 def test_osworld_v2_recipe_composes_to_initial_cc_envelope(monkeypatch):
@@ -97,10 +125,7 @@ def test_osworld_v2_recipe_uses_expected_gym_context_management(monkeypatch):
     gym = config.env["nemo_gym"]
 
     assert gym["config_paths"] == [
-        "responses_api_models/vllm_model/configs/vllm_model.yaml",
-        "responses_api_agents/nemotron_osworld/configs/nemotron_osworld_cc.yaml",
-        "resources_servers/osworld/configs/osworld.yaml",
-        "resources_servers/osworld/configs/opensandbox_osworld.yaml",
+        "benchmarks/osworld/configs/osworld_nemo_rl_opensandbox.yaml",
     ]
     assert all("vllm_model_for_training" not in path for path in gym["config_paths"])
     assert (
@@ -110,17 +135,15 @@ def test_osworld_v2_recipe_uses_expected_gym_context_management(monkeypatch):
         is False
     )
 
-    agent = gym["nemotron_osworld"]["responses_api_agents"]["nemotron_osworld"]
-    context_history = agent["context_history"]
-    assert agent["max_steps"] == 3
-    assert agent["max_parallel_rollouts"] == 2
-    assert context_history["enabled"] is True
-    assert context_history["schedule"] == {
-        "type": "turn_chunked_recency",
-        "actions_per_chunk": 2,
-    }
-    assert context_history["policy"]["config"]["images"]["keep_last_groups"] == 1
-    assert context_history["max_response_retries"] == 0
+    resolved = _resolve_gym_config(config)
+    agent = resolved.osworld_nano_omni_agent.responses_api_agents.osworld_agent
+    assert agent.max_steps == 150
+    assert agent.concurrency == 8
+    assert agent.runner_name == "nemotron_v3_nano_omni_agent"
+    assert agent.history_policy == {"name": "fixed", "params": {"keep_images": 2}}
+    assert agent.exact_trace_transport_version == 3
+    assert agent.sandbox_provider == "osworld_opensandbox"
+    assert agent.sandbox_spec.provider_options.extensions.poolRef == "osworld-kvm"
 
     generation = config.policy["generation"]
     assert generation["backend"] == "vllm"
@@ -138,33 +161,19 @@ def test_osworld_v2_recipe_resolves_paired_gym_configs(monkeypatch):
     monkeypatch.setenv("OSWORLD_GRPO_TRAIN_DATA", "/data/osworld-train.jsonl")
 
     config = compose_and_validate_config([])
-    gym_config = GlobalConfigDictParser().parse(
-        GlobalConfigDictParserConfig(
-            initial_global_config_dict=OmegaConf.create(
-                config.env["nemo_gym"]
-                | {
-                    "policy_base_url": "http://unused.invalid/v1",
-                    "policy_api_key": "test-key",
-                    "policy_model_name": config.policy["model_name"],
-                }
-            ),
-            skip_load_from_cli=True,
-            skip_load_from_dotenv=True,
-            offline=True,
-        )
-    )
+    gym_config = _resolve_gym_config(config)
 
-    agent = gym_config.nemotron_osworld.responses_api_agents.nemotron_osworld
-    assert agent.entrypoint == "cc_app.py"
-    assert agent.token_id_capture is True
-    assert agent.context_history.enabled is True
+    agent = gym_config.osworld_nano_omni_agent.responses_api_agents.osworld_agent
+    assert agent.entrypoint == "app.py"
+    assert agent.runner_name == "nemotron_v3_nano_omni_agent"
+    assert agent.exact_trace_transport_version == 3
     assert (
         gym_config.policy_model.responses_api_models.vllm_model.return_token_id_information
         is False
     )
 
 
-def test_osworld_v2_recipe_selects_agentenv_fork_oversampling(monkeypatch):
+def test_osworld_v2_recipe_selects_agentenv_profile(monkeypatch):
     monkeypatch.setenv("NANO_OMNI_MODEL_NAME", "/models/nemotron-omni")
     monkeypatch.setenv(
         "NANO_OMNI_CHAT_TEMPLATE",
@@ -173,32 +182,22 @@ def test_osworld_v2_recipe_selects_agentenv_fork_oversampling(monkeypatch):
     monkeypatch.setenv("OSWORLD_GRPO_TRAIN_DATA", "/data/osworld-train.jsonl")
     monkeypatch.setenv(
         "OSWORLD_SANDBOX_CONFIG",
-        "nemo_gym/sandbox/providers/agentenv/configs/agentenv.yaml",
+        "benchmarks/osworld/configs/osworld_nemo_rl_agentenv.yaml",
     )
-    monkeypatch.setenv("AGENTENV_ENDPOINT", "https://agentenv.example")
+    monkeypatch.setenv("AGENTENV_URL", "http://agentenv.example")
     monkeypatch.setenv("AGENTENV_API_KEY", "test-key")
-    monkeypatch.setenv("AGENTENV_TLS_CA", "/private/agentenv-ca.pem")
+    monkeypatch.setenv("AGENTENV_TEMPLATE", "osworld-slim-pixel-parity-20261001")
 
     config = compose_and_validate_config([])
-    gym_config = GlobalConfigDictParser().parse(
-        GlobalConfigDictParserConfig(
-            initial_global_config_dict=OmegaConf.create(
-                config.env["nemo_gym"]
-                | {
-                    "policy_base_url": "http://unused.invalid/v1",
-                    "policy_api_key": "test-key",
-                    "policy_model_name": config.policy["model_name"],
-                }
-            ),
-            skip_load_from_cli=True,
-            skip_load_from_dotenv=True,
-            offline=True,
-        )
-    )
+    gym_config = _resolve_gym_config(config)
 
     assert config.env["nemo_gym"]["config_paths"][-1].endswith("agentenv.yaml")
-    assert gym_config.sandbox.agentenv.create.template == "osworld-slim-pixel-parity-20261001"
-    assert gym_config.osworld_resources_server.resources_servers.osworld.fork_oversampling is True
+    agent = gym_config.osworld_nano_omni_agent.responses_api_agents.osworld_agent
+    assert agent.sandbox_provider == "osworld_agentenv"
+    assert agent.sandbox_spec.image == "osworld-slim-pixel-parity-20261001"
+    assert gym_config.osworld_agentenv.e2b.connection.api_url == (
+        "http://agentenv.example"
+    )
 
 
 def test_osworld_v2_molt_b8k8_recipe_composes_and_validates(monkeypatch):
@@ -251,8 +250,15 @@ def test_osworld_v2_molt_b8k8_recipe_composes_and_validates(monkeypatch):
         "gpus_per_node": 8,
         "num_nodes": 3,
     }
-    assert config.cluster["num_nodes"] == 4
-    assert config.cluster["gpus_per_node"] == 8
+    assert config.cluster.num_nodes == 4
+    assert config.cluster.gpus_per_node == 8
+    assert (
+        cc_execution_row_multiple(config.policy, dp_size=1, logprobs_required=True) == 1
+    )
+    with pytest.raises(
+        ValueError, match="sequence packing currently requires data parallel size 1"
+    ):
+        cc_execution_row_multiple(config.policy, dp_size=2, logprobs_required=True)
     megatron = config.policy["megatron_cfg"]
     assert megatron["freeze_vision_model"] is True
     assert megatron["freeze_vision_projection"] is True
@@ -265,52 +271,26 @@ def test_osworld_v2_molt_b8k8_recipe_composes_and_validates(monkeypatch):
     assert megatron["freeze_moe_router"] is True
     assert megatron["moe_router_bias_update_rate"] == 0.0
 
-    agent = config.env["nemo_gym"]["nemotron_osworld"]["responses_api_agents"][
-        "nemotron_osworld"
-    ]
-    assert agent["max_steps"] == 150
-    assert agent["max_parallel_rollouts"] == 8
-    assert agent["context_history"]["schedule"]["actions_per_chunk"] == 100
-    assert agent["context_history"]["schedule"]["actions_per_chunk"] != (
-        config.async_rl.max_inflight_prompts
-    )
-    assert (
-        agent["context_history"]["policy"]["config"]["images"]["keep_last_groups"] == 2
-    )
-    assert agent["context_history"]["guards"]["max_active_images"] == 10
-    assert agent["context_history"]["guards"]["reserved_generation_tokens"] == 11152
     assert config.checkpointing["enabled"] is False
     assert config.rollout_checkpointing.snapshot_attempt_interval_s is None
 
-    gym_config = GlobalConfigDictParser().parse(
-        GlobalConfigDictParserConfig(
-            initial_global_config_dict=OmegaConf.create(
-                config.env["nemo_gym"]
-                | {
-                    "policy_base_url": "http://unused.invalid/v1",
-                    "policy_api_key": "test-key",
-                    "policy_model_name": config.policy["model_name"],
-                }
-            ),
-            skip_load_from_cli=True,
-            skip_load_from_dotenv=True,
-            offline=True,
-        )
+    gym_config = _resolve_gym_config(config)
+    resolved_agent = (
+        gym_config.osworld_nano_omni_agent.responses_api_agents.osworld_agent
     )
-    resolved_agent = gym_config.nemotron_osworld.responses_api_agents.nemotron_osworld
     assert resolved_agent.max_steps == 150
-    assert resolved_agent.max_parallel_rollouts == 8
-    assert resolved_agent.context_history.policy.config.images.keep_last_groups == 2
-    assert resolved_agent.context_history.guards.max_active_images == 10
+    assert resolved_agent.concurrency == 8
+    assert resolved_agent.history_policy.params.keep_images == 2
+    assert resolved_agent.exact_trace_transport_version == 3
 
     monkeypatch.setenv("OSWORLD_MAX_STEPS", "20")
     monkeypatch.setenv("OSWORLD_MAX_PARALLEL_ROLLOUTS", "4")
     smoke_config = compose_and_validate_config([], config_path=MOLT_CONFIG_PATH)
-    smoke_agent = smoke_config.env["nemo_gym"]["nemotron_osworld"][
-        "responses_api_agents"
-    ]["nemotron_osworld"]
-    assert smoke_agent["max_steps"] == 20
-    assert smoke_agent["max_parallel_rollouts"] == 4
+    smoke_agent = _resolve_gym_config(
+        smoke_config
+    ).osworld_nano_omni_agent.responses_api_agents.osworld_agent
+    assert smoke_agent.max_steps == 20
+    assert smoke_agent.concurrency == 4
 
 
 def test_launcher_selects_molt_recipe_and_preserves_hydra_overrides(monkeypatch):
@@ -399,9 +379,7 @@ def test_flash_recipes_compose_and_validate(
     monkeypatch.setenv("OSWORLD_GRPO_TRAIN_DATA", "/data/rlvr-band/train.jsonl")
     monkeypatch.setenv("OSWORLD_CHECKPOINT_DIR", "/checkpoints/osworld-v2")
 
-    config = compose_and_validate_config(
-        [], config_path=RECIPE_CONFIG_PATHS[recipe]
-    )
+    config = compose_and_validate_config([], config_path=RECIPE_CONFIG_PATHS[recipe])
 
     assert config.grpo.num_prompts_per_step == prompts
     assert config.grpo.num_generations_per_prompt == generations

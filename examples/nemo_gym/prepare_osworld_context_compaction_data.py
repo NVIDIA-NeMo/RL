@@ -194,7 +194,7 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Include only this verifier task ID; may be passed more than once.",
     )
-    parser.add_argument("--agent-name", default="nemotron_osworld")
+    parser.add_argument("--agent-name", default="osworld_nano_omni_agent")
     parser.add_argument("--max-output-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)

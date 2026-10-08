@@ -2255,11 +2255,6 @@ class RolloutManager:
                 if classify_rollout_failure(error) is FailureClass.INFRA:
                     infra_attempts += 1
                     last_infra_error = error
-                    # CC selections are request-local until checkpoint recovery
-                    # persists them. Drop this abandoned group through the usual
-                    # bounded policy; do not redispatch and lose sealed selections.
-                    if self._context_compaction:
-                        break
                     if infra_attempts >= policy.max_infra_attempts:
                         break
                     self._stats.record_redispatch(reason)
@@ -2345,9 +2340,6 @@ class RolloutManager:
             rollout_ids=list(rollout_ids),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
-        # CC does not retry or checkpoint; keep selected-response metadata in this request
-        # while the existing ledger tracks sibling completion and publication.
-        cc_selections = {}
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -2360,16 +2352,11 @@ class RolloutManager:
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
+            logical_selection = None
             if self._context_compaction:
-                selection = env_extras.get("ng_logical_selection")
-                if not selection:
+                logical_selection = env_extras.get("ng_logical_selection")
+                if not logical_selection:
                     raise ValueError("CC completion must contain selected responses")
-                if (
-                    generation_index in cc_selections
-                    and cc_selections[generation_index] != selection
-                ):
-                    raise ValueError("conflicting duplicate CC completion")
-                cc_selections[generation_index] = selection
             gate_rollout_id = env_extras.get("ng_rollout_id")
             if receipt is not None and not isinstance(receipt, dict):
                 raise ValueError(
@@ -2413,6 +2400,7 @@ class RolloutManager:
                     mask_sample=mask_sample,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
+                    logical_selection=logical_selection,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2444,6 +2432,7 @@ class RolloutManager:
                     mask_sample=mask_sample,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
+                    logical_selection=logical_selection,
                 )
 
         try:
@@ -2477,7 +2466,17 @@ class RolloutManager:
                 mask_sample,
                 reward_checks,
                 reward_log_contexts,
+                logical_selections,
             ) = self._recovery_ledger.finalization_inputs(group_id)
+            durable_logical_selections = tuple(
+                selection for selection in logical_selections if selection is not None
+            )
+            if self._context_compaction and len(durable_logical_selections) != len(
+                rollout_ids
+            ):
+                raise ValueError(
+                    "CC finalization requires a durable selection for every owner"
+                )
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
@@ -2491,9 +2490,7 @@ class RolloutManager:
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
                 logical_selections=(
-                    tuple(cc_selections[i] for i in range(len(rollout_ids)))
-                    if self._context_compaction
-                    else None
+                    durable_logical_selections if self._context_compaction else None
                 ),
                 execution_row_multiple=self._execution_row_multiple,
             )

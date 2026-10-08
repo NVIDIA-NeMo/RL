@@ -75,9 +75,7 @@ def test_freeze_band_copies_and_rewrites_complete_gym_snapshot(tmp_path):
     assert (output / "SHA256SUMS").is_file()
 
     task = json.loads((output / "tasks" / "task_001.json").read_text())
-    frozen_asset = Path(
-        task["config"][0]["parameters"]["files"][0]["local_path"]
-    )
+    frozen_asset = Path(task["config"][0]["parameters"]["files"][0]["local_path"])
     assert frozen_asset.is_relative_to(output)
     assert frozen_asset.read_text() == "portable asset\n"
     assert all(
@@ -86,11 +84,10 @@ def test_freeze_band_copies_and_rewrites_complete_gym_snapshot(tmp_path):
     )
 
     rows = [
-        json.loads(line)
-        for line in (output / "train.jsonl").read_text().splitlines()
+        json.loads(line) for line in (output / "train.jsonl").read_text().splitlines()
     ]
     assert len(rows) == 2
-    assert rows[0]["agent_ref"]["name"] == "nemotron_osworld"
+    assert rows[0]["agent_ref"]["name"] == "osworld_nano_omni_agent"
     assert rows[0]["verifier_metadata"]["id"] == "task_001"
     assert rows[1]["context_compaction_group_id"].endswith("repeat:1")
 

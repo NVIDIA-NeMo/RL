@@ -98,7 +98,7 @@ def main() -> None:
         raise ValueError(f"Train/eval task ID overlap: {overlap}")
 
     generation_kwargs = {
-        "agent_name": "nemotron_osworld",
+        "agent_name": "osworld_nano_omni_agent",
         "max_output_tokens": args.max_output_tokens,
         "temperature": args.temperature,
         "top_p": args.top_p,

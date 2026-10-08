@@ -39,7 +39,7 @@ def test_prepare_rows_adds_v2_routing_and_keeps_only_stable_provenance():
     rows = prepare.prepare_osworld_rows(
         [source],
         num_repeats=2,
-        agent_name="nemotron_osworld",
+        agent_name="osworld_nano_omni_agent",
         max_output_tokens=2048,
         temperature=0.6,
         top_p=0.95,
@@ -56,7 +56,7 @@ def test_prepare_rows_adds_v2_routing_and_keeps_only_stable_provenance():
         assert row["verifier_metadata"] == original["verifier_metadata"]
         assert row["agent_ref"] == {
             "type": "responses_api_agents",
-            "name": "nemotron_osworld",
+            "name": "osworld_nano_omni_agent",
         }
         assert row["responses_create_params"] == {
             "input": [

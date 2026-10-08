@@ -157,7 +157,7 @@ class DrGRPOAdvantageEstimator:
     def compute_advantage(self, prompt_ids, rewards, mask, valid_mask=None, **kwargs):
         """Return ``reward - prompt_group_mean`` expanded over response tokens."""
         del kwargs
-        baseline, _ = calculate_baseline_and_std_per_prompt(
+        baseline, _, _ = calculate_baseline_and_std_per_prompt(
             prompt_ids,
             rewards,
             torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
@@ -185,7 +185,7 @@ class ReinforceBaselineAdvantageEstimator:
         rewards: torch.Tensor,
     ) -> torch.Tensor:
         """Return unwhitened ``reward - group_mean`` per logical rollout."""
-        baseline, _ = calculate_baseline_and_std_per_prompt(
+        baseline, _, _ = calculate_baseline_and_std_per_prompt(
             prompt_ids,
             rewards,
             torch.ones_like(rewards),

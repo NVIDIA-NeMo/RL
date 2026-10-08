@@ -20,8 +20,8 @@ The default smoke recipe is
 `examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_v2_cc_flash_b8n8_dr_grpo_checkpoint.yaml`.
 The final AgentEnv target is B=17/N=16 (272 logical trajectories per optimizer
 step), available with either Dr.GRPO or the REINFORCE baseline. AgentEnv
-initializes each task once and forks the active N owners from that state; this
-is infrastructure oversampling, not extra trajectories beyond configured N.
+restores each rollout from the same prebuilt microVM template; the configured
+N owners remain independent trajectories.
 Mid-turn VM snapshots are not part of this release; recovery is at a completed
 optimizer-step boundary.
 
@@ -47,13 +47,14 @@ The validated launcher requires:
 - Access to GitHub/Python package indexes the first time NeMo Gym builds its
   shared component environment. The OSWorld dependency is pinned to
   `terrykong/OSWorld@5d8c93592be588ab8e9909bed82f3b480fd4f533`,
-  Ray to `2.56.1`, and the OpenSandbox SDK to `0.1.15`.
+  Ray to a supported `>=2.58` release and the OpenSandbox SDK to the versions
+  pinned by the checked-out RL/Gym lockfiles.
 
 ## 2. Clone the pinned code
 
 ```bash
 git clone --recurse-submodules \
-  --branch osworld-v2-cc-integration \
+  --branch linglinj/flashreinforce-agentenv-osworld \
   https://github.com/jinglinglingling/RL.git nemo-rl-osworld-v2
 cd nemo-rl-osworld-v2
 git submodule update --init --recursive
@@ -111,8 +112,8 @@ wc -l /shared/data/osworld/train-5x.jsonl
 ```
 
 The preparation script removes framework-owned rollout IDs and adds the
-`nemotron_osworld` Gym route. SingleController creates fresh logical owner and
-attempt IDs at runtime.
+official `osworld_nano_omni_agent` Gym route. SingleController creates fresh
+logical owner and attempt IDs at runtime.
 
 Prepare the corresponding one-copy, 361-task evaluation file:
 
@@ -173,9 +174,10 @@ Required values are:
 - `NANO_OMNI_MODEL_NAME`
 - `NANO_OMNI_CHAT_TEMPLATE`
 - `OSWORLD_GRPO_TRAIN_DATA`
-- `OSWORLD_SANDBOX_PROVIDER=opensandbox` plus `OPENSANDBOX_DOMAIN` and its API
-  key, or `OSWORLD_SANDBOX_PROVIDER=agentenv` plus `AGENTENV_ENDPOINT`,
-  `AGENTENV_API_KEY`, `AGENTENV_TLS_CA`, and `AGENTENV_TEMPLATE`
+- `OSWORLD_SANDBOX_PROVIDER=opensandbox` plus `OPENSANDBOX_BASE_URL` and its
+  API key, or `OSWORLD_SANDBOX_PROVIDER=agentenv` plus `AGENTENV_URL`,
+  `AGENTENV_API_KEY`, and `AGENTENV_TEMPLATE` (with `AGENTENV_TLS_CA` only for
+  an internal TLS issuer)
 - `SLURM_ACCOUNT` and `SLURM_PARTITION`
 - `OSWORLD_RESULTS_ROOT`
 
@@ -216,7 +218,7 @@ Before calling `sbatch`, the launcher:
 4. syntax-checks the shell launchers; and
 5. configures the Ray head and workers to use the qualified driver venv.
 
-Each node then checks Python 3.13.14, Ray 2.56.1, RL/Gym import provenance, and
+Each node then checks Python 3.13.14, Ray >=2.58, RL/Gym import provenance, and
 the fully resolved SingleController configuration before model loading begins.
 
 The command prints `series_root`, `checkpoint_dir`, and the submitted Job ID.
@@ -295,6 +297,6 @@ SingleController + TransferQueue.
 - OpenSandbox setup failures should be diagnosed from the Gym server logs and
   guest control API before resubmitting. Confirm that the API key authorizes
   protected create/release operations, `OSWORLD_POOL_REF` exists with enough
-  warm capacity, and all compute nodes can resolve `OPENSANDBOX_DOMAIN`.
+  warm capacity, and all compute nodes can resolve `OPENSANDBOX_BASE_URL`.
 - NeMo Gym environments are not relocatable. Keep `OSWORLD_GYM_VENV_DIR` on the
   shared destination cluster and let this image build it there.

@@ -109,35 +109,19 @@ env:
           # metadata even though this evaluator does not persist CC receipts.
           # This matches the v1 vllm_model_for_training evaluator contract.
           return_token_id_information: true
-    nemotron_osworld:
+    osworld_nano_omni_agent:
       responses_api_agents:
-        nemotron_osworld:
+        osworld_agent:
           token_id_capture: false
           max_steps: 100
-          max_parallel_rollouts: 32
+          concurrency: 32
           temperature: 0.6
           top_p: 1.0
           max_tokens: 16384
-          context_history:
-            enabled: true
-            policy:
-              type: recency
-              config:
-                images:
-                  enabled: true
-                  protect_initial_context: true
-                  keep_last_groups: 2
-            schedule:
-              type: turn_chunked_recency
-              actions_per_chunk: 100
-            guards:
-              # Token-count measurement is served by the capture endpoint.
-              # Eval does not retain token receipts, so use the same 3-to-10
-              # image sawtooth and let vLLM enforce its 49K hard limit.
-              max_total_tokens: null
-              reserved_generation_tokens: 0
-              max_active_images: 10
-            max_response_retries: 0
+          history_policy:
+            name: fixed
+            params:
+              keep_images: 2
 
 # The inference-only legacy runner does not use SC token receipts or TQ.
 token_capture:

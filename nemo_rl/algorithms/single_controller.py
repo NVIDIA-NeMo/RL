@@ -1282,7 +1282,16 @@ class SingleControllerActor:
             "recovery_restore"
         ) as cut:
             recovery_ledger.load_state_dict(cut, parsed_state.ledger_state)
-            recovery_ledger.prepare_for_restart(cut)
+            recovery_ledger.prepare_for_restart(
+                cut,
+                require_logical_selection=bool(
+                    getattr(
+                        self._master_config.token_capture,
+                        "context_compaction",
+                        False,
+                    )
+                ),
+            )
             self._batch_shortfall = parsed_state.batch_shortfall
             canonical_state = self._buffer.metadata_state_dict(
                 saved_capacity=self._async_cfg.max_buffered_rollouts
@@ -3002,12 +3011,8 @@ class SingleControllerActor:
         )
         selection_kwargs = self._streaming_ppo_selection_kwargs()
         context_compaction = self._master_config.token_capture.context_compaction
-        stage_full_advantage_window = (
-            self._async_cfg.stage_full_advantage_window
-        )
-        staged_policy_probe_interval_s = (
-            self._async_cfg.staged_policy_probe_interval_s
-        )
+        stage_full_advantage_window = self._async_cfg.stage_full_advantage_window
+        staged_policy_probe_interval_s = self._async_cfg.staged_policy_probe_interval_s
 
         while self._train_steps < self._algo_cfg.max_num_steps:
             version_during_step = self._trainer_version
@@ -3191,9 +3196,7 @@ class SingleControllerActor:
                                         self._trainer.prepare_for_lp_inference,
                                         keep_train_buffers=False,
                                     )
-                                with self._timer.time(
-                                    "staged_policy_probe_heartbeat"
-                                ):
+                                with self._timer.time("staged_policy_probe_heartbeat"):
                                     await asyncio.to_thread(
                                         self._trainer.get_logprobs_from_meta,
                                         heartbeat_meta,
@@ -3310,9 +3313,7 @@ class SingleControllerActor:
                             )
                         if groups_dispatched == 0:
                             try:
-                                await asyncio.to_thread(
-                                    self._gen.snapshot_step_metrics
-                                )
+                                await asyncio.to_thread(self._gen.snapshot_step_metrics)
                             except RayActorError as error:
                                 log.warning(
                                     "Skipping generation snapshot metrics: %s",
@@ -5892,16 +5893,11 @@ class SingleControllerActor:
         logical = has_logical_owners(meta)
         if logical:
             grpo_family = (
-                (
-                    self._algo_cfg.adv_estimator.name == "grpo"
-                    and isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
-                )
-                or (
-                    self._algo_cfg.adv_estimator.name == "dr_grpo"
-                    and isinstance(
-                        self._advantage_estimator, DrGRPOAdvantageEstimator
-                    )
-                )
+                self._algo_cfg.adv_estimator.name == "grpo"
+                and isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+            ) or (
+                self._algo_cfg.adv_estimator.name == "dr_grpo"
+                and isinstance(self._advantage_estimator, DrGRPOAdvantageEstimator)
             )
             molt_reinforce = (
                 self._algo_cfg.adv_estimator.name == "reinforce_baseline"
@@ -5914,9 +5910,7 @@ class SingleControllerActor:
                 or not isinstance(self._algo_cfg, GRPOConfig)
                 or not (grpo_family or molt_reinforce)
             ):
-                raise ValueError(
-                    "CC logical owners require a supported GRPO estimator"
-                )
+                raise ValueError("CC logical owners require a supported GRPO estimator")
             validate_cc_objective(self._algo_cfg, self._master_config.loss_fn)
         if self._advantage_estimator is None:
             return meta, True

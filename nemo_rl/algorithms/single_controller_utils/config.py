@@ -926,7 +926,8 @@ def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
         and loss.is_correction_gating == "binary_kl"
         and loss.truncated_importance_sampling_ratio_min is not None
         and loss.truncated_importance_sampling_ratio is not None
-        and loss.truncated_importance_sampling_ratio_min <= 0
+        and loss.truncated_importance_sampling_ratio_min
+        <= 0
         < loss.truncated_importance_sampling_ratio
         and loss.force_on_policy_ratio
         and not loss.disable_ppo_ratio
@@ -946,22 +947,30 @@ def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
 def cc_execution_row_multiple(
     policy: PolicyConfig, *, dp_size: int, logprobs_required: bool
 ) -> int:
-    """Common row divisibility for the initial fixed-batch Megatron consumers.
+    """Return the physical-row padding quantum for qualified CC consumers.
 
     Policy and reference forwards share this trainer's mesh and logprob MBS.
-    Non-interleaved PP admits any positive microbatch count; interleaved PP
-    and token-budget planners require separate qualification.
+    Fixed batches need a DP/microbatch multiple. Sequence packing accepts
+    variable physical-row counts only on the currently qualified DP1 path.
     """
+    megatron_cfg = policy["megatron_cfg"]
+    sequence_packing = bool(policy["sequence_packing"]["enabled"])
     if (
-        not policy["megatron_cfg"]["enabled"]
-        or policy["sequence_packing"]["enabled"]
+        not megatron_cfg["enabled"]
         or policy["dynamic_batching"]["enabled"]
-        or policy["megatron_cfg"].get("virtual_pipeline_model_parallel_size")
-        is not None
+        or megatron_cfg.get("virtual_pipeline_model_parallel_size") is not None
     ):
         raise ValueError(
             "CC execution padding requires fixed-batch, non-interleaved Megatron"
         )
+    if sequence_packing:
+        if type(dp_size) is not int or dp_size != 1:
+            raise ValueError(
+                "CC sequence packing currently requires data parallel size 1"
+            )
+        return 1
+    if megatron_cfg.get("context_parallel_size", 1) > 1:
+        raise ValueError("CC context parallelism requires sequence packing")
     sizes = [policy["train_micro_batch_size"]]
     if logprobs_required:
         sizes.append(policy["logprob_batch_size"])
@@ -1596,8 +1605,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 or async_config.min_groups_for_streaming_train
                 != master_config.grpo.num_prompts_per_step
                 or (
-                    master_config.loss_fn.loss_agg_mode
-                    == "prompt-mean-token-mean"
+                    master_config.loss_fn.loss_agg_mode == "prompt-mean-token-mean"
                     and not async_config.stage_full_advantage_window
                 )
                 or (

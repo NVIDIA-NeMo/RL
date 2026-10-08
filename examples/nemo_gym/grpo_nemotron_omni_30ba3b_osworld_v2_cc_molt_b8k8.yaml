@@ -107,29 +107,6 @@ env:
     # observed cold start reached the old 1800s deadline as its final shards
     # became ready, so retain enough margin for uncached continuation nodes.
     model_endpoint_readiness_timeout_seconds: ${oc.decode:${oc.env:OSWORLD_MODEL_ENDPOINT_READINESS_TIMEOUT_SECONDS,2700}}
-    nemotron_osworld:
-      responses_api_agents:
-        nemotron_osworld:
-          max_steps: ${oc.decode:${oc.env:OSWORLD_MAX_STEPS,150}}
-          max_parallel_rollouts: ${oc.decode:${oc.env:OSWORLD_MAX_PARALLEL_ROLLOUTS,8}}
-          max_tokens: 16384
-          context_history:
-            policy:
-              type: recency
-              config:
-                images:
-                  enabled: true
-                  protect_initial_context: true
-                  keep_last_groups: 2
-            # This is context-compaction cadence, not Molt concurrency K.
-            schedule:
-              type: turn_chunked_recency
-              actions_per_chunk: 100
-            guards:
-              max_total_tokens: 49152
-              reserved_generation_tokens: 11152
-              max_active_images: 10
-            max_response_retries: 0
 
 async_rl:
   sampler:

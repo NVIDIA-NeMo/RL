@@ -62,13 +62,15 @@ fi
 export OSWORLD_SANDBOX_PROVIDER="${OSWORLD_SANDBOX_PROVIDER:-opensandbox}"
 case "$OSWORLD_SANDBOX_PROVIDER" in
   opensandbox)
-    if [[ -z "${OPENSANDBOX_DOMAIN:-}" && -n "${OPENSANDBOX_BASE_URL:-}" ]]; then
-      opensandbox_host="${OPENSANDBOX_BASE_URL#*://}"
-      export OPENSANDBOX_DOMAIN="${opensandbox_host%%/*}"
+    if [[ -z "${OPENSANDBOX_BASE_URL:-}" && -n "${OPENSANDBOX_DOMAIN:-}" ]]; then
+      export OPENSANDBOX_BASE_URL="$OPENSANDBOX_DOMAIN"
     fi
     export OPENSANDBOX_API_KEY="${OPENSANDBOX_API_KEY:-}"
     ;;
   agentenv)
+    if [[ -z "${AGENTENV_URL:-}" && -n "${AGENTENV_ENDPOINT:-}" ]]; then
+      export AGENTENV_URL="$AGENTENV_ENDPOINT"
+    fi
     export AGENTENV_TEMPLATE="${AGENTENV_TEMPLATE:-osworld-slim-pixel-parity-20261001}"
     ;;
   *)
@@ -86,9 +88,9 @@ required_vars=(
   OSWORLD_RESULTS_ROOT
 )
 if [[ "$OSWORLD_SANDBOX_PROVIDER" == "agentenv" ]]; then
-  required_vars+=(AGENTENV_ENDPOINT AGENTENV_API_KEY AGENTENV_TLS_CA AGENTENV_TEMPLATE)
+  required_vars+=(AGENTENV_URL AGENTENV_API_KEY AGENTENV_TEMPLATE)
 else
-  required_vars+=(OPENSANDBOX_DOMAIN)
+  required_vars+=(OPENSANDBOX_BASE_URL)
 fi
 if [[ "$OSWORLD_DRIVER_SCRIPT" == "eval_driver.sh" ]]; then
   case "${OSWORLD_EVAL_MODE:-}" in
@@ -136,7 +138,7 @@ export NANO_OMNI_MODEL_NAME
 NANO_OMNI_MODEL_NAME="$(canonical_dir "$NANO_OMNI_MODEL_NAME")"
 export NANO_OMNI_CHAT_TEMPLATE
 NANO_OMNI_CHAT_TEMPLATE="$(canonical_file "$NANO_OMNI_CHAT_TEMPLATE")"
-if [[ "$OSWORLD_SANDBOX_PROVIDER" == "agentenv" ]]; then
+if [[ "$OSWORLD_SANDBOX_PROVIDER" == "agentenv" && -n "${AGENTENV_TLS_CA:-}" ]]; then
   export AGENTENV_TLS_CA
   AGENTENV_TLS_CA="$(canonical_file "$AGENTENV_TLS_CA")"
 fi
@@ -297,7 +299,7 @@ add_identity_mount() {
 
 add_identity_mount "$NANO_OMNI_MODEL_NAME"
 add_identity_mount "$NANO_OMNI_CHAT_TEMPLATE"
-if [[ "$OSWORLD_SANDBOX_PROVIDER" == "agentenv" ]]; then
+if [[ "$OSWORLD_SANDBOX_PROVIDER" == "agentenv" && -n "${AGENTENV_TLS_CA:-}" ]]; then
   add_identity_mount "$AGENTENV_TLS_CA"
 fi
 if [[ "$OSWORLD_DRIVER_SCRIPT" != "eval_driver.sh" ]]; then

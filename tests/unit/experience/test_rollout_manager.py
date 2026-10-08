@@ -64,7 +64,10 @@ from nemo_rl.experience.rollout_manager import (
     RolloutStats,
     _nemo_gym_metric_namespace,
 )
-from nemo_rl.experience.rollout_reassembler import SegmentReceipt
+from nemo_rl.experience.rollout_reassembler import (
+    ActionOutputFlags,
+    RolloutSelection,
+)
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
     RolloutRecoveryLedger,
@@ -1335,9 +1338,10 @@ def test_nemo_gym_build_inputs_stamps_logical_group_coordinates():
     assert [row["_rowidx"] for row in rows] == [0, 1, 2]
 
     recovery_rows = impl._build_inputs(input_sample, generation_indices=[0, 2])
-    assert [
-        row[NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY] for row in recovery_rows
-    ] == [[0, 2], [0, 2]]
+    assert [row[NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY] for row in recovery_rows] == [
+        [0, 2],
+        [0, 2],
+    ]
 
 
 def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
@@ -1934,10 +1938,10 @@ def _receipt_record(
     instance_configs=None,
     *,
     loss_multiplier=1.0,
-    logical_segments=None,
+    logical_selections=None,
 ):
     instance_configs = instance_configs or [None] * len(rollout_ids)
-    logical_segments = logical_segments or [None] * len(rollout_ids)
+    logical_selections = logical_selections or [None] * len(rollout_ids)
     completions = [
         Completion(
             message_log=[],
@@ -1946,13 +1950,15 @@ def _receipt_record(
                 "ng_receipt": receipt,
                 "ng_rollout_id": rid,
                 **({"instance_config": cfg} if cfg is not None else {}),
-                **({"ng_logical_segments": segments} if segments is not None else {}),
+                **(
+                    {"ng_logical_selection": selection} if selection is not None else {}
+                ),
             },
             truncated=False,
             reward=0.5,
         )
-        for rid, receipt, cfg, segments in zip(
-            rollout_ids, receipts, instance_configs, logical_segments
+        for rid, receipt, cfg, selection in zip(
+            rollout_ids, receipts, instance_configs, logical_selections
         )
     ]
     return PromptGroupRecord(
@@ -1974,9 +1980,10 @@ def _make_capture_manager(
     retry_policy: RolloutRetryPolicy | None = None,
     instance_configs=None,
     recovery_config: RolloutRecoveryConfig | None = None,
+    context_compaction: bool = False,
 ):
     mgr = object.__new__(RolloutManager)
-    mgr._context_compaction = False
+    mgr._context_compaction = context_compaction
     mgr._execution_row_multiple = 1
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations
@@ -2032,16 +2039,18 @@ def _make_capture_manager(
                 }
                 for rollout_id in selected_ids
             ]
-            logical_segments = (
+            logical_selections = (
                 [
-                    [
-                        SegmentReceipt(
-                            capture_rollout_id=rollout_id,
-                            receipt=receipt,
-                            selected_response_ids=("response-0",),
-                        )
-                    ]
-                    for rollout_id, receipt in zip(selected_ids, receipts)
+                    RolloutSelection(
+                        response_ids=("response-0",),
+                        action_flags=(
+                            ActionOutputFlags(
+                                invalid_tool_call=False,
+                                malformed_thinking=False,
+                            ),
+                        ),
+                    )
+                    for _ in selected_ids
                 ]
                 if context_compaction
                 else None
@@ -2051,7 +2060,7 @@ def _make_capture_manager(
                 receipts,
                 instance_configs=selected_configs,
                 loss_multiplier=float(_sample.get("loss_multiplier", 1.0)),
-                logical_segments=logical_segments,
+                logical_selections=logical_selections,
             )
             if on_completion is not None:
                 for generation_index, completion in zip(indices, record.completions):
@@ -2345,7 +2354,7 @@ class TestGenerateForFinalizationFlow:
             restored._impl.seen_recovery_granularity is RecoveryGranularity.PROMPT_GROUP
         )
 
-    def test_cc_sibling_restore_reuses_durable_logical_segments(self):
+    def test_cc_sibling_restore_reuses_durable_logical_selections(self):
         first = _make_capture_manager(
             _FakeCaptureBuffer(),
             context_compaction=True,
@@ -2365,13 +2374,15 @@ class TestGenerateForFinalizationFlow:
             "rollout_id": sealed_id,
             "manifest": [{"staging_key": f"{sealed_id}/call"}],
         }
-        sealed_segments = [
-            SegmentReceipt(
-                capture_rollout_id=sealed_id,
-                receipt=sealed_receipt,
-                selected_response_ids=("response-0",),
-            )
-        ]
+        sealed_selection = RolloutSelection(
+            response_ids=("response-0",),
+            action_flags=(
+                ActionOutputFlags(
+                    invalid_tool_call=False,
+                    malformed_thinking=False,
+                ),
+            ),
+        )
         _with_cut(
             first._tq_buffer,
             lambda cut: first.recovery_ledger.mark_sibling_sealed(
@@ -2382,7 +2393,7 @@ class TestGenerateForFinalizationFlow:
                 receipt=sealed_receipt,
                 reward=0.5,
                 mask_sample=False,
-                logical_segments=sealed_segments,
+                logical_selection=sealed_selection,
             ),
         )
 
@@ -2399,7 +2410,7 @@ class TestGenerateForFinalizationFlow:
         _with_cut(
             restored._tq_buffer,
             lambda cut: restored.recovery_ledger.prepare_for_restart(
-                cut, require_logical_segments=True
+                cut, require_logical_selection=True
             ),
         )
 
@@ -2413,9 +2424,9 @@ class TestGenerateForFinalizationFlow:
 
         assert request is not None
         assert restored._impl.seen_generation_indices == [1]
-        assert request.logical_segments is not None
-        assert request.logical_segments[0] == tuple(sealed_segments)
-        assert len(request.logical_segments[1]) == 1
+        assert request.logical_selections is not None
+        assert request.logical_selections[0] == sealed_selection
+        assert request.logical_selections[1].response_ids == ("response-0",)
 
 def test_capture_completion_preserves_checks_and_raw_reward_until_finalization():
     from nemo_rl.experience.reward_penalties import RewardChecks

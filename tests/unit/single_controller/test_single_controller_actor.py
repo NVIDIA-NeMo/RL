@@ -249,6 +249,14 @@ def _stamp_advantage_stage_config(ctrl, *, shardable: bool = True) -> None:
         teacher_logprobs_required=ctrl._teacher_logprobs_required,
         message_level_advantage_penalties_enabled=penalties_enabled,
         shardable=shardable,
+        prompt_mean_token_mean=(
+            getattr(
+                getattr(getattr(ctrl, "_master_config", None), "loss_fn", None),
+                "loss_agg_mode",
+                None,
+            )
+            == "prompt-mean-token-mean"
+        ),
         train_data_dump_dir=str(dump.log_dir) if dump is not None else None,
     )
     ctrl._advantage_computer = AdvantageComputer(
@@ -1879,11 +1887,14 @@ def _train_pump_controller(*, sampler) -> object:
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
         checkpointing={"enabled": False, "save_period": 10},
+        token_capture=SimpleNamespace(context_compaction=False),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._async_cfg = SimpleNamespace(
         min_groups_for_streaming_train=1,
+        stage_full_advantage_window=False,
+        staged_policy_probe_interval_s=600,
         rollout_failure=SimpleNamespace(min_step_batch_fraction=0.9),
         sampler=SimpleNamespace(
             max_lookahead_versions=1,
@@ -2445,7 +2456,7 @@ def test_train_pump_stages_full_advantage_window_before_training(monkeypatch) ->
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     sampler = _ChunkedSampler(meta, chunks=2)
     ctrl = _train_pump_controller(sampler=sampler)
@@ -2492,7 +2503,7 @@ def test_train_pump_reprobes_staged_group_during_long_arrival_gap(monkeypatch) -
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
 
     class _GapSampler(_EmptySampler):

@@ -162,6 +162,9 @@ def _controller(meta, data, *, grpo=None, loss=None):
         teacher_logprobs_required=False,
         message_level_advantage_penalties_enabled=ctrl._message_level_advantage_penalties_enabled,
         shardable=True,
+        prompt_mean_token_mean=(
+            ctrl._master_config.loss_fn.loss_agg_mode == "prompt-mean-token-mean"
+        ),
         train_data_dump_dir=None,
     )
     ctrl._advantage_computer = AdvantageComputer(
@@ -194,9 +197,20 @@ def test_deduplicates_unequal_segments_without_pooling_identical_prompts_across_
     assert valid and "advantages" in result.fields
     assert len(ctrl._dp_client.puts) == 1
     reward_partial = ctrl._step_log_dict["reward_partials"][0]
-    assert reward_partial.weighted_total == 2
+    assert reward_partial.weighted_total == 26
     assert reward_partial.weight == 4
-    assert data["advantages"].count_nonzero() == 0
+    by_sample = dict(zip(meta.sample_ids, data["advantages"], strict=True))
+    for sample_id, expected in {
+        "a_g0_s0": -1.0,
+        "a_g0_s1": -1.0,
+        "a_g1_s0": 1.0,
+        "b_g0_s0": -2.0,
+        "b_g0_s1": -2.0,
+        "b_g0_s2": -2.0,
+        "b_g1_s0": 2.0,
+        "a_pad0": 0.0,
+    }.items():
+        torch.testing.assert_close(by_sample[sample_id], torch.full((3,), expected))
 
 
 @pytest.mark.parametrize("mask_owner", [False, True])
@@ -460,9 +474,7 @@ def test_molt_owner_scalar_is_invariant_to_physical_segment_splitting():
 
 
 def test_flash_prompt_weights_pool_all_segments_and_rollouts_per_dispatch_group():
-    meta, data = _batch(
-        [("a", [(0.0, 2), (1.0, 1)]), ("b", [(0.0, 3), (1.0, 1)])]
-    )
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)]), ("b", [(0.0, 3), (1.0, 1)])])
     ctrl = _controller(
         meta,
         data,
@@ -506,9 +518,10 @@ def test_reward_clipping_precedes_logical_advantages_and_reward_metrics():
     torch.testing.assert_close(
         data["advantages"][:, 1], torch.tensor([-0.5, -0.5, 0.5])
     )
-    torch.testing.assert_close(
-        ctrl._step_log_dict["rewards"][0], torch.tensor([0.0, 1.0])
-    )
+    reward_partial = ctrl._step_log_dict["reward_partials"][0]
+    assert reward_partial.weighted_total == 1
+    assert reward_partial.weight == 2
+
 
 @pytest.mark.parametrize("filtering", [False, True])
 def test_overlong_filter_flag_is_respected_for_all_owner_segments(filtering):

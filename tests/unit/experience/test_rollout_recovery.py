@@ -29,7 +29,10 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.experience.rollout_reassembler import SegmentReceipt
+from nemo_rl.experience.rollout_reassembler import (
+    ActionOutputFlags,
+    RolloutSelection,
+)
 from nemo_rl.experience.rollout_recovery import (
     _ATTEMPT_STATE_FIELDS,
     _GROUP_STATE_FIELDS,
@@ -86,19 +89,15 @@ def _prompt(idx: int = 7) -> DatumSpec:
     }
 
 
-def _logical_segment(rollout_id: str, staging_key: str) -> SegmentReceipt:
-    return SegmentReceipt(
-        capture_rollout_id=rollout_id,
-        receipt={
-            "rollout_id": rollout_id,
-            "manifest": [
-                {
-                    "staging_key": staging_key,
-                    "response_id": "response-0",
-                }
-            ],
-        },
-        selected_response_ids=("response-0",),
+def _logical_selection() -> RolloutSelection:
+    return RolloutSelection(
+        response_ids=("response-0",),
+        action_flags=(
+            ActionOutputFlags(
+                invalid_tool_call=False,
+                malformed_thinking=False,
+            ),
+        ),
     )
 
 
@@ -232,7 +231,7 @@ def _sealed_attempt_state() -> dict[str, Any]:
             },
             reward=1.0,
             mask_sample=True,
-            logical_segments=[_logical_segment(gate_id, "g7/sibling-0/call-0")],
+            logical_selection=_logical_selection(),
         )
     )
     return ledger.state_dict()
@@ -749,7 +748,7 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
     sealed_attempt_id = group.siblings[0].current_attempt.attempt_id
     sealed_id = group.gate_rollout_id(0)
-    expected_logical_segments = [_logical_segment(sealed_id, "g7/sibling-0/call-0")]
+    expected_logical_selection = _logical_selection()
     _mutate(
         lambda cut: ledger.mark_sibling_sealed(
             cut,
@@ -762,7 +761,7 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
             },
             reward=1.0,
             mask_sample=True,
-            logical_segments=expected_logical_segments,
+            logical_selection=expected_logical_selection,
         )
     )
 
@@ -780,8 +779,8 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
     )
     assert restored.expected_staging_keys() == {"g7/sibling-0/call-0"}
     assert (
-        recovered_group.siblings[0].current_attempt.logical_segments
-        == expected_logical_segments
+        recovered_group.siblings[0].current_attempt.logical_selection
+        == expected_logical_selection
     )
 
     retry = _mutate(lambda cut: restored.prepare_incomplete_retry(cut, "g7"))
@@ -818,7 +817,7 @@ def test_legacy_cc_restart_redispatches_the_complete_group() -> None:
             },
             reward=1.0,
             mask_sample=False,
-            logical_segments=[_logical_segment(sealed_id, "g7/sibling-0/call-0")],
+            logical_selection=_logical_selection(),
         )
     )
 
@@ -826,11 +825,11 @@ def test_legacy_cc_restart_redispatches_the_complete_group() -> None:
     legacy_state["schema_version"] = 2
     for sibling in legacy_state["groups"][0]["siblings"]:
         for attempt in sibling["attempts"]:
-            attempt.pop("logical_segments")
+            attempt.pop("logical_selection")
 
     restored = RolloutRecoveryLedger.from_state_dict(legacy_state)
     _mutate(
-        lambda cut: restored.prepare_for_restart(cut, require_logical_segments=True)
+        lambda cut: restored.prepare_for_restart(cut, require_logical_selection=True)
     )
     recovered = restored.get_group("g7")
 
@@ -844,6 +843,24 @@ def test_legacy_cc_restart_redispatches_the_complete_group() -> None:
         RolloutAttemptStatus.RESERVED,
         RolloutAttemptStatus.RESERVED,
     ]
+
+
+def test_legacy_segment_checkpoint_redispatches_the_complete_group() -> None:
+    state = _sealed_attempt_state()
+    state["schema_version"] = 3
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    attempt.pop("logical_selection")
+    attempt["logical_segments"] = [{"legacy_segment": True}]
+
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    _mutate(
+        lambda cut: restored.prepare_for_restart(cut, require_logical_selection=True)
+    )
+
+    attempt = restored.get_group("g7").siblings[0].current_attempt
+    assert attempt.status is RolloutAttemptStatus.ABANDONED
+    assert attempt.logical_selection is None
+    assert restored.expected_staging_keys() == set()
 
 
 @pytest.mark.parametrize(
@@ -919,7 +936,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
         mask_sample,
         evidence,
         log_contexts,
-        logical_segments,
+        logical_selections,
     ) = restored.finalization_inputs("g7")
 
     assert physical_ids == gate_ids
@@ -929,7 +946,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     assert mask_sample == [True, False]
     assert evidence == [None, None]
     assert log_contexts == [None, None]
-    assert logical_segments == [None, None]
+    assert logical_selections == [None, None]
 
     state["schema_version"] = ROLLOUT_RECOVERY_SCHEMA_VERSION + 1
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):

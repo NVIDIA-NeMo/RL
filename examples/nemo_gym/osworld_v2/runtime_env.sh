@@ -10,24 +10,25 @@ set -euo pipefail
 export OSWORLD_SANDBOX_PROVIDER="${OSWORLD_SANDBOX_PROVIDER:-opensandbox}"
 case "$OSWORLD_SANDBOX_PROVIDER" in
   opensandbox)
-    if [[ -z "${OPENSANDBOX_DOMAIN:-}" && -n "${OPENSANDBOX_BASE_URL:-}" ]]; then
-      opensandbox_host="${OPENSANDBOX_BASE_URL#*://}"
-      export OPENSANDBOX_DOMAIN="${opensandbox_host%%/*}"
+    if [[ -z "${OPENSANDBOX_BASE_URL:-}" && -n "${OPENSANDBOX_DOMAIN:-}" ]]; then
+      export OPENSANDBOX_BASE_URL="$OPENSANDBOX_DOMAIN"
     fi
-    : "${OPENSANDBOX_DOMAIN:?}"
-    export OSWORLD_SANDBOX_CONFIG=resources_servers/osworld/configs/opensandbox_osworld.yaml
+    : "${OPENSANDBOX_BASE_URL:?}"
+    export OSWORLD_SANDBOX_CONFIG=benchmarks/osworld/configs/osworld_nemo_rl_opensandbox.yaml
     ;;
   agentenv)
-    : "${AGENTENV_ENDPOINT:?}"
+    if [[ -z "${AGENTENV_URL:-}" && -n "${AGENTENV_ENDPOINT:-}" ]]; then
+      export AGENTENV_URL="$AGENTENV_ENDPOINT"
+    fi
+    : "${AGENTENV_URL:?}"
     : "${AGENTENV_API_KEY:?}"
-    : "${AGENTENV_TLS_CA:?}"
-    test -r "$AGENTENV_TLS_CA"
     export AGENTENV_TEMPLATE="${AGENTENV_TEMPLATE:-osworld-slim-pixel-parity-20261001}"
-    export OSWORLD_SANDBOX_CONFIG=nemo_gym/sandbox/providers/agentenv/configs/agentenv.yaml
-    # aiohttp uses Python's default SSL context; the evaluator's local
-    # forwarders load the same pinned CA explicitly.
-    export SSL_CERT_FILE="$AGENTENV_TLS_CA"
-    export NEMO_GYM_PROXY_CA_BUNDLE="$AGENTENV_TLS_CA"
+    export OSWORLD_SANDBOX_CONFIG=benchmarks/osworld/configs/osworld_nemo_rl_agentenv.yaml
+    if [[ -n "${AGENTENV_TLS_CA:-}" ]]; then
+      test -r "$AGENTENV_TLS_CA"
+      export SSL_CERT_FILE="$AGENTENV_TLS_CA"
+      export NEMO_GYM_PROXY_CA_BUNDLE="$AGENTENV_TLS_CA"
+    fi
     ;;
   *)
     echo "OSWORLD_SANDBOX_PROVIDER must be opensandbox or agentenv" >&2
