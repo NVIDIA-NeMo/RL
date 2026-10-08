@@ -527,10 +527,10 @@ over-statement of the fetch phase and an under-statement overall.
 `volume_mb` counts *transfers*, not data size, and two things follow from
 that. A byte written and later read is counted on both sides. And every
 reporting process is summed, so four ranks each fetching their own shard
-count four times. Both are correct for "what crossed the wire" -- on a real
-step get moved ~23 MB against put's ~18 MB, because every DP rank fetches
-its shard once for the logprob pass and again for the train pass. Neither
-is correct for "how big was the batch", which these series cannot answer.
+count four times. Both are correct for "what crossed the wire" -- every DP
+rank fetches its shard once for the logprob pass and again for the train
+pass, so get counts the batch twice. Neither is correct for "how big was the
+batch", which these series cannot answer.
 
 The rollout actor is in the fan-out (`grpo_train_sync` registers it via
 `TQPolicy.add_data_plane_snapshot_source`), so `kv_first_write` -- the write
