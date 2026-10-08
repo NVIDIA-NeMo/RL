@@ -1117,7 +1117,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     unsupported = [
         name
         for name, enabled in (
-            ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
             ("reward_scaling", algo_cfg.reward_scaling.enabled),
             ("reward_shaping", algo_cfg.reward_shaping.enabled),
         )
@@ -1191,6 +1190,32 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "but max_buffered_rollouts is still validated against the wider one. "
             "Remove it, or add a `ppo` block with policy_training_start_step > 0."
         )
+    
+    # Filtering reports a zero-variance group as a dropped prompt, so the dropped-prompt
+    # knobs decide what it costs. Neither default substitutes one, which would silently
+    # shrink steps instead of resampling.
+    if algo_cfg.use_dynamic_sampling:
+        rollout_failure = async_config.rollout_failure
+        if rollout_failure.on_dropped_prompt != "replace":
+            raise ValueError(
+                "grpo.use_dynamic_sampling requires "
+                'async_rl.rollout_failure.on_dropped_prompt="replace"; with '
+                f'"{rollout_failure.on_dropped_prompt}" a filtered group is never '
+                "substituted, so each zero-variance group silently shrinks its "
+                "training step instead of being resampled."
+            )
+        if rollout_failure.max_replacement_attempts < 1:
+            raise ValueError(
+                "grpo.use_dynamic_sampling requires "
+                "async_rl.rollout_failure.max_replacement_attempts >= 1; at 0 no "
+                "replacement is ever attempted for a filtered group."
+            )
+        if algo_cfg.num_generations_per_prompt < 2:
+            raise ValueError(
+                "grpo.use_dynamic_sampling requires num_generations_per_prompt >= 2: "
+                "a single generation has no within-group spread, so every group "
+                f"would be filtered (got {algo_cfg.num_generations_per_prompt})."
+            )
 
     if not is_ppo_run(master_config):
         # A value block without `ppo` is inert -- nothing builds the critic --
