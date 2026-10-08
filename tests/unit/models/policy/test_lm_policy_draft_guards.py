@@ -32,7 +32,7 @@ def _draft_config(
             "pipeline_model_parallel_size": pipeline_model_parallel_size,
             "use_fused_linear_logprobs": use_fused_linear_logprobs,
         },
-        "dtensor_cfg": {"enabled": False},
+        "automodel_cfg": {"enabled": False},
         "draft": {"enabled": True, "speculator_type": "eagle3"},
         "sequence_packing": {"enabled": sequence_packing_enabled},
     }
@@ -91,7 +91,7 @@ def test_draft_with_fused_linear_logprobs_is_rejected(sequence_packing_enabled):
 def _automodel_dspark_config():
     return {
         "megatron_cfg": {"enabled": False},
-        "dtensor_cfg": {"enabled": True},
+        "automodel_cfg": {"enabled": True},
         "draft": {
             "enabled": True,
             "speculator_type": "dspark",
@@ -103,15 +103,15 @@ def _automodel_dspark_config():
 
 def test_automodel_dspark_draft_config_passes_backend_guards():
     """dspark on the Automodel (DTensor v2) backend must clear the
-    "requires the DTensor backend" guard in lm_policy.py -- every other test
+    "requires the Automodel backend" guard in lm_policy.py -- every other test
     in this file only covers the Megatron backend, so a regression like
-    dtensor_v2_enable silently keying off the removed dtensor_cfg._v2 (which
-    made this guard reject every valid Automodel draft config) would not have
-    been caught here."""
+    automodel_enabled silently keying off a removed/renamed config field
+    (which made this guard reject every valid Automodel draft config) would
+    not have been caught here."""
     try:
         _init_policy(_automodel_dspark_config())
     except ValueError as e:
-        assert "requires the DTensor backend" not in str(e)
+        assert "requires the Automodel backend" not in str(e)
     except Exception:
         # Reaching config plumbing beyond the draft guards is sufficient.
         pass

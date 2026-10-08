@@ -1604,7 +1604,7 @@ def setup(
                 "FP8 KV cache can only be used together with FP8 model weights."
             )
         if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
-            assert policy_config["dtensor_cfg"]["enabled"] == False, (
+            assert not (policy_config.get("automodel_cfg") or {}).get("enabled"), (
                 "DTensor backend is not supported with kv cache fp8 enabled."
             )
             assert not should_use_async_rollouts(generation_config), (
@@ -4914,7 +4914,7 @@ def async_grpo_train(
 
             traceback.print_exc()
             _flush_collector_telemetry()
-            return
+            raise
     else:
         print("🔄 Preparing policy generation for inference...")
         try:
@@ -4926,13 +4926,13 @@ def async_grpo_train(
 
             traceback.print_exc()
             _flush_collector_telemetry()
-            return
+            raise
 
     # Generation must hold the policy's real weights before any backend starts
     # collecting. In particular, vLLM and Dynamo start with dummy weights when
     # the first refit supplies model parameters.
     ray.get(trajectory_collector.set_weight_version.remote(weight_version))
-    trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader))
+    ray.get(trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader)))
     print("📦 Started continuous background trajectory collection")
 
     print("✅ Policy generation setup complete, proceeding to validation...")

@@ -1530,6 +1530,7 @@ class AsyncNemoGymRolloutImpl:
 
         # Aggregate metrics across all samples.
         n = len(completions)
+        truncation_rate = sum(truncated) / n
         rollout_metrics: dict[str, Any] = {
             **calculate_single_metric(total_reward, n, "total_reward"),
             # turn metrics
@@ -1545,7 +1546,8 @@ class AsyncNemoGymRolloutImpl:
             "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
             # truncated metrics
             "natural_termination_rate": sum(not t for t in truncated) / n,
-            "truncation_rate": sum(truncated) / n,
+            "truncation_rate": truncation_rate,
+            f"{agent_name}/truncation_rate": truncation_rate,
         }
 
         # Agent-level metrics. Receipts are lineage records, not agent
@@ -1564,6 +1566,20 @@ class AsyncNemoGymRolloutImpl:
                 rollout_metrics.update(
                     calculate_single_metric(values, n, f"{agent_name}/{key}")
                 )
+
+        # Emit authoritative live token metrics after full-result metrics so
+        # similarly named environment metadata cannot overwrite them. In receipt
+        # mode these come from the manifest-derived token counts above.
+        rollout_metrics.update(
+            calculate_single_metric(
+                total_tokens, n, f"{agent_name}/total_tokens_per_sample"
+            )
+        )
+        rollout_metrics.update(
+            calculate_single_metric(
+                assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
+            )
+        )
         if self._log_full_result_tables:
             rollout_metrics[f"{agent_name}/full_result"] = Table(
                 data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],

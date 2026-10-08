@@ -16,7 +16,7 @@ DTensor-v2 drafters and their config surface. For GRPO fundamentals, see the
 
 | `policy.draft.speculator_type` | Drafter family | Checkpoint examples | Requires |
 | --- | --- | --- | --- |
-| `"dspark"` | DSpark block drafter (multi-token block proposal) | `deepseek-ai/dspark_qwen3_8b_block7` | `policy.dtensor_cfg.enabled=true` |
+| `"dspark"` | DSpark block drafter (multi-token block proposal) | `deepseek-ai/dspark_qwen3_8b_block7` | `policy.automodel_cfg.enabled=true` |
 | `"dflash"` | DFlash block drafter (markov-free, confidence-free variant of DSpark) | `RedHatAI/*-speculator.dflash` | same as `dspark` |
 | `"eagle3"` | EAGLE3 TTT (test-time-training) drafter | `RedHatAI/*-speculator.eagle3`, SGLang SpecForge native-flat checkpoints (e.g. `lmsys/SGLang-EAGLE3-*`) | DTensor v2 (this guide) **or** Megatron (see the [Eagle3 guide](eagle3-speculative-decoding.md)) |
 
@@ -33,7 +33,7 @@ Draft co-training requires the Automodel backend:
 
 ```yaml
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
 ```
 
@@ -157,8 +157,8 @@ layout, `norm_before_residual`) are always read from the draft checkpoint's
 
 ### Limitations
 
-- Not compatible with `policy.dtensor_cfg.sequence_parallel`,
-  `policy.dtensor_cfg.lora_cfg.enabled`, or `policy.sequence_packing.enabled`.
+- Not compatible with `policy.automodel_cfg.sequence_parallel`,
+  `policy.automodel_cfg.lora_cfg.enabled`, or `policy.sequence_packing.enabled`.
 
 ## How It Works
 

@@ -119,16 +119,16 @@ def draft_full_refit_enabled(policy_cfg: dict) -> bool:
 
     DTensor is always the v2 (Automodel) backend now (DTensor v1 and its
     dtensor_cfg._v2 toggle have been removed upstream), so
-    dtensor_cfg.enabled alone identifies the DTensor v2 path.
+    automodel_cfg.enabled alone identifies the DTensor v2 path.
     """
     from nemo_rl.models.policy.draft_config import coerce_draft_config
 
     draft_config = coerce_draft_config(policy_cfg.get("draft"))
-    dtensor_cfg = policy_cfg.get("dtensor_cfg") or {}
+    automodel_cfg = policy_cfg.get("automodel_cfg") or {}
     return (
         draft_config is not None
         and bool(draft_config.enabled)
-        and bool(dtensor_cfg.get("enabled", False))
+        and bool(automodel_cfg.get("enabled", False))
     )
 
 

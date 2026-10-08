@@ -118,12 +118,12 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
 
         Note: Value models don't need a reference model since they don't compute KL divergence.
         """
-        if config["dtensor_cfg"]["context_parallel_size"] > 1:
+        if config["automodel_cfg"]["context_parallel_size"] > 1:
             raise NotImplementedError(
                 "DTensorValueWorkerV2 cannot be initialized with "
                 "context_parallel_size > 1 because its get_values() scoring path "
                 "does not support context parallelism. Set "
-                "value.dtensor_cfg.context_parallel_size=1."
+                "value.automodel_cfg.context_parallel_size=1."
             )
 
         # Apply patches
@@ -145,7 +145,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         self.cfg = config
         self.tokenizer = tokenizer
         self.lora_enabled = (
-            config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
+            config["automodel_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
 
         assert (
@@ -189,9 +189,9 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         self.cp_size = distributed_manager.cp_size
 
         # Initialize checkpoint manager
-        dtensor_cfg = config["dtensor_cfg"]
+        automodel_cfg = config["automodel_cfg"]
         checkpoint_config = build_checkpoint_config(
-            dtensor_cfg,
+            automodel_cfg,
             model_repo_id=config["model_name"],
             dequantize_base_checkpoint=config.get("dequantize_base_checkpoint", False),
             is_peft=self.lora_enabled,
@@ -303,7 +303,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         )
 
         # Setup cache clearing callback if configured
-        empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
+        empty_cache_steps = self.cfg.get("automodel_cfg", {}).get(
             "clear_cache_every_n_steps"
         )
         if empty_cache_steps:

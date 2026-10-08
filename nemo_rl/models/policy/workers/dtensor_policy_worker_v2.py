@@ -288,7 +288,7 @@ class DTensorPolicyWorkerV2Impl(
             self.processor = None
         self.is_vlm = self.processor is not None
         self.lora_enabled = (
-            config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
+            config["automodel_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
 
         print(f"Initializing DTensorPolicyWorkerV2 with is_vlm={self.is_vlm}")
@@ -335,9 +335,9 @@ class DTensorPolicyWorkerV2Impl(
         requires_synchronous_checkpoint = (
             getattr(runtime_config.model_config, "model_type", None) == "deepseek_v4"
         )
-        dtensor_cfg = config["dtensor_cfg"]
+        automodel_cfg = config["automodel_cfg"]
         checkpoint_config = build_checkpoint_config(
-            dtensor_cfg,
+            automodel_cfg,
             model_repo_id=config["model_name"],
             dequantize_base_checkpoint=config.get("dequantize_base_checkpoint", False),
             is_peft=self.lora_enabled,
@@ -503,7 +503,7 @@ class DTensorPolicyWorkerV2Impl(
         )
 
         # Setup cache clearing callback if configured
-        empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
+        empty_cache_steps = self.cfg.get("automodel_cfg", {}).get(
             "clear_cache_every_n_steps"
         )
         if empty_cache_steps:

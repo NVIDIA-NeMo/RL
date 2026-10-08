@@ -63,7 +63,7 @@ policy:
   - milestones:
     - 5
 
-  dtensor_cfg:
+  automodel_cfg:
     tensor_parallel_size: 2
     activation_checkpointing: true
     env_vars:
