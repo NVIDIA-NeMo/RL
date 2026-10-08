@@ -13,6 +13,13 @@ policy:
   # (logprob_chunk_size); raise pipeline_model_parallel_size to 2 if the learner
   # runs out of memory on the longest rows.
   max_total_sequence_length: 262144
+  megatron_cfg:
+    # The identity fast run (2026-10-07) trained step 1 at PP=1 and then ran out of
+    # learner memory in the step-2 backward pass with rows of 70-80k tokens
+    # (175 GiB in use on one GPU); 32-turn episodes reach 118k-token prompts.
+    # Two pipeline stages halve the per-GPU layer count; TP8 x PP2 x DP2 keeps
+    # EP16 valid on 32 training GPUs.
+    pipeline_model_parallel_size: 2
   generation:
     vllm_kwargs:
       # Do not size the prefill chunk to the whole window: vLLM profiles and
