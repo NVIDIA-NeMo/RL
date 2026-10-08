@@ -1311,10 +1311,6 @@ class MOPDTeacherScorer:
             )
             metrics["turns_aligned"] += 1
 
-        if turns:
-            metrics["samples_with_valid_alignment"] += 1
-        else:
-            metrics["samples_fully_masked"] += 1
         return _PreparedSample(teacher_ids=tuple(teacher_ids), turns=tuple(turns))
 
     def _project(
@@ -1394,6 +1390,11 @@ class MOPDTeacherScorer:
                     )
                     valid_mask[row, student_start:student_end] = True
 
+        # Count coverage from the final mask so early-returned, failed, and
+        # fully rejected samples all count as fully masked.
+        rows_with_valid_tokens = int(valid_mask.any(dim=1).sum().item())
+        metrics["samples_with_valid_alignment"] = rows_with_valid_tokens
+        metrics["samples_fully_masked"] = batch_size - rows_with_valid_tokens
         metrics["valid_tokens"] = int(valid_mask.sum().item())
         return projected, valid_mask
 

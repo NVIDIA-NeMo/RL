@@ -947,3 +947,61 @@ def test_scorer_emits_every_counter_on_clean_batch() -> None:
     missing = sorted(name for name in counters if f"mopd/{name}" not in result.metrics)
     assert not missing, f"clean batch omits counters: {missing}"
 
+
+def test_sample_coverage_counts_every_fully_masked_row(monkeypatch) -> None:
+    """Coverage comes from the final mask, so every masked row is counted."""
+    real_align_token_ids = scoring.align_token_ids
+
+    def reject_cd_only_turn(student_ids, teacher_ids, **kwargs):
+        pairs = real_align_token_ids(student_ids, teacher_ids, **kwargs)
+        if list(student_ids) == [4, 5]:
+            for pair in pairs:
+                pair.is_correct = False
+        return pairs
+
+    monkeypatch.setattr(scoring, "align_token_ids", reject_cd_only_turn)
+    teacher_group = _TeacherGroup()
+    teacher_group.cfg = {"max_total_sequence_length": 3}
+    scorer = scoring.build_mopd_teacher_scorer(
+        student_tokenizer=_PieceTokenizer(["q", "a", "b", "c", "d"]),
+        teacher_group=teacher_group,
+        cross_tokenizer_config=_cross_tokenizer_config(),
+        teacher_tokenizer=_PieceTokenizer(["q", "ab", "cd"]),
+    )
+
+    def message_log(answer_ids):
+        return [
+            {"role": "user", "content": "q", "token_ids": [1]},
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": answer_ids,
+                "generation_logprobs": [0.0] * len(answer_ids),
+            },
+        ]
+
+    result = scorer.score(
+        input_ids=torch.tensor(
+            [
+                [1, 2, 3, 4, 5, 0, 0],  # aligned
+                [1, 2, 3, 4, 5, 2, 3],  # teacher transcript over the length cap
+                [1, 0, 0, 0, 0, 0, 0],  # preparation raises
+                [1, 4, 5, 0, 0, 0, 0],  # every alignment pair is rejected
+            ]
+        ),
+        input_lengths=torch.tensor([5, 7, 1, 3]),
+        message_logs=[
+            message_log([2, 3, 4, 5]),
+            message_log([2, 3, 4, 5, 2, 3]),
+            [{"content": "q", "token_ids": [1]}],  # missing role
+            message_log([4, 5]),
+        ],
+    )
+
+    assert result.valid_mask.any(dim=1).tolist() == [True, False, False, False]
+    assert result.metrics["mopd/teacher_transcripts_too_long"] == 1.0
+    assert result.metrics["mopd/sample_prepare_failures"] == 1.0
+    assert result.metrics["mopd/incorrect_alignment_pairs_masked"] >= 1.0
+    assert result.metrics["mopd/samples"] == 4.0
+    assert result.metrics["mopd/samples_with_valid_alignment"] == 1.0
+    assert result.metrics["mopd/samples_fully_masked"] == 3.0
