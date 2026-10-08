@@ -38,14 +38,14 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from nemo_rl.algorithms.logits_sampling_utils import (
-    TrainingSamplingParams,
-    need_top_k_or_top_p_filtering,
-)
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
+)
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
 from nemo_rl.algorithms.single_controller_utils.utils import (
