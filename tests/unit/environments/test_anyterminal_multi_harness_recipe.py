@@ -28,6 +28,10 @@ SUPER_SYNC_4N_DEBUG_RECIPE = (
     REPO_ROOT
     / "examples/nemo_gym/grpo_anyterminal_multi_harness_nemotron_super_omni_sync_4n_debug_single_controller.yaml"
 )
+NANO_OMNI_SYNC_2N_DEBUG_RECIPE = (
+    REPO_ROOT
+    / "examples/nemo_gym/grpo_anyterminal_multi_harness_nemotron_nano_omni_sync_2n_debug_single_controller.yaml"
+)
 
 
 def test_anyterminal_multi_harness_recipe_resolves_async_training_contract():
@@ -177,3 +181,46 @@ def test_super_omni_sync_debug_recipes_keep_native_context_and_minimum_training_
         assert config["grpo"]["num_prompts_per_step"] == 4
         assert config["grpo"]["num_generations_per_prompt"] == 2
         assert config["policy"]["train_global_batch_size"] == 8
+
+
+def test_nano_omni_sync_2n_debug_recipe_resolves_multi_harness_topology():
+    register_omegaconf_resolvers()
+    config = OmegaConf.to_container(
+        load_config(NANO_OMNI_SYNC_2N_DEBUG_RECIPE), resolve=True
+    )
+
+    assert config["policy"]["model_name"] == (
+        "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
+    )
+    assert config["cluster"]["num_nodes"] == 2
+    assert config["policy"]["generation"]["colocated"] == {
+        "enabled": False,
+        "resources": {"gpus_per_node": 8, "num_nodes": 1},
+    }
+    assert config["policy"]["generation"]["vllm_cfg"][
+        "reasoning_parser_plugin"
+    ].endswith("nano_v3_reasoning_parser.py")
+    assert config["policy"]["generation"]["vllm_cfg"][
+        "http_server_serving_chat_kwargs"
+    ]["reasoning_parser"] == "nano_v3"
+    assert config["env"]["nemo_gym"]["fan_out"] == {
+        "anyterminal_multi_harness": [
+            "anyterminal_opencode",
+            "anyterminal_openclaw",
+            "anyterminal_pi",
+            "anyterminal_hermes",
+        ]
+    }
+    assert config["grpo"]["num_prompts_per_step"] == 4
+    assert config["grpo"]["num_generations_per_prompt"] == 2
+    assert config["policy"]["train_global_batch_size"] == 8
+    assert config["async_rl"]["sampler"]["max_lookahead_versions"] == 0
+    assert config["data_plane"]["enabled"] is True
+    assert config["token_capture"]["enabled"] is True
+    assert config["env"]["nemo_gym"]["anyterminal_opencode"][
+        "responses_api_agents"
+    ]["anyterminal_agent"]["agent_kwargs"] == {
+        "context_window": 8192,
+        "max_input_tokens": 3584,
+        "max_output_tokens": 4096,
+    }
