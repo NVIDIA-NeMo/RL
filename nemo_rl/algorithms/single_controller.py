@@ -94,7 +94,6 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _write_latest_checkpoint_status,
-    aggregate_rollout_metrics,
 )
 from nemo_rl.algorithms.metric_utils import (
     SETUP_TIMING_PREFIX,
@@ -163,6 +162,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.metric_utils import Metric, reduce_step
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
@@ -712,6 +712,7 @@ class SingleControllerActor:
         self._trainer_version: int = restored_trainer_version
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
+        self._legacy_rollout_metrics_warned = False
         self._step_log_dict: dict[str, list] = {
             "reward_partials": [],
             "advantage_partials": [],
@@ -3301,15 +3302,25 @@ class SingleControllerActor:
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
-                per_group_rollout_metrics: dict[str, list[Any]] = {}
+                declared_rollout_metrics: list[dict[str, Metric]] = []
                 for group_metrics in selected_rollout_metrics:
-                    for metric_name, value in group_metrics.items():
-                        per_group_rollout_metrics.setdefault(metric_name, []).append(
-                            value
-                        )
-                step_metrics.update(
-                    aggregate_rollout_metrics(per_group_rollout_metrics)
-                )
+                    declared = [
+                        isinstance(value, Metric) for value in group_metrics.values()
+                    ]
+                    if not all(declared):
+                        if any(declared):
+                            raise ValueError(
+                                "Rollout group mixes declared and plain metrics"
+                            )
+                        if not self._legacy_rollout_metrics_warned:
+                            log.warning(
+                                "Omitting legacy replay rollout metrics without declared "
+                                "reductions; selected-row validity accounting is retained"
+                            )
+                            self._legacy_rollout_metrics_warned = True
+                        continue
+                    declared_rollout_metrics.append(group_metrics)
+                step_metrics.update(reduce_step(declared_rollout_metrics))
                 try:
                     step_metrics.update(
                         await asyncio.to_thread(self._gen.get_step_metrics)

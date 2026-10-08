@@ -23,8 +23,13 @@ import ray
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
-from nemo_rl.data_plane.schema import ROLLOUT_METRICS
-from nemo_rl.experience.metric_utils import RolloutTelemetry, calculate_single_metric
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, UNKNOWN_ROLLOUT_ENVIRONMENT
+from nemo_rl.experience.metric_utils import (
+    Metric,
+    RolloutTelemetry,
+    distribution,
+    rollout_environment_metric_component,
+)
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.venvs import make_actor_runtime_env
@@ -49,7 +54,7 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
-    rollout_environment: str = "unknown"
+    rollout_environment: str = UNKNOWN_ROLLOUT_ENVIRONMENT
     telemetry: tuple[Optional[RolloutTelemetry], ...] = ()
 
 
@@ -116,7 +121,9 @@ class RolloutReassemblerActor:  # pragma: no cover
         if request.telemetry and len(request.telemetry) != len(request.rollout_ids):
             raise ValueError("Finalizer telemetry must align with logical siblings")
         if any(
-            snapshot is not None and snapshot.environment != request.rollout_environment
+            snapshot is not None
+            and rollout_environment_metric_component(snapshot.environment)
+            != request.rollout_environment
             for snapshot in request.telemetry
         ):
             raise ValueError("Finalizer telemetry environment mismatch")
@@ -155,15 +162,18 @@ class RolloutReassemblerActor:  # pragma: no cover
                     # placeholder False for truncated. Match the finalizer's
                     # actual length-cap flag, never log that placeholder.
                     truncated = int(length == self._max_seq_len)
-                    prefix = f"environment/{snapshot.environment}"
-                    metrics.update(
-                        calculate_single_metric([truncated], 1, f"{prefix}/truncated")
-                    )
+                    prefix = f"environment/{request.rollout_environment}"
+                    metrics.update(distribution(f"{prefix}/truncated", [truncated]))
                     for scope in ("", f"{prefix}/"):
-                        metrics[f"{scope}truncation_rate"] = float(truncated)
-                        metrics[f"{scope}natural_termination_rate"] = float(
-                            1 - truncated
+                        metrics[f"{scope}truncation_rate"] = Metric([truncated], "mean")
+                        metrics[f"{scope}natural_termination_rate"] = Metric(
+                            [1 - truncated], "mean"
                         )
+                    # Preserve the producer's raw agent alias as well as the
+                    # sanitized environment namespace, including names with '/'.
+                    metrics[f"{snapshot.environment}/truncation_rate"] = Metric(
+                        [truncated], "mean"
+                    )
                     selected_metrics.append(metrics)
                 result.meta.extra_info[ROLLOUT_METRICS] = selected_metrics
             else:

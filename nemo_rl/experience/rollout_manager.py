@@ -40,7 +40,11 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import VLLM_CONTENT_KEY, VLLM_PROMPT_KEYS
-from nemo_rl.data_plane.schema import MASK_SAMPLE
+from nemo_rl.data_plane.schema import (
+    MASK_SAMPLE,
+    ROLLOUT_ENVIRONMENT_TAG,
+    UNKNOWN_ROLLOUT_ENVIRONMENT,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
@@ -65,9 +69,11 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.metric_utils import (
+    Metric,
     RolloutTelemetry,
-    calculate_single_metric,
-    pct,
+    distribution,
+    metrics_from_plain,
+    optional_distributions,
 )
 from nemo_rl.experience.metric_utils import (
     rollout_environment_metric_component as _rollout_environment_metric_component,
@@ -86,7 +92,6 @@ from nemo_rl.experience.rollouts import (
     _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
     _dummy_routed_experts_for_tokens,
-    _effort_shaping_metrics,
     _EffortShapingMetrics,
     _find_routed_experts_template,
     _tensorize_by_key,
@@ -109,6 +114,25 @@ from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
 RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
+
+
+def _declared_effort_metrics(shaping: _EffortShapingMetrics) -> dict[str, Metric]:
+    """Keep effort observations raw, especially medians of streamed siblings."""
+    metrics: dict[str, Metric] = {}
+    for name, values in (
+        ("length_reward_low", shaping.length_rewards_low),
+        ("reward_low", shaping.rewards_low),
+        ("length_low", shaping.low_lengths),
+        ("length_high", shaping.high_lengths),
+    ):
+        if values:
+            metrics[f"mean_{name}"] = Metric(list(values), "mean")
+    if shaping.low_lengths:
+        metrics["median_length_low"] = Metric(list(shaping.low_lengths), "median")
+    if shaping.high_lengths:
+        metrics["median_length_high"] = Metric(list(shaping.high_lengths), "median")
+    return metrics
+
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
@@ -573,22 +597,27 @@ class AsyncRolloutImpl:
                 all_sample_metrics,
                 environment=input_sample["task_name"],
             )
-            rollout_metrics["mean_prompt_length"] = float(
+            prompt_length = float(
                 sum(
                     len(message["token_ids"]) for message in input_sample["message_log"]
                 )
             )
             prefix = f"environment/{_rollout_environment_metric_component(input_sample['task_name'])}"
             rollout_metrics.update(
-                calculate_single_metric(
-                    [rollout_metrics["mean_prompt_length"]] * len(completions),
-                    len(completions),
+                distribution(
                     f"{prefix}/prompt_tokens_per_sample",
+                    [prompt_length] * len(completions),
                 )
             )
+            rollout_metrics["mean_prompt_length"] = Metric([prompt_length], "mean")
 
         timer.stop(f"{timer_prefix}/total")
-        rollout_metrics.update(timer.get_timing_metrics("sum"))
+        rollout_metrics.update(
+            {
+                name: Metric([value], "mean")
+                for name, value in timer.get_timing_metrics("sum").items()
+            }
+        )
 
         return PromptGroupRecord(
             prompt_idx=input_sample["idx"],
@@ -596,7 +625,7 @@ class AsyncRolloutImpl:
             extra_env_info=input_sample["extra_env_info"],
             metadata={
                 "task_name": input_sample["task_name"],
-                "rollout_environment": _rollout_environment_metric_component(
+                ROLLOUT_ENVIRONMENT_TAG: _rollout_environment_metric_component(
                     input_sample["task_name"]
                 ),
             },
@@ -884,7 +913,7 @@ class AsyncRolloutImpl:
         all_sample_metrics: list[dict],
         *,
         environment: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Metric]:
         """Aggregate per-sample metrics across all completions."""
         # Prepare lists of values for each metric.
         total_reward = [c.reward for c in completions]
@@ -906,70 +935,64 @@ class AsyncRolloutImpl:
 
         # Aggregate metrics across all samples.
         n = len(all_sample_metrics)
-        rollout_metrics: dict[str, Any] = {
-            **calculate_single_metric(total_reward, n, "total_reward"),
-            # turn metrics
-            "total_turns": sum(turn_count),
-            **calculate_single_metric(turn_count, n, "turns_per_sample"),
-            "turns_per_sample/p95": pct(turn_count, 95),
-            "turns_per_sample/p99": pct(turn_count, 99),
-            # token metrics
-            **calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
-            **calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
-            **calculate_single_metric(env_tokens, n, "env_tokens_per_sample"),
-            # max_gen_tokens_per_turn: Diagnostic for long single generations
-            "max_gen_tokens_per_turn/max": max(max_gen_tokens_per_turn),
-            "max_gen_tokens_per_turn/mean": sum(max_gen_tokens_per_turn) / n,
-            "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
-            # truncated metrics
-            **calculate_single_metric(truncated, n, "truncated"),
-            **calculate_single_metric(terminated, n, "terminated"),
-            **calculate_single_metric(max_turns_reached, n, "max_turns_reached"),
-            "truncation_rate": sum(truncated) / n,
-            "natural_termination_rate": sum(terminated) / n,
-            "max_turns_reached_rate": sum(max_turns_reached) / n,
-        }
-
-        # Reuse V1's reducer for legacy aliases and per-turn/worker telemetry.
-        # These adapters only describe completed rows; generation and masks
-        # remain untouched.
-        rollout_metrics.update(
-            _aggregate_multi_turn_rollout_metrics(
-                [
-                    {
-                        **sample,
-                        "total_reward": completion.reward,
-                        "truncated": completion.truncated,
-                        "max_gen_tokens_per_turn": longest,
-                    }
-                    for sample, completion, longest in zip(
-                        all_sample_metrics,
-                        completions,
-                        max_gen_tokens_per_turn,
-                        strict=True,
-                    )
-                ]
-            )
+        rollout_metrics: dict[str, Metric] = {}
+        for name, values in (
+            ("total_reward", total_reward),
+            ("turns_per_sample", turn_count),
+            ("total_tokens_per_sample", total_tokens),
+            ("gen_tokens_per_sample", assistant_tokens),
+            ("env_tokens_per_sample", env_tokens),
+            ("max_gen_tokens_per_turn", max_gen_tokens_per_turn),
+            ("truncated", truncated),
+            ("terminated", terminated),
+            ("max_turns_reached", max_turns_reached),
+        ):
+            rollout_metrics.update(distribution(name, values))
+        # This is the sole V1 plain-number adapter. Legacy aliases retain V1's
+        # numeric reduction rules; no names are reinterpreted at step close.
+        native = _aggregate_multi_turn_rollout_metrics(
+            [
+                {
+                    **sample,
+                    "total_reward": completion.reward,
+                    "truncated": completion.truncated,
+                    "max_gen_tokens_per_turn": longest,
+                }
+                for sample, completion, longest in zip(
+                    all_sample_metrics,
+                    completions,
+                    max_gen_tokens_per_turn,
+                    strict=True,
+                )
+            ]
         )
         rollout_metrics.update(
-            calculate_single_metric(
-                max_gen_tokens_per_turn, n, "max_gen_tokens_per_turn"
+            metrics_from_plain(
+                {
+                    **native,
+                    # Supply the raw counterparts for V1 summaries that do not expose
+                    # their own histogram, so the adapter does not average percentiles.
+                    **{
+                        f"{name}/histogram": metric.values
+                        for name, metric in rollout_metrics.items()
+                        if metric.reduce == "dist"
+                    },
+                }
             )
         )
+        if "per_worker_token_counts" in native:
+            rollout_metrics["per_worker_token_counts"] = Metric(
+                [native["per_worker_token_counts"]], "sum_by_key"
+            )
         if environment is not None:
             prefix = f"environment/{_rollout_environment_metric_component(environment)}"
-            # Worker accounting stays global. Per-turn histograms get their own
-            # distribution family so they cannot be mistaken for sample counts.
-            for name, value in list(rollout_metrics.items()):
+            for name, metric in list(rollout_metrics.items()):
                 if name != "per_worker_token_counts" and not name.startswith(
                     "histogram/"
                 ):
-                    rollout_metrics[f"{prefix}/{name}"] = value
-            rollout_metrics[f"{prefix}/sample_count"] = n
+                    rollout_metrics[f"{prefix}/{name}"] = metric
+            rollout_metrics[f"{prefix}/sample_count"] = Metric([n], "sum")
             for name, values in (
-                ("terminated", terminated),
-                ("truncated", truncated),
-                ("max_turns_reached", max_turns_reached),
                 (
                     "gen_tokens_per_turn",
                     [t for m in all_sample_metrics for t in m["turn_gen_tokens"]],
@@ -984,9 +1007,7 @@ class AsyncRolloutImpl:
                 ),
             ):
                 if values:
-                    rollout_metrics.update(
-                        calculate_single_metric(values, len(values), f"{prefix}/{name}")
-                    )
+                    rollout_metrics.update(distribution(f"{prefix}/{name}", values))
         return rollout_metrics
 
 
@@ -1094,7 +1115,12 @@ class AsyncNemoGymRolloutImpl:
                 )
 
         timer.stop(f"{timer_prefix}/total")
-        rollout_metrics.update(timer.get_timing_metrics("sum"))
+        rollout_metrics.update(
+            {
+                name: Metric([value], "mean")
+                for name, value in timer.get_timing_metrics("sum").items()
+            }
+        )
 
         resolved_agent_ref = rollout_inputs[0].get("agent_ref")
         if not isinstance(resolved_agent_ref, dict):
@@ -1114,7 +1140,7 @@ class AsyncNemoGymRolloutImpl:
             extra_env_info=record_extra_env_info,
             metadata={
                 "task_name": "nemo_gym",
-                "rollout_environment": _rollout_environment_metric_component(
+                ROLLOUT_ENVIRONMENT_TAG: _rollout_environment_metric_component(
                     _nemo_gym_metric_namespace(rollout_inputs[0])
                 ),
             },
@@ -1279,12 +1305,12 @@ class AsyncNemoGymRolloutImpl:
                 row_metrics = self._compute_rollout_metrics(row_completions, agent_name)
                 row_shaping = shaping_by_rowidx[rowidx]
                 if row_shaping is not None:
-                    row_metrics.update(_effort_shaping_metrics(row_shaping))
+                    row_metrics.update(_declared_effort_metrics(row_shaping))
                 row_metrics.update(
                     self._compute_reward_penalty_metrics(penalty_counts, 1)
                 )
                 row_completions[0].telemetry = RolloutTelemetry.from_metrics(
-                    _rollout_environment_metric_component(agent_name), row_metrics
+                    agent_name, row_metrics
                 )
                 await on_completion(rowidx, row_completions[0])
             if timing_metrics is not None:
@@ -1467,19 +1493,27 @@ class AsyncNemoGymRolloutImpl:
                     else None
                 ),
             )
-            # Same helper the batched path uses, so the two cannot drift apart.
-            rollout_metrics.update(_effort_shaping_metrics(shaping))
+            rollout_metrics.update(_declared_effort_metrics(shaping))
             rollout_metrics.update(
                 self._compute_reward_penalty_metrics(
                     penalty_counts, len(completed_results)
                 )
             )
 
-        rollout_metrics.update(env_timing_metrics)
+        rollout_metrics.update(
+            {
+                name: Metric([value], "mean")
+                for name, value in env_timing_metrics.items()
+            }
+        )
         for handle in shard_set.all_handles:
             label = shard_set.instance_label(handle)
-            rollout_metrics[f"{timer_prefix}/routing/group_share/{label}"] = 0
-        rollout_metrics[f"{timer_prefix}/routing/group_share/{instance_label}"] = 1
+            rollout_metrics[f"{timer_prefix}/routing/group_share/{label}"] = Metric(
+                [0], "mean"
+            )
+        rollout_metrics[f"{timer_prefix}/routing/group_share/{instance_label}"] = (
+            Metric([1], "mean")
+        )
 
         return completions, prompt_message_log, rollout_metrics
 
@@ -1549,13 +1583,16 @@ class AsyncNemoGymRolloutImpl:
 
     def _compute_reward_penalty_metrics(
         self, penalty_counts: dict[str, int], num_results: int
-    ) -> dict[str, float]:
+    ) -> dict[str, Metric]:
         """Return enabled penalty rates using the legacy Gym metric names."""
-        return compute_reward_penalty_metrics(
+        plain = compute_reward_penalty_metrics(
             penalty_counts,
             num_results,
             self._reward_penalty_config,
         )
+        return {
+            name: Metric([value] * num_results, "mean") for name, value in plain.items()
+        }
 
     def _compute_rollout_metrics(
         self,
@@ -1563,7 +1600,7 @@ class AsyncNemoGymRolloutImpl:
         agent_name: str,
         *,
         prompt_lengths: list[int] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Metric]:
         """Aggregate per-sample and per-agent metrics."""
         # Prepare lists of values for each metric.
         total_reward = [c.reward for c in completions]
@@ -1628,154 +1665,110 @@ class AsyncNemoGymRolloutImpl:
 
         # Aggregate metrics across all samples.
         n = len(completions)
-        truncation_rate = sum(truncated) / n
-        rollout_metrics: dict[str, Any] = {
-            **calculate_single_metric(total_reward, n, "total_reward"),
-            # turn metrics
-            **calculate_single_metric(turn_count, n, "turns_per_sample"),
-            "turns_per_sample/p95": pct(turn_count, 95),
-            "turns_per_sample/p99": pct(turn_count, 99),
-            # token metrics
-            **calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
-            **calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
-            **calculate_single_metric(
-                max_gen_tokens_per_turn, n, "max_gen_tokens_per_turn"
-            ),
-            "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
-            # truncated metrics
-            "natural_termination_rate": sum(not t for t in truncated) / n,
-            "truncation_rate": truncation_rate,
-            f"{agent_name}/truncation_rate": truncation_rate,
-        }
-
-        # Keep global metrics for continuity, and also retain distributions under
-        # the resolved environment name. SingleController selects the exact groups
-        # used by training before aggregating these observations, so mixed-task
-        # runs can diagnose one environment without contamination from another.
         environment = _rollout_environment_metric_component(agent_name)
         environment_prefix = f"environment/{environment}"
+        # The producer chooses names and reducers together. Capture observations
+        # count model calls/deltas, not message-log turns/tokens.
+        turn_name = "capture/calls_per_sample" if receipt_mode else "turns_per_sample"
+        total_name = (
+            "capture/deepest_chain_tokens_per_sample"
+            if receipt_mode
+            else "total_tokens_per_sample"
+        )
+        gen_name = (
+            "capture/delta_tokens_per_sample"
+            if receipt_mode
+            else "gen_tokens_per_sample"
+        )
+        max_name = (
+            "capture/max_delta_tokens_per_call"
+            if receipt_mode
+            else "max_gen_tokens_per_turn"
+        )
+        rollout_metrics: dict[str, Metric] = {}
+        for scope in ("", f"{environment_prefix}/"):
+            for name, values in (
+                ("total_reward", total_reward),
+                (turn_name, turn_count),
+                (total_name, total_tokens),
+                (gen_name, assistant_tokens),
+                (max_name, max_gen_tokens_per_turn),
+            ):
+                rollout_metrics.update(distribution(f"{scope}{name}", values))
+            rollout_metrics[f"{scope}natural_termination_rate"] = Metric(
+                [not value for value in truncated], "mean"
+            )
+            rollout_metrics[f"{scope}truncation_rate"] = Metric(truncated, "mean")
+        rollout_metrics.update(
+            distribution(f"{environment_prefix}/truncated", truncated)
+        )
+        rollout_metrics[f"{environment_prefix}/sample_count"] = Metric([n], "sum")
+        rollout_metrics[f"{agent_name}/truncation_rate"] = Metric(truncated, "mean")
         if prompt_lengths is not None:
-            # V1 NeMo-Gym records the first input-message length (not the
-            # completed conversation length) as mean_prompt_length.
-            rollout_metrics["mean_prompt_length"] = sum(prompt_lengths) / n
+            # V1 Gym counts the first input message, not all prompt messages.
+            rollout_metrics["mean_prompt_length"] = Metric(prompt_lengths, "mean")
             rollout_metrics.update(
-                calculate_single_metric(
-                    prompt_lengths, n, f"{environment_prefix}/prompt_tokens_per_sample"
+                distribution(
+                    f"{environment_prefix}/prompt_tokens_per_sample", prompt_lengths
                 )
             )
-        rollout_metrics.update(
-            calculate_single_metric(
-                total_reward, n, f"{environment_prefix}/total_reward"
-            )
-        )
-        rollout_metrics.update(
-            calculate_single_metric(
-                turn_count, n, f"{environment_prefix}/turns_per_sample"
-            )
-        )
-        rollout_metrics.update(
-            calculate_single_metric(
-                total_tokens, n, f"{environment_prefix}/total_tokens_per_sample"
-            )
-        )
-        rollout_metrics.update(
-            calculate_single_metric(
-                assistant_tokens, n, f"{environment_prefix}/gen_tokens_per_sample"
-            )
-        )
-        rollout_metrics.update(
-            calculate_single_metric(
-                max_gen_tokens_per_turn,
-                n,
-                f"{environment_prefix}/max_gen_tokens_per_turn",
-            )
-        )
-        rollout_metrics.update(
-            calculate_single_metric(
-                [int(value) for value in truncated],
-                n,
-                f"{environment_prefix}/truncated",
-            )
-        )
-        rollout_metrics[f"{environment_prefix}/sample_count"] = n
-        for name, values in (
-            ("turns_per_sample", turn_count),
-            ("max_gen_tokens_per_turn", max_gen_tokens_per_turn),
-        ):
-            rollout_metrics[f"{environment_prefix}/{name}/p95"] = pct(values, 95)
-        rollout_metrics[f"{environment_prefix}/turns_per_sample/p99"] = pct(
-            turn_count, 99
-        )
-        for name in ("natural_termination_rate", "truncation_rate"):
-            rollout_metrics[f"{environment_prefix}/{name}"] = rollout_metrics[name]
 
-        # Agent-level metrics. Receipts are lineage records, not agent
-        # results — keep them (and their manifests) out of the logged table.
+        # Receipts are lineage metadata, never full-result table entries.
         agent_extras = [
-            {k: v for k, v in (c.env_extras or {}).items() if k not in ("ng_receipt",)}
+            {k: v for k, v in (c.env_extras or {}).items() if k != "ng_receipt"}
             for c in completions
         ]
-        for key in agent_extras[0].keys():
-            values = [
-                float(r[key])  # type: ignore
-                for r in agent_extras
-                if isinstance(r.get(key), (bool, int, float))
-            ]
-            if values:
-                rollout_metrics.update(
-                    calculate_single_metric(values, n, f"{agent_name}/{key}")
-                )
-                rollout_metrics.update(
-                    calculate_single_metric(
-                        values,
-                        n,
-                        f"{environment_prefix}/env_extra/{key}",
-                    )
-                )
-
-        # Emit authoritative live token metrics after full-result metrics so
-        # similarly named environment metadata cannot overwrite them. In receipt
-        # mode these come from the manifest-derived token counts above.
+        numeric_rows = [
+            {
+                key: float(value)
+                for key, value in row.items()
+                if isinstance(value, (bool, int, float))
+            }
+            for row in agent_extras
+        ]
         rollout_metrics.update(
-            calculate_single_metric(
-                total_tokens, n, f"{agent_name}/total_tokens_per_sample"
-            )
+            optional_distributions(f"{environment_prefix}/env_extra", numeric_rows)
         )
         rollout_metrics.update(
-            calculate_single_metric(
-                assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
+            optional_distributions(
+                agent_name,
+                [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key
+                        not in {"total_tokens_per_sample", "gen_tokens_per_sample"}
+                    }
+                    for row in numeric_rows
+                ],
             )
+        )
+        # Live token counts override similarly named environment diagnostics.
+        rollout_metrics.update(
+            distribution(f"{agent_name}/total_tokens_per_sample", total_tokens)
+        )
+        rollout_metrics.update(
+            distribution(f"{agent_name}/gen_tokens_per_sample", assistant_tokens)
         )
         if self._log_full_result_tables:
-            rollout_metrics[f"{agent_name}/full_result"] = Table(
-                data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
-                columns=["Full result"],
+            rollout_metrics[f"{agent_name}/full_result"] = Metric(
+                [
+                    Table(
+                        data=[
+                            [json.dumps(row, separators=(",", ":"))]
+                            for row in agent_extras
+                        ],
+                        columns=["Full result"],
+                    )
+                ],
+                "concat",
             )
-
-        # Necessary for downstream nemo rl logging/printing.
-        rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
-            "gen_tokens_per_sample/mean"
-        ]
-        if receipt_mode:
-            # Capture manifests count model calls and append deltas, not the
-            # user messages / assistant tokens used by V1. Do not put proxies
-            # under V1 names in the selected-step logger.
-            capture_names = {
-                "turns_per_sample": "calls_per_sample",
-                "total_tokens_per_sample": "deepest_chain_tokens_per_sample",
-                "gen_tokens_per_sample": "delta_tokens_per_sample",
-                "max_gen_tokens_per_turn": "max_delta_tokens_per_call",
-                "mean_gen_tokens_per_sample": "mean_delta_tokens_per_sample",
-            }
-            for scope in ("", f"{environment_prefix}/"):
-                for family, capture_name in capture_names.items():
-                    original = f"{scope}{family}"
-                    for key in list(rollout_metrics.keys()):
-                        if key == original or key.startswith(f"{original}/"):
-                            suffix = key.removeprefix(original)
-                            rollout_metrics[
-                                f"{scope}capture/{capture_name}{suffix}"
-                            ] = rollout_metrics.pop(key)
+        mean_gen_name = (
+            "capture/mean_delta_tokens_per_sample"
+            if receipt_mode
+            else "mean_gen_tokens_per_sample"
+        )
+        rollout_metrics[mean_gen_name] = Metric(assistant_tokens, "mean")
         return rollout_metrics
 
 
@@ -2248,6 +2241,13 @@ class RolloutManager:
             self._stats.committed += 1
             rollout_metrics = record.rollout_metrics
             mean_output_tokens = rollout_metrics.get("mean_gen_tokens_per_sample", 0)
+            if isinstance(mean_output_tokens, Metric):
+                if mean_output_tokens.reduce != "mean":
+                    raise ValueError(
+                        "Output-token accounting requires a mean declaration"
+                    )
+                values = mean_output_tokens.values
+                mean_output_tokens = sum(values) / len(values) if values else 0
             output_tokens = 0
             if isinstance(mean_output_tokens, (int, float)):
                 total_output_tokens = float(mean_output_tokens) * len(
@@ -2444,9 +2444,7 @@ class RolloutManager:
             rollout_ids=list(rollout_ids),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
-        rollout_environment = _rollout_environment_metric_component(
-            _nemo_gym_metric_namespace(input_sample.get("extra_env_info") or {})
-        )
+        rollout_environment = UNKNOWN_ROLLOUT_ENVIRONMENT
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -2554,7 +2552,7 @@ class RolloutManager:
                         recovery_granularity=recovery_group.recovery_granularity,
                     )
                     rollout_environment = record.metadata.get(
-                        "rollout_environment", rollout_environment
+                        ROLLOUT_ENVIRONMENT_TAG, rollout_environment
                     )
             finally:
                 if inflight_registry is not None:
@@ -2580,7 +2578,9 @@ class RolloutManager:
             if environments:
                 # Fully sealed restored groups do not dispatch, so the resolved
                 # Gym namespace must come from their durable observations.
-                rollout_environment = next(iter(environments))
+                rollout_environment = _rollout_environment_metric_component(
+                    next(iter(environments))
+                )
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),

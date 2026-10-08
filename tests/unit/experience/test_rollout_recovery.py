@@ -29,7 +29,12 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.experience.metric_utils import RolloutTelemetry
+from nemo_rl.experience.metric_utils import (
+    Metric,
+    RolloutTelemetry,
+    distribution,
+    reduce_step,
+)
 from nemo_rl.experience.rollout_recovery import (
     _ATTEMPT_STATE_FIELDS,
     _GROUP_STATE_FIELDS,
@@ -838,22 +843,18 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
 
 
 @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
-def test_sealed_telemetry_roundtrip_and_duplicate_seal(granularity):
+def test_sealed_telemetry_roundtrip_and_duplicate_seal(granularity, tmp_path):
     state = _sealed_attempt_state()
     snapshot = RolloutTelemetry.from_metrics(
         "swe",
         {
-            "environment/swe/turns_per_sample/histogram": [3],
-            "environment/swe/turns_per_sample/stddev": float("nan"),
-            "environment/swe/sample_count": 1,
-            "effort/length_reward/mean": 0.5,
-            "swe/full_result": object(),
+            **distribution("environment/swe/turns_per_sample", [3]),
+            "environment/swe/sample_count": Metric([1], "sum"),
+            "effort/length_reward/mean": Metric([0.5], "mean"),
+            "swe/full_result": Metric([object()], "concat"),
         },
     )
-    assert snapshot.scalars == {
-        "environment/swe/sample_count": 1.0,
-        "effort/length_reward/mean": 0.5,
-    }
+    assert "swe/full_result" not in snapshot.metrics
     attempt = state["groups"][0]["siblings"][0]["attempts"][0]
     state["groups"][0]["status"] = "generating"
     state["groups"][0]["recovery_granularity"] = granularity.value
@@ -886,12 +887,17 @@ def test_sealed_telemetry_roundtrip_and_duplicate_seal(granularity):
                 )
             )
     checkpoint = ledger.state_dict()
+    path = tmp_path / "rollout_recovery.pt"
+    torch.save(checkpoint, path)
+    checkpoint = torch.load(path, weights_only=True)
     restored = RolloutRecoveryLedger.from_state_dict(checkpoint)
     saved = restored.get_group("g7").siblings[0].current_attempt.telemetry
     assert saved == snapshot
-    assert saved.to_metrics()["environment/swe/turns_per_sample/histogram"] == [3.0]
-    snapshot.observations["environment/swe/turns_per_sample"] = 99
-    assert saved.observations["environment/swe/turns_per_sample"] == 3
+    assert reduce_step([saved.to_metrics()])[
+        "environment/swe/turns_per_sample/histogram"
+    ] == [3.0]
+    snapshot.metrics["environment/swe/turns_per_sample"].values[0] = 99
+    assert saved.metrics["environment/swe/turns_per_sample"].values == [3]
 
 
 def test_version_two_restore_does_not_fabricate_telemetry():

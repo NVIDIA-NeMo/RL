@@ -29,7 +29,12 @@ import nemo_rl.experience.rollout_reassembler_actor as actor_module
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
-from nemo_rl.experience.metric_utils import RolloutTelemetry
+from nemo_rl.experience.metric_utils import (
+    Metric,
+    RolloutTelemetry,
+    distribution,
+    reduce_step,
+)
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import (
     ReassemblyRequest,
@@ -222,8 +227,10 @@ def test_finalizer_retains_only_complete_sibling_telemetry(
     actor._finalizer.finalize_group.return_value = result
     snapshot = RolloutTelemetry(
         "swe",
-        {"environment/swe/turns_per_sample": 3.0},
-        {"environment/swe/sample_count": 1.0},
+        {
+            **distribution("environment/swe/turns_per_sample", [3.0]),
+            "environment/swe/sample_count": Metric([1.0], "sum"),
+        },
     )
     request = replace(
         _request(),
@@ -232,16 +239,11 @@ def test_finalizer_retains_only_complete_sibling_telemetry(
     )
     assert actor.finalize(request) is result
     if complete:
-        assert meta.extra_info[ROLLOUT_METRICS][0][
-            "environment/swe/turns_per_sample/histogram"
-        ] == [3.0]
+        metrics = reduce_step(meta.extra_info[ROLLOUT_METRICS])
+        assert metrics["environment/swe/turns_per_sample/histogram"] == [3.0]
         assert_metadata_only(result)
-        assert meta.extra_info[ROLLOUT_METRICS][0]["truncation_rate"] == int(
-            max_seq_len == 3
-        )
-        assert meta.extra_info[ROLLOUT_METRICS][0][
-            "environment/swe/truncated/histogram"
-        ] == [int(max_seq_len == 3)]
+        assert metrics["truncation_rate"] == int(max_seq_len == 3)
+        assert metrics["environment/swe/truncated/histogram"] == [int(max_seq_len == 3)]
     else:
         assert ROLLOUT_METRICS not in meta.extra_info
         assert "lacks complete rollout telemetry" in caplog.text
@@ -254,9 +256,7 @@ def test_finalizer_rejects_misaligned_telemetry_before_publication():
     with pytest.raises(ValueError, match="align with logical siblings"):
         actor.finalize(replace(_request(), telemetry=(None, None)))
     with pytest.raises(ValueError, match="environment mismatch"):
-        actor.finalize(
-            replace(_request(), telemetry=(RolloutTelemetry("wrong", {}, {}),))
-        )
+        actor.finalize(replace(_request(), telemetry=(RolloutTelemetry("wrong", {}),)))
     actor._finalizer.finalize_group.assert_not_called()
 
 

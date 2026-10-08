@@ -52,7 +52,12 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
 )
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.metric_utils import (
+    Metric,
+    calculate_single_metric,
+    pct,
+    reduce_step,
+)
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutTimeouts,
@@ -2417,8 +2422,8 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         "completion_count": 2,
         "agent": "agent",
         "prompt_lengths": [1, 2],
-        "remote_time": 2.0,
-        "timing/test/routing/group_share/nemo_gym": 1,
+        "remote_time": Metric([2.0], "mean"),
+        "timing/test/routing/group_share/nemo_gym": Metric([1], "mean"),
     }
 
 
@@ -2590,7 +2595,19 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
 
     manager._stream_rows = fake_stream_rows
     manager._results_to_completions = lambda _results: ([object()], {})
-    manager._compute_rollout_metrics = lambda *_args: {}
+
+    def _compute_metrics(
+        completions: list[object],
+        agent: str,
+        *,
+        prompt_lengths: list[int] | None = None,
+    ) -> dict[str, object]:
+        assert len(completions) == 1
+        assert agent == "agent"
+        assert prompt_lengths == [1]
+        return {}
+
+    manager._compute_rollout_metrics = _compute_metrics
     manager._compute_reward_penalty_metrics = lambda *_args: {}
 
     async def run_group():
@@ -2603,10 +2620,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
     metrics = [asyncio.run(run_group())[2] for _ in range(3)]
 
     assert selected == [first, second, first]
-    per_group_metrics = {key: [group[key] for group in metrics] for key in metrics[0]}
-    from nemo_rl.algorithms.grpo import aggregate_rollout_metrics
-
-    aggregated = aggregate_rollout_metrics(per_group_metrics)
+    aggregated = reduce_step(metrics)
     assert aggregated["timing/test/routing/group_share/tools/0"] == pytest.approx(2 / 3)
     assert aggregated["timing/test/routing/group_share/tools/1"] == pytest.approx(1 / 3)
 

@@ -25,6 +25,10 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.metric_utils import REWARD_KEY
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import (
+    ROLLOUT_ENVIRONMENT_TAG,
+    UNKNOWN_ROLLOUT_ENVIRONMENT,
+)
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
@@ -276,14 +280,31 @@ def environment_sample_counts(
     Environment flags count independently of other, potentially overlapping filters.
     Valid samples sum the final sample weights, as in the policy loss; valid tokens
     sum the weighted next-token mask, excluding the first sequence position.
+
+    Args:
+        tags: One data-plane tag dict per selected sample, or None when the
+            rows carry no tags at all.
+        mask_sample: Bool tensor, True where the environment flagged the row.
+        final_sample_mask: Per-sample loss weights after every filter.
+        final_token_mask: Per-token loss mask already multiplied by
+            final_sample_mask.
+
+    Returns:
+        Dict mapping "environment/<name>/<counter>" to its total for this
+        chunk, for counters num_samples, num_mask_sample_filtered,
+        num_valid_samples and num_valid_tokens.
+
+    Raises:
+        ValueError: If tags is given but its length does not match the
+            number of selected samples.
     """
     size = mask_sample.numel()
     if tags is not None and len(tags) != size:
         raise ValueError("Environment tags must align with selected samples")
     environments = (
-        [tag.get("rollout_environment", "unknown") for tag in tags]
+        [tag.get(ROLLOUT_ENVIRONMENT_TAG, UNKNOWN_ROLLOUT_ENVIRONMENT) for tag in tags]
         if tags is not None
-        else ["unknown"] * size
+        else [UNKNOWN_ROLLOUT_ENVIRONMENT] * size
     )
     valid_tokens = final_token_mask[:, 1:].sum(dim=-1).detach().cpu().tolist()
     valid_samples = final_sample_mask.detach().cpu().tolist()

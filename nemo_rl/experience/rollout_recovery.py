@@ -879,7 +879,7 @@ class RolloutRecoveryLedger:
                                     "mask_sample": attempt.mask_sample,
                                     "staging_keys": list(attempt.staging_keys),
                                     "telemetry": (
-                                        dataclasses.asdict(attempt.telemetry)
+                                        attempt.telemetry.to_state()
                                         if attempt.telemetry is not None
                                         else None
                                     ),

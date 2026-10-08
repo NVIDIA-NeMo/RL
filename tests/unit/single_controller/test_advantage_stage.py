@@ -129,6 +129,7 @@ class TestRpcBoundaryStaysMetadataOnly:
             ),
             has_valid_training_tokens=True,
             num_mask_sample_filtered=1,
+            environment_counts={"environment/swe/num_samples": 2.0},
             reward_partial=RewardPartial.from_rows(torch.tensor([1.0, 3.0])),
             advantage_partial=AdvantagePartial.from_values(torch.tensor([0.5, 1.5])),
             seq_logprob_error_metrics={"max_seq_mult_prob_error": 1.25},
@@ -148,6 +149,7 @@ class TestRpcBoundaryStaysMetadataOnly:
             ),
             has_valid_training_tokens=True,
             num_mask_sample_filtered=0,
+            environment_counts={},
             reward_partial=RewardPartial.from_rows(torch.tensor([1.0])),
             # The regression this guard exists for: handing back the tensor
             # instead of its reduction.
@@ -468,6 +470,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "meta",
         "has_valid_training_tokens",
         "num_mask_sample_filtered",
+        "environment_counts",
         # Already reduced to a handful of floats, not the reward tensors.
         "reward_partial",
         "advantage_partial",
@@ -551,7 +554,11 @@ def _pool_meta() -> KVBatchMeta:
         sample_ids=[f"s{i}" for i in range(NUM_GROUPS * GROUP_SIZE)],
         fields=["total_reward"],
         tags=[
-            {"weight_version": 0, GROUP_ID_TAG: f"group-{i // GROUP_SIZE}"}
+            {
+                "weight_version": 0,
+                GROUP_ID_TAG: f"group-{i // GROUP_SIZE}",
+                "rollout_environment": "swe" if i // GROUP_SIZE % 2 else "math",
+            }
             for i in range(NUM_GROUPS * GROUP_SIZE)
         ],
     )
@@ -673,6 +680,7 @@ def _run(estimator_name: str, num_actors: int):
         advantage_partials=ctrl._step_log_dict["advantage_partials"],
         sequence_lengths=[],
         num_mask_sample_filtered=ctrl._step_log_dict["num_mask_sample_filtered"],
+        environment_counts=ctrl._step_log_dict["environment_counts"],
         # opd turns these on; they reduce count-weighted across calls, so a
         # shard that got them wrong would only show up here.
         seq_logprob_error_metrics=ctrl._step_log_dict["seq_logprob_error_metrics"],
@@ -696,6 +704,12 @@ def test_sharded_pool_matches_in_process(estimator_name: str) -> None:
     assert [actor.calls for actor in ctrl._advantage_actors] == [[8], [8], [8]]
     torch.testing.assert_close(adv_pool, adv_local)
     assert metrics_pool == pytest.approx(metrics_local)
+    for environment in ("swe", "math"):
+        prefix = f"environment/{environment}"
+        assert metrics_pool[f"{prefix}/num_samples"] == 12
+        assert metrics_pool[f"{prefix}/num_valid_samples"] == 12
+        assert metrics_pool[f"{prefix}/num_valid_tokens"] == 12 * (SEQ - 1)
+        assert metrics_pool[f"{prefix}/num_mask_sample_filtered"] == 0
     assert valid_pool == valid_local
     assert opd_pool == pytest.approx(opd_local)
 
