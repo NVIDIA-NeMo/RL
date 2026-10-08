@@ -720,6 +720,13 @@ $$
 
 Intuitively, this measures the average multiplicative probability error for sampled tokens, where samples are drawn as $x \sim \pi_{\text{inference-framework}}$. The purpose of this is to highlight any obvious sampling errors or discrepancies between the inference backend and training framework. If it trends upward steeply over the course of training past $\sim 1-2\%$, there is usually a problem with how your weights are being updated. If these metrics are very spiky, they can indicate a bug in the inference framework or buggy weight refitting.
 
+Because it is a mean, a single token whose logprobs differ by tens of nats (for example, an MoE top-k routing flip between the inference and training frameworks) dominates a whole step: $\exp(30) \approx 10^{13}$. The GRPO training loops (`grpo_train`, `async_grpo_train` and `grpo_train_sync`) therefore also log two tail metrics over the same tokens, which separate the bulk mismatch from rare spikes:
+
+* `token_mult_prob_error_p999`: the 99.9th percentile of $\exp(|\text{log-train-fwk}_i - \text{logprobs-inference-fwk}_i|)$. It ignores the worst 0.1% of tokens (about a thousand per step in a typical 1M-token batch), so it stays stable when a few tokens spike but rises when many tokens drift.
+* `num_tokens_logprob_error_above_10_nats`: the number of tokens whose logprobs differ by more than 10 nats (a probability ratio above $e^{10} \approx 2 \times 10^4$). These are the spikes that dominate `token_mult_prob_error`.
+
+Neither is logged when `force_on_policy_ratio` skips the separate logprob pass or when a step has no loss tokens.
+
 ### KL Divergence Error
 This feature is controlled by the following metrics:
 * `gen_kl_error`: $D_{\text{KL}}(P_{gen} || P_{policy})$
