@@ -90,3 +90,26 @@ Known operational constraints carried over: the cluster service
 about 30-41 minutes (hence per-step checkpoints and chained cycles), and
 Harbor installs OpenCode inside every task container at trial start (keep
 `AGENTIC_VBENCH_CONCURRENCY` around 16 or the Node download fails under load).
+
+## Validation status
+
+First smoke on this branch (job 2176033, 2026-10-08; 8 nodes, 4 prompts x 4
+generations, 12 turns, 256k window, W&B online
+`agentic_vbench_ut_smoke_4x4_12t_20261008-160340`):
+
+- Step 1 trained end to end with sequence packing and CP=2 and wrote its
+  checkpoint at 22 minutes: total step time 206 s (training 23 s, logprobs 9 s,
+  checkpoint 126 s), `timing/train/exposed_generation` 0.0008 s (ready_first
+  kept generation fully hidden behind training), 16 valid samples, 0 poisoned
+  rollouts, 0 masked, token-in continuation rate 0.91, token-mult-prob error
+  1.04. Rewards were all 0.0 at 12 turns (loss 0), so the step validates the
+  pipeline rather than learning; the 32-turn configuration is the one with
+  reward signal.
+- The proxy's local step-cap reply fired in every episode that hit the turn
+  cap, and ordinary capture attached every served call (no "Unresolved parent"
+  poisoning), confirming the fix for the failure seen on the cc branch's
+  off-mode run.
+- Earlier in the day the first launch failed at worker creation because the
+  fresh worktree's Megatron-Bridge submodule was empty under the launcher's
+  mount (now a preflight check), and the Gym venv prefetch rejected the
+  environment-server stanza this Gym does not have (removed on this branch).
