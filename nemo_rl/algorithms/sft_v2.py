@@ -255,17 +255,6 @@ class SFTSingleControllerActor:
             // self._placement_plan.logical_world_size,
             "max_sequence_length": config.data["max_input_seq_length"],
             "placement_fingerprint": self._placement_plan.placement_hash,
-            "packing_algorithm": config.policy["sequence_packing"]["algorithm"]
-            if config.data["energon"].packing_buffer_size is not None
-            else None,
-            # This caps sources per physical pack. Energon's similarly named
-            # max_samples_per_sequence instead controls sequential shard reads.
-            "max_sequences_per_bin": config.policy["sequence_packing"].get(
-                "max_sequences_per_bin"
-            ),
-            "sequence_length_pad_multiple": config.policy[
-                "make_sequence_length_divisible_by"
-            ],
             "only_unmask_final": config.sft.only_unmask_final,
         }
         if self._loader_states is None:
@@ -465,8 +454,8 @@ def setup_sft_v2(
         raise ValueError("SFTv2 supports only the Megatron policy backend.")
     sequence_packing = master_config.policy["sequence_packing"]
     dynamic_batching = master_config.policy["dynamic_batching"]
-    energon_packing = master_config.data["energon"].packing_buffer_size is not None
-    if not energon_packing:
+    packing = master_config.data["energon"].task_encoder.packing
+    if packing is None:
         if sequence_packing["enabled"] or dynamic_batching["enabled"]:
             raise ValueError("SFTv2 without Energon packing requires fixed batching.")
     else:
@@ -476,9 +465,7 @@ def setup_sft_v2(
             raise ValueError(
                 "Energon packing requires sequence_packing enabled with fuse_loss."
             )
-        if sequence_packing.get("algorithm") not in {
-            algorithm.value for algorithm in PackingAlgorithm
-        }:
+        if packing.name not in {algorithm.value for algorithm in PackingAlgorithm}:
             raise ValueError("Energon SFT requires a supported packing algorithm.")
         if dynamic_batching["enabled"]:
             raise ValueError("Energon packing does not support dynamic batching.")
@@ -510,7 +497,7 @@ def setup_sft_v2(
     max_sequence_length = master_config.data["max_input_seq_length"]
     if max_sequence_length is None:
         raise ValueError("SFTv2 requires data.max_input_seq_length.")
-    if energon_packing:
+    if packing is not None:
         megatron_cfg = master_config.policy["megatron_cfg"]
         if (
             megatron_cfg.get("moe_token_dispatcher_type") == "flex"
@@ -518,7 +505,12 @@ def setup_sft_v2(
         ):
             raise ValueError("Energon packing does not support HybridEP flex dispatch.")
 
-        pad_multiple = master_config.policy["make_sequence_length_divisible_by"]
+        pad_multiple = packing.options.sequence_length_pad_multiple
+        if pad_multiple != master_config.policy["make_sequence_length_divisible_by"]:
+            raise ValueError(
+                "Energon packing sequence_length_pad_multiple must match policy."
+                "make_sequence_length_divisible_by."
+            )
         parallel_multiple = get_parallel_token_alignment(megatron_cfg)
         if pad_multiple % parallel_multiple != 0:
             raise ValueError(
@@ -529,6 +521,10 @@ def setup_sft_v2(
             raise ValueError(
                 "Energon packing requires max_input_seq_length to be divisible by "
                 "make_sequence_length_divisible_by."
+            )
+        if packing.options.max_sequence_length != max_sequence_length:
+            raise ValueError(
+                "Energon pack capacity must match the SFT maximum sequence length."
             )
 
         fp8_multiple = get_fp8_token_alignment(megatron_cfg) * parallel_multiple

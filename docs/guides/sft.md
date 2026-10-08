@@ -260,6 +260,8 @@ data:
         options:
           max_sequence_length: ${policy.max_total_sequence_length}
           sequence_length_pad_multiple: ${policy.make_sequence_length_divisible_by}
+          max_sequences_per_bin: 16   # optional cap on source conversations per pack
+          balanced_knapsack_delta: 0 # optional extra initial bins for this algorithm
     max_samples_per_sequence: null  # optional shard read-order control
 ```
 
@@ -268,6 +270,10 @@ enables packed fused loss. `max_samples_per_sequence` only controls how many
 consecutive samples Energon reads from one shard; it does not affect pack
 layout. Without an Energon packing configuration, SFTv2 requires fixed
 batching.
+`max_sequences_per_bin` defaults to no cap. `balanced_knapsack_delta` defaults
+to zero and is supported only by `balanced_greedy_knapsack`. The configured
+pack capacity must match `data.max_input_seq_length`, and its padding multiple
+must match `policy.make_sequence_length_divisible_by`.
 Dynamic batching and HybridEP flex dispatch are not supported with
 Energon-owned packs.
 
@@ -290,13 +296,24 @@ data:
     model_family: nemotron
     task_encoder:
       python_file: /workspace/plugins/nemotron_energon/__init__.py
-      object: NemotronMultiModalTaskEncoder
+      object_name: NemotronMultiModalTaskEncoder
       options:
         prompt_format: nemotron6-moe
     cookers:
       - python_file: /workspace/plugins/nemotron_energon/__init__.py
-        object: cook_nemotron_conversation
+        object_name: cook_nemotron_conversation
 ```
+
+Use `object_name` to select the exported class or function. The older YAML key
+`object` remains accepted as an alias; do not specify both keys.
+
+For `GenericSFTTaskEncoder`, `loss_mask_mode=None` (the default) creates masks
+from assistant roles. With `loss_mask_mode="precomputed"`, each message must
+provide a binary, one-dimensional `token_loss_mask` tensor with the same shape
+as `token_ids`. This mode preserves the supplied mask for packed and unpacked
+conversations and rejects `only_unmask_final=true`. Packed batches also mask
+padding and the first token of each source, which has no preceding prediction
+within that source.
 
 The selected file's SHA-256 digest is included in the loader checkpoint
 identity. When the selected file is a package `__init__.py`, the digest covers

@@ -124,6 +124,61 @@ def test_sft_v2_worker_uses_megatron_worker_environment() -> None:
     )
 
 
+@pytest.mark.parametrize("restored", [False, True])
+def test_setup_sft_dataloader_calls_current_loader_api(restored: bool) -> None:
+    from nemo_rl.data.energon.sft_worker import SFTMegatronPolicyWorker
+
+    worker_cls = SFTMegatronPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker._is_replica_leader = MagicMock(return_value=True)
+    worker._sft_loader = None
+    worker._sft_processor = object()
+    data_config = {
+        "train": {"path": "/dataset", "split": "train", "virtual_epoch_length": 8},
+        "energon": EnergonLoaderConfig(model_family="qwen"),
+    }
+    state = {"loader_state": "saved"} if restored else None
+    with (
+        patch(
+            "nemo_rl.data.energon.sft_worker.build_energon_sft_loader", autospec=True
+        ) as build_loader,
+        patch(
+            "nemo_rl.data.energon.sft_worker.parallel_state.get_data_parallel_rank",
+            return_value=1,
+        ),
+        patch(
+            "nemo_rl.data.energon.sft_worker.parallel_state.get_data_parallel_world_size",
+            return_value=2,
+        ),
+    ):
+        assert worker.setup_sft_dataloader(
+            data_config=data_config,
+            batch_size=2,
+            max_sequence_length=128,
+            placement_fingerprint="placement",
+            only_unmask_final=False,
+            restored_state=state,
+        )
+        build_loader.assert_called_once_with(
+            data_config=data_config,
+            source=data_config["train"],
+            processor=worker._sft_processor,
+            batch_size=2,
+            max_sequence_length=128,
+            split_role="train",
+            logical_rank=1,
+            logical_world_size=2,
+            placement_fingerprint="placement",
+            only_unmask_final=False,
+        )
+        if restored:
+            build_loader.return_value.load_state_dict.assert_called_once_with(state)
+        else:
+            build_loader.return_value.load_state_dict.assert_not_called()
+    assert worker._sft_logical_rank == 1
+    assert worker._sft_logical_world_size == 2
+
+
 def test_sft_v2_worker_publishes_sequence_alignment() -> None:
     from nemo_rl.data.energon.sft_worker import SFTMegatronPolicyWorker
 

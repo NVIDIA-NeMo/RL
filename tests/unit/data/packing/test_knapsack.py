@@ -18,7 +18,6 @@ from nemo_rl.data.packing import (
     BalancedGreedyKnapsackPacker,
     GreedyKnapsackPacker,
     PackingAlgorithm,
-    SequencePacker,
     get_packer,
 )
 
@@ -35,6 +34,17 @@ def test_factory_builds_knapsack_packers(algorithm, packer_type) -> None:
     assert isinstance(get_packer(algorithm.value, 10), packer_type)
 
 
+def test_factory_forwards_balanced_knapsack_delta() -> None:
+    packer = get_packer(
+        PackingAlgorithm.BALANCED_GREEDY_KNAPSACK,
+        10,
+        balanced_knapsack_delta=5,
+    )
+
+    assert isinstance(packer, BalancedGreedyKnapsackPacker)
+    assert packer.balanced_knapsack_delta == 5
+
+
 def test_greedy_knapsack_takes_largest_remaining_item_that_fits() -> None:
     assert GreedyKnapsackPacker(10).pack([6, 5, 4, 3, 2]) == [
         [0, 2],
@@ -43,19 +53,28 @@ def test_greedy_knapsack_takes_largest_remaining_item_that_fits() -> None:
 
 
 def test_balanced_knapsack_spreads_equal_items_across_minimum_bins() -> None:
-    packer = BalancedGreedyKnapsackPacker(8)
+    packer = BalancedGreedyKnapsackPacker(8, balanced_knapsack_delta=0)
 
     assert packer.pack([4, 4, 4, 4]) == [[0, 2], [1, 3]]
 
 
 @pytest.mark.parametrize(
-    "packer_type",
-    [GreedyKnapsackPacker, BalancedGreedyKnapsackPacker],
+    "packer",
+    [GreedyKnapsackPacker(10), BalancedGreedyKnapsackPacker(10)],
 )
-def test_knapsack_packers_keep_common_interface_constraints(
-    packer_type: type[SequencePacker],
-) -> None:
-    packer = packer_type(10, max_sequences_per_bin=1)
+def test_knapsack_packers_keep_common_interface_constraints(packer) -> None:
+    packer.max_sequences_per_bin = 1
     assert packer.pack([4, 3, 2]) == [[0], [1], [2]]
     with pytest.raises(ValueError, match="exceeds bin capacity"):
-        packer_type(10).pack([11])
+        packer.pack([11])
+
+
+def test_balanced_knapsack_delta_changes_bin_assignment() -> None:
+    assert get_packer("balanced_greedy_knapsack", 8, balanced_knapsack_delta=1).pack(
+        [4, 4, 4, 4]
+    ) == [[0, 3], [1], [2]]
+
+
+def test_balanced_knapsack_rejects_negative_delta() -> None:
+    with pytest.raises(ValueError, match="nonnegative"):
+        get_packer("balanced_greedy_knapsack", 8, balanced_knapsack_delta=-1)

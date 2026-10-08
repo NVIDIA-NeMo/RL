@@ -14,7 +14,7 @@
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 from nemo_rl.data.energon.multimodal.model_families import ModelFamily
 
@@ -33,6 +33,7 @@ class EnergonPackingOptions(BaseModel, extra="forbid"):
 
     max_sequence_length: Annotated[int, Field(ge=1)]
     sequence_length_pad_multiple: Annotated[int, Field(ge=1)]
+    max_sequences_per_bin: Annotated[int, Field(ge=1)] | None = None
     balanced_knapsack_delta: Annotated[int, Field(ge=0)] | None = None
 
     @model_validator(mode="after")
@@ -57,7 +58,11 @@ class EnergonTaskEncoderConfig(BaseModel, extra="allow"):
 
     name: str | None = "generic_sft"
     python_file: str | None = None
-    object: str | None = None
+    object_name: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("object_name", "object"),
+        serialization_alias="object",
+    )
     options: dict[str, Any] = Field(default_factory=dict)
     packing: EnergonPackingConfig | None = None
 
@@ -66,6 +71,8 @@ class EnergonTaskEncoderConfig(BaseModel, extra="allow"):
     def _from_registry_key(cls, value: Any) -> Any:
         if isinstance(value, str):
             return {"name": value}
+        if isinstance(value, dict) and "object_name" in value and "object" in value:
+            raise ValueError("Use only one of object_name or its legacy alias object.")
         if isinstance(value, dict) and value.get("python_file") and "name" not in value:
             return {**value, "name": None}
         return value
@@ -73,14 +80,14 @@ class EnergonTaskEncoderConfig(BaseModel, extra="allow"):
     @model_validator(mode="after")
     def _validate_component_reference(self) -> "EnergonTaskEncoderConfig":
         if self.name is not None:
-            if self.python_file is not None or self.object is not None:
+            if self.python_file is not None or self.object_name is not None:
                 raise ValueError(
-                    "Task encoder must use either name or python_file and object."
+                    "Task encoder must use either name or python_file and object_name."
                 )
             return self
-        if not self.python_file or not self.object:
+        if not self.python_file or not self.object_name:
             raise ValueError(
-                "File-backed task encoders require python_file and object."
+                "File-backed task encoders require python_file and object_name."
             )
         return self
 
@@ -90,7 +97,11 @@ class EnergonCookerConfig(BaseModel, extra="allow"):
 
     name: str | None = "generic_conversation"
     python_file: str | None = None
-    object: str | None = None
+    object_name: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("object_name", "object"),
+        serialization_alias="object",
+    )
     options: dict[str, Any] = Field(default_factory=dict)
     has_subflavors: dict[str, str | int | float | bool | None] | None = None
 
@@ -99,6 +110,8 @@ class EnergonCookerConfig(BaseModel, extra="allow"):
     def _from_registry_key(cls, value: Any) -> Any:
         if isinstance(value, str):
             return {"name": value}
+        if isinstance(value, dict) and "object_name" in value and "object" in value:
+            raise ValueError("Use only one of object_name or its legacy alias object.")
         if isinstance(value, dict) and value.get("python_file") and "name" not in value:
             return {**value, "name": None}
         return value
@@ -106,13 +119,13 @@ class EnergonCookerConfig(BaseModel, extra="allow"):
     @model_validator(mode="after")
     def _validate_component_reference(self) -> "EnergonCookerConfig":
         if self.name is not None:
-            if self.python_file is not None or self.object is not None:
+            if self.python_file is not None or self.object_name is not None:
                 raise ValueError(
-                    "Cooker must use either name or python_file and object."
+                    "Cooker must use either name or python_file and object_name."
                 )
             return self
-        if not self.python_file or not self.object:
-            raise ValueError("File-backed cookers require python_file and object.")
+        if not self.python_file or not self.object_name:
+            raise ValueError("File-backed cookers require python_file and object_name.")
         return self
 
 

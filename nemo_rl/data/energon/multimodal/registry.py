@@ -38,7 +38,7 @@ class ComponentConfig(Protocol):
 
     name: str | None
     python_file: str | None
-    object: str | None
+    object_name: str | None
 
 
 @dataclass(frozen=True)
@@ -287,13 +287,13 @@ def selected_registry_identity(
         "task_encoder": TASK_ENCODER_REGISTRY.configured_identity(
             name=task_encoder.name,
             python_file=task_encoder.python_file,
-            object_name=task_encoder.object,
+            object_name=task_encoder.object_name,
         ),
         "cookers": [
             COOKER_REGISTRY.configured_identity(
                 name=cooker.name,
                 python_file=cooker.python_file,
-                object_name=cooker.object,
+                object_name=cooker.object_name,
             )
             for cooker in cookers
         ],
