@@ -860,28 +860,40 @@ GDR GET.
 Every Mooncake process plays one or both of two roles:
 
 - **client** — puts and gets data.
-- **owner** — its RAM holds the data (a *segment*).
+- **storage** — its RAM holds the data (a *segment*).
 
-A checkpoint save has to call every owner, because the data lives in that
-owner's memory. Who owns memory therefore decides both **where memory
-pressure lands** and **who sits on the save path**.
+A checkpoint save has to call every storage process, because the data lives
+in its memory. Which processes are storage therefore decides both **where
+memory pressure lands** and **who sits on the save path**.
 
 ```
 co-located (default, storage_unit_segment_size: 0)
-  trainer / controller          each: client + owner (global_segment_size)
+  trainer / controller          each: client + storage (global_segment_size)
   generation (vLLM, Megatron)   client only (segment 0), unless a trainer
                                 in the same process attached first
   save calls every trainer process   ← a busy trainer stalls the save
 
 separated (storage_unit_segment_size > 0)
   trainer / vLLM / controller   client only (segment 0)
-  MooncakeStorageUnit (CPU)     owner only (storage_unit_segment_size each)
+  MooncakeStorageUnit (CPU)     storage only (storage_unit_segment_size each)
   save calls the units only      ← GPU processes never on the save path
 ```
 
 Puts and gets are one-sided RDMA, so a unit's process never runs on the data
 path; it only does work during a checkpoint save or load. One CPU per unit is
-enough. This is the same shape as TQ's `simple` backend (`SimpleStorageUnit`).
+enough.
+
+The `simple` backend is always separated: TQ's `SimpleStorageUnit` actors are
+the only storage, and every other process is a client.
+
+| | `mooncake_cpu` units | `simple` units |
+|---|---|---|
+| storage | `MooncakeStorageUnit` (opt-in) | `SimpleStorageUnit` (always) |
+| data held in | registered Mooncake segment | the unit's Python memory |
+| put / get | one-sided RDMA; unit CPU idle | ZMQ request served by the unit's threads |
+| checkpoint save | each unit writes its own shard | each unit writes its own data |
+| count | `num_storage_units` (`null`: 2 per node) | `num_storage_units` |
+| placement | `storage_unit_placement` (default `all`) | `storage_unit_placement` (default `null`: TQ SPREAD) |
 
 **Placement** — `storage_unit_placement` names the clusters whose nodes host
 units (`num_storage_units` in total, round-robin over those nodes; `null`
@@ -930,7 +942,7 @@ back on.
 ### Experimental Mooncake storage checkpoints
 
 With storage units on, the `MooncakeStorageUnit` actors are the only
-checkpoint participants. Otherwise the participants are the actors that own a
+checkpoint participants. Otherwise the participants are the actors that hold a
 segment, as described below.
 
 
@@ -942,19 +954,19 @@ No additional Mooncake-specific checkpoint setting is needed. Ordinary PUTs
 remain in Mooncake memory and perform no checkpoint-related filesystem I/O.
 
 On `tq.save_checkpoint(...)`, existing workers query disjoint slices of the
-controller's object keys and group their ownership metadata by destination.
-Ray object references route those groups directly to the owners; the
-coordinator forwards references, not per-object addresses or sizes. Each owner
-writes directly from its own hard-pinned CPU memory into one packed shard and
-an offset/size index. SAVE performs no native GET, staging-buffer copy, or
+controller's object keys and group their location metadata by destination.
+Ray object references route those groups directly to the storage processes;
+the coordinator forwards references, not per-object addresses or sizes. Each
+storage process writes directly from its own hard-pinned CPU memory into one
+packed shard and an offset/size index. SAVE performs no native GET, staging-buffer copy, or
 buffer registration. Only metadata moves between processes. For multiple
-complete replicas, a canonical live owner is selected; this prioritizes
+complete replicas, a canonical live storage process is selected; this prioritizes
 locality, not global byte balancing. The coordinator publishes the small shard
-manifest after every owner has flushed, fsynced, and acknowledged its shard.
+manifest after every storage process has flushed, fsynced, and acknowledged its shard.
 
 SingleController supplies its candidate actor handles: policy/value/teacher
 workers, finalizer and advantage actors, and the `MooncakeStorageUnit` actors
-when storage units are on. Only candidates that own a segment take part, so
+when storage units are on. Only candidates that hold a segment take part, so
 generation workers (which attach with segment 0) never do. Their Ray methods
 carry checkpoint commands and completion metadata only; each method uses its
 process's existing Mooncake store. No registry, listener threads, or
@@ -967,8 +979,8 @@ zero storage capacity: they can still PUT/GET through Mooncake, but cannot own
 payload that the controller has no actor endpoint to command. Actors retain
 their configured segment sizes (0 for every client when storage units are on).
 This removes the driver's segment from the available capacity. Other callers of the
-plugin must supply their existing owner handles with
-`configure_checkpoint_workers(...)` before save/load. Unreachable owners fail
+plugin must supply their existing storage actor handles with
+`configure_checkpoint_workers(...)` before save/load. Unreachable storage actors fail
 the checkpoint rather than silently falling back to centralized copying.
 
 On `tq.load_checkpoint(...)`, the plugin balances saved shards over currently
@@ -1016,7 +1028,7 @@ configuration knobs. Workers inherit this storage mode from TQ's controller.
 Other jobs keep TQ's storage defaults. This version supports NeMo-RL's HTTP
 metadata mode and rejects `P2PHANDSHAKE`,
 whose public Mooncake API does not expose the local transfer endpoint needed for
-exact owner matching.
+exact storage-process matching.
 
 Capacity rule of thumb (any backend):
 
