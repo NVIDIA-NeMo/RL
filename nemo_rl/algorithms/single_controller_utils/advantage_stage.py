@@ -34,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 
@@ -429,6 +429,13 @@ class AdvantageComputer:
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
+        advantage_valid_mask = final_sample_mask
+        if (
+            not cfg.is_ppo
+            and cast(GRPOConfig, cfg.algo).masked_reward_policy == "include"
+        ):
+            # Preserve data-plane validity: token-capture placeholders never vote.
+            advantage_valid_mask = sample_mask
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
@@ -470,10 +477,8 @@ class AdvantageComputer:
                 rewards=rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
-                # Real validity (token-capture placeholders carry sample_mask 0,
-                # and mask_sample/overlong/seq-logprob-error rows are folded in
-                # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
+                valid_mask=advantage_valid_mask,
+                normalization_mask=token_mask * advantage_valid_mask.unsqueeze(-1),
                 **kwargs,
             )
             if cfg.is_ppo:
