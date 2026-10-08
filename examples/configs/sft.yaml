@@ -257,6 +257,10 @@ data:
   train:
     dataset_name: "squad"
     split: "train"
+    # For megatron_sft_packed, set on each packed dataset entry:
+    # megatron_sft:
+    #   prompt_format: identity
+    #   override_pad_token: null
   validation:
     dataset_name: "squad"
     split: "validation"
@@ -265,6 +269,7 @@ data:
     prompt_file: null
     system_prompt_file: null
     processor: "sft_processor"
+    chat_key: "messages" # Key containing the ordered conversation messages.
 
   # You can also use multiple datasets by using a list of datasets.
   # See `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example.

@@ -168,6 +168,118 @@ self.val_dataset = None
 self.split_train_validation(split_validation_size, seed)
 ```
 
+### Megatron-LM offline-packed datasets
+
+Use `megatron_sft_packed` when each JSONL record groups one or more
+conversations that must remain in one training row and you want to bypass NeMo
+RL's generic online sequence-packing path. This dataset mode is available only
+with the Megatron backend.
+
+Each line must be a JSON object whose `messages` field is an ordered list of
+OpenAI-style messages. A packed row must start with a `system` message and end
+with an `assistant` message. To place multiple conversations in one row, start
+each additional conversation with another `system` message:
+
+```json
+{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"2+2?"},{"role":"assistant","content":"4"},{"role":"system","content":"You are concise."},{"role":"user","content":"Capital of France?"},{"role":"assistant","content":"Paris."}]}
+```
+
+A `.jsonl.packed` suffix is also accepted and is read as JSON Lines, so an
+offline packer can mark its output without the loader treating it as an unknown
+format.
+
+This path is text-only. Every message `content` must be a string; multimodal
+records are not supported.
+
+#### Producing a packed dataset
+
+Packing happens offline, before training. The producer decides how many
+conversations fit in one row; the loader only re-tokenizes what it is given.
+
+1. Pick the pack length and use it for both sides. The packer must target the
+   same `data.max_input_seq_length` the training config sets.
+2. Pick the tokenizer and the prompt format and use them for both sides. The
+   loader re-tokenizes each record with `megatron_sft.prompt_format`, so a more
+   verbose tokenization than the packer's overflows the row. The loader warns
+   and drops the overflowing tail rather than failing, so check the logs after
+   changing either.
+3. Greedily append whole conversations to a row until the next one would not
+   fit, then start a new row. Each conversation begins with its own `system`
+   message, which is what marks the segment boundary.
+4. For context parallelism, keep every conversation a multiple of
+   `2 * context_parallel_size` tokens, or let the loader pad each segment up to
+   that multiple.
+
+The processor tokenizes each record, then pads or right-truncates it to
+`data.max_input_seq_length`. A reference packer uses the loader's token-count
+helper, so its row boundaries match the loader for the same tokenizer and prompt
+format. It expects raw JSONL records with a `messages` array; every conversation
+must start with `system` and end with `assistant`:
+
+```bash
+uv run examples/converters/pack_megatron_sft_jsonl.py \
+  --input /path/to/raw.jsonl \
+  --output /path/to/train.jsonl.packed \
+  --tokenizer /path/to/tokenizer \
+  --max-seq-length 262144 \
+  --prompt-format identity \
+  --context-parallel-size 16
+```
+
+Use the same tokenizer, prompt format, sequence length, and CP size for packing
+and training. The packer warns if one conversation exceeds the row length; the
+loader truncates that conversation, so inspect warnings before training.
+
+Configure the dataset and the direct packed path as follows:
+
+```yaml
+sft:
+  only_unmask_final: false
+  val_micro_batch_size: 1
+
+policy:
+  train_micro_batch_size: 1
+  dtensor_cfg:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    context_parallel_size: 1
+    use_fused_linear_logprobs: false
+
+data:
+  train:
+    dataset_name: megatron_sft_packed
+    data_path: /path/to/train.jsonl.packed
+    megatron_sft:
+      prompt_format: identity
+      override_pad_token: null
+  validation:
+    dataset_name: megatron_sft_packed
+    data_path: /path/to/validation.jsonl.packed
+    megatron_sft:
+      prompt_format: identity
+      override_pad_token: null
+  default:
+    chat_key: messages
+```
+
+`megatron_sft.prompt_format` accepts `identity`, `nemotron-nano-v2`, or
+`nemotron-h-aligned`. The optional `override_pad_token` replaces the preset's
+pad token; assistant-prefix masking is defined by the prompt-format preset.
+
+For context parallelism, every conversation segment is padded to a multiple of
+`2 * context_parallel_size`. The size comes from
+`policy.megatron_cfg.context_parallel_size`, not the dataset entry. A
+direct-packed training or validation split cannot be mixed with
+regular datasets, and direct-packed SFT does not support dynamic batching,
+draft training, router replay, `sft.only_unmask_final=true`,
+`policy.sequence_packing.fuse_loss=true`, or fused linear log-probability loss. The relevant training or validation micro batch size must
+be 1. At context-parallel size 1, online `policy.sequence_packing.enabled` is
+not required. For context-parallel size greater than 1, set it to `true` as
+required by the MCore context-parallel path.
+
 ### Energon Multimodal Datasets
 
 The optional Energon SFT backend reads prepared WebDataset shards while the existing Hugging Face backend remains the default. `megatron-energon` ships in the `mcore` extra, and the Megatron policy workers pick that environment up from `ACTOR_ENVIRONMENT_REGISTRY`, so the driver runs under a plain `uv run`:

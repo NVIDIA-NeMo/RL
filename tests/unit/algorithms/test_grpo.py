@@ -454,7 +454,7 @@ def mock_grpo_components():
     tokenizer.pad_token_id = 0
 
     loss_config = ClippedPGLossConfig(
-        ratio_clip_min=0.8, ratio_clip_max=1.2, ratio_clip_c=1.0
+        ratio_clip_min=0.8, ratio_clip_max=1.2, ratio_clip_c=None
     )
     loss_fn = ClippedPGLossFn(loss_config)
     logger = MagicMock()
@@ -1544,6 +1544,60 @@ def mock_sync_grpo_infrastructure(policy):
     policy.tq_partition_id = 0
 
     return stack
+
+
+@pytest.mark.parametrize("failure_phase", ["refit", "prepare"])
+@pytest.mark.parametrize("telemetry_fails", [False, True])
+def test_async_grpo_propagates_generation_setup_failure(
+    mock_grpo_components: dict[str, Any],
+    failure_phase: str,
+    telemetry_fails: bool,
+) -> None:
+    """Setup errors reach the caller even if flushing collector telemetry fails."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    mock_grpo_components["checkpointer"].get_latest_checkpoint_path.return_value = None
+    policy_generation = _mock_policy_generation()
+    policy_generation.weight_synchronizer.is_stale = failure_phase == "refit"
+    setup_error = RuntimeError(f"{failure_phase} failed")
+    if failure_phase == "prepare":
+        policy_generation.prepare_for_generation.side_effect = setup_error
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    collector_events: list[str] = []
+
+    with (
+        mock_async_grpo_infrastructure(
+            mock_batch,
+            {"mean_gen_tokens_per_sample": 2.0},
+            collector_events=collector_events,
+            refit_side_effect=setup_error if failure_phase == "refit" else None,
+        ),
+        patch.object(
+            StubAsyncTrajectoryCollector, "flush_telemetry", create=True
+        ) as flush_telemetry,
+    ):
+        if telemetry_fails:
+            flush_telemetry.remote.side_effect = RuntimeError("telemetry failed")
+        with pytest.raises(RuntimeError) as exc_info:
+            async_grpo_train(
+                mock_grpo_components["policy"],
+                policy_generation,
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                mock_grpo_components["checkpointer"],
+                _initial_grpo_save_state(),
+                master_config,
+            )
+        assert exc_info.value is setup_error
+        flush_telemetry.remote.assert_called_once_with(quiesce_timeout_s=3.0)
+
+    assert "start_collection" not in collector_events
+    mock_grpo_components["policy"].train.assert_not_called()
 
 
 def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components):
