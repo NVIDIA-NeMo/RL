@@ -1922,6 +1922,7 @@ def test_load_weights_rejects_unnegotiated_mxfp8_payload(fp8_module, monkeypatch
                 model=object(),
                 vllm_config=types.SimpleNamespace(additional_config={}),
             ),
+            model_load_weights=lambda weights: list(weights),
         )
 
 
@@ -1940,6 +1941,7 @@ def test_load_weights_rejects_prequantized_mxfp8_without_scale(fp8_module, monke
                 model=object(),
                 vllm_config=types.SimpleNamespace(additional_config={}),
             ),
+            model_load_weights=lambda weights: list(weights),
         )
 
 

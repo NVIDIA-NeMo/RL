@@ -1657,9 +1657,9 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     _disable_opd_full(worker)
     worker.model = _FakeTrainableModel()
     worker.model.eval = lambda: events.append("eval")
-    worker.cfg = (
-        {"generation": {"backend": generation_backend}} if generation_backend else {}
-    )
+    worker.cfg = {"megatron_cfg": {}}
+    if generation_backend:
+        worker.cfg["generation"] = {"backend": generation_backend}
     worker.is_generation_colocated = colocated
     worker.inference_model = object() if has_inference_model else None
     worker._colocated_reshard_plan = None
