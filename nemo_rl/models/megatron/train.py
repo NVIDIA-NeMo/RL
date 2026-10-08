@@ -58,6 +58,7 @@ from nemo_rl.data.megatron_sft_packed import is_direct_packed_row
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
+    distributed_vocab_logsumexp,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
@@ -876,10 +877,16 @@ class LogprobsPostProcessor:
         cfg: PolicyConfig,
         sampling_params: Optional[TrainingSamplingParams] = None,
         use_fused_linear_logprobs: bool = False,
+        topk: Optional[int] = None,
     ):
+        if topk is not None and topk <= 0:
+            raise ValueError(f"topk must be positive when set, got {topk}")
+        if topk is not None and use_fused_linear_logprobs:
+            raise ValueError("Top-k capture is incompatible with fused-linear logprobs")
         self.cfg = cfg
         self.sampling_params = sampling_params
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
+        self.topk = topk
 
     def __call__(
         self,
@@ -964,6 +971,16 @@ class LogprobsPostProcessor:
 
             token_logprobs = token_logprobs[:, :original_seq_length]
             result_dict["logprobs"] = token_logprobs
+
+            if self.topk is not None:
+                _, topk_result = TopkLogitsPostProcessor(
+                    cfg=self.cfg, k=self.topk, return_logsumexp=True
+                )(data_dict, cu_seqlens_padded, original_seq_length)(output_tensor)
+                result_dict["topk_logprobs"] = (
+                    topk_result["topk_logits"].to(torch.float32)
+                    - topk_result["V_logsumexp"].to(torch.float32).unsqueeze(-1)
+                ).to(torch.bfloat16)
+                result_dict["topk_indices"] = topk_result["topk_indices"]
 
             return torch.tensor(0.0, device=token_logprobs.device), result_dict
 
@@ -1148,9 +1165,10 @@ class TeacherFullPayloadPostProcessor:
 
 
 class TopkLogitsPostProcessor:
-    def __init__(self, cfg: PolicyConfig, k: int):
+    def __init__(self, cfg: PolicyConfig, k: int, return_logsumexp: bool = False):
         self.cfg = cfg
         self.k = k
+        self.return_logsumexp = return_logsumexp
 
     def __call__(
         self,
@@ -1201,6 +1219,13 @@ class TopkLogitsPostProcessor:
                 vocab_end_index=vocab_start_index + vocab_shard_size,
                 chunk_size=chunk_size,
             )
+            V_logsumexp_local = None
+            if self.return_logsumexp:
+                V_logsumexp_local = distributed_vocab_logsumexp(
+                    output_tensor,
+                    tp_grp,
+                    chunk_size=chunk_size,
+                )
 
             if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                 cp_grp = get_context_parallel_group()
@@ -1220,6 +1245,14 @@ class TopkLogitsPostProcessor:
                         dtype=topk_idx_local.dtype,
                         device=topk_idx_local.device,
                     )
+                    V_logsumexp_full = None
+                    if self.return_logsumexp:
+                        assert V_logsumexp_local is not None
+                        V_logsumexp_full = torch.zeros(
+                            (1, total_packed_len),
+                            dtype=V_logsumexp_local.dtype,
+                            device=V_logsumexp_local.device,
+                        )
 
                     for i in range(batch_size):
                         start_idx = cu_seqlens_padded_cpu[i]
@@ -1231,12 +1264,24 @@ class TopkLogitsPostProcessor:
                             local_idx_slice = topk_idx_local[
                                 :, start_idx // cp_size : end_idx // cp_size, :
                             ]
+                            local_lse_slice = None
+                            if self.return_logsumexp:
+                                assert V_logsumexp_local is not None
+                                local_lse_slice = V_logsumexp_local[
+                                    :, start_idx // cp_size : end_idx // cp_size
+                                ]
                             gathered_vals = allgather_cp_sharded_tensor(
                                 local_vals_slice, cp_grp, seq_dim=1
                             )
                             gathered_idx = allgather_cp_sharded_tensor(
                                 local_idx_slice, cp_grp, seq_dim=1
                             )
+                            gathered_lse = None
+                            if self.return_logsumexp:
+                                assert local_lse_slice is not None
+                                gathered_lse = allgather_cp_sharded_tensor(
+                                    local_lse_slice, cp_grp, seq_dim=1
+                                )
                             # Some kernels may return [X, Y, k] where X*Y = (end_idx - start_idx).
                             # Flatten leading dims and reshape to [1, expected_len, k] to match target.
                             expected_len = end_idx - start_idx
@@ -1254,8 +1299,20 @@ class TopkLogitsPostProcessor:
                                 gathered_idx = gathered_idx.reshape(
                                     1, expected_len, gathered_idx.shape[-1]
                                 )
+                            if self.return_logsumexp:
+                                assert gathered_lse is not None
+                                assert V_logsumexp_full is not None
+                                if (
+                                    gathered_lse.dim() == 2
+                                    and gathered_lse.shape[1] != expected_len
+                                ):
+                                    gathered_lse = gathered_lse.reshape(1, expected_len)
                             topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
                             topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
+                            if self.return_logsumexp:
+                                assert gathered_lse is not None
+                                assert V_logsumexp_full is not None
+                                V_logsumexp_full[:, start_idx:end_idx] = gathered_lse
                 else:
                     # Sequence packing must be enabled when CP > 1
                     raise RuntimeError(
@@ -1264,6 +1321,7 @@ class TopkLogitsPostProcessor:
             else:
                 topk_vals_full = topk_vals_local
                 topk_idx_full = topk_idx_local
+                V_logsumexp_full = V_logsumexp_local if self.return_logsumexp else None
 
             if pack:
                 assert cu_seqlens_padded_cpu is not None
@@ -1279,6 +1337,14 @@ class TopkLogitsPostProcessor:
                     dtype=topk_idx_full.dtype,
                     device=topk_idx_full.device,
                 )
+                out_lse = None
+                if self.return_logsumexp:
+                    assert V_logsumexp_full is not None
+                    out_lse = torch.zeros(
+                        (batch_size, unpacked_seqlen),
+                        dtype=V_logsumexp_full.dtype,
+                        device=V_logsumexp_full.device,
+                    )
                 for i in range(batch_size):
                     seq_len = seq_lengths_cpu[i]
                     start_idx = cu_seqlens_padded_cpu[i]
@@ -1289,15 +1355,29 @@ class TopkLogitsPostProcessor:
                         out_idx[i, :seq_len, :] = topk_idx_full[
                             0, start_idx : start_idx + seq_len, :
                         ]
-                return output_tensor.new_zeros(()), {
+                        if self.return_logsumexp:
+                            assert out_lse is not None
+                            assert V_logsumexp_full is not None
+                            out_lse[i, :seq_len] = V_logsumexp_full[
+                                0, start_idx : start_idx + seq_len
+                            ]
+                result = {
                     "topk_logits": out_vals,
                     "topk_indices": out_idx,
                 }
+                if self.return_logsumexp:
+                    assert out_lse is not None
+                    result["V_logsumexp"] = out_lse
+                return output_tensor.new_zeros(()), result
             else:
-                return output_tensor.new_zeros(()), {
+                result = {
                     "topk_logits": topk_vals_full[:, :original_seq_length],
                     "topk_indices": topk_idx_full[:, :original_seq_length],
                 }
+                if self.return_logsumexp:
+                    assert V_logsumexp_full is not None
+                    result["V_logsumexp"] = V_logsumexp_full
+                return output_tensor.new_zeros(()), result
 
         return processor_fn_inner
 
