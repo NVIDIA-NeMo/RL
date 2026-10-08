@@ -174,9 +174,13 @@ env:
 
 logger:
   log_dir: logs/grpo-anyterminal-multi-harness-qwen3-0.6b
-  wandb_enabled: false
+  wandb_enabled: true
   tensorboard_enabled: true
   monitor_gpus: true
+  wandb:
+    project: multi-harness-RL
+    name: anyterminal-multi-harness-qwen3-0.6b
+    log_nemo_gym_full_result_tables: true
 
 cluster:
   num_nodes: 1

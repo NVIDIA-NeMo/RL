@@ -130,4 +130,4 @@ logger:
   wandb:
     project: multi-harness-RL
     name: anyterminal-multi-harness-nano-omni-sync-2n-debug
-    log_nemo_gym_full_result_tables: false
+    log_nemo_gym_full_result_tables: true

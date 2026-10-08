@@ -139,4 +139,4 @@ logger:
   wandb:
     project: multi-harness-RL
     name: anyterminal-multi-harness-super-omni
-    log_nemo_gym_full_result_tables: false
+    log_nemo_gym_full_result_tables: true
