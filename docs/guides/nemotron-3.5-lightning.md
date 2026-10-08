@@ -281,7 +281,7 @@ The Lightning checkpoint ships a Multi-Token Prediction (MTP) module
 end-to-end without code changes: the automodel custom NemotronH
 implementation builds only the backbone and LM head, the DCP loader never
 reads the `mtp.*` tensors, and vLLM skips them at load and refit. Keep
-`dtensor_cfg.automodel_kwargs.force_hf` and generation `speculative_config`
+`automodel_cfg.automodel_kwargs.force_hf` and generation `speculative_config`
 unset, otherwise the MTP module is instantiated.
 
 ### Launch training

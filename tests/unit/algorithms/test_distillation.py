@@ -886,12 +886,12 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
                         },
                     },
                 },
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },
             "teacher": {
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },
@@ -1024,14 +1024,14 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
                         },
                     },
                 },
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
                 "model_name": "test-policy",
             },
             "teacher": {
                 "model_name": "test-teacher",
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },
@@ -1180,13 +1180,13 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
                         "enabled": True,
                     },
                 },
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },
             "teacher": {
                 "model_name": "test-teacher",
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },
@@ -1325,7 +1325,7 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
         teacher={},
         loss_fn={},
         distillation=DistillationConfig(max_val_samples=None),
-        data={},
+        data={"train": {}},
         env={"should_use_nemo_gym": True, "nemo_gym": {}},
         logger={"log_dir": "/tmp/logs"},
         checkpointing={"enabled": False},
@@ -1417,12 +1417,12 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
                         },
                     },
                 },
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },
             "teacher": {
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },

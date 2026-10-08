@@ -15,7 +15,7 @@ There are a number of ways to pass environment variables to Ray workers in NeMo 
 - Example: `export HF_TOKEN=<your_token>`
 
 ### 3. YAML Configuration `env_vars` (high)
-- Set in YAML config files under `policy.megatron_cfg.env_vars` or `policy.dtensor_cfg.env_vars`.
+- Set in YAML config files under `policy.megatron_cfg.env_vars` or `policy.automodel_cfg.env_vars`.
 - Useful for controlling environment variables on an experiment level.
 - Example:
   ```yaml

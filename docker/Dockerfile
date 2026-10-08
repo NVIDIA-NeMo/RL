@@ -75,12 +75,24 @@ apt-get install -y --no-install-recommends \
     ccache \
     protobuf-compiler \
 
-# Nsight
+# Nsight: install a pinned release from NVIDIA's devtools apt repo instead of
+# the CUDA base image's bundled copy, which is built against an outdated Go
+# toolchain with known CVEs. Also remove that bundled copy outright, and pin
+# an exact version + signed-by keyring instead of the previous unpinned
+# install with a mismatched (CUDA repo) apt-key. Same fix as
+# NVIDIA-NeMo/Gym#3739 and NVIDIA-NeMo/Megatron-Bridge#6128.
 apt install -y --no-install-recommends gnupg
-echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list
-apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(uname -m | sed 's/aarch64/sbsa/')/7fa2af80.pub
+rm -rf /usr/local/cuda*/NsightSystems-cli-* /opt/nvidia/nsight-systems*
+apt-get remove --purge -y --allow-change-held-packages 'nsight-systems*' || true
+NSYS_VERSION="2026.5.1.161-265138896106v0"
+NSYS_RELEASE=$(echo "${NSYS_VERSION}" | cut -d. -f1-3)
+NSYS_REPO="https://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture)"
+curl -fsSL "${NSYS_REPO}/nvidia.pub" -o /usr/share/keyrings/nvidia-devtools.asc
+echo "deb [signed-by=/usr/share/keyrings/nvidia-devtools.asc] ${NSYS_REPO}/ /" \
+    | tee /etc/apt/sources.list.d/nvidia-devtools.list
 apt update
-apt install -y nsight-systems-cli
+apt install -y --no-install-recommends "nsight-systems-cli-${NSYS_RELEASE}=${NSYS_VERSION}"
+rm -f /etc/apt/sources.list.d/nvidia-devtools.list /usr/share/keyrings/nvidia-devtools.asc
 
 # To fix CVE-2025-68973
 apt install -y --only-upgrade gnupg
@@ -555,6 +567,14 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     rm -f "${GYM_VLLM_OVERRIDE}"
 fi
 EOF
+# ray's bundled Java worker jar ships an outdated httpcore5 with a known CVE
+# (GHSA-hf6x-8p5f-cgmf). NeMo-RL never uses Ray's Java cross-language worker,
+# and removing the jar doesn't affect ray.init(), remote tasks, actors, or
+# ray.serve (verified in NVIDIA-NeMo/Gym#3779/#3826). Sweep every venv (base,
+# per-backend worker venvs, gym-prefetched venvs) and the default uv cache
+# (/root/.cache/uv, since this stage never overrides UV_CACHE_DIR) that it
+# could have landed in.
+RUN find /opt /root -name ray_dist.jar -delete
 # Generate container fingerprint for frozen environment support
 # Store outside /opt/nemo-rl to avoid being overwritten by user mounts
 RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint

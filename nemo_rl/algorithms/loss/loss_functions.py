@@ -3399,9 +3399,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             # disjoint rank-local windows at a single gradient fanout.
             return group_all_reduce_sum_with_grad(local_ce, cp_group)
 
-        per_token_ce = student_next_token_ce(
-            logits, input_ids=data["input_ids"], seq_index=data.get("seq_index")
-        )
+        per_token_ce = student_next_token_ce(logits, input_ids=data["input_ids"])
         label_mask = ce_label_mask(
             token_mask=data["token_mask"],
             sample_mask=data["sample_mask"],

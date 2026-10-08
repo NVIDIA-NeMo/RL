@@ -116,8 +116,7 @@ policy:
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
     checkpoint:
       model_save_format: "safetensors"
@@ -317,8 +316,7 @@ value:
     enabled: false
     reward_model_type: "regression"
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
     checkpoint:
       model_save_format: "safetensors"
