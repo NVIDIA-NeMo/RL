@@ -38,9 +38,9 @@ from nemo_rl.algorithms.async_utils import (
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
 from nemo_rl.algorithms.async_utils.trajectory_collector import (
-    _warn_stale_prefix_cache_once,
     _stamped_task_indices,
     _unanimous_task_index,
+    _warn_stale_prefix_cache_once,
 )
 from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
@@ -2801,9 +2801,14 @@ class TestAsyncTrajectoryCollector:
             collector.resume_after_refit()
 
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
-        assert collector.policy_generation.pause_generation_for_refit_calls == [False, False]
+        assert collector.policy_generation.pause_generation_for_refit_calls == [
+            False,
+            False,
+        ]
         output = capsys.readouterr().out
-        assert output.count("prefix cache is NOT invalidated across weight updates") == 1
+        assert (
+            output.count("prefix cache is NOT invalidated across weight updates") == 1
+        )
         _warn_stale_prefix_cache_once.cache_clear()
 
     def test_in_flight_refit_without_recompute_does_not_warn_when_prefix_caching_off(
