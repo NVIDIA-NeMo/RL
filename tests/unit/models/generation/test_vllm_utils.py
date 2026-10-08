@@ -1207,6 +1207,30 @@ def test_pad_and_align_rejects_uint16_expert_ids_overflowing_dtype(monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    "enabled,token_information_attached,captured,expected",
+    [
+        (False, True, True, False),
+        (True, True, False, True),
+        (True, False, True, True),
+        # A call that asks for no token ids (e.g. a Gym user simulator) must not
+        # get routes: Gym rejects partial token metadata.
+        (True, False, False, False),
+    ],
+)
+def test_should_attach_routed_experts(
+    enabled, token_information_attached, captured, expected
+):
+    assert (
+        vllm_utils.should_attach_routed_experts(
+            enabled=enabled,
+            token_information_attached=token_information_attached,
+            captured=captured,
+        )
+        is expected
+    )
+
+
 def _generation_stub(counters):
     """Enough of a ``VllmGeneration`` to call ``get_step_metrics`` unbound.
 

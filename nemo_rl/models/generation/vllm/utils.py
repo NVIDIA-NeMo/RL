@@ -358,6 +358,23 @@ def pad_and_align_routed_expert_indices(
     return (full, stats) if return_stats else full
 
 
+def should_attach_routed_experts(
+    *, enabled: bool, token_information_attached: bool, captured: bool
+) -> bool:
+    """Whether a chat completion carries its routed experts.
+
+    Routes travel only with the token information they align to, or on a
+    captured call. Gym's response models take token metadata (prompt and
+    generation token ids, generation logprobs, routed experts) all or nothing,
+    so routes on a response without token ids fail validation there. A captured
+    call needs them for staging; its capture path strips them, with the token
+    ids and logprobs, before the response leaves the worker. A call that asks
+    for neither, e.g. a Gym user simulator served by the policy engine, gets
+    none.
+    """
+    return enabled and (token_information_attached or captured)
+
+
 def attach_routed_experts_to_chat_response_choices(
     response: Any,
     final_request_output: Any,

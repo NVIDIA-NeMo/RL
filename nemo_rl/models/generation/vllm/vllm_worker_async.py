@@ -59,6 +59,7 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
 from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
+    should_attach_routed_experts,
     attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
     validate_rollout_prompt,
@@ -1288,13 +1289,20 @@ class VllmAsyncGenerationWorkerImpl(
                 ):
                     return response
 
-                if request.logprobs and return_as_token_id:
+                token_information_attached = bool(
+                    request.logprobs and return_as_token_id
+                )
+                if token_information_attached:
                     response = attach_token_information_to_chat_response_choices(
                         response,
                         final_res,
                     )
 
-                if worker_self._return_routed_experts_enabled():
+                if should_attach_routed_experts(
+                    enabled=worker_self._return_routed_experts_enabled(),
+                    token_information_attached=token_information_attached,
+                    captured=id(request) in worker_self._capture_calls,
+                ):
                     response = attach_routed_experts_to_chat_response_choices(
                         response,
                         final_res,
