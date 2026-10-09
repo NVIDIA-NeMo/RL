@@ -1257,11 +1257,12 @@ class MegatronPolicyWorkerImpl(
             "shared-prefix train mode requires a per-stage token bin capacity"
         )
         # Imported only on the shared path: these adapters need megatron.rl.
-        from nemo_rl.models.megatron.shared_prefix_alignment import (
+        from megatron.rl.shared_prefix_alignment import (
             align_physical_units,
             align_training_units,
             materialize_alignment,
         )
+
         from nemo_rl.models.megatron.shared_prefix_dense_bins import (
             plan_dense_training_bins,
             share_prefixes_in_dense_training_bins,

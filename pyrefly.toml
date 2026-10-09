@@ -272,7 +272,6 @@ project-includes = [
   "nemo_rl/models/huggingface/__init__.py",
   "nemo_rl/models/megatron/__init__.py",
   "nemo_rl/models/megatron/alignment.py",
-  "nemo_rl/models/megatron/shared_prefix_alignment.py",
   "nemo_rl/models/megatron/shared_prefix_dense_bins.py",
   "nemo_rl/models/megatron/draft/__init__.py",
   "nemo_rl/models/megatron/draft/optimizer.py",
