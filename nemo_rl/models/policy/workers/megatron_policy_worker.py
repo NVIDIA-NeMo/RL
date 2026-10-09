@@ -143,6 +143,10 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.telemetry.setup import init_telemetry_worker
+from nemo_rl.utils.gc_freeze import (
+    freeze_initialised_heap,
+    gc_collection_counts,
+)
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -888,6 +892,19 @@ class MegatronPolicyWorkerImpl(
         log_gpu_memory_diagnostics(
             label="init_complete", worker_type="MegatronPolicyWorker"
         )
+
+        # Everything built above stays alive for the whole run. Freezing it keeps
+        # the per-refit gc.collect() and the automatic full collections from
+        # walking it on every step (see nemo_rl/utils/gc_freeze.py).
+        self._gc_counts_at_last_offload: Optional[tuple[int, int, int]] = None
+        freeze_stats = freeze_initialised_heap()
+        if self.rank == 0:
+            print(
+                f"[gc-freeze] froze {freeze_stats['frozen']} objects after init "
+                f"(collected {freeze_stats['collected']}, "
+                f"{freeze_stats['seconds']:.2f}s)",
+                flush=True,
+            )
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -4789,11 +4806,19 @@ class MegatronPolicyWorkerImpl(
         print(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
+        # Collections per generation since the previous refit (the explicit
+        # gc.collect() above counts as one generation-2 run when enabled).
+        gc_counts = gc_collection_counts()
+        previous = getattr(self, "_gc_counts_at_last_offload", None) or (0, 0, 0)
+        gc_runs = tuple(now - then for now, then in zip(gc_counts, previous))
+        self._gc_counts_at_last_offload = gc_counts
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             phases = " ".join(f"{name}={sec:.2f}s" for name, sec in offload_phases.items())
             print(
                 "[offload-timing] offload_before_refit "
-                f"total={time.perf_counter() - offload_t0:.2f}s {phases}",
+                f"total={time.perf_counter() - offload_t0:.2f}s {phases} "
+                f"gc_runs={gc_runs[0]}/{gc_runs[1]}/{gc_runs[2]} "
+                f"gc_frozen={gc.get_freeze_count()}",
                 flush=True,
             )
         no_grad.__exit__(None, None, None)
