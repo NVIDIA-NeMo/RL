@@ -43,10 +43,6 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineRpcMixin,
 )
 from nemo_rl.models.generation.vllm.config import (
-    NATIVE_LORA_ADAPTER_ID,
-    NATIVE_LORA_ADAPTER_NAME,
-    NATIVE_LORA_ADAPTER_PATH,
-    NATIVE_LORA_CONFIG_KEY,
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
@@ -54,6 +50,7 @@ from nemo_rl.models.generation.vllm.config import (
     validate_nvfp4_pertoken_model,
     vllm_nemotron_h_fp32_lm_head_enabled,
 )
+from nemo_rl.models.generation.vllm.lora_utils import make_native_lora_request
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     FINISHED_REASON_LABEL,
@@ -267,27 +264,6 @@ def _configure_nvfp4_pertoken_engine_kwargs(
         llm_kwargs,
         validated_config.resolved_ignore(),
         explicit_engine_kwargs=cfg.get("vllm_kwargs") or {},
-    )
-
-
-def _make_native_lora_request(config: VllmConfig) -> Any:
-    """Build the stable in-memory adapter request selected by native refit."""
-    vllm_kwargs = config.get("vllm_kwargs") or {}
-    additional_config = vllm_kwargs.get("additional_config") or {}
-    if (
-        config.get("lora_refit_mode") != "native"
-        or not vllm_kwargs.get("enable_lora")
-        or NATIVE_LORA_CONFIG_KEY not in additional_config
-    ):
-        return None
-
-    # Optional vLLM dependency: import only in the vLLM worker environment.
-    from vllm.lora.request import LoRARequest
-
-    return LoRARequest(
-        lora_name=NATIVE_LORA_ADAPTER_NAME,
-        lora_int_id=NATIVE_LORA_ADAPTER_ID,
-        lora_path=NATIVE_LORA_ADAPTER_PATH,
     )
 
 
@@ -571,7 +547,7 @@ class BaseVllmGenerationWorker:
             import vllm
 
             self.SamplingParams = vllm.SamplingParams
-            self._native_lora_request = _make_native_lora_request(self.cfg)
+            self._native_lora_request = make_native_lora_request(self.cfg)
         except ImportError:
             raise ImportError(
                 "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "

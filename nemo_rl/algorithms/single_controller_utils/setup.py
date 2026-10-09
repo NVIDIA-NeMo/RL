@@ -132,16 +132,14 @@ from nemo_rl.models.generation.megatron.megatron_generation import MegatronGener
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
-from nemo_rl.models.generation.vllm.config import (
-    VllmConfig,
-    configure_vllm_lora_refit,
-)
+from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
 from nemo_rl.models.policy import OnPolicyDistillationFullTransport, PolicyConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
@@ -1069,11 +1067,9 @@ def setup_single_controller(
     generation_config = policy_config["generation"]
     data_config = master_config.data
 
-    # Materialize native-LoRA settings before generation and trainer may be
-    # constructed concurrently on disjoint clusters. Without this, the DTensor
-    # worker would send only A/B while vLLM still expected merged full weights.
-    if generation_config["backend"] == "vllm":
-        configure_vllm_lora_refit(policy_config)
+    # Validate every LoRA rollout representation and materialize native vLLM
+    # settings before generation and trainer are constructed concurrently.
+    configure_lora_refit(policy_config)
 
     # Every nccl_reshard precondition, checked once, here, before any GPU work.
     #

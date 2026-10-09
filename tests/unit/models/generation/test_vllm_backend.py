@@ -1499,7 +1499,7 @@ def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatc
 @pytest.mark.vllm
 def test_native_lora_collective_clones_buffers_and_installs_adapter(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.config import NATIVE_LORA_CONFIG_KEY
+    from nemo_rl.models.generation.vllm.lora_utils import NATIVE_LORA_CONFIG_KEY
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
@@ -1547,7 +1547,7 @@ def test_install_native_lora_replaces_and_activates_stable_adapter(monkeypatch):
     from vllm.lora.peft_helper import PEFTHelper
 
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.config import (
+    from nemo_rl.models.generation.vllm.lora_utils import (
         NATIVE_LORA_ADAPTER_ID,
         NATIVE_LORA_CONFIG_KEY,
     )
@@ -1624,7 +1624,7 @@ def test_install_native_lora_rejects_unapplied_runtime_module(monkeypatch):
     from vllm.lora.peft_helper import PEFTHelper
 
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.config import NATIVE_LORA_CONFIG_KEY
+    from nemo_rl.models.generation.vllm.lora_utils import NATIVE_LORA_CONFIG_KEY
 
     adapter_manager = MagicMock()
     adapter_manager.model = SimpleNamespace(hf_to_vllm_mapper=None)
@@ -1678,7 +1678,7 @@ def test_install_native_lora_rejects_trainable_skipped_module(monkeypatch):
     from vllm.lora.peft_helper import PEFTHelper
 
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.config import NATIVE_LORA_CONFIG_KEY
+    from nemo_rl.models.generation.vllm.lora_utils import NATIVE_LORA_CONFIG_KEY
 
     adapter_manager = MagicMock()
     adapter_manager.model = SimpleNamespace(
@@ -1721,7 +1721,7 @@ def test_install_native_lora_rejects_trainable_skipped_module(monkeypatch):
 @pytest.mark.vllm
 def test_native_lora_ipc_clones_buffers_and_installs_adapter(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.config import NATIVE_LORA_CONFIG_KEY
+    from nemo_rl.models.generation.vllm.lora_utils import NATIVE_LORA_CONFIG_KEY
     from nemo_rl.models.policy.utils import IPCProtocol, calculate_aligned_size
 
     tensor_names = ["model.layer.lora_A.weight", "model.layer.lora_B.weight"]

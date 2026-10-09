@@ -27,17 +27,15 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 @pytest.mark.vllm
 @pytest.mark.parametrize("mode", ["native", "merged"])
 def test_native_lora_request_uses_stable_identity(mode):
-    from nemo_rl.models.generation.vllm.config import (
+    from nemo_rl.models.generation.vllm.lora_utils import (
         NATIVE_LORA_ADAPTER_ID,
         NATIVE_LORA_ADAPTER_NAME,
         NATIVE_LORA_ADAPTER_PATH,
         NATIVE_LORA_CONFIG_KEY,
-    )
-    from nemo_rl.models.generation.vllm.vllm_worker import (
-        _make_native_lora_request,
+        make_native_lora_request,
     )
 
-    request = _make_native_lora_request(
+    request = make_native_lora_request(
         cast(
             Any,
             {
@@ -63,11 +61,9 @@ def test_native_lora_request_uses_stable_identity(mode):
 
 @pytest.mark.vllm
 def test_native_default_without_lora_does_not_create_request():
-    from nemo_rl.models.generation.vllm.vllm_worker import (
-        _make_native_lora_request,
-    )
+    from nemo_rl.models.generation.vllm.lora_utils import make_native_lora_request
 
-    assert _make_native_lora_request(cast(Any, {"lora_refit_mode": "native"})) is None
+    assert make_native_lora_request(cast(Any, {"lora_refit_mode": "native"})) is None
 
 
 @pytest.mark.vllm

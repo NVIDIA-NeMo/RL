@@ -135,7 +135,6 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VLLM_SPARSE_REFIT_TRANSPORTS,
-    configure_vllm_lora_refit,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
@@ -144,6 +143,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -616,9 +616,9 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for GRPO"
     )
+    configure_lora_refit(policy_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
-        configure_vllm_lora_refit(policy_config)
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
     elif generation_config["backend"] == "dynamo":
         # Validate the complete managed-Dynamo boundary before allocating Ray

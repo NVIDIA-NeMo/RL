@@ -1,0 +1,10 @@
+defaults: grpo-qwen3-8B-base-1n8g-fsdp2-lora.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-8B-base-1n8g-fsdp2-lora-merged
+policy:
+  generation:
+    lora_refit_mode: merged
+logger:
+  log_dir: logs/grpo-qwen3-8B-base-1n8g-fsdp2-lora-merged
+  wandb:
+    name: grpo-qwen3-8B-base-1n8g-fsdp2-lora-merged

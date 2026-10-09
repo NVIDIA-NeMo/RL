@@ -16,7 +16,7 @@ import gc
 import warnings
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Iterable, Literal, Optional
+from typing import Any, Generator, Iterable, Literal, Optional, cast
 
 import ray
 import torch
@@ -200,18 +200,6 @@ def automodel_lora_params_generator(
         )
 
 
-def automodel_refit_params_generator(
-    model: nn.Module,
-    target_dtype: torch.dtype,
-    lora_refit_mode: Literal["native", "merged"],
-) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Yield the configured factorized or merged vLLM refit representation."""
-    if lora_refit_mode == "native":
-        yield from automodel_lora_params_generator(model, target_dtype)
-        return
-    yield from automodel_params_generator(model, target_dtype)
-
-
 def automodel_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -376,20 +364,12 @@ class AutomodelPolicyWorkerImpl(
         self.lora_enabled = (
             config["automodel_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
-        self.lora_refit_mode: Literal["native", "merged"] = "merged"
         generation_config = config.get("generation")
-        if (
-            self.lora_enabled
-            and generation_config is not None
-            and generation_config["backend"] == "vllm"
-        ):
-            configured_mode = generation_config.get("lora_refit_mode")
-            if configured_mode not in ("native", "merged"):
-                raise ValueError(
-                    "LoRA training with vLLM requires "
-                    "policy.generation.lora_refit_mode to be 'native' or 'merged'."
-                )
-            self.lora_refit_mode = configured_mode
+        if self.lora_enabled and generation_config is not None:
+            self.lora_refit_mode: Literal["native", "merged"] = cast(
+                Literal["native", "merged"],
+                cast(dict[str, Any], generation_config)["lora_refit_mode"],
+            )
 
         print(f"Initializing AutomodelPolicyWorker with is_vlm={self.is_vlm}")
 
@@ -1179,10 +1159,10 @@ class AutomodelPolicyWorkerImpl(
         self, *, refit_payload_mode: RefitPayloadMode = "hf_export"
     ) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
-        if self.lora_refit_mode == "native":
+        if self.lora_enabled and self.lora_refit_mode == "native":
             return {
                 name: (tensor.shape, tensor.dtype)
-                for name, tensor in dtensor_lora_params_generator(
+                for name, tensor in automodel_lora_params_generator(
                     self.model, self.dtype
                 )
             }
@@ -1205,6 +1185,15 @@ class AutomodelPolicyWorkerImpl(
                 state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
 
         return state_dict_info
+
+    def _refit_params_generator(
+        self,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Yield native A/B tensors or the unchanged merged full state."""
+        if self.lora_enabled and self.lora_refit_mode == "native":
+            yield from automodel_lora_params_generator(self.model, self.dtype)
+            return
+        yield from automodel_params_generator(self.model, self.dtype)
 
     @torch.no_grad()
     def calibrate_qkv_fp8_scales(
@@ -1242,9 +1231,7 @@ class AutomodelPolicyWorkerImpl(
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=automodel_refit_params_generator(
-                self.model, self.dtype, self.lora_refit_mode
-            ),
+            params_generator=self._refit_params_generator(),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -1357,9 +1344,7 @@ class AutomodelPolicyWorkerImpl(
         automodel_post_iter_func = lambda x: x[1]
 
         packed_broadcast_producer(
-            iterator=automodel_refit_params_generator(
-                self.model, self.dtype, self.lora_refit_mode
-            ),
+            iterator=self._refit_params_generator(),
             group=self.model_update_group,
             src=0,
             post_iter_func=automodel_post_iter_func,

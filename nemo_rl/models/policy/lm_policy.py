@@ -56,6 +56,7 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
+    validate_lora_refit_policy_config,
     validate_fp32_lm_head_config,
 )
 from nemo_rl.utils.flops_tracker import (
@@ -156,6 +157,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         megatron_enabled = bool(config.get("megatron_cfg", {}).get("enabled", False))
         automodel_enabled = bool(config.get("automodel_cfg", {}).get("enabled", False))
+        validate_lora_refit_policy_config(config)
         # Normalize in place: every downstream reader (workers, setup, train)
         # accesses draft config by attribute, so a hand-built PolicyConfig has
         # to be validated here rather than only inside MasterConfig.
