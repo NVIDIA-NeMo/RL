@@ -58,7 +58,7 @@ on:
       trtllm-cache-scope:
         required: false
         default: ""
-        description: Optional scope (e.g. a release branch name such as r0.8.0) inserted into the TRT-LLM cache image tags so a branch that pins a different TRT-LLM ref does not share caches with main. Also publishes the image under a `<scope>` tag for PR builds. Empty keeps the unscoped tags.
+        description: Optional scope (e.g. a release branch name such as r0.8.0) inserted into the TRT-LLM cache image tags so a branch that pins a different TRT-LLM ref does not share caches with main. Empty keeps the unscoped tags.
         type: string
       dockerfile:
         required: true
@@ -310,8 +310,6 @@ jobs:
       - name: Compute build metadata
         id: build_meta
         shell: bash
-        env:
-          CACHE_SCOPE: ${{ inputs.trtllm-cache-scope }}
         run: |
           set -euo pipefail
 
@@ -324,13 +322,14 @@ jobs:
           if [[ "$GH_REF" == "refs/heads/main" ]]; then
             CACHE_KEY="main"
             TAGS+=("$REGISTRY/$IMAGE_NAME:main")
+          elif [[ "$GH_REF" =~ ^refs/heads/r[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            # Only builds of the release branch itself (not of its PRs) publish the branch tag
+            # that Lfast runs on PRs to that branch reuse; the cache is likewise branch-scoped.
+            CACHE_KEY="${GH_REF#refs/heads/}"
+            TAGS+=("$REGISTRY/$IMAGE_NAME:$CACHE_KEY")
           elif [[ -n "$PR_NUMBER" ]]; then
             CACHE_KEY="$PR_NUMBER"
             TAGS+=("$REGISTRY/$IMAGE_NAME:$PR_NUMBER")
-            # Release-branch PRs also publish the branch tag that their Lfast runs reuse.
-            if [[ -n "$CACHE_SCOPE" ]]; then
-              TAGS+=("$REGISTRY/$IMAGE_NAME:$CACHE_SCOPE")
-            fi
           else
             CACHE_KEY=$(printf '%s' "${GITHUB_REF_NAME:-$RUN_ID}" | tr '/' '-' | tr -cd '[:alnum:]._-')
             if [[ -z "$CACHE_KEY" ]]; then
