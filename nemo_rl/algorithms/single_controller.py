@@ -2567,6 +2567,33 @@ class SingleControllerActor:
             )
         return target
 
+    async def _select_training_chunk(
+        self, *, min_prompt_groups: int, max_prompt_groups: int
+    ) -> tuple[Optional[KVBatchMeta], int]:
+        if not self._async_cfg.coalesce_streaming_tails:
+            return await self._sampler.select(
+                current_train_weight=self._trainer_version,
+                min_prompt_groups=min_prompt_groups,
+                max_prompt_groups=max_prompt_groups,
+            )
+
+        # InOrderSampler returns without mutation or suspension when the full
+        # remainder is not ready. Always take it whole when it is ready.
+        meta, count = await self._sampler.select(
+            current_train_weight=self._trainer_version,
+            min_prompt_groups=max_prompt_groups,
+            max_prompt_groups=max_prompt_groups,
+        )
+        if meta is not None or max_prompt_groups < 2 * min_prompt_groups:
+            return meta, count
+        # Leave at least the streaming floor for the final chunk. Selection
+        # transfers training claims, so never claim then return withheld groups.
+        return await self._sampler.select(
+            current_train_weight=self._trainer_version,
+            min_prompt_groups=min_prompt_groups,
+            max_prompt_groups=max_prompt_groups - min_prompt_groups,
+        )
+
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
 
@@ -2684,8 +2711,7 @@ class SingleControllerActor:
                         training_claim_ids_before = (
                             self._buffer.training_owned_group_ids()
                         )
-                        train_meta, num_groups = await self._sampler.select(
-                            current_train_weight=self._trainer_version,
+                        train_meta, num_groups = await self._select_training_chunk(
                             min_prompt_groups=min_prompt_groups,
                             max_prompt_groups=max_prompt_groups,
                         )
