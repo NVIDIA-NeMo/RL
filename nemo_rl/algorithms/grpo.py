@@ -143,10 +143,10 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     current_trace_carrier,

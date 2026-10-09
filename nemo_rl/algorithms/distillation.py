@@ -70,9 +70,9 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_vllm_refit_config,
 )
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     evaluate_span,

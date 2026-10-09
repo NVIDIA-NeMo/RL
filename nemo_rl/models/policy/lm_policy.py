@@ -56,8 +56,8 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
-    validate_lora_refit_policy_config,
     validate_fp32_lm_head_config,
+    validate_lora_refit_policy_config,
 )
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
