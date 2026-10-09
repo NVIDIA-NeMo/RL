@@ -71,6 +71,19 @@ print(
 )
 PY
 
+"$OSWORLD_DRIVER_PYTHON" - <<'PY'
+from vllm.parser.parser_manager import ParserManager
+from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
+
+plugin_path = (
+    "nemo_rl/models/generation/vllm/reasoning_parsers/"
+    "nano_v3_reasoning_parser.py"
+)
+ReasoningParserManager.import_reasoning_parser(plugin_path)
+ParserManager.get_reasoning_parser("nano_v3")
+print("osworld-v2-reasoning-parser-preflight-ok", plugin_path)
+PY
+
 cd "$OSWORLD_RL_ROOT"
 if [[ -n "${OSWORLD_EVAL_MODE:-}" ]]; then
   case "$OSWORLD_EVAL_MODE" in
