@@ -621,10 +621,13 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
         if "lb_watchdog.sh" in block and "--output=" in block
     )
 
-    assert "--het-group=1" in replica_launch
+    # The component selectors are per-mode arrays: hetgroups inline, none in serve.
+    assert '"${het_ext[@]}"' in replica_launch
     assert '-A "${SLURM_JOB_ACCOUNT}"' not in replica_launch
     assert '-p "${SLURM_JOB_PARTITION}"' not in replica_launch
-    assert "--het-group=0" in lb_launch
+    assert '"${het_ray[@]}"' in lb_launch
+    assert "het_ray=(--het-group=0)" in source
+    assert "het_ext=(--het-group=1)" in source
     assert '-A "${SLURM_JOB_ACCOUNT}"' in lb_launch
     assert '-p "${SLURM_JOB_PARTITION}"' in lb_launch
 
@@ -646,7 +649,9 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert "RAY_NODELIST" not in source
     assert "external-vllm-lb-preflight" not in source
     assert "if ! ready=$(" in source
-    assert 'env \\\n  SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source
+    assert (
+        'env \\\n    SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source
+    )
     assert 'if [[ -n "${SLURM_RESTART_COUNT:-}" ]]; then' in source
     assert (
         'LOG_DIR="${BASE_LOG_DIR}/${SLURM_JOB_ID}-${SLURM_RESTART_COUNT}-logs"'
@@ -945,3 +950,355 @@ def test_lightning_launcher_rejects_invalid_external_pool_tp():
 
     assert result.returncode == 2
     assert "must be divisible by GPUS_PER_NODE=4" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Serve mode, early Ray, and attach_and_run.sh, exercised end to end against
+# stub Slurm commands. The stub srun registers each replica in the real backend
+# registry (or not, per test), so the wrapper's readiness loop runs unchanged.
+# ---------------------------------------------------------------------------
+
+_STUB_SRUN = r"""#!/bin/bash
+export_arg=""
+is_lb=0
+for arg in "$@"; do
+  case "${arg}" in --export=*) export_arg="${arg#--export=}" ;; esac
+  [[ "${arg}" == *lb_watchdog.sh* ]] && is_lb=1
+done
+trap 'exit 0' TERM INT
+if (( is_lb )); then
+  echo lb >> "${STUB_LOG}/lb_launches"
+  while true; do sleep 0.1; done
+fi
+IFS=, read -ra assignments <<< "${export_arg}"
+for assignment in "${assignments[@]}"; do
+  [[ "${assignment}" == *=* ]] && export "${assignment}"
+done
+echo "${REPLICA_ID}" >> "${STUB_LOG}/replica_launches"
+if [[ -z "${STUB_NO_REGISTER:-}" ]]; then
+  source "${EXTERNAL_VLLM_TOOLS_DIR}/vllm_backend_registry.sh"
+  registry_add "${REPLICA_ID}" 127.0.0.1 8000
+fi
+while true; do
+  if [[ -f "${STUB_LOG}/crash_${REPLICA_ID}" ]]; then
+    rm -f "${STUB_LOG}/crash_${REPLICA_ID}"
+    exit 1
+  fi
+  sleep 0.1
+done
+"""
+
+
+def _stub_env(tmp_path, **extra):
+    """Stub Slurm/network commands on PATH and a pool contract for two pools."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stubs = {
+        "srun": _STUB_SRUN,
+        "scontrol": '#!/bin/bash\n[[ "$1 $2" == "show hostnames" ]] && tr , "\\n" <<< "$3"\n',
+        "getent": '#!/bin/bash\necho "127.0.0.1 STREAM $2"\n',
+        "curl": "#!/bin/bash\nexit 0\n",
+        "squeue": '#!/bin/bash\necho "${STUB_SQUEUE_STATE:-}"\n',
+    }
+    for name, body in stubs.items():
+        stub = bin_dir / name
+        stub.write_text(body)
+        stub.chmod(0o755)
+    tools = tmp_path / "tools"
+    subprocess.run(
+        ["cp", "-a", str(REPO_ROOT / "tools/external_gym_vllm"), str(tools)],
+        check=True,
+    )
+    stub_log = tmp_path / "stub_log"
+    stub_log.mkdir()
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "STUB_LOG": str(stub_log),
+        "SLURM_JOB_ID": "555",
+        "SLURM_JOB_ACCOUNT": "account",
+        "SLURM_JOB_PARTITION": "partition",
+        "SLURM_SUBMIT_DIR": str(REPO_ROOT),
+        "BASE_LOG_DIR": str(tmp_path / "logs"),
+        "CONTAINER": "training.sqsh",
+        "MOUNTS": f"{tmp_path}:{tmp_path}",
+        "EXTERNAL_VLLM_SHARED_ROOT": str(tmp_path),
+        "EXTERNAL_VLLM_TOOLS_DIR_HOST": str(tools),
+        "EXTERNAL_VLLM_POOLS": "ALPHA BETA",
+    }
+    for pool, replicas, port in (("ALPHA", 2, 9213), ("BETA", 1, 9214)):
+        env.update(
+            {
+                f"{pool}_CONTAINER": "judge.sqsh",
+                f"{pool}_MODEL": "model-id",
+                f"{pool}_VLLM_PYTHON": "/opt/python",
+                f"{pool}_REPLICAS": str(replicas),
+                f"{pool}_TENSOR_PARALLEL_SIZE": "4",
+                f"{pool}_LB_PORT": str(port),
+                f"{pool}_URL_PLACEHOLDER": f"__{pool}_BASE_URL__",
+            }
+        )
+    env.update(extra)
+    return env
+
+
+def _wait_for(predicate, timeout_s, message):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.1)
+    raise AssertionError(message)
+
+
+def _start(script, env, tmp_path):
+    out = open(tmp_path / "wrapper.out", "w")
+    return subprocess.Popen(
+        ["bash", str(script)],
+        env=env,
+        stdout=out,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+
+def _stop(process):
+    if process.poll() is None:
+        process.send_signal(signal.SIGTERM)
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            pass
+    # Reap anything the stubs left behind (each test runs in its own session).
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if process.poll() is None:
+        process.wait(timeout=5)
+
+
+def test_serve_mode_rejects_a_heterogeneous_job(tmp_path):
+    env = _stub_env(
+        tmp_path,
+        EXTERNAL_VLLM_MODE="serve",
+        EXTERNAL_VLLM_POOL_DIR=str(tmp_path / "pool"),
+        SLURM_HET_SIZE="2",
+    )
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "serve mode runs as a plain (non-heterogeneous) job" in result.stderr
+
+
+def test_serve_mode_requires_a_pool_dir_and_rejects_unknown_modes(tmp_path):
+    script = REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh"
+    env = _stub_env(tmp_path, EXTERNAL_VLLM_MODE="serve")
+    result = subprocess.run(
+        ["bash", str(script)], env=env, capture_output=True, text=True
+    )
+    assert result.returncode != 0
+    assert "EXTERNAL_VLLM_POOL_DIR is required in serve mode" in result.stderr
+
+    env["EXTERNAL_VLLM_MODE"] = "attach"
+    result = subprocess.run(
+        ["bash", str(script)], env=env, capture_output=True, text=True
+    )
+    assert result.returncode != 0
+    assert "EXTERNAL_VLLM_MODE must be inline or serve, got: attach" in result.stderr
+
+
+def test_serve_mode_publishes_urls_relaunches_dead_replicas_and_withdraws_ready(
+    tmp_path,
+):
+    pool_dir = tmp_path / "pool"
+    env = _stub_env(
+        tmp_path,
+        EXTERNAL_VLLM_MODE="serve",
+        EXTERNAL_VLLM_POOL_DIR=str(pool_dir),
+        EXTERNAL_VLLM_SERVE_POLL_S="0.2",
+        SLURM_JOB_NODELIST="node1,node2,node3",
+    )
+    stub_log = Path(env["STUB_LOG"])
+    process = _start(
+        REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh", env, tmp_path
+    )
+    try:
+        # COMMAND is not required in serve mode, and no ray.sub is started.
+        _wait_for((pool_dir / "READY").exists, 60, "pools never published READY")
+        assert (pool_dir / "pools.env").read_text().splitlines() == [
+            "ALPHA=http://127.0.0.1:9213/v1",
+            "BETA=http://127.0.0.1:9214/v1",
+        ]
+        assert (
+            pool_dir / "alpha_url"
+        ).read_text().strip() == "http://127.0.0.1:9213/v1"
+        assert (pool_dir / "beta_url").read_text().strip() == "http://127.0.0.1:9214/v1"
+        assert (pool_dir / "job_id").read_text().strip() == "555"
+        assert not (pool_dir / "STOPPED").exists()
+        launches = (stub_log / "replica_launches").read_text().split()
+        assert sorted(launches) == ["555-alpha-0", "555-alpha-1", "555-beta-0"]
+
+        # A replica that dies is relaunched; the published URLs stay as they were.
+        (stub_log / "crash_555-alpha-1").touch()
+        _wait_for(
+            lambda: (
+                (stub_log / "replica_launches").read_text().split().count("555-alpha-1")
+                == 2
+            ),
+            15,
+            "dead replica was not relaunched",
+        )
+        assert (pool_dir / "READY").exists()
+        assert (
+            pool_dir / "alpha_url"
+        ).read_text().strip() == "http://127.0.0.1:9213/v1"
+    finally:
+        _stop(process)
+
+    output = (tmp_path / "wrapper.out").read_text()
+    assert "ALPHA replica 1 exited; relaunch 1/5" in output
+    assert not (pool_dir / "READY").exists()
+    assert (pool_dir / "STOPPED").read_text().startswith("555 ")
+
+
+def test_serve_mode_gives_up_on_a_crash_looping_replica(tmp_path):
+    pool_dir = tmp_path / "pool"
+    env = _stub_env(
+        tmp_path,
+        EXTERNAL_VLLM_MODE="serve",
+        EXTERNAL_VLLM_POOL_DIR=str(pool_dir),
+        EXTERNAL_VLLM_SERVE_POLL_S="0.2",
+        EXTERNAL_VLLM_MAX_RESTARTS="1",
+        SLURM_JOB_NODELIST="node1,node2,node3",
+    )
+    stub_log = Path(env["STUB_LOG"])
+    process = _start(
+        REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh", env, tmp_path
+    )
+    try:
+        _wait_for((pool_dir / "READY").exists, 60, "pools never published READY")
+        for launch in (1, 2):
+            (stub_log / "crash_555-beta-0").touch()
+            _wait_for(
+                lambda: not (stub_log / "crash_555-beta-0").exists(),
+                15,
+                f"crash {launch} was not consumed",
+            )
+        process.wait(timeout=15)
+    finally:
+        _stop(process)
+
+    assert process.returncode == 1
+    assert (
+        "BETA replica 0 exited 1 times; giving up"
+        in (tmp_path / "wrapper.out").read_text()
+    )
+    assert not (pool_dir / "READY").exists()
+    assert (pool_dir / "STOPPED").exists()
+
+
+def test_early_ray_starts_nemo_rl_before_the_pools_are_healthy(tmp_path):
+    ray_sub = tmp_path / "ray.sub"
+    command_seen = tmp_path / "command_seen"
+    ray_sub.write_text(f'#!/bin/bash\necho "$COMMAND" > {command_seen}\nsleep 600\n')
+    env = _stub_env(
+        tmp_path,
+        SLURM_HET_SIZE="2",
+        SLURM_JOB_NODELIST_HET_GROUP_0="ray1",
+        SLURM_JOB_NODELIST_HET_GROUP_1="node1,node2,node3",
+        COMMAND="train alpha=__ALPHA_BASE_URL__ beta=__BETA_BASE_URL__",
+        RAY_SUB=str(ray_sub),
+        EXTERNAL_VLLM_EARLY_RAY="1",
+        STUB_NO_REGISTER="1",  # replicas never become ready
+    )
+    process = _start(
+        REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh", env, tmp_path
+    )
+    try:
+        _wait_for(command_seen.exists, 30, "ray.sub was not started while pools load")
+        assert command_seen.read_text().strip() == (
+            "train alpha=http://127.0.0.1:9213/v1 beta=http://127.0.0.1:9214/v1"
+        )
+        assert process.poll() is None  # still waiting on the pools
+    finally:
+        _stop(process)
+    output = (tmp_path / "wrapper.out").read_text()
+    assert "starting NeMo RL while external vLLM pools load" in output
+    assert "ALPHA ready: 0/2" in output
+
+
+def _attach_env(tmp_path, *, ready_job, squeue_state, **extra):
+    env = _stub_env(tmp_path)
+    pool_dir = tmp_path / "pool"
+    pool_dir.mkdir()
+    (pool_dir / "job_id").write_text(f"{ready_job}\n")
+    (pool_dir / "READY").write_text("2026-01-01T00:00:00\n")
+    (pool_dir / "alpha_url").write_text("http://10.0.0.1:9213/v1\n")
+    (pool_dir / "beta_url").write_text("http://10.0.0.1:9214/v1\n")
+    ray_sub = tmp_path / "ray.sub"
+    ray_sub.write_text(f'#!/bin/bash\necho "$COMMAND" > {tmp_path / "command_seen"}\n')
+    env.update(
+        {
+            "EXTERNAL_VLLM_POOL_DIR": str(pool_dir),
+            "EXTERNAL_VLLM_POOL_JOB": "777",
+            "COMMAND": "train alpha=__ALPHA_BASE_URL__ beta=__BETA_BASE_URL__",
+            "RAY_SUB": str(ray_sub),
+            "STUB_SQUEUE_STATE": squeue_state,
+            "EXTERNAL_VLLM_ATTACH_POLL_S": "0.1",
+            **extra,
+        }
+    )
+    return env
+
+
+def test_attach_and_run_substitutes_pool_urls_and_runs_ray_sub(tmp_path):
+    env = _attach_env(tmp_path, ready_job="777", squeue_state="RUNNING")
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "tools/external_gym_vllm/attach_and_run.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "command_seen").read_text().strip() == (
+        "train alpha=http://10.0.0.1:9213/v1 beta=http://10.0.0.1:9214/v1"
+    )
+    assert "attach: ALPHA -> http://10.0.0.1:9213/v1" in result.stdout
+
+
+def test_attach_and_run_ignores_ready_left_by_another_pool_job(tmp_path):
+    env = _attach_env(
+        tmp_path,
+        ready_job="666",
+        squeue_state="RUNNING",
+        EXTERNAL_VLLM_ATTACH_TIMEOUT="1",
+    )
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "tools/external_gym_vllm/attach_and_run.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode != 0
+    assert "judge pool job 777 not READY after 1s" in result.stderr
+    assert not (tmp_path / "command_seen").exists()
+
+
+def test_attach_and_run_fails_when_the_pool_job_is_gone(tmp_path):
+    env = _attach_env(tmp_path, ready_job="777", squeue_state="")
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "tools/external_gym_vllm/attach_and_run.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode != 0
+    assert "judge pool job 777 is gone" in result.stderr
+    assert not (tmp_path / "command_seen").exists()
