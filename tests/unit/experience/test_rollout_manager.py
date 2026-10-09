@@ -1158,11 +1158,7 @@ def test_capture_metrics_are_mirrored_into_the_resolved_harness_namespace():
 
     metrics = impl._compute_rollout_metrics([completion], "anyterminal_openclaw")
 
-    # Receipt rewards are finalized after canonical-row reassembly, so the
-    # rollout-side metrics must not publish the raw pre-finalization reward.
-    # ``aggregate_capture_reward_metrics`` later emits the authoritative
-    # ``anyterminal_openclaw/reward/*`` series from ``RewardLogContext``.
-    assert "anyterminal_openclaw/total_reward/mean" not in metrics
+    assert metrics["anyterminal_openclaw/total_reward/mean"] == 1.0
     assert metrics["anyterminal_openclaw/turns_per_sample/mean"] == 2.0
     assert metrics["anyterminal_openclaw/total_tokens_per_sample/mean"] == 13.0
     assert metrics["anyterminal_openclaw/gen_tokens_per_sample/mean"] == 8.0

@@ -1,0 +1,56 @@
+# Nano 3.5 RLVR SingleController performance-comparison arm using NeMo-RL's
+# managed, non-colocated vLLM generation workers. The external-vLLM comparison
+# arm uses rlvr_sc_smoke_small_external_vllm.yaml with the same batch, model,
+# training, Gym, and judge settings.
+defaults:
+  - rlvr_sc_smoke_small_external_vllm.yaml
+
+policy:
+  generation:
+    backend: vllm
+    port_range_low: 3000
+    port_range_high: 4999
+    refit_transport: nccl_reshard
+    mcore_generation_config: null
+    remote_vllm_cfg: null
+    refit_cfg: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: auto
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      expert_parallel_size: 4
+      gpu_memory_utilization: 0.85
+      max_model_len: ${policy.max_total_sequence_length}
+      enable_prefix_caching: true
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+      reasoning_parser_plugin: ${oc.env:NANO35_VLLM_REASONING_PARSER_PLUGIN}
+    vllm_kwargs:
+      moe_backend: flashinfer_cutlass
+      attention_backend: FLASH_ATTN
+      max_num_seqs: 768
+      max_num_batched_tokens: 16384
+      enable_chunked_prefill: true
+      mamba_ssm_cache_dtype: float32
+      compilation_config:
+        cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 384, 512, 768]
+        cudagraph_mode: PIECEWISE
+        pass_config:
+          fuse_allreduce_rms: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 4

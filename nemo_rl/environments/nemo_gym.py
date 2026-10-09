@@ -255,6 +255,8 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         should_expose_http_server = generation_config.get("vllm_cfg", {}).get(
             "expose_http_server"
         )
+    elif generation_config["backend"] == "remote_vllm":
+        should_expose_http_server = True
     else:
         should_expose_http_server = False
     assert should_expose_http_server, (
@@ -1550,6 +1552,9 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         # Megatron Inference is always async; should_use_async_rollouts rejects
         # an explicit mcore_generation_config.async_engine key.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
+    elif backend == "remote_vllm":
+        # The externally managed server is already OpenAI-compatible.
+        pass
     else:
         raise ValueError(
             "NeMo-Gym setup supports vllm, dynamo, or megatron generation; got "
@@ -2096,7 +2101,9 @@ def _build_single_gym_actor(
         )
 
     actor = NemoGym.options(**actor_options).remote(actor_config)
-    shard_set = NemoGymShardSet(handles={DEFAULT_SHARD_NAME: [actor]}, fan_out=fan_out)
+    shard_set = NemoGymShardSet(
+        handles={DEFAULT_SHARD_NAME: [actor]}, fan_out=fan_out
+    )
     try:
         ray.get(actor._spinup.remote())
         if fan_out:

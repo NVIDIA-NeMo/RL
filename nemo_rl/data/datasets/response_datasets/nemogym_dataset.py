@@ -84,12 +84,12 @@ class NemoGymDataset(RawDataset):
 
         if fan_out:
 
-            def expand_batch(batch: dict[str, list[str]]) -> dict[str, list[str]]:
+            def expand_batch(batch: Mapping[str, list[str]]) -> dict[str, list[str]]:
                 expanded_rows: list[str] = []
                 for raw_line in batch["extra_env_info"]:
                     row = json.loads(raw_line)
-                    # Explicit Environment Server routing is not agent routing
-                    # and must never be multiplied across agent harnesses.
+                    # Explicit Environment Server routing is not agent routing and
+                    # therefore must never be multiplied across agent harnesses.
                     if "_ng_environment_server" in row:
                         expanded_rows.append(raw_line)
                         continue
@@ -113,7 +113,12 @@ class NemoGymDataset(RawDataset):
                         expanded_rows.append(json.dumps(copy))
                 return {"extra_env_info": expanded_rows}
 
-            self.dataset = self.dataset.map(expand_batch, batched=True)
+            self.dataset = self.dataset.map(
+                expand_batch,
+                batched=True,
+                remove_columns=self.dataset.column_names,
+                desc="Expanding NeMo Gym harness fan-out",
+            )
             # Coverage checks must inspect the expanded rows rather than the
             # unexpanded source file recorded above.
             self.agent_name_sources = None

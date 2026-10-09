@@ -32,6 +32,13 @@ NANO_OMNI_SYNC_2N_DEBUG_RECIPE = (
     REPO_ROOT
     / "examples/nemo_gym/grpo_anyterminal_multi_harness_nemotron_nano_omni_sync_2n_debug_single_controller.yaml"
 )
+EXTERNAL_VLLM_RECIPE = (
+    REPO_ROOT
+    / "examples/nemo_gym/nemotron-3.5-nano/swe_anyterminal_multi_harness_external_vllm.yaml"
+)
+EXTERNAL_VLLM_LAUNCHER = (
+    REPO_ROOT / "tools/external_rollout_vllm/launch_anyterminal_multi_harness.sh"
+)
 
 
 def test_anyterminal_multi_harness_recipe_resolves_async_training_contract():
@@ -275,3 +282,53 @@ def test_nano_omni_sync_2n_debug_recipe_resolves_multi_harness_topology():
     assert config["logger"]["wandb_enabled"] is True
     assert config["logger"]["wandb"]["entity"] == "adlr"
     assert config["logger"]["wandb"]["log_nemo_gym_full_result_tables"] is True
+
+
+def test_external_vllm_recipe_resolves_production_multi_harness_contract(
+    monkeypatch,
+):
+    monkeypatch.setenv("EXTERNAL_ROLLOUT_VLLM_URL", "http://rollout/v1")
+    monkeypatch.setenv("EXTERNAL_ROLLOUT_HF_EXPORT_DIR", "/tmp/hf-exports")
+    register_omegaconf_resolvers()
+    config = OmegaConf.to_container(load_config(EXTERNAL_VLLM_RECIPE), resolve=True)
+
+    assert config["cluster"]["gpus_per_node"] == 4
+    assert config["cluster"]["num_nodes"] == 8
+    assert config["cluster"]["segment_size"] == 2
+    assert config["grpo"]["num_prompts_per_step"] == 128
+    assert config["grpo"]["num_generations_per_prompt"] == 16
+    assert config["grpo"]["max_num_steps"] == 1_000_000
+    assert config["policy"]["train_global_batch_size"] == 2048
+    assert config["policy"]["max_total_sequence_length"] == 196608
+    assert config["policy"]["generation"]["backend"] == "remote_vllm"
+    assert config["policy"]["generation"]["remote_vllm_cfg"]["max_model_len"] == 196608
+    assert config["policy"]["draft"]["enabled"] is False
+    assert config["env"]["nemo_gym"]["fan_out"] == {
+        "anyterminal_multi_harness": [
+            "anyterminal_opencode",
+            "anyterminal_openclaw",
+            "anyterminal_pi",
+            "anyterminal_hermes",
+        ]
+    }
+    assert config["env"]["nemo_gym"]["config_paths"][-1].endswith(
+        "anyterminal_multi_harness_opensandbox.yaml"
+    )
+    assert config["token_capture"]["enabled"] is True
+    assert config["logger"]["wandb"]["entity"] == "adlr"
+    assert config["logger"]["wandb"]["project"] == "multi-harness-RL"
+
+
+def test_external_vllm_launcher_keeps_scale_and_cache_routing_contract():
+    source = EXTERNAL_VLLM_LAUNCHER.read_text()
+
+    assert 'ROLLOUT_REPLICAS="${ROLLOUT_REPLICAS:-16}"' in source
+    assert 'ROLLOUT_REPLICAS_PER_NODE="${ROLLOUT_REPLICAS_PER_NODE:-4}"' in source
+    assert 'ROLLOUT_TENSOR_PARALLEL_SIZE="${ROLLOUT_TENSOR_PARALLEL_SIZE:-1}"' in source
+    assert 'VLLM_ROUTER_POLICY="${VLLM_ROUTER_POLICY:-consistent_hash}"' in source
+    assert "--max-model-len 196608" in source
+    assert "--max-num-seqs 1024" in source
+    assert "--max-num-batched-tokens 32768" in source
+    assert "--async-scheduling" in source
+    assert "--enable-prefix-caching" in source
+    assert "grpo.max_num_steps" not in source
