@@ -437,7 +437,9 @@ override-dependencies = [
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # Frontend 1.27 updates its grouped-GEMM kernels for CUTLASS DSL 4.6.x.
+  # Both the SwiGLU and SReLU joint grouped-MLP fusions require those updates.
+  "nvidia-cudnn-frontend==1.27.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # Keep NCCL shared with the isolated Dynamo environment across torch upgrades.

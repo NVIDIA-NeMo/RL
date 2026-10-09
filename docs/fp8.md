@@ -134,6 +134,47 @@ To train with FP8, you need to set the Megatron path and configure it using the 
                 fp8_quantizer_factory: null # required for "custom" recipe; importable Python path e.g. package.module.quantizer_factory
 ```
 
+### CuTeDSL grouped-MoE fusion
+
+On Blackwell GPUs, Transformer Engine can fuse the grouped expert FC1,
+activation, and FC2 operations with its CuTeDSL grouped-MLP path. For a gated
+routed-expert MLP, enable the operation fuser and use the interleaved gate/up
+layout required by the fused kernel:
+
+```yaml
+policy:
+  megatron_cfg:
+    moe_grouped_gemm: true
+    moe_mlp_glu_interleave_size: 32
+    use_transformer_engine_op_fuser: true
+    fp8_cfg:
+      enabled: true
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      fp8_param: false  # true is also supported for MXFP8
+    env_vars:
+      NVTE_CUTEDSL_FUSED_GROUPED_MLP: "1"
+```
+
+Models with grouped shared experts can also set
+`use_grouped_gemm_for_shared_expert: true` and
+`moe_shared_expert_glu_interleave_size: 32`. A shared-expert interleave size
+without the grouped shared-expert implementation is rejected during setup.
+Weighted squared-ReLU models use `use_fused_weighted_squared_relu: true`; they
+do not need the gated-MLP interleave setting.
+
+The interleave options describe the physical Megatron FC1 layout. NeMo RL
+restores the standard contiguous gate/up layout before refitting vLLM, SGLang,
+or Megatron generation. For MXFP8 parameter storage, it first materializes the
+logical BF16 weight and then restores the row layout so FP8 data stays paired
+with its scales. Physical FP8 export for other FP8 recipes does not yet have a
+scale-aware interleave transform and fails with an explicit error.
+
+Omit these options to preserve the model provider's defaults. The NeMo RL
+dependency set pins `nvidia-cudnn-frontend` to a version containing the
+CUTLASS DSL 4.6.x grouped-GEMM updates used by the SwiGLU and weighted
+squared-ReLU fusions.
+
 ### Per-module Transformer Engine precision recipes
 
 For finer-grained Megatron training precision, point
