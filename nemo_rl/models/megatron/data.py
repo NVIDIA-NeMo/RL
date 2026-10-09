@@ -805,10 +805,9 @@ def _resolve_shared_prefix_execution_topology(
 ) -> tuple[int, int, int]:
     """Resolve the shared-prefix TP size, CP size and physical packing multiple.
 
-    Low-level unit callers that omit ``megatron_cfg`` retain the legacy TP1,
-    CP1, SP-disabled topology. A supplied topology must obey the shared-prefix
-    SP contract, and an absent/``None`` physical multiple resolves to its
-    topology quantum rather than through a truthiness fallback.
+    The topology must obey the shared-prefix SP contract, and
+    ``make_sequence_length_divisible_by`` must be a multiple of its quantum;
+    :func:`validate_shared_prefix_training_config` already enforces both.
     """
     # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds.
     from megatron.rl.shared_prefix_tensors import (
@@ -816,20 +815,16 @@ def _resolve_shared_prefix_execution_topology(
         resolve_shared_prefix_physical_padding_multiple,
     )
 
-    raw_megatron_cfg = cfg.get("megatron_cfg")
-    if raw_megatron_cfg is None:
-        tp_size, cp_size = 1, 1
-    else:
-        megatron_cfg = cast(MegatronConfig, raw_megatron_cfg)
-        tp_size, cp_size, _ = resolve_shared_prefix_parallel_topology(
-            tp_size=megatron_cfg["tensor_model_parallel_size"],
-            cp_size=megatron_cfg["context_parallel_size"],
-            sequence_parallel=megatron_cfg["sequence_parallel"],
-        )
+    megatron_cfg = cast(MegatronConfig, cfg["megatron_cfg"])
+    tp_size, cp_size, _ = resolve_shared_prefix_parallel_topology(
+        tp_size=megatron_cfg["tensor_model_parallel_size"],
+        cp_size=megatron_cfg["context_parallel_size"],
+        sequence_parallel=megatron_cfg["sequence_parallel"],
+    )
     padding_multiple = resolve_shared_prefix_physical_padding_multiple(
         tp_size=tp_size,
         cp_size=cp_size,
-        padding_multiple=cfg.get("make_sequence_length_divisible_by"),
+        padding_multiple=cfg["make_sequence_length_divisible_by"],
     )
     return tp_size, cp_size, padding_multiple
 
@@ -916,7 +911,7 @@ def plan_shared_prefix_execution_units(
     *_, padding_multiple = _resolve_shared_prefix_execution_topology(cfg)
     row_slots = _get_prescribed_shared_prefix_slots(data)
     group_config = get_shared_prefix_training_config(cfg)
-    packing_cfg = cfg.get("sequence_packing") or {}
+    packing_cfg = cfg["sequence_packing"]
     return plan_execution_units(
         rows,
         row_slots=row_slots,

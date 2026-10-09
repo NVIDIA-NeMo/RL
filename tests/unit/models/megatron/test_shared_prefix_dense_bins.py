@@ -42,6 +42,11 @@ def config(multiple=1):
     return {
         "make_sequence_length_divisible_by": multiple,
         "sequence_packing": {"algorithm": "modified_first_fit_decreasing"},
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "sequence_parallel": False,
+        },
     }
 
 
