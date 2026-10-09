@@ -606,24 +606,20 @@ def _process_single_image_at_num_tokens(
         round(1.0 / image_processor.downsample_ratio)
     )
 
-    def run_pinned(single_image: Image.Image) -> dict[str, Any]:
-        # The image-path per-image budget is clamp((max_model_len-4)*ds^2, ...),
-        # so max_model_len = num_tokens + 4 requests exactly num_tokens*ds^2
-        # patches. Instance mutation is the only knob: the wrapper's
-        # ImagesKwargs silently ignore unknown kwargs. Both attach call sites
-        # run this on a single thread with no awaits in between (same pattern
-        # as the processor's own _is_video_mode flag).
-        original = image_processor.max_model_len
-        try:
-            image_processor.max_model_len = num_tokens + 4
-            processed = dict(
-                processor(text=image_token, images=[single_image], return_tensors=None)
-            )
-        finally:
-            image_processor.max_model_len = original
-        return processed
-
-    processed = run_pinned(image)
+    # The image-path per-image budget is clamp((max_model_len-4)*ds^2, ...),
+    # so max_model_len = num_tokens + 4 requests exactly num_tokens*ds^2
+    # patches. Instance mutation is the only knob: the wrapper's ImagesKwargs
+    # silently ignore unknown kwargs. Both attach call sites run this on a
+    # single thread with no awaits in between (same pattern as the processor's
+    # own _is_video_mode flag).
+    original = image_processor.max_model_len
+    try:
+        image_processor.max_model_len = num_tokens + 4
+        processed = dict(
+            processor(text=image_token, images=[image], return_tensors=None)
+        )
+    finally:
+        image_processor.max_model_len = original
     actual = _image_num_tokens_from_processed(processed)
     if actual == [num_tokens]:
         return processed
