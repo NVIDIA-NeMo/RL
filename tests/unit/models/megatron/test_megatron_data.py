@@ -2392,13 +2392,18 @@ class TestSharedPrefixMicrobatchIterator:
                 data, _shared_prefix_cfg(), 1, None, shared_prefix_bin_capacity=64
             )
 
-    def test_iterator_keeps_caller_batch_and_unit_order(self):
+    @pytest.mark.parametrize("group_id_type", ["numpy", "list"])
+    def test_iterator_keeps_caller_batch(self, group_id_type):
         from nemo_rl.models.megatron.data import (
             SHARED_PREFIX_SOURCE_ROW_INDEX,
             get_microbatch_iterator,
         )
 
         data = _shared_prefix_batch(_STAR_TOKENS, _STAR_PROMPTS, _STAR_GROUPS)
+        if group_id_type == "list":
+            # A list field is used as is, so only the shallow copy protects data.
+            data["shared_prefix_group_id"] = list(_STAR_GROUPS)
+        fields = {key: data[key] for key in data}
         cfg = _shared_prefix_cfg()
         units = self._plan(data, cfg)
         _, num_units, mbs, _, padded = get_microbatch_iterator(
@@ -2411,6 +2416,8 @@ class TestSharedPrefixMicrobatchIterator:
             shared_prefix_execution_units=units,
         )
         assert SHARED_PREFIX_SOURCE_ROW_INDEX not in data
+        assert all(data[key] is value for key, value in fields.items())
+        assert set(data) == set(fields)
         assert (num_units, mbs) == (len(units), 1)
         assert padded == max(unit.physical_length for unit in units)
 
