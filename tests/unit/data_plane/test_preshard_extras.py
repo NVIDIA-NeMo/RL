@@ -27,13 +27,15 @@ identity preserved across shards).
 
 from __future__ import annotations
 
+import pytest
 import torch
 
+from nemo_rl.data.packing.shared_prefix_metadata import SHARED_PREFIX_EXECUTION_SLOT
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, GROUP_ID_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 from ._rollout_shapes import (
@@ -203,6 +205,66 @@ def test_shard_meta_for_dp_unsorted_round_trip():
     aggregated.reorder_data(unsorted)
     assert aggregated["ids"] == meta.sample_ids
     assert aggregated["rows"].tolist() == list(range(n))
+
+
+def _tagged_group_meta(group_sizes: list[int]) -> KVBatchMeta:
+    """Rows grouped only by ``GROUP_ID_TAG``; sample ids carry no ``_g`` suffix."""
+    sample_ids: list[str] = []
+    tags: list[dict] = []
+    lengths: list[int] = []
+    for group, size in enumerate(group_sizes):
+        for index in range(size):
+            sample_ids.append(f"row{len(sample_ids)}")
+            tags.append({GROUP_ID_TAG: f"group{group}"})
+            lengths.append(8 + index)
+    return KVBatchMeta(
+        partition_id="train",
+        task_name="logprobs",
+        sample_ids=sample_ids,
+        fields=["input_ids"],
+        sequence_lengths=lengths,
+        extra_info={},
+        tags=tags,
+    )
+
+
+def test_shard_meta_for_dp_shared_prefix_groups_rows_by_group_id_tag():
+    pytest.importorskip("megatron.rl.shared_prefix_metadata")
+    meta = _tagged_group_meta([4, 4, 4, 4])
+
+    shards, _ = shard_meta_for_dp(
+        meta,
+        dp_world=2,
+        sequence_packing_args={"max_tokens_per_microbatch": 256},
+        shared_prefix_groups=True,
+    )
+
+    ranks_by_group: dict[str, set[int]] = {}
+    for rank, shard in enumerate(shards):
+        assert shard.tags is not None
+        assert len(shard.extra_info[SHARED_PREFIX_EXECUTION_SLOT]) == len(
+            shard.sample_ids
+        )
+        for tag in shard.tags:
+            ranks_by_group.setdefault(tag[GROUP_ID_TAG], set()).add(rank)
+    assert sorted(ranks_by_group) == [f"group{group}" for group in range(4)]
+    assert all(len(ranks) == 1 for ranks in ranks_by_group.values())
+    assert sorted(k for shard in shards for k in shard.sample_ids) == sorted(
+        meta.sample_ids
+    )
+
+
+def test_shard_meta_for_dp_shared_prefix_requires_group_id_tags():
+    meta = _tagged_group_meta([2, 2])
+    meta.tags[1] = {}
+
+    with pytest.raises(ValueError, match="tag on every row"):
+        shard_meta_for_dp(
+            meta,
+            dp_world=2,
+            sequence_packing_args={"max_tokens_per_microbatch": 256},
+            shared_prefix_groups=True,
+        )
 
 
 # ── meta utility helpers ──────────────────────────────────────────────

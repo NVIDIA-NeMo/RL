@@ -32,13 +32,13 @@ from nemo_rl.data.packing.shared_prefix_cost import estimate_shared_prefix_row_w
 from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_EXECUTION_SLOT,
     SHARED_PREFIX_PROMPT_LENGTHS,
-    parse_grouped_sample_id,
     plan_fixed_execution_slots,
     plan_group_coherent_shards,
 )
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
+    GROUP_ID_TAG,
     INPUT_IDS,
     INPUT_LENGTHS,
     META_IDX,
@@ -77,9 +77,10 @@ def shard_meta_for_dp(
         batch_size: Total samples; ``None`` for the logprob path, GBS for train.
         sequence_packing_args: Packing config dict for ``shard_by_batch_size``.
         dynamic_batching_args: Dynamic-batching config dict; mutually exclusive with the above.
-        shared_prefix_groups: Assign complete ``{group_id}_g{index}`` groups
-            coherently to DP ranks. This supersedes ordinary row-level sequence
-            packing; each worker performs the structured star planning locally.
+        shared_prefix_groups: Assign complete prompt groups (rows sharing a
+            ``GROUP_ID_TAG`` tag) coherently to DP ranks. This supersedes
+            ordinary row-level sequence packing; each worker performs the
+            structured star planning locally.
 
     Returns:
         ``(per_rank_metas, unsorted_indices)``. ``unsorted_indices`` contains
@@ -108,19 +109,14 @@ def shard_meta_for_dp(
             raise ValueError(
                 "shared-prefix group sharding does not support dynamic batching"
             )
-        parsed_sample_ids = [parse_grouped_sample_id(item) for item in meta.sample_ids]
-        generation_indices: dict[str, list[int]] = {}
-        for group_id, generation_index in parsed_sample_ids:
-            generation_indices.setdefault(group_id, []).append(generation_index)
-        for group_id, indices in generation_indices.items():
-            expected_indices = list(range(len(indices)))
-            if sorted(indices) != expected_indices:
-                raise ValueError(
-                    "shared-prefix TQ sample IDs must contain each generation "
-                    f"index exactly once from 0 through {len(indices) - 1}; "
-                    f"group {group_id!r} has indices {sorted(indices)}"
-                )
-        group_ids = [group_id for group_id, _ in parsed_sample_ids]
+        # The explicit row tag, like the advantage baseline, rather than the
+        # "{group_id}_g{i}" sample-id naming convention.
+        if meta.tags is None or any(GROUP_ID_TAG not in tag for tag in meta.tags):
+            raise ValueError(
+                f"shared-prefix group sharding requires a {GROUP_ID_TAG!r} tag on "
+                "every row"
+            )
+        group_ids = [tag[GROUP_ID_TAG] for tag in meta.tags]
         if sequence_packing_args is None:
             raise ValueError(
                 "shared-prefix group sharding requires sequence-packing arguments"
