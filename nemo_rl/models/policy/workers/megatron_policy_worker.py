@@ -111,6 +111,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.megatron.setup import (
+    SUPPORTED_SHARED_PREFIX_FOREST_STABLE_ROUTER_CAPABILITY,
     SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
     _get_mcore_shared_prefix_training_capability,
     build_inference_model,
@@ -124,15 +125,6 @@ from nemo_rl.models.megatron.setup import (
     validate_megatron_config,
     validate_model_paths,
 )
-from nemo_rl.models.megatron.shared_prefix_alignment import (
-    align_physical_units,
-    align_training_units,
-    materialize_alignment,
-)
-from nemo_rl.models.megatron.shared_prefix_dense_bins import (
-    plan_dense_training_bins,
-    share_prefixes_in_dense_training_bins,
-)
 from nemo_rl.models.megatron.train import (
     LogprobsPostProcessor,
     LossPostProcessor,
@@ -141,7 +133,11 @@ from nemo_rl.models.megatron.train import (
     aggregate_training_statistics,
     megatron_forward_backward,
 )
-from nemo_rl.models.policy import PolicyConfig, get_shared_prefix_training_config
+from nemo_rl.models.policy import (
+    PolicyConfig,
+    SharedPrefixTrainingConfig,
+    get_shared_prefix_training_config,
+)
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -266,60 +262,51 @@ def _restore_logprobs_in_source_order(
     return restored
 
 
-# Worker ``Timer`` labels for the shared-prefix per-call planning and the
-# model-world forward-count barrier. The barrier wait used to be invisible
-# inside the enclosing ``train`` / ``get_logprobs`` labels (and, on the driver,
-# inside ``policy_training``); it now has its own label so it can be told apart
-# from compute.
+# Worker ``Timer`` label for the shared-prefix per-call planning. It includes
+# the model-world forward-count agreement, so cross-rank skew is visible apart
+# from the enclosing ``train`` / ``get_logprobs`` compute.
 SHARED_PREFIX_EXECUTION_PLANNING_TIMER_KEY = "shared_prefix_execution_planning"
-SHARED_PREFIX_EXECUTION_BARRIER_TIMER_KEY = "shared_prefix_execution_barrier"
-# Returned-metrics keys. ``*_seconds`` is this rank's summed barrier wait for
-# the call (same contract as ``train_elapsed_seconds``). ``*_dp_sum_seconds``
-# rides along in ``all_mb_metrics``, whose default reducer in grpo.py and the
-# single-controller utilities sums list entries across DP-replica leaders, so
-# the logged value is the sum over DP ranks of the per-rank wait.
-SHARED_PREFIX_EXECUTION_BARRIER_SECONDS_KEY = "shared_prefix_execution_barrier_seconds"
-SHARED_PREFIX_EXECUTION_BARRIER_DP_SUM_KEY = (
-    "shared_prefix_execution_barrier_dp_sum_seconds"
-)
 
 
-def _require_equal_shared_prefix_execution_count(
+def _agree_shared_prefix_execution_count(
     local_count: int,
+    local_rows: int,
     *,
+    local_error: Optional[BaseException],
     stage: str,
     device: torch.device | str = "cuda",
-) -> int:
-    """Require every model-world rank to execute the same number of forwards.
+) -> tuple[int, int, int]:
+    """Agree on per-rank forward counts with one model-world collective.
 
     The default process group is the full model world across TP, CP, PP, and DP;
     every rank whose schedule can share a collective dependency must agree. A
     masked dummy forward is not safe here:
     Hybrid MoE layers can attach router auxiliary losses inside the model that
     are independent of the outer token/sample loss masks.
+
+    A local planning failure rides in the same ``all_reduce``, so every rank
+    raises together instead of leaving its peers blocked in the collective.
+    Returns ``(minimum_count, maximum_count, minimum_rows)``.
     """
-    if local_count < 1:
-        raise ValueError(f"shared-prefix {stage} requires at least one execution unit")
-    count_bounds = torch.tensor(
-        [local_count, -local_count],
+    if local_error is None and local_count < 1:
+        local_error = ValueError(
+            f"shared-prefix {stage} requires at least one execution unit"
+        )
+    bounds = torch.tensor(
+        [local_count, -local_count, -local_rows, int(local_error is not None)],
         dtype=torch.int64,
         device=device,
     )
-    torch.distributed.all_reduce(
-        count_bounds,
-        op=torch.distributed.ReduceOp.MAX,
-    )
-    maximum = int(count_bounds[0].item())
-    minimum = -int(count_bounds[1].item())
-    if minimum != maximum:
+    torch.distributed.all_reduce(bounds, op=torch.distributed.ReduceOp.MAX)
+    maximum, negative_minimum, negative_rows, any_error = bounds.tolist()
+    if local_error is not None:
+        raise local_error
+    if any_error:
         raise RuntimeError(
-            "shared-prefix physical forward counts differ across the full model "
-            f"world during {stage}: min={minimum}, max={maximum}. The first "
-            "implementation requires group-coherent sharding to produce an equal "
-            "number of star plus fallback execution units on every rank; masked "
-            "dummy forwards are unsafe for Hybrid MoE auxiliary losses."
+            f"shared-prefix {stage} planning failed on another model-world rank; "
+            "see that rank's error"
         )
-    return maximum
+    return -negative_minimum, maximum, -negative_rows
 
 
 def _model_self_packs_for_cp(model: Any) -> bool:
@@ -599,6 +586,8 @@ class MegatronPolicyWorkerImpl(
     _train_step_state: Optional[dict[str, Any]] = None
     _remote_sparse_refit: Any = None
     _async_checkpoint_cuda_cache_active: bool = False
+    # Resolved once in __init__; workers that bypass it keep shared prefix off.
+    _shared_prefix_cfg: SharedPrefixTrainingConfig = SharedPrefixTrainingConfig()
 
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
@@ -632,7 +621,7 @@ class MegatronPolicyWorkerImpl(
         stage: Literal["train", "logprobs"] = (
             "logprobs" if meta.task_name in ("prev_lp", "ref_lp") else "train"
         )
-        if get_shared_prefix_training_config(self.cfg).enabled_for(stage=stage):
+        if self._shared_prefix_cfg.enabled_for(stage=stage):
             if len(meta.sample_ids) != data.size:
                 raise ValueError(
                     "shared-prefix sample IDs must align with fetched rows"
@@ -791,9 +780,7 @@ class MegatronPolicyWorkerImpl(
         init_telemetry_worker()
 
         self.cfg = config
-        self._shared_prefix_training_enabled = (
-            get_shared_prefix_training_config(config).mode == "train"
-        )
+        self._shared_prefix_cfg = get_shared_prefix_training_config(config)
         self._router_replay_enabled = router_replay_enabled(config)
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
@@ -1144,9 +1131,7 @@ class MegatronPolicyWorkerImpl(
 
     def _validate_shared_prefix_worker_features(self) -> None:
         """Reject features outside the first exact Hybrid star contract."""
-        if not get_shared_prefix_training_config(self.cfg).enabled_for(
-            stage="logprobs"
-        ):
+        if not self._shared_prefix_cfg.enabled_for(stage="logprobs"):
             return
 
         unsupported: list[str] = []
@@ -1208,7 +1193,7 @@ class MegatronPolicyWorkerImpl(
 
     def _validate_shared_prefix_loss(self, loss_fn: LossFunction) -> None:
         """Require the logprob loss interface implemented by star fan-out."""
-        if not self._shared_prefix_training_enabled:
+        if not self._shared_prefix_cfg.enabled_for(stage="train"):
             return
         if loss_fn.input_type is not LossInputType.LOGPROB:
             raise NotImplementedError(
@@ -1218,22 +1203,17 @@ class MegatronPolicyWorkerImpl(
 
     def _shared_prefix_bin_capacity(
         self,
-        key: Literal["train_mb_tokens", "logprob_mb_tokens"],
+        stage: Literal["train", "logprobs"],
     ) -> Optional[int]:
         """Resolve the active stage capacity without touching disabled configs."""
-        stage: Literal["train", "logprobs"] = (
-            "logprobs" if key == "logprob_mb_tokens" else "train"
-        )
-        if not get_shared_prefix_training_config(self.cfg).enabled_for(stage=stage):
+        if not self._shared_prefix_cfg.enabled_for(stage=stage):
             return None
         sequence_packing = self.cfg.get("sequence_packing")
         if sequence_packing is None or sequence_packing["enabled"] is not True:
             raise RuntimeError(
                 "shared-prefix train mode requires enabled sequence packing"
             )
-        key = get_shared_prefix_training_config(self.cfg).token_budget_key_for(
-            stage=stage
-        )
+        key = self._shared_prefix_cfg.token_budget_key_for(stage=stage)
         if key not in sequence_packing:
             raise ValueError(
                 f"shared-prefix train mode requires sequence_packing.{key}"
@@ -1250,22 +1230,35 @@ class MegatronPolicyWorkerImpl(
     ) -> Optional[tuple[Any, ...]]:
         """Plan this call's shared-prefix forwards once, under their own timer.
 
-        Returns ``None`` when sharing is disabled for this stage. The units feed both
-        :func:`get_microbatch_iterator` (which then skips its own planning and
-        the iterator's device-copy re-planning) and the forward-count barrier.
+        Returns ``None`` when sharing is disabled for this stage. The units feed
+        :func:`get_microbatch_iterator`, which then skips its own planning and
+        the iterator's device-copy re-planning. Planning ends with the single
+        model-world agreement on the forward count, which also carries any
+        rank-local planning failure so that every rank raises together.
         """
-        if not get_shared_prefix_training_config(self.cfg).enabled_for(stage=stage):
+        group_config = self._shared_prefix_cfg
+        if not group_config.enabled_for(stage=stage):
             return None
         assert bin_capacity is not None, (
             "shared-prefix train mode requires a per-stage token bin capacity"
         )
-        group_config = get_shared_prefix_training_config(self.cfg)
+        # Imported only on the shared path: these adapters need megatron.rl.
+        from nemo_rl.models.megatron.shared_prefix_alignment import (
+            align_physical_units,
+            align_training_units,
+            materialize_alignment,
+        )
+        from nemo_rl.models.megatron.shared_prefix_dense_bins import (
+            plan_dense_training_bins,
+            share_prefixes_in_dense_training_bins,
+        )
+
         if stage == "logprobs" and group_config.match_logprob_training_layout:
             # This controls planning only. The caller still runs no-grad inference.
             forward_only = False
         if group_config.pack_groups:
             if (
-                "hybrid_forest_stable_router_v1"
+                SUPPORTED_SHARED_PREFIX_FOREST_STABLE_ROUTER_CAPABILITY
                 not in _get_mcore_shared_prefix_training_capability()
             ):
                 raise NotImplementedError(
@@ -1287,28 +1280,44 @@ class MegatronPolicyWorkerImpl(
                 )
         with self.timer.time(SHARED_PREFIX_EXECUTION_PLANNING_TIMER_KEY):
             dense_training = not forward_only and group_config.training_dense_bins
-            if dense_training:
-                units = plan_dense_training_bins(
-                    data, cfg=self.cfg, bin_capacity=bin_capacity
-                )
-            else:
-                units = plan_shared_prefix_execution_units(
-                    data,
-                    cfg=self.cfg,
-                    bin_capacity=bin_capacity,
-                    forward_only=forward_only,
-                )
-            if not group_config.align_data_parallel:
-                return units
+            units: tuple[Any, ...] = ()
+            planning_error: Optional[Exception] = None
+            try:
+                if dense_training:
+                    units = plan_dense_training_bins(
+                        data, cfg=self.cfg, bin_capacity=bin_capacity
+                    )
+                else:
+                    units = plan_shared_prefix_execution_units(
+                        data,
+                        cfg=self.cfg,
+                        bin_capacity=bin_capacity,
+                        forward_only=forward_only,
+                    )
+            except Exception as error:
+                # Re-raised by the agreement below, after the collective.
+                planning_error = error
             # EP can span DP replicas: agree across the entire model world before
             # any forward enters an expert collective. No dummy rows or losses.
-            bounds = torch.tensor(
-                [len(units), -data.size],
-                device="cuda",
-                dtype=torch.int64,
+            minimum_count, target_count, minimum_rows = (
+                _agree_shared_prefix_execution_count(
+                    len(units),
+                    data.size,
+                    local_error=planning_error,
+                    stage=stage,
+                )
             )
-            torch.distributed.all_reduce(bounds, op=torch.distributed.ReduceOp.MAX)
-            target_count, minimum_rows = int(bounds[0]), -int(bounds[1])
+            if not group_config.align_data_parallel:
+                if minimum_count != target_count:
+                    raise RuntimeError(
+                        "shared-prefix physical forward counts differ across the "
+                        f"full model world during {stage}: min={minimum_count}, "
+                        f"max={target_count}. The first implementation requires "
+                        "group-coherent sharding to produce an equal number of "
+                        "star plus fallback execution units on every rank; masked "
+                        "dummy forwards are unsafe for Hybrid MoE auxiliary losses."
+                    )
+                return units
             if target_count > minimum_rows:
                 raise RuntimeError(
                     "Cannot align forward counts using real rows on every rank"
@@ -1348,6 +1357,13 @@ class MegatronPolicyWorkerImpl(
                 aligned = share_prefixes_in_dense_training_bins(
                     data, aligned, cfg=self.cfg, bin_capacity=bin_capacity
                 )
+            # Every alignment materializes exactly target_count units, so the
+            # agreed count needs no second collective.
+            if len(aligned) != target_count:
+                raise RuntimeError(
+                    "shared-prefix alignment produced "
+                    f"{len(aligned)} execution units, expected {target_count}"
+                )
             return aligned
 
     @contextmanager
@@ -1357,7 +1373,7 @@ class MegatronPolicyWorkerImpl(
         Keep this scope around forward AND backward so activation checkpoint
         recomputation uses the same GEMM row blocks as the original forward.
         """
-        if not get_shared_prefix_training_config(self.cfg).uniform_router_gating:
+        if not self._shared_prefix_cfg.uniform_router_gating:
             yield
             return
         # Megatron is optional for policies that do not select this backend.
@@ -1366,58 +1382,39 @@ class MegatronPolicyWorkerImpl(
         with router_gating_token_blocks():
             yield
 
-    @contextmanager
-    def _logprob_mtp_scope(self) -> Iterator[None]:
-        """Bypass auxiliary MTP for every logprob unit, including dense fallbacks."""
-        if not get_shared_prefix_training_config(self.cfg).bypass_evaluation_mtp:
-            yield
-            return
-        # HybridModel is optional outside this explicitly enabled execution path.
-        from megatron.core.models.hybrid.hybrid_model import HybridModel
-
+    def _single_pp1_hybrid_model(self) -> Any:
+        """Return the unwrapped PP1 HybridModel that the evaluation MTP bypass toggles."""
+        message = (
+            "policy.shared_prefix_training.bypass_evaluation_mtp requires a PP1 "
+            "HybridModel"
+        )
+        try:
+            # HybridModel is optional outside this explicitly enabled path.
+            from megatron.core.models.hybrid.hybrid_model import HybridModel
+        except ImportError as error:
+            raise NotImplementedError(message) from error
         chunks = _unwrapped_chunks(self.model)
         if (
             len(chunks) != 1
             or not isinstance(chunks[0], HybridModel)
             or parallel_state.get_pipeline_model_parallel_world_size() != 1
         ):
-            raise NotImplementedError(
-                "Evaluation MTP bypass requires a PP1 HybridModel"
-            )
-        core = chunks[0]
+            raise NotImplementedError(message)
+        return chunks[0]
+
+    @contextmanager
+    def _logprob_mtp_scope(self) -> Iterator[None]:
+        """Bypass auxiliary MTP for every logprob unit, including dense fallbacks."""
+        if not self._shared_prefix_cfg.bypass_evaluation_mtp:
+            yield
+            return
+        core = self._single_pp1_hybrid_model()
         saved = core.mtp_process
         core.mtp_process = False
         try:
             yield
         finally:
             core.mtp_process = saved
-
-    def _timed_shared_prefix_execution_barrier(
-        self,
-        local_count: int,
-        *,
-        stage: str,
-    ) -> tuple[int, float]:
-        """Run the model-world forward-count barrier under its own timer label.
-
-        The barrier itself is unchanged: the same MAX ``all_reduce`` on the
-        default group, at the same position relative to the surrounding
-        collectives on every rank, raising the same ``RuntimeError`` on a
-        mismatch. Only the attribution changes. ``Timer`` has no pause/resume
-        (``stop`` finalizes a measurement), so the wait cannot be carved out of
-        the enclosing ``train`` / ``get_logprobs`` label; it is recorded under
-        ``SHARED_PREFIX_EXECUTION_BARRIER_TIMER_KEY`` and the elapsed seconds
-        are returned so callers can surface them in their metrics.
-        """
-        self.timer.start(SHARED_PREFIX_EXECUTION_BARRIER_TIMER_KEY)
-        try:
-            agreed_count = _require_equal_shared_prefix_execution_count(
-                local_count,
-                stage=stage,
-            )
-        finally:
-            elapsed = self.timer.stop(SHARED_PREFIX_EXECUTION_BARRIER_TIMER_KEY)
-        return agreed_count, elapsed
 
     def _get_model_extra_state_dict(self) -> dict[str, Any]:
         fp8_enabled = self.fp8_cfg and self.fp8_cfg.get("enabled", False)
@@ -1586,7 +1583,6 @@ class MegatronPolicyWorkerImpl(
             all_mb_metrics = []
             losses = []
             total_num_microbatches = 0
-            shared_prefix_barrier_seconds = 0.0
             for gb_idx in range(num_global_batches):
                 gb_result = process_global_batch(
                     data,
@@ -1613,9 +1609,7 @@ class MegatronPolicyWorkerImpl(
 
                 attach_media_token_validity_mask(batch, self.media_placeholder_token_id)
 
-                shared_prefix_bin_capacity = self._shared_prefix_bin_capacity(
-                    "train_mb_tokens"
-                )
+                shared_prefix_bin_capacity = self._shared_prefix_bin_capacity("train")
                 shared_prefix_execution_units = (
                     self._plan_shared_prefix_execution_units(
                         batch,
@@ -1641,15 +1635,6 @@ class MegatronPolicyWorkerImpl(
                     shared_prefix_bin_capacity=shared_prefix_bin_capacity,
                     shared_prefix_execution_units=shared_prefix_execution_units,
                 )
-                if self._shared_prefix_training_enabled:
-                    (
-                        num_microbatches,
-                        barrier_seconds,
-                    ) = self._timed_shared_prefix_execution_barrier(
-                        num_microbatches,
-                        stage="train",
-                    )
-                    shared_prefix_barrier_seconds += barrier_seconds
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
 
@@ -1866,13 +1851,6 @@ class MegatronPolicyWorkerImpl(
             losses=losses,
             data_parallel_group=parallel_state.get_data_parallel_group(),
         )
-        if self._shared_prefix_training_enabled:
-            # Barrier wait is still inside ``train_elapsed_seconds`` and the
-            # driver's ``policy_training`` wall clock; this entry lets those be
-            # corrected without new plumbing (see the key's comment above).
-            mb_metrics[SHARED_PREFIX_EXECUTION_BARRIER_DP_SUM_KEY] = [
-                shared_prefix_barrier_seconds
-            ]
 
         metrics = {
             "global_loss": global_loss.cpu(),
@@ -1883,10 +1861,6 @@ class MegatronPolicyWorkerImpl(
             "grad_norm": torch.tensor([grad_norm]),
             "train_elapsed_seconds": metrics_train_elapsed,  # pragma: no cover
         }
-        if self._shared_prefix_training_enabled:
-            metrics[SHARED_PREFIX_EXECUTION_BARRIER_SECONDS_KEY] = (
-                shared_prefix_barrier_seconds
-            )
         # Read "config" via getattr-by-string so the token stays out of
         # train.__code__.co_names; with torch 2.11 cloudpickle otherwise
         # matches torch.distributed.config (a non-pickleable ConfigModuleInstance).
@@ -2069,9 +2043,6 @@ class MegatronPolicyWorkerImpl(
             "all_mb_metrics": [],
             "mb_losses": [],
             "total_num_microbatches": 0,
-            # Summed shared-prefix forward-count barrier wait across this step's
-            # train_microbatch calls; surfaced by finish_train_step.
-            "shared_prefix_execution_barrier_seconds": 0.0,
             # One increment per train_microbatch call, i.e. the number of
             # streaming chunks the controller has fed into this optimizer step
             # so far.
@@ -2334,7 +2305,7 @@ class MegatronPolicyWorkerImpl(
         # call carries one DP slice; the iterator subdivides into pipeline
         # microbatches.
         attach_media_token_validity_mask(data, self.media_placeholder_token_id)
-        shared_prefix_bin_capacity = self._shared_prefix_bin_capacity("train_mb_tokens")
+        shared_prefix_bin_capacity = self._shared_prefix_bin_capacity("train")
         shared_prefix_execution_units = self._plan_shared_prefix_execution_units(
             data,
             bin_capacity=shared_prefix_bin_capacity,
@@ -2357,15 +2328,6 @@ class MegatronPolicyWorkerImpl(
             shared_prefix_bin_capacity=shared_prefix_bin_capacity,
             shared_prefix_execution_units=shared_prefix_execution_units,
         )
-        if self._shared_prefix_training_enabled:
-            (
-                num_microbatches,
-                barrier_seconds,
-            ) = self._timed_shared_prefix_execution_barrier(
-                num_microbatches,
-                stage="presharded train",
-            )
-            state["shared_prefix_execution_barrier_seconds"] += barrier_seconds
         state["total_num_microbatches"] += int(num_microbatches)
 
         loss_post_processor = LossPostProcessor(
@@ -2748,11 +2710,6 @@ class MegatronPolicyWorkerImpl(
             losses=losses_to_aggregate,
             data_parallel_group=parallel_state.get_data_parallel_group(),
         )
-        if self._shared_prefix_training_enabled:
-            # Same surfacing as the synchronous train() path.
-            mb_metrics[SHARED_PREFIX_EXECUTION_BARRIER_DP_SUM_KEY] = [
-                state["shared_prefix_execution_barrier_seconds"]
-            ]
 
         metrics = {
             "global_loss": global_loss.cpu(),
@@ -2764,10 +2721,6 @@ class MegatronPolicyWorkerImpl(
         }
         if draft_grad_norm is not None:
             metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
-        if self._shared_prefix_training_enabled:
-            metrics[SHARED_PREFIX_EXECUTION_BARRIER_SECONDS_KEY] = state[
-                "shared_prefix_execution_barrier_seconds"
-            ]
 
         # MoE aux-loss metrics: same convention as sync train() — scale
         # by the total pipeline-microbatch count accumulated across all
@@ -2851,9 +2804,7 @@ class MegatronPolicyWorkerImpl(
         # against a different media alignment than the one trained on.
         attach_media_token_validity_mask(data, self.media_placeholder_token_id)
 
-        shared_prefix_bin_capacity = self._shared_prefix_bin_capacity(
-            "logprob_mb_tokens"
-        )
+        shared_prefix_bin_capacity = self._shared_prefix_bin_capacity("logprobs")
         shared_prefix_execution_units = self._plan_shared_prefix_execution_units(
             data,
             bin_capacity=shared_prefix_bin_capacity,
@@ -2879,22 +2830,6 @@ class MegatronPolicyWorkerImpl(
             shared_prefix_execution_units=shared_prefix_execution_units,
             shared_prefix_stage="logprobs",
         )
-        if get_shared_prefix_training_config(self.cfg).enabled_for(stage="logprobs"):
-            # get_logprobs returns only the logprob tensor (no metrics channel),
-            # so the wait is visible through the worker Timer label and this
-            # debug line only.
-            (
-                num_microbatches,
-                barrier_seconds,
-            ) = self._timed_shared_prefix_execution_barrier(
-                num_microbatches,
-                stage="logprob",
-            )
-            log.debug(
-                "[shared-prefix] logprob execution barrier rank=%d wait=%.4fs",
-                self.rank,
-                barrier_seconds,
-            )
 
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
             "use_fused_linear_logprobs", False
@@ -2934,9 +2869,7 @@ class MegatronPolicyWorkerImpl(
             )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            if get_shared_prefix_training_config(self.cfg).enabled_for(
-                stage="logprobs"
-            ):
+            if self._shared_prefix_cfg.enabled_for(stage="logprobs"):
                 logprobs = _restore_logprobs_in_source_order(
                     list_of_logprobs,
                     sequence_length=seq_length,
@@ -3425,7 +3358,7 @@ class MegatronPolicyWorkerImpl(
                 - topk_logits: Tensor of top-k logits for each position in the sequence
                 - topk_indices: Tensor of top-k indices for each position in the sequence
         """
-        if self._shared_prefix_training_enabled:
+        if self._shared_prefix_cfg.enabled_for(stage="train"):
             raise NotImplementedError(
                 "shared-prefix train mode does not support top-k-logit forwards; "
                 "current, old, and reference logprob forwards are supported"
