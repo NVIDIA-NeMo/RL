@@ -51,9 +51,12 @@ AutoModel support for this model landed in the `r0.6.0` branch with
 [#3874](https://github.com/NVIDIA-NeMo/Automodel/pull/3874) (cherry-pick of
 [#3801](https://github.com/NVIDIA-NeMo/Automodel/pull/3801)); it also carries
 the `fc2_latent_proj` dtype fix (part of the same #3801 squash) that NeMo RL's
-FSDP mixed-precision policy requires. The Automodel submodule pin on NeMo RL
-`main` (`4066772c9`) includes both. vLLM and the rest of the dependencies are
-the standard NeMo RL pins.
+FSDP mixed-precision policy requires, and
+[#4211](https://github.com/NVIDIA-NeMo/Automodel/pull/4211), which keeps the
+Mamba `A_log` / `dt_bias` / `D` parameters in fp32 storage after FSDP2
+sharding (required for checkpoint resume on torch >= 2.11). The Automodel
+submodule pin on NeMo RL `main` (`b916107a5`) includes all of them. vLLM and the
+rest of the dependencies are the standard NeMo RL pins.
 
 Containers built before this pin ship worker venvs whose editable
 `nemo_automodel` still points at the image's older Automodel checkout, and the

@@ -7,7 +7,7 @@ defaults: ../../grpo_math_1B.yaml
 # guide for why EP must stay within a node.
 #
 # Requirements:
-#   - Automodel r0.6.0 @ 4066772c9 or later (Nemotron 3.5 Super VL support,
+#   - Automodel r0.6.0 @ b916107a5 or later (Nemotron 3.5 Super VL support,
 #     Automodel #3801 / #3874), the Automodel submodule pin on main.
 #   - Stock vLLM 0.29.0 (pyproject pin): it registers NemotronH_Omni_Reasoning_V3
 #     and loads the checkpoint's RADIO weights for the (unused) vision tower.
