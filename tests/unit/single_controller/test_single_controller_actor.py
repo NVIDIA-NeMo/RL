@@ -4883,7 +4883,7 @@ def test_dedicated_streaming_ppo_keeps_models_resident_and_replays_split_critic(
     ]
 
 
-def test_streamed_critic_first_epoch_precedes_refit_and_second_epoch_replays(
+def test_streamed_critic_epochs_replay_the_same_step_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ctrl, metas, calls = _streaming_ppo_controller(monkeypatch, critic_epochs=2)
@@ -4896,7 +4896,6 @@ def test_streamed_critic_first_epoch_precedes_refit_and_second_epoch_replays(
     assert calls.count("critic.begin_train_step") == 2
     assert calls.count("critic.finish_train_step") == 2
     assert calls.index("critic.begin_train_step") < calls.index("refit")
-    assert calls.index("refit") < calls.index("critic.finish_train_step")
     assert [meta.sample_ids for meta in ctrl._value.trained_metas] == [
         meta.sample_ids for meta in metas
     ] * 2
@@ -4905,6 +4904,52 @@ def test_streamed_critic_first_epoch_precedes_refit_and_second_epoch_replays(
     assert ctrl._dp_client.cleared_ids == [
         sample_id for meta in metas for sample_id in meta.sample_ids
     ]
+
+
+def test_dedicated_second_critic_epoch_completes_while_policy_commit_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctrl, metas, calls = _streaming_ppo_controller(monkeypatch, critic_epochs=2)
+    ctrl._value_dedicated = True
+    ctrl._algo_cfg.value_training_mode = "split"
+    ctrl._stream_value_training = True
+    policy_commit_started = threading.Event()
+    release_policy_commit = threading.Event()
+    second_critic_commit = threading.Event()
+    finish_policy = ctrl._trainer.finish_train_step
+    finish_critic = ctrl._value.finish_train_step
+
+    def blocked_policy_commit() -> dict:
+        policy_commit_started.set()
+        assert release_policy_commit.wait(timeout=3.0)
+        return finish_policy()
+
+    def record_critic_commit() -> dict:
+        result = finish_critic()
+        if ctrl._value.optimizer_updates == 2:
+            second_critic_commit.set()
+        return result
+
+    ctrl._trainer.finish_train_step = blocked_policy_commit
+    ctrl._value.finish_train_step = record_critic_commit
+
+    async def run() -> None:
+        task = asyncio.create_task(ctrl._train_pump())
+        try:
+            assert await asyncio.to_thread(policy_commit_started.wait, 3.0)
+            assert await asyncio.to_thread(second_critic_commit.wait, 3.0)
+            assert "refit" not in calls
+        finally:
+            release_policy_commit.set()
+        await asyncio.wait_for(task, timeout=3.0)
+
+    asyncio.run(run())
+
+    assert ctrl._value.optimizer_updates == 2
+    assert [meta.sample_ids for meta in ctrl._value.trained_metas] == [
+        meta.sample_ids for meta in metas
+    ] * 2
+    assert calls.index("critic.finish_training") < calls.index("clear_samples")
 
 
 def test_streamed_critic_failure_aborts_both_open_steps(
