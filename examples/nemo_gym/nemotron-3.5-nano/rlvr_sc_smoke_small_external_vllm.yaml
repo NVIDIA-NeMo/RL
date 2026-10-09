@@ -1,0 +1,202 @@
+# Nemotron 3.5 Nano RLVR SingleController smoke with policy rollout served by
+# an external vLLM process. This mirrors the post-training-pipelines
+# rlvr_sc_smoke_small workload, adapted to the schemas in this NeMo RL checkout.
+defaults:
+  - ../../configs/grpo_math_1B_megatron_single_controller.yaml
+  - ../nemotron-3.5-lightning/rlvr.yaml
+
+cluster:
+  gpus_per_node: 4
+  # Policy training only. The launch script allocates one additional Ray node
+  # for the Gym-managed safety judge.
+  num_nodes: 4
+  segment_size: 2
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/nano35-rlvr-external-rollout-smoke
+  metric_name: null
+  checkpoint_must_save_by: "00:01:00:00"
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 16
+  max_num_steps: 2
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  async_grpo: null
+  skip_reference_policy_logprobs_calculation: true
+  malformed_thinking_advantage: -5.0
+
+loss_fn:
+  # Required by the ready_first sampler because a batch can mix policy versions.
+  force_on_policy_ratio: false
+
+policy:
+  # The launcher replaces this with the Nano 3.5 SFT checkpoint path.
+  model_name: /path/to/nemotron-3.5-nano-checkpoint
+  train_global_batch_size: 256
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+
+  megatron_cfg:
+    moe_flex_dispatcher_backend: alltoall
+    moe_hybridep_num_sms: 32
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  generation:
+    backend: remote_vllm
+    mcore_generation_config: null
+    vllm_cfg: null
+    vllm_kwargs: null
+    refit_cfg: null
+    # A vanilla OpenAI Chat Completions server validates
+    # prompt_tokens + max_tokens <= max_model_len. Reserving the entire context
+    # for output leaves zero prompt capacity, unlike NeMo-RL's managed vLLM
+    # path, which clamps the request dynamically. Keep enough room for the
+    # amplified-dolphin prompts when using the external service.
+    max_new_tokens: 32768
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
+    stop_token_ids: null
+    stop_strings: null
+    remote_vllm_cfg:
+      base_url: ${oc.env:EXTERNAL_ROLLOUT_VLLM_URL}
+      served_model_name: policy
+      max_model_len: ${policy.max_total_sequence_length}
+      health_path: /health
+      models_path: /v1/models
+      server_info_path: /server_info
+      pause_path: /pause
+      resume_path: /resume
+      collective_rpc_path: /collective_rpc
+      reset_prefix_cache_path: /reset_prefix_cache
+      request_timeout_s: 7200.0
+      # /server_info serializes the full 30B model/server configuration and
+      # takes several seconds on the official vLLM nightly image. urllib's
+      # timeout covers the response body as well as connection establishment.
+      connect_timeout_s: 30.0
+      api_key_env_var: null
+      refit:
+        checkpoint_dir: ${oc.env:EXTERNAL_ROLLOUT_HF_EXPORT_DIR}
+        # Keep freezes in-flight requests across the checkpoint reload; they
+        # continue against the new weights after the service resumes.
+        inflight_policy: keep
+        timeout_s: 1800.0
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+async_rl:
+  sampler:
+    name: ready_first
+    max_staleness_versions: 1
+  recompute_kv_cache_after_weight_updates: false
+  min_groups_for_streaming_train: 4
+  max_inflight_prompts: 32
+  max_buffered_rollouts: 32
+  rollout_failure:
+    max_infra_attempts_per_prompt: 5
+    max_data_attempts_per_prompt: 2
+    backoff_base_s: 1.0
+    max_backoff_s: 30.0
+    max_consecutive_dropped_prompts: 0
+    max_skipped_prompts: 0
+    on_dropped_prompt: replace
+    max_replacement_attempts: 1
+    replacement_reserve_prompts: 1
+    min_step_batch_fraction: 0.9
+    nemo_gym:
+      rollout_timeout_s: 9000.0
+  stall_watchdog:
+    interval_s: 30.0
+    stall_timeout_s: 10800.0
+    stall_action: warn
+    gym_subprocess_check: true
+  generation_fleet_health:
+    enabled: false
+    refit_timeout_s: null
+  generation_router:
+    enabled: false
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: 16
+  mooncake_cpu:
+    global_segment_size: 34359738368
+    local_buffer_size: 8589934592
+
+# The generic GRPO base config supplies OpenMathInstruct-2 on the concrete
+# train/validation mappings. Those keys take precedence over data.default, so
+# override them explicitly for the amplified-dolphin Gym JSONL blend.
+data:
+  train:
+    dataset_name: NemoGymDataset
+    split_validation_size: 0
+  validation:
+    dataset_name: NemoGymDataset
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    skip_venv_if_present: true
+    num_gpu_nodes: 1
+    gzip_responses_enabled: true
+    gzip_responses_minimum_size: 4096
+    gzip_responses_compresslevel: 1
+    global_aiohttp_keepalive_timeout_seconds: 2.0
+    uvicorn_timeout_keep_alive_seconds: 15
+    run_response_cache_enabled: true
+    run_response_cache_max_entries: 8192
+    run_response_cache_ttl_seconds: 7200
+    run_response_cache_max_response_bytes: 67108864
+    run_response_cache_max_total_bytes: 8589934592
+    run_response_cache_body_read_retries: 4
+    run_response_cache_retry_delay_seconds: 0.25
+    run_response_cache_log_interval: 1000
+    global_aiohttp_connector_limit: 65536
+    global_aiohttp_connector_limit_per_host: 16384
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 8
+    policy_model_reasoning_off:
+      responses_api_models:
+        vllm_model:
+          num_workers: 8
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          vllm_serve_kwargs:
+            data_parallel_size: 1
+
+logger:
+  log_dir: logs/nano35-rlvr-external-rollout-smoke
+  wandb:
+    project: nano35-rlvr-main-tot-smoke
+    name: nano35-rlvr-external-rollout-smoke
+  swanlab:
+    name: nano35-rlvr-external-rollout-smoke
+  mlflow:
+    experiment_name: nano35-rlvr-main-tot-smoke
+    run_name: nano35-rlvr-external-rollout-smoke

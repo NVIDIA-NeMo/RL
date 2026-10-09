@@ -455,6 +455,35 @@ def _build_clusters(
         )
         return cluster, cluster, teacher_topology
 
+    if backend == "remote_vllm":
+        # The rollout server owns GPUs in a separate Slurm heterogeneous group.
+        # Give every student GPU in this Ray cluster to the policy. Returning
+        # the same handle for inference keeps the actor's cluster-pinning
+        # contract without allocating a second placement group; the remote
+        # generation adapter never schedules work on it.
+        node_constraints, remaining_ids, topology = prepare_segment_topology(
+            segment_size,
+            policy_nodes,
+            role="policy",
+        )
+        teacher_topology = (
+            {node_id: topology[node_id] for node_id in remaining_ids}
+            if segment_size is not None
+            else None
+        )
+        train_cluster = RayVirtualCluster(
+            name="sc_train_cluster",
+            bundle_ct_per_node_list=[gpus_per_node] * policy_nodes,
+            use_gpus=True,
+            num_gpus_per_node=gpus_per_node,
+            max_colocated_worker_groups=train_worker_groups,
+            port_range_low=port_range_low,
+            port_range_high=port_range_high,
+            segment_size=segment_size,
+            node_resource_constraints=node_constraints,
+        )
+        return train_cluster, train_cluster, teacher_topology
+
     # Non-colocated: split node into train + inference clusters.
     inference_resources = generation_config["colocated"]["resources"]
     inference_gpus_per_node = inference_resources["gpus_per_node"]
@@ -617,6 +646,11 @@ def _build_generation(
             defer_model_load=defer_model_load,
         )
 
+    elif backend == "remote_vllm":
+        from nemo_rl.models.generation.remote_vllm import RemoteVllmGeneration
+
+        gen = RemoteVllmGeneration(config=generation_config)
+
     elif backend == "sglang":
         assert not defer_model_load, (
             "defer_model_load is only supported for the vllm backend"
@@ -650,7 +684,8 @@ def _build_generation(
 
     else:
         raise ValueError(
-            "single_controller_utils.setup only supports vllm, sglang, or megatron "
+            "single_controller_utils.setup only supports vllm, remote_vllm, "
+            "sglang, or megatron "
             f"generation; got {backend!r}"
         )
 
@@ -775,10 +810,13 @@ def _spinup_gym(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
+    model_name = generation_config["model_name"]
+    if generation_config["backend"] == "remote_vllm":
+        model_name = generation_config["remote_vllm_cfg"]["served_model_name"]
     shard_set = build_nemo_gym_actors(
         master_config.env,
         base_urls=base_urls,
-        model_name=generation_config["model_name"],
+        model_name=model_name,
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
@@ -805,6 +843,8 @@ def _generation_max_seq_len(generation_config) -> int:
         return generation_config["sglang_cfg"]["context_length"]
     if backend == "megatron":
         return generation_config["mcore_generation_config"]["max_model_len"]
+    if backend == "remote_vllm":
+        return generation_config["remote_vllm_cfg"]["max_model_len"]
     raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
@@ -1264,9 +1304,13 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] not in ("vllm", "megatron"):
+        if generation_config["backend"] not in (
+            "vllm",
+            "megatron",
+            "remote_vllm",
+        ):
             raise NotImplementedError(
-                "token_capture.enabled supports vllm or megatron; got "
+                "token_capture.enabled supports vllm, megatron, or remote_vllm; got "
                 f"{generation_config['backend']!r}"
             )
         generation_config_dict = cast(dict[str, Any], generation_config)
@@ -1464,9 +1508,14 @@ def setup_single_controller(
     use_nemo_gym = should_use_nemo_gym(master_config)
     data_tokenizer = processor if processor is not None else tokenizer
     is_vlm = processor is not None
-    if use_nemo_gym and generation_config["backend"] not in ("vllm", "megatron"):
+    if use_nemo_gym and generation_config["backend"] not in (
+        "vllm",
+        "megatron",
+        "remote_vllm",
+    ):
         raise NotImplementedError(
-            "SC NeMo-Gym integration currently supports the vllm and megatron backends only; got "
+            "SC NeMo-Gym integration currently supports vllm, remote_vllm, "
+            "and megatron backends only; got "
             f"{generation_config['backend']!r}"
         )
     # Backend settings checks are pure config: run them before anything builds.
@@ -1937,13 +1986,20 @@ def setup_single_controller(
             include_multimodal_fields=processor is not None,
         )
     if token_capture_cfg.enabled:
-        # Both active backends stage canonical Gym rows in serving workers;
-        # only vLLM workers stage captured media beside them (capture_media).
-        generation.setup_token_capture(
-            dp_config,
-            token_capture_cfg.staging_partition,
-            capture_media=capture_media,
-        )
+        # Managed serving workers host capture in process. External vLLM sends
+        # dependency-neutral token records back through the controller bridge.
+        if generation_config["backend"] == "remote_vllm":
+            generation.setup_token_capture(
+                dp_config,
+                token_capture_cfg.staging_partition,
+                dp_client=dp_client,
+            )
+        else:
+            generation.setup_token_capture(
+                dp_config,
+                token_capture_cfg.staging_partition,
+                capture_media=capture_media,
+            )
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
