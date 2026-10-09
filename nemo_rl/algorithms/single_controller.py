@@ -86,7 +86,6 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
-    ReadyFirstSampler,
     ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
@@ -179,6 +178,7 @@ from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.models.policy import get_shared_prefix_training_config
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.telemetry.instrumentation import (
@@ -341,6 +341,11 @@ class SingleControllerActor:
     # rather than raising out of the training loop.
     _tracer: Any = None
 
+    # Declared on the class so an instance built without __init__ keeps the dense
+    # path. Resolved from the policy config rather than read off the trainer, so
+    # a trainer without shared-prefix attributes cannot turn the feature on.
+    _shared_prefix_logprobs_enabled: bool = False
+
     def __init__(
         self,
         master_config: MasterConfig,
@@ -368,6 +373,9 @@ class SingleControllerActor:
 
         self._master_config = master_config
         self._algo_cfg = algo_config(master_config)
+        self._shared_prefix_logprobs_enabled = get_shared_prefix_training_config(
+            master_config.policy
+        ).enabled_for(stage="logprobs")
         self._async_cfg = master_config.async_rl
         self._is_ppo: bool = is_ppo_run(master_config)
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
@@ -2663,6 +2671,29 @@ class SingleControllerActor:
             )
         return target
 
+    def _shared_prefix_dp_world(self) -> Optional[int]:
+        """DP size each shared-prefix chunk must be a multiple of; None when off.
+
+        Checked before the first chunk trains. The pump otherwise discovers an
+        unaligned step target mid-step, after earlier chunks already ran
+        forward/backward.
+
+        Raises:
+            ValueError: ``num_prompts_per_step`` is not a multiple of the
+                trainer's data-parallel size.
+        """
+        if not self._shared_prefix_logprobs_enabled:
+            return None
+        dp_world = self._trainer.sharding_annotations.get_axis_size("data_parallel")
+        num_prompts_per_step = self._algo_cfg.num_prompts_per_step
+        if num_prompts_per_step % dp_world:
+            raise ValueError(
+                "Shared-prefix execution assigns complete prompt groups to DP "
+                f"ranks, so num_prompts_per_step={num_prompts_per_step} must be "
+                f"a multiple of the policy data-parallel size {dp_world}"
+            )
+        return dp_world
+
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
 
@@ -2708,6 +2739,13 @@ class SingleControllerActor:
         """
         policy_training_start_step = (
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
+        )
+        shared_prefix_dp_world = self._shared_prefix_dp_world()
+        # Opt-in per concrete class (own __dict__, never inherited), like the
+        # custom-sampler capabilities; without it chunks stay at exact-min size.
+        sampler_aligns_groups = (
+            type(self._sampler).__dict__.get("supports_prompt_group_multiple", False)
+            is True
         )
 
         while self._train_steps < self._algo_cfg.max_num_steps:
@@ -2793,22 +2831,20 @@ class SingleControllerActor:
                             max_prompt_groups,
                         )
                         selection_options: dict[str, int] = {}
-                        if self._trainer.shared_prefix_training_config.enabled_for(
-                            stage="logprobs"
-                        ):
-                            dp_world = self._trainer.sharding_annotations.get_axis_size(
-                                "data_parallel"
-                            )
+                        if shared_prefix_dp_world is not None:
+                            dp_world = shared_prefix_dp_world
                             dispatch_groups = (
                                 (min_prompt_groups + dp_world - 1) // dp_world
                             ) * dp_world
+                            # Invariant only: the entry DP check plus setup's
+                            # zero drop budget keep every remainder aligned.
                             if dispatch_groups > max_prompt_groups:
                                 raise ValueError(
                                     "Shared-prefix step remainder must contain complete DP groups: "
                                     f"remaining={max_prompt_groups}, dp={dp_world}"
                                 )
                             min_prompt_groups = dispatch_groups
-                            if isinstance(self._sampler, ReadyFirstSampler):
+                            if sampler_aligns_groups:
                                 # Round the actual ready count inside the sampler;
                                 # a rounded upper bound alone cannot align a
                                 # partially filled buffer. Preserve greedy order.
