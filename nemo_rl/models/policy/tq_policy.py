@@ -209,7 +209,11 @@ class TQPolicy(TQDriverMixin, Policy):
     def _with_shared_work_metadata(
         self, meta: KVBatchMeta, *, stage: Literal["train", "logprobs"]
     ) -> KVBatchMeta:
-        """Backfill old rollout metadata using only the stored prefix-length column."""
+        """Tag rows with their stored prompt lengths for work-weighted sharding.
+
+        The rollout reassembler ships prompt lengths only as a TQ column, so
+        this is the sole producer of the row tags ``shard_meta_for_dp`` reads.
+        """
         config = self.shared_prefix_training_config
         if config.work_weights_for(stage=stage) is None:
             return meta
