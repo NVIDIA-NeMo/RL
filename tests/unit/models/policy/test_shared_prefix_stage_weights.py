@@ -276,5 +276,17 @@ def test_non_tq_policy_sharding_rejects_shared_execution(mode, stage):
             policy._shard_for_train(data, batch_size=2)
 
 
+@pytest.mark.parametrize("mode", ["logprobs", "train"])
+def test_non_tq_policy_rejects_shared_execution_before_allocating_workers(mode):
+    with patch(
+        "nemo_rl.models.policy.lm_policy.validate_shared_prefix_training_config",
+        return_value=SharedPrefixTrainingConfig(mode=mode),
+    ):
+        # Raises before the cluster or tokenizer is touched.
+        with pytest.raises(NotImplementedError, match="single-controller TQPolicy"):
+            Policy(cluster=None, config={}, tokenizer=None)
+    assert TQPolicy._supports_shared_prefix_execution
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

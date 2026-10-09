@@ -15,7 +15,7 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Any, Iterable, Optional, Union
+from typing import Any, ClassVar, Iterable, Optional, Union
 
 import numpy as np
 import ray
@@ -101,6 +101,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     shared_prefix_training_config: SharedPrefixTrainingConfig = (
         SharedPrefixTrainingConfig()
     )
+    # Shared-prefix forwards need per-row group IDs, prompt lengths and
+    # execution slots, which only the data-plane dispatch of TQPolicy carries.
+    _supports_shared_prefix_execution: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -152,6 +155,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self.shared_prefix_training_config = validate_shared_prefix_training_config(
             config
         )
+        # Fail before allocating workers rather than at the first get_logprobs
+        # or train call. An inference-only refit destination never plans
+        # shared-prefix forwards.
+        if (
+            self.shared_prefix_training_config.enabled_for(stage="logprobs")
+            and not is_refit_destination
+            and not self._supports_shared_prefix_execution
+        ):
+            raise NotImplementedError(
+                "shared-prefix execution requires the single-controller TQPolicy path"
+            )
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:

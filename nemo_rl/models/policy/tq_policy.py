@@ -36,7 +36,7 @@ from collections import Counter, defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, ClassVar, Literal, Optional
 
 import ray
 
@@ -136,6 +136,8 @@ class TQPolicy(TQDriverMixin, Policy):
     schema covering ``DP_TRAIN_FIELDS`` (the bulk schema written by the
     rollout actor at first put + driver-/worker-written deltas).
     """
+
+    _supports_shared_prefix_execution: ClassVar[bool] = True
 
     def __init__(
         self,
