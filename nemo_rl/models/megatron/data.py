@@ -93,6 +93,9 @@ class SharedPrefixForwardMetadata:
     ``padded_total_length`` is the minimally ``M``-padded global star length.
     ``tensor_bin`` retains the global physical and logical correctness metadata
     used to route scalar next-token log-probabilities.
+    ``exclude_sequence_padding_from_expert_bias`` states the dense path's MoE
+    expert-bias convention for per-branch padding rows: packed dense units
+    mask their padding exactly when this is true.
     """
 
     tensor_bin: "SharedPrefixTensorBin"
@@ -101,6 +104,7 @@ class SharedPrefixForwardMetadata:
     cp_rank: int
     cp_size: int
     padded_total_length: int
+    exclude_sequence_padding_from_expert_bias: bool
 
 
 @dataclass
@@ -972,6 +976,9 @@ def process_shared_prefix_microbatch(
     tp_size, cp_size, padding_multiple = _resolve_shared_prefix_execution_topology(cfg)
     cp_rank = get_context_parallel_rank() if cp_size > 1 else 0
     source_sequence_length = data_dict["input_ids"].shape[1]
+    # Packed dense units mask their padding from MoE routing with HybridEP;
+    # star units state the same convention to the model.
+    mask_sequence_padding = uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
     for unit in execution_units:
         unit_rows = list(unit.row_indices)
         unit_data = data_dict.select_indices(unit_rows)
@@ -1005,6 +1012,7 @@ def process_shared_prefix_microbatch(
                 cp_size=cp_size,
                 padded_total_length=cp_shard.padded_total_length,
                 padding_multiple=padding_multiple,
+                exclude_sequence_padding_from_expert_bias=mask_sequence_padding,
             )
             mtp_loss_mask = None
             if "mtp_loss_mask" in data_dict:
@@ -1051,9 +1059,7 @@ def process_shared_prefix_microbatch(
             pad_full_seq_to=pad_full_seq_to,
             pack_sequences=True,
             straggler_timer=straggler_timer,
-            create_packed_seq_padding_mask=uses_hybridep_flex_dispatcher(
-                cfg["megatron_cfg"]
-            ),
+            create_packed_seq_padding_mask=mask_sequence_padding,
             mtp_enabled=mtp_enabled,
         )
         yield ProcessedMicrobatch(

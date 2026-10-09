@@ -279,6 +279,12 @@ def model_forward(
                 additional_kwargs["shared_prefix_layout"] = (
                     MCoreSharedPrefixForestLayout(roots)
                 )
+        if shared_prefix.exclude_sequence_padding_from_expert_bias:
+            # Match the dense packed path, which masks per-sequence padding
+            # from MoE expert-bias counts with HybridEP. Sent only when set.
+            additional_kwargs[
+                "shared_prefix_exclude_sequence_padding_from_expert_bias"
+            ] = True
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params

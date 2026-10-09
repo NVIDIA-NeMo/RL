@@ -2564,3 +2564,49 @@ class TestSharedPrefixMicrobatchIterator:
                 microbatch.data_dict["input_ids"],
                 data["input_ids"][list(metadata.tensor_bin.layout.row_indices)],
             )
+
+    @pytest.mark.parametrize(
+        "backend,excluded", [("hybridep", True), ("deepep", False)]
+    )
+    def test_star_units_state_the_expert_bias_padding_convention(
+        self, backend, excluded
+    ):
+        """Star forwards mask per-branch padding exactly when dense units do."""
+        pytest.importorskip("megatron.core.models.hybrid.shared_prefix")
+        from nemo_rl.models.megatron.data import process_shared_prefix_microbatch
+        from nemo_rl.models.megatron.train import model_forward
+
+        data = _shared_prefix_batch(_STAR_TOKENS, _STAR_PROMPTS, _STAR_GROUPS)
+        cfg = _shared_prefix_cfg()
+        cfg["megatron_cfg"].update(
+            moe_token_dispatcher_type="flex", moe_flex_dispatcher_backend=backend
+        )
+        microbatch = next(
+            process_shared_prefix_microbatch(
+                data_dict=data,
+                cfg=cfg,
+                bin_capacity=64,
+                execution_units=self._plan(data, cfg),
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=1,
+                pad_packed_seq_to_multiple_of=1,
+                pad_full_seq_to=None,
+                straggler_timer=None,
+            )
+        )
+        metadata = microbatch.shared_prefix
+        assert metadata.exclude_sequence_padding_from_expert_bias is excluded
+
+        model = MagicMock(return_value=torch.zeros(1, 1, 1))
+        model_forward(
+            model=model,
+            data_dict=microbatch.data_dict,
+            input_ids_cp_sharded=microbatch.input_ids_cp_sharded,
+            position_ids=microbatch.position_ids,
+            attention_mask=None,
+            shared_prefix=metadata,
+        )
+        # Sent only when set, so MCore builds without the argument still run.
+        assert model.call_args.kwargs.get(
+            "shared_prefix_exclude_sequence_padding_from_expert_bias"
+        ) is (True if excluded else None)
