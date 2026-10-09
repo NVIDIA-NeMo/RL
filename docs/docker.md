@@ -70,6 +70,27 @@ When these build arguments are set, the corresponding `uv sync --extra` commands
 > [!NOTE]
 > If you skip vLLM, SGLang, or TRT-LLM during the build but later try to use those backends at runtime, the dependencies will be fetched and built on-demand. This may add significant setup time on first use.
 
+## Gym h2-ping-sidecar
+
+The release image ships the NeMo Gym `h2-ping-sidecar` prebuilt at `/opt/h2-ping-sidecar/h2-ping-sidecar`. It is a local HTTP/2 PING proxy that keeps long requests to NVCF endpoints alive past the 340 second idle limit (see `nemo_gym/tools/sidecar/README.md` in the Gym submodule). Gym can build it on first use, but that needs Go 1.25 or newer, which the image does not include. The Dockerfile builds it once with a throwaway Go toolchain and removes the toolchain afterwards.
+
+To use it from a recipe, enable the `sidecar:` block in `env.nemo_gym` and point it at the prebuilt binary:
+
+```yaml
+env:
+  nemo_gym:
+    sidecar:
+      enabled: true
+      binary: /opt/h2-ping-sidecar/h2-ping-sidecar
+      build_if_missing: false
+      instances:
+        - name: judge
+          upstream: https://<function-id>.invocation.api.nvcf.nvidia.com
+          listen: 127.0.0.1:1250
+```
+
+Use `--build-arg GO_VERSION=<1.25.x release>` to build with a different Go release, for example to pick up a Go security fix.
+
 ## Custom Setup Commands
 
 By default, the Docker image installs [apptainer](https://apptainer.org/) (with a `singularity` symlink) via a pluggable `custom-setup` build stage. The default script is `docker/install_apptainer.sh`. You can override or skip this step at build time.

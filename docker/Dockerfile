@@ -24,6 +24,8 @@
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 # Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
 #   --build-arg BUILD_DYNAMO=1
+# Go toolchain used (and then removed) to prebuild Gym's h2-ping-sidecar into /opt/h2-ping-sidecar:
+#   --build-arg GO_VERSION=1.25.14
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 # Unprivileged runtime identity (for example the NeMo CI agent workloads) that owns the shared
@@ -681,6 +683,23 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
     rm -f "${GYM_VLLM_OVERRIDE}"
 fi
+EOF
+# Prebuild Gym's h2-ping-sidecar: a local HTTP/2 PING proxy that keeps long requests to NVCF endpoints
+# alive past the 340 s Global Accelerator idle limit (see nemo_gym/tools/sidecar/README.md in the Gym
+# submodule). Gym builds it on first use and needs Go >= 1.25, which this image does not ship, so build it
+# here with a throwaway toolchain. Recipes that enable `sidecar:` should set
+# `sidecar.binary: /opt/h2-ping-sidecar/h2-ping-sidecar` (and `build_if_missing: false`). Go and its caches
+# are removed again, so the final image has no Go. Bump GO_VERSION for Go security releases (the proxy is
+# mostly net/http and crypto/tls); the module's minimum is in Gym's nemo_gym/tools/sidecar/go.mod.
+ARG GO_VERSION=1.25.14
+RUN <<"EOF" bash -exu
+case "${TARGETARCH:-amd64}" in arm64) GOARCH=arm64 ;; *) GOARCH=amd64 ;; esac
+curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz" | tar -C /tmp -xz
+(cd /opt/nemo-rl/3rdparty/Gym-workspace/Gym/nemo_gym/tools/sidecar && \
+    GOCACHE=/tmp/gocache GOPATH=/tmp/gopath GOTOOLCHAIN=local PATH="/tmp/go/bin:${PATH}" \
+    go build -buildvcs=false -trimpath -o /opt/h2-ping-sidecar/h2-ping-sidecar .)
+rm -rf /tmp/go /tmp/gocache /tmp/gopath
+test -x /opt/h2-ping-sidecar/h2-ping-sidecar
 EOF
 # ray's bundled Java worker jar ships an outdated httpcore5 with a known CVE
 # (GHSA-hf6x-8p5f-cgmf). NeMo-RL never uses Ray's Java cross-language worker,
