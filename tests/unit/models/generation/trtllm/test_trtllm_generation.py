@@ -352,20 +352,20 @@ def test_disagg_defaults_come_from_the_schema_not_the_call_sites():
         cfg = _config(disaggregation=raw) if raw is not None else _config()
         disagg = resolve_trtllm_disagg_config(cfg)
         assert disagg.enabled is False
-        assert disagg.num_context_engines == 1
-        assert disagg.num_generation_engines == 1
+        assert disagg.num_prefill_engines == 1
+        assert disagg.num_decode_engines == 1
         assert disagg.num_frontend_workers == 1
         assert disagg.frontend_base_port == 17300
         assert disagg.ctx_router == "conversation"
         assert disagg.gen_router == "load_balancing"
         assert disagg.cache_transceiver_backend == "DEFAULT"
         assert disagg.cache_transceiver_runtime is None
-        assert disagg.ctx_trtllm_kwargs == {}
+        assert "prefill_engine" not in cfg["trtllm_cfg"]
 
 
 def test_a_plausible_but_wrong_router_is_rejected():
     # round_robin parses as a str but silently discards the prefix affinity the
-    # context engines depend on, so the schema has to reject it.
+    # prefill engines depend on, so the schema has to reject it.
     with pytest.raises(ValidationError):
         resolve_trtllm_disagg_config(
             _config(disaggregation={"enabled": True, "ctx_router": "round_robin"})
@@ -381,39 +381,42 @@ def test_unknown_disagg_keys_are_preserved_for_older_configs():
 
 
 @pytest.mark.parametrize(
-    "disaggregation, world_size, expected_roles, expected_tps, expected_replicas",
+    "trtllm_overrides, world_size, expected_roles, expected_tps, expected_replicas",
     [
         # Disabled: a replica is an engine, so the count follows TP as before.
-        (None, 8, ["generation"] * 8, [1] * 8, 8),
+        ({}, 8, ["aggregated"] * 8, [1] * 8, 8),
         # Enabled, 1:1 at TP1 -- the exemplar's defaults on one 8-GPU node.
         (
-            {"enabled": True},
+            {"disaggregation": {"enabled": True}},
             8,
-            ["context", "generation"] * 4,
+            ["prefill", "decode"] * 4,
             [1, 1] * 4,
             4,
         ),
         # Per-role TP and engine counts are independent, and same-role engines
-        # stay contiguous within a replica.
+        # stay contiguous within a replica. The role overrides sit beside the
+        # shared engine config, not under disaggregation.
         (
             {
-                "enabled": True,
-                "num_context_engines": 2,
-                "num_generation_engines": 1,
-                "ctx_trtllm_kwargs": {"tensor_parallel_size": 1},
-                "gen_trtllm_kwargs": {"tensor_parallel_size": 2},
+                "disaggregation": {
+                    "enabled": True,
+                    "num_prefill_engines": 2,
+                    "num_decode_engines": 1,
+                },
+                "prefill_engine": {"tensor_parallel_size": 1},
+                "decode_engine": {"tensor_parallel_size": 2},
             },
             8,
-            ["context", "context", "generation"] * 2,
+            ["prefill", "prefill", "decode"] * 2,
             [1, 1, 2] * 2,
             2,
         ),
     ],
 )
 def test_plan_engines_lays_replicas_out_contiguously(
-    disaggregation, world_size, expected_roles, expected_tps, expected_replicas
+    trtllm_overrides, world_size, expected_roles, expected_tps, expected_replicas
 ):
-    cfg = _config(**({"disaggregation": disaggregation} if disaggregation else {}))
+    cfg = _config(**trtllm_overrides)
     generation = TrtllmGeneration.__new__(TrtllmGeneration)
     generation.cfg = cfg
     generation.tp_size = cfg["trtllm_cfg"]["tensor_parallel_size"]
@@ -428,11 +431,9 @@ def test_plan_engines_lays_replicas_out_contiguously(
 
 def test_plan_engines_rejects_a_replica_width_that_does_not_tile_the_cluster():
     cfg = _config(
-        disaggregation={
-            "enabled": True,
-            "ctx_trtllm_kwargs": {"tensor_parallel_size": 2},
-            "gen_trtllm_kwargs": {"tensor_parallel_size": 1},
-        }
+        disaggregation={"enabled": True},
+        ctx={"tensor_parallel_size": 2},
+        gen={"tensor_parallel_size": 1},
     )
     generation = TrtllmGeneration.__new__(TrtllmGeneration)
     generation.cfg = cfg

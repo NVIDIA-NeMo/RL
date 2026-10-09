@@ -13,11 +13,10 @@
 # limitations under the License.
 """One replica's disaggregation front-end, backed by TRT-LLM's ``OpenAIDisaggServer``.
 
-Started the same way as :mod:`trtllm_http_server`: a uvicorn app in a daemon
-thread, returning the URL NeMo-Gym will talk to. That server owns everything
-below the replica boundary — which context engine runs the prefill, which
-generation engine runs the decode, and the KV handshake between them. NeMo RL
-only hands it the two address pools and the router policies.
+Started like :mod:`trtllm_http_server`: a uvicorn app in a daemon thread,
+returning the URL NeMo-Gym talks to. NeMo RL hands it the two address pools and
+the router policies; everything below that -- engine choice per leg, the KV
+handshake -- is the disagg server's.
 """
 
 import json
@@ -60,8 +59,8 @@ def build_config(
         node_id: Must be distinct per replica. TRT-LLM's default is
             ``uuid.getnode() % 256``, documented as assuming a single disagg
             server per machine, and we run one per replica.
-        ctx_router: Stateful, so a trajectory's turns keep reaching the context
-            engine holding its prefix.
+        ctx_router: Stateful, so a trajectory's turns keep reaching the
+            prefill engine holding its prefix.
         gen_router: Stateless, so placement stays local to this replica and no
             coordinator process is needed.
     """
@@ -86,7 +85,7 @@ def build_config(
         node_id=node_id,
     )
     # Post-construction assignment, same as TRT-LLM's own YAML parser
-    # (llmapi/disagg_utils.py extract_disagg_cfg): thins the gen leg so the
+    # (llmapi/disagg_utils.py extract_disagg_cfg): thins the decode leg so the
     # relay stops re-serializing a 30k-int id array and the full history.
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
     config.gen_strip_message_history = gen_strip_message_history
@@ -345,7 +344,7 @@ def _build_adaptor_class() -> type:
             """Pass a downstream 4xx through instead of masking it as a 500.
 
             The base implementation only re-raises ``HTTPException``; a 4xx
-            from a context/generation engine arrives as an
+            from a prefill/decode engine arrives as an
             ``aiohttp.ClientResponseError`` and falls into the catch-all that
             turns it into ``500 Internal server error``. The aggregated server
             returns that same rejection to the caller as a 4xx, so without this

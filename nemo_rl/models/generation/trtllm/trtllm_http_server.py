@@ -332,7 +332,7 @@ def create_app(
         # id at all.
         #
         # Until then a turn lands on an effectively random attention-DP rank and
-        # the context engine re-prefills most of its history: measured at
+        # the prefill engine re-prefills most of its history: measured at
         # 2P-DEP8 / conc 512, 17-26% of turns found their prefix on the serving
         # rank (about 1/DEP) versus 96-97% once the id flows. Nothing fails --
         # disaggregation just gives up most of its benefit -- so treat a run
@@ -372,7 +372,7 @@ def create_app(
         )
 
         # On the generation leg the disagg server hands over the exact token ids
-        # the context engine built KV for (openai_disagg_service._get_gen_request).
+        # the prefill engine built KV for (openai_disagg_service._get_gen_request).
         # Rebuilding them from `messages` could yield a different sequence, which
         # would decode against mismatched KV -- and silently. Prefer what it sent,
         # and skip the chat-template work entirely: nothing downstream of this

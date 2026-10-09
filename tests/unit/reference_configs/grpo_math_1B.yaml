@@ -403,6 +403,13 @@ policy:
     val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
+    disaggregation:
+      enabled: false
+      num_prefill_engines: 1
+      num_decode_engines: 1
+      num_frontend_workers: 1
+      frontend_tokenize: false
+      frontend_base_port: 17300
     # null = topology default (IPC colocated, NCCL non-colocated). For
     # non-colocated Megatron generation it selects the packed collective; use
     # mcore for native refit.

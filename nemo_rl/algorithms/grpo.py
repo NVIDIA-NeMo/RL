@@ -121,6 +121,7 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import (
+    DisaggConfig,
     GenerationConfig,
     GenerationInterface,
     GenerationSamplingParams,
@@ -631,6 +632,26 @@ def setup(
         )
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
+
+    # generation.disaggregation is written in backend-agnostic terms, but only
+    # the TRT-LLM backend implements it today: it is the one with a frontend
+    # (OpenAIDisaggServer) to place in front of the two engine pools and a KV
+    # transceiver to carry the handoff. Every other backend would silently
+    # ignore the whole block and serve aggregated, which looks like a working
+    # run at half the configured engine count -- so refuse to start instead.
+    disagg = generation_config.get("disaggregation")
+    disagg_enabled = (
+        disagg.enabled
+        if isinstance(disagg, DisaggConfig)
+        else bool((disagg or {}).get("enabled"))
+    )
+    if disagg_enabled and generation_config["backend"] != "trtllm":
+        raise ValueError(
+            "policy.generation.disaggregation.enabled is only supported for "
+            f"backend='trtllm', got '{generation_config['backend']}'. Set it to "
+            "false, or switch the backend."
+        )
+
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
 
@@ -1142,13 +1163,13 @@ def setup(
                     )
                 elif generation_config["backend"] == "trtllm":
                     trtllm_cfg = generation_config.get("trtllm_cfg", {})
-                    disagg_cfg = trtllm_cfg.get("disaggregation") or {}
+                    disagg_cfg = generation_config.get("disaggregation") or {}
                     if disagg_cfg.get("enabled"):
                         # Under PD disaggregation the unit to keep inside one
                         # NVLink domain is the *replica*, not the engine: an
                         # engine's TP group all-reduces internally, but the KV
-                        # cache handed from the replica's context engines to its
-                        # generation engines crosses the transceiver on every
+                        # cache handed from the replica's prefill engines to its
+                        # decode engines crosses the transceiver on every
                         # turn. Sizing this by the engine (below) yields
                         # nodes_per_instance=1 whenever an engine fits in a node,
                         # which skips domain pinning entirely and lets a replica
@@ -1159,7 +1180,9 @@ def setup(
                         # asserts pp == 1, so folding it in would only suggest a
                         # dimension this backend does not have.
                         def _role_tp(role: str) -> int:
-                            overrides = disagg_cfg.get(f"{role}_trtllm_kwargs") or {}
+                            # Per-role engine overrides live beside the engine
+                            # config they override, not under disaggregation.
+                            overrides = trtllm_cfg.get(f"{role}_engine") or {}
                             return int(
                                 overrides.get(
                                     "tensor_parallel_size",
@@ -1167,9 +1190,14 @@ def setup(
                                 )
                             )
 
+                        # Both default to 1, matching DisaggConfig, so enabling
+                        # disaggregation without naming the counts sizes a
+                        # one-of-each replica here as it does in the backend.
                         gpus_per_instance = int(
-                            disagg_cfg["num_context_engines"] * _role_tp("ctx")
-                            + disagg_cfg["num_generation_engines"] * _role_tp("gen")
+                            disagg_cfg.get("num_prefill_engines", 1)
+                            * _role_tp("prefill")
+                            + disagg_cfg.get("num_decode_engines", 1)
+                            * _role_tp("decode")
                         )
                     else:
                         gpus_per_instance = trtllm_cfg[

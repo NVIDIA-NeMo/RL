@@ -189,11 +189,6 @@ class TrtllmAsyncGenerationWorkerImpl:
         self.TrtSamplingParams = TrtSamplingParams
 
         engine_cfg = self.engine_cfg
-        # This engine's TP is the number of bundles TrtllmGeneration tied to it,
-        # not the config value: under PD disaggregation with asymmetric TP the
-        # context and generation engines are different widths, and the config
-        # holds only the default. Identical to engine_cfg["tensor_parallel_size"]
-        # whenever the layout is uniform.
         tp_size = len(self._bundle_indices)
         self._colocated = self.cfg["colocated"]["enabled"]
 
@@ -268,7 +263,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             llm_kwargs["kv_cache_config"] = KvCacheConfig(**kv_cache_kwargs)
 
         # PD disaggregation: every engine gets a cache transceiver. The
-        # context/generation role is per *request* in TRT-LLM
+        # prefill/decode role is per *request* in TRT-LLM
         # (DisaggregatedParams.request_type), not per engine, so engines are
         # symmetric here; which pool an engine lands in is decided by the
         # replica's disagg server from its address alone.
@@ -276,33 +271,17 @@ class TrtllmAsyncGenerationWorkerImpl:
         if disagg_cfg.get("enabled"):
             from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
-            transceiver_kwargs: dict[str, Any] = {
-                "backend": disagg_cfg["cache_transceiver_backend"],
-            }
-            if disagg_cfg.get("max_tokens_in_buffer") is not None:
-                transceiver_kwargs["max_tokens_in_buffer"] = disagg_cfg[
-                    "max_tokens_in_buffer"
-                ]
-            # Only forward when set, so TRT-LLM keeps its own "auto" default
-            # otherwise. Worth forwarding at all because "auto" resolves to the
-            # C++ transceiver whenever it cannot confirm the model's preference,
-            # and a hybrid Mamba model under disaggregation needs the Python
-            # (v2) transceiver to hand its recurrent state over.
-            if disagg_cfg.get("cache_transceiver_runtime") is not None:
-                transceiver_kwargs["transceiver_runtime"] = disagg_cfg[
-                    "cache_transceiver_runtime"
-                ]
-            if disagg_cfg.get("kv_cache_bounce_size_mb") is not None:
-                transceiver_kwargs["kv_cache_bounce_size_mb"] = disagg_cfg[
-                    "kv_cache_bounce_size_mb"
-                ]
-            if disagg_cfg.get("kv_transfer_timeout_ms") is not None:
-                transceiver_kwargs["kv_transfer_timeout_ms"] = disagg_cfg[
-                    "kv_transfer_timeout_ms"
-                ]
-            llm_kwargs["cache_transceiver_config"] = CacheTransceiverConfig(
-                **transceiver_kwargs
-            )
+            # Tuning the transceiver (runtime, bounce size, timeouts) is an
+            # AsyncLLM argument like any other, so it is set through
+            # trtllm_kwargs.cache_transceiver_config rather than duplicated on
+            # the disaggregation schema. Only the default is supplied here:
+            # without a transceiver config carrying a backend, LlmArgs does not
+            # consider the engine disaggregated at all (llm_args.py: is_disagg),
+            # so the engine would come up and fail on the first KV transfer.
+            if "cache_transceiver_config" not in extra_trtllm_kwargs:
+                llm_kwargs["cache_transceiver_config"] = CacheTransceiverConfig(
+                    backend="DEFAULT"
+                )
 
         moe_tp = engine_cfg.get("moe_tensor_parallel_size")
         moe_ep = engine_cfg.get("moe_expert_parallel_size")

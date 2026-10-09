@@ -6,7 +6,7 @@
 #
 # Resource layout (2 nodes x 4 GPUs):
 #   - node 0: policy training, Megatron CP4 (Qwen3-1.7B is dense and tiny)
-#   - node 1: one disagg replica -- 1 context engine (TP2) + 1 generation
+#   - node 1: one disagg replica -- 1 prefill engine (TP2) + 1 decode
 #     engine (TP2) fronted by 2 disagg servers. Replica width 2*2 = 4 GPUs,
 #     so the 4 rollout GPUs hold exactly one replica.
 #
@@ -69,31 +69,37 @@ policy:
       reasoning_parser: deepseek-r1
       default_chat_template_kwargs:
         enable_thinking: true
-      disaggregation:
-        enabled: true
-        num_context_engines: 1
-        num_generation_engines: 1
+      # How TRT-LLM implements the layout above: what the OpenAIDisaggServer
+      # process itself needs, passed straight through to DisaggServerConfig.
+      disagg_server:
         ctx_router: conversation
         gen_router: load_balancing
-        # docker/Dockerfile builds the wheel with --nixl_root.
-        cache_transceiver_backend: NIXL
-        # Two frontends, so the per-replica sharding of Gym's sticky
-        # sha256(session_id) client selection is exercised rather than
-        # collapsing to the single-frontend path.
-        num_frontend_workers: 2
-        # Outside virtual_cluster's master-port window (1400-1999).
-        frontend_base_port: 17300
         # On by default here: these three are the disaggregation-specific
         # paths most likely to perturb token-level agreement between the
         # sampler and the trainer, which is exactly what the
         # token_mult_prob_error gate in the driver measures.
         gen_tokids_ctxbytes: true
         gen_strip_message_history: true
-        frontend_tokenize: true
+    disaggregation:
+      enabled: true
+      num_prefill_engines: 1
+      num_decode_engines: 1
+      # Two frontends, so the per-replica sharding of Gym's sticky
+      # sha256(session_id) client selection is exercised rather than
+      # collapsing to the single-frontend path.
+      num_frontend_workers: 2
+      # Outside virtual_cluster's master-port window (1400-1999).
+      frontend_base_port: 17300
+      frontend_tokenize: true
+    trtllm_kwargs:
+      # KV cache transceiver: an AsyncLLM argument like any other, so it
+      # lives here rather than on the disaggregation schema.
+      cache_transceiver_config:
+        # docker/Dockerfile builds the wheel with --nixl_root.
+        backend: NIXL
         # 10 min. TRT-LLM's 60 s default is tuned for short prompts; this
         # workload runs to 81920 tokens.
         kv_transfer_timeout_ms: 600000
-    trtllm_kwargs:
       # TRT-LLM's analog of policy.hf_config_overrides, which only the vLLM
       # backend reads. model_kwargs overrides the HF pretrained_config
       # (precedence: model_kwargs > config file > class defaults), so this is
@@ -108,7 +114,7 @@ policy:
       # max_num_tokens".
       enable_chunked_prefill: true
       kv_cache_config:
-        # The context engine prefills only each turn's delta and the receiving
+        # The prefill engine prefills only each turn's delta and the receiving
         # engine skips blocks it already holds on transfer.
         enable_block_reuse: true
 
