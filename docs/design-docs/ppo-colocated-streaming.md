@@ -85,7 +85,7 @@ complete batch. Changing chunk boundaries can therefore change policy gradients.
 Critic returns are unaffected; gradient/loss normalization still uses the full
 update's valid count.
 
-Streaming requires one policy epoch, in-order sampling, separate generation GPUs,
+Streaming requires `ppo_epochs=1`, an in-order or ready-first sampler, separate generation GPUs,
 and classic Megatron DDP (including expert gradient buffers). Setup rejects
 Megatron FSDP and MXFP8 parameters with
 `policy.megatron_cfg.optimizer.use_distributed_optimizer: true`, regardless of
