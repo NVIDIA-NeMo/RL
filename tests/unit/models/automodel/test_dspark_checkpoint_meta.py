@@ -189,8 +189,8 @@ def test_weights_only_load_does_not_enforce_optimizer_layout(monkeypatch):
     optimizer's layout into the expected metadata: checkpoints saved without
     a layout record, or with a different optimizer grouping, remain loadable
     when optimizer state is not being restored."""
-    from unittest.mock import MagicMock
     from types import SimpleNamespace
+    from unittest.mock import MagicMock
 
     import torch
     from torch import nn
