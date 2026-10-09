@@ -194,17 +194,17 @@ class TQPolicy(TQDriverMixin, Policy):
 
     def _with_shared_prefix_fields(
         self,
-        fields: tuple[str, ...] | list[str],
+        fields: tuple[str, ...],
         *,
-        stage: Literal["train", "logprobs"] = "train",
-    ) -> list[str]:
+        stage: Literal["train", "logprobs"],
+    ) -> tuple[str, ...]:
         """Add opt-in metadata fields while preserving disabled-mode schemas."""
-        resolved = list(fields)
-        if self.shared_prefix_training_config.enabled_for(stage=stage):
-            for field in (SHARED_PREFIX_PROMPT_LENGTHS,):
-                if field not in resolved:
-                    resolved.append(field)
-        return resolved
+        if (
+            self.shared_prefix_training_config.enabled_for(stage=stage)
+            and SHARED_PREFIX_PROMPT_LENGTHS not in fields
+        ):
+            return (*fields, SHARED_PREFIX_PROMPT_LENGTHS)
+        return fields
 
     def _with_shared_work_metadata(
         self, meta: KVBatchMeta, *, stage: Literal["train", "logprobs"]
@@ -259,17 +259,19 @@ class TQPolicy(TQDriverMixin, Policy):
             num_samples: Expected total samples this step.
             group_size: GRPO group size for balanced sampling; ``None`` disables grouping.
         """
+        if self.shared_prefix_training_config.enabled_for(stage="logprobs"):
+            # Sync trainers write no prompt lengths or group-coherent sample IDs.
+            raise NotImplementedError(
+                "shared-prefix execution requires the single-controller trainer"
+            )
         self.dp_client.register_partition(
             partition_id=self.tq_partition_id,
-            fields=self._with_shared_prefix_fields(
-                fields_with_optional_opd_full(
-                    fields_with_optional_routed_experts(
-                        DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
-                    ),
-                    field=self._opd_full_field,
-                    teacher_index_field=self._opd_full_teacher_index_field,
+            fields=fields_with_optional_opd_full(
+                fields_with_optional_routed_experts(
+                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
                 ),
-                stage="logprobs",
+                field=self._opd_full_field,
+                teacher_index_field=self._opd_full_teacher_index_field,
             ),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
@@ -573,32 +575,23 @@ class TQPolicy(TQDriverMixin, Policy):
         # forward would run image-blind while the logprob forwards saw images.
         train_meta = self._with_route_fields(
             meta,
-            self._with_shared_prefix_fields(
-                tuple(
-                    fields_with_optional_opd_full(
-                        train_fields,
-                        field=self._opd_full_field,
-                        teacher_index_field=self._opd_full_teacher_index_field,
-                    )
-                ),
+            tuple(
+                fields_with_optional_opd_full(
+                    train_fields,
+                    field=self._opd_full_field,
+                    teacher_index_field=self._opd_full_teacher_index_field,
+                )
             ),
             task_name="train",
             want_routes=True,
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
-            train_meta = self._with_shared_work_metadata(train_meta, stage="train")
             dp_metas, _ = shard_meta_for_dp(
                 train_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
                 batch_size=batch_size,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
-                shared_prefix_groups=(
-                    self.shared_prefix_training_config.mode == "train"
-                ),
-                shared_prefix_work_weights=(
-                    self.shared_prefix_training_config.work_weights_for(stage="train")
-                ),
             )
 
         if self.flops_tracker is not None:
@@ -730,6 +723,7 @@ class TQPolicy(TQDriverMixin, Policy):
                         teacher_index_field=self._opd_full_teacher_index_field,
                     )
                 ),
+                stage="train",
             ),
             task_name="train",
             want_routes=True,
@@ -743,7 +737,7 @@ class TQPolicy(TQDriverMixin, Policy):
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
                 shared_prefix_groups=(
-                    self.shared_prefix_training_config.mode == "train"
+                    self.shared_prefix_training_config.enabled_for(stage="train")
                 ),
                 shared_prefix_work_weights=(
                     self.shared_prefix_training_config.work_weights_for(stage="train")

@@ -15,7 +15,7 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Any, Iterable, Literal, Optional, Union
+from typing import Any, Iterable, Optional, Union
 
 import numpy as np
 import ray
@@ -24,14 +24,6 @@ from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.data.packing.shared_prefix_cost import estimate_shared_prefix_row_work
-from nemo_rl.data.packing.shared_prefix_metadata import (
-    SHARED_PREFIX_EXECUTION_SLOT,
-    SHARED_PREFIX_GROUP_ID,
-    SHARED_PREFIX_PROMPT_LENGTHS,
-    plan_fixed_execution_slots,
-    plan_group_coherent_shards,
-)
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -50,6 +42,8 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.policy import (
     PolicyConfig,
+    SharedPrefixTrainingConfig,
+    validate_shared_prefix_data_parallel_size,
     validate_shared_prefix_training_config,
 )
 from nemo_rl.models.policy.draft_config import coerce_draft_config
@@ -102,6 +96,12 @@ def _aggregate_megatron_flops_metrics(
 
 
 class Policy(ColocatablePolicyInterface, GenerationInterface):
+    # Disabled default for instances built without ``__init__`` (test stubs);
+    # ``__init__`` replaces it with the validated config.
+    shared_prefix_training_config: SharedPrefixTrainingConfig = (
+        SharedPrefixTrainingConfig()
+    )
+
     def __init__(
         self,
         cluster: RayVirtualCluster,
@@ -327,6 +327,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 f"Required minimum world size: PP({pp_size}) * CP({cp_size}) * TP({tp_size}) = {model_parallel_size}. "
                 f"This would result in DP = {actual_world_size}/{model_parallel_size} = {actual_world_size / model_parallel_size:.3f}, but DP must be ≥ 1. "
                 f"Please either increase the number of GPUs/nodes or reduce the parallelism parameters."
+            )
+        if not is_refit_destination:
+            # An inference-only refit destination never plans shared-prefix
+            # forwards, and its world size is not the trainer's.
+            validate_shared_prefix_data_parallel_size(
+                self.shared_prefix_training_config,
+                data_parallel_size=actual_world_size // model_parallel_size,
             )
 
         if actual_world_size % model_parallel_size != 0:
@@ -582,76 +589,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     # DRY for Policy's logprob/train methods only. The data-plane sibling
     # TQPolicy shards KVBatchMeta via ``shard_meta_for_dp``; the
     # driver-on-data vs driver-on-meta split is by design.
-    def _shard_shared_prefix_data(
-        self,
-        data: BatchedDataDict[Any],
-        *,
-        bin_capacity: int,
-        stage: Literal["train", "logprobs"],
-        batch_size: Optional[int] = None,
-    ) -> tuple[list["SlicedDataDict"], Optional[list[int]]]:
-        """Assign complete prompt groups to DP ranks before worker planning."""
-        if SHARED_PREFIX_GROUP_ID not in data or "input_lengths" not in data:
-            raise ValueError(
-                "shared-prefix train mode requires group IDs and input_lengths "
-                "before data-parallel sharding"
-            )
-        raw_group_ids = data[SHARED_PREFIX_GROUP_ID]
-        group_ids = list(raw_group_ids)
-        raw_lengths = data["input_lengths"]
-        sequence_lengths = (
-            [int(length) for length in raw_lengths.detach().cpu().tolist()]
-            if isinstance(raw_lengths, torch.Tensor)
-            else [int(length) for length in raw_lengths]
-        )
-        if SHARED_PREFIX_EXECUTION_SLOT in data:
-            raise ValueError(
-                "input batch contains reserved shared-prefix execution-slot field"
-            )
-        slot_plan = plan_fixed_execution_slots(
-            group_ids=group_ids,
-            sequence_lengths=sequence_lengths,
-            bin_capacity=bin_capacity,
-            batch_size=batch_size,
-            sequence_length_pad_multiple=self.cfg["make_sequence_length_divisible_by"],
-        )
-        assignment_lengths = sequence_lengths
-        weights = self.shared_prefix_training_config.work_weights_for(stage=stage)
-        if weights is not None:
-            raw_prefixes = data[SHARED_PREFIX_PROMPT_LENGTHS]
-            prompt_lengths = (
-                raw_prefixes.detach().cpu().tolist()
-                if isinstance(raw_prefixes, torch.Tensor)
-                else list(raw_prefixes)
-            )
-            assignment_lengths = estimate_shared_prefix_row_work(
-                group_ids=group_ids,
-                sequence_lengths=sequence_lengths,
-                prompt_lengths=prompt_lengths,
-                physical_weight=weights[0],
-                expanded_weight=weights[1],
-            )
-        plan = plan_group_coherent_shards(
-            group_ids=group_ids,
-            sequence_lengths=assignment_lengths,
-            num_shards=self.data_parallel_size,
-            batch_size=batch_size,
-        )
-        sharded_data: list[SlicedDataDict] = []
-        for indices in plan.shard_indices:
-            shard = data.select_indices(list(indices))
-            shard[SHARED_PREFIX_EXECUTION_SLOT] = torch.tensor(
-                [slot_plan.row_slot_ids[index] for index in indices],
-                dtype=torch.long,
-            )
-            sharded_data.append(SlicedDataDict(shard.get_dict()))
-        rank_order = (
-            list(plan.rank_order_permutation)
-            if plan.rank_order_permutation is not None
-            else None
-        )
-        return sharded_data, rank_order
-
     def _shard_for_logprob(
         self,
         data: BatchedDataDict[Any],
@@ -665,16 +602,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         neither sharding path reorders rows).
         """
         if self.shared_prefix_training_config.enabled_for(stage="logprobs"):
-            return self._shard_shared_prefix_data(
-                data,
-                bin_capacity=self.cfg["sequence_packing"][
-                    self.shared_prefix_training_config.token_budget_key_for(
-                        stage="logprobs"
-                    )
-                ],
-                stage="logprobs",
+            raise NotImplementedError(
+                "shared-prefix execution requires the single-controller TQPolicy path"
             )
-
         dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
@@ -716,15 +646,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         does not return ``unsorted_data_indices`` because train returns
         scalar metrics (no per-row outputs to reorder).
         """
-        if self.shared_prefix_training_config.mode == "train":
-            sharded_data, _ = self._shard_shared_prefix_data(
-                data,
-                bin_capacity=self.cfg["sequence_packing"]["train_mb_tokens"],
-                stage="train",
-                batch_size=batch_size,
+        if self.shared_prefix_training_config.enabled_for(stage="train"):
+            raise NotImplementedError(
+                "shared-prefix execution requires the single-controller TQPolicy path"
             )
-            return sharded_data
-
         dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
