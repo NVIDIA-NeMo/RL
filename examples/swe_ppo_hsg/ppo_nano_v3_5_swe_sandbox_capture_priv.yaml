@@ -1,0 +1,819 @@
+# =============================================================================
+# SWE PPO on the SingleController -- the legacy async-PPO recipe
+# (ppo_nano_v3_5_swe_opencode_priv_sc.yaml) on Gym's opencode_sandboxed_agent
+# + OpenSandbox with token capture ON, training subagent sessions as segment
+# rows. Legacy parity:
+#   - stock OpenCode 1.17.11; the fork's anthropic.txt system prompt as the
+#     build agent prompt (the date/cwd env block stays: stock cannot drop it);
+#     legacy user prompt pre-rendered into the rows; 400 steps; compaction off;
+#     no max_tokens (remaining_context); temperature/top_p forced on every
+#     session via vllm_model.sampling_overrides; agent timeout 2700 s, test
+#     timeout 900 s. Deviation: the command deny-list also binds subagents.
+#   - token_capture.segment_rows: every subagent chain is its own PPO row
+#     (per-row GAE, as the echo multi-trace path trained them).
+#   - env.mask_sample_rules: legacy masking (agent timeout/OOM, eval
+#     timeout/OOM) plus context-limited sessions (deliberate deviation: legacy
+#     trained overflow-ended max_compaction sessions; masked here like
+#     overlong rows).
+#   - reward penalties: text checks at rollout time, token checks per chain in
+#     the finalizer.
+# Cluster values (model, data, warm start, sandbox credentials) come from the
+# launcher.
+# =============================================================================
+cluster:
+  gpus_per_node: 4
+  num_nodes: 128
+  segment_size: 16
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/ppo_ultra_e2e
+  metric_name: null
+  higher_is_better: true
+  keep_top_k: 1000000
+  save_period: 3
+  ft_keep_latest_k: 1
+  ft_save_period: 1
+  save_optimizer: true
+  checkpoint_must_save_by: 00:03:30:00
+  save_data_plane: false
+ppo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 32
+  max_rollout_turns: 1
+  # SC clamps max_num_steps to max_num_epochs x batches; legacy never enforced epochs.
+  max_num_epochs: 100000
+  max_num_steps: 1000000
+  ppo_epochs: 1
+  critic_ppo_epochs: null
+  # Legacy async-PPO diagnostics (single_controller_utils/legacy_diagnostics.py):
+  # rollout_debug_step*.jsonl, critic EV/ece/bias/residual/adv_raw metrics, the
+  # extra post-update critic forward, and the packed ppo_rollout_dump_step*.pt.
+  log_rollout_debug: true
+  log_critic_diagnostics: true
+  log_post_update_critic_metrics: true
+  log_rollout_dump: true
+  rollout_dump_period: 5
+  # ready_first requires no critic warmup.
+  policy_training_start_step: 0
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  max_val_samples: 256
+  val_batch_size: 256
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  skip_reference_policy_logprobs_calculation: true
+  seq_logprob_error_threshold: 2
+  # Legacy: multi-trace DP pad rows all copy the step's first row (they stay in
+  # all_rows whitening). `cyclic` is upstream SC.
+  multi_trace_pad_source: row0
+  adv_estimator:
+    name: gae
+    gae_lambda: 1.0
+    gae_gamma: 1
+    normalize_advantages: true
+    # Legacy: whiten over every row's tokens (masked + pad rows included).
+    normalize_over: all_rows
+    gae_lambda_value: 1.0
+    gae_lambda_policy: 1
+    length_adaptive_alpha: null
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  async_ppo: null
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 3
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+value_loss_fn:
+  scale: 1.0
+  cliprange: 0.5
+policy:
+  model_name: ???
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 131072
+  precision: bfloat16
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: true
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 32
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 8
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.001
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_aux_loss_coeff: 0.0
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+    apply_rope_fusion: true
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
+    gradient_accumulation_fusion: false
+    defer_fp32_logits: true
+    track_moe_metrics: true
+    moe_per_layer_logging: true
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+    mtp_loss_scaling_factor: 0.3
+    mtp_use_repeated_layer: true
+    mtp_num_layers: 5
+    mtp_detach_heads: true
+    optimizer:
+      optimizer: adam
+      lr: 3.0e-06
+      min_lr: 3.0e-06
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      adam_eps: 1e-10
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3e-7
+      override_opt_param_scheduler: true
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      fp8_param: false
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+    env_vars:
+      NCCL_NVLS_ENABLE: '0'
+      # The step-2 policy backward allocates a 12 GiB fp32 logits grad; with the
+      # default allocator ~14 GiB sat reserved-but-unused.
+      # Refit is an NCCL collective, so the expandable-segment IPC caveat is moot.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    fp32_lm_head: tf32
+    clear_memory_caches_before_refit: true
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+    fuse_loss: true
+  make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size}, ${policy.megatron_cfg.context_parallel_size}},
+    2}
+  max_grad_norm: 1.0
+  optimizer: null
+  scheduler: null
+  generation:
+    port_range_low: 11001
+    port_range_high: 15000
+    backend: vllm
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: auto
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      skip_tokenizer_init: false
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+      fp32_lm_head: tf32
+    vllm_kwargs:
+      attention_backend: FLASH_ATTN
+      moe_backend: triton
+      mamba_ssm_cache_dtype: float32
+      disable_custom_all_reduce: true
+      compilation_config:
+        cudagraph_mode: PIECEWISE
+        cudagraph_capture_sizes:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+        - 64
+        pass_config:
+          fuse_allreduce_rms: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 64
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+value:
+  model_name: ${policy.model_name}
+  tokenizer:
+    name: ${value.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: ${policy.train_global_batch_size}
+  train_micro_batch_size: ${policy.train_micro_batch_size}
+  logprob_batch_size: ${policy.logprob_batch_size}
+  max_total_sequence_length: ${add:${policy.max_total_sequence_length}, 33024}
+  precision: bfloat16
+  swe_privileged_critic:
+    enabled: true
+    max_total_tokens: 32768
+  reward_model_cfg:
+    enabled: false
+    reward_model_type: regression
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 32
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 8
+    pipeline_dtype: ${value.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.001
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_aux_loss_coeff: 0.0
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+    apply_rope_fusion: true
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
+    gradient_accumulation_fusion: false
+    defer_fp32_logits: true
+    track_moe_metrics: true
+    moe_per_layer_logging: true
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+    mtp_loss_scaling_factor: 0.0
+    mtp_num_layers: 0
+    mtp_detach_heads: true
+    optimizer:
+      optimizer: adam
+      lr: 6.0e-06
+      min_lr: 6.0e-06
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      adam_eps: 1e-15
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${value.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+    scheduler:
+      start_weight_decay: ${value.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${value.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 6.0e-07
+      override_opt_param_scheduler: true
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      fp8_param: false
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+    env_vars:
+      NCCL_NVLS_ENABLE: '0'
+      # The step-2 policy backward allocates a 12 GiB fp32 logits grad; with the
+      # default allocator ~14 GiB sat reserved-but-unused.
+      # Refit is an NCCL collective, so the expandable-segment IPC caveat is moot.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    clear_memory_caches_before_refit: true
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${value.max_total_sequence_length}
+    logprob_mb_tokens: ${value.max_total_sequence_length}
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+  make_sequence_length_divisible_by: ${mul:${mul:${value.megatron_cfg.tensor_model_parallel_size}, ${value.megatron_cfg.context_parallel_size}},
+    2}
+  max_grad_norm: 1.0
+  optimizer: null
+  scheduler: null
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: null
+  validation:
+    data_path: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    skip_venv_if_present: true
+    num_gpu_nodes: 0
+    port_range_low: 15001
+    port_range_high: 20000
+    # A cold start builds the Gym server venvs (~6-8 min of installs each onto Lustre), past
+    # Gym's 600 s default. Stay under NeMo-RL's 1800 s shard spinup so Gym's error surfaces first.
+    server_spinup_timeout_seconds: 1500
+    invalid_tool_call_patterns:
+    - <tool_call>
+    - </tool_call>
+    - <function_call>
+    - </function_call>
+    thinking_tags:
+    - <think>
+    - </think>
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/swe_rebench/configs/swe_rebench_opencode.yaml
+    - resources_servers/swe_internal_v1/configs/swe_internal_v1_opencode.yaml
+    - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+    swe_rebench_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent: &legacy_opencode_agent
+          opencode_version: 1.17.11
+          # The default installer downloads OpenCode from opencode.ai inside each sandbox and
+          # needs curl, which ~1/3 of SWE-rebench images lack (those rollouts fail with
+          # "opencode: command not found"). For a network-free, libc-aware install, point these
+          # at a cached installer and glibc/musl binaries readable inside the sandbox (e.g. a
+          # read-only bucket mount).
+          remote_opencode_install_script_path: null
+          remote_opencode_binary_path: null
+          remote_opencode_musl_binary_path: null
+          token_id_capture: true
+          concurrency: ${mul:2, ${mul:${ppo.num_prompts_per_step}, ${ppo.num_generations_per_prompt}}}
+          opencode_max_context_window: ${policy.generation.vllm_cfg.max_model_len}
+          # Legacy sent no max_tokens: generations run to the context limit.
+          output_token_policy: remaining_context
+          # Legacy model calls never timed out (requestTimeoutMs=0).
+          opencode_model_call_timeout: null
+          # Legacy agent wall-clock timeout (swebench_agent_timeout).
+          sandbox_timeout: 2700
+          # Legacy scored a failed agent's patch like any other.
+          execution_failure_reward_zero: false
+          # Rows come from data.train; no Gym-side dataset.
+          datasets: []
+          opencode_config:
+            # Overflow ends the session (legacy: compaction off, max 0).
+            compaction:
+              auto: false
+              prune: false
+            # Permissions: Gym's default deny-list (the fork's cli.ts list,
+            # webfetch/websearch/skill denied) applies to every agent. Legacy
+            # applied it to the main agent only; a config merge cannot remove
+            # the default's top-level keys.
+            agent:
+              build:
+                steps: 400
+                # nv-opencode ebfb82f packages/opencode/src/session/prompt/anthropic.txt
+                prompt: |
+                  You are OpenCode, the best coding agent on the planet.
+
+                  You are an interactive CLI tool that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
+
+                  IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.
+
+                  If the user asks for help or wants to give feedback inform them of the following:
+                  - ctrl+p to list available actions
+                  - To give feedback, users should report the issue at
+                    https://github.com/anomalyco/opencode
+
+                  When the user directly asks about OpenCode (eg. "can OpenCode do...", "does OpenCode have..."), or asks in second person (eg. "are you able...", "can you do..."), or asks how to use a specific OpenCode feature (eg. implement a hook, write a slash command, or install an MCP server), use the WebFetch tool to gather information to answer the question from OpenCode docs. The list of available docs is available at https://opencode.ai/docs
+
+                  # Tone and style
+                  - Only use emojis if the user explicitly requests it. Avoid using emojis in all communication unless asked.
+                  - Your output will be displayed on a command line interface. Your responses should be short and concise. You can use GitHub-flavored markdown for formatting, and will be rendered in a monospace font using the CommonMark specification.
+                  - Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. Never use tools like Bash or code comments as means to communicate with the user during the session.
+                  - NEVER create files unless they're absolutely necessary for achieving your goal. ALWAYS prefer editing an existing file to creating a new one. This includes markdown files.
+
+                  # Professional objectivity
+                  Prioritize technical accuracy and truthfulness over validating the user's beliefs. Focus on facts and problem-solving, providing direct, objective technical info without any unnecessary superlatives, praise, or emotional validation. It is best for the user if OpenCode honestly applies the same rigorous standards to all ideas and disagrees when necessary, even if it may not be what the user wants to hear. Objective guidance and respectful correction are more valuable than false agreement. Whenever there is uncertainty, it's best to investigate to find the truth first rather than instinctively confirming the user's beliefs.
+
+                  # Task Management
+                  You have access to the TodoWrite tools to help you manage and plan tasks. Use these tools VERY frequently to ensure that you are tracking your tasks and giving the user visibility into your progress.
+                  These tools are also EXTREMELY helpful for planning tasks, and for breaking down larger complex tasks into smaller steps. If you do not use this tool when planning, you may forget to do important tasks - and that is unacceptable.
+
+                  It is critical that you mark todos as completed as soon as you are done with a task. Do not batch up multiple tasks before marking them as completed.
+
+                  Examples:
+
+                  <example>
+                  user: Run the build and fix any type errors
+                  assistant: I'm going to use the TodoWrite tool to write the following items to the todo list:
+                  - Run the build
+                  - Fix any type errors
+
+                  I'm now going to run the build using Bash.
+
+                  Looks like I found 10 type errors. I'm going to use the TodoWrite tool to write 10 items to the todo list.
+
+                  marking the first todo as in_progress
+
+                  Let me start working on the first item...
+
+                  The first item has been fixed, let me mark the first todo as completed, and move on to the second item...
+                  ..
+                  ..
+                  </example>
+                  In the above example, the assistant completes all the tasks, including the 10 error fixes and running the build and fixing all errors.
+
+                  <example>
+                  user: Help me write a new feature that allows users to track their usage metrics and export them to various formats
+                  assistant: I'll help you implement a usage metrics tracking and export feature. Let me first use the TodoWrite tool to plan this task.
+                  Adding the following todos to the todo list:
+                  1. Research existing metrics tracking in the codebase
+                  2. Design the metrics collection system
+                  3. Implement core metrics tracking functionality
+                  4. Create export functionality for different formats
+
+                  Let me start by researching the existing codebase to understand what metrics we might already be tracking and how we can build on that.
+
+                  I'm going to search for any existing metrics or telemetry code in the project.
+
+                  I've found some existing telemetry code. Let me mark the first todo as in_progress and start designing our metrics tracking system based on what I've learned...
+
+                  [Assistant continues implementing the feature step by step, marking todos as in_progress and completed as they go]
+                  </example>
+
+
+                  # Doing tasks
+                  The user will primarily request you perform software engineering tasks. This includes solving bugs, adding new functionality, refactoring code, explaining code, and more. For these tasks the following steps are recommended:
+                  - 
+                  - Use the TodoWrite tool to plan the task if required
+
+                  - Tool results and user messages may include <system-reminder> tags. <system-reminder> tags contain useful information and reminders. They are automatically added by the system, and bear no direct relation to the specific tool results or user messages in which they appear.
+
+
+                  # Tool usage policy
+                  - When doing file search, prefer to use the Task tool in order to reduce context usage.
+                  - You should proactively use the Task tool with specialized agents when the task at hand matches the agent's description.
+
+                  - When WebFetch returns a message about a redirect to a different host, you should immediately make a new WebFetch request with the redirect URL provided in the response.
+                  - You can call multiple tools in a single response. If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in parallel. Maximize use of parallel tool calls where possible to increase efficiency. However, if some tool calls depend on previous calls to inform dependent values, do NOT call these tools in parallel and instead call them sequentially. For instance, if one operation must complete before another starts, run these operations sequentially instead. Never use placeholders or guess missing parameters in tool calls.
+                  - If the user specifies that they want you to run tools "in parallel", you MUST send a single message with multiple tool use content blocks. For example, if you need to launch multiple agents in parallel, send a single message with multiple Task tool calls.
+                  - Use specialized tools instead of bash commands when possible, as this provides a better user experience. For file operations, use dedicated tools: Read for reading files instead of cat/head/tail, Edit for editing instead of sed/awk, and Write for creating files instead of cat with heredoc or echo redirection. Reserve bash tools exclusively for actual system commands and terminal operations that require shell execution. NEVER use bash echo or other command-line tools to communicate thoughts, explanations, or instructions to the user. Output all communication directly in your response text instead.
+                  - VERY IMPORTANT: When exploring the codebase to gather context or to answer a question that is not a needle query for a specific file/class/function, it is CRITICAL that you use the Task tool instead of running search commands directly.
+                  <example>
+                  user: Where are errors from the client handled?
+                  assistant: [Uses the Task tool to find the files that handle client errors instead of using Glob or Grep directly]
+                  </example>
+                  <example>
+                  user: What is the codebase structure?
+                  assistant: [Uses the Task tool]
+                  </example>
+
+                  IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the conversation.
+
+                  # Code References
+
+                  When referencing specific functions or pieces of code include the pattern `file_path:line_number` to allow the user to easily navigate to the source code location.
+
+                  <example>
+                  user: Where are errors from the client handled?
+                  assistant: Clients are marked as failed in the `connectToServer` function in src/services/process.ts:712.
+                  </example>
+    swe_internal_v1_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent: *legacy_opencode_agent
+    swe_rebench_resources_server:
+      resources_servers:
+        swe_rebench: &legacy_swe_resources
+          # Legacy swebench_tests_timeout.
+          evaluation_timeout: 900
+          apply_anti_cheating: true
+          sandbox_config:
+            resources:
+              memory_mib: 65536
+            # Legacy container toolchain setup on agent and eval sandboxes: Maven/Gradle
+            # mirror, Karma Chrome wrapper, _JAVA_OPTIONS, DOTNET_GCHeapHardLimit.
+            legacy_container_setup: true
+    swe_internal_v1_resources_server:
+      resources_servers:
+        swe_internal_v1: *legacy_swe_resources
+    use_absolute_ip: true
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
+          # Legacy Gym retried 429/502/503/504/520 without limit; upstream caps them at
+          # 3 tries. 7200 tries x 0.5 s ~ 1 h waits out transient vLLM overload instead
+          # of failing the rollout. Other retryable statuses (incl. 500) stay at 3.
+          max_rate_limit_attempts: 7200
+          # The fork forced temperature/top_p on every session; subagent
+          # requests otherwise omit top_p and fail NeMo-RL's on-policy check.
+          sampling_overrides:
+            temperature: ${policy.generation.temperature}
+            top_p: ${policy.generation.top_p}
+    # Echo-path multi-trace only; capture trains sessions as segment rows.
+    train_on_all_session_traces: false
+    # Legacy: a trace with NaN policy logprobs is kept and masked from the loss.
+    # `raise` (upstream) fails the rollout and retries the whole group.
+    nan_generation_logprobs: mask
+  # Legacy SWE masking (Gym swe_agents, mask_unresolved_agent_errors=false):
+  # agent timeout, agent OOM, eval timeout / OOM (swe_rebench / swe_internal_v1
+  # report those as evaluation_completed=false).
+  # Deliberate deviation: a session that ran out of context is masked like an
+  # overlong (truncated) row. Legacy masked only rows of exactly
+  # max_total_sequence_length and trained overflow-ended sessions
+  # (max_compaction) a few hundred tokens short of it -- the same censoring,
+  # split by where the boundary fell. Like every rule here it masks the whole
+  # rollout (all segment rows, subagent rows included); it fires on the main
+  # session's ending only (a subagent that runs out of context still trains, as
+  # in legacy).
+  mask_sample_rules:
+  - name: agent_timeout
+    field: opencode_error_type
+    equals: timeout
+  - name: agent_timeout_exception
+    field: opencode_error_type
+    equals: TimeoutError
+  - name: agent_oom
+    field: opencode_exit_code
+    equals: 137
+  - name: eval_incomplete
+    field: evaluation_completed
+    equals: false
+  - name: context_limited
+    field: opencode_context_limited
+    equals: true
+logger:
+  log_dir: logs
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: ultra-v3-swe-e2e
+    name: ppo-ultra-e2e
+    # W&B "Step" = trainer step, so SC runs line up with legacy runs in shared panels.
+    trainer_step_as_wandb_step: true
+    # Off: per-step transcript tables were ~1.7 GB/step (5-20 MB strings) and stalled the W&B
+    # row; legacy never uploaded them (no such option in legacy NeMo-RL).
+    log_nemo_gym_full_result_tables: false
+  tensorboard: {}
+  mlflow:
+    experiment_name: ppo-ultra-e2e
+    run_name: ppo-ultra-e2e
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+effort_levels:
+  low_string: '{reasoning effort: efficient}'
+  low_weight: 0.1
+  low_penalty: 1
+  low_ub: 15000
+reward_penalties:
+  penalize_duplicated_reasoning: true
+  penalize_empty_final_answer: true
+  penalize_unwanted_tokens: true
+  penalize_malformed_think_tag: true
+  # Legacy: duplicated-reasoning / empty-final-answer checked once per rollout.
+  rollout_scoped_penalties_on_all_segments: false
+  token_ids:
+    unwanted:
+    - 2
+    think_open: 12
+    think_close: 13
+async_rl:
+  sampler:
+    name: ready_first
+    max_staleness_versions: 1
+  recompute_kv_cache_after_weight_updates: false
+  min_groups_for_streaming_train: ${ppo.num_prompts_per_step}
+  max_inflight_prompts: ${mul:2, ${ppo.num_prompts_per_step}}
+  max_buffered_rollouts: ${mul:2, ${ppo.num_prompts_per_step}}
+  diagnostics: false
+  rollout_failure:
+    max_infra_attempts_per_prompt: 5
+    max_data_attempts_per_prompt: 2
+    backoff_base_s: 1.0
+    max_backoff_s: 30.0
+    max_skipped_prompts: 0
+    max_consecutive_dropped_prompts: 0
+    min_step_batch_fraction: 0.9
+    on_dropped_prompt: shrink
+    max_replacement_attempts: 1
+    replacement_reserve_prompts: 1
+    native:
+      generation_timeout_s: null
+      env_timeout_s: null
+    nemo_gym:
+      rollout_timeout_s: null
+      max_row_attempts: 3
+  stall_watchdog:
+    interval_s: 30.0
+    stall_timeout_s: 3600.0
+    stall_action: warn
+    gym_subprocess_check: true
+  generation_fleet_health:
+    enabled: false
+    probe_interval_s: 5.0
+    probe_timeout_s: 2.0
+    unhealthy_threshold: 3
+    healthy_threshold: 2
+    selection: least_outstanding
+    max_restart_attempts_per_shard: 5
+    restart_dead_shards: false
+    restart_timeout_s: 1800.0
+    restart_backoff_s: 60.0
+    min_healthy_shards: 1
+    refit_timeout_s: 300.0
+  generation_router:
+    enabled: false
+    port_range_low: 1202
+    port_range_high: 1300
+    backend_timeout_s: 600.0
+    connect_timeout_s: 5.0
+    no_healthy_backend_status: 409
+  checkpoint_replay_buffer: false
+rollout_checkpointing:
+  snapshot_attempt_interval_s: null
+  telemetry_interval_s: null
+  max_consecutive_failures: 3
+  keep_latest_k: 2
+  restore_mode: latest
+  extra_fingerprint_excluded_paths: []
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+  mooncake_cpu:
+    global_segment_size: 68719476736
+    local_buffer_size: 4294967296
+    reuse_registered_buffers: true
+    staging_buffer_size: 268435456
+token_capture:
+  enabled: true
+  staging_partition: rollout_staging
+  segment_rows:
+    enabled: true
+    # Canonical row + up to 15 subagent rows; drops show as
+    # finalize/segments_dropped_by_cap.
+    max_per_rollout: 16
+rollout_recovery:
+  default_granularity: sibling
+  task_source_granularity_overrides: {}
+  agent_granularity_overrides: {}
