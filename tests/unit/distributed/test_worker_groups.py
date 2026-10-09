@@ -26,6 +26,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import (
+    MultiWorkerFuture,
     RayWorkerBuilder,
     RayWorkerGroup,
     _get_initializer_env_vars,
@@ -968,6 +969,61 @@ def test_run_all_workers_sharded_data_2d_output_replicated(worker_group_2d_shard
     # Assuming MultiWorkerFuture.get_results returns in order of return_from_workers
     assert "my_rank: 0" in results[0]  # from worker 0
     assert "my_rank: 2" in results[1]  # from worker 2
+
+
+def test_fetch_returned_only_selects_object_refs_before_ray_get(monkeypatch):
+    refs = [ray.ObjectRef.from_random() for _ in range(3)]
+    result_by_ref = {
+        refs[0]: "worker-10",
+        refs[1]: "worker-12",
+        refs[2]: "worker-15",
+    }
+    fetched_refs = []
+
+    def fake_get(object_refs):
+        fetched_refs.append(list(object_refs))
+        return [result_by_ref[ref] for ref in object_refs]
+
+    monkeypatch.setattr(ray, "get", fake_get)
+    future_bundle = MultiWorkerFuture(
+        futures=refs,
+        called_workers=[10, 12, 15],
+        return_from_workers=[15, 10],
+    )
+    worker_group = object.__new__(RayWorkerGroup)
+
+    selected_results = worker_group.get_all_worker_results(
+        future_bundle, fetch_returned_only=True
+    )
+
+    assert fetched_refs == [[refs[2], refs[0]]]
+    assert selected_results == ["worker-15", "worker-10"]
+
+    fetched_refs.clear()
+    default_results = worker_group.get_all_worker_results(future_bundle)
+
+    assert fetched_refs == [refs]
+    assert default_results == ["worker-15", "worker-10"]
+
+
+def test_fetch_returned_only_without_called_workers_indexes_futures(monkeypatch):
+    refs = [ray.ObjectRef.from_random() for _ in range(3)]
+    fetched_refs = []
+
+    def fake_get(object_refs):
+        fetched_refs.append(list(object_refs))
+        return [refs.index(ref) for ref in object_refs]
+
+    monkeypatch.setattr(ray, "get", fake_get)
+    future_bundle = MultiWorkerFuture(futures=refs, return_from_workers=[2, 0])
+    worker_group = object.__new__(RayWorkerGroup)
+
+    results = worker_group.get_all_worker_results(
+        future_bundle, fetch_returned_only=True
+    )
+
+    assert fetched_refs == [[refs[2], refs[0]]]
+    assert results == [2, 0]
 
 
 def test_nsight_configuration_forwarding(register_test_actor, virtual_cluster):
