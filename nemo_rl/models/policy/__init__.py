@@ -579,10 +579,6 @@ class MegatronConfig(TypedDict):
     # only specific modules (see recompute_modules). "selective" typically saves ~10-18GB
     # for MoE models while retaining higher throughput than "full".
     recompute_granularity: NotRequired[Literal["full", "selective"]]
-    # Full recompute resolves to uniform chunks of one layer in Megatron setup.
-    # Optional raw values are accepted only when they agree with that resolution.
-    recompute_method: NotRequired[Literal["uniform"]]
-    recompute_num_layers: NotRequired[int]
     # Modules to selectively recompute when recompute_granularity="selective".
     # MCore valid options: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts"].
     # Defaults to ["core_attn"] when None. Full list and per-module constraints:
@@ -1036,28 +1032,6 @@ def validate_shared_prefix_training_config(
             f"policy.shared_prefix_training.mode={shared_prefix_config.mode} currently requires "
             "policy.megatron_cfg.pipeline_model_parallel_size=1."
         )
-
-    recompute_granularity = megatron_config.get("recompute_granularity")
-    if megatron_config["activation_checkpointing"] and recompute_granularity in (
-        None,
-        "full",
-    ):
-        recompute_method = megatron_config.get("recompute_method")
-        if recompute_method not in (None, "uniform"):
-            raise ValueError(
-                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} full activation "
-                "recomputation requires policy.megatron_cfg.recompute_method='uniform' "
-                f"when supplied; got {recompute_method!r}."
-            )
-        recompute_num_layers = megatron_config.get("recompute_num_layers")
-        if recompute_num_layers is not None and (
-            isinstance(recompute_num_layers, bool) or recompute_num_layers != 1
-        ):
-            raise ValueError(
-                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} full activation "
-                "recomputation requires policy.megatron_cfg.recompute_num_layers=1 "
-                f"when supplied; got {recompute_num_layers!r}."
-            )
 
     cuda_graph_impl = megatron_config.get("cuda_graph_impl")
     if cuda_graph_impl is not None and cuda_graph_impl != "none":

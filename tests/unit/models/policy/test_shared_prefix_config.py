@@ -437,3 +437,10 @@ def test_group_packing_across_data_parallel_requires_alignment(
         validate_shared_prefix_data_parallel_size(
             config, data_parallel_size=data_parallel_size
         )
+
+
+def test_megatron_config_drops_unapplied_recompute_keys():
+    from nemo_rl.models.policy import MegatronConfig
+
+    assert "recompute_method" not in MegatronConfig.__annotations__
+    assert "recompute_num_layers" not in MegatronConfig.__annotations__
