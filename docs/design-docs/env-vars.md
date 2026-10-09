@@ -16,6 +16,7 @@ There are a number of ways to pass environment variables to Ray workers in NeMo 
 
 ### 3. YAML Configuration `env_vars` (high)
 - Set in YAML config files under `policy.megatron_cfg.env_vars` or `policy.automodel_cfg.env_vars`.
+- `policy.automodel_cfg.deterministic: true` also sets `CUBLAS_WORKSPACE_CONFIG=:4096:8` and `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` for the policy workers, overriding those two keys if they are also given in `env_vars`.
 - Useful for controlling environment variables on an experiment level.
 - Example:
   ```yaml

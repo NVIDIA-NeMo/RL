@@ -21,6 +21,9 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     expert_parallel_size: 8
+    # Bitwise-reproducible forward/backward, so the step-1 policy and reference
+    # logprobs match exactly (loss = ln 2) and runs repeat. Costs ~13% step time.
+    deterministic: true
     # Recompute activations to fit 30B-A3B on 1n8g: avoids the full-vocab
     # log_softmax OOM in DPO loss-input prep (~step 8) on 80 GiB GPUs.
     activation_checkpointing: true

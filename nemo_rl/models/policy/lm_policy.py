@@ -54,6 +54,7 @@ from nemo_rl.models.policy.interfaces import (
     TopkLogitsOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    DETERMINISTIC_ENV_VARS,
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
     validate_fp32_lm_head_config,
@@ -287,6 +288,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["automodel_cfg"]["context_parallel_size"]
 
             env_vars = config["automodel_cfg"].get("env_vars", {})
+            if config["automodel_cfg"].get("deterministic"):
+                env_vars = {**(env_vars or {}), **DETERMINISTIC_ENV_VARS}
 
         # If a worker extension class is provided, use it instead of the default worker builder class
         if extension_fqn is not None:
