@@ -22,20 +22,16 @@ from nemo_rl.algorithms.grpo import setup
 
 
 @pytest.mark.parametrize("mode", ["logprobs", "train"])
-@pytest.mark.parametrize("data_plane_enabled", [False, True])
-def test_standard_grpo_rejects_missing_metadata_producer(mode, data_plane_enabled):
+def test_standard_grpo_rejects_missing_metadata_producer(mode):
     # The deliberately minimal config ensures the guard runs before other setup.
-    config = SimpleNamespace(
-        policy={"shared_prefix_training": {"mode": mode}},
-        data_plane={"enabled": data_plane_enabled},
-    )
+    config = SimpleNamespace(policy={"shared_prefix_training": {"mode": mode}})
     with pytest.raises(
         ValueError, match="SingleController.*token_capture.enabled=true"
     ):
         setup(config, tokenizer=None, dataset=None, val_dataset=None)
 
 
-@pytest.mark.parametrize("mode", [None, "disabled", "observe", "dense"])
+@pytest.mark.parametrize("mode", [None, "disabled", "dense"])
 def test_standard_grpo_keeps_nonshared_setup_path(mode):
     policy = {} if mode is None else {"shared_prefix_training": {"mode": mode}}
     config = SimpleNamespace(policy=policy)

@@ -46,11 +46,12 @@ class TestStageWorkWeights(unittest.TestCase):
         self.assertIsNone(cfg.work_weights_for(stage="logprobs"))
 
     def test_disabled_stages_do_not_resolve_weights(self):
-        for mode in ("disabled", "observe", "dense", "logprobs"):
-            cfg = SharedPrefixTrainingConfig(mode=mode, shard_work_weights=(1, 1))
-            self.assertIsNone(cfg.work_weights_for(stage="train"))
-            if mode != "logprobs":
-                self.assertIsNone(cfg.work_weights_for(stage="logprobs"))
+        cfg = SharedPrefixTrainingConfig(mode="logprobs", shard_work_weights=(1, 1))
+        self.assertIsNone(cfg.work_weights_for(stage="train"))
+        self.assertEqual(cfg.work_weights_for(stage="logprobs"), (1, 1))
+        for mode in ("disabled", "dense"):
+            with self.subTest(mode=mode), self.assertRaises(ValidationError):
+                SharedPrefixTrainingConfig(mode=mode, shard_work_weights=(1, 1))
 
     def test_invalid_overrides_fail_before_backend_setup(self):
         for weights in ((-1, 1), (0, 0)):
@@ -65,7 +66,7 @@ class TestStageWorkWeights(unittest.TestCase):
                         )
                     }
                 )
-        for mode in ("disabled", "observe", "dense", "logprobs"):
+        for mode in ("disabled", "dense", "logprobs"):
             with (
                 self.subTest(mode=mode),
                 self.assertRaisesRegex(ValueError, "requires shared train"),
