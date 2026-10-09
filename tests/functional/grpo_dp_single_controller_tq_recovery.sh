@@ -32,6 +32,8 @@ COMMON_OVERRIDES=(
     '+async_rl.sampler.max_staleness_versions=1'
     async_rl.max_inflight_prompts=8
     async_rl.max_buffered_rollouts=8
+    # Bridge rewrites the scheduler position on resume only when this is on.
+    '+policy.megatron_cfg.scheduler.override_opt_param_scheduler=true'
 )
 if [[ "$BACKEND" == "mooncake_cpu" ]]; then
     COMMON_OVERRIDES+=(
@@ -49,6 +51,8 @@ EXP_NAME="$TEST_NAME/run" RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" \
     grpo.max_num_steps=2 \
     checkpointing.checkpoint_must_save_by=0:0:0:1
 cp "$BASE_RUN_LOG" "$PHASE1_LOG"
+# Phase 2 re-runs the base test, which deletes its log dir; keep phase 1's.
+cp -r "$TEST_DIR/run/logs" "$TEST_DIR/phase1_logs"
 
 test -d "$CHECKPOINT_DIR/step_1/data_plane"
 test -f "$CHECKPOINT_DIR/step_1/replay_buffer_metadata.pt"
@@ -64,6 +68,23 @@ echo "=== Phase 2: start a fresh process, restore TQ, and train one more step ==
 EXP_NAME="$TEST_NAME/run" RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" \
     "${COMMON_OVERRIDES[@]}" grpo.max_num_steps=2
 cp "$BASE_RUN_LOG" "$PHASE2_LOG"
+
+# Both phases are still in LR warmup, so the resumed LR must be higher than
+# phase 1's. A scheduler reset on resume makes them equal.
+uv run --directory "$PROJECT_ROOT" tests/json_dump_tb_logs.py "$TEST_DIR/phase1_logs" \
+    --output_path "$TEST_DIR/phase1_metrics.json"
+uv run --directory "$PROJECT_ROOT" tests/json_dump_tb_logs.py "$TEST_DIR/run/logs" \
+    --output_path "$TEST_DIR/phase2_metrics.json"
+uv run --directory "$PROJECT_ROOT" python - "$TEST_DIR/phase1_metrics.json" "$TEST_DIR/phase2_metrics.json" <<'EOF'
+import json
+import sys
+
+before, after = (json.load(open(path))["train/lr"] for path in sys.argv[1:3])
+assert min(after.values()) > max(before.values()), (
+    f"train/lr did not advance across the resume: {before} -> {after}"
+)
+print(f"✓ train/lr advanced across the resume: {before} -> {after}")
+EOF
 
 grep -q "Native TQ checkpoint restored and validated: groups=${REPLAY_GROUP_COUNT}" "$PHASE2_LOG"
 grep -q "Native TQ replay inventory validated" "$PHASE2_LOG"

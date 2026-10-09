@@ -307,7 +307,7 @@ def process_microbatch(
         assert not enable_seq_packing, (
             "multimodal kwargs are not supported for sequence packing"
         )
-        assert not cfg["dtensor_cfg"]["sequence_parallel"], (
+        assert not cfg["automodel_cfg"]["sequence_parallel"], (
             "Sequence parallel is not supported with multimodal since there's an issue when you do not pass position_ids. See https://github.com/NVIDIA-NeMo/Automodel/issues/652"
         )
 

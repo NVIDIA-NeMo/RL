@@ -36,7 +36,7 @@ PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64 uv run python examples/run_dpo.py .
 ```yaml
 policy:
   # ...
-  dtensor_cfg:
+  automodel_cfg:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
 ```

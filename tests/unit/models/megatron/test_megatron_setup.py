@@ -123,6 +123,63 @@ def test_resolve_optimizer_fp8_moment_dtypes():
 
 
 @pytest.mark.mcore
+def test_sync_consumed_samples_on_scheduler_load_survives_bridge_override():
+    """Bridge overwrites num_steps with consumed_train_samples after loading the scheduler."""
+    from nemo_rl.models.megatron.setup import _sync_consumed_samples_on_scheduler_load
+
+    class _Scheduler:
+        num_steps = 0
+
+        def load_state_dict(self, state_dict):
+            self.num_steps = state_dict["num_steps"]
+
+    scheduler = _Scheduler()
+    state = SimpleNamespace(train_state=None)
+
+    with _sync_consumed_samples_on_scheduler_load(state, scheduler):
+        # Bridge's load order: train_state from the checkpoint (0 in checkpoints
+        # saved before the save-side fix), then the scheduler, then the
+        # override_opt_param_scheduler copy.
+        state.train_state = SimpleNamespace(consumed_train_samples=0)
+        scheduler.load_state_dict({"num_steps": 96})
+        scheduler.num_steps = state.train_state.consumed_train_samples
+
+    assert scheduler.num_steps == 96
+    assert state.train_state.consumed_train_samples == 96
+    assert "load_state_dict" not in vars(scheduler)
+
+
+@pytest.mark.mcore
+def test_load_checkpoint_checkpoint_state_migration_hook_dne():
+    """
+    When this test fails, add a checkpoint hook to load_checkpoint()
+    to set state.train_state.consumed_train_samples = scheduler.num_steps
+    from the scheduler checkpoint and remove this context manager:
+    _sync_consumed_samples_on_scheduler_load
+
+    Draft PR: https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/6321
+
+    False positives can happen, in which case just add the new arg to
+    the list if it's not the hook this test is referring to.
+    """
+    import inspect
+
+    from megatron.bridge.training.checkpointing import load_checkpoint
+
+    assert list(inspect.signature(load_checkpoint).parameters) == [
+        "state",
+        "model",
+        "optimizer",
+        "opt_param_scheduler",
+        "strict",
+        "checkpointing_context",
+        "skip_load_to_model_and_opt",
+        "pg_collection",
+        "module_name",
+    ]
+
+
+@pytest.mark.mcore
 class TestValidateModelPaths:
     """Tests for validate_model_paths function."""
 
@@ -5462,7 +5519,11 @@ class TestPeftWarmStart:
             ),
             optimizer=SimpleNamespace(use_distributed_optimizer=False),
             rng=SimpleNamespace(data_parallel_random_init=False),
-            ddp=SimpleNamespace(use_megatron_fsdp=False),
+            ddp=SimpleNamespace(
+                use_megatron_fsdp=False,
+                fp8_param_gather=False,
+                fp4_param_gather=False,
+            ),
         )
         state = SimpleNamespace(
             cfg=cfg,

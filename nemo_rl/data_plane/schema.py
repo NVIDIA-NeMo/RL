@@ -59,7 +59,8 @@ MALFORMED_THINKING_MASK = "malformed_thinking_mask"
 
 # Tensor fields in the train partition. Rollout writes the input
 # subset on first put; later stages add prev_logprobs /
-# reference_policy_logprobs (workers) and advantages (driver).
+# reference_policy_logprobs (workers) and advantages (driver);
+# under top-k/top-p the prev-logprob stage also rewrites token_mask.
 DP_TRAIN_FIELDS = (
     "input_ids",
     "input_lengths",

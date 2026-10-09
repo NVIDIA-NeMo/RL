@@ -28,13 +28,15 @@ does not know how to handle``.
 
 torch 2.13 bumped the version byte from 2 to 3 without changing the ``'c'``
 payload, so when the training venv runs torch 2.13 and an inference venv runs
-torch 2.11 (sglang / TRT-LLM, whose kernels are built against 2.11) every
-colocated refit dies at the first handle. Rewriting the version byte of
-``'c'`` handles to the legacy value makes them readable by both versions. The
-expandable-segment format did change, so ``'e'`` handles -- what the trainer
-emits under ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` -- are left
-alone; they still open on a same-torch consumer (vLLM) and trip torch's
-version check on a torch 2.11 one (sglang / TRT-LLM).
+torch 2.11 (sglang, whose kernels are built against 2.11) every colocated refit
+dies at the first handle. Rewriting the version byte of ``'c'`` handles to the
+legacy value makes them readable by both versions, and is a no-op for a
+consumer already on 2.13. The expandable-segment format did change, so ``'e'``
+handles -- what the trainer emits under
+``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` -- are left alone; they
+still open on a same-torch consumer (vLLM, and TRT-LLM since the 1.3.0rc28
+bump moved that venv to 2.13) and trip torch's version check on a torch 2.11
+one (sglang).
 """
 
 from typing import Any

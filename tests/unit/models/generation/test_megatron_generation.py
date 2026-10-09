@@ -691,7 +691,7 @@ basic_megatron_test_config: PolicyConfig = {
     # The dynamic inference engine requires fp16/bf16
     "precision": "bfloat16",
     "offload_optimizer_for_logprob": False,
-    "dtensor_cfg": {"enabled": False},
+    "automodel_cfg": {"enabled": False},
     "dynamic_batching": {"enabled": False},
     "sequence_packing": {"enabled": False},
     "make_sequence_length_divisible_by": 1,

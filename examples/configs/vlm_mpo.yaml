@@ -43,7 +43,7 @@ policy:
   max_total_sequence_length: 8192
   precision: bfloat16
   offload_optimizer_for_logprob: false
-  dtensor_cfg:
+  automodel_cfg:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""
     enabled: false

@@ -100,6 +100,14 @@ CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
 SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray.
+NRL_MOUNT_HOST_ENROOT=${NRL_MOUNT_HOST_ENROOT:-}  # Set to 1 to bind-mount the compute node's enroot into the training container (see the block after GRES detection).
+case "$NRL_MOUNT_HOST_ENROOT" in
+  ""|0|1) ;;
+  *)
+    echo "Error: NRL_MOUNT_HOST_ENROOT must be unset, 0, or 1, got '$NRL_MOUNT_HOST_ENROOT'." >&2
+    exit 1
+    ;;
+esac
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-1301}
@@ -257,6 +265,31 @@ if [[ -n "$GRES_ARG" ]]; then
   echo "[INFO] GRES support detected. Using: $GRES_ARG"
 else
   echo "[INFO] No GRES support detected. Running without --gres flag."
+fi
+
+# NRL_MOUNT_HOST_ENROOT=1: a process inside the training container (for example
+# a NeMo Gym agent server that runs each agent in its own sandbox) starts
+# containers with the compute node's enroot, so the node's enroot binaries and
+# directories ride into the training container. Expanded here, on the compute
+# node, because the submit host may carry no enroot at all; enroot's runtime
+# exec's its sibling helpers by bare name (enroot-mount, enroot-nsenter, ...),
+# so every /usr/bin/enroot* file comes along, not just the launcher, and the
+# library, share, and configuration directories are mounted when present
+# (site packages install the libraries under /usr/lib, /usr/lib64 or
+# /usr/libexec). Unset (the default), nothing is mounted.
+if [[ "${NRL_MOUNT_HOST_ENROOT:-}" == "1" ]]; then
+  _enroot_bins=(/usr/bin/enroot*)
+  if [[ ! -e "${_enroot_bins[0]}" ]]; then
+    echo "ERROR: NRL_MOUNT_HOST_ENROOT=1 but /usr/bin/enroot* matches no file on $(hostname); the node has no enroot to mount into the training container." >&2
+    exit 1
+  fi
+  for _enroot_dir in /usr/lib/enroot /usr/lib64/enroot /usr/libexec/enroot /usr/share/enroot /etc/enroot; do
+    [[ -e "$_enroot_dir" ]] && MOUNTS="${MOUNTS:+$MOUNTS,}$_enroot_dir:$_enroot_dir"
+  done
+  for _enroot_bin in "${_enroot_bins[@]}"; do
+    MOUNTS="${MOUNTS:+$MOUNTS,}$_enroot_bin:$_enroot_bin"
+  done
+  echo "[INFO] NRL_MOUNT_HOST_ENROOT=1: bind-mounting $(hostname)'s enroot ($(enroot version 2>/dev/null || echo unknown version), ${#_enroot_bins[@]} binaries) into the training container."
 fi
 
 COMMON_SRUN_ARGS="$GRES_ARG"

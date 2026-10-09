@@ -14,7 +14,7 @@ policy:
   model_name: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5 
   max_total_sequence_length: 32768
   train_global_batch_size: 128
-  dtensor_cfg:
+  automodel_cfg:
     activation_checkpointing: true
     context_parallel_size: 8
     tensor_parallel_size: 4
@@ -22,7 +22,7 @@ policy:
   dynamic_batching:
     train_mb_tokens: 4096
     logprob_mb_tokens: 8192
-  make_sequence_length_divisible_by: ${max:${mul:${policy.dtensor_cfg.context_parallel_size},
+  make_sequence_length_divisible_by: ${max:${mul:${policy.automodel_cfg.context_parallel_size},
     2}, ${policy.max_total_sequence_length}}
   max_grad_norm: null
   optimizer:

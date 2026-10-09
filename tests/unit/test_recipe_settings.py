@@ -35,7 +35,7 @@ RECIPE_ROOT = Path(__file__).parents[2] / "examples/configs/recipes"
 def test_hybridep_regression_recipes_keep_legacy_deepep(recipe_name: str) -> None:
     register_omegaconf_resolvers()
     config = load_config(RECIPE_ROOT / recipe_name)
-    assert config.policy.dtensor_cfg.automodel_kwargs.backend.dispatcher == "deepep"
+    assert config.policy.automodel_cfg.automodel_kwargs.backend.dispatcher == "deepep"
     assert config.policy.make_sequence_length_divisible_by == 1
 
 
@@ -47,8 +47,8 @@ def test_gemma4_cp_keeps_local_hybridep_inputs_aligned(
     config = load_config(
         RECIPE_ROOT / "llm/dapo-gemma4-26ba4b-it-4n8g-fsdp2ep16cp2-automodel.yaml"
     )
-    config.policy.dtensor_cfg.context_parallel_size = context_parallel_size
-    global_alignment = 64 * config.policy.dtensor_cfg.context_parallel_size
+    config.policy.automodel_cfg.context_parallel_size = context_parallel_size
+    global_alignment = 64 * config.policy.automodel_cfg.context_parallel_size
     assert config.policy.make_sequence_length_divisible_by == global_alignment
     assert config.policy.dynamic_batching.sequence_length_round == global_alignment
 
@@ -92,6 +92,6 @@ def test_automodel_recipes_preserve_backend_choices(
 ) -> None:
     register_omegaconf_resolvers()
     config = load_config(RECIPE_ROOT / recipe_name)
-    backend = config.policy.dtensor_cfg.automodel_kwargs.backend
+    backend = config.policy.automodel_cfg.automodel_kwargs.backend
     assert backend.dispatcher == dispatcher
     assert backend.experts == experts
