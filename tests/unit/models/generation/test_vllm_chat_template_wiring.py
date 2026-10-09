@@ -22,11 +22,13 @@ one makes /tokenize render differently from /v1/chat/completions on the same
 conversation.
 
 These tests drive the real _setup_vllm_openai_api_server against a fake vLLM
-module tree and inspect what each consumer was constructed with.
+module tree, inspect consumer configuration, and exercise captured raw responses.
 """
 
 import sys
 import types
+from collections.abc import AsyncIterator
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -195,6 +197,144 @@ def _build_server(monkeypatch, serving_chat_kwargs):
     worker._setup_vllm_openai_api_server(_FakeApp())
     assert _BUILT["chat"][0].kwargs["engine_client"] is worker._http_engine_client
     return _BUILT["renderer"], _BUILT["chat"], _BUILT["tokenize"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "admitted,marker,stream,token_ids,default_token_ids,logprobs,bypass,invalid_raw",
+    [
+        (True, True, False, True, False, True, True, False),
+        (True, True, False, None, True, True, True, False),
+        (False, True, False, True, False, True, False, False),
+        (False, False, False, True, False, True, False, False),
+        (True, True, True, True, False, True, False, False),
+        (True, True, False, False, True, True, False, False),
+        (True, True, False, True, False, False, False, False),
+        (True, True, False, True, False, True, True, True),
+    ],
+    ids=[
+        "captured-raw",
+        "server-default-token-ids",
+        "unadmitted-marker",
+        "ordinary",
+        "streaming",
+        "no-raw-arrays",
+        "no-logprobs",
+        "invalid-raw-logprobs",
+    ],
+)
+async def test_captured_chat_logprobs_bypass(
+    monkeypatch: Any,
+    admitted: bool,
+    marker: bool,
+    stream: bool,
+    token_ids: bool | None,
+    default_token_ids: bool,
+    logprobs: bool,
+    bypass: bool,
+    invalid_raw: bool,
+) -> None:
+    """Drive the real serving MRO and retain engine-native arrays unchanged."""
+    _, chats, _ = _build_server(monkeypatch, {})
+    serving = chats[0]
+    serving.return_tokens_as_token_ids = default_token_ids
+    serving.renderer = types.SimpleNamespace(tokenizer=None)
+    capture_calls = {}
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_calls", capture_calls, raising=False
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_return_routed_experts_enabled",
+        lambda _self: False,
+    )
+    request = types.SimpleNamespace(
+        ng_capture={} if marker else None,
+        stream=stream,
+        logprobs=logprobs,
+        top_logprobs=0,
+        return_tokens_as_token_ids=token_ids,
+    )
+    if admitted:
+        capture_calls[id(request)] = object()
+    original_request_fields = vars(request).copy()
+    ordinary_logprobs = object()
+    builder = MagicMock(return_value=ordinary_logprobs)
+    monkeypatch.setattr(
+        _OpenAIServingChat, "_create_chat_logprobs", builder, raising=False
+    )
+
+    async def format_response(
+        self: Any,
+        upstream_request: Any,
+        results: AsyncIterator[Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        assert upstream_request is request
+        async for output in results:
+            final_output = output
+        response_type = sys.modules[
+            "vllm.entrypoints.openai.chat_completion.protocol"
+        ].ChatCompletionResponse
+        response = response_type()
+        response.usage = None
+        response.choices = [
+            types.SimpleNamespace(
+                index=0,
+                message=types.SimpleNamespace(),
+                logprobs=self._create_chat_logprobs(
+                    token_ids=final_output.outputs[0].token_ids,
+                    top_logprobs=final_output.outputs[0].logprobs,
+                )
+                if upstream_request.logprobs
+                else None,
+            )
+        ]
+        return response
+
+    monkeypatch.setattr(
+        _OpenAIServingChat,
+        "chat_completion_full_generator",
+        format_response,
+        raising=False,
+    )
+
+    async def results() -> AsyncIterator[Any]:
+        for token, probability in [(7, -0.5)]:
+            yield types.SimpleNamespace(
+                prompt_token_ids=[1, 2],
+                outputs=[
+                    types.SimpleNamespace(
+                        index=0,
+                        token_ids=[token],
+                        logprobs=[
+                            {}
+                            if invalid_raw
+                            else {token: types.SimpleNamespace(logprob=probability)}
+                        ],
+                        text="tail",
+                        finish_reason="stop",
+                        stop_reason=None,
+                    )
+                ],
+            )
+
+    if invalid_raw:
+        with pytest.raises(RuntimeError, match="did not include the selected token"):
+            await serving.chat_completion_full_generator(request, results())
+        assert builder.call_count == 0
+        return
+
+    response = await serving.chat_completion_full_generator(request, results())
+    choice = response.choices[0]
+    assert (choice.logprobs is None) == (bypass or not logprobs)
+    assert builder.call_count == (0 if bypass or not logprobs else 1)
+    assert vars(request) == original_request_fields
+    if logprobs and (token_ids if token_ids is not None else default_token_ids):
+        assert choice.message.prompt_token_ids == [1, 2]
+        assert choice.message.generation_token_ids == [7]
+        assert choice.message.generation_log_probs == [-0.5]
 
 
 @pytest.mark.parametrize(

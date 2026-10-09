@@ -60,6 +60,9 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.prefix_read_batcher import PrefixReadBatcher
+from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
+    CapturedChatLogprobsMixin,
+)
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
@@ -1911,12 +1914,22 @@ class VllmAsyncGenerationWorkerImpl(
                             prefix_token_ids=restored_parser_prefix,
                         )
 
-                response = await super().chat_completion_full_generator(
-                    request,
-                    capture_result_generator(),
-                    *args,
-                    **kwargs,
+                # Capture stages the raw arrays below and strips OpenAI logprobs
+                # after the terminal PUT. Skip only their object construction;
+                # changing request.logprobs would also change engine sampling.
+                bypass_logprobs = bool(
+                    not request.stream
+                    and request.logprobs
+                    and return_as_token_id
+                    and id(request) in worker_self._capture_calls
                 )
+                with self._bypass_chat_logprobs(enabled=bypass_logprobs):
+                    response = await super().chat_completion_full_generator(
+                        request,
+                        capture_result_generator(),
+                        *args,
+                        **kwargs,
+                    )
                 if (
                     not isinstance(response, ChatCompletionResponse)
                     or final_res is None
@@ -1966,7 +1979,11 @@ class VllmAsyncGenerationWorkerImpl(
 
                 return response
 
-        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
+        class NeMoRLOpenAIServingChat(
+            NeMoRLOpenAIServingChatMixin,
+            CapturedChatLogprobsMixin,
+            OpenAIServingChat,
+        ):
             pass
 
         class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
