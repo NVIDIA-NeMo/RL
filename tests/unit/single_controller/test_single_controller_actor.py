@@ -1226,7 +1226,10 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     assert "advantages" in (result_meta.fields or [])
 
 
-def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
+@pytest.mark.parametrize("tokenless_sample", [False, True])
+def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
+    tokenless_sample,
+) -> None:
     """SC passes the TQ teacher column under OPD's estimator contract."""
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
@@ -1249,7 +1252,11 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
                 {
                     "prompt_ids_for_adv": torch.zeros(2, 3, dtype=torch.long),
                     "total_reward": torch.zeros(2),
-                    "token_mask": torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]]),
+                    "token_mask": torch.tensor(
+                        [[0.0, 1.0, 1.0], [1.0, 0.0, 0.0]]
+                        if tokenless_sample
+                        else [[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]
+                    ),
                     "sample_mask": torch.ones(2),
                     "mask_sample": torch.zeros(2, dtype=torch.bool),
                     "truncated": torch.zeros(2, dtype=torch.bool),
@@ -1311,22 +1318,30 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         "repeated_batch",
     }
     assert "logprobs_policy" not in captured_kwargs
-    assert torch.allclose(
-        captured_kwargs["teacher_logprobs"] - captured_kwargs["prev_logprobs"],
-        torch.full((2, 3), 0.25),
+    valid_mask = captured_kwargs["mask"].bool()
+    num_valid_tokens = 2 if tokenless_sample else 4
+    torch.testing.assert_close(
+        (captured_kwargs["teacher_logprobs"] - captured_kwargs["prev_logprobs"])[
+            valid_mask
+        ],
+        torch.full((num_valid_tokens,), 0.25),
     )
     assert "advantages" in (enriched.fields or [])
-    assert ctrl._opd_stat_sum == pytest.approx(1.0)
-    assert ctrl._opd_stat_sumsq == pytest.approx(0.25)
-    assert ctrl._opd_stat_count == 4
+    assert ctrl._opd_stat_sum == pytest.approx(0.25 * num_valid_tokens)
+    assert ctrl._opd_stat_sumsq == pytest.approx(0.25**2 * num_valid_tokens)
+    assert ctrl._opd_stat_count == num_valid_tokens
     assert ctrl._dp_client.put_fields is not None
     written_advantages = ctrl._dp_client.put_fields["advantages"]
     torch.testing.assert_close(
-        written_advantages,
-        torch.full_like(written_advantages, 0.1),
+        written_advantages[valid_mask],
+        torch.full((num_valid_tokens,), 0.1),
     )
     logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
-    torch.testing.assert_close(logged, torch.full((4,), 0.1))
+    torch.testing.assert_close(logged, torch.full((num_valid_tokens,), 0.1))
+    if tokenless_sample:
+        torch.testing.assert_close(
+            ctrl._dp_client.put_fields["sample_mask"], torch.tensor([1.0, 0.0])
+        )
 
 
 def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:
