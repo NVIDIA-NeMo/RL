@@ -220,7 +220,7 @@ class AutomodelConfig(TypedDict):
     # Make the policy's forward and backward bitwise reproducible: deterministic
     # torch/cuBLAS/cuDNN algorithms and Transformer Engine kernels. Costs step
     # time (about 13% on Nemotron-3 Nano 30B-A3B DPO); absent or false keeps the
-    # faster non-deterministic kernels.
+    # faster non-deterministic kernels. Applies to policy workers only.
     deterministic: NotRequired[bool]
 
 
