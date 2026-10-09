@@ -121,7 +121,7 @@ def test_prompt_config_overrides_match_mcore_fields(
     import megatron.core.inference.config as mcore_inference_config
 
     mcore_cls = getattr(mcore_inference_config, mcore_cls_name)
-    assert set(overrides_cls.__annotations__) == {
+    assert set(overrides_cls.model_fields) == {
         field.name for field in dataclasses.fields(mcore_cls)
     }
 

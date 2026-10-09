@@ -85,6 +85,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.megatron.config import (
+    MultimodalPromptConfigOverrides,
     resolve_refit_execution_batch_bytes,
 )
 from nemo_rl.models.generation.megatron.utils import (
@@ -596,8 +597,12 @@ class MegatronGenerationMixin:
                     f"{inference_wrapper_cls.__name__} does not define a multimodal "
                     "prompt contract to override."
                 )
+            prompt_config_overrides = MultimodalPromptConfigOverrides.model_validate(
+                prompt_config_overrides
+            )
             multimodal_prompt_config = MultimodalPromptConfig.from_dict(
-                prompt_config_overrides, defaults=wrapper_prompt_defaults
+                prompt_config_overrides.model_dump(exclude_unset=True),
+                defaults=wrapper_prompt_defaults,
             )
 
         inference_config_kwargs: dict[str, Any] = {

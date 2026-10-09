@@ -14,6 +14,8 @@
 
 from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
+from pydantic import BaseModel, ConfigDict
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy import Fp8Config, PolicyConfig
 from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
@@ -31,24 +33,28 @@ def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
     return configured_bytes
 
 
-class MediaPromptSpecOverrides(TypedDict):
+class MediaPromptSpecOverrides(BaseModel):
     """Partial MCore `MediaPromptSpec`. Omitted fields keep the wrapper's defaults."""
 
-    model_token: NotRequired[str]
-    prefix: NotRequired[str]
-    suffix: NotRequired[str]
-    input_marker: NotRequired[str | None]
-    content_part_separator: NotRequired[str]
-    expansion_mode: NotRequired[Literal["single", "temporal_patch"]]
-    include_frame_timestamps_for_nemotron_vl: NotRequired[bool]
+    model_config = ConfigDict(extra="forbid")
+
+    model_token: Optional[str] = None
+    prefix: Optional[str] = None
+    suffix: Optional[str] = None
+    input_marker: Optional[str] = None
+    content_part_separator: Optional[str] = None
+    expansion_mode: Optional[Literal["single", "temporal_patch"]] = None
+    include_frame_timestamps_for_nemotron_vl: Optional[bool] = None
 
 
-class MultimodalPromptConfigOverrides(TypedDict):
+class MultimodalPromptConfigOverrides(BaseModel):
     """Partial MCore `MultimodalPromptConfig`. Omitted fields keep the wrapper's defaults."""
 
-    image_spec: NotRequired[MediaPromptSpecOverrides]
-    video_spec: NotRequired[MediaPromptSpecOverrides]
-    content_part_order: NotRequired[Literal["preserve", "media_first"]]
+    model_config = ConfigDict(extra="forbid")
+
+    image_spec: Optional[MediaPromptSpecOverrides] = None
+    video_spec: Optional[MediaPromptSpecOverrides] = None
+    content_part_order: Optional[Literal["preserve", "media_first"]] = None
 
 
 class MCoreGenerationSpecificArgs(TypedDict):

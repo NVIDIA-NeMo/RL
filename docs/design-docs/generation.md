@@ -334,7 +334,11 @@ data:
     video_sampling_style: nemotron_vl
 ```
 
-This setting controls NeMo-RL's video preprocessing only. It does not change the
+Nemotron-VL video preprocessing always uses timestamped `temporal_patch`
+expansion, the only video format Nemotron checkpoints are trained on, so keep
+the Megatron inference `video_spec` on that format.
+
+These settings control NeMo-RL's video preprocessing only. They do not change the
 Megatron inference prompt, which comes from the selected
 `megatron_inference_wrapper`. The Nemotron Omni wrapper already defaults to
 timestamped temporal-patch video prompts. For other wrappers, or to change these

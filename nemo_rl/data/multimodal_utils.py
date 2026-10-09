@@ -1679,6 +1679,8 @@ def attach_processor_media_token_validity_mask(
     message: dict[str, Any], processor: Any
 ) -> None:
     """Record which rollout tokens are processor-owned media placeholders."""
+    # TODO: Add support for audio placeholder masks. This function only
+    # handles image (and video) placeholder tokens.
     token_ids = message.get("token_ids")
     image_token = getattr(processor, "image_token", None)
     tokenizer = getattr(processor, "tokenizer", None)
@@ -1941,9 +1943,11 @@ def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) 
     Args:
         batch: Batch with ``[B, S]`` ``input_ids``.
         media_token_id: Media placeholder token ID, or None if the model does not
-            accept the mask, in which case any existing mask is removed.
+            accept the mask, in which case any existing mask is removed. The
+            Megatron policy worker passes None when
+            ``_model_accepts_media_token_validity_mask`` is False.
     """
-    if media_token_id is None:  # if _model_accepts_media_token_validity_mask
+    if media_token_id is None:
         batch.pop("media_token_validity_mask", None)
         return
     input_ids = batch.get("input_ids", None)

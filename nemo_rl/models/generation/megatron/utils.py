@@ -196,13 +196,16 @@ def build_image_preprocessing_config(
         merge_size = int(read("merge_size", "spatial_merge_size") or 1)
 
     dynamic_resolution_kwargs: dict[str, Any] = {}
-    model_length = (
-        dynamic_resolution_model_length
-        if dynamic_resolution_model_length is not None
-        else read("max_model_len")
-    )
-    if model_length is not None:
-        dynamic_resolution_kwargs["dynamic_resolution_model_length"] = int(model_length)
+    if dynamic_resolution_model_length is not None:
+        dynamic_resolution_kwargs["dynamic_resolution_model_length"] = int(
+            dynamic_resolution_model_length
+        )
+    else:
+        max_model_len = read("max_model_len")
+        if max_model_len is not None:
+            dynamic_resolution_kwargs["dynamic_resolution_model_length"] = int(
+                max_model_len
+            )
     if dynamic_resolution_rounding_mode is not None:
         dynamic_resolution_kwargs["dynamic_resolution_rounding_mode"] = str(
             dynamic_resolution_rounding_mode

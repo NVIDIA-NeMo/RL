@@ -4101,15 +4101,50 @@ class TestPromptExtraction:
         )
 
     def test_grpo_empty_media_payload_does_not_claim_token_ownership(self):
-        """Filtered PackedTensor rows carry type metadata but no media segments."""
+        """Filtered PackedTensor rows in a batch with real media are not anchors."""
         template = PackedTensor(torch.ones(1, 3, 2, 2), dim_to_pack=0)
-        message_log = [
+        filtered_log = [
             {
                 "role": "user",
                 "content": "",
                 "token_ids": torch.tensor([7, 7]),
                 "pixel_values": PackedTensor.empty_like(template),
             },
+        ]
+        media_log = [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor([7]),
+                "pixel_values": template,
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([filtered_log, media_log])
+
+        torch.testing.assert_close(
+            filtered_log[0]["media_token_validity_mask"],
+            torch.tensor([False, False]),
+        )
+        torch.testing.assert_close(
+            media_log[0]["media_token_validity_mask"], torch.tensor([True])
+        )
+
+    @pytest.mark.parametrize("emptied_media", [False, True])
+    def test_grpo_drops_media_validity_without_media_segments(self, emptied_media):
+        """A batch with no media segments carries no media-validity field."""
+        message = {
+            "role": "user",
+            "content": "",
+            "token_ids": torch.tensor([1, 7, 2]),
+            "media_token_validity_mask": torch.tensor([False, True, False]),
+        }
+        if emptied_media:
+            message["pixel_values"] = PackedTensor.empty_like(
+                PackedTensor(torch.ones(1, 3, 2, 2), dim_to_pack=0)
+            )
+        message_log = [
+            message,
             {
                 "role": "assistant",
                 "content": "",
@@ -4120,10 +4155,8 @@ class TestPromptExtraction:
 
         add_grpo_token_loss_masks_and_generation_logprobs([message_log])
 
-        torch.testing.assert_close(
-            message_log[0]["media_token_validity_mask"],
-            torch.tensor([False, False]),
-        )
+        assert all("media_token_validity_mask" not in m for m in message_log)
+        assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([1]))
 
     def test_grpo_ignores_unregistered_packed_message_metadata(self):
         """Only registered multimodal PackedTensor fields activate media masks."""
