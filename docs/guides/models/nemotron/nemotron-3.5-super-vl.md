@@ -83,14 +83,14 @@ These are set in the recipe and are required for this model:
 | `policy.generation.vllm_kwargs.limit_mm_per_prompt.image` | `1` | vLLM sizes the encoder budget from this limit, and an unset modality defaults to 999 images per prompt. |
 | `policy.generation.vllm_kwargs.mamba_ssm_cache_dtype` | `float32` | Matches the checkpoint's `mamba_ssm_cache_dtype`. |
 | `policy.generation.vllm_cfg.skip_tokenizer_init` | (automatic) | vLLM's multimodal encoder budget calls the tokenizer during engine init for this architecture. `NemotronH_Omni_Reasoning_V3` is listed in `TOKENIZER_REQUIRED_ARCHITECTURES`, so NeMo RL keeps the tokenizer regardless of the text-only default. |
-| `policy.dtensor_cfg.automodel_kwargs.force_hf` | unset | The custom AutoModel implementation and its state-dict adapter are required for EP and per-tensor refit. |
-| `policy.dtensor_cfg.env_vars.PYTORCH_CUDA_ALLOC_CONF` | unset | With `expandable_segments:True` PyTorch exports CUDA IPC handles as file descriptors fetched via `pidfd_getfd`; on clusters where that syscall path is unavailable the colocated trainer-to-vLLM refit fails with `pidfd_getfd: Bad file descriptor`. The default allocator uses legacy `cudaIpcMemHandle` sharing. |
+| `policy.automodel_cfg.automodel_kwargs.force_hf` | unset | The custom AutoModel implementation and its state-dict adapter are required for EP and per-tensor refit. |
+| `policy.automodel_cfg.env_vars.PYTORCH_CUDA_ALLOC_CONF` | unset | With `expandable_segments:True` PyTorch exports CUDA IPC handles as file descriptors fetched via `pidfd_getfd`; on clusters where that syscall path is unavailable the colocated trainer-to-vLLM refit fails with `pidfd_getfd: Bad file descriptor`. The default allocator uses legacy `cudaIpcMemHandle` sharing. |
 
 ### Parallelism
 
 - **Training EP stays within a node.** The recipe uses `expert_parallel_size: 4`
   on 4-GPU GB200 nodes with the HybridEP dispatcher
-  (`policy.dtensor_cfg.automodel_kwargs.backend.dispatcher: hybridep`), which
+  (`policy.automodel_cfg.automodel_kwargs.backend.dispatcher: hybridep`), which
   requires `make_sequence_length_divisible_by: 64`. The DeepEP dispatcher also
   works at EP=4 but its V1 `Buffer` API assumes an expert-parallel group of up to
   8 ranks is intranode; EP=8 on 4-GPU nodes fails with

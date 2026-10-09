@@ -20,18 +20,18 @@ defaults: ../../grpo_math_1B.yaml
 #   - hf_config_overrides.num_nextn_predict_layers=0 drops the checkpoint's MTP
 #     head (num_nextn_predict_layers=1, mtp.* tensors) on the training side;
 #     generation speculative_config must stay unset for the same reason.
-#   - dtensor_cfg.automodel_kwargs.force_hf must NOT be set (the custom
+#   - automodel_cfg.automodel_kwargs.force_hf must NOT be set (the custom
 #     NemotronOmni implementation + state-dict adapter are required for EP and
 #     per-tensor refit).
 #   - moe_parallelizer.ignore_router_for_ac (the Automodel default, kept
 #     explicit) is needed with activation checkpointing: bf16 router top-k is
 #     nondeterministic, and recomputed expert permutation buffers can change
 #     shape and crash backward (CheckpointError).
-#   - dtensor_cfg.expert_parallel_size=4 keeps the EP group within one 4-GPU
+#   - automodel_cfg.expert_parallel_size=4 keeps the EP group within one 4-GPU
 #     node (vLLM TP/EP=4 so an engine fits one node). The experts use the
 #     HybridEP dispatcher, which needs make_sequence_length_divisible_by=64.
-#   - Do not set dtensor_cfg.env_vars.PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-#     here (see the dtensor_cfg comment): it breaks the IPC refit on some clusters.
+#   - Do not set automodel_cfg.env_vars.PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#     here (see the automodel_cfg comment): it breaks the IPC refit on some clusters.
 #   - Validated on 16 x 4-GPU GB200 nodes (AIME-2024 0.53 -> 0.79 over 50
 #     steps); fewer nodes run out of host memory at the first checkpoint save.
 grpo:
@@ -93,7 +93,7 @@ policy:
       total_iters: 10000000000
   - milestones:
     - 10
-  dtensor_cfg:
+  automodel_cfg:
     expert_parallel_size: 4
     activation_checkpointing: true
     moe_parallelizer:
