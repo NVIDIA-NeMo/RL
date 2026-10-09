@@ -2050,3 +2050,101 @@ class TestAggregateTrainingStatistics:
         )
 
         assert grad_enabled_during_all_reduce == [False]
+
+
+@pytest.mark.parametrize("pack_groups", [False, True], ids=["stars", "forest"])
+def test_shared_prefix_logprobs_match_dense_rows(pack_groups):
+    """Star/forest logprob fan-out equals a dense per-row evaluation at TP1/CP1.
+
+    The synthetic logits depend only on a token and its logical position, so
+    any routing error between packed predictors and source rows is visible.
+    """
+    pytest.importorskip("megatron.rl.shared_prefix_execution")
+    import numpy as np
+
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.megatron import train
+    from nemo_rl.models.megatron.data import (
+        plan_shared_prefix_execution_units,
+        process_shared_prefix_microbatch,
+    )
+
+    tokens = [[1, 2, 3, 4, 5], [9, 8, 7], [1, 2, 3, 6], [9, 8, 6, 5], [1, 2, 3, 7, 8]]
+    prompt_lengths = [3, 2, 3, 2, 3]
+    groups = ["a", "b", "a", "b", "a"]
+    lengths = [len(row) for row in tokens]
+    width = max(lengths) + 2
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [row + [0] * (width - len(row)) for row in tokens]
+            ),
+            "input_lengths": torch.tensor(lengths),
+            "shared_prefix_prompt_lengths": torch.tensor(prompt_lengths),
+            "shared_prefix_group_id": np.asarray(groups, dtype=object),
+            "_shared_prefix_execution_slot": torch.zeros(len(tokens), dtype=torch.long),
+        }
+    )
+    cfg = {
+        "sequence_packing": {"enabled": True, "algorithm": "first_fit_decreasing"},
+        "make_sequence_length_divisible_by": 1,
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "sequence_parallel": False,
+        },
+        "shared_prefix_training": {
+            "mode": "train",
+            "pack_groups": pack_groups,
+            "repack_groups": pack_groups,
+        },
+    }
+    units = plan_shared_prefix_execution_units(data, cfg=cfg, bin_capacity=64)
+    assert all(unit.shared_layout is not None for unit in units)
+    assert len(units) == (1 if pack_groups else 2)
+
+    vocab = 16
+    generator = torch.Generator().manual_seed(0)
+    token_logits = torch.randn(vocab, vocab, generator=generator)
+    position_logits = torch.randn(width, vocab, generator=generator)
+    ids = data["input_ids"]
+    dense = torch.log_softmax(token_logits[ids] + position_logits[:width], dim=-1)
+    dense_next = dense[:, :-1].gather(-1, ids[:, 1:, None]).squeeze(-1)
+
+    with (
+        patch.object(train, "get_context_parallel_world_size", return_value=1),
+        patch.object(train, "get_context_parallel_rank", return_value=0),
+        patch.object(train, "get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(train, "get_tensor_model_parallel_rank", return_value=0),
+    ):
+        microbatches = process_shared_prefix_microbatch(
+            data_dict=data,
+            cfg=cfg,
+            bin_capacity=64,
+            execution_units=units,
+            seq_length_key="input_lengths",
+            pad_individual_seqs_to_multiple_of=1,
+            pad_packed_seq_to_multiple_of=1,
+            pad_full_seq_to=None,
+            straggler_timer=None,
+        )
+        for microbatch in microbatches:
+            metadata = microbatch.shared_prefix
+            packed_ids = microbatch.input_ids_cp_sharded[0]
+            positions = microbatch.position_ids[0]
+            logits = (token_logits[packed_ids] + position_logits[positions])[None]
+            logprobs = train.shared_prefix_next_token_logprobs(
+                logits, metadata, chunk_size=3
+            )
+            for local_row, row in enumerate(metadata.tensor_bin.layout.row_indices):
+                valid = lengths[row] - 1
+                torch.testing.assert_close(
+                    logprobs[local_row, :valid],
+                    dense_next[row, :valid],
+                    rtol=0,
+                    atol=1e-6,
+                )
+                assert not logprobs[local_row, valid:].any()
+
+            with pytest.raises(RuntimeError, match="vocabulary"):
+                train.shared_prefix_next_token_logprobs(logits[..., :5], metadata)

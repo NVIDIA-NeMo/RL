@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from functools import partial
@@ -35,7 +34,6 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     PipelineOffloadManager,
 )
-from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import (
     StragglerDetector,
     get_model_config,
@@ -58,11 +56,6 @@ from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
-from nemo_rl.data.packing import (
-    SharedPrefixForestLayout,
-    get_shared_prefix_context_parallel_indices,
-    get_shared_prefix_physical_alignment,
-)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     DistributedLogprob,
@@ -166,24 +159,6 @@ def suspend_activation_offload_for_forward_only(
                 model_config.fine_grained_activation_offloading = original_value
 
 
-def _wraps_float16_module(model: object) -> bool:
-    """Whether a ``Float16Module`` sits anywhere in ``model``'s wrapper chain.
-
-    Megatron hands the forward function the outermost wrapper (typically
-    ``DistributedDataParallel``), whose ``forward`` forwards keyword arguments
-    to ``Float16Module``; that class accepts ``fp32_output`` and swallows it.
-    """
-    module = model
-    for _ in range(8):
-        if isinstance(module, Float16Module):
-            return True
-        inner = getattr(module, "module", None)
-        if inner is None or inner is module:
-            return False
-        module = inner
-    return False
-
-
 def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
@@ -199,7 +174,6 @@ def model_forward(
     media_token_validity_mask: Optional[torch.Tensor] = None,
     model_slices_context_parallel_inputs: bool = False,
     shared_prefix: Optional[SharedPrefixForwardMetadata] = None,
-    shared_prefix_train_mode: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -223,8 +197,6 @@ def model_forward(
         model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
         shared_prefix: Structured Hybrid star layout and CP ownership metadata
             for the capability-negotiated shared-prefix model path.
-        shared_prefix_train_mode: Whether the forward is part of a
-            shared-prefix train schedule, including conventional fallback units.
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -263,6 +235,7 @@ def model_forward(
         from megatron.core.models.hybrid.shared_prefix import (
             SharedPrefixLayout as MCoreSharedPrefixLayout,
         )
+        from megatron.rl.shared_prefix_packing import SharedPrefixForestLayout
 
         # Read the canonical parent-linked descriptor. The lowering guard
         # rejects deeper trees before they can reach the current star kernels.
@@ -322,18 +295,7 @@ def model_forward(
     if media_token_validity_mask is not None:
         additional_kwargs["media_token_validity_mask"] = media_token_validity_mask
 
-    # GPTModel accepts ``fp32_output`` to suppress its optional logits cast.
-    # Raw MCore HybridModel does not expose that keyword, but the trainer is
-    # wrapped (DDP -> Float16Module -> model) and ``Float16Module.forward``
-    # consumes ``fp32_output`` itself without forwarding it; when the flag is
-    # left at its default the wrapper upcasts the whole [1, T/CP, V/TP] output
-    # to fp32. In shared-prefix train mode pass the flag whenever that wrapper
-    # is present so the star path receives output-layer-dtype logits exactly
-    # like the dense path (the bounded log-probability gather below casts its
-    # own chunks to fp32); an unwrapped HybridModel would reject the keyword.
-    if defer_fp32_logits and (
-        not shared_prefix_train_mode or _wraps_float16_module(model)
-    ):
+    if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
     if use_fused_linear_logprobs:
         additional_kwargs["labels"] = input_ids_cp_sharded
@@ -350,22 +312,6 @@ def model_forward(
             **multimodal_data,
         )
 
-    if (
-        shared_prefix is not None
-        and os.environ.get("NEMORL_SHARED_PREFIX_RUNTIME_TRACE") == "1"
-    ):
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        layout = shared_prefix.tensor_bin.layout
-        print(
-            "NEMORL_SHARED_PREFIX_FORWARD_COMPLETED "
-            f"rank={rank} training={int(model.training)} "
-            f"prompt_tokens={sum(root.prompt_length for _, root in layout.iter_roots())} "
-            f"completions={len(layout.completion_lengths)} "
-            f"logical_tokens={layout.total_length} "
-            f"physical_tokens={shared_prefix.padded_total_length}",
-            flush=True,
-        )
-
     # A model that slices context parallelism itself returns (output,
     # sliced_loss_mask) when it was handed a full-sequence loss_mask, so the
     # caller can see the mask in the model's own CP-local token order. The MTP
@@ -376,25 +322,6 @@ def model_forward(
         output_tensor = output_tensor[0]
 
     return output_tensor
-
-
-SHARED_PREFIX_SYNC_FREE_CHECKS_ENV = "NEMORL_SHARED_PREFIX_SYNC_FREE_CHECKS"
-
-
-def _shared_prefix_sync_free_checks_enabled() -> bool:
-    """Whether :func:`shared_prefix_next_token_logprobs` skips its host syncs.
-
-    Off by default: the function keeps its descriptive host-side
-    ``ValueError`` checks (one ``.item()`` each per microbatch), so a bad
-    target token fails with a legible message and a still-usable CUDA
-    context. ``NEMORL_SHARED_PREFIX_SYNC_FREE_CHECKS=1`` opts a perf run into
-    the sync-free variant: the vocab guard becomes a device-side assertion
-    (a violation then surfaces as a sticky ``CUDA error: device-side assert
-    triggered`` whose text only reaches the worker's stderr) and the provably
-    redundant scatter-width check is skipped. Read per call so tests and
-    operators can flip it without re-importing.
-    """
-    return os.environ.get(SHARED_PREFIX_SYNC_FREE_CHECKS_ENV, "0") == "1"
 
 
 def shared_prefix_next_token_logprobs(
@@ -421,6 +348,12 @@ def shared_prefix_next_token_logprobs(
     gathers and scatters remain differentiable, so branch gradients accumulate
     into the one shared prompt exactly as in a dense conventional forward.
     """
+    # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds.
+    from megatron.rl.shared_prefix_tensors import (
+        get_shared_prefix_context_parallel_indices,
+        get_shared_prefix_physical_alignment,
+    )
+
     if packed_logits.ndim != 3 or packed_logits.shape[0] != 1:
         raise ValueError(
             "shared-prefix Hybrid logits must have shape "
@@ -470,11 +403,7 @@ def shared_prefix_next_token_logprobs(
             "shared-prefix metadata padding_multiple must be a positive multiple "
             f"of topology alignment Q={topology_alignment}, got {padding_multiple!r}"
         )
-    padded_total_length = (
-        layout.physical_total_length
-        if shared_prefix.padded_total_length is None
-        else shared_prefix.padded_total_length
-    )
+    padded_total_length = shared_prefix.padded_total_length
     if padded_total_length < layout.physical_total_length:
         raise ValueError(
             "shared-prefix padded length is shorter than the physical layout: "
@@ -539,27 +468,14 @@ def shared_prefix_next_token_logprobs(
     )
     local_vocab_size = packed_logits.shape[-1]
     global_padded_vocab_size = local_vocab_size * tp_size
-    # This guard protects against silent corruption, so it stays: with TP>1,
+    # This guard protects against silent corruption: with TP>1,
     # DistributedLogprob masks a target outside every vocabulary shard to
-    # logprob 0 instead of failing (TP1's gather would device-assert on its
-    # own). Nothing upstream bounds token ids against the model's padded vocab.
-    # By default it is the descriptive host-side check (one ``.item()`` per
-    # microbatch). NEMORL_SHARED_PREFIX_SYNC_FREE_CHECKS=1 swaps in a
-    # device-side assertion that costs no host sync but reports a violation
-    # only as a generic, context-poisoning CUDA device-side assert.
-    target_tokens_in_vocab = (
-        (target_tokens >= 0) & (target_tokens < global_padded_vocab_size)
-    ).all()
-    if _shared_prefix_sync_free_checks_enabled():
-        torch._assert_async(
-            target_tokens_in_vocab,
-            "shared-prefix target token is outside the TP-sharded padded vocabulary",
-        )
-    elif target_tokens.numel() and not bool(target_tokens_in_vocab.item()):
-        raise ValueError(
-            "shared-prefix target token is outside the TP-sharded padded "
-            f"vocabulary: padded_vocab={global_padded_vocab_size}"
-        )
+    # logprob 0 instead of failing. Nothing upstream bounds token ids against
+    # the model's padded vocab. The device-side assertion costs no host sync.
+    torch._assert_async(
+        ((target_tokens >= 0) & (target_tokens < global_padded_vocab_size)).all(),
+        "shared-prefix target token is outside the TP-sharded padded vocabulary",
+    )
 
     prediction_count = predictor_positions.numel()
     if cp_size == 1:
@@ -638,16 +554,17 @@ def shared_prefix_next_token_logprobs(
             # DistributedLogprob reduces only the selected scalar across TP
             # vocabulary shards. Its custom backward forms the exact local
             # softmax gradient, avoiding a full-vocabulary gather and an extra
-            # differentiable-collective TP multiplier.
+            # differentiable-collective TP multiplier. The [1, rows, vocab]
+            # view selects its scatter backward instead of the int64 one-hot.
             selected_logprobs.append(
                 DistributedLogprob.apply(
-                    logits_chunk,
-                    target_chunk,
+                    logits_chunk.unsqueeze(0),
+                    target_chunk.unsqueeze(0),
                     tp_rank * local_vocab_size,
                     (tp_rank + 1) * local_vocab_size,
                     get_tensor_model_parallel_group(),
                     not torch.is_grad_enabled(),
-                )
+                ).squeeze(0)
             )
     # Keep even a padding-only CP rank connected to the model graph without
     # reducing over its entire local vocabulary tensor.
@@ -673,37 +590,28 @@ def shared_prefix_next_token_logprobs(
     )
 
     restored = packed_logprobs.new_zeros((row_count, sequence_length - 1))
-    source_to_local = {
-        source_row: local_row for local_row, source_row in enumerate(layout.row_indices)
-    }
+    # Host lookup table from source row to this unit's output row; completion
+    # rows index it per token without a Python dict lookup.
+    source_to_local = torch.full((max(layout.row_indices) + 1,), -1, dtype=torch.long)
+    source_to_local[list(layout.row_indices)] = torch.arange(
+        row_count, dtype=torch.long
+    )
     prompt_offset = 0
     for _, root in roots:
         count = root.prompt_length - 1
-        rows = [source_to_local[row] for row in root.row_indices]
+        rows = source_to_local[list(root.row_indices)]
         restored[rows, :count] = packed_logprobs[
             prompt_offset : prompt_offset + count
         ].unsqueeze(0)
         prompt_offset += count
 
-    scatter_rows = torch.tensor(
-        [
-            source_to_local[int(source_row)]
-            for source_row in layout.completion_scatter_rows
-        ],
-        dtype=torch.long,
-        device=device,
-    )
+    scatter_rows = source_to_local.index_select(
+        0, torch.tensor(layout.completion_scatter_rows, dtype=torch.long)
+    ).to(device=device)
+    # The planner emits columns ``<= total_length - 2`` and
+    # ``materialize_shared_prefix_layout`` rejects rows longer than their
+    # input, so every column is inside ``restored`` by construction.
     scatter_columns = tensor_indices.completion_scatter_columns.to(device=device)
-    # Defensive only, so skipped in sync-free mode: the planner emits column
-    # ``prompt_length + offset - 1 <= total_length - 2`` and
-    # ``materialize_shared_prefix_layout`` already rejected any row whose
-    # total_length exceeds its input length (<= the source width), so every
-    # column is inside ``restored``'s width by construction; an out-of-range
-    # column would also fail loudly in the indexed assignment below.
-    if not _shared_prefix_sync_free_checks_enabled() and bool(
-        torch.any(scatter_columns >= sequence_length - 1).item()
-    ):
-        raise ValueError("shared-prefix completion scatter exceeds source width")
     restored[scatter_rows, scatter_columns] = packed_logprobs[prompt_prediction_count:]
     return restored
 
@@ -846,7 +754,6 @@ def forward_with_post_processing_fn(
                 media_token_validity_mask=media_token_validity_mask,
                 model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
                 shared_prefix=shared_prefix,
-                shared_prefix_train_mode=processed_mb.shared_prefix_train_mode,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
