@@ -38,7 +38,9 @@ export MAX_STEPS=${MAX_STEPS:-20}
 export AGENTIC_VBENCH_CONCURRENCY=${AGENTIC_VBENCH_CONCURRENCY:-$((NUM_PROMPTS * NUM_GENERATIONS))}
 # No compaction: the declared window is the policy's real 256k window.
 export AGENTIC_VBENCH_CONTEXT_TOKENS=${AGENTIC_VBENCH_CONTEXT_TOKENS:-262144}
-export AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER=${AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER:-0.4}
+# Full task budget (1800 s per episode); the GPU reaper exemption in launch_sc.sh
+# removes the kill-window reason for a shorter cap.
+export AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER=${AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER:-1.0}
 # Without compaction a 32-turn episode is one training row of its whole context.
 # On 8 training nodes rows of 92-93k tokens trained but a step holding 97k rows
 # OOM'd even with longer rows rejected (runs 2184181, 2184532); the ceiling moves

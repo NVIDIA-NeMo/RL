@@ -31,8 +31,9 @@ export AGENTIC_VBENCH_CONCURRENCY=${AGENTIC_VBENCH_CONCURRENCY:-$((NUM_PROMPTS *
 # OpenCode compacts when its declared window fills: 64k so compaction happens in
 # ordinary episodes while the policy's real window stays 256k.
 export AGENTIC_VBENCH_CONTEXT_TOKENS=${AGENTIC_VBENCH_CONTEXT_TOKENS:-65536}
-# Harbor stops OpenCode at 0.4 x the task's 1800 s and verifies what was delivered.
-export AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER=${AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER:-0.4}
+# Full task budget (1800 s per episode); the GPU reaper exemption in launch_sc.sh
+# removes the kill-window reason for a shorter cap.
+export AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER=${AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER:-1.0}
 export SAVE_PERIOD=${SAVE_PERIOD:-1}
 export JOB_CYCLES=${JOB_CYCLES:-6}
 export BASE_NAME=${BASE_NAME:-agentic_vbench_ut_cc_16n_fast_step_$(date -u +%Y%m%d-%H%M%S)}

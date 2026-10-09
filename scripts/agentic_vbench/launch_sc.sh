@@ -273,8 +273,13 @@ COMMAND_EOF
 export COMMAND
 
 last_array_task=$((job_cycles - 1))
+# The cluster's OccupiedIdleGPUsJobReaper cancels jobs whose GPUs look idle;
+# model loading, Harbor container setup and the first long-episode wave keep the
+# generation GPUs idle for well over an hour. Declare the exemption up front.
+sbatch_comment="${SBATCH_COMMENT:-{\"OccupiedIdleGPUsJobReaper\":{\"exemptIdleTimeMins\":\"120\",\"reason\":\"data_loading\",\"description\":\"Model load, task-container setup and agentic rollouts keep GPUs idle for up to 120 minutes\"}}}"
 submit_args=(
   --parsable
+  --comment="${sbatch_comment}"
   --nodes="${num_nodes}"
   --gres="gpu:${gpus_per_node}"
   --exclusive
@@ -290,6 +295,7 @@ submit_args=(
 )
 
 echo "candidate=${candidate_name}"
+echo "sbatch_comment=${sbatch_comment}"
 echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template} vllm_load_format=${vllm_load_format}"
 echo "context_compaction=${context_compaction} opencode_compaction_auto=${AGENTIC_VBENCH_COMPACTION_AUTO} opencode_prune=${AGENTIC_VBENCH_COMPACTION_PRUNE} max_turns=${AGENTIC_VBENCH_MAX_TURNS:-32} context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS:-49152} output_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS:-8192} tasks=${AGENTIC_VBENCH_TASKS:-all}"
 echo "episodes=${AGENTIC_VBENCH_OUTPUT_ROOT}"
