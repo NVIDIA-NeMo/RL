@@ -37,7 +37,7 @@ from nemo_rl.data import packing
 from nemo_rl.data.packing import get_packer
 from nemo_rl.models.policy import get_shared_prefix_training_config
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.data.packing.shared_prefix_cost import with_prompt_length_tags
+from nemo_rl.data.packing.shared_prefix_metadata import with_prompt_length_tags
 assert get_shared_prefix_training_config({}).mode == "disabled"
 assert with_prompt_length_tags(None, prompt_lengths=[2], sequence_lengths=[4])
 bins = get_packer("first_fit_decreasing", bin_capacity=8).pack([4, 4])

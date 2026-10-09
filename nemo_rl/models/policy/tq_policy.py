@@ -41,9 +41,9 @@ from typing import Any, Literal, Optional
 import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.data.packing.shared_prefix_cost import with_prompt_length_tags
 from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_PROMPT_LENGTHS,
+    with_prompt_length_tags,
 )
 from nemo_rl.data_plane import (
     KVBatchMeta,

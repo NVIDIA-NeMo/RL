@@ -21,12 +21,16 @@ importable without the optional Megatron installation.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from typing import Any
+
 __all__ = [
     "SHARED_PREFIX_EXECUTION_SLOT",
     "SHARED_PREFIX_GROUP_ID",
     "SHARED_PREFIX_PROMPT_LENGTHS",
     "group_id_from_sample_id",
     "parse_grouped_sample_id",
+    "with_prompt_length_tags",
 ]
 
 SHARED_PREFIX_GROUP_ID = "shared_prefix_group_id"
@@ -58,3 +62,35 @@ def group_id_from_sample_id(sample_id: str) -> str:
     """Recover the TQ prompt-group prefix from ``{group_id}_g{index}``."""
     group_id, _ = parse_grouped_sample_id(sample_id)
     return group_id
+
+
+def with_prompt_length_tags(
+    tags: Sequence[Mapping[str, Any]] | None,
+    *,
+    prompt_lengths: Sequence[int],
+    sequence_lengths: Sequence[int],
+) -> list[dict[str, Any]]:
+    """Carry prompt lengths through the metadata's existing row transforms."""
+    if len(prompt_lengths) != len(sequence_lengths):
+        raise ValueError("Prompt lengths must align with sequence lengths")
+    if tags is not None and len(tags) != len(prompt_lengths):
+        raise ValueError("Prompt lengths must align with row tags")
+    result = (
+        [dict(tag) for tag in tags]
+        if tags is not None
+        else [{} for _ in prompt_lengths]
+    )
+    for tag, prefix, length in zip(
+        result, prompt_lengths, sequence_lengths, strict=True
+    ):
+        if type(prefix) is not int or not 0 <= prefix <= length:
+            raise ValueError(
+                "Prompt length must be an integer within the real sequence"
+            )
+        if (
+            SHARED_PREFIX_PROMPT_LENGTHS in tag
+            and tag[SHARED_PREFIX_PROMPT_LENGTHS] != prefix
+        ):
+            raise ValueError("Prompt length tag disagrees with its tensor field")
+        tag[SHARED_PREFIX_PROMPT_LENGTHS] = prefix
+    return result
