@@ -64,6 +64,7 @@ from nemo_rl.models.generation.vllm.utils import (
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
+    remap_multimodal_placeholders,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
@@ -1165,6 +1166,21 @@ class VllmAsyncGenerationWorkerImpl(
                     admission=admission,
                     splice=splice,
                 )
+                # Must precede the reassignment below: the remap reads the
+                # current value of prompt_token_ids as the template-coordinate
+                # sequence the placeholders were computed against. Reordering
+                # these two statements silently degrades to a no-op.
+                # Successful media capture already remapped these ranges.
+                if media is None and (
+                    mm_placeholders := engine_prompt.get("mm_placeholders")
+                ):
+                    engine_prompt["mm_placeholders"] = remap_multimodal_placeholders(
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                        final_token_ids=final_prompt_token_ids,
+                        mm_placeholders=mm_placeholders,
+                        splice=splice,
+                    )
+
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
                 # Clamp after prefix replacement since the prompt length may have changed.

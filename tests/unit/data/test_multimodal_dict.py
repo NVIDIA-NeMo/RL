@@ -63,6 +63,7 @@ def test_packed_data_basic():
         "NemotronNanoVLV2Processor",
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
         "NemotronH_Omni_Reasoning_V3Processor",
+        "NemotronH_Super_Omni_Reasoning_V3Processor",
     ],
 )
 def test_placeholder_processors_use_patchify(processor_name):

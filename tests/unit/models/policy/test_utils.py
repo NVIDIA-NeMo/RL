@@ -18,6 +18,7 @@ import sys
 import time
 import traceback
 import unittest.mock
+import warnings
 import weakref
 
 import pytest
@@ -30,6 +31,7 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
+    make_empty_cache_best_effort_under_expandable_segments,
     rebuild_cuda_tensor_from_ipc,
     stream_weights_via_ipc_zmq_impl,
 )
@@ -623,3 +625,72 @@ class TestEnsureTeacherIpcBuffer:
         assert s2 is s and h2 is h
         s3, _ = ensure_teacher_ipc_buffer(s, h, 3, 1, 4, 8, torch.float32, dev)
         assert s3 is not s and s3.shape == (3, 1, 4, 8)
+
+
+def test_empty_cache_guard_noops_without_expandable_segments(monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
+    original = torch.cuda.empty_cache
+    try:
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is original
+    finally:
+        torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_skips_flush_entirely_under_es(monkeypatch):
+    """The guard must warn and skip, never call the real empty_cache: the
+    failing allocator call corrupts CUDA state even when its exception is
+    caught."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
+    original = torch.cuda.empty_cache
+    calls = []
+
+    def _records():
+        calls.append(1)
+
+    try:
+        torch.cuda.empty_cache = _records
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is not _records
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.cuda.empty_cache()  # must not raise, must not call through
+        assert calls == []
+        assert any("expandable_segments" in str(w.message) for w in caught)
+        # idempotent: re-applying must not double-wrap
+        wrapped = torch.cuda.empty_cache
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is wrapped
+    finally:
+        torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_never_touches_broken_allocator(monkeypatch):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
+    original = torch.cuda.empty_cache
+
+    def _raises_other():
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    try:
+        torch.cuda.empty_cache = _raises_other
+        make_empty_cache_best_effort_under_expandable_segments()
+        torch.cuda.empty_cache()  # must not raise because it must not call through
+    finally:
+        torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_requires_opt_in_env(monkeypatch):
+    """Patching a global torch API is opt-in: without NRL_BEST_EFFORT_EMPTY_CACHE=1
+    the guard leaves empty_cache alone even under expandable_segments."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.delenv("NRL_BEST_EFFORT_EMPTY_CACHE", raising=False)
+    original = torch.cuda.empty_cache
+    try:
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is original
+    finally:
+        torch.cuda.empty_cache = original

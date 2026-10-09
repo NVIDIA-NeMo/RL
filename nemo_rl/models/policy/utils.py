@@ -288,6 +288,41 @@ def configure_dynamo_cache() -> None:
     torch._inductor.config.autotune_local_cache = False
 
 
+def make_empty_cache_best_effort_under_expandable_segments() -> None:
+    """Skip torch.cuda.empty_cache() when expandable segments are on.
+
+    With ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``,
+    ``torch._C._cuda_emptyCache()`` can raise ``RuntimeError: std::get: wrong
+    index for variant`` and leave the caching allocator corrupted (the process
+    later dies of cudaErrorIllegalAddress), so catching the exception is not
+    enough. empty_cache is memory hygiene, not a correctness requirement, and
+    expandable segments already return freed blocks to the segment pool.
+
+    Opt-in via ``NRL_BEST_EFFORT_EMPTY_CACHE=1``: patching a global torch API
+    is intrusive. Without the flag this is a no-op.
+    """
+    if os.environ.get("NRL_BEST_EFFORT_EMPTY_CACHE", "0") != "1":
+        return
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments:True" not in alloc_conf:
+        return
+    original_empty_cache = torch.cuda.empty_cache
+    if getattr(original_empty_cache, "_nrl_best_effort", False):
+        return
+
+    def _best_effort_empty_cache() -> None:
+        # Never call through: the failing flush corrupts the allocator even
+        # when its exception is caught (see the docstring above).
+        warnings.warn(
+            "torch.cuda.empty_cache() skipped under expandable_segments "
+            "(allocator-corrupting torch bug; see NRL empty_cache guard)",
+            stacklevel=2,
+        )
+
+    _best_effort_empty_cache._nrl_best_effort = True  # type: ignore[attr-defined]
+    torch.cuda.empty_cache = _best_effort_empty_cache
+
+
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
     """Get runtime environment configuration for policy workers.
 
