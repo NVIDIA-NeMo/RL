@@ -17,6 +17,7 @@ on:
   push:
     branches:
       - main
+      - "r[0-9]+.[0-9]+.[0-9]+"
       - "pull-request/[0-9]+"
   schedule:
     - cron: "0 9 * * *"
@@ -120,6 +121,10 @@ jobs:
               cache_scope="$base_ref"
             fi
           else
+            # Runs on the release branch itself (push after a merge) own that branch's caches and image tag.
+            if [[ "${{ github.ref_name }}" =~ ^r[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              cache_scope="${{ github.ref_name }}"
+            fi
             base_ref="HEAD~1"
             base_sha=$(git rev-parse HEAD~1)
             head_ref="HEAD"
@@ -284,8 +289,9 @@ jobs:
           } | tee -a "$GITHUB_OUTPUT"
 
           # Determine image tag: Lfast and docs reuse a prebuilt container, workflow_dispatch can override.
-          # Lfast on a release-branch PR reuses that branch's container (published by its L0+ builds)
-          # because the main container carries main's TRT-LLM wheel, not the release branch's.
+          # Lfast on a release-branch PR reuses that branch's container (published only by builds of the
+          # release branch itself after merges) because the main container carries main's TRT-LLM wheel,
+          # not the release branch's. PR builds never overwrite it.
           IMAGE_TAG=""
           if [[ "$TEST_LEVEL" == "Lfast" && -n "$CACHE_SCOPE" ]]; then
             IMAGE_TAG="$CACHE_SCOPE"
