@@ -35,6 +35,9 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     # Rare MoE routing mismatches can dominate the mean token_mult_prob_error.
     # Check the bulk error and cap severe outlier tokens at every training step.
+    # PR #4459 observed 0-2 severe tokens/step and P99.9 up to 1.501;
+    # 60 saved H100 batches from PR #4569 observed 0-2 and up to 1.4963 offline.
+    # Keep one token of headroom; recalibrate if this recipe's token volume changes.
     # Require both metrics at all 20 steps; missing or non-finite values must fail.
     uv run tests/check_metrics.py $JSON_METRICS \
         'data["validation/accuracy"]["20"] > 0.4' \

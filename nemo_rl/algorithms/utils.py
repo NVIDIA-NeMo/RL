@@ -302,19 +302,21 @@ def compute_token_logprob_error_tail_metrics(
       10 nats (probability ratio > e^10 ~ 2e4), i.e. the rare spikes the percentile
       ignores. At ~1M tokens per step one such token moves the mean by > 0.02.
 
-    Empty when no token is valid.
+    Empty when no token is valid. A non-finite error on any valid token makes
+    the percentile infinite, so rare NaN/Inf values cannot evade a tail check.
     """
     mask = (token_mask * sample_mask.unsqueeze(-1)).bool()
     errors = (generation_logprobs - prev_logprobs).abs()[mask].float()
     if errors.numel() == 0:
         return {}
-    k = math.ceil(0.999 * errors.numel())
-    return {
+    if torch.isfinite(errors).all():
+        k = math.ceil(0.999 * errors.numel())
         # float64 exp saturates to inf instead of raising like math.exp above ~709 nats.
-        "token_mult_prob_error_p999": torch.kthvalue(errors, k)
-        .values.double()
-        .exp()
-        .item(),
+        p999 = torch.kthvalue(errors, k).values.double().exp().item()
+    else:
+        p999 = float("inf")
+    return {
+        "token_mult_prob_error_p999": p999,
         "num_tokens_logprob_error_above_10_nats": int((errors > 10.0).sum().item()),
     }
 

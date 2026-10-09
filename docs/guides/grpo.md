@@ -726,6 +726,7 @@ Because it is a mean, a single token whose logprobs differ by tens of nats (for 
 * `num_tokens_logprob_error_above_10_nats`: the number of tokens whose logprobs differ by more than 10 nats (a probability ratio above $e^{10} \approx 2 \times 10^4$). These are the spikes that dominate `token_mult_prob_error`.
 
 Neither is logged when `force_on_policy_ratio` skips the separate logprob pass or when a step has no loss tokens.
+If any loss token has a non-finite logprob error, `token_mult_prob_error_p999` is infinite so the percentile cannot hide numerical failures among the rare outliers. Non-finite values outside the loss mask are ignored.
 
 ### KL Divergence Error
 This feature is controlled by the following metrics:

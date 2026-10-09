@@ -1132,6 +1132,48 @@ def test_compute_token_logprob_error_tail_metrics():
     )
 
 
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -float("inf")])
+def test_token_logprob_tail_metrics_do_not_hide_nonfinite_tokens(
+    invalid: float,
+) -> None:
+    # One bad token is below the percentile's 0.1% tail and the severe-token cap.
+    # It must still fail the nightly's finite-value check.
+    generation = torch.zeros(1, 2000)
+    previous = torch.zeros_like(generation)
+    previous[0, -1] = invalid
+    token_mask = torch.ones_like(generation)
+    metrics = compute_token_logprob_error_tail_metrics(
+        generation_logprobs=generation,
+        prev_logprobs=previous,
+        token_mask=token_mask,
+        sample_mask=torch.ones(1),
+    )
+    assert metrics["token_mult_prob_error_p999"] == math.inf
+
+    # Invalid values outside the loss mask do not affect the metrics.
+    token_mask[0, -1] = 0
+    metrics = compute_token_logprob_error_tail_metrics(
+        generation_logprobs=generation,
+        prev_logprobs=previous,
+        token_mask=token_mask,
+        sample_mask=torch.ones(1),
+    )
+    assert metrics == {
+        "token_mult_prob_error_p999": 1.0,
+        "num_tokens_logprob_error_above_10_nats": 0,
+    }
+
+
+def test_token_logprob_tail_metrics_count_strictly_above_ten_nats() -> None:
+    metrics = compute_token_logprob_error_tail_metrics(
+        generation_logprobs=torch.zeros(1, 4),
+        prev_logprobs=torch.tensor([[-10.0, 10.0, -10.01, 10.01]]),
+        token_mask=torch.ones(1, 4),
+        sample_mask=torch.ones(1),
+    )
+    assert metrics["num_tokens_logprob_error_above_10_nats"] == 2
+
+
 class TestPrintEfficiencySummary:
     def test_basic_efficiency_calculation(self, capsys):
         """Test that efficiency is computed correctly from metrics."""
