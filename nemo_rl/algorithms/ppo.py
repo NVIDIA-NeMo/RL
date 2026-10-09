@@ -198,6 +198,7 @@ class PPOConfig(BaseModel, extra="allow"):
     # Number of critic (value) passes over each rollout batch. Defaults to
     # ppo_epochs (see validate_epoch) unless explicitly set.
     critic_ppo_epochs: int = 4
+    # SingleController only: split accumulates chunks; whole_batch uses train_from_meta.
     value_training_mode: Literal["split", "whole_batch"] = "split"
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
