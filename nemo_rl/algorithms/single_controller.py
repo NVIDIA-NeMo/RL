@@ -2784,10 +2784,10 @@ class SingleControllerActor:
                 c. Claimed groups retain their _buffer_capacity permits until
                     step cleanup; evicted groups release theirs immediately.
             2. Prepare the batch.
-                a. Value model forward (PPO only), parking policy parameters and
-                    optimizer on CPU where supported. Pending policy gradients
-                    stay on GPU.
-                b. Policy and reference logprobs.
+                a. Value model forward (PPO only) and policy/reference logprobs
+                    run concurrently with dedicated value GPUs, sequentially
+                    when the models share GPUs. Shared-GPU policy state is parked
+                    on CPU for the critic; pending gradients stay on GPU.
                 c. _advantage_stage.
             3. Train on the chunk.
                 a. Policy model: train_microbatches_from_meta accumulates gradients.
@@ -3156,63 +3156,28 @@ class SingleControllerActor:
                                         await asyncio.to_thread(
                                             self._trainer.finish_inference
                                         )
-                        with (
-                            self._timer.time("value_inference"),
-                            managed_span(
-                                RLSpanGroup.ADVANTAGE,
-                                "rl.sc.value_inference",
-                                tracer=self._tracer,
-                            ),
+                        if self._value_dedicated and (
+                            self._policy_logprobs_required
+                            or self._reference_logprobs_required
                         ):
-                            train_meta = await self._value_stage(
+                            train_meta = await self._run_parallel_ppo_inference(
+                                train_meta,
+                                already_prepared=value_inference_prepared,
+                                preserve_train_step=value_step_open,
+                                step_open=step_open,
+                            )
+                        else:
+                            train_meta = await self._run_value_inference(
                                 train_meta,
                                 already_prepared=value_inference_prepared,
                                 preserve_train_step=value_step_open,
                             )
-                        value_inference_prepared = False
-                        if step_open:
-                            with self._timer.time("training_prep"):
-                                await asyncio.to_thread(
-                                    self._trainer.prepare_for_training
-                                )
-
-                    # Compute prev_logprobs / ref_logprobs
-                    if policy_logprobs_required or self._reference_logprobs_required:
-                        with (
-                            self._timer.time("logprob_inference_prep"),
-                            managed_span(
-                                RLSpanGroup.DATA_PROCESSING,
-                                "rl.sc.logprob_inference_prep",
-                                tracer=self._tracer,
-                            ),
-                        ):
-                            # Once the step is open, gradients are accumulating
-                            # in the trainer's grad buffers across chunks. The
-                            # Megatron buffer offload frees that storage outright
-                            # and its reload zeroes it, so offloading here would
-                            # discard every chunk but the last while the 1/N
-                            # normalizer still counts all of them.
-                            await asyncio.to_thread(
-                                self._trainer.prepare_for_lp_inference,
-                                keep_train_buffers=step_open or self._value_dedicated,
+                            await self._run_policy_logprobs(
+                                train_meta, step_open=step_open
                             )
-                        with (
-                            self._timer.time("policy_and_reference_logprobs"),
-                            managed_span(
-                                RLSpanGroup.LOGPROB,
-                                "rl.sc.policy_and_reference_logprobs",
-                                tracer=self._tracer,
-                            ),
-                        ):
-                            if policy_logprobs_required:
-                                await asyncio.to_thread(
-                                    self._trainer.get_logprobs_from_meta, train_meta
-                                )
-                            if self._reference_logprobs_required:
-                                await asyncio.to_thread(
-                                    self._trainer.get_reference_policy_logprobs_from_meta,
-                                    train_meta,
-                                )
+                        value_inference_prepared = False
+                    else:
+                        await self._run_policy_logprobs(train_meta, step_open=False)
                     # Compute advantages
                     with (
                         self._timer.time("advantage_calculation"),
@@ -5372,6 +5337,97 @@ class SingleControllerActor:
         self._rollout_permitted.set()
         self._rollout_manager.resume_request_deadlines()
         return aborted_stale_inflight_groups
+
+    async def _run_value_inference(
+        self,
+        meta: KVBatchMeta,
+        *,
+        already_prepared: bool,
+        preserve_train_step: bool,
+    ) -> KVBatchMeta:
+        with (
+            self._timer.time("value_inference"),
+            managed_span(
+                RLSpanGroup.ADVANTAGE,
+                "rl.sc.value_inference",
+                tracer=self._tracer,
+            ),
+        ):
+            return await self._value_stage(
+                meta,
+                already_prepared=already_prepared,
+                preserve_train_step=preserve_train_step,
+            )
+
+    async def _run_policy_logprobs(
+        self, meta: KVBatchMeta, *, step_open: bool
+    ) -> None:
+        if step_open:
+            with self._timer.time("training_prep"):
+                await asyncio.to_thread(self._trainer.prepare_for_training)
+        if not (self._policy_logprobs_required or self._reference_logprobs_required):
+            return
+        with (
+            self._timer.time("logprob_inference_prep"),
+            managed_span(
+                RLSpanGroup.DATA_PROCESSING,
+                "rl.sc.logprob_inference_prep",
+                tracer=self._tracer,
+            ),
+        ):
+            await asyncio.to_thread(
+                self._trainer.prepare_for_lp_inference,
+                keep_train_buffers=step_open or self._value_dedicated,
+            )
+        with (
+            self._timer.time("policy_and_reference_logprobs"),
+            managed_span(
+                RLSpanGroup.LOGPROB,
+                "rl.sc.policy_and_reference_logprobs",
+                tracer=self._tracer,
+            ),
+        ):
+            if self._policy_logprobs_required:
+                await asyncio.to_thread(self._trainer.get_logprobs_from_meta, meta)
+            if self._reference_logprobs_required:
+                await asyncio.to_thread(
+                    self._trainer.get_reference_policy_logprobs_from_meta, meta
+                )
+
+    async def _run_parallel_ppo_inference(
+        self,
+        meta: KVBatchMeta,
+        *,
+        already_prepared: bool,
+        preserve_train_step: bool,
+        step_open: bool,
+    ) -> KVBatchMeta:
+        value_task = asyncio.create_task(
+            self._run_value_inference(
+                meta,
+                already_prepared=already_prepared,
+                preserve_train_step=preserve_train_step,
+            )
+        )
+        logprob_task = asyncio.create_task(
+            self._run_policy_logprobs(meta, step_open=step_open)
+        )
+        pending = asyncio.gather(value_task, logprob_task, return_exceptions=True)
+        try:
+            value_result, logprob_result = await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            await pending
+            raise
+        errors = [
+            result
+            for result in (value_result, logprob_result)
+            if isinstance(result, BaseException)
+        ]
+        if len(errors) > 1:
+            raise BaseExceptionGroup("Parallel PPO inference failed", errors)
+        if errors:
+            raise errors[0]
+        return cast(KVBatchMeta, value_result)
 
     async def _value_stage(
         self,

@@ -4223,6 +4223,176 @@ def test_dedicated_value_keeps_both_models_resident_during_ppo_step(
     ]
 
 
+def test_parallel_ppo_inference_overlaps_and_joins_value_metadata() -> None:
+    async def run() -> None:
+        original_meta = object()
+        value_meta = object()
+        value_started = asyncio.Event()
+        logprobs_started = asyncio.Event()
+
+        async def value_stage(meta: object, **kwargs: object) -> object:
+            assert meta is original_meta
+            assert kwargs == {
+                "already_prepared": True,
+                "preserve_train_step": True,
+            }
+            value_started.set()
+            await asyncio.wait_for(logprobs_started.wait(), timeout=1.0)
+            return value_meta
+
+        async def logprobs(meta: object, **kwargs: object) -> None:
+            assert meta is original_meta
+            assert kwargs == {"step_open": True}
+            logprobs_started.set()
+            await asyncio.wait_for(value_started.wait(), timeout=1.0)
+
+        controller = SimpleNamespace(
+            _run_value_inference=value_stage,
+            _run_policy_logprobs=logprobs,
+        )
+        result = await asyncio.wait_for(
+            SingleControllerActor._run_parallel_ppo_inference(
+                controller,
+                original_meta,
+                already_prepared=True,
+                preserve_train_step=True,
+                step_open=True,
+            ),
+            timeout=1.0,
+        )
+        assert result is value_meta
+
+    asyncio.run(run())
+
+
+def test_dedicated_train_pump_overlaps_value_and_policy_inference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    meta = _single_group_meta()
+    calls: list[str] = []
+    value = _NoOpValue(calls=calls, prefix="critic.")
+    controller, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta), value=value
+    )
+    controller._value_dedicated = True
+    controller._policy_logprobs_required = True
+    trainer = _OrderRecordingTrainer(calls)
+    controller._trainer = trainer
+    value_started = threading.Event()
+    logprobs_started = threading.Event()
+    value_forward = value.get_values_from_meta
+    logprobs_forward = trainer.get_logprobs_from_meta
+
+    def concurrent_value_forward(batch_meta: KVBatchMeta) -> None:
+        value_started.set()
+        assert logprobs_started.wait(timeout=1.0)
+        value_forward(batch_meta)
+
+    def concurrent_logprobs_forward(batch_meta: KVBatchMeta) -> None:
+        logprobs_started.set()
+        assert value_started.wait(timeout=1.0)
+        logprobs_forward(batch_meta)
+
+    value.get_values_from_meta = concurrent_value_forward
+    trainer.get_logprobs_from_meta = concurrent_logprobs_forward
+
+    async def advantage_stage(batch_meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
+        assert "values" in batch_meta.fields
+        assert value_started.is_set() and logprobs_started.is_set()
+        return batch_meta, True
+
+    controller._advantage_stage = AsyncMock(side_effect=advantage_stage)
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(controller._train_pump(), timeout=3.0))
+
+    assert calls.count("critic.get_values_from_meta") == 1
+    assert calls.count("policy.get_logprobs_from_meta") == 1
+
+
+def test_parallel_ppo_inference_drains_peer_after_failure() -> None:
+    async def run() -> None:
+        logprobs_started = asyncio.Event()
+        release_logprobs = asyncio.Event()
+        logprobs_finished = asyncio.Event()
+
+        async def value_stage(meta: object, **kwargs: object) -> object:
+            await asyncio.wait_for(logprobs_started.wait(), timeout=1.0)
+            raise RuntimeError("value inference failed")
+
+        async def logprobs(meta: object, **kwargs: object) -> None:
+            logprobs_started.set()
+            await release_logprobs.wait()
+            logprobs_finished.set()
+
+        controller = SimpleNamespace(
+            _run_value_inference=value_stage,
+            _run_policy_logprobs=logprobs,
+        )
+        task = asyncio.create_task(
+            SingleControllerActor._run_parallel_ppo_inference(
+                controller,
+                object(),
+                already_prepared=False,
+                preserve_train_step=False,
+                step_open=False,
+            )
+        )
+        await asyncio.wait_for(logprobs_started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        assert not task.done()
+        release_logprobs.set()
+        with pytest.raises(RuntimeError, match="value inference failed"):
+            await asyncio.wait_for(task, timeout=1.0)
+        assert logprobs_finished.is_set()
+
+    asyncio.run(run())
+
+
+def test_parallel_ppo_inference_drains_both_tasks_on_cancellation() -> None:
+    async def run() -> None:
+        value_started = asyncio.Event()
+        logprobs_started = asyncio.Event()
+        release = asyncio.Event()
+        finished: list[str] = []
+
+        async def value_stage(meta: object, **kwargs: object) -> object:
+            value_started.set()
+            await release.wait()
+            finished.append("value")
+            return meta
+
+        async def logprobs(meta: object, **kwargs: object) -> None:
+            logprobs_started.set()
+            await release.wait()
+            finished.append("logprobs")
+
+        controller = SimpleNamespace(
+            _run_value_inference=value_stage,
+            _run_policy_logprobs=logprobs,
+        )
+        task = asyncio.create_task(
+            SingleControllerActor._run_parallel_ppo_inference(
+                controller,
+                object(),
+                already_prepared=False,
+                preserve_train_step=False,
+                step_open=False,
+            )
+        )
+        await asyncio.wait_for(value_started.wait(), timeout=1.0)
+        await asyncio.wait_for(logprobs_started.wait(), timeout=1.0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        assert set(finished) == {"value", "logprobs"}
+
+    asyncio.run(run())
+
+
 def test_train_pump_parks_the_policy_when_neither_logprob_is_needed(
     monkeypatch,
 ) -> None:
