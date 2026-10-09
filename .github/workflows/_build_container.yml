@@ -187,8 +187,15 @@ jobs:
             CCACHE_TAG_PREFIX="${CCACHE_TAG_PREFIX:+${CCACHE_TAG_PREFIX}-${CACHE_SCOPE}}"
             WHEEL_TAG_PREFIX="${WHEEL_TAG_PREFIX:+${WHEEL_TAG_PREFIX}-${CACHE_SCOPE}}"
           fi
+          # Only builds of main or of a release branch itself may write the shared TRT-LLM cache images;
+          # PR builds still read (seed from) them but never push, so an unmerged PR cannot alter them.
+          PUBLISH_CACHE=false
+          if [[ "$GH_REF" == "refs/heads/main" || "$GH_REF" =~ ^refs/heads/r[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            PUBLISH_CACHE=true
+          fi
           {
             echo "arch=$ARCH"
+            echo "publish=$PUBLISH_CACHE"
             if [[ -n "$CCACHE_TAG_PREFIX" ]]; then
               echo "ccache_tag=${CCACHE_TAG_PREFIX}-${ARCH}-${CACHE_KEY}"
             fi
@@ -444,7 +451,7 @@ jobs:
         # Cache mounts survive a failed RUN in the current Buildx builder. Run
         # this step after both successful and failed image builds so completed
         # compiler outputs are preserved for the next retry.
-        if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.ccache_tag != '' && steps.trtllm_cache_export.outcome == 'success' && steps.trtllm_cache_delta.outputs.ccache_has_delta != 'false' }}
+        if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.publish == 'true' && steps.trtllm_cache.outputs.ccache_tag != '' && steps.trtllm_cache_export.outcome == 'success' && steps.trtllm_cache_delta.outputs.ccache_has_delta != 'false' }}
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           file: ${{ inputs.dockerfile }}
@@ -470,7 +477,7 @@ jobs:
       - name: Update TRT-LLM wheel cache image
         # Persist the custom wheel even when the release build fails, so a
         # retry can reuse completed compilation work.
-        if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.wheel_tag != '' && steps.trtllm_cache_export.outcome == 'success' && steps.trtllm_cache_delta.outputs.wheel_has_delta != 'false' }}
+        if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.publish == 'true' && steps.trtllm_cache.outputs.wheel_tag != '' && steps.trtllm_cache_export.outcome == 'success' && steps.trtllm_cache_delta.outputs.wheel_has_delta != 'false' }}
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           file: ${{ inputs.dockerfile }}
