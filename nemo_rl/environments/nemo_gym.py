@@ -504,6 +504,10 @@ def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
+    # Session-trace training mode; a default so focused tests that build the
+    # actor without __init__ (and restarted actors) read None, not AttributeError.
+    _training_mode: Optional[str] = None
+
     def __init__(self, cfg: NemoGymConfig):
         # Named explicitly: built from the environment registry rather than
         # by RayWorkerGroup, so nothing sets NRL_WORKER_GROUP for it.
