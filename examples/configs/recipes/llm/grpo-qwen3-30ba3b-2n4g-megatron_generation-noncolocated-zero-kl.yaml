@@ -8,9 +8,18 @@ checkpointing:
 policy:
   train_global_batch_size: 32
   max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 64
   megatron_cfg:
     zero_train_gen_mismatch: true
+    batch_invariant_mode: true
+    batch_invariant_backend: te_native
+    batch_invariant_collective: ordered
+    attention_backend: flash
+    flash_attention_version: 4
     moe_permute_fusion: false
+    env_vars:
+      CUBLASLT_WORKSPACE_SIZE: '0'
+      CUBLAS_WORKSPACE_CONFIG: :0:0
     tensor_model_parallel_size: 1
     expert_model_parallel_size: 4
     moe_router_dtype: fp32

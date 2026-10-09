@@ -44,7 +44,6 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     RefitPayloadMode,
 )
-from nemo_rl.models.megatron.batch_invariant import batch_invariant_token_multiple
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import (
@@ -251,27 +250,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "two."
             )
         if megatron_enabled:
-            if (
-                config["megatron_cfg"].get("batch_invariant_mode")
-                or config["megatron_cfg"].get("zero_train_gen_mismatch")
-            ) and not config["sequence_packing"]["enabled"]:
-                # Align policy token dims with MCore generation buckets. Also
-                # keyed on zero_train_gen_mismatch: Policy is built before the
-                # workers resolve it into batch_invariant_mode.
-                tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
-                config["make_sequence_length_divisible_by"] = (
-                    batch_invariant_token_multiple(
-                        config["make_sequence_length_divisible_by"], tp_size=tp_size
-                    )
-                )
-                if config["dynamic_batching"]["enabled"]:
-                    config["dynamic_batching"]["sequence_length_round"] = (
-                        batch_invariant_token_multiple(
-                            config["dynamic_batching"]["sequence_length_round"],
-                            tp_size=tp_size,
-                        )
-                    )
-
             worker_builder_cls_fqn = resolve_policy_worker_cls(
                 "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
                 config,
@@ -281,14 +259,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
             env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
-            # Workspace-free cuBLAS for te_native / zero-KL; must be set before
-            # CUDA init in the actor.
-            if (
-                config["megatron_cfg"].get("batch_invariant_mode")
-                and config["megatron_cfg"].get("batch_invariant_backend") == "te_native"
-            ) or config["megatron_cfg"].get("zero_train_gen_mismatch"):
-                env_vars["CUBLASLT_WORKSPACE_SIZE"] = "0"
-                env_vars["CUBLAS_WORKSPACE_CONFIG"] = ":0:0"
 
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(

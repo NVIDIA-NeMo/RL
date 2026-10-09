@@ -132,6 +132,8 @@ policy:
     moe_router_bias_update_rate: 1.0e-3
     moe_permute_fusion: true
     apply_rope_fusion: true
+    # Pin FA2; flash-attn-4 is installed, so TE would otherwise pick FA4. Zero-KL recipes set 4.
+    flash_attention_version: 2
     bias_activation_fusion: true
     defer_fp32_logits: false
     moe_per_layer_logging: false

@@ -34,12 +34,8 @@ uv run --no-sync examples/run_grpo.py \
 
 uv run --no-sync tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# The preset must have switched the kernels on, and must not have had to
-# override anything the recipe sets (an override means the recipe drifted from
-# the preset and would reintroduce train/generation mismatch).
+# The recipe must have switched the batch-invariant kernels on.
 grep -F -q "[zero_train_gen_mismatch] batch-invariant kernels enabled: backend=te_native collective=ordered flash_attention_version=4" $RUN_LOG
-assert_not_grep "zero_train_gen_mismatch=true overrides" $RUN_LOG \
-    "Recipe values conflict with the zero_train_gen_mismatch preset"
 
 MAX_RECORDED_STEP=$(jq -r 'if has("train/loss") then (."train/loss" | keys | map(tonumber) | max // 0) else 0 end' $JSON_METRICS)
 if [[ $MAX_RECORDED_STEP -lt $MAX_STEPS ]]; then

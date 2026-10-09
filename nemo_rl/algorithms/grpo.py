@@ -141,6 +141,7 @@ from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
+from nemo_rl.models.megatron.zero_train_gen_mismatch import validate_zero_train_gen_kl
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -861,6 +862,9 @@ def setup(
         )
 
     _validate_use_kl_in_reward_compat(master_config)
+
+    # Fail on an invalid zero-KL config before Ray allocates GPUs.
+    validate_zero_train_gen_kl(policy_config, check_environment=False)
 
     # ==========================
     #          Cluster

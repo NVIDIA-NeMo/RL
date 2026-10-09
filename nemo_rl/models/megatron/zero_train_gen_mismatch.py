@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Zero train/generation KL (batch-invariant Megatron) resolve, validate, and enable.
+"""Zero train/generation KL (batch-invariant Megatron): validate the recipe, then enable.
 
-Only BF16 (no FP8) is supported.
+The recipe sets every required value; this module only checks them. Only BF16
+(no FP8) is supported.
 """
 
 from __future__ import annotations
@@ -28,7 +29,12 @@ from typing import TYPE_CHECKING, Any
 import torch
 from packaging.version import Version
 
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
+from nemo_rl.models.megatron.batch_invariant import batch_invariant_token_multiple
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
@@ -45,7 +51,7 @@ TRANSFORMER_ENGINE_MIN_VERSION = Version("2.18")
 FLASH_ATTN_MIN_VERSION = Version("2.8.1")
 CUTEDSL_MIN_VERSION = Version("4.6.0.dev0")
 
-_ZERO_KL_MEGATRON_DEFAULTS: dict[str, Any] = {
+_ZERO_KL_MEGATRON_REQUIRED: dict[str, Any] = {
     "batch_invariant_mode": True,
     "moe_permute_fusion": False,
     "attention_backend": "flash",
@@ -54,9 +60,14 @@ _ZERO_KL_MEGATRON_DEFAULTS: dict[str, Any] = {
     "batch_invariant_collective": "ordered",
 }
 
-_ZERO_KL_GENERATION_DEFAULTS: dict[str, Any] = {
-    "logprobs_mode": "raw_logprobs",
+_ZERO_KL_GENERATION_REQUIRED: dict[str, Any] = {
     "enable_chunked_prefill": False,
+}
+
+# Workspace-free cuBLAS (fixed reduction order) for the te_native backend.
+_TE_NATIVE_ENV_VARS = {
+    "CUBLASLT_WORKSPACE_SIZE": "0",
+    "CUBLAS_WORKSPACE_CONFIG": ":0:0",
 }
 
 
@@ -78,37 +89,6 @@ class ZeroTrainGenValidation:
             warnings.warn(msg, UserWarning, stacklevel=3)
 
 
-def resolve_zero_train_gen_mismatch(config: PolicyConfig) -> None:
-    """Apply zero-KL defaults; warn when overriding user recipe values."""
-    if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
-        return
-
-    mc = config["megatron_cfg"]
-    generation = config.get("generation")
-    defaults: list[tuple[dict[str, Any], str, dict[str, Any]]] = [
-        (mc, "policy.megatron_cfg", _ZERO_KL_MEGATRON_DEFAULTS),
-    ]
-    if generation is not None:
-        defaults.append(
-            (
-                generation["mcore_generation_config"],
-                "policy.generation.mcore_generation_config",
-                _ZERO_KL_GENERATION_DEFAULTS,
-            )
-        )
-    for cfg, config_path, values in defaults:
-        for key, value in values.items():
-            if key in cfg and cfg[key] != value:
-                warnings.warn(
-                    f"zero_train_gen_mismatch=true overrides {config_path}.{key}"
-                    f"={cfg[key]!r} with {value!r}: the configured value would "
-                    "reintroduce train/generation mismatch.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-            cfg[key] = value
-
-
 def validate_zero_train_gen_mismatch(
     config: PolicyConfig,
     *,
@@ -120,8 +100,9 @@ def validate_zero_train_gen_mismatch(
     if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return out
 
+    _validate_required_values(config, out)
     _validate_backend(config, out)
-    _validate_platform(config, out, check_device=check_platform)
+    _validate_platform(out, check_device=check_platform)
     if check_packages:
         _validate_packages(out)
     _validate_precision(config, out)
@@ -163,6 +144,34 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             "packing changes microbatch composition and the packed log-prob path "
             "does not share generation's fused log-softmax."
         )
+    token_multiple = batch_invariant_token_multiple(
+        megatron_cfg["tensor_model_parallel_size"]
+    )
+    if config["make_sequence_length_divisible_by"] % token_multiple:
+        out.violations.append(
+            "batch_invariant_mode=True requires policy.make_sequence_length_divisible_by "
+            f"to be a multiple of {token_multiple} to align with MCore generation "
+            f"buckets (got {config['make_sequence_length_divisible_by']})."
+        )
+    dynamic_batching = config["dynamic_batching"]
+    if (
+        dynamic_batching["enabled"]
+        and dynamic_batching["sequence_length_round"] % token_multiple
+    ):
+        out.violations.append(
+            "batch_invariant_mode=True requires "
+            f"policy.dynamic_batching.sequence_length_round to be a multiple of "
+            f"{token_multiple} (got {dynamic_batching['sequence_length_round']})."
+        )
+    if megatron_cfg.get("batch_invariant_backend") == "te_native":
+        env_vars = megatron_cfg.get("env_vars") or {}
+        for key, value in _TE_NATIVE_ENV_VARS.items():
+            if env_vars.get(key) != value:
+                out.violations.append(
+                    f"batch_invariant_backend='te_native' requires "
+                    f"policy.megatron_cfg.env_vars.{key}={value!r} "
+                    f"(got {env_vars.get(key)!r})."
+                )
     if megatron_cfg.get("use_fused_linear_logprobs"):
         out.violations.append(
             "batch_invariant_mode=True is incompatible with "
@@ -196,6 +205,24 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
                 "batch_invariant_mode=True with "
                 "transformer_impl='inference_optimized' requires "
                 "policy.precision='bfloat16'."
+            )
+        if inference_cfg.get("logprobs_mode") != "raw_logprobs":
+            out.violations.append(
+                "batch_invariant_mode=True requires "
+                "policy.generation.mcore_generation_config.logprobs_mode='raw_logprobs' "
+                f"(got {inference_cfg.get('logprobs_mode')!r})."
+            )
+        sampling = TrainingSamplingParams(
+            top_k=generation_cfg["top_k"],
+            top_p=generation_cfg["top_p"],
+            temperature=generation_cfg["temperature"],
+        )
+        if sampling.temperature != 1.0 or need_top_k_or_top_p_filtering(sampling):
+            out.violations.append(
+                "batch_invariant_mode=True scores raw logprobs, so it requires "
+                "policy.generation.temperature=1.0, top_p=1.0, top_k=null "
+                f"(got temperature={sampling.temperature}, top_p={sampling.top_p}, "
+                f"top_k={sampling.top_k})."
             )
         matching_fields = (
             "tensor_model_parallel_size",
@@ -311,20 +338,21 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     )
 
 
-def configure_zero_train_gen_mismatch(
-    config: PolicyConfig,
-    *,
-    apply_kernels: bool,
+def validate_zero_train_gen_kl(
+    config: PolicyConfig, *, check_environment: bool
 ) -> None:
-    """Resolve, validate, and optionally enable batch-invariant kernels."""
-    if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
-        return
+    """Raise if the zero-KL / batch-invariant config is invalid.
 
-    resolve_zero_train_gen_mismatch(config)
+    ``check_environment=False`` runs only the config checks, so the driver can
+    call it before Ray allocates GPUs; workers also check the installed
+    packages and the GPU.
+    """
+    if "megatron_cfg" not in config:  # DTensor / Automodel policies
+        return
     result = validate_zero_train_gen_mismatch(
         config,
-        check_packages=apply_kernels,
-        check_platform=apply_kernels,
+        check_packages=check_environment,
+        check_platform=check_environment,
     )
     result.emit_warnings()
     result.raise_if_invalid(
@@ -335,10 +363,29 @@ def configure_zero_train_gen_mismatch(
     bi_result.emit_warnings()
     bi_result.raise_if_invalid("batch_invariant_mode=True failed validation:")
 
-    if not apply_kernels:
-        return
 
-    enable_batch_invariant_kernels(config)
+def _validate_required_values(
+    config: PolicyConfig, out: ZeroTrainGenValidation
+) -> None:
+    """The recipe must set every value the preset needs; nothing is rewritten."""
+    megatron_cfg = config["megatron_cfg"]
+    for key, value in _ZERO_KL_MEGATRON_REQUIRED.items():
+        if megatron_cfg.get(key) != value:
+            out.violations.append(
+                f"policy.megatron_cfg.{key} must be {value!r} "
+                f"(got {megatron_cfg.get(key)!r})."
+            )
+
+    generation = config.get("generation")
+    if generation is None or generation.get("backend") != "megatron":
+        return  # reported by _validate_backend
+    mcore_generation_config = generation["mcore_generation_config"]
+    for key, value in _ZERO_KL_GENERATION_REQUIRED.items():
+        if mcore_generation_config.get(key) != value:
+            out.violations.append(
+                f"policy.generation.mcore_generation_config.{key} must be "
+                f"{value!r} (got {mcore_generation_config.get(key)!r})."
+            )
 
 
 def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
@@ -364,20 +411,8 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
         )
 
 
-def _validate_platform(
-    config: PolicyConfig, out: ZeroTrainGenValidation, *, check_device: bool
-) -> None:
+def _validate_platform(out: ZeroTrainGenValidation, *, check_device: bool) -> None:
     """Blackwell + FA4 only (mcore extra: flash-attn-4, CuteDSL). Hopper/FA3 not supported."""
-    megatron_cfg = config["megatron_cfg"]
-    fa_ver = megatron_cfg.get("flash_attention_version")
-    if fa_ver != 4:
-        out.violations.append(
-            "zero_train_gen_mismatch requires policy.megatron_cfg."
-            f"flash_attention_version=4 (got {fa_ver!r}). Hopper (FA3) is not "
-            "supported; use Blackwell with the flash-attn-4 stack."
-        )
-        return
-
     if not check_device:
         return
 

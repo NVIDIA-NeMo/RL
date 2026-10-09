@@ -329,9 +329,8 @@ from nemo_rl.models.megatron.router_replay import (
     validate_router_replay_config,
 )
 from nemo_rl.models.megatron.zero_train_gen_mismatch import (
-    configure_zero_train_gen_mismatch,
     enable_batch_invariant_kernels,
-    validate_batch_invariant_mode,
+    validate_zero_train_gen_kl,
     validate_zero_train_gen_model_provider,
 )
 from nemo_rl.models.policy import (
@@ -440,24 +439,10 @@ def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, 
 
 
 def enable_batch_invariant_mode(config: PolicyConfig) -> None:
-    """Validate and enable Megatron-Core batch-invariant kernels before CUDA init."""
-    if not config["megatron_cfg"].get("batch_invariant_mode"):
-        return
-
-    result = validate_batch_invariant_mode(config)
-    result.raise_if_invalid("batch_invariant_mode=True failed validation:")
-    enable_batch_invariant_kernels(config)
-
-
-def enable_zero_train_gen_kl(
-    config: PolicyConfig, *, apply_kernels: bool = True
-) -> None:
-    """Resolve zero_train_gen_mismatch into batch-invariant defaults and enable it.
-
-    Recipe values that differ from the defaults are overridden with a warning.
-    Call with ``apply_kernels=True`` before CUDA init.
-    """
-    configure_zero_train_gen_mismatch(config, apply_kernels=apply_kernels)
+    """Validate, then enable Megatron-Core batch-invariant kernels before CUDA init."""
+    validate_zero_train_gen_kl(config, check_environment=True)
+    if config["megatron_cfg"].get("batch_invariant_mode"):
+        enable_batch_invariant_kernels(config)
 
 
 def destroy_parallel_state():
@@ -557,9 +542,6 @@ def validate_and_set_config(
             "with TP>1: set policy.megatron_cfg.sequence_parallel=true."
         )
 
-    # Must run before sampling_params: it resolves batch_invariant_mode.
-    enable_zero_train_gen_kl(config, apply_kernels=False)
-
     # Handle generation configuration
     is_generation_colocated = None
     sampling_params = None
@@ -567,13 +549,12 @@ def validate_and_set_config(
         generation_cfg = config["generation"]
         # set generation colocated
         is_generation_colocated = generation_cfg["colocated"]["enabled"]
-        # Batch-invariant generation returns raw logprobs; score the same way.
-        if not config["megatron_cfg"].get("batch_invariant_mode"):
-            sampling_params = TrainingSamplingParams(
-                top_k=generation_cfg["top_k"],
-                top_p=generation_cfg["top_p"],
-                temperature=generation_cfg["temperature"],
-            )
+        # set sampling params
+        sampling_params = TrainingSamplingParams(
+            top_k=generation_cfg["top_k"],
+            top_p=generation_cfg["top_p"],
+            temperature=generation_cfg["temperature"],
+        )
 
     # Setup data types
     dtype_map = {

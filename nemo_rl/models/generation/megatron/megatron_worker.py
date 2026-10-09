@@ -600,12 +600,7 @@ class MegatronGenerationMixin:
                 0.1 + 0.1 * num_speculative_tokens if is_hybrid_model else None
             ),
             "num_speculative_tokens": num_speculative_tokens,
-            # Batch-invariant generation reports raw logprobs, like policy scoring.
-            "logprobs_mode": (
-                "raw_logprobs"
-                if self.cfg["megatron_cfg"].get("batch_invariant_mode")
-                else mcore_generation_config["logprobs_mode"]
-            ),
+            "logprobs_mode": mcore_generation_config["logprobs_mode"],
             "max_requests": max_requests,
             "image_preprocessing_config": image_preprocessing_config,
             "video_preprocessing_config": video_preprocessing_config,

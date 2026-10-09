@@ -1,7 +1,7 @@
 """Unit tests for the zero train/generation KL preset (`zero_train_gen_mismatch`).
 
 Everything here is CPU-only. Megatron-Core, Transformer Engine and FlashAttention
-are replaced by small fake modules so the resolve / validate / enable logic runs
+are replaced by small fake modules so the validate / enable logic runs
 in any environment, and the shipped zero-KL recipes are loaded from disk and
 pushed through the same gates the workers run at startup.
 """
@@ -9,12 +9,12 @@ pushed through the same gates the workers run at startup.
 import copy
 import sys
 import types
-import warnings
 from dataclasses import make_dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from omegaconf import OmegaConf
 from packaging.version import Version
 
@@ -37,12 +37,24 @@ GOOD_VERSIONS = {
 
 
 def _policy_config() -> dict[str, Any]:
-    """Smallest policy config that passes every zero-KL gate."""
+    """Smallest policy config that passes every zero-KL gate (recipe-complete)."""
     return {
         "precision": "bfloat16",
+        "make_sequence_length_divisible_by": 64,
         "sequence_packing": {"enabled": False},
+        "dynamic_batching": {"enabled": False, "sequence_length_round": 64},
         "megatron_cfg": {
             "zero_train_gen_mismatch": True,
+            "batch_invariant_mode": True,
+            "batch_invariant_backend": "te_native",
+            "batch_invariant_collective": "ordered",
+            "attention_backend": "flash",
+            "flash_attention_version": 4,
+            "moe_permute_fusion": False,
+            "env_vars": {
+                "CUBLASLT_WORKSPACE_SIZE": "0",
+                "CUBLAS_WORKSPACE_CONFIG": ":0:0",
+            },
             "tensor_model_parallel_size": 1,
             "pipeline_model_parallel_size": 1,
             "context_parallel_size": 1,
@@ -52,16 +64,17 @@ def _policy_config() -> dict[str, Any]:
         },
         "generation": {
             "backend": "megatron",
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": None,
             "colocated": {"enabled": False},
-            "mcore_generation_config": {"transformer_impl": "inference_optimized"},
+            "mcore_generation_config": {
+                "transformer_impl": "inference_optimized",
+                "logprobs_mode": "raw_logprobs",
+                "enable_chunked_prefill": False,
+            },
         },
     }
-
-
-def _resolved_config() -> dict[str, Any]:
-    config = _policy_config()
-    zgm.resolve_zero_train_gen_mismatch(config)
-    return config
 
 
 def _install_fake_module(
@@ -114,55 +127,49 @@ def test_emit_warnings_raises_user_warnings():
 
 
 # --------------------------------------------------------------------------- #
-# resolve_zero_train_gen_mismatch
+# Required values: the recipe sets them, the validator checks them
 # --------------------------------------------------------------------------- #
 
 
-def test_resolve_applies_defaults_on_both_sides():
-    config = _resolved_config()
-    megatron_cfg = config["megatron_cfg"]
-    generation_cfg = config["generation"]["mcore_generation_config"]
-
-    assert megatron_cfg["batch_invariant_mode"] is True
-    assert megatron_cfg["moe_permute_fusion"] is False
-    assert megatron_cfg["attention_backend"] == "flash"
-    assert megatron_cfg["flash_attention_version"] == 4
-    assert megatron_cfg["batch_invariant_backend"] == "te_native"
-    assert megatron_cfg["batch_invariant_collective"] == "ordered"
-    assert generation_cfg["logprobs_mode"] == "raw_logprobs"
-    assert generation_cfg["enable_chunked_prefill"] is False
-
-
-def test_resolve_does_not_warn_when_recipe_already_matches():
+def test_valid_recipe_values_are_accepted_without_modification():
     config = _policy_config()
-    config["megatron_cfg"]["moe_permute_fusion"] = False
-    config["megatron_cfg"]["flash_attention_version"] = 4
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        zgm.resolve_zero_train_gen_mismatch(config)
-
-
-def test_resolve_warns_and_overrides_a_conflicting_value():
-    config = _policy_config()
-    config["megatron_cfg"]["flash_attention_version"] = 3
-    with pytest.warns(UserWarning, match="flash_attention_version"):
-        zgm.resolve_zero_train_gen_mismatch(config)
-    assert config["megatron_cfg"]["flash_attention_version"] == 4
-
-
-def test_resolve_is_a_noop_when_the_preset_is_off():
-    config = _policy_config()
-    config["megatron_cfg"]["zero_train_gen_mismatch"] = False
     before = copy.deepcopy(config)
-    zgm.resolve_zero_train_gen_mismatch(config)
-    assert config == before
+    result = _validate(config)
+    assert result.violations == []
+    assert config == before  # the validator never rewrites the config
 
 
-def test_resolve_without_generation_only_touches_megatron_cfg():
+@pytest.mark.parametrize(
+    ("key", "bad"),
+    [
+        ("batch_invariant_mode", False),
+        ("moe_permute_fusion", True),
+        ("attention_backend", "fused"),
+        ("flash_attention_version", 2),
+        ("batch_invariant_backend", "triton"),
+        ("batch_invariant_collective", "multimem"),
+    ],
+)
+def test_validate_rejects_a_wrong_megatron_value_without_rewriting_it(key, bad):
     config = _policy_config()
-    del config["generation"]
-    zgm.resolve_zero_train_gen_mismatch(config)
-    assert config["megatron_cfg"]["batch_invariant_mode"] is True
+    config["megatron_cfg"][key] = bad
+    result = _validate(config)
+    assert any(f"policy.megatron_cfg.{key} must be" in v for v in result.violations)
+    assert config["megatron_cfg"][key] == bad
+
+
+def test_validate_rejects_a_missing_required_megatron_value():
+    config = _policy_config()
+    del config["megatron_cfg"]["moe_permute_fusion"]
+    result = _validate(config)
+    assert any("moe_permute_fusion must be False" in v for v in result.violations)
+
+
+def test_validate_rejects_chunked_prefill():
+    config = _policy_config()
+    config["generation"]["mcore_generation_config"]["enable_chunked_prefill"] = True
+    result = _validate(config)
+    assert any("enable_chunked_prefill must be False" in v for v in result.violations)
 
 
 # --------------------------------------------------------------------------- #
@@ -171,26 +178,27 @@ def test_resolve_without_generation_only_touches_megatron_cfg():
 
 
 def test_batch_invariant_valid_config_has_no_findings():
-    result = zgm.validate_batch_invariant_mode(_resolved_config())
+    result = zgm.validate_batch_invariant_mode(_policy_config())
     assert result.violations == []
     assert result.warnings == []
 
 
 def test_batch_invariant_off_reports_nothing():
     config = _policy_config()
+    config["megatron_cfg"]["batch_invariant_mode"] = False
     config["megatron_cfg"]["context_parallel_size"] = 4
     assert zgm.validate_batch_invariant_mode(config).violations == []
 
 
 def test_batch_invariant_rejects_tensor_parallel():
-    config = _resolved_config()
+    config = _policy_config()
     config["megatron_cfg"]["tensor_model_parallel_size"] = 2
     result = zgm.validate_batch_invariant_mode(config)
     assert any("tensor_model_parallel_size=1" in v for v in result.violations)
 
 
 def test_batch_invariant_reports_a_train_generation_tp_mismatch():
-    config = _resolved_config()
+    config = _policy_config()
     config["megatron_cfg"]["tensor_model_parallel_size"] = 2
     config["generation"]["mcore_generation_config"]["tensor_model_parallel_size"] = 1
     result = zgm.validate_batch_invariant_mode(config)
@@ -232,14 +240,14 @@ def test_batch_invariant_reports_a_train_generation_tp_mismatch():
     ids=["cp", "packing", "fused-logprobs", "attention", "fa-version", "gen", "dtype"],
 )
 def test_batch_invariant_rejects_unsupported_settings(mutate, expected):
-    config = _resolved_config()
+    config = _policy_config()
     mutate(config)
     result = zgm.validate_batch_invariant_mode(config)
     assert any(expected in v for v in result.violations), result.violations
 
 
-def test_batch_invariant_requires_the_resolved_fields():
-    config = _resolved_config()
+def test_batch_invariant_requires_the_batch_invariant_fields():
+    config = _policy_config()
     del config["megatron_cfg"]["batch_invariant_backend"]
     result = zgm.validate_batch_invariant_mode(config)
     assert any("batch_invariant_backend" in v for v in result.violations)
@@ -257,7 +265,7 @@ def _validate(config: dict[str, Any], **kwargs: Any) -> zgm.ZeroTrainGenValidati
 
 
 def test_validate_valid_config_has_no_findings():
-    result = _validate(_resolved_config())
+    result = _validate(_policy_config())
     assert result.violations == []
     assert result.warnings == []
 
@@ -270,28 +278,28 @@ def test_validate_is_a_noop_when_the_preset_is_off():
 
 
 def test_validate_rejects_a_non_megatron_generation_backend():
-    config = _resolved_config()
+    config = _policy_config()
     config["generation"]["backend"] = "vllm"
     result = _validate(config)
     assert any("generation.backend must be 'megatron'" in v for v in result.violations)
 
 
 def test_validate_rejects_colocated_generation():
-    config = _resolved_config()
+    config = _policy_config()
     config["generation"]["colocated"] = {"enabled": True}
     result = _validate(config)
     assert any("does not support colocated generation" in v for v in result.violations)
 
 
 def test_validate_rejects_missing_generation_block():
-    config = _resolved_config()
+    config = _policy_config()
     del config["generation"]
     result = _validate(config)
     assert any("generation.backend must be 'megatron'" in v for v in result.violations)
 
 
 def test_validate_rejects_a_non_inference_optimized_generation_transformer_impl():
-    config = _resolved_config()
+    config = _policy_config()
     config["generation"]["mcore_generation_config"]["transformer_impl"] = (
         "transformer_engine"
     )
@@ -301,13 +309,13 @@ def test_validate_rejects_a_non_inference_optimized_generation_transformer_impl(
 
 @pytest.mark.parametrize("version", [None, 3, 2])
 def test_validate_requires_flash_attention_4(version):
-    config = _resolved_config()
+    config = _policy_config()
     if version is None:
         del config["megatron_cfg"]["flash_attention_version"]
     else:
         config["megatron_cfg"]["flash_attention_version"] = version
     result = _validate(config)
-    assert any("flash_attention_version=4" in v for v in result.violations)
+    assert any("flash_attention_version must be 4" in v for v in result.violations)
 
 
 @pytest.mark.parametrize(
@@ -319,7 +327,7 @@ def test_validate_requires_flash_attention_4(version):
     ],
 )
 def test_validate_provider_rejects_unsupported_architecture(key, value):
-    config = _resolved_config()
+    config = _policy_config()
     model_cfg = types.SimpleNamespace(**{key: value})
 
     with pytest.raises(ValueError, match=key):
@@ -327,7 +335,7 @@ def test_validate_provider_rejects_unsupported_architecture(key, value):
 
 
 def test_validate_provider_is_noop_when_the_preset_is_off():
-    config = _resolved_config()
+    config = _policy_config()
     config["megatron_cfg"]["zero_train_gen_mismatch"] = False
     model_cfg = types.SimpleNamespace(multi_latent_attention=True)
 
@@ -335,14 +343,14 @@ def test_validate_provider_is_noop_when_the_preset_is_off():
 
 
 def test_validate_rejects_non_bf16_precision():
-    config = _resolved_config()
+    config = _policy_config()
     config["precision"] = "float16"
     assert any("precision='bfloat16'" in v for v in _validate(config).violations)
 
 
 @pytest.mark.parametrize("side", ["train", "generation"])
 def test_validate_rejects_fp8_on_either_side(side):
-    config = _resolved_config()
+    config = _policy_config()
     if side == "train":
         config["megatron_cfg"]["fp8_cfg"] = {"enabled": True}
     else:
@@ -447,9 +455,8 @@ def test_megatron_core_feature_probe_reports_a_missing_install(monkeypatch):
 
 
 def test_platform_device_check_is_skipped_without_check_device():
-    config = _resolved_config()
     out = zgm.ZeroTrainGenValidation()
-    zgm._validate_platform(config, out, check_device=False)
+    zgm._validate_platform(out, check_device=False)
     assert out.violations == []
 
 
@@ -462,7 +469,7 @@ def test_platform_requires_blackwell(monkeypatch, capability, expected):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
     out = zgm.ZeroTrainGenValidation()
-    zgm._validate_platform(_resolved_config(), out, check_device=True)
+    zgm._validate_platform(out, check_device=True)
     if expected is None:
         assert out.violations == []
     else:
@@ -535,7 +542,7 @@ def test_allow_installed_flash_attn_4_does_nothing_when_not_installed(monkeypatc
 
 
 # --------------------------------------------------------------------------- #
-# enable_batch_invariant_kernels / configure_zero_train_gen_mismatch
+# enable_batch_invariant_kernels / validate_zero_train_gen_kl
 # --------------------------------------------------------------------------- #
 
 
@@ -556,7 +563,7 @@ def _fake_batch_invariant_kernels(
     return calls
 
 
-def test_enable_batch_invariant_kernels_passes_the_resolved_settings(monkeypatch):
+def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
     calls = _fake_batch_invariant_kernels(monkeypatch)
     opened: list[bool] = []
     shimmed: list[bool] = []
@@ -567,7 +574,7 @@ def test_enable_batch_invariant_kernels_passes_the_resolved_settings(monkeypatch
         zgm, "_use_fused_log_softmax_at_tp1", lambda: shimmed.append(True)
     )
 
-    zgm.enable_batch_invariant_kernels(_resolved_config())
+    zgm.enable_batch_invariant_kernels(_policy_config())
 
     assert opened == [True]
     assert shimmed == [True]
@@ -577,54 +584,137 @@ def test_enable_batch_invariant_kernels_passes_the_resolved_settings(monkeypatch
     ]
 
 
-def test_configure_is_a_noop_when_the_preset_is_off(monkeypatch):
+def test_validate_kl_is_a_noop_when_everything_is_off():
     config = _policy_config()
     config["megatron_cfg"]["zero_train_gen_mismatch"] = False
+    config["megatron_cfg"]["batch_invariant_mode"] = False
+    config["precision"] = "float16"
+    zgm.validate_zero_train_gen_kl(config, check_environment=False)
+
+
+@pytest.mark.parametrize("policy", [{}, {"megatron_cfg": {"enabled": False}}])
+def test_validate_kl_ignores_non_megatron_policies(policy):
+    zgm.validate_zero_train_gen_kl(policy, check_environment=False)
+
+
+def test_validate_kl_accepts_a_valid_config_without_touching_the_environment(
+    monkeypatch,
+):
+    # No package or GPU lookups on the driver.
     monkeypatch.setattr(
-        zgm,
-        "enable_batch_invariant_kernels",
-        lambda cfg: pytest.fail("kernels must not be enabled"),
+        zgm, "_validate_packages", lambda out: pytest.fail("driver checks packages")
     )
-    zgm.configure_zero_train_gen_mismatch(config, apply_kernels=True)
-    assert "batch_invariant_mode" not in config["megatron_cfg"]
-
-
-def test_configure_without_kernels_resolves_and_validates(monkeypatch):
     monkeypatch.setattr(
-        zgm,
-        "enable_batch_invariant_kernels",
-        lambda cfg: pytest.fail("kernels must not be enabled"),
+        zgm, "_validate_platform", lambda *a, **k: pytest.fail("driver checks GPU")
     )
     config = _policy_config()
-    zgm.configure_zero_train_gen_mismatch(config, apply_kernels=False)
-    assert config["megatron_cfg"]["batch_invariant_mode"] is True
+    before = copy.deepcopy(config)
+    zgm.validate_zero_train_gen_kl(config, check_environment=False)
+    assert config == before
 
 
-def test_configure_raises_on_an_invalid_config(monkeypatch):
-    monkeypatch.setattr(zgm, "enable_batch_invariant_kernels", lambda cfg: None)
+def test_validate_kl_checks_the_environment_on_workers(monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr(zgm, "_validate_packages", lambda out: seen.append("packages"))
+    monkeypatch.setattr(
+        zgm, "_validate_platform", lambda out, **k: seen.append("platform")
+    )
+    zgm.validate_zero_train_gen_kl(_policy_config(), check_environment=True)
+    assert seen == ["platform", "packages"]
+
+
+def test_validate_kl_raises_on_an_invalid_preset():
     config = _policy_config()
     config["precision"] = "float16"
     with pytest.raises(ValueError, match="zero_train_gen_mismatch=true failed"):
-        zgm.configure_zero_train_gen_mismatch(config, apply_kernels=False)
+        zgm.validate_zero_train_gen_kl(config, check_environment=False)
 
 
-def test_configure_raises_when_batch_invariant_checks_fail(monkeypatch):
-    monkeypatch.setattr(zgm, "enable_batch_invariant_kernels", lambda cfg: None)
+def test_validate_kl_raises_when_batch_invariant_checks_fail():
     config = _policy_config()
     config["megatron_cfg"]["tensor_model_parallel_size"] = 2
     with pytest.raises(ValueError, match="batch_invariant_mode=True failed"):
-        zgm.configure_zero_train_gen_mismatch(config, apply_kernels=False)
+        zgm.validate_zero_train_gen_kl(config, check_environment=False)
 
 
-def test_configure_enables_kernels_after_validation(monkeypatch):
-    enabled: list[dict[str, Any]] = []
-    monkeypatch.setattr(zgm, "enable_batch_invariant_kernels", enabled.append)
-    _set_versions(monkeypatch, GOOD_VERSIONS)
+def test_validate_kl_checks_batch_invariant_mode_without_the_preset():
     config = _policy_config()
-    # No GPU is needed: the platform gate skips when CUDA is unavailable.
-    monkeypatch.setattr(zgm, "_validate_platform", lambda *a, **k: None)
-    zgm.configure_zero_train_gen_mismatch(config, apply_kernels=True)
-    assert enabled == [config]
+    config["megatron_cfg"]["zero_train_gen_mismatch"] = False
+    config["generation"]["top_p"] = 0.9
+    with pytest.raises(ValueError, match="top_p=1.0"):
+        zgm.validate_zero_train_gen_kl(config, check_environment=False)
+
+
+# --------------------------------------------------------------------------- #
+# Batch-invariant checks that used to be silent config rewrites
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (lambda c: c["generation"].update(top_p=0.9), "top_p=1.0"),
+        (lambda c: c["generation"].update(top_k=50), "top_k=null"),
+        (lambda c: c["generation"].update(temperature=0.7), "temperature=1.0"),
+        (
+            lambda c: c["generation"]["mcore_generation_config"].update(
+                logprobs_mode="processed_logprobs"
+            ),
+            "logprobs_mode='raw_logprobs'",
+        ),
+        (
+            lambda c: c.update(make_sequence_length_divisible_by=1),
+            "make_sequence_length_divisible_by",
+        ),
+        (
+            lambda c: c.update(
+                dynamic_batching={"enabled": True, "sequence_length_round": 32}
+            ),
+            "dynamic_batching.sequence_length_round",
+        ),
+        (
+            lambda c: c["megatron_cfg"].update(env_vars=None),
+            "env_vars.CUBLASLT_WORKSPACE_SIZE",
+        ),
+        (
+            lambda c: c["megatron_cfg"]["env_vars"].update(
+                CUBLAS_WORKSPACE_CONFIG=":4096:8"
+            ),
+            "env_vars.CUBLAS_WORKSPACE_CONFIG",
+        ),
+    ],
+    ids=[
+        "top_p",
+        "top_k",
+        "temperature",
+        "logprobs_mode",
+        "divisible_by",
+        "dynamic_round",
+        "no_env_vars",
+        "bad_env_var",
+    ],
+)
+def test_batch_invariant_requires_recipe_values_instead_of_rewriting(mutate, expected):
+    config = _policy_config()
+    mutate(config)
+    before = copy.deepcopy(config)
+    result = zgm.validate_batch_invariant_mode(config)
+    assert any(expected in v for v in result.violations), result.violations
+    assert config == before
+
+
+def test_batch_invariant_does_not_require_cublas_env_for_other_backends():
+    config = _policy_config()
+    config["megatron_cfg"]["batch_invariant_backend"] = "triton"
+    config["megatron_cfg"]["env_vars"] = None
+    result = zgm.validate_batch_invariant_mode(config)
+    assert not any("env_vars" in v for v in result.violations)
+
+
+def test_batch_invariant_token_multiple_accepts_larger_multiples():
+    config = _policy_config()
+    config["make_sequence_length_divisible_by"] = 128
+    assert zgm.validate_batch_invariant_mode(config).violations == []
 
 
 # --------------------------------------------------------------------------- #
@@ -645,14 +735,12 @@ def _load_policy(name: str) -> dict[str, Any]:
 @pytest.mark.parametrize("name", ZERO_KL_EXEMPLARS)
 def test_shipped_recipes_pass_the_zero_kl_gates(name):
     policy = _load_policy(name)
-    zgm.configure_zero_train_gen_mismatch(policy, apply_kernels=False)
-    assert policy["megatron_cfg"]["batch_invariant_mode"] is True
+    zgm.validate_zero_train_gen_kl(policy, check_environment=False)
 
 
 @pytest.mark.parametrize("name", ZERO_KL_EXEMPLARS)
 def test_shipped_recipes_train_and_generate_with_the_same_tp(name):
     policy = _load_policy(name)
-    zgm.configure_zero_train_gen_mismatch(policy, apply_kernels=False)
     from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
 
     inference = merged_inference_megatron_cfg(policy)
@@ -661,6 +749,45 @@ def test_shipped_recipes_train_and_generate_with_the_same_tp(name):
         == policy["megatron_cfg"]["tensor_model_parallel_size"]
     )
     assert inference["context_parallel_size"] == 1
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "expected"), [(1, 64), (2, 64), (3, 66), (128, 128)]
+)
+def test_batch_invariant_token_multiple(tp_size, expected):
+    from nemo_rl.models.megatron.batch_invariant import batch_invariant_token_multiple
+
+    assert batch_invariant_token_multiple(tp_size) == expected
+
+
+def _standalone_megatron_exemplars() -> list[Path]:
+    """Top-level exemplars that define a full (enabled) Megatron block themselves."""
+    found = []
+    for path in sorted(CONFIGS_DIR.glob("*.yaml")):
+        raw = yaml.safe_load(path.read_text())
+        if not isinstance(raw, dict) or "defaults" in raw:
+            continue
+        for section in raw.values():
+            megatron_cfg = (
+                section.get("megatron_cfg") if isinstance(section, dict) else None
+            )
+            if isinstance(megatron_cfg, dict) and "apply_rope_fusion" in megatron_cfg:
+                found.append(path)
+                break
+    return found
+
+
+@pytest.mark.parametrize("path", _standalone_megatron_exemplars(), ids=lambda p: p.name)
+def test_base_exemplars_pin_flash_attention_to_fa2(path):
+    # flash-attn-4 is installed in the mcore extra; without an explicit pin TE
+    # would pick FA4 for every Megatron run. Only batch-invariant recipes use 4.
+    raw = yaml.safe_load(path.read_text())
+    for section in raw.values():
+        megatron_cfg = (
+            section.get("megatron_cfg") if isinstance(section, dict) else None
+        )
+        if isinstance(megatron_cfg, dict) and "apply_rope_fusion" in megatron_cfg:
+            assert megatron_cfg.get("flash_attention_version") == 2, path.name
 
 
 def test_token_rounder_matches_megatron_core():
