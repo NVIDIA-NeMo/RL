@@ -316,12 +316,13 @@ meta, driver_carry, rollout_metrics, _ = ray.get(
         val_batch, uids=uids, partition_id="val",
         finish_generation=False,                       # keep inference state warm
         task_to_env_override=val_task_to_env,
-        # turn_* are not written to TQ; validation gets them via driver_carry
-        carry_keys=["total_reward", "turn_roles", "turn_contents"],
+        carry_keys=["total_reward"],                   # only field val consumes
     )
 )
 total_rewards.extend(driver_carry["total_reward"].tolist())
-roles, contents = driver_carry["turn_roles"], driver_carry["turn_contents"]
+mlog_cols = policy.read_from_dataplane(
+    meta, select_fields=["turn_roles", "turn_contents"],
+)
 policy.finish_step(meta)
 ```
 
@@ -514,10 +515,9 @@ Two things it still understates, both independent of the reduction:
   the exposed total is `driver + max(workers)` and a max over all processes
   keeps only the larger. The driver issues about one op of each kind per step
   against the workers' bulk fetches, so the dropped term is small.
-- The rollout actor's `kv_first_write` -- the largest write in the step -- is
-  in the fan-out (see below) but is also serial with the workers' fetches, so
-  the max keeps only the larger of the two. On the sync path that write is on
-  the critical path.
+- **The rollout actor is in no scope at all** (see below), so `kv_first_write`
+  -- the largest write in the step -- is missing from this number. On the sync
+  path that write is on the critical path.
 
 The barrier is also at the all-reduce rather than at the end of the fetch: a
 fast rank can start forward while a slow one is still fetching, so what leaks
@@ -527,15 +527,16 @@ over-statement of the fetch phase and an under-statement overall.
 `volume_mb` counts *transfers*, not data size, and two things follow from
 that. A byte written and later read is counted on both sides. And every
 reporting process is summed, so four ranks each fetching their own shard
-count four times. Both are correct for "what crossed the wire" -- every DP
-rank fetches its shard once for the logprob pass and again for the train
-pass, so get counts the batch twice. Neither is correct for "how big was the
-batch", which these series cannot answer.
+count four times. Both are correct for "what crossed the wire" -- on a real
+step get moved 20.8 MB against put's 2.7 MB, because every DP rank fetches
+its shard once for the logprob pass and again for the train pass. Neither
+is correct for "how big was the batch", which these series cannot answer.
 
-The rollout actor is in the fan-out (`grpo_train_sync` registers it via
-`TQPolicy.add_data_plane_snapshot_source`), so `kv_first_write` -- the write
-of the entire rollout batch -- counts in `volume_mb/by_op/put` and
-`comm_volume_mb`.
+**The rollout actor is not in the fan-out**, so `kv_first_write` -- the
+write of the entire rollout batch, and the largest write in the step -- is
+absent from `volume_mb/by_op/put` and from `comm_volume_mb`. That is why
+put reads small next to get. Read the write side as "what the driver and
+policy workers wrote", not as the step's write traffic.
 
 On the cluster path the per-op `wall_ms` is summed over processes that ran
 concurrently, so the **`by_op` percentages** are shares of aggregate
@@ -606,11 +607,11 @@ Two more read differently in the cluster view and are named to say so:
   cluster path reported the lifetime max: after one 50 ms call every later
   step still read 50 ms.
 
-`grpo_train_sync` fans out to the driver, every policy worker, and the
-rollout actor (registered via `TQPolicy.add_data_plane_snapshot_source`,
-since it builds its own client off the worker group), and logs the combined
-result under `data_plane/cluster/` instead of the driver's own, so
-`kv_first_write` is in these totals. It falls back to `data_plane/driver/` when the fan-out finds only one
+`grpo_train_sync` fans out to the driver and every policy worker, and logs
+the combined result under `data_plane/cluster/` instead of the driver's
+own. **It does not reach the rollout actor**, which builds its own client
+and is not on the worker group — so `kv_first_write`, the write of the
+whole rollout, is not in these totals. It falls back to `data_plane/driver/` when the fan-out finds only one
 process. Measured: **~2.4 ms and ~1 kB per process per step** for 10
 processes, against a 6x wider view of the traffic. The fan-out is
 best-effort — a rank that cannot answer is dropped rather than failing the

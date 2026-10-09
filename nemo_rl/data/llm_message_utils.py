@@ -765,14 +765,14 @@ def remap_dataset_keys(
 # *underlying storage* of view-aliased tensor slices — for a vllm batched
 # output arena that's ~100 MB per row instead of the slice's ~10 KB.
 #
-# The helpers below split `message_log` into per-field arrays (role/content
+# The helpers below split `message_log` into per-field arrays at the
+# wire boundary (token tensors flat in `bulk_batch`, role/content
 # strings as object arrays, per-turn lengths as one slim tensor) and
-# rebuild the list-of-dicts shape on the consumer from local-arena views.
-# No tensor ever reaches per-row pickle. `SyncRolloutActor` does not write
-# these fields to the data plane; they reach the driver via `driver_carry`.
+# rebuild the list-of-dicts shape on the consumer from local-arena
+# views. No tensor ever reaches per-row pickle.
 
-# Fields consumed by :func:`reconstruct_message_log` to rebuild the
-# list-of-dicts view, when a batch carries them.
+# Fields ridden by `bulk_batch` and consumed by
+# :func:`reconstruct_message_log` to rebuild the list-of-dicts view.
 MESSAGE_LOG_BULK_FIELDS = ("turn_lengths", "turn_roles", "turn_contents")
 
 
