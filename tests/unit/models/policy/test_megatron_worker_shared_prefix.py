@@ -32,7 +32,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-pytest.importorskip("megatron.bridge")
+# Probe the concrete module: test_modelopt_worker_utils.py leaves stub
+# ``megatron.bridge`` packages in sys.modules that a package probe accepts.
+pytest.importorskip("megatron.bridge.training.checkpointing")
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module  # noqa: E402
 from nemo_rl.algorithms.loss.interfaces import LossInputType, LossType  # noqa: E402

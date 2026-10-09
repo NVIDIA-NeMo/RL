@@ -21,7 +21,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-pytest.importorskip("megatron.bridge")
+# Probe the concrete module: test_modelopt_worker_utils.py leaves stub
+# ``megatron.bridge`` packages in sys.modules that a package probe accepts.
+pytest.importorskip("megatron.bridge.models.hybrid.hybrid_provider")
 
 from megatron.bridge.models.hybrid.hybrid_provider import (  # noqa: E402
     HybridModelProvider,
