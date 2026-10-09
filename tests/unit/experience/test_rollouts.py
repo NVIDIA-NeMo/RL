@@ -2090,14 +2090,70 @@ def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
         accumulator.add(1, {"row": 1}, resolved_agent_ref={"name": "agent-b"})
 
 
+def test_group_reward_diagnostics_reports_ties_and_skips_incomplete_scores():
+    results = [
+        {
+            "full_result": {
+                "reward": reward,
+                "reward_score_raw": raw_score,
+                "reward_overall_score_raw": reward if index < 2 else None,
+            }
+        }
+        for index, (reward, raw_score) in enumerate(
+            ((1.0, 2.0), (1.0, 2.0), (2.0, 4.0))
+        )
+    ]
+
+    metrics = rollouts_mod._group_reward_diagnostics(results)
+    assert metrics["zero_advantage_group_pct"] == 0.0
+    assert metrics["total_reward/std_in_group"] == pytest.approx(1 / 3**0.5)
+    assert metrics["reward_score_raw/std_in_group"] == pytest.approx(2 / 3**0.5)
+    assert metrics["reward_score_raw/pairwise_tie_pct"] == pytest.approx(100 / 3)
+    assert not any(key.startswith("reward_overall_score_raw/") for key in metrics)
+
+
+def test_sync_group_reward_diagnostics_preserve_prompt_boundaries():
+    results = [
+        {
+            "full_result": {
+                "reward": reward,
+                "reward_score_raw": reward,
+                "reward_overall_score_raw": reward,
+            }
+        }
+        for reward in (1.0, 1.0, 2.0, 2.0)
+    ]
+    metrics = rollouts_mod._group_reward_diagnostics(results, group_size=2)
+    assert metrics["zero_advantage_group_pct"] == 100.0
+    assert metrics["total_reward/std_in_group/mean"] == 0.0
+    assert metrics["reward_score_raw/all_equal_in_group_pct"] == 100.0
+    assert metrics["reward_score_raw/pairwise_tie_pct"] == 100.0
+
+
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
-def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
+@pytest.mark.parametrize("length_penalty_enabled", [False, True])
+@pytest.mark.parametrize(
+    "token_counts, counts_valid",
+    [
+        ((1, 1), True),
+        (None, False),
+        ((None, 1), False),
+        ((1, None), False),
+        (("invalid", 1), False),
+        ((True, 1), False),
+        ((-1, 1), False),
+    ],
+)
+def test_postprocess_nemo_gym_group_returns_task_index(
+    log_full_result_tables, length_penalty_enabled, token_counts, counts_valid
+):
     rows = [
         {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
         {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
     ]
     results = []
-    for reward in (1.0, 2.0):
+    rewards = (1.0, 1.0) if length_penalty_enabled else (1.0, 2.0)
+    for result_index, reward in enumerate(rewards):
         input_message = {
             "role": "user",
             "content": "prompt",
@@ -2115,8 +2171,40 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
                         "generation_logprobs": torch.tensor([-0.1]),
                     },
                 ],
-                "full_result": {"reward": reward},
+                "reasoning_token_count": result_index,
+                "response_token_count": 1,
+                "token_extraction_valid": True,
+                "full_result": {
+                    "reward": reward,
+                    "reward_score_raw": reward,
+                    "reward_rubric_aggregate_valid": reward
+                    if result_index == 0
+                    else None,
+                    "reward_overall_score_raw": reward,
+                    "reward_overall_score": reward + 0.1,
+                    "reward_length_adjustment": 0.1,
+                    "genrm_parse_failure_rate_per_group": 0.0,
+                    "genrm_rubric_parse_failure_rate_per_group": 0.5,
+                    "response": {
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [
+                                    {"text": "a" if result_index == 0 else "aaa"}
+                                ],
+                            }
+                        ]
+                    },
+                },
             }
+        )
+
+    # Keep the first row's measured zero; vary only the second row's diagnostics.
+    for key in ("reasoning_token_count", "response_token_count"):
+        results[1].pop(key)
+    if token_counts is not None:
+        results[1]["reasoning_token_count"], results[1]["response_token_count"] = (
+            token_counts
         )
 
     rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
@@ -2132,10 +2220,41 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=log_full_result_tables,
+        length_penalty_config={
+            "default": {
+                "group_total_length_penalty_coeff": 0.1,
+                "length_type": "chars",
+            }
+        }
+        if length_penalty_enabled
+        else None,
     )
 
     assert rollout_result.task_index == 42
-    assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
+    expected_rewards = [1.05, 0.95] if length_penalty_enabled else [1.0, 2.0]
+    assert rollout_result.final_batch["total_reward"].tolist() == pytest.approx(
+        expected_rewards
+    )
+    assert rollout_result.rollout_metrics["total_reward/std_in_group"] == pytest.approx(
+        0.1 / 2**0.5 if length_penalty_enabled else 1 / 2**0.5
+    )
+    assert rollout_result.rollout_metrics["reward_score_raw/mean"] == sum(rewards) / 2
+    assert rollout_result.rollout_metrics["reward_rubric_aggregate_valid/mean"] == 1.0
+    assert "reward_rubric_mean_clean/mean" not in rollout_result.rollout_metrics
+    assert "genrm_api_error_rate_per_group/mean" not in rollout_result.rollout_metrics
+    assert rollout_result.rollout_metrics["zero_advantage_group_pct"] == 0.0
+    assert rollout_result.rollout_metrics["reasoning_tokens_per_sample/mean"] == (
+        0.5 if counts_valid else 0.0
+    )
+    assert rollout_result.rollout_metrics["response_tokens_per_sample/mean"] == 1.0
+    assert rollout_result.rollout_metrics[
+        "reasoning_response_token_extraction_failure_rate"
+    ] == (0.0 if counts_valid else 0.5)
+    assert (
+        rollout_result.rollout_metrics["reward_overall_score_raw/mean"]
+        == sum(rewards) / 2
+    )
+    assert rollout_result.rollout_metrics["reward_length_adjustment/mean"] == 0.1
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
@@ -2168,7 +2287,13 @@ def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
                         ),
                     },
                 ],
-                "full_result": {"reward": float(index)},
+                "reasoning_token_count": 0,
+                "response_token_count": assistant_token_count,
+                "token_extraction_valid": True,
+                "full_result": {
+                    "reward": float(index),
+                    "optional_score": float(index) if index % 2 else None,
+                },
             }
         )
 
@@ -2199,6 +2324,8 @@ def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     assert metrics["agent-b/total_tokens_per_sample/histogram"] == [3, 3]
     assert metrics["agent-b/gen_tokens_per_sample/mean"] == pytest.approx(2.0)
     assert metrics["agent-b/gen_tokens_per_sample/histogram"] == [2, 2]
+    assert metrics["agent-a/optional_score/mean"] == 1.0
+    assert metrics["agent-b/optional_score/mean"] == 3.0
     assert rollout_result.final_batch["truncated"].tolist() == is_truncated
 
 
@@ -2766,6 +2893,8 @@ def test_run_async_nemo_gym_rollout(
             "total_reward/histogram": None,
             "natural_termination_rate": None,
             "truncation_rate": None,
+            "zero_advantage_group_pct": 100.0,
+            "reasoning_response_token_extraction_failure_rate": 1.0,
             # per agent metrics
             "example_multi_step_simple_agent/full_result": None,
             "example_multi_step_simple_agent/accuracy/histogram": None,
