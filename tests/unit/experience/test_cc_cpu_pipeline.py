@@ -24,8 +24,10 @@ from nemo_gym.context_management import (
     ContextHistoryConfig,
     ContextManagedResponsesClient,
 )
-from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
-from nemo_gym.openai_utils import NeMoGymAsyncOpenAI
+from nemo_gym.openai_utils import (
+    NeMoGymAsyncOpenAI,
+    NeMoGymResponseCreateParamsNonStreaming,
+)
 from nemo_gym.server_utils import ServerClient
 from nemo_gym.token_id_capture.staging.records import RolloutManifest, StageResult
 from responses_api_agents.simple_agent_with_compaction.tests.test_client import (
@@ -34,17 +36,28 @@ from responses_api_agents.simple_agent_with_compaction.tests.test_client import 
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
+from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+from nemo_rl.environments.nemo_gym import GymTransportError
+from nemo_rl.experience.rollout_manager import RolloutRetryPolicy
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
-from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+from nemo_rl.experience.rollout_recovery import (
+    RecoveryGranularity,
+    _receipt_staging_keys,
+)
 from nemo_rl.models.generation.capture_context import decide_capture_input
 from tests.unit.experience.test_cc_dispatch import _env
 from tests.unit.experience.test_logical_owner_finalization import (
     capture_segment,
     finalize,
     gym_harness,
+)
+from tests.unit.experience.test_rollout_manager import (
+    _FakeCaptureBuffer,
+    _make_capture_manager,
+    _receipt_record,
 )
 from tests.unit.single_controller.test_cc_optimizer_batch import _setup
 
@@ -240,6 +253,122 @@ def test_twenty_turn_shared_client_to_replay_and_advantages(
         ctrl._trainer.finish_train_step.assert_called_once()
         assert ctrl._trainer_version == 1 and ctrl._consumed_samples == 1
         assert ctrl._buffer.meta_list == [] and plane.list_sample_ids("train") == []
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_transient_failure_recovers_full_cc_group_into_train_pump(
+    pipeline: tuple, monkeypatch: pytest.MonkeyPatch, granularity: RecoveryGranularity
+) -> None:
+    """Compose live retry, real capture/finalization and the controller train pump."""
+    harness, plane, finalizer = pipeline
+    env = _env(harness)
+    manager = _make_capture_manager(
+        _FakeCaptureBuffer(),
+        retry_policy=RolloutRetryPolicy(
+            max_infra_attempts=2,
+            max_data_attempts=1,
+            max_gym_row_attempts=1,
+            backoff_base_s=0,
+            max_backoff_s=0,
+            max_skipped_prompts=0,
+            max_consecutive_dropped_prompts=0,
+        ),
+        recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+    )
+    manager._context_compaction = True
+    attempts: list[tuple[int, ...]] = []
+    expected_tokens: dict[int, list[int]] = {}
+
+    async def run_rollout(
+        _sample: Any,
+        *,
+        rollout_ids: list[str],
+        generation_indices: list[int],
+        on_completion: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        attempts.append(tuple(generation_indices))
+        for index in generation_indices:
+            scope = rollout_ids[index]
+            # Two independent contexts exercise multi-row reconstruction per owner.
+            chunks = [
+                await asyncio.to_thread(capture_segment, harness, scope)
+                for _ in range(2)
+            ]
+            expected_tokens[index] = [
+                1000 + len(harness.worker_calls) - 1,
+                1000 + len(harness.worker_calls),
+            ]
+            processed = await env._postprocess_receipt_mode(
+                {"_ng_rollout_id": scope},
+                {
+                    "reward": float(index),
+                    "response": {
+                        "id": chunks[-1]["ids"][-1],
+                        "output": [
+                            item for chunk in chunks for item in chunk["output"]
+                        ],
+                    },
+                },
+            )
+            record = _receipt_record([scope], [processed["receipt"]])
+            completion = record.completions[0]
+            completion.reward = float(index)
+            completion.env_extras["ng_logical_selection"] = processed[
+                "logical_selection"
+            ]
+            await on_completion(index, completion)
+            if len(attempts) == 1:
+                raise GymTransportError("first dispatch lost its response")
+        return record
+
+    manager._impl.run_rollout = run_rollout
+
+    async def exercise() -> None:
+        request = await manager.generate_for_finalization({"idx": 99})
+        assert request is not None and manager.stats.skipped == 0
+        assert attempts == (
+            [(0, 1), (1,)]
+            if granularity is RecoveryGranularity.SIBLING
+            else [(0, 1), (0, 1)]
+        )
+        assert len(request.capture_receipts) == 2
+        result = finalizer.finalize_group(
+            request.group_id,
+            list(request.rollout_ids),
+            list(request.receipts),
+            list(request.rewards),
+            fallback_weight_version=request.fallback_weight_version,
+            prompt_idx=request.prompt_idx,
+            mask_sample=list(request.mask_sample),
+            canonical_sample_ids=list(request.canonical_sample_ids),
+            logical_selections=list(request.logical_selections),
+        )
+        assert result.valid_row_count == result.meta.size == 4
+        ctrl = await ready_controller(monkeypatch, plane, result.meta)
+        checked: list[int] = []
+
+        def learner(meta: Any, *args: Any, **kwargs: Any) -> None:
+            data = plane.get_samples(
+                meta.sample_ids, "train", ["input_ids", "token_mask", "advantages"]
+            )
+            for owner in range(2):
+                tokens = []
+                for row, tag in enumerate(meta.tags):
+                    if tag["logical_slot"] == owner:
+                        mask = data["token_mask"][row].bool()
+                        tokens.extend(data["input_ids"][row][mask].tolist())
+                        assert torch.all(data["advantages"][row][mask] == owner - 0.5)
+                assert tokens == expected_tokens[owner]
+            checked.append(meta.size)
+
+        ctrl._trainer.train_microbatches_from_meta.side_effect = learner
+        await asyncio.wait_for(ctrl._train_pump(), timeout=5)
+        assert checked == [4]
+        ctrl._trainer.finish_train_step.assert_called_once()
+        assert ctrl._trainer_version == 1 and ctrl._consumed_samples == 1
 
     asyncio.run(exercise())
 
