@@ -80,6 +80,8 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.interfaces import (
@@ -1475,15 +1477,19 @@ def mock_sync_grpo_infrastructure(policy):
     driver_carry = BatchedDataDict(
         {
             "total_reward": torch.tensor([1.0]),
-            "prompt_ids_for_adv": torch.tensor([[1, 2, 3]]),
             "input_lengths": torch.tensor([4]),
             "loss_multiplier": torch.tensor([1.0]),
             "truncated": torch.tensor([False]),
             "length": torch.tensor([3]),
         }
     )
-    meta = MagicMock()
-    meta.fields = ["input_ids"]
+    meta = KVBatchMeta(
+        sample_ids=["rollout_g0"],
+        partition_id="train",
+        task_name="train",
+        fields=["input_ids"],
+        tags=[{GROUP_ID_TAG: "rollout"}],
+    )
     rollout_metrics = {
         "mean_gen_tokens_per_sample": 10.0,
         "max_gen_tokens": 20,
@@ -1544,6 +1550,60 @@ def mock_sync_grpo_infrastructure(policy):
     policy.tq_partition_id = 0
 
     return stack
+
+
+@pytest.mark.parametrize("failure_phase", ["refit", "prepare"])
+@pytest.mark.parametrize("telemetry_fails", [False, True])
+def test_async_grpo_propagates_generation_setup_failure(
+    mock_grpo_components: dict[str, Any],
+    failure_phase: str,
+    telemetry_fails: bool,
+) -> None:
+    """Setup errors reach the caller even if flushing collector telemetry fails."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    mock_grpo_components["checkpointer"].get_latest_checkpoint_path.return_value = None
+    policy_generation = _mock_policy_generation()
+    policy_generation.weight_synchronizer.is_stale = failure_phase == "refit"
+    setup_error = RuntimeError(f"{failure_phase} failed")
+    if failure_phase == "prepare":
+        policy_generation.prepare_for_generation.side_effect = setup_error
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    collector_events: list[str] = []
+
+    with (
+        mock_async_grpo_infrastructure(
+            mock_batch,
+            {"mean_gen_tokens_per_sample": 2.0},
+            collector_events=collector_events,
+            refit_side_effect=setup_error if failure_phase == "refit" else None,
+        ),
+        patch.object(
+            StubAsyncTrajectoryCollector, "flush_telemetry", create=True
+        ) as flush_telemetry,
+    ):
+        if telemetry_fails:
+            flush_telemetry.remote.side_effect = RuntimeError("telemetry failed")
+        with pytest.raises(RuntimeError) as exc_info:
+            async_grpo_train(
+                mock_grpo_components["policy"],
+                policy_generation,
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                mock_grpo_components["checkpointer"],
+                _initial_grpo_save_state(),
+                master_config,
+            )
+        assert exc_info.value is setup_error
+        flush_telemetry.remote.assert_called_once_with(quiesce_timeout_s=3.0)
+
+    assert "start_collection" not in collector_events
+    mock_grpo_components["policy"].train.assert_not_called()
 
 
 def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components):
@@ -2991,7 +3051,7 @@ def test_setup_dtensor_fp8_kv_cache_guard(
     master_config.data.update(shuffle=False, num_workers=0)
     master_config.policy.update(
         model_name="deepseek-v4-test",
-        dtensor_cfg={"enabled": True},
+        automodel_cfg={"enabled": True},
         megatron_cfg={"enabled": False},
     )
     master_config.policy["generation"]["vllm_cfg"].update(
@@ -3523,7 +3583,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
 
     master_config = mock_grpo_components["master_config"]
     master_config.policy["model_name"] = "fake-model"
-    master_config.policy["dtensor_cfg"] = {"enabled": False}
+    master_config.policy["automodel_cfg"] = {"enabled": False}
     master_config.policy["megatron_cfg"] = {
         "enabled": False,
         "pipeline_model_parallel_size": 1,
@@ -3643,7 +3703,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     master_config = mock_grpo_components["master_config"]
     master_config.policy["model_name"] = "test-model"
     master_config.policy["tokenizer"] = {"use_fastokens": False}
-    master_config.policy["dtensor_cfg"] = {"enabled": False}
+    master_config.policy["automodel_cfg"] = {"enabled": False}
     master_config.policy["megatron_cfg"] = {
         "enabled": False,
         "pipeline_model_parallel_size": 1,
@@ -3770,7 +3830,7 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     master_config = mock_grpo_components["master_config"]
     master_config.policy["model_name"] = "test-model"
     master_config.policy["tokenizer"] = {"use_fastokens": False}
-    master_config.policy["dtensor_cfg"] = {"enabled": False}
+    master_config.policy["automodel_cfg"] = {"enabled": False}
     master_config.policy["megatron_cfg"] = {
         "enabled": False,
         "pipeline_model_parallel_size": 1,
@@ -6367,6 +6427,15 @@ class TestAggregateRolloutMetrics:
         result = aggregate_rollout_metrics(metrics)
         assert result["mean_gen_tokens_per_sample"] == pytest.approx(200.0)
         assert result["reward/mean"] == pytest.approx(0.7)
+
+    def test_per_agent_truncation_rates_are_averaged(self):
+        metrics = {
+            "agent-a/truncation_rate": [0.0, 0.5, 1.0],
+            "agent-b/truncation_rate": [0.25, 0.75],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["agent-a/truncation_rate"] == pytest.approx(0.5)
+        assert result["agent-b/truncation_rate"] == pytest.approx(0.5)
 
     def test_non_numeric_passed_through(self):
         metrics = {"some_list_metric": [["a", "b"], ["c", "d"]]}

@@ -14,13 +14,14 @@
 """Sync GRPO rollout actor — sibling of ``async_utils``.
 
 Houses :class:`SyncRolloutActor`, the Ray actor that owns the multi-turn
-rollout loop AND the post-rollout flatten / mask / prompt extraction /
-reward shaping / baseline-std for a sync GRPO step. The driver dispatches
-a per-step prompt batch + uids; the actor runs ``run_multi_turn_rollout``
+rollout loop and post-rollout flattening and masking for a sync GRPO step.
+The driver dispatches a per-step prompt batch; the actor runs ``run_multi_turn_rollout``
 (or async / nemo_gym variants), then writes the bulk schema to TQ via
 :func:`nemo_rl.data_plane.column_io.kv_first_write`. Only a ``KVBatchMeta``
-and a small per-sample ``driver_carry`` dict (rewards, masks, lengths,
-baseline/std, prompt_ids_for_adv) cross back to the driver via Ray.
+and a small per-sample ``driver_carry`` dict (rewards, masks, lengths)
+cross back to the driver via Ray. The driver computes reward shaping and
+baseline/std. Prompt-group identities travel
+with the metadata tags.
 
 **Goal — rollout 1-hop put**: bulk tensors (input_ids, output_ids,
 attention_mask, position_ids, multi_modal_inputs, generation_logprobs,
@@ -49,7 +50,7 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTED_EXPERTS_FIELD
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
@@ -73,31 +74,20 @@ OPT_IN_CARRY_KEYS: tuple[str, ...] = ("turn_roles", "turn_contents")
 
 def _flatten_rollout_message_log_for_tq(
     message_logs: list[Any],
-    prompt_lengths: torch.Tensor,
     *,
     pad_token_id: int,
     make_sequence_length_divisible_by: int,
-) -> tuple[BatchedDataDict[Any], torch.Tensor, BatchedDataDict[Any]]:
+) -> tuple[BatchedDataDict[Any], torch.Tensor]:
     """Prepare rollout message logs for the TQ payload and driver carry."""
+    # Deferred to avoid the grpo -> sync_rollout_actor import cycle.
     from nemo_rl.algorithms.grpo import (
         add_grpo_token_loss_masks_and_generation_logprobs,
-        extract_initial_prompt_messages,
     )
     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
     from nemo_rl.experience.rollouts import backfill_missing_routed_experts
 
     pad = {"pad_value_dict": {"token_ids": pad_token_id}}
-    # Must precede the prompt extraction: it reuses the same message dicts, so
-    # backfilling here also covers the prompt flatten below.
     backfill_missing_routed_experts(message_logs)
-    prompt_message_logs = extract_initial_prompt_messages(
-        message_logs,
-        prompt_lengths,
-    )
-    prompt_flat, _ = batched_message_log_to_flat_message(
-        prompt_message_logs,
-        **pad,
-    )
 
     add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
     flat, input_lengths = batched_message_log_to_flat_message(
@@ -105,14 +95,14 @@ def _flatten_rollout_message_log_for_tq(
         **pad,
         make_sequence_length_divisible_by=make_sequence_length_divisible_by,
     )
-    return flat, input_lengths, prompt_flat
+    return flat, input_lengths
 
 
 @ray.remote  # pragma: no cover
 class SyncRolloutActor:
     """Per-step rollout dispatcher.
 
-    Runs: rollout + flatten + mask + prompt extraction + baseline/std + TQ put.
+    Runs: rollout + flatten + mask + TQ put.
     Returns ``(meta, driver_carry, rollout_metrics, gen_metrics)``.
 
     Lifecycle: one instance per ``grpo_train_sync`` invocation. The driver
@@ -164,9 +154,9 @@ class SyncRolloutActor:
            clears per-step generation accumulators before the rollout.
         2. **Rollout** — runs ``run_multi_turn_rollout`` (or the async /
            nemo-gym variants) to produce ``final_batch``.
-        3. **Flatten + mask + prompt extraction** — converts
+        3. **Flatten + mask** — converts
            ``message_log`` layout to flat tensors; builds token mask,
-           sample mask, prompt-only ids, baseline/std.
+           sample mask. The driver computes baseline/std using group tags.
         4. **Write bulk to TQ** — ``kv_first_write`` puts every tensor
            field in one flat ``put_samples``; the driver never touches
            bulk bytes.
@@ -211,8 +201,7 @@ class SyncRolloutActor:
         Returns:
             ``(meta, driver_carry, rollout_metrics, generation_logger_metrics)``
             where ``driver_carry`` is a per-row dict of tensors the driver
-            uses for compute (rewards, masks, lengths, prompt_ids_for_adv,
-            …) — stays on the driver, never crosses an actor boundary.
+            uses for compute (rewards, masks, lengths, …). Bulk tensors stay in TQ.
         """
         # Lazy imports keep rollout-specific dependencies off the actor startup path.
         # ``_policy_dtype`` sizes the VLM pixel tensors below.
@@ -287,12 +276,11 @@ class SyncRolloutActor:
         fb = final_batch.to("cpu")
         del final_batch
 
-        # Flatten message_log → bulk tensors + extract original prompt ids.
+        # Flatten message_log → bulk tensors.
         # GRPO masks only generated assistant turns, even if the dataset
         # prompt itself contains assistant messages as conversation history.
-        flat, input_lengths, prompt_flat = _flatten_rollout_message_log_for_tq(
+        flat, input_lengths = _flatten_rollout_message_log_for_tq(
             fb["message_log"],
-            fb["length"],
             pad_token_id=self.tokenizer.pad_token_id,
             make_sequence_length_divisible_by=cfg.policy[
                 "make_sequence_length_divisible_by"
@@ -377,7 +365,6 @@ class SyncRolloutActor:
             "truncated": truncated,
             "length": length,
             "input_lengths": input_lengths,
-            "prompt_ids_for_adv": prompt_flat["token_ids"],
             # Computed by decompose_message_log above; feeds
             # apply_reward_shaping on the driver without a TQ fetch.
             "response_token_lengths": decomposed["response_token_lengths"],
@@ -414,6 +401,11 @@ class SyncRolloutActor:
         n_per_prompt = n_samples // n_prompts
         uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
         sample_ids = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
+        tags = multimodal_row_tags(multimodal, len(sample_ids))
+        if tags is None:
+            tags = [{} for _ in sample_ids]
+        for tag, uid in zip(tags, (uid for uid in uids for _ in range(n_per_prompt))):
+            tag[GROUP_ID_TAG] = uid
         trace_rollout_payload(keys=sample_ids, data=bulk_batch)
         meta = kv_first_write(
             bulk_batch,
@@ -424,7 +416,7 @@ class SyncRolloutActor:
             # Per-row shapes the flattening removes from the payload. ``tags``
             # is the transport's per-sample channel and is projected with the
             # rows, so no consumer re-keys them.
-            tags=multimodal_row_tags(multimodal, len(sample_ids)),
+            tags=tags,
             task_name=partition_id,
             pad_to_multiple=int(
                 cfg.policy.get("make_sequence_length_divisible_by") or 1

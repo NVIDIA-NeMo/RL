@@ -83,6 +83,7 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
+from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.observability import (
     log_step_metrics,
@@ -176,7 +177,7 @@ def _apply_dynamic_sampling(
     Args:
         meta: This iteration's ``KVBatchMeta``.
         driver_carry: Per-row driver-local tensors for this iteration
-            (rewards, masks, prompt_ids_for_adv, baseline/std, …).
+            (rewards, masks, baseline/std, …).
         pending_meta: Survivors accumulated from prior iterations.
         pending_carry: ``driver_carry`` rows aligned to ``pending_meta``.
         pending_unfiltered_rewards: All iterations' rewards pre-filter,
@@ -534,11 +535,9 @@ def grpo_train_sync(
     adv_estimator = _create_advantage_estimator(master_config)
 
     # Driver-side pad-value dict for materialize() — the wire emits
-    # jagged tensors for variable-length token fields (input_ids,
-    # prompt_ids_for_adv); other fields default to pad=0.
+    # jagged tensors for variable-length input_ids; other fields default to pad=0.
     _pad_dict = {
         "input_ids": tokenizer.pad_token_id,
-        "prompt_ids_for_adv": tokenizer.pad_token_id,
     }
     if not hasattr(policy, "dp_cfg"):
         raise ValueError(
@@ -560,8 +559,8 @@ def grpo_train_sync(
 
     # ── Sync rollout actor (rollout 1-hop put) ──────────────────────
     # The actor owns the multi-turn rollout loop AND post-rollout
-    # flatten / mask construction / prompt extraction / baseline-std /
-    # TQ first-write. Bulk tensors stay actor-side until put_samples;
+    # flatten / mask construction / TQ first-write.
+    # Bulk tensors stay actor-side until put_samples;
     # driver receives only KVBatchMeta + small slice via Ray.
     rollout_actor = SyncRolloutActor.options(
         runtime_env=make_actor_runtime_env(
@@ -733,13 +732,13 @@ def grpo_train_sync(
                 )
 
                 # ── Rollout 1-hop put: actor runs rollout + flatten +
-                # mask construction + prompt extraction + baseline/std,
+                # mask construction,
                 # writes bulk to TQ in one flat put_samples, returns
                 # only meta + small slice. Bulk never visits the driver.
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
-                    # Single Ray RPC: rollout + flatten + mask + prompt
-                    # extraction + baseline/std + put_samples + finish
+                    # Single Ray RPC: rollout + flatten + mask +
+                    # put_samples + finish
                     # generation + logger metrics — all bundled into one
                     # round-trip.
                     # ``first_iter`` is the actor's signal to call
@@ -789,12 +788,13 @@ def grpo_train_sync(
                         and "unshaped_total_reward" in driver_carry
                         else None
                     )
+                    prompt_group_ids = group_index_column(row_group_ids(meta))
                     (
                         baseline,
                         std,
                         _,
                     ) = calculate_baseline_and_std_per_prompt(
-                        driver_carry["prompt_ids_for_adv"],
+                        prompt_group_ids,
                         driver_carry["total_reward"],
                         torch.ones_like(driver_carry["total_reward"]),
                         leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
@@ -814,7 +814,7 @@ def grpo_train_sync(
                         )
                         is_trivial_prompt_distribution = (
                             calculate_trivial_reward_distributions(
-                                driver_carry["prompt_ids_for_adv"],
+                                prompt_group_ids,
                                 dynamic_sampling_rewards,
                                 torch.ones_like(dynamic_sampling_rewards),
                             )
@@ -891,7 +891,9 @@ def grpo_train_sync(
                 baseline = driver_carry["baseline"]
                 std = driver_carry["std"]
                 input_lengths = driver_carry["input_lengths"]
-                prompt_ids_for_adv = driver_carry["prompt_ids_for_adv"]
+                # Factorize after dynamic sampling combines metadata from different
+                # rollout calls, so their distinct UUIDs cannot share an index.
+                prompt_ids_for_adv = group_index_column(row_group_ids(meta))
                 loss_multiplier = driver_carry["loss_multiplier"]
                 truncated = driver_carry["truncated"]
                 length = driver_carry["length"]

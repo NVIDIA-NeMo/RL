@@ -78,7 +78,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 # pre-flight (which assumes [B, student_seq, ...] for every 2+D tensor) must
 # skip them. Sources:
 #   - teacher_full_logits_ipc: list[B] of CUDA IPC handle dicts produced by
-#     FullLogitsPostProcessor in dtensor_policy_worker_v2.get_full_logits_ipc.
+#     FullLogitsPostProcessor in automodel_policy_worker.get_full_logits_ipc.
 #     Not a tensor at all — list of dicts — but listed here so the worker's
 #     dict-level dim check skips it.
 #   - teacher_input_ids/teacher_token_mask + alignment_*: produced by
@@ -165,7 +165,7 @@ class TeacherConfig(BaseModel, extra="allow"):
     """Per-teacher config for multi-teacher cross-tokenizer distillation.
 
     Carries the full ``PolicyConfig`` content (``model_name``, ``tokenizer``,
-    ``dtensor_cfg``, …) as permitted extras, plus the cross-tokenizer knobs
+    ``automodel_cfg``, …) as permitted extras, plus the cross-tokenizer knobs
     declared below. Use :meth:`policy_config` to recover the plain
     ``PolicyConfig`` dict for ``Policy`` construction.
 
@@ -251,12 +251,12 @@ def setup(
     # the TP=CP=1 multi-teacher prototype, this path supports TP/CP/diff-DP
     # sharding (the loss is parallelism-invariant), so there is deliberately NO
     # tensor/context_parallel_size==1 assert.
-    assert policy_config["dtensor_cfg"]["enabled"], (
-        "xtoken distillation requires policy.dtensor_cfg.enabled=true."
+    assert (policy_config.get("automodel_cfg") or {}).get("enabled"), (
+        "xtoken distillation requires policy.automodel_cfg.enabled=true."
     )
     for i, tc in enumerate(teacher_configs):
-        assert tc["dtensor_cfg"]["enabled"], (
-            f"xtoken distillation requires teachers.{i}.dtensor_cfg.enabled=true."
+        assert (tc.get("automodel_cfg") or {}).get("enabled"), (
+            f"xtoken distillation requires teachers.{i}.automodel_cfg.enabled=true."
         )
 
     # A null projection path marks a same-vocab teacher (direct KL, no
@@ -424,8 +424,8 @@ def setup(
     # order) and tile it cleanly into per-DP-rank chunks and whole microbatches.
     # assert_teacher_student_batch_grid checks both (GBS agreement + tiling).
     student_dp = student_policy.data_parallel_size
-    student_tp = policy_config["dtensor_cfg"]["tensor_parallel_size"]
-    student_cp = policy_config["dtensor_cfg"]["context_parallel_size"]
+    student_tp = policy_config["automodel_cfg"]["tensor_parallel_size"]
+    student_cp = policy_config["automodel_cfg"]["context_parallel_size"]
     # Each teacher may differ from the student (and from each other) in
     # DP/MBS/TP/CP, so check the batch grid and node-local IPC layout per
     # teacher. Train and validation share the grid (the student reuses its train
@@ -450,8 +450,8 @@ def setup(
             gpus_per_node=cluster_config.gpus_per_node,
             student_tp=student_tp,
             student_cp=student_cp,
-            teacher_tp=tc["dtensor_cfg"]["tensor_parallel_size"],
-            teacher_cp=tc["dtensor_cfg"]["context_parallel_size"],
+            teacher_tp=tc["automodel_cfg"]["tensor_parallel_size"],
+            teacher_cp=tc["automodel_cfg"]["context_parallel_size"],
             student_dp=student_dp,
             teacher_dp=teacher_dp,
         )

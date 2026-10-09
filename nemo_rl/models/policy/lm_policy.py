@@ -24,6 +24,10 @@ from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.megatron_sft_packed import (
+    MEGATRON_SFT_PACKED_BATCH_FIELDS,
+    is_direct_packed_row,
+)
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -66,6 +70,8 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
+
+_DIRECT_PACKED_SFT_REQUIRED_KEYS = MEGATRON_SFT_PACKED_BATCH_FIELDS
 
 
 def _aggregate_megatron_flops_metrics(
@@ -148,8 +154,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         pp_size = 1
         cp_size = 1
 
-        megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
-        dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
+        megatron_enabled = bool(config.get("megatron_cfg", {}).get("enabled", False))
+        automodel_enabled = bool(config.get("automodel_cfg", {}).get("enabled", False))
         # Normalize in place: every downstream reader (workers, setup, train)
         # accesses draft config by attribute, so a hand-built PolicyConfig has
         # to be validated here rather than only inside MasterConfig.
@@ -159,19 +165,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         draft_enabled = bool(draft_config is not None and draft_config.enabled)
         generation_config = config.get("generation") or {}
         nvfp4_pertoken_rollout = generation_config.get("nvfp4_pertoken_rollout") or {}
-        if megatron_enable and dtensor_enable:
+        if megatron_enabled and automodel_enabled:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
-                "DTensor (policy.dtensor_cfg.enabled=true), not both."
+                "Automodel (policy.automodel_cfg.enabled=true), not both. A config "
+                "that used to set policy.dtensor_cfg.enabled=false must now set "
+                "policy.automodel_cfg.enabled=false: dtensor_cfg has been renamed "
+                "and no longer disables anything."
             )
-        if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enable:
+        if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enabled:
             raise ValueError(
                 "generation.nvfp4_pertoken_rollout requires the Megatron "
                 "training backend (policy.megatron_cfg.enabled=true); DTensor "
                 "does not implement TE NVFP4 training."
             )
         validate_fp32_lm_head_config(
-            config, megatron_enabled=megatron_enable, dtensor_enabled=dtensor_enable
+            config,
+            megatron_enabled=megatron_enabled,
+            automodel_enabled=automodel_enabled,
         )
         hf_config = None
         hf_config_overrides = config.get("hf_config_overrides") or {}
@@ -185,16 +196,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
                 validate_fp32_lm_head_config(
                     config,
-                    megatron_enabled=megatron_enable,
-                    dtensor_enabled=dtensor_enable,
+                    megatron_enabled=megatron_enabled,
+                    automodel_enabled=automodel_enabled,
                     model_config=hf_config,
                 )
-        if reserved_http_server_ports is not None and not megatron_enable:
+        if reserved_http_server_ports is not None and not megatron_enabled:
             raise ValueError(
                 "reserved_http_server_ports is only supported by the Megatron "
                 "worker (policy.megatron_cfg.enabled=true)."
             )
-        if draft_enabled and not megatron_enable:
+        if draft_enabled and not megatron_enabled:
             raise ValueError(
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
                 "Set policy.megatron_cfg.enabled=true or disable policy.draft."
@@ -238,7 +249,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "which the fused path never materializes. Disable one of the "
                 "two."
             )
-        if megatron_enable:
+        if megatron_enabled:
             worker_builder_cls_fqn = resolve_policy_worker_cls(
                 "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
                 config,
@@ -256,26 +267,26 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
 
         else:
-            if not dtensor_enable:
+            if not automodel_enabled:
                 raise ValueError(
                     "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
-                    "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
+                    "or set policy.automodel_cfg.enabled=true to use the Automodel training backend."
                 )
 
             worker_builder_cls_fqn = resolve_policy_worker_cls(
-                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
+                "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker",
                 config,
             )
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 warnings.warn(
-                    "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorPolicyWorker V2. This variable is set in our container, but "
+                    "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in AutomodelPolicyWorker. This variable is set in our container, but "
                     "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
                 )
 
-            tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
-            cp_size = config["dtensor_cfg"]["context_parallel_size"]
+            tp_size = config["automodel_cfg"]["tensor_parallel_size"]
+            cp_size = config["automodel_cfg"]["context_parallel_size"]
 
-            env_vars = config["dtensor_cfg"].get("env_vars", {})
+            env_vars = config["automodel_cfg"].get("env_vars", {})
 
         # If a worker extension class is provided, use it instead of the default worker builder class
         if extension_fqn is not None:
@@ -349,7 +360,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             worker_sharding_annotations=self.sharding_annotations,
             pre_init_communication_queue=pre_init_queue,
         )
-        if megatron_enable:
+        if megatron_enabled:
             worker_kwargs["is_refit_destination"] = is_refit_destination
         elif is_refit_destination:
             raise ValueError("is_refit_destination=True requires the Megatron backend.")
@@ -358,7 +369,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if reserved_http_server_ports is not None:
             worker_kwargs["reserved_http_server_ports"] = reserved_http_server_ports
 
-        if dtensor_enable:
+        if automodel_enabled:
             # DTensor workers reconstruct tokenizer/processor locally to avoid
             # pickling across incompatible transformers versions (v4 head → v5 worker).
             config["tokenizer"]["use_processor"] = processor is not None
@@ -611,6 +622,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self,
         data: BatchedDataDict[Any],
         batch_size: int,
+        *,
+        micro_batch_size: Optional[int] = None,
     ) -> list["SlicedDataDict"]:
         """Shard inputs for ``train``.
 
@@ -621,7 +634,50 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         scalar metrics (no per-row outputs to reorder).
         """
         dp_size = self.data_parallel_size
-        if self.use_dynamic_batches:
+        if is_direct_packed_row(data):
+            missing = _DIRECT_PACKED_SFT_REQUIRED_KEYS.difference(data)
+            if missing:
+                raise ValueError(
+                    "Direct packed SFT batch is missing required fields: "
+                    f"{sorted(missing)}"
+                )
+            if (
+                "megatron_cfg" not in self.cfg
+                or not self.cfg["megatron_cfg"]["enabled"]
+            ):
+                raise ValueError("Direct packed SFT rows require the Megatron backend")
+            if "draft" in self.cfg and self.cfg["draft"]["enabled"]:
+                raise NotImplementedError(
+                    "Direct packed SFT rows do not support draft training"
+                )
+            effective_micro_batch_size = (
+                micro_batch_size
+                if micro_batch_size is not None
+                else self.cfg["train_micro_batch_size"]
+            )
+            if effective_micro_batch_size != 1:
+                raise ValueError("Direct packed SFT rows require micro batch size 1")
+            if self.cfg["dynamic_batching"]["enabled"]:
+                raise ValueError(
+                    "Direct packed SFT rows require dynamic batching to be disabled"
+                )
+            if batch_size != data.size:
+                raise ValueError(
+                    "Direct packed SFT global batch size must equal the packed row "
+                    f"count: gbs={batch_size}, rows={data.size}"
+                )
+            if batch_size % dp_size != 0:
+                raise ValueError(
+                    "Direct packed SFT global batch size must be divisible by data "
+                    f"parallel size: gbs={batch_size}, dp={dp_size}"
+                )
+            sharded_data = [
+                SlicedDataDict(
+                    data.select_indices(list(range(dp_rank, data.size, dp_size)))
+                )
+                for dp_rank in range(dp_size)
+            ]
+        elif self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
             ]["train_mb_tokens"]
@@ -892,7 +948,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
         with timer.time("policy_training/sharding_data") if timer else nullcontext():
-            sharded_data = self._shard_for_train(data, batch_size)
+            if is_direct_packed_row(data):
+                sharded_data = self._shard_for_train(
+                    data,
+                    batch_size,
+                    micro_batch_size=micro_batch_size,
+                )
+            else:
+                sharded_data = self._shard_for_train(data, batch_size)
         self._report_sharded_payload(sharded_data, "policy_train")
 
         if self.flops_tracker is not None:
@@ -1380,7 +1443,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         DTensor checkpoint resources are configured when the Policy is
         constructed. ``weights_path`` selects the destination for each save.
         """
-        if bool(self.cfg.get("dtensor_cfg", {}).get("enabled", False)):
+        if bool(self.cfg.get("automodel_cfg", {}).get("enabled", False)):
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,
