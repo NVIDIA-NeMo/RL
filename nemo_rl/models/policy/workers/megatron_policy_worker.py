@@ -2134,7 +2134,10 @@ class MegatronPolicyWorkerImpl(
         # split step boundary here so finish reports this step alone. The
         # collector also clears after a successful finish; clearing at begin
         # additionally prevents an aborted/failed step from leaking forward.
-        self._clear_mtp_metrics_tracker()
+        # Scoped to execution-changing shared-prefix modes (shared arms and the
+        # dense control) so the default path keeps its MTP logging unchanged.
+        if self._shared_prefix_cfg.mode not in ("disabled", "observe"):
+            self._clear_mtp_metrics_tracker()
         # Match sync train() inference-state reset (line 332-340).
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -3557,9 +3560,7 @@ class MegatronPolicyWorkerImpl(
 
     def _clear_mtp_metrics_tracker(self) -> None:
         """Clear process-global MTP logging state at a split-step boundary."""
-        model_config = self._get_model_config()
-        mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
-        if mtp_num_layers is not None and mtp_num_layers > 0:
+        if self.mtp_enabled:
             # Imported lazily for the same cloudpickle isolation reason as
             # get_mtp_metrics in _collect_mtp_metrics.
             from megatron.core.transformer.multi_token_prediction import (
