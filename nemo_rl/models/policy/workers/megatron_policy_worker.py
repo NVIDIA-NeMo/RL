@@ -64,8 +64,8 @@ from nemo_rl.data.multimodal_utils import (
 from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_EXECUTION_SLOT,
     SHARED_PREFIX_GROUP_ID,
-    group_id_from_sample_id,
 )
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -616,21 +616,21 @@ class MegatronPolicyWorkerImpl(
         self,
         data: BatchedDataDict[Any],
         meta: Any,
+        *,
+        stage: Optional[Literal["train", "logprobs"]],
     ) -> BatchedDataDict[Any]:
         """Preserve sibling rows only for this TQ consumer's enabled stage."""
-        stage: Literal["train", "logprobs"] = (
-            "logprobs" if meta.task_name in ("prev_lp", "ref_lp") else "train"
-        )
-        if self._shared_prefix_cfg.enabled_for(stage=stage):
-            if len(meta.sample_ids) != data.size:
+        if stage is not None and self._shared_prefix_cfg.enabled_for(stage=stage):
+            if meta.tags is None or len(meta.tags) != data.size:
+                raise ValueError("shared-prefix row tags must align with fetched rows")
+            if any(GROUP_ID_TAG not in tag for tag in meta.tags):
                 raise ValueError(
-                    "shared-prefix sample IDs must align with fetched rows"
+                    f"shared-prefix dispatch requires a {GROUP_ID_TAG!r} tag on "
+                    "every row"
                 )
-            # Use the same durable row identity that the driver shards on.
-            # Avoid an extra non-tensor queue column and its broadcast semantics.
-            data[SHARED_PREFIX_GROUP_ID] = [
-                group_id_from_sample_id(sample_id) for sample_id in meta.sample_ids
-            ]
+            # The row tag the driver shards complete groups on. Avoid an extra
+            # non-tensor queue column and its broadcast semantics.
+            data[SHARED_PREFIX_GROUP_ID] = [tag[GROUP_ID_TAG] for tag in meta.tags]
             data = _normalize_shared_prefix_group_ids(data)
             raw_slots = (meta.extra_info or {}).get(SHARED_PREFIX_EXECUTION_SLOT)
             if raw_slots is None:
@@ -648,7 +648,7 @@ class MegatronPolicyWorkerImpl(
                 dtype=torch.long,
             )
             return data
-        return super()._attach_or_repack_pack_metadata(data, meta)
+        return super()._attach_or_repack_pack_metadata(data, meta, stage=stage)
 
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.

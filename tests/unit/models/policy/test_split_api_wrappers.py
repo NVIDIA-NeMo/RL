@@ -56,8 +56,8 @@ class _SplitStubWorker(TQWorkerMixin):
         self.calls.append(("fetch", meta))
         return {"data_from": meta}
 
-    def _attach_or_repack_pack_metadata(self, data, meta):
-        self.calls.append(("attach", meta))
+    def _attach_or_repack_pack_metadata(self, data, meta, *, stage):
+        self.calls.append(("attach", meta, stage))
         return data
 
     def _is_replica_leader(self) -> bool:
@@ -103,6 +103,7 @@ class TestPreshardedWrappers:
         out = w.train_microbatch_presharded(meta=meta)
         assert out is None  # metrics accumulate in the open-step state
         assert [c[0] for c in w.calls] == ["fetch", "attach", "train_microbatch"]
+        assert w.calls[1][2] == "train"
         assert w.calls[-1][1] == {"data_from": meta}
 
     def test_finish_tags_replica_leader(self):
