@@ -59,6 +59,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_multimodal import (
+    _has_image_before_first_trainable_output,
     _index_per_turn_images,
     _is_trainable_output_item,
     _without_initial_media_sources,
@@ -1183,6 +1184,10 @@ Depending on your data shape, you may want to change these values."""
         returned_media_sources = extract_input_media_sources_from_responses_messages(
             media_messages
         )
+        first_turn_has_additional_images = (
+            processor is not None
+            and _has_image_before_first_trainable_output(response["output"])
+        )
         initial_media_matches_raw_input = (
             bool(raw_initial_sources)
             and len(agent_initial_sources) == len(raw_initial_sources)
@@ -1205,6 +1210,12 @@ Depending on your data shape, you may want to change these values."""
             not include_initial_multimodal_data
             and initial_media_matches_raw_input
             and returned_media_matches_raw_input
+            # A tool image before the first model response shares the first
+            # trainable turn with the initial media. Keep that initial media in
+            # the actor payload so rollout-budget repair covers the complete
+            # ordered image set rather than marking a tool-only subset as
+            # authoritative.
+            and not first_turn_has_additional_images
         )
         raw_initial_image_sources = [
             source
