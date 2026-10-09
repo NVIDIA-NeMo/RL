@@ -18,7 +18,6 @@ import unittest
 import numpy as np
 import pytest
 import torch
-from pydantic import ValidationError
 
 # Module-level megatron imports would break COLLECTION on non-mcore CI shards
 # (marks only deselect at run time); skip collection gracefully instead.
@@ -34,10 +33,6 @@ from nemo_rl.models.megatron.data import plan_shared_prefix_execution_units
 from nemo_rl.models.megatron.shared_prefix_dense_bins import (
     plan_dense_training_bins,
     share_prefixes_in_dense_training_bins,
-)
-from nemo_rl.models.policy import (
-    SharedPrefixTrainingConfig,
-    validate_shared_prefix_training_config,
 )
 
 pytestmark = pytest.mark.mcore
@@ -188,45 +183,9 @@ class TestSharedPrefixDenseBins(unittest.TestCase):
             data, [unit], cfg=config(), bin_capacity=68
         )
         assert shared.shared_layout is not None
-        assert [len(root.row_indices) for root in shared.shared_layout.roots] == [16, 1]
+        # Past the 16-branch limit, one group splits into even roots.
+        assert [len(root.row_indices) for root in shared.shared_layout.roots] == [9, 8]
         assert shared.shared_layout.mtp_loss_group_root_counts == (2,)
-
-    def test_flag_is_strict_and_disabled_by_default(self):
-        assert SharedPrefixTrainingConfig().training_dense_bins is False
-        with self.assertRaises(ValidationError):
-            SharedPrefixTrainingConfig(training_dense_bins="true")
-
-    def _test_flag_requires_training_and_aligned_group_execution(self, field, value):
-        shared = dict(
-            mode="train",
-            training_dense_bins=True,
-            pack_groups=True,
-            repack_groups=True,
-            align_data_parallel=True,
-        )
-        shared[field] = value
-        with self.assertRaisesRegex(ValueError, "training_dense_bins requires"):
-            validate_shared_prefix_training_config({"shared_prefix_training": shared})
-
-    def test_flag_requires_training_and_aligned_group_execution_0(self):
-        self._test_flag_requires_training_and_aligned_group_execution(
-            "mode", "logprobs"
-        )
-
-    def test_flag_requires_training_and_aligned_group_execution_1(self):
-        self._test_flag_requires_training_and_aligned_group_execution(
-            "pack_groups", False
-        )
-
-    def test_flag_requires_training_and_aligned_group_execution_2(self):
-        self._test_flag_requires_training_and_aligned_group_execution(
-            "repack_groups", False
-        )
-
-    def test_flag_requires_training_and_aligned_group_execution_3(self):
-        self._test_flag_requires_training_and_aligned_group_execution(
-            "align_data_parallel", False
-        )
 
 
 if __name__ == "__main__":

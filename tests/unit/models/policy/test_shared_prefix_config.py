@@ -51,7 +51,11 @@ def policy_config():
 
 @pytest.fixture
 def megatron_rl():
-    """Checks past the topology resolver need the megatron.rl planning modules."""
+    """Checks past the topology resolver need the megatron.rl planning modules.
+
+    Tests that use it are also marked ``mcore``, so they run in the Megatron
+    lane instead of always skipping in the default one.
+    """
     pytest.importorskip("megatron.rl.shared_prefix_tensors")
 
 
@@ -66,6 +70,7 @@ def test_shared_filtering_rejected_before_backend_setup(
         validate_shared_prefix_training_config(policy_config)
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize("mode", ["logprobs", "train"])
 @pytest.mark.parametrize("top_k", [None, 0, -1])
 def test_shared_unfiltered_sampling_and_temperature_allowed(
@@ -76,6 +81,7 @@ def test_shared_unfiltered_sampling_and_temperature_allowed(
     assert validate_shared_prefix_training_config(policy_config).mode == mode
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize("mode", ["logprobs", "train"])
 def test_shared_policy_without_generation_config_allowed(
     policy_config, megatron_rl, mode
@@ -107,6 +113,7 @@ def test_inactive_mtp_bypass_rejected_for_every_backend(policy_config, megatron)
         validate_shared_prefix_training_config(policy_config)
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize("mode", ["dense", "logprobs", "train"])
 def test_mtp_bypass_allowed_in_execution_or_dense_control(
     policy_config, megatron_rl, mode
@@ -278,6 +285,36 @@ def test_effective_flag_combinations_accepted(block):
     assert SharedPrefixTrainingConfig(**block).mode == block["mode"]
 
 
+def test_training_dense_bins_is_strict_and_disabled_by_default():
+    assert SharedPrefixTrainingConfig().training_dense_bins is False
+    with pytest.raises(ValidationError):
+        SharedPrefixTrainingConfig(training_dense_bins="true")
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("mode", "logprobs"),
+        ("pack_groups", False),
+        ("repack_groups", False),
+        ("align_data_parallel", False),
+    ],
+)
+def test_training_dense_bins_requires_training_and_aligned_group_execution(
+    field, value
+):
+    block = {
+        "mode": "train",
+        "training_dense_bins": True,
+        "pack_groups": True,
+        "repack_groups": True,
+        "align_data_parallel": True,
+    }
+    block[field] = value
+    with pytest.raises(ValueError, match="training_dense_bins requires"):
+        validate_shared_prefix_training_config({"shared_prefix_training": block})
+
+
 def _set(path, value):
     def mutate(config):
         target = config
@@ -415,6 +452,7 @@ def test_enabled_mode_policy_requirements(policy_config, mode, mutate, error, me
         validate_shared_prefix_training_config(policy_config)
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize("mode", ["logprobs", "train"])
 @pytest.mark.parametrize("mutate,error,message", _TOPOLOGY_REQUIREMENT_ERRORS)
 def test_enabled_mode_topology_requirements(
@@ -437,6 +475,7 @@ def test_dense_control_requires_megatron(policy_config, enabled):
         validate_shared_prefix_training_config(policy_config)
 
 
+@pytest.mark.mcore
 def test_hybridep_without_prepadding_accepted(policy_config, megatron_rl):
     policy_config["megatron_cfg"].update(
         moe_token_dispatcher_type="flex",
