@@ -97,6 +97,7 @@ jobs:
       REGISTRY: ${{ inputs.registry }}
       IMAGE_NAME: ${{ inputs.image-name }}
       GH_REF: ${{ github.ref }}
+      GH_EVENT_NAME: ${{ github.event_name }}
       RUN_ID: ${{ github.run_id }}
     steps:
       - name: Checkout repository
@@ -187,10 +188,11 @@ jobs:
             CCACHE_TAG_PREFIX="${CCACHE_TAG_PREFIX:+${CCACHE_TAG_PREFIX}-${CACHE_SCOPE}}"
             WHEEL_TAG_PREFIX="${WHEEL_TAG_PREFIX:+${WHEEL_TAG_PREFIX}-${CACHE_SCOPE}}"
           fi
-          # Only builds of main or of a release branch itself may write the shared TRT-LLM cache images;
-          # PR builds still read (seed from) them but never push, so an unmerged PR cannot alter them.
+          # Only builds of main or pushes to a release branch may write the shared TRT-LLM cache images;
+          # PR builds and manual release-branch dispatches still read (seed from) them but never push,
+          # so an unmerged PR or an experimental dispatch cannot alter them.
           PUBLISH_CACHE=false
-          if [[ "$GH_REF" == "refs/heads/main" || "$GH_REF" =~ ^refs/heads/r[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ "$GH_REF" == "refs/heads/main" || ( "$GH_EVENT_NAME" == "push" && "$GH_REF" =~ ^refs/heads/r[0-9]+\.[0-9]+\.[0-9]+$ ) ]]; then
             PUBLISH_CACHE=true
           fi
           {
@@ -329,9 +331,9 @@ jobs:
           if [[ "$GH_REF" == "refs/heads/main" ]]; then
             CACHE_KEY="main"
             TAGS+=("$REGISTRY/$IMAGE_NAME:main")
-          elif [[ "$GH_REF" =~ ^refs/heads/r[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            # Only builds of the release branch itself (not of its PRs) publish the branch tag
-            # that Lfast runs on PRs to that branch reuse; the cache is likewise branch-scoped.
+          elif [[ "$GH_EVENT_NAME" == "push" && "$GH_REF" =~ ^refs/heads/r[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            # Only pushes to the release branch itself (not its PRs or manual dispatches) publish the
+            # branch tag that Lfast runs on PRs to that branch reuse; the cache is likewise branch-scoped.
             CACHE_KEY="${GH_REF#refs/heads/}"
             TAGS+=("$REGISTRY/$IMAGE_NAME:$CACHE_KEY")
           elif [[ -n "$PR_NUMBER" ]]; then
@@ -351,6 +353,12 @@ jobs:
             CACHE_FROM+=("type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_KEY-buildcache,mode=max")
           fi
 
+          # A manual dispatch on a release branch reads the branch cache but writes a run-private one.
+          CACHE_TO_KEY="$CACHE_KEY"
+          if [[ "$GH_EVENT_NAME" != "push" && "$GH_REF" =~ ^refs/heads/r[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            CACHE_TO_KEY="run-$RUN_ID"
+          fi
+
           {
             echo "tags<<EOF"
             printf '%s\n' "${TAGS[@]}"
@@ -358,7 +366,7 @@ jobs:
             echo "cache-from<<EOF"
             printf '%s\n' "${CACHE_FROM[@]}"
             echo "EOF"
-            echo "cache-to=type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_KEY-buildcache,mode=max"
+            echo "cache-to=type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_TO_KEY-buildcache,mode=max"
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push

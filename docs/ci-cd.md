@@ -23,7 +23,7 @@ Tests are organized into levels of increasing scope and cost:
 ## Shared Build Caches
 
 - The prebuilt `main` container and the TRT-LLM ccache/wheel cache images are written only by builds of `main` itself. PR builds read them but never push to them.
-- Release branches (`r<major>.<minor>.<patch>`) get their own container tag (`:<branch>`), `<branch>-buildcache` and branch-scoped TRT-LLM caches, written only by pushes to that branch. They never write `main`'s caches or the `uv-cache` image.
+- Release branches (`r<major>.<minor>.<patch>`) get their own container tag (`:<branch>`), `<branch>-buildcache` and branch-scoped TRT-LLM caches, written only by pushes to that branch (manual dispatches on a release branch publish nothing shared). They never write `main`'s caches or the `uv-cache` image.
 - A PR's own image is tagged with its run ID and PR number only.
 
 ## Triggering CI on Pull Requests
