@@ -256,6 +256,26 @@ def _apply_dynamic_sampling(
     return pending_meta, pending_carry, [], True, ds_metrics, unfiltered_for_log
 
 
+def _train_data_log_rewards(
+    rewards: torch.Tensor, use_dynamic_sampling: bool
+) -> dict[str, list[float]]:
+    """Reward columns of the per-step ``train_data_step*.jsonl``.
+
+    Every column of that file is one entry per trained row, so ``rewards``
+    must be the trained rows' rewards (``driver_carry`` order). The
+    pre-filter rewards that dynamic sampling tracks for ``metrics["reward"]``
+    are a different population: ``_apply_dynamic_sampling`` concatenates every
+    round's unfiltered rewards and truncates them to ``train_prompts_size``, so
+    the lengths match but entry ``i`` belongs to another rollout (including
+    ones dynamic sampling dropped). ``filtered_rewards`` is kept under dynamic
+    sampling for readers of the existing key; it equals ``rewards``.
+    """
+    columns = {"rewards": rewards.tolist()}
+    if use_dynamic_sampling:
+        columns["filtered_rewards"] = columns["rewards"]
+    return columns
+
+
 def validate_sync(
     *,
     rollout_actor: SyncRolloutActor,
@@ -1370,13 +1390,11 @@ def grpo_train_sync(
                 log_data: dict = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
-                if master_config.grpo.use_dynamic_sampling:
-                    # Legacy semantics: ``rewards`` is unfiltered total_reward,
-                    # ``filtered_rewards`` is the kept slice that's trained on.
-                    log_data["rewards"] = unfiltered_rewards.tolist()
-                    log_data["filtered_rewards"] = rewards.tolist()
-                else:
-                    log_data["rewards"] = rewards.tolist()
+                log_data.update(
+                    _train_data_log_rewards(
+                        rewards, master_config.grpo.use_dynamic_sampling
+                    )
+                )
                 log_data["input_lengths"] = input_lengths.tolist()
                 log_data["token_loss_mask"] = token_mask.tolist()
                 log_data["sample_loss_mask"] = sample_mask.tolist()
