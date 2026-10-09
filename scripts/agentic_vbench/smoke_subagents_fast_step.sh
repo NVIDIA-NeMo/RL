@@ -52,7 +52,7 @@ exec bash "$script_dir/smoke_off_32turns_256k.sh" \
   async_rl.sampler.max_lookahead_versions=0 \
   "async_rl.max_inflight_prompts=${NUM_PROMPTS}" \
   "async_rl.max_buffered_rollouts=${NUM_PROMPTS}" \
-  "token_capture.max_train_row_tokens=${SUBAGENT_MAX_ROW_TOKENS}" \
+  "+token_capture.max_train_row_tokens=${SUBAGENT_MAX_ROW_TOKENS}" \
   +env.nemo_gym.training_mode=subagent \
   "+${agent}.opencode_training_mode=subagent" \
   "+${agent}.opencode_subagents_enabled=true" \
