@@ -192,6 +192,8 @@ MAX_WORKER_PORT=${MAX_WORKER_PORT:-2999}
 ########################################################
 # Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
+# Setting LOKI_PUSH_URL streams those same logs to Loki over the network instead
+# of copying them to the shared filesystem. Requires an image with Grafana Alloy.
 ########################################################
 
 # Unset UV_CACHE_DIR to avoid local cache directory interferring with the container cache
@@ -661,6 +663,102 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
   mkdir -p "$SANDBOX_PORTS_DIR"
 fi
 
+# srun -o with %t produces per-task log files; zero-pad to the worker-count width
+# so ray-worker-*.log filenames sort naturally (e.g. ray-worker-007.log). Used
+# both by the worker srun below and by the Alloy sidecar, which has to name the
+# same file.
+_num_workers=$((SLURM_JOB_NUM_NODES - 1))
+_task_digits=${#_num_workers}
+
+# The sandbox sidecars send stdout and stderr to one file per node under
+# SANDBOX_PORTS_DIR. That directory is on the shared FS, so every node's Alloy
+# can see all of the files; only the head tails them, otherwise each file ships
+# once per node. Runs without a sandbox get a path that never exists.
+if [[ -n "$SANDBOX_PORTS_DIR" ]]; then
+  _sandbox_log_glob="$SANDBOX_PORTS_DIR/sandbox-*.log"
+else
+  _sandbox_log_glob=/tmp/no-sandbox.log
+fi
+
+# Alloy log export, sourced by both roles once RAY_NODE_ROLE is set. Kept in its
+# own file so the two generated container commands don't each need a copy, and
+# sourced early in them so it inherits SLURM_* before the scrub.
+ALLOY_SIDECAR_FILE="$LOG_DIR/alloy_sidecar.sh"
+cat > "$ALLOY_SIDECAR_FILE" <<EOF
+[[ -n "\${LOKI_PUSH_URL:-}" ]] || return 0
+
+ALLOY_CONFIG="\${ALLOY_CONFIG:-$SLURM_SUBMIT_DIR/alloy/config.alloy}"
+# Alloy resolves the endpoint and certs itself and only reports failures to its
+# own log, so check them here instead: a missing export should say so in the
+# wrapper log rather than silently ship nothing.
+_alloy_missing=()
+[[ -x /usr/local/bin/alloy ]] || _alloy_missing+=(/usr/local/bin/alloy)
+[[ -r "\$ALLOY_CONFIG" ]] || _alloy_missing+=("\$ALLOY_CONFIG")
+command -v setsid >/dev/null || _alloy_missing+=(setsid)
+# Only the shipped config authenticates with mTLS; a custom ALLOY_CONFIG brings
+# its own auth, which Alloy validates itself.
+if [[ "\$ALLOY_CONFIG" == "$SLURM_SUBMIT_DIR/alloy/config.alloy" ]]; then
+  for _v in LOKI_CA_FILE LOKI_CERT_FILE LOKI_KEY_FILE; do
+    [[ -r "\${!_v:-}" ]] || _alloy_missing+=("\$_v=\${!_v:-unset}")
+  done
+fi
+if (( \${#_alloy_missing[@]} )); then
+  echo "[WARNING] Alloy log export disabled, unusable: \${_alloy_missing[*]}" >&2
+  return 0
+fi
+
+# Slurm names the cluster in every job, so the label is populated without the
+# user having to export anything.
+export CLUSTER_NAME="\${CLUSTER_NAME:-\${SLURM_CLUSTER_NAME:-}}"
+
+if [[ "\$RAY_NODE_ROLE" == head ]]; then
+  export RAY_WRAPPER_LOG_FILE="$LOG_DIR/ray-head.log"
+  export RAY_DRIVER_LOG_FILE="$LOG_DIR/ray-driver.log"
+  export RAY_SANDBOX_LOG_GLOB="$_sandbox_log_glob"
+else
+  printf -v RAY_WRAPPER_LOG_FILE '%s/ray-worker-%0*d.log' "$LOG_DIR" $_task_digits "\$SLURM_PROCID"
+  export RAY_WRAPPER_LOG_FILE
+  # Workers have no driver log; point that source at a path that never exists.
+  export RAY_DRIVER_LOG_FILE=/tmp/no-driver.log
+  # The sandbox files are shared; only the head ships them.
+  export RAY_SANDBOX_LOG_GLOB=/tmp/no-sandbox.log
+fi
+
+alloy_stop() {
+  local rc=\$?
+  trap - EXIT
+  sleep 5
+  kill -TERM "\$ALLOY_PID" 2>/dev/null || true
+  # Bounded drain: a backlogged Alloy must not hold the job open indefinitely.
+  local waited=0
+  while kill -0 "\$ALLOY_PID" 2>/dev/null && (( waited < 60 )); do
+    sleep 1
+    waited=\$((waited + 1))
+  done
+  kill -KILL "\$ALLOY_PID" 2>/dev/null || true
+  exit "\$rc"
+}
+
+# New session: teardown signals the wrapper's process group, and Alloy has to
+# outlive that to ship the final lines.
+# --disable-reporting: Alloy otherwise posts a usage report to stats.grafana.org
+# every few hours, from every node.
+setsid /usr/local/bin/alloy run "\$ALLOY_CONFIG" --storage.path=/tmp/alloy-state --disable-reporting > "$LOG_DIR/alloy-\$(hostname).log" 2>&1 &
+ALLOY_PID=\$!
+# Alloy exits within a second if it cannot bind its HTTP port or load the
+# config. Without this the line below would claim success and ship nothing.
+sleep 2
+if ! kill -0 "\$ALLOY_PID" 2>/dev/null; then
+  echo "[WARNING] Alloy exited at startup; see $LOG_DIR/alloy-\$(hostname).log" >&2
+  return 0
+fi
+echo "[INFO] Alloy started (pid \$ALLOY_PID)"
+trap alloy_stop EXIT
+# Without a TERM trap bash dies before EXIT runs, so a cancelled job loses
+# whatever Alloy had not yet shipped.
+trap 'exit 143' TERM
+EOF
+
 # First we start the head of the ray cluster on one of the physical nodes
 # Give the head node actual resources to make it schedulable
 
@@ -688,6 +786,9 @@ fi
 # elapsed counter shares the submit-side timeline.
 log_phase() { local t0="\${NRL_JOB_START_EPOCH:-0}"; echo "[NRL_PHASE][\$(date '+%Y-%m-%dT%H:%M:%S%z')][+\$(( \$(date +%s) - \${t0%.*} ))s] \$*"; }
 log_phase "head container started on \$(hostname)"
+
+export RAY_NODE_ROLE=head
+source "$ALLOY_SIDECAR_FILE"
 
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
@@ -921,6 +1022,9 @@ fi
 log_phase() { local t0="\${NRL_JOB_START_EPOCH:-0}"; echo "[NRL_PHASE][\$(date '+%Y-%m-%dT%H:%M:%S%z')][+\$(( \$(date +%s) - \${t0%.*} ))s] \$*"; }
 log_phase "worker \$SLURM_PROCID container started on \$(hostname)"
 
+export RAY_NODE_ROLE=worker
+source "$ALLOY_SIDECAR_FILE"
+
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
     pkill -P $$ || true
@@ -1115,11 +1219,7 @@ SRUN_PIDS["ray-head"]=$!
 # the number of srun/slurmctld RPCs stays constant regardless of node count. In
 # single-node mode there are no workers: the head already registers its GPUs as Ray
 # resources.
-_num_workers=$((SLURM_JOB_NUM_NODES - 1))
 if [[ $_num_workers -gt 0 ]]; then
-  # srun -o with %t produces per-task log files; zero-pad to the worker-count
-  # width so ray-worker-*.log filenames sort naturally (e.g. ray-worker-007.log).
-  _task_digits=${#_num_workers}
   srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
     --nodes=$_num_workers \
     --ntasks=$_num_workers \
