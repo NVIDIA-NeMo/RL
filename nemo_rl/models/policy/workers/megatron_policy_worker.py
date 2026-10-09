@@ -1131,6 +1131,20 @@ class MegatronPolicyWorkerImpl(
 
     def _validate_shared_prefix_worker_features(self) -> None:
         """Reject features outside the first exact Hybrid star contract."""
+        # The dense comparison control may select these knobs too. Check them
+        # before the execution-mode return so an unsupported stack fails here
+        # rather than at the first logprob forward after model load.
+        if self._shared_prefix_cfg.uniform_router_gating:
+            from megatron.core.transformer.moe import moe_utils
+
+            if not hasattr(moe_utils, "router_gating_token_blocks"):
+                raise NotImplementedError(
+                    "policy.shared_prefix_training.uniform_router_gating requires "
+                    "an MCore build that provides "
+                    "moe_utils.router_gating_token_blocks"
+                )
+        if self._shared_prefix_cfg.bypass_evaluation_mtp:
+            self._single_pp1_hybrid_model()
         if not self._shared_prefix_cfg.enabled_for(stage="logprobs"):
             return
 
