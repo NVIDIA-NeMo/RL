@@ -205,19 +205,28 @@ def test_final_norm_applied_before_projection_in_both_paths(patched_model, frame
     features = torch.tensor(
         [[[1.0, 2.0, 4.0, 8.0], [2.0, 3.0, 5.0, 9.0]]], dtype=torch.bfloat16
     )
+    weight = torch.tensor([0.5, 2.0, 3.0, 1.5])
+    bias = torch.tensor([1.0, -2.0, 0.25, 4.0])
     model.load_weights(
         [
-            ("vision_final_layernorm.weight", torch.ones(4)),
-            ("vision_final_layernorm.bias", torch.zeros(4)),
+            ("vision_final_layernorm.weight", weight),
+            ("vision_final_layernorm.bias", bias),
         ]
     )
+    model.mlp1 = nn.Linear(4, 4, dtype=torch.bfloat16)
+    with torch.no_grad():
+        model.mlp1.weight.copy_(
+            torch.tensor([[1, 2, -1, 0], [-2, 1, 3, 1], [0, -1, 2, 4], [3, 0, -2, 1]])
+        )
+        model.mlp1.bias.copy_(torch.tensor([1.0, -0.5, 2.0, -1.0]))
     model.vision_model = lambda pixels, **kwargs: (None, features)
     model.patch_size = model.video_temporal_patch_size = 1
     model.downsample_ratio = 1
     model.pixel_shuffle = lambda features, **kwargs: features
     model.pixel_shuffle_dynamic_res = lambda features, **kwargs: features
     pixels = torch.zeros(1, 3, 1, 2)
-    expected = model._apply_vision_final_layernorm(features)
+    normalized = nn.functional.layer_norm(features.float(), (4,), weight, bias, 1e-6)
+    expected = model.mlp1(normalized.to(torch.bfloat16))
     torch.testing.assert_close(
         model.extract_feature(pixels, num_frames=frames), expected, rtol=0, atol=0
     )

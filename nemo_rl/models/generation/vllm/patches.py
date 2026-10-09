@@ -602,6 +602,9 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
 
     The layer runs in FP32 before pixel shuffle/projection. Both affine
     parameters must load before activation, including dummy startup + refit.
+    Supports stock vLLM 0.29 source or this patch's complete output. Custom
+    forks, including the already-fixed serving fork below, are not recognized;
+    unexpected source layouts fail before writing rather than being skipped.
     References: RL #4036 and TomerBN-Nvidia/vllm commit 10908b9f.
     """
     try:
