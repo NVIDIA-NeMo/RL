@@ -395,6 +395,9 @@ SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY = "hybrid_star_mtp_dense_head
 SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY = (
     "hybrid_star_positionless_attention_v1"
 )
+SUPPORTED_SHARED_PREFIX_FOREST_STABLE_ROUTER_CAPABILITY = (
+    "hybrid_forest_stable_router_v1"
+)
 
 
 def destroy_parallel_state():
@@ -789,7 +792,9 @@ def _validate_shared_prefix_model_capability(
             "policy.megatron_cfg.model_overrides.hidden_dropout if appropriate."
         )
 
-    if model_cfg.window_size not in (None, (-1, -1)):
+    # YAML overrides resolve list-valued windows, and MCore does not normalize.
+    window_size = model_cfg.window_size
+    if window_size is not None and tuple(window_size) != (-1, -1):
         raise NotImplementedError(
             f"policy.shared_prefix_training.mode={shared_prefix_config.mode} does not support sliding-window "
             f"attention; resolved model_cfg.window_size={model_cfg.window_size!r}. "
@@ -863,25 +868,23 @@ def _validate_shared_prefix_model_capability(
                 "once per completion."
             )
 
-        if getattr(model_cfg, "moe_aux_loss_coeff", 0.0) not in (None, 0, 0.0):
+        # moe_aux_loss_coeff needs no check: MCore applies it only for the
+        # auxiliary load-balancing types rejected above.
+
+        if getattr(model_cfg, "moe_z_loss_coeff", None) is not None:
             raise NotImplementedError(
                 f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
-                "model_cfg.moe_aux_loss_coeff=0.0 until router losses are "
-                "multiplicity-aware."
+                "model_cfg.moe_z_loss_coeff=null until router losses are "
+                "multiplicity-aware; set "
+                "policy.megatron_cfg.model_overrides.moe_z_loss_coeff=null."
             )
 
-        if getattr(model_cfg, "moe_z_loss_coeff", None) not in (None, 0, 0.0):
+        if getattr(model_cfg, "moe_input_jitter_eps", None) is not None:
             raise NotImplementedError(
                 f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
-                "model_cfg.moe_z_loss_coeff to be null or zero until router losses "
-                "are multiplicity-aware."
-            )
-
-        if getattr(model_cfg, "moe_input_jitter_eps", None) not in (None, 0, 0.0):
-            raise NotImplementedError(
-                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
-                "model_cfg.moe_input_jitter_eps to be null or zero; independently "
-                "jittered prompt copies are incompatible with exact prefix sharing."
+                "model_cfg.moe_input_jitter_eps=null; independently jittered prompt "
+                "copies are incompatible with exact prefix sharing. Set "
+                "policy.megatron_cfg.model_overrides.moe_input_jitter_eps=null."
             )
 
         if getattr(model_cfg, "moe_expert_capacity_factor", None) is not None:
@@ -1619,18 +1622,6 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_router_load_balancing_type = config["megatron_cfg"][
         "moe_router_load_balancing_type"
     ]
-    if get_shared_prefix_training_config(config).enabled_for(stage="logprobs"):
-        # These provider fields may carry nonzero defaults even when the policy
-        # recipe explicitly disables the corresponding router regularizer.  Copy
-        # them by key presence (rather than truthiness) so zero and null overrides
-        # survive into the resolved model config inspected by capability guards.
-        for field_name in (
-            "moe_aux_loss_coeff",
-            "moe_z_loss_coeff",
-            "moe_input_jitter_eps",
-        ):
-            if field_name in config["megatron_cfg"]:
-                setattr(model_cfg, field_name, config["megatron_cfg"][field_name])
     # Set this to 0.0 to disable updates to the moe router expert bias
     model_cfg.moe_router_bias_update_rate = config["megatron_cfg"][
         "moe_router_bias_update_rate"
