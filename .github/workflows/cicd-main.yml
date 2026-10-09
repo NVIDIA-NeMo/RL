@@ -293,7 +293,7 @@ jobs:
           # release branch itself after merges) because the main container carries main's TRT-LLM wheel,
           # not the release branch's. PR builds never overwrite it.
           IMAGE_TAG=""
-          if [[ "$TEST_LEVEL" == "Lfast" && -n "$CACHE_SCOPE" ]]; then
+          if [[ "$TEST_LEVEL" == "Lfast" && "$IS_PULLREQUEST" == "true" && -n "$CACHE_SCOPE" ]]; then
             IMAGE_TAG="$CACHE_SCOPE"
           elif [[ "$TEST_LEVEL" == "Lfast" || "$TEST_LEVEL" == "docs" ]]; then
             IMAGE_TAG="main"
