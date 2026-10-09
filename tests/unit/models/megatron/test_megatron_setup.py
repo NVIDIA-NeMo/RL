@@ -2215,6 +2215,28 @@ class TestApplyPerformanceConfig:
         assert model_cfg.cuda_graph_modules == ["attn"]
         assert model_cfg.cuda_graph_warmup_steps == 1
 
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            ({}, 2),
+            ({"flash_attention_version": None}, 2),
+            ({"flash_attention_version": 2}, 2),
+            ({"flash_attention_version": 3}, 3),
+            ({"flash_attention_version": 4}, 4),
+        ],
+    )
+    def test_flash_attention_version_defaults_to_fa2(self, configured, expected):
+        """Unset means FA2 (not TE's auto choice, which would be FA4); explicit wins."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(gated_linear_unit=True)
+        config = self._config()
+        config["megatron_cfg"].update(configured)
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.flash_attention_version == expected
+
     def test_basic_performance_config(self):
         """Test applying basic performance configuration."""
         from nemo_rl.models.megatron.setup import _apply_performance_config

@@ -571,8 +571,9 @@ class MegatronConfig(TypedDict):
     batch_invariant_backend: NotRequired[Literal["deepgemm", "te_native", "triton"]]
     # Cross-rank EP combine: "ordered" is portable, "multimem" uses NVLS.
     batch_invariant_collective: NotRequired[Literal["multimem", "ordered"]]
-    # FlashAttention generation: 2 in the base configs; 4 for batch-invariant /
-    # zero-KL recipes (3 or 4 are accepted under batch_invariant_mode).
+    # FlashAttention generation. Defaults to 2 when unset (flash-attn-4 is installed,
+    # so TE's auto choice would be FA4); batch-invariant / zero-KL recipes set 4
+    # (3 or 4 are accepted under batch_invariant_mode).
     flash_attention_version: NotRequired[Literal[2, 3, 4] | None]
     # flag to enable zero train/gen KL with generation.backend='megatron'.
     zero_train_gen_mismatch: NotRequired[bool]

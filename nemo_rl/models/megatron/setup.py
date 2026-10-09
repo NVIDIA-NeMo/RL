@@ -1829,9 +1829,12 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
 
+    # Default to FA2 for every Megatron run: flash-attn-4 is installed, so TE
+    # would otherwise pick FA4. Batch-invariant / zero-KL recipes set 4.
     flash_attention_version = config["megatron_cfg"].get("flash_attention_version")
-    if flash_attention_version is not None:
-        model_cfg.flash_attention_version = flash_attention_version
+    model_cfg.flash_attention_version = (
+        2 if flash_attention_version is None else flash_attention_version
+    )
 
     if "batch_invariant_mode" in config["megatron_cfg"]:
         model_cfg.batch_invariant_mode = config["megatron_cfg"]["batch_invariant_mode"]

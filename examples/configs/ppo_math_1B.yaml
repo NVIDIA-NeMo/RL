@@ -181,7 +181,6 @@ policy:
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     apply_rope_fusion: True
-    # Pin FA2; flash-attn-4 is installed, so TE would otherwise pick FA4. Zero-KL recipes set 4.
     flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
@@ -403,7 +402,6 @@ value:
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     apply_rope_fusion: True
-    # Pin FA2; flash-attn-4 is installed, so TE would otherwise pick FA4. Zero-KL recipes set 4.
     flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
