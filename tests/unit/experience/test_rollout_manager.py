@@ -31,6 +31,7 @@ import uuid
 from copy import deepcopy
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -47,6 +48,7 @@ from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.failures import GenerationUnavailable
+from nemo_rl.experience.metric_utils import rpc_safe_rollout_metrics
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -71,6 +73,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
 )
+from nemo_rl.utils.rpc_guard import assert_metadata_only
 
 # Fixtures shared with the heavyweight rollout tests.
 from tests.unit.environments.test_nemo_gym import (
@@ -1106,6 +1109,7 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
     generation_index, completion = streamed[0]
     assert generation_index == 0
     assert completion.env_extras["ng_rollout_id"] == "r0"
+    assert completion.env_extras["agent_ref"] == {"name": "resolved-agent"}
     assert "mask_sample" not in completion.env_extras["instance_config"]
 
 
@@ -1170,33 +1174,77 @@ def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
     assert metrics["agent/gen_tokens_per_sample/histogram"] == [1, 3]
 
 
-def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics():
-    def _receipt_completion(manifest, truncated):
+def test_nemo_gym_receipt_rollout_metrics_leave_token_metrics_to_finalizer():
+    # Receipts carry no tokens, and a manifest cannot stand in for them: a
+    # root call's delta_len includes its prompt. The finalizer measures the
+    # canonical rows and publishes the token, turn and truncation metrics
+    # (RolloutReassembler.finalize_group), so a receipt group reports only
+    # its reward and agent metrics here.
+    def _receipt_completion(manifest, reward):
         return Completion(
             message_log=[],
             env_extras={
-                "reward": 0.5,
+                "reward": reward,
+                "pass_rate": 1.0,
                 "ng_receipt": {"rollout_id": "r", "manifest": manifest},
             },
-            truncated=truncated,
-            reward=0.5,
+            truncated=False,
+            reward=reward,
         )
 
     completions = [
         _receipt_completion(
-            [{"cum_len": 5, "delta_len": 2}, {"cum_len": 9, "delta_len": 3}],
-            truncated=False,
+            [{"cum_len": 5, "delta_len": 5}, {"cum_len": 9, "delta_len": 4}], 1.0
         ),
-        _receipt_completion([{"cum_len": 4, "delta_len": 4}], truncated=True),
+        _receipt_completion([{"cum_len": 4, "delta_len": 4}], 0.0),
     ]
 
     metrics = _nemo_gym_impl(True)._compute_rollout_metrics(completions, "agent")
 
-    assert metrics["agent/truncation_rate"] == pytest.approx(0.5)
-    assert metrics["agent/total_tokens_per_sample/histogram"] == [9, 4]
-    assert metrics["agent/total_tokens_per_sample/mean"] == pytest.approx(6.5)
-    assert metrics["agent/gen_tokens_per_sample/histogram"] == [5, 4]
-    assert metrics["agent/gen_tokens_per_sample/mean"] == pytest.approx(4.5)
+    assert metrics["total_reward/mean"] == pytest.approx(0.5)
+    assert metrics["total_reward/histogram"] == [1.0, 0.0]
+    assert metrics["agent/reward/mean"] == pytest.approx(0.5)
+    assert metrics["agent/pass_rate/mean"] == pytest.approx(1.0)
+    measured_on_rows = (
+        "turns_per_sample",
+        "tokens_per_sample",
+        "max_gen_tokens_per_turn",
+        "truncation_rate",
+        "termination_rate",
+    )
+    assert [
+        key for key in metrics if any(name in key for name in measured_on_rows)
+    ] == []
+
+
+def test_rpc_safe_rollout_metrics_keeps_numbers_only():
+    metrics = {
+        "total_reward/mean": 0.5,
+        "total_reward/histogram": [1, 0.0],
+        "agent/pass_rate/mean": True,
+        "timing/rollout/total": np.float32(2.5),
+        "routing/group_share/nemo_gym": np.int64(1),
+        "agent/full_result": object(),
+        "agent/nested": {"mean": 1.0},
+        "agent/label": "text",
+        "agent/tensor": torch.tensor(1.0),
+        "agent/mixed_list": [1.0, "x"],
+    }
+
+    safe = rpc_safe_rollout_metrics(metrics)
+
+    assert safe == {
+        "total_reward/mean": 0.5,
+        "total_reward/histogram": [1.0, 0.0],
+        "agent/pass_rate/mean": 1.0,
+        "timing/rollout/total": 2.5,
+        "routing/group_share/nemo_gym": 1.0,
+    }
+    assert all(
+        type(value) is float or all(type(item) is float for item in value)
+        for value in safe.values()
+    )
+    assert_metadata_only(safe)
 
 
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
@@ -1909,7 +1957,12 @@ class _FakeCaptureBuffer(_FakeBuffer):
 
 
 def _receipt_record(
-    rollout_ids, receipts, instance_configs=None, *, loss_multiplier=1.0
+    rollout_ids,
+    receipts,
+    instance_configs=None,
+    *,
+    loss_multiplier=1.0,
+    rollout_metrics=None,
 ):
     instance_configs = instance_configs or [None] * len(rollout_ids)
     completions = [
@@ -1919,6 +1972,7 @@ def _receipt_record(
                 "reward": 0.5,
                 "ng_receipt": receipt,
                 "ng_rollout_id": rid,
+                "agent_ref": {"name": "resolved-agent"},
                 **({"instance_config": cfg} if cfg is not None else {}),
             },
             truncated=False,
@@ -1932,7 +1986,7 @@ def _receipt_record(
         extra_env_info={},
         metadata={"task_name": "nemo_gym"},
         completions=completions,
-        rollout_metrics={},
+        rollout_metrics=dict(rollout_metrics or {}),
         loss_multiplier=loss_multiplier,
     )
 
@@ -1945,6 +1999,7 @@ def _make_capture_manager(
     retry_policy: RolloutRetryPolicy | None = None,
     instance_configs=None,
     recovery_config: RolloutRecoveryConfig | None = None,
+    record_metrics=None,
 ):
     mgr = object.__new__(RolloutManager)
     mgr._tokenizer = None
@@ -2006,6 +2061,7 @@ def _make_capture_manager(
                 receipts,
                 instance_configs=selected_configs,
                 loss_multiplier=float(_sample.get("loss_multiplier", 1.0)),
+                rollout_metrics=record_metrics,
             )
             if on_completion is not None:
                 for generation_index, completion in zip(indices, record.completions):
@@ -2017,6 +2073,71 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+    def test_resolved_route_survives_all_sealed_restore(self, granularity):
+        prompt = {
+            "prompt": "p",
+            "idx": 9,
+            "extra_env_info": {"task_source": "source-not-agent-name"},
+        }
+        first = _make_capture_manager(
+            _FakeCaptureBuffer(),
+            recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+        )
+        request = _run(first.generate_for_finalization(prompt))
+        assert request.resolved_agent_name == "resolved-agent"
+        assert "agent_ref" not in prompt["extra_env_info"]
+
+        async def unexpected_rollout(_sample):
+            pytest.fail("all-sealed recovery must not regenerate to resolve routing")
+
+        restored = _make_capture_manager(
+            _FakeCaptureBuffer(), on_run=unexpected_rollout
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.load_state_dict(
+                cut, first.recovery_ledger.state_dict()
+            ),
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.prepare_for_restart(cut),
+        )
+        recovered = _run(
+            restored.generate_for_finalization(
+                prompt, lineage_group_id=request.group_id
+            )
+        )
+        assert recovered.resolved_agent_name == "resolved-agent"
+        assert recovered.receipts == request.receipts
+        assert restored._impl.seen_generation_indices is None
+        # Nothing was regenerated, so no dispatch metrics ride the request;
+        # the finalizer still measures the restored rows.
+        assert recovered.rollout_metrics == {}
+
+    def test_request_carries_rpc_safe_dispatch_metrics(self):
+        mgr = _make_capture_manager(
+            _FakeCaptureBuffer(),
+            record_metrics={
+                "total_reward/mean": 0.5,
+                "total_reward/histogram": [0.5, 0.5],
+                "resolved-agent/pass_rate/mean": 1,
+                "timing/rollout/total": 2.5,
+                # A full-result table cannot cross the metadata-only RPC.
+                "resolved-agent/full_result": object(),
+            },
+        )
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+
+        assert request.rollout_metrics == {
+            "total_reward/mean": 0.5,
+            "total_reward/histogram": [0.5, 0.5],
+            "resolved-agent/pass_rate/mean": 1.0,
+            "timing/rollout/total": 2.5,
+        }
+
     def test_request_carries_env_mask_flags(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(

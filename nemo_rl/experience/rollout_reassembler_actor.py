@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import ray
@@ -46,6 +46,13 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
+    # Resolved by Gym and persisted with the sealed receipts for teacher routing.
+    resolved_agent_name: Optional[str] = None
+    # Gym-side rollout metrics of the dispatch that produced the receipts
+    # (agent results, rollout timing), numbers and number lists only. The
+    # finalizer publishes them with the rows, under its own measurements of
+    # the canonical rows. Not persisted: empty after an all-sealed restore.
+    rollout_metrics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -128,6 +135,8 @@ class RolloutReassemblerActor:  # pragma: no cover
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
             canonical_sample_ids=list(request.canonical_sample_ids),
+            rollout_metrics=dict(request.rollout_metrics),
+            metrics_namespace=request.resolved_agent_name,
         )
         assert_metadata_only(result)
         return result

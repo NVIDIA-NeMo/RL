@@ -43,13 +43,19 @@ import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
+from nemo_rl.data_plane.schema import (
+    MASK_SAMPLE,
+    ROLLOUT_METRICS,
+    ROUTE_PLAN_TAG,
+    TRUNCATED,
+)
 from nemo_rl.data_plane.tq_token_sink import (
     FetchedStagedCall,
     StagedMediaTensors,
     TQTokenSink,
     TQTokenSource,
 )
+from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
@@ -90,6 +96,10 @@ class FinalizedRollout:
     # media columns (staged in the same put as each call's tokens) and
     # structurally validated. None for text rollouts.
     media: Optional[dict[str, PackedTensor]] = None
+    # Policy-generated tokens of each model call on the trained chain, root to
+    # terminal (Gym's link_spans; each call is carry-then-generation, so these
+    # sum to the row's token_mask). Empty for rejected rows.
+    call_generation_lengths: tuple[int, ...] = ()
 
 
 @dataclass
@@ -201,6 +211,68 @@ def _media_fields_for_group(rows: list[FinalizedRollout]) -> dict[str, PackedTen
         ]
         stacked[key] = PackedTensor.concat(parts)
     return stacked
+
+
+def _canonical_rollout_metrics(
+    rows: list[FinalizedRollout],
+    *,
+    max_seq_len: int,
+    metrics_namespace: Optional[str],
+) -> dict[str, Any]:
+    """Rollout metrics measured on one group's canonical rows.
+
+    Same names and per-sample definitions as the token path's
+    ``AsyncNemoGymRolloutImpl._compute_rollout_metrics``, which cannot measure
+    token-free receipts. Rewards cover every rollout, as there; the token,
+    turn and truncation metrics cover the rows that verified, since
+    placeholders carry no tokens. A turn is one model call on the trained
+    chain, and a row is truncated when it reaches ``max_seq_len`` (the rule
+    behind the published ``truncated`` column).
+    """
+    metrics = calculate_single_metric(
+        [row.reward for row in rows], len(rows), "total_reward"
+    )
+    valid_rows = [row for row in rows if row.valid]
+    if not valid_rows:
+        return metrics
+    n = len(valid_rows)
+    turns = [len(row.call_generation_lengths) for row in valid_rows]
+    total_tokens = [len(row.token_ids) for row in valid_rows]
+    gen_tokens = [int(sum(row.token_mask)) for row in valid_rows]
+    max_gen_tokens_per_turn = [
+        max(row.call_generation_lengths, default=0) for row in valid_rows
+    ]
+    truncated_rows = sum(length == max_seq_len for length in total_tokens)
+    truncation_rate = truncated_rows / n
+    metrics.update(
+        {
+            **calculate_single_metric(turns, n, "turns_per_sample"),
+            "turns_per_sample/p95": pct(turns, 95),
+            "turns_per_sample/p99": pct(turns, 99),
+            **calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
+            **calculate_single_metric(gen_tokens, n, "gen_tokens_per_sample"),
+            **calculate_single_metric(
+                max_gen_tokens_per_turn, n, "max_gen_tokens_per_turn"
+            ),
+            "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
+            "natural_termination_rate": (n - truncated_rows) / n,
+            "truncation_rate": truncation_rate,
+        }
+    )
+    metrics["mean_gen_tokens_per_sample"] = metrics["gen_tokens_per_sample/mean"]
+    if metrics_namespace:
+        metrics[f"{metrics_namespace}/truncation_rate"] = truncation_rate
+        metrics.update(
+            calculate_single_metric(
+                total_tokens, n, f"{metrics_namespace}/total_tokens_per_sample"
+            )
+        )
+        metrics.update(
+            calculate_single_metric(
+                gen_tokens, n, f"{metrics_namespace}/gen_tokens_per_sample"
+            )
+        )
+    return metrics
 
 
 class RolloutReassembler:
@@ -431,6 +503,9 @@ class RolloutReassembler:
             routed_experts=routed_experts,
             route_plan=route_plan,
             media=media,
+            call_generation_lengths=tuple(
+                int(generation_len) for _, _, generation_len in row.link_spans
+            ),
         )
 
     def _resolve_media(
@@ -521,6 +596,8 @@ class RolloutReassembler:
         prompt_idx: int,
         loss_multiplier: float = 1.0,
         canonical_sample_ids: Optional[list[str]] = None,
+        rollout_metrics: Optional[dict[str, Any]] = None,
+        metrics_namespace: Optional[str] = None,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
 
@@ -537,6 +614,11 @@ class RolloutReassembler:
         is not carried from the dispatcher -- the receipt path has no real
         tokens to measure it from at dispatch time -- so it is computed here
         instead, from each row's rebuilt length against ``max_seq_len``.
+        The group's rollout metrics ride the published meta as
+        ``extra_info[ROLLOUT_METRICS]``, as on the token path: the
+        dispatcher's ``rollout_metrics`` (agent results, rollout timing)
+        under the token, turn and truncation metrics measured here, with
+        per-agent token and truncation metrics under ``metrics_namespace``.
         """
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
@@ -807,6 +889,18 @@ class RolloutReassembler:
             sample_ids=list(sample_ids),
             fields=cast(list[str], list(fields.keys())),
             sequence_lengths=[int(s) for s in lengths.tolist()],
+            extra_info={
+                ROLLOUT_METRICS: [
+                    {
+                        **(rollout_metrics or {}),
+                        **_canonical_rollout_metrics(
+                            rows,
+                            max_seq_len=self._max_seq_len,
+                            metrics_namespace=metrics_namespace,
+                        ),
+                    }
+                ]
+            },
             tags=[dict(t) for t in tags],
         )
         return FinalizedGroup(

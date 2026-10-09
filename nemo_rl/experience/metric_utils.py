@@ -15,8 +15,10 @@
 """Shared aggregation helpers for rollout metrics."""
 
 import math
+import numbers
 import statistics
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 
 def is_histogram_metric(name: str) -> bool:
@@ -56,3 +58,24 @@ def pct(values: Sequence[float | int], p: float) -> float:
     sorted_v = sorted(values)
     idx = min(int(len(sorted_v) * p / 100), len(sorted_v) - 1)
     return float(sorted_v[idx])
+
+
+def rpc_safe_rollout_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the numeric part of a rollout-metrics dict.
+
+    Scalars become floats and lists of numbers (histogram observations)
+    become lists of floats, so the result can cross a metadata-only RPC
+    (``assert_metadata_only``). Anything else, such as a full-result table,
+    is dropped.
+    """
+    safe: dict[str, Any] = {}
+    for key, value in metrics.items():
+        if not isinstance(key, str):
+            continue
+        if isinstance(value, numbers.Real):
+            safe[key] = float(value)
+        elif isinstance(value, (list, tuple)) and all(
+            isinstance(item, numbers.Real) for item in value
+        ):
+            safe[key] = [float(item) for item in value]
+    return safe
