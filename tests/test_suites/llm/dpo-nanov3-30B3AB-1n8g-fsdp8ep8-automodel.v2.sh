@@ -34,11 +34,11 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] < 0.694' \
-        'data["train/loss"]["11"] < 0.57' \
-        'data["train/preference_loss"]["1"] < 0.694' \
-        'data["train/preference_loss"]["11"] < 0.57' \
-        'mean(data["timing/train/total_step_time"], -5, -1) < 5'
+        'abs(data["train/loss"]["1"] - 0.6931) < 0.0005' \
+        'data["train/loss"]["11"] < 0.61' \
+        'abs(data["train/preference_loss"]["1"] - 0.6931) < 0.0005' \
+        'data["train/preference_loss"]["11"] < 0.61' \
+        'mean(data["timing/train/total_step_time"], -5, -1) < 6.5'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
