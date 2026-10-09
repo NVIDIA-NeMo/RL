@@ -120,7 +120,7 @@ def main() -> None:
         (
             policy,
             policy_generation,
-            _nemo_gym,
+            nemo_gym,
             cluster,
             dataloader,
             val_dataloader,
@@ -139,6 +139,10 @@ def main() -> None:
             processor=processor,
             policy_factory=make_policy_factory(config.data_plane),
         )
+        if nemo_gym is not None:
+            task_to_env["nemo_gym"] = nemo_gym
+            if val_task_to_env is not None:
+                val_task_to_env["nemo_gym"] = nemo_gym
 
     rl_init_timer.record("total", time.perf_counter() - main_start)
     rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
