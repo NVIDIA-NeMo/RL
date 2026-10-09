@@ -1396,7 +1396,11 @@ class MegatronPolicyWorkerImpl(
             yield
 
     def _single_pp1_hybrid_model(self) -> Any:
-        """Return the unwrapped PP1 HybridModel that the evaluation MTP bypass toggles."""
+        """Return the unwrapped PP1 HybridModel whose forward the MTP bypass targets.
+
+        The bypass passes ``compute_mtp_loss=False`` to every logprob forward;
+        ``GPTModel.forward`` does not accept that argument.
+        """
         message = (
             "policy.shared_prefix_training.bypass_evaluation_mtp requires a PP1 "
             "HybridModel"
@@ -1414,20 +1418,6 @@ class MegatronPolicyWorkerImpl(
         ):
             raise NotImplementedError(message)
         return chunks[0]
-
-    @contextmanager
-    def _logprob_mtp_scope(self) -> Iterator[None]:
-        """Bypass auxiliary MTP for every logprob unit, including dense fallbacks."""
-        if not self._shared_prefix_cfg.bypass_evaluation_mtp:
-            yield
-            return
-        core = self._single_pp1_hybrid_model()
-        saved = core.mtp_process
-        core.mtp_process = False
-        try:
-            yield
-        finally:
-            core.mtp_process = saved
 
     def _get_model_extra_state_dict(self) -> dict[str, Any]:
         fp8_enabled = self.fp8_cfg and self.fp8_cfg.get("enabled", False)
@@ -2864,7 +2854,6 @@ class MegatronPolicyWorkerImpl(
 
         with (
             self._router_gating_scope(),
-            self._logprob_mtp_scope(),
             maybe_r3_trace_stage("prev-logprob", enabled=use_router_replay),
         ):
             list_of_logprobs = megatron_forward_backward(
@@ -2882,6 +2871,9 @@ class MegatronPolicyWorkerImpl(
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
                 use_router_replay=use_router_replay,
                 router_replay_train=False,
+                # Skips auxiliary MTP in every logprob unit, dense fallbacks
+                # included; setup checked for a PP1 HybridModel.
+                compute_mtp_loss=not self._shared_prefix_cfg.bypass_evaluation_mtp,
             )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):

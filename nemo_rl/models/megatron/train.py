@@ -174,6 +174,7 @@ def model_forward(
     media_token_validity_mask: Optional[torch.Tensor] = None,
     model_slices_context_parallel_inputs: bool = False,
     shared_prefix: Optional[SharedPrefixForwardMetadata] = None,
+    compute_mtp_loss: bool = True,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -197,6 +198,9 @@ def model_forward(
         model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
         shared_prefix: Structured Hybrid star layout and CP ownership metadata
             for the capability-negotiated shared-prefix model path.
+        compute_mtp_loss: Whether the model runs its MTP auxiliary objective.
+            ``False`` is passed to the model only when set; it requires a
+            model forward that accepts ``compute_mtp_loss`` (HybridModel).
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -297,6 +301,10 @@ def model_forward(
 
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
+    if not compute_mtp_loss:
+        # Sent only when disabled, so the default call is unchanged for model
+        # forwards (GPTModel) that do not accept the argument.
+        additional_kwargs["compute_mtp_loss"] = False
     if use_fused_linear_logprobs:
         additional_kwargs["labels"] = input_ids_cp_sharded
         # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
@@ -649,6 +657,7 @@ def forward_with_post_processing_fn(
     use_router_replay: bool = False,
     router_replay_train: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    compute_mtp_loss: bool = True,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -670,6 +679,7 @@ def forward_with_post_processing_fn(
         enable_opd_full_capture: Whether to capture pre-LM-head hidden states for
             the full-vocabulary MOPD teacher payload
         model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
+        compute_mtp_loss: Whether the model runs its MTP auxiliary objective.
 
     Returns:
         tuple: (output_tensor, post_processing_fn_wrapped)
@@ -759,6 +769,7 @@ def forward_with_post_processing_fn(
                 media_token_validity_mask=media_token_validity_mask,
                 model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
                 shared_prefix=shared_prefix,
+                compute_mtp_loss=compute_mtp_loss,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
@@ -901,6 +912,7 @@ def megatron_forward_backward(
     use_router_replay: bool = False,
     router_replay_train: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    compute_mtp_loss: bool = True,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -926,6 +938,8 @@ def megatron_forward_backward(
         enable_opd_full_capture: Whether to capture pre-LM-head hidden states for
             the full-vocabulary MOPD teacher payload
         model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
+        compute_mtp_loss: Whether the model runs its MTP auxiliary objective.
+            Logprob forwards may pass ``False`` to skip it on a HybridModel.
 
     Returns:
         Results from the forward/backward execution
@@ -945,6 +959,7 @@ def megatron_forward_backward(
         use_router_replay=use_router_replay,
         router_replay_train=router_replay_train,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+        compute_mtp_loss=compute_mtp_loss,
     )
     forward_backward_func = get_forward_backward_func()
     if use_router_replay:
