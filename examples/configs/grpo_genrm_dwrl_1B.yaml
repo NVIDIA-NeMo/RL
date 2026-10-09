@@ -132,7 +132,7 @@ checkpointing:
   # the buffered window fresh instead of reusing completed groups (which skew
   # toward short rollouts at a save boundary).
   load_replay_buffer: true
-  model_save_format: "safetensors"
+  model_save_format: "safetensors"   # must be null if policy.dtensor_cfg._v2 == false
   save_consolidated: false
   save_optimizer: true
 
@@ -439,7 +439,7 @@ policy:
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
     vllm_cfg:
-      async_engine: false
+      async_engine: true
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
@@ -462,7 +462,13 @@ policy:
       reset_encoder_cache_after_weight_update: false # Invalidate cached multimodal encoder outputs after a successful async refit. Only safe when generation is quiesced (grpo.async_grpo.in_flight_weight_updates=false).
       http_refit_server_port: null # Optional fixed port for Kubernetes targetPorts.
       zmq_refit_server_port: null # Optional fixed ZeroMQ relay port for Kubernetes targetPorts.
-    vllm_kwargs: {}
+    vllm_kwargs:
+      attention_backend: FLASH_ATTN
+      compilation_config:
+        cudagraph_capture_sizes: [1,2,4,8,16,32,64]
+        pass_config:
+          fuse_allreduce_rms: false
+
     colocated:
       # true: generation shares training GPUs
       # false: uses dedicated generation resources

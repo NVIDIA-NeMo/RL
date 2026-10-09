@@ -1415,7 +1415,7 @@ async def run_sample_multi_turn_rollout(
         "task_name": task_name,
         "total_reward": torch.tensor(total_reward),
         "stop_strings": current_stop_strings,
-        "idx": sample_idx,
+        "idx": initial_sample_state.get("idx", sample_idx),
     }
     if multi_reward_seen:
         for name, acc in reward_acc_dict.items():
