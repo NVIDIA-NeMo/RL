@@ -2834,9 +2834,9 @@ class SingleControllerActor:
                 c. _advantage_stage.
             3. Train on the chunk.
                 a. Policy model: train_microbatches_from_meta accumulates gradients.
-                b. Full-batch PPO closes each actor epoch here; streaming PPO and
-                    GRPO accumulate across chunks and close the policy step in 5.
-                    Streaming PPO requires ppo.ppo_epochs=1.
+                b. Full-batch PPO closes each actor epoch here (kept for ppo_epochs > 1);
+                    streaming PPO and GRPO accumulate across chunks and close the policy
+                    step in 5. Streaming PPO requires ppo.ppo_epochs=1.
             4. Close the chunk. Refresh min_sample_version and the dispatch tally. The
                 consumed rows stay in TQ: staged capture deltas are read by the policy
                 workers during 3, so nothing is cleared until the step closes.
