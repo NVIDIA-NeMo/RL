@@ -948,7 +948,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     )
 
 
-@pytest.mark.parametrize("support_mismatch", [False, True])
+@pytest.mark.parametrize("support_mismatch", ["none", "token", "sample"])
 def test_advantage_stage_reports_seq_logprob_metrics_without_masking(
     support_mismatch,
 ) -> None:
@@ -971,8 +971,10 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking(
         batch_size=[batch_size],
     )
     data_plane = _AdvantageDataPlane(data)
-    if support_mismatch:
+    if support_mismatch == "token":
         data["prev_logprobs"][0, 1] = -float("inf")
+    elif support_mismatch == "sample":
+        data["prev_logprobs"][0, 1:] = -float("inf")
     estimator = _MaskRecordingAdvantageEstimator()
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -1012,24 +1014,47 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking(
     assert "prev_logprobs" in data_plane.selected_fields
     assert "generation_logprobs" in data_plane.selected_fields
     assert data_plane.written_fields is not None
-    assert "sample_mask" not in data_plane.written_fields
     assert estimator.mask is not None
-    if support_mismatch:
+    if support_mismatch != "none":
         expected_mask = torch.ones(batch_size, sequence_length)
-        expected_mask[0, 1] = 0
-        torch.testing.assert_close(estimator.mask, expected_mask)
+        if support_mismatch == "sample":
+            expected_mask[0, 1:] = 0
+        else:
+            expected_mask[0, 1] = 0
         torch.testing.assert_close(
             data_plane.written_fields["token_mask"], expected_mask
         )
+        if support_mismatch == "sample":
+            torch.testing.assert_close(
+                data_plane.written_fields["sample_mask"], torch.tensor([0.0, 1.0])
+            )
+            expected_mask[0] = 0
+        torch.testing.assert_close(estimator.mask, expected_mask)
     else:
         assert estimator.mask.all()
         assert "token_mask" not in data_plane.written_fields
+    if support_mismatch != "sample":
+        assert "sample_mask" not in data_plane.written_fields
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
     assert metrics[0]["num_masked_seqs_by_logprob_error"] == 0
     assert ctrl._step_log_dict["num_mask_sample_filtered"] == [0]
     assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(math.e)
+    valid_seqs = 1 if support_mismatch == "sample" else 2
+    assert metrics[0]["_num_valid_seqs_before"] == valid_seqs
+    assert metrics[0]["_num_valid_seqs_after"] == valid_seqs
+    if support_mismatch == "sample":
+        # A second chunk has two valid rows with probability error 1.
+        data["prev_logprobs"].zero_()
+        data["generation_logprobs"].zero_()
+        asyncio.run(ctrl._advantage_stage(meta))
+        reduced = single_controller.reduce_advantage_pump_metrics(**ctrl._step_log_dict)
+        expected_mean = (math.e + 2) / 3
+        assert reduced["mean_seq_mult_prob_error"] == pytest.approx(expected_mean)
+        assert reduced["mean_seq_mult_prob_error_after_mask"] == pytest.approx(
+            expected_mean
+        )
 
 
 def test_advantage_stage_clips_training_values_and_metrics() -> None:
@@ -1331,7 +1356,9 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     assert ctrl._opd_stat_sumsq == pytest.approx(0.25**2 * num_valid_tokens)
     assert ctrl._opd_stat_count == num_valid_tokens
     assert ctrl._dp_client.put_fields is not None
-    written_advantages = ctrl._dp_client.put_fields["advantages"]
+    written_advantages = single_controller.tensor_field(
+        ctrl._dp_client.put_fields, "advantages"
+    )
     torch.testing.assert_close(
         written_advantages[valid_mask],
         torch.full((num_valid_tokens,), 0.1),

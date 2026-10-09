@@ -5221,17 +5221,17 @@ class SingleControllerActor:
                     ),
                 }
             )
-            num_valid_seqs_before = float(
-                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
-                .sum()
-                .item()
-            )
             seq_error_metrics = compute_and_apply_seq_logprob_error_masking(
                 train_data=masking_data,
                 rewards=rewards,
                 seq_logprob_error_threshold=seq_logprob_error_threshold,
             )
             token_mask = masking_data["token_mask"]
+            num_valid_seqs_before = float(
+                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                .sum()
+                .item()
+            )
             final_sample_mask = masking_data["sample_mask"]
             data[adv_cfg.policy_logprobs_field] = masking_data["prev_logprobs"]
             num_valid_seqs_after = float(
