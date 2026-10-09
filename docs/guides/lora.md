@@ -16,10 +16,10 @@ For the theory behind the method, see
 
 LoRA is implemented on two training backends, each with its own config schema:
 
-| Backend | Config path | Notes |
-| --- | --- | --- |
-| **Automodel** | `policy.automodel_cfg.lora_cfg` | This is the default backend. |
-| **Megatron Core** | `policy.megatron_cfg.peft` | Requires `policy.megatron_cfg.enabled=true` (and `policy.automodel_cfg.enabled=false`). |
+| Training backend | Config path | Rollout representation | Notes |
+| --- | --- | --- | --- |
+| **Automodel** | `policy.automodel_cfg.lora_cfg` | Native A/B with synchronous vLLM by default; merged is opt-in. | This is the default training backend. |
+| **Megatron Core** | `policy.megatron_cfg.peft` | Merged full weights. | Requires `policy.megatron_cfg.enabled=true`, `policy.automodel_cfg.enabled=false`, and `policy.generation.lora_refit_mode=merged` for rollout algorithms. |
 
 LoRA is supported across the SFT, GRPO, and DPO algorithms on both backends.
 
@@ -109,6 +109,9 @@ policy:
       lora_dtype: None              # Adapter weights dtype
       share_expert_adapters: true   # Share one adapter across grouped MoE experts on each EP rank
       restore_from: null            # Warm start from a donor PEFT checkpoint (see below)
+  generation:
+    # Megatron LoRA does not yet export native vLLM adapter tensors.
+    lora_refit_mode: merged
 ```
 
 ### Megatron Parameter Details
@@ -202,6 +205,9 @@ Individual recipes may still set
 parallelization compatibility. That setting is independent of native refit; native refit
 itself accepts either HF-native LoRA names or names converted by a custom Automodel
 state-dict adapter.
+
+Native refit requires `policy.generation.backend: vllm`. Other rollout backends use the
+`merged` representation and must set `policy.generation.lora_refit_mode: merged`.
 
 The previous full-weight behavior remains available as an explicit compatibility or
 performance opt-in:

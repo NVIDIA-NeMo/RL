@@ -17,7 +17,8 @@ import os
 import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from functools import partial
 from typing import Any, Literal, Optional, Protocol
 
 import torch
@@ -29,10 +30,11 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
 )
-from nemo_rl.models.generation.vllm.config import (
+from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
+from nemo_rl.models.generation.vllm.lora_utils import (
     NATIVE_LORA_ADAPTER_ID,
-    REFITTABLE_FP8_KV_CACHE_DTYPES,
     NativeLoraRefitSettings,
+    collect_native_lora,
     native_lora_refit_settings,
 )
 from nemo_rl.models.generation.vllm.draft_utils import (
@@ -82,12 +84,6 @@ WeightUpdateFinalizer = Callable[[], None]
 
 if os.environ.get(DRAFT_DISABLE_MODULE_SHARING_ENV) == "1":
     disable_draft_module_sharing()
-
-
-@contextmanager
-def _noop_weight_update_lifecycle() -> Iterator[WeightUpdateFinalizer]:
-    """Provide the common lifecycle shape when only adapter tensors change."""
-    yield lambda: None
 
 
 class IPCWeightManifestError(RuntimeError):
@@ -1463,7 +1459,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             runtime_input_modules.update(packed_inputs)
         if adapter_manager.is_pooling_model:
             runtime_input_modules.update(
-                name.removeprefix("model.") for name in runtime_input_modules
+                [name.removeprefix("model.") for name in runtime_input_modules]
             )
         unexpected_runtime_modules = sorted(
             name
@@ -1914,7 +1910,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
             lifecycle = (
-                _noop_weight_update_lifecycle()
+                nullcontext(lambda: None)
                 if native_lora_refit
                 else self._weight_update_lifecycle("ipc")
             )
@@ -1969,10 +1965,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                             "state_dict_info"
                         )
                         if native_lora_refit:
-                            for name, tensor in weights:
-                                native_lora_tensors[name] = tensor.to(
-                                    device="cpu", copy=True
-                                )
+                            collect_native_lora(native_lora_tensors, weights)
                         else:
                             self._load_weights(weights)
                     except Exception as error:
@@ -2072,19 +2065,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         native_lora_refit = self._native_lora_refit_settings() is not None
         native_lora_tensors: dict[str, torch.Tensor] = {}
 
-        def collect_native_lora(weights: list[tuple[str, torch.Tensor]]) -> None:
-            # Packed receive buffers are reused. Retain an independent CPU
-            # staging copy, matching vLLM's normal adapter-loading lifecycle.
-            for name, tensor in weights:
-                native_lora_tensors[name] = tensor.to(device="cpu", copy=True)
-
         try:
             if native_lora_refit:
                 packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
                     group=self.model_update_group,
                     src=0,
-                    post_unpack_func=collect_native_lora,
+                    post_unpack_func=partial(collect_native_lora, native_lora_tensors),
                 )
                 self._install_native_lora(native_lora_tensors)
                 gc.collect()

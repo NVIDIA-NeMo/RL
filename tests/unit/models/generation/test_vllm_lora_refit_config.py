@@ -16,19 +16,17 @@ from copy import deepcopy
 
 import pytest
 
-from nemo_rl.models.generation.vllm.config import (
-    NATIVE_LORA_CONFIG_KEY,
-    configure_vllm_lora_refit,
-)
+from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.lora_utils import NATIVE_LORA_CONFIG_KEY
+from nemo_rl.models.policy.utils import configure_lora_refit
 
 
 def _native_policy_config() -> dict:
     return {
         "precision": "bfloat16",
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "enabled": True,
-            "_v2": True,
-            "automodel_kwargs": {"force_hf": True},
+            "automodel_kwargs": {"force_hf": False},
             "lora_cfg": {
                 "enabled": True,
                 "dim": 16,
@@ -53,7 +51,7 @@ def _native_policy_config() -> dict:
 def test_native_lora_refit_materializes_vllm_adapter_config() -> None:
     policy_config = _native_policy_config()
 
-    configure_vllm_lora_refit(policy_config)
+    configure_lora_refit(policy_config)
 
     generation_config = policy_config["generation"]
     vllm_kwargs = generation_config["vllm_kwargs"]
@@ -72,11 +70,15 @@ def test_native_lora_refit_materializes_vllm_adapter_config() -> None:
 
 def test_native_lora_refit_does_not_require_force_hf() -> None:
     policy_config = _native_policy_config()
-    policy_config["dtensor_cfg"]["automodel_kwargs"]["force_hf"] = False
+    del policy_config["automodel_cfg"]["automodel_kwargs"]
 
-    configure_vllm_lora_refit(policy_config)
+    configure_lora_refit(policy_config)
 
     assert policy_config["generation"]["vllm_kwargs"]["enable_lora"] is True
+
+
+def test_lora_refit_mode_is_not_a_required_vllm_key() -> None:
+    assert "lora_refit_mode" not in VllmConfig.__required_keys__
 
 
 def test_native_lora_refit_allows_explicitly_disabled_speculative_decoding() -> None:
@@ -86,7 +88,7 @@ def test_native_lora_refit_allows_explicitly_disabled_speculative_decoding() -> 
         "method": "mtp",
     }
 
-    configure_vllm_lora_refit(policy_config)
+    configure_lora_refit(policy_config)
 
     assert policy_config["generation"]["vllm_kwargs"]["enable_lora"] is True
 
@@ -95,7 +97,7 @@ def test_native_lora_refit_sizes_cpu_cache_for_configured_adapter_capacity() -> 
     policy_config = _native_policy_config()
     policy_config["generation"]["vllm_kwargs"]["max_loras"] = 2
 
-    configure_vllm_lora_refit(policy_config)
+    configure_lora_refit(policy_config)
 
     assert policy_config["generation"]["vllm_kwargs"]["max_cpu_loras"] == 2
 
@@ -105,7 +107,7 @@ def test_merged_lora_refit_is_an_explicit_unchanged_opt_in() -> None:
     policy_config["generation"]["lora_refit_mode"] = "merged"
     original_vllm_kwargs = deepcopy(policy_config["generation"]["vllm_kwargs"])
 
-    configure_vllm_lora_refit(policy_config)
+    configure_lora_refit(policy_config)
 
     generation_config = policy_config["generation"]
     assert generation_config["vllm_cfg"]["load_format"] == "dummy"
@@ -117,7 +119,7 @@ def test_lora_refit_rejects_missing_mode() -> None:
     del policy_config["generation"]["lora_refit_mode"]
 
     with pytest.raises(KeyError, match="lora_refit_mode"):
-        configure_vllm_lora_refit(policy_config)
+        configure_lora_refit(policy_config)
 
 
 def test_lora_refit_rejects_invalid_mode() -> None:
@@ -125,15 +127,41 @@ def test_lora_refit_rejects_invalid_mode() -> None:
     policy_config["generation"]["lora_refit_mode"] = "invalid"
 
     with pytest.raises(ValueError, match="lora_refit_mode"):
-        configure_vllm_lora_refit(policy_config)
+        configure_lora_refit(policy_config)
 
 
 def test_native_default_is_a_noop_when_lora_is_disabled() -> None:
     policy_config = _native_policy_config()
-    policy_config["dtensor_cfg"]["lora_cfg"]["enabled"] = False
+    policy_config["automodel_cfg"]["lora_cfg"]["enabled"] = False
     original_policy_config = deepcopy(policy_config)
 
-    configure_vllm_lora_refit(policy_config)
+    configure_lora_refit(policy_config)
+
+    assert policy_config == original_policy_config
+
+
+def test_lora_without_rollout_does_not_require_refit_mode() -> None:
+    policy_config = _native_policy_config()
+    del policy_config["generation"]
+
+    configure_lora_refit(policy_config)
+
+
+def test_native_lora_refit_rejects_non_vllm_rollout() -> None:
+    policy_config = _native_policy_config()
+    policy_config["generation"]["backend"] = "sglang"
+
+    with pytest.raises(ValueError, match="backend=vllm"):
+        configure_lora_refit(policy_config)
+
+
+def test_merged_lora_refit_allows_non_vllm_rollout() -> None:
+    policy_config = _native_policy_config()
+    policy_config["generation"]["backend"] = "sglang"
+    policy_config["generation"]["lora_refit_mode"] = "merged"
+    original_policy_config = deepcopy(policy_config)
+
+    configure_lora_refit(policy_config)
 
     assert policy_config == original_policy_config
 
@@ -141,10 +169,6 @@ def test_native_default_is_a_noop_when_lora_is_disabled() -> None:
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (
-            lambda cfg: cfg["dtensor_cfg"].update({"_v2": False}),
-            "_v2=true",
-        ),
         (
             lambda cfg: cfg["generation"].update({"refit_transport": "nixl"}),
             "refit_transport=null",
@@ -202,11 +226,11 @@ def test_native_default_is_a_noop_when_lora_is_disabled() -> None:
             "does not match",
         ),
         (
-            lambda cfg: cfg["dtensor_cfg"]["lora_cfg"].update({"use_dora": True}),
+            lambda cfg: cfg["automodel_cfg"]["lora_cfg"].update({"use_dora": True}),
             "use_dora=true",
         ),
         (
-            lambda cfg: cfg["dtensor_cfg"]["lora_cfg"].update(
+            lambda cfg: cfg["automodel_cfg"]["lora_cfg"].update(
                 {"moe_rank_scaling": True}
             ),
             "moe_rank_scaling=true",
@@ -218,16 +242,16 @@ def test_native_lora_refit_rejects_unsupported_config(mutation, message) -> None
     mutation(policy_config)
 
     with pytest.raises(ValueError, match=message):
-        configure_vllm_lora_refit(policy_config)
+        configure_lora_refit(policy_config)
 
 
 def test_native_lora_refit_rejects_megatron_policy() -> None:
     policy_config = _native_policy_config()
-    policy_config["dtensor_cfg"] = {"enabled": False}
+    policy_config["automodel_cfg"] = {"enabled": False}
     policy_config["megatron_cfg"] = {
         "enabled": True,
         "peft": {"enabled": True, "dim": 16, "alpha": 64},
     }
 
-    with pytest.raises(ValueError, match="DTensor v2"):
-        configure_vllm_lora_refit(policy_config)
+    with pytest.raises(ValueError, match="Automodel"):
+        configure_lora_refit(policy_config)

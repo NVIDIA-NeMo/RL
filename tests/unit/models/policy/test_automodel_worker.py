@@ -969,7 +969,7 @@ class TestDTensorLoraParamsGenerator:
 
         model = GroupedFactorizedModel()
 
-        tensors = dict(dtensor_lora_params_generator(model, torch.bfloat16))
+        tensors = dict(automodel_lora_params_generator(model, torch.bfloat16))
 
         assert set(tensors) == {
             f"backbone.layers.0.mixer.experts.{expert_id}.{projection}.lora_{factor}.weight"
@@ -1023,11 +1023,12 @@ class TestDTensorLoraParamsGenerator:
         assert all(tensor.dtype == torch.bfloat16 for tensor in tensors.values())
         assert all(tensor.is_contiguous() for tensor in tensors.values())
 
-        worker = object.__new__(DTensorPolicyWorkerV2Impl)
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = model
         worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
         worker.lora_refit_mode = "native"
-        refit_info = DTensorPolicyWorkerV2Impl.prepare_refit_info(worker)
+        refit_info = AutomodelPolicyWorkerImpl.prepare_refit_info(worker)
 
         assert refit_info == {
             name: (tensor.shape, tensor.dtype) for name, tensor in tensors.items()
@@ -1061,6 +1062,7 @@ class TestDTensorLoraParamsGenerator:
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
         worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
         worker.lora_refit_mode = "native"
 
         refit_info = AutomodelPolicyWorkerImpl.prepare_refit_info(worker)
@@ -1077,6 +1079,7 @@ class TestDTensorLoraParamsGenerator:
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
         worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
         worker.lora_refit_mode = mode
         worker.cpu_offload = False
         worker.zmq_socket = object()
@@ -1085,14 +1088,12 @@ class TestDTensorLoraParamsGenerator:
         selected_modes = []
         sentinel = torch.ones(1)
 
-        def refit_generator(_model, _dtype, selected_mode):
-            selected_modes.append(selected_mode)
+        def refit_generator():
+            selected_modes.append(worker.lora_refit_mode)
             yield "sentinel", sentinel
 
         stream_impl = MagicMock()
-        monkeypatch.setattr(
-            worker_mod, "automodel_refit_params_generator", refit_generator
-        )
+        worker._refit_params_generator = refit_generator
         monkeypatch.setattr(
             "nemo_rl.models.policy.utils.stream_weights_via_ipc_zmq_impl",
             stream_impl,
@@ -1112,20 +1113,19 @@ class TestDTensorLoraParamsGenerator:
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
         worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
         worker.lora_refit_mode = mode
         worker.cpu_offload = False
         worker.model_update_group = object()
         selected_modes = []
         sentinel = torch.ones(1)
 
-        def refit_generator(_model, _dtype, selected_mode):
-            selected_modes.append(selected_mode)
+        def refit_generator():
+            selected_modes.append(worker.lora_refit_mode)
             yield "sentinel", sentinel
 
         producer = MagicMock()
-        monkeypatch.setattr(
-            worker_mod, "automodel_refit_params_generator", refit_generator
-        )
+        worker._refit_params_generator = refit_generator
         monkeypatch.setattr(worker_mod, "packed_broadcast_producer", producer)
 
         worker._broadcast_weights_for_collective()
@@ -1153,7 +1153,7 @@ def test_prepare_refit_info_preserves_fp32_router_correction_bias():
     worker.model = RouterModel()
     worker.dtype = torch.bfloat16
     worker.draft_model = None
-    worker.lora_refit_mode = "merged"
+    worker.lora_enabled = False
 
     refit_info = AutomodelPolicyWorkerImpl.prepare_refit_info(worker)
 
