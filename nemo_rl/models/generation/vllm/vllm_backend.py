@@ -2297,6 +2297,32 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+        import os
+
+        if os.environ.get("NRL_NSYS_WORKER_PATTERNS"):
+            import subprocess
+
+            try:
+                out = subprocess.run(
+                    ["nsys", "sessions", "list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                ).stdout
+                for line in out.splitlines():
+                    parts = line.split()
+                    if parts and parts[0].isdigit():
+                        try:
+                            subprocess.run(
+                                ["nsys", "stop", "--session=" + parts[0]],
+                                capture_output=True,
+                                text=True,
+                                timeout=180,
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
 
 class VllmInternalWorkerExtensionWithCheckpointEngine(
