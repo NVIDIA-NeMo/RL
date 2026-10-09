@@ -699,6 +699,11 @@ def forward_with_post_processing_fn(
             raise NotImplementedError(
                 "shared-prefix train mode does not support top-k-logit forwards"
             )
+        if isinstance(post_processing_fn, TeacherFullPayloadPostProcessor):
+            raise NotImplementedError(
+                "shared-prefix train mode does not support teacher full-payload "
+                "forwards"
+            )
         if not isinstance(
             post_processing_fn, (LossPostProcessor, LogprobsPostProcessor)
         ):
@@ -1276,7 +1281,8 @@ class LogprobsPostProcessor:
                     "filtering"
                 )
         cu_seqlens_padded_cpu = None
-        if self.cfg["sequence_packing"]["enabled"] and cu_seqlens_padded is not None:
+        if self.cfg["sequence_packing"]["enabled"] and not input_is_next_token_logprobs:
+            assert cu_seqlens_padded is not None
             cu_seqlens_padded_cpu = to_cpu_int_tuple(cu_seqlens_padded)
 
         def processor_fn_inner(output_tensor):
@@ -1297,10 +1303,7 @@ class LogprobsPostProcessor:
             elif self.use_fused_linear_logprobs:
                 token_logprobs = output_tensor.to(torch.float32)
                 token_logprobs = token_logprobs[:, : original_seq_length - 1]
-            elif (
-                self.cfg["sequence_packing"]["enabled"]
-                and cu_seqlens_padded is not None
-            ):
+            elif self.cfg["sequence_packing"]["enabled"]:
                 assert cu_seqlens_padded_cpu is not None
                 tp_grp = get_tensor_model_parallel_group()
                 tp_rank = get_tensor_model_parallel_rank()

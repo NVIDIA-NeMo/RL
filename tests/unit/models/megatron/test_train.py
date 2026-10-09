@@ -2052,6 +2052,59 @@ class TestAggregateTrainingStatistics:
         assert grad_enabled_during_all_reduce == [False]
 
 
+class TestSharedPrefixTrainGuards:
+    """Shared-prefix guards in the logprob post-processor and forward dispatch."""
+
+    def test_packed_logprobs_require_boundaries_unless_precomputed(self):
+        """A packed dense microbatch without boundaries must not fall through."""
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron.train import LogprobsPostProcessor
+
+        processor = LogprobsPostProcessor(cfg={"sequence_packing": {"enabled": True}})
+        data = BatchedDataDict({"input_ids": torch.tensor([[1, 2, 3, 4]])})
+        with pytest.raises(AssertionError):
+            processor(
+                data_dict=data,
+                input_ids=data["input_ids"],
+                cu_seqlens_padded=None,
+                original_seq_length=4,
+            )
+
+        precomputed = torch.randn(1, 3)
+        _, outputs = processor(
+            data_dict=data,
+            input_ids=data["input_ids"],
+            cu_seqlens_padded=None,
+            original_seq_length=4,
+            input_is_next_token_logprobs=True,
+        )(precomputed)
+        assert torch.equal(outputs["logprobs"][:, 1:], precomputed)
+
+    def test_shared_prefix_rejects_teacher_full_payload(self):
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            TeacherFullPayloadPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        processed_mb = ProcessedMicrobatch(
+            data_dict=MagicMock(),
+            input_ids=torch.tensor([[1, 2, 3]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+            shared_prefix=MagicMock(),
+        )
+        with pytest.raises(NotImplementedError, match="teacher full-payload"):
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=MagicMock(spec=TeacherFullPayloadPostProcessor),
+            )
+
+
 @pytest.mark.parametrize("pack_groups", [False, True], ids=["stars", "forest"])
 def test_shared_prefix_logprobs_match_dense_rows(pack_groups):
     """Star/forest logprob fan-out equals a dense per-row evaluation at TP1/CP1.
