@@ -5185,6 +5185,7 @@ class SingleControllerActor:
             tensor_field(data, adv_cfg.reward_field)
         ).float()
         token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
+        original_token_mask = token_mask
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
@@ -5204,7 +5205,7 @@ class SingleControllerActor:
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
         # report sequence-level generation/training mismatch. A threshold adds
-        # masking; leaving it unset keeps this metrics-only.
+        # threshold filtering; support-mask validity applies in either case.
         if self._policy_logprobs_required:
             masking_data = BatchedDataDict(
                 {
@@ -5230,7 +5231,9 @@ class SingleControllerActor:
                 rewards=rewards,
                 seq_logprob_error_threshold=seq_logprob_error_threshold,
             )
+            token_mask = masking_data["token_mask"]
             final_sample_mask = masking_data["sample_mask"]
+            data[adv_cfg.policy_logprobs_field] = masking_data["prev_logprobs"]
             num_valid_seqs_after = float(
                 ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
                 .sum()
@@ -5345,6 +5348,8 @@ class SingleControllerActor:
         )
 
         fields_to_put = {adv_cfg.output_field: advantages}
+        if not torch.equal(token_mask, original_token_mask):
+            fields_to_put[adv_cfg.token_mask_field] = token_mask
         if not torch.equal(final_sample_mask, sample_mask):
             fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
         new_fields = [adv_cfg.output_field]

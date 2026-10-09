@@ -1014,16 +1014,20 @@ def test_grpo_sync_seq_logprob_error_helper_accepts_dict_result(monkeypatch):
         fake_masking,
     )
 
-    sample_mask, metrics = grpo_sync_mod._compute_seq_logprob_error_metrics(
-        token_mask=torch.ones(2, 3),
-        sample_mask=torch.ones(2),
-        prev_logprobs=torch.zeros(2, 3),
-        generation_logprobs=torch.zeros(2, 3),
-        rewards=torch.tensor([1.0, 0.0]),
-        seq_logprob_error_threshold=1.2,
+    token_mask, sample_mask, prev_logprobs, metrics = (
+        grpo_sync_mod._compute_seq_logprob_error_metrics(
+            token_mask=torch.ones(2, 3),
+            sample_mask=torch.ones(2),
+            prev_logprobs=torch.zeros(2, 3),
+            generation_logprobs=torch.zeros(2, 3),
+            rewards=torch.tensor([1.0, 0.0]),
+            seq_logprob_error_threshold=1.2,
+        )
     )
 
     assert torch.equal(sample_mask, torch.tensor([1.0, 0.0]))
+    assert torch.equal(token_mask, torch.ones(2, 3))
+    assert torch.equal(prev_logprobs, torch.zeros(2, 3))
     assert metrics["max_seq_mult_prob_error"] == 2.5
     assert metrics["mean_seq_mult_prob_error"] == 1.5
     assert metrics["min_seq_mult_prob_error"] == 1.0
@@ -1516,7 +1520,12 @@ def mock_sync_grpo_infrastructure(policy):
     stack.enter_context(
         patch(
             "nemo_rl.algorithms.grpo_sync._compute_seq_logprob_error_metrics",
-            return_value=(torch.ones(1), _mock_seq_logprob_error_result()),
+            return_value=(
+                torch.ones(1, 4),
+                torch.ones(1),
+                torch.zeros(1, 4),
+                _mock_seq_logprob_error_result(),
+            ),
         )
     )
     adv_estimator = MagicMock()
@@ -5941,6 +5950,11 @@ class TestValidateFunction:
 class TestComputeAndApplySeqLogprobErrorMasking:
     """Tests for the compute_and_apply_seq_logprob_error_masking function."""
 
+    @pytest.fixture(autouse=True)
+    def reset_env_calls(self):
+        # Override the module's environment fixture for these pure tensor tests.
+        yield
+
     def _create_train_data(
         self,
         batch_size: int,
@@ -5971,7 +5985,7 @@ class TestComputeAndApplySeqLogprobErrorMasking:
     def test_nonfinite_logprobs_respect_token_mask(
         self, bad: float, field: str, masked_position: bool
     ) -> None:
-        """Padding cannot poison a row, but nonfinite response errors reject it."""
+        """Exclude policy support mismatches; other nonfinite errors reject a row."""
         train_data = self._create_train_data(
             2,
             4,
@@ -5983,13 +5997,67 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         result = compute_and_apply_seq_logprob_error_masking(
             train_data, torch.ones(2), seq_logprob_error_threshold=2.0
         )
-        assert result["num_masked_seqs"] == (0 if masked_position else 1)
+        rejected = not masked_position and not (
+            field == "prev_logprobs" and bad == -float("inf")
+        )
+        assert result["num_masked_seqs"] == int(rejected)
         assert train_data["sample_mask"].tolist() == [
-            1.0 if masked_position else 0.0,
+            0.0 if rejected else 1.0,
             1.0,
         ]
         if masked_position:
             assert math.isfinite(result["max_seq_mult_prob_error"])
+
+    @pytest.mark.parametrize("data_plane", [False, True])
+    def test_policy_support_mask_reaches_training_counts(self, data_plane):
+        train_data = self._create_train_data(
+            1,
+            4,
+            torch.tensor([[0.0, 0.0, -float("inf"), 0.0]]),
+            torch.tensor([[0.0, 0.0, -12.564064, 0.0]]),
+            token_mask=torch.tensor([[0.0, 1.0, 1.0, 0.0]]),
+        )
+        if data_plane:
+            from nemo_rl.algorithms.grpo_sync import _compute_seq_logprob_error_metrics
+
+            token_mask, sample_mask, prev_logprobs, result = (
+                _compute_seq_logprob_error_metrics(
+                    **train_data,
+                    rewards=torch.ones(1),
+                    seq_logprob_error_threshold=None,
+                )
+            )
+            train_data.update(
+                token_mask=token_mask,
+                sample_mask=sample_mask,
+                prev_logprobs=prev_logprobs,
+            )
+        else:
+            result = compute_and_apply_seq_logprob_error_masking(
+                train_data, torch.ones(1), seq_logprob_error_threshold=None
+            )
+        assert train_data["token_mask"].tolist() == [[0.0, 1.0, 0.0, 0.0]]
+        assert train_data["sample_mask"].tolist() == [1.0]
+        assert torch.isfinite(train_data["prev_logprobs"]).all()
+        assert (
+            train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1)
+        ).sum() == 1
+        assert result["max_seq_mult_prob_error"] == pytest.approx(1.0)
+
+    @pytest.mark.parametrize("threshold", [None, 2.0])
+    def test_policy_support_mask_excludes_tokenless_rows(self, threshold):
+        train_data = self._create_train_data(
+            1,
+            3,
+            torch.tensor([[0.0, -float("inf"), -float("inf")]]),
+            torch.zeros(1, 3),
+            token_mask=torch.tensor([[0.0, 1.0, 1.0]]),
+        )
+        compute_and_apply_seq_logprob_error_masking(
+            train_data, torch.ones(1), threshold
+        )
+        assert train_data["sample_mask"].tolist() == [0.0]
+        assert train_data["token_mask"].sum() == 0
 
     def test_no_threshold_only_computes_metrics(self):
         """Test that when threshold is None, only metrics are computed (no masking)."""
@@ -6259,7 +6327,7 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         assert result["max_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
         assert result["mean_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
         assert result["min_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
-        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0, 1.0]))
+        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0, 0.0]))
 
     def test_empty_batch_returns_zero_metrics(self):
         """Test handling of edge case with empty batch."""

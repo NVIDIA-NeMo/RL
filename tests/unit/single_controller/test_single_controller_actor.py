@@ -948,7 +948,10 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     )
 
 
-def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
+@pytest.mark.parametrize("support_mismatch", [False, True])
+def test_advantage_stage_reports_seq_logprob_metrics_without_masking(
+    support_mismatch,
+) -> None:
     batch_size, sequence_length = 2, 5
     generation_logprobs = torch.zeros(batch_size, sequence_length)
     generation_logprobs[1, 1:] = 1.0
@@ -968,6 +971,8 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
         batch_size=[batch_size],
     )
     data_plane = _AdvantageDataPlane(data)
+    if support_mismatch:
+        data["prev_logprobs"][0, 1] = -float("inf")
     estimator = _MaskRecordingAdvantageEstimator()
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -1009,7 +1014,16 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     assert data_plane.written_fields is not None
     assert "sample_mask" not in data_plane.written_fields
     assert estimator.mask is not None
-    assert estimator.mask.all()
+    if support_mismatch:
+        expected_mask = torch.ones(batch_size, sequence_length)
+        expected_mask[0, 1] = 0
+        torch.testing.assert_close(estimator.mask, expected_mask)
+        torch.testing.assert_close(
+            data_plane.written_fields["token_mask"], expected_mask
+        )
+    else:
+        assert estimator.mask.all()
+        assert "token_mask" not in data_plane.written_fields
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
     assert metrics[0]["num_masked_seqs_by_logprob_error"] == 0
