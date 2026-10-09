@@ -2,3 +2,7 @@ defaults: grpo-llama3.2-1b-instruct-1n8g-fsdp2tp2-temp0.8-topp0.9-topk50.yaml
 data_plane:
   enabled: true
   backend: mooncake_cpu
+data:
+  # mooncake_cpu RDMA-pins a large segment on the driver, so forking DataLoader
+  # workers from it copies the pinned pages (~20s per validation); load in-process.
+  num_workers: 0

@@ -425,6 +425,22 @@ class TestWandbLogger:
         )
 
     @patch("nemo_rl.utils.logger.wandb")
+    def test_log_table_logs_each_step_with_a_step_column(self, mock_wandb):
+        """Each step logs its own table, its rows tagged with their step."""
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
+
+        logger.log_table(["op", "ms"], [["put", 1.0], ["get", 2.0]], 1, "t")
+        logger.log_table(["op", "ms"], [["put", 3.0]], 2, "t")
+
+        assert mock_wandb.Table.call_args_list == [
+            call(
+                columns=["step", "op", "ms"],
+                data=[[1, "put", 1.0], [1, "get", 2.0]],
+            ),
+            call(columns=["step", "op", "ms"], data=[[2, "put", 3.0]]),
+        ]
+
+    @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics(self, mock_wandb):
         """Test logging metrics to WandbLogger."""
         cfg = WandbConfig(project="test-project", name="test-run")
