@@ -42,7 +42,6 @@ from typing import Any, Optional, cast
 import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
-from nemo_rl.data.packing.shared_prefix_cost import with_prompt_length_tags
 from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_PROMPT_LENGTHS,
 )
@@ -752,9 +751,11 @@ class RolloutReassembler:
         if self._include_shared_prefix_metadata:
             # Keep verified capture boundaries. Invalid placeholders remain exactly
             # as the baseline produced them and force conventional fallback packing.
-            prompt_lengths = [int(row.prompt_len) if row.valid else 0 for row in rows]
+            # The tensor column is the only transport; the driver derives row
+            # tags from it only when work-weighted sharding needs them.
             train_batch[SHARED_PREFIX_PROMPT_LENGTHS] = torch.tensor(
-                prompt_lengths, dtype=torch.long
+                [int(row.prompt_len) if row.valid else 0 for row in rows],
+                dtype=torch.long,
             )
         sample_ids, fields, tags = pack_payload(
             train_batch,
@@ -762,10 +763,6 @@ class RolloutReassembler:
             group_id=group_id,
             prompt_idx=prompt_idx,
         )
-        if self._include_shared_prefix_metadata:
-            tags = with_prompt_length_tags(
-                tags, prompt_lengths=prompt_lengths, sequence_lengths=seq_lens
-            )
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
             span_count = 0
