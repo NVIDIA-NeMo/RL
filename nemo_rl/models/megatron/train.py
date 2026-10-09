@@ -598,8 +598,7 @@ def shared_prefix_next_token_logprobs(
     )
 
     restored = packed_logprobs.new_zeros((row_count, sequence_length - 1))
-    # Host lookup table from source row to this unit's output row; completion
-    # rows index it per token without a Python dict lookup.
+    # Host lookup table from source row to this unit's output row.
     source_to_local = torch.full((max(layout.row_indices) + 1,), -1, dtype=torch.long)
     source_to_local[list(layout.row_indices)] = torch.arange(
         row_count, dtype=torch.long
@@ -613,8 +612,12 @@ def shared_prefix_next_token_logprobs(
         ].unsqueeze(0)
         prompt_offset += count
 
-    scatter_rows = source_to_local.index_select(
-        0, torch.tensor(layout.completion_scatter_rows, dtype=torch.long)
+    # Completion tokens follow the layout's row order, one row's tokens at a
+    # time, so the output rows repeat each local row by its completion length
+    # without building the per-token source-row tuple on the host.
+    scatter_rows = torch.repeat_interleave(
+        torch.arange(row_count, dtype=torch.long),
+        torch.tensor(layout.completion_lengths, dtype=torch.long),
     ).to(device=device)
     # The planner emits columns ``<= total_length - 2`` and
     # ``materialize_shared_prefix_layout`` rejects rows longer than their
