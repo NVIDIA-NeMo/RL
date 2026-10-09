@@ -10,7 +10,9 @@ defaults: ../configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-circle-click-2n8g
 grpo:
   num_prompts_per_step: 4
   num_generations_per_prompt: 2
-  max_num_epochs: 1
+  # Treat the scheduler allocation as the run boundary; do not stop after the
+  # four-task validation dataset has been consumed once.
+  max_num_epochs: 1000000
   max_num_steps: 1000000
   val_period: 0
   val_at_start: false
@@ -114,6 +116,8 @@ env:
       responses_api_agents:
         anyterminal_agent:
           global_agent_timeout: 900
+          agent_kwargs:
+            context_window: ${add:${policy.max_total_sequence_length},-512}
 
 data_plane:
   enabled: true
@@ -146,6 +150,7 @@ logger:
   tensorboard_enabled: true
   monitor_gpus: true
   wandb:
+    entity: adlr
     project: multi-harness-RL
     name: anyterminal-multi-harness-nano-omni-sync-2n-debug
     log_nemo_gym_full_result_tables: true

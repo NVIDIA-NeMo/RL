@@ -49,6 +49,8 @@ def test_anyterminal_multi_harness_recipe_resolves_async_training_contract():
     }
     assert config["grpo"]["num_prompts_per_step"] == 4
     assert config["grpo"]["num_generations_per_prompt"] == 2
+    assert config["grpo"]["max_num_epochs"] == 1_000_000
+    assert config["grpo"]["max_num_steps"] == 1_000_000
     assert config["policy"]["train_global_batch_size"] == 8
     assert config["data"]["train"]["dataset_name"] == "NemoGymDataset"
     assert set(config["data"]["train"]) == {"dataset_name", "data_path"}
@@ -77,20 +79,27 @@ def test_anyterminal_multi_harness_recipe_resolves_async_training_contract():
     assert config["policy"]["generation"]["vllm_cfg"]["max_model_len"] == 16384
     assert config["policy"]["generation"]["vllm_cfg"]["expose_http_server"] is True
     assert config["policy"]["generation"]["colocated"]["enabled"] is False
-    assert config["env"]["nemo_gym"]["anyterminal_opencode"][
-        "responses_api_agents"
-    ]["anyterminal_agent"]["agent_kwargs"] == {
+    assert config["env"]["nemo_gym"]["anyterminal_opencode"]["responses_api_agents"][
+        "anyterminal_agent"
+    ]["agent_kwargs"] == {
         "context_window": 15872,
         "max_input_tokens": 11776,
         "max_output_tokens": 4096,
     }
-    assert config["env"]["nemo_gym"]["anyterminal_openclaw"][
-        "responses_api_agents"
-    ]["anyterminal_agent"]["agent_kwargs"] == {
+    assert config["env"]["nemo_gym"]["anyterminal_openclaw"]["responses_api_agents"][
+        "anyterminal_agent"
+    ]["agent_kwargs"] == {
         "context_window": 15872,
         "max_output_tokens": 4096,
     }
+    assert config["env"]["nemo_gym"]["anyterminal_hermes"]["responses_api_agents"][
+        "anyterminal_agent"
+    ]["agent_kwargs"] == {
+        "max_turns": 3,
+        "context_window": 15872,
+    }
     assert config["logger"]["wandb_enabled"] is True
+    assert config["logger"]["wandb"]["entity"] == "adlr"
     assert config["logger"]["wandb"]["log_nemo_gym_full_result_tables"] is True
 
 
@@ -108,6 +117,7 @@ def test_super_omni_anyterminal_recipe_resolves_training_topology():
     }
     assert config["grpo"]["num_prompts_per_step"] == 4
     assert config["grpo"]["num_generations_per_prompt"] == 2
+    assert config["grpo"]["max_num_epochs"] == 1_000_000
     assert config["grpo"]["max_num_steps"] == 1_000_000
     assert config["grpo"]["async_grpo"] is None
     assert config["policy"]["train_global_batch_size"] == 8
@@ -132,20 +142,24 @@ def test_super_omni_anyterminal_recipe_resolves_training_topology():
     assert config["token_capture"]["enabled"] is True
     assert config["data_plane"]["enabled"] is True
     assert config["checkpointing"]["enabled"] is False
-    assert config["env"]["nemo_gym"]["anyterminal_opencode"][
-        "responses_api_agents"
-    ]["anyterminal_agent"]["agent_kwargs"] == {
+    assert config["env"]["nemo_gym"]["anyterminal_opencode"]["responses_api_agents"][
+        "anyterminal_agent"
+    ]["agent_kwargs"] == {
         "context_window": 15872,
         "max_input_tokens": 11776,
         "max_output_tokens": 4096,
     }
-    assert config["env"]["nemo_gym"]["anyterminal_openclaw"][
-        "responses_api_agents"
-    ]["anyterminal_agent"]["agent_kwargs"] == {
+    assert config["env"]["nemo_gym"]["anyterminal_openclaw"]["responses_api_agents"][
+        "anyterminal_agent"
+    ]["agent_kwargs"] == {
         "context_window": 15872,
         "max_output_tokens": 4096,
     }
+    assert config["env"]["nemo_gym"]["anyterminal_hermes"]["responses_api_agents"][
+        "anyterminal_agent"
+    ]["agent_kwargs"] == {"context_window": 15872}
     assert config["logger"]["wandb_enabled"] is True
+    assert config["logger"]["wandb"]["entity"] == "adlr"
     assert config["logger"]["wandb"]["log_nemo_gym_full_result_tables"] is True
 
 
@@ -217,9 +231,12 @@ def test_nano_omni_sync_2n_debug_recipe_resolves_multi_harness_topology():
     assert config["policy"]["generation"]["vllm_cfg"][
         "reasoning_parser_plugin"
     ].endswith("nano_v3_reasoning_parser.py")
-    assert config["policy"]["generation"]["vllm_cfg"][
-        "http_server_serving_chat_kwargs"
-    ]["reasoning_parser"] == "nano_v3"
+    assert (
+        config["policy"]["generation"]["vllm_cfg"]["http_server_serving_chat_kwargs"][
+            "reasoning_parser"
+        ]
+        == "nano_v3"
+    )
     assert config["policy"]["generation"]["vllm_kwargs"]["kernel_config"] == {
         "enable_flashinfer_autotune": False,
     }
@@ -233,22 +250,28 @@ def test_nano_omni_sync_2n_debug_recipe_resolves_multi_harness_topology():
     }
     assert config["grpo"]["num_prompts_per_step"] == 4
     assert config["grpo"]["num_generations_per_prompt"] == 2
+    assert config["grpo"]["max_num_epochs"] == 1_000_000
+    assert config["grpo"]["max_num_steps"] == 1_000_000
     assert config["policy"]["train_global_batch_size"] == 8
     assert config["async_rl"]["sampler"]["max_lookahead_versions"] == 0
     assert config["data_plane"]["enabled"] is True
     assert config["token_capture"]["enabled"] is True
-    assert config["env"]["nemo_gym"]["anyterminal_opencode"][
-        "responses_api_agents"
-    ]["anyterminal_agent"]["agent_kwargs"] == {
+    assert config["env"]["nemo_gym"]["anyterminal_opencode"]["responses_api_agents"][
+        "anyterminal_agent"
+    ]["agent_kwargs"] == {
         "context_window": 15872,
         "max_input_tokens": 7680,
         "max_output_tokens": 8192,
     }
-    assert config["env"]["nemo_gym"]["anyterminal_openclaw"][
-        "responses_api_agents"
-    ]["anyterminal_agent"]["agent_kwargs"] == {
+    assert config["env"]["nemo_gym"]["anyterminal_openclaw"]["responses_api_agents"][
+        "anyterminal_agent"
+    ]["agent_kwargs"] == {
         "context_window": 15872,
         "max_output_tokens": 4096,
     }
+    assert config["env"]["nemo_gym"]["anyterminal_hermes"]["responses_api_agents"][
+        "anyterminal_agent"
+    ]["agent_kwargs"] == {"context_window": 15872}
     assert config["logger"]["wandb_enabled"] is True
+    assert config["logger"]["wandb"]["entity"] == "adlr"
     assert config["logger"]["wandb"]["log_nemo_gym_full_result_tables"] is True
