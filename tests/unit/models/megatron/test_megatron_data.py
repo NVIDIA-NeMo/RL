@@ -2485,7 +2485,7 @@ class TestSharedPrefixMicrobatchIterator:
             else unit
             for unit in units
         )
-        with pytest.raises(ValueError, match="disagrees with its layout"):
+        with pytest.raises(ValueError, match="must equal its layout's rows"):
             get_microbatch_iterator(
                 data,
                 cfg,

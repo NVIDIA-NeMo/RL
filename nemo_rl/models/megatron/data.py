@@ -459,24 +459,12 @@ def get_microbatch_iterator(
         )
 
         # Units planned on ``data`` address its rows in order. Reject a plan for
-        # a different batch, and a star whose rows disagree with its layout:
-        # the logprob fan-out follows the layout's row order.
+        # a different batch, and a star whose rows or length disagree with its
+        # layout: the logprob fan-out follows the layout's row order.
         validate_shared_prefix_execution_units(
             shared_prefix_execution_units,
             batch_size=data.size,
         )
-        for unit in shared_prefix_execution_units:
-            layout = unit.shared_layout
-            if layout is not None and (
-                tuple(unit.row_indices) != tuple(layout.row_indices)
-                or unit.physical_length != layout.physical_total_length
-            ):
-                raise ValueError(
-                    "precomputed shared-prefix execution unit disagrees with its "
-                    f"layout: rows {tuple(unit.row_indices)} vs "
-                    f"{tuple(layout.row_indices)}, physical length "
-                    f"{unit.physical_length} vs {layout.physical_total_length}"
-                )
 
         # Retain an explicit source-row index so expanded shared/fallback
         # forwards can be restored to the caller's conventional order. A
