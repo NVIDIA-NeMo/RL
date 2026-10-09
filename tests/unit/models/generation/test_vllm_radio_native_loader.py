@@ -187,6 +187,17 @@ def radio_model(patched_sources):
     return model, params, lambda weights: load_weights(model, weights), hidden
 
 
+def _assert_loaded(loaded: set[str], expected: set[str]) -> None:
+    """Check the keys this loader call wrote.
+
+    The LayerScale loader patch (applied to the same function by the installed
+    vLLM when a generation worker has started) backfills unloaded ``ls1``/``ls2``
+    into ``loaded_params``; tolerate those so the tests are order-independent.
+    """
+    assert expected <= loaded
+    assert all(name.endswith((".ls1", ".ls2")) for name in loaded - expected)
+
+
 def test_legacy_names_still_load_through_the_stock_path(radio_model):
     _, params, load, hidden = radio_model
     fused = torch.arange(3 * hidden * hidden, dtype=torch.float32).reshape(
@@ -205,10 +216,13 @@ def test_legacy_names_still_load_through_the_stock_path(radio_model):
     assert torch.equal(
         params["model.patch_generator.pos_embed"], torch.ones(1, 2, hidden)
     )
-    assert loaded == {
-        "model.encoder.layers.0.attn.qkv.weight",
-        "model.patch_generator.pos_embed",
-    }
+    _assert_loaded(
+        loaded,
+        {
+            "model.encoder.layers.0.attn.qkv.weight",
+            "model.patch_generator.pos_embed",
+        },
+    )
 
 
 def test_native_names_write_qkv_shards_and_layer_scale(radio_model):
@@ -252,14 +266,17 @@ def test_native_names_write_qkv_shards_and_layer_scale(radio_model):
         params["model.patch_generator.cls_token.token"], torch.full((1, 1, hidden), 8.0)
     )
     assert "model.encoder.layers.0.unknown.weight" not in loaded
-    assert loaded == {
-        "model.encoder.layers.0.attn.qkv.weight",
-        "model.encoder.layers.0.attn.proj.weight",
-        "model.encoder.layers.0.norm1.weight",
-        "model.encoder.layers.0.ls1",
-        "model.patch_generator.embedder.weight",
-        "model.patch_generator.cls_token.token",
-    }
+    _assert_loaded(
+        loaded,
+        {
+            "model.encoder.layers.0.attn.qkv.weight",
+            "model.encoder.layers.0.attn.proj.weight",
+            "model.encoder.layers.0.norm1.weight",
+            "model.encoder.layers.0.ls1",
+            "model.patch_generator.embedder.weight",
+            "model.patch_generator.cls_token.token",
+        },
+    )
 
 
 def test_hybrid_names_from_automodel_r060_write_qkv_shards(radio_model):
@@ -291,8 +308,11 @@ def test_hybrid_names_from_automodel_r060_write_qkv_shards(radio_model):
         torch.full((hidden, hidden), 4.0),
     )
     assert torch.equal(params["model.encoder.layers.0.ls2"], torch.full((hidden,), 9.0))
-    assert loaded == {
-        "model.encoder.layers.0.attn.qkv.weight",
-        "model.encoder.layers.0.attn.proj.weight",
-        "model.encoder.layers.0.ls2",
-    }
+    _assert_loaded(
+        loaded,
+        {
+            "model.encoder.layers.0.attn.qkv.weight",
+            "model.encoder.layers.0.attn.proj.weight",
+            "model.encoder.layers.0.ls2",
+        },
+    )
