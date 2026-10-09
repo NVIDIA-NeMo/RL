@@ -630,7 +630,22 @@ def test_video_datum_requires_explicit_video_data_config(tmp_path):
 
 def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_path):
     data_path = tmp_path / "video-gym.jsonl"
-    data_path.write_text(json.dumps({"row": 1}) + "\n", encoding="utf-8")
+    video_row = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_video",
+                            "video_url": "data:video/mp4;base64,AAAA",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    data_path.write_text(json.dumps(video_row) + "\n", encoding="utf-8")
     expected_media_config = {
         "num_frames": 32,
         "video_sampling_style": "nemotron_vl",
@@ -672,7 +687,7 @@ def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_pa
     )
     processor = SimpleNamespace(
         apply_chat_template=lambda *args: None,
-        tokenizer=object(),
+        tokenizer=SimpleNamespace(bos_token_id=None),
     )
 
     train_dataset, _ = setup_response_data(
@@ -1173,6 +1188,13 @@ example_multi_step_simple_agent:
       model_server:
         type: responses_api_models
         name: openai_model
+example_multi_step_environment_server:
+  environment_servers:
+    legacy_agent:
+      entrypoint: app.py
+      agent_server:
+        type: responses_api_agents
+        name: example_multi_step_simple_agent
 openai_model:
   responses_api_models:
     vllm_model:
