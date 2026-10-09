@@ -27,12 +27,10 @@ pytest.importorskip("megatron.bridge")
 pytest.importorskip("megatron.rl.shared_prefix_dense_bins")
 
 from megatron.rl.shared_prefix_alignment import materialize_alignment
+from megatron.rl.shared_prefix_execution import SharedPrefixExecutionUnit
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.megatron.data import (
-    _SharedPrefixExecutionUnit,
-    plan_shared_prefix_execution_units,
-)
+from nemo_rl.models.megatron.data import plan_shared_prefix_execution_units
 from nemo_rl.models.megatron.shared_prefix_dense_bins import (
     plan_dense_training_bins,
     share_prefixes_in_dense_training_bins,
@@ -90,7 +88,7 @@ class TestSharedPrefixDenseBins(unittest.TestCase):
             [3, 3, 3],
             ["a", "b", "a"],
         )
-        original = _SharedPrefixExecutionUnit((0, 1, 2), None, 15)
+        original = SharedPrefixExecutionUnit((0, 1, 2), None, 15)
         (unit,) = share_prefixes_in_dense_training_bins(
             data, [original], cfg=config(), bin_capacity=15
         )
@@ -120,7 +118,7 @@ class TestSharedPrefixDenseBins(unittest.TestCase):
 
     def _test_prefix_or_group_mismatch_remains_dense(self, tokens, groups):
         data = batch(tokens, [3, 3], groups)
-        original = _SharedPrefixExecutionUnit((0, 1), None, 8)
+        original = SharedPrefixExecutionUnit((0, 1), None, 8)
         assert share_prefixes_in_dense_training_bins(
             data, [original], cfg=config(), bin_capacity=8
         ) == (original,)
@@ -137,7 +135,7 @@ class TestSharedPrefixDenseBins(unittest.TestCase):
 
     def _test_empty_prompt_or_completion_retains_every_row(self, prompts):
         data = batch([[1, 2, 3, 8], [1, 2, 3, 9]], prompts, ["a", "a"])
-        original = _SharedPrefixExecutionUnit((0, 1), None, 8)
+        original = SharedPrefixExecutionUnit((0, 1), None, 8)
         assert share_prefixes_in_dense_training_bins(
             data, [original], cfg=config(), bin_capacity=8
         ) == (original,)
@@ -176,7 +174,7 @@ class TestSharedPrefixDenseBins(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly once"):
             share_prefixes_in_dense_training_bins(
                 data,
-                [_SharedPrefixExecutionUnit((0, 0), None, 8)],
+                [SharedPrefixExecutionUnit((0, 0), None, 8)],
                 cfg=config(),
                 bin_capacity=8,
             )
@@ -185,7 +183,7 @@ class TestSharedPrefixDenseBins(unittest.TestCase):
 
     def test_many_siblings_keep_branch_limit_and_single_normalization_group(self):
         data = batch([[1, 2, 3, 8 + i] for i in range(17)], [3] * 17, ["a"] * 17)
-        unit = _SharedPrefixExecutionUnit(tuple(range(17)), None, 68)
+        unit = SharedPrefixExecutionUnit(tuple(range(17)), None, 68)
         (shared,) = share_prefixes_in_dense_training_bins(
             data, [unit], cfg=config(), bin_capacity=68
         )

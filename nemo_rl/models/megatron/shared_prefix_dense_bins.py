@@ -14,21 +14,19 @@
 """Opt-in training packing: align dense row bins, then share exact prefixes."""
 
 from collections.abc import Sequence
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
-from megatron.rl.shared_prefix_dense_bins import (
-    plan_dense_training_bins as plan_dense_bins,
-    share_prefixes_in_dense_training_bins as share_dense_bins,
-)
 from nemo_rl.data.packing.algorithms import get_packer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.megatron.data import (
     _build_shared_prefix_rows,
     _normalize_shared_prefix_group_ids,
     _resolve_shared_prefix_execution_topology,
-    _SharedPrefixExecutionUnit,
 )
 from nemo_rl.models.policy import PolicyConfig, SequencePackingConfig
+
+if TYPE_CHECKING:
+    from megatron.rl.shared_prefix_execution import SharedPrefixExecutionUnit
 
 
 def _row_costs(data: BatchedDataDict[Any], multiple: int) -> list[int]:
@@ -40,8 +38,13 @@ def _row_costs(data: BatchedDataDict[Any], multiple: int) -> list[int]:
 
 def plan_dense_training_bins(
     data: BatchedDataDict[Any], *, cfg: PolicyConfig, bin_capacity: int
-) -> tuple[_SharedPrefixExecutionUnit, ...]:
+) -> tuple["SharedPrefixExecutionUnit", ...]:
     """Pack full rows across groups; leave prefix reuse until after DP alignment."""
+    # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds.
+    from megatron.rl.shared_prefix_dense_bins import (
+        plan_dense_training_bins as plan_dense_bins,
+    )
+
     *_, multiple = _resolve_shared_prefix_execution_topology(cfg)
     costs = _row_costs(data, multiple)
     if any(cost <= 0 or cost > bin_capacity for cost in costs):
@@ -64,17 +67,22 @@ def plan_dense_training_bins(
 
 def share_prefixes_in_dense_training_bins(
     data: BatchedDataDict[Any],
-    units: Sequence[_SharedPrefixExecutionUnit],
+    units: Sequence["SharedPrefixExecutionUnit"],
     *,
     cfg: PolicyConfig,
     bin_capacity: int,
-) -> tuple[_SharedPrefixExecutionUnit, ...]:
+) -> tuple["SharedPrefixExecutionUnit", ...]:
     """Replace each aligned dense bin with an exact forest when it saves work.
 
     Every bin retains one MTP auxiliary-loss normalization group, including
     independent singleton roots. Causal boundaries remain per source row.
     Ineligible bins remain conventional, with no dropped or synthetic rows.
     """
+    # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds.
+    from megatron.rl.shared_prefix_dense_bins import (
+        share_prefixes_in_dense_training_bins as share_dense_bins,
+    )
+
     *_, multiple = _resolve_shared_prefix_execution_topology(cfg)
     costs = _row_costs(data, multiple)
     rows = _build_shared_prefix_rows(_normalize_shared_prefix_group_ids(data))
