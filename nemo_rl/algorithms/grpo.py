@@ -1162,6 +1162,9 @@ def setup(
                         "pipeline_parallel_size", 1
                     )
                 elif generation_config["backend"] == "trtllm":
+                    # TP is the whole engine width here: TrtllmGeneration
+                    # asserts pipeline_parallel_size == 1, so there is no PP
+                    # factor to fold in.
                     trtllm_cfg = generation_config.get("trtllm_cfg", {})
                     disagg_cfg = generation_config.get("disaggregation") or {}
                     if disagg_cfg.get("enabled"):
@@ -1175,10 +1178,6 @@ def setup(
                         # which skips domain pinning entirely and lets a replica
                         # straddle racks -- correct, but with the KV transfer
                         # demoted from NVLink to InfiniBand.
-                        #
-                        # No pipeline_parallel_size factor: TrtllmGeneration
-                        # asserts pp == 1, so folding it in would only suggest a
-                        # dimension this backend does not have.
                         def _role_tp(role: str) -> int:
                             # Per-role engine overrides live beside the engine
                             # config they override, not under disaggregation.
@@ -1200,9 +1199,7 @@ def setup(
                             * _role_tp("decode")
                         )
                     else:
-                        gpus_per_instance = trtllm_cfg[
-                            "tensor_parallel_size"
-                        ] * trtllm_cfg.get("pipeline_parallel_size", 1)
+                        gpus_per_instance = trtllm_cfg["tensor_parallel_size"]
                 elif generation_config["backend"] == "dynamo":
                     gpus_per_instance = DynamoConfig.model_validate(
                         generation_config

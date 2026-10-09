@@ -32,6 +32,7 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
+    DisaggConfig,
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
@@ -41,7 +42,8 @@ from nemo_rl.models.generation.trtllm.config import (
     TrtllmConfig,
     TrtllmDisaggServerConfig,
     TrtllmEngineArgs,
-    resolve_trtllm_disagg_config,
+    resolve_disagg_layout,
+    resolve_disagg_server_config,
 )
 
 
@@ -55,7 +57,7 @@ class TrtllmGeneration(GenerationInterface):
     ) -> None:
         """Pre-initialize placement groups matching TRT-LLM's topology."""
         trtllm_cfg = config["trtllm_cfg"]
-        disagg = resolve_trtllm_disagg_config(config)
+        disagg = resolve_disagg_layout(config)
         engine_tp = trtllm_cfg["tensor_parallel_size"]
         if disagg.enabled:
             engine_tp = max(
@@ -94,7 +96,7 @@ class TrtllmGeneration(GenerationInterface):
             "PD disaggregation requires non-colocated generation: colocated mode "
             "sleeps the engines between rollouts, which drops the KV cache the "
             "transceiver needs. Set colocated.enabled=false or "
-            "trtllm_cfg.disaggregation.enabled=false."
+            "generation.disaggregation.enabled=false."
         )
 
         needs_cross_node = widest_engine_gpus > cluster.num_gpus_per_node
@@ -120,7 +122,8 @@ class TrtllmGeneration(GenerationInterface):
         # Validated once here rather than per access: every disagg default
         # lives on the schema, so the rest of this class reads attributes
         # instead of re-deriving a default per key.
-        self._disagg = resolve_trtllm_disagg_config(config)
+        self._disagg = resolve_disagg_layout(config)
+        self._disagg_server = resolve_disagg_server_config(config)
 
         # Per-engine role and TP width, in engine order -- the single source of
         # truth for how the cluster is sliced. Without disaggregation every
@@ -596,8 +599,12 @@ class TrtllmGeneration(GenerationInterface):
     # ------------------------------------------------------------------ #
 
     @property
-    def _disagg_cfg(self) -> TrtllmDisaggServerConfig:
+    def _disagg_cfg(self) -> DisaggConfig:
         return self._disagg
+
+    @property
+    def _disagg_server_cfg(self) -> TrtllmDisaggServerConfig:
+        return self._disagg_server
 
     def _assert_direct_dispatch_allowed(self) -> None:
         """Reject the token-in-token-out path while PD is enabled.
@@ -614,7 +621,7 @@ class TrtllmGeneration(GenerationInterface):
                 "path; TrtllmGeneration.generate()/generate_async() dispatch "
                 "directly to engines and would silently bypass it. Use the "
                 "NeMo-Gym entrypoint, or set "
-                "trtllm_cfg.disaggregation.enabled=false."
+                "generation.disaggregation.enabled=false."
             )
 
     def _start_disagg_servers(self) -> list[Optional[str]]:
@@ -632,6 +639,7 @@ class TrtllmGeneration(GenerationInterface):
             return self._disagg_server_urls
 
         disagg = self._disagg_cfg
+        server = self._disagg_server
         num_prefill = disagg.num_prefill_engines
         num_decode = disagg.num_decode_engines
         per_replica = num_prefill + num_decode
@@ -683,10 +691,10 @@ class TrtllmGeneration(GenerationInterface):
                     (a["host"], a["port"])
                     for a in addrs[base + num_prefill : base + per_replica]
                 ],
-                ctx_router=disagg.ctx_router,
-                gen_router=disagg.gen_router,
-                gen_tokids_ctxbytes=disagg.gen_tokids_ctxbytes,
-                gen_strip_message_history=disagg.gen_strip_message_history,
+                ctx_router=server.ctx_router,
+                gen_router=server.gen_router,
+                gen_tokids_ctxbytes=server.gen_tokids_ctxbytes,
+                gen_strip_message_history=server.gen_strip_message_history,
                 frontend_tokenize=disagg.frontend_tokenize,
                 model_name=self.cfg["model_name"],
                 default_chat_template_kwargs=self.cfg["trtllm_cfg"].get(

@@ -200,48 +200,27 @@ class OptionalResourcesConfig(TypedDict):
 
 
 class DisaggConfig(BaseModel, extra="allow"):
-    """Prefill/decode disaggregation, in the terms every backend shares.
-
-    A *replica* is ``num_prefill_engines`` prefill engines plus
-    ``num_decode_engines`` decode engines, fronted by ``num_frontend_workers``
-    servers that expose the URLs the rollout client talks to. The replica *count* is never configured: it follows from the
-    inference cluster's size, the same way the DP-shard count does without
-    disaggregation.
-
-    Only the layout lives here -- how many engines of each role, how many
-    frontends, and whether they tokenize. How KV actually moves between the two
-    roles and how requests are routed inside a replica are backend-specific, so
-    a backend subclasses this and adds them (see ``TrtllmDisaggServerConfig``). The
-    per-role *engine* overrides are not here either: they are engine config, so
-    they sit beside the backend's own engine block
-    (``trtllm_cfg.prefill_engine`` / ``trtllm_cfg.decode_engine``). ``extra="allow"`` means an older config carrying a
-    backend's extra keys still loads.
-    """
+    """Prefill/decode disaggregation, in the terms every backend shares."""
 
     enabled: bool = False
 
-    # Engines per replica. The two are independent, so the P:D ratio is free.
+    # Engines per replica; independent, so the P:D ratio is free.
     num_prefill_engines: int = 1
     num_decode_engines: int = 1
 
-    # Frontend servers per replica. Each is its own actor with a distinct URL,
-    # and the rollout client's per-session affinity shards conversations across
-    # them, so one frontend's CPU stops being the replica's turn-throughput
-    # ceiling. 1 = single-frontend behavior.
+    # Frontend servers per replica, each its own actor with a distinct URL. The
+    # rollout client shards conversations across them by session, so one
+    # frontend's CPU stops being the replica's throughput ceiling.
     num_frontend_workers: int = 1
 
-    # Render the chat template and tokenize on the frontends, which hand the
-    # engines prompt token ids directly. Rendering cost grows with conversation
-    # length and would otherwise sit in one process per prefill engine, which
-    # can only be scaled by adding GPUs; frontends are CPU-only, so this is what
-    # makes num_frontend_workers worth raising.
+    # Render and tokenize on the frontends instead of the prefill adapter,
+    # which is one process per engine and scales only by adding GPUs.
+    # Frontends are CPU-only -- this is what num_frontend_workers buys.
     frontend_tokenize: bool = False
 
-    # Base port for the frontends' deterministic ports
-    # (base + replica_idx * num_frontend_workers + frontend_idx). Deterministic
-    # so a restarted frontend re-binds the SAME port and its URL stays valid;
-    # keep the range outside virtual_cluster's random master-port window
-    # (1400-1999).
+    # base + replica_idx * num_frontend_workers + frontend_idx. Deterministic
+    # so a restarted frontend re-binds the same port and its URL stays valid;
+    # keep it clear of virtual_cluster's random master-port window (1400-1999).
     frontend_base_port: int = 17300
 
 
@@ -294,10 +273,8 @@ class GenerationConfig(TypedDict):
     # Populated from grpo.debug_payload_metrics; not meant to be set by the user.
     _debug_payload_metrics: NotRequired[bool]
 
-    # Prefill/decode disaggregation layout, in the terms every backend shares.
-    # Lives here rather than in a backend block because nothing in it is
-    # backend-specific; how a backend *implements* disaggregation goes in its
-    # own block (e.g. trtllm_cfg.disagg_server).
+    # The layout, in the terms every backend shares. How a backend *implements*
+    # disaggregation goes in that backend's own block.
     disaggregation: NotRequired[DisaggConfig]
 
 
