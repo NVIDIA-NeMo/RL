@@ -242,6 +242,34 @@ def _is_trainable_output_item(item: dict) -> bool:
     return bool(item.get("generation_token_ids"))
 
 
+def _has_image_before_first_trainable_output(output: list[dict]) -> bool:
+    """Whether Gym adds an image before the first model response."""
+    for item in output:
+        if _is_trainable_output_item(item):
+            return False
+        if item.get("role") == "assistant":
+            continue
+        if item.get("type") == "function_call_output":
+            source = item.get("output")
+            if isinstance(source, str) and _looks_like_image_src(source):
+                return True
+        content = item.get("content") or []
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if (
+                not isinstance(part, dict)
+                or part.get("type") not in IMAGE_CONTENT_TYPES
+            ):
+                continue
+            source = part.get("image") or part.get("image_url") or part.get("url")
+            if isinstance(source, dict):
+                source = source.get("url")
+            if source is not None:
+                return True
+    return False
+
+
 def _index_per_turn_images(
     output: list[dict],
     input_messages: list[dict] | None = None,
