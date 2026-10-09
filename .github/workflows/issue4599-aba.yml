@@ -1,0 +1,127 @@
+name: Issue 4599 isolated A-B-A verification
+on:
+  push:
+    branches: [fujial/issue4599-ci-aba]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Free runner disk space as in the original lint job
+        run: |
+          sudo apt-get clean
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/dotnet /opt/az
+          pip cache purge || true
+          sudo npm cache clean --force || true
+      - name: Checkout original failing commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ab893185018a05588efc6a6de11ba81942fd057d
+          submodules: recursive
+          persist-credentials: false
+      - name: Install original CI uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86
+        with:
+          version: "0.11.18"
+          enable-cache: false
+      - name: Install original CI Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version-file: .python-version
+      - name: Compare original, patched, restored source
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/issue4599-evidence"
+          mkdir -p "$evidence"
+          factory=nemo_rl/data_plane/factory.py
+          test "$(git rev-parse HEAD)" = ab893185018a05588efc6a6de11ba81942fd057d
+          git status --porcelain > "$evidence/initial-status.txt"
+          test ! -s "$evidence/initial-status.txt"
+          git rev-parse HEAD > "$evidence/commit.txt"
+          git submodule status --recursive > "$evidence/submodules.txt"
+          uv --version > "$evidence/uv-version.txt"
+          uv venv
+          uv run --group dev pre-commit install
+          uv run --group dev python --version > "$evidence/python-version.txt"
+          uv run --group dev pyrefly --version > "$evidence/pyrefly-version.txt"
+          uv pip freeze > "$evidence/packages-before.txt"
+          sha256sum uv.lock pyproject.toml pyrefly.toml .pre-commit-config.yaml > "$evidence/config-before.sha256"
+          cp "$factory" "$evidence/factory-original.py"
+          
+          run_check() {
+            local phase="$1"
+            set +e
+            uv run --group dev pre-commit run --all-files --show-diff-on-failure --color=always > "$evidence/$phase.log" 2>&1
+            local result=$?
+            set -e
+            printf '%s\n' "$result" > "$evidence/$phase.exit"
+            cat "$evidence/$phase.log"
+            sha256sum "$factory" > "$evidence/$phase-source.sha256"
+          }
+          
+          run_check A-original
+          git diff --exit-code
+          uv run --group dev python - <<'PY'
+          from pathlib import Path
+          p = Path('nemo_rl/data_plane/factory.py')
+          source = p.read_text()
+          old = '    def _make_policy(**kwargs: Any) -> TQPolicy:\n        return TQPolicy(**kwargs, dp_cfg=cfg)'
+          new = '    # Preserve the non-optional type when captured by the deferred constructor.\n    dp_cfg: DataPlaneConfig = cfg\n\n    def _make_policy(**kwargs: Any) -> TQPolicy:\n        return TQPolicy(**kwargs, dp_cfg=dp_cfg)'
+          assert source.count(old) == 1
+          p.write_text(source.replace(old, new))
+          PY
+          git diff -- "$factory" > "$evidence/only-change.patch"
+          test "$(git hash-object "$factory")" = 59a0331bffd8abed80abbab28056a16e2e9ef0da
+          cp "$factory" "$evidence/factory-patched.py"
+          run_check B-patched
+          test "$(git diff --name-only)" = "$factory"
+          cmp "$factory" "$evidence/factory-patched.py"
+          cp "$evidence/factory-original.py" "$factory"
+          run_check A2-restored
+          git diff --exit-code
+          uv pip freeze > "$evidence/packages-after.txt"
+          sha256sum uv.lock pyproject.toml pyrefly.toml .pre-commit-config.yaml > "$evidence/config-after.sha256"
+          diff -u "$evidence/packages-before.txt" "$evidence/packages-after.txt"
+          diff -u "$evidence/config-before.sha256" "$evidence/config-after.sha256"
+          export EVIDENCE_DIR="$evidence"
+          uv run --group dev python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+          
+          root = Path(os.environ['EVIDENCE_DIR'])
+          results = []
+          for phase, expected in [('A-original', 1), ('B-patched', 0), ('A2-restored', 1)]:
+              log = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', (root / f'{phase}.log').read_text())
+              code = int((root / f'{phase}.exit').read_text())
+              same_error = all(marker in log for marker in [
+                  'TypedDict[DataPlaneConfig] | None', 'bad-argument-type',
+                  'nemo_rl/data_plane/factory.py:78:42',
+                  'nemo_rl.models.policy.tq_policy.TQPolicy.__init__',
+              ])
+              results.append(dict(phase=phase, exit_code=code, expected_exit=expected,
+                                  original_error=same_error,
+                                  passed=code == expected and same_error == (expected == 1)))
+          summary = {'same_environment': True, 'only_change': 'nemo_rl/data_plane/factory.py', 'results': results}
+          (root / 'results.json').write_text(json.dumps(summary, indent=2) + '\n')
+          print(json.dumps(summary, indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('## Issue #4599: same-runner A/B/A comparison\n\n')
+              out.write('| Source | Exit | Original diagnostic | Expected result confirmed |\n|---|---:|---|---|\n')
+              for row in results:
+                  out.write(f"| {row['phase']} | {row['exit_code']} | {row['original_error']} | {row['passed']} |\n")
+              out.write('\nOne runner, one interpreter and dependency environment; lockfile, checker settings and installed packages unchanged.\n')
+          assert all(row['passed'] for row in results), 'The expected A/B/A evidence was NOT established; inspect logs.'
+          PY
+      - name: Upload evidence even if comparison fails
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: issue4599-aba-evidence
+          path: ${{ runner.temp }}/issue4599-evidence
+          if-no-files-found: error
+          retention-days: 30
