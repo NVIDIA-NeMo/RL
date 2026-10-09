@@ -148,8 +148,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         pp_size = 1
         cp_size = 1
 
-        megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
-        dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
+        megatron_enabled = bool(config.get("megatron_cfg", {}).get("enabled", False))
+        automodel_enabled = bool(config.get("automodel_cfg", {}).get("enabled", False))
         # Normalize in place: every downstream reader (workers, setup, train)
         # accesses draft config by attribute, so a hand-built PolicyConfig has
         # to be validated here rather than only inside MasterConfig.
@@ -159,19 +159,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         draft_enabled = bool(draft_config is not None and draft_config.enabled)
         generation_config = config.get("generation") or {}
         nvfp4_pertoken_rollout = generation_config.get("nvfp4_pertoken_rollout") or {}
-        if megatron_enable and dtensor_enable:
+        if megatron_enabled and automodel_enabled:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
-                "DTensor (policy.dtensor_cfg.enabled=true), not both."
+                "Automodel (policy.automodel_cfg.enabled=true), not both. A config "
+                "that used to set policy.dtensor_cfg.enabled=false must now set "
+                "policy.automodel_cfg.enabled=false: dtensor_cfg has been renamed "
+                "and no longer disables anything."
             )
-        if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enable:
+        if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enabled:
             raise ValueError(
                 "generation.nvfp4_pertoken_rollout requires the Megatron "
                 "training backend (policy.megatron_cfg.enabled=true); DTensor "
                 "does not implement TE NVFP4 training."
             )
         validate_fp32_lm_head_config(
-            config, megatron_enabled=megatron_enable, dtensor_enabled=dtensor_enable
+            config,
+            megatron_enabled=megatron_enabled,
+            automodel_enabled=automodel_enabled,
         )
         hf_config = None
         hf_config_overrides = config.get("hf_config_overrides") or {}
@@ -185,16 +190,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
                 validate_fp32_lm_head_config(
                     config,
-                    megatron_enabled=megatron_enable,
-                    dtensor_enabled=dtensor_enable,
+                    megatron_enabled=megatron_enabled,
+                    automodel_enabled=automodel_enabled,
                     model_config=hf_config,
                 )
-        if reserved_http_server_ports is not None and not megatron_enable:
+        if reserved_http_server_ports is not None and not megatron_enabled:
             raise ValueError(
                 "reserved_http_server_ports is only supported by the Megatron "
                 "worker (policy.megatron_cfg.enabled=true)."
             )
-        if draft_enabled and not megatron_enable:
+        if draft_enabled and not megatron_enabled:
             raise ValueError(
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
                 "Set policy.megatron_cfg.enabled=true or disable policy.draft."
@@ -238,7 +243,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "which the fused path never materializes. Disable one of the "
                 "two."
             )
-        if megatron_enable:
+        if megatron_enabled:
             worker_builder_cls_fqn = resolve_policy_worker_cls(
                 "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
                 config,
@@ -256,26 +261,26 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
 
         else:
-            if not dtensor_enable:
+            if not automodel_enabled:
                 raise ValueError(
                     "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
-                    "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
+                    "or set policy.automodel_cfg.enabled=true to use the Automodel training backend."
                 )
 
             worker_builder_cls_fqn = resolve_policy_worker_cls(
-                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
+                "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker",
                 config,
             )
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 warnings.warn(
-                    "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorPolicyWorker V2. This variable is set in our container, but "
+                    "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in AutomodelPolicyWorker. This variable is set in our container, but "
                     "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
                 )
 
-            tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
-            cp_size = config["dtensor_cfg"]["context_parallel_size"]
+            tp_size = config["automodel_cfg"]["tensor_parallel_size"]
+            cp_size = config["automodel_cfg"]["context_parallel_size"]
 
-            env_vars = config["dtensor_cfg"].get("env_vars", {})
+            env_vars = config["automodel_cfg"].get("env_vars", {})
 
         # If a worker extension class is provided, use it instead of the default worker builder class
         if extension_fqn is not None:
@@ -349,7 +354,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             worker_sharding_annotations=self.sharding_annotations,
             pre_init_communication_queue=pre_init_queue,
         )
-        if megatron_enable:
+        if megatron_enabled:
             worker_kwargs["is_refit_destination"] = is_refit_destination
         elif is_refit_destination:
             raise ValueError("is_refit_destination=True requires the Megatron backend.")
@@ -358,7 +363,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if reserved_http_server_ports is not None:
             worker_kwargs["reserved_http_server_ports"] = reserved_http_server_ports
 
-        if dtensor_enable:
+        if automodel_enabled:
             # DTensor workers reconstruct tokenizer/processor locally to avoid
             # pickling across incompatible transformers versions (v4 head → v5 worker).
             config["tokenizer"]["use_processor"] = processor is not None
@@ -1379,7 +1384,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         DTensor checkpoint resources are configured when the Policy is
         constructed. ``weights_path`` selects the destination for each save.
         """
-        if bool(self.cfg.get("dtensor_cfg", {}).get("enabled", False)):
+        if bool(self.cfg.get("automodel_cfg", {}).get("enabled", False)):
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,

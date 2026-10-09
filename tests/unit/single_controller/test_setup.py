@@ -488,6 +488,39 @@ def test_single_controller_ppo_recipe_inherits_overlong_filtering():
     assert config.ppo.overlong_filtering is True
 
 
+def test_single_controller_token_capture_nightly_recipe_resolves_to_runtime_contract(
+    monkeypatch,
+):
+    """The token-capture nightly must pass the same validation the entrypoint runs.
+
+    Its in_order sampler keeps one dispatched batch in flight per lookahead
+    version plus the live one, so the buffer must hold two steps of prompt
+    groups; anything smaller fails validation before any GPU is allocated.
+    """
+    monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    recipe = repo_root / (
+        "examples/configs/recipes/llm/"
+        "grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-"
+        "single-controller-token_capture.yaml"
+    )
+    resolved = OmegaConf.to_container(load_config(recipe), resolve=True)
+
+    assert isinstance(resolved, dict)
+    config = MasterConfig.model_validate(resolved)
+    validate_single_controller_config(config)
+    assert config.token_capture.enabled is True
+    assert config.async_rl.sampler.name == "in_order"
+    assert config.async_rl.max_buffered_rollouts == (
+        config.grpo.num_prompts_per_step
+        * (config.async_rl.sampler.max_lookahead_versions + 1)
+    )
+    assert config.policy["train_global_batch_size"] == (
+        config.grpo.num_prompts_per_step * config.grpo.num_generations_per_prompt
+    )
+
+
 @pytest.mark.parametrize(
     ("reference_policy_kl_penalty", "expected_init_reference_model"),
     [(0.0, False), (0.01, True)],
@@ -536,7 +569,7 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
     )
     overrides = [
         "policy.model_name=Qwen/Qwen3-0.6B",
-        "policy.dtensor_cfg.enabled=false",
+        "policy.automodel_cfg.enabled=false",
         "policy.megatron_cfg.enabled=true",
         "policy.megatron_cfg.tensor_model_parallel_size=1",
         "policy.megatron_cfg.pipeline_model_parallel_size=1",
@@ -1300,7 +1333,7 @@ class TestSetup:
                 "must equal policy.train_global_batch_size",
             ),
             ("buffer_capacity", ValueError, "required capacity"),
-            ("megatron_dtensor_trainer", ValueError, "megatron_cfg.enabled"),
+            ("megatron_automodel_trainer", ValueError, "megatron_cfg.enabled"),
             ("megatron_recompute_mismatch", ValueError, "kv_cache_management_mode"),
             ("megatron_fleet_health", NotImplementedError, "generation_fleet_health"),
             (
@@ -1352,7 +1385,7 @@ class TestSetup:
         elif invalid_case == "deferred_routes_without_capture":
             mc = _make_master_config()
             mc.token_capture.defer_routed_experts_to_policy = True
-        elif invalid_case == "megatron_dtensor_trainer":
+        elif invalid_case == "megatron_automodel_trainer":
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=False
             )

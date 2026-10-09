@@ -13,7 +13,7 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 4
   max_total_sequence_length: 4096
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   optimizer: null
   scheduler: null

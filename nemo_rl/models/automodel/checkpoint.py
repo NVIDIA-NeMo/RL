@@ -52,7 +52,7 @@ def _resolve_lora_adapter_dir(restore_from: str) -> str:
         if os.path.isfile(os.path.join(candidate, "adapter_model.safetensors")):
             return candidate
     raise FileNotFoundError(
-        f"dtensor_cfg.lora_cfg.restore_from={restore_from!r}: no "
+        f"automodel_cfg.lora_cfg.restore_from={restore_from!r}: no "
         "adapter_model.safetensors found there or in its 'model' subdirectory. "
         "restore_from must point to a PEFT adapter checkpoint (a directory "
         "containing adapter_model.safetensors + adapter_config.json, e.g. a "
@@ -61,7 +61,7 @@ def _resolve_lora_adapter_dir(restore_from: str) -> str:
 
 
 def build_checkpoint_config(
-    dtensor_cfg: Mapping[str, Any],
+    automodel_cfg: Mapping[str, Any],
     *,
     model_repo_id: str,
     dequantize_base_checkpoint: bool,
@@ -76,7 +76,7 @@ def build_checkpoint_config(
     v2 workers; defaults belong in the exemplar configs.
 
     Args:
-        dtensor_cfg: The worker's ``policy.dtensor_cfg`` / ``value.dtensor_cfg``
+        automodel_cfg: The worker's ``policy.automodel_cfg`` / ``value.automodel_cfg``
             mapping. Automodel checkpoint settings are read from its nested
             ``checkpoint`` block; all other keys are ignored.
         model_repo_id: Forwarded to Automodel's ``CheckpointingConfig.model_repo_id``.
@@ -95,11 +95,11 @@ def build_checkpoint_config(
         accepts, meant to be splatted into
         ``AutomodelCheckpointingConfig(enabled=True, checkpoint_dir="", **result)``.
     """
-    raw_checkpoint_config = dtensor_cfg["checkpoint"]
+    raw_checkpoint_config = automodel_cfg["checkpoint"]
     model_save_format = raw_checkpoint_config["model_save_format"]
     if model_save_format not in ("torch_save", "safetensors"):
         raise ValueError(
-            "dtensor_cfg.checkpoint.model_save_format must be 'torch_save' or "
+            "automodel_cfg.checkpoint.model_save_format must be 'torch_save' or "
             "'safetensors' when using DTensor v2."
         )
 
