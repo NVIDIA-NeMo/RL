@@ -217,6 +217,11 @@ class AutomodelConfig(TypedDict):
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
     checkpoint: NotRequired[AutomodelCheckpointConfig]
+    # Make the policy's forward and backward bitwise reproducible: deterministic
+    # torch/cuBLAS/cuDNN algorithms and Transformer Engine kernels. Costs step
+    # time (about 13% on Nemotron-3 Nano 30B-A3B DPO); absent or false keeps the
+    # faster non-deterministic kernels.
+    deterministic: NotRequired[bool]
 
 
 class SequencePackingConfigDisabled(TypedDict):
