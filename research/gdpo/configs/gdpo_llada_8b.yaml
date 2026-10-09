@@ -71,7 +71,7 @@ policy:
       mc_samples: 1
       p_mask_prompt: 0.0
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
     tensor_parallel_size: 1
     # Context parallelism shards the sequence, but the ELBO masks positions

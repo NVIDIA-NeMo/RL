@@ -17,13 +17,14 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.distributed.nn.functional
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
 )
+from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
 if TYPE_CHECKING:
     # megatron-core (optional "mcore" extra) is imported lazily below so this
@@ -897,8 +898,9 @@ def get_cp_sharded_next_token_logprobs(
     *,
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    shift_targets: bool = True,
 ) -> torch.Tensor:
-    """Next-token log probabilities using Automodel's context-parallel layout.
+    """Token log probabilities using Automodel's context-parallel layout.
 
     NeMo-RL owns the next-token semantics (the shift) and the vocabulary-parallel
     reduction; Automodel's ``ContextParallelSharder`` owns where the tokens live.
@@ -913,9 +915,12 @@ def get_cp_sharded_next_token_logprobs(
             model batch, i.e. the owner of the layout ``logits`` was produced in.
         chunk_size: Optional sequence chunk size for the vocab-parallel kernels.
         sampling_params: Optional top-k/top-p filtering configuration.
+        shift_targets: Whether position ``i`` scores token ``i+1``. Set to
+            ``False`` for position-aligned masked diffusion models.
 
     Returns:
-        Canonical-order log probabilities with shape ``[B, S - 1]``.
+        Canonical-order log probabilities with shape ``[B, S - 1]`` when
+        ``shift_targets`` is true, otherwise ``[B, S]``.
     """
     if isinstance(logits, DTensor):
         tp_group = logits.device_mesh.get_group("tp")
@@ -933,7 +938,7 @@ def get_cp_sharded_next_token_logprobs(
     # Shift on the canonical sequence, then map into the model's layout with the
     # same ShardLayout the batch went through. ``fill`` only lands on CP padding,
     # which the trim below removes.
-    global_targets = input_ids.roll(shifts=-1, dims=1)
+    global_targets = input_ids.roll(shifts=-1, dims=1) if shift_targets else input_ids
     local_targets = cp_sharder.shard_token_tensor(global_targets, seq_dim=1, fill=0)
 
     local_logprobs = _tp_target_logprobs(
@@ -949,94 +954,6 @@ def get_cp_sharded_next_token_logprobs(
 
     # Differentiable gather back to canonical order, minus Automodel's CP padding.
     logprobs = cp_sharder.gather_token_tensor(local_logprobs, seq_dim=1, trim=True)
-    return logprobs[:, :-1]
-
-
-def dtensor_from_parallel_logits_to_logprobs(
-    vocab_parallel_logits: torch.Tensor,
-    target: DTensor | torch.Tensor,
-    vocab_start_index: int,
-    vocab_end_index: int,
-    tp_group: torch.distributed.ProcessGroup,
-    inference_only: bool = False,
-    seq_index: Optional[torch.Tensor] = None,
-    chunk_size: Optional[int] = None,
-    sampling_params: Optional[TrainingSamplingParams] = None,
-    *,
-    shift_targets: bool = True,
-) -> torch.Tensor:
-    """Get log probabilities from TP+CP sharded vocab logits.
-
-    Args:
-        vocab_parallel_logits (orch.Tensor): Logits distributed across tensor parallel workers,
-            with shape [batch_size, seq_len, vocab_size/tp_size].
-        target (DTensor): Target token indices with shape [batch_size, seq_len].
-            NOTE: Must be the unmodified targets as this function will shift them internally
-            (unless ``shift_targets`` is False).
-        vocab_start_index (int): Starting vocabulary index for this worker's partition.
-        vocab_end_index (int): Ending vocabulary index for this worker's partition.
-        tp_group (torch.distributed.ProcessGroup): Process group for distributed communication.
-        inference_only (bool, optional): If True, tensors won't be saved for backward pass. Defaults to False.
-        seq_index (Optional[torch.Tensor]): Sequence index tensor with shape [seq_len].
-            It is only provided for cp sharded logits. It represents how tensor is sharded across the sequence dimension.
-        chunk_size (Optional[int]): Sequence dimension chunk size for computing the log probabilities.
-        sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
-        shift_targets (bool, optional): If True (default), targets are rolled left by one so that
-            position ``i`` scores token ``i+1`` -- the autoregressive convention. Set to False for
-            masked diffusion language models, where position ``i`` scores token ``i`` directly and
-            no sequence position is dropped. Defaults to True.
-
-    Returns:
-        torch.Tensor: Log probabilities tensor with shape [batch_size, seq_len-1] when
-            ``shift_targets`` is True (the sequence dimension is reduced by 1 due to the target
-            shifting), or [batch_size, seq_len] when it is False.
-    """
-    cp_size = 1
-
-    if (
-        isinstance(target, DTensor)
-        and target.device_mesh.mesh_dim_names is not None
-        and "cp" in target.device_mesh.mesh_dim_names
-    ):
-        cp_dim_index = target.device_mesh.mesh_dim_names.index("cp")
-        cp_size = target.device_mesh.shape[cp_dim_index]
-
-    if cp_size > 1:
-        assert seq_index is not None, "seq_index must be provided for cp sharded logits"
-        target_shape = torch.Size(target.shape)
-        cp_mesh = target.device_mesh
-        cp_placements = target.placements
-        _, sorted_indices = torch.sort(seq_index)
-        # Recover the original order of the target
-        target = target.full_tensor()[:, sorted_indices]
-        if shift_targets:
-            target = target.roll(shifts=-1, dims=-1)
-        target = target[:, seq_index]
-
-        # Reshard
-        target = distribute_tensor(target, cp_mesh, cp_placements)
-        target = target.to_local()
-    elif shift_targets:
-        target = target.roll(shifts=-1, dims=-1)
-
-    logprobs = _tp_target_logprobs(
-        vocab_parallel_logits,
-        target,
-        vocab_start_index=vocab_start_index,
-        vocab_end_index=vocab_end_index,
-        tp_group=tp_group,
-        chunk_size=chunk_size,
-        sampling_params=sampling_params,
-        inference_only=inference_only,
-    )
-
-    if cp_size > 1:
-        # logprobs is sharded on the sequence dimension.
-        # Get full sequence tensor, vocab dim has been reduced already.
-        logprobs_dtensor = DTensor.from_local(logprobs, cp_mesh, cp_placements)
-        logprobs = logprobs_dtensor.full_tensor()[:, sorted_indices]
-        assert logprobs.shape == target_shape
-
     return logprobs[:, :-1] if shift_targets else logprobs
 
 
@@ -1150,7 +1067,7 @@ def from_parallel_logits_to_logprobs(
 def from_parallel_logits_to_logprobs_packed_sequences(
     vocab_parallel_logits: torch.Tensor,
     target: torch.Tensor,
-    cu_seqlens_padded: torch.Tensor,
+    cu_seqlens_padded: CpuIntTuple,
     unpacked_seqlen: int,
     vocab_start_index: int,
     vocab_end_index: int,
@@ -1170,9 +1087,10 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         target (torch.Tensor): Packed target token indices.
             If target_is_pre_rolled=False: shape [1, T] — unmodified targets, rolled internally.
             If target_is_pre_rolled=True: shape [1, T // CP] — pre-rolled and pre-CP-sharded.
-        cu_seqlens_padded (torch.Tensor): Cumulative sequence lengths tensor with shape [batch_size + 1].
+        cu_seqlens_padded: Cumulative sequence lengths with shape [batch_size + 1].
             cu_seqlens_padded[i] indicates the start position of sequence i in the packed format
-            (full, not CP-adjusted).
+            (full, not CP-adjusted). CPU-resident values avoid synchronization in
+            the host-side packing loops.
         unpacked_seqlen (int): The length of the unpacked sequence tensor.
         vocab_start_index (int): Starting vocabulary index for this worker's partition.
         vocab_end_index (int): Ending vocabulary index for this worker's partition.
@@ -1192,7 +1110,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
             unpacked_seqlen-1]`` layout, or physical ``[1, T-1]`` layout when
             ``return_packed_layout`` is true.
     """
-    batch_size = cu_seqlens_padded.shape[0] - 1
+    batch_size = len(cu_seqlens_padded) - 1
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
 
     if not target_is_pre_rolled:
@@ -1206,8 +1124,8 @@ def from_parallel_logits_to_logprobs_packed_sequences(
             target.shape[0] // cp_size, dtype=target.dtype, device=target.device
         )
         for i in range(batch_size):
-            start_idx = cu_seqlens_padded[i].item()
-            end_idx = cu_seqlens_padded[i + 1].item()
+            start_idx = cu_seqlens_padded[i]
+            end_idx = cu_seqlens_padded[i + 1]
 
             seq_targets = target[start_idx:end_idx]
             rolled_seq_targets = seq_targets.roll(shifts=-1, dims=0)
@@ -1276,8 +1194,8 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         # per-sequence cp_allgather
         final_probs = torch.zeros(probs.shape[0] * cp_size, device=probs.device)
         for i in range(batch_size):
-            start_idx = cu_seqlens_padded[i].item()
-            end_idx = cu_seqlens_padded[i + 1].item()
+            start_idx = cu_seqlens_padded[i]
+            end_idx = cu_seqlens_padded[i + 1]
             final_probs[start_idx:end_idx] = allgather_cp_sharded_tensor(
                 probs[start_idx // cp_size : end_idx // cp_size], cp_group, seq_dim=0
             )
@@ -1291,8 +1209,8 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     )
     # Filter out the last token of each sequence
     for i in range(batch_size):
-        start_idx = cu_seqlens_padded[i].item()
-        end_idx = cu_seqlens_padded[i + 1].item()
+        start_idx = cu_seqlens_padded[i]
+        end_idx = cu_seqlens_padded[i + 1]
 
         # Exclude the last position (which has the rolled target from position 0)
         if end_idx - start_idx > 0:
@@ -1647,7 +1565,6 @@ def vocab_parallel_argmax(
 def get_logprobs_from_vocab_parallel_logits(
     vocab_parallel_logits: DTensor,
     input_ids: torch.Tensor | DTensor,
-    seq_index: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     *,
@@ -1662,9 +1579,8 @@ def get_logprobs_from_vocab_parallel_logits(
         vocab_parallel_logits (DTensor): Logits distributed across tensor parallel workers,
             with shape [batch_size, seq_len, vocab_size/tp_size].
         input_ids (torch.Tensor | DTensor): Input token IDs for which to compute log probabilities,
-            with shape [batch_size, seq_len].
-        seq_index (Optional[torch.Tensor]): Sequence index for the input IDs,
-            with shape [sequence_length].
+            with shape [batch_size, seq_len]. NOTE: Must be the unmodified targets as this
+            function will shift them internally.
         chunk_size (Optional[int]): Sequence dimension chunk size for computing log probabilities.
         sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
         shift_targets (bool, optional): If True (default), position ``i`` scores token ``i+1``
@@ -1672,41 +1588,43 @@ def get_logprobs_from_vocab_parallel_logits(
             token ``i`` at position ``i`` and keep every sequence position. Defaults to True.
 
     Returns:
-        torch.Tensor: Log probabilities for the given input IDs.
+        torch.Tensor: Log probabilities for the given input IDs, with shape
+            ``[batch_size, seq_len - 1]`` when ``shift_targets`` is true,
+            otherwise ``[batch_size, seq_len]``.
     """
-    device_mesh = vocab_parallel_logits.device_mesh
-    if seq_index is not None:
-        assert (
-            device_mesh.mesh_dim_names is not None
-            and "cp" in device_mesh.mesh_dim_names
-        ), "seq_index must be provided for cp sharded logits"
+    # This function handles TP only. Fail loudly rather than silently mis-shifting.
+    if (
+        isinstance(input_ids, DTensor)
+        and input_ids.device_mesh.mesh_dim_names is not None
+        and "cp" in input_ids.device_mesh.mesh_dim_names
+    ):
+        raise NotImplementedError(
+            "get_logprobs_from_vocab_parallel_logits handles TP only; use "
+            "get_cp_sharded_next_token_logprobs for context parallelism."
+        )
 
-    tp_size = 1
-
-    tp_group = device_mesh.get_group("tp")
+    tp_group = vocab_parallel_logits.device_mesh.get_group("tp")
     tp_rank = tp_group.rank()
     tp_size = tp_group.size()
-
     vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_size
 
-    return dtensor_from_parallel_logits_to_logprobs(
+    logprobs = _tp_target_logprobs(
         vocab_parallel_logits.to_local(),
-        input_ids,
-        vocab_interval_per_rank * tp_rank,
-        (tp_rank + 1) * vocab_interval_per_rank,
-        tp_group,
-        inference_only=not torch.is_grad_enabled(),
-        seq_index=seq_index,
+        input_ids.roll(shifts=-1, dims=-1) if shift_targets else input_ids,
+        vocab_start_index=vocab_interval_per_rank * tp_rank,
+        vocab_end_index=(tp_rank + 1) * vocab_interval_per_rank,
+        tp_group=tp_group,
         chunk_size=chunk_size,
         sampling_params=sampling_params,
-        shift_targets=shift_targets,
+        inference_only=not torch.is_grad_enabled(),
     )
+
+    return logprobs[:, :-1] if shift_targets else logprobs
 
 
 def get_next_token_logprobs_from_logits(
     input_ids: torch.Tensor,
     next_token_logits: torch.Tensor,
-    seq_index: Optional[torch.Tensor] = None,
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -1718,14 +1636,13 @@ def get_next_token_logprobs_from_logits(
 
     This function handles four cases:
     1. Vocab parallel (Megatron-style): uses from_parallel_logits_to_logprobs
-    2. Automodel context parallel: uses get_cp_sharded_next_token_logprobs
-    3. DTensor: uses get_logprobs_from_vocab_parallel_logits
+    2. Automodel with context parallel: uses get_cp_sharded_next_token_logprobs
+    3. Automodel without context parallel: uses get_logprobs_from_vocab_parallel_logits
     4. Non-parallel: applies top-k/top-p filtering, log_softmax, and gather
 
     Args:
         input_ids: Input token IDs of shape [batch_size, seq_len]
         next_token_logits: Logits tensor of shape [batch_size, seq_len, vocab_size]
-        seq_index: Sequence index tensor for the V1 DTensor worker's CP path
         vocab_parallel_rank: Rank in the vocab parallel group (required if vocab_parallel_group is provided)
         vocab_parallel_group: Process group for vocab parallelism
         context_parallel_group: Process group for context parallelism
@@ -1733,8 +1650,8 @@ def get_next_token_logprobs_from_logits(
         chunk_size: Sequence-dim chunk size for the vocab-parallel path; only
             applied without top-k/top-p sampling.
         cp_sharder: Automodel ``ContextParallelSharder`` that sharded this
-            forward's model batch (V2 automodel worker with cp_size > 1). When
-            set, ``next_token_logits`` is this rank's CP-local shard and the
+            forward's model batch; set only when cp_size > 1. When set,
+            ``next_token_logits`` is this rank's CP-local shard and the
             sharder owns the sequence layout.
 
     Returns:
@@ -1780,7 +1697,6 @@ def get_next_token_logprobs_from_logits(
         logprobs = get_logprobs_from_vocab_parallel_logits(
             next_token_logits,
             input_ids,
-            seq_index=seq_index,
             sampling_params=sampling_params,
         )
 
@@ -1986,8 +1902,8 @@ def get_distillation_topk_logprobs_from_logits(
     # Move teacher topk indices to the same device as student logits
     teacher_topk_indices = teacher_topk_indices.to(student_logits.device)
 
-    # Automodel owns the sequence layout when a sharder is present. Neutralize
-    # the legacy CP group before deriving its size so no legacy layout work runs.
+    # Automodel owns the sequence layout when a sharder is present, so its CP group
+    # must not drive the layout work below.
     cp_group = None if cp_sharder is not None else context_parallel_group
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
 
@@ -2015,27 +1931,13 @@ def get_distillation_topk_logprobs_from_logits(
         vocab_start_index = tp_rank * V_local
         vocab_end_index = (tp_rank + 1) * V_local
 
-        # Legacy DTensor callers still derive CP from the tensor mesh. Automodel
-        # supplies its model-owned sequence layout explicitly instead.
-        if cp_sharder is None:
-            if (
-                device_mesh.mesh_dim_names is not None
-                and "cp" in device_mesh.mesh_dim_names
-            ):
-                cp_group = device_mesh.get_group("cp")
-                cp_size = cp_group.size()
-            else:
-                cp_group = None
-                cp_size = 1
-
     else:
         student_logits = student_logits
         parallel_group = None
 
-    # Automodel owns the sequence layout: shard the teacher indices into the
-    # model's local layout. The legacy CP state was neutralized above so its
-    # load-balanced relayout stays out of the way. Gather back to canonical order
-    # through the sharder once the student log-probs exist.
+    # Automodel owns the sequence layout: shard the teacher indices into the model's
+    # local layout, then gather back to canonical order through the sharder once the
+    # student log-probs exist.
     indices_for_logits = teacher_topk_indices
     if cp_sharder is not None:
         indices_for_logits = cp_sharder.shard_token_tensor(

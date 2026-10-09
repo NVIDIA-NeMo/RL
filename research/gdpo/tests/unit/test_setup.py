@@ -36,7 +36,7 @@ VALID_LOSS = {
 
 def make_policy(dllm=True, **overrides):
     cfg = {
-        "dtensor_cfg": {"enabled": True, "context_parallel_size": 1},
+        "automodel_cfg": {"enabled": True, "context_parallel_size": 1},
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
         "megatron_cfg": {"enabled": False},
@@ -100,13 +100,13 @@ def test_causal_only_features_are_rejected(section):
 
 
 def test_context_parallelism_is_rejected():
-    policy = make_policy(dtensor_cfg={"enabled": True, "context_parallel_size": 2})
+    policy = make_policy(automodel_cfg={"enabled": True, "context_parallel_size": 2})
     with pytest.raises(ValueError, match="context_parallel_size"):
         validate_gdpo_config(policy, VALID_LOSS)
 
 
 def test_context_parallel_size_one_is_allowed():
-    policy = make_policy(dtensor_cfg={"enabled": True, "context_parallel_size": 1})
+    policy = make_policy(automodel_cfg={"enabled": True, "context_parallel_size": 1})
     validate_gdpo_config(policy, VALID_LOSS)
 
 

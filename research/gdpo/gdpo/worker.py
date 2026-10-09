@@ -46,23 +46,23 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
-from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
-    DTensorPolicyWorkerV2Impl,
+from nemo_rl.models.policy.workers.automodel_policy_worker import (
+    AutomodelPolicyWorkerImpl,
 )
 
 
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+    runtime_env=get_runtime_env_for_policy_worker("automodel_policy_worker")
 )  # pragma: no cover
-class DTensorGDPOPolicyWorker(DTensorPolicyWorkerV2Impl):
-    """DTensor policy worker with SDMC scoring and block denoising."""
+class AutomodelGDPOPolicyWorker(AutomodelPolicyWorkerImpl):
+    """Automodel policy worker with SDMC scoring and block denoising."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.diffusion_cfg = masked_diffusion_config_from_policy(self.cfg)
         if self.diffusion_cfg is None:
             raise ValueError(
-                "DTensorGDPOPolicyWorker requires policy.masked_diffusion.enabled=true"
+                "AutomodelGDPOPolicyWorker requires policy.masked_diffusion.enabled=true"
             )
         generation_cfg = self.cfg["generation"]
         assert generation_cfg is not None
@@ -174,11 +174,14 @@ class DTensorGDPOPolicyWorker(DTensorPolicyWorkerV2Impl):
         processed_mb: Any,
         post_processing_fn: Any,
         sequence_dim: int,
-    ) -> torch.Tensor:
-        return self._gdpo_elbo_logprobs(
-            processed_mb=processed_mb,
-            post_processing_fn=post_processing_fn,
-            sequence_dim=sequence_dim,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        return (
+            self._gdpo_elbo_logprobs(
+                processed_mb=processed_mb,
+                post_processing_fn=post_processing_fn,
+                sequence_dim=sequence_dim,
+            ),
+            {},
         )
 
     @torch.no_grad()

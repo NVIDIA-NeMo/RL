@@ -23,7 +23,7 @@ import types
 
 import torch
 from gdpo import train_gdpo
-from gdpo.worker import DTensorGDPOPolicyWorker
+from gdpo.worker import AutomodelGDPOPolicyWorker
 
 from nemo_rl.models.automodel.train import (
     LogprobsPostProcessor,
@@ -31,7 +31,7 @@ from nemo_rl.models.automodel.train import (
     automodel_forward_backward,
 )
 
-_WORKER_CLS = DTensorGDPOPolicyWorker.__ray_metadata__.modified_class
+_WORKER_CLS = AutomodelGDPOPolicyWorker.__ray_metadata__.modified_class
 
 
 def test_forward_backward_reads_only_what_the_base_worker_passes(monkeypatch):

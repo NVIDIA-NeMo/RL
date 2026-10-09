@@ -28,6 +28,7 @@ from nemo_rl.algorithms.rm import (
     setup,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 def test_get_rm_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -161,7 +162,7 @@ def test_context_parallel_rejected_for_dtensor_rm():
     config = MasterConfig.model_construct(
         **{
             "policy": {
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": True,
                     "context_parallel_size": 2,
                     "tensor_parallel_size": 1,
@@ -172,7 +173,7 @@ def test_context_parallel_rejected_for_dtensor_rm():
             },
             "rm": RMConfig.model_construct(seed=42),
             "data": {},
-            "logger": {},
+            "logger": LoggerConfig.model_construct(),
             "cluster": {},
             "checkpointing": {},
         }
@@ -195,7 +196,7 @@ def test_context_parallel_allowed_when_one():
     config = MasterConfig.model_construct(
         **{
             "policy": {
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": True,
                     "context_parallel_size": 1,
                     "tensor_parallel_size": 1,
@@ -206,7 +207,7 @@ def test_context_parallel_allowed_when_one():
             },
             "rm": RMConfig.model_construct(seed=42),
             "data": {},
-            "logger": {},
+            "logger": LoggerConfig.model_construct(),
             "cluster": {},
             "checkpointing": {},
         }

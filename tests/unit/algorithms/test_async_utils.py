@@ -67,6 +67,8 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     _warn_unsupported_in_flight_refit_pause_once,
 )
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 @ray.remote(num_cpus=0)
@@ -2433,10 +2435,7 @@ class TestAsyncTrajectoryCollector:
                 },
             },
             env={"should_use_nemo_gym": False},
-            logger={
-                "wandb_enabled": False,
-                "wandb": {"log_nemo_gym_full_result_tables": False},
-            },
+            logger=LoggerConfig.model_construct(),
         )
 
     def test_collector_selects_ppo_config(self):
@@ -3280,7 +3279,7 @@ class TestAsyncTrajectoryCollector:
     def test_nemo_gym_batch_retry_forwards_effort_config_without_duplicates(
         self, monkeypatch
     ):
-        """Retries preserve effort shaping and do not re-enqueue buffered groups."""
+        """Retries preserve effort shaping and length penalties without re-enqueueing buffered groups."""
 
         class _ReadyResult:
             def __init__(self, value):
@@ -3319,6 +3318,10 @@ class TestAsyncTrajectoryCollector:
                 "low_string": "{reasoning effort: efficient}",
             }
         }
+        length_penalty_cfg = LengthPenaltyConfig.model_validate(
+            {"default": {"total_bonus": 0.1, "top_percentile": 0.5}}
+        )
+        collector.master_config.grpo.length_penalty = length_penalty_cfg
         target_weight = 15
         collector._generating_targets.add(target_weight)
         repeated_batch = BatchedDataDict(
@@ -3352,6 +3355,8 @@ class TestAsyncTrajectoryCollector:
                 low_ub=15_000,
                 low_string="{reasoning effort: efficient}",
             )
+            # The collector forwards the typed grpo.length_penalty block.
+            assert kwargs["length_penalty_config"] is length_penalty_cfg
             rollout_calls += 1
             task_indices = [
                 row["_ng_task_index"] for row in kwargs["input_batch"]["extra_env_info"]

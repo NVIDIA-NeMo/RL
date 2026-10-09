@@ -96,10 +96,10 @@ def validate_gdpo_config(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -
                 f"masked positions, which {name} assumes away. Disable it."
             )
 
-    dtensor_cfg = policy_cfg.get("dtensor_cfg")
-    if dtensor_cfg and dtensor_cfg.get("context_parallel_size", 1) > 1:
+    automodel_cfg = policy_cfg.get("automodel_cfg")
+    if automodel_cfg and automodel_cfg.get("context_parallel_size", 1) > 1:
         raise ValueError(
-            "policy.dtensor_cfg.context_parallel_size > 1 is not supported with "
+            "policy.automodel_cfg.context_parallel_size > 1 is not supported with "
             "policy.masked_diffusion.enabled=true: context parallelism shards the sequence, "
             "but the ELBO masks positions across the whole sequence. Set it to 1."
         )

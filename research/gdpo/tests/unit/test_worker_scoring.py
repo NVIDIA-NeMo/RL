@@ -24,11 +24,11 @@ import types
 import pytest
 import torch
 from gdpo import SdmcElboEstimator, SdmcLikelihoodConfig
-from gdpo.worker import DTensorGDPOPolicyWorker
+from gdpo.worker import AutomodelGDPOPolicyWorker
 
 # The worker is a Ray actor class; the plain class carrying the methods sits
 # behind __ray_metadata__ and is what we bind the method under test from.
-_WORKER_CLS = DTensorGDPOPolicyWorker.__ray_metadata__.modified_class
+_WORKER_CLS = AutomodelGDPOPolicyWorker.__ray_metadata__.modified_class
 
 MASK_ID = 99
 PAD_ID = 0

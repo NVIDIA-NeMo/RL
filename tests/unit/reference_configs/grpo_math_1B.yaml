@@ -41,6 +41,8 @@ grpo:
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     reward_weights: null  # GDPO-specific: one weight per reward component
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+    proximal_teacher_alpha: 1.0  # OPD-specific: TROPD proximal-teacher weight in (0, 1]; 1.0 is plain MOPD
+    subtract_global_baseline: false  # OPD-specific: center advantages on the step's mean over valid tokens
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -59,6 +61,9 @@ grpo:
   deduplicate_multimodal_data: false
   # Debug-only exact Ray payload telemetry; serialization adds runtime overhead.
   debug_payload_metrics: false
+  # Optional per-prompt-group length penalties/bonuses for NeMo-Gym rollouts
+  # (binary-reward envs only). See docs/guides/length-penalty.md. null disables.
+  length_penalty: null
 
   async_grpo:
     enabled: false # Set to true to enable async training mode
@@ -120,6 +125,8 @@ loss_fn:
   # VAPO positive-example NLL loss weight: L = L_PPO + mu * L_NLL(correct samples).
   # 0.0 disables it. VAPO paper recommends 0.1.
   positive_example_nll_weight: 0.0
+  metrics_level: "full"
+  enable_torch_compile: false
 
 checkpointing:
   enabled: true
@@ -154,8 +161,7 @@ policy:
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
   worker_extension_cls_fqn: null
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
@@ -363,7 +369,7 @@ policy:
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.automodel_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
 
   optimizer:
@@ -546,14 +552,20 @@ logger:
     project: "grpo-dev"
     name: "grpo-dev-logger"
     log_nemo_gym_full_result_tables: false
+    entity: null
+    id: null
+    resume: null
   swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"
-  tensorboard: {}
+  tensorboard:
+    log_dir: null
   mlflow:
     experiment_name: "grpo-dev"
     run_name: "grpo-dev-logger"
     tracking_uri: "http://localhost:5000"
+    run_id: null
+    artifact_location: null
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

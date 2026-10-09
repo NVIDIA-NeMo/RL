@@ -90,7 +90,7 @@ are never scored by the SDMC estimator.
 
 ### Adapters
 
-The exemplar trains LoRA adapters (`policy.dtensor_cfg.lora_cfg`, r=128,
+The exemplar trains LoRA adapters (`policy.automodel_cfg.lora_cfg`, r=128,
 alpha=64, dropout=0.05) on the seven projection modules used by the published
 recipe. This is not just a memory convenience: the ELBO keeps
 `quadrature * mc_samples` forward activations alive for the backward pass, so
@@ -171,7 +171,7 @@ train against the wrong likelihood:
 | `sequence_packing`, `dynamic_batching` | Reorder or reuse tokens in ways that assume a causal factorization. |
 | `megatron_cfg.enabled` | Only the DTensor backend implements the ELBO path. |
 | `router_replay` | Assumes one stable token-to-expert map per rollout; a dLLM re-routes every position on every denoising step. |
-| `dtensor_cfg.context_parallel_size > 1` | Shards the sequence, but the ELBO masks positions across the whole sequence. |
+| `automodel_cfg.context_parallel_size > 1` | Shards the sequence, but the ELBO masks positions across the whole sequence. |
 | Nonzero `reference_policy_kl_penalty`, `use_kl_in_reward` | Existing KL estimators require token log probabilities rather than per-position ELBO contributions. |
 | `grpo.seq_logprob_error_threshold` | Denoising does not expose generation-time token log probabilities to compare against policy ELBOs. |
 | `generation.stop_strings` | The denoiser fills a canvas rather than decoding incrementally; use `stop_token_ids`. |

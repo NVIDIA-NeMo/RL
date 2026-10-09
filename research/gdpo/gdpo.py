@@ -41,8 +41,9 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
-WORKER_FQN = "gdpo.worker.DTensorGDPOPolicyWorker"
+WORKER_FQN = "gdpo.worker.AutomodelGDPOPolicyWorker"
 ACTOR_ENVIRONMENT_REGISTRY[WORKER_FQN] = PY_EXECUTABLES.AUTOMODEL
 
 
@@ -75,7 +76,9 @@ def main() -> None:
     config = load_config(args.config)
     if overrides:
         config = parse_hydra_overrides(config, overrides)
-    config = MasterConfig(**OmegaConf.to_container(config, resolve=True))
+    config = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(config)
+    config = MasterConfig(**config)
     pprint.pprint(config)
 
     validate_gdpo_config(config.policy, config.loss_fn, config.grpo)

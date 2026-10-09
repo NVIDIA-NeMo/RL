@@ -31,15 +31,15 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
 
 try:
-    import nemo_rl.models.policy.workers.dtensor_policy_worker_v2 as worker_mod
+    import nemo_rl.models.policy.workers.automodel_policy_worker as worker_mod
     from nemo_rl.models.automodel.config import (
         ModelAndOptimizerState,
         RuntimeConfig,
     )
-    from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
-        DTensorPolicyWorkerV2Impl,
+    from nemo_rl.models.policy.workers.automodel_policy_worker import (
+        AutomodelPolicyWorkerImpl,
         _maybe_adapt_tensor_to_hf,
-        dtensor_params_generator,
+        automodel_params_generator,
     )
 
     NEMO_AUTOMODEL_AVAILABLE = True
@@ -61,8 +61,8 @@ class _FakeTrainableModel:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_get_logprobs_uses_the_microbatch_hook(monkeypatch):
-    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+def test_automodel_get_logprobs_uses_the_microbatch_hook(monkeypatch):
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.timer = MagicMock()
     worker.cfg = {"logprob_batch_size": 2}
     worker.model = MagicMock()
@@ -71,7 +71,7 @@ def test_dtensor_v2_get_logprobs_uses_the_microbatch_hook(monkeypatch):
     worker.dp_mesh = MagicMock()
     worker.tokenizer = MagicMock()
     worker._make_logprobs_post_processor = MagicMock(return_value="postprocessor")
-    worker._logprobs_for_microbatch = MagicMock(return_value=torch.zeros(2, 3))
+    worker._logprobs_for_microbatch = MagicMock(return_value=(torch.zeros(2, 3), {}))
     microbatch = object()
     data = MagicMock()
 
@@ -82,7 +82,7 @@ def test_dtensor_v2_get_logprobs_uses_the_microbatch_hook(monkeypatch):
         lambda *args, **kwargs: ([microbatch], 1),
     )
 
-    output = DTensorPolicyWorkerV2Impl.get_logprobs(worker, data)
+    output = AutomodelPolicyWorkerImpl.get_logprobs(worker, data)
 
     worker._logprobs_for_microbatch.assert_called_once_with(
         processed_mb=microbatch,
@@ -95,7 +95,7 @@ def test_dtensor_v2_get_logprobs_uses_the_microbatch_hook(monkeypatch):
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 def test_dtensor_v2_prepare_for_training_restores_optimizer(monkeypatch):
-    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
     model = _FakeTrainableModel()
     restored_devices = []
 
@@ -109,7 +109,7 @@ def test_dtensor_v2_prepare_for_training_restores_optimizer(monkeypatch):
     monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
 
-    DTensorPolicyWorkerV2Impl.prepare_for_training(worker)
+    AutomodelPolicyWorkerImpl.prepare_for_training(worker)
 
     assert model.train_called
     assert restored_devices == ["cuda"]
@@ -129,7 +129,7 @@ def test_dtensor_v2_prepare_for_lp_inference_keep_train_buffers(
     here, so pin it: inverted, it would strand the optimizer on CPU for the rest
     of the step.
     """
-    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
     model = _FakeTrainableModel()
     offloaded_devices = []
 
@@ -146,7 +146,7 @@ def test_dtensor_v2_prepare_for_lp_inference_keep_train_buffers(
     # The allocator wake-up is a real ``.cuda()`` call; keep this test CPU-only.
     monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: MagicMock())
 
-    DTensorPolicyWorkerV2Impl.prepare_for_lp_inference(
+    AutomodelPolicyWorkerImpl.prepare_for_lp_inference(
         worker, keep_train_buffers=keep_train_buffers
     )
 
@@ -157,11 +157,11 @@ def test_dtensor_v2_prepare_for_lp_inference_keep_train_buffers(
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 def test_dtensor_v2_update_moe_gate_bias_called_when_supported():
-    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = MagicMock()
     worker.model.update_moe_gate_bias = MagicMock()
 
-    DTensorPolicyWorkerV2Impl._update_moe_gate_bias_if_supported(worker)
+    AutomodelPolicyWorkerImpl._update_moe_gate_bias_if_supported(worker)
 
     worker.model.update_moe_gate_bias.assert_called_once_with()
 
@@ -169,13 +169,13 @@ def test_dtensor_v2_update_moe_gate_bias_called_when_supported():
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 def test_dtensor_v2_update_moe_gate_bias_noop_when_unsupported():
-    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
     # A real module without the hook: getattr(..., None) must short-circuit so
     # models that do not expose update_moe_gate_bias are unaffected.
     worker.model = nn.Linear(1, 1)
 
     # Should be a no-op and must not raise.
-    DTensorPolicyWorkerV2Impl._update_moe_gate_bias_if_supported(worker)
+    AutomodelPolicyWorkerImpl._update_moe_gate_bias_if_supported(worker)
 
 
 def create_test_config(
@@ -217,8 +217,7 @@ def create_test_config(
                 },
             },
         },
-        "dtensor_cfg": {
-            "_v2": True,
+        "automodel_cfg": {
             "enabled": True,
             "checkpoint": {
                 "model_save_format": "safetensors",
@@ -264,7 +263,7 @@ def create_test_config(
         "max_grad_norm": 1.0,
     }
     if automodel_kwargs is not None:
-        config["dtensor_cfg"]["automodel_kwargs"] = automodel_kwargs
+        config["automodel_cfg"]["automodel_kwargs"] = automodel_kwargs
     return config
 
 
@@ -455,6 +454,17 @@ def test_dtensor_v2_mixed_precision_training_and_logprobs(
         assert loss_tensor.dtype == torch.float32, (
             f"Loss should be float32, got {loss_tensor.dtype}"
         )
+        num_global_batches = train_data.size // config["train_global_batch_size"]
+        scaled_metric_loss = sum(results["all_mb_metrics"]["loss"])
+        torch.testing.assert_close(
+            loss_tensor.sum(),
+            torch.tensor(
+                scaled_metric_loss * num_global_batches,
+                dtype=loss_tensor.dtype,
+            ),
+            rtol=1e-4,
+            atol=1e-5,
+        )
 
         policy.finish_training()
 
@@ -583,8 +593,8 @@ class TestMaybeAdaptTensorToHF:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-class TestDTensorParamsGenerator:
-    """Tests for the dtensor_params_generator helper function."""
+class TestAutomodelParamsGenerator:
+    """Tests for the automodel_params_generator helper function."""
 
     def test_simple_model_yields_adapted_tensors(self):
         """Test that generator yields correct (name, tensor) pairs for a simple model."""
@@ -593,7 +603,7 @@ class TestDTensorParamsGenerator:
         target_dtype = torch.float32
 
         # Act
-        results = list(dtensor_params_generator(model, target_dtype))
+        results = list(automodel_params_generator(model, target_dtype))
 
         # Assert
         assert len(results) == 2, "Linear layer should have weight and bias"
@@ -617,7 +627,7 @@ class TestDTensorParamsGenerator:
         target_dtype = torch.bfloat16
 
         # Act
-        results = list(dtensor_params_generator(model, target_dtype))
+        results = list(automodel_params_generator(model, target_dtype))
 
         # Assert
         for name, tensor in results:
@@ -638,7 +648,7 @@ class TestDTensorParamsGenerator:
                     "ordinary_buffer", torch.arange(4, dtype=torch.float32)
                 )
 
-        results = dict(dtensor_params_generator(RouterModel(), torch.bfloat16))
+        results = dict(automodel_params_generator(RouterModel(), torch.bfloat16))
 
         assert results["e_score_correction_bias"].dtype == torch.float32
         assert results["ordinary_buffer"].dtype == torch.bfloat16
@@ -650,7 +660,7 @@ class TestDTensorParamsGenerator:
         target_dtype = torch.float32
 
         # Act
-        results = list(dtensor_params_generator(model, target_dtype))
+        results = list(automodel_params_generator(model, target_dtype))
 
         # Assert
         for name, tensor in results:
@@ -670,7 +680,7 @@ class TestDTensorParamsGenerator:
         target_dtype = torch.float32
 
         # Act
-        results = list(dtensor_params_generator(model, target_dtype))
+        results = list(automodel_params_generator(model, target_dtype))
 
         # Assert
         # Each state_dict entry (weight, bias) goes through adapter
@@ -687,19 +697,19 @@ class TestDTensorParamsGenerator:
         target_dtype = torch.float32
 
         # Act
-        results = list(dtensor_params_generator(model, target_dtype))
+        results = list(automodel_params_generator(model, target_dtype))
 
         # Assert
         assert len(results) == 0, "Empty model should yield no parameters"
 
     def test_generator_is_iterable(self):
-        """Test that dtensor_params_generator returns an iterable generator."""
+        """Test that automodel_params_generator returns an iterable generator."""
         # Arrange
         model = nn.Linear(10, 5)
         target_dtype = torch.float32
 
         # Act
-        gen = dtensor_params_generator(model, target_dtype)
+        gen = automodel_params_generator(model, target_dtype)
 
         # Assert
         from collections.abc import Generator as ABCGenerator
@@ -721,7 +731,7 @@ class TestDTensorParamsGenerator:
         target_dtype = torch.float32
 
         # Act
-        results = list(dtensor_params_generator(model, target_dtype))
+        results = list(automodel_params_generator(model, target_dtype))
 
         # Assert
         # Should have 4 parameters: 2 weights + 2 biases from the Linear layers
@@ -750,11 +760,11 @@ def test_prepare_refit_info_preserves_fp32_router_correction_bias():
                 "ordinary_buffer", torch.arange(4, dtype=torch.float32)
             )
 
-    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = RouterModel()
     worker.dtype = torch.bfloat16
 
-    refit_info = DTensorPolicyWorkerV2Impl.prepare_refit_info(worker)
+    refit_info = AutomodelPolicyWorkerImpl.prepare_refit_info(worker)
 
     assert refit_info["e_score_correction_bias"][1] == torch.float32
     assert refit_info["ordinary_buffer"][1] == torch.bfloat16
@@ -766,15 +776,15 @@ class TestAutocastContext:
     """Tests for the precision context retained by the policy worker."""
 
     def test_disabled_returns_noop_context(self):
-        worker = object.__new__(DTensorPolicyWorkerV2Impl)
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.autocast_enabled = False
 
         with worker._autocast_context():
             assert not torch.is_autocast_enabled("cuda")
 
-    @patch("nemo_rl.models.policy.workers.dtensor_policy_worker_v2.torch.autocast")
+    @patch("nemo_rl.models.policy.workers.automodel_policy_worker.torch.autocast")
     def test_enabled_uses_worker_dtype(self, mock_autocast):
-        worker = object.__new__(DTensorPolicyWorkerV2Impl)
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.autocast_enabled = True
         worker.dtype = torch.bfloat16
         expected_context = MagicMock()
@@ -794,7 +804,7 @@ def _init_v2_worker_mocked(
     optimizer_path,
     model_type=None,
 ):
-    """Run DTensorPolicyWorkerV2Impl.__init__ with all heavy deps mocked.
+    """Run AutomodelPolicyWorkerImpl.__init__ with all heavy deps mocked.
 
     Returns (worker, call_log, setup_mock, load_checkpoint_mock).
     """
@@ -845,7 +855,7 @@ def _init_v2_worker_mocked(
         self.checkpoint_manager.load_checkpoint = load_checkpoint_mock
 
     monkeypatch.setattr(
-        DTensorPolicyWorkerV2Impl,
+        AutomodelPolicyWorkerImpl,
         "_init_checkpoint_manager",
         fake_init_checkpoint_manager,
     )
@@ -881,7 +891,7 @@ def _init_v2_worker_mocked(
     config = {
         "model_name": "base-model",
         "tokenizer": {},
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "checkpoint": {
                 "model_save_format": "safetensors",
                 "save_consolidated": "false",
@@ -889,8 +899,8 @@ def _init_v2_worker_mocked(
         },
         "generation": {},
     }
-    worker = object.__new__(DTensorPolicyWorkerV2Impl)
-    DTensorPolicyWorkerV2Impl.__init__(
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
+    AutomodelPolicyWorkerImpl.__init__(
         worker,
         config,
         weights_path=weights_path,
