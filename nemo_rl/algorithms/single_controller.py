@@ -5185,6 +5185,7 @@ class SingleControllerActor:
             tensor_field(data, adv_cfg.reward_field)
         ).float()
         token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
+        original_token_mask = token_mask
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
@@ -5201,10 +5202,12 @@ class SingleControllerActor:
         if self._algo_cfg.overlong_filtering:
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
 
+        training_token_mask = token_mask
+        training_sample_mask = final_sample_mask
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
         # report sequence-level generation/training mismatch. A threshold adds
-        # masking; leaving it unset keeps this metrics-only.
+        # threshold filtering; support-mask validity applies in either case.
         if self._policy_logprobs_required:
             masking_data = BatchedDataDict(
                 {
@@ -5220,17 +5223,19 @@ class SingleControllerActor:
                     ),
                 }
             )
-            num_valid_seqs_before = float(
-                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
-                .sum()
-                .item()
-            )
             seq_error_metrics = compute_and_apply_seq_logprob_error_masking(
                 train_data=masking_data,
                 rewards=rewards,
                 seq_logprob_error_threshold=seq_logprob_error_threshold,
             )
+            token_mask = masking_data["token_mask"]
+            num_valid_seqs_before = float(
+                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                .sum()
+                .item()
+            )
             final_sample_mask = masking_data["sample_mask"]
+            data[adv_cfg.policy_logprobs_field] = masking_data["prev_logprobs"]
             num_valid_seqs_after = float(
                 ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
                 .sum()
@@ -5242,6 +5247,16 @@ class SingleControllerActor:
             seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
+            if opd_module.get_opd_full_config(self._master_config) is None:
+                training_token_mask = token_mask
+                training_sample_mask = final_sample_mask
+            else:
+                # Exact full-vocabulary KL does not depend on the sampled target.
+                # Keep support filtering local to sampled-logprob diagnostics;
+                # training still honors environment, length and empty-row masks.
+                training_sample_mask = training_sample_mask * training_token_mask[
+                    :, 1:
+                ].bool().any(dim=-1)
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
@@ -5275,11 +5290,16 @@ class SingleControllerActor:
 
         # Training predicts token t from position t - 1, so token_mask[:, 1:]
         # is the exact mask used when global_valid_toks and the loss are built.
-        has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
+        has_valid_training_tokens = bool(
+            (training_token_mask[:, 1:] * training_sample_mask.unsqueeze(-1))
+            .bool()
+            .any()
+            .item()
+        )
         # Value-model estimators (GAE) hand back the regression target alongside
         # the advantages; the group-relative ones return a bare tensor.
         returns: Optional[torch.Tensor] = None
-        if has_valid_training_tokens:
+        if mask[:, 1:].bool().any():
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
@@ -5323,7 +5343,7 @@ class SingleControllerActor:
 
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
-        self._step_log_dict["sample_masks"].append(final_sample_mask.detach().cpu())
+        self._step_log_dict["sample_masks"].append(training_sample_mask.detach().cpu())
         if self._teacher_logprobs_required:
             valid = response_advantages.detach().double()
             self._opd_stat_sum += float(valid.sum())
@@ -5345,8 +5365,10 @@ class SingleControllerActor:
         )
 
         fields_to_put = {adv_cfg.output_field: advantages}
-        if not torch.equal(final_sample_mask, sample_mask):
-            fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
+        if not torch.equal(training_token_mask, original_token_mask):
+            fields_to_put[adv_cfg.token_mask_field] = training_token_mask
+        if not torch.equal(training_sample_mask, sample_mask):
+            fields_to_put[adv_cfg.sample_mask_field] = training_sample_mask
         new_fields = [adv_cfg.output_field]
         if returns is not None:
             fields_to_put[adv_cfg.returns_field] = returns

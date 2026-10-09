@@ -16,6 +16,7 @@ import itertools
 import pytest
 import torch
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
@@ -588,6 +589,108 @@ def test_clipped_pg_loss_reinforce_mode():
         **loss_input,
     )
     torch.testing.assert_close(actual_loss, expected_loss)
+
+
+@pytest.mark.parametrize("force_on_policy_ratio", [False, True])
+@pytest.mark.parametrize("reference_policy_kl_penalty", [0.0, 0.01])
+def test_clipped_pg_loss_excludes_support_mismatches(
+    force_on_policy_ratio, reference_policy_kl_penalty
+):
+    data, _, _, _ = _setup_clipped_pg_test_data(seq_len=5, device="cpu")
+    data["advantages"][:, 1:] = 1.0
+    data["prev_logprobs"][:, 1:] = torch.tensor([[0.0, -0.3, -float("inf"), -0.5]])
+    data["generation_logprobs"][:, 1:] = torch.tensor([[0.0, -12.564064, -0.25, -0.5]])
+    curr = torch.tensor([[0.0, -float("inf"), -0.25, -0.5]], requires_grad=True)
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=reference_policy_kl_penalty,
+            force_on_policy_ratio=force_on_policy_ratio,
+        )
+    )
+    counts = dict(global_valid_seqs=torch.tensor(1), global_valid_toks=torch.tensor(4))
+    loss, metrics = loss_fn(next_token_logprobs=curr, data=data, **counts)
+    loss.backward()
+
+    # Compare with explicitly excluded tokens using the same global denominator.
+    expected_data = data.copy()
+    expected_data["token_mask"] = data["token_mask"].clone()
+    expected_data["token_mask"][0, 2] = 0
+    if not force_on_policy_ratio:
+        expected_data["token_mask"][0, 3] = 0
+    expected_curr = curr.detach().clone().requires_grad_()
+    expected_loss, expected_metrics = loss_fn(
+        next_token_logprobs=expected_curr, data=expected_data, **counts
+    )
+    expected_loss.backward()
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(curr.grad, expected_curr.grad)
+    assert torch.isfinite(loss)
+    assert torch.isfinite(curr.grad).all()
+    assert curr.grad[0, 1] == 0
+    assert curr.grad[0, 0] != 0  # A finite zero logprob is still a valid token.
+    if not force_on_policy_ratio:
+        assert curr.grad[0, 2] == 0
+    if reference_policy_kl_penalty == 0:
+        assert loss.item() == pytest.approx(-0.75 if force_on_policy_ratio else -0.5)
+        assert curr.grad[0, 0].item() == pytest.approx(-0.25)
+    assert metrics["gen_kl_error"] == pytest.approx(0.0)
+    assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
+    assert metrics == pytest.approx(expected_metrics)
+
+
+@pytest.mark.parametrize("seq_logprob_error_in_loss", [False, True])
+def test_clipped_pg_loss_tokenless_rows_are_not_survivors(seq_logprob_error_in_loss):
+    data, _, _, _ = _setup_clipped_pg_test_data(seq_len=3, device="cpu")
+    curr = torch.full((1, 2), -float("inf"), requires_grad=True)
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            force_on_policy_ratio=True,
+            seq_logprob_error_in_loss=seq_logprob_error_in_loss,
+        ),
+        seq_logprob_error_threshold=2.0 if seq_logprob_error_in_loss else None,
+    )
+    loss, metrics = loss_fn(
+        next_token_logprobs=curr,
+        data=data,
+        global_valid_seqs=torch.tensor(1),
+        global_valid_toks=torch.tensor(2),
+    )
+    loss.backward()
+    assert loss.item() == 0.0
+    torch.testing.assert_close(curr.grad, torch.zeros_like(curr))
+    assert metrics["num_valid_samples"] == 0
+    if seq_logprob_error_in_loss:
+        assert metrics["seq_logprob_error_valid_tokens"] == 0
+        assert metrics["seq_logprob_error_valid_seqs"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_clipped_pg_loss_top_p_support_mismatch_backward():
+    data, _, _, _ = _setup_clipped_pg_test_data(seq_len=3, vocab_size=4, device="cuda")
+    data["input_ids"][:] = torch.tensor([[0, 0, 3]], device="cuda")
+    data["advantages"][:, 1:] = 1.0
+    logits = torch.tensor(
+        [[[2.0, 1.0, 0.0, -10.0]] * 3], device="cuda", requires_grad=True
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(reference_policy_kl_penalty=0.0, force_on_policy_ratio=True)
+    )
+    loss_input, data = prepare_loss_input(
+        logits, data, loss_fn, sampling_params=TrainingSamplingParams(top_p=0.95)
+    )
+    assert torch.isneginf(loss_input["next_token_logprobs"][0, 1])
+    loss, _ = loss_fn(
+        data=data,
+        global_valid_seqs=torch.tensor(1, device="cuda"),
+        global_valid_toks=torch.tensor(2, device="cuda"),
+        **loss_input,
+    )
+    loss.backward()
+    assert loss.item() == pytest.approx(-0.5)
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad[0, 0].count_nonzero() > 0
+    assert logits.grad[0, 1].count_nonzero() == 0
 
 
 def test_clipped_pg_loss_force_on_policy_ratio():
