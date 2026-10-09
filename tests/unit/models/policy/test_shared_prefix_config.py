@@ -13,7 +13,11 @@
 # limitations under the License.
 """Shared-prefix configuration errors must precede worker initialization."""
 
+import sys
+from pathlib import Path
+
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from nemo_rl.models.policy import (
@@ -40,6 +44,7 @@ def policy_config():
             "train_mb_tokens": 32,
             "logprob_mb_tokens": 32,
         },
+        "make_sequence_length_divisible_by": 1,
         "generation": {"top_p": 1.0, "top_k": 0, "temperature": 0.7},
     }
 
@@ -337,6 +342,17 @@ _TOPOLOGY_REQUIREMENT_ERRORS = [
         "positive integer",
     ),
     (
+        _chain(_use_tp2, _set(("make_sequence_length_divisible_by",), None)),
+        ValueError,
+        r"positive integer multiple of the shared-prefix TP/CP alignment M=4 "
+        r"\(TP=2, CP=1\); got None",
+    ),
+    (
+        _chain(_use_tp2, _set(("make_sequence_length_divisible_by",), 2)),
+        ValueError,
+        "alignment M=4.*got 2",
+    ),
+    (
         _chain(
             _use_tp2,
             _set(("make_sequence_length_divisible_by",), 4),
@@ -370,6 +386,23 @@ _TOPOLOGY_REQUIREMENT_ERRORS = [
         r"fp8_cfg\.enabled=false",
     ),
     (_set(("quant_cfg",), "nvfp4"), ValueError, r"policy\.quant_cfg=null"),
+    (
+        _set(
+            ("megatron_cfg",),
+            {
+                "enabled": True,
+                "tensor_model_parallel_size": 1,
+                "context_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
+                "moe_hybridep_prepad_packed_inputs": True,
+            },
+        ),
+        NotImplementedError,
+        "moe_hybridep_prepad_packed_inputs=true",
+    ),
 ]
 
 
@@ -402,6 +435,33 @@ def test_dense_control_requires_megatron(policy_config, enabled):
         return
     with pytest.raises(ValueError, match="dense comparison control requires"):
         validate_shared_prefix_training_config(policy_config)
+
+
+def test_hybridep_without_prepadding_accepted(policy_config, megatron_rl):
+    policy_config["megatron_cfg"].update(
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_hybridep_prepad_packed_inputs=False,
+    )
+    assert validate_shared_prefix_training_config(policy_config).mode == "train"
+
+
+@pytest.mark.parametrize("mode", ["logprobs", "train"])
+def test_missing_megatron_rl_names_the_requirement(policy_config, monkeypatch, mode):
+    policy_config["shared_prefix_training"]["mode"] = mode
+    # A None entry makes the import raise ImportError, as in a Megatron-free venv.
+    monkeypatch.setitem(sys.modules, "megatron.rl.shared_prefix_tensors", None)
+    with pytest.raises(
+        ImportError, match=r"megatron\.rl shared-prefix modules.*driver"
+    ):
+        validate_shared_prefix_training_config(policy_config)
+
+
+@pytest.mark.parametrize("mode", ["disabled", "dense"])
+def test_inactive_modes_do_not_import_megatron_rl(policy_config, monkeypatch, mode):
+    policy_config["shared_prefix_training"]["mode"] = mode
+    monkeypatch.setitem(sys.modules, "megatron.rl.shared_prefix_tensors", None)
+    assert validate_shared_prefix_training_config(policy_config).mode == mode
 
 
 @pytest.mark.parametrize(
@@ -444,3 +504,20 @@ def test_megatron_config_drops_unapplied_recompute_keys():
 
     assert "recompute_method" not in MegatronConfig.__annotations__
     assert "recompute_num_layers" not in MegatronConfig.__annotations__
+
+
+def test_exemplar_documents_every_key_at_its_default():
+    exemplar = (
+        Path(__file__).parents[4]
+        / "examples/configs/grpo_math_1B_megatron_single_controller.yaml"
+    )
+    lines = exemplar.read_text().splitlines()
+    start = lines.index("  # shared_prefix_training:")
+    block = []
+    for line in lines[start:]:
+        if not line.startswith("  # "):
+            break
+        block.append(line.removeprefix("  # "))
+    documented = yaml.safe_load("\n".join(block))["shared_prefix_training"]
+    assert set(documented) == set(SharedPrefixTrainingConfig.model_fields)
+    assert SharedPrefixTrainingConfig(**documented) == SharedPrefixTrainingConfig()

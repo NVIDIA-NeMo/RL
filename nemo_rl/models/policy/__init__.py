@@ -985,7 +985,18 @@ def validate_shared_prefix_training_config(
             resolve_shared_prefix_parallel_topology,
             resolve_shared_prefix_physical_padding_multiple,
         )
+    except ImportError as error:
+        raise ImportError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires "
+            "the megatron.rl shared-prefix modules (Megatron-LM with shared-prefix "
+            "support) to be importable in the driver environment, because "
+            "configuration validation and data-parallel sharding run there. "
+            "Launch with the Megatron extra (e.g. `uv run --extra mcore ...`) "
+            "and check the Megatron-LM submodule pin, or set "
+            "policy.shared_prefix_training.mode=disabled."
+        ) from error
 
+    try:
         tp_size, cp_size, _sequence_parallel = resolve_shared_prefix_parallel_topology(
             tp_size=megatron_config["tensor_model_parallel_size"],
             cp_size=megatron_config["context_parallel_size"],
@@ -999,18 +1010,28 @@ def validate_shared_prefix_training_config(
             f"exactly when TP>1: {error}"
         ) from error
 
+    # The resolver maps None to the topology quantum M. The config must still
+    # name an explicit multiple of M: MasterConfig requires the key, and
+    # driver-side slot planning reads the raw value.
+    topology_alignment = resolve_shared_prefix_physical_padding_multiple(
+        tp_size=tp_size, cp_size=cp_size, padding_multiple=None
+    )
+    configured_multiple = config.get("make_sequence_length_divisible_by")
+    padding_error = (
+        "policy.make_sequence_length_divisible_by must be a positive integer "
+        f"multiple of the shared-prefix TP/CP alignment M={topology_alignment} "
+        f"(TP={tp_size}, CP={cp_size}); got {configured_multiple!r}."
+    )
+    if configured_multiple is None:
+        raise ValueError(padding_error)
     try:
         padding_multiple = resolve_shared_prefix_physical_padding_multiple(
             tp_size=tp_size,
             cp_size=cp_size,
-            padding_multiple=config.get("make_sequence_length_divisible_by"),
+            padding_multiple=configured_multiple,
         )
     except ValueError as error:
-        raise ValueError(
-            "policy.make_sequence_length_divisible_by must be absent/None or "
-            "a positive integer multiple of the shared-prefix TP/CP topology "
-            f"alignment; got {config.get('make_sequence_length_divisible_by')!r}."
-        ) from error
+        raise ValueError(padding_error) from error
     for capacity_key in ("train_mb_tokens", "logprob_mb_tokens"):
         capacity = sequence_packing_config.get(capacity_key)
         if capacity is None:
@@ -1052,6 +1073,20 @@ def validate_shared_prefix_training_config(
             f"policy.shared_prefix_training.mode={shared_prefix_config.mode} currently requires "
             "policy.quant_cfg=null; FP4 and other ModelOpt training quantization "
             "are not supported."
+        )
+
+    if (
+        megatron_config.get("moe_token_dispatcher_type") == "flex"
+        and megatron_config.get("moe_flex_dispatcher_backend") == "hybridep"
+        and megatron_config.get("moe_hybridep_prepad_packed_inputs")
+    ):
+        # Shared-prefix star units are not prepadded to the expert-group
+        # maximum, so ranks would disagree on HybridEP dispatch sizes and on
+        # the number of prepad collectives.
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} does not "
+            "support policy.megatron_cfg.moe_hybridep_prepad_packed_inputs=true; "
+            "disable HybridEP input prepadding."
         )
 
     return shared_prefix_config

@@ -186,6 +186,32 @@ policy:
   megatron_cfg:
     enabled: true
 
+  # Experimental shared-prompt-prefix execution for GRPO groups; see
+  # docs/design-docs/shared-prefix-execution.md. Omitting the block is the same
+  # as mode: disabled, and every key below is shown at its default. Enabled
+  # modes require token_capture.enabled=true, sequence packing, the Megatron
+  # backend with megatron.rl importable in the driver environment, top_p=1.0
+  # with top_k disabled, and make_sequence_length_divisible_by set to a multiple
+  # of the TP/CP alignment M (1 at TP1/CP1, 2*CP at TP1, 2*TP*CP otherwise).
+  # Unknown keys are rejected.
+  # shared_prefix_training:
+  #   # disabled | dense (conventional packing, comparison control) |
+  #   # logprobs (share prefixes in logprob forwards) | train (logprobs and training)
+  #   mode: disabled
+  #   pack_groups: false                  # forest execution under each stage's token budget
+  #   repack_groups: false                # rebuild local slots per group; requires pack_groups
+  #   pack_dense_fallbacks: false         # repack fallback rows; requires pack_groups
+  #   merge_dense_fallbacks: false        # fold fallback bins into forests; requires pack_dense_fallbacks
+  #   evaluation_packing: false           # drop the MTP budget in logprob forwards; requires pack_groups
+  #   align_data_parallel: false          # required with pack_groups at DP>1; requires repack_groups
+  #   match_logprob_training_layout: false  # logprobs reuse the training plan; mode=train only
+  #   training_dense_bins: false          # train only; requires pack/repack_groups and align_data_parallel
+  #   preserve_training_prefixes_during_alignment: false  # requires align_data_parallel
+  #   bypass_evaluation_mtp: false        # skip MTP in logprob forwards; also allowed in dense
+  #   uniform_router_gating: false        # fixed router GEMM row blocks; also allowed in dense
+  #   shard_work_weights: null            # [shared-backbone, expanded-token] DP balance weights
+  #   training_shard_work_weights: null   # training-stage override; mode=train only
+
   generation:
     # HTTP ports inherit the shared [3000, 4999) band from grpo_math_1B.yaml.
     mcore_generation_config:
