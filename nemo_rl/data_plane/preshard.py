@@ -28,12 +28,9 @@ from typing import Any, Optional
 
 import torch
 
-from nemo_rl.data.packing.shared_prefix_cost import estimate_shared_prefix_row_work
 from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_EXECUTION_SLOT,
     SHARED_PREFIX_PROMPT_LENGTHS,
-    plan_fixed_execution_slots,
-    plan_group_coherent_shards,
 )
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import (
@@ -121,18 +118,26 @@ def shard_meta_for_dp(
             raise ValueError(
                 "shared-prefix group sharding requires sequence-packing arguments"
             )
-        if "max_tokens_per_microbatch" not in sequence_packing_args:
-            raise ValueError(
-                "shared-prefix group sharding requires "
-                "sequence_packing_args.max_tokens_per_microbatch"
-            )
+        for key in ("max_tokens_per_microbatch", "sequence_length_pad_multiple"):
+            if key not in sequence_packing_args:
+                raise ValueError(
+                    f"shared-prefix group sharding requires sequence_packing_args.{key}"
+                )
+        # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds,
+        # and dense sharding must stay importable without it.
+        from megatron.rl.shared_prefix_cost import estimate_shared_prefix_row_work
+        from megatron.rl.shared_prefix_metadata import (
+            plan_fixed_execution_slots,
+            plan_group_coherent_shards,
+        )
+
         slot_plan = plan_fixed_execution_slots(
             group_ids=group_ids,
             sequence_lengths=sequence_lengths,
             bin_capacity=int(sequence_packing_args["max_tokens_per_microbatch"]),
             batch_size=batch_size,
             sequence_length_pad_multiple=int(
-                sequence_packing_args.get("sequence_length_pad_multiple", 1)
+                sequence_packing_args["sequence_length_pad_multiple"]
             ),
         )
         assignment_lengths = sequence_lengths
@@ -149,6 +154,8 @@ def shard_meta_for_dp(
                 prompt_lengths=[tag[SHARED_PREFIX_PROMPT_LENGTHS] for tag in meta.tags],
                 physical_weight=shared_prefix_work_weights[0],
                 expanded_weight=shared_prefix_work_weights[1],
+                # Each execution slot stores its own prompt copy.
+                row_slot_ids=slot_plan.row_slot_ids,
             )
         plan = plan_group_coherent_shards(
             group_ids=group_ids,

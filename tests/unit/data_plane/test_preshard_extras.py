@@ -235,7 +235,10 @@ def test_shard_meta_for_dp_shared_prefix_groups_rows_by_group_id_tag():
     shards, _ = shard_meta_for_dp(
         meta,
         dp_world=2,
-        sequence_packing_args={"max_tokens_per_microbatch": 256},
+        sequence_packing_args={
+            "max_tokens_per_microbatch": 256,
+            "sequence_length_pad_multiple": 1,
+        },
         shared_prefix_groups=True,
     )
 

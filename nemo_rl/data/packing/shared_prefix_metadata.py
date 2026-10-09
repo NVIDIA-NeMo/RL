@@ -12,88 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility adapter for :mod:`megatron.rl.shared_prefix_metadata`.
+"""Shared-prefix row metadata carried through NeMo RL batches.
 
-The implementation is owned by Megatron. Imports stay lazy so ordinary dense
-NeMo RL backends do not require the optional Megatron installation.
+Planning is owned by :mod:`megatron.rl.shared_prefix_metadata`; callers
+import it lazily so driver-side modules that only route batches stay
+importable without the optional Megatron installation.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from megatron.rl.shared_prefix_metadata import (
-        GroupCoherentShardPlan,
-        FixedExecutionSlotPlan,
-    )
-
 __all__ = [
-    "GroupCoherentShardPlan",
-    "FixedExecutionSlotPlan",
-    "plan_fixed_execution_slots",
-    "plan_group_coherent_shards",
+    "SHARED_PREFIX_EXECUTION_SLOT",
     "SHARED_PREFIX_GROUP_ID",
     "SHARED_PREFIX_PROMPT_LENGTHS",
-    "SHARED_PREFIX_EXECUTION_SLOT",
     "group_id_from_sample_id",
+    "parse_grouped_sample_id",
 ]
-
-
-def __getattr__(name: str) -> Any:
-    if name not in ("GroupCoherentShardPlan", "FixedExecutionSlotPlan"):
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    from importlib import import_module
-
-    value = getattr(import_module("megatron.rl.shared_prefix_metadata"), name)
-    globals()[name] = value
-    return value
-
-
-def plan_fixed_execution_slots(
-    *,
-    group_ids: Sequence[str],
-    sequence_lengths: Sequence[int],
-    bin_capacity: int,
-    batch_size: int | None = None,
-    sequence_length_pad_multiple: int = 1,
-    max_rows_per_slot: int = 16,
-) -> FixedExecutionSlotPlan:
-    """Delegate to :func:`megatron.rl.shared_prefix_metadata.plan_fixed_execution_slots`."""
-    from megatron.rl.shared_prefix_metadata import (
-        plan_fixed_execution_slots as implementation,
-    )
-
-    return implementation(
-        group_ids=group_ids,
-        sequence_lengths=sequence_lengths,
-        bin_capacity=bin_capacity,
-        batch_size=batch_size,
-        sequence_length_pad_multiple=sequence_length_pad_multiple,
-        max_rows_per_slot=max_rows_per_slot,
-    )
-
-
-def plan_group_coherent_shards(
-    *,
-    group_ids: Sequence[str],
-    sequence_lengths: Sequence[int],
-    num_shards: int,
-    batch_size: int | None = None,
-) -> GroupCoherentShardPlan:
-    """Delegate to :func:`megatron.rl.shared_prefix_metadata.plan_group_coherent_shards`."""
-    from megatron.rl.shared_prefix_metadata import (
-        plan_group_coherent_shards as implementation,
-    )
-
-    return implementation(
-        group_ids=group_ids,
-        sequence_lengths=sequence_lengths,
-        num_shards=num_shards,
-        batch_size=batch_size,
-    )
-
 
 SHARED_PREFIX_GROUP_ID = "shared_prefix_group_id"
 SHARED_PREFIX_PROMPT_LENGTHS = "shared_prefix_prompt_lengths"

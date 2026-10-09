@@ -123,7 +123,7 @@ def test_shared_prefix_preshard_assigns_complete_groups_and_round_trips(
     dp_world, work_weights
 ):
     pytest.importorskip("megatron.rl.shared_prefix_metadata")
-    from nemo_rl.data.packing.shared_prefix_metadata import plan_fixed_execution_slots
+    from megatron.rl.shared_prefix_metadata import plan_fixed_execution_slots
 
     meta = _grouped_meta()
     shards, permutation = _shard(
@@ -183,6 +183,34 @@ def test_shared_prefix_preshard_rejects_groups_that_cannot_split_evenly():
     pytest.importorskip("megatron.rl.shared_prefix_metadata")
     with pytest.raises(ValueError, match="complete groups per rank"):
         _shard(_grouped_meta(), 3)
+
+
+@pytest.mark.mcore
+def test_shared_prefix_work_weights_cost_each_execution_slot(monkeypatch):
+    cost = pytest.importorskip("megatron.rl.shared_prefix_cost")
+    from megatron.rl.shared_prefix_metadata import plan_fixed_execution_slots
+
+    estimate = cost.estimate_shared_prefix_row_work
+    calls = []
+
+    def record(**kwargs):
+        calls.append(kwargs)
+        return estimate(**kwargs)
+
+    monkeypatch.setattr(cost, "estimate_shared_prefix_row_work", record)
+    meta = _grouped_meta()
+    _shard(meta, 2, shared_prefix_work_weights=(4, 1))
+
+    # A group split into K slots stores its prompt K times.
+    expected_slots = plan_fixed_execution_slots(
+        group_ids=[tag[GROUP_ID_TAG] for tag in meta.tags],
+        sequence_lengths=meta.sequence_lengths,
+        bin_capacity=_PACKING_ARGS["max_tokens_per_microbatch"],
+        batch_size=None,
+        sequence_length_pad_multiple=1,
+    ).row_slot_ids
+    assert max(expected_slots) > 0
+    assert len(calls) == 1 and calls[0]["row_slot_ids"] == expected_slots
 
 
 @pytest.mark.mcore

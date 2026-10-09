@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility adapter for :mod:`megatron.rl.shared_prefix_cost`.
+"""Shared-prefix prompt-length row tags for work-weighted sharding.
 
-The implementation is owned by Megatron. Imports stay lazy so ordinary dense
-NeMo RL backends do not require the optional Megatron installation.
+The cost model itself is owned by :mod:`megatron.rl.shared_prefix_cost`.
 """
 
 from __future__ import annotations
@@ -25,29 +24,7 @@ from typing import Any
 
 from nemo_rl.data.packing.shared_prefix_metadata import SHARED_PREFIX_PROMPT_LENGTHS
 
-__all__ = ["estimate_shared_prefix_row_work", "with_prompt_length_tags"]
-
-
-def estimate_shared_prefix_row_work(
-    *,
-    group_ids: Sequence[str],
-    sequence_lengths: Sequence[int],
-    prompt_lengths: Sequence[int],
-    physical_weight: int = 4,
-    expanded_weight: int = 1,
-) -> list[int]:
-    """Delegate to :func:`megatron.rl.shared_prefix_cost.estimate_shared_prefix_row_work`."""
-    from megatron.rl.shared_prefix_cost import (
-        estimate_shared_prefix_row_work as implementation,
-    )
-
-    return implementation(
-        group_ids=group_ids,
-        sequence_lengths=sequence_lengths,
-        prompt_lengths=prompt_lengths,
-        physical_weight=physical_weight,
-        expanded_weight=expanded_weight,
-    )
+__all__ = ["with_prompt_length_tags"]
 
 
 def with_prompt_length_tags(
