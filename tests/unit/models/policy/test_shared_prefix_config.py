@@ -360,6 +360,11 @@ _POLICY_REQUIREMENT_ERRORS = [
         r"peft\.enabled=false",
     ),
     (
+        _set(("router_replay",), {"enabled": True}),
+        ValueError,
+        r"does not support policy\.router_replay\.enabled=true",
+    ),
+    (
         _set(("sequence_packing", "enabled"), False),
         ValueError,
         r"sequence_packing\.enabled=true",
@@ -512,6 +517,19 @@ def test_inactive_modes_do_not_import_megatron_rl(policy_config, monkeypatch, mo
     policy_config["shared_prefix_training"]["mode"] = mode
     monkeypatch.setitem(sys.modules, "megatron.rl.shared_prefix_tensors", None)
     assert validate_shared_prefix_training_config(policy_config).mode == mode
+
+
+@pytest.mark.parametrize("mode", ["disabled", "dense"])
+def test_inactive_modes_allow_router_replay(policy_config, mode):
+    policy_config["shared_prefix_training"]["mode"] = mode
+    policy_config["router_replay"] = {"enabled": True}
+    assert validate_shared_prefix_training_config(policy_config).mode == mode
+
+
+@pytest.mark.mcore
+def test_enabled_mode_allows_disabled_router_replay(policy_config, megatron_rl):
+    policy_config["router_replay"] = {"enabled": False}
+    assert validate_shared_prefix_training_config(policy_config).mode == "train"
 
 
 @pytest.mark.parametrize(

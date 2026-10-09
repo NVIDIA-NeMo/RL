@@ -973,6 +973,17 @@ def validate_shared_prefix_training_config(
             "and shared-prefix gradient semantics have not been validated."
         )
 
+    # Inlined instead of router_replay_enabled(): nemo_rl.models.megatron.router_replay
+    # imports PolicyConfig from this module.
+    router_replay_config = config.get("router_replay")
+    if router_replay_config is not None and router_replay_config["enabled"]:
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} does not "
+            "support policy.router_replay.enabled=true: routed_experts are recorded per "
+            "dense row, while shared-prefix execution stores each prompt once. Disable "
+            "router replay or set policy.shared_prefix_training.mode=disabled."
+        )
+
     sequence_packing_config = config.get("sequence_packing")
     if sequence_packing_config is None or not sequence_packing_config["enabled"]:
         raise ValueError(
