@@ -150,6 +150,7 @@ MXFP8_CASES = {
         "gpus_per_node": 4,
         "segment_size": 4,
         "async_engine": True,
+        "optimizer_lr": 1.0e-7,
         "moe_backend": "flashinfer_trtllm",
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
@@ -163,6 +164,9 @@ MXFP8_CASES = {
         "async_engine": True,
         "tensor_parallel_size": 4,
         "moe_backend": "flashinfer_trtllm",
+        "discard_weights_on_sleep": True,
+        "num_first_layers_in_bf16": 3,
+        "num_last_layers_in_bf16": 18,
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
             "model.layers.*.mlp.gate",
@@ -176,6 +180,8 @@ MXFP8_CASES = {
         "async_engine": True,
         "tensor_parallel_size": 4,
         "moe_backend": "flashinfer_trtllm",
+        "num_first_layers_in_bf16": 3,
+        "num_last_layers_in_bf16": 18,
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
             "model.layers.*.mlp.gate",
@@ -256,6 +262,18 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     )
     if expected.get("tensor_parallel_size") is not None:
         assert vllm_cfg["tensor_parallel_size"] == expected["tensor_parallel_size"]
+    if expected.get("num_first_layers_in_bf16") is not None:
+        assert (
+            vllm_cfg["num_first_layers_in_bf16"] == expected["num_first_layers_in_bf16"]
+        )
+        assert (
+            vllm_cfg["num_last_layers_in_bf16"] == expected["num_last_layers_in_bf16"]
+        )
+    if expected.get("discard_weights_on_sleep") is not None:
+        assert (
+            config["policy"]["generation"]["colocated"]["discard_weights_on_sleep"]
+            is expected["discard_weights_on_sleep"]
+        )
     if expected["async_engine"] is not None:
         assert vllm_cfg["async_engine"] is expected["async_engine"]
     assert (
@@ -266,6 +284,11 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
         assert (
             config["policy"]["train_global_batch_size"]
             == expected["train_global_batch_size"]
+        )
+    if expected.get("optimizer_lr") is not None:
+        assert (
+            config["policy"]["megatron_cfg"]["optimizer"]["lr"]
+            == expected["optimizer_lr"]
         )
 
     expected_async = "-async-1off-" in case_name

@@ -3,10 +3,17 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-235b-16n4g-mxfp8-rollout
 policy:
   generation:
+    colocated:
+      discard_weights_on_sleep: true
     vllm_cfg:
       tensor_parallel_size: 4
       precision: "fp8"
       is_mx: true
+      # Keep the first three boundary layers and layers 76-93 in BF16. The
+      # failing-token replay's MXFP8 error accelerates from layer 76 and then
+      # diverges sharply in layer 89.
+      num_first_layers_in_bf16: 3
+      num_last_layers_in_bf16: 18
       quantization_ignore_patterns:
         - model.layers.*.self_attn.*
         - model.layers.*.mlp.gate
