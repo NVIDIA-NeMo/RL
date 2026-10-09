@@ -80,6 +80,8 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.interfaces import (
@@ -1475,15 +1477,19 @@ def mock_sync_grpo_infrastructure(policy):
     driver_carry = BatchedDataDict(
         {
             "total_reward": torch.tensor([1.0]),
-            "prompt_ids_for_adv": torch.tensor([[1, 2, 3]]),
             "input_lengths": torch.tensor([4]),
             "loss_multiplier": torch.tensor([1.0]),
             "truncated": torch.tensor([False]),
             "length": torch.tensor([3]),
         }
     )
-    meta = MagicMock()
-    meta.fields = ["input_ids"]
+    meta = KVBatchMeta(
+        sample_ids=["rollout_g0"],
+        partition_id="train",
+        task_name="train",
+        fields=["input_ids"],
+        tags=[{GROUP_ID_TAG: "rollout"}],
+    )
     rollout_metrics = {
         "mean_gen_tokens_per_sample": 10.0,
         "max_gen_tokens": 20,
