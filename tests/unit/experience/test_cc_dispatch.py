@@ -10,9 +10,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import nemo_rl.environments.nemo_gym as gym_environment
+from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.environments.nemo_gym import GymTransportError, NemoGym
 from nemo_rl.experience.rollout_manager import RolloutRetryPolicy, RolloutTimeouts
 from nemo_rl.experience.rollout_reassembler import ActionOutputFlags, RolloutSelection
+from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.utils.timer import Timer
 from tests.unit.experience.test_rollout_generation_failures import (
     _FakeGymMethod,
@@ -72,8 +74,12 @@ def test_cc_row_stream_disables_ray_replay_and_row_redispatch():
 
 
 @pytest.mark.parametrize("failure_type", [GymTransportError, ValueError, TimeoutError])
-def test_cc_group_drops_transport_failure_without_replaying_agent(failure_type):
+def test_cc_group_retries_infrastructure_failures_until_budget_exhausted(
+    failure_type, monkeypatch
+):
     attempts = []
+    sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
 
     async def execute_then_lose_response(_sample):
         attempts.append("mutation applied")
@@ -83,8 +89,8 @@ def test_cc_group_drops_transport_failure_without_replaying_agent(failure_type):
         max_infra_attempts=5,
         max_data_attempts=4,
         max_gym_row_attempts=3,
-        backoff_base_s=0,
-        max_backoff_s=0,
+        backoff_base_s=0.25,
+        max_backoff_s=1,
         max_skipped_prompts=10,
         max_consecutive_dropped_prompts=10,
     )
@@ -98,10 +104,185 @@ def test_cc_group_drops_transport_failure_without_replaying_agent(failure_type):
             asyncio.run(manager.generate_for_finalization({"idx": 1}))
     else:
         assert asyncio.run(manager.generate_for_finalization({"idx": 1})) is None
-    assert attempts == ["mutation applied"]
-    assert len(buffer.abort_calls) == 1
+    expected_attempts = 1 if failure_type is ValueError else policy.max_infra_attempts
+    assert attempts == ["mutation applied"] * expected_attempts
+    assert len(buffer.abort_calls) == expected_attempts
+    assert [call.args[0] for call in sleep.await_args_list] == [
+        policy.backoff_for(attempt) for attempt in range(1, expected_attempts)
+    ]
     assert buffer.commit_calls == []
     assert manager.stats.skipped == (0 if failure_type is ValueError else 1)
+
+
+@pytest.mark.parametrize(
+    "granularity", [RecoveryGranularity.SIBLING, RecoveryGranularity.PROMPT_GROUP]
+)
+def test_cc_infra_retry_preserves_only_sealed_selections(granularity):
+    """Retry only missing siblings; discard unsealed selections on a group restart."""
+    first_selection = RolloutSelection(("first",), (ActionOutputFlags(False, False),))
+    retried_selection = RolloutSelection(
+        ("retried",), (ActionOutputFlags(False, False),)
+    )
+    second_selection = RolloutSelection(("second",), (ActionOutputFlags(False, False),))
+    attempts = []
+    policy = RolloutRetryPolicy(
+        max_infra_attempts=2,
+        max_data_attempts=1,
+        max_gym_row_attempts=1,
+        backoff_base_s=0,
+        max_backoff_s=0,
+        max_skipped_prompts=0,
+        max_consecutive_dropped_prompts=1,
+    )
+    buffer = _FakeCaptureBuffer()
+    manager = _make_capture_manager(
+        buffer,
+        retry_policy=policy,
+        recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+    )
+    manager._context_compaction = True
+
+    async def run_with_one_transient_failure(
+        _sample, *, rollout_ids, generation_indices, on_completion, **_kwargs
+    ):
+        attempts.append(tuple(generation_indices))
+        selected_ids = [rollout_ids[index] for index in generation_indices]
+        record = _receipt_record(
+            selected_ids,
+            [
+                {
+                    "rollout_id": rollout_id,
+                    "manifest": [{"staging_key": f"{rollout_id}/call"}],
+                }
+                for rollout_id in selected_ids
+            ],
+        )
+        for index, completion in zip(generation_indices, record.completions):
+            completion.env_extras["ng_logical_selection"] = (
+                (first_selection if len(attempts) == 1 else retried_selection)
+                if index == 0
+                else second_selection
+            )
+            await on_completion(index, completion)
+            if len(attempts) == 1:
+                # Simulate a lost response after sibling 0 has been reported.
+                raise GymTransportError("transient response loss")
+        return record
+
+    manager._impl.run_rollout = run_with_one_transient_failure
+    request = asyncio.run(manager.generate_for_finalization({"idx": 1}))
+    assert request is not None
+    expected_first = (
+        first_selection
+        if granularity is RecoveryGranularity.SIBLING
+        else retried_selection
+    )
+    assert request.logical_selections == (expected_first, second_selection)
+    assert attempts == (
+        [(0, 1), (1,)]
+        if granularity is RecoveryGranularity.SIBLING
+        else [(0, 1), (0, 1)]
+    )
+    assert len(buffer.abort_calls) == 1
+    assert manager.stats.skipped == 0
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_cc_retry_discards_selection_if_sealing_fails(monkeypatch, granularity):
+    """A reported selection must not outlive its failed receipt seal."""
+    manager = _make_capture_manager(
+        _FakeCaptureBuffer(),
+        retry_policy=RolloutRetryPolicy.single_attempt(
+            max_infra_attempts=2, backoff_base_s=0, max_backoff_s=0
+        ),
+        recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+    )
+    manager._context_compaction = True
+    attempts = []
+    selections = [
+        RolloutSelection((name,), (ActionOutputFlags(False, False),))
+        for name in ("abandoned", "fresh")
+    ]
+    method_name = (
+        "mark_sibling_sealed"
+        if granularity is RecoveryGranularity.SIBLING
+        else "mark_group_sealed"
+    )
+    original = getattr(manager._recovery_ledger, method_name)
+    seals = []
+
+    def fail_first_seal(*args, **kwargs):
+        seals.append(1)
+        if len(seals) == 1:
+            raise GymTransportError("seal interrupted")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(manager._recovery_ledger, method_name, fail_first_seal)
+
+    async def run(_sample, *, rollout_ids, generation_indices, on_completion, **kw):
+        attempts.append(tuple(generation_indices))
+        selected_ids = [rollout_ids[i] for i in generation_indices]
+        record = _receipt_record(selected_ids, [None] * len(selected_ids))
+        for index, completion in zip(generation_indices, record.completions):
+            completion.env_extras["ng_logical_selection"] = selections[
+                len(attempts) - 1
+            ]
+            await on_completion(index, completion)
+        return record
+
+    manager._impl.run_rollout = run
+    request = asyncio.run(manager.generate_for_finalization({"idx": 1}))
+    assert attempts == [(0, 1), (0, 1)]
+    assert request.logical_selections == (selections[1], selections[1])
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_cc_retry_after_all_siblings_sealed_does_not_replay(granularity):
+    manager = _make_capture_manager(
+        _FakeCaptureBuffer(),
+        retry_policy=RolloutRetryPolicy.single_attempt(
+            max_infra_attempts=2, backoff_base_s=0, max_backoff_s=0
+        ),
+        recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+    )
+    manager._context_compaction = True
+    selection = RolloutSelection(("accepted",), (ActionOutputFlags(False, False),))
+    attempts = []
+
+    async def run(_sample, *, rollout_ids, generation_indices, on_completion, **kw):
+        attempts.append(tuple(generation_indices))
+        record = _receipt_record(rollout_ids, [None] * len(rollout_ids))
+        for index, completion in zip(generation_indices, record.completions):
+            completion.env_extras["ng_logical_selection"] = selection
+            await on_completion(index, completion)
+        raise GymTransportError("stream failed after final completion")
+
+    manager._impl.run_rollout = run
+    request = asyncio.run(manager.generate_for_finalization({"idx": 1}))
+    assert attempts == [(0, 1)]
+    assert request.logical_selections == (selection, selection)
+    assert manager.stats.skipped == 0
+
+
+def test_cc_cancellation_cleans_up_without_retry():
+    buffer = _FakeCaptureBuffer()
+    attempts = []
+
+    async def cancelled(_sample):
+        attempts.append(1)
+        raise asyncio.CancelledError()
+
+    manager = _make_capture_manager(
+        buffer,
+        on_run=cancelled,
+        retry_policy=RolloutRetryPolicy.single_attempt(max_infra_attempts=2),
+    )
+    manager._context_compaction = True
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(manager.generate_for_finalization({"idx": 1}))
+    assert attempts == [1]
+    assert len(buffer.abort_calls) == 1
+    assert manager.stats.skipped == 0
 
 
 def test_cc_hung_stream_deadline_drops_group_and_cancels_collection():
