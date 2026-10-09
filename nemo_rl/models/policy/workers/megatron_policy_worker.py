@@ -1245,8 +1245,8 @@ class MegatronPolicyWorkerImpl(
         """Plan this call's shared-prefix forwards once, under their own timer.
 
         Returns ``None`` when sharing is disabled for this stage. The units feed
-        :func:`get_microbatch_iterator`, which then skips its own planning and
-        the iterator's device-copy re-planning. Planning ends with the single
+        :func:`get_microbatch_iterator`, which requires them and does no
+        planning of its own. Planning ends with the single
         model-world agreement on the forward count, which also carries any
         rank-local planning failure so that every rank raises together.
         """
@@ -1264,6 +1264,7 @@ class MegatronPolicyWorkerImpl(
         )
 
         from nemo_rl.models.megatron.shared_prefix_dense_bins import (
+            _row_costs,
             plan_dense_training_bins,
             share_prefixes_in_dense_training_bins,
         )
@@ -1338,10 +1339,7 @@ class MegatronPolicyWorkerImpl(
                     "Cannot align forward counts using real rows on every rank"
                 )
             *_, multiple = _resolve_shared_prefix_execution_topology(self.cfg)
-            costs = [
-                (int(length) + multiple - 1) // multiple * multiple
-                for length in data["input_lengths"].tolist()
-            ]
+            costs = _row_costs(data, multiple)
             if forward_only and group_config.evaluation_packing:
                 aligned, _ = align_physical_units(
                     units,
