@@ -318,22 +318,15 @@ def pad_and_align_routed_expert_indices(
             "Router replay allows at most one surplus final-token route."
         )
 
-    default_route = torch.arange(
-        routed.shape[2],
+    full = torch.full(
+        (padded_length, routed.shape[1], routed.shape[2]),
+        R3_MISSING_ROUTE_SENTINEL,
         dtype=routed_experts_dtype,
         device=device,
-    )
-    full = (
-        default_route.view(1, 1, -1)
-        .expand(padded_length, routed.shape[1], routed.shape[2])
-        .clone()
     )
     routes_to_copy = min(expected_routes, routed.shape[0])
     if routes_to_copy > 0:
         full[:routes_to_copy] = routed[:routes_to_copy].to(device=device)
-    # Missing routes and the final token (never run through the model) have no
-    # recorded route; the sentinel makes Megatron route those tokens itself.
-    full[routes_to_copy:valid_length] = R3_MISSING_ROUTE_SENTINEL
     return (full, stats) if return_stats else full
 
 

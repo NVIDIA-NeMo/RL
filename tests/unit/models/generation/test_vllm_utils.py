@@ -292,12 +292,8 @@ def test_normalize_routed_experts_full_sequence_alignment():
         routed_experts[:5],
         completion_output.routed_experts.to(ROUTED_EXPERTS_FALLBACK_DTYPE),
     )
-    # The final token (position 5) has no route; batch padding keeps a valid one.
-    assert routed_experts[5].eq(R3_MISSING_ROUTE_SENTINEL).all()
-    expected_default_route = torch.tensor(
-        [0, 1], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
-    ).view(1, 1, 2)
-    assert torch.equal(routed_experts[6:], expected_default_route.expand(2, 3, 2))
+    # The final token (position 5) and batch padding have no route.
+    assert routed_experts[5:].eq(R3_MISSING_ROUTE_SENTINEL).all()
 
 
 def test_normalize_routed_experts_concatenates_prompt_and_decode():
@@ -349,11 +345,7 @@ def test_normalize_routed_experts_uses_missing_route_sentinel_for_last_token():
     )
 
     assert torch.equal(routed_experts[:2], completion_output.routed_experts)
-    assert routed_experts[2].eq(R3_MISSING_ROUTE_SENTINEL).all()
-    expected_default_route = torch.tensor(
-        [0, 1, 2], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
-    ).view(1, 1, 3)
-    assert torch.equal(routed_experts[3:], expected_default_route.expand(2, 2, 3))
+    assert routed_experts[2:].eq(R3_MISSING_ROUTE_SENTINEL).all()
 
 
 def test_normalize_routed_experts_final_token_is_sentinel_even_if_vllm_returns_route():
