@@ -1251,9 +1251,18 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     assert "advantages" in (result_meta.fields or [])
 
 
-@pytest.mark.parametrize("tokenless_sample", [False, True])
+@pytest.mark.parametrize(
+    ("tokenless_sample", "support_mismatch", "full_vocab"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, True, True),
+        (True, True, True),
+    ],
+)
 def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
-    tokenless_sample,
+    tokenless_sample, support_mismatch, full_vocab
 ) -> None:
     """SC passes the TQ teacher column under OPD's estimator contract."""
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -1286,7 +1295,9 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
                     "mask_sample": torch.zeros(2, dtype=torch.bool),
                     "truncated": torch.zeros(2, dtype=torch.bool),
                     "generation_logprobs": torch.full((2, 3), 0.5),
-                    "prev_logprobs": torch.full((2, 3), 0.5),
+                    "prev_logprobs": torch.full(
+                        (2, 3), -float("inf") if support_mismatch else 0.5
+                    ),
                     "teacher_reference_logprobs": torch.full((2, 3), 0.75),
                 },
                 batch_size=(2,),
@@ -1308,7 +1319,8 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
         grpo=GRPOConfig(
             seq_logprob_error_threshold=None,
             advantage_clip_high=0.1,
-        )
+        ),
+        on_policy_distillation={"enabled": True, "full": {"enabled": full_vocab}},
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -1333,7 +1345,34 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
 
     enriched, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
 
-    assert has_valid_training_tokens
+    assert has_valid_training_tokens == (not support_mismatch or full_vocab)
+    assert ctrl._dp_client.put_fields is not None
+    if support_mismatch:
+        # Sampled diagnostics have no supported target, but exact KL retains
+        # every original loss-active position, even when the whole batch misses.
+        assert not captured_kwargs
+        fields = ctrl._dp_client.put_fields
+        torch.testing.assert_close(
+            single_controller.tensor_field(fields, "advantages"), torch.zeros(2, 3)
+        )
+        expected_sample_mask = (
+            torch.tensor([1.0, 0.0]) if tokenless_sample else torch.ones(2)
+        )
+        if full_vocab:
+            assert "token_mask" not in fields
+            if tokenless_sample:
+                torch.testing.assert_close(fields["sample_mask"], expected_sample_mask)
+            else:
+                assert "sample_mask" not in fields
+        else:
+            expected_sample_mask.zero_()
+            assert not fields["token_mask"].any()
+            torch.testing.assert_close(fields["sample_mask"], expected_sample_mask)
+        torch.testing.assert_close(
+            ctrl._step_log_dict["sample_masks"][0], expected_sample_mask
+        )
+        assert ctrl._opd_stat_count == 0
+        return
     assert set(captured_kwargs) >= {
         "teacher_logprobs",
         "prev_logprobs",

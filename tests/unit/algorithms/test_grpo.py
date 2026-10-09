@@ -6008,8 +6008,7 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         if masked_position:
             assert math.isfinite(result["max_seq_mult_prob_error"])
 
-    @pytest.mark.parametrize("data_plane", [False, True])
-    def test_policy_support_mask_reaches_training_counts(self, data_plane):
+    def test_policy_support_mask_reaches_training_counts(self):
         train_data = self._create_train_data(
             1,
             4,
@@ -6017,25 +6016,9 @@ class TestComputeAndApplySeqLogprobErrorMasking:
             torch.tensor([[0.0, 0.0, -12.564064, 0.0]]),
             token_mask=torch.tensor([[0.0, 1.0, 1.0, 0.0]]),
         )
-        if data_plane:
-            from nemo_rl.algorithms.grpo_sync import _compute_seq_logprob_error_metrics
-
-            token_mask, sample_mask, prev_logprobs, result = (
-                _compute_seq_logprob_error_metrics(
-                    **train_data,
-                    rewards=torch.ones(1),
-                    seq_logprob_error_threshold=None,
-                )
-            )
-            train_data.update(
-                token_mask=token_mask,
-                sample_mask=sample_mask,
-                prev_logprobs=prev_logprobs,
-            )
-        else:
-            result = compute_and_apply_seq_logprob_error_masking(
-                train_data, torch.ones(1), seq_logprob_error_threshold=None
-            )
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data, torch.ones(1), seq_logprob_error_threshold=None
+        )
         assert train_data["token_mask"].tolist() == [[0.0, 1.0, 0.0, 0.0]]
         assert train_data["sample_mask"].tolist() == [1.0]
         assert torch.isfinite(train_data["prev_logprobs"]).all()
@@ -6796,8 +6779,24 @@ def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
 
+    support_mask = torch.tensor([[1.0, 1.0, 0.0, 1.0]])
     with ExitStack() as stack:
         stack.enter_context(mock_sync_grpo_infrastructure(policy))
+        stack.enter_context(
+            patch(
+                "nemo_rl.algorithms.grpo_sync._compute_seq_logprob_error_metrics",
+                return_value=(
+                    support_mask,
+                    torch.ones(1),
+                    torch.zeros(1, 4),
+                    _mock_seq_logprob_error_result(),
+                ),
+            )
+        )
+        create_estimator = stack.enter_context(
+            patch("nemo_rl.algorithms.grpo_sync._create_advantage_estimator")
+        )
+        create_estimator.return_value.compute_advantage.return_value = torch.zeros(1, 4)
         stack.enter_context(
             patch("nemo_rl.algorithms.grpo_sync.validate_sync", return_value=({}, {}))
         )
@@ -6816,6 +6815,13 @@ def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
             master_config,
         )
 
+    written_fields = policy.write_to_dataplane.call_args.kwargs["fields"]
+    torch.testing.assert_close(written_fields["token_mask"], support_mask)
+    torch.testing.assert_close(written_fields["sample_mask"], torch.ones(1))
+    torch.testing.assert_close(
+        create_estimator.return_value.compute_advantage.call_args.kwargs["mask"],
+        support_mask,
+    )
     calls = mock_grpo_components["logger"].log_metrics.call_args_list
     want = f"data_plane/{scope}"
     dp = [i for i, c in enumerate(calls) if c.kwargs.get("prefix") == want]
