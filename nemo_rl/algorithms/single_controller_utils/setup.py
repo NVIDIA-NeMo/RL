@@ -1189,10 +1189,14 @@ def setup_single_controller(
             "single_controller_utils does not support "
             "data.use_multiple_dataloader=True yet."
         )
-    if opd_module.is_opd_enabled(master_config) and processor is not None:
-        raise NotImplementedError(
-            "SingleController MOPD currently supports text-only teacher inputs. "
-            "Use the legacy controller for multimodal MOPD."
+    if (
+        opd_module.is_opd_enabled(master_config)
+        and processor is not None
+        and not master_config.token_capture.enabled
+    ):
+        raise ValueError(
+            "SingleController multimodal MOPD requires token_capture.enabled=true "
+            "to reuse the rollout's captured media for teacher scoring."
         )
 
     checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
