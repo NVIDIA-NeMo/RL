@@ -1,6 +1,6 @@
 defaults: ./grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt-long.v3.yaml
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     tensor_parallel_size: 4
   make_sequence_length_divisible_by: 4
   generation:

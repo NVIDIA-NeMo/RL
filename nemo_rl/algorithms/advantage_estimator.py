@@ -100,7 +100,8 @@ class GRPOAdvantageEstimator:
         """Compute GRPO advantages.
 
         Args:
-            prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
+            prompt_ids: Row equality keys of shape [batch_size, k] identifying
+                rollout groups; GRPO callers supply explicit ids with k=1.
             rewards: Tensor of shape [batch_size] containing reward for each sample.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
                   Used only for expanding advantages to token-level shape.

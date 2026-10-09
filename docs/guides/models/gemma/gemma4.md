@@ -52,7 +52,7 @@ See the [GRPO guide](../../grpo.md) for algorithm and launch details.
 Context Parallel support uses the refactored AutoModel CP interface introduced
 by [PR #3498](https://github.com/NVIDIA-NeMo/RL/pull/3498). The E2B and 31B CP2
 recipes are thin overrides of their CP1 parents that change
-`policy.dtensor_cfg.context_parallel_size` to `2`. The 26B-A4B CP2 recipe also
+`policy.automodel_cfg.context_parallel_size` to `2`. The 26B-A4B CP2 recipe also
 changes expert parallelism from EP32 to EP16 so the model-parallel product fits
 on the same four-node allocation. Other model, optimizer, sequence-length, and
 generation settings remain identical to their CP1 parents.
@@ -78,7 +78,7 @@ other metrics are plotted at every recorded training step.
 ### E2B Context Parallel Parity
 
 The E2B CP1 and CP2 runs use the same 100-step training configuration except
-for `policy.dtensor_cfg.context_parallel_size`. Their trajectories remain close
+for `policy.automodel_cfg.context_parallel_size`. Their trajectories remain close
 across the six metrics: the mean absolute difference in validation accuracy is
 0.0083 across six aligned validation points, while the mean absolute difference
 in generation KL error is 1.6e-5 across 100 aligned training points.
@@ -99,7 +99,7 @@ validation accuracies are 0.741 for EP32 × CP1 and 0.751 for EP16 × CP2.
 ### 31B Context Parallel Parity
 
 The 31B CP1 and CP2 runs use the same four-node training configuration except
-for `policy.dtensor_cfg.context_parallel_size`. Both runs complete 100 steps.
+for `policy.automodel_cfg.context_parallel_size`. Both runs complete 100 steps.
 The mean absolute difference in validation accuracy is 0.0099 across 20 aligned
 validation points, while the mean absolute difference in generation KL error is
 2.2e-5 across 100 aligned training points. The final validation accuracies are

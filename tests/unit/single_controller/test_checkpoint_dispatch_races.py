@@ -211,6 +211,16 @@ class _PendingLedger:
         self._groups = [group for group in self._groups if group.group_id != group_id]
 
 
+def _sidecar_state(ledger: RolloutRecoveryLedger) -> dict[str, Any]:
+    """Ledger state plus the controller-owned keys every sidecar must carry."""
+    return {
+        **ledger.state_dict(),
+        "reward_settings": None,
+        "finalizer_metrics_by_group": {},
+        "finalizer_rewards_by_group": {},
+    }
+
+
 class _RecoveryRolloutManager:
     def __init__(self, ledger: RolloutRecoveryLedger) -> None:
         self.recovery_ledger = ledger
@@ -882,7 +892,10 @@ def test_canonical_replay_wins_over_stale_ledger_entry(
     asyncio.run(exercise())
 
 
-def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None:
+@pytest.mark.parametrize("schema_version", [2, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+def test_recovery_replays_step_7_without_readmitting_the_batch(
+    tmp_path, schema_version: int
+) -> None:
     """An admitted batch keeps target_step=7 across a process restart."""
 
     async def exercise() -> None:
@@ -918,6 +931,20 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
             batch_shortfall={6: 1},
             sampler_stamps_target_steps=True,
         )
+        saved_state["schema_version"] = schema_version
+        if schema_version == 2:
+            for key in (
+                "reward_settings",
+                "finalizer_metrics_by_group",
+                "finalizer_rewards_by_group",
+            ):
+                saved_state.pop(key)
+            for group in saved_state["groups"]:
+                group.pop("resolved_agent_name", None)
+                for sibling in group["siblings"]:
+                    for attempt in sibling["attempts"]:
+                        attempt.pop("reward_checks", None)
+                        attempt.pop("reward_log_context", None)
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
         torch.save(saved_state, recovery_path)
         payload_sha256 = hashlib.sha256(recovery_path.read_bytes()).hexdigest()
@@ -928,6 +955,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
         _init_recovery_telemetry(controller, train_steps=7)
+        controller._restored_replay_groups_to_regenerate = []
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
@@ -935,7 +963,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
-            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "rollout_recovery_schema_version": schema_version,
             "rollout_recovery_payload_sha256": payload_sha256,
             "rollout_recovery_group_count": 1,
         }
@@ -1037,7 +1065,7 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
                     admitted=False,
                 )
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
-        torch.save(saved_ledger.state_dict(), recovery_path)
+        torch.save(_sidecar_state(saved_ledger), recovery_path)
 
         sampler = _CountingInOrderSampler()
         sampler.restore_dispatch_index(6)
@@ -1045,6 +1073,7 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
         _init_recovery_telemetry(controller, train_steps=7)
+        controller._restored_replay_groups_to_regenerate = []
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
@@ -1197,12 +1226,13 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
                     admitted=True,
                 )
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
-        torch.save(saved_ledger.state_dict(), recovery_path)
+        torch.save(_sidecar_state(saved_ledger), recovery_path)
 
         rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        controller._restored_replay_groups_to_regenerate = []
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
             token_capture=SimpleNamespace(enabled=False)
