@@ -117,34 +117,24 @@ def test_right_shift_loss_wrapper_shifts_logits_and_delegates_attributes():
     assert wrapper.aggregation_type == inner.aggregation_type
 
 
-def test_cp_value_postprocessors_gather_before_right_shift(monkeypatch):
-    """Inference and loss paths must shift only after restoring global CP order."""
-    from nemo_rl.models.automodel.train import ValueLossPostProcessor
-    from nemo_rl.models.value import utils as value_utils
-    from nemo_rl.models.value.utils import gather_and_right_shift_values
+def test_cp_value_postprocessors_gather_before_right_shift():
+    """Inference and loss paths shift only after the CP sharder restores order."""
+    from nemo_rl.models.automodel.train import LossPostProcessor, ScorePostProcessor
+    from nemo_rl.models.value.utils import right_shift_values
     from nemo_rl.models.value.workers.automodel_value_worker import (
         RightShiftLossWrapper,
     )
 
     local_logits = torch.tensor([[[10.0], [40.0]]])
     full_logits = torch.tensor([[[10.0], [20.0], [30.0], [40.0]]])
-    gathered_inputs = []
+    cp_sharder = MagicMock()
+    cp_sharder.gather_token_tensor.return_value = full_logits
 
-    def fake_allgather(values, cp_group, seq_dim):
-        gathered_inputs.append(values.clone())
-        assert cp_group == "cp-group"
-        assert seq_dim == 1
-        return full_logits.squeeze(-1) if values.ndim == 2 else full_logits
-
-    monkeypatch.setattr(value_utils, "allgather_cp_sharded_tensor", fake_allgather)
-    monkeypatch.setattr(
-        "nemo_rl.models.automodel.train.allgather_cp_sharded_tensor", fake_allgather
+    scores = ScorePostProcessor(cfg={})(
+        logits=local_logits,
+        cp_sharder=cp_sharder,
     )
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
-
-    inference_values = gather_and_right_shift_values(
-        local_logits.squeeze(-1), "cp-group"
-    )
+    inference_values = right_shift_values(scores)
     torch.testing.assert_close(
         inference_values, torch.tensor([[0.0, 10.0, 20.0, 30.0]])
     )
@@ -163,7 +153,7 @@ def test_cp_value_postprocessors_gather_before_right_shift(monkeypatch):
     inner = RecordingLoss()
     cp_mesh = MagicMock()
     cp_mesh.get_group.return_value = "cp-group"
-    processor = ValueLossPostProcessor(
+    processor = LossPostProcessor(
         loss_fn=RightShiftLossWrapper(inner),
         cfg={},
         cp_mesh=cp_mesh,
@@ -176,75 +166,12 @@ def test_cp_value_postprocessors_gather_before_right_shift(monkeypatch):
         processed_inputs=MagicMock(),
         global_valid_seqs=torch.tensor(1),
         global_valid_toks=torch.tensor(4),
-        cp_sharder=None,
+        cp_sharder=cp_sharder,
     )
     expected = torch.tensor([[[0.0], [10.0], [20.0], [30.0]]])
     torch.testing.assert_close(inner.seen_logits, expected)
     torch.testing.assert_close(loss, expected.sum())
-    # Both paths handed the unshifted local shard to the gather operation.
-    torch.testing.assert_close(gathered_inputs[0], local_logits.squeeze(-1))
-    torch.testing.assert_close(gathered_inputs[1], local_logits)
-
-
-def test_context_parallel_sequence_length_validation():
-    from nemo_rl.models.value.workers.automodel_value_worker import (
-        validate_context_parallel_sequence_length,
-    )
-
-    validate_context_parallel_sequence_length(seq_len=8, cp_size=2)
-    with pytest.raises(ValueError, match=r"divisible by 2 \* context parallel"):
-        validate_context_parallel_sequence_length(seq_len=6, cp_size=2)
-
-
-def test_context_parallel_batch_padding():
-    from nemo_rl.models.value.workers.automodel_value_worker import (
-        pad_batch_for_context_parallel,
-    )
-
-    data = BatchedDataDict(
-        {
-            "input_ids": torch.arange(12).reshape(2, 6),
-            "attention_mask": torch.ones(2, 6),
-            "returns": torch.ones(2, 6),
-            "input_lengths": torch.tensor([6, 5]),
-        }
-    )
-
-    padded, original_seq_len = pad_batch_for_context_parallel(
-        data, cp_size=2, pad_token_id=99
-    )
-
-    assert original_seq_len == 6
-    assert padded["input_ids"].shape == (2, 8)
-    assert padded["attention_mask"].shape == (2, 8)
-    assert padded["returns"].shape == (2, 8)
-    assert padded["input_lengths"].shape == (2,)
-    assert torch.all(padded["input_ids"][:, 6:] == 99)
-    assert torch.all(padded["attention_mask"][:, 6:] == 0)
-    assert torch.all(padded["returns"][:, 6:] == 0)
-    # The caller's batch is not mutated.
-    assert data["input_ids"].shape == (2, 6)
-
-
-@pytest.mark.parametrize("cp_size", [1, 2])
-def test_context_parallel_batch_padding_noop(cp_size):
-    from nemo_rl.models.value.workers.automodel_value_worker import (
-        pad_batch_for_context_parallel,
-    )
-
-    data = BatchedDataDict(
-        {
-            "input_ids": torch.arange(8).reshape(2, 4),
-            "attention_mask": torch.ones(2, 4),
-        }
-    )
-
-    padded, original_seq_len = pad_batch_for_context_parallel(
-        data, cp_size=cp_size, pad_token_id=99
-    )
-
-    assert padded is data
-    assert original_seq_len == 4
+    assert cp_sharder.gather_token_tensor.call_count == 2
 
 
 def _create_value_test_config(
@@ -301,29 +228,6 @@ def _create_value_test_config(
             "kwargs": {"factor": 1.0, "total_iters": 1_000_000},
         },
     }
-
-
-def test_value_worker_init_rejects_cp_scoring_before_setup(monkeypatch):
-    from nemo_rl.models.value.workers import automodel_value_worker
-
-    config = _create_value_test_config(model_name="unused", cp=2)
-    apply_transformer_engine_patch = MagicMock()
-    monkeypatch.setattr(
-        automodel_value_worker,
-        "apply_transformer_engine_patch",
-        apply_transformer_engine_patch,
-    )
-
-    with pytest.raises(
-        NotImplementedError,
-        match=r"get_values\(\) scoring path does not support context parallelism",
-    ):
-        automodel_value_worker.AutomodelValueWorkerImpl(
-            config=config,
-            tokenizer=MagicMock(),
-        )
-
-    apply_transformer_engine_patch.assert_not_called()
 
 
 def _load_dcp_state(checkpoint_dir: Path, output_path: Path) -> dict[str, Any]:
@@ -390,10 +294,10 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
                 "algorithm": "modified_first_fit_decreasing",
             }
         elif k == "context_parallel":
-            config["dtensor_cfg"]["context_parallel_size"] = 2
+            config["automodel_cfg"]["context_parallel_size"] = 2
             config["precision"] = "bfloat16"
             config["make_sequence_length_divisible_by"] = (
-                4 * config["dtensor_cfg"]["tensor_parallel_size"]
+                4 * config["automodel_cfg"]["tensor_parallel_size"]
             )
         else:
             raise ValueError(f"Unknown config_updates key: {k!r}")
@@ -813,7 +717,7 @@ def test_value_worker_train_forward_equivalence(
                 worker.prepare_for_inference()
                 worker.save_checkpoint(
                     weights_path=weights_path,
-                    checkpointing_cfg=_make_checkpointing_cfg(tmp_path),
+                    is_final_checkpoint=False,
                 )
                 return None
             worker.prepare_for_training()

@@ -715,8 +715,6 @@ class TestScorePostProcessor:
                 cu_seqlens_q=torch.tensor([0, 3, 8, 10])
             ),
             vlm_kwargs={},
-            cp_buffers=[],
-            seq_index=None,
         )
 
         result = processor(
@@ -1163,13 +1161,13 @@ class TestForwardWithPostProcessingFn:
         # Verify result shape
         assert result.shape == (batch_size,)
 
-    def test_forward_with_score_post_processor_rejects_cp(
+    def test_forward_with_score_post_processor_gathers_cp(
         self,
         mock_model,
         base_cfg,
     ):
-        batch_size = 4
-        seq_len = 64
+        batch_size = 1
+        seq_len = 4
         input_ids = torch.randint(0, 32000, (batch_size, seq_len))
         processed_inputs = ProcessedInputs(
             input_ids=input_ids,
@@ -1191,25 +1189,33 @@ class TestForwardWithPostProcessingFn:
             original_batch_size=batch_size,
             original_seq_len=seq_len,
         )
+        local_logits = torch.tensor([[[10.0], [40.0]]])
+        full_logits = torch.tensor([[[10.0], [20.0], [30.0], [40.0]]])
+        mock_model.return_value = MagicMock(logits=local_logits)
+        cp_sharder = MagicMock()
+        cp_sharder.gather_token_tensor.return_value = full_logits
         prepared = PreparedModelForward(
             model_batch={"input_ids": input_ids},
             cp_size=2,
-            cp_sharder=MagicMock(),
+            cp_sharder=cp_sharder,
             model_context_factory=nullcontext,
         )
 
-        with pytest.raises(
-            NotImplementedError,
-            match="ScorePostProcessor does not support context_parallel_size > 1",
-        ):
-            forward_with_post_processing_fn(
-                model=mock_model,
-                prepared=prepared,
-                post_processing_fn=ScorePostProcessor(cfg=base_cfg),
-                processed_mb=processed_mb,
-            )
+        result, metrics, _ = forward_with_post_processing_fn(
+            model=mock_model,
+            prepared=prepared,
+            post_processing_fn=ScorePostProcessor(cfg=base_cfg),
+            processed_mb=processed_mb,
+        )
 
-        mock_model.assert_not_called()
+        torch.testing.assert_close(result, full_logits.squeeze(-1))
+        torch.testing.assert_close(metrics["scores"], result)
+        cp_sharder.gather_token_tensor.assert_called_once_with(
+            local_logits,
+            seq_dim=1,
+            trim=True,
+            fill=0.0,
+        )
 
 
 # =====================
