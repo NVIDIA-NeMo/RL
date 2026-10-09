@@ -1,0 +1,82 @@
+# Subagent RL for Agentic-VBench (port plan and status)
+
+Branch `arushig/agentic-vbench-subagents` (worktree `nemo-rl-ut-avb-subagents`)
+builds on the unified-teacher + context-compaction branch and adds subagent
+training modelled on `mengxiwu/nemo-rl-internal` branch
+`mengxiwu/compaction-subagent-nemorl-v2` (the `sand73` compaction/subagent
+harness, read on 2026-10-09 from a local clone at
+`/lustre/fsw/portfolios/nemotron/users/arushig/nemo-rl-internal-subagent`).
+
+## What the reference does
+
+- One fixed `training_mode` per run: `plain`, `compaction` or `subagent`,
+  validated at config time, on every published rollout and on resume. Compaction
+  and subagents are never combined.
+- Subagent mode: OpenCode's `task` tool is enabled for the primary agent; the
+  configured `general` child runs in its own session with the parent's
+  permissions, tools and turn limit, except an explicit `task` deny (depth one).
+  Sibling task calls run in parallel; each is foreground and the parent waits.
+- Training semantics: parent and child sessions are separate contiguous trace
+  rows of one scored rollout. Each session's own generated tokens are trained;
+  the copy of a child's answer inside the parent's tool result is context only.
+  The reward and GRPO advantage are computed once per original rollout and
+  shared across its traces; traces never add reward votes or change
+  prompt-group, sibling or scheduler counts (`multi_trace.py`,
+  `LogicalRolloutBatch`).
+- Evidence: per-trace ownership (`session_id`, `root_session_id`,
+  `parent_session_id`, `spawn_call_id`, owned `request_ids`, a
+  generation-call manifest with token digests) validated by
+  `session_traces.py`; checkpoint/replay recovery preserves ownership and
+  refuses semantic drift.
+- Mechanism: NeMo-Gym token echo (the agent returns exact prompt/generation
+  tokens per session) with a Gym and OpenCode provider source overlay that
+  exposes session identities and compaction boundaries.
+
+## How it maps onto this stack
+
+Our capture is the framework-owned ledger (PR #4200 / Gym PR #3368) with stock
+OpenCode behind the agent's capture proxy, so the semantics port and the
+mechanism changes:
+
+| Reference | Here |
+|---|---|
+| Token echo per session, Gym/OpenCode overlay | Ledger-captured calls; the proxy identifies sessions from request shape (stock OpenCode sends no session header) and routes each session to its own capture stream |
+| `traces` in the Gym result, `_postprocess_nemo_gym_traces` | Finalizer segments: a logical rollout already yields one row per chain (`{owner}_s{n}`, `segment_index`); child sessions become additional chains of the same owner, tagged with the session metadata |
+| `multi_trace.py` logical-rollout collapse | Partly present (grouping prompt and `owner_mask` are shared across a rollout's rows); vendored module supplies the explicit validation of one reward vote per rollout and complete trace ownership |
+| Ownership masks in the loss | Automatic: only generated tokens of each chain are targets; a child's answer copied into the parent's tool result is prompt text in the parent's chain |
+| `training_mode` config + validators | `session_traces.py` vendored; agent knobs `opencode_training_mode`, `opencode_subagents_enabled`, `opencode_subagent_max_depth`, `opencode_subagent_max_active` |
+| OpenCode `general` child with `task` deny | `harbor_runner.job_config`: `permission.task` allow/deny, `agent.general` (mode subagent, parent's steps, `task` deny) |
+
+## Phases
+
+0. **Vendored validation (done, this branch):** `nemo_rl/environments/session_traces.py`,
+   `nemo_rl/algorithms/single_controller_utils/multi_trace.py` and their tests,
+   unchanged from the reference, not yet wired.
+1. **Harness (done on the Gym branch `cc-pr3368-unified-subagents`):** the agent
+   config knobs above; `job_config` emits the OpenCode permission and `general`
+   child configuration and rejects compaction/pruning in subagent mode. Default
+   behaviour changes in one way for every mode: the `task` tool is now denied
+   unless subagents are enabled, so single-session runs are single-session by
+   construction.
+2. **Session-aware capture (next):** the proxy keys sessions by the request's
+   leading context (system prompt and first user turn); a child session gets its
+   own capture rollout id under the episode (`<rollout>-c<k>`), so Gym's
+   sequential admission holds per session while siblings run in parallel. The
+   agent returns the child ids and `spawn_call_id` (the parent's `task`
+   tool-call id) in its verify response; the finalizer fetches all session
+   receipts of an owner and tags rows with `session_role`/`parent_session_id`.
+3. **Trainer semantics:** `env.nemo_gym.training_mode` plus
+   `async_rl.multi_trace_enabled` wiring in config validation, one reward vote
+   per owner across session rows (`logical_rollout_batch`), resume checks
+   (`validate_multitrace_resume_config`), and evidence
+   (`trace_training_evidence`) logged per step.
+4. **Validation:** unit tests for session detection and tagging; a smoke with
+   `AGENTIC_VBENCH_TRAINING_MODE=subagent` on assembly tasks checking observed
+   parallel children, out-of-order returns, one reward vote per rollout, and
+   zero poisoned calls; then the 20-step run.
+
+## Not ported
+
+Score centering, the SFT export tooling, the SWE-bench harness and the
+`sand71`/`sand73` validation primitives are specific to the reference's
+experiments and are not part of this port.
