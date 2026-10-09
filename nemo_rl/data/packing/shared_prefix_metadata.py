@@ -24,9 +24,6 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-
-if TYPE_CHECKING:
     from megatron.rl.shared_prefix_metadata import (
         GroupCoherentShardPlan,
         FixedExecutionSlotPlan,
@@ -37,11 +34,9 @@ __all__ = [
     "FixedExecutionSlotPlan",
     "plan_fixed_execution_slots",
     "plan_group_coherent_shards",
-    "make_repeated_group_ids",
     "SHARED_PREFIX_GROUP_ID",
     "SHARED_PREFIX_PROMPT_LENGTHS",
     "SHARED_PREFIX_EXECUTION_SLOT",
-    "stamp_repeated_group_ids",
     "group_id_from_sample_id",
 ]
 
@@ -100,41 +95,9 @@ def plan_group_coherent_shards(
     )
 
 
-def make_repeated_group_ids(
-    *,
-    num_rows: int,
-    group_size: int,
-    namespace: str,
-) -> list[str]:
-    """Delegate to :func:`megatron.rl.shared_prefix_metadata.make_repeated_group_ids`."""
-    from megatron.rl.shared_prefix_metadata import (
-        make_repeated_group_ids as implementation,
-    )
-
-    return implementation(num_rows=num_rows, group_size=group_size, namespace=namespace)
-
-
 SHARED_PREFIX_GROUP_ID = "shared_prefix_group_id"
 SHARED_PREFIX_PROMPT_LENGTHS = "shared_prefix_prompt_lengths"
 SHARED_PREFIX_EXECUTION_SLOT = "_shared_prefix_execution_slot"
-
-
-def stamp_repeated_group_ids(
-    batch: "BatchedDataDict[Any]",
-    *,
-    group_size: int,
-    namespace: str,
-) -> None:
-    """Attach validated prompt-group IDs to a repeated batch in place."""
-    if SHARED_PREFIX_GROUP_ID in batch:
-        raise ValueError(
-            f"batch already contains reserved field {SHARED_PREFIX_GROUP_ID!r}"
-        )
-    batch[SHARED_PREFIX_GROUP_ID] = make_repeated_group_ids(
-        num_rows=batch.size,
-        group_size=group_size,
-        namespace=namespace,
-    )
 
 
 def parse_grouped_sample_id(sample_id: str) -> tuple[str, int]:

@@ -15,33 +15,9 @@
 import pytest
 
 from nemo_rl.data.packing.shared_prefix_metadata import (
-    SHARED_PREFIX_GROUP_ID,
     group_id_from_sample_id,
     parse_grouped_sample_id,
-    stamp_repeated_group_ids,
 )
-
-
-class _BatchStub(dict[str, list[int] | list[str]]):
-    """Minimal batch protocol needed by the metadata stamper."""
-
-    @property
-    def size(self) -> int:
-        return len(self["rows"])
-
-
-def test_stamp_repeated_group_ids_refuses_reserved_field_overwrite() -> None:
-    batch = _BatchStub({"rows": [0, 1, 2, 3]})
-    stamp_repeated_group_ids(batch, group_size=2, namespace="batch")
-
-    assert batch[SHARED_PREFIX_GROUP_ID] == [
-        "batch:0",
-        "batch:0",
-        "batch:1",
-        "batch:1",
-    ]
-    with pytest.raises(ValueError, match="already contains"):
-        stamp_repeated_group_ids(batch, group_size=2, namespace="again")
 
 
 def test_group_id_from_sample_id_handles_embedded_group_markers() -> None:
