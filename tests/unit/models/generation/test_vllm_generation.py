@@ -198,7 +198,7 @@ def test_nvfp4_pertoken_warns_on_an_entry_point_without_end_to_end_coverage():
     assert not [w for w in caught if "has end-to-end coverage" in str(w.message)]
 
 
-basic_dtensor_test_config: PolicyConfig = {
+basic_automodel_test_config: PolicyConfig = {
     "model_name": basic_vllm_test_config["model_name"],
     "tokenizer": {
         "name": basic_vllm_test_config["tokenizer"]["name"],
@@ -221,7 +221,7 @@ basic_dtensor_test_config: PolicyConfig = {
             "eps": 1e-8,
         },
     },
-    "dtensor_cfg": {
+    "automodel_cfg": {
         "enabled": True,
         "checkpoint": {
             "model_save_format": "safetensors",
@@ -1703,7 +1703,7 @@ def get_basic_megatron_test_config(
         "logprob_batch_size": 2,
         "precision": precision,
         "offload_optimizer_for_logprob": False,
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },
         "dynamic_batching": {
@@ -2120,7 +2120,7 @@ async def test_vllm_policy_generation_async(
         vllm_config["vllm_cfg"]["async_engine"] = True
         vllm_config["vllm_cfg"]["tensor_parallel_size"] = tensor_parallel_size
         vllm_config["vllm_cfg"]["pipeline_parallel_size"] = pipeline_parallel_size
-        dtensor_config = basic_dtensor_test_config
+        automodel_config = basic_automodel_test_config
         from nemo_rl.models.policy.lm_policy import Policy
 
         print("creating vllm policy...")
@@ -2128,7 +2128,7 @@ async def test_vllm_policy_generation_async(
         async_policy.finish_generation()
 
         print("creating lm policy...")
-        lm_policy = Policy(cluster, dtensor_config, tokenizer)
+        lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print("preparing refit info...")
         state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
@@ -2229,8 +2229,8 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
     from nemo_rl.models.policy.lm_policy import Policy
 
-    dtensor_config = basic_dtensor_test_config
-    lm_policy = Policy(cluster, dtensor_config, tokenizer)
+    automodel_config = basic_automodel_test_config
+    lm_policy = Policy(cluster, automodel_config, tokenizer)
 
     state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
     policy.prepare_refit_info(state_dict_info)
@@ -2548,12 +2548,12 @@ async def test_vllm_generation_with_hf_training_colocated(
 
     # Create Policy
     print("Creating DTensor policy...")
-    dtensor_config = deepcopy(basic_dtensor_test_config)
-    dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
-    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
-    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
-    dtensor_config["train_global_batch_size"] = 4
-    lm_policy = Policy(cluster, dtensor_config, tokenizer)
+    automodel_config = deepcopy(basic_automodel_test_config)
+    automodel_config["automodel_cfg"]["cpu_offload"] = cpu_offload
+    automodel_config["automodel_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    automodel_config["automodel_cfg"]["lora_cfg"]["enabled"] = enable_lora
+    automodel_config["train_global_batch_size"] = 4
+    lm_policy = Policy(cluster, automodel_config, tokenizer)
 
     # Prepare refit info
     print("Preparing refit info...")
@@ -2623,13 +2623,13 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     )
     # Create Policy
     print("Creating DTensor policy...")
-    dtensor_config = deepcopy(basic_dtensor_test_config)
-    dtensor_config["generation"]["colocated"]["enabled"] = False
-    dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
-    dtensor_config["train_global_batch_size"] = 4
-    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
-    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
-    lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
+    automodel_config = deepcopy(basic_automodel_test_config)
+    automodel_config["generation"]["colocated"]["enabled"] = False
+    automodel_config["automodel_cfg"]["cpu_offload"] = cpu_offload
+    automodel_config["train_global_batch_size"] = 4
+    automodel_config["automodel_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    automodel_config["automodel_cfg"]["lora_cfg"]["enabled"] = enable_lora
+    lm_policy = Policy(policy_cluster_separate, automodel_config, tokenizer)
 
     # Refit
     # initialize collective communication for update weights
@@ -3292,14 +3292,14 @@ def test_vllm_weight_update_and_prefix_cache_reset(
     if tensor_parallel_size > 1:
         vllm_config["vllm_kwargs"] = {"distributed_executor_backend": "ray"}
 
-    dtensor_config = basic_dtensor_test_config
+    automodel_config = basic_automodel_test_config
 
     # Create policies
     vllm_policy = None
     lm_policy = None
     try:
         print(f"Creating DTensor policy for TP={tensor_parallel_size}...")
-        lm_policy = Policy(cluster, dtensor_config, tokenizer)
+        lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print(f"Creating vLLM policy for TP={tensor_parallel_size}...")
         vllm_policy = VllmGeneration(cluster, vllm_config)
@@ -3410,7 +3410,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
 
     print("Creating Training Policy...")
     if train_backend == "dtensor":
-        train_config = deepcopy(basic_dtensor_test_config)
+        train_config = deepcopy(basic_automodel_test_config)
     elif train_backend == "megatron":
         train_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
     else:
@@ -3488,8 +3488,8 @@ def test_vllm_generation_with_stop(cluster, test_input_data, tokenizer, is_eval)
         vllm_generation.finish_generation()
 
         print("Creating DTensor policy...")
-        dtensor_config = basic_dtensor_test_config
-        lm_policy = Policy(cluster, dtensor_config, tokenizer)
+        automodel_config = basic_automodel_test_config
+        lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print("preparing refit info...")
         state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
@@ -3589,7 +3589,7 @@ async def test_vllm_refit_non_colocated_update_weights(
 
     # Get policy config
     if policy_type == "dtensor":
-        lm_config = deepcopy(basic_dtensor_test_config)
+        lm_config = deepcopy(basic_automodel_test_config)
     else:
         assert policy_type == "megatron"
         lm_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")

@@ -161,7 +161,7 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
             f"force_hf=False but the custom model for {arch} uses an adapter that "
             f"does not implement 'convert_single_tensor_to_hf', which is required "
             f"for weight syncing. Please set "
-            f"`policy.dtensor_cfg.automodel_kwargs.force_hf=true` or file an issue "
+            f"`policy.automodel_cfg.automodel_kwargs.force_hf=true` or file an issue "
             f"at https://github.com/NVIDIA-NeMo/Automodel to add support."
         )
 
@@ -170,7 +170,7 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
         f"WARNING: Custom model for {arch} uses an adapter that does not implement "
         f"'convert_single_tensor_to_hf' (required for weight syncing). "
         f"Auto-setting force_hf=True. To silence this warning, explicitly set "
-        f"`policy.dtensor_cfg.automodel_kwargs.force_hf=true` in your config."
+        f"`policy.automodel_cfg.automodel_kwargs.force_hf=true` in your config."
     )
     automodel_kwargs["force_hf"] = True
 
@@ -326,7 +326,7 @@ def validate_and_prepare_config(
     dtype = STRING_TO_DTYPE[precision]
 
     # Get other configuration values
-    cpu_offload = config["dtensor_cfg"]["cpu_offload"]
+    cpu_offload = config["automodel_cfg"]["cpu_offload"]
     offload_optimizer_for_logprob = config.get("offload_optimizer_for_logprob", False)
     max_grad_norm = config["max_grad_norm"]
     enable_seq_packing = config["sequence_packing"]["enabled"]
@@ -354,7 +354,7 @@ def validate_and_prepare_config(
     # NeMoAutoModelForCausalLM uses flash_attention_2 by default
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
-    cp_size_cfg = config["dtensor_cfg"]["context_parallel_size"]
+    cp_size_cfg = config["automodel_cfg"]["context_parallel_size"]
     attn_impl = (
         "flash_attention_2"
         if (enable_seq_packing and cp_size_cfg == 1)
@@ -413,9 +413,9 @@ def validate_and_prepare_config(
         model_class = resolve_model_class(model_config.model_type)
 
     # Get parallelization sizes
-    tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
-    cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
-    sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
+    tp_size = config["automodel_cfg"].get("tensor_parallel_size", 1)
+    cp_size = config["automodel_cfg"].get("context_parallel_size", 1)
+    sequence_parallel_enabled = config["automodel_cfg"]["sequence_parallel"]
 
     # Validate parallelization configuration
     if cp_size > 1 and enable_seq_packing:
@@ -495,11 +495,11 @@ def setup_distributed(
     cpu_offload = runtime_config.cpu_offload
 
     # Extract parallelization config
-    tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
-    cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
-    ep_size = config["dtensor_cfg"].get("expert_parallel_size", 1)
-    dp_replicate_size = config["dtensor_cfg"].get("dp_replicate_size", 1)
-    sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
+    tp_size = config["automodel_cfg"].get("tensor_parallel_size", 1)
+    cp_size = config["automodel_cfg"].get("context_parallel_size", 1)
+    ep_size = config["automodel_cfg"].get("expert_parallel_size", 1)
+    dp_replicate_size = config["automodel_cfg"].get("dp_replicate_size", 1)
+    sequence_parallel_enabled = config["automodel_cfg"]["sequence_parallel"]
 
     # HSDP requires the data-parallel axis to evenly contain the replicate dim.
     model_parallel_size = tp_size * cp_size * ep_size
@@ -512,7 +512,7 @@ def setup_distributed(
         )
 
     # Build tp_plan from custom_parallel_plan config if set, else None (auto-select)
-    tp_plan = config["dtensor_cfg"].get("custom_parallel_plan", None)
+    tp_plan = config["automodel_cfg"].get("custom_parallel_plan", None)
 
     # Create FSDP2Config
     fsdp2_config = FSDP2Config(
@@ -524,12 +524,12 @@ def setup_distributed(
             output_dtype=torch.float32,
         ),
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
-        activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
-        defer_fsdp_grad_sync=config["dtensor_cfg"].get("defer_fsdp_grad_sync", True),
+        activation_checkpointing=config["automodel_cfg"]["activation_checkpointing"],
+        defer_fsdp_grad_sync=config["automodel_cfg"].get("defer_fsdp_grad_sync", True),
     )
 
     # Create MoEParallelizerConfig from nested moe_parallelizer options
-    moe_parallelizer_cfg = config["dtensor_cfg"].get("moe_parallelizer", {})
+    moe_parallelizer_cfg = config["automodel_cfg"].get("moe_parallelizer", {})
     moe_config = MoEParallelizerConfig(**moe_parallelizer_cfg)
 
     # Handle world_size=1 + cpu_offload
@@ -581,7 +581,7 @@ def _validate_lora_adapter_config(
     config_path = os.path.join(adapter_dir, "adapter_config.json")
     if not os.path.isfile(config_path):
         raise FileNotFoundError(
-            f"dtensor_cfg.lora_cfg.restore_from: {config_path} not found. The "
+            f"automodel_cfg.lora_cfg.restore_from: {config_path} not found. The "
             "donor checkpoint must carry an adapter_config.json so its "
             "provenance can be validated."
         )
@@ -589,20 +589,20 @@ def _validate_lora_adapter_config(
         adapter_config = json.load(f)
     if adapter_config.get("peft_type") != "LORA":
         raise ValueError(
-            f"dtensor_cfg.lora_cfg.restore_from: {config_path} has "
+            f"automodel_cfg.lora_cfg.restore_from: {config_path} has "
             f"peft_type={adapter_config.get('peft_type')!r}; only 'LORA' "
             "adapters can be warm-started from."
         )
     for config_key, lora_key in (("r", "dim"), ("lora_alpha", "alpha")):
         if config_key not in adapter_config:
             raise ValueError(
-                f"dtensor_cfg.lora_cfg.restore_from: {config_path} has no "
+                f"automodel_cfg.lora_cfg.restore_from: {config_path} has no "
                 f"{config_key!r} field; cannot verify compatibility with this "
                 "run's lora_cfg."
             )
         if int(adapter_config[config_key]) != int(lora_cfg[lora_key]):
             raise ValueError(
-                f"dtensor_cfg.lora_cfg.restore_from: donor adapter "
+                f"automodel_cfg.lora_cfg.restore_from: donor adapter "
                 f"{config_key}={adapter_config[config_key]} does not match this "
                 f"run's lora_cfg.{lora_key}={lora_cfg[lora_key]}. Warm starting "
                 "requires the same LoRA rank and scaling; train a new adapter "
@@ -611,7 +611,7 @@ def _validate_lora_adapter_config(
     donor_base = adapter_config.get("base_model_name_or_path")
     if donor_base and donor_base != "N/A" and donor_base != model_name:
         raise ValueError(
-            f"dtensor_cfg.lora_cfg.restore_from: donor adapter was trained on "
+            f"automodel_cfg.lora_cfg.restore_from: donor adapter was trained on "
             f"base model {donor_base!r} but this run uses model_name="
             f"{model_name!r}."
         )
@@ -634,7 +634,7 @@ def _validate_lora_adapter_keys(
         donor_keys = set(f.keys())
     if not donor_keys:
         raise ValueError(
-            f"dtensor_cfg.lora_cfg.restore_from: {adapter_dir}/"
+            f"automodel_cfg.lora_cfg.restore_from: {adapter_dir}/"
             "adapter_model.safetensors contains no tensors."
         )
     # HF PEFT exports prefix keys with "base_model.model."; the loader strips
@@ -668,7 +668,7 @@ def _validate_lora_adapter_keys(
     unexpected = sorted(normalized_donor_keys - normalized_expected_keys)
     if missing or unexpected:
         raise ValueError(
-            "dtensor_cfg.lora_cfg.restore_from: donor adapter key mismatch "
+            "automodel_cfg.lora_cfg.restore_from: donor adapter key mismatch "
             f"against this run's LoRA parameters. Missing from donor: "
             f"{missing[:5]}{' ...' if len(missing) > 5 else ''}; unexpected in "
             f"donor: {unexpected[:5]}{' ...' if len(unexpected) > 5 else ''}. "
@@ -749,7 +749,7 @@ def setup_model_and_optimizer(
     tp_size = distributed_context.tp_size
     cp_size = distributed_context.cp_size
     sequence_parallel_enabled = fsdp2_config.sequence_parallel
-    ep_size = config["dtensor_cfg"].get("expert_parallel_size", 1)
+    ep_size = config["automodel_cfg"].get("expert_parallel_size", 1)
 
     model_name = config["model_name"]
 
@@ -787,7 +787,7 @@ def setup_model_and_optimizer(
                 "Context parallel is not supported for the Gemma 4 unified "
                 "checkpoint (model_type='gemma4_unified'). Its global-attention "
                 "GQA uses head_dim=512, for which no CP SDPA kernel is available. "
-                "Set policy.dtensor_cfg.context_parallel_size = 1. See "
+                "Set policy.automodel_cfg.context_parallel_size = 1. See "
                 "docs/guides/models/gemma/gemma4.md."
             )
 
@@ -813,13 +813,13 @@ def setup_model_and_optimizer(
                 )
 
     # LoRA configuration
-    lora_cfg = config["dtensor_cfg"].get("lora_cfg", None)
+    lora_cfg = config["automodel_cfg"].get("lora_cfg", None)
     peft_config = None
     lora_enabled = lora_cfg is not None and lora_cfg["enabled"]
     if not lora_enabled and (lora_cfg or {}).get("restore_from"):
         raise ValueError(
-            "dtensor_cfg.lora_cfg.restore_from is set but "
-            "dtensor_cfg.lora_cfg.enabled is False. Enable LoRA to warm start "
+            "automodel_cfg.lora_cfg.restore_from is set but "
+            "automodel_cfg.lora_cfg.enabled is False. Enable LoRA to warm start "
             "from an adapter checkpoint."
         )
     if lora_enabled:
@@ -834,7 +834,7 @@ def setup_model_and_optimizer(
     print(f"[Rank {rank}] Initializing model via from_pretrained...")
 
     # Prepare automodel kwargs
-    automodel_kwargs = config["dtensor_cfg"].get("automodel_kwargs", {})
+    automodel_kwargs = config["automodel_cfg"].get("automodel_kwargs", {})
     if automodel_kwargs.get("backend", None) is not None:
         backend_class = _resolve_target(
             automodel_kwargs.get("backend", None)["_target_"]
@@ -873,7 +873,7 @@ def setup_model_and_optimizer(
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,
         ]
-    elif config["dtensor_cfg"]["activation_checkpointing"]:
+    elif config["automodel_cfg"]["activation_checkpointing"]:
         # For activation checkpointing, we must disable the cudnn SDPA backend because
         # it may not be selected during recomputation.
         # In that case, we will get the following error:
@@ -888,7 +888,7 @@ def setup_model_and_optimizer(
 
     # For activation checkpointing, we also must globally disable the cudnn SDPA backend
     # to ensure that cudnn does not get selected during recomputation.
-    if config["dtensor_cfg"]["activation_checkpointing"]:
+    if config["automodel_cfg"]["activation_checkpointing"]:
         from torch.backends import cuda
 
         cuda.enable_cudnn_sdp(False)
@@ -918,7 +918,7 @@ def setup_model_and_optimizer(
         strategy_config=fsdp2_config,
         pipeline_config=None,
         moe_parallel_config=moe_config if ep_size > 1 else None,
-        activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
+        activation_checkpointing=config["automodel_cfg"]["activation_checkpointing"],
     )
 
     # Create model via from_pretrained - handles meta device init, parallelization,

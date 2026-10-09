@@ -120,7 +120,11 @@ def load_dataset_from_path(
         ".parquet": "parquet",
         ".txt": "text",
     }
-    suffix = os.path.splitext(data_path)[-1].lower()
+    suffix = (
+        ".jsonl"
+        if data_path.lower().endswith(".jsonl.packed")
+        else os.path.splitext(data_path)[-1].lower()
+    )
     dataset_type = FILEEXT2TYPE.get(suffix)
     # Keep each JSONL line as an unparsed string, whatever the file suffix.
     keep_raw_lines = suffix == ".jsonl" or (
@@ -200,6 +204,7 @@ def resolve_external_dataset_class(dataset_name: str) -> type:
 # they configured. Keys consumed by the dispatchers themselves (dataset_name,
 # env_name, processor, prompt_file, system_prompt_file) are deliberately absent.
 _BEHAVIORAL_DATASET_CONFIG_KEYS = (
+    "chat_key",
     "chosen_key",
     "data_path",
     "download_dir",

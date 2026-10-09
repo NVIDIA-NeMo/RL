@@ -114,7 +114,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     --config $PROJECT_ROOT/examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml \
     policy.model_name=$MODEL_DIR \
     ++policy.router_replay.enabled=true \
-    policy.dtensor_cfg.enabled=false \
+    policy.automodel_cfg.enabled=false \
     policy.megatron_cfg.enabled=true \
     policy.megatron_cfg.tensor_model_parallel_size=2 \
     policy.megatron_cfg.pipeline_model_parallel_size=1 \

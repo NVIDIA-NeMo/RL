@@ -78,6 +78,7 @@ apt-get install -y --no-install-recommends \
     vim \
     ccache \
     protobuf-compiler \
+    libzmq3-dev \
 
 # Nsight: install a pinned release from NVIDIA's devtools apt repo instead of
 # the CUDA base image's bundled copy, which is built against an outdated Go
@@ -197,7 +198,6 @@ ARG TRTLLM_CCACHE_MAXSIZE=20G
 ARG TRTLLM_BUILD_JOBS=24
 ARG RUNTIME_UID
 ARG RUNTIME_GID
-
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
@@ -364,6 +364,21 @@ EOF
 COPY --from=nemo-rl tools/build-custom-trtllm.sh ./tools/build-custom-trtllm.sh
 COPY --from=nemo-rl --link 3rdparty/TensorRT-LLM-workspace/ ./3rdparty/TensorRT-LLM-workspace/
 
+# NIXL is only consumed by the TRT-LLM wheel build below, so it is built inside
+# that block rather than in `base`. Keep in sync with the pinned TRT-LLM ref's
+# docker/common/install_nixl.sh; re-check on every [tool.trtllm].ref bump.
+#
+# Declared here rather than with the other ARGs: BuildKit puts ARG and ENV into
+# the environment of every later RUN, so declaring it above the dependency RUN
+# would make a NIXL bump bust that hour-long layer for every image, including
+# SKIP_TRTLLM_BUILD=1 ones.
+ARG NIXL_VERSION=v1.4.0
+# The NGC base image sets ENV NIXL_VERSION=1.0.1, and an ARG only changes the
+# build-time environment. Re-export so the image -- and _backend.py's wheel
+# cache key, since build_wheel.py bundles NIXL into the wheel -- see the
+# version actually built here.
+ENV NIXL_VERSION=${NIXL_VERSION}
+
 RUN --mount=type=ssh \
     --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
     --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked \
@@ -382,6 +397,80 @@ if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
     echo "SKIP_TRTLLM_BUILD is set; skipping the isolated TRT-LLM build"
     exit 0
 fi
+
+# KV cache transceiver (TRT-LLM prefill/decode disaggregation).
+#
+# TensorRT-LLM compiles every non-MPI cache-transceiver backend out of the wheel
+# unless it is built against UCX, and the NIXL backend additionally needs NIXL
+# headers/libs at cmake time (cpp/CMakeLists.txt only runs find_package(NIXL)
+# inside its ENABLE_UCX block). backend=DEFAULT resolves to NIXL, so an image
+# without NIXL can only serve an explicit backend=UCX.
+#
+# Built here rather than in `base` so SKIP_TRTLLM_BUILD images don't pay for it:
+# nothing outside the wheel build below consumes NIXL, and build_wheel.py
+# vendors both UCX and NIXL into the wheel with $ORIGIN rpaths, so the runtime
+# image needs neither on LD_LIBRARY_PATH.
+#
+# UCX itself ships in the NGC base image under /usr/local/ucx, but cmake's
+# find_package(ucx) does not search that prefix on its own -- hence ucx_ROOT.
+# libzmq (apt-installed in `base`) is the UCX wrapper's control plane: a hard
+# cmake requirement to build, and a runtime dependency on every node that runs
+# an engine, since the wrapper is dlopen()ed on the first KV transfer.
+export ucx_ROOT=/usr/local/ucx
+export LD_LIBRARY_PATH="/usr/local/ucx/lib:${LD_LIBRARY_PATH:-}"
+
+if [[ ! -d /usr/local/ucx/lib/cmake/ucx ]]; then
+    echo "UCX missing from the base image; NIXL's UCX plugin cannot build" >&2
+    exit 1
+fi
+
+(
+# NIXL builds with meson/ninja and links Python bindings against pybind11. Like
+# the other from-source builds in this repo (tools/build-custom-flashinfer.sh,
+# tools/build-custom-vllm.sh), the build-time Python deps go into a uv venv
+# rather than the system interpreter -- and this one is thrown away in the same
+# layer, so nothing survives into the runtime environment.
+uv venv /tmp/nixl-build-venv
+uv pip install --python /tmp/nixl-build-venv/bin/python meson ninja pybind11 setuptools
+export PATH="/tmp/nixl-build-venv/bin:${PATH}"
+
+GDS_PATH=/usr/local/cuda/targets/x86_64-linux
+if [[ "$(uname -m)" != "x86_64" ]]; then
+    GDS_PATH=/usr/local/cuda/targets/sbsa-linux
+fi
+# NIXL links against the CUDA driver stub, which does not live on the default
+# loader path inside the build container.
+CUDA_SO=$(find /usr/local -name libcuda.so.1 | head -n1)
+if [[ -z "${CUDA_SO}" ]]; then
+    echo "libcuda.so.1 not found under /usr/local; NIXL cannot link against the CUDA driver" >&2
+    exit 1
+fi
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$(dirname "${CUDA_SO}")"
+
+cd /tmp
+git clone --depth 1 -b "${NIXL_VERSION}" https://github.com/ai-dynamo/nixl.git
+cd nixl
+meson setup builddir \
+    -Ducx_path=/usr/local/ucx \
+    -Dcudapath_lib=/usr/local/cuda/lib64 \
+    -Dcudapath_inc=/usr/local/cuda/include \
+    -Dgds_path="${GDS_PATH}" \
+    -Dinstall_headers=true \
+    -Ddisable_plugins=POSIX \
+    -Dbuild_tests=false \
+    -Dbuild_examples=false \
+    --buildtype=release
+cd builddir && ninja install
+cd /tmp && rm -rf /tmp/nixl /tmp/nixl-build-venv
+)
+
+test -f /opt/nvidia/nvda_nixl/include/nixl.h
+# ldconfig rather than ENV: this runs inside a conditional block, so the arch
+# dir is discovered rather than hardcoded, and SKIP_TRTLLM_BUILD images get
+# neither the libraries nor the loader entry.
+NIXL_LIB=$(dirname "$(find /opt/nvidia/nvda_nixl -name libnixl.so -print -quit)")
+printf '%s\n' "${NIXL_LIB}" "${NIXL_LIB}/plugins" > /etc/ld.so.conf.d/nixl.conf
+ldconfig
 
 # These settings are build-only and intentionally do not persist in the final
 # NeMo-RL image. COMPILERCHECK=content is robust to compiler timestamp changes
