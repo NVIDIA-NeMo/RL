@@ -4089,12 +4089,13 @@ requires-dist = [
     { name = "hydra-core" },
     { name = "itsdangerous" },
     { name = "jinja2", specifier = ">=3.1" },
+    { name = "jinja2", marker = "extra == 'ray'", specifier = ">=3.1" },
     { name = "jsonschema", specifier = ">=4.18,<5" },
     { name = "mcp", specifier = ">=1.28.1,<2" },
     { name = "mlflow", marker = "extra == 'mlflow'", specifier = ">=3.16.1" },
     { name = "mlflow-skinny", marker = "extra == 'mlflow'", specifier = ">=3.16.1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8.0" },
-    { name = "nemo-gym", extras = ["dev", "mlflow", "sandbox", "wandb"], marker = "extra == 'all'" },
+    { name = "nemo-gym", extras = ["dev", "mlflow", "ray", "sandbox", "wandb"], marker = "extra == 'all'" },
     { name = "nemo-lens", extras = ["sdk"], marker = "extra == 'telemetry'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b0f977d414b2f89938604a0b7eaa78ee08bc8700" },
     { name = "omegaconf" },
     { name = "openai", specifier = "==2.44.0" },
@@ -4118,6 +4119,7 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'dev'" },
     { name = "python-multipart", specifier = ">=0.0.27" },
     { name = "ray", extras = ["default"], specifier = ">=2.58.0" },
+    { name = "ray", extras = ["default"], marker = "extra == 'ray'", specifier = ">=2.58.0" },
     { name = "requests-mock", marker = "extra == 'dev'" },
     { name = "rich" },
     { name = "ruff", marker = "extra == 'dev'" },
@@ -4132,7 +4134,7 @@ requires-dist = [
     { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.30.0" },
     { name = "yappi", specifier = ">=1.7.6" },
 ]
-provides-extras = ["all", "mlflow", "wandb", "vllm", "sandbox", "openshell", "telemetry", "dev"]
+provides-extras = ["all", "ray", "mlflow", "wandb", "vllm", "sandbox", "openshell", "telemetry", "dev"]
 
 [package.metadata.requires-dev]
 codec = [
