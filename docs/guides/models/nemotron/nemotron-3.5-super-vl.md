@@ -169,5 +169,18 @@ same order as the drift documented for other models; the isolated
 `token_mult_prob_error` returns to ~1.03 on the next step. The chain ran as five
 4-hour Slurm jobs that resumed from the latest checkpoint.
 
-**Image GRPO, CLEVR-CoGenT** — reference curves for the image recipe on stock
-vLLM 0.29 will be added once the 16-node run completes.
+**Image GRPO, CLEVR-CoGenT** — 63 steps, `max_new_tokens: 4096`, starting from
+`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16` on stock vLLM 0.29 with
+the RADIO source patches described above (vision tower frozen).
+
+![Nemotron 3.5 Super VL image GRPO training curves](../../../assets/nemotron/nemotron-3.5-super-vl-image-grpo-clevr-16n4g.png)
+
+CLEVR-CoGenT (valA, 256 samples) accuracy rises from 0.78 at step 0 to **0.90
+at step 50** (0.82 at step 10, 0.88 at step 20, 0.90 at steps 30 and 40, 0.90
+at step 60) while the mean validation response length falls from ~1,120 to
+~800 tokens. Training reward moves from a 0.71-0.87 band in the first ten
+steps to 0.86-0.95 after step 30. `gen_kl_error` stays flat at 0.0025-0.0031,
+`token_mult_prob_error` at 1.02-1.04 and `truncation_rate` below 0.05: trainer
+and vLLM stay in agreement across every refit. Steps take ~8 minutes (16 to
+20 minutes when the batch retries generation); the chain ran as three 4-hour
+Slurm jobs that resumed from the latest checkpoint (steps 21 and 43).
