@@ -2185,6 +2185,57 @@ def test_restore_first_train_step_param_sync(
         assert worker._first_train_step_forward_pre_hook_disabled is True
 
 
+def test_colocated_inference_model_gets_glm52_native_fp8_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
+    inference_mcfg = {
+        "tensor_model_parallel_size": 2,
+        "pipeline_model_parallel_size": 1,
+        "expert_model_parallel_size": 8,
+        "context_parallel_size": 1,
+        "transformer_impl": "transformer_engine",
+    }
+    model_provider = object()
+    worker._colocated_reshard_plan = SimpleNamespace(
+        inference_megatron_cfg=inference_mcfg,
+        initial_model_provider=model_provider,
+    )
+    worker.megatron_cfg = object()
+    inference_model = object()
+    build_calls = []
+    patch_calls = []
+
+    def fake_build(inference_config, megatron_cfg, provider):
+        build_calls.append((inference_config, megatron_cfg, provider))
+        return inference_model
+
+    def fake_patch(model, *, hf_model_id, model_config):
+        patch_calls.append((model, hf_model_id, model_config))
+        return 2
+
+    monkeypatch.setattr(megatron_policy_worker, "build_inference_model", fake_build)
+    monkeypatch.setattr(
+        megatron_policy_worker, "maybe_enable_glm52_dsa_native_fp8", fake_patch
+    )
+
+    config = {"model_name": "zai-org/GLM-5.2", "megatron_cfg": {"enabled": True}}
+    worker._build_colocated_inference_model(config)
+
+    assert worker.inference_model is inference_model
+    assert build_calls == [
+        (
+            {**config, "megatron_cfg": inference_mcfg},
+            worker.megatron_cfg,
+            model_provider,
+        )
+    ]
+    assert patch_calls == [(inference_model, "zai-org/GLM-5.2", model_provider)]
+    assert worker._colocated_reshard_plan is None
+
+
 def test_prepare_for_generation_disables_param_gather_hook_before_wake(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
