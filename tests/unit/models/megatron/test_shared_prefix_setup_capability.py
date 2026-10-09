@@ -24,6 +24,9 @@ import pytest
 # Probe the concrete module: test_modelopt_worker_utils.py leaves stub
 # ``megatron.bridge`` packages in sys.modules that a package probe accepts.
 pytest.importorskip("megatron.bridge.models.hybrid.hybrid_provider")
+# The validator rejects shared mode before any provider check when the
+# megatron.rl planner is missing, as in a Megatron-LM that predates it.
+pytest.importorskip("megatron.rl.shared_prefix_execution")
 
 from megatron.bridge.models.hybrid.hybrid_provider import (  # noqa: E402
     HybridModelProvider,
