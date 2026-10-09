@@ -230,8 +230,8 @@ def model_forward(
                 "shared-prefix Hybrid forward does not support fused linear logprobs"
             )
         # Optional until a shared-prefix run is selected: stock MCore installs
-        # do not provide this integration module, while disabled/observe modes
-        # must retain their existing import and execution behavior.
+        # do not provide this integration module, while disabled mode must
+        # retain its existing import and execution behavior.
         from megatron.core.models.hybrid.shared_prefix import (
             SharedPrefixLayout as MCoreSharedPrefixLayout,
         )

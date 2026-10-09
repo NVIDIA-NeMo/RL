@@ -711,8 +711,8 @@ def _validate_shared_prefix_model_capability(
             f"{required_capability!r} for resolved TP={tp_size}, CP={cp_size}, "
             f"SP={sequence_parallel}; detected "
             f"{detected_capability!r}. Kernel-only ports do not satisfy this "
-            "training capability. Use mode=observe until the model integration "
-            "is installed."
+            "training capability. Set policy.shared_prefix_training.mode=disabled "
+            "until the model integration is installed."
         )
 
     if SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY not in capabilities:

@@ -2149,7 +2149,7 @@ class MegatronPolicyWorkerImpl(
         # additionally prevents an aborted/failed step from leaking forward.
         # Scoped to execution-changing shared-prefix modes (shared arms and the
         # dense control) so the default path keeps its MTP logging unchanged.
-        if self._shared_prefix_cfg.mode not in ("disabled", "observe"):
+        if self._shared_prefix_cfg.mode != "disabled":
             self._clear_mtp_metrics_tracker()
         # Match sync train() inference-state reset (line 332-340).
         if hasattr(self.model, "inference_params"):
