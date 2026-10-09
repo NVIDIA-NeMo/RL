@@ -439,7 +439,7 @@ def get_microbatch_iterator(
             "megatron_cfg"
         ].get("moe_hybridep_prepad_packed_inputs"):
             # Star units are padded only to M, not to the expert-group maximum,
-            # and would skip the prepad collective that fallback units issue.
+            # and skip the prepad collective, so no shared-mode unit prepads.
             raise NotImplementedError(
                 "shared-prefix train mode does not support "
                 "moe_hybridep_prepad_packed_inputs"
@@ -1059,10 +1059,6 @@ def process_shared_prefix_microbatch(
             straggler_timer=straggler_timer,
             create_packed_seq_padding_mask=uses_hybridep_flex_dispatcher(
                 cfg["megatron_cfg"]
-            ),
-            prepad_packed_seq_for_hybridep=(
-                uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
-                and cfg["megatron_cfg"].get("moe_hybridep_prepad_packed_inputs")
             ),
             mtp_enabled=mtp_enabled,
         )
