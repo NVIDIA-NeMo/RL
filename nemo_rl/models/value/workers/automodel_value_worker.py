@@ -42,8 +42,8 @@ from nemo_rl.models.automodel.setup import (
     validate_and_prepare_config,
 )
 from nemo_rl.models.automodel.train import (
+    LossPostProcessor,
     ScorePostProcessor,
-    ValueLossPostProcessor,
     aggregate_training_statistics,
     automodel_forward_backward,
     forward_with_post_processing_fn,
@@ -54,64 +54,13 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
-from nemo_rl.models.value.utils import (
-    gather_and_right_shift_values,
-    right_shift_values,
-)
+from nemo_rl.models.value.utils import right_shift_values
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.tensor_ops import pad_and_concat
-
-
-def validate_context_parallel_sequence_length(seq_len: int, cp_size: int) -> None:
-    """Require the 2*CP chunks used by load-balanced causal attention."""
-    if cp_size > 1 and seq_len % (2 * cp_size) != 0:
-        raise ValueError(
-            f"Sequence length {seq_len} must be divisible by 2 * context "
-            f"parallel size ({2 * cp_size})."
-        )
-
-
-def pad_batch_for_context_parallel(
-    data: BatchedDataDict[Any],
-    cp_size: int,
-    pad_token_id: int,
-) -> tuple[BatchedDataDict[Any], int]:
-    """Right-pad sequence-aligned tensors for load-balanced CP attention.
-
-    PPO rollout batches are padded according to the policy topology, which can
-    differ from the value topology. A CP value model therefore has to enforce
-    its own ``2 * cp_size`` sequence multiple before creating CP buffers.
-    """
-    _, original_seq_len = check_sequence_dim(data)
-    if cp_size <= 1:
-        return data, original_seq_len
-
-    multiple = 2 * cp_size
-    padded_seq_len = ((original_seq_len + multiple - 1) // multiple) * multiple
-    if padded_seq_len == original_seq_len:
-        return data, original_seq_len
-
-    pad_len = padded_seq_len - original_seq_len
-    padded = BatchedDataDict[Any](data.copy())
-    for key, value in data.items():
-        if (
-            torch.is_tensor(value)
-            and value.ndim > 1
-            and value.shape[1] == original_seq_len
-        ):
-            pad_value = pad_token_id if key == "input_ids" else 0
-            padded[key] = torch.nn.functional.pad(
-                value,
-                (0, 0) * (value.ndim - 2) + (0, pad_len),
-                mode="constant",
-                value=pad_value,
-            )
-
-    return padded, original_seq_len
 
 
 class RightShiftLossWrapper:
@@ -158,14 +107,6 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
 
         Note: Value models don't need a reference model since they don't compute KL divergence.
         """
-        if config["automodel_cfg"]["context_parallel_size"] > 1:
-            raise NotImplementedError(
-                "AutomodelValueWorker cannot be initialized with "
-                "context_parallel_size > 1 because its get_values() scoring path "
-                "does not support context parallelism. Set "
-                "value.automodel_cfg.context_parallel_size=1."
-            )
-
         # Apply patches
         apply_transformer_engine_patch()
 
@@ -308,11 +249,6 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
             mbs = self.cfg["train_micro_batch_size"]
-        data, _ = pad_batch_for_context_parallel(
-            data,
-            self.cp_size,
-            self.tokenizer.eos_token_id or 0,
-        )
         local_gbs = gbs // self.dp_size
         total_dataset_size = torch.tensor(data.size, device="cuda")
         torch.distributed.all_reduce(
@@ -323,8 +259,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         num_global_batches = int(total_dataset_size.item()) // gbs
 
         # Validate sequence dimension
-        sequence_dim, seq_dim_size = check_sequence_dim(data)
-        validate_context_parallel_sequence_length(seq_dim_size, self.cp_size)
+        sequence_dim, _ = check_sequence_dim(data)
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -338,7 +273,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         # with the megatron value worker (V[t]=V(s_t) instead of V(s_{t+1}))
         # so GAE / MseValueLossFn / value clipping are self-consistent.
         wrapped_loss_fn = RightShiftLossWrapper(loss_fn)
-        loss_post_processor = ValueLossPostProcessor(
+        loss_post_processor = LossPostProcessor(
             loss_fn=wrapped_loss_fn,
             cfg=self.cfg,
             cp_mesh=self.cp_mesh,
@@ -480,15 +415,8 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
             else self.cfg.get("logprob_batch_size", self.cfg["train_micro_batch_size"])
         )
 
-        data, original_seq_len = pad_batch_for_context_parallel(
-            data,
-            self.cp_size,
-            self.tokenizer.eos_token_id or 0,
-        )
-
         # Validate sequence dimension
         sequence_dim, seq_dim_size = check_sequence_dim(data)
-        validate_context_parallel_sequence_length(seq_dim_size, self.cp_size)
 
         all_values = []
         self.model.eval()
@@ -531,14 +459,10 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
                         processed_mb=processed_mb,
                         sequence_dim=sequence_dim,
                     )
-                    # CP emits load-balanced sequence shards. Restore global
-                    # token order before shifting, including across shard
-                    # boundaries, to match train() and Megatron semantics.
-                    values = gather_and_right_shift_values(
-                        values,
-                        self.cp_mesh.get_group() if self.cp_size > 1 else None,
-                        sequence_dim,
-                    )
+                    # ScorePostProcessor has already restored the canonical CP
+                    # order. Shift only after that gather so cross-shard token
+                    # boundaries match the Megatron value convention.
+                    values = right_shift_values(values)
 
                 # Skip dummy batches
                 if batch_idx >= iterator_len:
@@ -551,7 +475,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
 
         return_data["values"] = pad_and_concat(
             all_values, target_len=seq_dim_size
-        )[:, :original_seq_len].cpu()
+        ).cpu()
 
         return return_data
 

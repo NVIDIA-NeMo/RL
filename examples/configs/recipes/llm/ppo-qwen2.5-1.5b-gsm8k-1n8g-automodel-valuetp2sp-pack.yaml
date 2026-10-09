@@ -2,7 +2,7 @@ defaults: ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.yaml
 checkpointing:
   checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-pack
 value:
-  dtensor_cfg:
+  automodel_cfg:
     context_parallel_size: 1
   dynamic_batching:
     enabled: false
