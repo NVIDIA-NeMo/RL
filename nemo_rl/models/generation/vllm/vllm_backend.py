@@ -1909,8 +1909,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         try:
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
+            noop_finalize: WeightUpdateFinalizer = lambda: None
             lifecycle = (
-                nullcontext(lambda: None)
+                nullcontext(noop_finalize)
                 if native_lora_refit
                 else self._weight_update_lifecycle("ipc")
             )
