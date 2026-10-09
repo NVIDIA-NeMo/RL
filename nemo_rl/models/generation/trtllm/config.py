@@ -12,136 +12,116 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, Optional, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
-from pydantic import BaseModel, Field
-
-from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.interfaces import DisaggConfig, GenerationConfig
 
 
-class TrtllmDisaggConfig(BaseModel, extra="allow"):
-    """Prefill/decode disaggregation.
+class TrtllmDisaggServerConfig(DisaggConfig):
+    """The layout plus TRT-LLM's ``OpenAIDisaggServer`` settings.
 
-    A *replica* is ``num_context_engines`` context engines plus
-    ``num_generation_engines`` generation engines, fronted by one
-    ``OpenAIDisaggServer`` that exposes the single URL NeMo-Gym talks to. The
-    replica *count* is not configured: it follows from the inference cluster's
-    size, the same way the DP-shard count does without disaggregation.
+    The layout -- engines per replica, frontend count, frontend tokenization --
+    is inherited from :class:`DisaggConfig`. What this adds is only what the
+    frontend process needs: which routers it runs and how it thins the
+    prefill->decode relay. Everything that configures an *engine* is engine
+    config: the per-role overrides are ``trtllm_cfg.prefill_engine`` /
+    ``trtllm_cfg.decode_engine``, and the KV cache transceiver is
+    ``trtllm_kwargs.cache_transceiver_config`` like any other AsyncLLM argument.
+
+    This backend additionally caps the inherited ``num_frontend_workers``:
+    ``num_replicas * num_frontend_workers`` must be <= 256, the snowflake
+    node_id space each frontend mints request ids from.
 
     Requires non-colocated generation: colocated sleeps the engines between
-    rollouts, and a replica's context and generation engines must be resident
+    rollouts, and a replica's prefill and decode engines must be resident
     together for the KV transceiver to work.
     """
 
-    enabled: bool = False
-
-    # Engines per replica. The two are independent, so the P:D ratio is free.
-    num_context_engines: int = 1
-    num_generation_engines: int = 1
-
     # Routing inside a replica, decided entirely by the disagg server.
     #
-    # The context router must be *stateful* so a trajectory's turns return to
+    # These four keep TRT-LLM's own spelling of the two legs (ctx/gen) because
+    # they are passed straight through to DisaggServerConfig; everything NeMo RL
+    # owns reads prefill/decode.
+    #
+    # The ctx router must be *stateful* so a trajectory's turns return to
     # the engine holding its prefix -- that engine accumulates the prefix across
     # turns and only prefills the delta, so sending a later turn elsewhere
     # throws the work away.
     #
-    # The generation router need not be: a generation engine receives KV freshly
-    # from the context engine on every turn, so it has nothing worth returning
+    # The gen router need not be: a decode engine receives KV freshly
+    # from the prefill engine on every turn, so it has nothing worth returning
     # to, and a wrong load guess only costs transient skew. Keeping it stateless
     # also keeps placement local, with no coordinator process.
     #
     # Both are ``Literal`` rather than ``str`` because a plausible-but-wrong
     # value is the dangerous case: ``ctx_router="round_robin"`` parses fine and
-    # silently throws away the prefix affinity the context engines depend on.
+    # silently throws away the prefix affinity the prefill engines depend on.
     ctx_router: Literal["conversation", "kv_cache_aware"] = "conversation"
     gen_router: Literal["round_robin", "load_balancing"] = "load_balancing"
 
-    # Frontend (disagg server) workers per replica. Each is its own
-    # DisaggServerActor with a distinct URL; NeMo-Gym's per-session client
-    # selection shards conversations across them, so one frontend's CPU stops
-    # being the replica's turn-throughput ceiling. 1 = single-frontend
-    # behavior. replicas * workers must be <= 256 (snowflake node_id space).
-    num_frontend_workers: int = 1
-    # Relay ctx->gen prompt token ids as one base64 int32 string instead of a
-    # 30k-int JSON array (TRT-LLM DisaggServerConfig.gen_tokids_ctxbytes).
+    # Relay prefill->decode prompt token ids as one base64 int32 string instead
+    # of a 30k-int JSON array (DisaggServerConfig.gen_tokids_ctxbytes).
     gen_tokids_ctxbytes: bool = False
-    # Strip the conversation history from the generation leg; the relayed
-    # token ids carry the full prefix, so the generation adapter never needs
-    # the messages (DisaggServerConfig.gen_strip_message_history).
+    # Strip the conversation history from the decode leg; the relayed token ids
+    # carry the full prefix, so the decode adapter never needs the messages
+    # (DisaggServerConfig.gen_strip_message_history).
     gen_strip_message_history: bool = False
-    # Frontends render the chat template and tokenize (via the adapters'
-    # exact shared pipeline) and attach prompt_token_ids_b64 to the ctx leg,
-    # so the single ctx adapter process does no template work. Guarded by
-    # ctx-side shadow validation (NRL_TRTLLM_TOKENIZE_SHADOW_RATE).
-    frontend_tokenize: bool = False
-    # Base port for the frontend workers' deterministic ports
-    # (base + replica_idx * num_frontend_workers + frontend_idx). Deterministic
-    # so a restarted frontend actor re-binds the SAME port and its URL stays
-    # valid; keep the range outside virtual_cluster's random master-port window
-    # (1400-1999).
-    frontend_base_port: int = 17300
-
-    # Mapped onto TRT-LLM's CacheTransceiverConfig.
-    cache_transceiver_backend: Literal["DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"] = (
-        "DEFAULT"
-    )
-
-    # "CPP" | "PYTHON". TRT-LLM defaults to "auto", which only adopts
-    # the model's preferred runtime when the effective backend supports it and
-    # silently falls back to the C++ transceiver otherwise -- and that fallback
-    # is not what a hybrid Mamba model wants: the recurrent-state handoff needs
-    # the Python (v2) transceiver. Left unset here so TRT-LLM keeps its own
-    # default; set it explicitly to force one.
-    cache_transceiver_runtime: Optional[Literal["CPP", "PYTHON"]] = None
-
-    # MiB of bounce buffer, or 0 to keep the per-block path. Bounce coalesces a
-    # request's scattered per-block KV into one contiguous fabric-VMM buffer and
-    # issues a single multi-rail NIXL write, which sidesteps registering every
-    # VMM-split block descriptor individually -- the step that fails here with
-    # "registerMem: registration failed for the specified or all potential
-    # backends". Only the Python (v2) transceiver reads it.
-    kv_cache_bounce_size_mb: Optional[int] = None
-    max_tokens_in_buffer: Optional[int] = None
-
-    # Milliseconds before an unfinished KV transfer is cancelled on either
-    # side. TRT-LLM's default (60 s) is tuned for short prompts at low
-    # concurrency; at high rollout concurrency the ctx-side timeout can fire
-    # in bulk and the resulting cancel/retry churn stresses the transceiver,
-    # so large multi-turn workloads want a much larger value.
-    kv_transfer_timeout_ms: Optional[int] = None
-
-    # Per-role overrides merged over trtllm_cfg. Any trtllm_cfg key goes here --
-    # tensor_parallel_size and the MoE split are the ones that usually differ,
-    # and each role must satisfy moe_tp * moe_ep == its own TP. A role may also
-    # carry its own ``trtllm_kwargs`` (including ``kv_cache_config``) when
-    # prefill and decode want different engine tuning. Genuinely an arbitrary
-    # TRT-LLM passthrough, so ``dict[str, Any]`` is the right type here.
-    ctx_trtllm_kwargs: dict[str, Any] = Field(default_factory=dict)
-    gen_trtllm_kwargs: dict[str, Any] = Field(default_factory=dict)
-
-    def role_trtllm_kwargs(self, role: Literal["ctx", "gen"]) -> dict[str, Any]:
-        """One role's engine overrides, selected without attribute reflection."""
-        return self.ctx_trtllm_kwargs if role == "ctx" else self.gen_trtllm_kwargs
 
 
-class TrtllmSpecificArgs(TypedDict):
+class TrtllmEngineKnobs(TypedDict, total=False):
+    """The settings a replica's prefill and decode engines may disagree on.
+
+    Deliberately narrow. Everything else in ``trtllm_cfg`` describes the *model*
+    (``precision``, ``max_model_len``, the parsers) or the engine's contract
+    with the rest of the system (``async_engine``, ``expose_http_server``, the
+    refit flags); two engines of one replica differing on any of those would not
+    serve one coherent policy. What is left is how wide the engine is, how its
+    experts are split, and how much memory and batch it gets.
+
+    Shared by the two blocks below, so neither has to restate them and they
+    cannot drift. All optional: a role block names only what differs, and the
+    shared block's required-in-practice keys (``tensor_parallel_size``,
+    ``max_batch_size``, ``max_num_tokens``) are enforced by the exemplar YAML
+    plus a direct subscript read that fails loudly, not by this type.
+    """
+
     tensor_parallel_size: int
-    model_name: NotRequired[str]
-    gpu_memory_utilization: NotRequired[float]
-    max_model_len: int
-    precision: str
+    gpu_memory_utilization: float
     max_batch_size: int
     max_num_tokens: int
-    expose_http_server: NotRequired[bool]
-    async_engine: NotRequired[bool]
     # MoE expert parallelism. TRT-LLM splits the TP dimension on MoE layers
     # into moe_tp × moe_ep, so the constraint is
     #     moe_tensor_parallel_size * moe_expert_parallel_size == tensor_parallel_size
     # The outer worker count is unchanged (still TP × PP × DP) — these only
-    # affect how MoE expert weights are partitioned inside each TP rank.
-    moe_tensor_parallel_size: NotRequired[int]
-    moe_expert_parallel_size: NotRequired[int]
+    # affect how MoE expert weights are partitioned inside each TP rank. Under
+    # disaggregation it is checked against *this engine's* TP, since both the TP
+    # and the split can differ between prefill and decode.
+    moe_tensor_parallel_size: int
+    moe_expert_parallel_size: int
+
+
+class TrtllmEngineArgs(TrtllmEngineKnobs):
+    """One role's engine overrides: ``trtllm_cfg.{prefill,decode}_engine``."""
+
+    # Raw TRT-LLM constructor kwargs for this role's engines, merged over the
+    # replica-wide ``generation.trtllm_kwargs``. This is how prefill and decode
+    # get different engine tuning -- a separate ``kv_cache_config``, say.
+    #
+    # The shared block has no counterpart on purpose: its engine kwargs already
+    # have a home one level up at ``generation.trtllm_kwargs``, and a second
+    # spelling under ``trtllm_cfg`` would be two places to look for the same
+    # thing.
+    trtllm_kwargs: NotRequired[dict[str, Any]]
+
+
+class TrtllmSpecificArgs(TrtllmEngineKnobs):
+    """``trtllm_cfg``: the per-engine knobs plus what every engine shares."""
+
+    model_name: NotRequired[str]
+    max_model_len: int
+    precision: str
+    expose_http_server: NotRequired[bool]
+    async_engine: NotRequired[bool]
     # These mirror grpo.async_grpo.{in_flight_weight_updates,
     # recompute_kv_cache_after_weight_updates}. They are duplicated here because
     # TrtllmGeneration.update_weights_from_collective() reads the drain / kv-recompute
@@ -151,7 +131,6 @@ class TrtllmSpecificArgs(TypedDict):
     # grpo.async_grpo so they cannot diverge).
     in_flight_weight_updates: NotRequired[bool]
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
-    disaggregation: NotRequired[TrtllmDisaggConfig]
     default_chat_template_kwargs: NotRequired[dict[str, Any]]
     # TRT-LLM's registered parser names:
     #   "qwen3"       -> Qwen3ToolParser      (JSON format: {"name":..., "arguments":{...}})
@@ -159,25 +138,57 @@ class TrtllmSpecificArgs(TypedDict):
     tool_parser: NotRequired[str]
     reasoning_parser: NotRequired[str]
 
+    # Per-role engine overrides under PD disaggregation, merged over the
+    # shared values above. Keys outside TrtllmEngineArgs are rejected at
+    # startup by TrtllmGeneration._role_overrides.
+    prefill_engine: NotRequired[TrtllmEngineArgs]
+    decode_engine: NotRequired[TrtllmEngineArgs]
+
+    disagg_server: NotRequired[TrtllmDisaggServerConfig]
+
 
 class TrtllmConfig(GenerationConfig):
     trtllm_cfg: TrtllmSpecificArgs
     # Escape hatch for arbitrary TRT-LLM LLM/AsyncLLM constructor kwargs not
     # covered by TrtllmSpecificArgs (e.g. sampler_type, enable_attention_dp).
-    # Spread into the engine constructor as `**trtllm_kwargs`.
+    # Spread into the engine constructor as `**trtllm_kwargs`, and shared by
+    # every engine -- a single engine's are trtllm_cfg.{ctx,gen}.trtllm_kwargs,
+    # which are merged over these.
     trtllm_kwargs: NotRequired[dict[str, Any]]
 
 
-def resolve_trtllm_disagg_config(config: TrtllmConfig) -> TrtllmDisaggConfig:
-    """Validate ``trtllm_cfg.disaggregation`` into its schema.
+def resolve_trtllm_disagg_config(config: TrtllmConfig) -> TrtllmDisaggServerConfig:
+    """Merge the shared layout with this backend's disaggregation mechanics.
+
+    The two are configured apart on purpose: ``generation.disaggregation`` is
+    the layout any backend would need (engine counts, frontends), while
+    ``trtllm_cfg.disagg_server`` is what the frontend process needs (its
+    routers, its relay thinning). Callers want one object, so the two are
+    merged here -- the split is a property of the config file, not of the code
+    reading it.
 
     Absent is the same as present-and-disabled: every field carries its default
-    on :class:`TrtllmDisaggConfig`, so callers read attributes unconditionally
-    instead of re-deriving a default per key at the call site.
+    on :class:`TrtllmDisaggServerConfig`, so callers read attributes
+    unconditionally instead of re-deriving a default per key at the call site.
     """
-    raw = config["trtllm_cfg"].get("disaggregation")
-    if raw is None:
-        return TrtllmDisaggConfig()
-    if isinstance(raw, TrtllmDisaggConfig):
-        return raw
-    return TrtllmDisaggConfig.model_validate(raw)
+
+    def _as_dict(raw: Any) -> dict[str, Any]:
+        if raw is None:
+            return {}
+        if isinstance(raw, DisaggConfig):
+            return raw.model_dump(exclude_unset=True)
+        return dict(raw)
+
+    layout = _as_dict(config.get("disaggregation"))
+    mechanics = _as_dict(config["trtllm_cfg"].get("disagg_server"))
+    # A key in both would make the winner depend on merge order, which is
+    # exactly the kind of silent mismatch the split is meant to prevent.
+    both = sorted(set(layout) & set(mechanics))
+    if both:
+        raise ValueError(
+            f"{both} set in both generation.disaggregation and "
+            f"trtllm_cfg.disagg_server. The first holds the backend-agnostic "
+            f"layout, the second this backend's mechanics; keep each key in "
+            f"exactly one."
+        )
+    return TrtllmDisaggServerConfig.model_validate({**layout, **mechanics})

@@ -39,7 +39,8 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmConfig,
-    TrtllmDisaggConfig,
+    TrtllmDisaggServerConfig,
+    TrtllmEngineArgs,
     resolve_trtllm_disagg_config,
 )
 
@@ -59,11 +60,11 @@ class TrtllmGeneration(GenerationInterface):
         if disagg.enabled:
             engine_tp = max(
                 int(
-                    disagg.role_trtllm_kwargs(role).get(
+                    (trtllm_cfg.get(f"{role}_engine") or {}).get(
                         "tensor_parallel_size", engine_tp
                     )
                 )
-                for role in ("ctx", "gen")
+                for role in ("prefill", "decode")
             )
         pp = trtllm_cfg.get("pipeline_parallel_size", 1)
         assert pp == 1, (
@@ -84,7 +85,7 @@ class TrtllmGeneration(GenerationInterface):
 
         # Colocated time-multiplexes the GPUs: engines sleep (dropping the whole
         # KV pool) while the policy trains. Disaggregation cannot survive that --
-        # a replica's context and generation engines must be resident *at the
+        # a replica's prefill and decode engines must be resident *at the
         # same time* for the transceiver to hand a prefilled cache over, and the
         # disagg servers hold HTTP connections to engines that would be asleep.
         # Reject the combination instead of hanging on the first request after a
@@ -123,8 +124,8 @@ class TrtllmGeneration(GenerationInterface):
 
         # Per-engine role and TP width, in engine order -- the single source of
         # truth for how the cluster is sliced. Without disaggregation every
-        # engine is identical; under it, each replica contributes its context
-        # engines followed by its generation engines.
+        # engine is identical; under it, each replica contributes its prefill
+        # engines followed by its decode engines.
         (
             self._engine_roles,
             self._engine_tps,
@@ -154,8 +155,8 @@ class TrtllmGeneration(GenerationInterface):
         # both TP and the MoE split can differ between prefill and decode.
         if self._disagg_cfg.enabled:
             engine_configs = [
-                (f"{role}_trtllm_kwargs", self._role_kwargs(role))
-                for role in ("ctx", "gen")
+                (f"trtllm_cfg.{role}_engine", self._role_kwargs(role))
+                for role in ("prefill", "decode")
             ]
         else:
             engine_configs = [("trtllm_cfg", self.cfg["trtllm_cfg"])]
@@ -313,24 +314,58 @@ class TrtllmGeneration(GenerationInterface):
     #  Engine layout
     # ------------------------------------------------------------------ #
 
-    def _role_kwargs(self, role: Literal["ctx", "gen"]) -> dict[str, Any]:
-        """This role's engine overrides, merged over the base ``trtllm_cfg``.
+    @staticmethod
+    def _role_overrides(
+        trtllm_cfg: Any, role: Literal["prefill", "decode"]
+    ) -> dict[str, Any]:
+        """``trtllm_cfg.{role}_engine``, or empty when unset.
 
-        Any TRT-LLM kwarg may be overridden per role; TP and the MoE split are
-        the ones that usually differ between prefill and decode.
+        Only the keys of ``TrtllmEngineArgs`` may appear. The rest of
+        ``trtllm_cfg`` describes the model or the engine's contract with the
+        rest of the system, so a role differing on one would not serve the same
+        policy as its replica-mate -- and an unknown key here is not inert, it
+        is spread into the AsyncLLM constructor. Rejected here rather than
+        ignored, because silently dropping a knob someone wrote down is worse
+        than refusing to start.
         """
-        overrides = self._disagg_cfg.role_trtllm_kwargs(role)
-        return {**self.cfg["trtllm_cfg"], **overrides}
+        overrides = dict(trtllm_cfg.get(f"{role}_engine") or {})
+        allowed = (
+            TrtllmEngineArgs.__required_keys__ | TrtllmEngineArgs.__optional_keys__
+        )
+        unsupported = sorted(set(overrides) - allowed)
+        if unsupported:
+            raise ValueError(
+                f"trtllm_cfg.{role}_engine may only override "
+                f"{sorted(allowed)}, "
+                f"got {unsupported}. Settings shared by every engine of the "
+                f"replica belong on trtllm_cfg itself, and engine kwargs "
+                f"shared by both roles on generation.trtllm_kwargs."
+            )
+        return overrides
+
+    def _role_kwargs(self, role: Literal["prefill", "decode"]) -> dict[str, Any]:
+        """This role's engine config: ``trtllm_cfg`` with its overrides applied.
+
+        The overridable set is ``TrtllmEngineArgs``; TP and the MoE split are
+        the ones that usually differ between prefill and decode. The sibling
+        role's block is dropped so an engine never sees the other one's.
+        """
+        shared = {
+            k: v
+            for k, v in self.cfg["trtllm_cfg"].items()
+            if k not in ("prefill_engine", "decode_engine")
+        }
+        return {**shared, **self._role_overrides(self.cfg["trtllm_cfg"], role)}
 
     def _plan_engines(self, world_size: int) -> tuple[list[str], list[int], int]:
-        r"""Per-engine ``(role, tp_width)``, in engine order.
+        r"""Per-engine ``(role, width)``, in engine order.
 
-        Without disaggregation every engine is a plain generation engine of
+        Without disaggregation every engine is an aggregated engine of
         ``tensor_parallel_size`` GPUs. Under disaggregation each replica
-        contributes its context engines followed by its generation engines:
+        contributes its prefill engines followed by its decode engines:
 
-            [ctx_tp x M, gen_tp x K,   ctx_tp x M, gen_tp x K, ...]
-             \______ replica 0 _____/  \____ replica 1 ...
+            [prefill_width x M, decode_width x K,   prefill_width x M, ...]
+             \_________ replica 0 __________/  \____ replica 1 ...
 
         The replica *count* is derived, not configured: it follows from the
         cluster size, the same way the DP-shard count does without
@@ -347,30 +382,32 @@ class TrtllmGeneration(GenerationInterface):
             # Without disaggregation a replica *is* an engine: one DP shard,
             # one URL, nothing below it to front. Reporting n rather than 1
             # keeps "replica" meaning the same thing on both paths.
-            return ["generation"] * n, [self.tp_size] * n, n
+            return ["aggregated"] * n, [self.tp_size] * n, n
 
-        ctx_tp = int(self._role_kwargs("ctx")["tensor_parallel_size"])
-        gen_tp = int(self._role_kwargs("gen")["tensor_parallel_size"])
-        for role, value in (("ctx", ctx_tp), ("gen", gen_tp)):
-            assert value >= 1, f"{role}_trtllm_kwargs.tensor_parallel_size must be >= 1"
+        prefill_tp = int(self._role_kwargs("prefill")["tensor_parallel_size"])
+        decode_tp = int(self._role_kwargs("decode")["tensor_parallel_size"])
+        for role, value in (("prefill", prefill_tp), ("decode", decode_tp)):
+            assert value >= 1, (
+                f"trtllm_cfg.{role}_engine.tensor_parallel_size must be >= 1"
+            )
 
-        num_ctx = disagg.num_context_engines
-        num_gen = disagg.num_generation_engines
-        assert num_ctx >= 1 and num_gen >= 1, (
+        num_prefill = disagg.num_prefill_engines
+        num_decode = disagg.num_decode_engines
+        assert num_prefill >= 1 and num_decode >= 1, (
             f"a replica needs at least one engine of each role, got "
-            f"num_context_engines={num_ctx}, num_generation_engines={num_gen}"
+            f"num_prefill_engines={num_prefill}, num_decode_engines={num_decode}"
         )
 
-        replica_width = num_ctx * ctx_tp + num_gen * gen_tp
+        replica_width = num_prefill * prefill_tp + num_decode * decode_tp
         assert world_size % replica_width == 0, (
-            f"replica width {replica_width} GPUs "
-            f"({num_ctx} ctx x TP{ctx_tp} + {num_gen} gen x TP{gen_tp}) does not "
+            f"replica width {replica_width} GPUs ({num_prefill} prefill x "
+            f"TP{prefill_tp} + {num_decode} decode x TP{decode_tp}) does not "
             f"divide the {world_size} inference GPUs."
         )
         num_replicas = world_size // replica_width
 
-        roles = (["context"] * num_ctx + ["generation"] * num_gen) * num_replicas
-        tps = ([ctx_tp] * num_ctx + [gen_tp] * num_gen) * num_replicas
+        roles = (["prefill"] * num_prefill + ["decode"] * num_decode) * num_replicas
+        tps = ([prefill_tp] * num_prefill + [decode_tp] * num_decode) * num_replicas
         return roles, tps, num_replicas
 
     def _config_with_engine_overrides(
@@ -384,7 +421,7 @@ class TrtllmGeneration(GenerationInterface):
         every worker the same config, so the driver attaches a map keyed by
         :meth:`_engine_key` and each worker looks up its own entry.
 
-        The context/generation *role* is per request in TRT-LLM, so an engine
+        The prefill/decode *role* is per request in TRT-LLM, so an engine
         does not strictly need to know it; it is recorded anyway because the
         transceiver config and the role's kwargs are chosen from it.
         """
@@ -396,11 +433,10 @@ class TrtllmGeneration(GenerationInterface):
         for (pg_idx, bundles), role in zip(
             node_bundle_indices, self._engine_roles, strict=True
         ):
-            prefix: Literal["ctx", "gen"] = "ctx" if role == "context" else "gen"
             # Ordinal within the role, so a layout with several engines of one
-            # role (CTX_ENGINES=2, or more than one replica) can still tell them
-            # apart. Only consumers that need a stable per-engine name use it --
-            # the nsys report filename, so far.
+            # role (num_prefill_engines=2, or more than one replica) can still
+            # tell them apart. Only consumers that need a stable per-engine
+            # name use it -- the nsys report filename, so far.
             ordinal = role_counts.get(role, 0)
             role_counts[role] = ordinal + 1
             # Every engine gets an entry: the worker treats a missing key as a
@@ -409,7 +445,7 @@ class TrtllmGeneration(GenerationInterface):
             overrides[self._engine_key(pg_idx, bundles)] = {
                 "_disagg_role": role,
                 "_disagg_role_ordinal": ordinal,
-                **self._disagg_cfg.role_trtllm_kwargs(prefix),
+                **self._role_overrides(self.cfg["trtllm_cfg"], role),
             }
 
         cfg = dict(self.cfg)
@@ -508,7 +544,7 @@ class TrtllmGeneration(GenerationInterface):
             # picks the physical node behind each per-node PG, so consecutive
             # pg_idx values can land in different NVLink domains -- and engines
             # are laid out replica by replica, which would put a replica's
-            # context and generation engines on opposite sides of the fabric and
+            # prefill and decode engines on opposite sides of the fabric and
             # push its KV handoff onto InfiniBand. Only the *order* changes;
             # every PG is still used exactly once.
             for pg_idx in cluster.get_topology_sorted_pg_indices():
@@ -524,15 +560,29 @@ class TrtllmGeneration(GenerationInterface):
                     cursor += tp
                     engine_idx += 1
                 if cursor != pg.bundle_count:
-                    # An engine may not straddle a placement group (== node):
-                    # TRT-LLM does not support cross-node TP, and a partially
-                    # filled node would leave GPUs idle while the engine count
-                    # silently drops.
+                    # Every engine here fits a node (this branch only runs when
+                    # it does), but the greedy fill left too little room for the
+                    # next one, so it would be split across nodes. An engine is
+                    # one tied worker group keyed by a single pg_idx and cannot
+                    # be. Stopping early instead would leave these GPUs idle and
+                    # silently run fewer engines than the config asks for.
+                    free = pg.bundle_count - cursor
+                    replica_width = sum(engine_tps) // max(self.num_replicas, 1)
+                    if engine_idx < len(engine_tps):
+                        why = (
+                            f"engine {engine_idx} needs TP{engine_tps[engine_idx]} "
+                            f"but only {free} GPU(s) are left on it"
+                        )
+                    else:
+                        why = f"{free} GPU(s) are left over with no engines to place"
                     raise ValueError(
-                        f"Engine widths {engine_tps} do not tile placement group "
-                        f"{pg_idx} ({pg.bundle_count} bundles): {cursor} bundles "
-                        f"used. Choose per-role TP sizes whose group total "
-                        f"divides the GPUs per node."
+                        f"Engine layout does not tile placement group {pg_idx} "
+                        f"({pg.bundle_count} GPUs): {why}. An engine cannot span "
+                        f"nodes. Engine widths in order: {engine_tps}. Two layouts "
+                        f"always tile: give every role tensor_parallel_size == "
+                        f"GPUs per node (one engine per node), or make the replica "
+                        f"width ({replica_width}) divide GPUs per node (whole "
+                        f"replicas per node)."
                     )
 
         if not tied_groups:
@@ -546,7 +596,7 @@ class TrtllmGeneration(GenerationInterface):
     # ------------------------------------------------------------------ #
 
     @property
-    def _disagg_cfg(self) -> TrtllmDisaggConfig:
+    def _disagg_cfg(self) -> TrtllmDisaggServerConfig:
         return self._disagg
 
     def _assert_direct_dispatch_allowed(self) -> None:
@@ -582,9 +632,9 @@ class TrtllmGeneration(GenerationInterface):
             return self._disagg_server_urls
 
         disagg = self._disagg_cfg
-        num_ctx = disagg.num_context_engines
-        num_gen = disagg.num_generation_engines
-        per_replica = num_ctx + num_gen
+        num_prefill = disagg.num_prefill_engines
+        num_decode = disagg.num_decode_engines
+        per_replica = num_prefill + num_decode
 
         assert self.cfg["trtllm_cfg"].get("expose_http_server"), (
             "PD disaggregation requires trtllm_cfg.expose_http_server=true: an "
@@ -626,11 +676,12 @@ class TrtllmGeneration(GenerationInterface):
             base = replica_idx * per_replica
             serve_args = dict(
                 ctx_addrs=[
-                    (a["host"], a["port"]) for a in addrs[base : base + num_ctx]
+                    (a["host"], a["port"])
+                    for a in addrs[base : base + num_prefill]
                 ],
                 gen_addrs=[
                     (a["host"], a["port"])
-                    for a in addrs[base + num_ctx : base + per_replica]
+                    for a in addrs[base + num_prefill : base + per_replica]
                 ],
                 ctx_router=disagg.ctx_router,
                 gen_router=disagg.gen_router,
@@ -679,7 +730,7 @@ class TrtllmGeneration(GenerationInterface):
         self._disagg_server_urls = ray.get(futures)
         print(
             f"  ✓ PD disaggregation: {self.num_replicas} replica(s) x "
-            f"({num_ctx} context + {num_gen} generation) engines, "
+            f"({num_prefill} prefill + {num_decode} decode) engines, "
             f"{n_fe} frontend worker(s) each; "
             f"disagg servers: {self._disagg_server_urls}",
             flush=True,
