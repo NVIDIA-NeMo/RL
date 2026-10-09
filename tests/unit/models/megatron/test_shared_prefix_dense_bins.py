@@ -16,15 +16,23 @@
 import unittest
 
 import numpy as np
+import pytest
 import torch
 from pydantic import ValidationError
+
+# Module-level megatron imports would break COLLECTION on non-mcore CI shards
+# (marks only deselect at run time); skip collection gracefully instead.
+pytest.importorskip("megatron.core")
+pytest.importorskip("megatron.bridge")
+pytest.importorskip("megatron.rl.shared_prefix_dense_bins")
+
+from megatron.rl.shared_prefix_alignment import materialize_alignment
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.megatron.data import (
     _SharedPrefixExecutionUnit,
     plan_shared_prefix_execution_units,
 )
-from nemo_rl.models.megatron.shared_prefix_alignment import materialize_alignment
 from nemo_rl.models.megatron.shared_prefix_dense_bins import (
     plan_dense_training_bins,
     share_prefixes_in_dense_training_bins,
@@ -33,6 +41,8 @@ from nemo_rl.models.policy import (
     SharedPrefixTrainingConfig,
     validate_shared_prefix_training_config,
 )
+
+pytestmark = pytest.mark.mcore
 
 
 def config(multiple=1):
@@ -74,16 +84,19 @@ class TestSharedPrefixDenseBins(unittest.TestCase):
             plan_shared_prefix_execution_units(data, cfg=config(), bin_capacity=1)
 
     def test_mixed_roots_preserve_causal_rows_and_one_mtp_group(self):
+        # Multi-token, unequal completions: predecessor maps are per token.
         data = batch(
-            [[1, 2, 3, 8], [4, 5, 6, 9], [1, 2, 3, 10]], [3, 3, 3], ["a", "b", "a"]
+            [[1, 2, 3, 8, 11], [4, 5, 6, 9, 12, 14], [1, 2, 3, 10]],
+            [3, 3, 3],
+            ["a", "b", "a"],
         )
-        original = _SharedPrefixExecutionUnit((0, 1, 2), None, 12)
+        original = _SharedPrefixExecutionUnit((0, 1, 2), None, 15)
         (unit,) = share_prefixes_in_dense_training_bins(
-            data, [original], cfg=config(), bin_capacity=12
+            data, [original], cfg=config(), bin_capacity=15
         )
         forest = unit.shared_layout
         assert forest is not None and forest.mtp_loss_group_root_counts == (2,)
-        assert unit.physical_length == 9 and sorted(unit.row_indices) == [0, 1, 2]
+        assert unit.physical_length == 12 and sorted(unit.row_indices) == [0, 1, 2]
         physical = data["input_ids"][
             list(forest.token_gather_rows), list(forest.token_gather_columns)
         ]
@@ -99,10 +112,11 @@ class TestSharedPrefixDenseBins(unittest.TestCase):
                 assert torch.equal(
                     restored, data["input_ids"][row, : data["input_lengths"][row]]
                 )
-                assert (
-                    forest.predecessor_positions[forest.row_indices.index(row)]
-                    == offset + root.prompt_length - 1
-                )
+                for token in range(root.completion_lengths[index]):
+                    k = forest.completion_positions.index(start + token)
+                    assert forest.predecessor_positions[k] == (
+                        start + token - 1 if token else offset + root.prompt_length - 1
+                    )
 
     def _test_prefix_or_group_mismatch_remains_dense(self, tokens, groups):
         data = batch(tokens, [3, 3], groups)
