@@ -75,6 +75,30 @@ mechanism changes:
    parallel children, out-of-order returns, one reward vote per rollout, and
    zero poisoned calls; then the 20-step run.
 
+## Capture of child sessions on this stack (phase 2 design notes)
+
+- Gym's framework-owned admission rejects a call while another call of the same
+  rollout is pending, so the proxy serializes model calls per episode (it
+  already did). Parallel children therefore overlap on tool execution and
+  container work, not on model calls; this is the same ledger invariant the
+  reference satisfied with per-session echo.
+- A child session needs no new capture rollout id: its first call has a
+  different leading context (the task prompt), so the ledger roots a new chain,
+  exactly as it does for a compaction rewrite; later child calls match their
+  own chain by longest complete prefix.
+- The explicit parent hint (`x-nemo-gym-capture-parent`) is accepted only on the
+  Responses API, not on the chat route OpenCode uses, so two children spawned
+  with byte-identical task prompts would be an "ambiguous source-prefix
+  candidate" and that call would fail. This is a known limitation; prompts are
+  not altered to disambiguate.
+- The proxy tags every served call with `session_id` (digest of system prompt
+  plus opening user turn), `session_role`, `parent_session_id` and
+  `spawn_call_id` (the parent's `task` tool-call whose `prompt` the child's
+  opening turn repeats), and the agent returns `session_traces` (response ids
+  per session) in its verify response. The trainer maps those response ids to
+  capture chains to tag rows for `session_traces.py` validation and the
+  one-vote-per-rollout batch.
+
 ## Not ported
 
 Score centering, the SFT export tooling, the SWE-bench harness and the
