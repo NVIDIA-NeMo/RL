@@ -314,32 +314,24 @@ def create_app(
         tools: list[dict] | None = body.get("tools")
         logprobs_requested = body.get("logprobs", False)
 
-        # Under PD disaggregation a replica's OpenAIDisaggServer drives this
-        # endpoint twice per request -- once context_only, once generation_only
-        # -- carrying the handshake between the two. The wire model differs from
-        # the engine one (opaque_state is bytes in the engine, base64 on the
-        # wire), so use TRT-LLM's own converter rather than reproducing it.
-        # Conversation identity for rank-affine ADP routing: canonical body
+        # Conversation identity for rank-affine ADP routing: body
         # conversation_params, else the id the disagg service stamps onto
-        # disaggregated_params for its ctx/gen legs. None = no affinity.
+        # disaggregated_params. None = no affinity.
         #
-        # The canonical field is not populated yet: Gym is the only component
-        # that knows the rollout identity, and no released Gym sends it (it
-        # appears nowhere in the tree, including upstream main). It arrives with
-        # https://github.com/NVIDIA-NeMo/Gym/pull/3582 ("forward gym session id
-        # as backend conversation id"), still open at time of writing, after
-        # which the Gym submodule pin has to be bumped for this branch to see an
-        # id at all.
-        #
-        # Until then a turn lands on an effectively random attention-DP rank and
-        # the prefill engine re-prefills most of its history: measured at
-        # 2P-DEP8 / conc 512, 17-26% of turns found their prefix on the serving
-        # rank (about 1/DEP) versus 96-97% once the id flows. Nothing fails --
-        # disaggregation just gives up most of its benefit -- so treat a run
-        # with no conversation id as unmeasured rather than as a baseline.
+        # Nothing sends it yet: Gym owns the rollout identity and starts
+        # forwarding it with NVIDIA-NeMo/Gym#3582, which also needs a Gym
+        # submodule pin bump here. Without an id a turn lands on a random
+        # attention-DP rank and re-prefills most of its history (prefix on the
+        # serving rank for 17-26% of turns vs 96-97% with it, at 2P-DEP8 /
+        # conc 512) -- nothing fails, so treat such a run as unmeasured.
         _conv_id = (body.get("conversation_params") or {}).get("conversation_id") or (
             body.get("disaggregated_params") or {}
         ).get("conversation_id")
+
+        # The disagg server drives this endpoint twice per request -- once
+        # context_only, once generation_only -- carrying the handshake between
+        # them. opaque_state is bytes in the engine but base64 on the wire, so
+        # convert with TRT-LLM's own helper rather than reproducing it.
         disagg_params = None
         if body.get("disaggregated_params") is not None:
             from tensorrt_llm.serve.openai_protocol import (
@@ -371,24 +363,16 @@ def create_app(
             else None
         )
 
-        # On the generation leg the disagg server hands over the exact token ids
-        # the prefill engine built KV for (openai_disagg_service._get_gen_request).
-        # Rebuilding them from `messages` could yield a different sequence, which
-        # would decode against mismatched KV -- and silently. Prefer what it sent,
-        # and skip the chat-template work entirely: nothing downstream of this
-        # block reads `conversation`, and under gen_strip_message_history the
-        # messages are not even complete. (Before this short-circuit the
-        # generation leg rendered two full 30k-token templates per request and
-        # then discarded them.)
-        supplied = body.get("prompt_token_ids")
-        if supplied is None and body.get("prompt_token_ids_b64"):
+        # b64 when gen_tokids_ctxbytes is set, an int array otherwise.
+        supplied = body.get("prompt_token_ids") or body.get("prompt_token_ids_b64")
+        if isinstance(supplied, str):
             # Same int32 buffer encoding openai_server.py uses on this hop.
             import base64
 
             import numpy as np
 
             supplied = np.frombuffer(
-                base64.b64decode(body["prompt_token_ids_b64"]), dtype=np.int32
+                base64.b64decode(supplied), dtype=np.int32
             ).tolist()
 
         if supplied:
