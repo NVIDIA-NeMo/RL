@@ -259,6 +259,8 @@ def test_nano_omni_sync_2n_debug_recipe_resolves_multi_harness_topology():
     assert config["grpo"]["num_generations_per_prompt"] == 2
     assert config["grpo"]["max_num_epochs"] == 1_000_000
     assert config["grpo"]["max_num_steps"] == 1_000_000
+    assert config["env"]["nemo_gym"]["server_spinup_timeout_seconds"] == 0
+    assert config["env"]["nemo_gym"]["model_endpoint_readiness_timeout_seconds"] == 0
     assert config["policy"]["train_global_batch_size"] == 8
     assert config["async_rl"]["sampler"]["max_lookahead_versions"] == 0
     assert config["data_plane"]["enabled"] is True
