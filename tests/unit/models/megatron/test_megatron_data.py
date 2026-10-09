@@ -2321,3 +2321,239 @@ def test_get_pack_sequence_parameters_for_megatron(get_pack_sequence_parameters_
         # Check that all workers succeeded
         for i, result in enumerate(results):
             assert result["success"], f"Worker {i} failed: {result['error']}"
+
+
+def _shared_prefix_batch(tokens, prompt_lengths, group_ids):
+    """Build a shared-prefix batch whose every group runs in one prescribed slot."""
+    import numpy as np
+
+    lengths = [len(row) for row in tokens]
+    width = max(lengths) + 2
+    return BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [row + [0] * (width - len(row)) for row in tokens]
+            ),
+            "input_lengths": torch.tensor(lengths),
+            "token_mask": torch.ones(len(tokens), width),
+            "sample_mask": torch.ones(len(tokens)),
+            "shared_prefix_prompt_lengths": torch.tensor(prompt_lengths),
+            "shared_prefix_group_id": np.asarray(group_ids, dtype=object),
+            "_shared_prefix_execution_slot": torch.zeros(len(tokens), dtype=torch.long),
+        }
+    )
+
+
+def _shared_prefix_cfg(capacity=64, **shared_prefix_training):
+    return {
+        "sequence_packing": {
+            "enabled": True,
+            "algorithm": "modified_first_fit_decreasing",
+            "train_mb_tokens": capacity,
+            "logprob_mb_tokens": capacity,
+        },
+        "dynamic_batching": {"enabled": False},
+        "make_sequence_length_divisible_by": 1,
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "sequence_parallel": False,
+            "pipeline_model_parallel_size": 1,
+        },
+        "shared_prefix_training": {"mode": "train", **shared_prefix_training},
+    }
+
+
+# Two exact-prompt groups: every unit is a star, so no CP/packing state is needed.
+_STAR_TOKENS = [[1, 2, 3, 4, 5], [1, 2, 3, 6], [9, 8, 7], [1, 2, 3, 7, 8], [9, 8, 6]]
+_STAR_PROMPTS = [3, 3, 2, 3, 2]
+_STAR_GROUPS = ["a", "a", "b", "a", "b"]
+
+
+@pytest.mark.mcore
+class TestSharedPrefixMicrobatchIterator:
+    """Shared-prefix guards in the Megatron microbatch iterator and planner."""
+
+    @pytest.fixture(autouse=True)
+    def _require_megatron_rl(self):
+        pytest.importorskip("megatron.rl.shared_prefix_execution")
+
+    def _plan(self, data, cfg, capacity=64):
+        from nemo_rl.models.megatron.data import plan_shared_prefix_execution_units
+
+        return plan_shared_prefix_execution_units(data, cfg=cfg, bin_capacity=capacity)
+
+    def test_iterator_requires_planned_units(self):
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+        data = _shared_prefix_batch(_STAR_TOKENS, _STAR_PROMPTS, _STAR_GROUPS)
+        with pytest.raises(ValueError, match="shared_prefix_execution_units"):
+            get_microbatch_iterator(
+                data, _shared_prefix_cfg(), 1, None, shared_prefix_bin_capacity=64
+            )
+
+    def test_iterator_keeps_caller_batch_and_unit_order(self):
+        from nemo_rl.models.megatron.data import (
+            SHARED_PREFIX_SOURCE_ROW_INDEX,
+            get_microbatch_iterator,
+        )
+
+        data = _shared_prefix_batch(_STAR_TOKENS, _STAR_PROMPTS, _STAR_GROUPS)
+        cfg = _shared_prefix_cfg()
+        units = self._plan(data, cfg)
+        _, num_units, mbs, _, padded = get_microbatch_iterator(
+            data,
+            cfg,
+            1,
+            None,
+            seq_length_key="input_lengths",
+            shared_prefix_bin_capacity=64,
+            shared_prefix_execution_units=units,
+        )
+        assert SHARED_PREFIX_SOURCE_ROW_INDEX not in data
+        assert (num_units, mbs) == (len(units), 1)
+        assert padded == max(unit.physical_length for unit in units)
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "delegate_pack_to_model",
+            "delegate_mtp_loss_mask_to_model",
+            "model_slices_context_parallel_inputs",
+        ],
+    )
+    def test_iterator_rejects_model_owned_inputs(self, flag):
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+        data = _shared_prefix_batch(_STAR_TOKENS, _STAR_PROMPTS, _STAR_GROUPS)
+        cfg = _shared_prefix_cfg()
+        units = self._plan(data, cfg)
+        with pytest.raises(NotImplementedError, match=flag):
+            get_microbatch_iterator(
+                data,
+                cfg,
+                1,
+                None,
+                shared_prefix_bin_capacity=64,
+                shared_prefix_execution_units=units,
+                **{flag: True},
+            )
+
+    def test_iterator_rejects_hybridep_prepadding(self):
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+        data = _shared_prefix_batch(_STAR_TOKENS, _STAR_PROMPTS, _STAR_GROUPS)
+        cfg = _shared_prefix_cfg()
+        units = self._plan(data, cfg)
+        cfg["megatron_cfg"].update(
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_prepad_packed_inputs=True,
+        )
+        with pytest.raises(
+            NotImplementedError, match="moe_hybridep_prepad_packed_inputs"
+        ):
+            get_microbatch_iterator(
+                data,
+                cfg,
+                1,
+                None,
+                shared_prefix_bin_capacity=64,
+                shared_prefix_execution_units=units,
+            )
+
+    def test_iterator_rejects_star_rows_out_of_layout_order(self):
+        from dataclasses import replace
+
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+        data = _shared_prefix_batch(_STAR_TOKENS, _STAR_PROMPTS, _STAR_GROUPS)
+        cfg = _shared_prefix_cfg()
+        units = self._plan(data, cfg)
+        star = next(unit for unit in units if len(unit.row_indices) > 1)
+        assert star.shared_layout is not None
+        reordered = tuple(
+            replace(unit, row_indices=tuple(reversed(unit.row_indices)))
+            if unit is star
+            else unit
+            for unit in units
+        )
+        with pytest.raises(ValueError, match="disagrees with its layout"):
+            get_microbatch_iterator(
+                data,
+                cfg,
+                1,
+                None,
+                shared_prefix_bin_capacity=64,
+                shared_prefix_execution_units=reordered,
+            )
+
+    def test_missing_group_id_raises_value_error(self):
+        data = _shared_prefix_batch(_STAR_TOKENS, _STAR_PROMPTS, _STAR_GROUPS)
+        del data["shared_prefix_group_id"]
+        with pytest.raises(ValueError, match="shared_prefix_group_id"):
+            self._plan(data, _shared_prefix_cfg())
+
+    def test_dense_fallbacks_honor_max_sequences_per_bin(self):
+        # Each group's last sibling changes the prompt's final token, so its rows
+        # cannot share one exact prompt and are packed as dense fallbacks.
+        tokens = [
+            [1, 2, 3, 4],
+            [1, 2, 5, 6],
+            [7, 8, 9, 1],
+            [7, 8, 2, 3],
+            [4, 5, 6, 7],
+            [4, 5, 1, 2],
+        ]
+        groups = ["a", "a", "b", "b", "c", "c"]
+        data = _shared_prefix_batch(tokens, [3] * 6, groups)
+        cfg = _shared_prefix_cfg(
+            pack_groups=True, repack_groups=True, pack_dense_fallbacks=True
+        )
+        cfg["sequence_packing"]["max_sequences_per_bin"] = 2
+        units = self._plan(data, cfg)
+        dense_sizes = [len(u.row_indices) for u in units if u.shared_layout is None]
+        assert sum(dense_sizes) == 6
+        assert max(dense_sizes) <= 2
+
+    def test_dense_packer_rejects_pair_grouping_key(self):
+        from nemo_rl.models.megatron.data import _make_shared_prefix_dense_packer
+
+        with pytest.raises(ValueError, match="pair_grouping_key"):
+            _make_shared_prefix_dense_packer(
+                {
+                    "algorithm": "modified_first_fit_decreasing",
+                    "pair_grouping_key": "pair_index",
+                },
+                bin_capacity=8,
+            )
+
+    def test_star_units_carry_complete_forward_metadata(self):
+        from nemo_rl.models.megatron.data import process_shared_prefix_microbatch
+
+        data = _shared_prefix_batch(_STAR_TOKENS, _STAR_PROMPTS, _STAR_GROUPS)
+        cfg = _shared_prefix_cfg()
+        units = self._plan(data, cfg)
+        microbatches = list(
+            process_shared_prefix_microbatch(
+                data_dict=data,
+                cfg=cfg,
+                bin_capacity=64,
+                execution_units=units,
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=1,
+                pad_packed_seq_to_multiple_of=1,
+                pad_full_seq_to=None,
+                straggler_timer=None,
+            )
+        )
+        assert len(microbatches) == len(units)
+        for unit, microbatch in zip(units, microbatches):
+            metadata = microbatch.shared_prefix
+            assert metadata is not None
+            assert (metadata.cp_rank, metadata.cp_size) == (0, 1)
+            assert metadata.padded_total_length == unit.physical_length
+            assert torch.equal(
+                microbatch.data_dict["input_ids"],
+                data["input_ids"][list(metadata.tensor_bin.layout.row_indices)],
+            )

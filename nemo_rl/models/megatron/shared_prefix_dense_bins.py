@@ -16,10 +16,10 @@
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
 
-from nemo_rl.data.packing.algorithms import get_packer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.megatron.data import (
     _build_shared_prefix_rows,
+    _make_shared_prefix_dense_packer,
     _normalize_shared_prefix_group_ids,
     _resolve_shared_prefix_execution_topology,
 )
@@ -51,17 +51,10 @@ def plan_dense_training_bins(
         raise ValueError("Training rows must fit the expanded token budget")
     # Shared-prefix validation already requires sequence packing to be enabled.
     packing = cast(SequencePackingConfig, cfg["sequence_packing"])
-    if packing.get("pair_grouping_key") is not None:
-        raise ValueError("Dense-bin prefix sharing does not support pair_grouping_key")
-    packer = get_packer(
-        packing["algorithm"],
-        bin_capacity=bin_capacity,
-        max_sequences_per_bin=packing.get("max_sequences_per_bin"),
-    )
     return plan_dense_bins(
         costs=costs,
         bin_capacity=bin_capacity,
-        dense_packer=lambda row_costs: packer.pack(list(row_costs)),
+        dense_packer=_make_shared_prefix_dense_packer(packing, bin_capacity),
     )
 
 

@@ -19,6 +19,7 @@ from math import lcm
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Iterator,
     Literal,
     Optional,
@@ -417,6 +418,32 @@ def get_microbatch_iterator(
             )
         if not cfg["sequence_packing"]["enabled"]:
             raise ValueError("shared-prefix train mode requires sequence packing")
+        model_owned_inputs = [
+            name
+            for name, enabled in (
+                ("delegate_pack_to_model", delegate_pack_to_model),
+                ("delegate_mtp_loss_mask_to_model", delegate_mtp_loss_mask_to_model),
+                (
+                    "model_slices_context_parallel_inputs",
+                    model_slices_context_parallel_inputs,
+                ),
+            )
+            if enabled
+        ]
+        if model_owned_inputs:
+            raise NotImplementedError(
+                "shared-prefix train mode packs and CP-shards every unit itself "
+                f"and does not support {', '.join(model_owned_inputs)}"
+            )
+        if uses_hybridep_flex_dispatcher(cfg["megatron_cfg"]) and cfg[
+            "megatron_cfg"
+        ].get("moe_hybridep_prepad_packed_inputs"):
+            # Star units are padded only to M, not to the expert-group maximum,
+            # and would skip the prepad collective that fallback units issue.
+            raise NotImplementedError(
+                "shared-prefix train mode does not support "
+                "moe_hybridep_prepad_packed_inputs"
+            )
         if SHARED_PREFIX_SOURCE_ROW_INDEX in data:
             raise ValueError(
                 f"input batch contains reserved field {SHARED_PREFIX_SOURCE_ROW_INDEX!r}"
@@ -427,12 +454,25 @@ def get_microbatch_iterator(
             validate_shared_prefix_execution_units,
         )
 
-        # Units planned on ``data`` address its rows in order; only guard
-        # against a plan for a different batch.
+        # Units planned on ``data`` address its rows in order. Reject a plan for
+        # a different batch, and a star whose rows disagree with its layout:
+        # the logprob fan-out follows the layout's row order.
         validate_shared_prefix_execution_units(
             shared_prefix_execution_units,
             batch_size=data.size,
         )
+        for unit in shared_prefix_execution_units:
+            layout = unit.shared_layout
+            if layout is not None and (
+                tuple(unit.row_indices) != tuple(layout.row_indices)
+                or unit.physical_length != layout.physical_total_length
+            ):
+                raise ValueError(
+                    "precomputed shared-prefix execution unit disagrees with its "
+                    f"layout: rows {tuple(unit.row_indices)} vs "
+                    f"{tuple(layout.row_indices)}, physical length "
+                    f"{unit.physical_length} vs {layout.physical_total_length}"
+                )
 
         # Retain an explicit source-row index so expanded shared/fallback
         # forwards can be restored to the caller's conventional order. A
@@ -700,6 +740,10 @@ def _normalize_shared_prefix_group_ids(
     packed tensors, and lists. Normalize only the opted-in group field and leave
     the caller's batch untouched.
     """
+    if SHARED_PREFIX_GROUP_ID not in data_dict:
+        raise ValueError(
+            f"shared-prefix train mode requires batch field {SHARED_PREFIX_GROUP_ID!r}"
+        )
     group_ids = data_dict[SHARED_PREFIX_GROUP_ID]
     if isinstance(group_ids, list):
         return data_dict
@@ -822,6 +866,27 @@ def _get_prescribed_shared_prefix_slots(
     )
 
 
+def _make_shared_prefix_dense_packer(
+    packing_cfg: Mapping[str, Any], bin_capacity: int
+) -> Callable[[Sequence[int]], list[list[int]]]:
+    """Return the conventional length packer for shared-prefix dense units.
+
+    Dense units honor ``max_sequences_per_bin`` like ordinary sequence packing.
+    Star and forest units are not row-capped: one forward holds every sibling.
+    """
+    if packing_cfg.get("pair_grouping_key") is not None:
+        raise ValueError("shared-prefix train mode does not support pair_grouping_key")
+
+    def pack(lengths: Sequence[int]) -> list[list[int]]:
+        return get_packer(
+            packing_cfg["algorithm"],
+            bin_capacity=bin_capacity,
+            max_sequences_per_bin=packing_cfg.get("max_sequences_per_bin"),
+        ).pack(list(lengths))
+
+    return pack
+
+
 def plan_shared_prefix_execution_units(
     data: BatchedDataDict[Any],
     *,
@@ -852,12 +917,6 @@ def plan_shared_prefix_execution_units(
     row_slots = _get_prescribed_shared_prefix_slots(data)
     group_config = get_shared_prefix_training_config(cfg)
     packing_cfg = cfg.get("sequence_packing") or {}
-
-    def pack_dense(lengths: Sequence[int]) -> list[list[int]]:
-        return get_packer(packing_cfg["algorithm"], bin_capacity=bin_capacity).pack(
-            lengths
-        )
-
     return plan_execution_units(
         rows,
         row_slots=row_slots,
@@ -869,7 +928,7 @@ def plan_shared_prefix_execution_units(
         merge_dense_fallbacks=group_config.merge_dense_fallbacks,
         forward_only=forward_only,
         evaluation_packing=group_config.evaluation_packing,
-        dense_packer=pack_dense,
+        dense_packer=_make_shared_prefix_dense_packer(packing_cfg, bin_capacity),
         largest_first=packing_cfg.get("microbatch_order") == "largest_first",
     )
 
