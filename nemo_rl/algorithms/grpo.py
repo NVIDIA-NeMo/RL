@@ -113,6 +113,7 @@ from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
     backfill_missing_routed_experts,
+    get_effort_config,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -2584,12 +2585,7 @@ def _write_latest_checkpoint_status(
 
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
     """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
-    if "nemo_gym" not in master_config.env:
-        return None
-    effort_dict = master_config.env["nemo_gym"].get("effort_levels")
-    if effort_dict is None:
-        return None
-    return EffortLevelsConfig.model_validate(effort_dict)
+    return get_effort_config(master_config.env)
 
 
 def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch.Tensor:
@@ -3506,7 +3502,7 @@ def _grpo_train_impl(
                         # Stored on the batch so dynamic sampling filters it.
                         repeated_batch["env_baseline"], _, _ = (
                             calculate_baseline_and_std_per_prompt(
-                                input_ids,
+                                repeated_batch[PROMPT_GROUP_IDS_KEY],
                                 repeated_batch["env_reward"],
                                 torch.ones_like(rewards),
                                 leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
