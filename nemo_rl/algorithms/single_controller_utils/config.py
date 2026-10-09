@@ -1308,6 +1308,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
 
+    if getattr(algo_cfg, "stop_at_entropy_below", None) is not None:
+        raise NotImplementedError(
+            "grpo.stop_at_entropy_below is supported by grpo_train, "
+            "async_grpo_train and the data-plane sync trainer; SingleController "
+            "does not support it yet."
+        )
+
     reward_penalties_enabled = any(
         getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
     )

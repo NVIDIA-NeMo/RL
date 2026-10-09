@@ -37,6 +37,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 from nemo_rl.algorithms.grpo import (
     AdvEstimatorConfig,
     AsyncGRPOConfig,
+    EntropyFloorStop,
     GRPOConfig,
     MasterConfig,
     RewardPenaltyConfig,
@@ -56,6 +57,7 @@ from nemo_rl.algorithms.grpo import (
     _save_async_replay_buffer_checkpoint,
     _shutdown_completed_nemo_gym_startup,
     _startup_pipeline_ready,
+    _step_approx_entropy,
     _validate_multimodal_dedup_capability,
     _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
@@ -4921,6 +4923,140 @@ def test_early_stop_saves_final_checkpoint(mock_grpo_components, train_func, tmp
         is True
     )
     assert checkpointer.shutdown.called
+
+
+def test_step_approx_entropy_sums_microbatch_fragments():
+    """Per-microbatch approx_entropy values are fragments of one batch mean."""
+    fragments = [0.31 / 64] * 64
+    assert _step_approx_entropy(
+        {"all_mb_metrics": {"approx_entropy": fragments}}
+    ) == pytest.approx(0.31)
+    assert _step_approx_entropy(
+        {"all_mb_metrics": {"approx_entropy": [0.1, float("nan"), 0.2]}}
+    ) == pytest.approx(0.3)
+    assert _step_approx_entropy({"all_mb_metrics": {"loss": [0.5]}}) is None
+    assert _step_approx_entropy({"all_mb_metrics": {"approx_entropy": []}}) is None
+    assert _step_approx_entropy({}) is None
+
+
+def test_entropy_floor_stop_counts_consecutive_steps():
+    guard = EntropyFloorStop(threshold=0.18, patience=3)
+    assert guard.update(0.10) is None
+    assert guard.update(0.10) is None
+    assert guard.update(0.25) is None  # back above the floor resets the count
+    assert guard.update(0.10) is None
+    assert guard.update(0.10) is None
+    message = guard.update(0.17)
+    assert message is not None and "stop_at_entropy_below=0.18" in message
+
+
+def test_entropy_floor_stop_disabled_and_missing_metric():
+    assert EntropyFloorStop(threshold=None).update(0.0) is None
+    guard = EntropyFloorStop(threshold=0.18)
+    with pytest.warns(UserWarning, match="approx_entropy"):
+        assert guard.update(None) is None
+    assert guard.update(None) is None  # warns only once
+    assert guard.update(0.1) is not None
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"stop_at_entropy_below": float("nan")}, "stop_at_entropy_below"),
+        ({"stop_at_entropy_patience": 0}, "stop_at_entropy_patience"),
+    ],
+)
+def test_grpo_config_rejects_invalid_entropy_stop(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        GRPOConfig(**kwargs)
+
+
+def _run_entropy_stop_trainer(
+    mock_grpo_components, train_func, tmp_path, entropy_fragments
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_end = False
+    master_config.grpo.stop_at_entropy_below = 0.18
+    master_config.grpo.stop_at_entropy_patience = 2
+    master_config.checkpointing["enabled"] = True
+    # save_period alone can never fire, so only the early stop saves.
+    master_config.checkpointing["save_period"] = 1000
+    master_config.checkpointing["metric_name"] = None
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
+    checkpointer.checkpoint_dir = tmp_path
+    policy = mock_grpo_components["policy"]
+    policy.train.return_value["all_mb_metrics"]["approx_entropy"] = entropy_fragments
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    with ExitStack() as stack:
+        validate_target = _enter_stop_test_mocks(
+            stack,
+            train_func,
+            master_config,
+            mock_grpo_components,
+            mock_batch,
+            mock_rollout_metrics,
+        )
+        stack.enter_context(patch("nemo_rl.algorithms.grpo.torch.save"))
+        stack.enter_context(patch("nemo_rl.algorithms.grpo_sync.torch.save"))
+        stack.enter_context(patch(validate_target, return_value=({}, {})))
+        train_func(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+    train_calls = (
+        policy.train_from_meta.call_count
+        if train_func is grpo_train_sync
+        else policy.train.call_count
+    )
+    return train_calls, checkpointer, policy
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_training_stops_at_entropy_floor(mock_grpo_components, train_func, tmp_path):
+    """Entropy below the floor for `patience` steps saves a final checkpoint and stops."""
+    # Two microbatch fragments: step approx_entropy = 0.05 + 0.05 = 0.10 < 0.18.
+    train_calls, checkpointer, policy = _run_entropy_stop_trainer(
+        mock_grpo_components, train_func, tmp_path, [0.05, 0.05]
+    )
+
+    assert train_calls == 2
+    checkpointer.init_tmp_checkpoint.assert_called_once()
+    assert checkpointer.init_tmp_checkpoint.call_args.args[0] == 2
+    policy.save_checkpoint.assert_called_once()
+    assert policy.save_checkpoint.call_args.kwargs["is_final_checkpoint"] is True
+    assert checkpointer.shutdown.called
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_entropy_floor_reads_the_summed_step_value(
+    mock_grpo_components, train_func, tmp_path
+):
+    """Fragments averaging 0.10 but summing to 0.40 (the logged value) do not trip 0.18."""
+    train_calls, checkpointer, _ = _run_entropy_stop_trainer(
+        mock_grpo_components, train_func, tmp_path, [0.10, 0.10, 0.10, 0.10]
+    )
+
+    assert train_calls == 5
+    assert checkpointer.init_tmp_checkpoint.call_args.args[0] == 5
 
 
 def test_training_stops_on_configured_pass_k_metric(mock_grpo_components):
