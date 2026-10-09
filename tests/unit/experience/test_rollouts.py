@@ -2310,11 +2310,12 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     }
     manager._tokenizer = None
     manager._effort_config = None
-    manager._results_to_completions = lambda results: (
+    manager._results_to_completions = lambda results, **_: (
         [result["value"] for result in results],
         {},
+        ({}, {}, 0),
     )
-    manager._compute_reward_penalty_metrics = lambda counts, num_results: {}
+    manager._compute_reward_penalty_metrics = lambda counts, num_results, **_: {}
     manager._compute_rollout_metrics = lambda completions, agent: {
         "completion_count": len(completions),
         "agent": agent,
@@ -2517,9 +2518,13 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
             )
 
     manager._stream_rows = fake_stream_rows
-    manager._results_to_completions = lambda _results: ([object()], {})
+    manager._results_to_completions = lambda _results, **_: (
+        [object()],
+        {},
+        ({}, {}, 0),
+    )
     manager._compute_rollout_metrics = lambda *_args: {}
-    manager._compute_reward_penalty_metrics = lambda *_args: {}
+    manager._compute_reward_penalty_metrics = lambda *_args, **_kwargs: {}
 
     async def run_group():
         return await manager._run_rollouts(

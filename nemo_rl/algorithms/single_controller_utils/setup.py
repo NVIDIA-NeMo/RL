@@ -2025,6 +2025,13 @@ def setup_single_controller(
                 include_summary_rows=bool(
                     token_capture_cfg.segment_rows.include_summary_rows
                 ),
+                nan_generation_logprobs=str(
+                    ((master_config.env or {}).get("nemo_gym") or {}).get(
+                        "nan_generation_logprobs", "mask"
+                    )
+                ),
+                reward_penalty_config=resolved_reward_penalty_config,
+                tokenizer_config=dict(master_config.policy["tokenizer"]),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

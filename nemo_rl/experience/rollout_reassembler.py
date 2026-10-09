@@ -51,6 +51,7 @@ failure is a pre-publication ``route_assembly:<reason>`` rejection.
 
 from __future__ import annotations
 
+import math
 import time
 import warnings
 from collections import Counter
@@ -67,6 +68,10 @@ from nemo_rl.data_plane.tq_token_sink import (
     StagedMediaTensors,
     TQTokenSink,
     TQTokenSource,
+)
+from nemo_rl.experience.legacy_rollout_metrics import (
+    ROLLOUT_DEBUG_TAG,
+    capture_rollout_debug_tag,
 )
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.route_assembly import (
@@ -152,6 +157,12 @@ class FinalizedRollout:
     segments_rejected: int = 0
     # compaction_summary chains dropped because include_summary_rows is off.
     segments_skipped_summary: int = 0
+    # NaN generation logprobs were zeroed and this row alone is force-masked
+    # (env.nemo_gym.nan_generation_logprobs=mask, the echo path's behavior).
+    nan_logprobs_masked: bool = False
+    # Token-scoped reward penalties any chain of the rollout hit (canonical row
+    # only); a hit zeroes the rollout's reward on every row.
+    penalty_hits: tuple[str, ...] = ()
 
 
 @dataclass
@@ -182,6 +193,12 @@ class FinalizedGroup:
     # Extra segment rows published after the canonical block
     # (``len(meta.sample_ids) == total_row_count + extra_row_count``).
     extra_row_count: int = 0
+    # Per rollout, in rollout order: generated tokens over all its rows and its
+    # longest single generation (0 for a rejected rollout). Receipts only carry
+    # manifest deltas, so these are the true legacy gen_tokens_per_sample /
+    # max_gen_tokens_per_turn sizes.
+    rollout_gen_tokens: tuple[int, ...] = ()
+    rollout_max_gen_tokens_per_turn: tuple[int, ...] = ()
 
 
 def _concat_media(parts: list[StagedMediaTensors]) -> StagedMediaTensors:
@@ -288,6 +305,9 @@ class RolloutReassembler:
         segment_rows_enabled: bool = False,
         max_rows_per_rollout: int = 1,
         include_summary_rows: bool = True,
+        nan_generation_logprobs: str = "mask",
+        reward_penalty_config: Optional[dict[str, Any]] = None,
+        tokenizer_config: Optional[dict[str, Any]] = None,
     ) -> None:
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -315,6 +335,17 @@ class RolloutReassembler:
                 f"(canonical row plus at least one segment), got {max_rows_per_rollout}"
             )
         self._include_summary_rows = bool(include_summary_rows)
+        if nan_generation_logprobs not in ("mask", "raise"):
+            raise ValueError(
+                "nan_generation_logprobs must be 'mask' or 'raise', "
+                f"got {nan_generation_logprobs!r}"
+            )
+        self._nan_generation_logprobs = nan_generation_logprobs
+        # Resolved reward_penalties (token ids, thinking tags); the tokenizer
+        # decodes generations for the think-tag string check, loaded lazily.
+        self._reward_penalty_config = dict(reward_penalty_config or {})
+        self._tokenizer_config = tokenizer_config
+        self._tokenizer: Any = None
         self._warned_missing_linearize_all = False
         self._staging_partition = staging_partition
         # (num_moe_layers, topk), learned from the first rebuilt row that
@@ -472,6 +503,15 @@ class RolloutReassembler:
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
 
+        # Token penalties over every chain, before the summary filter and the
+        # cap, as the echo path checks every session trace.
+        try:
+            penalty_hits = self._token_penalty_hits(chain_rows)
+        except ValueError as error:
+            return rejected(f"penalty_spans:{error}", staging_keys)
+        if penalty_hits:
+            reward = 0.0
+
         # Summary rows: drop the compaction_summary chains before the cap when
         # they are not wanted, so the cap budget goes to the other chains.
         segments_skipped_summary = 0
@@ -537,6 +577,7 @@ class RolloutReassembler:
                         segments_dropped_by_cap=segments_dropped_by_cap,
                         segments_rejected=segments_rejected,
                         segments_skipped_summary=segments_skipped_summary,
+                        penalty_hits=penalty_hits,
                     )
                 )
             else:
@@ -544,6 +585,84 @@ class RolloutReassembler:
                     _replace_dataclass(row, trace_in_rollout_idx=publish_idx)
                 )
         return renumbered
+
+    def _token_penalty_hits(self, chain_rows: list[Any]) -> tuple[str, ...]:
+        """Token-scoped reward penalties over every chain of one rollout.
+
+        Parity with ``apply_reward_penalties`` on the echo path, which checks
+        each session trace's (user delta, assistant generation) message pairs:
+        a linearized chain is the same sequence of (carry, generation) spans.
+        Returns the penalty names hit (``unwanted_token``,
+        ``malformed_think_tag``). The message-level ``has_malformed_thinking``
+        flag has no capture-path source and is not checked.
+
+        Raises:
+            ValueError: The link spans do not tile the chain's tokens.
+        """
+        cfg = self._reward_penalty_config
+        check_unwanted = bool(cfg.get("penalize_unwanted_tokens"))
+        check_think = bool(cfg.get("penalize_malformed_think_tag"))
+        if not (check_unwanted or check_think):
+            return ()
+        token_ids_cfg = cfg.get("token_ids") or {}
+        unwanted = {int(token) for token in token_ids_cfg.get("unwanted") or ()}
+        think_open = token_ids_cfg.get("think_open")
+        think_close = token_ids_cfg.get("think_close")
+        tags = tuple(cfg.get("thinking_tags") or ("<think>", "</think>"))
+        hits: set[str] = set()
+        for chain in chain_rows:
+            token_ids = list(chain.token_ids)
+            offset = 0
+            for _call_id, carry_len, generation_len in getattr(chain, "link_spans", ()):
+                carry = token_ids[offset : offset + int(carry_len)]
+                offset += int(carry_len)
+                generation = token_ids[offset : offset + int(generation_len)]
+                offset += int(generation_len)
+                if check_unwanted and unwanted.intersection(generation):
+                    hits.add("unwanted_token")
+                if (
+                    check_think
+                    and "malformed_think_tag" not in hits
+                    and self._malformed_think_tag(
+                        carry, generation, think_open, think_close, tags
+                    )
+                ):
+                    hits.add("malformed_think_tag")
+            if offset != len(token_ids):
+                raise ValueError(
+                    f"link spans cover {offset} of {len(token_ids)} chain tokens"
+                )
+        return tuple(sorted(hits))
+
+    def _malformed_think_tag(
+        self,
+        carry: list[int],
+        generation: list[int],
+        think_open: Optional[int],
+        think_close: Optional[int],
+        tags: tuple[str, ...],
+    ) -> bool:
+        """One turn of the echo path's malformed-think-tag check."""
+        if think_open is not None and think_close is not None:
+            # Thinking mode from the prompt: balanced tags mean thinking off
+            # (no tags generated); one trailing open tag means thinking on
+            # (exactly one close tag generated). Anything else is a violation.
+            prompt_open, prompt_close = carry.count(think_open), carry.count(think_close)
+            if prompt_open == prompt_close:
+                expected = (0, 0)
+            elif prompt_open == prompt_close + 1:
+                expected = (0, 1)
+            else:
+                return True
+            if (generation.count(think_open), generation.count(think_close)) != expected:
+                return True
+        # Tags spelled with ordinary tokens bypass the id check.
+        if self._tokenizer is None:
+            from nemo_rl.algorithms.utils import get_tokenizer
+
+            self._tokenizer = get_tokenizer(self._tokenizer_config)
+        text = self._tokenizer.decode(generation, skip_special_tokens=False)
+        return text.count(tags[0]) > 0 or text.count(tags[1]) > 1
 
     def _build_chain_row(
         self,
@@ -637,6 +756,17 @@ class RolloutReassembler:
                 if failure is not None:
                     return None, f"route_assembly:{failure}"
 
+        logprobs = [float(lp) for lp in chain.logprobs]
+        nan_logprobs_masked = any(math.isnan(lp) for lp in logprobs)
+        if nan_logprobs_masked:
+            if self._nan_generation_logprobs == "raise":
+                raise ValueError(
+                    f"rollout {rollout_id} row {trace_idx} has NaN generation "
+                    "logprobs (env.nemo_gym.nan_generation_logprobs=raise)"
+                )
+            # As on the echo path: zero them so no reduction turns NaN, and
+            # force-mask this row only.
+            logprobs = [0.0 if math.isnan(lp) else lp for lp in logprobs]
         return (
             FinalizedRollout(
                 rollout_id=rollout_id,
@@ -644,7 +774,7 @@ class RolloutReassembler:
                 rejection_reason=None,
                 token_ids=list(chain.token_ids),
                 token_mask=list(chain.token_mask),
-                logprobs=list(chain.logprobs),
+                logprobs=logprobs,
                 prompt_len=int(chain.prompt_len),
                 reward=reward,
                 staging_keys=list(staging_keys) if owns_cleanup else [],
@@ -659,6 +789,7 @@ class RolloutReassembler:
                 chain_index=int(getattr(chain, "chain_index", trace_idx)),
                 link_spans=link_spans,
                 media=media,
+                nan_logprobs_masked=nan_logprobs_masked,
             ),
             None,
         )
@@ -751,6 +882,7 @@ class RolloutReassembler:
         prompt_idx: int,
         loss_multiplier: float = 1.0,
         canonical_sample_ids: Optional[list[str]] = None,
+        rollout_infos: Optional[list[dict[str, Any]]] = None,
     ) -> FinalizedGroup:
         """Publish the N canonical rows (plus any segment rows) for one prompt group.
 
@@ -782,6 +914,9 @@ class RolloutReassembler:
             canonical_sample_ids = rollout_ids
         assert len(canonical_sample_ids) == len(rollout_ids), (
             "canonical_sample_ids must be one per rollout"
+        )
+        assert rollout_infos is None or len(rollout_infos) == len(rollout_ids), (
+            "rollout_infos must be one per rollout"
         )
         _group_t0 = time.perf_counter()
         per_rollout = [
@@ -824,6 +959,38 @@ class RolloutReassembler:
             sum(1 for count in rows_per_rollout if count > 1)
         )
         metrics["finalize/segment_rows"] = float(len(extra_entries))
+        # Legacy per-trace / per-rollout panels (echo path: one trace per session),
+        # over the published valid rows: turns = generation spans, tokens = the
+        # row's tokens. Per-rollout values sum the rollout's rows, as legacy did.
+        valid_entries = [
+            (rollout_idx, row)
+            for rollout_idx, row in zip(row_rollout_idx, rows)
+            if row.valid
+        ]
+        if valid_entries:
+            turns = [len(row.link_spans) for _, row in valid_entries]
+            gen_tokens = [int(sum(row.token_mask)) for _, row in valid_entries]
+            per_rollout: dict[int, list[FinalizedRollout]] = {}
+            for rollout_idx, row in valid_entries:
+                per_rollout.setdefault(rollout_idx, []).append(row)
+            n_valid = len(per_rollout)
+            legacy = {
+                "turns_per_trace": sum(turns) / len(turns),
+                "turns_per_trace_max": float(max(turns)),
+                "gen_tokens_per_trace": sum(gen_tokens) / len(gen_tokens),
+                "traces_per_sample": len(valid_entries) / n_valid,
+                "subagent_traces_per_sample": sum(
+                    row.trace_kind == "subagent" for _, row in valid_entries
+                )
+                / n_valid,
+                "turns_per_sample": sum(turns) / n_valid,
+                "gen_tokens_per_sample": sum(gen_tokens) / n_valid,
+                "total_tokens_per_sample": sum(
+                    len(row.token_ids) for _, row in valid_entries
+                )
+                / n_valid,
+            }
+            metrics.update({f"finalize/legacy/{k}": float(v) for k, v in legacy.items()})
         for kind, count in Counter(row.trace_kind for _, row in extra_entries).items():
             metrics[f"finalize/segment_rows_by_kind_{kind}"] = float(count)
         metrics["finalize/chains_skipped_ambiguous"] = float(
@@ -960,10 +1127,29 @@ class RolloutReassembler:
         sample_mask = torch.zeros(n, dtype=torch.float32)
         lengths = torch.tensor(seq_lens, dtype=torch.long)
         # Extra rows carry their rollout's reward / mask_sample verbatim.
+        # Token penalties zero the rollout's reward on every row.
+        rewards = [
+            0.0 if canonical_rows[i].penalty_hits else rewards[i]
+            for i in range(n_rollouts)
+        ]
+        for flag, name in (
+            ("penalize_unwanted_tokens", "unwanted_token"),
+            ("penalize_malformed_think_tag", "malformed_think_tag"),
+        ):
+            if self._reward_penalty_config.get(flag):
+                metrics[f"finalize/penalty/{name}_rate"] = (
+                    sum(name in row.penalty_hits for row in canonical_rows) / n_rollouts
+                )
         rewards_t = torch.tensor(
             [rewards[i] for i in row_rollout_idx], dtype=torch.float32
         )
-        mask_sample_rows = [bool(mask_sample[i]) for i in row_rollout_idx]
+        mask_sample_rows = [
+            bool(mask_sample[i]) or row.nan_logprobs_masked
+            for i, row in zip(row_rollout_idx, rows)
+        ]
+        metrics["finalize/nan_logprob_rows_masked"] = float(
+            sum(row.nan_logprobs_masked for row in rows)
+        )
         for r, row in enumerate(rows):
             if not row.valid:
                 continue
@@ -1042,12 +1228,34 @@ class RolloutReassembler:
         # rows_in_rollout is the rollout's total published rows (canonical
         # included, 1 on placeholders) so a consumer can assert it holds the
         # whole rollout, not merely no orphan.
+        compacted_rollouts = {
+            rollout_idx
+            for rollout_idx, row in zip(row_rollout_idx, rows)
+            if row.valid
+            and row.trace_kind
+            in (TRACE_KIND_COMPACTION_SEGMENT, TRACE_KIND_COMPACTION_SUMMARY)
+        }
         for tag, row, rollout_idx in zip(tags, rows, row_rollout_idx):
             tag["rollout_local_idx"] = int(rollout_idx)
             tag["trace_in_rollout_idx"] = int(row.trace_in_rollout_idx)
             tag["trace_kind"] = row.trace_kind if row.valid else TRACE_KIND_PLACEHOLDER
             tag["segment_index"] = int(row.segment_index)
             tag["rows_in_rollout"] = int(rows_per_rollout[rollout_idx])
+            if rollout_infos is not None:
+                # Same per-row provenance the echo path's commit writes, for
+                # rollout_debug_step*.jsonl and the legacy trace-kind panels.
+                tag[ROLLOUT_DEBUG_TAG] = capture_rollout_debug_tag(
+                    rollout_infos[rollout_idx],
+                    finalizer_kind=tag["trace_kind"],
+                    rollout_compacted=rollout_idx in compacted_rollouts,
+                    segment_index=int(row.segment_index),
+                    turns=len(row.link_spans),
+                    prompt_tokens=int(row.prompt_len),
+                    gen_tokens=int(sum(row.token_mask)),
+                    rollout_local_idx=int(rollout_idx),
+                    trace_in_rollout_idx=int(row.trace_in_rollout_idx),
+                    is_empty_rollout=not row.valid,
+                )
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
             span_count = 0
@@ -1123,6 +1331,15 @@ class RolloutReassembler:
             sequence_lengths=[int(s) for s in lengths.tolist()],
             tags=[dict(t) for t in tags],
         )
+        rollout_gen_tokens = [0] * n_rollouts
+        rollout_max_gen_tokens_per_turn = [0] * n_rollouts
+        for rollout_idx, row in zip(row_rollout_idx, rows):
+            if row.valid:
+                rollout_gen_tokens[rollout_idx] += int(sum(row.token_mask))
+                rollout_max_gen_tokens_per_turn[rollout_idx] = max(
+                    rollout_max_gen_tokens_per_turn[rollout_idx],
+                    max((int(gen) for _, _, gen in row.link_spans), default=0),
+                )
         return FinalizedGroup(
             meta=meta,
             group_min_wv=group_min_wv,
@@ -1135,6 +1352,8 @@ class RolloutReassembler:
             valid_row_count=len(valid_rows),
             total_row_count=n_rollouts,
             extra_row_count=len(extra_entries),
+            rollout_gen_tokens=tuple(rollout_gen_tokens),
+            rollout_max_gen_tokens_per_turn=tuple(rollout_max_gen_tokens_per_turn),
         )
 
     # ── internals ───────────────────────────────────────────────────────────

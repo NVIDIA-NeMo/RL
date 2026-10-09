@@ -123,6 +123,7 @@ def reduce_advantage_pump_metrics(
     num_assistant_messages: list[int] | None = None,
     num_routed_experts_backfilled: list[int] | None = None,
     canonical_masks: list[torch.Tensor] | None = None,
+    segment_canonical_masks: list[torch.Tensor] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -140,6 +141,9 @@ def reduce_advantage_pump_metrics(
             reward). Multiplied into the ``reward`` weights so a rollout with
             several rows still counts once. None (or a length mismatch with
             ``rewards``) keeps the ``sample_masks`` weighting.
+        segment_canonical_masks: The same per-row canonical flags for PPO,
+            whose ``reward`` stays the per-row mean of the legacy echo path
+            (segment rows included); they only add ``reward_per_rollout``.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
         num_mask_sample_filtered: Environment-flagged sample counts, one per
@@ -159,6 +163,16 @@ def reduce_advantage_pump_metrics(
         cat_rewards = torch.cat([r.flatten() for r in rewards])
         if sample_masks:
             cat_masks = torch.cat([m.flatten() for m in sample_masks])
+            if segment_canonical_masks:
+                cat_segment = torch.cat([c.flatten() for c in segment_canonical_masks])
+                if cat_segment.numel() == cat_masks.numel():
+                    rollout_masks = cat_masks * cat_segment.to(cat_masks.dtype)
+                    rollout_sum = rollout_masks.sum()
+                    out["reward_per_rollout"] = (
+                        float((cat_rewards * rollout_masks).sum() / rollout_sum)
+                        if rollout_sum > 0
+                        else 0.0
+                    )
             if canonical_masks:
                 cat_canonical = torch.cat([c.flatten() for c in canonical_masks])
                 if cat_canonical.numel() == cat_masks.numel():

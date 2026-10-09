@@ -70,6 +70,7 @@ from nemo_rl.experience.interfaces import (
 from nemo_rl.experience.legacy_rollout_metrics import (
     legacy_rollout_group_metrics,
     legacy_rollout_timing_aliases,
+    rollout_debug_info,
 )
 from nemo_rl.experience.mask_sample_rules import (
     MaskSampleRule,
@@ -1018,6 +1019,9 @@ class AsyncNemoGymRolloutImpl:
     batched through a single NeMo-Gym run_rollouts call.
     """
 
+    # Instances built without __init__ (tests) run with no operator mask rules.
+    _mask_sample_rules: tuple[MaskSampleRule, ...] = ()
+
     def __init__(
         self,
         tokenizer: TokenizerType,
@@ -1496,7 +1500,13 @@ class AsyncNemoGymRolloutImpl:
             rollout_metrics.update(_effort_shaping_metrics(shaping))
             rollout_metrics.update(
                 self._compute_reward_penalty_metrics(
-                    penalty_counts, len(completed_results)
+                    penalty_counts,
+                    len(completed_results),
+                    # Capture receipts: the token penalties run in the finalizer
+                    # and report as finalize/penalty/*_rate, not here as zeros.
+                    token_penalties=not any(
+                        "receipt" in result for result in completed_results
+                    ),
                 )
             )
             mask_rule_counts, mask_rule_reward_sums, mask_rule_any_count = (
@@ -1625,6 +1635,23 @@ class AsyncNemoGymRolloutImpl:
                     result, self._reward_penalty_config
                 ).items():
                     penalty_counts[flag] = penalty_counts.get(flag, 0) + hit
+        # Token capture: the receipt carries the scored Gym response but no
+        # tokens yet, so only the rollout-scoped (text) penalties run here, once
+        # on the response as legacy did. The token penalties run per chain in
+        # the finalizer (RolloutReassembler), which zeroes the same reward.
+        receipt_views = [
+            {"message_log": [], "full_result": r["full_result"]}
+            for r in results
+            if "receipt" in r and not r["full_result"].get("is_empty_rollout")
+        ]
+        if receipt_views:
+            for flag, count in apply_reward_penalties(
+                receipt_views,
+                _penalty_config_with(
+                    self._reward_penalty_config, _TRACE_SCOPED_PENALTIES
+                ),
+            ).items():
+                penalty_counts[flag] = penalty_counts.get(flag, 0) + count
         completions = []
         for result in results:
             if "receipt" in result:
@@ -1699,13 +1726,21 @@ class AsyncNemoGymRolloutImpl:
         return out
 
     def _compute_reward_penalty_metrics(
-        self, penalty_counts: dict[str, int], num_results: int
+        self,
+        penalty_counts: dict[str, int],
+        num_results: int,
+        *,
+        token_penalties: bool = True,
     ) -> dict[str, float]:
         """Return enabled penalty rates using the legacy Gym metric names."""
         return compute_reward_penalty_metrics(
             penalty_counts,
             num_results,
-            self._reward_penalty_config,
+            self._reward_penalty_config
+            if token_penalties
+            else _penalty_config_with(
+                self._reward_penalty_config, _TRACE_SCOPED_PENALTIES
+            ),
         )
 
     def _compute_rollout_metrics(
@@ -1915,6 +1950,10 @@ class RolloutManager:
         # deliberately: the question it answers -- "is the fleet still answering
         # anyone?" -- is about the fleet, not about one prompt's history.
         self._consecutive_infra_drops: int = 0
+        # Token capture: each finalized group's PromptGroupRecord.rollout_metrics,
+        # keyed by group_id until the controller attaches them to the group's
+        # replay metadata (the echo path commits them with the record itself).
+        self._capture_rollout_metrics: dict[str, dict[str, Any]] = {}
 
     @property
     def stats(self) -> RolloutStats:
@@ -1933,6 +1972,10 @@ class RolloutManager:
         """Step-level ``mask_rules/*`` hits since the last call ({} on the native impl)."""
         pop = getattr(self._impl, "pop_mask_rule_metrics", None)
         return pop() if pop is not None else {}
+
+    def pop_capture_rollout_metrics(self, group_id: str) -> dict[str, Any]:
+        """Rollout metrics of a token-capture group ({} when none were recorded)."""
+        return self._capture_rollout_metrics.pop(group_id, {})
 
     @property
     def recovery_ledger(self) -> RolloutRecoveryLedger:
@@ -2401,12 +2444,16 @@ class RolloutManager:
         infra_attempts = 0
         data_attempts = 0
         last_infra_error: Optional[Exception] = None
+        # Per-sibling rollout_debug_info, kept across attempts so siblings sealed
+        # by an earlier attempt keep their info on the published rows.
+        rollout_infos: dict[int, dict[str, Any]] = {}
         while infra_attempts < policy.max_infra_attempts:
             try:
                 request = await self._generate_for_finalization_attempt(
                     input_sample,
                     recovery_group_id=recovery_group_id,
                     inflight_registry=inflight_registry,
+                    rollout_infos=rollout_infos,
                 )
             except Exception as error:
                 reason = type(error).__name__
@@ -2465,8 +2512,11 @@ class RolloutManager:
         *,
         recovery_group_id: str,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]],
+        rollout_infos: Optional[dict[int, dict[str, Any]]] = None,
     ) -> "ReassemblyRequest":
         """Dispatch the current sibling cohort and leave one slot unready."""
+        if rollout_infos is None:
+            rollout_infos = {}
         from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
         assert self._tq_buffer is not None
@@ -2544,6 +2594,10 @@ class RolloutManager:
                     )
                 )
             )
+            # JSON round trip: the finalizer RPC carries metadata-only primitives.
+            rollout_infos[generation_index] = json.loads(
+                json.dumps(rollout_debug_info(env_extras), default=str)
+            )
 
             if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                 result = SiblingSealResult(
@@ -2595,12 +2649,17 @@ class RolloutManager:
                             group_id,
                             generation_indices=pending_indices,
                         )
-                    await self.run_rollout(
+                    record = await self.run_rollout(
                         attempt_input_sample,
                         rollout_ids=list(rollout_ids),
                         generation_indices=pending_indices,
                         on_completion=_record_streamed_completion,
                         recovery_granularity=recovery_group.recovery_granularity,
+                    )
+                    # Finalizer rows commit without a PromptGroupRecord; keep its
+                    # rollout metrics for the controller to attach at commit.
+                    self._capture_rollout_metrics[group_id] = dict(
+                        record.rollout_metrics
                     )
             finally:
                 if inflight_registry is not None:
@@ -2622,6 +2681,9 @@ class RolloutManager:
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
+                rollout_infos=tuple(
+                    rollout_infos.get(i, {}) for i in range(len(physical_rollout_ids))
+                ),
             )
             from nemo_rl.experience.rollout_reassembler_actor import (
                 assert_metadata_only,
@@ -2635,6 +2697,7 @@ class RolloutManager:
             # run end (there is no prefix-clear primitive in the data plane
             # yet). Their ledger files are inert — failure rows or missing
             # terminal rows keep any later read fail-closed.
+            self._capture_rollout_metrics.pop(group_id, None)
             self._tq_buffer.abort(group_id)
             async with self._recovery_mutation() as cut:
                 # Intentional staleness aborts discard the ledger owner before

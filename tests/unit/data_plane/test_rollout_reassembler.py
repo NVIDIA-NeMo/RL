@@ -55,6 +55,10 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQTokenSource,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
+from nemo_rl.experience.legacy_rollout_metrics import (  # noqa: E402
+    ROLLOUT_DEBUG_TAG,
+    decode_rollout_debug_tag,
+)
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler  # noqa: E402
 from nemo_rl.experience.route_plan import decode_route_plan  # noqa: E402
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
@@ -1501,3 +1505,278 @@ def test_finalize_group_counts_skipped_summary_rows(tq_client, partitions, monke
     )
     assert [tag["rows_in_rollout"] for tag in plain.meta.tags] == [1]
     assert plain.metrics["finalize/segment_rows_skipped_summary"] == 0.0
+
+
+def _install_nan_subagent(monkeypatch, rollout_id: str) -> None:
+    """One subagent segment row whose generation logprobs hold a NaN."""
+    _install_fake_linearize_all(
+        monkeypatch, extras_by_rollout={rollout_id: [("subagent", [40, 41, 42, 43])]}
+    )
+    linearize_all = _rebuild_mod.verify_and_linearize_all
+
+    def with_nan(receipt, snapshots):
+        linearized = linearize_all(receipt, snapshots)
+        linearized.rows[1].logprobs = [0.0, 0.0, float("nan"), -0.5]
+        return linearized
+
+    monkeypatch.setattr(_rebuild_mod, "verify_and_linearize_all", with_nan)
+
+
+def test_finalize_group_force_masks_only_the_row_with_nan_logprobs(
+    tq_client, partitions, monkeypatch
+):
+    group_id = "nangrp"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_ids[0])
+    _install_nan_subagent(monkeypatch, rollout_ids[0])
+
+    finalized = _segment_finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=9,
+        prompt_idx=3,
+        loss_multiplier=1.0,
+    )
+
+    extra_id = f"{group_id}_g0_t1"
+    assert finalized.meta is not None
+    assert finalized.meta.sample_ids == rollout_ids + [extra_id]
+    rows = _fetch_rows(tq_client, rollout_ids + [extra_id])
+    # Only the NaN row is masked (the echo path's per-trace forced mask).
+    assert torch.as_tensor(rows["mask_sample"]).flatten().tolist() == [
+        False,
+        False,
+        True,
+    ]
+    seg_lp = torch.as_tensor(rows["generation_logprobs"][2]).flatten()
+    assert seg_lp[:4].tolist() == [0.0, 0.0, 0.0, -0.5]
+    assert torch.isfinite(torch.as_tensor(rows["generation_logprobs"])).all()
+    assert finalized.metrics["finalize/nan_logprob_rows_masked"] == 1.0
+
+
+def test_finalize_rollout_raises_on_nan_logprobs_when_configured(
+    tq_client, partitions, monkeypatch
+):
+    rollout_id = "nan_r0"
+    receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_id)
+    _install_nan_subagent(monkeypatch, rollout_id)
+    finalizer = _segment_finalizer(tq_client, nan_generation_logprobs="raise")
+    with pytest.raises(ValueError, match="NaN generation logprobs"):
+        finalizer.finalize_rollout(rollout_id, receipt, reward=1.0)
+
+
+def test_nan_generation_logprobs_policy_is_validated():
+    with pytest.raises(ValueError, match="nan_generation_logprobs"):
+        RolloutReassembler(
+            object(),
+            partition_id=CANONICAL_PARTITION,
+            staging_partition=STAGING_PARTITION,
+            pad_token_id=PAD,
+            max_seq_len=16,
+            nan_generation_logprobs="drop",
+        )
+
+
+# ── token-scoped reward penalties (capture-path parity with the echo path) ────
+
+
+class _CharDecodeTokenizer:
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(chr(i) for i in ids)
+
+
+def _penalty_finalizer(tq_client, **penalty_config) -> RolloutReassembler:
+    finalizer = _segment_finalizer(tq_client, reward_penalty_config=penalty_config)
+    finalizer._tokenizer = _CharDecodeTokenizer()
+    return finalizer
+
+
+def _publish_with_subagent(tq_client, monkeypatch, group_id, subagent_tokens, **cfg):
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_ids[0])
+    _install_fake_linearize_all(
+        monkeypatch, extras_by_rollout={rollout_ids[0]: [("subagent", subagent_tokens)]}
+    )
+    finalized = _penalty_finalizer(tq_client, **cfg).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=9,
+        prompt_idx=3,
+    )
+    rows = _fetch_rows(tq_client, rollout_ids + [f"{group_id}_g0_t1"])
+    return finalized, torch.as_tensor(rows["total_reward"]).flatten().tolist()
+
+
+def test_unwanted_token_in_a_subagent_generation_zeroes_every_row(
+    tq_client, partitions, monkeypatch
+):
+    # Subagent chain: carry [40, 41], generation [99, 43] -> unwanted 99 generated.
+    finalized, rewards = _publish_with_subagent(
+        tq_client,
+        monkeypatch,
+        "pen_unw",
+        [40, 41, 99, 43],
+        penalize_unwanted_tokens=True,
+        token_ids={"unwanted": [99]},
+    )
+    assert rewards == [0.0, 0.0, 0.0]
+    assert finalized.metrics["finalize/penalty/unwanted_token_rate"] == 0.5
+
+
+def test_unwanted_token_in_the_prompt_carry_is_not_penalized(
+    tq_client, partitions, monkeypatch
+):
+    finalized, rewards = _publish_with_subagent(
+        tq_client,
+        monkeypatch,
+        "pen_carry",
+        [99, 41, 42, 43],
+        penalize_unwanted_tokens=True,
+        token_ids={"unwanted": [99]},
+    )
+    assert rewards == [1.0, 0.0, 1.0]
+    assert finalized.metrics["finalize/penalty/unwanted_token_rate"] == 0.0
+
+
+def test_think_tag_spelled_out_in_a_generation_is_penalized(
+    tq_client, partitions, monkeypatch
+):
+    generation = [ord(c) for c in "<think>x"]
+    finalized, rewards = _publish_with_subagent(
+        tq_client,
+        monkeypatch,
+        "pen_str",
+        [65, 66, *generation],
+        penalize_malformed_think_tag=True,
+        thinking_tags=["<think>", "</think>"],
+    )
+    assert rewards == [0.0, 0.0, 0.0]
+    assert finalized.metrics["finalize/penalty/malformed_think_tag_rate"] == 0.5
+
+
+def test_think_tag_token_counts_follow_the_prompt_thinking_mode(
+    tq_client, partitions, monkeypatch
+):
+    # Prompt carry ends with an open tag (thinking on): the generation must
+    # close it exactly once. This one never does -> violation.
+    finalized, rewards = _publish_with_subagent(
+        tq_client,
+        monkeypatch,
+        "pen_tok",
+        [65, 500, 66, 67],
+        penalize_malformed_think_tag=True,
+        thinking_tags=["<think>", "</think>"],
+        token_ids={"think_open": 500, "think_close": 501},
+    )
+    assert rewards == [0.0, 0.0, 0.0]
+    finalized, rewards = _publish_with_subagent(
+        tq_client,
+        monkeypatch,
+        "pen_tok_ok",
+        [65, 500, 501, 67],
+        penalize_malformed_think_tag=True,
+        thinking_tags=["<think>", "</think>"],
+        token_ids={"think_open": 500, "think_close": 501},
+    )
+    assert finalized.metrics["finalize/penalty/malformed_think_tag_rate"] == 0.0
+
+
+def test_penalty_spans_that_do_not_tile_the_chain_reject_the_rollout(
+    tq_client, partitions, monkeypatch
+):
+    rollout_id = "pen_span_r0"
+    receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_id)
+    _install_fake_linearize_all(
+        monkeypatch, extras_by_rollout={rollout_id: [("subagent", [40, 41, 42, 43])]}
+    )
+    linearize_all = _rebuild_mod.verify_and_linearize_all
+
+    def short_spans(receipt, snapshots):
+        linearized = linearize_all(receipt, snapshots)
+        linearized.rows[1].link_spans = [("seg1", 1, 1)]
+        return linearized
+
+    monkeypatch.setattr(_rebuild_mod, "verify_and_linearize_all", short_spans)
+    rows = _penalty_finalizer(
+        tq_client, penalize_unwanted_tokens=True, token_ids={"unwanted": [99]}
+    ).finalize_rollout(rollout_id, receipt, reward=1.0)
+    assert len(rows) == 1 and not rows[0].valid
+    assert rows[0].rejection_reason.startswith("penalty_spans:")
+
+
+def test_finalize_group_reports_legacy_per_trace_metrics(
+    tq_client, partitions, monkeypatch
+):
+    group_id = "legacy_m"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt, expected = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_ids[0])
+    _install_fake_linearize_all(
+        monkeypatch, extras_by_rollout={rollout_ids[0]: [("subagent", [40, 41, 42, 43])]}
+    )
+    finalized = _segment_finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=9,
+        prompt_idx=3,
+    )
+    m = finalized.metrics
+    # One valid rollout (the other is a placeholder) with a terminal row and a
+    # one-turn subagent row.
+    assert m["finalize/legacy/traces_per_sample"] == 2.0
+    assert m["finalize/legacy/subagent_traces_per_sample"] == 1.0
+    assert m["finalize/legacy/gen_tokens_per_sample"] == sum(expected.token_mask) + 2
+    assert m["finalize/legacy/total_tokens_per_sample"] == len(expected.token_ids) + 4
+    assert m["finalize/legacy/turns_per_sample"] == len(expected.link_spans) + 1
+    assert m["finalize/legacy/turns_per_trace"] == (len(expected.link_spans) + 1) / 2
+    # No rollout_infos: no rollout_debug provenance on the rows.
+    assert all(ROLLOUT_DEBUG_TAG not in tag for tag in finalized.meta.tags)
+
+
+def test_finalize_group_stamps_rollout_debug_tags(tq_client, partitions, monkeypatch):
+    group_id = "dbg_tag"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt, expected = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_ids[0])
+    _install_fake_linearize_all(
+        monkeypatch, extras_by_rollout={rollout_ids[0]: [("subagent", [40, 41, 42, 43])]}
+    )
+    infos = [{"agent_timed_out": False, "dataset_name": "swe_rebench"}, {}]
+    finalized = _segment_finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=9,
+        prompt_idx=3,
+        rollout_infos=infos,
+    )
+    decoded = [decode_rollout_debug_tag(tag) for tag in finalized.meta.tags]
+    # Canonical block (g0 terminal, g1 placeholder), then g0's subagent row.
+    assert [d["rollout_local_idx"] for d in decoded] == [0, 1, 0]
+    assert [d["trace_in_rollout_idx"] for d in decoded] == [0, 0, 1]
+    kinds = [d["trace_metadata"]["kind"] for d in decoded]
+    assert kinds == ["uncompacted", "empty", "subagent"]
+    assert [d["is_empty_rollout"] for d in decoded] == [False, True, False]
+    assert decoded[0]["rollout_info"] == infos[0] == decoded[2]["rollout_info"]
+    assert decoded[1]["rollout_info"] == {}
+    assert decoded[0]["trace_metadata"]["turns"] == len(expected.link_spans)
+    assert decoded[0]["trace_metadata"]["gen_tokens"] == sum(expected.token_mask)
+    assert decoded[2]["trace_metadata"]["turns"] == 1
+    # Per-rollout generation sizes: g0 terminal + subagent rows, g1 rejected.
+    assert finalized.rollout_gen_tokens == (
+        sum(expected.token_mask) + decoded[2]["trace_metadata"]["gen_tokens"],
+        0,
+    )
+    assert finalized.rollout_max_gen_tokens_per_turn[0] >= max(
+        gen for _, _, gen in expected.link_spans
+    )
+    assert finalized.rollout_max_gen_tokens_per_turn[1] == 0

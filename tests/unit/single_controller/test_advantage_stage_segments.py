@@ -33,7 +33,9 @@ What the stage must do with extra rows (see
   masks, so a rollout that trains through a segment row while its canonical
   row is gate-masked still votes (LOO-correct baseline);
 * orphans, duplicate canonicals, non-GRPO estimators and incomplete chunks
-  fail loudly.
+  fail loudly;
+* PPO instead runs GAE on every row (each row has its own critic values), and
+  its DP pad rows are left out of the rollout identity and checks.
 """
 
 from __future__ import annotations
@@ -49,7 +51,9 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    GAEConfig,
     GDPOAdvantageEstimator,
+    GeneralizedAdvantageEstimator,
     GRPOAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
@@ -69,6 +73,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
 )
 from nemo_rl.algorithms.single_controller_utils.segment_stats import (
     new_segment_stats_accumulator,
+    reduce_segment_stats,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import INPUT_LENGTHS
@@ -487,8 +492,7 @@ def test_non_grpo_estimators_are_rejected_with_extra_rows():
     gdpo = GDPOAdvantageEstimator(AdvEstimatorConfig(name="gdpo"), ClippedPGLossConfig())
     with pytest.raises(NotImplementedError, match="GDPOAdvantageEstimator"):
         _run(rows, num_generations_per_prompt=2, estimator=gdpo)
-    with pytest.raises(NotImplementedError, match=r"\(PPO\)"):
-        _run(rows, num_generations_per_prompt=2, is_ppo=True)
+    # PPO is accepted: it runs GAE per row (see the PPO tests below).
     # Without extra rows the estimator type is not restricted here: the
     # guard must not fire; whether GDPO then succeeds or complains about the
     # reward components this fixture lacks is not what this test pins.
@@ -529,3 +533,131 @@ def test_chunk_completeness_failures():
         segment_rows_enabled=False,
     )
     assert valid and _written(plane, "advantages").shape == (3, SEQ)
+
+
+# ── PPO: per-row GAE, DP pad rows ──────────────────────────────────────────
+
+
+def _gae_estimator() -> GeneralizedAdvantageEstimator:
+    return GeneralizedAdvantageEstimator(
+        GAEConfig(gae_lambda=0.95, gae_gamma=1.0), ClippedPGLossConfig()
+    )
+
+
+def _ppo_batch(
+    rows: list[_Row], *, pad_sources: tuple[int, ...] = ()
+) -> tuple[TensorDict, KVBatchMeta]:
+    """The finalizer's rows plus critic values, then DP pad rows appended the
+    way ``_pad_rows_to_dp_multiple`` writes them: copies of the source rows
+    under ``{sid}_pad{k}`` with the source tags and ``sample_mask`` zeroed."""
+    data, meta = _batch(rows)
+    n = len(rows)
+    data["values"] = torch.rand(n, SEQ, generator=torch.Generator().manual_seed(0))
+    if not pad_sources:
+        return data, meta
+    index = torch.tensor(list(range(n)) + list(pad_sources))
+    padded = data[index].clone()
+    padded["sample_mask"][n:] = 0.0
+    tags = list(meta.tags or [])
+    meta = KVBatchMeta(
+        partition_id=meta.partition_id,
+        task_name=meta.task_name,
+        sample_ids=list(meta.sample_ids)
+        + [f"{meta.sample_ids[i]}_pad{k}" for k, i in enumerate(pad_sources)],
+        fields=list(padded.keys()),
+        tags=tags + [dict(tags[i]) for i in pad_sources],
+    )
+    return padded, meta
+
+
+def _run_ppo(data: TensorDict, meta: KVBatchMeta, **controller_kwargs):
+    plane = _DataPlane(data)
+    ctrl = _controller(
+        plane, estimator=_gae_estimator(), is_ppo=True, **controller_kwargs
+    )
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert plane.written is not None
+    return plane, ctrl, valid
+
+
+def _direct_gae(data: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+    """GAE on every row, as the echo multi-trace path runs it (all_rows)."""
+    final = data["sample_mask"] * (~data["mask_sample"]).float()
+    return _gae_estimator().compute_advantage(
+        prompt_ids=data["prompt_ids_for_adv"],
+        rewards=data["total_reward"],
+        mask=data["token_mask"],
+        values=data["values"],
+        valid_mask=final,
+        logprobs_policy=data["prev_logprobs"],
+    )
+
+
+def test_ppo_segment_rows_get_per_row_gae_not_the_rollout_broadcast():
+    rows = _three_rollouts_with_extras()
+    data, meta = _ppo_batch(rows)
+    plane, _, valid = _run_ppo(data, meta, num_generations_per_prompt=3)
+    assert valid
+    advantages, returns = _direct_gae(data)
+    torch.testing.assert_close(_written(plane, "advantages"), advantages)
+    torch.testing.assert_close(_written(plane, "returns"), returns)
+    # Each segment row has its own values, so it is not a copy of its
+    # rollout's canonical row (the GRPO broadcast).
+    written = _written(plane, "advantages")
+    assert not torch.equal(written[3], written[0])
+    assert not torch.equal(written[5], written[1])
+
+
+def test_ppo_pad_rows_do_not_count_as_rollouts_or_canonical_rows():
+    rows = _three_rollouts_with_extras()
+    # Two copies of row 0 (ppo.multi_trace_pad_source=row0), tags included.
+    data, meta = _ppo_batch(rows, pad_sources=(0, 0))
+    # Whole groups and whole rollouts hold on the real rows; the pads (own
+    # unparsable ids, copied rows_in_rollout tags) must not trip the check.
+    plane, ctrl, valid = _run_ppo(data, meta, num_generations_per_prompt=3)
+    assert valid
+    assert _written(plane, "advantages").shape == (len(rows) + 2, SEQ)
+    # GAE still whitens over every row's tokens, pads included (all_rows).
+    advantages, _ = _direct_gae(data)
+    torch.testing.assert_close(_written(plane, "advantages"), advantages)
+    # PPO files its canonical flags apart: ``reward`` stays the legacy per-row
+    # mean and ``reward_per_rollout`` uses these.
+    assert "canonical_masks" not in ctrl._step_log_dict or not ctrl._step_log_dict[
+        "canonical_masks"
+    ]
+    assert ctrl._step_log_dict["segment_canonical_masks"][0].tolist() == [
+        1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    ]
+    assert ctrl._step_log_dict["num_mask_sample_filtered"] == [0]
+    segments = reduce_segment_stats(ctrl._segment_stats_acc)
+    assert segments["segments/rows"] == len(rows)
+    assert segments["segments/rollouts"] == 3
+
+
+def test_pad_rows_outside_ppo_fail_loudly():
+    rows = [_Row("a", 0, reward=1.0), _Row("a", 1, reward=0.0)]
+    data, meta = _ppo_batch(rows, pad_sources=(0,))
+    plane = _DataPlane(data)
+    ctrl = _controller(plane, num_generations_per_prompt=2)
+    with pytest.raises(RuntimeError, match="DP pad rows"):
+        asyncio.run(ctrl._advantage_stage(meta))
+
+
+def test_ppo_reward_metric_stays_per_row_with_a_per_rollout_companion():
+    from nemo_rl.algorithms.single_controller_utils.utils import (
+        reduce_advantage_pump_metrics,
+    )
+
+    # Rollout 0 (reward 1) has a subagent row; rollout 1 (reward 0) has none.
+    rewards = [torch.tensor([1.0, 0.0, 1.0])]
+    sample_masks = [torch.ones(3)]
+    out = reduce_advantage_pump_metrics(
+        rewards,
+        [torch.zeros(3)],
+        [4, 4, 4],
+        sample_masks=sample_masks,
+        segment_canonical_masks=[torch.tensor([1.0, 1.0, 0.0])],
+    )
+    # Legacy echo semantics: every trained row counts.
+    assert out["reward"] == pytest.approx(2 / 3)
+    assert out["reward_per_rollout"] == pytest.approx(0.5)

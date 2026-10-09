@@ -28,8 +28,9 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
 )
 from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils.config import SegmentRowsConfig
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 from nemo_rl.experience.route_plan import (
@@ -105,6 +106,7 @@ def _controller(actor: object) -> Any:
     ctrl._rollout_recovery_ledger = MagicMock()
     ctrl._rollout_recovery_ledger.__contains__.return_value = False
     ctrl._rollout_manager = MagicMock()
+    ctrl._rollout_manager.pop_capture_rollout_metrics.return_value = {}
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
@@ -112,7 +114,9 @@ def _controller(actor: object) -> Any:
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
-        token_capture=SimpleNamespace(staging_partition="staging"),
+        token_capture=SimpleNamespace(
+            staging_partition="staging", segment_rows=SegmentRowsConfig()
+        ),
         grpo=SimpleNamespace(num_prompts_per_step=1),
     )
     ctrl._trainer_version = 3
@@ -157,6 +161,87 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
         staging_keys=["group_g0/call"],
     )
     assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
+
+
+def _privileged(ctrl: Any, env_info: dict[str, Any]) -> Any:
+    """Give the controller a real privilege store and a dataset prompt lookup."""
+    import torch
+
+    from nemo_rl.algorithms import swe_privileged_critic as spc
+
+    class _CharTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+        def decode(self, ids):
+            return "".join(chr(i) for i in ids)
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "".join(m["content"] for m in messages)
+
+        def __call__(self, text, return_tensors=None, add_special_tokens=False):
+            return {"input_ids": torch.tensor([self.encode(text)])}
+
+    ctrl._privilege_store = spc.SwePrivilegePrefixStore(
+        _CharTokenizer(), spc.SwePrivilegedCriticConfig(enabled=True)
+    )
+    ctrl._dataset_prompt = AsyncMock(return_value={"extra_env_info": env_info})
+    return spc
+
+
+def _finalized_meta() -> KVBatchMeta:
+    return KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0", "group_g0_t1"],
+        fields=["input_ids"],
+        sequence_lengths=[3, 2],
+        tags=[{"weight_version": 3}, {"weight_version": 3}],
+    )
+
+
+def test_privileged_critic_stamps_finalized_rows_before_commit() -> None:
+    result = FinalizedGroup(
+        meta=_finalized_meta(),
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    spc = _privileged(
+        ctrl, {"instance_id": "repo__9", "patch": "diff --git a/z b/z\n+fix"}
+    )
+
+    asyncio.run(ctrl._finalize_with_actor(_request()))
+
+    ctrl._dataset_prompt.assert_awaited_once_with(17)
+    committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
+    # Every row, segment rows included, references the instance's prefix.
+    assert [tag[spc.PRIVILEGE_KEY_TAG] for tag in committed_meta.tags] == [
+        "repo__9",
+        "repo__9",
+    ]
+    assert committed_meta.sample_ids == ["group_g0", "group_g0_t1"]
+    assert "repo__9" in ctrl._privilege_store.prefixes_for(committed_meta)
+
+
+def test_privileged_critic_without_golden_patch_cleans_up_and_never_commits() -> None:
+    result = FinalizedGroup(
+        meta=_finalized_meta(),
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    _privileged(ctrl, {"instance_id": "repo__9"})
+
+    with pytest.raises(ValueError, match="no golden patch"):
+        asyncio.run(ctrl._finalize_with_actor(_request()))
+
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+    assert ctrl._dp_client.clear_calls
 
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:
@@ -230,6 +315,59 @@ def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
     ctrl._buffer.commit_finalized.assert_not_awaited()
     assert "group" not in ctrl._finalizer_metrics_by_group
     assert ctrl._available_finalizers.get_nowait() is actor
+    # The group's stashed rollout metrics are consumed even when it drops.
+    ctrl._rollout_manager.pop_capture_rollout_metrics.assert_called_once_with("group")
+
+
+def test_capture_rollout_metrics_ride_on_the_committed_meta() -> None:
+    result = FinalizedGroup(
+        meta=_finalized_meta(),
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    metrics = {"agent/rollout_time_taken/mean": 12.5}
+    ctrl._rollout_manager.pop_capture_rollout_metrics.return_value = metrics
+
+    asyncio.run(ctrl._finalize_with_actor(_request()))
+
+    ctrl._rollout_manager.pop_capture_rollout_metrics.assert_called_once_with("group")
+    committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
+    # Same sidecar the echo path's TQReplayBuffer.commit writes.
+    assert committed_meta.extra_info[ROLLOUT_METRICS] == [metrics]
+    assert committed_meta.sample_ids == result.meta.sample_ids
+    assert committed_meta.tags == result.meta.tags
+
+
+def test_capture_generation_sizes_replace_the_receipt_time_proxy() -> None:
+    result = FinalizedGroup(
+        meta=_finalized_meta(),
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+        rollout_gen_tokens=(1200,),
+        rollout_max_gen_tokens_per_turn=(700,),
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    # Receipt-time proxy: manifest deltas, tool output included.
+    ctrl._rollout_manager.pop_capture_rollout_metrics.return_value = {
+        "mean_gen_tokens_per_sample": 5000.0,
+        "gen_tokens_per_sample/mean": 5000.0,
+        "agent/rollout_time_taken/mean": 12.5,
+    }
+
+    asyncio.run(ctrl._finalize_with_actor(_request()))
+
+    (metrics,) = ctrl._buffer.commit_finalized.await_args.args[2].extra_info[
+        ROLLOUT_METRICS
+    ]
+    assert metrics["mean_gen_tokens_per_sample"] == 1200
+    assert metrics["gen_tokens_per_sample/mean"] == 1200
+    assert metrics["max_gen_tokens_per_turn/max"] == 700
+    assert metrics["agent/rollout_time_taken/mean"] == 12.5
 
 
 def test_post_train_cleanup_clears_canonical_rows_and_route_plan_staging_keys() -> None:

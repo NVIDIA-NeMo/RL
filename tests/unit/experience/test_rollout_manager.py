@@ -1853,7 +1853,12 @@ class _FakeCaptureBuffer(_FakeBuffer):
 
 
 def _receipt_record(
-    rollout_ids, receipts, instance_configs=None, *, loss_multiplier=1.0
+    rollout_ids,
+    receipts,
+    instance_configs=None,
+    *,
+    loss_multiplier=1.0,
+    rollout_metrics=None,
 ):
     instance_configs = instance_configs or [None] * len(rollout_ids)
     completions = [
@@ -1876,7 +1881,7 @@ def _receipt_record(
         extra_env_info={},
         metadata={"task_name": "nemo_gym"},
         completions=completions,
-        rollout_metrics={},
+        rollout_metrics=dict(rollout_metrics or {}),
         loss_multiplier=loss_multiplier,
     )
 
@@ -1908,6 +1913,7 @@ def _make_capture_manager(
     mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
+    mgr._capture_rollout_metrics = {}
     mgr._recovery_ledger = RolloutRecoveryLedger()
     mgr._data_plane_checkpoint_barrier = buf.data_plane_checkpoint_barrier
 
@@ -1950,6 +1956,7 @@ def _make_capture_manager(
                 receipts,
                 instance_configs=selected_configs,
                 loss_multiplier=float(_sample.get("loss_multiplier", 1.0)),
+                rollout_metrics={"agent/rollout_time_taken/mean": 12.5},
             )
             if on_completion is not None:
                 for generation_index, completion in zip(indices, record.completions):
@@ -2006,6 +2013,14 @@ class TestGenerateForFinalizationFlow:
         assert request.mask_sample == (False, False)
         assert request.loss_multiplier == 0.25
         assert request.fallback_weight_version == 7
+        # One rollout_debug_info per rollout, metadata-only for the RPC.
+        assert len(request.rollout_infos) == 2
+        assert all(isinstance(info, dict) for info in request.rollout_infos)
+        # The group's rollout metrics wait for the controller, popped once.
+        assert mgr.pop_capture_rollout_metrics(group_id) == {
+            "agent/rollout_time_taken/mean": 12.5
+        }
+        assert mgr.pop_capture_rollout_metrics(group_id) == {}
         # Finalization and commit are exclusively owned by the controller's
         # actor-pool path; the manager leaves the reservation unready.
         assert buf.commit_calls == []
@@ -2020,6 +2035,7 @@ class TestGenerateForFinalizationFlow:
         with pytest.raises(RuntimeError, match="rollout exploded"):
             _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
         assert len(buf.abort_calls) == 1
+        assert mgr._capture_rollout_metrics == {}
 
     def test_exhausted_capture_cleans_internally_owned_recovery_group(self, capsys):
         buf = _FakeCaptureBuffer()
@@ -2343,7 +2359,7 @@ def test_a_penalty_on_any_session_trace_zeroes_the_whole_rollout_when_opted_in()
     )
     empty_answer = [{"type": "message", "content": [{"text": ""}]}]
 
-    completions, penalty_counts = impl._results_to_completions(
+    completions, penalty_counts, _ = impl._results_to_completions(
         [_multi_trace_result(empty_answer)]
     )
 
@@ -2359,7 +2375,7 @@ def test_token_penalties_still_check_every_segment_by_default():
     )
     answer = [{"type": "message", "content": [{"text": "sub answer"}]}]
 
-    completions, penalty_counts = impl._results_to_completions(
+    completions, penalty_counts, _ = impl._results_to_completions(
         [_multi_trace_result(answer)]
     )
 
@@ -2367,3 +2383,60 @@ def test_token_penalties_still_check_every_segment_by_default():
     # penalty fires on the segments themselves and zeroes the shared reward.
     assert [c.reward for c in completions] == [0.0, 0.0]
     assert penalty_counts["unwanted_token"] == 1
+
+
+def _receipt_result_with_output(output):
+    return {
+        "message_log": [],
+        "receipt": {"rollout_id": "r0", "manifest": []},
+        "rollout_id": "r0",
+        "full_result": {"reward": 1.0, "response": {"output": output}},
+    }
+
+
+def test_capture_receipts_get_the_rollout_scoped_text_penalties():
+    # The model copied its reasoning into the final answer verbatim.
+    result = _receipt_result_with_output(
+        [
+            {"type": "reasoning", "summary": [{"text": "same"}]},
+            {"type": "message", "content": [{"text": "same"}]},
+        ]
+    )
+    impl = _nemo_gym_impl(
+        True,
+        {
+            "penalize_duplicated_reasoning": True,
+            "penalize_empty_final_answer": True,
+            "penalize_unwanted_tokens": True,
+            "token_ids": {"unwanted": [2]},
+        },
+    )
+    completions, penalty_counts, _ = impl._results_to_completions([result])
+    assert completions[0].reward == 0.0
+    assert penalty_counts["duplicated_reasoning"] == 1
+    # The token penalties run in the finalizer, not on the token-free receipt.
+    assert penalty_counts["unwanted_token"] == 0
+    metrics = impl._compute_reward_penalty_metrics(
+        penalty_counts, 1, token_penalties=False
+    )
+    assert metrics == {
+        "reasoning_equal_to_final_answer_rate": 1.0,
+        "empty_final_answer_rate": 0.0,
+    }
+
+
+def test_capture_receipt_with_a_clean_answer_keeps_its_reward():
+    result = _receipt_result_with_output(
+        [
+            {"type": "reasoning", "summary": [{"text": "think"}]},
+            {"type": "message", "content": [{"text": "answer"}]},
+        ]
+    )
+    impl = _nemo_gym_impl(
+        True,
+        {"penalize_duplicated_reasoning": True, "penalize_empty_final_answer": True},
+    )
+    completions, penalty_counts, _ = impl._results_to_completions([result])
+    assert completions[0].reward == 1.0
+    assert penalty_counts["duplicated_reasoning"] == 0
+    assert penalty_counts["empty_final_answer"] == 0

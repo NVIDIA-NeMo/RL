@@ -50,6 +50,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
     MasterConfig,
+    TokenCaptureConfig,
 )
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
@@ -1010,6 +1011,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
+    ctrl._master_config = SimpleNamespace(token_capture=TokenCaptureConfig())
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._algo_cfg = GRPOConfig(
         seq_logprob_error_threshold=None,

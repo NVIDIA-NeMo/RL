@@ -119,6 +119,8 @@ def rollout_debug_info(full_result: Mapping[str, Any]) -> dict[str, Any]:
         if not any(s.get("parent_session_id") for s in segs)
     )
     num_subagent_compactions = num_compactions - num_root_compactions
+    if "opencode_finished" in full_result:
+        return _sandboxed_agent_debug_info(full_result, instance_config)
     return {
         "instance_id": problem_info.get("instance_id") or instance_config.get("name"),
         "dataset_name": problem_info.get("dataset_name"),
@@ -147,6 +149,51 @@ def rollout_debug_info(full_result: Mapping[str, Any]) -> dict[str, Any]:
             }
             for m in segment_metas
         ],
+    }
+
+
+def _sandboxed_agent_debug_info(
+    full_result: Mapping[str, Any], instance_config: Mapping[str, Any]
+) -> dict[str, Any]:
+    """:func:`rollout_debug_info` for a Gym opencode_sandboxed_agent result.
+
+    Maps the sandbox agent's and SWE servers' fields onto the legacy record so
+    the legacy termination / delegation / dataset breakdowns read the same:
+    an exec timeout is ``agent_timeout``, exit 137 ``agent_oom``, any other
+    failed OpenCode run (including a context-length stop, which legacy's fork
+    reported as ``max_compaction``) ``other_error``; an evaluation the server
+    reports incomplete because it timed out / was killed is ``eval_timeout`` /
+    ``eval_oom``. Session segments arrive later as finalizer rows, so the
+    segment fields are empty and subagent sessions are the ``task`` calls.
+    """
+    error_type = full_result.get("opencode_error_type")
+    agent_timed_out = error_type in ("timeout", "TimeoutError")
+    oom_killed = full_result.get("opencode_exit_code") == 137
+    agent_error_kind = None
+    if not (agent_timed_out or oom_killed) and full_result.get("opencode_failed"):
+        agent_error_kind = str(error_type or "opencode_failed")
+    eval_error = str(full_result.get("error") or "")
+    eval_incomplete = full_result.get("evaluation_completed") is False
+    return {
+        "instance_id": full_result.get("instance_id"),
+        "dataset_name": full_result.get("dataset_name"),
+        "reward": full_result.get("reward"),
+        "resolved": full_result.get("resolved"),
+        "patch_exists": (full_result.get("model_patch_bytes") or 0) > 0,
+        "mask_sample": bool(instance_config.get("mask_sample", False)),
+        "agent_error_kind": agent_error_kind,
+        "agent_timed_out": agent_timed_out,
+        "eval_timed_out": eval_incomplete and "timed out" in eval_error,
+        "oom_killed": oom_killed,
+        "eval_oom_killed": eval_incomplete and "exit 137" in eval_error,
+        "openhands_run_time": full_result.get("opencode_run_time_taken"),
+        "final_eval_time": full_result.get("patch_verification_time_taken"),
+        "num_segments": 0,
+        "num_compactions": 0,
+        "num_root_compactions": 0,
+        "num_subagent_compactions": 0,
+        "num_subagent_sessions": int(full_result.get("opencode_num_task_calls") or 0),
+        "segments": [],
     }
 
 
@@ -587,6 +634,7 @@ def _prepare_group(results: Sequence[Mapping[str, Any]]) -> Optional[dict[str, A
             ],
         }
     return {
+        "capture": any("receipt" in r for r in results),
         "per_rollout_sizes": per_rollout_sizes,
         "rollout_results": rollout_results,
         "traces": traces,
@@ -682,6 +730,20 @@ def _aggregate_group(
             }
         )
         metrics["mean_gen_tokens_per_sample"] = metrics["gen_tokens_per_sample/mean"]
+    if prepared.get("capture"):
+        # Token-capture receipts carry no message logs: the per-trace panels
+        # come from the finalizer's rows (finalize/*), and delegation from the
+        # agent's subagent launches.
+        metrics = {
+            k: v
+            for k, v in metrics.items()
+            if not k.startswith(_PER_TRACE_METRIC_PREFIXES)
+        }
+        metrics["delegation_rate"] = (
+            sum(1 for info in rollout_infos if info["num_subagent_sessions"] > 0)
+            / batch_size
+        )
+        return metrics
     if reward_penalty_config and "token_ids" in reward_penalty_config:
         metrics.update(
             think_tag_violation_metrics(
@@ -689,6 +751,17 @@ def _aggregate_group(
             )
         )
     return metrics
+
+
+# Legacy panels built from session-trace message logs, which token-capture
+# receipts do not have.
+_PER_TRACE_METRIC_PREFIXES = (
+    "turns_per_trace",
+    "traces_per_sample",
+    "subagent_traces_per_sample",
+    "compaction/",
+    "empty_rollout_count",
+)
 
 
 def _is_nemo_gym_extras(extras: Mapping[str, Any]) -> bool:
@@ -749,6 +822,77 @@ def rollout_debug_tags(completions: Sequence[Any]) -> list[str] | None:
             )
         )
     return rows
+
+
+def capture_rollout_debug_tag(
+    rollout_info: Mapping[str, Any],
+    *,
+    finalizer_kind: str,
+    rollout_compacted: bool,
+    segment_index: int,
+    turns: int,
+    prompt_tokens: int,
+    gen_tokens: int,
+    rollout_local_idx: int,
+    trace_in_rollout_idx: int,
+    is_empty_rollout: bool,
+) -> str:
+    """:func:`rollout_debug_tags` row for a token-capture finalizer row.
+
+    Finalizer kinds map onto the legacy names: placeholder -> ``empty``,
+    ``subagent`` and ``compaction_summary`` unchanged, ``compaction_segment``
+    -> ``pre_compaction``, and the terminal row -> ``post_compaction`` when its
+    rollout compacted, else ``uncompacted``.
+    """
+    if is_empty_rollout or finalizer_kind == "placeholder":
+        kind = "empty"
+    elif finalizer_kind == "compaction_segment":
+        kind = "pre_compaction"
+    elif finalizer_kind in ("subagent", "compaction_summary"):
+        kind = finalizer_kind
+    else:
+        kind = "post_compaction" if rollout_compacted else "uncompacted"
+    return json.dumps(
+        {
+            "rollout_info": dict(rollout_info),
+            "trace_metadata": {
+                "segment_index": segment_index,
+                "kind": kind,
+                "turns": turns,
+                "prompt_tokens": prompt_tokens,
+                "gen_tokens": gen_tokens,
+            },
+            "rollout_local_idx": rollout_local_idx,
+            "trace_in_rollout_idx": trace_in_rollout_idx,
+            "is_empty_rollout": is_empty_rollout,
+        },
+        default=str,
+    )
+
+
+def capture_generation_size_metrics(
+    gen_tokens: Sequence[int], max_gen_tokens_per_turn: Sequence[int]
+) -> dict[str, Any]:
+    """Legacy-named generation sizes of a token-capture group, from its finalized rows.
+
+    At rollout time a receipt only has its manifest's per-call deltas (every token
+    new since the previous call, tool output included), so the rollout-time
+    ``gen_tokens_per_sample`` / ``max_gen_tokens_per_turn`` overcount generation.
+    These replace them with the model-generated token counts (all of a rollout's
+    rows, subagents included; 0 for a rejected rollout), as legacy logged them.
+    """
+    if not gen_tokens:
+        return {}
+    n = len(gen_tokens)
+    metrics = {
+        **calculate_single_metric(list(gen_tokens), n, "gen_tokens_per_sample"),
+        **calculate_single_metric(
+            list(max_gen_tokens_per_turn), n, "max_gen_tokens_per_turn"
+        ),
+        "max_gen_tokens_per_turn/p95": pct(list(max_gen_tokens_per_turn), 95),
+    }
+    metrics["mean_gen_tokens_per_sample"] = metrics["gen_tokens_per_sample/mean"]
+    return metrics
 
 
 def decode_rollout_debug_tag(tag: Mapping[str, Any] | None) -> dict[str, Any] | None:

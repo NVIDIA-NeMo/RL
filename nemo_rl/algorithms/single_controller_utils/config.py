@@ -1606,15 +1606,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "async_rl.max_buffered_rollouts; excess finalizer actors cannot be busy",
             stacklevel=2,
         )
-    if token_capture_config.enabled and reward_penalties_enabled:
-        warnings.warn(
-            "reward_penalties are enabled but token-capture receipt rollouts "
-            "carry no generated tokens/text at rollout time, so the penalty "
-            "checks are skipped and capture-path rewards stay unpenalized "
-            "(penalty-rate metrics will read 0). Disable the reward_penalties "
-            "flags to make this explicit, or run without token capture to "
-            "train with penalized rewards.",
-            stacklevel=2,
+    if (
+        token_capture_config.enabled
+        and master_config.reward_penalties.rollout_scoped_penalties_on_all_segments
+    ):
+        # Capture runs the rollout-scoped (text) penalties at rollout time on
+        # the scored Gym response, the only response it has, and the token
+        # penalties per chain in the finalizer.
+        raise ValueError(
+            "reward_penalties.rollout_scoped_penalties_on_all_segments=true is "
+            "not supported with token_capture.enabled=true: only the rollout's "
+            "response is available to the text penalties"
         )
     if (
         token_capture_config.enabled

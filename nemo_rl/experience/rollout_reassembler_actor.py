@@ -68,6 +68,9 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
+    # Per-rollout rollout_debug_info (empty when unavailable); the finalizer
+    # stamps it on the rows' rollout_debug tag like the echo path's commit.
+    rollout_infos: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -89,6 +92,14 @@ class RolloutReassemblerActorConfig:
     # token_capture.segment_rows.include_summary_rows: publish the single-call
     # compaction_summary chains (the harness's summary request) as rows too.
     include_summary_rows: bool = True
+    # env.nemo_gym.nan_generation_logprobs: "mask" zeroes NaN logprobs and
+    # force-masks the row (echo-path behavior); "raise" fails the finalizer.
+    nan_generation_logprobs: str = "mask"
+    # Resolved reward_penalties: the finalizer runs the token-scoped penalties
+    # (unwanted tokens, malformed think tags) that need rebuilt tokens; the
+    # tokenizer config decodes generations for the think-tag string check.
+    reward_penalty_config: Optional[dict[str, Any]] = None
+    tokenizer_config: Optional[dict[str, Any]] = None
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -147,6 +158,9 @@ class RolloutReassemblerActor:  # pragma: no cover
             segment_rows_enabled=config.segment_rows_enabled,
             max_rows_per_rollout=config.max_rows_per_rollout,
             include_summary_rows=config.include_summary_rows,
+            nan_generation_logprobs=config.nan_generation_logprobs,
+            reward_penalty_config=config.reward_penalty_config,
+            tokenizer_config=config.tokenizer_config,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
@@ -189,6 +203,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
             canonical_sample_ids=list(request.canonical_sample_ids),
+            rollout_infos=list(request.rollout_infos) or None,
         )
         assert_metadata_only(result)
         return result

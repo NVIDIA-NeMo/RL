@@ -31,6 +31,8 @@ from nemo_rl.experience.interfaces import TRACE_METADATA_KEY, Completion
 from nemo_rl.experience.legacy_rollout_metrics import (
     ROLLOUT_DEBUG_TAG,
     aggregate_rollout_metrics_with_sum_counts,
+    capture_generation_size_metrics,
+    capture_rollout_debug_tag,
     compaction_rollout_metrics,
     decode_rollout_debug_tag,
     legacy_rollout_group_metrics,
@@ -938,3 +940,110 @@ def test_legacy_rollout_timing_aliases():
         "timing/rollout/postprocess_results_pct": 25.0,
     }
     assert legacy_rollout_timing_aliases({}, "x", "y") == {}
+
+
+class TestSandboxedAgentDebugInfo:
+    """Gym opencode_sandboxed_agent results map onto the legacy record."""
+
+    @staticmethod
+    def _result(**fields):
+        base = {
+            "opencode_finished": True,
+            "opencode_failed": False,
+            "opencode_exit_code": 0,
+            "opencode_error_type": None,
+            "evaluation_completed": True,
+            "reward": 1.0,
+            "resolved": True,
+            "instance_id": "repo__1",
+            "dataset_name": "nebius/SWE-rebench-V2",
+            "model_patch_bytes": 120,
+            "opencode_num_task_calls": 2,
+            "opencode_run_time_taken": 300.0,
+            "patch_verification_time_taken": 40.0,
+            "instance_config": {"mask_sample": False},
+        }
+        base.update(fields)
+        return base
+
+    @pytest.mark.parametrize(
+        ("fields", "kind"),
+        [
+            ({}, "completed"),
+            ({"opencode_error_type": "timeout", "opencode_failed": True}, "agent_timeout"),
+            ({"opencode_exit_code": 137, "opencode_failed": True}, "agent_oom"),
+            ({"opencode_failed": True}, "other_error"),
+            ({"evaluation_completed": False, "error": "evaluation timed out"}, "eval_timeout"),
+            (
+                {"evaluation_completed": False, "error": "evaluation was killed (exit 137, likely OOM)"},
+                "eval_oom",
+            ),
+        ],
+    )
+    def test_termination_kinds(self, fields, kind):
+        info = rollout_debug_info(self._result(**fields))
+        assert termination_kind(info) == kind
+
+    def test_dataset_delegation_and_timings(self):
+        info = rollout_debug_info(self._result())
+        assert info["dataset_name"] == "nebius/SWE-rebench-V2"
+        assert info["num_subagent_sessions"] == 2
+        assert info["patch_exists"] is True
+        assert info["openhands_run_time"] == 300.0
+        assert info["final_eval_time"] == 40.0
+
+
+class TestCaptureRolloutDebugTag:
+    def _decoded(self, finalizer_kind, *, compacted=False, empty=False):
+        tag = capture_rollout_debug_tag(
+            {"dataset_name": "swe_rebench"},
+            finalizer_kind=finalizer_kind,
+            rollout_compacted=compacted,
+            segment_index=0,
+            turns=3,
+            prompt_tokens=10,
+            gen_tokens=7,
+            rollout_local_idx=2,
+            trace_in_rollout_idx=1,
+            is_empty_rollout=empty,
+        )
+        return decode_rollout_debug_tag({"rollout_debug": tag})
+
+    def _kind(self, finalizer_kind, **kwargs):
+        return self._decoded(finalizer_kind, **kwargs)["trace_metadata"]["kind"]
+
+    def test_maps_finalizer_kinds_to_legacy_names(self):
+        assert self._kind("terminal") == "uncompacted"
+        assert self._kind("terminal", compacted=True) == "post_compaction"
+        assert self._kind("compaction_segment", compacted=True) == "pre_compaction"
+        assert self._kind("compaction_summary", compacted=True) == "compaction_summary"
+        assert self._kind("subagent") == "subagent"
+        assert self._kind("placeholder", empty=True) == "empty"
+
+    def test_matches_echo_row_schema(self):
+        decoded = self._decoded("terminal")
+        assert set(decoded) == {
+            "rollout_info",
+            "trace_metadata",
+            "rollout_local_idx",
+            "trace_in_rollout_idx",
+            "is_empty_rollout",
+        }
+        assert decoded["rollout_info"] == {"dataset_name": "swe_rebench"}
+        assert decoded["trace_metadata"]["turns"] == 3
+        assert decoded["trace_metadata"]["gen_tokens"] == 7
+        assert (decoded["rollout_local_idx"], decoded["trace_in_rollout_idx"]) == (2, 1)
+
+
+class TestCaptureGenerationSizeMetrics:
+    def test_legacy_names_from_per_rollout_sizes(self):
+        metrics = capture_generation_size_metrics([100, 300, 0], [40, 90, 0])
+        assert metrics["gen_tokens_per_sample/mean"] == pytest.approx(400 / 3)
+        assert metrics["mean_gen_tokens_per_sample"] == metrics["gen_tokens_per_sample/mean"]
+        assert metrics["gen_tokens_per_sample/max"] == 300
+        assert metrics["gen_tokens_per_sample/histogram"] == [100, 300, 0]
+        assert metrics["max_gen_tokens_per_turn/max"] == 90
+        assert metrics["max_gen_tokens_per_turn/p95"] == 90
+
+    def test_no_sizes_leaves_metrics_alone(self):
+        assert capture_generation_size_metrics([], []) == {}

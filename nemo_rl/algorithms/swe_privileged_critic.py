@@ -295,15 +295,22 @@ def resolve_privilege_fields(env_info: dict[str, Any]) -> dict[str, str]:
     to be re-joined against the source JSONL at critic-build time.
 
     Top-level ``metadata`` wins over ``instance_dict`` when both carry a key.
+    Rows in the Gym sandboxed-agent format (e.g. ``swe_rebench``) carry the
+    instance fields at the row's top level instead; those are the fallback.
     """
-    md = (env_info or {}).get("responses_create_params", {}).get("metadata", {})
+    env_info = env_info or {}
+    md = (env_info.get("responses_create_params") or {}).get("metadata") or {}
     try:
         idict = json.loads(md.get("instance_dict") or "{}")
     except (json.JSONDecodeError, TypeError):
         idict = {}
     if not isinstance(idict, dict):
         idict = {}
-    src: dict[str, Any] = {**idict, **{k: v for k, v in md.items() if v}}
+    src: dict[str, Any] = {
+        **{k: v for k, v in env_info.items() if v},
+        **idict,
+        **{k: v for k, v in md.items() if v},
+    }
 
     gold = ""
     for key in GOLD_KEYS:
@@ -526,16 +533,28 @@ class SwePrivilegePrefixStore:
             ValueError: No golden patch resolves for the instance. Training on
                 would silently produce a blind critic under a privileged label.
         """
-        fields = resolve_privilege_fields(record.extra_env_info or {})
+        return await self.enrich_from_env_info(
+            meta, record.extra_env_info or {}, record.prompt_idx
+        )
+
+    async def enrich_from_env_info(
+        self, meta: KVBatchMeta, env_info: dict[str, Any], prompt_idx: int
+    ) -> KVBatchMeta:
+        """:meth:`enrich` from the prompt's ``extra_env_info`` directly.
+
+        The token-capture path commits finalizer rows without a
+        ``PromptGroupRecord``; the controller looks the prompt up instead.
+        """
+        fields = resolve_privilege_fields(env_info)
         if not fields["golden_patch"]:
             raise ValueError(
                 "SWE privileged critic: no golden patch resolved for prompt "
-                f"{record.prompt_idx} (instance_id={fields['instance_id']!r}). "
+                f"{prompt_idx} (instance_id={fields['instance_id']!r}). "
                 f"Expected one of {GOLD_KEYS} in extra_env_info's "
-                "responses_create_params.metadata / its instance_dict, or an "
-                f"R2E-Gym-style {R2E_COMMIT_KEY!r}."
+                "responses_create_params.metadata / its instance_dict / the row's "
+                f"top level, or an R2E-Gym-style {R2E_COMMIT_KEY!r}."
             )
-        key = fields["instance_id"] or f"__prompt{record.prompt_idx}"
+        key = fields["instance_id"] or f"__prompt{prompt_idx}"
         if key not in self._prefixes:
             prefix, stats = await asyncio.to_thread(
                 render_reference_prefix, fields, self._tokenizer, self._cfg

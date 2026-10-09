@@ -140,6 +140,46 @@ def test_enrich_fails_loudly_without_a_golden_patch():
         asyncio.run(store.enrich(_meta("ga", 1, [4]), _record(_env_info(patch=""))))
 
 
+def _sandbox_row(instance_id="repo__2", patch="diff --git a/y b/y\n+fix2"):
+    """A Gym sandboxed-agent row (e.g. swe_rebench): instance fields at top level."""
+    return {
+        "instance_id": instance_id,
+        "patch": patch,
+        "test_patch": "diff --git a/t b/t\n+test",
+        "FAIL_TO_PASS": ["t::b"],
+        "PASS_TO_PASS": ["t::c"],
+        "responses_create_params": {"input": [{"role": "user", "content": "fix"}]},
+        "agent_ref": {"type": "responses_api_agents", "name": "agent"},
+    }
+
+
+def test_sandboxed_agent_rows_resolve_from_the_row_top_level():
+    fields = spc.resolve_privilege_fields(_sandbox_row())
+    assert fields["instance_id"] == "repo__2"
+    assert fields["golden_patch"] == "diff --git a/y b/y\n+fix2"
+    assert fields["test_patch"] == "diff --git a/t b/t\n+test"
+    assert fields["fail_to_pass"] == "t::b"
+    assert fields["pass_to_pass"] == "t::c"
+
+
+def test_metadata_still_wins_over_the_row_top_level():
+    row = {**_env_info(), "instance_id": "other", "patch": "top-level patch"}
+    fields = spc.resolve_privilege_fields(row)
+    assert fields["instance_id"] == "repo__1"
+    assert fields["golden_patch"] == "diff --git a/x b/x\n+fix"
+
+
+def test_enrich_from_env_info_stamps_like_enrich():
+    via_record = asyncio.run(
+        _store().enrich(_meta("ga", 2, [5, 7]), _record(_sandbox_row(), prompt_idx=3))
+    )
+    via_env_info = asyncio.run(
+        _store().enrich_from_env_info(_meta("ga", 2, [5, 7]), _sandbox_row(), 3)
+    )
+    assert via_env_info.tags == via_record.tags
+    assert via_env_info.tags[0][spc.PRIVILEGE_KEY_TAG] == "repo__2"
+
+
 def test_step_metrics_are_per_instance():
     store = _store(max_total_tokens=8)  # forces truncation
     metas = [

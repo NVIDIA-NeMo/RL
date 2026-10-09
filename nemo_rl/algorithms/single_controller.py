@@ -55,7 +55,7 @@ import uuid
 import warnings
 from collections import deque
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -200,6 +200,7 @@ from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.legacy_rollout_metrics import (
     aggregate_rollout_metrics_with_sum_counts,
+    capture_generation_size_metrics,
 )
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
@@ -598,7 +599,7 @@ class SingleControllerActor:
             else None
         )
         self._legacy_efficiency = LegacyEfficiencyClock()
-        if self._multi_trace:
+        if self._variable_rows:
             shard_multiples = [
                 handle.sharding_annotations.get_axis_size("data_parallel")
                 * handle.cfg["train_micro_batch_size"]
@@ -829,6 +830,7 @@ class SingleControllerActor:
             # 1.0 on the canonical row of each rollout, 0.0 on token-capture
             # segment rows; weights the step reward mean per rollout.
             "canonical_masks": [],
+            "segment_canonical_masks": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
         self._opd_gap_sum = 0.0
@@ -2030,6 +2032,10 @@ class SingleControllerActor:
         valid-row fraction is no longer a finalizer-side drop -- the caller
         decides that, since only the caller can source a replacement.
         """
+        # Popped before any await so a dropped or cancelled group leaves no entry.
+        rollout_metrics = self._rollout_manager.pop_capture_rollout_metrics(
+            request.group_id
+        )
         self._finalizer_waiters += 1
         queue_depth = max(
             0,
@@ -2110,10 +2116,40 @@ class SingleControllerActor:
                     )
                 else:
                     try:
+                        meta = finalized.meta
+                        if rollout_metrics:
+                            # Same sidecar the echo path's TQReplayBuffer.commit
+                            # writes; the train pump merges it into step metrics.
+                            # Generation sizes come from the finalized rows: the
+                            # receipt-time ones count tool output too.
+                            rollout_metrics = {
+                                **rollout_metrics,
+                                **capture_generation_size_metrics(
+                                    finalized.rollout_gen_tokens,
+                                    finalized.rollout_max_gen_tokens_per_turn,
+                                ),
+                            }
+                            meta = replace(
+                                meta,
+                                extra_info={
+                                    **meta.extra_info,
+                                    ROLLOUT_METRICS: [rollout_metrics],
+                                },
+                            )
+                        if self._privilege_store is not None:
+                            # The echo path stamps privilege tags in the replay
+                            # buffer's commit; finalizer rows commit without a
+                            # PromptGroupRecord, so look the prompt up here.
+                            prompt = await self._dataset_prompt(int(request.prompt_idx))
+                            meta = await self._privilege_store.enrich_from_env_info(
+                                meta,
+                                dict(prompt.get("extra_env_info") or {}),
+                                int(request.prompt_idx),
+                            )
                         await self._buffer.commit_finalized(
                             cut,
                             request.group_id,
-                            finalized.meta,
+                            meta,
                             finalized.group_min_wv,
                             finalized.group_max_wv,
                             staging_keys=finalized.staging_keys,
@@ -2383,6 +2419,11 @@ class SingleControllerActor:
                                     "known-key cleanup failed for group "
                                     f"{request.group_id}"
                                 ) from cleanup_error
+                            if (
+                                self._privilege_store is not None
+                                and finalized.meta is not None
+                            ):
+                                self._privilege_store.release([finalized.meta])
                             print(
                                 f"  finalize: group {request.group_id} below "
                                 "min_valid_fraction_per_group "
@@ -3211,9 +3252,10 @@ class SingleControllerActor:
                         self._rollout_manager.suspend_request_deadlines()
                         await asyncio.to_thread(self._gen.finish_generation)
 
-                    # Multi-trace steps carry a variable number of rows; pad them
-                    # to the data-parallel multiple the policy and critic shard by.
-                    if self._multi_trace:
+                    # Multi-trace / PPO segment-row steps carry a variable number
+                    # of rows; pad them to the data-parallel multiple the policy
+                    # and critic shard by.
+                    if self._variable_rows:
                         with self._timer.time("data_processing"):
                             train_meta, pad_meta = await self._pad_rows_to_dp_multiple(
                                 train_meta
@@ -3519,7 +3561,7 @@ class SingleControllerActor:
                         self._privilege_store.step_metrics(consumed_metas)
                     )
                     self._privilege_store.release(consumed_metas)
-                if self._multi_trace:
+                if self._variable_rows:
                     step_metrics["multi_trace/pad_rows"] = float(self._step_pad_rows)
                     step_metrics["multi_trace/rows"] = float(
                         sum(len(m.sample_ids) for m in consumed_metas)
@@ -5656,7 +5698,7 @@ class SingleControllerActor:
         both models take the actual row count as their global batch size.
         Empty otherwise, leaving the configured value in effect.
         """
-        if not self._multi_trace:
+        if not self._variable_rows:
             return {}
         return {"gbs": len(meta.sample_ids)}
 
@@ -5793,21 +5835,46 @@ class SingleControllerActor:
         # rollout_local_idx / trace_in_rollout_idx / trace_kind; the sample-id
         # grammar is the fallback. Without segment rows every row is canonical
         # and the stage below is exactly the single-row path.
-        identity = resolve_row_identity(meta.sample_ids, meta.tags)
+        # DP pad rows ({sid}_pad{k}, sample_mask 0) belong to no rollout: the
+        # identity, the whole-rollout checks and the row metrics cover the real
+        # rows only.
+        real_rows = torch.tensor(
+            [not is_pad_row(str(sid)) for sid in meta.sample_ids], dtype=torch.bool
+        )
+        real_index = torch.nonzero(real_rows, as_tuple=False).reshape(-1)
+        has_pad_rows = int(real_index.numel()) != len(meta.sample_ids)
+
+        def real(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is None or not has_pad_rows:
+                return tensor
+            return tensor.index_select(0, real_index)
+
+        identity = resolve_row_identity(
+            [meta.sample_ids[i] for i in real_index.tolist()],
+            (
+                [meta.tags[i] for i in real_index.tolist()]
+                if meta.tags is not None
+                else None
+            ),
+        )
         has_extra_rows = identity.has_extra_rows
-        if has_extra_rows and (
+        if has_extra_rows and not (
             self._is_ppo
-            or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+            or isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
         ):
             raise NotImplementedError(
                 "token_capture.segment_rows published "
                 f"{int((~identity.is_canonical).sum().item())} extra row(s) in "
-                "this chunk, but rollout-level advantages (computed on the "
-                "canonical rows and broadcast to the segment rows) are only "
-                "implemented for the GRPO advantage estimator; got "
-                f"{type(self._advantage_estimator).__name__}"
-                f"{' (PPO)' if self._is_ppo else ''}. Disable segment_rows or "
-                "switch to grpo.adv_estimator.name=grpo."
+                "this chunk, but segment rows are only implemented for PPO "
+                "(per-row GAE) and the GRPO advantage estimator (canonical rows, "
+                "broadcast to the segment rows); got "
+                f"{type(self._advantage_estimator).__name__}. Disable "
+                "segment_rows or switch to grpo.adv_estimator.name=grpo."
+            )
+        if has_pad_rows and not self._is_ppo:
+            raise RuntimeError(
+                "DP pad rows reached a non-PPO advantage stage; only PPO pads "
+                "variable-row steps."
             )
         if has_extra_rows and identity.orphan_rows:
             raise RuntimeError(
@@ -5850,9 +5917,6 @@ class SingleControllerActor:
         ).bool()
 
         # DP pad rows copy their source row's flag; count each real row once.
-        real_rows = torch.tensor(
-            [not is_pad_row(str(sid)) for sid in meta.sample_ids], dtype=torch.bool
-        )
         num_mask_sample_filtered = int((mask_sample & real_rows).sum().item())
         self._step_log_dict["num_mask_sample_filtered"].append(num_mask_sample_filtered)
         final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
@@ -5954,14 +6018,14 @@ class SingleControllerActor:
         try:
             accumulate_masking_stats(
                 self._masking_stats_acc,
-                prompt_ids=prompt_ids,
-                rewards=rewards,
-                sample_mask=sample_mask,
-                mask_sample=mask_sample,
-                truncated=truncated,
+                prompt_ids=real(prompt_ids),
+                rewards=real(rewards),
+                sample_mask=real(sample_mask),
+                mask_sample=real(mask_sample),
+                truncated=real(truncated),
                 overlong_filtering=bool(self._algo_cfg.overlong_filtering),
-                final_sample_mask=final_sample_mask,
-                baseline_mask=baseline_mask,
+                final_sample_mask=real(final_sample_mask),
+                baseline_mask=real(baseline_mask),
                 is_canonical=identity.is_canonical,
                 rollout_key=identity.rollout_key,
             )
@@ -5984,7 +6048,10 @@ class SingleControllerActor:
             if getattr(self._advantage_estimator, "normalize_over", None) == "all_rows"
             else mask
         )
-        if has_valid_training_tokens and has_extra_rows:
+        # PPO trains segment rows like echo multi-trace rows: GAE runs per row on
+        # the row's own values, with the rollout's reward at its last token (the
+        # legacy multi-trace semantics), so only GRPO takes the broadcast path.
+        if has_valid_training_tokens and has_extra_rows and not self._is_ppo:
             # Rollout-level advantages: the estimator sees one row per rollout
             # (the canonical rows, in row order) so segment rows never count
             # as extra siblings; each rollout's advantage is then broadcast to
@@ -6057,26 +6124,33 @@ class SingleControllerActor:
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["sample_masks"].append(final_sample_mask.detach().cpu())
-        self._step_log_dict.setdefault("canonical_masks", []).append(
-            identity.is_canonical.float().cpu()
-        )
+        # Full-length like rewards / sample_masks; pad rows are not canonical.
+        # PPO keeps the legacy per-row ``reward`` (segment rows count, as on
+        # the echo path) and reports ``reward_per_rollout`` beside it.
+        canonical_mask = torch.zeros(len(meta.sample_ids), dtype=torch.bool)
+        canonical_mask[real_index] = identity.is_canonical
+        self._step_log_dict.setdefault(
+            "segment_canonical_masks" if self._is_ppo else "canonical_masks", []
+        ).append(canonical_mask.float().cpu())
         try:
             accumulate_rollout_stats(
                 self._rollout_stats_acc,
-                prompt_ids=prompt_ids,
-                rewards=rewards,
-                sample_mask=final_sample_mask,
-                token_mask=token_mask,
-                truncated=truncated,
-                seq_lens=tensor_field(
-                    await call_data_plane(
-                        self._dp_client,
-                        "get_samples",
-                        sample_ids=meta.sample_ids,
-                        partition_id=meta.partition_id,
-                        select_fields=[INPUT_LENGTHS],
-                    ),
-                    INPUT_LENGTHS,
+                prompt_ids=real(prompt_ids),
+                rewards=real(rewards),
+                sample_mask=real(final_sample_mask),
+                token_mask=real(token_mask),
+                truncated=real(truncated),
+                seq_lens=real(
+                    tensor_field(
+                        await call_data_plane(
+                            self._dp_client,
+                            "get_samples",
+                            sample_ids=meta.sample_ids,
+                            partition_id=meta.partition_id,
+                            select_fields=[INPUT_LENGTHS],
+                        ),
+                        INPUT_LENGTHS,
+                    )
                 ),
                 is_canonical=identity.is_canonical,
             )
@@ -6087,20 +6161,20 @@ class SingleControllerActor:
                 self._segment_stats_acc,
                 rollout_key=identity.rollout_key,
                 trace_kind=identity.trace_kind,
-                final_sample_mask=final_sample_mask,
-                sample_mask=sample_mask,
-                token_mask=token_mask,
+                final_sample_mask=real(final_sample_mask),
+                sample_mask=real(sample_mask),
+                token_mask=real(token_mask),
                 generation_logprobs=(
-                    tensor_field(data, adv_cfg.generation_logprobs_field)
+                    real(tensor_field(data, adv_cfg.generation_logprobs_field))
                     if self._policy_logprobs_required
                     else None
                 ),
                 prev_logprobs=(
-                    tensor_field(data, adv_cfg.policy_logprobs_field)
+                    real(tensor_field(data, adv_cfg.policy_logprobs_field))
                     if self._policy_logprobs_required
                     else None
                 ),
-                pre_gate_sample_mask=pre_gate_sample_mask,
+                pre_gate_sample_mask=real(pre_gate_sample_mask),
                 is_canonical=identity.is_canonical,
             )
         except Exception as error:  # metrics must never fail a step
@@ -6200,6 +6274,16 @@ class SingleControllerActor:
         )
 
     # ── utility helpers ────────────────────────────────────────────────────
+
+    @property
+    def _variable_rows(self) -> bool:
+        """Whether steps carry a variable row count to pad and size the GBS by.
+
+        Echo multi-trace rows, and PPO token-capture segment rows: the critic
+        shards by the global batch size, so they pad to the DP multiple too.
+        GRPO segment rows rely on sequence packing instead.
+        """
+        return self._multi_trace or (self._is_ppo and self._segment_rows_enabled())
 
     def _segment_rows_enabled(self) -> bool:
         """``token_capture.segment_rows.enabled``; False on configs without the block."""
