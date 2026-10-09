@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import datetime
 import hashlib
 import json
 import os
@@ -495,6 +496,19 @@ def configure_refit_environment(config) -> None:
         os.environ["NCCL_CUMEM_ENABLE"] = "0" if backend == "sglang" else "1"
 
 
+def _distributed_timeout_minutes(config) -> Optional[float]:
+    """Return ``megatron_cfg.distributed_timeout_minutes``, or None when unset."""
+    timeout_minutes = (config.get("megatron_cfg") or {}).get(
+        "distributed_timeout_minutes"
+    )
+    if timeout_minutes is not None and timeout_minutes <= 0:
+        raise ValueError(
+            "policy.megatron_cfg.distributed_timeout_minutes must be positive, "
+            f"got {timeout_minutes}"
+        )
+    return timeout_minutes
+
+
 def setup_distributed(config) -> None:
     """Handle NCCL settings, dtype mapping, and basic config setup."""
     configure_refit_environment(config)
@@ -503,8 +517,16 @@ def setup_distributed(config) -> None:
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
-    # Initialize process group
-    torch.distributed.init_process_group("nccl")
+    # Initialize process group. Bridge skips its own init_process_group when one
+    # already exists, so the collective timeout of the default group (used by
+    # dist-checkpoint save finalize / load) has to be set here.
+    timeout_minutes = _distributed_timeout_minutes(config)
+    if timeout_minutes is None:
+        torch.distributed.init_process_group("nccl")
+    else:
+        torch.distributed.init_process_group(
+            "nccl", timeout=datetime.timedelta(minutes=timeout_minutes)
+        )
 
 
 def validate_and_set_config(
@@ -2071,6 +2093,11 @@ def _create_megatron_config(
         )
 
     dist_cfg = DistributedInitConfig()
+    # Bridge creates the model-parallel groups (TP/PP/DP/CP/EP) with an explicit
+    # timeout from this field, so it must match the default group's timeout.
+    timeout_minutes = _distributed_timeout_minutes(config)
+    if timeout_minutes is not None:
+        dist_cfg.distributed_timeout_minutes = timeout_minutes
     if "use_gloo_process_groups" in config["megatron_cfg"]:
         dist_cfg.use_gloo_process_groups = config["megatron_cfg"][
             "use_gloo_process_groups"

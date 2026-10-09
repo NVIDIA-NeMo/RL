@@ -24,6 +24,7 @@ nemo_rl.models.megatron.setup, focusing on:
 - Model path validation
 """
 
+import datetime
 import os
 import warnings
 from dataclasses import dataclass, field, fields
@@ -3271,6 +3272,68 @@ class TestCreateMegatronConfigGlooProcessGroups:
         assert (
             dist_config.use_gloo_process_groups
             == DistributedInitConfig().use_gloo_process_groups
+        )
+
+
+@pytest.mark.mcore
+class TestDistributedTimeoutMinutes:
+    """distributed_timeout_minutes reaches the default and model-parallel groups."""
+
+    @staticmethod
+    def _init_process_group_call(megatron_cfg):
+        from nemo_rl.models.megatron.setup import setup_distributed
+
+        with (
+            patch("nemo_rl.models.megatron.setup.configure_dynamo_cache"),
+            patch("nemo_rl.models.megatron.setup.destroy_parallel_state"),
+            patch("torch.distributed.init_process_group") as mock_init,
+        ):
+            setup_distributed({"megatron_cfg": megatron_cfg, "generation": None})
+
+        mock_init.assert_called_once()
+        return mock_init.call_args
+
+    def test_setup_distributed_forwards_timeout(self):
+        call_args = self._init_process_group_call({"distributed_timeout_minutes": 30})
+
+        assert call_args.args == ("nccl",)
+        assert call_args.kwargs == {"timeout": datetime.timedelta(minutes=30)}
+
+    @pytest.mark.parametrize(
+        "megatron_cfg", [{}, {"distributed_timeout_minutes": None}]
+    )
+    def test_setup_distributed_unset_keeps_torch_default(self, megatron_cfg):
+        call_args = self._init_process_group_call(megatron_cfg)
+
+        assert call_args.args == ("nccl",)
+        assert call_args.kwargs == {}
+
+    @pytest.mark.parametrize("minutes", [0, -5])
+    def test_non_positive_timeout_is_rejected(self, minutes):
+        with pytest.raises(ValueError, match="distributed_timeout_minutes"):
+            self._init_process_group_call({"distributed_timeout_minutes": minutes})
+
+    def test_forwarded_to_bridge_dist_config(self):
+        cfg = TestCreateMegatronConfigGlooProcessGroups._config(
+            distributed_timeout_minutes=30
+        )
+        dist_config = TestCreateMegatronConfigGlooProcessGroups()._dist_config_passed_to_container(
+            cfg
+        )
+
+        assert dist_config.distributed_timeout_minutes == 30
+
+    def test_absent_key_defers_to_bridge_default(self):
+        from megatron.bridge.training.config import DistributedInitConfig
+
+        cfg = TestCreateMegatronConfigGlooProcessGroups._config()
+        dist_config = TestCreateMegatronConfigGlooProcessGroups()._dist_config_passed_to_container(
+            cfg
+        )
+
+        assert (
+            dist_config.distributed_timeout_minutes
+            == DistributedInitConfig().distributed_timeout_minutes
         )
 
 
