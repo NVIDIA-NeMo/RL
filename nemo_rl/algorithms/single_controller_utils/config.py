@@ -655,6 +655,11 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Initially requires unit dataset loss weights and disables both trainer and
     # rollout checkpointing; ordinary capture retains those capabilities.
     context_compaction: bool = False
+    # Reject (never train) a rebuilt row longer than this many tokens; the
+    # owner's other rows are dropped with it. None keeps every row. Bounds the
+    # learner's activation memory for long append-only histories (an identity or
+    # subagent episode has no compaction to split its context into rows).
+    max_train_row_tokens: Optional[PositiveInt] = None
 
 
 @dataclass(frozen=True)

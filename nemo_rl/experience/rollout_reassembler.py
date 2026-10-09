@@ -304,8 +304,12 @@ class RolloutReassembler:
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
+        max_train_row_tokens: Optional[int] = None,
     ) -> None:
         self._dp_client = dp_client
+        if max_train_row_tokens is not None and max_train_row_tokens < 1:
+            raise ValueError("max_train_row_tokens must be positive")
+        self._max_train_row_tokens = max_train_row_tokens
         self._partition_id = partition_id
         # Whether the staging partition carries media columns (setup's
         # ``token_capture.enabled and processor is not None``). Text-only runs
@@ -649,6 +653,31 @@ class RolloutReassembler:
 
     # ── per group ───────────────────────────────────────────────────────────
 
+    def _cap_row_length(self, row: FinalizedRollout) -> FinalizedRollout:
+        """Reject a valid row longer than ``max_train_row_tokens``.
+
+        The staged evidence is kept on the row so cleanup still covers it; the
+        group publisher substitutes a placeholder and the metrics count the
+        ``row_too_long`` reason.
+        """
+        cap = self._max_train_row_tokens
+        if cap is None or not row.valid or len(row.token_ids) <= cap:
+            return row
+        return replace(
+            row,
+            valid=False,
+            rejection_reason=f"row_too_long:{len(row.token_ids)}>{cap}",
+            token_ids=[],
+            token_mask=[],
+            logprobs=[],
+            prompt_len=0,
+            model_call_ids=(),
+            routed_experts=None,
+            route_plan=None,
+            media=None,
+            output_masks={},
+        )
+
     def finalize_group(
         self,
         group_id: str,
@@ -698,7 +727,9 @@ class RolloutReassembler:
         logical = None
         if logical_selections is None:
             rows = [
-                self.finalize_rollout(rollout_id, receipt, reward=reward)
+                self._cap_row_length(
+                    self.finalize_rollout(rollout_id, receipt, reward=reward)
+                )
                 for rollout_id, receipt, reward in zip(rollout_ids, receipts, rewards)
             ]
         else:
@@ -1285,12 +1316,14 @@ class RolloutReassembler:
                     prepared.staging_keys.extend(
                         record.staging_key for record in parsed.manifest
                     )
-                row = self.finalize_rollout(
-                    expected_id,
-                    segment.receipt,
-                    reward=reward,
-                    context_compaction=True,
-                    action_flags=segment.action_flags,
+                row = self._cap_row_length(
+                    self.finalize_rollout(
+                        expected_id,
+                        segment.receipt,
+                        reward=reward,
+                        context_compaction=True,
+                        action_flags=segment.action_flags,
+                    )
                 )
                 selected = segment.selected_response_ids
                 record_by_call = (

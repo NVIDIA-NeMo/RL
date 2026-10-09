@@ -151,6 +151,8 @@ class RolloutReassemblerActorConfig:
     max_seq_len: int
     # Whether the staging partition carries media columns (VLM capture).
     capture_media: bool
+    # Rows rebuilt longer than this are rejected (row_too_long); None = no cap.
+    max_train_row_tokens: Optional[int] = None
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -206,6 +208,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
             capture_media=config.capture_media,
+            max_train_row_tokens=config.max_train_row_tokens,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

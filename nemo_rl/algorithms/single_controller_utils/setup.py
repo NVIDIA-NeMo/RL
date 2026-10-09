@@ -2005,6 +2005,7 @@ def setup_single_controller(
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
+                max_train_row_tokens=token_capture_cfg.max_train_row_tokens,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

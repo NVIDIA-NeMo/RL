@@ -39,6 +39,10 @@ export AGENTIC_VBENCH_CONCURRENCY=${AGENTIC_VBENCH_CONCURRENCY:-$((NUM_PROMPTS *
 # No compaction: the declared window is the policy's real 256k window.
 export AGENTIC_VBENCH_CONTEXT_TOKENS=${AGENTIC_VBENCH_CONTEXT_TOKENS:-262144}
 export AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER=${AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER:-0.4}
+# Without compaction a 32-turn episode is one training row of its whole context.
+# Rows up to ~95k tokens trained on 8 training nodes; 114k and 123k rows OOM'd
+# (run 2184181). Reject longer rows instead of crashing the learner.
+export SUBAGENT_MAX_ROW_TOKENS=${SUBAGENT_MAX_ROW_TOKENS:-98304}
 export SAVE_PERIOD=${SAVE_PERIOD:-1}
 export JOB_CYCLES=${JOB_CYCLES:-6}
 export BASE_NAME=${BASE_NAME:-agentic_vbench_subagents_16n_fast_step_$(date -u +%Y%m%d-%H%M%S)}
@@ -48,6 +52,7 @@ exec bash "$script_dir/smoke_off_32turns_256k.sh" \
   async_rl.sampler.max_lookahead_versions=0 \
   "async_rl.max_inflight_prompts=${NUM_PROMPTS}" \
   "async_rl.max_buffered_rollouts=${NUM_PROMPTS}" \
+  "token_capture.max_train_row_tokens=${SUBAGENT_MAX_ROW_TOKENS}" \
   +env.nemo_gym.training_mode=subagent \
   "+${agent}.opencode_training_mode=subagent" \
   "+${agent}.opencode_subagents_enabled=true" \
