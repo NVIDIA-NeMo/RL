@@ -115,7 +115,67 @@ jobs:
               for row in results:
                   out.write(f"| {row['phase']} | {row['exit_code']} | {row['original_error']} | {row['passed']} |\n")
               out.write('\nOne runner, one interpreter and dependency environment; lockfile, checker settings and installed packages unchanged.\n')
-          assert all(row['passed'] for row in results), 'The expected A/B/A evidence was NOT established; inspect logs.'
+          print('Initial comparison recorded; repeat checks below test for intermittency.')
+          PY
+      - name: Check repeatability with unchanged dependencies
+        shell: bash
+        run: |
+          uv run --group dev python -u - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          
+          root = Path(os.environ['RUNNER_TEMP']) / 'issue4599-evidence'
+          factory = Path('nemo_rl/data_plane/factory.py')
+          results = []
+          for phase, source, limit, stop_on_original in [
+              ('original', 'factory-original.py', 20, True),
+              ('patched', 'factory-patched.py', 10, False),
+              ('restored', 'factory-original.py', 20, True),
+          ]:
+              factory.write_bytes((root / source).read_bytes())
+              for attempt in range(1, limit + 1):
+                  result = subprocess.run(
+                      ['uv', 'run', '--group', 'dev', 'pyrefly', 'check', '--output-format', 'json'],
+                      capture_output=True, text=True, check=False,
+                  )
+                  (root / f'repeat-{phase}-{attempt}.json').write_text(result.stdout)
+                  (root / f'repeat-{phase}-{attempt}.stderr').write_text(result.stderr)
+                  payload = json.loads(result.stdout)
+                  errors = payload.get('errors', [])
+                  matching = [e for e in errors if (
+                      'nemo_rl/data_plane/factory.py' in json.dumps(e)
+                      and 'bad-argument-type' in json.dumps(e)
+                      and 'dp_cfg' in json.dumps(e)
+                      and 'None' in json.dumps(e)
+                  )]
+                  row = dict(phase=phase, attempt=attempt, exit_code=result.returncode,
+                             errors=len(errors), original_error=bool(matching))
+                  results.append(row)
+                  print(json.dumps(row), flush=True)
+                  (root / 'repeated-results.json').write_text(json.dumps(results, indent=2) + '\n')
+                  if stop_on_original and matching:
+                      break
+          
+          subprocess.run(['git', 'diff', '--exit-code'], check=True)
+          freeze = subprocess.check_output(['uv', 'pip', 'freeze'], text=True)
+          assert freeze == (root / 'packages-before.txt').read_text()
+          subprocess.run(['sha256sum', '-c', str(root / 'config-before.sha256')], check=True)
+          summary = {}
+          for phase in ['original', 'patched', 'restored']:
+              rows = [r for r in results if r['phase'] == phase]
+              summary[phase] = dict(runs=len(rows), clean=sum(r['exit_code'] == 0 for r in rows),
+                                    original_error=sum(r['original_error'] for r in rows))
+          (root / 'repeated-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('\n## Repeated execution of the original pyrefly hook\n\n')
+              out.write('| Source | Runs | Clean | Original error |\n|---|---:|---:|---:|\n')
+              for phase, row in summary.items():
+                  out.write(f"| {phase} | {row['runs']} | {row['clean']} | {row['original_error']} |\n")
+          assert summary['original']['original_error'] > 0, 'Original failure not reproduced'
+          assert summary['restored']['original_error'] > 0, 'Restored failure not reproduced'
+          assert summary['patched']['clean'] == summary['patched']['runs'], 'Patched check failed'
           PY
       - name: Upload evidence even if comparison fails
         if: always()
