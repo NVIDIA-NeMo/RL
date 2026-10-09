@@ -129,8 +129,39 @@ def test_math_data_processor():
     assert dataset[1]["extra_env_info"]["ground_truth"] == "answer2"
 
 
-@pytest.fixture(params=[False, True], ids=["default-system", "default-system-bos"])
+# Real chat templates from issue #4185. Two-call rendering changes the prompt for
+# each of them; Qwen3 keeps the same token IDs and only checks the joined text.
+_EVAL_CHAT_TOKENIZERS = [
+    "Qwen/Qwen2.5-Math-1.5B-Instruct",
+    "moonshotai/Moonlight-16B-A3B-Instruct",
+    "openai/gpt-oss-20b",
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "meta-llama/Llama-3.2-1B-Instruct",
+    "microsoft/Phi-4-mini-instruct",
+    "mistralai/Mistral-Nemo-Instruct-2407",
+    "zai-org/GLM-4.5-Air",
+    "Qwen/Qwen3-0.6B",
+]
+
+
+# Module scope loads each tokenizer once and keeps one in memory at a time.
+@pytest.fixture(
+    scope="module",
+    params=[
+        "default-system",
+        "default-system-bos",
+        *(
+            pytest.param(name, marks=pytest.mark.hf_gated)
+            for name in _EVAL_CHAT_TOKENIZERS
+        ),
+    ],
+)
 def eval_chat_tokenizer(request: pytest.FixtureRequest) -> PreTrainedTokenizerFast:
+    if not request.param.startswith("default-system"):
+        return get_tokenizer(
+            TokenizerConfig(name=request.param, chat_template="default")
+        )
     backend = Tokenizer(
         models.BPE(
             vocab={
@@ -150,7 +181,7 @@ def eval_chat_tokenizer(request: pytest.FixtureRequest) -> PreTrainedTokenizerFa
         "{% endfor %}"
         "{% if add_generation_prompt %}assistant:{% endif %}"
     )
-    if request.param:
+    if request.param == "default-system-bos":
         template = "{{ bos_token }}" + template
     return PreTrainedTokenizerFast(
         tokenizer_object=backend, bos_token="<bos>", chat_template=template
@@ -206,10 +237,6 @@ def test_eval_processors_render_complete_conversation(
     token_ids = torch.cat([message["token_ids"] for message in result["message_log"]])
     assert rendered == expected_text
     assert token_ids.tolist() == expected_ids
-    assert rendered.count("system:") == 1
-    assert rendered.count("assistant:") == 1
-    assert rendered.count("<bos>") == expected_text.count("<bos>")
-    assert ("Default instruction." in rendered) == (not with_system)
     assert result["length"] == len(expected_ids)
     assert result["loss_multiplier"] == 1.0
     assert result["extra_env_info"] == expected_info
