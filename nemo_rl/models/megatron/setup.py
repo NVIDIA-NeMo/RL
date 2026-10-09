@@ -14,6 +14,7 @@
 
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import threading
@@ -640,6 +641,24 @@ def _validate_shared_prefix_model_capability(
     shared_prefix_config = get_shared_prefix_training_config(config)
     if not shared_prefix_config.enabled_for(stage="logprobs"):
         return
+
+    # The data and train modules import megatron.rl only inside shared-prefix
+    # code, so a missing package would otherwise surface at the first shared
+    # microbatch rather than here.
+    try:
+        has_shared_prefix_planner = (
+            importlib.util.find_spec("megatron.rl.shared_prefix_execution") is not None
+        )
+    except ModuleNotFoundError:
+        # The installed megatron-core wheel has no megatron.rl package at all.
+        has_shared_prefix_planner = False
+    if not has_shared_prefix_planner:
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires "
+            "a Megatron-LM build with the megatron.rl shared-prefix modules; "
+            "megatron.rl.shared_prefix_execution is not importable in the worker "
+            "environment."
+        )
 
     megatron_config = config.get("megatron_cfg")
     if megatron_config is not None:
