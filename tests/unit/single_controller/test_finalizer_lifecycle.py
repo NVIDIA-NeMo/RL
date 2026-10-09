@@ -29,7 +29,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 from nemo_rl.experience.route_plan import (
@@ -90,6 +90,7 @@ def _request() -> ReassemblyRequest:
         rewards=(1.0,),
         mask_sample=(False,),
         fallback_weight_version=3,
+        rollout_metrics={"anyterminal_openclaw/reward/mean": 1.0},
     )
 
 
@@ -151,6 +152,9 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
     assert ctrl._available_finalizers.get_nowait() is actor
     assert ctrl._active_finalizers == 0
     assert ctrl._finalizer_unknown_outcomes == 0
+    assert meta.extra_info[ROLLOUT_METRICS] == [
+        {"anyterminal_openclaw/reward/mean": 1.0}
+    ]
     ctrl._buffer.commit_finalized.assert_awaited_once_with(
         ANY,
         "group",

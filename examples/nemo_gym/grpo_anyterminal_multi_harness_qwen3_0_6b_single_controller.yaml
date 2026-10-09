@@ -16,7 +16,10 @@
 defaults: "../configs/grpo_math_1B.yaml"
 
 grpo:
-  max_num_epochs: 2
+  # Treat the scheduler allocation as the run boundary; do not stop after a
+  # short fixed number of dataset passes.
+  max_num_epochs: 1000000
+  max_num_steps: 1000000
   num_prompts_per_step: 4
   num_generations_per_prompt: 2
   val_period: 0
@@ -176,6 +179,7 @@ env:
           global_agent_timeout: 300
           agent_kwargs:
             max_turns: 3
+            context_window: ${add:${policy.max_total_sequence_length},-512}
 
 logger:
   log_dir: logs/grpo-anyterminal-multi-harness-qwen3-0.6b
@@ -183,6 +187,7 @@ logger:
   tensorboard_enabled: true
   monitor_gpus: true
   wandb:
+    entity: adlr
     project: multi-harness-RL
     name: anyterminal-multi-harness-qwen3-0.6b
     log_nemo_gym_full_result_tables: true

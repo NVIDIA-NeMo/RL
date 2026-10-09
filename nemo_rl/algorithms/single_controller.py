@@ -1862,6 +1862,10 @@ class SingleControllerActor:
                         ) from cleanup_error
                     committed = False
                 else:
+                    if request.rollout_metrics:
+                        finalized.meta.extra_info.setdefault(
+                            ROLLOUT_METRICS, []
+                        ).append(dict(request.rollout_metrics))
                     try:
                         await self._buffer.commit_finalized(
                             cut,
