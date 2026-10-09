@@ -115,6 +115,11 @@ class RolloutSelection:
     response_ids: tuple[str, ...]
     action_flags: tuple[ActionOutputFlags, ...]
     truncated: bool = False
+    # Session-trace training (subagents): the OpenCode session that owns each
+    # selected response and its role ("parent" | "child"), parallel to
+    # ``response_ids``. None when the harness reports no sessions.
+    session_ids: tuple[str, ...] | None = None
+    session_roles: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +133,38 @@ class SegmentReceipt:
     truncated: bool = False
     # Image columns occupy the selected terminal's existing staging key.
     action_flags: tuple[ActionOutputFlags, ...] | None = None
+    # Owning OpenCode session of this segment's chain (session-trace training).
+    session_id: str | None = None
+    session_role: str | None = None
+
+
+def group_selected_chains(records: list[Any]) -> list[list[int]]:
+    """Group selected capture records (in capture order) into continuation chains.
+
+    Returns index lists into ``records``. A record without a parent roots a new
+    chain; a continuation attaches to the open chain whose tail is its parent.
+    Chains may interleave in capture order: a parent session resumes after its
+    child sessions' calls, and parallel children alternate. Every link is still
+    verified against the ledger's explicit ``parent_call_id``; a continuation
+    whose parent is not the tail of any selected chain is rejected, exactly as
+    before for the single-chain case.
+    """
+    chains: list[list[int]] = []
+    tails: dict[str, int] = {}
+    for index, record in enumerate(records):
+        parent = record.parent_call_id
+        if parent is None:
+            tails[record.model_call_id] = len(chains)
+            chains.append([index])
+            continue
+        chain = tails.pop(parent, None)
+        if chain is None:
+            raise ValueError(
+                "Selected continuation must follow its selected predecessor"
+            )
+        chains[chain].append(index)
+        tails[record.model_call_id] = chain
+    return chains
 
 
 @dataclass
@@ -1144,25 +1181,24 @@ class RolloutReassembler:
                 raise ValueError("Selected responses must preserve capture order")
             if by_response[selected[-1]].model_call_id != parsed.terminal_model_call_id:
                 raise ValueError("Selected terminal differs from the scored receipt")
-            chains: list[list[CallRecord]] = []
-            chain_flags: list[list[ActionOutputFlags]] = []
-            for response_id, flags in zip(
-                selected, selection.action_flags, strict=True
+            selected_records: list[CallRecord] = [
+                by_response[response_id] for response_id in selected
+            ]
+            sessions = selection.session_ids
+            roles = selection.session_roles
+            if (sessions is None) != (roles is None) or (
+                sessions is not None
+                and (len(sessions) != len(selected) or len(roles) != len(selected))
             ):
-                record = by_response[response_id]
-                if record.parent_call_id is None:
-                    chains.append([])
-                    chain_flags.append([])
-                elif (
-                    not chains or record.parent_call_id != chains[-1][-1].model_call_id
-                ):
-                    raise ValueError(
-                        "Selected continuation must follow its selected predecessor"
-                    )
-                chains[-1].append(record)
-                chain_flags[-1].append(flags)
+                raise ValueError("Session ownership must parallel the selection")
             owner_plan = []
-            for chain, flags in zip(chains, chain_flags, strict=True):
+            for members in group_selected_chains(selected_records):
+                chain = [selected_records[index] for index in members]
+                flags = [selection.action_flags[index] for index in members]
+                if sessions is not None and len(
+                    {sessions[index] for index in members}
+                ) != 1:
+                    raise ValueError("A continuation chain cannot span sessions")
                 row_receipt = parsed.model_copy(
                     update={
                         "manifest": chain,
@@ -1179,6 +1215,8 @@ class RolloutReassembler:
                         ),
                         action_flags=tuple(flags),
                         truncated=selection.truncated,
+                        session_id=sessions[members[0]] if sessions else None,
+                        session_role=roles[members[0]] if roles else None,
                     )
                 )
             plans.append(owner_plan)
@@ -1372,6 +1410,14 @@ class RolloutReassembler:
                             flag.malformed_thinking for flag in flags
                         ),
                         "num_assistant_messages": len(segment.selected_response_ids),
+                        **(
+                            {
+                                "session_id": segment.session_id,
+                                "session_role": segment.session_role,
+                            }
+                            if segment.session_id is not None
+                            else {}
+                        ),
                     }
                 )
         prepared.staging_keys = list(dict.fromkeys(prepared.staging_keys))

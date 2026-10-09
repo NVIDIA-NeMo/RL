@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Subagent-RL smoke: the parent OpenCode agent may delegate with the `task` tool
+# to depth-one `general` children; every session's calls are captured as their
+# own framework-owned context segment and the whole episode trains as one
+# scored logical owner (parent segment + one segment per child). OpenCode
+# compaction is off (identity arm): the ledger roots a new chain for each child
+# the same way it does for a compaction rewrite.
+#
+# Trainer contract: env.nemo_gym.training_mode=subagent plus the agent override
+# block NeMo-RL validates against it (validate_session_training_config). The
+# same knobs reach the Harbor runner through the environment so the yaml's
+# ${oc.env} defaults and the override block agree.
+#
+# Same step shaping as smoke_cc_16n_fast_step.sh (zero lookahead, one step of
+# groups in flight, 12-minute agent cap, per-step checkpoints, chained cycles).
+#   bash scripts/agentic_vbench/smoke_subagents_fast_step.sh
+set -euo pipefail
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+code_dir=$(cd "$script_dir/../.." && pwd)
+export AGENTIC_VBENCH_BACKEND_DIR=${AGENTIC_VBENCH_BACKEND_DIR:-$code_dir/data/agentic_vbench/backend-cc-4}
+export GYM_VENV_DIR=${GYM_VENV_DIR:-$code_dir/data/agentic_vbench/gym_venvs_cc_unified}
+# Framework-owned segments on, OpenCode compaction/pruning off, subagents on.
+export CONTEXT_COMPACTION=true
+export AGENTIC_VBENCH_COMPACTION_AUTO=false
+export AGENTIC_VBENCH_COMPACTION_PRUNE=false
+export AGENTIC_VBENCH_TRAINING_MODE=subagent
+export AGENTIC_VBENCH_SUBAGENTS_ENABLED=true
+export NUM_NODES=${NUM_NODES:-16}
+export NUM_GEN_NODES=${NUM_GEN_NODES:-8}
+export SEGMENT_SIZE=${SEGMENT_SIZE:-8}
+export NUM_PROMPTS=${NUM_PROMPTS:-8}
+export NUM_GENERATIONS=${NUM_GENERATIONS:-4}
+export MAX_STEPS=${MAX_STEPS:-20}
+# Children run concurrently with each other inside one episode, so a step's
+# episodes can hold more containers than rollouts; Harbor backend slots bound it.
+export AGENTIC_VBENCH_CONCURRENCY=${AGENTIC_VBENCH_CONCURRENCY:-$((NUM_PROMPTS * NUM_GENERATIONS))}
+# No compaction: the declared window is the policy's real 256k window.
+export AGENTIC_VBENCH_CONTEXT_TOKENS=${AGENTIC_VBENCH_CONTEXT_TOKENS:-262144}
+export AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER=${AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER:-0.4}
+export SAVE_PERIOD=${SAVE_PERIOD:-1}
+export JOB_CYCLES=${JOB_CYCLES:-6}
+export BASE_NAME=${BASE_NAME:-agentic_vbench_subagents_16n_fast_step_$(date -u +%Y%m%d-%H%M%S)}
+export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$BASE_NAME}
+agent=env.nemo_gym.agentic_vbench_agent.responses_api_agents.agentic_vbench_agent
+exec bash "$script_dir/smoke_off_32turns_256k.sh" \
+  async_rl.sampler.max_lookahead_versions=0 \
+  "async_rl.max_inflight_prompts=${NUM_PROMPTS}" \
+  "async_rl.max_buffered_rollouts=${NUM_PROMPTS}" \
+  +env.nemo_gym.training_mode=subagent \
+  "+${agent}.opencode_training_mode=subagent" \
+  "+${agent}.opencode_subagents_enabled=true" \
+  "+${agent}.opencode_subagent_max_depth=1" \
+  "+${agent}.opencode_subagent_max_active=null" \
+  "+${agent}.opencode_compaction_auto=false" \
+  "+${agent}.opencode_compaction_prune=false" \
+  "$@"

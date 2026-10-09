@@ -57,7 +57,9 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
+from nemo_rl.environments.gym_sessions import session_trace_metadata
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.session_traces import validate_session_training_config
 from nemo_rl.environments.nemo_gym_multimodal import (
     _has_image_before_first_trainable_output,
     _index_per_turn_images,
@@ -362,6 +364,11 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+    # Session-trace training contract (plain | compaction | subagent). When set,
+    # captured-history postprocessing binds the harness's ``session_traces`` to
+    # the selected capture chains and validates them (subagent mode: one scored
+    # owner whose segments are the parent context and each child context).
+    training_mode: NotRequired[Optional[str]]
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -512,6 +519,23 @@ class NemoGym(EnvironmentInterface):
         )
         if self._context_compaction and not capture_config.get("enabled"):
             raise ValueError("context compaction requires external token capture")
+        self._training_mode = cfg.get("training_mode")
+        if self._training_mode is not None:
+            if not self._context_compaction:
+                raise ValueError(
+                    "training_mode requires token_capture.context_compaction=true: "
+                    "session traces train as framework-owned context segments"
+                )
+            # The harness contract lives in the agent override block
+            # (responses_api_agents.agentic_vbench_agent.*); it must agree.
+            validate_session_training_config(
+                {
+                    "nemo_gym": {
+                        **dict(cfg.get("initial_global_config_dict") or {}),
+                        "training_mode": self._training_mode,
+                    }
+                }
+            )
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -1164,6 +1188,19 @@ Depending on your data shape, you may want to change these values."""
             receipt.update(
                 capture_poisoned=True, failure_reason="logical_execution_failure"
             )
+        session_tags = None
+        session_ids: tuple[str, ...] | None = None
+        session_roles: tuple[str, ...] | None = None
+        if self._training_mode is not None and selected:
+            # A fatal mismatch fails this attempt as a data error: the batch
+            # never trains an attempt whose session ownership is unaccounted.
+            session_tags, session_ids, session_roles = session_trace_metadata(
+                result.get("session_traces"),
+                selected_response_ids=tuple(r.response_id for r in selected),
+                training_mode=self._training_mode,
+                compaction_summaries=result.get("compaction_summaries"),
+                rollout_id=owner,
+            )
         selection = RolloutSelection(
             response_ids=tuple(r.response_id for r in selected),
             action_flags=tuple(
@@ -1179,12 +1216,21 @@ Depending on your data shape, you may want to change these values."""
                 for r in selected
             ),
             truncated=truncated,
+            session_ids=session_ids,
+            session_roles=session_roles,
         )
         full_result: dict[str, Any] = {
             key: value
             for key, value in result.items()
             if isinstance(value, (str, int, float, bool))
         }
+        if session_tags is not None:
+            # env_extras keep scalars only; the per-session evidence rides as JSON.
+            full_result["session_trace_metadata"] = json.dumps(session_tags)
+            full_result["num_sessions"] = len(session_tags)
+            full_result["num_child_sessions"] = sum(
+                tag["session_role"] == "child" for tag in session_tags
+            )
         full_result["instance_config"] = {
             "mask_sample": result["instance_config"]["mask_sample"]
         }
@@ -1934,6 +1980,7 @@ def _build_gym_actor_config(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    training_mode = nemo_gym_dict.pop("training_mode", None)
     port_range = {
         key: value
         for key in ("port_range_low", "port_range_high")
@@ -1974,6 +2021,7 @@ def _build_gym_actor_config(
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
+        training_mode=training_mode,
         **port_range,
         **multimodal_flags,
     )

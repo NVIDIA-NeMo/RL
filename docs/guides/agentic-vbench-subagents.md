@@ -99,6 +99,40 @@ mechanism changes:
   capture chains to tag rows for `session_traces.py` validation and the
   one-vote-per-rollout batch.
 
+## Phase 3: trainer wiring on the ledger-based stack
+
+Our stack already trains one scored owner as several physical rows (the
+context-compaction segments, `{owner}_s{n}`, with one reward per owner in
+`logical_advantage`). Subagent training reuses that machinery; the reference's
+token-echo multi-trace loop is not ported.
+
+- `env.nemo_gym.training_mode` (`plain | compaction | subagent`) is a NeMo-RL
+  key consumed by `NemoGym` (never reaches Gym). It requires
+  `token_capture.context_compaction=true` and is validated at actor init
+  against the agent override block
+  (`env.nemo_gym.agentic_vbench_agent.responses_api_agents.agentic_vbench_agent.opencode_*`)
+  with the vendored `validate_session_training_config`.
+- `_postprocess_captured_history` binds the agent's `session_traces` to the
+  selected capture chains (`nemo_rl/environments/gym_sessions.py`): every
+  selected response must be owned by exactly one session, the parent must own
+  a selected response, plain/subagent modes forbid OpenCode compaction, and
+  the per-session tags pass `validate_session_trace_metadata`. The tags ride
+  `env_extras.session_trace_metadata` (JSON) with `num_sessions` /
+  `num_child_sessions`; the `RolloutSelection` carries `session_ids` /
+  `session_roles` parallel to the selected responses.
+- `RolloutReassembler._plan_selected_calls` now groups selected records into
+  chains by explicit `parent_call_id` even when chains interleave in capture
+  order (`group_selected_chains`): a parent resumes after its children, and
+  parallel children alternate. Every link is still verified; a chain cannot
+  span sessions. Each `SegmentReceipt` and row tag carries `session_id` /
+  `session_role`.
+- Launcher: `scripts/agentic_vbench/smoke_subagents_fast_step.sh` (identity
+  arm + subagents; same fast-step shaping as the compaction launcher).
+
+Masking semantics follow from the segments: a child's final answer is
+assistant text in the child's row and a tool result (prompt tokens) in the
+parent's row, so it is trained once.
+
 ## Not ported
 
 Score centering, the SFT export tooling, the SWE-bench harness and the
