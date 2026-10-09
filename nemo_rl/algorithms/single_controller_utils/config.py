@@ -494,12 +494,22 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     recompute_kv_cache_after_weight_updates: bool = False
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
+    # Keep at least the streaming floor for a trailing chunk (in_order only).
+    coalesce_streaming_tails: bool = False
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
     max_buffered_rollouts: int = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+
+    @model_validator(mode="after")
+    def _validate_streaming_tail_coalescing(self) -> "AsyncRLConfig":
+        if self.coalesce_streaming_tails and self.sampler.name != "in_order":
+            raise ValueError(
+                "async_rl.coalesce_streaming_tails requires sampler.name=in_order"
+            )
+        return self
 
     @model_validator(mode="after")
     def _reject_renamed_blocks(self) -> "AsyncRLConfig":
