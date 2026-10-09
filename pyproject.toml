@@ -261,7 +261,10 @@ modelopt = ["nvidia-modelopt"]
 nvrx = [
   "nvidia-resiliency-ext==0.7.0",
 ] # for ft_launcher (fault-tolerant training launcher)
-nemo_gym = ["nemo_gym"]
+# [telemetry]: Gym installs into each server venv the telemetry packages present in the process that starts it.
+# That process is the NemoGym actor.
+# Without the FastAPI instrumentation here, every Gym server logs an import traceback when telemetry is on.
+nemo_gym = ["nemo_gym[telemetry]"]
 
 [dependency-groups]
 
