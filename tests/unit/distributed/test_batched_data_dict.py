@@ -582,6 +582,43 @@ def test_sequence_packing_long_sequences():
     assert len(problem_ids_seen) == batch_size
 
 
+def test_sequence_packing_oversized_sequence_gets_own_microbatch():
+    """A sequence longer than max_tokens_per_microbatch is packed alone."""
+    batch_data = BatchedDataDict(
+        {
+            "input_ids": torch.ones(4, 2048, dtype=torch.long),
+            "sequence_lengths": torch.tensor([300, 1500, 200, 400]),
+            "problem_ids": torch.arange(4),
+        }
+    )
+    sequence_packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=1024,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=1,
+    )
+
+    sharded_batches, _ = batch_data.shard_by_batch_size(
+        shards=2, sequence_packing_args=sequence_packing_args
+    )
+
+    problem_ids_seen = []
+    for shard in sharded_batches:
+        for mb in shard.make_microbatch_iterator_for_packable_sequences():
+            problem_ids = mb["problem_ids"].tolist()
+            problem_ids_seen.extend(problem_ids)
+            if 1 in problem_ids:
+                assert problem_ids == [1]
+            else:
+                assert mb["sequence_lengths"].sum().item() <= 1024
+    assert sorted(problem_ids_seen) == [0, 1, 2, 3]
+    assert (
+        max(max(lens) for s in sharded_batches for lens in s.micro_batch_lengths)
+        == 1500
+    )
+
+
 def test_sequence_packing_with_dynamic_batching_conflict():
     """Test that sequence packing and dynamic batching cannot be used together."""
     batch_data = BatchedDataDict(

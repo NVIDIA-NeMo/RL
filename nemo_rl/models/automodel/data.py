@@ -261,6 +261,14 @@ def process_microbatch(
     input_ids = mb.get("input_ids").cuda()
 
     if enable_seq_packing:
+        # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
+        min_seq_len = cfg["sequence_packing"]["train_mb_tokens"]
+        packed_len = int(mb["input_lengths"].sum())
+        if packed_len > min_seq_len:
+            # A sequence longer than the bin capacity is packed alone; keep its
+            # row aligned to make_sequence_length_divisible_by.
+            multiple = cfg["make_sequence_length_divisible_by"]
+            min_seq_len = (packed_len + multiple - 1) // multiple * multiple
         input_ids, position_ids, _ = pack_sequences(
             input_ids=input_ids,
             input_lengths=mb["input_lengths"],
@@ -269,9 +277,7 @@ def process_microbatch(
             ],  # flash attention 2 expects flattened input
             padding_value=tokenizer.eos_token_id,
             return_attention_mask=False,
-            min_seq_len=cfg["sequence_packing"][
-                "train_mb_tokens"
-            ],  # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
+            min_seq_len=min_seq_len,
         )
         seq_len = input_ids.shape[1]
         attention_mask = None
