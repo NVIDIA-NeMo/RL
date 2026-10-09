@@ -4917,8 +4917,10 @@ class SingleControllerActor:
         deadline = self._async_cfg.generation_fleet_health.refit_timeout_s
         return None if deadline is None else deadline + self._REFIT_UNWIND_GRACE_S
 
-    async def _sync_weights_within(self, kv_scales, what: str) -> None:
-        """Run the refit off-loop, and stop waiting if it outlives the deadline.
+    async def _sync_weights_within(
+        self, kv_scales, what: str, *, operation: Optional[Callable[[], Any]] = None
+    ) -> Any:
+        """Run a refit operation off-loop, bounded by the existing deadline.
 
         WHY THIS IS NEEDED ON TOP OF EVERY WORKER-SIDE BOUND. A frozen-but-alive rank is a
         Ray actor that never answers, and Ray puts no timeout on an actor call. So the
@@ -4945,12 +4947,12 @@ class SingleControllerActor:
         replaced. Acceptable against a guaranteed 30-minute stall, and it is why this path
         is bounded-failure-first rather than resume-and-forget.
         """
+        operation = operation or partial(
+            self._weight_synchronizer.sync_weights, kv_scales=kv_scales
+        )
         budget_s = self._refit_await_budget_s()
         if budget_s is None:
-            await asyncio.to_thread(
-                self._weight_synchronizer.sync_weights, kv_scales=kv_scales
-            )
-            return
+            return await asyncio.to_thread(operation)
 
         loop = asyncio.get_running_loop()
         settled: asyncio.Future = loop.create_future()
@@ -4963,16 +4965,16 @@ class SingleControllerActor:
 
         def _run() -> None:
             try:
-                self._weight_synchronizer.sync_weights(kv_scales=kv_scales)
+                result = operation()
             except BaseException as exc:  # noqa: BLE001 - re-raised on the loop below
                 loop.call_soon_threadsafe(_settle, settled.set_exception, exc)
             else:
-                loop.call_soon_threadsafe(_settle, settled.set_result, None)
+                loop.call_soon_threadsafe(_settle, settled.set_result, result)
 
         threading.Thread(target=_run, name=f"sc-refit-{what}", daemon=True).start()
 
         try:
-            await asyncio.wait_for(settled, budget_s)
+            return await asyncio.wait_for(settled, budget_s)
         except asyncio.TimeoutError:
             raise RefitAborted(
                 f"the {what} refit did not return within {budget_s}s. Every worker-side "
@@ -4988,7 +4990,7 @@ class SingleControllerActor:
     ) -> int:
         """Pause new rollout dispatches, synchronize weights, resume.
 
-        SC owns the pause gate. vLLM serves through the refit; it supports live weight updates.
+        SC owns the admission gate and pauses async vLLM without dropping requests.
         A colocated engine is instead already stood down: the synchronizer's sync is the wake,
         and step 4 resumes dispatch.
 
@@ -5008,6 +5010,29 @@ class SingleControllerActor:
             weight synchronization.
         """
         self._rollout_permitted.clear()
+
+        generation_cfg = self._master_config.policy["generation"]
+        pause_vllm = (
+            generation_cfg["backend"] == "vllm"
+            and generation_cfg["vllm_cfg"]["async_engine"]
+            and not self._gen.blocks_training()
+        )
+
+        async def pause_for_refit() -> None:
+            paused = await self._sync_weights_within(
+                None,
+                "generation pause",
+                operation=partial(
+                    self._gen.pause_generation_for_refit,
+                    clear_cache=self._async_cfg.recompute_kv_cache_after_weight_updates,
+                ),
+            )
+            if not paused:
+                raise RuntimeError("vLLM generation pause before refit failed")
+
+        if pause_vllm:
+            self._rollout_manager.suspend_request_deadlines()
+            await pause_for_refit()
 
         # TODO(#2625): Abort unconditionally once Gym-path abort is validated;
         # for now only the native path aborts stale in-flight requests.
@@ -5089,6 +5114,9 @@ class SingleControllerActor:
                 raise
             with self._recovery_window():
                 await self._recover_from_failed_refit(failure)
+                # Recovery may replace an engine that was previously paused.
+                if pause_vllm:
+                    await pause_for_refit()
                 # Re-read: the recovery condemns the silent participant and rebuilds over
                 # the survivors, so the retry's membership is not the first attempt's. This
                 # is the likelier of the two windows -- the shard is restarting precisely
@@ -5107,7 +5135,8 @@ class SingleControllerActor:
             # promoted inside its window, and everything below this must still run on
             # both paths.
             self._record_refit_landed(participants)
-        if self._async_cfg.recompute_kv_cache_after_weight_updates:
+        if self._async_cfg.recompute_kv_cache_after_weight_updates and not pause_vllm:
+            # The async-vLLM pause already clears caches when requested.
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would
             # freeze the event loop itself -- taking the watchdog, which is an asyncio
@@ -5122,6 +5151,14 @@ class SingleControllerActor:
             await asyncio.to_thread(
                 self._gen.set_rollout_weight_version, self._trainer_version
             )
+        if pause_vllm:
+            resumed = await self._sync_weights_within(
+                None,
+                "generation resume",
+                operation=self._gen.resume_generation_after_refit,
+            )
+            if not resumed:
+                raise RuntimeError("vLLM generation resume after refit failed")
         self._rollout_permitted.set()
         self._rollout_manager.resume_request_deadlines()
         return aborted_stale_inflight_groups
