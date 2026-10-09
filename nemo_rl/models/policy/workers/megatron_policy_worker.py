@@ -1857,6 +1857,26 @@ class MegatronPolicyWorkerImpl(
                 )
             raise
 
+    @contextmanager
+    def _preserve_streaming_microbatch_flags(self, continuing: bool) -> Iterator[None]:
+        # Each chunk starts a new pipeline schedule, but only the first chunk
+        # starts a new optimizer step. Resetting TE's first-microbatch flag on
+        # later chunks would overwrite fused weight gradients already accumulated.
+        if not continuing:
+            yield
+            return
+        model = self.model
+        missing = object()
+        previous = model.__dict__.get("set_is_first_microbatch", missing)
+        model.set_is_first_microbatch = lambda: None
+        try:
+            yield
+        finally:
+            if previous is missing:
+                del model.set_is_first_microbatch
+            else:
+                model.set_is_first_microbatch = previous
+
     def _train_microbatch_body(
         self,
         state: dict[str, Any],
@@ -1964,6 +1984,7 @@ class MegatronPolicyWorkerImpl(
         with (
             maybe_r3_trace_stage("train", enabled=use_router_replay),
             self.model.no_sync(),
+            self._preserve_streaming_microbatch_flags(state["num_chunks"] > 1),
         ):
             rerun_state_machine = get_rerun_state_machine()
             while rerun_state_machine.should_run_forward_backward(data_iterator):
