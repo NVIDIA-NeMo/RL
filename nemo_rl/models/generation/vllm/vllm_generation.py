@@ -1620,7 +1620,16 @@ class VllmGeneration(GenerationInterface):
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
             results = ray.get(futures)
-            return all(result for result in results if result is not None)
+            refused = [i for i, result in enumerate(results) if result is False]
+            if refused:
+                print(
+                    f"⚠️ vLLM prefix-cache reset refused on {len(refused)}/{len(results)} "
+                    f"engine(s) (indices {refused}); their cached prefixes still hold the "
+                    "previous weights",
+                    flush=True,
+                )
+                return False
+            return True
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")
             return False

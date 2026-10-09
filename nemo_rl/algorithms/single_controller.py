@@ -5047,7 +5047,14 @@ class SingleControllerActor:
             # the loop this is a blocking Ray call, and a wedged generation worker would
             # freeze the event loop itself -- taking the watchdog, which is an asyncio
             # task on that same loop, down with it.
-            await asyncio.to_thread(self._gen.invalidate_kv_cache)
+            reset_ok = await asyncio.to_thread(self._gen.invalidate_kv_cache)
+            # The flag's whole point is that generation after this refit runs on the new
+            # weights everywhere; a refused reset is worth a loud line in the run log.
+            print(
+                "  _sync_weights: generation prefix/KV caches "
+                + ("reset after refit" if reset_ok else "NOT reset after refit (see worker logs)"),
+                flush=True,
+            )
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)

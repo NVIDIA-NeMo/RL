@@ -2065,8 +2065,17 @@ class VllmAsyncGenerationWorkerImpl(
             traceback.print_exc()
             return False
 
-    async def reset_prefix_cache_async(self):
-        """Async version of reset_prefix_cache."""
+    async def reset_prefix_cache_async(self, reset_running_requests: bool = True) -> bool:
+        """Async version of reset_prefix_cache.
+
+        After a weight update the prefix cache (KV blocks and, for hybrid models, the
+        Mamba states) still holds activations of the previous weights, and vLLM only
+        resets it when no block is in use -- never the case under continuous rollouts,
+        so the plain call was refused on every refit and the refusal dropped. With
+        ``reset_running_requests`` vLLM first preempts every running request to the
+        waiting queue (they re-prefill with the new weights when rescheduled), so the
+        reset cannot be refused. Returns vLLM's success flag.
+        """
         assert self.llm is not None, (
             "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
         )
@@ -2076,9 +2085,12 @@ class VllmAsyncGenerationWorkerImpl(
                 "reset_prefix_cache_async can only be used with async_engine=True. Use reset_prefix_cache instead."
             )
 
-        await self.llm.reset_prefix_cache()
+        reset_ok = await self.llm.reset_prefix_cache(
+            reset_running_requests=reset_running_requests
+        )
         gc.collect()
         torch.cuda.empty_cache()
+        return reset_ok is not False
 
     async def pause_generation_async(self, *, clear_cache: bool) -> bool:
         """Pause vLLM generation for an in-flight weight update."""
