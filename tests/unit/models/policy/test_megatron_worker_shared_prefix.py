@@ -17,7 +17,8 @@ They cover the default (disabled) path for workers built without ``__init__``,
 the single model-world count agreement that carries rank-local planning
 failures, the MTP tracker reset scope, the dense-control capability checks
 that must run at worker setup rather than at the first forward, the
-evaluation MTP bypass, and the TQ row metadata the worker attaches per stage.
+evaluation MTP bypass, and the TQ row metadata the worker attaches per stage,
+including on an OPD teacher that inherits the student's mode.
 """
 
 from __future__ import annotations
@@ -45,7 +46,10 @@ from nemo_rl.data.packing.shared_prefix_metadata import (  # noqa: E402
 from nemo_rl.data_plane import KVBatchMeta  # noqa: E402
 from nemo_rl.data_plane.schema import GROUP_ID_TAG  # noqa: E402
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
-from nemo_rl.models.policy import SharedPrefixTrainingConfig  # noqa: E402
+from nemo_rl.models.policy import (  # noqa: E402
+    SharedPrefixTrainingConfig,
+    get_shared_prefix_training_config,
+)
 from nemo_rl.utils.timer import Timer  # noqa: E402
 from tests.unit.models.policy.test_megatron_split_state import (  # noqa: E402
     _make_worker,
@@ -393,3 +397,45 @@ def test_stage_without_sharing_uses_the_base_packing_path(stage: Any) -> None:
             is sentinel
         )
     assert base.call_args.kwargs["stage"] == stage
+
+
+def test_teacher_with_an_inherited_logprobs_mode_uses_the_base_packing_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Teacher dispatches are not group-sharded, so the driver prescribes no
+    # execution slots. With the student's mode the fetch below would raise.
+    from tests.unit.models.policy.test_teacher_worker_group import (
+        _shared_prefix_student_config,
+        _teacher_worker_cfg,
+    )
+
+    student_config = _shared_prefix_student_config()
+    assert get_shared_prefix_training_config(student_config).enabled_for(
+        stage="logprobs"
+    )
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.cfg = _teacher_worker_cfg(monkeypatch, student_config)
+    # Resolved as MegatronPolicyWorkerImpl.__init__ does.
+    worker._shared_prefix_cfg = get_shared_prefix_training_config(worker.cfg)
+    worker._fetch = lambda meta: _batch(1)
+    worker.get_logprobs = lambda data, micro_batch_size=None: BatchedDataDict(
+        {"logprobs": torch.zeros(1, 4)}
+    )
+    worker._write_back_result_field = MagicMock()
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="teacher_lp:teacher",
+        sample_ids=["sample0"],
+        sequence_lengths=[4],
+        tags=[{GROUP_ID_TAG: "a"}],
+    )
+
+    with patch.object(
+        worker_module.TQWorkerMixin,
+        "_attach_or_repack_pack_metadata",
+        side_effect=lambda data, meta, *, stage: data,
+    ) as base:
+        worker.get_teacher_logprobs_presharded(meta)
+
+    assert base.call_args.kwargs["stage"] == "logprobs"
+    worker._write_back_result_field.assert_called_once()

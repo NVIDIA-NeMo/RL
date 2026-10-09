@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -214,6 +215,76 @@ def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatc
     assert "pretrained_checkpoint" not in teacher.cfg
     # The student's own config is left alone.
     assert policy_config["pretrained_checkpoint"]["path"] == "/ckpt/sft"
+
+
+def _teacher_worker_cfg(
+    monkeypatch: pytest.MonkeyPatch, policy_config: dict[str, Any]
+) -> dict[str, Any]:
+    """Build a one-GPU teacher from ``policy_config``; return its worker config."""
+    import nemo_rl.distributed.worker_groups as worker_groups
+    from nemo_rl.models.policy.teacher_worker_group import (
+        TeacherConfig,
+        TeacherWorkerGroup,
+    )
+
+    captured = {}
+
+    class FakeWorkerBuilder:
+        def __init__(self, worker_path, cfg, **kwargs):
+            del worker_path, kwargs
+            captured["cfg"] = cfg
+
+    class FakeWorkerGroup:
+        def __init__(self, cluster, worker_builder, **kwargs):
+            del cluster, worker_builder, kwargs
+
+    monkeypatch.setattr(worker_groups, "RayWorkerBuilder", FakeWorkerBuilder)
+    monkeypatch.setattr(worker_groups, "RayWorkerGroup", FakeWorkerGroup)
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    teacher_config = TeacherConfig(
+        alias="teacher",
+        model_name="/ckpt/teacher",
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        num_nodes=1,
+        gpus_per_node=1,
+        precision="bf16",
+        micro_batch_size=1,
+        megatron_cfg_overrides={},
+    )
+
+    TeacherWorkerGroup(
+        teacher_config, cluster, policy_config, MagicMock(), teacher_index=0
+    )
+    return captured["cfg"]
+
+
+def _shared_prefix_student_config() -> dict[str, Any]:
+    return {
+        "model_name": "/ckpt/student",
+        "megatron_cfg": {"enabled": True},
+        "dtensor_cfg": {"enabled": False},
+        "sequence_packing": {"enabled": False},
+        "dynamic_batching": {"enabled": False},
+        "shared_prefix_training": {"mode": "logprobs", "uniform_router_gating": True},
+    }
+
+
+def test_teacher_worker_group_disables_student_shared_prefix_training(monkeypatch):
+    """Teacher dispatches are never group-sharded, so the mode must not carry over."""
+    policy_config = _shared_prefix_student_config()
+
+    cfg = _teacher_worker_cfg(monkeypatch, policy_config)
+
+    assert cfg["shared_prefix_training"] == {"mode": "disabled"}
+    # The student's own config is left alone.
+    assert policy_config["shared_prefix_training"] == {
+        "mode": "logprobs",
+        "uniform_router_gating": True,
+    }
 
 
 def _disable_opd_full(teacher) -> None:
