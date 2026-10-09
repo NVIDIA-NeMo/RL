@@ -979,6 +979,20 @@ def validate_shared_prefix_training_config(
             f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires "
             "policy.sequence_packing.enabled=true."
         )
+    sequence_packing_config = cast(SequencePackingConfig, sequence_packing_config)
+    if sequence_packing_config["algorithm"] == "first_fit_shuffle":
+        # Every model-parallel rank packs its own dense units and must get
+        # identical bins; this packer shuffles with the global Python RNG.
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} does not "
+            "support policy.sequence_packing.algorithm=first_fit_shuffle; choose a "
+            "deterministic packer."
+        )
+    if sequence_packing_config.get("pair_grouping_key") is not None:
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} does not "
+            "support policy.sequence_packing.pair_grouping_key."
+        )
 
     try:
         from megatron.rl.shared_prefix_tensors import (

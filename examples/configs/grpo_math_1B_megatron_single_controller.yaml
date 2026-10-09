@@ -189,11 +189,12 @@ policy:
   # Experimental shared-prompt-prefix execution for GRPO groups; see
   # docs/design-docs/shared-prefix-execution.md. Omitting the block is the same
   # as mode: disabled, and every key below is shown at its default. Enabled
-  # modes require token_capture.enabled=true, sequence packing, the Megatron
-  # backend with megatron.rl importable in the driver environment, top_p=1.0
-  # with top_k disabled, and make_sequence_length_divisible_by set to a multiple
-  # of the TP/CP alignment M (1 at TP1/CP1, 2*CP at TP1, 2*TP*CP otherwise).
-  # Unknown keys are rejected.
+  # modes require token_capture.enabled=true, sequence packing with a
+  # deterministic algorithm (not first_fit_shuffle) and no pair_grouping_key,
+  # the Megatron backend with megatron.rl importable in the driver environment,
+  # top_p=1.0 with top_k disabled, and make_sequence_length_divisible_by set to
+  # a multiple of the TP/CP alignment M (1 at TP1/CP1, 2*CP at TP1, 2*TP*CP
+  # otherwise). Unknown keys are rejected.
   # shared_prefix_training:
   #   # disabled | dense (conventional packing, comparison control) |
   #   # logprobs (share prefixes in logprob forwards) | train (logprobs and training)

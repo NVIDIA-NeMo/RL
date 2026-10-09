@@ -41,6 +41,7 @@ def policy_config():
         },
         "sequence_packing": {
             "enabled": True,
+            "algorithm": "modified_first_fit_decreasing",
             "train_mb_tokens": 32,
             "logprob_mb_tokens": 32,
         },
@@ -364,6 +365,16 @@ _POLICY_REQUIREMENT_ERRORS = [
         r"sequence_packing\.enabled=true",
     ),
     (_delete("sequence_packing"), ValueError, r"sequence_packing\.enabled=true"),
+    (
+        _set(("sequence_packing", "algorithm"), "first_fit_shuffle"),
+        ValueError,
+        r"algorithm=first_fit_shuffle",
+    ),
+    (
+        _set(("sequence_packing", "pair_grouping_key"), "pair_index"),
+        ValueError,
+        r"sequence_packing\.pair_grouping_key",
+    ),
 ]
 
 # These run after the megatron.rl topology resolver is imported.
