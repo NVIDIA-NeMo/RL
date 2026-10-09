@@ -1400,12 +1400,23 @@ class RolloutReassembler:
             if owner_valid:
                 prepared.valid_owner_count += 1
             else:
+                # Keep a row-length rejection visible in the metrics bucket; any
+                # other cause stays the generic owner-level reason.
+                owner_reason = next(
+                    (
+                        row.rejection_reason
+                        for row in rebuilt
+                        if not row.valid
+                        and (row.rejection_reason or "").startswith("row_too_long")
+                    ),
+                    "logical_owner_invalid",
+                )
                 rebuilt = [
                     replace(
                         first,
                         rollout_id=f"{owner_id}_s0",
                         valid=False,
-                        rejection_reason="logical_owner_invalid",
+                        rejection_reason=owner_reason,
                         token_ids=[],
                         token_mask=[],
                         logprobs=[],

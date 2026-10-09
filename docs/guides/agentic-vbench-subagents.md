@@ -130,10 +130,12 @@ token-echo multi-trace loop is not ported.
   arm + subagents; same fast-step shaping as the compaction launcher).
 
 Row length: without compaction an episode is one row of its whole context.
-On 8 training nodes rows up to ~95k tokens trained and 114k/123k rows OOM'd
-the learner (smoke 2184181), so the launcher sets
-`token_capture.max_train_row_tokens=98304`; longer rows are rejected
-(`row_too_long`) and their owner trains nothing that step.
+On 8 training nodes rows of 92-93k tokens trained, 114k/123k rows OOM'd the
+learner (smoke 2184181), and a step holding 97k rows OOM'd with a 98k cap
+(smoke 2184532), so the launcher sets `token_capture.max_train_row_tokens=81920`
+(must be passed with Hydra `+`); longer rows are rejected (`row_too_long`,
+kept as the owner's rejection reason in the finalize metrics) and their owner
+trains nothing that step.
 
 Masking semantics follow from the segments: a child's final answer is
 assistant text in the child's row and a tool result (prompt tokens) in the

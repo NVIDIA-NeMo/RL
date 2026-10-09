@@ -40,9 +40,11 @@ export AGENTIC_VBENCH_CONCURRENCY=${AGENTIC_VBENCH_CONCURRENCY:-$((NUM_PROMPTS *
 export AGENTIC_VBENCH_CONTEXT_TOKENS=${AGENTIC_VBENCH_CONTEXT_TOKENS:-262144}
 export AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER=${AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER:-0.4}
 # Without compaction a 32-turn episode is one training row of its whole context.
-# Rows up to ~95k tokens trained on 8 training nodes; 114k and 123k rows OOM'd
-# (run 2184181). Reject longer rows instead of crashing the learner.
-export SUBAGENT_MAX_ROW_TOKENS=${SUBAGENT_MAX_ROW_TOKENS:-98304}
+# On 8 training nodes rows of 92-93k tokens trained but a step holding 97k rows
+# OOM'd even with longer rows rejected (runs 2184181, 2184532); the ceiling moves
+# with image tokens and allocator state. Reject rows above 80k instead of
+# crashing the learner (rejected owners train nothing that step).
+export SUBAGENT_MAX_ROW_TOKENS=${SUBAGENT_MAX_ROW_TOKENS:-81920}
 export SAVE_PERIOD=${SAVE_PERIOD:-1}
 export JOB_CYCLES=${JOB_CYCLES:-6}
 export BASE_NAME=${BASE_NAME:-agentic_vbench_subagents_16n_fast_step_$(date -u +%Y%m%d-%H%M%S)}
