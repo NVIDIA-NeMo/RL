@@ -442,7 +442,8 @@ class TimeoutChecker:
 
         Args:
             timeout (str or None): Timeout in format 'DD:HH:MM:SS'. If None, timeout is considered infinite.
-            fit_last_save_time (bool): If True, considers average iteration time when checking timeout.
+            fit_last_save_time (bool): If True, saves early when the slowest iteration seen so far
+                would not finish before the timeout.
         """
         super().__init__()
         self.last_save_time = (
@@ -454,8 +455,14 @@ class TimeoutChecker:
         self.previous_iteration_time: Optional[float] = None
         self.fit_last_save_time = fit_last_save_time
 
-    def would_save(self) -> bool:
-        """Return whether the deadline is due without consuming the signal."""
+    def would_save(self, extra_s: float = 0.0) -> bool:
+        """Return whether the deadline is due without consuming the signal.
+
+        Args:
+            extra_s (float): Additional seconds the next iteration is expected to take
+                beyond a regular one (e.g. an upcoming validation pass). Only used when
+                ``fit_last_save_time`` is enabled.
+        """
         if self.last_saved:
             return False
 
@@ -463,10 +470,10 @@ class TimeoutChecker:
         elapsed_time = current_time - self.start_time
 
         if self.fit_last_save_time and self.iteration_times:
-            average_iteration_time = sum(self.iteration_times) / len(
-                self.iteration_times
-            )
-            if elapsed_time + average_iteration_time >= self.last_save_time:
+            # Budget for the slowest iteration seen so far rather than the mean, so a
+            # single slow iteration cannot run past the deadline.
+            predicted_iteration_time = max(self.iteration_times) + max(0.0, extra_s)
+            if elapsed_time + predicted_iteration_time >= self.last_save_time:
                 return True
 
         if elapsed_time >= self.last_save_time:
@@ -474,12 +481,12 @@ class TimeoutChecker:
 
         return False
 
-    def check_save(self):
+    def check_save(self, extra_s: float = 0.0) -> bool:
         # Flush
         sys.stdout.flush()
         sys.stderr.flush()
 
-        if not self.would_save():
+        if not self.would_save(extra_s):
             return False
 
         self.last_saved = True
