@@ -28,7 +28,7 @@ from typing import Any, Optional
 
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
@@ -72,6 +72,14 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.reward_penalties import (
+    effort_shaping_enabled,
+    has_duplicated_reasoning,
+    has_empty_final_answer,
+    has_unwanted_tokens,
+    is_low_effort,
+    shape_effort_reward,
+)
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationConfig,
@@ -81,6 +89,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationSamplingParams,
 )
 from nemo_rl.telemetry.instrumentation import dispatch_with_trace_context
+from nemo_rl.utils.length_penalty import (
+    LengthPenaltyConfig,
+    apply_group_length_penalties,
+)
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
@@ -431,6 +443,19 @@ class EffortLevelsConfig(BaseModel, extra="allow"):
     low_string: str = ""
     """Substring that must appear in the user prompt to trigger shaping."""
 
+    @model_validator(mode="after")
+    def validate_length_bound(self) -> "EffortLevelsConfig":
+        if self.low_weight > 0 and self.low_string and self.low_ub <= 0:
+            raise ValueError("active effort shaping requires low_ub > 0")
+        return self
+
+
+def get_effort_config(env: dict[str, Any]) -> Optional[EffortLevelsConfig]:
+    """Resolve the optional Gym effort config using its centralized defaults."""
+    gym = env.get("nemo_gym")
+    effort = gym.get("effort_levels") if gym is not None else None
+    return EffortLevelsConfig.model_validate(effort) if effort is not None else None
+
 
 @dataclass
 class _EffortShapingMetrics:
@@ -441,44 +466,11 @@ class _EffortShapingMetrics:
 
 
 def _terminal_completion_length(result: dict) -> Optional[int]:
-    """Terminal assistant completion length for effort shaping, or None.
-
-    Legacy rollouts carry tokens inline: the last ``message_log`` entry is the
-    terminal turn, and its ``token_ids`` length is the completion length (0 if
-    that turn is not an assistant turn, matching the pre-receipt behavior).
-
-    Token-capture receipt rollouts carry ``message_log: []`` by design — the
-    tokens live in the capture ledger. The manifest's ``delta_len`` is NOT the
-    same quantity (a root call's delta stages prompt + generation, per the
-    ledger invariant ``parentless rows have prev_len == 0``), so the length
-    comes from the scored response's usage block instead: ``output_tokens``
-    is the terminal call's generation length, matching the legacy semantics.
-    A receipt row with no usable usage returns None so the caller skips
-    shaping rather than inventing a length.
-    """
+    """Return inline terminal assistant length; capture is shaped after verification."""
     message_log = result.get("message_log") or []
     if message_log:
         last = message_log[-1]
         return len(last["token_ids"]) if last["role"] == "assistant" else 0
-    # TODO(token-capture): the agent ACCUMULATES usage across model calls onto
-    # the scored response (simple_agent accumulate_response_usage), so
-    # output_tokens equals the terminal generation only for single-call
-    # rollouts; on multi-call rollouts this shapes on the accumulated total
-    # while the legacy path uses the final assistant turn only. All observed
-    # capture runs are single-call (finalize/calls_per_rollout == 1.0). The
-    # durable fix is upstream: per-call generation counts on the receipt
-    # (Gym preserving per-call usage, or CallRecord recording generation
-    # length distinct from staged delta_len).
-    full_result = result.get("full_result")
-    if isinstance(full_result, dict):
-        response = full_result.get("response")
-        if isinstance(response, dict):
-            usage = response.get("usage")
-            if isinstance(usage, dict):
-                for key in ("output_tokens", "completion_tokens"):
-                    tokens = usage.get(key)
-                    if isinstance(tokens, (int, float)):
-                        return int(tokens)
     return None
 
 
@@ -501,43 +493,23 @@ def _apply_effort_shaping(
     low_lengths: list[int] = []
     high_lengths: list[int] = []
 
-    if (
-        effort_config is None
-        or effort_config.low_weight <= 0
-        or not effort_config.low_string
-    ):
+    if not effort_shaping_enabled(effort_config):
         return _EffortShapingMetrics(
             length_rewards_low, rewards_low, low_lengths, high_lengths
         )
 
+    assert effort_config is not None
     lengths = [_terminal_completion_length(r) for r in results]
     orig_rewards = [r["full_result"]["reward"] for r in results]
     for i, result in enumerate(results):
-        # Token-capture receipt rows with no resolvable terminal length are
-        # skipped fail-closed: shaping a length we do not have would award the
-        # maximum shortness bonus to a row that may be arbitrarily long.
+        # Inline results with a missing or empty message log have no terminal
+        # length. Skip them to avoid awarding an unearned shortness bonus.
         length = lengths[i]
         if length is None:
             continue
-        prompt = next(
-            (
-                msg["content"]
-                for msg in reversed(
-                    nemo_gym_rows[i]["responses_create_params"]["input"]
-                )
-                if msg.get("role") == "user" and "content" in msg
-            ),
-            "",
-        )
-        if effort_config.low_string in prompt:
-            length_reward = min(
-                1.0,
-                effort_config.low_weight * (1.0 - length / effort_config.low_ub),
-            )
-            new_reward = (
-                orig_rewards[i]
-                + orig_rewards[i] * max(length_reward, 0.0)
-                + effort_config.low_penalty * min(length_reward, 0.0)
+        if is_low_effort(nemo_gym_rows[i], effort_config):
+            new_reward, length_reward = shape_effort_reward(
+                orig_rewards[i], length=length, config=effort_config
             )
             result["full_result"]["reward"] = new_reward
             length_rewards_low.append(length_reward)
@@ -2197,25 +2169,7 @@ def apply_reward_penalties(
     ):
         for result in results:
             output_items = result["full_result"].get("response", {}).get("output", [])
-            is_duplicated = False
-            for item1, item2 in zip(output_items, output_items[1:]):
-                if item1.get("type") != "reasoning":
-                    continue
-                summary = item1.get("summary", [])
-                if not summary or "text" not in summary[0]:
-                    continue
-                reasoning_text = summary[0]["text"].strip()
-                content = item2.get("content", "")
-                if isinstance(content, list) and content and "text" in content[0]:
-                    chat_text = content[0]["text"].strip()
-                elif isinstance(content, str):
-                    chat_text = content.strip()
-                else:
-                    continue
-                if reasoning_text and chat_text and reasoning_text == chat_text:
-                    is_duplicated = True
-                    break
-            if is_duplicated:
+            if has_duplicated_reasoning(output_items):
                 result["full_result"]["reward"] = 0.0
 
                 counts["duplicated_reasoning"] += 1
@@ -2226,23 +2180,7 @@ def apply_reward_penalties(
     ):
         for result in results:
             output_items = result["full_result"].get("response", {}).get("output", [])
-            # Skip if the last output item is a function_call — it is legit for model to
-            # produce reasoning and then a function_call as the last output item in PivotRL
-            if output_items and output_items[-1].get("type") == "function_call":
-                continue
-            final_answer_text = None
-            for item in reversed(output_items):
-                # Skip items without content (function_call, function_call_output, etc.)
-                if "content" not in item:
-                    continue
-                content = item["content"]
-                if isinstance(content, list) and content and "text" in content[0]:
-                    final_answer_text = content[0]["text"].strip()
-                    break
-                elif isinstance(content, str):
-                    final_answer_text = content.strip()
-                    break
-            if final_answer_text is None or final_answer_text == "":
+            if has_empty_final_answer(output_items):
                 result["full_result"]["reward"] = 0.0
 
                 counts["empty_final_answer"] += 1
@@ -2255,15 +2193,14 @@ def apply_reward_penalties(
             reward_penalty_config, "unwanted"
         )
         for result in results:
-            has_unwanted_token = False
-            for msg in result["message_log"]:
-                if msg["role"] != "assistant":
-                    continue
-                # Penalize any configured unwanted token in the assistant generation,
-                # including the terminal position.
-                if any(token_id in msg["token_ids"] for token_id in unwanted_token_ids):
-                    has_unwanted_token = True
-                    break
+            has_unwanted_token = has_unwanted_tokens(
+                (
+                    msg["token_ids"]
+                    for msg in result["message_log"]
+                    if msg["role"] == "assistant"
+                ),
+                unwanted_token_ids,
+            )
             if has_unwanted_token:
                 result["full_result"]["reward"] = 0.0
 
@@ -2631,6 +2568,7 @@ async def run_async_nemo_gym_rollout(
     greedy: bool = False,
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
+    length_penalty_config: LengthPenaltyConfig | dict[str, Any] | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
     returns_entire_batch: bool = False,
@@ -2664,6 +2602,8 @@ async def run_async_nemo_gym_rollout(
         greedy: Must be ``False`` because this path does not support greedy mode.
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
+        length_penalty_config: Optional ``grpo.length_penalty`` block; applied per
+            prompt group of ``identity_num_generations`` rows.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
         mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
             flags in the rollout batch for loss masking.
@@ -2854,8 +2794,10 @@ async def run_async_nemo_gym_rollout(
                         log_full_result_tables=log_full_result_tables,
                         effort_config=effort_config,
                         reward_penalty_config=reward_penalty_config,
+                        length_penalty_config=length_penalty_config,
                         thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
+                        group_size=identity_num_generations,
                     )
                     if accumulator.is_complete:
                         final_rollout_result = rollout_result
@@ -2895,6 +2837,7 @@ def run_nemo_gym_rollout_sync(
     greedy: bool = False,
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
+    length_penalty_config: LengthPenaltyConfig | dict[str, Any] | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     sampling_params: Optional[GenerationSamplingParams] = None,
     mask_env_flagged_samples: bool = True,
@@ -2925,6 +2868,8 @@ def run_nemo_gym_rollout_sync(
         greedy: Must be ``False`` because this path does not support greedy mode.
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
+        length_penalty_config: Optional ``grpo.length_penalty`` block; applied per
+            prompt group of ``num_generations_per_prompt`` rows.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
         num_generations_per_prompt: Number of contiguous rows produced from each
             original prompt. Each such group stays on one actor instance.
@@ -2967,6 +2912,7 @@ def run_nemo_gym_rollout_sync(
             greedy=greedy,
             effort_config=effort_config,
             reward_penalty_config=reward_penalty_config,
+            length_penalty_config=length_penalty_config,
             thinking_tags=thinking_tags,
             mask_env_flagged_samples=mask_env_flagged_samples,
             returns_entire_batch=True,
@@ -2993,10 +2939,17 @@ def _postprocess_single_nemo_gym_group(
     log_full_result_tables: bool,
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
+    length_penalty_config: LengthPenaltyConfig | dict[str, Any] | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
+    group_size: Optional[int] = None,
 ) -> NemoGymRolloutResult:
-    """Postprocess one complete prompt group from the NeMo-Gym stream."""
+    """Postprocess one complete prompt group from the NeMo-Gym stream.
+
+    ``group_size`` is the number of contiguous rows sharing one prompt identity
+    (``identity_num_generations``); the synchronous path hands the whole batch
+    in as one call, so it may hold several prompt groups. Defaults to the batch.
+    """
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
 
@@ -3004,6 +2957,28 @@ def _postprocess_single_nemo_gym_group(
         reward_penalty_config, tokenizer, thinking_tags=thinking_tags
     )
     penalty_counts = apply_reward_penalties(results, resolved_reward_penalty_config)
+
+    # Length penalties rewrite full_result["reward"] in place; keep the reward
+    # as handed to the hook (``env_reward``) so training can still report the
+    # env pass rate and how far rewards moved.
+    env_rewards: torch.Tensor | None = None
+    length_penalty_metrics: dict[str, float] = {}
+    if length_penalty_config is not None:
+        # Copy the per-row fields the length adjustments consume.
+        for nemo_gym_row, result in zip(nemo_gym_rows, results):
+            result["agent_ref"] = nemo_gym_row["agent_ref"]
+            result["profiled_rewards"] = nemo_gym_row.get("profiled_rewards")
+            result["profiled_output_lengths"] = nemo_gym_row.get(
+                "profiled_output_lengths"
+            )
+            result["profile_band"] = nemo_gym_row.get("profile_band")
+        env_rewards = torch.tensor([r["full_result"]["reward"] for r in results])
+        length_penalty_metrics = apply_group_length_penalties(
+            results,
+            length_penalty_config,
+            group_size if group_size is not None else len(results),
+            tokenizer=tokenizer,
+        )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
@@ -3102,14 +3077,24 @@ def _postprocess_single_nemo_gym_group(
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
-        for nemo_gym_row, result in zip(nemo_gym_rows, results):
+        agent_to_sample_metrics: dict[str, list[dict]] = defaultdict(list)
+        for nemo_gym_row, result, sample_metrics in zip(
+            nemo_gym_rows, results, all_sample_metrics
+        ):
             agent_ref = nemo_gym_row["agent_ref"]
             agent_name = agent_ref["name"]
             agent_to_results[agent_name].append(result["full_result"])
+            agent_to_sample_metrics[agent_name].append(sample_metrics)
             result["agent_ref"] = agent_ref
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
+            agent_sample_metrics = agent_to_sample_metrics[agent_name]
+            agent_truncations = [m["hit_max_tokens"] for m in agent_sample_metrics]
+            per_agent_metrics[f"{agent_name}/truncation_rate"] = sum(
+                agent_truncations
+            ) / len(agent_truncations)
+
             keys = agent_results[0].keys()
             for key in keys:
                 values = [
@@ -3123,6 +3108,23 @@ def _postprocess_single_nemo_gym_group(
                             values, len(agent_results), f"{agent_name}/{key}"
                         )
                     )
+
+            # Emit authoritative live token metrics after full-result metrics so
+            # similarly named environment metadata cannot overwrite them.
+            per_agent_metrics.update(
+                calculate_single_metric(
+                    [m["total_tokens"] for m in agent_sample_metrics],
+                    len(agent_sample_metrics),
+                    f"{agent_name}/total_tokens_per_sample",
+                )
+            )
+            per_agent_metrics.update(
+                calculate_single_metric(
+                    [m["assistant_tokens"] for m in agent_sample_metrics],
+                    len(agent_sample_metrics),
+                    f"{agent_name}/gen_tokens_per_sample",
+                )
+            )
 
             if log_full_result_tables:
                 to_log = [
@@ -3179,8 +3181,11 @@ def _postprocess_single_nemo_gym_group(
         final_batch[MASK_SAMPLE] = _mask_sample_flags(
             result["full_result"] for result in results
         )
+    if env_rewards is not None:
+        final_batch["env_reward"] = env_rewards
 
     rollout_metrics.update(_effort_shaping_metrics(shaping))
+    rollout_metrics.update(length_penalty_metrics)
 
     rollout_metrics.update(
         compute_reward_penalty_metrics(

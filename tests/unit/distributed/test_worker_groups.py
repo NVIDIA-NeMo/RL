@@ -1060,7 +1060,7 @@ def test_get_nsight_config_if_pattern_matches():
             "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:5"
         ),
     ):
-        result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
+        result = get_nsight_config_if_pattern_matches("automodel_policy_worker")
         assert result == {}
 
     # Test 3: Pattern matches with wildcard
@@ -1073,11 +1073,11 @@ def test_get_nsight_config_if_pattern_matches():
             "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:5"
         ),
     ):
-        result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
+        result = get_nsight_config_if_pattern_matches("automodel_policy_worker")
         assert "nsight" in result
         assert result["nsight"]["t"] == "cuda,nvtx"
         assert result["nsight"]["s"] == "none"
-        assert result["nsight"]["o"] == "'dtensor_policy_worker_1:5_%p'"
+        assert result["nsight"]["o"] == "'automodel_policy_worker_1:5_%p'"
         assert result["nsight"]["stop-on-exit"] == "true"
 
     # Test 4: Exact name match
@@ -1197,7 +1197,7 @@ def test_get_nsight_config_extra_options():
             {"capture-range": "none", "cuda-graph-trace": "graph"},
         ),
     ):
-        result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
+        result = get_nsight_config_if_pattern_matches("automodel_policy_worker")
         assert "nsight" in result
         nsight = result["nsight"]
         assert nsight["capture-range"] == "none"

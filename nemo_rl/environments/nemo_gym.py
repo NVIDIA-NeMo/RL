@@ -2096,9 +2096,7 @@ def _build_single_gym_actor(
         )
 
     actor = NemoGym.options(**actor_options).remote(actor_config)
-    shard_set = NemoGymShardSet(
-        handles={DEFAULT_SHARD_NAME: [actor]}, fan_out=fan_out
-    )
+    shard_set = NemoGymShardSet(handles={DEFAULT_SHARD_NAME: [actor]}, fan_out=fan_out)
     try:
         ray.get(actor._spinup.remote())
         if fan_out:

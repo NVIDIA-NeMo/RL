@@ -59,7 +59,7 @@ from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 # register the worker extension class to the actor environment registry
 ACTOR_ENVIRONMENT_REGISTRY[
-    "template_project.worker_extension.DTensorPolicyWorkerV2Extension"
+    "template_project.worker_extension.AutomodelPolicyWorkerExtension"
 ] = PY_EXECUTABLES.AUTOMODEL
 
 
@@ -103,7 +103,7 @@ def main(config: MasterConfig) -> None:
         config=policy_config,
         tokenizer=tokenizer,
         init_reference_model=False,
-        worker_extension_cls_fqn="template_project.worker_extension.DTensorPolicyWorkerV2Extension",
+        worker_extension_cls_fqn="template_project.worker_extension.AutomodelPolicyWorkerExtension",
     )
     print("  ✓ Policy created")
 

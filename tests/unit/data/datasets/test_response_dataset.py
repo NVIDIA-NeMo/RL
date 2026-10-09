@@ -130,9 +130,7 @@ def test_nemo_gym_dataset_fans_every_matching_task_out_to_each_agent(tmp_path):
     ]
     data_path.write_text("".join(f"{json.dumps(row)}\n" for row in rows))
 
-    dataset = NemoGymDataset(
-        str(data_path), fan_out={"shared": ["opencode", "hermes"]}
-    )
+    dataset = NemoGymDataset(str(data_path), fan_out={"shared": ["opencode", "hermes"]})
     expanded = [json.loads(row["extra_env_info"]) for row in dataset.dataset]
 
     assert len(expanded) == 4

@@ -1055,7 +1055,7 @@ def prepare_xtoken_cross_tokenizer_loss_input(
                 "context parallel size, but got "
                 f"sequence_length={full_student_seq_len}, cp_size={cp_size}. "
                 "Set policy.make_sequence_length_divisible_by to a multiple of "
-                "policy.dtensor_cfg.context_parallel_size."
+                "policy.automodel_cfg.context_parallel_size."
             )
         cp_rank = torch.distributed.get_rank(cp_group) if cp_group is not None else 0
         student_seq_len = full_student_seq_len // cp_size

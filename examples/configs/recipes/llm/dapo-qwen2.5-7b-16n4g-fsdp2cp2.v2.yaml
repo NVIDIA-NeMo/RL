@@ -1,6 +1,6 @@
 defaults: ./dapo-qwen2.5-7b.v2.yaml
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     context_parallel_size: 2
 checkpointing:
   checkpoint_dir: results/dapo-qwen2.5-7b-16n4g-fsdp2cp2

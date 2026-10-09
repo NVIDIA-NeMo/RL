@@ -115,7 +115,7 @@ def mock_tp_mesh():
 @pytest.fixture
 def base_cfg():
     return {
-        "dtensor_cfg": {"sequence_parallel": False},
+        "automodel_cfg": {"sequence_parallel": False},
         "sequence_packing": {"train_mb_tokens": 256},
         "generation": {"temperature": 1.0, "top_p": 1.0, "top_k": None},
     }
@@ -660,7 +660,7 @@ class TestLogprobsPostProcessor:
             vlm_kwargs={},
         )
 
-        result = processor(
+        result, _ = processor(
             logits=logits,
             data_dict=data_dict,
             processed_inputs=processed_inputs,
@@ -697,7 +697,7 @@ class TestLogprobsPostProcessor:
             vlm_kwargs={},
         )
 
-        result = processor(
+        result, _ = processor(
             logits=logits,
             data_dict=data_dict,
             processed_inputs=processed_inputs,
@@ -805,7 +805,7 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([data_dict1, data_dict2])
 
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
             "sequence_packing": {"enabled": False},
         }
 
@@ -1810,7 +1810,7 @@ class TestLogprobsPostProcessorSeqPacking:
         with patch.object(
             torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
         ):
-            result = processor(
+            result, _ = processor(
                 logits=logits,
                 data_dict=data_dict,
                 processed_inputs=processed_inputs,
@@ -1857,7 +1857,7 @@ class TestLogprobsPostProcessorSeqPacking:
             vlm_kwargs={},
         )
 
-        result = processor(
+        result, _ = processor(
             logits=logits,
             data_dict=data_dict,
             processed_inputs=processed_inputs,
