@@ -879,16 +879,36 @@ def _validate_shared_prefix_model_capability(
             if isinstance(load_balancing_type, list)
             else [load_balancing_type]
         )
-        if any(item not in (None, "none") for item in load_balancing_types):
+        # Mirrors MCore's shared-prefix stack check. Sinkhorn and quantile
+        # balancing replace top-k routing; the auxiliary-loss types only add a
+        # loss term, rejected below while its coefficient is nonzero.
+        if any(
+            item not in ("none", "aux_loss", "seq_aux_loss", "global_aux_loss")
+            for item in load_balancing_types
+        ):
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} supports "
+                "model_cfg.moe_router_load_balancing_type 'none', 'aux_loss', "
+                "'seq_aux_loss' or 'global_aux_loss'; resolved "
+                f"{load_balancing_type!r}."
+            )
+        aux_loss_coeff = getattr(model_cfg, "moe_aux_loss_coeff", 0.0)
+        aux_loss_coeffs = (
+            aux_loss_coeff
+            if isinstance(aux_loss_coeff, list)
+            else [aux_loss_coeff] * len(load_balancing_types)
+        )
+        # As in MCore's TopKRouter, a coefficient paired with 'none' adds no loss.
+        if any(
+            item != "none" and coeff is not None and float(coeff) != 0.0
+            for item, coeff in zip(load_balancing_types, aux_loss_coeffs)
+        ):
             raise NotImplementedError(
                 f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires "
-                "model_cfg.moe_router_load_balancing_type='none'; shared prompts "
-                "currently contribute router auxiliary statistics once rather than "
-                "once per completion."
+                "model_cfg.moe_aux_loss_coeff=0 for auxiliary load-balancing types; "
+                "shared prompts currently contribute router auxiliary statistics "
+                "once rather than once per completion."
             )
-
-        # moe_aux_loss_coeff needs no check: MCore applies it only for the
-        # auxiliary load-balancing types rejected above.
 
         if getattr(model_cfg, "moe_z_loss_coeff", None) is not None:
             raise NotImplementedError(
@@ -911,6 +931,13 @@ def _validate_shared_prefix_model_capability(
                 f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
                 "model_cfg.moe_expert_capacity_factor=null; token dropping depends "
                 "on the duplicated-token population that shared-prefix execution removes."
+            )
+
+        if getattr(model_cfg, "moe_expert_rank_capacity_factor", None) is not None:
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
+                "model_cfg.moe_expert_rank_capacity_factor=null; a dropped prompt row "
+                "would remove its expert contribution from every completion sharing it."
             )
 
         if getattr(model_cfg, "moe_router_enable_expert_bias", False):
