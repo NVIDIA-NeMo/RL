@@ -282,6 +282,7 @@ class BaseSampler(abc.ABC):
         valid_idxs: list[int],
         min_prompt_groups: int,
         max_prompt_groups: int,
+        group_multiple: int = 1,
     ) -> tuple[Optional[KVBatchMeta], int]:
         """Cap, drop from the buffer, and concat the chosen groups.
 
@@ -292,6 +293,9 @@ class BaseSampler(abc.ABC):
         if len(valid_idxs) < min_prompt_groups:
             return None, 0
         requested_groups = min(len(valid_idxs), max_prompt_groups)
+        requested_groups -= requested_groups % group_multiple
+        if requested_groups < min_prompt_groups:
+            return None, 0
         selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
         selected_rollout_metrics = [
@@ -415,7 +419,13 @@ class _GatedSampler(BaseSampler):
     def __init__(self, buffer: TQReplayBuffer, *, gate_window: int) -> None:
         super().__init__(buffer)
         self._gate_window = 0
+        self._group_multiple = 1
         self.set_gate_window(gate_window)
+
+    def set_group_multiple(self, group_multiple: int) -> None:
+        if group_multiple < 1:
+            raise ValueError("group_multiple must be positive")
+        self._group_multiple = group_multiple
 
     def set_gate_window(self, gate_window: int) -> None:
         if gate_window < 0:
@@ -494,7 +504,10 @@ class ReadyFirstSampler(_GatedSampler):
             if weight <= current_train_weight and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            group_multiple=self._group_multiple,
         )
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -600,7 +613,10 @@ class InOrderSampler(_GatedSampler):
             if target == current_train_weight and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            group_multiple=self._group_multiple,
         )
 
     async def evict(self, *, current_train_weight: int) -> int:

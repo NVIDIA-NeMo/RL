@@ -54,9 +54,24 @@ class TQValue(TQDriverMixin, Value):
     built alongside this critic already did that. Partition lifecycle stays
     with the caller.
 
-    TODO(#2625): the value workers have no split begin/microbatch/finish train
-    API yet, so one train_from_meta call is one optimizer step and the
-    SingleController requires a PPO step to be a single streaming chunk.
+    The split API accumulates chunks into one optimizer step. Keep the model
+    resident between begin and finish/abort so gradient buffers survive.
+    Across calls the chunks must contain exactly ``gbs`` samples. Each chunk
+    must be shardable over critic DP ranks (and, without packing/dynamic
+    batching, contain complete microbatches on each rank). Masks affect loss
+    normalization, not the sample count. Failed steps require abort before reuse.
+
+    Typical usage::
+
+        value.prepare_for_training()
+        try:
+            value.begin_train_step(loss_fn)
+            for meta in chunks:
+                value.train_microbatches_from_meta(meta)
+            metrics = value.finish_train_step()
+        finally:
+            value.abort_train_step()
+            value.finish_training()
     """
 
     def __init__(
@@ -206,4 +221,63 @@ class TQValue(TQDriverMixin, Value):
             )
         return _aggregate_train_results(
             self.worker_group.get_all_worker_results(futures)
+        )
+
+    def begin_train_step(
+        self,
+        loss_fn: LossFunction,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> None:
+        """Open one logical value update on all workers."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "begin_train_step_presharded",
+                loss_fn=loss_fn,
+                gbs=self.cfg["train_global_batch_size"] if gbs is None else gbs,
+                mbs=self.cfg["train_micro_batch_size"] if mbs is None else mbs,
+            )
+        )
+
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, timer: Optional[Timer] = None
+    ) -> None:
+        """Accumulate a token-only chunk using the existing presharded worker API."""
+        spa, dba = self._packing_args("train_mb_tokens")
+        train_meta = self._isolated_meta(
+            meta,
+            fields=list(DP_VALUE_TRAIN_FIELDS),
+            task_name="value_train",
+            include_multimodal=False,
+        )
+        with timer.time("value_training/shard_meta") if timer else nullcontext():
+            metas, _ = shard_meta_for_dp(
+                train_meta,
+                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                batch_size=None,
+                sequence_packing_args=spa,
+                dynamic_batching_args=dba,
+            )
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "train_microbatch_presharded",
+            meta=metas,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=_REPLICATED_AXES,
+            output_is_replicated=_REPLICATED_AXES,
+        )
+        self.worker_group.get_all_worker_results(futures)
+
+    def finish_train_step(self) -> dict[str, Any]:
+        """Commit one update; deduplicate metrics from TP/CP/PP replicas."""
+        results = ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "finish_train_step_presharded",
+            )
+        )
+        return _aggregate_train_results([r for r in results if r["is_replica_leader"]])
+
+    def abort_train_step(self) -> None:
+        """Discard the open update on every worker without stepping."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data("abort_train_step_presharded")
         )

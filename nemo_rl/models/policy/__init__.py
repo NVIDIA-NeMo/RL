@@ -534,8 +534,8 @@ class MegatronConfig(TypedDict):
     # No effect when use_fused_linear_logprobs is set, which bypasses the
     # output layer's logits path.
     fp32_lm_head: NotRequired[bool]
-    # When mtp_num_layers=0, Multi-Token Prediction is disabled.
-    mtp_num_layers: NotRequired[int]
+    # None disables MTP for hybrid checkpoints with an MTP layer pattern.
+    mtp_num_layers: NotRequired[int | None]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
     mtp_loss_scaling_factor: NotRequired[float]
     # Populated by the algorithm before Megatron setup to size the LR scheduler.

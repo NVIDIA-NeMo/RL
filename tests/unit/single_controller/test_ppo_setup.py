@@ -287,16 +287,9 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="the `ppo` block is absent"):
             validate_single_controller_config(mc)
 
-    def test_rejects_multi_chunk_streaming(self):
-        """PPO cannot spread one full-batch optimizer epoch across chunks."""
+    def test_accepts_multi_chunk_streaming(self):
         mc = _ppo_master_config(min_groups_for_streaming_train=1)
-
-        with pytest.raises(
-            ValueError,
-            match=r"min_groups_for_streaming_train \(1\) == "
-            rf"num_prompts_per_step \({_NUM_PROMPTS_PER_STEP}\)",
-        ):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_rejects_value_global_batch_size_mismatch(self):
         mc = _ppo_master_config(value=_value_config(train_global_batch_size=4))

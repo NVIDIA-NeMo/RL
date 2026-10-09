@@ -16,6 +16,7 @@ import gc
 import os
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional, TypeVar
 
 import ray
@@ -51,7 +52,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType, MetricNormalizer
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
@@ -64,6 +65,9 @@ from nemo_rl.models.megatron.common import (
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
+)
+from nemo_rl.models.megatron.pipeline_parallel import (
+    broadcast_loss_metrics_from_last_stage,
 )
 from nemo_rl.models.megatron.setup import (
     finalize_megatron_setup,
@@ -94,6 +98,21 @@ from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 from nemo_rl.utils.tensor_ops import pad_and_concat
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+@dataclass
+class _ValueTrainStep:
+    loss_fn: LossFunction
+    gbs: int
+    mbs: int
+    counts: torch.Tensor
+    grad_sync_func: Any
+    no_sync_func: Any
+    finalize_model_grads_func: Any
+    metrics: list[dict[str, Any]] = field(default_factory=list)
+    num_microbatches: int = 0
+    num_chunks: int = 0
+    failed: bool = False
 
 
 def _install_value_head_load_skip(chunk: GPTModel) -> None:
@@ -346,6 +365,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         """
         # Must be the first CUDA-touching call in this process.
         # With `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` (set by `configure_worker()`),
+        self._train_step_state: Optional[_ValueTrainStep] = None
         gpu_ids = ray.get_gpu_ids()
         local_rank = int(gpu_ids[0])
         os.environ["LOCAL_RANK"] = str(local_rank)
@@ -506,6 +526,8 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         Returns:
             Dictionary with training metrics (global_loss, grad_norm, etc.)
         """
+        if self._train_step_state is not None:
+            raise RuntimeError("finish or abort the open value train step before train")
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -586,6 +608,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                         defer_fp32_logits=self.defer_fp32_logits,
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
+                        compute_mtp_loss=False,
                     )
 
                 # Empty unused memory
@@ -708,6 +731,250 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
         return metrics
 
+    def _assert_train_step_open(self) -> _ValueTrainStep:
+        state = self._train_step_state
+        if state is None:
+            raise RuntimeError("no value train step open; call begin_train_step first")
+        if state.failed:
+            raise RuntimeError("value train step failed; call abort_train_step first")
+        return state
+
+    def _restore_train_hooks(self, state: _ValueTrainStep) -> None:
+        model_config = getattr(self.model, "config")
+        model_config.grad_sync_func = state.grad_sync_func
+        model_config.no_sync_func = state.no_sync_func
+        model_config.finalize_model_grads_func = state.finalize_model_grads_func
+
+    @wrap_with_nvtx_name("megatron_value_worker/begin_train_step")
+    def begin_train_step(
+        self,
+        loss_fn: LossFunction,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> None:
+        """Open one optimizer step; subsequent chunks accumulate unreduced gradients."""
+        if self._train_step_state is not None:
+            raise RuntimeError("a value train step is already open; finish or abort it")
+        gbs = self.cfg["train_global_batch_size"] if gbs is None else gbs
+        mbs = self.cfg["train_micro_batch_size"] if mbs is None else mbs
+        if gbs <= 0 or mbs <= 0 or gbs % self.dp_size:
+            raise ValueError(
+                "positive gbs/mbs and gbs divisible by DP size are required"
+            )
+        model_config = getattr(self.model, "config")
+        if model_config.finalize_model_grads_func is None:
+            raise RuntimeError(
+                "value split training requires the Megatron gradient finalizer"
+            )
+        if hasattr(self.model, "inference_params"):
+            self.model.inference_params = None
+        self.model.train()
+        self.model.zero_grad_buffer()
+        self.optimizer.zero_grad()
+        state = _ValueTrainStep(
+            loss_fn=loss_fn,
+            gbs=gbs,
+            mbs=mbs,
+            counts=torch.zeros(3, dtype=torch.float64, device="cuda"),
+            grad_sync_func=model_config.grad_sync_func,
+            no_sync_func=model_config.no_sync_func,
+            finalize_model_grads_func=model_config.finalize_model_grads_func,
+        )
+        self._train_step_state = state
+        # A pipeline schedule normally finalizes every invocation. Across chunks,
+        # even one such reduction would corrupt the still-local gradient buffer.
+        model_config.grad_sync_func = None
+        model_config.no_sync_func = nullcontext
+        model_config.finalize_model_grads_func = None
+
+    @wrap_with_nvtx_name("megatron_value_worker/train_microbatch")
+    def train_microbatch(self, data: BatchedDataDict[Any]) -> None:
+        """Accumulate one DP shard without stepping or synchronizing gradients."""
+        state = self._assert_train_step_open()
+        try:
+            if data.size == 0:
+                raise ValueError(
+                    "value training requires a nonempty chunk on every DP rank"
+                )
+            if (
+                not self._policy_like_cfg.get("sequence_packing", {}).get(
+                    "enabled", False
+                )
+                and not self._policy_like_cfg.get("dynamic_batching", {}).get(
+                    "enabled", False
+                )
+                and data.size % state.mbs
+            ):
+                raise ValueError(
+                    "each value train chunk must contain complete microbatches per DP rank"
+                )
+            sample_mask = data["sample_mask"]
+            state.counts[0] += sample_mask.sum()
+            state.counts[1] += (
+                data["token_mask"][:, 1:] * sample_mask.unsqueeze(-1)
+            ).sum()
+            state.counts[2] += data.size
+            iterator, nmb, actual_mbs, _, padded_length = get_microbatch_iterator(
+                data,
+                self._policy_like_cfg,
+                state.mbs,
+                straggler_timer=self.mcore_state.straggler_timer,
+            )
+            processor = LossPostProcessor(
+                loss_fn=state.loss_fn,
+                cfg=self._policy_like_cfg,
+                num_microbatches=nmb,
+                prepare_fn=_value_loss_prepare_fn,
+            )
+            # Sum the loss now; normalize once using all chunks' valid counts.
+            one = torch.tensor(1.0, device="cuda")
+            with self.model.no_sync():
+                rerun = get_rerun_state_machine()
+                executed = False
+                while rerun.should_run_forward_backward(iterator):
+                    if executed:
+                        raise RuntimeError(
+                            "value split training cannot replay one chunk on accumulated "
+                            "gradients; abort and retry the complete train step"
+                        )
+                    losses = megatron_forward_backward(
+                        model=self.model,
+                        data_iterator=iterator,
+                        num_microbatches=nmb,
+                        seq_length=padded_length,
+                        mbs=actual_mbs,
+                        post_processing_fn=processor,
+                        forward_only=False,
+                        defer_fp32_logits=self.defer_fp32_logits,
+                        global_valid_seqs=one,
+                        global_valid_toks=one,
+                        compute_mtp_loss=False,
+                    )
+                    executed = True
+                if not executed:
+                    raise RuntimeError(
+                        "value train chunk did not execute forward/backward"
+                    )
+            metrics = losses if is_pipeline_last_stage(ignore_virtual=True) else None
+            state.metrics.extend(broadcast_loss_metrics_from_last_stage(metrics))
+            state.num_microbatches += int(nmb)
+            state.num_chunks += 1
+            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                torch.cuda.empty_cache()
+        except Exception:
+            # Cleanup applies to any backend failure; never allow a partial
+            # forward/backward to be committed or retried on dirty gradients.
+            state.failed = True
+            self._restore_train_hooks(state)
+            raise
+
+    @wrap_with_nvtx_name("megatron_value_worker/finish_train_step")
+    def finish_train_step(self) -> dict[str, Any]:
+        """Finalize one complete global batch and return the usual value metrics."""
+        state = self._assert_train_step_open()
+        try:
+            if state.num_chunks == 0:
+                raise RuntimeError("cannot finish an empty value train step")
+            counts = state.counts.clone()
+            torch.distributed.all_reduce(
+                counts, group=parallel_state.get_data_parallel_group()
+            )
+            seqs, toks, samples = counts.tolist()
+            if samples != state.gbs:
+                raise ValueError(
+                    f"value train step has {samples} samples; expected {state.gbs}"
+                )
+            denominator = (
+                toks if state.loss_fn.loss_type == LossType.TOKEN_LEVEL else seqs
+            )
+            if denominator <= 0:
+                raise ValueError(
+                    "value train step has no valid training tokens or sequences"
+                )
+            inv_n = 1.0 / denominator
+            self.model.scale_gradients(inv_n)
+            if self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
+                "overlap_grad_reduce"
+            ]:
+                self.model.start_grad_sync()
+            state.finalize_model_grads_func([self.model], None)
+            torch.cuda.synchronize()
+            _, grad_norm, _ = self.optimizer.step()
+            grad_norm = reduce_max_stat_across_model_parallel_group(
+                grad_norm,
+                mp_group=get_pg_collection(self.model).mp,
+            )
+            lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
+            wd = self.scheduler.get_wd()
+            self.scheduler.step(increment=state.gbs)
+            normalizers = getattr(state.loss_fn, "metric_normalizations", {})
+            mb_metrics = defaultdict(list)
+            for metrics in state.metrics:
+                for name, value in metrics.items():
+                    kind = normalizers.get(name)
+                    scale = inv_n
+                    if (
+                        "_min" in name
+                        or "_max" in name
+                        or kind is MetricNormalizer.NONE
+                    ):
+                        scale = 1.0
+                    elif kind is MetricNormalizer.TOKENS:
+                        scale = 1.0 / max(toks, 1)
+                    elif kind is MetricNormalizer.SEQUENCES:
+                        scale = 1.0 / max(seqs, 1)
+                    mb_metrics[name].append(value * scale)
+                for name, value in (
+                    ("lr", lr),
+                    ("wd", wd),
+                    ("global_valid_seqs", seqs),
+                    ("global_valid_toks", toks),
+                ):
+                    mb_metrics[name].append(value)
+            loss = torch.tensor([sum(mb_metrics["loss"])], device="cuda")
+            torch.distributed.all_reduce(
+                loss, group=parallel_state.get_data_parallel_group()
+            )
+            result = {
+                "global_loss": loss.cpu(),
+                "rank": torch.distributed.get_rank(),
+                "all_mb_metrics": dict(mb_metrics),
+                "grad_norm": torch.tensor(
+                    [grad_norm if grad_norm is not None else 0.0]
+                ),
+            }
+            model_config = getattr(self.model, "config")
+            if (getattr(model_config, "num_moe_experts", None) or 0) > 1:
+                result["moe_metrics"] = get_moe_metrics(
+                    loss_scale=1.0 / max(1, state.num_microbatches),
+                    per_layer_logging=self.cfg["megatron_cfg"].get(
+                        "moe_per_layer_logging", False
+                    ),
+                    num_layers=model_config.num_layers,
+                    mtp_num_layers=getattr(model_config, "mtp_num_layers", None),
+                    track_names=get_aux_loss_track_names(model_config),
+                )
+            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
+                torch.cuda.empty_cache()
+            self._train_step_state = None
+            return result
+        except Exception:
+            state.failed = True
+            raise
+        finally:
+            self._restore_train_hooks(state)
+
+    @wrap_with_nvtx_name("megatron_value_worker/abort_train_step")
+    def abort_train_step(self) -> None:
+        """Discard uncommitted gradients. Idempotent; cannot undo an optimizer step."""
+        state = self._train_step_state
+        if state is None:
+            return
+        self._restore_train_hooks(state)
+        self.model.zero_grad_buffer()
+        self.optimizer.zero_grad()
+        self._train_step_state = None
+
     @wrap_with_nvtx_name("megatron_value_worker/get_values")
     def get_values(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
@@ -721,6 +988,11 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         Returns:
             BatchedDataDict with "values" key of shape [batch_size, seq_length].
         """
+        if self._train_step_state is not None:
+            raise RuntimeError(
+                "finish or abort the value train step before inference/offload"
+            )
+
         no_grad = torch.no_grad()
         no_grad.__enter__()
 
@@ -765,6 +1037,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 input_ids=input_ids_cp_sharded,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
+                compute_mtp_loss=False,
                 **additional_kwargs,
             )
 
@@ -843,6 +1116,11 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
     def prepare_for_inference(self):
         """Prepare model for value inference."""
+        if self._train_step_state is not None:
+            raise RuntimeError(
+                "finish or abort the value train step before inference/offload"
+            )
+
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
 
@@ -929,6 +1207,11 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         The value head is the model's ``output_layer`` and is saved as part of
         the normal Megatron dist-checkpoint — no separate value-head sidecar.
         """
+        if self._train_step_state is not None:
+            raise RuntimeError(
+                "finish or abort the value train step before checkpointing"
+            )
+
         if not torch.distributed.is_initialized():
             raise RuntimeError(
                 "Distributed process group is not initialized. Cannot save checkpoint."
@@ -1000,6 +1283,11 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
     def finish_inference(self) -> None:
         """Offload model params to CPU after inference."""
+        if self._train_step_state is not None:
+            raise RuntimeError(
+                "finish or abort the value train step before inference/offload"
+            )
+
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )
@@ -1009,6 +1297,10 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
     def finish_training(self) -> None:
         """Offload model, gradients, and optimizer to CPU after training."""
+        if self._train_step_state is not None:
+            raise RuntimeError(
+                "finish or abort the value train step before inference/offload"
+            )
         self.model.eval()
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True

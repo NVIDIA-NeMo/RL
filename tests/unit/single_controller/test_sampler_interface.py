@@ -221,6 +221,45 @@ class TestInOrderEvictMatchesSelect:
         # past target, but unready -> skipped to avoid the commit race.
         assert _run(s.evict(current_train_weight=5)) == 0
 
+    def test_select_waits_for_complete_dp_multiple(self):
+        buffer = FakeBuffer()
+        for group_index in range(127):
+            buffer.add(f"g{group_index}", weight=0, target_step=0)
+        sampler = InOrderSampler(buffer, max_lookahead_versions=1)
+        sampler.set_group_multiple(2)
+
+        first_meta, first_count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=32,
+                max_prompt_groups=128,
+            )
+        )
+        assert first_count == 126
+        assert len(first_meta.sample_ids) == 126
+        assert len(buffer.meta_list) == 1
+
+        waiting_meta, waiting_count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=2,
+                max_prompt_groups=2,
+            )
+        )
+        assert waiting_meta is None
+        assert waiting_count == 0
+
+        buffer.add("g127", weight=0, target_step=0)
+        final_meta, final_count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=2,
+                max_prompt_groups=2,
+            )
+        )
+        assert final_count == 2
+        assert len(final_meta.sample_ids) == 2
+
 
 class TestFactory:
     @pytest.mark.parametrize(
@@ -608,6 +647,34 @@ class TestWeightFifoSelect:
 
 
 class TestReadyFirstSelect:
+    def test_select_waits_for_complete_dp_multiple(self):
+        buffer = FakeBuffer()
+        for group_index in range(3):
+            buffer.add(f"g{group_index}", weight=0)
+        sampler = ReadyFirstSampler(buffer, max_staleness_versions=1)
+        sampler.set_group_multiple(2)
+
+        first_meta, first_count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=2,
+                max_prompt_groups=4,
+            )
+        )
+        assert first_count == 2
+        assert len(first_meta.sample_ids) == 2
+        assert len(buffer.meta_list) == 1
+
+        waiting_meta, waiting_count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=2,
+                max_prompt_groups=4,
+            )
+        )
+        assert waiting_meta is None
+        assert waiting_count == 0
+
     def test_mixes_ready_weight_versions_in_buffer_order(self):
         buf = FakeBuffer()
         buf.add("old", weight=1)

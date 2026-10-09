@@ -1219,6 +1219,63 @@ class TestApplyMoeConfig:
 
 
 @pytest.mark.mcore
+class TestApplyMtpConfig:
+    @pytest.mark.parametrize("mtp_num_layers", [None, 5])
+    def test_hybrid_pattern_accepts_null_or_positive_layers(self, mtp_num_layers):
+        from nemo_rl.models.megatron.setup import (
+            _apply_mtp_config,
+            _validate_disabled_mtp,
+        )
+
+        model_cfg = SimpleNamespace(
+            hybrid_layer_pattern="M*M/*E",
+            mtp_num_layers=1,
+            mtp_hybrid_override_pattern="*E",
+            mtp_use_repeated_layer=True,
+        )
+        _apply_mtp_config(
+            model_cfg, {"megatron_cfg": {"mtp_num_layers": mtp_num_layers}}
+        )
+        assert model_cfg.mtp_num_layers == mtp_num_layers
+        if mtp_num_layers is None:
+            assert model_cfg.hybrid_layer_pattern == "M*M"
+            assert model_cfg.mtp_hybrid_override_pattern is None
+            assert model_cfg.mtp_use_repeated_layer is False
+            _validate_disabled_mtp(
+                model_cfg, {"megatron_cfg": {"mtp_num_layers": None}}
+            )
+        else:
+            assert model_cfg.hybrid_layer_pattern == "M*M/*E"
+            assert model_cfg.mtp_hybrid_override_pattern == "*E"
+
+    def test_hybrid_pattern_rejects_zero_layers(self):
+        from nemo_rl.models.megatron.setup import _apply_mtp_config
+
+        model_cfg = SimpleNamespace(hybrid_layer_pattern="M*M/*E", mtp_num_layers=1)
+        with pytest.raises(ValueError, match="mtp_num_layers=null"):
+            _apply_mtp_config(model_cfg, {"megatron_cfg": {"mtp_num_layers": 0}})
+
+    @pytest.mark.parametrize(
+        ("mtp_num_layers", "hybrid_pattern", "mtp_pattern"),
+        [(1, "M*M", None), (None, "M*M/*E", None), (None, "M*M", "*E")],
+    )
+    def test_null_rejects_provider_mtp_reactivation(
+        self, mtp_num_layers, hybrid_pattern, mtp_pattern
+    ):
+        from nemo_rl.models.megatron.setup import _validate_disabled_mtp
+
+        model_cfg = SimpleNamespace(
+            mtp_num_layers=mtp_num_layers,
+            hybrid_layer_pattern=hybrid_pattern,
+            mtp_hybrid_override_pattern=mtp_pattern,
+        )
+        with pytest.raises(ValueError, match="MTP remains enabled"):
+            _validate_disabled_mtp(
+                model_cfg, {"megatron_cfg": {"mtp_num_layers": None}}
+            )
+
+
+@pytest.mark.mcore
 class TestApplyPrecisionConfig:
     """Tests for _apply_precision_config function."""
 
