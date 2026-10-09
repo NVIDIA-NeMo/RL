@@ -309,7 +309,7 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
-        body: dict = await request.json()
+        body: dict = await _decode_request_body(request)
         messages: list[dict] = body.get("messages", [])
         tools: list[dict] | None = body.get("tools")
         logprobs_requested = body.get("logprobs", False)
@@ -669,6 +669,28 @@ def _resolve_tool_parser_name(configured_name: str | None, model_name: str) -> s
         f"Could not infer a tool parser from {model_name!r}; "
         "set trtllm_cfg.tool_parser explicitly."
     )
+
+
+# TRT-LLM's disagg orchestrator encodes the forwarded worker request with
+# msgspec msgpack and flags it with this header, deliberately leaving
+# Content-Type as application/json so FastAPI still routes the body
+# (tensorrt_llm/serve/openai_client.py: MSGPACK_HEADERS). A plain
+# ``await request.json()`` therefore dies on the first byte of every
+# orchestrator-forwarded request -- 0x8e is a msgpack fixmap header, not UTF-8.
+# Only the request leg is encoded this way: the client reads Content-Type off
+# the response solely to reject an unexpected event-stream, so responses stay
+# ordinary JSON.
+_MSGPACK_REQUEST_HEADER = "x-trtllm-msgpack"
+
+
+async def _decode_request_body(request: "Request") -> dict[str, Any]:
+    """Body as a dict, honoring the orchestrator's msgpack framing."""
+    if request.headers.get(_MSGPACK_REQUEST_HEADER) != "1":
+        return await request.json()
+
+    import msgspec
+
+    return msgspec.msgpack.decode(await request.body())
 
 
 def _build_tool_parser(name: str) -> Any:

@@ -39,16 +39,18 @@ from nemo_rl.environments.nemo_gym import (
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
     setup_nemo_gym_config,
+    should_use_nemo_gym,
     spinup_nemo_gym_actor,
 )
 
 
-@pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron"])
+@pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron", "trtllm"])
 def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
     generation = {
         "backend": backend,
         "vllm_cfg": {"async_engine": False, "expose_http_server": False},
         "mcore_generation_config": {"expose_http_server": False},
+        "trtllm_cfg": {"async_engine": False, "expose_http_server": False},
         "stop_strings": ["stop"],
         "stop_token_ids": [1],
     }
@@ -56,15 +58,43 @@ def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
 
     setup_nemo_gym_config(config, tokenizer=None)
 
+    is_vllm_like = backend in ("vllm", "dynamo")
     assert generation["vllm_cfg"] == {
-        "async_engine": backend != "megatron",
-        "expose_http_server": backend != "megatron",
+        "async_engine": is_vllm_like,
+        "expose_http_server": is_vllm_like,
     }
     assert generation["mcore_generation_config"] == {
         "expose_http_server": backend == "megatron"
     }
+    assert generation["trtllm_cfg"] == {
+        "async_engine": backend == "trtllm",
+        "expose_http_server": backend == "trtllm",
+    }
     assert generation["stop_strings"] is None
     assert generation["stop_token_ids"] is None
+
+
+def test_setup_nemo_gym_config_trtllm_matches_should_use_nemo_gym() -> None:
+    """The key setup_nemo_gym_config writes is the one should_use_nemo_gym reads.
+
+    The two diverged before: should_use_nemo_gym accepted trtllm while
+    setup_nemo_gym_config raised on it, so every trtllm + Gym run died at
+    startup.
+    """
+    generation = {
+        "backend": "trtllm",
+        "trtllm_cfg": {"async_engine": False, "expose_http_server": False},
+        "stop_strings": None,
+        "stop_token_ids": None,
+    }
+    config = SimpleNamespace(
+        policy={"generation": generation},
+        env={"should_use_nemo_gym": True},
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert should_use_nemo_gym(config)
 
 
 def test_setup_nemo_gym_config_rejects_unsupported_backend() -> None:

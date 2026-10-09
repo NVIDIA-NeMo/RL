@@ -91,6 +91,43 @@ def test_required_prefix_token_ids_is_a_stripped_field():
     assert "required_prefix_token_ids" in _GYM_ONLY_REQUEST_FIELDS
 
 
+def test_parallel_tool_calls_is_a_stripped_field():
+    """A tool-use dataset can carry it; TRT-LLM's request model does not declare it.
+
+    Unlike the other entries this is an OpenAI-standard chat-completions field,
+    so it arrives from ordinary Gym traffic rather than a vLLM extension:
+    responses_create_params carries ``parallel_tool_calls`` and the vllm_model
+    proxy forwards it verbatim. TRT-LLM's ChatCompletionRequest stops at
+    ``tools`` / ``tool_choice`` and is extra="forbid", so leaving it in turns
+    every rollout request into a 400 and the whole run dies in rollout
+    collection rather than at startup.
+    """
+    assert "parallel_tool_calls" in _GYM_ONLY_REQUEST_FIELDS
+
+
+def test_a_tool_use_body_survives_stripping_with_its_tools_intact():
+    payload = {
+        "model": "qwen",
+        "messages": [{"role": "user", "content": "fix the bug"}],
+        "tools": [{"type": "function", "function": {"name": "str_replace_editor"}}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+        "max_tokens": 8,
+    }
+    body = json.dumps(payload).encode()
+    app = _CaptureApp()
+
+    _drive(_DropGymOnlyRequestFields(app), _scope("/v1/chat/completions", body), body)
+
+    got = json.loads(app.body)
+    assert "parallel_tool_calls" not in got
+    # The fields TRT-LLM does declare must not be collateral damage.
+    assert got["tools"] == payload["tools"]
+    assert got["tool_choice"] == "auto"
+    headers = dict(app.scope["headers"])
+    assert int(headers[b"content-length"]) == len(app.body)
+
+
 def test_vllm_only_fields_are_stripped_and_content_length_follows():
     payload = _warmup_payload()
     body = json.dumps(payload).encode()

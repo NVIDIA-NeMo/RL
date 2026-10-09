@@ -1,0 +1,123 @@
+# Nightly coverage for TRT-LLM prefill/decode disaggregation behind NeMo-Gym.
+
+# Uses the SWE pivot single-step tool-use environment (Stage 2.1), not the
+# agentic SWE-bench rollout: no Apptainer, no per-instance SIFs, so it runs on
+# ordinary CI nodes.
+#
+# Resource layout (2 nodes x 4 GPUs):
+#   - node 0: policy training, Megatron CP4 (Qwen3-1.7B is dense and tiny)
+#   - node 1: one disagg replica -- 1 context engine (TP2) + 1 generation
+#     engine (TP2) fronted by 2 disagg servers. Replica width 2*2 = 4 GPUs,
+#     so the 4 rollout GPUs hold exactly one replica.
+#
+# Data: nvidia/Nemotron-RL-Super-Training-Blends (swe1 split), the same split
+# the vLLM sibling grpo-qwen3-1.7b-1n8g-megatron-super-swe1 reads.
+
+defaults: grpo-qwen3-1.7b-1n8g-megatron-super-swe1.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1
+
+grpo:
+  async_grpo:
+    # The sibling runs synchronously; async is what exercises refit against
+    # live disagg engines.
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: true
+
+policy:
+  megatron_cfg:
+    # 4 training GPUs, down from the sibling's 8.
+    context_parallel_size: 4
+
+  generation:
+    backend: trtllm
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1
+    trtllm_cfg:
+      # Per-role widths are identical here, so the top-level block is also the
+      # per-engine width; the override dicts below only carry the MoE split,
+      # which is a no-op for a dense model.
+      tensor_parallel_size: 2
+      precision: ${policy.precision}
+      max_model_len: ${policy.max_total_sequence_length}
+      max_batch_size: 32
+      # With enable_chunked_prefill below this bounds a prefill chunk, not a
+      # prompt. 8192 was too small even for a chunk here.
+      max_num_tokens: 16384
+      gpu_memory_utilization: 0.7
+      async_engine: true
+      in_flight_weight_updates: ${grpo.async_grpo.in_flight_weight_updates}
+      recompute_kv_cache_after_weight_updates: ${grpo.async_grpo.recompute_kv_cache_after_weight_updates}
+      # Every engine needs an address for the disagg server to reach it.
+      expose_http_server: true
+      # Required, not optional: TRT-LLM's auto-resolution reads
+      # Path(model_name)/"config.json", so it only works for a local checkpoint
+      # directory and returns None for a hub id like "Qwen/Qwen3-1.7B".
+      # MODEL_TYPE_TO_TOOL_PARSER maps model_type "qwen3" to "qwen3"
+      # (Qwen3ToolParser, JSON <tool_call>{...}</tool_call>). The vLLM sibling
+      # names qwen3_coder, which is the XML <function=...> shape -- that is a
+      # vLLM-side choice and does not carry over.
+      tool_parser: qwen3
+      # TRT-LLM's deepseek-r1 parser with reasoning_at_start=enable_thinking is
+      # the equivalent of the vLLM deepseek_r1 parser the sibling configures.
+      reasoning_parser: deepseek-r1
+      default_chat_template_kwargs:
+        enable_thinking: true
+      disaggregation:
+        enabled: true
+        num_context_engines: 1
+        num_generation_engines: 1
+        ctx_router: conversation
+        gen_router: load_balancing
+        # docker/Dockerfile builds the wheel with --nixl_root.
+        cache_transceiver_backend: NIXL
+        # Two frontends, so the per-replica sharding of Gym's sticky
+        # sha256(session_id) client selection is exercised rather than
+        # collapsing to the single-frontend path.
+        num_frontend_workers: 2
+        # Outside virtual_cluster's master-port window (1400-1999).
+        frontend_base_port: 17300
+        # On by default here: these three are the disaggregation-specific
+        # paths most likely to perturb token-level agreement between the
+        # sampler and the trainer, which is exactly what the
+        # token_mult_prob_error gate in the driver measures.
+        gen_tokids_ctxbytes: true
+        gen_strip_message_history: true
+        frontend_tokenize: true
+        # 10 min. TRT-LLM's 60 s default is tuned for short prompts; this
+        # workload runs to 81920 tokens.
+        kv_transfer_timeout_ms: 600000
+    trtllm_kwargs:
+      # TRT-LLM's analog of policy.hf_config_overrides, which only the vLLM
+      # backend reads. model_kwargs overrides the HF pretrained_config
+      # (precedence: model_kwargs > config file > class defaults), so this is
+      # what lets the engine serve past Qwen3-1.7B's native
+      # max_position_embeddings of 40960 -- the sibling's 81920 window needs it,
+      # and this dataset really does carry prompts over 40960.
+      model_kwargs:
+        max_position_embeddings: 131072
+      # Required, not a tuning knob: without it max_num_tokens bounds a whole
+      # prompt rather than a prefill chunk, and this dataset's prompts run to
+      # ~37k tokens -- every request 400s with "prompt length should not exceed
+      # max_num_tokens".
+      enable_chunked_prefill: true
+      kv_cache_config:
+        # The context engine prefills only each turn's delta and the receiving
+        # engine skips blocks it already holds on transfer.
+        enable_block_reuse: true
+
+logger:
+  log_dir: logs/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1
+
+cluster:
+  num_nodes: 2
+  gpus_per_node: 4
