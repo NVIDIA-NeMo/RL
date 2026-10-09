@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -22,6 +23,7 @@ from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _build_prompt_token_ids,
     _build_sampling_params,
     _compute_splice_inputs,
+    _decode_request_body,
     _make_parse_tool_calls,
     _resolve_tool_parser_name,
 )
@@ -237,3 +239,46 @@ def test_trtllm_parser_rejects_invalid_tool_arguments():
 
     with pytest.raises(ValueError, match="function.arguments"):
         _parse_with_trtllm(messages)
+
+
+class _FakeRequest:
+    """Minimal Request stand-in: headers plus the two body accessors."""
+
+    def __init__(self, headers: dict, raw: bytes):
+        self.headers = headers
+        self._raw = raw
+
+    async def body(self) -> bytes:
+        return self._raw
+
+    async def json(self):
+        return json.loads(self._raw)
+
+
+def test_a_plain_json_body_is_decoded_as_json():
+    payload = {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}
+    request = _FakeRequest({}, json.dumps(payload).encode())
+
+    assert asyncio.run(_decode_request_body(request)) == payload
+
+
+def test_a_msgpack_body_is_decoded_when_the_orchestrator_flags_it():
+    """TRT-LLM's disagg orchestrator msgpacks the forwarded worker request.
+
+    It leaves Content-Type as application/json so FastAPI still routes the body
+    and signals the encoding with X-TRTLLM-Msgpack instead
+    (tensorrt_llm/serve/openai_client.py: MSGPACK_HEADERS). Decoding on
+    Content-Type alone therefore hands json.loads a msgpack frame, and every
+    orchestrator-forwarded request dies on its first byte.
+    """
+    msgspec = pytest.importorskip("msgspec")
+    payload = {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}
+    raw = msgspec.msgpack.Encoder().encode(payload)
+    # The header, not the content type, is what selects the decoder.
+    request = _FakeRequest(
+        {"content-type": "application/json", "x-trtllm-msgpack": "1"}, raw
+    )
+
+    assert asyncio.run(_decode_request_body(request)) == payload
+    with pytest.raises(UnicodeDecodeError):
+        json.loads(raw)

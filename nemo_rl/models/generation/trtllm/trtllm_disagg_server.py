@@ -99,10 +99,18 @@ def build_config(
 # prefix-override extension (used by the MLPerf warmup); the TRT-LLM engine
 # adapter derives the on-policy prefix from the assistant messages instead and
 # ignores the top-level field, so dropping it here keeps both paths identical.
+#
+# `parallel_tool_calls` is not a vLLM extension but an OpenAI-standard
+# chat-completions field; TRT-LLM's ChatCompletionRequest declares `tools` and
+# `tool_choice` and stops there. It reaches us because a tool-use dataset can
+# carry it in responses_create_params, which Gym's vllm_model proxy forwards
+# verbatim into the chat-completions body. TRT-LLM has no knob for it either
+# way, so dropping it leaves the engine's native behavior unchanged.
 _GYM_ONLY_REQUEST_FIELDS = (
     "return_tokens_as_token_ids",
     "return_token_ids",
     "required_prefix_token_ids",
+    "parallel_tool_calls",
 )
 
 # Prefix vLLM uses when asked to report tokens as ids, which NeMo-Gym parses.
