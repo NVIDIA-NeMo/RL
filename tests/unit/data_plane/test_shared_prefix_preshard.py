@@ -30,8 +30,8 @@ concurrently; update this file if one of them changes:
 - Work-weighted sharding reads a ``SHARED_PREFIX_PROMPT_LENGTHS`` tag per row.
 - ``RolloutReassembler(include_shared_prefix_metadata=True)`` publishes the
   ``SHARED_PREFIX_PROMPT_LENGTHS`` column (verified prompt length, 0 for a
-  placeholder) and a ``GROUP_ID_TAG`` tag on every row. Whether it also tags
-  prompt lengths is not asserted (the review fix ships them as a column only).
+  placeholder) and a ``GROUP_ID_TAG`` tag on every row, and does not tag
+  prompt lengths.
 - ``_register_single_controller_partitions(dp_client, master_config=,
   partition_id=, include_multimodal_fields=)``.
 - The train pump gates DP alignment on the controller attribute
@@ -375,6 +375,10 @@ def test_reassembler_publishes_prompt_lengths_and_group_tags(tq_client):
         assert finalized.meta is not None
         assert finalized.meta.sample_ids == rollout_ids
         assert [tag[GROUP_ID_TAG] for tag in finalized.meta.tags] == [group_id] * 2
+        # Prompt lengths travel only as the column, never as row tags.
+        assert all(
+            SHARED_PREFIX_PROMPT_LENGTHS not in tag for tag in finalized.meta.tags
+        )
         published = tq_client.get_samples(
             sample_ids=rollout_ids,
             partition_id=_CANONICAL_PARTITION,
