@@ -2539,6 +2539,107 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     return num_masked
 
 
+def _apply_async_sample_masks(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    overlong_filtering: bool,
+    timer: Optional[Timer] = None,
+) -> tuple[dict[str, int], int]:
+    """Zero loss_multiplier for masked async rows and attribute each mask once.
+
+    Reasons are applied in precedence order (pre-existing zero loss multiplier,
+    overlong filtering, rollout ``mask_sample``), and each masked row counts
+    toward exactly one ``num_masked_seqs_by_*`` metric.
+    The final set of masked rows is the same as applying each filter
+    independently; only the attribution is exclusive.
+
+    Args:
+        repeated_batch: Training batch; ``loss_multiplier`` is updated in place.
+        overlong_filtering: Whether truncated rows are masked. When enabled,
+            ``truncated`` is required, as in the sync path.
+        timer: Optional timer. The overlong and mask_sample steps keep their
+            historical ``overlong_filter`` / ``mask_sample_filter`` labels.
+
+    Returns:
+        Tuple of the per-reason metrics (including ``num_masked_seqs_total``,
+        which excludes logprob-error masking applied later) and the legacy
+        ``num_mask_sample_filtered`` count: all rows flagged by ``mask_sample``,
+        including those already masked for another reason.
+    """
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    if loss_multiplier.ndim != 1:
+        raise ValueError(
+            "loss_multiplier must be one-dimensional, got "
+            f"shape={tuple(loss_multiplier.shape)}"
+        )
+    batch_size = loss_multiplier.numel()
+    eligible = loss_multiplier != 0
+    sample_mask_metrics = {
+        "num_masked_seqs_by_loss_multiplier": int((~eligible).sum().item()),
+        "num_masked_seqs_by_overlong_filtering": 0,
+        "num_masked_seqs_by_rollout": 0,
+    }
+    num_mask_sample_filtered = 0
+
+    def timed(label: str):
+        return timer.time(label) if timer is not None else nullcontext()
+
+    # TODO: support empty NeMo-Gym responses (response.output == []). Today
+    # _postprocess_nemo_gym_to_nemo_rl_result raises for these rows. Recovering
+    # them (see #4001 on super-v3.5-posttraining) needs a producer that emits a
+    # placeholder row plus a row-aligned marker column, and a reason here that
+    # masks marked rows ahead of overlong filtering and reports
+    # num_masked_seqs_by_empty_response_output. The producer runs in the shared
+    # Gym actor, so it must be opt-in until the sync, grpo_sync, distillation,
+    # and single-controller paths also mask the placeholder rows.
+    # (field, metric, timer label, required, enabled)
+    mask_reasons = [
+        (
+            "truncated",
+            "num_masked_seqs_by_overlong_filtering",
+            "overlong_filter",
+            True,
+            overlong_filtering,
+        ),
+        (
+            "mask_sample",
+            "num_masked_seqs_by_rollout",
+            "mask_sample_filter",
+            False,
+            True,
+        ),
+    ]
+    for field_name, metric_name, timer_label, required, enabled in mask_reasons:
+        with timed(timer_label):
+            if not enabled:
+                continue
+            if field_name not in repeated_batch:
+                if required:
+                    raise KeyError(
+                        f"{field_name!r} is required to apply async sample masking"
+                    )
+                continue
+            candidate_mask = repeated_batch[field_name]
+            if not isinstance(candidate_mask, torch.Tensor):
+                candidate_mask = torch.as_tensor(candidate_mask)
+            candidate_mask = candidate_mask.reshape(-1)
+            if candidate_mask.numel() != batch_size:
+                raise ValueError(
+                    f"{field_name} has {candidate_mask.numel()} rows; "
+                    f"expected {batch_size}"
+                )
+            candidate_mask = candidate_mask.to(device=eligible.device, dtype=torch.bool)
+            if field_name == "mask_sample":
+                num_mask_sample_filtered = int(candidate_mask.sum().item())
+            newly_masked = eligible & candidate_mask
+            sample_mask_metrics[metric_name] = int(newly_masked.sum().item())
+            loss_multiplier[newly_masked] = 0
+            eligible &= ~newly_masked
+
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    sample_mask_metrics["num_masked_seqs_total"] = sum(sample_mask_metrics.values())
+    return sample_mask_metrics, num_mask_sample_filtered
+
+
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     """Whether NeMo Gym is responsible for full response logging.
 
@@ -2950,11 +3051,12 @@ def compute_and_apply_seq_logprob_error_masking(
             seq_mult_prob_error <= seq_logprob_error_threshold
         ).float() * original_sample_mask
 
-        diff_mask = original_sample_mask - seq_error_mask
-        num_masked_seqs = int(diff_mask.sum().item())
+        # Count rows, not mask mass, so non-binary sample masks cannot skew
+        # the number of masked sequences.
+        diff_mask_bool = original_sample_mask.bool() & ~seq_error_mask.bool()
+        num_masked_seqs = int(diff_mask_bool.sum().item())
 
         if num_masked_seqs > 0:
-            diff_mask_bool = diff_mask.bool()
             masked_correct_count = int(
                 (rewards.view(-1)[diff_mask_bool] == 1).sum().item()
             )
@@ -5193,6 +5295,7 @@ def async_grpo_train(
                 ),
             ):
                 num_mask_sample_filtered = 0
+                sample_mask_metrics: dict[str, int] = {}
 
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
@@ -5401,23 +5504,15 @@ def async_grpo_train(
                         tracer=_tracer,
                     ),
                 ):
-                    # Apply overlong filtering - mask out truncated sequences from loss computation
-                    with timer.time("overlong_filter"):
-                        use_overlong_filtering = master_config.grpo.overlong_filtering
-                        if use_overlong_filtering:
-                            loss_multiplier = repeated_batch["loss_multiplier"].clone()
-                            truncated = repeated_batch["truncated"]
-
-                            if isinstance(truncated, list):
-                                truncated = torch.tensor(truncated, dtype=torch.bool)
-
-                            loss_multiplier[truncated] = 0
-                            repeated_batch["loss_multiplier"] = loss_multiplier
-
-                    with timer.time("mask_sample_filter"):
-                        num_mask_sample_filtered = _apply_mask_sample_filter(
-                            repeated_batch
+                    # Mask empty-response, overlong, and rollout-flagged rows,
+                    # attributing each masked row to exactly one reason.
+                    sample_mask_metrics, num_mask_sample_filtered = (
+                        _apply_async_sample_masks(
+                            repeated_batch,
+                            overlong_filtering=master_config.grpo.overlong_filtering,
+                            timer=timer,
                         )
+                    )
 
                     # Add loss mask to each message
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
@@ -5531,6 +5626,21 @@ def async_grpo_train(
                         seq_logprob_error_metrics[
                             "num_masked_seqs_by_logprob_error"
                         ] = seq_logprob_error_metrics.pop("num_masked_seqs")
+                # Fold pre-training logprob-error masking into the per-reason
+                # totals. With seq_logprob_error_in_loss the metrics are {} here:
+                # the loss reports num_masked_seqs_by_logprob_error through
+                # all_mb_metrics, and num_masked_seqs_total then covers only the
+                # pre-training reasons.
+                if "num_masked_seqs_by_logprob_error" in seq_logprob_error_metrics:
+                    num_logprob_error_masks = int(
+                        seq_logprob_error_metrics["num_masked_seqs_by_logprob_error"]
+                    )
+                    sample_mask_metrics["num_masked_seqs_by_logprob_error"] = (
+                        num_logprob_error_masks
+                    )
+                    sample_mask_metrics["num_masked_seqs_total"] += (
+                        num_logprob_error_masks
+                    )
 
                 # Pad teacher logprobs to match train_data sequence length.
                 if trajectory_teacher_logprobs is not None:
@@ -5811,6 +5921,7 @@ def async_grpo_train(
                     LOSS_KEY: train_results["loss"].numpy(),
                     REWARD_KEY: rewards.numpy(),
                     "num_mask_sample_filtered": num_mask_sample_filtered,
+                    **sample_mask_metrics,
                     GRAD_NORM_KEY: train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
