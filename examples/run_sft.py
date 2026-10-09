@@ -16,6 +16,7 @@ import argparse
 import os
 import pprint
 from functools import partial
+from typing import Any, cast
 
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
@@ -30,6 +31,7 @@ from nemo_rl.data.datasets import (
     update_single_dataset_config,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
@@ -59,7 +61,25 @@ def parse_args():
 
 
 # TODO @yukih: move to nemo_rl/data/utils.py after data processor refactored
-def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
+def _load_sft_response_dataset(dataset_config: Any, policy_config: PolicyConfig):
+    if dataset_config.get("dataset_name") != "megatron_sft_packed":
+        return load_response_dataset(dataset_config)
+    megatron_cfg = policy_config.get("megatron_cfg")
+    if megatron_cfg is None or not megatron_cfg["enabled"]:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires the Megatron backend"
+        )
+    return load_response_dataset(
+        dataset_config,
+        context_parallel_size=int(
+            cast(MegatronConfig, megatron_cfg)["context_parallel_size"]
+        ),
+    )
+
+
+def setup_data(
+    tokenizer: AutoTokenizer, data_config: DataConfig, policy_config: PolicyConfig
+):
     print("\n▶ Setting up data...")
     # setup train dataset
     task_data_processors = {}
@@ -73,7 +93,15 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         # load dataset
         if "default" in data_config and data_config["default"] is not None:
             update_single_dataset_config(cfg, data_config["default"])
-        data = load_response_dataset(cfg)
+        data = _load_sft_response_dataset(cfg, policy_config)
+        if (
+            data.task_name == "megatron_sft_packed"
+            and data.task_name in task_data_processors
+        ):
+            raise ValueError(
+                "SFT does not support multiple megatron_sft_packed datasets "
+                "in the same training split"
+            )
         data_list.append(data)
         # bind task_name to task_data_processors
         data_processor = partial(
@@ -123,7 +151,15 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             # load dataset
             if "default" in data_config and data_config["default"] is not None:
                 update_single_dataset_config(cfg, data_config["default"])
-            val_data = load_response_dataset(cfg)
+            val_data = _load_sft_response_dataset(cfg, policy_config)
+            if (
+                val_data.task_name == "megatron_sft_packed"
+                and val_data.task_name in val_task_data_processors
+            ):
+                raise ValueError(
+                    "SFT does not support multiple megatron_sft_packed datasets "
+                    "in the same validation split"
+                )
             val_data_list.append(val_data.dataset)
             # bind task_name to task_data_processors
             val_data_processor = partial(
@@ -204,7 +240,7 @@ def main(is_vlm: bool = False):
                 "Energon backend is not supported for V1, use `run_sft_v2.py` instead."
             )
         else:
-            dataset, val_dataset = setup_data(tokenizer, config.data)
+            dataset, val_dataset = setup_data(tokenizer, config.data, config.policy)
 
         (
             policy,

@@ -30,7 +30,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     dpo.val_batches=1 \
     dpo.val_global_batch_size=8 \
     policy.train_global_batch_size=8 \
-    policy.dtensor_cfg.lora_cfg.enabled=true \
+    policy.automodel_cfg.lora_cfg.enabled=true \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \

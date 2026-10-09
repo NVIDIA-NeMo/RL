@@ -31,7 +31,7 @@ policy:
   # Ray/container launchers must override this repo-relative example path with
   # an absolute path visible to every worker.
   quant_cfg: examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   optimizer: null
   scheduler: null

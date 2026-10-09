@@ -17,7 +17,13 @@ def test_collective_refit_always_resets_prefix_cache():
     model.modules.return_value = []
     model_loader = MagicMock()
     engine = MagicMock()
-    engine.model_engine = SimpleNamespace(model=model, model_loader=model_loader)
+    # begin_weight_update/finish_weight_update call these on the model engine.
+    engine.model_engine = SimpleNamespace(
+        model=model,
+        model_loader=model_loader,
+        unwrap_compiled_model_for_refit=MagicMock(),
+        restore_compiled_model_after_refit=MagicMock(),
+    )
     engine.control_action.return_value = nullcontext()
 
     extension.engine = engine
@@ -30,7 +36,6 @@ def test_collective_refit_always_resets_prefix_cache():
             "nemo_rl.models.generation.trtllm.trtllm_backend.packed_broadcast_consumer"
         ),
         patch("torch.cuda.synchronize"),
-        patch("torch.cuda.current_stream") as current_stream,
     ):
         result = extension.update_weights_from_collective(
             drain=False,
@@ -41,28 +46,8 @@ def test_collective_refit_always_resets_prefix_cache():
     model_loader.begin_update_weights.assert_called_once_with()
     model_loader.finalize_update_weights.assert_called_once_with()
     model_loader.abort_update_weights.assert_not_called()
-    current_stream.return_value.synchronize.assert_called_once_with()
-    engine.reset_prefix_cache.assert_called_once_with()
-
-
-def test_refit_finalization_falls_back_for_older_trtllm():
-    from nemo_rl.models.generation.trtllm import trtllm_backend as backend
-
-    extension = backend.NcclExtension.__new__(backend.NcclExtension)
-    module = MagicMock()
-    module._weights_removed = False
-    model = MagicMock()
-    model.modules.return_value = [module]
-    model_loader = MagicMock()
-    extension.engine = SimpleNamespace(
-        model_engine=SimpleNamespace(model=model, model_loader=model_loader)
+    engine.model_engine.unwrap_compiled_model_for_refit.assert_called_once_with()
+    engine.model_engine.restore_compiled_model_after_refit.assert_called_once_with(
+        engine.resource_manager
     )
-
-    with patch.object(
-        backend.WorkerExtension, "finalize_weight_update", None, create=True
-    ):
-        extension._finalize_weight_update()
-
-    model_loader.finalize_update_weights.assert_called_once_with()
-    module.process_weights_after_loading.assert_called_once_with()
-    module.post_load_weights.assert_called_once_with()
+    engine.reset_prefix_cache.assert_called_once_with()

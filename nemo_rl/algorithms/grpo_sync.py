@@ -83,6 +83,7 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
+from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.observability import (
     log_step_metrics,
@@ -176,7 +177,7 @@ def _apply_dynamic_sampling(
     Args:
         meta: This iteration's ``KVBatchMeta``.
         driver_carry: Per-row driver-local tensors for this iteration
-            (rewards, masks, prompt_ids_for_adv, baseline/std, …).
+            (rewards, masks, baseline/std, …).
         pending_meta: Survivors accumulated from prior iterations.
         pending_carry: ``driver_carry`` rows aligned to ``pending_meta``.
         pending_unfiltered_rewards: All iterations' rewards pre-filter,
@@ -268,8 +269,8 @@ def validate_sync(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """TQ-mediated counterpart to :func:`nemo_rl.algorithms.grpo.validate`.
 
-    Per-batch: register the val partition → ``rollout_to_tq`` →
-    ``policy.read_from_dataplane`` for message logs → ``policy.finish_step``.
+    Per-batch: register the val partition → ``rollout_to_tq`` (turn_roles /
+    turn_contents returned in ``driver_carry``) → ``policy.finish_step``.
     Caller owns ``policy_generation.prepare_for_generation`` /
     ``finish_generation`` around the call; the actor's per-rollout
     ``finish_generation`` is suppressed so inference state stays warm
@@ -421,9 +422,9 @@ def _log_data_plane_metrics_impl(
 
     The prefix names the scope because the two differ by a lot: the driver
     issues about one op of each kind per step while the bulk traffic is the
-    workers' per-DP-rank ``get_samples``. Note that even the cluster view
-    omits the rollout actor, which builds its own client and is not on the
-    worker group -- so ``kv_first_write`` is not in these totals.
+    workers' per-DP-rank ``get_samples``. The cluster view also includes the
+    rollout actor (registered via ``add_data_plane_snapshot_source``), so
+    ``kv_first_write`` is in these totals.
     """
     get_metrics = getattr(policy, "get_data_plane_step_metrics", None)
     if not callable(get_metrics):
@@ -534,11 +535,9 @@ def grpo_train_sync(
     adv_estimator = _create_advantage_estimator(master_config)
 
     # Driver-side pad-value dict for materialize() — the wire emits
-    # jagged tensors for variable-length token fields (input_ids,
-    # prompt_ids_for_adv); other fields default to pad=0.
+    # jagged tensors for variable-length input_ids; other fields default to pad=0.
     _pad_dict = {
         "input_ids": tokenizer.pad_token_id,
-        "prompt_ids_for_adv": tokenizer.pad_token_id,
     }
     if not hasattr(policy, "dp_cfg"):
         raise ValueError(
@@ -560,8 +559,8 @@ def grpo_train_sync(
 
     # ── Sync rollout actor (rollout 1-hop put) ──────────────────────
     # The actor owns the multi-turn rollout loop AND post-rollout
-    # flatten / mask construction / prompt extraction / baseline-std /
-    # TQ first-write. Bulk tensors stay actor-side until put_samples;
+    # flatten / mask construction / TQ first-write.
+    # Bulk tensors stay actor-side until put_samples;
     # driver receives only KVBatchMeta + small slice via Ray.
     rollout_actor = SyncRolloutActor.options(
         runtime_env=make_actor_runtime_env(
@@ -574,6 +573,7 @@ def grpo_train_sync(
         master_config=master_config,
         dp_cfg=dp_cfg,
     )
+    policy.add_data_plane_snapshot_source(rollout_actor)
 
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
@@ -733,13 +733,13 @@ def grpo_train_sync(
                 )
 
                 # ── Rollout 1-hop put: actor runs rollout + flatten +
-                # mask construction + prompt extraction + baseline/std,
+                # mask construction,
                 # writes bulk to TQ in one flat put_samples, returns
                 # only meta + small slice. Bulk never visits the driver.
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
-                    # Single Ray RPC: rollout + flatten + mask + prompt
-                    # extraction + baseline/std + put_samples + finish
+                    # Single Ray RPC: rollout + flatten + mask +
+                    # put_samples + finish
                     # generation + logger metrics — all bundled into one
                     # round-trip.
                     # ``first_iter`` is the actor's signal to call
@@ -758,6 +758,7 @@ def grpo_train_sync(
                             partition_id=policy.tq_partition_id,
                             group_size=master_config.grpo.num_generations_per_prompt,
                             first_iter=(dynamic_sampling_num_gen_batches == 1),
+                            apply_length_penalty=True,
                         )
                     )
 
@@ -789,12 +790,13 @@ def grpo_train_sync(
                         and "unshaped_total_reward" in driver_carry
                         else None
                     )
+                    prompt_group_ids = group_index_column(row_group_ids(meta))
                     (
                         baseline,
                         std,
                         _,
                     ) = calculate_baseline_and_std_per_prompt(
-                        driver_carry["prompt_ids_for_adv"],
+                        prompt_group_ids,
                         driver_carry["total_reward"],
                         torch.ones_like(driver_carry["total_reward"]),
                         leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
@@ -802,6 +804,17 @@ def grpo_train_sync(
                     )
                     driver_carry["baseline"] = baseline
                     driver_carry["std"] = std
+                    if "env_reward" in driver_carry:
+                        # grpo.length_penalty rewrote total_reward; keep a
+                        # baseline of the env reward for the pct_* diagnostics.
+                        driver_carry["env_baseline"], _, _ = (
+                            calculate_baseline_and_std_per_prompt(
+                                prompt_group_ids,
+                                driver_carry["env_reward"],
+                                torch.ones_like(driver_carry["env_reward"]),
+                                leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                            )
+                        )
                     tags = {
                         "std": driver_carry["std"].tolist(),
                         "baseline": driver_carry["baseline"].tolist(),
@@ -814,7 +827,7 @@ def grpo_train_sync(
                         )
                         is_trivial_prompt_distribution = (
                             calculate_trivial_reward_distributions(
-                                driver_carry["prompt_ids_for_adv"],
+                                prompt_group_ids,
                                 dynamic_sampling_rewards,
                                 torch.ones_like(dynamic_sampling_rewards),
                             )
@@ -891,7 +904,9 @@ def grpo_train_sync(
                 baseline = driver_carry["baseline"]
                 std = driver_carry["std"]
                 input_lengths = driver_carry["input_lengths"]
-                prompt_ids_for_adv = driver_carry["prompt_ids_for_adv"]
+                # Factorize after dynamic sampling combines metadata from different
+                # rollout calls, so their distinct UUIDs cannot share an index.
+                prompt_ids_for_adv = group_index_column(row_group_ids(meta))
                 loss_multiplier = driver_carry["loss_multiplier"]
                 truncated = driver_carry["truncated"]
                 length = driver_carry["length"]
@@ -900,6 +915,11 @@ def grpo_train_sync(
                 if hasattr(policy_generation, "get_step_metrics"):
                     gen_step_metrics = policy_generation.get_step_metrics()
                 baseline_for_log = baseline.clone()
+                env_baseline_for_log = (
+                    driver_carry["env_baseline"].clone()
+                    if "env_baseline" in driver_carry
+                    else None
+                )
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 skip_prev_logprobs, skip_reference_logprobs = (
@@ -1026,8 +1046,9 @@ def grpo_train_sync(
                         metrics=metrics,
                         baseline=baseline_for_log,
                         advantages=advantages,
+                        env_baseline=env_baseline_for_log,
                     )
-                    del baseline_for_log
+                    del baseline_for_log, env_baseline_for_log
 
                 # ── Driver delta-write: advantages + (post-masking)
                 # sample_mask under the same meta.sample_ids so workers fetch

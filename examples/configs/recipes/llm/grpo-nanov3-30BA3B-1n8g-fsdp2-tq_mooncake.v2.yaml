@@ -2,3 +2,7 @@ defaults: grpo-nanov3-30BA3B-1n8g-fsdp2.v2.yaml
 data_plane:
   enabled: true
   backend: mooncake_cpu
+data:
+  # mooncake_cpu RDMA-pins a large segment on the driver, so forking DataLoader
+  # workers from it copies the pinned pages (~20s per validation); load in-process.
+  num_workers: 0
