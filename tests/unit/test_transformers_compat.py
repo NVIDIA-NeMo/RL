@@ -60,9 +60,9 @@ def test_get_cached_module_file_handles_symlinked_hub_cache(monkeypatch, tmp_pat
         _compute_local_source_files_hash_with_symlink_fix
     ), (
         "The symlink-cache patch is not installed. If Transformers is now "
-        "5.13.0 or newer the upstream fix is already in place: delete "
-        "nemo_rl/transformers_compat.py, its bootstrap at the bottom of "
-        "nemo_rl/__init__.py, and this test file. Do not widen the version gate."
+        "5.13.0 or newer the upstream fix is already in place: delete the "
+        "dynamic-module hashing patch, its call in nemo_rl/__init__.py and "
+        "its tests. Keep the torch-FX helper. Do not widen the version gate."
     )
     for filename, content in _SOURCE_FILES.items():
         assert (cached_source_dir / filename).read_text(encoding="utf-8") == content
