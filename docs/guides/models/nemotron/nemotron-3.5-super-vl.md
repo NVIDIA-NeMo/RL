@@ -1,0 +1,145 @@
+# Nemotron 3.5 Super VL
+
+This page collects NeMo RL guidance for text post-training of Nemotron 3.5
+Super VL (`NemotronH_Omni_Reasoning_V3`), a hybrid Mamba + Attention MoE model
+with 512 routed experts (22 active) and a RADIO vision tower, on the AutoModel
+(DTensor) backend. Use it to launch the text DAPO recipe and understand the
+settings that are specific to this model.
+
+## What's Supported
+
+| Model | Modality | Training backend | Parallelism | Inference | Precision |
+| --- | --- | --- | --- | --- | --- |
+| Nemotron 3.5 Super VL (120B-A12B) | LLM (text) | AutoModel (DTensor) | FSDP2 + EP | vLLM | BF16 compute, FP32 master |
+
+Notes:
+
+- **Training** runs on the AutoModel (DTensor) backend with FSDP2 over all
+  parameters and expert parallelism (HybridEP dispatcher) for the routed
+  experts.
+- **Generation** uses the pinned stock vLLM, which registers
+  `NemotronH_Omni_Reasoning_V3` and loads the checkpoint's RADIO weights from
+  disk (`load_format=auto`) for the vision tower that the text recipe never
+  exercises. The language model is refit from the trainer every step.
+- The DAPO recipe drives the model text-only: the tokenizer path (no processor)
+  is used, so the DTensor worker runs with `is_vlm=false` and vLLM never
+  receives images.
+
+## Environment
+
+Use the standard NeMo RL environment described in the
+[installation guide](../../../about/installation.md). The Automodel submodule
+pinned on `main` (`r0.6.0` at `b916107a5` or later) registers
+`NemotronH_Omni_Reasoning_V3` and includes the fixes this recipe depends on
+(Automodel [#3874](https://github.com/NVIDIA-NeMo/Automodel/pull/3874) and
+[#4211](https://github.com/NVIDIA-NeMo/Automodel/pull/4211)); the stock vLLM
+pin registers the same architecture for generation. No custom source checkouts
+or manual builds are needed. For container and worker-venv details, see
+[Dependency Management](../../../design-docs/dependency-management.md).
+
+The recipe trains
+[`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16)
+on the DAPO-Math-17K training set with AIME-2024 validation, both from Hugging
+Face. Set `HF_HOME` to a cache visible from every node:
+
+```bash
+export HF_HOME=<path-to-shared-huggingface-cache>
+export WANDB_API_KEY=<your-wandb-api-key>
+```
+
+The recipe enables W&B logging; pass `logger.wandb_enabled=false` if W&B is not
+configured.
+
+## Example Recipe
+
+AutoModel (DTensor) training with colocated vLLM generation. The recipe YAML
+under `examples/configs/recipes/` is the source of truth.
+
+| Algo | Data | Seq | Train EP | vLLM TP/EP | `max_new_tokens` | Nodes | Recipe |
+|---|---|---|---|---|---|---|---|
+| DAPO (text) | DAPO-Math-17K / AIME-2024 | 9216 | 4 | 4 / 4 | 8192 | 16 x 4 GPUs | [`dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.yaml) |
+
+The recipe is sized for 16 x 4-GPU GB200 nodes: train `expert_parallel_size: 4`
+and vLLM `tensor_parallel_size: 4` / `expert_parallel_size: 4` (one vLLM engine
+per node). See [Parallelism](#parallelism) for why EP must stay within a node.
+
+It mirrors the Nemotron 3.5 Lightning DAPO recipe: dynamic sampling
+(`batch_multiplier: 3`), Clip-Higher (`ratio_clip_max: 0.28`), overlong
+filtering and soft overlong reward shaping, `reference_policy_kl_penalty: 0`,
+FusedAdam with FP32 master weights, activation checkpointing, and
+`moe_parallelizer.ignore_router_for_ac: true` (required with activation
+checkpointing on this MoE: the BF16 router top-k is nondeterministic on
+recompute).
+
+### Model-specific settings
+
+These are set in the recipe and are required for this model:
+
+| Setting | Value | Why |
+|---|---|---|
+| `policy.hf_config_overrides.num_nextn_predict_layers` | `0` | The checkpoint ships one MTP layer (`mtp.*` tensors). AutoModel builds it by default; this drops it on the training side. Keep `generation.vllm_kwargs.speculative_config` unset for the same reason. |
+| `policy.generation.vllm_kwargs.skip_mm_profiling` | `true` | No images are ever sent; skip vLLM's multimodal profiling pass and its encoder-cache reservation. |
+| `policy.generation.vllm_kwargs.mm_processor_cache_gb` | `0` | Drop vLLM's default 4 GiB host-side multimodal processor cache; host memory is the tight resource for this recipe. |
+| `policy.generation.vllm_kwargs.limit_mm_per_prompt.image` | `1` | vLLM sizes the encoder budget from this limit, and an unset modality defaults to 999 images per prompt. |
+| `policy.generation.vllm_kwargs.mamba_ssm_cache_dtype` | `float32` | Matches the checkpoint's `mamba_ssm_cache_dtype`. |
+| `policy.generation.vllm_cfg.skip_tokenizer_init` | (automatic) | vLLM's multimodal encoder budget calls the tokenizer during engine init for this architecture. `NemotronH_Omni_Reasoning_V3` is listed in `TOKENIZER_REQUIRED_ARCHITECTURES`, so NeMo RL keeps the tokenizer regardless of the text-only default. |
+| `policy.automodel_cfg.automodel_kwargs.force_hf` | unset | The custom AutoModel implementation and its state-dict adapter are required for EP and per-tensor refit. |
+| `policy.automodel_cfg.env_vars.PYTORCH_CUDA_ALLOC_CONF` | unset | With `expandable_segments:True` PyTorch exports CUDA IPC handles as file descriptors fetched via `pidfd_getfd`; on clusters where that syscall path is unavailable the colocated trainer-to-vLLM refit fails with `pidfd_getfd: Bad file descriptor`. The default allocator uses legacy `cudaIpcMemHandle` sharing. |
+
+### Parallelism
+
+- **Training EP stays within a node.** The recipe uses `expert_parallel_size: 4`
+  on 4-GPU GB200 nodes with the HybridEP dispatcher
+  (`policy.automodel_cfg.automodel_kwargs.backend.dispatcher: hybridep`), which
+  requires `make_sequence_length_divisible_by: 64`. The DeepEP dispatcher also
+  works at EP=4 but its V1 `Buffer` API assumes an expert-parallel group of up to
+  8 ranks is intranode; EP=8 on 4-GPU nodes fails with
+  `CUDA error ... deep_ep.cpp 'invalid resource handle'`.
+- **vLLM TP and EP live on the same GPUs.** `expert_parallel_size ==
+  tensor_parallel_size` runs one engine per node with dense layers TP-sharded
+  and experts EP-sharded (`enable_expert_parallel`). Set both to the GPUs per
+  node.
+- FSDP2 shards all parameters (including experts) over the full world, so
+  persistent memory per GPU does not depend on EP; EP only changes the
+  transient unsharded expert weights and all-to-all traffic.
+
+## Launch
+
+The recipe defaults to 16 nodes x 4 GPUs.
+
+```bash
+uv run examples/run_grpo.py \
+  --config examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.yaml
+```
+
+For launching on a multi-node Slurm or Kubernetes cluster, see the
+[cluster guide](../../../cluster.md); keep `cluster.num_nodes` and
+`cluster.gpus_per_node` in step with the allocation. Interrupted runs resume
+automatically from the latest checkpoint in `checkpointing.checkpoint_dir`.
+See the [GRPO guide](../../grpo.md) for the algorithm and common configuration
+details.
+
+## Reference Results
+
+### Training curves
+
+The run uses the recipe defaults (16 x 4-GPU GB200 nodes, train EP4, vLLM
+TP4/EP4) with the AutoModel (DTensor) backend and colocated vLLM generation,
+chained as 4-hour Slurm jobs that resume from the latest checkpoint. Curves are
+wandb exports; the x axis is the training step.
+
+**Text DAPO, DAPO-Math-17K / AIME-2024** — 43 steps, `max_new_tokens: 8192`,
+starting from `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`.
+
+![Nemotron 3.5 Super VL text DAPO training curves](../../../assets/nemotron/nemotron-3.5-super-vl-text-dapo-16n4g.png)
+
+AIME-2024 validation accuracy climbs from 0.41 at step 0 to **0.76 at step 40**
+(0.45 at step 10, 0.48 at step 20, 0.59 at step 30) while the mean validation
+response length falls from ~6,450 to ~4,600 tokens and `truncation_rate` drops
+from ~0.40 to ~0.15: the policy gets both more accurate and more concise.
+Training reward rises from a noisy -0.6 to -0.1 band to 0.2-0.6 after step 20.
+`gen_kl_error` drifts slowly from ~0.003 to ~0.0045 as the policy sharpens, the
+same order as the drift documented for other models; the isolated
+`token_mult_prob_error` spikes (steps 20, 32, 38) are single-step outliers and
+`token_mult_prob_error` returns to ~1.03 on the next step. The chain ran as five
+4-hour Slurm jobs that resumed from the latest checkpoint.
