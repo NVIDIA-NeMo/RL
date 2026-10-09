@@ -683,9 +683,7 @@ def test_tp1_logprob_shim_only_replaces_size_one_groups(monkeypatch):
     zgm._use_fused_log_softmax_at_tp1()  # idempotent: must not wrap twice
 
     sizes = {"tp1": 1, "tp2": 2}
-    monkeypatch.setattr(
-        torch.distributed, "get_world_size", lambda group: sizes[group]
-    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: sizes[group])
     logits = torch.randn(2, 5, 16, dtype=torch.bfloat16)
     target = torch.randint(0, 16, (2, 5))
     expected = (
