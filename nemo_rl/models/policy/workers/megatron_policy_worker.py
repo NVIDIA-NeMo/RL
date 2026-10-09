@@ -1149,7 +1149,7 @@ class MegatronPolicyWorkerImpl(
             return
 
         unsupported: list[str] = []
-        if self.cfg.get("is_vlm", False):
+        if self.cfg.get("is_vlm"):
             unsupported.append("VLM/multimodal policy")
         if self.cfg["dynamic_batching"]["enabled"]:
             unsupported.append("dynamic batching")
@@ -1172,8 +1172,8 @@ class MegatronPolicyWorkerImpl(
             unsupported.append("model-owned context-parallel slicing")
         if self.media_placeholder_token_id is not None:
             unsupported.append("media-token forwarding")
-        fp8_cfg = self.cfg["megatron_cfg"].get("fp8_cfg", None)
-        if fp8_cfg is not None and fp8_cfg.get("enabled", False):
+        fp8_cfg = self.cfg["megatron_cfg"].get("fp8_cfg")
+        if fp8_cfg is not None and fp8_cfg["enabled"]:
             unsupported.append("FP8 execution")
 
         model_config = self._get_model_config()
