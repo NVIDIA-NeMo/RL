@@ -65,8 +65,8 @@ def test_v2_workers_do_not_tuple_unpack_model_state():
     the next time a field is added."""
     repo = Path(__file__).resolve().parents[4]
     for rel in (
-        "nemo_rl/models/policy/workers/dtensor_policy_worker_v2.py",
-        "nemo_rl/models/value/workers/dtensor_value_worker_v2.py",
+        "nemo_rl/models/policy/workers/automodel_policy_worker.py",
+        "nemo_rl/models/value/workers/automodel_value_worker.py",
     ):
         source = (repo / rel).read_text()
         assert not re.search(r"\)\s*=\s*model_and_optimizer_state\b", source), (

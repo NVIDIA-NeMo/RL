@@ -23,9 +23,9 @@ try:
 except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
-import nemo_rl.models.policy.workers.dtensor_policy_worker_v2 as worker_mod
-from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
-    DTensorPolicyWorkerV2Impl,
+import nemo_rl.models.policy.workers.automodel_policy_worker as worker_mod
+from nemo_rl.models.policy.workers.automodel_policy_worker import (
+    AutomodelPolicyWorkerImpl,
 )
 
 pytestmark = pytest.mark.automodel
@@ -39,8 +39,8 @@ class _TinyDraft(nn.Module):
         self.register_buffer("t2d", torch.zeros(16, dtype=torch.bool))
 
 
-def _make_worker(with_draft: bool = True) -> DTensorPolicyWorkerV2Impl:
-    worker = DTensorPolicyWorkerV2Impl.__new__(DTensorPolicyWorkerV2Impl)
+def _make_worker(with_draft: bool = True) -> AutomodelPolicyWorkerImpl:
+    worker = AutomodelPolicyWorkerImpl.__new__(AutomodelPolicyWorkerImpl)
     worker.model = nn.Linear(4, 4, bias=False)
     worker.draft_model = _TinyDraft() if with_draft else None
     worker.dtype = torch.bfloat16
@@ -70,7 +70,7 @@ def _assert_draft_stream(params: dict[str, torch.Tensor]):
 def test_refit_params_generator_appends_typed_draft_keys():
     worker = _make_worker()
     params = _collect(
-        worker_mod.dtensor_params_generator(
+        worker_mod.automodel_params_generator(
             worker.model, worker.dtype, draft_model=worker.draft_model
         )
     )
@@ -80,7 +80,7 @@ def test_refit_params_generator_appends_typed_draft_keys():
 def test_refit_params_generator_without_draft_has_no_draft_keys():
     worker = _make_worker(with_draft=False)
     params = _collect(
-        worker_mod.dtensor_params_generator(
+        worker_mod.automodel_params_generator(
             worker.model, worker.dtype, draft_model=worker.draft_model
         )
     )

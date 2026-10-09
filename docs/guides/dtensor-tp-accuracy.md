@@ -10,7 +10,7 @@ We have encountered several accuracy issues related to TP in **DTensor**, includ
 
 1. **For policy models**: We observed severe `token_mult_prob_error` spikes when TP was enabled during post-training of a Qwen3 dense model (e.g., [Qwen/Qwen3-4B-Instruct-2507 · Hugging Face](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)), indicating a significant difference between the training and inference engines.
 2. **For reward models**: The reward model exhibited large discrepancies under different TP configurations.
-3. **For overall model training performance**: Using a $TP > 1$ configuration often leads to degraded downstream performance when utilizing **DTensorPolicyWorkerV2**.
+3. **For overall model training performance**: Using a $TP > 1$ configuration often leads to degraded downstream performance when utilizing **AutomodelPolicyWorker**.
 
 ### Misalignment between Training and Inference for Policy Models
 
