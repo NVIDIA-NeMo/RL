@@ -27,6 +27,10 @@ from ray.exceptions import ActorDiedError
 from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    OPDAdvantageEstimator,
+)
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     REPLAY_BUFFER_METADATA_FILENAME,
@@ -40,7 +44,9 @@ from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
+    _OPDMoments,
     _pooled_opd_metrics,
+    _pooled_opd_term_metrics,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -1279,6 +1285,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
+    ctrl._opd_term_moments = {}
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
@@ -1334,6 +1341,139 @@ def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None
             "on_policy_distillation/adv_std": 2.0,
         }
     )
+
+
+def test_pooled_opd_term_metrics_pool_chunks_exactly() -> None:
+    """Term moments pool across chunks like the gap: values [0, 2] then [-4]."""
+    term = _OPDMoments()
+    term.add(torch.tensor([0.0, 2.0]))
+    term.add(torch.tensor([-4.0]))
+
+    metrics = _pooled_opd_term_metrics({"outcome_adv": term})
+
+    assert metrics == pytest.approx(
+        {
+            "on_policy_distillation/outcome_adv_mean": -2.0 / 3.0,
+            "on_policy_distillation/outcome_adv_std": math.sqrt(28.0 / 3.0),
+            "on_policy_distillation/outcome_adv_abs_mean": 2.0,
+        }
+    )
+    assert _pooled_opd_term_metrics({}) == {}
+
+
+def test_opd_advantage_stage_trains_on_tropd_plus_outcome_advantage() -> None:
+    """With the real estimator SC writes the mixed advantage and pools each term."""
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    prompt_ids = torch.zeros(2, 3, dtype=torch.long)
+    rewards = torch.tensor([1.0, 0.0])
+    token_mask = torch.tensor([[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]])
+    teacher = torch.tensor([[0.0, -0.25, -0.5], [0.0, -0.25, -0.5]])
+    student = torch.full((2, 3), -0.5)
+
+    class FakeDataPlane:
+        def __init__(self):
+            self.put_fields = None
+
+        def get_samples(self, sample_ids, partition_id, select_fields):
+            del sample_ids, partition_id, select_fields
+            return TensorDict(
+                {
+                    "prompt_ids_for_adv": prompt_ids.clone(),
+                    "total_reward": rewards.clone(),
+                    "token_mask": token_mask.clone(),
+                    "sample_mask": torch.ones(2),
+                    "mask_sample": torch.zeros(2, dtype=torch.bool),
+                    "truncated": torch.zeros(2, dtype=torch.bool),
+                    "generation_logprobs": student.clone(),
+                    "prev_logprobs": student.clone(),
+                    "teacher_reference_logprobs": teacher.clone(),
+                    "input_lengths": torch.tensor([3, 3]),
+                },
+                batch_size=(2,),
+            )
+
+        def put_samples(self, sample_ids, partition_id, fields):
+            del sample_ids, partition_id
+            self.put_fields = fields
+
+    estimator = OPDAdvantageEstimator(
+        AdvEstimatorConfig(
+            name="opd",
+            proximal_teacher_alpha=0.2,
+            distillation_advantage_weight=0.5,
+            outcome_advantage_weight=1.0,
+        ),
+        ClippedPGLossConfig(),
+    )
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = True
+    ctrl._is_ppo = False
+    ctrl._dp_client = FakeDataPlane()
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig(seq_logprob_error_threshold=None)
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "sample_masks": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+        "num_mask_sample_filtered": [],
+    }
+    ctrl._opd_stat_sum = 0.0
+    ctrl._opd_stat_sumsq = 0.0
+    ctrl._opd_stat_count = 0
+    ctrl._opd_term_moments = {}
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["a", "b"],
+        fields=[],
+        sequence_lengths=[3, 3],
+    )
+
+    _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert has_valid_training_tokens
+    expected = estimator.compute_advantage_parts(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=token_mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=student,
+        valid_mask=torch.ones(2),
+    )
+    assert expected.outcome is not None
+    assert not torch.equal(expected.outcome, torch.zeros_like(expected.outcome))
+    written = ctrl._dp_client.put_fields["advantages"]
+    if written.is_nested:  # SC writes one ragged row per sample
+        written = written.to_padded_tensor(0.0)
+    torch.testing.assert_close(written, expected.advantages)
+    # The gap statistic stays the raw teacher-student log-ratio: [0.25, 0] per row.
+    assert ctrl._opd_stat_sum == pytest.approx(0.5)
+    assert ctrl._opd_stat_sumsq == pytest.approx(0.125)
+    assert ctrl._opd_stat_count == 4
+    trained = token_mask.bool()
+    assert set(ctrl._opd_term_moments) == {"adv", "distill_adv", "outcome_adv"}
+    for name, values in (
+        ("adv", expected.advantages),
+        ("distill_adv", expected.distillation),
+        ("outcome_adv", expected.outcome),
+    ):
+        assert ctrl._opd_term_moments[name].count == 4
+        # _OPDMoments accumulates in float64.
+        assert ctrl._opd_term_moments[name].total == pytest.approx(
+            float(torch.masked_select(values, trained).double().sum())
+        )
+    metrics = _pooled_opd_term_metrics(ctrl._opd_term_moments)
+    assert metrics["on_policy_distillation/outcome_adv_abs_mean"] > 0.0
 
 
 class _EmptySampler:
@@ -1672,6 +1812,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
+    ctrl._opd_term_moments = {}
     ctrl._teacher_coordinator = None
     return ctrl
 

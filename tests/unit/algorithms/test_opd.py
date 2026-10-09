@@ -1281,6 +1281,41 @@ def test_create_advantage_estimator_opd_branch():
     assert len(caught) == 3
 
 
+def test_create_advantage_estimator_opd_passes_the_configured_block():
+    """TR-OPD and outcome-mixing settings reach the estimator, not a stub config."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.advantage_estimator import (
+        AdvEstimatorConfig,
+        OPDAdvantageEstimator,
+    )
+    from nemo_rl.algorithms.grpo import GRPOConfig, _create_advantage_estimator
+
+    loss_fn = SimpleNamespace(
+        disable_ppo_ratio=True,
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type="icepop",
+    )
+    master_config = SimpleNamespace(
+        grpo=GRPOConfig(
+            adv_estimator=AdvEstimatorConfig(
+                name="opd",
+                proximal_teacher_alpha=0.2,
+                distillation_advantage_weight=0.1,
+                outcome_advantage_weight=1.0,
+            )
+        ),
+        loss_fn=loss_fn,
+    )
+
+    estimator = _create_advantage_estimator(master_config)
+
+    assert isinstance(estimator, OPDAdvantageEstimator)
+    assert estimator.proximal_teacher_alpha == 0.2
+    assert estimator.distillation_advantage_weight == 0.1
+    assert estimator.outcome_advantage_weight == 1.0
+
+
 def _meta_teacher_class():
     class MetaTeacher:
         def __init__(self):

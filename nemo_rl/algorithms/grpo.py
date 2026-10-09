@@ -2580,8 +2580,13 @@ def _create_advantage_estimator(master_config: MasterConfig):
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
-        adv_estimator = OPDAdvantageEstimator({"name": "opd"}, loss_config)
-        print("  ✓ Using OPD advantage estimator")
+        adv_estimator = OPDAdvantageEstimator(adv_estimator_config, loss_config)
+        print(
+            "  ✓ Using OPD advantage estimator "
+            f"(proximal_teacher_alpha={adv_estimator_config.proximal_teacher_alpha}, "
+            f"distillation_advantage_weight={adv_estimator_config.distillation_advantage_weight}, "
+            f"outcome_advantage_weight={adv_estimator_config.outcome_advantage_weight})"
+        )
         # Warn if loss_fn is not configured per MOPD paper recommendations.
         if not loss_config.disable_ppo_ratio:
             warnings.warn(

@@ -36,6 +36,40 @@ tool / environment tokens contribute zero. Because the advantage subtracts a
 real `prev_logprobs`, MOPD requires the student log-probabilities to actually be
 computed — see [Configuration](#configuration).
 
+### Trust-region target and outcome reward
+
+Two groups of `adv_estimator` options change the advantage:
+
+- `proximal_teacher_alpha` (TR-OPD, default `1.0`) distills toward the proximal
+  teacher `alpha · π_teacher + (1 − alpha) · π_student` instead of the teacher:
+
+  ```
+  Â_t = sg[ log(1 − alpha + alpha · π_teacher(t) / π_student(t)) ]
+  ```
+
+  For small gaps this is about `alpha` times the log-ratio, and it never falls
+  below `log(1 − alpha)`: a token the teacher rejects costs at most
+  `log(1 − alpha)` (−0.22 at `alpha = 0.2`), while a token the teacher prefers
+  keeps a logarithmic push. `1.0` is the plain advantage above.
+- `outcome_advantage_weight` (default `0.0`) and `distillation_advantage_weight`
+  (default `1.0`) add the GRPO group advantage of each rollout's reward, computed
+  with the same block's `normalize_rewards` and `use_leave_one_out_baseline`, to
+  every trained token of the rollout:
+
+  ```
+  A_t = distillation_advantage_weight · Â_t + outcome_advantage_weight · Â_GRPO
+  ```
+
+  The distillation term is about zero on text both models predict, such as a
+  repetition loop, so pure distillation never pushes against a rollout that loops
+  or runs out its budget; the outcome term does, because such rollouts fail.
+
+These options are rejected at config load on estimators other than `opd`, as is
+an `opd` block whose two weights are both `0`. The step metrics keep
+`on_policy_distillation/teacher_student_logprob_gap_mean` as the raw log-ratio of
+the trained tokens and report the pooled terms before advantage clipping as
+`on_policy_distillation/{adv,distill_adv,outcome_adv}_{mean,std,abs_mean}`.
+
 ## Configuration
 
 Enable MOPD in two places: select the advantage estimator and add the
@@ -48,6 +82,10 @@ grpo:
     enabled: true
   adv_estimator:
     name: opd
+    # Optional, see "Trust-region target and outcome reward" (defaults shown).
+    proximal_teacher_alpha: 1.0
+    distillation_advantage_weight: 1.0
+    outcome_advantage_weight: 0.0
   # OPD subtracts a real prev_logprobs, so it must not be skipped.
   seq_logprob_error_threshold: 2.0
 

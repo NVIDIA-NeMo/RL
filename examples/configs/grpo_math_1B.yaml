@@ -12,6 +12,7 @@ grpo:
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
+  masked_sample_rewards_in_baseline: false  # SingleController only: when true, masked incomplete rows still count in the group baseline/std
   advantage_clip_low: null
   advantage_clip_high: null
   max_val_samples: 256
@@ -41,6 +42,10 @@ grpo:
     normalize_rewards: ${grpo.normalize_rewards}
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+    # OPD specific (name: "opd"; see docs/about/algorithms/mopd.md):
+    proximal_teacher_alpha: 1.0  # TR-OPD target alpha*p_teacher + (1-alpha)*p_student, in (0, 1]; 1.0 = plain MOPD
+    distillation_advantage_weight: 1.0  # weight of the per-token distillation advantage
+    outcome_advantage_weight: 0.0  # weight of the GRPO group advantage of the reward; 0.0 = pure distillation
   reward_scaling:
     enabled: false
     source_min: 0.0

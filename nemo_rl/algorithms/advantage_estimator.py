@@ -34,10 +34,12 @@ Reference papers:
 - MOPD: https://arxiv.org/abs/2601.02780
 """
 
-from typing import Literal, Optional
+import math
+from dataclasses import dataclass
+from typing import Annotated, Literal, Optional
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
@@ -53,13 +55,56 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     """Configuration for advantage estimator (GRPO, GDPO, OPD, or Reinforce++)."""
 
     name: Literal["grpo", "gdpo", "opd", "reinforce_plus_plus"] = "grpo"
-    # GRPO specific
+    # GRPO specific; also the outcome term of OPD (see outcome_advantage_weight).
     normalize_rewards: bool = True
     use_leave_one_out_baseline: bool = True
     # GDPO specific: optional per-component weights w_n for the aggregation.
     reward_weights: list[float] | None = None
     # Reinforce++ specific
     minus_baseline: bool = True
+    # OPD specific (name="opd"). TR-OPD proximal teacher: the distillation target is
+    # the mixture alpha * p_teacher + (1 - alpha) * p_student, so each token's
+    # distillation advantage is log(1 - alpha + alpha * p_teacher / p_student), bounded
+    # below by log(1 - alpha). 1.0 is plain MOPD, the raw teacher-student log-ratio.
+    proximal_teacher_alpha: Annotated[float, Field(gt=0.0, le=1.0)] = 1.0
+    # OPD specific: advantage = distillation_advantage_weight * distillation term
+    #   + outcome_advantage_weight * GRPO group advantage of the rollout's reward
+    #   (normalize_rewards and use_leave_one_out_baseline above). 1.0 / 0.0 is pure
+    #   distillation; a positive outcome weight lets failed rollouts (loops, timeouts)
+    #   push their tokens down, which the distillation term alone never does.
+    distillation_advantage_weight: Annotated[float, Field(ge=0.0)] = 1.0
+    outcome_advantage_weight: Annotated[float, Field(ge=0.0)] = 0.0
+
+    @model_validator(mode="after")
+    def validate_opd_fields(self) -> "AdvEstimatorConfig":
+        """Fail loudly on OPD settings that would be ignored or zero the advantage."""
+        changed = [
+            field
+            for field, is_changed in (
+                ("proximal_teacher_alpha", self.proximal_teacher_alpha != 1.0),
+                (
+                    "distillation_advantage_weight",
+                    self.distillation_advantage_weight != 1.0,
+                ),
+                ("outcome_advantage_weight", self.outcome_advantage_weight != 0.0),
+            )
+            if is_changed
+        ]
+        if self.name != "opd" and changed:
+            raise ValueError(
+                f"grpo.adv_estimator.{', '.join(changed)} only apply to name='opd' "
+                f"(got name={self.name!r}); the {self.name} estimator would ignore them."
+            )
+        if (
+            self.name == "opd"
+            and self.distillation_advantage_weight == 0.0
+            and self.outcome_advantage_weight == 0.0
+        ):
+            raise ValueError(
+                "grpo.adv_estimator.distillation_advantage_weight and "
+                "outcome_advantage_weight are both 0: every OPD advantage would be zero."
+            )
+        return self
 
 
 class GAEConfig(BaseModel, extra="allow"):
@@ -630,30 +675,128 @@ class GeneralizedAdvantageEstimator:
         return advantages, returns
 
 
+@dataclass
+class OPDAdvantageParts:
+    """Per-token terms of one OPD advantage computation, each ``[B, S]`` and masked.
+
+    Attributes:
+        teacher_student_gap: Raw ``log p_teacher - log p_student`` of the sampled
+            tokens, before the TR-OPD target and the weights (diagnostic).
+        distillation: ``distillation_advantage_weight`` times the distillation
+            advantage (the TR-OPD target when ``proximal_teacher_alpha`` < 1).
+        outcome: ``outcome_advantage_weight`` times the GRPO group advantage of the
+            rollout's reward, or None when that weight is 0.
+        advantages: ``distillation`` plus ``outcome``: what the loss trains on.
+    """
+
+    teacher_student_gap: torch.Tensor
+    distillation: torch.Tensor
+    outcome: Optional[torch.Tensor]
+    advantages: torch.Tensor
+
+
 class OPDAdvantageEstimator:
     """Multi-Teacher On-Policy Distillation (MOPD) advantage estimator (arXiv:2601.02780).
 
-    Computes token-level distillation advantages:
+    Computes token-level distillation advantages (Equation 8 of the MOPD paper):
         Â_MOPD,t = sg[log π_teacher - log π_student]
 
-    This is Equation 8 from the MOPD paper. The IS truncation (w_t, the
-    hard gate on the training-to-inference ratio) is handled separately by
-    ICE-POP mode in ClippedPGLoss — not here.
+    With ``proximal_teacher_alpha`` < 1 (TR-OPD) the target is the proximal teacher
+    ``alpha * π_teacher + (1 - alpha) * π_student`` instead, so
+        Â_t = sg[log(1 - alpha + alpha * π_teacher / π_student)],
+    which is about ``alpha`` times the log-ratio for small gaps and never below
+    ``log(1 - alpha)``. With ``outcome_advantage_weight`` > 0 the GRPO group advantage
+    of each rollout's reward is added to every token of the rollout:
+        A_t = distillation_advantage_weight * Â_t + outcome_advantage_weight * Â_GRPO.
 
-    The loss function should be configured with:
-        disable_ppo_ratio: true               (REINFORCE, no PPO ratio)
-        use_importance_sampling_correction: true
-        truncated_importance_sampling_type: icepop
-        truncated_importance_sampling_ratio_min: <eps_low>
-        truncated_importance_sampling_ratio: <eps_high>
+    The importance-sampling correction for the sampler/trainer mismatch lives in
+    ClippedPGLoss (the MOPD paper pairs this estimator with REINFORCE and an
+    ICE-POP gate); this estimator only produces advantages.
 
     Required kwargs in compute_advantage:
         teacher_logprobs: [B, S] teacher model log probabilities
         prev_logprobs: [B, S] student training-engine log probabilities
     """
 
-    def __init__(self, estimator_config: dict, loss_config: dict):
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        self.proximal_teacher_alpha = estimator_config.proximal_teacher_alpha
+        self.distillation_advantage_weight = (
+            estimator_config.distillation_advantage_weight
+        )
+        self.outcome_advantage_weight = estimator_config.outcome_advantage_weight
+        # The outcome term is exactly the GRPO estimator on the same block's
+        # normalize_rewards / use_leave_one_out_baseline settings.
+        self._outcome_estimator: Optional[GRPOAdvantageEstimator] = (
+            GRPOAdvantageEstimator(estimator_config, loss_config)
+            if self.outcome_advantage_weight > 0.0
+            else None
+        )
         self.last_metrics: dict[str, float] = {}
+
+    def compute_advantage_parts(
+        self,
+        *,
+        prompt_ids: torch.Tensor,
+        rewards: torch.Tensor,
+        mask: torch.Tensor,
+        teacher_logprobs: Optional[torch.Tensor],
+        prev_logprobs: Optional[torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> OPDAdvantageParts:
+        """Compute the OPD advantage and its terms.
+
+        Args:
+            prompt_ids: [B, L] prompt ids; equal rows form one group for the outcome term.
+            rewards: [B] rollout rewards (used only by the outcome term).
+            mask: [B, S] token mask; every returned term is multiplied by it.
+            teacher_logprobs: [B, S] teacher model logprobs (required).
+            prev_logprobs: [B, S] student training-engine logprobs (required).
+            valid_mask: Optional [B] mask of rollouts whose reward enters the
+                outcome term's per-prompt baseline/std (see GRPOAdvantageEstimator).
+
+        Returns:
+            The masked per-token terms; ``advantages`` is the training advantage.
+        """
+        if teacher_logprobs is None:
+            raise ValueError("OPD requires teacher_logprobs")
+        if prev_logprobs is None:
+            raise ValueError("OPD requires prev_logprobs")
+
+        # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
+        gap = (teacher_logprobs - prev_logprobs).detach()
+        if self.proximal_teacher_alpha == 1.0:
+            distillation = gap
+        else:
+            # TR-OPD: log(alpha * π_teacher + (1 - alpha) * π_student) - log π_student
+            alpha = self.proximal_teacher_alpha
+            proximal_teacher_logprobs = torch.logaddexp(
+                teacher_logprobs + math.log(alpha),
+                prev_logprobs + math.log1p(-alpha),
+            )
+            distillation = (proximal_teacher_logprobs - prev_logprobs).detach()
+        distillation = self.distillation_advantage_weight * distillation * mask
+        advantages = distillation
+
+        outcome: Optional[torch.Tensor] = None
+        if self._outcome_estimator is not None:
+            grpo_advantages = self._outcome_estimator.compute_advantage(
+                prompt_ids, rewards, mask, valid_mask=valid_mask
+            )
+            outcome = (
+                self.outcome_advantage_weight
+                * grpo_advantages.to(device=gap.device, dtype=gap.dtype)
+                * mask
+            )
+            advantages = advantages + outcome
+
+        return OPDAdvantageParts(
+            teacher_student_gap=gap * mask,
+            distillation=distillation,
+            outcome=outcome,
+            advantages=advantages,
+        )
 
     def compute_advantage(
         self,
@@ -662,48 +805,55 @@ class OPDAdvantageEstimator:
         mask,
         teacher_logprobs=None,
         prev_logprobs=None,
+        valid_mask=None,
         **kwargs,
     ):
-        """Compute OPD distillation advantages.
+        """Compute OPD advantages (see compute_advantage_parts for the terms).
 
         Args:
-            prompt_ids: [B] prompt IDs (unused, kept for interface compatibility)
-            rewards: [B] rewards (unused for pure distillation)
+            prompt_ids: [B, L] prompt ids; equal rows form one group for the outcome term.
+            rewards: [B] rewards (used only when outcome_advantage_weight > 0).
             mask: [B, S] token mask
             teacher_logprobs: [B, S] teacher model logprobs (required)
             prev_logprobs: [B, S] student training-engine logprobs (required)
+            valid_mask: Optional [B] rollouts that enter the outcome baseline.
+            **kwargs: Arguments of other estimators (unused).
 
         Returns:
-            [B, S] token-level distillation advantages (stop-gradient)
+            [B, S] token-level advantages (stop-gradient)
         """
-        if teacher_logprobs is None:
-            raise ValueError("OPD requires teacher_logprobs")
-        if prev_logprobs is None:
-            raise ValueError("OPD requires prev_logprobs")
+        parts = self.compute_advantage_parts(
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            mask=mask,
+            teacher_logprobs=teacher_logprobs,
+            prev_logprobs=prev_logprobs,
+            valid_mask=valid_mask,
+        )
+        self._compute_metrics(parts, mask)
+        return parts.advantages
 
-        # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
-        distill_advantages = (teacher_logprobs - prev_logprobs).detach()
-
-        # Apply mask
-        advantages = distill_advantages * mask
-
-        # Metrics
-        self._compute_metrics(distill_advantages, advantages, mask)
-
-        return advantages
-
-    def _compute_metrics(self, distill_advantages, advantages, mask):
+    def _compute_metrics(self, parts: OPDAdvantageParts, mask: torch.Tensor) -> None:
         """Compute OPD logging metrics and store in self.last_metrics."""
         valid_bool = mask.bool()
-        distill_valid = torch.masked_select(distill_advantages, valid_bool)
-        adv_valid = torch.masked_select(advantages, valid_bool)
 
-        distill_mean = distill_valid.mean().item() if distill_valid.numel() > 0 else 0.0
-        adv_mean = adv_valid.mean().item() if adv_valid.numel() > 0 else 0.0
-        adv_std = adv_valid.std().item() if adv_valid.numel() > 1 else 0.0
+        def mean_and_std(values: torch.Tensor) -> tuple[float, float]:
+            selected = torch.masked_select(values, valid_bool)
+            mean = selected.mean().item() if selected.numel() > 0 else 0.0
+            std = selected.std().item() if selected.numel() > 1 else 0.0
+            return mean, std
 
+        gap_mean, _ = mean_and_std(parts.teacher_student_gap)
+        adv_mean, adv_std = mean_and_std(parts.advantages)
+        distill_mean, distill_std = mean_and_std(parts.distillation)
         self.last_metrics = {
-            "on_policy_distillation/teacher_student_logprob_gap_mean": distill_mean,
+            "on_policy_distillation/teacher_student_logprob_gap_mean": gap_mean,
             "on_policy_distillation/adv_mean": adv_mean,
             "on_policy_distillation/adv_std": adv_std,
+            "on_policy_distillation/distill_adv_mean": distill_mean,
+            "on_policy_distillation/distill_adv_std": distill_std,
         }
+        if parts.outcome is not None:
+            outcome_mean, outcome_std = mean_and_std(parts.outcome)
+            self.last_metrics["on_policy_distillation/outcome_adv_mean"] = outcome_mean
+            self.last_metrics["on_policy_distillation/outcome_adv_std"] = outcome_std

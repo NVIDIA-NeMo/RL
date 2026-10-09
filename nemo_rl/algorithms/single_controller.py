@@ -73,6 +73,10 @@ import torch
 from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.advantage_estimator import (
+    OPDAdvantageEstimator,
+    OPDAdvantageParts,
+)
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
     DATA_PLANE_CHECKPOINT_DIR,
@@ -105,6 +109,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     is_ppo_run,
 )
+from nemo_rl.algorithms.single_controller_utils.masking_stats import (
+    accumulate_masking_stats,
+    new_masking_stats_accumulator,
+    reduce_masking_stats,
+)
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
     ROLLOUT_CHECKPOINT_ATTEMPT_REASONS,
@@ -119,16 +128,6 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     prepare_snapshot_paths,
     prune_bootstrap_snapshots,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import (
-    SingleControllerActorArgs,
-    _maybe_restore_native_data_plane_checkpoint,
-    _register_single_controller_partitions,
-)
-from nemo_rl.algorithms.single_controller_utils.masking_stats import (
-    accumulate_masking_stats,
-    new_masking_stats_accumulator,
-    reduce_masking_stats,
-)
 from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
     accumulate_rollout_stats,
     new_rollout_stats_accumulator,
@@ -137,6 +136,11 @@ from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
 )
 from nemo_rl.algorithms.single_controller_utils.sample_masks import (
     baseline_valid_mask,
+)
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    SingleControllerActorArgs,
+    _maybe_restore_native_data_plane_checkpoint,
+    _register_single_controller_partitions,
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
@@ -295,6 +299,58 @@ def _pooled_opd_metrics(
         "on_policy_distillation/adv_mean": mean,
         "on_policy_distillation/adv_std": math.sqrt(max(variance, 0.0)),
     }
+
+
+@dataclass
+class _OPDMoments:
+    """Exact pooled moments of one OPD advantage term over a step's trained tokens."""
+
+    total: float = 0.0
+    total_sq: float = 0.0
+    total_abs: float = 0.0
+    count: int = 0
+
+    def add(self, values: torch.Tensor) -> None:
+        """Fold one chunk's selected per-token values into the moments."""
+        values = values.detach().double()
+        self.total += float(values.sum())
+        self.total_sq += float((values * values).sum())
+        self.total_abs += float(values.abs().sum())
+        self.count += int(values.numel())
+
+
+def _accumulate_opd_term_moments(
+    moments: dict[str, _OPDMoments], parts: OPDAdvantageParts, valid: torch.Tensor
+) -> None:
+    """Pool one chunk's OPD terms (advantage, distillation, outcome) over valid tokens."""
+    terms = {"adv": parts.advantages, "distill_adv": parts.distillation}
+    if parts.outcome is not None:
+        terms["outcome_adv"] = parts.outcome
+    for name, values in terms.items():
+        moments.setdefault(name, _OPDMoments()).add(torch.masked_select(values, valid))
+
+
+def _pooled_opd_term_metrics(moments: dict[str, _OPDMoments]) -> dict[str, float]:
+    """Whole-step mean, std and mean absolute value of each pooled OPD term.
+
+    ``adv`` is the estimator's advantage before clipping and message penalties; once
+    the estimator reports terms it replaces the gap-based ``adv_mean``/``adv_std``
+    of _pooled_opd_metrics.
+    """
+    metrics: dict[str, float] = {}
+    for name, term in moments.items():
+        if term.count <= 0:
+            continue
+        mean = term.total / term.count
+        variance = (
+            (term.total_sq - term.count * mean * mean) / (term.count - 1)
+            if term.count > 1
+            else 0.0
+        )
+        metrics[f"on_policy_distillation/{name}_mean"] = mean
+        metrics[f"on_policy_distillation/{name}_std"] = math.sqrt(max(variance, 0.0))
+        metrics[f"on_policy_distillation/{name}_abs_mean"] = term.total_abs / term.count
+    return metrics
 
 
 def _train_fields_for_step(
@@ -707,6 +763,8 @@ class SingleControllerActor:
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
+        # Per-term moments of the OPD advantage (advantage, distillation, outcome).
+        self._opd_term_moments: dict[str, _OPDMoments] = {}
 
         # Seeded here rather than in run(): on resume _trainer_version is the
         # checkpoint's step, so a run resuming mid-warmup needs the widened
@@ -3113,9 +3171,11 @@ class SingleControllerActor:
                         self._opd_stat_count,
                     )
                 )
+                step_metrics.update(_pooled_opd_term_metrics(self._opd_term_moments))
                 self._opd_stat_sum = 0.0
                 self._opd_stat_sumsq = 0.0
                 self._opd_stat_count = 0
+                self._opd_term_moments = {}
                 if self._teacher_coordinator is not None:
                     step_metrics.update(self._teacher_coordinator.drain_metrics())
 
@@ -5197,7 +5257,21 @@ class SingleControllerActor:
         # Value-model estimators (GAE) hand back the regression target alongside
         # the advantages; the group-relative ones return a bare tensor.
         returns: Optional[torch.Tensor] = None
-        if has_valid_training_tokens:
+        # OPD's per-term breakdown (distillation / outcome), pooled into step metrics.
+        opd_parts: Optional[OPDAdvantageParts] = None
+        if has_valid_training_tokens and isinstance(
+            self._advantage_estimator, OPDAdvantageEstimator
+        ):
+            opd_parts = self._advantage_estimator.compute_advantage_parts(
+                prompt_ids=prompt_ids,
+                rewards=rewards,
+                mask=mask,
+                teacher_logprobs=kwargs["teacher_logprobs"],
+                prev_logprobs=kwargs["prev_logprobs"],
+                valid_mask=baseline_mask,
+            )
+            result = opd_parts.advantages
+        elif has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
@@ -5211,6 +5285,7 @@ class SingleControllerActor:
                 valid_mask=baseline_mask,
                 **kwargs,
             )
+        if has_valid_training_tokens:
             if self._is_ppo:
                 advantages, returns = result
             else:
@@ -5266,14 +5341,26 @@ class SingleControllerActor:
         except Exception as error:  # metrics must never fail a step
             log.warning("Skipping rollout_stats accumulation: %s", error)
         if self._teacher_logprobs_required:
-            valid = response_advantages.detach().double()
-            self._opd_stat_sum += float(valid.sum())
-            self._opd_stat_sumsq += float((valid * valid).sum())
-            self._opd_stat_count += int(valid.numel())
+            # The raw teacher-student gap of the trained tokens, independent of
+            # the TR-OPD target, the advantage weights and message penalties.
+            gap = (
+                torch.masked_select(
+                    kwargs["teacher_logprobs"] - kwargs["prev_logprobs"], mask.bool()
+                )
+                .detach()
+                .double()
+            )
+            self._opd_stat_sum += float(gap.sum())
+            self._opd_stat_sumsq += float((gap * gap).sum())
+            self._opd_stat_count += int(gap.numel())
+            if opd_parts is not None:
+                _accumulate_opd_term_moments(
+                    self._opd_term_moments, opd_parts, mask.bool()
+                )
 
-        # OPD accumulates its statistics from the estimator output above. The
-        # ordinary advantage metrics and policy training use the clipped values,
-        # matching the legacy paths.
+        # OPD statistics above come from the raw gap and the estimator's terms
+        # before clipping. The ordinary advantage metrics and policy training use
+        # the clipped values, matching the legacy paths.
         if not self._is_ppo:
             assert isinstance(self._algo_cfg, GRPOConfig)
             advantages = _clip_grpo_advantages(
