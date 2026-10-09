@@ -108,10 +108,19 @@ class _LegacyWindowedSubclass(_MinSampler, WindowedSampler):
         )
 
 
-def _shared_prefix_controller(monkeypatch, sampler, *, num_prompts_per_step, dp):
+def _shared_prefix_controller(
+    monkeypatch,
+    sampler,
+    *,
+    num_prompts_per_step,
+    dp,
+    shared_prefix=True,
+    min_groups_for_streaming_train=1,
+):
     ctrl = _train_pump_controller(sampler=sampler)
-    ctrl._shared_prefix_logprobs_enabled = True
+    ctrl._shared_prefix_logprobs_enabled = shared_prefix
     ctrl._algo_cfg.num_prompts_per_step = num_prompts_per_step
+    ctrl._async_cfg.min_groups_for_streaming_train = min_groups_for_streaming_train
     ctrl._rollout_exhausted.clear()
     ctrl._buffer_capacity = asyncio.Semaphore(64)
     ctrl._trainer = _ShardedTrainer(dp)
@@ -149,6 +158,55 @@ def test_aligned_step_without_sampler_alignment_takes_exact_dp_chunks(monkeypatc
     ] == [
         (4, 4),
         (4, 4),
+    ]
+    assert all("prompt_group_multiple" not in c for c in sampler.calls)
+
+
+def test_streaming_chunks_round_up_to_whole_dp_groups(monkeypatch):
+    # 12 groups at DP 4 with a 5-group streaming minimum: 8 (5 rounded up to
+    # whole DP groups), then the 4-group remainder.
+    sampler = _MinSampler()
+    ctrl = _shared_prefix_controller(
+        monkeypatch,
+        sampler,
+        num_prompts_per_step=12,
+        dp=4,
+        min_groups_for_streaming_train=5,
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+
+    assert ctrl._train_steps == 1
+    assert [
+        (c["min_prompt_groups"], c["max_prompt_groups"]) for c in sampler.calls
+    ] == [
+        (8, 8),
+        (4, 4),
+    ]
+    assert ctrl._trainer.train_calls == 2
+
+
+def test_dense_pump_never_aligns_to_dp(monkeypatch):
+    # The default path keeps exact streaming chunks, even when the step is not
+    # a multiple of DP, and needs no shared-prefix attribute on the trainer.
+    sampler = _MinSampler()
+    ctrl = _shared_prefix_controller(
+        monkeypatch,
+        sampler,
+        num_prompts_per_step=6,
+        dp=4,
+        shared_prefix=False,
+        min_groups_for_streaming_train=5,
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+
+    assert ctrl._train_steps == 1
+    assert [
+        (c["min_prompt_groups"], c["max_prompt_groups"]) for c in sampler.calls
+    ] == [
+        (5, 6),
+        (1, 1),
     ]
     assert all("prompt_group_multiple" not in c for c in sampler.calls)
 

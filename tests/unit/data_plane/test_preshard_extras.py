@@ -30,7 +30,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from nemo_rl.data.packing.shared_prefix_metadata import SHARED_PREFIX_EXECUTION_SLOT
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
@@ -225,35 +224,6 @@ def _tagged_group_meta(group_sizes: list[int]) -> KVBatchMeta:
         sequence_lengths=lengths,
         extra_info={},
         tags=tags,
-    )
-
-
-def test_shard_meta_for_dp_shared_prefix_groups_rows_by_group_id_tag():
-    pytest.importorskip("megatron.rl.shared_prefix_metadata")
-    meta = _tagged_group_meta([4, 4, 4, 4])
-
-    shards, _ = shard_meta_for_dp(
-        meta,
-        dp_world=2,
-        sequence_packing_args={
-            "max_tokens_per_microbatch": 256,
-            "sequence_length_pad_multiple": 1,
-        },
-        shared_prefix_groups=True,
-    )
-
-    ranks_by_group: dict[str, set[int]] = {}
-    for rank, shard in enumerate(shards):
-        assert shard.tags is not None
-        assert len(shard.extra_info[SHARED_PREFIX_EXECUTION_SLOT]) == len(
-            shard.sample_ids
-        )
-        for tag in shard.tags:
-            ranks_by_group.setdefault(tag[GROUP_ID_TAG], set()).add(rank)
-    assert sorted(ranks_by_group) == [f"group{group}" for group in range(4)]
-    assert all(len(ranks) == 1 for ranks in ranks_by_group.values())
-    assert sorted(k for shard in shards for k in shard.sample_ids) == sorted(
-        meta.sample_ids
     )
 
 

@@ -11,43 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared-prefix transport through the data plane and the train pump.
+"""Shared-prefix transport through the data plane.
 
 Covers the driver-side pieces between rollout and the Megatron worker:
 complete-group DP sharding with prescribed execution slots, the reassembler's
-prompt-length column and group tags, the rollout partition schema, and the
-train pump's DP-aligned prompt-group selection.
-
-Cross-module API assumptions. Other review fixes edit these modules
-concurrently; update this file if one of them changes:
-
-- ``shard_meta_for_dp(meta, dp_world=, batch_size=, sequence_packing_args=,
-  shared_prefix_groups=True, shared_prefix_work_weights=)`` returns per-rank
-  metas plus a permutation for ``BatchedDataDict.reorder_data`` (or None). It
-  groups rows by prompt group: the PR head parses ``{group}_g{index}`` sample
-  IDs and the review fix reads the ``GROUP_ID_TAG`` row tag. The metas here
-  carry both, consistently, so the tests hold for either key.
-- Work-weighted sharding reads a ``SHARED_PREFIX_PROMPT_LENGTHS`` tag per row.
-- ``RolloutReassembler(include_shared_prefix_metadata=True)`` publishes the
-  ``SHARED_PREFIX_PROMPT_LENGTHS`` column (verified prompt length, 0 for a
-  placeholder) and a ``GROUP_ID_TAG`` tag on every row, and does not tag
-  prompt lengths.
-- ``_register_single_controller_partitions(dp_client, master_config=,
-  partition_id=, include_multimodal_fields=)``.
-- The train pump gates DP alignment on the controller attribute
-  ``_shared_prefix_logprobs_enabled`` (class default False, set from the policy
-  config). At the PR head it reads ``trainer.shared_prefix_training_config``
-  instead, so the pump tests fail there by design (review entry 4.2).
+prompt-length column and group tags, and the rollout partition schema. The
+train pump's DP-aligned prompt-group selection is covered in
+``tests/unit/single_controller/test_shared_prefix_controller.py``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import random
 from collections import defaultdict
-from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -73,25 +50,25 @@ _GROUP_SIZE = 4
 
 
 def _grouped_meta() -> KVBatchMeta:
-    """Eight prompt groups of four rows each, interleaved across the batch."""
+    """Eight prompt groups of four rows each, interleaved across the batch.
+
+    Only the ``GROUP_ID_TAG`` row tag names the group: sample ids are opaque and
+    do not follow the ``{group}_g{index}`` rollout naming.
+    """
     rng = random.Random(0)
     rows = []
     for group in range(_GROUPS):
         prompt_length = rng.randint(20, 60)
-        for index in range(_GROUP_SIZE):
+        for _ in range(_GROUP_SIZE):
             rows.append(
-                (
-                    f"grp{group}",
-                    index,
-                    prompt_length,
-                    prompt_length + rng.randint(1, 90),
-                )
+                (f"grp{group}", prompt_length, prompt_length + rng.randint(1, 90))
             )
     rng.shuffle(rows)
+    sample_ids = [f"row{row}" for row in range(len(rows))]
     return KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
-        sample_ids=[f"{group}_g{index}" for group, index, _, _ in rows],
+        sample_ids=sample_ids,
         fields=["input_ids"],
         sequence_lengths=[length for *_, length in rows],
         extra_info={},
@@ -99,9 +76,9 @@ def _grouped_meta() -> KVBatchMeta:
             {
                 GROUP_ID_TAG: group,
                 SHARED_PREFIX_PROMPT_LENGTHS: prompt_length,
-                "owner": f"{group}_g{index}",
+                "owner": sample_id,
             }
-            for group, index, prompt_length, _ in rows
+            for sample_id, (group, prompt_length, _) in zip(sample_ids, rows)
         ],
     )
 
@@ -391,96 +368,3 @@ def test_reassembler_publishes_prompt_lengths_and_group_tags(tq_client):
     finally:
         tq_client.clear_samples(sample_ids=None, partition_id=_STAGING_PARTITION)
         tq_client.clear_samples(sample_ids=None, partition_id=_CANONICAL_PARTITION)
-
-
-def _pump_controller(monkeypatch, *, num_prompts_per_step, dp_world, shared_prefix):
-    """The repo's train-pump double with a DP axis and a min-groups sampler."""
-    import nemo_rl.algorithms.single_controller as single_controller
-    from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
-    from tests.unit.single_controller.test_single_controller_actor import (
-        _EmptySampler,
-        _NoOpTrainer,
-        _train_pump_controller,
-    )
-
-    class _ShardedTrainer(_NoOpTrainer):
-        # No shared-prefix attributes: the gate must come from the controller.
-        def __init__(self) -> None:
-            self.sharding_annotations = SimpleNamespace(
-                get_axis_size=lambda axis: dp_world
-            )
-            self.train_calls = 0
-
-        def train_microbatches_from_meta(self, meta, *, train_fields):
-            del meta, train_fields
-            self.train_calls += 1
-
-    class _MinGroupsSampler(_EmptySampler):
-        """Returns exactly ``min_prompt_groups`` fresh groups."""
-
-        def __init__(self) -> None:
-            self.calls: list[dict[str, Any]] = []
-            self.next_group = 0
-
-        async def select(self, **kwargs):
-            BaseSampler._validate_group_bounds(
-                kwargs["min_prompt_groups"], kwargs["max_prompt_groups"]
-            )
-            self.calls.append(dict(kwargs))
-            count = kwargs["min_prompt_groups"]
-            groups = [f"grp{self.next_group + offset}" for offset in range(count)]
-            self.next_group += count
-            meta = KVBatchMeta(
-                partition_id="rollout_data",
-                task_name="train",
-                sample_ids=[f"{group}_g0" for group in groups],
-                fields=[],
-                sequence_lengths=[1] * count,
-                tags=[{"weight_version": 0, GROUP_ID_TAG: group} for group in groups],
-            )
-            return meta, count
-
-    sampler = _MinGroupsSampler()
-    controller = _train_pump_controller(sampler=sampler)
-    controller._shared_prefix_logprobs_enabled = shared_prefix
-    controller._algo_cfg.num_prompts_per_step = num_prompts_per_step
-    controller._async_cfg.min_groups_for_streaming_train = 5
-    controller._rollout_exhausted.clear()
-    controller._buffer_capacity = asyncio.Semaphore(64)
-    controller._trainer = _ShardedTrainer()
-    controller._sync_weights = AsyncMock(return_value=0)
-    controller._logger = MagicMock()
-    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
-    return controller, sampler
-
-
-def test_train_pump_rounds_shared_prefix_chunks_up_to_whole_dp_groups(monkeypatch):
-    # 12 groups at DP 4 with a 5-group streaming minimum: 8 (5 rounded up to
-    # whole DP groups), then the 4-group remainder.
-    controller, sampler = _pump_controller(
-        monkeypatch, num_prompts_per_step=12, dp_world=4, shared_prefix=True
-    )
-
-    asyncio.run(asyncio.wait_for(controller._train_pump(), timeout=5.0))
-
-    assert controller._train_steps == 1
-    assert [
-        (call["min_prompt_groups"], call["max_prompt_groups"]) for call in sampler.calls
-    ] == [(8, 8), (4, 4)]
-    assert controller._trainer.train_calls == 2
-
-
-def test_train_pump_without_shared_prefix_never_aligns_to_dp(monkeypatch):
-    # The default path keeps exact streaming chunks, even when the step is not
-    # a multiple of DP, and needs no shared-prefix attribute on the trainer.
-    controller, sampler = _pump_controller(
-        monkeypatch, num_prompts_per_step=6, dp_world=4, shared_prefix=False
-    )
-
-    asyncio.run(asyncio.wait_for(controller._train_pump(), timeout=5.0))
-
-    assert controller._train_steps == 1
-    assert [
-        (call["min_prompt_groups"], call["max_prompt_groups"]) for call in sampler.calls
-    ] == [(5, 6), (1, 1)]
-    assert all("prompt_group_multiple" not in call for call in sampler.calls)
