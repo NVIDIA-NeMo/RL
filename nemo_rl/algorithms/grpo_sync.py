@@ -808,7 +808,7 @@ def grpo_train_sync(
                         # baseline of the env reward for the pct_* diagnostics.
                         driver_carry["env_baseline"], _, _ = (
                             calculate_baseline_and_std_per_prompt(
-                                driver_carry["prompt_ids_for_adv"],
+                                prompt_group_ids,
                                 driver_carry["env_reward"],
                                 torch.ones_like(driver_carry["env_reward"]),
                                 leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,

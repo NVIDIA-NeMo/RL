@@ -3506,7 +3506,7 @@ def _grpo_train_impl(
                         # Stored on the batch so dynamic sampling filters it.
                         repeated_batch["env_baseline"], _, _ = (
                             calculate_baseline_and_std_per_prompt(
-                                input_ids,
+                                repeated_batch[PROMPT_GROUP_IDS_KEY],
                                 repeated_batch["env_reward"],
                                 torch.ones_like(rewards),
                                 leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
