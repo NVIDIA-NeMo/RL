@@ -2834,17 +2834,30 @@ def compute_and_apply_seq_logprob_error_masking(
 
     Args:
         train_data: Training data dict containing token_mask, sample_mask,
-                   prev_logprobs, and generation_logprobs. If masking is applied,
-                   sample_mask will be updated in-place.
+                   prev_logprobs, and generation_logprobs. Invalid policy tokens
+                   are excluded from token_mask; threshold filtering updates sample_mask.
         rewards: Reward tensor for computing statistics on masked sequences.
         seq_logprob_error_threshold: If set, mask sequences with mult_prob_error
-                                    exceeding this threshold. If None, only compute metrics.
+                                    exceeding this threshold. None disables error-threshold
+                                    filtering, but token/sample validity still applies.
 
     Returns:
         Dict with keys: max_seq_mult_prob_error, mean_seq_mult_prob_error,
         min_seq_mult_prob_error, max/mean/min_seq_mult_prob_error_after_mask,
         num_masked_seqs, masked_correct_pct
     """
+    # Apply the previous forward's support mask before global training counts.
+    # Worker-local mask changes do not cross the get_logprobs RPC boundary.
+    train_data["token_mask"] = train_data["token_mask"] * ~torch.isneginf(
+        train_data["prev_logprobs"]
+    )
+    train_data["sample_mask"] = train_data["sample_mask"] * train_data["token_mask"][
+        :, 1:
+    ].bool().any(dim=-1)
+    train_data["prev_logprobs"] = torch.where(
+        train_data["token_mask"].bool(), train_data["prev_logprobs"], 0.0
+    )
+
     # Compute sequence-level logprob error metrics (always)
     token_mask = train_data["token_mask"][:, 1:]
     sample_mask = train_data["sample_mask"]
