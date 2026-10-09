@@ -887,8 +887,9 @@ class RolloutReassembler:
                     f"rollout {row.rollout_id}"
                 )
             routed[i, : row_routes.shape[0]] = row_routes
+            # The final token never has a recorded route; don't count it.
             sentinel_tokens += int(
-                row_routes.eq(ROUTE_MISSING_SENTINEL).all(-1).all(-1).sum().item()
+                row_routes[:-1].eq(ROUTE_MISSING_SENTINEL).all(-1).all(-1).sum().item()
             )
         if valid_rows:
             metrics["finalize/routed_experts_row_coverage"] = (

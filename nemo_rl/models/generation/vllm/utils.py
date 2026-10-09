@@ -331,8 +331,9 @@ def pad_and_align_routed_expert_indices(
     routes_to_copy = min(expected_routes, routed.shape[0])
     if routes_to_copy > 0:
         full[:routes_to_copy] = routed[:routes_to_copy].to(device=device)
-    if stats["missing_routes"] > 0:
-        full[routes_to_copy:expected_routes] = R3_MISSING_ROUTE_SENTINEL
+    # Missing routes and the final token (never run through the model) have no
+    # recorded route; the sentinel makes Megatron route those tokens itself.
+    full[routes_to_copy:valid_length] = R3_MISSING_ROUTE_SENTINEL
     return (full, stats) if return_stats else full
 
 

@@ -292,10 +292,12 @@ def test_normalize_routed_experts_full_sequence_alignment():
         routed_experts[:5],
         completion_output.routed_experts.to(ROUTED_EXPERTS_FALLBACK_DTYPE),
     )
+    # The final token (position 5) has no route; batch padding keeps a valid one.
+    assert routed_experts[5].eq(R3_MISSING_ROUTE_SENTINEL).all()
     expected_default_route = torch.tensor(
         [0, 1], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
     ).view(1, 1, 2)
-    assert torch.equal(routed_experts[5:], expected_default_route.expand(3, 3, 2))
+    assert torch.equal(routed_experts[6:], expected_default_route.expand(2, 3, 2))
 
 
 def test_normalize_routed_experts_concatenates_prompt_and_decode():
@@ -319,15 +321,12 @@ def test_normalize_routed_experts_concatenates_prompt_and_decode():
         device=torch.device("cpu"),
     )
 
-    expected_default_route = torch.tensor(
-        [0, 1], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
-    ).view(1, 1, 2)
     assert torch.equal(routed_experts[:2], request_output.prompt_routed_experts)
     assert torch.equal(routed_experts[2:4], completion_output.routed_experts[:2])
-    assert torch.equal(routed_experts[4:], expected_default_route.expand(1, 1, 2))
+    assert routed_experts[4].eq(R3_MISSING_ROUTE_SENTINEL).all()
 
 
-def test_normalize_routed_experts_uses_valid_dummy_route_for_missing_last_token():
+def test_normalize_routed_experts_uses_missing_route_sentinel_for_last_token():
     class Output:
         pass
 
@@ -349,14 +348,15 @@ def test_normalize_routed_experts_uses_valid_dummy_route_for_missing_last_token(
         device=torch.device("cpu"),
     )
 
+    assert torch.equal(routed_experts[:2], completion_output.routed_experts)
+    assert routed_experts[2].eq(R3_MISSING_ROUTE_SENTINEL).all()
     expected_default_route = torch.tensor(
         [0, 1, 2], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
     ).view(1, 1, 3)
-    assert torch.equal(routed_experts[:2], completion_output.routed_experts)
-    assert torch.equal(routed_experts[2:], expected_default_route.expand(3, 2, 3))
+    assert torch.equal(routed_experts[3:], expected_default_route.expand(2, 2, 3))
 
 
-def test_normalize_routed_experts_keeps_final_token_dummy_even_if_vllm_returns_route():
+def test_normalize_routed_experts_final_token_is_sentinel_even_if_vllm_returns_route():
     class Output:
         pass
 
@@ -379,11 +379,8 @@ def test_normalize_routed_experts_keeps_final_token_dummy_even_if_vllm_returns_r
         device=torch.device("cpu"),
     )
 
-    expected_default_route = torch.tensor(
-        [0, 1, 2], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
-    ).view(1, 1, 3)
     assert torch.equal(routed_experts[:2], completion_output.routed_experts[:2])
-    assert torch.equal(routed_experts[2:], expected_default_route.expand(1, 2, 3))
+    assert routed_experts[2].eq(R3_MISSING_ROUTE_SENTINEL).all()
 
 
 def test_normalize_routed_experts_strict_mode_marks_missing_routes_for_fallback():
@@ -420,10 +417,7 @@ def test_normalize_routed_experts_strict_mode_marks_missing_routes_for_fallback(
             (3, 1, 2), R3_MISSING_ROUTE_SENTINEL, dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
         ),
     )
-    expected_default_route = torch.tensor(
-        [0, 1], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
-    ).view(1, 1, 2)
-    assert torch.equal(routed_experts[5:], expected_default_route)
+    assert routed_experts[5].eq(R3_MISSING_ROUTE_SENTINEL).all()
 
 
 def test_normalize_routed_experts_can_reject_missing_routes_when_fallback_disabled():
@@ -513,14 +507,14 @@ def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_i
         [[10]],
         [[11]],
         [[30]],
-        [[0]],
+        [[R3_MISSING_ROUTE_SENTINEL]],
     ]
     assert _decoded_routes(response.choices[1].message.routed_experts) == [
         [[10]],
         [[11]],
         [[31]],
         [[32]],
-        [[0]],
+        [[R3_MISSING_ROUTE_SENTINEL]],
     ]
 
 
@@ -582,7 +576,7 @@ def test_attach_routed_experts_to_chat_response_choices_warns_on_missing_routes(
         [[11]],
         [[R3_MISSING_ROUTE_SENTINEL]],
         [[R3_MISSING_ROUTE_SENTINEL]],
-        [[0]],
+        [[R3_MISSING_ROUTE_SENTINEL]],
     ]
 
 
