@@ -5,16 +5,31 @@ logger:
   wandb:
     project: nemo-rl-single-controller-example
     name: ppo-deepseek-r1-distill-qwen-7b-8n4g-megatron-noncolocated-async-single-controller
+  swanlab:
+    name: ppo_dapo_megatron_1B
+  mlflow:
+    run_name: ppo_dapo_megatron_1B
 ppo:
   num_prompts_per_step: 2048
+  num_generations_per_prompt: 1
   ppo_epochs: 1
   critic_ppo_epochs: 1
   policy_training_start_step: 400
+  overlong_filtering: true
   skip_reference_policy_logprobs_calculation: false
+  adv_estimator:
+    gae_lambda_policy: 1
+    gae_lambda_value: 1.0
 loss_fn:
   reference_policy_kl_penalty: 0.001
+  ratio_clip_max: 0.2
+  ratio_clip_c: 3
+  use_importance_sampling_correction: true
   truncated_importance_sampling_type: tis
   truncated_importance_sampling_ratio: 5
+value_loss_fn:
+  scale: 1.0
+  cliprange: 0.5
 policy:
   model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
   tokenizer:
@@ -33,6 +48,13 @@ policy:
     logprob_mb_tokens: 18432
   megatron_cfg:
     defer_fp32_logits: true
+    optimizer:
+      weight_decay: 0.01
+    scheduler:
+      start_weight_decay: 0.01
+      end_weight_decay: 0.01
+      lr_warmup_iters: 0
+      lr_warmup_init: 0
   generation:
     max_new_tokens: 18432
     colocated:
@@ -56,17 +78,25 @@ value:
   megatron_cfg:
     optimizer:
       lr: 2.0e-05
+      weight_decay: 0.01
     scheduler:
       start_weight_decay: 0.01
       end_weight_decay: 0.01
+      lr_warmup_iters: 0
 cluster:
   num_nodes: 8
   gpus_per_node: 4
 async_rl:
   sampler:
     warmup_lookahead_versions: 2
+  recompute_kv_cache_after_weight_updates: true
   max_inflight_prompts: ${mul:${ppo.num_prompts_per_step}, 3}
   max_buffered_rollouts: ${mul:${ppo.num_prompts_per_step}, 3}
 checkpointing:
   enabled: true
   checkpoint_dir: results/ppo-deepseek-r1-distill-qwen-7b-8n4g-megatron-noncolocated-async-single-controller
+  save_period: 10
+data_plane:
+  observability:
+    enabled: true
+    verify_tensor_hash: false
