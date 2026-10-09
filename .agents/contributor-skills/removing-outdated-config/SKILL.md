@@ -1,7 +1,6 @@
 ---
 name: removing-outdated-config
-description: How to remove or rename a config key in NeMo-RL so stale configs fail at startup with the migration to apply, instead of failing deep in a run or being silently ignored.
-when_to_use: Removing a config key, renaming one, or changing the shape a key accepts; 'delete this config option', 'this key is no longer used', 'migrate the config', during review of a PR that drops a YAML key.
+description: How to remove or rename a config key in NeMo-RL so stale configs fail at startup with the migration to apply, instead of failing deep in a run or being silently ignored. Use when removing a config key, renaming one, or changing the shape a key accepts; 'delete this config option', 'this key is no longer used', 'migrate the config', during review of a PR that drops a YAML key.
 ---
 
 # Removing a Config Key

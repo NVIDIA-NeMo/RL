@@ -1,7 +1,6 @@
 ---
 name: testing
-description: Testing conventions for NeMo-RL. Covers Ray actor coverage pragmas, nightly test requirements, and recipe naming rules.
-when_to_use: Writing or reviewing tests; adding a nightly test; naming a recipe; 'coverage pragma', 'Ray actor test', 'nightly test requirement', 'how to name recipes', during code review of test files.
+description: Testing conventions for NeMo-RL. Covers Ray actor coverage pragmas, nightly test requirements, and recipe naming rules. Use when writing or reviewing tests; adding a nightly test; naming a recipe; 'coverage pragma', 'Ray actor test', 'nightly test requirement', 'how to name recipes', during code review of test files.
 ---
 
 # Testing Conventions
