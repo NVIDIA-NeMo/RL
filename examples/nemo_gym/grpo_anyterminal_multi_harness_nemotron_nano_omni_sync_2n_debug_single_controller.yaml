@@ -63,6 +63,11 @@ env:
   nemo_gym:
     is_trajectory_collection: false
     skip_venv_if_present: true
+    # First-run portable harness setup can exceed 30 minutes on shared NFS.
+    # Let the scheduler allocation, rather than an internal startup timer,
+    # define the boundary for this interactive debugging recipe.
+    server_spinup_timeout_seconds: 0
+    model_endpoint_readiness_timeout_seconds: 0
     port_range_low: 5000
     port_range_high: 5999
     config_paths:
