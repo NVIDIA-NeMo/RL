@@ -985,7 +985,6 @@ def process_shared_prefix_microbatch(
                 data_dict["input_ids"],
                 input_lengths=data_dict["input_lengths"],
                 layout=unit.shared_layout,
-                materialize_attention_mask=False,
             )
             cp_shard = shard_shared_prefix_tensor_bin_for_context_parallel(
                 tensor_bin,
