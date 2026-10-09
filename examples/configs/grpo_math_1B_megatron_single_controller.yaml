@@ -194,7 +194,9 @@ policy:
   # the Megatron backend with megatron.rl importable in the driver environment,
   # top_p=1.0 with top_k disabled, and make_sequence_length_divisible_by set to
   # a multiple of the TP/CP alignment M (1 at TP1/CP1, 2*CP at TP1, 2*TP*CP
-  # otherwise). Unknown keys are rejected.
+  # otherwise). They also require router_replay disabled, zero
+  # async_rl.rollout_failure drop budgets, and num_prompts_per_step a multiple
+  # of the policy data-parallel size. Unknown keys are rejected.
   # shared_prefix_training:
   #   # disabled | dense (conventional packing, comparison control) |
   #   # logprobs (share prefixes in logprob forwards) | train (logprobs and training)

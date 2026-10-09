@@ -11,14 +11,17 @@ group subdivision and sharding, execution slots and plans, tensor
 materialization, TP/CP geometry, real-row alignment, and reconstruction within
 dense training bins. NeMo RL translates `BatchedDataDict` fields and policy
 configuration into that API, selects the conventional length-only packer,
-transports metadata, and coordinates worker execution. Existing NeMo packing
-imports delegate to the canonical Megatron implementation.
+transports metadata, and coordinates worker execution. NeMo RL imports
+`megatron.rl` lazily, only on shared-prefix paths, and does not re-export it:
+`nemo_rl.data.packing` keeps only the row-metadata field names and
+`with_prompt_length_tags`.
 
 The matching Megatron package must be available in both the driver and model
 worker environments when shared-prefix planning is enabled. Its pure packing
 modules do not initialize the GPU model or depend on NeMo RL. Standard dense
 NeMo imports do not require the optional Megatron backend. Portable packing
-tests are owned by Megatron; NeMo retains adapter and metadata-transport tests.
+tests are owned by Megatron; NeMo tests cover configuration validation,
+metadata transport, driver-side sharding and worker integration.
 
 The canonical `PackedTreeLayout` stores physical token spans, logical lengths,
 and parent node indices. Current packing emits stars/forests and uses that
@@ -64,6 +67,7 @@ policy:
     algorithm: modified_first_fit_decreasing
     train_mb_tokens: 32768
     logprob_mb_tokens: 32768
+  make_sequence_length_divisible_by: 16  # a multiple of M = 2 * TP * CP
   megatron_cfg:
     enabled: true
     pipeline_model_parallel_size: 1
@@ -78,7 +82,18 @@ policy:
 
 Shared execution requires the single-controller GRPO launcher with `data_plane.enabled: true` and `token_capture.enabled: true` in its existing algorithm configuration. Standard GRPO setup rejects `train` and `logprobs` modes because it does not produce group identities or prompt boundaries. Prompt boundaries are captured from the rollout rather than inferred from padded tokens. Workers must use the matching MCore shared-prefix implementation and its capability checks.
 
-Set `policy.generation.top_p: 1.0` and disable `policy.generation.top_k` (`null`, `0`, or `-1`). Shared next-token logprob extraction does not support top-k/top-p filtering, and configuration validation rejects it before policy workers are allocated. Temperature scaling remains supported. `bypass_evaluation_mtp` is accepted only in `dense`, `logprobs`, or `train` mode; disable it when switching to `disabled` or `observe`.
+Shared execution also requires the following. Validation rejects a violation before policy workers are allocated, except for the data-parallel condition, which the controller checks before the first training chunk.
+
+- `policy.router_replay` disabled.
+- `policy.megatron_cfg.moe_hybridep_prepad_packed_inputs` disabled with the flex HybridEP dispatcher.
+- A deterministic `policy.sequence_packing.algorithm` (not `first_fit_shuffle`) and no `pair_grouping_key`.
+- An explicit `policy.make_sequence_length_divisible_by` that is a multiple of the TP/CP alignment M: 1 at TP1/CP1, 2×CP at TP1 with CP>1, and 2×TP×CP at TP>1. Both `train_mb_tokens` and `logprob_mb_tokens` must also be multiples of it.
+- `async_rl.rollout_failure.max_skipped_prompts: 0` and `max_consecutive_dropped_prompts: 0`, because a dropped prompt can leave a step that no longer splits into complete data-parallel groups.
+- `grpo.num_prompts_per_step` a multiple of the policy data-parallel size, because complete prompt groups are assigned to DP ranks.
+
+Unknown keys under `policy.shared_prefix_training` are rejected. The commented block in `examples/configs/grpo_math_1B_megatron_single_controller.yaml` lists every key at its default.
+
+Set `policy.generation.top_p: 1.0` and disable `policy.generation.top_k` (`null`, `0`, or `-1`). Shared next-token logprob extraction does not support top-k/top-p filtering, and configuration validation rejects it before policy workers are allocated. Temperature scaling remains supported. `bypass_evaluation_mtp` is accepted only in `dense`, `logprobs`, or `train` mode; disable it when switching to `disabled`.
 
 For the ragged Mamba implementation studied in the experiments, set `NRL_SP_MAMBA_IMPL=ragged_state_fork` in worker environments. The backend's default `state_fork` is a different implementation. Other `NRL_SP_*` switches are experimental/diagnostic controls, not a supported tuning API. Their presence does not mean those variants were measured or qualified; do not enable them when reproducing the default configuration.
 
