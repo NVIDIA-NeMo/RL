@@ -340,12 +340,8 @@ def _register_single_controller_partitions(
             DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
-    shared_prefix_config = get_shared_prefix_training_config(policy_config)
-    if shared_prefix_config.enabled_for(stage="logprobs"):
-        if not token_capture_cfg.enabled:
-            raise ValueError(
-                "This shared-prefix port requires token_capture.enabled=true"
-            )
+    # setup_single_controller has already required token capture for this.
+    if get_shared_prefix_training_config(policy_config).enabled_for(stage="logprobs"):
         partition_fields.append(SHARED_PREFIX_PROMPT_LENGTHS)
     if include_multimodal_fields:
         partition_fields.extend(
@@ -1270,6 +1266,31 @@ def setup_single_controller(
                 UserWarning,
                 stacklevel=2,
             )
+    shared_prefix_enabled = get_shared_prefix_training_config(
+        policy_config
+    ).enabled_for(stage="logprobs")
+    if shared_prefix_enabled:
+        # Checked here, before any worker is allocated, rather than when the
+        # partitions are registered after every cluster is already built.
+        if not token_capture_cfg.enabled:
+            raise ValueError(
+                "policy.shared_prefix_training requires token_capture.enabled=true: "
+                "the rollout reassembler produces the per-row prompt lengths"
+            )
+        # A dropped prompt shrinks its step target (InOrderSampler) to a count
+        # that need not split into complete DP groups, and "replace" falls back
+        # to shrinking once its spares run out.
+        failure_cfg = master_config.async_rl.rollout_failure
+        if (
+            failure_cfg.max_skipped_prompts
+            or failure_cfg.max_consecutive_dropped_prompts
+        ):
+            raise ValueError(
+                "policy.shared_prefix_training requires "
+                "async_rl.rollout_failure.max_skipped_prompts=0 and "
+                "max_consecutive_dropped_prompts=0: a dropped prompt can leave a "
+                "step that no longer splits into complete data-parallel groups"
+            )
     if token_capture_cfg.enabled:
         if not should_use_nemo_gym(master_config):
             raise ValueError(
@@ -2020,9 +2041,7 @@ def setup_single_controller(
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
-                include_shared_prefix_metadata=get_shared_prefix_training_config(
-                    policy_config
-                ).enabled_for(stage="logprobs"),
+                include_shared_prefix_metadata=shared_prefix_enabled,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
