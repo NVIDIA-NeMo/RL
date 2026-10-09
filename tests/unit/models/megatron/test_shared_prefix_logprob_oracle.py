@@ -61,6 +61,7 @@ modules concurrently; update this file if one of them changes:
 
 import functools
 import hashlib
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -135,7 +136,9 @@ class _Case:
     # TransferQueue delivers group IDs as a numpy object array.
     numpy_group_ids: bool = False
     mtp_loss_mask: bool = False
-    # Structure the case must exercise: "stars", "forest" or "fallback".
+    # Structure the case must exercise beyond at least one shared unit: "stars",
+    # "forest", "fallback", "fragments" (a prompt split across shared units) or
+    # "forest_fragments" (a prompt split across roots of one forest).
     expect: Optional[str] = None
 
 
@@ -150,7 +153,20 @@ _CASES = {
     ),
     "forest": _Case(_SPEC_A, 12, _PACK, 512, numpy_group_ids=True, expect="forest"),
     "forest_small_bins": _Case(_SPEC_A, 13, _PACK, 160, expect="forest"),
-    "split_slots": _Case(_SPEC_A, 21, _PACK, 512, split_slots=True),
+    # repack_groups re-plans each complete group and ignores prescribed slots,
+    # so split slots run without it: five fragment stars and three singleton
+    # fallbacks, or, with pack_groups, one five-root forest and the fallbacks.
+    "split_slots": _Case(
+        _SPEC_A, 21, {"mode": "train"}, 512, split_slots=True, expect="fragments"
+    ),
+    "split_slots_packed": _Case(
+        _SPEC_A,
+        24,
+        {"mode": "train", "pack_groups": True},
+        512,
+        split_slots=True,
+        expect="forest_fragments",
+    ),
     "dense_bins": _Case(_SPEC_A, 14, _DENSE_BINS, 160),
     "fallbacks": _Case(
         _SPEC_B, 22, _PACK, 1024, placeholders=("g4",), expect="fallback"
@@ -609,12 +625,40 @@ def _check_case(
         else len(tuple(microbatch.shared_prefix.tensor_bin.layout.iter_roots()))
         for microbatch in seen
     ]
+    # An all-dense plan would pass the numeric checks below trivially.
+    assert any(count is not None for count in roots), roots
+    group_ids = batch[SHARED_PREFIX_GROUP_ID]
+    layouts = [
+        microbatch.shared_prefix.tensor_bin.layout
+        for microbatch in seen
+        if microbatch.shared_prefix is not None
+    ]
     if case.expect == "stars":
-        assert roots and all(count == 1 for count in roots), roots
+        assert all(count == 1 for count in roots), roots
     elif case.expect == "forest":
         assert any(count is not None and count > 1 for count in roots), roots
     elif case.expect == "fallback":
-        assert None in roots and any(count is not None for count in roots), roots
+        assert None in roots, roots
+    elif case.expect == "fragments":
+        units_per_group = Counter(
+            group
+            for layout in layouts
+            for group in {group_ids[row] for row in layout.row_indices}
+        )
+        assert max(units_per_group.values()) >= 2, units_per_group
+    elif case.expect == "forest_fragments":
+        roots_per_group = [
+            Counter(
+                group
+                for _, root in layout.iter_roots()
+                for group in {group_ids[row] for row in root.row_indices}
+            )
+            for layout in layouts
+        ]
+        assert None in roots, roots
+        assert any(max(counts.values()) >= 2 for counts in roots_per_group), (
+            roots_per_group
+        )
 
     # Summed unit losses equal the dense loss, and the CP/TP-summed gradient
     # matches it too: a dropped CP normalization or a non-differentiable CP
