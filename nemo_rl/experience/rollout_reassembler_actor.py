@@ -16,16 +16,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import ray
 
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.venvs import make_actor_runtime_env
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.rollouts import EffortLevelsConfig
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,8 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
+    reward_checks: tuple[RewardChecks | None, ...] | None = None
+    reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +72,8 @@ class RolloutReassemblerActorConfig:
     # column to; required with ``capture_media`` (the reassembler mints empty
     # media rows in this geometry for groups without media), ``None`` otherwise.
     media_columns: Optional[MediaColumnSpec]
+    reward_penalty_config: RewardPenaltyConfig | None = None
+    effort_config: EffortLevelsConfig | None = None
 
 
 @ray.remote(
@@ -92,6 +101,8 @@ class RolloutReassemblerActor:  # pragma: no cover
             max_seq_len=config.max_seq_len,
             capture_media=config.capture_media,
             media_columns=config.media_columns,
+            reward_penalty_config=config.reward_penalty_config,
+            effort_config=config.effort_config,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
@@ -134,6 +145,12 @@ class RolloutReassemblerActor:  # pragma: no cover
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
             canonical_sample_ids=list(request.canonical_sample_ids),
+            reward_checks=list(request.reward_checks)
+            if request.reward_checks is not None
+            else None,
+            reward_log_contexts=list(request.reward_log_contexts)
+            if request.reward_log_contexts is not None
+            else None,
         )
         assert_metadata_only(result)
         return result

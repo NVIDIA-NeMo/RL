@@ -27,7 +27,7 @@ policy:
   make_sequence_length_divisible_by: 1
   optimizer: null
   scheduler: null
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true

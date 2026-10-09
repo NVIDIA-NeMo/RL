@@ -115,7 +115,7 @@ def mock_tp_mesh():
 @pytest.fixture
 def base_cfg():
     return {
-        "dtensor_cfg": {"sequence_parallel": False},
+        "automodel_cfg": {"sequence_parallel": False},
         "sequence_packing": {"train_mb_tokens": 256},
         "generation": {"temperature": 1.0, "top_p": 1.0, "top_k": None},
     }
@@ -805,7 +805,7 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([data_dict1, data_dict2])
 
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
             "sequence_packing": {"enabled": False},
         }
 
