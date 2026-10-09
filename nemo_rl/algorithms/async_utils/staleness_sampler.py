@@ -75,7 +75,10 @@ class PromptGroupSampler(Protocol):
     ``supports_buffer_checkpoint = True``. It must additionally declare
     ``supports_training_claims = True`` before periodic rollout snapshots may
     be enabled; omitting that optional capability preserves the legacy
-    remove-on-selection behavior.
+    remove-on-selection behavior. A sampler whose ``select`` accepts
+    ``prompt_group_multiple`` declares ``supports_prompt_group_multiple = True``
+    in its own class body (the controller does not honor an inherited flag);
+    the controller otherwise pins shared-prefix chunks to ``min_prompt_groups``.
     """
 
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
@@ -103,6 +106,8 @@ class PromptGroupSampler(Protocol):
         Claim-aware samplers transfer the groups from ordinary replay-buffer
         selection into training ownership until the controller releases them.
         Legacy custom samplers may still remove selected groups immediately.
+        Samplers declaring ``supports_prompt_group_multiple`` also accept a
+        ``prompt_group_multiple`` keyword and return a multiple of it.
         """
         ...
 
@@ -173,6 +178,10 @@ class BaseSampler(abc.ABC):
 
     supports_buffer_checkpoint: ClassVar[bool] = False
     supports_training_claims: ClassVar[bool] = True
+    # Opt-in per concrete class: the controller reads it from the sampler
+    # class's own ``__dict__``, so a subclass (of this or of a built-in) that
+    # overrides ``select`` without the keyword never inherits it.
+    supports_prompt_group_multiple: ClassVar[bool] = False
 
     def __init__(self, buffer: TQReplayBuffer) -> None:
         self._buffer = buffer
@@ -226,6 +235,7 @@ class BaseSampler(abc.ABC):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        prompt_group_multiple: int = 1,
     ) -> tuple[Optional[KVBatchMeta], int]: ...
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -321,6 +331,7 @@ class WindowedSampler(BaseSampler):
 
     # Ungated restored groups are ordinary in-window candidates.
     supports_buffer_checkpoint: ClassVar[bool] = True
+    supports_prompt_group_multiple: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -380,6 +391,7 @@ class WindowedSampler(BaseSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        prompt_group_multiple: int = 1,
     ) -> tuple[Optional[KVBatchMeta], int]:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
@@ -397,7 +409,7 @@ class WindowedSampler(BaseSampler):
                 )
             )
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs, min_prompt_groups, max_prompt_groups, prompt_group_multiple
         )
 
 
@@ -475,6 +487,7 @@ class ReadyFirstSampler(_GatedSampler):
 
     # Committed groups retain start_weight, which is sufficient for selection.
     supports_buffer_checkpoint: ClassVar[bool] = True
+    supports_prompt_group_multiple: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -517,6 +530,7 @@ class WeightFifoSampler(_GatedSampler):
 
     # Committed groups retain start_weight, which is sufficient for selection.
     supports_buffer_checkpoint: ClassVar[bool] = True
+    supports_prompt_group_multiple: ClassVar[bool] = True
 
     def __init__(self, buffer: TQReplayBuffer, *, max_staleness_versions: int) -> None:
         super().__init__(buffer, gate_window=max_staleness_versions)
@@ -528,6 +542,7 @@ class WeightFifoSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        prompt_group_multiple: int = 1,
     ) -> tuple[Optional[KVBatchMeta], int]:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
@@ -545,7 +560,7 @@ class WeightFifoSampler(_GatedSampler):
             if weight == target_version and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs, min_prompt_groups, max_prompt_groups, prompt_group_multiple
         )
 
 
@@ -568,6 +583,7 @@ class InOrderSampler(_GatedSampler):
     # Committed groups retain target_step, which is sufficient for selection.
     # The controller checkpoints the exact dispatch cursor separately.
     supports_buffer_checkpoint: ClassVar[bool] = True
+    supports_prompt_group_multiple: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -598,6 +614,7 @@ class InOrderSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        prompt_group_multiple: int = 1,
     ) -> tuple[Optional[KVBatchMeta], int]:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         valid_idxs = [
@@ -606,7 +623,7 @@ class InOrderSampler(_GatedSampler):
             if target == current_train_weight and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs, min_prompt_groups, max_prompt_groups, prompt_group_multiple
         )
 
     async def evict(self, *, current_train_weight: int) -> int:
