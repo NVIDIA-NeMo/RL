@@ -18,7 +18,7 @@ import traceback
 import warnings
 from datetime import timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Iterable, Optional, cast
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -57,6 +57,101 @@ POLICY_WORKER_OVERRIDES = {
 
 _NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
 _NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
+
+LoraRefitMode = Literal["native", "merged"]
+
+
+def is_lora_enabled(policy_config: "PolicyConfig") -> bool:
+    """Return whether either supported training backend has LoRA enabled."""
+    automodel_config = policy_config.get("automodel_cfg") or {}
+    automodel_lora = automodel_config.get("lora_cfg") or {}
+    megatron_config = policy_config.get("megatron_cfg") or {}
+    megatron_lora = megatron_config.get("peft") or {}
+    return bool(
+        (automodel_config.get("enabled") and automodel_lora.get("enabled"))
+        or (megatron_config.get("enabled") and megatron_lora.get("enabled"))
+    )
+
+
+def validate_lora_refit_policy_config(
+    policy_config: "PolicyConfig",
+) -> LoraRefitMode | None:
+    """Validate backend-independent policy requirements for LoRA refit."""
+    if not is_lora_enabled(policy_config):
+        return None
+
+    raw_generation_config = policy_config.get("generation")
+    if raw_generation_config is None:
+        return None
+    generation_config = cast(dict[str, Any], raw_generation_config)
+
+    if "lora_refit_mode" not in generation_config:
+        raise KeyError(
+            "LoRA training with rollout requires policy.generation.lora_refit_mode."
+        )
+    mode = generation_config["lora_refit_mode"]
+    if mode not in ("native", "merged"):
+        raise ValueError(
+            "policy.generation.lora_refit_mode must be 'native' or 'merged'."
+        )
+    if mode == "merged":
+        return cast(LoraRefitMode, mode)
+
+    if generation_config["backend"] != "vllm":
+        raise ValueError(
+            "Native LoRA refit requires policy.generation.backend=vllm. "
+            "Use lora_refit_mode=merged with other rollout backends."
+        )
+
+    automodel_config = policy_config.get("automodel_cfg") or {}
+    automodel_lora = automodel_config.get("lora_cfg") or {}
+    megatron_config = policy_config.get("megatron_cfg") or {}
+    megatron_lora = megatron_config.get("peft") or {}
+    if not (
+        automodel_config.get("enabled")
+        and automodel_lora.get("enabled")
+        and not (megatron_config.get("enabled") and megatron_lora.get("enabled"))
+    ):
+        raise ValueError(
+            "Native LoRA refit currently requires the Automodel LoRA policy. "
+            "Set policy.generation.lora_refit_mode=merged for Megatron LoRA."
+        )
+    if automodel_lora.get("use_dora"):
+        raise ValueError(
+            "Native LoRA refit does not support use_dora=true because vLLM "
+            "cannot apply the additional trainable magnitude vector."
+        )
+    if automodel_lora.get("moe_rank_scaling"):
+        raise ValueError(
+            "Native LoRA refit does not support moe_rank_scaling=true because "
+            "vLLM currently accepts one adapter rank and scaling factor."
+        )
+    if policy_config["precision"] not in (
+        "bfloat16",
+        "bf16",
+        "float16",
+        "fp16",
+    ):
+        raise ValueError(
+            "Native LoRA refit currently supports bfloat16 or float16 policy "
+            f"precision, got {policy_config['precision']!r}."
+        )
+    return cast(LoraRefitMode, mode)
+
+
+def configure_lora_refit(policy_config: "PolicyConfig") -> None:
+    """Validate LoRA refit for every backend and configure native vLLM."""
+    mode = validate_lora_refit_policy_config(policy_config)
+    if mode != "native":
+        return
+
+    from nemo_rl.models.generation.vllm.lora_utils import (
+        configure_vllm_lora_refit,
+        validate_vllm_lora_refit,
+    )
+
+    validate_vllm_lora_refit(policy_config)
+    configure_vllm_lora_refit(policy_config)
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
