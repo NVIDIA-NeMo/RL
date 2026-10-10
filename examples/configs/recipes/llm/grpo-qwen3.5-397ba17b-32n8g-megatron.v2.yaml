@@ -25,6 +25,9 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 8192
+  # Cap the two refit staging buffers at 2 GiB each so the 8 GiB grouped-expert
+  # export still has enough contiguous GPU headroom.
+  refit_buffer_size_gb: 4
   automodel_cfg:
     enabled: false
   sequence_packing:
