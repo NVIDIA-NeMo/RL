@@ -37,6 +37,7 @@ dependencies = [
   "wandb>=0.30.0",                                                                                       # Address dependency vulnerabilities in bundled wandb-core
   "numpy",
   "datasets>=4.0.0",
+  "pyarrow",                                                                                             # for Parquet trace dumps (logger.trace_format)
   "rich",
   "math-verify",
   "accelerate>=0.26",

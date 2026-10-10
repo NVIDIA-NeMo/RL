@@ -358,9 +358,9 @@ def validate_sync(
         flush=True,
     )
     if logger is not None:
-        logger.log_batched_dict_as_jsonl(
+        logger.log_batched_dict_as_trace(
             {"content": all_message_logs, "rewards": total_rewards},
-            f"val_data_step{step}.jsonl",
+            f"val_data_step{step}",
         )
     timer.reset()
     gc.collect()
@@ -1378,23 +1378,24 @@ def grpo_train_sync(
                 else:
                     log_data["rewards"] = rewards.tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
-                log_data["token_loss_mask"] = token_mask.tolist()
+                # Per-token fields stay tensors; the trace writers convert per sample.
+                log_data["token_loss_mask"] = token_mask
                 log_data["sample_loss_mask"] = sample_mask.tolist()
-                log_data["advantages"] = advantages.tolist()
-                log_data["generation_logprobs"] = generation_logprobs.tolist()
-                log_data["prev_logprobs"] = prev_logprobs.tolist()
+                log_data["advantages"] = advantages
+                log_data["generation_logprobs"] = generation_logprobs
+                log_data["prev_logprobs"] = prev_logprobs
                 # input_ids was stashed before the step-end clear_samples (the
                 # keys are no longer in TQ at this point); ``_log_input_ids``
                 # is None when nemo_gym-responses logging path skipped the
                 # outer ``if not _should_log_nemo_gym_responses`` branch.
                 if _log_input_ids is not None:
-                    log_data["token_ids"] = _log_input_ids.tolist()
+                    log_data["token_ids"] = _log_input_ids
                 # ``content`` (raw assistant text) is fetched from TQ as
                 # an object-array column above (stashed before clear_samples).
                 if _log_content is not None:
                     log_data["content"] = _log_content.tolist()
-                logger.log_batched_dict_as_jsonl(
-                    log_data, f"train_data_step{total_steps + 1}.jsonl"
+                logger.log_batched_dict_as_trace(
+                    log_data, f"train_data_step{total_steps + 1}"
                 )
                 del log_data
 

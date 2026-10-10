@@ -4109,17 +4109,16 @@ def _grpo_train_impl(
                     log_data["filtered_rewards"] = rewards.tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
-                log_data["token_ids"] = train_data["input_ids"].tolist()
-                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+                # Per-token fields stay tensors; the trace writers convert per sample.
+                log_data["token_ids"] = train_data["input_ids"]
+                log_data["token_loss_mask"] = train_data["token_mask"]
                 log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
-                log_data["advantages"] = train_data["advantages"].tolist()
-                log_data["generation_logprobs"] = train_data[
-                    "generation_logprobs"
-                ].tolist()
-                log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+                log_data["advantages"] = train_data["advantages"]
+                log_data["generation_logprobs"] = train_data["generation_logprobs"]
+                log_data["prev_logprobs"] = train_data["prev_logprobs"]
 
-                logger.log_batched_dict_as_jsonl(
-                    log_data, f"train_data_step{total_steps + 1}.jsonl"
+                logger.log_batched_dict_as_trace(
+                    log_data, f"train_data_step{total_steps + 1}"
                 )
                 del log_data
             del flat_messages
@@ -4527,7 +4526,7 @@ def validate(
             "content": all_message_logs,
             "rewards": total_rewards,
         }
-        logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
+        logger.log_batched_dict_as_trace(val_log_data, f"val_data_step{step}")
 
     # Make sure to reset the timer after validation
     timer.reset()
@@ -6032,17 +6031,14 @@ def async_grpo_train(
                     log_data["filtered_rewards"] = rewards.tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
-                log_data["token_ids"] = train_data["input_ids"].tolist()
-                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+                # Per-token fields stay tensors; the trace writers convert per sample.
+                log_data["token_ids"] = train_data["input_ids"]
+                log_data["token_loss_mask"] = train_data["token_mask"]
                 log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
-                log_data["advantages"] = train_data["advantages"].tolist()
-                log_data["generation_logprobs"] = train_data[
-                    "generation_logprobs"
-                ].tolist()
-                log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-                logger.log_batched_dict_as_jsonl(
-                    log_data, f"train_data_step{step + 1}.jsonl"
-                )
+                log_data["advantages"] = train_data["advantages"]
+                log_data["generation_logprobs"] = train_data["generation_logprobs"]
+                log_data["prev_logprobs"] = train_data["prev_logprobs"]
+                logger.log_batched_dict_as_trace(log_data, f"train_data_step{step + 1}")
                 del log_data
             del train_data
             del flat_messages_content

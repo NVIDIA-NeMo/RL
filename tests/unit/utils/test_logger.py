@@ -22,6 +22,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 
@@ -2461,3 +2463,99 @@ def test_print_message_log_samples(capsys):
     assert "What is 2+2?" in captured.out
     assert "2+2 = 4" in captured.out
     assert "Sample 1 | Reward: 1.0000" in captured.out
+
+
+class TestTraceDump:
+    """Parquet trace dumps hold the same values as the JSONL dump."""
+
+    @pytest.fixture
+    def trace_logger(self, tmp_path):
+        cfg = LoggerConfig(
+            monitor_gpus=False, log_dir=str(tmp_path), trace_format="parquet"
+        )
+        return Logger(cfg)
+
+    @staticmethod
+    def _batch():
+        return {
+            "agent_ref": [
+                {"type": "agent", "name": "a"},
+                {"type": "agent", "name": "b"},
+            ],
+            "content": [["system", "user turn"], ["only turn"]],
+            "rewards": [1.0, -0.5],
+            "input_lengths": torch.tensor([3, 2]),
+            "token_ids": torch.tensor([[5, 6, 7, 0], [8, 9, 0, 0]]),
+            "advantages": torch.tensor([[0.25] * 4, [-1.5] * 4]),
+            "prev_logprobs": torch.tensor(
+                [[0.0, -1.1, -2.2, -9.0], [0.0, -0.3, 0.0, 0.0]], dtype=torch.bfloat16
+            ),
+            # Arrow cannot type tensors nested in dicts: stored as JSON strings.
+            "message_log": [
+                [{"role": "user", "token_ids": torch.tensor([1, 2])}],
+                [{"role": "assistant", "token_ids": torch.tensor([3])}],
+            ],
+        }
+
+    def test_parquet_matches_jsonl(self, trace_logger, tmp_path):
+        trace_logger.log_batched_dict_as_trace(self._batch(), "trace")
+        trace_logger.flush_traces()
+        trace_logger.log_batched_dict_as_jsonl(self._batch(), "trace.jsonl")
+
+        rows = pq.read_table(tmp_path / "trace.parquet").to_pylist()
+        with open(tmp_path / "trace.jsonl") as f:
+            records = [json.loads(line) for line in f]
+        assert len(rows) == len(records) == 2
+        for row, record in zip(rows, records):
+            assert row["idx"] == record["idx"]
+            for key in self._batch():
+                value = row[key]
+                if key == "message_log":
+                    value = json.loads(value)
+                # JSONL records keep a batch dimension of 1.
+                assert value == record[key][0], key
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_falls_back_to_jsonl(self, trace_logger, tmp_path):
+        with patch(
+            "nemo_rl.utils.logger.pq.write_table", side_effect=pa.ArrowInvalid("boom")
+        ):
+            trace_logger.log_batched_dict_as_trace(self._batch(), "trace")
+            trace_logger.flush_traces()
+
+        assert (tmp_path / "trace.jsonl").exists()
+        assert not (tmp_path / "trace.parquet").exists()
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_jsonl_when_format_unset(self, tmp_path):
+        logger = Logger(LoggerConfig(monitor_gpus=False, log_dir=str(tmp_path)))
+        logger.log_batched_dict_as_trace(self._batch(), "trace")
+        assert (tmp_path / "trace.jsonl").exists()
+
+    def test_async_writes_snapshot(self, trace_logger, tmp_path):
+        """In-place edits after handoff never reach the file."""
+        batch = self._batch()
+        trace_logger.log_batched_dict_as_trace(batch, "trace")
+        batch["token_ids"].fill_(-1)
+        batch["content"][0].append("edited")
+        trace_logger.flush_traces()
+
+        rows = pq.read_table(tmp_path / "trace.parquet").to_pylist()
+        assert rows[0]["token_ids"] == [5, 6, 7, 0]
+        assert rows[0]["content"] == ["system", "user turn"]
+
+    def test_async_failure_is_reported_not_raised(self, trace_logger, tmp_path, capsys):
+        def write_partial_then_fail(table, where, **kwargs):
+            with open(where, "wb") as f:
+                f.write(b"partial")
+            raise OSError("disk full")
+
+        with patch(
+            "nemo_rl.utils.logger.pq.write_table", side_effect=write_partial_then_fail
+        ):
+            trace_logger.log_batched_dict_as_trace(self._batch(), "trace")
+            trace_logger.flush_traces()
+
+        assert "Background trace dump failed" in capsys.readouterr().out
+        assert not (tmp_path / "trace.parquet").exists()
+        assert not list(tmp_path.glob("*.tmp"))
