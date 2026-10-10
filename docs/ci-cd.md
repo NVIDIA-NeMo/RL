@@ -12,13 +12,19 @@ Tests are organized into levels of increasing scope and cost:
 | **L0** | Doctests + unit tests (3 parallel suites: Generation, Policy, Other) | `CI:L0` label |
 | **L1** | Doctests + unit tests + functional tests (GPU) | `CI:L1` label, push to main/merge-group |
 | **L2** | Full suite including convergence tests | `CI:L2` label |
-| **Lfast** | Fast unit + functional tests, reuses pre-built main container (skips build) | `CI:Lfast` label |
+| **Lfast** | Fast unit + functional tests, reuses pre-built main container (skips build); PRs to a release branch (e.g. `r0.8.0`) reuse that branch's container, which is published only by builds of the release branch itself (pushes after merges), never by PR builds; until the first such build exists, Lfast on that branch cannot pull its image | `CI:Lfast` label |
 
 **Defaults:**
 - PRs do not run tests unless a CI label is applied.
 - Pushes to `main` and merge-group events force **L1**.
 - Nightly scheduled runs (09:00 UTC) run the full suite.
 - Doc-only changes are auto-detected and skip unnecessary tests.
+
+## Shared Build Caches
+
+- The prebuilt `main` container and the TRT-LLM ccache/wheel cache images are written only by builds of `main` itself. PR builds read them but never push to them.
+- Release branches (`r<major>.<minor>.<patch>`) get their own container tag (`:<branch>`), `<branch>-buildcache` and branch-scoped TRT-LLM caches, written only by pushes to that branch (manual dispatches on a release branch publish nothing shared). They never write `main`'s caches or the `uv-cache` image.
+- A PR's own image is tagged with its run ID and PR number only.
 
 ## Triggering CI on Pull Requests
 
