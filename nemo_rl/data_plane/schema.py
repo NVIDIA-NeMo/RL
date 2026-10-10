@@ -70,6 +70,17 @@ OPD_FULL_FIELDS = (OPD_FULL_HIDDEN_STATES_FIELD, OPD_FULL_LOGITS_FIELD)
 # during training. Not jagged/token-aligned -- one int per sample.
 OPD_FULL_TEACHER_INDEX_FIELD = "opd_full_teacher_index"
 
+# Sampled-token MOPD teacher columns. ``TEACHER_REFERENCE_LOGPROBS`` is the
+# distillation teacher's log-prob of each sampled token. With a contrast teacher
+# (``on_policy_distillation.contrast_negative_teacher``, the checkpoint the
+# teacher's RL started from), the same rows also get ``TEACHER_NEGATIVE_LOGPROBS``
+# and the estimator distills the difference, i.e. what RL taught the teacher.
+# ``TEACHER_LP_OUTPUT_FIELD`` is the ``KVBatchMeta.extra_info`` key naming which of
+# the two columns a teacher forward writes.
+TEACHER_REFERENCE_LOGPROBS = "teacher_reference_logprobs"
+TEACHER_NEGATIVE_LOGPROBS = "teacher_negative_logprobs"
+TEACHER_LP_OUTPUT_FIELD = "teacher_lp_output_field"
+
 
 # Full known tensor schema for SingleController's long-lived rollout partition.
 # The initial rollout put writes the first seven payload fields; later stages add
@@ -84,7 +95,8 @@ SC_ROLLOUT_SCHEMA_FIELDS = (
     "total_reward",
     "values",
     "returns",
-    "teacher_reference_logprobs",
+    TEACHER_REFERENCE_LOGPROBS,
+    TEACHER_NEGATIVE_LOGPROBS,
     *OPD_FULL_FIELDS,
     OPD_FULL_TEACHER_INDEX_FIELD,
     INVALID_TOOL_CALL_MASK,

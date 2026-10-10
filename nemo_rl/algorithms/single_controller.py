@@ -326,6 +326,8 @@ def _accumulate_opd_term_moments(
     terms = {"adv": parts.advantages, "distill_adv": parts.distillation}
     if parts.outcome is not None:
         terms["outcome_adv"] = parts.outcome
+    if parts.contrast_gap is not None:
+        terms["contrast_gap"] = parts.contrast_gap
     for name, values in terms.items():
         moments.setdefault(name, _OPDMoments()).add(torch.masked_select(values, valid))
 
@@ -440,6 +442,11 @@ class SingleControllerActor:
             and not self._algo_cfg.skip_reference_policy_logprobs_calculation
         )
         self._teacher_logprobs_required = opd_module.is_opd_enabled(master_config)
+        # Contrast teacher: a second per-token column the estimator subtracts
+        # from the teacher's (see OPDAdvantageEstimator.contrast_teacher).
+        self._contrast_logprobs_required = opd_module.is_contrast_teacher_enabled(
+            master_config
+        )
         self._train_fields = _train_fields_for_step(
             policy_logprobs_required=self._policy_logprobs_required,
             reference_logprobs_required=self._reference_logprobs_required,
@@ -5052,7 +5059,11 @@ class SingleControllerActor:
             # weights everywhere; a refused reset is worth a loud line in the run log.
             print(
                 "  _sync_weights: generation prefix/KV caches "
-                + ("reset after refit" if reset_ok else "NOT reset after refit (see worker logs)"),
+                + (
+                    "reset after refit"
+                    if reset_ok
+                    else "NOT reset after refit (see worker logs)"
+                ),
                 flush=True,
             )
         elapsed = time.monotonic() - t0
@@ -5230,6 +5241,11 @@ class SingleControllerActor:
                 data,
                 adv_cfg.teacher_logprobs_field,
             )
+        if self._contrast_logprobs_required:
+            kwargs["negative_teacher_logprobs"] = tensor_field(
+                data,
+                adv_cfg.negative_teacher_logprobs_field,
+            )
         if self._is_ppo:
             kwargs["values"] = tensor_field(data, adv_cfg.values_field)
 
@@ -5276,6 +5292,7 @@ class SingleControllerActor:
                 teacher_logprobs=kwargs["teacher_logprobs"],
                 prev_logprobs=kwargs["prev_logprobs"],
                 valid_mask=baseline_mask,
+                negative_teacher_logprobs=kwargs.get("negative_teacher_logprobs"),
             )
             result = opd_parts.advantages
         elif has_valid_training_tokens:
@@ -5427,6 +5444,8 @@ class SingleControllerActor:
             fields.append(adv_cfg.reference_logprobs_field)
         if self._teacher_logprobs_required:
             fields.append(adv_cfg.teacher_logprobs_field)
+        if self._contrast_logprobs_required:
+            fields.append(adv_cfg.negative_teacher_logprobs_field)
         if self._is_ppo:
             fields.append(adv_cfg.values_field)
         return list(dict.fromkeys(fields))

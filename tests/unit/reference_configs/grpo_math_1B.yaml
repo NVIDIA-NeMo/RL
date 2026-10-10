@@ -45,6 +45,11 @@ grpo:
     proximal_teacher_alpha: 1.0  # TR-OPD target alpha*p_teacher + (1-alpha)*p_student, in (0, 1]; 1.0 = plain MOPD
     distillation_advantage_weight: 1.0  # weight of the per-token distillation advantage
     outcome_advantage_weight: 0.0  # weight of the GRPO group advantage of the reward; 0.0 = pure distillation
+    # Contrast teacher (on_policy_distillation.contrast_negative_teacher): distill
+    #   contrast_alpha * (log p_teacher - log p_contrast), clipped to +-contrast_clip when set.
+    contrast_teacher: false
+    contrast_alpha: 1.0
+    contrast_clip: null
   reward_scaling:
     enabled: false
     source_min: 0.0

@@ -33,7 +33,12 @@ from nemo_rl.algorithms.opd import TeacherResourceConfig
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
 from nemo_rl.data_plane.column_io import round_up
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN, TEACHER_LP_FIELDS
+from nemo_rl.data_plane.schema import (
+    GLOBAL_FORWARD_PAD_SEQLEN,
+    TEACHER_LP_FIELDS,
+    TEACHER_LP_OUTPUT_FIELD,
+    TEACHER_REFERENCE_LOGPROBS,
+)
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -297,8 +302,16 @@ class TeacherWorkerGroup:
             )
         )
 
-    def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
-        """Dispatch a TQ metadata batch; workers fetch and write teacher logprobs."""
+    def get_logprobs_from_meta(
+        self,
+        meta: KVBatchMeta,
+        output_field: str = TEACHER_REFERENCE_LOGPROBS,
+    ) -> None:
+        """Dispatch a TQ metadata batch; workers fetch and write teacher logprobs.
+
+        ``output_field`` is the data-plane column the workers write; the contrast
+        teacher of a sampled-token MOPD run writes ``TEACHER_NEGATIVE_LOGPROBS``.
+        """
         if not meta.sequence_lengths:
             raise ValueError(
                 f"Teacher {self.alias!r} requires sequence_lengths in TQ metadata"
@@ -323,6 +336,7 @@ class TeacherWorkerGroup:
                 GLOBAL_FORWARD_PAD_SEQLEN: round_up(
                     max(meta.sequence_lengths), sequence_pad_multiple
                 ),
+                TEACHER_LP_OUTPUT_FIELD: output_field,
             },
         )
         sequence_packing_args = None

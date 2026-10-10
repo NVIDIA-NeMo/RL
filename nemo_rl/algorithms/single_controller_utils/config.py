@@ -1595,6 +1595,8 @@ class AdvantageConfig:
     generation_logprobs_field: str = "generation_logprobs"
     reference_logprobs_field: str = "reference_policy_logprobs"
     teacher_logprobs_field: str = "teacher_reference_logprobs"
+    # Contrast teacher column (on_policy_distillation.contrast_negative_teacher).
+    negative_teacher_logprobs_field: str = "teacher_negative_logprobs"
     # PPO only: the critic's pre-update prediction (input) and GAE's
     # regression target for it (output).
     values_field: str = "values"

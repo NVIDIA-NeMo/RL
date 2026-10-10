@@ -74,6 +74,15 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     #   push their tokens down, which the distillation term alone never does.
     distillation_advantage_weight: Annotated[float, Field(ge=0.0)] = 1.0
     outcome_advantage_weight: Annotated[float, Field(ge=0.0)] = 0.0
+    # OPD specific, contrast teacher (on_policy_distillation.contrast_negative_teacher
+    # must name the checkpoint the teacher's RL started from). The distillation term
+    # becomes contrast_alpha * (log p_teacher - log p_contrast) on the sampled tokens,
+    # clipped to [-contrast_clip, contrast_clip] when set: the teacher's RL-induced
+    # token preference, free of the style the pair shares. Incompatible with the
+    # TR-OPD target (proximal_teacher_alpha < 1), which mixes toward the teacher itself.
+    contrast_teacher: bool = False
+    contrast_alpha: Annotated[float, Field(gt=0.0)] = 1.0
+    contrast_clip: Optional[Annotated[float, Field(gt=0.0)]] = None
 
     @model_validator(mode="after")
     def validate_opd_fields(self) -> "AdvEstimatorConfig":
@@ -87,6 +96,9 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
                     self.distillation_advantage_weight != 1.0,
                 ),
                 ("outcome_advantage_weight", self.outcome_advantage_weight != 0.0),
+                ("contrast_teacher", self.contrast_teacher),
+                ("contrast_alpha", self.contrast_alpha != 1.0),
+                ("contrast_clip", self.contrast_clip is not None),
             )
             if is_changed
         ]
@@ -94,6 +106,20 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
             raise ValueError(
                 f"grpo.adv_estimator.{', '.join(changed)} only apply to name='opd' "
                 f"(got name={self.name!r}); the {self.name} estimator would ignore them."
+            )
+        if not self.contrast_teacher and (
+            self.contrast_alpha != 1.0 or self.contrast_clip is not None
+        ):
+            raise ValueError(
+                "grpo.adv_estimator.contrast_alpha / contrast_clip only apply with "
+                "contrast_teacher=true; set it (and "
+                "on_policy_distillation.contrast_negative_teacher) or drop them."
+            )
+        if self.contrast_teacher and self.proximal_teacher_alpha != 1.0:
+            raise ValueError(
+                "grpo.adv_estimator.contrast_teacher distills the teacher-minus-contrast "
+                "log-ratio; proximal_teacher_alpha < 1 (TR-OPD) targets the teacher itself. "
+                "Use contrast_clip to bound the contrast term instead."
             )
         if (
             self.name == "opd"
@@ -687,12 +713,15 @@ class OPDAdvantageParts:
         outcome: ``outcome_advantage_weight`` times the GRPO group advantage of the
             rollout's reward, or None when that weight is 0.
         advantages: ``distillation`` plus ``outcome``: what the loss trains on.
+        contrast_gap: Raw ``log p_teacher - log p_contrast`` of the sampled tokens
+            (what RL taught the teacher), or None without a contrast teacher.
     """
 
     teacher_student_gap: torch.Tensor
     distillation: torch.Tensor
     outcome: Optional[torch.Tensor]
     advantages: torch.Tensor
+    contrast_gap: Optional[torch.Tensor] = None
 
 
 class OPDAdvantageEstimator:
@@ -709,6 +738,12 @@ class OPDAdvantageEstimator:
     of each rollout's reward is added to every token of the rollout:
         A_t = distillation_advantage_weight * Â_t + outcome_advantage_weight * Â_GRPO.
 
+    With ``contrast_teacher`` (W2S-OPD's post-RL / pre-RL pair, arXiv:2607.26246,
+    in sampled-token form) the distillation term is instead
+        Â_t = sg[clip(contrast_alpha * (log π_teacher - log π_contrast), ±contrast_clip)],
+    the teacher's RL-induced preference for the sampled token, with the style the
+    two checkpoints share cancelled out.
+
     The importance-sampling correction for the sampler/trainer mismatch lives in
     ClippedPGLoss (the MOPD paper pairs this estimator with REINFORCE and an
     ICE-POP gate); this estimator only produces advantages.
@@ -716,6 +751,8 @@ class OPDAdvantageEstimator:
     Required kwargs in compute_advantage:
         teacher_logprobs: [B, S] teacher model log probabilities
         prev_logprobs: [B, S] student training-engine log probabilities
+        negative_teacher_logprobs: [B, S] contrast teacher log probabilities
+            (required with ``contrast_teacher``)
     """
 
     def __init__(
@@ -726,6 +763,9 @@ class OPDAdvantageEstimator:
             estimator_config.distillation_advantage_weight
         )
         self.outcome_advantage_weight = estimator_config.outcome_advantage_weight
+        self.contrast_teacher = estimator_config.contrast_teacher
+        self.contrast_alpha = estimator_config.contrast_alpha
+        self.contrast_clip = estimator_config.contrast_clip
         # The outcome term is exactly the GRPO estimator on the same block's
         # normalize_rewards / use_leave_one_out_baseline settings.
         self._outcome_estimator: Optional[GRPOAdvantageEstimator] = (
@@ -744,6 +784,7 @@ class OPDAdvantageEstimator:
         teacher_logprobs: Optional[torch.Tensor],
         prev_logprobs: Optional[torch.Tensor],
         valid_mask: Optional[torch.Tensor] = None,
+        negative_teacher_logprobs: Optional[torch.Tensor] = None,
     ) -> OPDAdvantageParts:
         """Compute the OPD advantage and its terms.
 
@@ -755,6 +796,8 @@ class OPDAdvantageEstimator:
             prev_logprobs: [B, S] student training-engine logprobs (required).
             valid_mask: Optional [B] mask of rollouts whose reward enters the
                 outcome term's per-prompt baseline/std (see GRPOAdvantageEstimator).
+            negative_teacher_logprobs: [B, S] contrast teacher logprobs; required
+                with ``contrast_teacher`` and ignored otherwise.
 
         Returns:
             The masked per-token terms; ``advantages`` is the training advantage.
@@ -766,7 +809,21 @@ class OPDAdvantageEstimator:
 
         # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
         gap = (teacher_logprobs - prev_logprobs).detach()
-        if self.proximal_teacher_alpha == 1.0:
+        contrast_gap: Optional[torch.Tensor] = None
+        if self.contrast_teacher:
+            if negative_teacher_logprobs is None:
+                raise ValueError(
+                    "contrast_teacher requires negative_teacher_logprobs (the contrast "
+                    "teacher's column); is on_policy_distillation.contrast_negative_teacher set?"
+                )
+            # What RL taught the teacher, on the student's own tokens.
+            contrast_gap = (teacher_logprobs - negative_teacher_logprobs).detach()
+            distillation = self.contrast_alpha * contrast_gap
+            if self.contrast_clip is not None:
+                distillation = distillation.clamp(
+                    -self.contrast_clip, self.contrast_clip
+                )
+        elif self.proximal_teacher_alpha == 1.0:
             distillation = gap
         else:
             # TR-OPD: log(alpha * π_teacher + (1 - alpha) * π_student) - log π_student
@@ -796,6 +853,7 @@ class OPDAdvantageEstimator:
             distillation=distillation,
             outcome=outcome,
             advantages=advantages,
+            contrast_gap=None if contrast_gap is None else contrast_gap * mask,
         )
 
     def compute_advantage(
@@ -806,6 +864,7 @@ class OPDAdvantageEstimator:
         teacher_logprobs=None,
         prev_logprobs=None,
         valid_mask=None,
+        negative_teacher_logprobs=None,
         **kwargs,
     ):
         """Compute OPD advantages (see compute_advantage_parts for the terms).
@@ -817,6 +876,7 @@ class OPDAdvantageEstimator:
             teacher_logprobs: [B, S] teacher model logprobs (required)
             prev_logprobs: [B, S] student training-engine logprobs (required)
             valid_mask: Optional [B] rollouts that enter the outcome baseline.
+            negative_teacher_logprobs: [B, S] contrast teacher logprobs (contrast_teacher).
             **kwargs: Arguments of other estimators (unused).
 
         Returns:
@@ -829,6 +889,7 @@ class OPDAdvantageEstimator:
             teacher_logprobs=teacher_logprobs,
             prev_logprobs=prev_logprobs,
             valid_mask=valid_mask,
+            negative_teacher_logprobs=negative_teacher_logprobs,
         )
         self._compute_metrics(parts, mask)
         return parts.advantages
@@ -857,3 +918,9 @@ class OPDAdvantageEstimator:
             outcome_mean, outcome_std = mean_and_std(parts.outcome)
             self.last_metrics["on_policy_distillation/outcome_adv_mean"] = outcome_mean
             self.last_metrics["on_policy_distillation/outcome_adv_std"] = outcome_std
+        if parts.contrast_gap is not None:
+            contrast_mean, contrast_std = mean_and_std(parts.contrast_gap)
+            self.last_metrics["on_policy_distillation/contrast_gap_mean"] = (
+                contrast_mean
+            )
+            self.last_metrics["on_policy_distillation/contrast_gap_std"] = contrast_std

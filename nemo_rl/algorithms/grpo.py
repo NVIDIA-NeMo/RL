@@ -2580,6 +2580,9 @@ def _create_advantage_estimator(master_config: MasterConfig):
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
+        opd_module.assert_contrast_teacher_consistent(
+            master_config, adv_estimator_config
+        )
         adv_estimator = OPDAdvantageEstimator(adv_estimator_config, loss_config)
         print(
             "  ✓ Using OPD advantage estimator "

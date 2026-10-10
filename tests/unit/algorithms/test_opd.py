@@ -1398,3 +1398,149 @@ def test_tq_teacher_enrichment_does_not_advertise_a_payload_when_full_is_disable
         "on_policy_distillation/teacher_full_payload_tokens"
         not in coordinator.drain_metrics()
     )
+
+
+def test_opd_cfg_folds_the_contrast_teacher_into_the_teacher_table():
+    from nemo_rl.algorithms import opd
+
+    cfg = opd._opd_cfg(
+        {
+            "on_policy_distillation": {
+                "enabled": True,
+                "teacher_model_by_agent_name": {"math": "/ckpt/rl"},
+                "contrast_negative_teacher": "/ckpt/sft",
+            }
+        }
+    )
+    assert cfg["teacher_model_by_agent_name"] == {
+        "math": "/ckpt/rl",
+        opd.CONTRAST_NEGATIVE_TEACHER_ALIAS: "/ckpt/sft",
+    }
+    assert opd.is_contrast_teacher_enabled(
+        {
+            "on_policy_distillation": {
+                "enabled": True,
+                "contrast_negative_teacher": "/ckpt/sft",
+            }
+        }
+    )
+    assert not opd.is_contrast_teacher_enabled(
+        {
+            "on_policy_distillation": {
+                "enabled": True,
+                "teacher_model_by_agent_name": {"math": "/ckpt/rl"},
+            }
+        }
+    )
+    # Without a contrast teacher the table is returned untouched.
+    plain = opd._opd_cfg(
+        {
+            "on_policy_distillation": {
+                "enabled": True,
+                "teacher_model_by_agent_name": {"math": "/ckpt/rl"},
+            }
+        }
+    )
+    assert plain["teacher_model_by_agent_name"] == {"math": "/ckpt/rl"}
+
+
+def test_assert_contrast_teacher_consistent():
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms import opd
+
+    with_teacher = {
+        "on_policy_distillation": {
+            "enabled": True,
+            "contrast_negative_teacher": "/ckpt/sft",
+        }
+    }
+    without_teacher = {"on_policy_distillation": {"enabled": True}}
+    opd.assert_contrast_teacher_consistent(
+        with_teacher, SimpleNamespace(contrast_teacher=True)
+    )
+    opd.assert_contrast_teacher_consistent(
+        without_teacher, SimpleNamespace(contrast_teacher=False)
+    )
+    with pytest.raises(ValueError, match="half-configured"):
+        opd.assert_contrast_teacher_consistent(
+            with_teacher, SimpleNamespace(contrast_teacher=False)
+        )
+    with pytest.raises(ValueError, match="half-configured"):
+        opd.assert_contrast_teacher_consistent(
+            without_teacher, SimpleNamespace(contrast_teacher=True)
+        )
+
+
+def test_tq_teacher_enrichment_scores_the_contrast_teacher_into_its_own_column(
+    monkeypatch,
+):
+    """With a contrast teacher every group is scored twice: the routed teacher
+    into teacher_reference_logprobs, the contrast group into
+    teacher_negative_logprobs, and the slot carries both fields."""
+    import asyncio
+
+    from nemo_rl.algorithms import opd
+
+    calls = []
+
+    class MetaTeacher:
+        def __init__(self, name):
+            self.name = name
+            self.sharding_annotations = _MockShardingAnnotations(1)
+
+        def get_logprobs_from_meta(
+            self, meta, output_field="teacher_reference_logprobs"
+        ):
+            calls.append((self.name, output_field, meta.size))
+
+    class FakeDataPlane:
+        def clear_samples(self, sample_ids, partition_id):
+            raise AssertionError("no padding expected with dp=1")
+
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=FakeDataPlane(),
+        teacher_worker_groups={
+            "primary": MetaTeacher("rl"),
+            opd.CONTRAST_NEGATIVE_TEACHER_ALIAS: MetaTeacher("sft"),
+        },
+        alias_to_group_alias={
+            "math": "primary",
+            opd.CONTRAST_NEGATIVE_TEACHER_ALIAS: opd.CONTRAST_NEGATIVE_TEACHER_ALIAS,
+        },
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {
+                "math": "/ckpt/rl",
+                opd.CONTRAST_NEGATIVE_TEACHER_ALIAS: "/ckpt/sft",
+            },
+            "contrast_negative_teacher": "/ckpt/sft",
+        },
+    )
+    meta = _teacher_meta("group", batch_size=2, seq_len=4)
+
+    enriched = asyncio.run(coordinator.enrich(meta, _teacher_record("math")))
+
+    assert calls == [
+        ("rl", "teacher_reference_logprobs", 2),
+        ("sft", "teacher_negative_logprobs", 2),
+    ]
+    assert "teacher_reference_logprobs" in enriched.fields
+    assert "teacher_negative_logprobs" in enriched.fields
+    metrics = coordinator.drain_metrics()
+    assert metrics["on_policy_distillation/teacher_batches"] == 1.0
+    assert metrics["on_policy_distillation/contrast_teacher_batches"] == 1.0
+
+
+def test_tq_teacher_coordinator_rejects_a_contrast_teacher_without_its_group():
+    from nemo_rl.algorithms import opd
+
+    with pytest.raises(ValueError, match="contrast_negative_teacher"):
+        opd.TQTeacherLogprobCoordinator(
+            dp_client=object(),
+            teacher_worker_groups={"primary": object()},
+            alias_to_group_alias={"math": "primary"},
+            on_policy_distillation_cfg={
+                "teacher_model_by_agent_name": {"math": "/ckpt/rl"},
+                "contrast_negative_teacher": "/ckpt/sft",
+            },
+        )

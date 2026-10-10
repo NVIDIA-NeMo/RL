@@ -38,6 +38,8 @@ from nemo_rl.data_plane.schema import (
     OPD_FULL_LOGITS_FIELD,
     OPD_FULL_TEACHER_INDEX_FIELD,
     TEACHER_LP_FIELDS,
+    TEACHER_NEGATIVE_LOGPROBS,
+    TEACHER_REFERENCE_LOGPROBS,
 )
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
@@ -138,6 +140,20 @@ class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     deduplicate_shared_teacher_checkpoints: bool = True
     non_colocated_teachers: Optional[NonColocatedTeachersConfig] = None
     full: Optional[OnPolicyDistillationFullConfig] = None
+    # Contrast teacher (sampled-token MOPD only): the checkpoint the distillation
+    # teacher's RL started from. Every prompt group is scored by it as well, and
+    # the estimator distills ``log p_teacher - log p_contrast`` on the sampled
+    # tokens -- what RL taught the teacher -- instead of the teacher's whole
+    # distribution (after W2S-OPD, arXiv:2607.26246, with the post-RL / pre-RL pair).
+    # It becomes a teacher worker group of its own under CONTRAST_NEGATIVE_TEACHER_ALIAS
+    # (same resources as the others) and is never routed to by agent name.
+    contrast_negative_teacher: Optional[str] = None
+
+
+# Alias under which the contrast teacher joins ``teacher_model_by_agent_name``
+# for resource reservation and worker-group creation. No Gym agent carries this
+# name, so routing by agent never selects it.
+CONTRAST_NEGATIVE_TEACHER_ALIAS = "__contrast_negative_teacher__"
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +167,11 @@ def _opd_cfg(master_config: Any) -> dict[str, Any]:
     Accepts a MasterConfig (where the field is an OnPolicyDistillationConfig
     BaseModel), a plain dict, or a config object missing the field (non-OPD
     recipes like math). Downstream code reads the result dict-style.
+
+    A configured ``contrast_negative_teacher`` is folded into the returned
+    ``teacher_model_by_agent_name`` under ``CONTRAST_NEGATIVE_TEACHER_ALIAS``, so
+    every consumer (teacher configs, node counts, cluster reservation, worker
+    groups, deduplication) sees it as one more teacher without special cases.
     """
     if isinstance(master_config, dict):
         cfg = master_config.get("on_policy_distillation")
@@ -159,8 +180,43 @@ def _opd_cfg(master_config: Any) -> dict[str, Any]:
     if cfg is None:
         return {}
     if isinstance(cfg, BaseModel):
-        return cfg.model_dump(exclude_none=True)
+        cfg = cfg.model_dump(exclude_none=True)
+    negative = cfg.get("contrast_negative_teacher")
+    if negative:
+        cfg = dict(cfg)
+        mapping = dict(cfg.get("teacher_model_by_agent_name", {}))
+        mapping[CONTRAST_NEGATIVE_TEACHER_ALIAS] = negative
+        cfg["teacher_model_by_agent_name"] = mapping
     return cfg
+
+
+def is_contrast_teacher_enabled(master_config: Any) -> bool:
+    """Whether sampled-token MOPD distills the teacher-minus-contrast log-ratio."""
+    cfg = _opd_cfg(master_config)
+    return bool(cfg.get("enabled", False)) and bool(
+        cfg.get("contrast_negative_teacher")
+    )
+
+
+def assert_contrast_teacher_consistent(
+    master_config: Any, adv_estimator_config: Any
+) -> None:
+    """Both halves of the contrast teacher must be configured, or neither.
+
+    The teacher side (``on_policy_distillation.contrast_negative_teacher``) pays
+    for a second teacher group and column; the estimator side
+    (``grpo.adv_estimator.contrast_teacher``) is what reads it. One without the
+    other is either wasted GPUs or an estimator that fails on its first batch.
+    """
+    has_teacher = is_contrast_teacher_enabled(master_config)
+    wants_contrast = bool(getattr(adv_estimator_config, "contrast_teacher", False))
+    if has_teacher != wants_contrast:
+        raise ValueError(
+            "contrast teacher half-configured: "
+            f"on_policy_distillation.contrast_negative_teacher is "
+            f"{'set' if has_teacher else 'unset'} but "
+            f"grpo.adv_estimator.contrast_teacher={wants_contrast}. Set both or neither."
+        )
 
 
 def is_opd_enabled(master_config: Any) -> bool:
@@ -357,7 +413,8 @@ class TQTeacherLogprobCoordinator:
     independent and can run concurrently.
     """
 
-    teacher_logprobs_field = "teacher_reference_logprobs"
+    teacher_logprobs_field = TEACHER_REFERENCE_LOGPROBS
+    teacher_negative_logprobs_field = TEACHER_NEGATIVE_LOGPROBS
 
     def __init__(
         self,
@@ -375,6 +432,22 @@ class TQTeacherLogprobCoordinator:
         self._teacher_worker_groups = dict(teacher_worker_groups)
         self._alias_to_group_alias = dict(alias_to_group_alias)
         self._opd_cfg = dict(on_policy_distillation_cfg)
+        # Contrast teacher: every group is also scored by this (physical) group,
+        # into its own column, after the routed teacher.
+        self._negative_group_alias: Optional[str] = None
+        if self._opd_cfg.get("contrast_negative_teacher"):
+            negative_group = self._alias_to_group_alias.get(
+                CONTRAST_NEGATIVE_TEACHER_ALIAS, CONTRAST_NEGATIVE_TEACHER_ALIAS
+            )
+            if negative_group not in self._teacher_worker_groups:
+                raise ValueError(
+                    "on_policy_distillation.contrast_negative_teacher is set but its "
+                    f"worker group {negative_group!r} is missing; available groups: "
+                    f"{sorted(self._teacher_worker_groups)}"
+                )
+            self._negative_group_alias = negative_group
+        self._negative_batches = 0
+        self._negative_inference_time_s = 0.0
         # Set when full-vocabulary MOPD is on: the teacher then writes a second,
         # per-token payload column the training fetch must also see.
         full_cfg = self._opd_cfg.get("full")
@@ -438,6 +511,7 @@ class TQTeacherLogprobCoordinator:
         self,
         meta: KVBatchMeta,
         group_alias: str,
+        output_field: str = TEACHER_REFERENCE_LOGPROBS,
     ) -> float:
         """Run the blocking TQ-read, teacher inference, and TQ-write sequence."""
         if not meta.sequence_lengths:
@@ -496,7 +570,12 @@ class TQTeacherLogprobCoordinator:
                 padded_meta = meta.concat(pad_meta)
 
             inference_started_at = time.perf_counter()
-            teacher.get_logprobs_from_meta(padded_meta)
+            if output_field == TEACHER_REFERENCE_LOGPROBS:
+                # Positional call keeps the historical worker-group contract
+                # (and the test fakes that implement only ``(meta)``).
+                teacher.get_logprobs_from_meta(padded_meta)
+            else:
+                teacher.get_logprobs_from_meta(padded_meta, output_field=output_field)
             inference_finished_at = time.perf_counter()
         except BaseException as enrichment_error:
             if temporary_sample_ids:
@@ -527,27 +606,9 @@ class TQTeacherLogprobCoordinator:
         """Write teacher logprobs before the replay-buffer slot becomes ready."""
         alias, group_alias = self._resolve_teacher(record)
         started_at = time.perf_counter()
-        lock_started_at = time.perf_counter()
-        # Wait for a physical teacher without occupying a default-executor
-        # thread. Only the active inference consumes a thread-pool slot.
-        async with self._teacher_locks[group_alias]:
-            lock_wait_s = time.perf_counter() - lock_started_at
-            # asyncio cannot cancel a running thread. Shield and explicitly
-            # drain it so replay-buffer rollback never clears rows while teacher
-            # workers are still fetching from or writing to those rows.
-            enrichment_task = asyncio.create_task(
-                asyncio.to_thread(self._enrich_sync, meta, group_alias)
-            )
-            try:
-                inference_time_s = await asyncio.shield(enrichment_task)
-            except asyncio.CancelledError:
-                try:
-                    await enrichment_task
-                except BaseException as drain_error:
-                    raise asyncio.CancelledError(
-                        f"cancelled while draining teacher enrichment for {group_alias!r}"
-                    ) from drain_error
-                raise
+        inference_time_s, lock_wait_s = await self._enrich_with(
+            meta, group_alias, self.teacher_logprobs_field
+        )
         total_time_s = time.perf_counter() - started_at
 
         self._teacher_batches += 1
@@ -567,11 +628,62 @@ class TQTeacherLogprobCoordinator:
             flush=True,
         )
         enriched_fields = [self.teacher_logprobs_field]
+        if self._negative_group_alias is not None:
+            # The contrast column lands after the teacher's; the slot is not
+            # ready until both are there, so the estimator never sees one alone.
+            negative_started_at = time.perf_counter()
+            negative_inference_s, negative_lock_wait_s = await self._enrich_with(
+                meta, self._negative_group_alias, self.teacher_negative_logprobs_field
+            )
+            self._negative_batches += 1
+            self._negative_inference_time_s += negative_inference_s
+            self._teacher_logprob_time_s += time.perf_counter() - negative_started_at
+            self._teacher_lock_wait_time_s += negative_lock_wait_s
+            print(
+                f"[teacher_logprob] group={self._negative_group_alias} (contrast) "
+                f"samples={meta.size} lock_wait={negative_lock_wait_s:.2f}s "
+                f"inference={negative_inference_s:.2f}s",
+                flush=True,
+            )
+            enriched_fields.append(self.teacher_negative_logprobs_field)
         if self._opd_full_field is not None:
             enriched_fields.append(self._opd_full_field)
         if self._opd_full_teacher_index_field is not None:
             enriched_fields.append(self._opd_full_teacher_index_field)
         return meta.with_fields(enriched_fields)
+
+    async def _enrich_with(
+        self,
+        meta: KVBatchMeta,
+        group_alias: str,
+        output_field: str,
+    ) -> tuple[float, float]:
+        """Score ``meta`` with one physical teacher group into ``output_field``.
+
+        Returns ``(inference_time_s, lock_wait_s)``.
+        """
+        lock_started_at = time.perf_counter()
+        # Wait for a physical teacher without occupying a default-executor
+        # thread. Only the active inference consumes a thread-pool slot.
+        async with self._teacher_locks[group_alias]:
+            lock_wait_s = time.perf_counter() - lock_started_at
+            # asyncio cannot cancel a running thread. Shield and explicitly
+            # drain it so replay-buffer rollback never clears rows while teacher
+            # workers are still fetching from or writing to those rows.
+            enrichment_task = asyncio.create_task(
+                asyncio.to_thread(self._enrich_sync, meta, group_alias, output_field)
+            )
+            try:
+                inference_time_s = await asyncio.shield(enrichment_task)
+            except asyncio.CancelledError:
+                try:
+                    await enrichment_task
+                except BaseException as drain_error:
+                    raise asyncio.CancelledError(
+                        f"cancelled while draining teacher enrichment for {group_alias!r}"
+                    ) from drain_error
+                raise
+        return inference_time_s, lock_wait_s
 
     def drain_metrics(self) -> dict[str, float]:
         """Return and reset teacher activity accumulated since the last drain."""
@@ -588,6 +700,15 @@ class TQTeacherLogprobCoordinator:
             metrics["on_policy_distillation/teacher_full_payload_tokens"] = float(
                 self._teacher_full_payload_tokens
             )
+        if self._negative_group_alias is not None:
+            metrics["on_policy_distillation/contrast_teacher_batches"] = float(
+                self._negative_batches
+            )
+            metrics["on_policy_distillation/contrast_teacher_inference_time_s"] = (
+                self._negative_inference_time_s
+            )
+            self._negative_batches = 0
+            self._negative_inference_time_s = 0.0
         if self._teacher_batches:
             # Cardinality describes what ran. On an idle step, zero reads as
             # "zero teacher models" rather than "no teacher activity."

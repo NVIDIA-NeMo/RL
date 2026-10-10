@@ -51,6 +51,8 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
+    TEACHER_LP_OUTPUT_FIELD,
+    TEACHER_REFERENCE_LOGPROBS,
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
@@ -1066,11 +1068,15 @@ class TQWorkerMixin:
                     )
                 self._write_back_stage_local(meta, stage_local_fields)
             del teacher_full_payload
+        # A contrast teacher (the checkpoint the distillation teacher's RL started
+        # from) scores the same rows into its own column; the coordinator names it.
         self._write_back_result_field(
             meta,
             result,
             result_key="logprobs",
-            tq_field="teacher_reference_logprobs",
+            tq_field=str(
+                extra.get(TEACHER_LP_OUTPUT_FIELD, TEACHER_REFERENCE_LOGPROBS)
+            ),
         )
         del result
 

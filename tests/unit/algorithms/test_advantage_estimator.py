@@ -325,3 +325,108 @@ def test_opd_defaults_are_accepted_on_every_estimator(name):
         outcome_advantage_weight=0.0,
     )
     assert config.name == name
+
+
+def _contrast_inputs():
+    prompt_ids = torch.tensor([[0], [0], [1], [1]])
+    rewards = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    mask = torch.ones(4, 3)
+    teacher = torch.tensor(
+        [[-1.0, -2.0, -3.0], [-1.0, -1.0, -1.0], [-0.5, -0.5, -0.5], [-2.0, -2.0, -2.0]]
+    )
+    negative = torch.tensor(
+        [[-1.5, -1.0, -3.0], [-2.0, -2.0, -2.0], [-0.5, -0.5, -0.5], [-1.0, -1.0, -1.0]]
+    )
+    prev = torch.full((4, 3), -0.7)
+    return prompt_ids, rewards, mask, teacher, negative, prev
+
+
+def test_contrast_teacher_distills_the_teacher_minus_contrast_log_ratio():
+    cfg = AdvEstimatorConfig(
+        name="opd",
+        contrast_teacher=True,
+        contrast_alpha=0.5,
+        contrast_clip=0.4,
+        distillation_advantage_weight=1.0,
+        outcome_advantage_weight=0.0,
+    )
+    est = OPDAdvantageEstimator(cfg, ClippedPGLossConfig())
+    prompt_ids, rewards, mask, teacher, negative, prev = _contrast_inputs()
+    parts = est.compute_advantage_parts(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=prev,
+        negative_teacher_logprobs=negative,
+    )
+    expected = (0.5 * (teacher - negative)).clamp(-0.4, 0.4)
+    torch.testing.assert_close(parts.distillation, expected)
+    torch.testing.assert_close(parts.contrast_gap, teacher - negative)
+    # The student does not enter the contrast term; the diagnostic gap still does.
+    torch.testing.assert_close(parts.teacher_student_gap, teacher - prev)
+    assert parts.outcome is None
+    adv = est.compute_advantage(
+        prompt_ids,
+        rewards,
+        mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=prev,
+        negative_teacher_logprobs=negative,
+    )
+    torch.testing.assert_close(adv, expected)
+    assert "on_policy_distillation/contrast_gap_mean" in est.last_metrics
+
+
+def test_contrast_teacher_requires_the_negative_column():
+    cfg = AdvEstimatorConfig(name="opd", contrast_teacher=True)
+    est = OPDAdvantageEstimator(cfg, ClippedPGLossConfig())
+    prompt_ids, rewards, mask, teacher, _, prev = _contrast_inputs()
+    with pytest.raises(ValueError, match="negative_teacher_logprobs"):
+        est.compute_advantage_parts(
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            mask=mask,
+            teacher_logprobs=teacher,
+            prev_logprobs=prev,
+        )
+
+
+def test_contrast_teacher_mixes_with_the_outcome_term():
+    cfg = AdvEstimatorConfig(
+        name="opd",
+        contrast_teacher=True,
+        distillation_advantage_weight=0.1,
+        outcome_advantage_weight=1.0,
+    )
+    est = OPDAdvantageEstimator(cfg, ClippedPGLossConfig())
+    prompt_ids, rewards, mask, teacher, negative, prev = _contrast_inputs()
+    parts = est.compute_advantage_parts(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=prev,
+        negative_teacher_logprobs=negative,
+    )
+    assert parts.outcome is not None
+    torch.testing.assert_close(parts.distillation, 0.1 * (teacher - negative))
+    torch.testing.assert_close(parts.advantages, parts.distillation + parts.outcome)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"contrast_alpha": 0.5},
+        {"contrast_clip": 0.5},
+        {"contrast_teacher": True, "proximal_teacher_alpha": 0.2},
+    ],
+)
+def test_contrast_fields_are_validated(kwargs):
+    with pytest.raises(ValidationError):
+        AdvEstimatorConfig(name="opd", **kwargs)
+
+
+def test_contrast_fields_are_rejected_on_other_estimators():
+    with pytest.raises(ValidationError, match="only apply to name='opd'"):
+        AdvEstimatorConfig(name="grpo", contrast_teacher=True)
