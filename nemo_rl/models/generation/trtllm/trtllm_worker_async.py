@@ -222,6 +222,36 @@ class TrtllmAsyncGenerationWorkerImpl:
         # they can override anything above for advanced tuning.
         llm_kwargs.update(extra_trtllm_kwargs)
 
+        if trtllm_cfg.get("is_mx") and trtllm_cfg["precision"] != "fp8":
+            raise ValueError("trtllm_cfg.is_mx=True requires precision='fp8'")
+        if (
+            trtllm_cfg.get("quantization_ignore_patterns") is not None
+            and trtllm_cfg["precision"] != "fp8"
+        ):
+            raise ValueError(
+                "trtllm_cfg.quantization_ignore_patterns requires precision='fp8'"
+            )
+
+        if trtllm_cfg["precision"] == "fp8":
+            # Imported here: TRT-LLM is an optional dependency.
+            from tensorrt_llm.llmapi.llm_args import MoeConfig
+
+            from nemo_rl.models.generation.trtllm.quantization.fp8 import (
+                configure_fp8_llm_kwargs,
+                configure_fp8_moe_backend,
+            )
+
+            is_mx = bool(trtllm_cfg.get("is_mx"))
+            configure_fp8_llm_kwargs(
+                llm_kwargs,
+                is_mx=is_mx,
+                ignore_patterns=trtllm_cfg.get("quantization_ignore_patterns"),
+            )
+
+            # Block-FP8 needs the TRTLLM MoE backend (DeepGEMM would resmooth to
+            # E8M0); MXFP8 uses CUTLASS or CuTe DSL. Other MoeConfig fields kept.
+            configure_fp8_moe_backend(llm_kwargs, MoeConfig, is_mx=is_mx)
+
         # Propagate the nsight runtime_env down to TRT-LLM's internal Ray GPU
         # workers.  The outer actor's @ray.remote nsight config does NOT inherit
         # into TRT-LLM's RayExecutor workers (ray_executor.py sets an explicit
@@ -340,7 +370,11 @@ class TrtllmAsyncGenerationWorkerImpl:
 
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         assert self.llm is not None
-        await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        patterns = self.cfg["trtllm_cfg"].get("quantization_ignore_patterns")
+        kwargs = {} if patterns is None else {"quantization_ignore_patterns": patterns}
+        await self.llm.collective_rpc(
+            "prepare_refit_info", args=(state_dict_info,), kwargs=kwargs
+        )
 
     async def update_weights_from_collective_async(
         self, *, drain: bool = True, recompute_kv: bool = False
@@ -352,9 +386,10 @@ class TrtllmAsyncGenerationWorkerImpl:
                 without draining in-flight requests (in-flight weight
                 update). Default True preserves the original drain-first
                 behavior.
-            recompute_kv: If True (and ``drain=False``), preempt all
-                in-flight requests after the refit so the scheduler
-                re-prefills them under the new weights.
+            recompute_kv: If True, re-prefill in-flight requests under the new
+                weights and reset the prefix cache after the refit
+                (``recompute_kv_cache_after_weight_updates``). If False,
+                in-flight requests keep their current KV cache.
         """
         assert self.llm is not None
         try:
@@ -362,10 +397,16 @@ class TrtllmAsyncGenerationWorkerImpl:
                 "update_weights_from_collective",
                 kwargs={"drain": drain, "recompute_kv": recompute_kv},
             )
-            worker_result = results[0] if results else True
-            if not worker_result:
+            if not results:
+                print("Error: TRT-LLM weight update returned no worker results.")
+                return False
+            failed_workers = [
+                (rank, result) for rank, result in enumerate(results) if not result
+            ]
+            if failed_workers:
                 print(
-                    f"Error: TRT-LLM worker failed to update weights. Result: {worker_result}"
+                    "Error: TRT-LLM workers failed to update weights. "
+                    f"Results: {failed_workers}"
                 )
                 return False
             return True
@@ -380,10 +421,16 @@ class TrtllmAsyncGenerationWorkerImpl:
         assert self.llm is not None
         try:
             results = await self.llm.collective_rpc("update_weights_via_ipc_zmq")
-            worker_result = results[0] if results else True
-            if not worker_result:
+            if not results:
+                print("Error: TRT-LLM IPC weight update returned no worker results.")
+                return False
+            failed_workers = [
+                (rank, result) for rank, result in enumerate(results) if not result
+            ]
+            if failed_workers:
                 print(
-                    f"Error: TRT-LLM worker failed to update weights via IPC. Result: {worker_result}"
+                    "Error: TRT-LLM workers failed to update weights via IPC. "
+                    f"Results: {failed_workers}"
                 )
                 return False
             return True

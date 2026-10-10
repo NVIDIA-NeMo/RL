@@ -42,6 +42,10 @@ policy: &POLICY_BASE
     logprob_chunk_size: null
 
     offload_optimizer_for_logprob: false
+    # Free grad buffers before non-colocated NCCL collective refit.
+    release_grads_before_refit: false
+    # Also move optimizer state to CPU when refit offload runs.
+    offload_optimizer_for_refit: true
 
     automodel_cfg: &AUTOMODEL_BASE
         enabled: true

@@ -33,6 +33,7 @@ import zmq
 from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
+from nemo_rl.models.generation.trtllm.quantization import fp8 as fp8_quantization
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -47,6 +48,25 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 os.environ.setdefault("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", "True")
 
 
+def _require_fp8_refit_hooks(model_loader: Any) -> None:
+    """Require TRT-LLM hooks for transactional FP8 refits."""
+    required_hooks = (
+        "begin_update_weights",
+        "finalize_update_weights",
+        "abort_update_weights",
+    )
+    missing_hooks = [
+        hook_name
+        for hook_name in required_hooks
+        if not callable(getattr(model_loader, hook_name, None))
+    ]
+    if missing_hooks:
+        raise RuntimeError(
+            "FP8 refit requires TRT-LLM weight-update hooks. "
+            f"Missing APIs: {missing_hooks}."
+        )
+
+
 class NcclExtension(WorkerExtension):
     """NCCL-based weight update extension for TRT-LLM Ray workers.
 
@@ -59,6 +79,9 @@ class NcclExtension(WorkerExtension):
     #  Collective initialisation (called once during setup)
     # ------------------------------------------------------------------ #
 
+    # Park the executor loop while the refit group is built: its NCCL collectives
+    # deadlock against the blocking ncclCommInitRank (seen as a 600 s watchdog kill).
+    @control_action_decorator
     def init_collective(
         self,
         rank_prefix: int,
@@ -100,8 +123,60 @@ class NcclExtension(WorkerExtension):
     #  Refit metadata (weight name → (shape, dtype) mapping)
     # ------------------------------------------------------------------ #
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self,
+        state_dict_info: dict[str, Any],
+        quantization_ignore_patterns: list[str] | None = None,
+    ) -> None:
         self.state_dict_info = state_dict_info
+        model = self.engine.model_engine.model
+        quant_config = model.model_config.quant_config
+        if fp8_quantization.is_quantized_expert_refit(quant_config):
+            # None: routed experts only. Otherwise quantize whatever the engine does
+            # not exclude (its exclude_modules also holds TRT-LLM's own defaults).
+            self._fp8_ignore_patterns = (
+                None
+                if quantization_ignore_patterns is None
+                else list(
+                    dict.fromkeys(
+                        [
+                            *quantization_ignore_patterns,
+                            *(getattr(quant_config, "exclude_modules", None) or []),
+                        ]
+                    )
+                )
+            )
+            fp8_quantization.validate_routed_experts(
+                state_dict_info, ignore_patterns=self._fp8_ignore_patterns
+            )
+            _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
+
+    def _ensure_refit_usable(self) -> None:
+        failure = getattr(self, "_fp8_refit_failure", None)
+        if failure is not None:
+            raise RuntimeError(
+                "This TRT-LLM worker is unusable after a failed partial FP8 "
+                f"refit and must be restarted. Original failure: {failure}"
+            )
+
+    def _abort_weight_update_after_failure(
+        self, model: Any, model_loader: Any, error: Exception
+    ) -> None:
+        fp8_refit_failed = fp8_quantization.is_quantized_expert_refit(
+            model.model_config.quant_config
+        )
+        if fp8_refit_failed:
+            # Mark poisoned before abort (abort may fail): never serve partial FP8 weights.
+            self._fp8_refit_failure = repr(error)
+        try:
+            model_loader.abort_update_weights()
+        finally:
+            if fp8_refit_failed:
+                raise RuntimeError(
+                    "Partial FP8 refit failed after runtime weights may have "
+                    "been modified. The TRT-LLM worker is poisoned and must be "
+                    "restarted."
+                ) from error
 
     # ------------------------------------------------------------------ #
     #  NCCL weight receive + reload
@@ -121,21 +196,36 @@ class NcclExtension(WorkerExtension):
                 If False, the swap happens at a scheduler step boundary
                 with in-flight requests still in the engine (in-flight
                 weight update).
-            recompute_kv: Only meaningful with ``drain=False``. If True,
-                preempt in-flight requests so they re-prefill under the new weights.
-                Otherwise, they keep decoding with their current KV cache. The
-                reusable prefix cache is cleared after every weight update.
+            recompute_kv: If True, call ``recompute_active_requests()`` after
+                the refit: in-flight requests are re-prefilled under the new
+                weights and the prefix cache is reset. If False, in-flight
+                requests keep decoding with their current KV cache. With
+                ``drain=True`` there are no in-flight requests, so True reduces
+                to a prefix-cache reset.
         """
         assert hasattr(self, "state_dict_info") and self.state_dict_info is not None, (
             "state_dict_info not set — call prepare_refit_info first"
         )
         model_engine = self.engine.model_engine
         model = model_engine.model
+        self._ensure_refit_usable()
 
         def load_model_weight_func(weight_list):
+            if fp8_quantization.is_quantized_expert_refit(
+                model.model_config.quant_config
+            ):
+                weights = fp8_quantization.load_weights(
+                    weight_list,
+                    is_mx=fp8_quantization.is_mxfp8_model(
+                        model.model_config.quant_config
+                    ),
+                    ignore_patterns=getattr(self, "_fp8_ignore_patterns", None),
+                )
+            else:
+                weights = dict(weight_list)
             model_engine.model_loader.reload(
                 model,
-                dict(weight_list),
+                weights,
                 allow_partial_loading=True,
             )
 
@@ -156,9 +246,15 @@ class NcclExtension(WorkerExtension):
                     post_unpack_func=load_model_weight_func,
                 )
                 self.finalize_weight_update()
+                if recompute_kv:
+                    # Re-prefill in-flight requests under the new weights; this
+                    # also resets the prefix cache (NVIDIA/TensorRT-LLM#17937).
+                    self.engine.recompute_active_requests()
                 self.finish_weight_update()
             except Exception as e:
-                model_engine.model_loader.abort_update_weights()
+                self._abort_weight_update_after_failure(
+                    model, model_engine.model_loader, e
+                )
                 print(f"Error in NcclExtension.update_weights_from_collective: {e}")
                 return False
 
@@ -195,6 +291,7 @@ class NcclExtension(WorkerExtension):
         )
         model_engine = self.engine.model_engine
         model = model_engine.model
+        self._ensure_refit_usable()
 
         buffer = None
         weights = None
@@ -231,6 +328,20 @@ class NcclExtension(WorkerExtension):
                     "Likely stale state_dict_info (wrong shape/dtype for some key)."
                 )
 
+                if fp8_quantization.is_quantized_expert_refit(
+                    model.model_config.quant_config
+                ):
+                    weights = fp8_quantization.load_weights(
+                        weights.items(),
+                        is_mx=fp8_quantization.is_mxfp8_model(
+                            model.model_config.quant_config
+                        ),
+                        ignore_patterns=getattr(self, "_fp8_ignore_patterns", None),
+                    )
+                    # The mapper may retain split QKVZ/BA views across IPC chunks;
+                    # detach them before ACK lets the trainer reuse the buffer.
+                    weights = fp8_quantization.clone_mapper_staging_weights(weights)
+
                 model_engine.model_loader.reload(
                     model,
                     weights,
@@ -251,7 +362,7 @@ class NcclExtension(WorkerExtension):
             torch.cuda.empty_cache()
             return True
         except Exception as e:
-            model_engine.model_loader.abort_update_weights()
+            self._abort_weight_update_after_failure(model, model_engine.model_loader, e)
             print(
                 f"Error in NcclExtension.update_weights_via_ipc_zmq: {e}\n"
                 f"{traceback.format_exc()}"

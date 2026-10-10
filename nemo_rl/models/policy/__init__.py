@@ -682,6 +682,10 @@ class PolicyConfig(TypedDict):
     # This sets the clipping norm for the AutomodelPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float | int]
+    # Free grad buffers before non-colocated collective refit (via offload_before_refit).
+    release_grads_before_refit: NotRequired[bool]
+    # Move optimizer state to CPU when offload_before_refit runs (Megatron default: True).
+    offload_optimizer_for_refit: NotRequired[bool]
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
         list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
