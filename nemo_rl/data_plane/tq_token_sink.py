@@ -43,6 +43,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import ray
 import torch
 from tensordict import TensorDict
@@ -194,7 +195,9 @@ def _bytes_tensor(value: bytes) -> torch.Tensor:
     """Encode non-empty bytes as one jagged TQ row."""
     if not value:
         raise ValueError("staging byte fields must be non-empty")
-    return torch.tensor([list(value)], dtype=torch.uint8)
+    # Own a writable buffer so Torch never views immutable bytes. This avoids
+    # materializing a Python integer for every byte in identity/digest columns.
+    return torch.from_numpy(np.frombuffer(bytearray(value), dtype=np.uint8)).unsqueeze(0)
 
 
 def _optional_digest_fields(value: str | None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -563,14 +566,14 @@ class TQTokenSink:
                 media, _media_sentinels(self._media_pixel_dtype)
             )
         field_dict = {
-            "token_ids_delta": torch.tensor(
-                [record.token_ids_delta], dtype=torch.int64
+            "token_ids_delta": torch.from_numpy(
+                np.array([record.token_ids_delta], dtype=np.int64)
             ),
-            "token_mask_delta": torch.tensor(
-                [record.token_mask_delta], dtype=torch.float32
+            "token_mask_delta": torch.from_numpy(
+                np.array([record.token_mask_delta], dtype=np.float32)
             ),
-            "generation_logprobs_delta": torch.tensor(
-                [record.generation_log_probs_delta], dtype=torch.float32
+            "generation_logprobs_delta": torch.from_numpy(
+                np.array([record.generation_log_probs_delta], dtype=np.float32)
             ),
             "schema_version": torch.tensor([record.schema_version], dtype=torch.int64),
             "digest_version": torch.tensor([record.digest_version], dtype=torch.int64),
