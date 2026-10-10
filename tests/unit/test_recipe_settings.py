@@ -95,3 +95,19 @@ def test_automodel_recipes_preserve_backend_choices(
     backend = config.policy.automodel_cfg.automodel_kwargs.backend
     assert backend.dispatcher == dispatcher
     assert backend.experts == experts
+
+
+@pytest.mark.parametrize(
+    ("recipe_name", "expected_async_save"),
+    [
+        ("grpo-deepseek-v3-32n4g.yaml", False),
+        ("grpo-deepseek-v3-64n4g.yaml", True),
+        ("grpo-deepseek-v3-64n4g-mxfp8-rollout.yaml", True),
+    ],
+)
+def test_deepseek_performance_recipes_preserve_checkpoint_save_mode(
+    recipe_name: str, expected_async_save: bool
+) -> None:
+    register_omegaconf_resolvers()
+    config = load_config(RECIPE_ROOT / "llm/performance" / recipe_name)
+    assert config.policy.megatron_cfg.checkpoint.async_save is expected_async_save
