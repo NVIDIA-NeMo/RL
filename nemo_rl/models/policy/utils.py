@@ -427,7 +427,11 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
 
 
 def stream_weights_via_ipc_zmq_impl(
-    params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
+    params_generator,
+    buffer_size_bytes: int,
+    zmq_socket,
+    rank: int,
+    worker_name: str,
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
