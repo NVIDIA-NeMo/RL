@@ -1381,7 +1381,11 @@ class AsyncNemoGymRolloutImpl:
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
             rollout_metrics = self._compute_rollout_metrics(
-                completions, _nemo_gym_metric_namespace(inputs[0])
+                completions,
+                _nemo_gym_metric_namespace(inputs[0]),
+                full_results=[
+                    result.get("full_result") or {} for result in completed_results
+                ],
             )
             # Same helper the batched path uses, so the two cannot drift apart.
             rollout_metrics.update(_effort_shaping_metrics(shaping))
@@ -1419,15 +1423,24 @@ class AsyncNemoGymRolloutImpl:
                 "generation_logprobs",
             )
 
-        # Same gate as the batched path: when masking is off, drop the env mask
-        # flag so later batch building never sees it. Receipt rollouts take the
-        # same gate because the capture finalization request reads the flag
-        # from the completion's env_extras.
-        if not self._mask_env_flagged_samples:
-            for result in results:
-                (result["full_result"].get("instance_config") or {}).pop(
-                    "mask_sample", None
-                )
+        def completion_extras(full_result: dict) -> dict:
+            # Same gate as the batched path: when masking is off, the completion
+            # carries no env mask flag so later batch building never sees it.
+            # Receipt rollouts take the same gate because the capture
+            # finalization request reads the flag from the completion's
+            # env_extras. The gate works on copies: the caller's result keeps
+            # both forms of the flag, so the per-agent metrics still report the
+            # flagged rate while the flag is not honored.
+            if self._mask_env_flagged_samples:
+                return full_result
+            extras = dict(full_result)
+            extras.pop(MASK_SAMPLE, None)
+            instance_config = extras.get("instance_config")
+            if isinstance(instance_config, dict):
+                extras["instance_config"] = {
+                    k: v for k, v in instance_config.items() if k != MASK_SAMPLE
+                }
+            return extras
 
         penalty_counts = apply_reward_penalties(
             token_results, self._reward_penalty_config
@@ -1435,7 +1448,7 @@ class AsyncNemoGymRolloutImpl:
         completions = []
         for result in results:
             if "receipt" in result:
-                env_extras = dict(result["full_result"])
+                env_extras = dict(completion_extras(result["full_result"]))
                 env_extras["ng_receipt"] = result["receipt"]
                 env_extras["ng_rollout_id"] = result["rollout_id"]
                 env_extras["ng_reward_checks"] = result.get("reward_checks")
@@ -1459,7 +1472,7 @@ class AsyncNemoGymRolloutImpl:
             completions.append(
                 Completion(
                     message_log=result["message_log"],
-                    env_extras=result["full_result"],
+                    env_extras=completion_extras(result["full_result"]),
                     truncated=truncated,
                     reward=float(result["full_result"]["reward"]),
                 )
@@ -1480,8 +1493,16 @@ class AsyncNemoGymRolloutImpl:
         self,
         completions: list[Completion],
         agent_name: str,
+        full_results: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
-        """Aggregate per-sample and per-agent metrics."""
+        """Aggregate per-sample and per-agent metrics.
+
+        ``full_results`` are the Gym results the completions were built from,
+        aligned with them. When given, the per-agent metrics aggregate those
+        rather than the completions' env_extras, so a field the completion
+        conversion drops on purpose (the env mask flag under
+        ``env.should_mask_flagged_samples: false``) is still reported.
+        """
         # Prepare lists of values for each metric.
         total_reward = [c.reward for c in completions]
         receipt_mode = bool(completions) and "ng_receipt" in (
@@ -1571,15 +1592,18 @@ class AsyncNemoGymRolloutImpl:
 
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
-        agent_extras = [
-            {
-                k: v
-                for k, v in (c.env_extras or {}).items()
-                if k not in ("ng_receipt", "ng_reward_checks", "ng_reward_log_context")
-                and not (receipt_mode and k == "reward")
-            }
-            for c in completions
-        ]
+        if full_results is not None:
+            agent_extras = [dict(full_result) for full_result in full_results]
+        else:
+            agent_extras = [
+                {
+                    k: v
+                    for k, v in (c.env_extras or {}).items()
+                    if k not in ("ng_receipt", "ng_reward_checks", "ng_reward_log_context")
+                    and not (receipt_mode and k == "reward")
+                }
+                for c in completions
+            ]
         for key in agent_extras[0].keys():
             values = [
                 float(r[key])  # type: ignore
@@ -2322,10 +2346,9 @@ class RolloutManager:
                     f"expected={gate_rollout_id!r}"
                 )
             mask_sample = bool(
-                (
-                    ((completion.env_extras or {}).get("instance_config") or {}).get(
-                        MASK_SAMPLE, False
-                    )
+                (completion.env_extras or {}).get(MASK_SAMPLE)
+                or ((completion.env_extras or {}).get("instance_config") or {}).get(
+                    MASK_SAMPLE, False
                 )
             )
 

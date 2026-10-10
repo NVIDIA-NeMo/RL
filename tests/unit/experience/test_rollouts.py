@@ -2449,7 +2449,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         {},
     )
     manager._compute_reward_penalty_metrics = lambda counts, num_results: {}
-    manager._compute_rollout_metrics = lambda completions, agent: {
+    manager._compute_rollout_metrics = lambda completions, agent, **_kwargs: {
         "completion_count": len(completions),
         "agent": agent,
     }
@@ -2642,7 +2642,10 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
         selected.append(environment)
         for row in pending:
             rowidx = row["_rowidx"]
-            results[rowidx] = {"input_message_log": [{"token_ids": [1]}]}
+            results[rowidx] = {
+                "input_message_log": [{"token_ids": [1]}],
+                "full_result": {"reward": 0.0},
+            }
             shaping_by_rowidx[rowidx] = SimpleNamespace(
                 length_rewards_low=[],
                 rewards_low=[],
@@ -2652,7 +2655,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
 
     manager._stream_rows = fake_stream_rows
     manager._results_to_completions = lambda _results: ([object()], {})
-    manager._compute_rollout_metrics = lambda *_args: {}
+    manager._compute_rollout_metrics = lambda *_args, **_kwargs: {}
     manager._compute_reward_penalty_metrics = lambda *_args: {}
 
     async def run_group():
@@ -2930,3 +2933,25 @@ def test_run_async_nemo_gym_rollout(
     1. In nemo_rl/experience/rollouts.py::run_async_nemo_gym_rollout, the sampling params are passed appropriately
     2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """
+
+
+def test_mask_sample_flags_read_either_form_of_the_flag():
+    """Either the verify response's first-class ``mask_sample`` field or the
+    ``instance_config.mask_sample`` extras mapping flags a sample. Gym defaults
+    the first-class field to False on every response, so a nested-only
+    environment carries a false first-class field beside the true nested one
+    and the two reads must be OR-ed, not ordered; unflagged and empty rows stay
+    unmasked."""
+    flags = rollouts_mod._mask_sample_flags(
+        [
+            {"mask_sample": True},
+            {"instance_config": {"mask_sample": True}},
+            # An older-form environment on a Gym that defaults the first-class
+            # field to False: either form flags the sample.
+            {"mask_sample": False, "instance_config": {"mask_sample": True}},
+            {"mask_sample": False, "instance_config": {}},
+            {},
+            None,
+        ]
+    )
+    assert flags.tolist() == [True, True, True, False, False, False]
