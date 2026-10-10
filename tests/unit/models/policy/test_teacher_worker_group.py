@@ -297,3 +297,166 @@ def test_teacher_logprobs_explicitly_skip_router_replay(
     # Preserve the teacher-logprob result contract, including unpacking order.
     assert set(result) == {"reference_logprobs"}
     torch.testing.assert_close(result["reference_logprobs"], data["input_ids"].float())
+
+
+# ── fp32 LM head: explicit per teacher ─────────────────────────────────────
+
+
+def test_teacher_fp32_lm_head_is_an_explicit_typed_field():
+    import pydantic
+
+    from nemo_rl.algorithms.opd import TeacherResourceConfig, TeacherResourceOverrides
+
+    assert TeacherResourceConfig().fp32_lm_head is False
+    assert TeacherResourceConfig(fp32_lm_head="tf32").fp32_lm_head == "tf32"
+    assert TeacherResourceOverrides().fp32_lm_head is None
+    with pytest.raises(pydantic.ValidationError):
+        TeacherResourceConfig(fp32_lm_head="fp16")
+    # A copy inside megatron_cfg_overrides would sidestep the student/teacher
+    # match check, so the typed field is the only place to set it.
+    for schema in (TeacherResourceConfig, TeacherResourceOverrides):
+        with pytest.raises(
+            pydantic.ValidationError, match="not inside megatron_cfg_overrides"
+        ):
+            schema(megatron_cfg_overrides={"fp32_lm_head": "tf32"})
+
+
+def test_teacher_fp32_lm_head_survives_a_partial_override_in_the_parsed_config():
+    """default_teacher_cfg sets it; an override that does not mention it keeps it."""
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
+
+    opd = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"general": "/ckpt/general", "code": "/ckpt/code"},
+        non_colocated_teachers={
+            "enabled": True,
+            "default_teacher_cfg": {"gpus_per_node": 4, "fp32_lm_head": "tf32"},
+            "teacher_overrides": {"code": {"micro_batch_size": 1}},
+        },
+    )
+
+    configs = {
+        config.alias: config
+        for config in create_teacher_configs_from_opd_config(
+            _opd_cfg({"on_policy_distillation": opd})
+        )
+    }
+
+    assert configs["general"].fp32_lm_head == "tf32"
+    assert configs["code"].fp32_lm_head == "tf32"
+    assert configs["code"].micro_batch_size == 1
+    assert "fp32_lm_head" not in configs["code"].megatron_cfg_overrides
+
+
+def _make_fp32_teacher_group(
+    policy_config: dict[str, Any], teacher_fp32_lm_head: Any
+) -> TeacherWorkerGroup:
+    (teacher_cfg,) = create_teacher_configs_from_opd_config(
+        {
+            "teacher_model_by_agent_name": {"teacher": "/teacher"},
+            "non_colocated_teachers": {
+                "default_teacher_cfg": {
+                    "gpus_per_node": 2,
+                    "micro_batch_size": 1,
+                    "fp32_lm_head": teacher_fp32_lm_head,
+                }
+            },
+        }
+    )
+    cluster = MagicMock()
+    cluster.world_size.return_value = 2
+    return TeacherWorkerGroup(teacher_cfg, cluster, policy_config, MagicMock())
+
+
+@pytest.mark.parametrize("teacher_value", [False, "tf32"])
+def test_teacher_never_inherits_the_student_fp32_lm_head(
+    student_policy_config: dict[str, Any],
+    mock_ray_worker_group: MagicMock,
+    teacher_value: Any,
+) -> None:
+    """The worker config carries the teacher's own setting, not the student's."""
+    student_policy_config["megatron_cfg"]["fp32_lm_head"] = "tf32"
+
+    teacher = _make_fp32_teacher_group(student_policy_config, teacher_value)
+
+    worker_config = mock_ray_worker_group.call_args.args[1].args[0]
+    assert worker_config is teacher.cfg
+    assert worker_config["megatron_cfg"]["fp32_lm_head"] == teacher_value
+    # The student's own config is left alone.
+    assert student_policy_config["megatron_cfg"]["fp32_lm_head"] == "tf32"
+
+
+def test_teacher_strict_fp32_lm_head_is_not_implemented(
+    student_policy_config: dict[str, Any], mock_ray_worker_group: MagicMock
+) -> None:
+    with pytest.raises(NotImplementedError, match="not implemented for MOPD teachers"):
+        _make_fp32_teacher_group(student_policy_config, True)
+    mock_ray_worker_group.assert_not_called()
+
+
+class _RecordingOutputLayer(torch.nn.Module):
+    """Stand-in output layer recording each GEMM's operand dtypes and TF32 flag."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.ones(4, 2, dtype=torch.bfloat16), requires_grad=False
+        )
+        self.calls: list[tuple[torch.dtype, torch.dtype, bool]] = []
+
+    def forward(self, input_, *args, weight=None, **kwargs):
+        w = weight if weight is not None else self.weight
+        self.calls.append(
+            (input_.dtype, w.dtype, torch.backends.cuda.matmul.allow_tf32)
+        )
+        return input_ @ w.t()
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("mode", [False, "tf32"])
+def test_teacher_worker_config_applies_its_own_fp32_lm_head(
+    student_policy_config: dict[str, Any],
+    mock_ray_worker_group: MagicMock,
+    mode: Any,
+) -> None:
+    """A teacher matching the student passes the worker check and gets its head.
+
+    Runs MegatronPolicyWorker.__init__'s fp32-head steps on the worker config
+    TeacherWorkerGroup builds: validate_fp32_lm_head_config, which checks the
+    teacher's setting against the student's vLLM env var carried over in the
+    copied config, then apply_fp32_lm_head(use_tf32=...) when enabled.
+    """
+    from types import SimpleNamespace
+
+    from nemo_rl.models.megatron.setup import (
+        apply_fp32_lm_head,
+        validate_fp32_lm_head_config,
+    )
+
+    student_policy_config["megatron_cfg"]["fp32_lm_head"] = mode
+    student_policy_config["generation"] = {
+        "backend": "vllm",
+        "vllm_cfg": {"env_vars": {"NRL_VLLM_FP32_LM_HEAD": "1"} if mode else {}},
+    }
+    cfg = _make_fp32_teacher_group(student_policy_config, mode).cfg
+
+    validate_fp32_lm_head_config(cfg)
+    layer = _RecordingOutputLayer()
+    fp32_lm_head = cfg["megatron_cfg"]["fp32_lm_head"]
+    if fp32_lm_head:
+        chunk = SimpleNamespace(
+            module=SimpleNamespace(output_layer=layer, post_process=True)
+        )
+        apply_fp32_lm_head([chunk], use_tf32=(fp32_lm_head == "tf32"))
+    tf32_before = torch.backends.cuda.matmul.allow_tf32
+
+    logits = layer(torch.ones(3, 2, dtype=torch.bfloat16))
+
+    if mode:
+        # Upcast operands, GEMM on TF32 tensor cores, fp32 logits.
+        assert logits.dtype == torch.float32
+        assert layer.calls == [(torch.float32, torch.float32, True)]
+    else:
+        assert logits.dtype == torch.bfloat16
+        assert layer.calls == [(torch.bfloat16, torch.bfloat16, tf32_before)]
+    assert torch.backends.cuda.matmul.allow_tf32 == tf32_before

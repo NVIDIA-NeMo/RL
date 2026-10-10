@@ -123,6 +123,42 @@ trainable) + 1 node vLLM generation (frozen) + 1 node teacher (frozen). Ten
 distinct teachers at 1 node each would instead add 10 nodes on top of the
 policy and generation nodes.
 
+### fp32 LM head
+
+`policy.megatron_cfg.fp32_lm_head: "tf32"` computes the student's LM head in
+fp32 on TF32 tensor cores (pair it with
+`policy.generation.vllm_cfg.env_vars.NRL_VLLM_FP32_LM_HEAD: "1"`). Teachers do
+not inherit it: each non-colocated teacher sets its own value, and setup
+rejects, before reserving any resources, a teacher whose setting differs from
+the student's.
+
+```yaml
+policy:
+  megatron_cfg:
+    fp32_lm_head: "tf32"
+  generation:
+    vllm_cfg:
+      env_vars:
+        NRL_VLLM_FP32_LM_HEAD: "1"
+
+on_policy_distillation:
+  non_colocated_teachers:
+    default_teacher_cfg:
+      fp32_lm_head: "tf32"  # required to match; never inherited from the student
+    # A per-alias override must match too:
+    # teacher_overrides: {<alias>: {fp32_lm_head: "tf32"}}
+```
+
+- MOPD supports `fp32_lm_head: false` and `"tf32"` only. `true` (the
+  strict-fp32 head, whose GEMM costs ~25x a bf16 one) is not implemented for
+  teachers, so it is rejected for a student with teachers too.
+- Set it as the teacher field above; `fp32_lm_head` inside
+  `megatron_cfg_overrides` is rejected.
+- With the head on, `use_fused_linear_logprobs: true` on a teacher is rejected:
+  the fused kernel bypasses `output_layer`.
+- Each teacher forward then materializes an fp32 copy of its LM-head shard and
+  fp32 logits (twice the bf16 logits tensor).
+
 ## Running MOPD
 
 MOPD collects rollouts through NeMo Gym, so use the NeMo Gym GRPO entrypoint

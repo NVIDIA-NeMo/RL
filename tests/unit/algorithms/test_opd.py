@@ -917,3 +917,127 @@ def test_compute_teacher_topk_runs_off_actor_event_loop():
     )
 
     assert worker_thread != event_loop_thread
+
+
+# ── fp32 LM head: teachers match the student ──────────────────────────────
+
+
+def _fp32_lm_head_config(
+    student, teachers, *, teacher_overrides=None, student_fused=False
+):
+    """Two-teacher MOPD config with explicit student and teacher fp32_lm_head."""
+    default_teacher_cfg = {"num_nodes": 1, "gpus_per_node": 4}
+    if teachers is not None:
+        default_teacher_cfg["fp32_lm_head"] = teachers
+    return {
+        "policy": {
+            "megatron_cfg": {
+                "enabled": True,
+                "fp32_lm_head": student,
+                "use_fused_linear_logprobs": student_fused,
+            }
+        },
+        "on_policy_distillation": {
+            "enabled": True,
+            "teacher_model_by_agent_name": {"math": "/ckpt/math", "code": "/ckpt/code"},
+            "non_colocated_teachers": {
+                "enabled": True,
+                "default_teacher_cfg": default_teacher_cfg,
+                "teacher_overrides": teacher_overrides or {},
+            },
+        },
+    }
+
+
+def _validate_teacher_fp32_lm_head(cfg):
+    from nemo_rl.algorithms import opd
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    teacher_configs = create_teacher_configs_from_opd_config(opd._opd_cfg(cfg))
+    opd.validate_teacher_fp32_lm_head(cfg, teacher_configs)
+
+
+@pytest.mark.parametrize(
+    "student, teachers", [(False, False), (None, False), ("tf32", "tf32")]
+)
+def test_teacher_fp32_lm_head_matching_the_student_is_accepted(student, teachers):
+    _validate_teacher_fp32_lm_head(_fp32_lm_head_config(student, teachers))
+
+
+@pytest.mark.parametrize("student, teachers", [("tf32", False), (False, "tf32")])
+def test_teacher_fp32_lm_head_mismatch_is_rejected(student, teachers):
+    with pytest.raises(ValueError, match="same fp32 LM head setting as the student"):
+        _validate_teacher_fp32_lm_head(_fp32_lm_head_config(student, teachers))
+
+
+def test_teacher_fp32_lm_head_is_not_inherited_from_the_student():
+    """Student on and teachers unset: each teacher has to opt in explicitly."""
+    with pytest.raises(ValueError, match="do not inherit"):
+        _validate_teacher_fp32_lm_head(_fp32_lm_head_config("tf32", None))
+
+
+def test_teacher_fp32_lm_head_mismatch_names_only_the_offending_teacher():
+    cfg = _fp32_lm_head_config(
+        "tf32", "tf32", teacher_overrides={"code": {"fp32_lm_head": False}}
+    )
+
+    with pytest.raises(ValueError, match="code=False") as excinfo:
+        _validate_teacher_fp32_lm_head(cfg)
+    assert "math=" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "student, teachers", [(True, True), (True, "tf32"), (True, False), ("tf32", True)]
+)
+def test_strict_fp32_lm_head_is_not_implemented_for_mopd(student, teachers):
+    with pytest.raises(NotImplementedError, match='use "tf32"'):
+        _validate_teacher_fp32_lm_head(_fp32_lm_head_config(student, teachers))
+
+
+def test_strict_fp32_student_without_teachers_is_left_alone():
+    """Only MOPD is restricted: a run without teachers keeps fp32_lm_head: true."""
+    from nemo_rl.algorithms import opd
+
+    opd.validate_teacher_fp32_lm_head(_fp32_lm_head_config(True, None), [])
+
+
+def test_teacher_fp32_lm_head_rejects_fused_logprobs():
+    """Fused linear+CE bypasses the teacher's output_layer, so the head is a no-op."""
+    overridden = _fp32_lm_head_config(
+        "tf32",
+        "tf32",
+        teacher_overrides={
+            "code": {"megatron_cfg_overrides": {"use_fused_linear_logprobs": True}}
+        },
+    )
+    with pytest.raises(ValueError, match=r"\['code'\].*use_fused_linear_logprobs"):
+        _validate_teacher_fp32_lm_head(overridden)
+    # Inherited from the student, it lands on every teacher.
+    with pytest.raises(
+        ValueError, match=r"\['math', 'code'\].*use_fused_linear_logprobs"
+    ):
+        _validate_teacher_fp32_lm_head(
+            _fp32_lm_head_config("tf32", "tf32", student_fused=True)
+        )
+
+
+def test_create_teacher_worker_groups_validates_fp32_lm_head_before_building(
+    monkeypatch,
+):
+    from nemo_rl.algorithms import opd
+    from nemo_rl.models.policy import teacher_worker_group
+
+    def fail_if_built(*args, **kwargs):
+        raise AssertionError("no teacher may be built for a mismatched config")
+
+    monkeypatch.setattr(teacher_worker_group, "TeacherWorkerGroup", fail_if_built)
+
+    with pytest.raises(ValueError, match="same fp32 LM head setting as the student"):
+        opd.create_teacher_worker_groups(
+            _fp32_lm_head_config("tf32", False),
+            {"make_sequence_length_divisible_by": 8},
+            tokenizer=object(),
+            teacher_clusters={"math": object(), "code": object()},
+        )
