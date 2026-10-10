@@ -274,12 +274,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
 
             worker_builder_cls_fqn = resolve_policy_worker_cls(
-                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
+                "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker",
                 config,
             )
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 warnings.warn(
-                    "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorPolicyWorker V2. This variable is set in our container, but "
+                    "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in AutomodelPolicyWorker. This variable is set in our container, but "
                     "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
                 )
 

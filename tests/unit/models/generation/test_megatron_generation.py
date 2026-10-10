@@ -29,6 +29,8 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.megatron import MegatronGeneration, megatron_generation
 from nemo_rl.models.generation.megatron.config import (
+    MediaPromptSpecOverrides,
+    MultimodalPromptConfigOverrides,
     dedicated_inference_megatron_cfg,
     merged_inference_megatron_cfg,
     resolve_refit_execution_batch_bytes,
@@ -48,6 +50,103 @@ from nemo_rl.weight_sync.membership import RefitMembership
 from tests.unit.test_utils import SimpleLossFn
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+def _master_config_for_megatron_validation(
+    policy_config: PolicyConfig, data: dict
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        policy=policy_config,
+        data=data,
+        async_rl=SimpleNamespace(
+            recompute_kv_cache_after_weight_updates=False,
+            generation_fleet_health=SimpleNamespace(enabled=False),
+        ),
+    )
+
+
+@pytest.mark.mcore
+def test_nemotron_video_style_does_not_materialize_megatron_prompt_contract() -> None:
+    config = deepcopy(basic_megatron_test_config)
+    mcore_config = config["generation"]["mcore_generation_config"]
+    mcore_config["multimodal_prompt_config"] = {
+        "video_spec": {"model_token": "<video>"}
+    }
+    master_config = _master_config_for_megatron_validation(
+        config,
+        {
+            "default": {"video_sampling_style": "nemotron_vl"},
+            "train": {"video_sampling_style": None},
+            "validation": {"video_sampling_style": None},
+        },
+    )
+
+    MegatronGeneration.validate_settings(master_config)
+
+    assert mcore_config["multimodal_prompt_config"]["video_spec"] == {
+        "model_token": "<video>",
+    }
+
+
+@pytest.mark.mcore
+def test_nemotron_video_style_accepts_explicit_megatron_prompt_contract() -> None:
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["mcore_generation_config"]["multimodal_prompt_config"] = {
+        "video_spec": {"expansion_mode": "single"}
+    }
+    master_config = _master_config_for_megatron_validation(
+        config, {"default": {"video_sampling_style": "nemotron_vl"}}
+    )
+
+    MegatronGeneration.validate_settings(master_config)
+
+    assert config["generation"]["mcore_generation_config"]["multimodal_prompt_config"][
+        "video_spec"
+    ] == {"expansion_mode": "single"}
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("overrides_cls", "mcore_cls_name"),
+    [
+        (MediaPromptSpecOverrides, "MediaPromptSpec"),
+        (MultimodalPromptConfigOverrides, "MultimodalPromptConfig"),
+    ],
+)
+def test_prompt_config_overrides_match_mcore_fields(
+    overrides_cls: type, mcore_cls_name: str
+) -> None:
+    import dataclasses
+
+    import megatron.core.inference.config as mcore_inference_config
+
+    mcore_cls = getattr(mcore_inference_config, mcore_cls_name)
+    assert set(overrides_cls.model_fields) == {
+        field.name for field in dataclasses.fields(mcore_cls)
+    }
+
+
+@pytest.mark.mcore
+def test_split_video_styles_do_not_override_explicit_inference_prompt_config() -> None:
+    config = deepcopy(basic_megatron_test_config)
+    mcore_config = config["generation"]["mcore_generation_config"]
+    mcore_config["multimodal_prompt_config"] = {
+        "video_spec": {"expansion_mode": "single"}
+    }
+    master_config = _master_config_for_megatron_validation(
+        config,
+        {
+            "default": {},
+            "train": {"video_sampling_style": "nemotron_vl"},
+            "validation": {"video_sampling_style": "nemotron_vl"},
+        },
+    )
+
+    MegatronGeneration.validate_settings(master_config)
+
+    assert mcore_config["multimodal_prompt_config"]["video_spec"] == {
+        "expansion_mode": "single"
+    }
 
 
 @pytest.mark.mcore
@@ -478,6 +577,35 @@ def test_bridge_refit_converts_external_state_through_streaming_api() -> None:
     assert worker._generation_refit_pending_weights == {}
 
 
+@pytest.mark.parametrize(
+    ("ignore_eos", "expected_termination_id"),
+    # MCore replaces a None termination_id with the tokenizer's EOS; -1 disables it.
+    [(False, 42), (True, -1)],
+)
+def test_sampling_params_can_ignore_eos(
+    monkeypatch, ignore_eos, expected_termination_id
+):
+    worker = object.__new__(MegatronGenerationMixin)
+    worker.cfg = {
+        "generation": {
+            "temperature": 1.0,
+            "top_k": None,
+            "top_p": 1.0,
+            "max_new_tokens": 8,
+            "ignore_eos": ignore_eos,
+        }
+    }
+    worker.megatron_tokenizer = SimpleNamespace(eod=42)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.SamplingParams",
+        lambda **kwargs: kwargs,
+    )
+
+    params = worker._build_sampling_params(greedy=False, stop_words=None)
+
+    assert params["termination_id"] == expected_termination_id
+
+
 @pytest.mark.mcore
 def test_multimodal_preprocessing_requires_policy_processor():
     class _ImageWrapper:
@@ -507,9 +635,19 @@ def test_multimodal_preprocessing_forwards_vision_model_type():
         )
     )
 
-    config = worker._build_image_preprocessing_config({"vision_model_type": "qwen-vl"})
+    config = worker._build_image_preprocessing_config(
+        {
+            "vision_model_type": "qwen-vl",
+            "image_dynamic_resolution_model_length": 16384,
+            "image_dynamic_resolution_rounding_mode": "round_plus_half",
+            "image_dynamic_resolution_resize_mode": "torch_bicubic_antialias",
+        }
+    )
 
     assert config.vision_model_type == "qwen-vl"
+    assert config.dynamic_resolution_model_length == 16384
+    assert config.dynamic_resolution_rounding_mode == "round_plus_half"
+    assert config.dynamic_resolution_resize_mode == "torch_bicubic_antialias"
 
 
 @pytest.mark.mcore

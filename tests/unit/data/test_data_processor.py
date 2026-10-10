@@ -93,6 +93,50 @@ def test_nemo_gym_data_processor_without_task_data_spec():
     assert result["length"] == 0
 
 
+def test_nemo_gym_video_config_preserves_non_video_rows(monkeypatch):
+    extra_env_info = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "/shared/frames/frame-0001.jpg",
+                        },
+                        {"type": "input_text", "text": "unmarked image row"},
+                    ],
+                }
+            ]
+        }
+    }
+    tokenizer = DummyTokenizer()
+    tokenizer.tokenizer = tokenizer
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym_multimodal.nemo_gym_example_to_video_datum_spec",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = nemo_gym_data_processor(
+        datum_dict={
+            "extra_env_info": json.dumps(extra_env_info),
+            "task_name": "nemo_gym",
+        },
+        task_data_spec=TaskDataSpec(
+            task_name="nemo_gym",
+            video_sampling_style="nemotron_vl",
+        ),
+        tokenizer=tokenizer,
+        max_seq_length=None,
+        idx=7,
+    )
+
+    assert result["extra_env_info"] == extra_env_info
+    assert result["idx"] == 7
+    assert result["length"] == 0
+
+
 def test_math_data_processor():
     raw_dataset = Dataset.from_list(
         [
