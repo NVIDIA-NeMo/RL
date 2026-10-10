@@ -213,6 +213,12 @@ policy: &POLICY_BASE
         - milestones: [10]
 
     generation:
+        # Native async generation retries infrastructure failures within the current turn.
+        # Environment calls are never replayed. Optional defaults (0 disables retries):
+        # native_retry:
+        #   max_retries: 2
+        #   backoff_seconds: 1.0
+        #   deadline_seconds: 1800.0
         # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
         # See ray.sub for the full port layout.
         port_range_low: 3000

@@ -257,6 +257,8 @@ def classify_rollout_failure(exc: BaseException) -> FailureClass:
         if current is None or id(current) in seen:
             break
         seen.add(id(current))
+        if isinstance(current, RolloutDataFailure):
+            return FailureClass.DATA
         if _is_infra(current):
             return FailureClass.INFRA
         current = current.__cause__
