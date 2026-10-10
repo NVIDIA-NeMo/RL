@@ -97,6 +97,19 @@ Each process sets stable-for-the-run values on its OTel `Resource` — `init_tel
 
 Attribute construction is best-effort: a missing config key simply omits that attribute; it never raises. Plus auto-detected host / GPU / SLURM / Kubernetes attributes from lens's resource detection.
 
+### Slurm attributes on workers
+
+`init_ray()` removes every `SLURM_*` variable from the environment it hands Ray workers, because those variables break TensorRT-LLM's launcher detection. A worker therefore cannot detect Slurm itself. To keep the job identity, `init_telemetry_driver` reads the Slurm attributes on the driver, before `init_ray()` runs, and adds them to `OTEL_RESOURCE_ATTRIBUTES`. Every worker inherits that variable, and lens reads its Slurm keys from it. The topology keys (`slurm.topology.addr` and `slurm.topology.addr_pattern`) describe the driver's node rather than the job, so they are left out. A value already present in `OTEL_RESOURCE_ATTRIBUTES`, for example one exported by the launcher, is kept.
+
+### NeMo-Gym's servers
+
+NeMo-Gym's servers are subprocesses of the `NemoGym` actor and set up telemetry themselves. Before starting them, the actor passes the run's identity through their environment:
+
+- `nv.dl.campaign.stage` through `OTEL_RESOURCE_ATTRIBUTES`.
+- The run id through `NEMO_LENS_RUN_ID`, so `nemo.run.id` on Gym's spans matches the rest of the run.
+
+They also inherit the Slurm attributes described above. NeMo-Gym itself does not set any of these, so a standalone NeMo-Gym run reports none of them. NeMo-Gym's other settings, such as the exporter and span groups, follow its own configuration, with `NEMO_LENS_*` variables as the shared fallback.
+
 ## Typical configurations
 
 Each example puts the NeMo-RL settings in the config and only the destination in the environment. The `++` form is a hydra-style CLI override: it is applied to the config and echoed into the run's log, so a one-off stays as traceable as an edit to the YAML.

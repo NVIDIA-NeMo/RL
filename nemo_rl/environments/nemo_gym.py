@@ -88,6 +88,7 @@ from nemo_rl.telemetry.instrumentation import (
     streaming_umbrella_span,
 )
 from nemo_rl.telemetry.setup import (
+    export_telemetry_identity_to_subprocesses,
     init_telemetry_worker,
     instrument_aiohttp_client,
     shutdown_telemetry,
@@ -649,6 +650,10 @@ Depending on your data shape, you may want to change these values."""
                 token_capture.get("control_timeout_s") or 60.0
             )
 
+        # Gym's servers are subprocesses of this actor and inherit its environment.
+        # Their spans are therefore filed under this run and its stage.
+        # Set here rather than in Gym, which also runs outside RL.
+        export_telemetry_identity_to_subprocesses()
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(

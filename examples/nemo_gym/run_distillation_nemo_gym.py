@@ -36,6 +36,7 @@ from nemo_rl.environments.nemo_gym import (
     should_use_nemo_gym,
 )
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -140,48 +141,59 @@ The validation set you pass in will directly be used for validation with no addi
     print("Final config:")
     pprint.pprint(config)
 
-    init_ray()
+    # Before init_ray(), so the resolved telemetry env is snapshotted into the Ray runtime_env.
+    # That env includes the Slurm identity, which init_ray() strips from what workers inherit.
+    # It reaches every worker, NeMo-Gym's servers included.
+    # A no-op unless telemetry is on.
+    init_telemetry_driver(config, algorithm="distillation")
 
-    (
-        student_policy,
-        teacher_policy,
-        student_generation,
-        nemo_gym,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        distillation_state,
-        master_config,
-    ) = setup(config, tokenizer, train_dataset, val_dataset)
+    try:
+        init_ray()
 
-    if student_generation is None:
-        raise ValueError("NeMo-Gym distillation requires a vLLM generation backend")
-    if nemo_gym is None:
-        raise ValueError("NeMo-Gym distillation setup did not initialize Nemo-Gym")
+        (
+            student_policy,
+            teacher_policy,
+            student_generation,
+            nemo_gym,
+            dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            distillation_state,
+            master_config,
+        ) = setup(config, tokenizer, train_dataset, val_dataset)
 
-    # Bind task_to_env and val_task_to_env for nemo_gym env
-    # NeMo-Gym is the only environment used by this runner.
-    task_to_env = {"nemo_gym": nemo_gym}
-    val_task_to_env = task_to_env
+        if student_generation is None:
+            raise ValueError("NeMo-Gym distillation requires a vLLM generation backend")
+        if nemo_gym is None:
+            raise ValueError("NeMo-Gym distillation setup did not initialize Nemo-Gym")
 
-    print("🚀 Running distillation training")
-    distillation_train(
-        student_policy,
-        teacher_policy,
-        student_generation,
-        dataloader,
-        val_dataloader,
-        tokenizer,
-        loss_fn,
-        task_to_env,
-        val_task_to_env,
-        logger,
-        checkpointer,
-        distillation_state,
-        master_config,
-    )
+        # Bind task_to_env and val_task_to_env for nemo_gym env
+        # NeMo-Gym is the only environment used by this runner.
+        task_to_env = {"nemo_gym": nemo_gym}
+        val_task_to_env = task_to_env
+
+        print("🚀 Running distillation training")
+        distillation_train(
+            student_policy,
+            teacher_policy,
+            student_generation,
+            dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            distillation_state,
+            master_config,
+        )
+
+    finally:
+        # Flush on the failure paths too. No-op when telemetry is inactive.
+        shutdown_telemetry()
 
 
 if __name__ == "__main__":
