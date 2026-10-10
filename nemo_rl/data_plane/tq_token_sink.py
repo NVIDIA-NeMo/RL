@@ -67,7 +67,7 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXTRAS_METADATA_FIELD,
     ROUTED_LEN_FIELD,
 )
-from nemo_rl.experience.route_assembly import RouteFragment
+from nemo_rl.experience.route_assembly import RouteFragment, boundary_route_rows
 
 # These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
 # transformed by stage() below. Adding a field means editing both this list and
@@ -531,10 +531,13 @@ class TQTokenSink:
                 else:
                     experts = torch.tensor(routed, dtype=torch.int16)
                     routed_encoding = ROUTE_ENCODING_LIST
-                if experts.dim() != 3 or experts.shape[0] != delta_len:
+                expected_len = delta_len + boundary_route_rows(record.prev_len)
+                if experts.dim() != 3 or experts.shape[0] != expected_len:
                     raise ValueError(
                         "routed_experts must already be delta-aligned: "
-                        f"got shape {tuple(experts.shape)} for delta_len={delta_len}"
+                        f"got shape {tuple(experts.shape)} for "
+                        f"prev_len={record.prev_len}, delta_len={delta_len} "
+                        f"(expected {expected_len} rows)"
                     )
                 field_dict[ROUTED_EXPERTS_FIELD] = experts.unsqueeze(0)
                 routed_len = int(experts.shape[0])

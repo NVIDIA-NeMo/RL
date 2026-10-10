@@ -61,6 +61,7 @@ from nemo_rl.experience.reward_penalties import (
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
+    boundary_route_rows,
     execute_route_plan,
 )
 from nemo_rl.experience.route_plan import (
@@ -406,7 +407,10 @@ class RolloutReassembler:
                 commitment = commitments_by_call.get(call_id)
                 if record is None or item is None or commitment is None:
                     return rejected(f"route_span_identity:{call_id}", staging_keys)
-                if item.routed_len not in (0, record.delta_len):
+                expected_routed_len = record.delta_len + boundary_route_rows(
+                    record.prev_len
+                )
+                if item.routed_len not in (0, expected_routed_len):
                     return rejected(f"routed_len_mismatch:{call_id}", staging_keys)
                 if generation_len < 0 or generation_len > record.delta_len:
                     return rejected(
@@ -961,8 +965,9 @@ class RolloutReassembler:
                     f"rollout {row.rollout_id}"
                 )
             routed[i, : row_routes.shape[0]] = row_routes
+            # The final token never has a recorded route; don't count it.
             sentinel_tokens += int(
-                row_routes.eq(ROUTE_MISSING_SENTINEL).all(-1).all(-1).sum().item()
+                row_routes[:-1].eq(ROUTE_MISSING_SENTINEL).all(-1).all(-1).sum().item()
             )
         if valid_rows:
             metrics["finalize/routed_experts_row_coverage"] = (
