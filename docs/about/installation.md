@@ -130,7 +130,7 @@ uv venv
 > export LD_LIBRARY_PATH=".venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
 >
 > # Verify TE picks up the correct cuDNN version (TE is in the mcore extra).
-> # The version should match nvidia-cudnn-cu13 pinned in pyproject.toml (currently 9.20.0).
+> # The version should match the nvidia-cudnn-cu13 pin in pyproject.toml.
 > uv run --extra mcore python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 > ```
 

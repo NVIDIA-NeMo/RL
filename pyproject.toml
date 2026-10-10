@@ -84,7 +84,10 @@ dependencies = [
   # the HTTP calls NeMo-Gym's client makes, so a Gym rollout continues the
   # run's trace rather than starting its own.
   "nemo-lens[sdk,aiohttp]>=0.2.0",
-  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'", # for transformer-engine no build isolation
+  # Headers for transformer-engine's no-build-isolation install, and the runtime floor for
+  # TE 2.18 fused-attention backward with 256-wide heads on SM 10.x (cuDNN >= 9.23.0 for
+  # bshd/sbhd, >= 9.25.0 for thd; see TE fused_attn.cpp). Keep equal to the override below.
+  "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
   # tilelang — required by fused DSA TileLang kernels on Blackwell and by the
   # replacement Triton kernel mamba-ssm requires when Triton >= 3.4.0 on Hopper;
   # see https://github.com/state-spaces/mamba/issues/640.
@@ -436,7 +439,7 @@ link-mode = "copy"
 override-dependencies = [
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
-  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
+  "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
