@@ -14,12 +14,20 @@
 
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import pytest
 import torch
+from jinja2.exceptions import TemplateError
 from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import (
+    AutoProcessor,
+    AutoTokenizer,
+    PreTrainedTokenizerBase,
+    PreTrainedTokenizerFast,
+)
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
@@ -573,6 +581,84 @@ def test_get_formatted_message_log_models(
                 add_special_tokens=False,
             )[0]
             assert normalize(actual_concat) == normalize(expected_concat)
+
+
+@pytest.mark.parametrize(
+    "chat_template",
+    [
+        pytest.param(
+            "{% set users = messages | selectattr('role', 'equalto', 'user') | list %}"
+            "{{ users[-1]['content'] }}|"
+            "{% for message in messages %}{{ message['role'] }}={{ message['content'] }};{% endfor %}",
+            id="undefined-leading-system",
+        ),
+        pytest.param(
+            "{% set users = messages | selectattr('role', 'equalto', 'user') | list %}"
+            "{% if not users %}{{ raise_exception('No user query found in messages.') }}{% endif %}"
+            "{{ bos_token }}{{ users[-1]['content'] }}|"
+            "{% for message in messages %}{{ message['role'] }}={{ message['content'] }};{% endfor %}",
+            id="explicit-leading-system-error-with-bos",
+        ),
+    ],
+)
+def test_get_formatted_message_log_defers_system_turns_requiring_user(
+    chat_template: str,
+) -> None:
+    backend_tokenizer = Tokenizer(WordLevel({"[UNK]": 0, "<s>": 1}, unk_token="[UNK]"))
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend_tokenizer, unk_token="[UNK]", bos_token="<s>"
+    )
+    tokenizer.chat_template = chat_template
+    message_log: LLMMessageLogType = [
+        {"role": "system", "content": "Follow the rules."},
+        {"role": "user", "content": "Help me."},
+        {"role": "assistant", "content": "Certainly."},
+    ]
+
+    result = get_formatted_message_log(
+        message_log,
+        tokenizer,
+        TaskDataSpec(task_name="test"),
+        add_eos_token=False,
+    )
+
+    expected = tokenizer.apply_chat_template(message_log, tokenize=False)
+    if not expected.startswith("<s>"):
+        expected = "<s>" + expected
+    assert result[0]["content"] == ""
+    assert result[0]["token_ids"].dtype == torch.int64
+    assert "system=Follow the rules.;user=Help me.;" in result[1]["content"]
+    assert "assistant=Certainly.;" in result[2]["content"]
+    assert (
+        "".join(cast(str, message["content"]) for message in result).count("<s>") == 1
+    )
+    assert "".join(cast(str, message["content"]) for message in result) == expected
+
+
+def test_get_formatted_message_log_reraises_template_errors_after_user() -> None:
+    backend_tokenizer = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend_tokenizer, unk_token="[UNK]"
+    )
+    tokenizer.chat_template = """
+        {% if messages[-1]['role'] == 'assistant' %}
+            {{ raise_exception('assistant turn rejected') }}
+        {% endif %}
+        {% for message in messages %}{{ message['content'] }}{% endfor %}
+    """
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": "Help me."},
+        {"role": "assistant", "content": "Certainly."},
+    ]
+
+    with pytest.raises(TemplateError, match="assistant turn rejected"):
+        get_formatted_message_log(
+            message_log,
+            tokenizer,
+            TaskDataSpec(task_name="test"),
+            add_bos_token=False,
+            add_eos_token=False,
+        )
 
 
 @pytest.mark.parametrize("enable_thinking", [True, False])

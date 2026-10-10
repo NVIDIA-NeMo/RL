@@ -17,6 +17,7 @@ from typing import Any, Optional, Union, cast
 import numpy as np
 import torch
 from datasets import Dataset
+from jinja2.exceptions import TemplateError
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.data.interfaces import (
@@ -532,6 +533,7 @@ def get_formatted_message_log(
 
     new_message_log: LLMMessageLogType = []
     prev_formatted_message = ""
+    bos_handled = False
     message_log_strs: list[dict[str, str]] = cast(
         list[dict[str, str]], message_log
     )  # we just use the str:str parts here
@@ -605,9 +607,17 @@ def get_formatted_message_log(
         if tools is not None:
             template_kwargs["tools"] = tools
 
-        formatted_message: str = tokenizer.apply_chat_template(  # type: ignore
-            message_log_strs[: i + 1], **template_kwargs
-        )
+        template_deferred = False
+        try:
+            formatted_message: str = tokenizer.apply_chat_template(  # type: ignore
+                message_log_strs[: i + 1], **template_kwargs
+            )
+        except TemplateError:
+            if i < first_user_msg_id:
+                formatted_message = prev_formatted_message
+                template_deferred = True
+            else:
+                raise
 
         ## get the length of the previous message, excluding the eos token (if present)
         prev_message_len_no_eos: int = get_first_index_that_differs(
@@ -641,14 +651,15 @@ def get_formatted_message_log(
                 print(formatted_message)
                 print("=" * 80 + "\n")
 
-        if i == 0:
-            if add_bos_token:
-                if tokenizer.bos_token is None:
-                    warnings.warn(
-                        "add_bos_token is True but the tokenizer does not have a BOS token. Skipping BOS token addition."
-                    )
-                elif not message_chunk.startswith(tokenizer.bos_token):
-                    message_chunk = tokenizer.bos_token + message_chunk
+        if add_bos_token and not bos_handled and not template_deferred:
+            bos_token = cast(Optional[str], tokenizer.bos_token)
+            if bos_token is None:
+                warnings.warn(
+                    "add_bos_token is True but the tokenizer does not have a BOS token. Skipping BOS token addition."
+                )
+            elif not message_chunk.startswith(bos_token):
+                message_chunk = bos_token + message_chunk
+            bos_handled = True
 
         if i == len(message_log_strs) - 1:
             r"""
