@@ -1401,3 +1401,99 @@ def test_init_checkpointer_respects_an_explicit_prefix_store_choice(monkeypatch)
     manager.init_checkpointer(config_updates={"is_async": True})
 
     assert os.environ["DCP_USE_PREFIX_STORE"] == "0"
+
+
+def _tiny_adamw(steps: int = 0):
+    torch.manual_seed(0)
+    model = torch.nn.Linear(4, 2, bias=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    for _ in range(steps):
+        model(torch.randn(3, 4)).pow(2).mean().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+    return model, optimizer
+
+
+def _save_optimizer_metadata(optimizer_path: str, with_state: bool) -> None:
+    """Write a minimal DCP optimizer checkpoint so the verifier can read its metadata."""
+    import torch.distributed.checkpoint as dcp
+
+    state = (
+        {"weight": {"exp_avg_sq": torch.ones(2), "step": torch.tensor(3.0)}}
+        if with_state
+        else {}
+    )
+    dcp.save(
+        {"optim": {"state": state, "param_groups": [{"lr": 1e-3}]}},
+        checkpoint_id=os.path.join(optimizer_path, "optim"),
+    )
+
+
+def _mocked_manager():
+    manager = AutomodelCheckpointManager(MagicMock(), MagicMock())
+    manager.checkpointer = MagicMock()
+    manager.update_checkpointer_config = MagicMock()
+    return manager
+
+
+@pytest.mark.automodel
+def test_load_checkpoint_rejects_optimizer_resume_that_restored_nothing(tmp_path):
+    """The checkpoint holds state, the optimizer is still fresh after the load: fail loudly."""
+    optimizer_path = str(tmp_path / "optimizer")
+    _save_optimizer_metadata(optimizer_path, with_state=True)
+    manager = _mocked_manager()
+    model, optimizer = _tiny_adamw(steps=0)  # as after a no-op DCP load
+
+    with pytest.raises(RuntimeError, match="not restored"):
+        manager.load_checkpoint(model, str(tmp_path), optimizer, optimizer_path)
+    manager.checkpointer.load_optimizer.assert_called_once()
+
+
+@pytest.mark.automodel
+def test_load_checkpoint_rejects_fresh_optimizer_when_metadata_unreadable(tmp_path):
+    """Without readable metadata the verifier falls back to requiring state and a step counter."""
+    manager = _mocked_manager()
+    model, optimizer = _tiny_adamw(steps=0)
+
+    with pytest.raises(RuntimeError, match="not restored"):
+        manager.load_checkpoint(
+            model, str(tmp_path), optimizer, str(tmp_path / "missing")
+        )
+
+
+@pytest.mark.automodel
+def test_load_checkpoint_accepts_restored_optimizer_state(tmp_path, capsys):
+    """A real restore (state entries + step counter) passes and logs a one-line summary."""
+    optimizer_path = str(tmp_path / "optimizer")
+    _save_optimizer_metadata(optimizer_path, with_state=True)
+    manager = _mocked_manager()
+    model, optimizer = _tiny_adamw(steps=3)  # as after a successful DCP load
+
+    manager.load_checkpoint(model, str(tmp_path), optimizer, optimizer_path)
+    manager.checkpointer.load_optimizer.assert_called_once()
+    out = capsys.readouterr().out
+    assert "optimizer state after resume" in out
+    assert "max step 3" in out
+    assert "2 state keys, step counter present" in out
+
+
+@pytest.mark.automodel
+def test_load_checkpoint_tolerates_checkpoint_without_optimizer_state(tmp_path):
+    """A checkpoint written before any optimizer step has nothing to restore and must not fail."""
+    optimizer_path = str(tmp_path / "optimizer")
+    _save_optimizer_metadata(optimizer_path, with_state=False)
+    manager = _mocked_manager()
+    model, optimizer = _tiny_adamw(steps=0)
+
+    manager.load_checkpoint(model, str(tmp_path), optimizer, optimizer_path)
+    manager.checkpointer.load_optimizer.assert_called_once()
+
+
+@pytest.mark.automodel
+def test_load_checkpoint_without_optimizer_path_skips_verification(tmp_path):
+    """No optimizer path means no optimizer load and no verification."""
+    manager = _mocked_manager()
+    model, optimizer = _tiny_adamw(steps=0)
+
+    manager.load_checkpoint(model, str(tmp_path), optimizer, None)
+    manager.checkpointer.load_optimizer.assert_not_called()
