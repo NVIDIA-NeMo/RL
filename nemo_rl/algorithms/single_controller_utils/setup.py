@@ -139,6 +139,7 @@ from nemo_rl.models.megatron.router_replay import (
 )
 from nemo_rl.models.policy import OnPolicyDistillationFullTransport, PolicyConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
@@ -1065,6 +1066,10 @@ def setup_single_controller(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     data_config = master_config.data
+
+    # Validate every LoRA rollout representation and materialize native vLLM
+    # settings before generation and trainer are constructed concurrently.
+    configure_lora_refit(policy_config)
 
     # Every nccl_reshard precondition, checked once, here, before any GPU work.
     #

@@ -29,6 +29,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     get_num_routed_experts,
 )
+from nemo_rl.models.generation.vllm.lora_utils import LoraRefitMode
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
     MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
@@ -214,6 +215,9 @@ class VllmConfig(GenerationConfig):
     # A custom checkpoint engine may use a ``module:ClassName`` selector.
     refit_transport: NotRequired[VllmRefitSelector | str | None]
     refit_cfg: NotRequired[VllmRefitConfig | None]
+    # LoRA policies use vLLM's factorized adapter runtime by default. Set to
+    # ``merged`` to opt into materializing and refitting full ``W + BA`` weights.
+    lora_refit_mode: NotRequired[LoraRefitMode]
 
     # quantization config
     quant_cfg: NotRequired[str | None]
