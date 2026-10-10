@@ -46,8 +46,13 @@ single `ValueError` listing every violation. The current requirements are:
   `inference_optimized` is rejected by config key name rather than surfacing as
   a raw MCore assert at model build.
 * **Precision** for vLLM supports BF16 train ↔ BF16 gen, blockwise-FP8 train
-  (`fp8_param=true` + blockwise recipe) ↔ FP8 gen, and BF16 train → MXFP8 gen
-  (`vllm_cfg.precision=fp8`, `vllm_cfg.is_mx=true`). Blockwise-FP8 train →
+  (`fp8_param=true` + blockwise recipe) ↔ FP8 gen, and BF16 or MXFP8 train
+  (`fp8_param=true` + mxfp8 recipe) → MXFP8 gen (`vllm_cfg.precision=fp8`,
+  `vllm_cfg.is_mx=true`). MXFP8 training storage is materialized as logical
+  BF16 for transport and re-quantized to MXFP8 by the vLLM receiver, the same
+  as BF16 training storage. The round trip is value-exact: MXFP8 → BF16
+  dequantization is lossless, and re-quantizing the result reproduces the
+  trainer's dequantized MXFP8 values. Blockwise- or tensorwise-FP8 train →
   MXFP8 gen is not supported.
 * Megatron generation accepts BF16 or supported Transformer Engine FP8 training
   parameter storage, including blockwise FP8 and MXFP8 with `fp8_param=true`.
@@ -76,7 +81,10 @@ single `ValueError` listing every violation. The current requirements are:
     scales. An alignment-aware MXFP8 transport would have to unswizzle,
     re-slice, and re-swizzle — most of the cost of a requantize anyway.
   The benefit of this path is capability (M-to-N reshard into a Megatron
-  engine), not bandwidth.
+  engine), not bandwidth. vLLM destinations use the same BF16 wire for MXFP8
+  training storage: the refit sends the dequantized logical weights and the
+  receiver reuses its BF16 → MXFP8 quantization, so no MXFP8 data or scale
+  layout crosses the wire.
 * BF16 FlashInfer TRTLLM MoE is supported through vLLM's native
   layerwise-reload path. Its grouped expert weights must use expert-parallel
   destination sharding with linear expert placement; tensor-sharded expert

@@ -681,13 +681,16 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             )
 
         # Precision compatibility (train ↔ gen). vLLM supports byte-compatible
-        # BF16/BF16 and blockwise-FP8/FP8, plus receiver-side BF16-to-MXFP8.
+        # BF16/BF16 and blockwise-FP8/FP8, plus receiver-side MXFP8 quantization
+        # of BF16 or MXFP8 training storage. MXFP8 storage has no physical export
+        # path, so it is sent as logical BF16 and re-quantized by the receiver.
         # Megatron generation sends logical BF16 weights from BF16 or TE-quantized
         # training storage, then writes BF16 or performs on-receive MXFP8
         # quantization at the destination.
         #   BF16 train  ↔ BF16 gen   (default, tested)
         #   FP8  train  ↔ FP8  gen   (fp8_param=True + blockwise + vllm precision=fp8)
         #   BF16 storage → MXFP8 gen  (receiver quantizes the resharded BF16 shard)
+        #   MXFP8 storage → MXFP8 gen (fp8_param=True + mxfp8 + is_mx; logical BF16)
         # FP8→BF16 has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
         fp8_param = fp8_cfg.get("fp8_param", False)
@@ -719,12 +722,15 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             if gen_precision == "fp8":
                 if fp8_param:
                     if vllm_cfg.get("is_mx"):
-                        violations.append(
-                            "policy.generation.vllm_cfg.is_mx=True does not support "
-                            "blockwise-FP8 storage from "
-                            "policy.megatron_cfg.fp8_cfg.fp8_param; use BF16 training "
-                            "storage for receiver-side MXFP8 quantization."
-                        )
+                        if fp8_recipe != "mxfp8":
+                            violations.append(
+                                "policy.generation.vllm_cfg.is_mx=True with "
+                                "policy.megatron_cfg.fp8_cfg.fp8_param=True requires "
+                                f"fp8_recipe='mxfp8' (got {fp8_recipe!r}); MXFP8 "
+                                "storage is sent as logical BF16 and re-quantized by "
+                                "the receiver. Use BF16 training storage for other "
+                                "recipes."
+                            )
                     elif fp8_recipe != "blockwise":
                         violations.append(
                             "policy.megatron_cfg.fp8_cfg.fp8_recipe must be 'blockwise' "
