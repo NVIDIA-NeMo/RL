@@ -1121,6 +1121,10 @@ def create_weights_mxfp8_moe(
         {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
     )
 
+    # Initialize the parameters created by this override directly instead of
+    # assuming every later layer implementation exposes these attribute names.
+    _initialize_dummy_mxfp8_scales(w13_weight_scale, w2_weight_scale)
+
 
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.
@@ -1375,12 +1379,6 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
     if requires_padding and not self.experts_cls.is_monolithic():
         raise NotImplementedError(
             "Padded FlashInfer TRTLLM MXFP8 MoE requires a monolithic kernel."
-        )
-
-    if first_load:
-        _initialize_dummy_mxfp8_scales(
-            layer.w13_weight_scale,
-            layer.w2_weight_scale,
         )
 
     if requires_padding:

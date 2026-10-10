@@ -9,9 +9,8 @@ policy:
       tensor_parallel_size: 4
       precision: "fp8"
       is_mx: true
-      # Keep the first three boundary layers and layers 76-93 in BF16. The
-      # failing-token replay's MXFP8 error accelerates from layer 76 and then
-      # diverges sharply in layer 89.
+      # Keep layers 0-2 and 76-93 in BF16; this boundary was chosen empirically
+      # to bound rollout/training probability error at the first and last steps.
       num_first_layers_in_bf16: 3
       num_last_layers_in_bf16: 18
       quantization_ignore_patterns:
