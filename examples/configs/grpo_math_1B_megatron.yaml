@@ -88,6 +88,12 @@ policy:
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false
+    # Optional checkpoint-I/O knobs forwarded to Megatron Bridge's
+    # CheckpointConfig. When unset, the historical hard-coded defaults are used.
+    # checkpoint:
+    #   fully_parallel_save: true   # Set false to simplify debugging at the cost of throughput
+    #   fully_parallel_load: true   # Set false to simplify debugging at the cost of throughput
+    #   load_rng: false             # Set true to include/restore RNG state for bit-exact resume
     # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
     cuda_graph_impl: "none"
     cuda_graph_modules: []
