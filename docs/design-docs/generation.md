@@ -20,6 +20,10 @@ The core of the generation system is defined in `interfaces.py`, which establish
        model_name: str           # Name or path of the model
    ```
 
+   The backends do not all interpret `temperature` / `top_p` / `top_k` identically — in
+   particular, the value meaning "no top-k restriction" differs between them. See
+   [Sampling Parameters Across Generation Backends](sampling-params.md).
+
 2. **GenerationDatumSpec**: A TypedDict that defines the input data format:
    ```python
    class GenerationDatumSpec(TypedDict):
