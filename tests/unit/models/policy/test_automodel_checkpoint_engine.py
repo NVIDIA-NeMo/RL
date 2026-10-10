@@ -34,6 +34,7 @@ def test_automodel_checkpoint_engine_weight_iterator():
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = nn.Linear(2, 1)
     worker.dtype = torch.float32
+    worker.draft_model = None
 
     weights = list(AutomodelPolicyWorkerImpl._checkpoint_engine_weight_iterator(worker))
 

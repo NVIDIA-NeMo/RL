@@ -50,6 +50,10 @@ from nemo_rl.models.generation.vllm.config import (
     validate_nvfp4_pertoken_model,
     vllm_nemotron_h_fp32_lm_head_enabled,
 )
+from nemo_rl.models.generation.vllm.draft_utils import (
+    DRAFT_DISABLE_MODULE_SHARING_ENV,
+    draft_module_sharing_disable_required,
+)
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     FINISHED_REASON_LABEL,
@@ -650,6 +654,26 @@ class BaseVllmGenerationWorker:
             and self._mtp_speculative_enabled
             and not mtp_weights_from_refit
         )
+
+        # Full-stream draft co-training refits the drafter's trained
+        # embed_tokens/lm_head. Under load_format="dummy" the pinned vLLM would
+        # alias those drafter modules to the target model's (no checkpoint load
+        # ever marks them as owned), and the draft refit would then overwrite
+        # the policy's serving weights through the alias. Disable the sharing
+        # before engine creation; the env flag re-applies it in any spawned
+        # vLLM executor worker. dspark/dflash exist only on the DTensor-v2
+        # full-stream path; eagle3 is gated on _draft_full_refit because the
+        # megatron eagle3 trainer streams a PARTIAL set (no embed_tokens) and
+        # relies on the drafter sharing the target's embedding.
+        if draft_module_sharing_disable_required(self.cfg):
+            # Deferred import: vllm_backend imports vllm eagerly, which only
+            # this vLLM-venv worker process should pay for.
+            from nemo_rl.models.generation.vllm.vllm_backend import (
+                disable_draft_module_sharing,
+            )
+
+            os.environ[DRAFT_DISABLE_MODULE_SHARING_ENV] = "1"
+            disable_draft_module_sharing()
 
         if (
             len(get_nsight_config_if_pattern_matches("vllm_generation_worker")) > 0

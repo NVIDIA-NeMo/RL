@@ -21,6 +21,14 @@ tests/test_suites/llm/dapo-gemma4-e2b-it-1n8g-fsdp2cp2-automodel.sh
 tests/test_suites/llm/dapo-gemma4-26ba4b-it-4n8g-fsdp2-automodel.sh
 tests/test_suites/llm/dapo-gemma4-31b-it-4n8g-fsdp2cp2-automodel.sh
 
+# Reference runs for draft co-training, kept for manual comparison without adding
+# to the recurring nightly budget: the 8B no-draft control for the
+# grpo-qwen3-8b-4n8g-automodel-{dspark,dflash,eagle3}.sh nightlies, and the
+# Qwen3-30B-A3B no-draft control and eagle3 draft run.
+tests/test_suites/llm/grpo-qwen3-8b-4n8g-automodel.sh
+tests/test_suites/llm/grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel.sh
+tests/test_suites/llm/grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel-eagle3.sh
+
 # The async video GRPO regression is self-contained, but its 16-node topology
 # is too large for nightly. Run it manually before changes to the async video
 # rollout/training path are merged.

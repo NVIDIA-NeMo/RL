@@ -1,0 +1,68 @@
+defaults: grpo-qwen3-8b-4n8g-automodel.yaml
+# Qwen3-30B-A3B-Instruct-2507 GRPO math baseline with EAGLE3 draft
+# co-training (DTensor v2 backend), 4 nodes x 8 GPUs.
+grpo:
+  val_period: 10
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel-eagle3
+  save_period: 15
+  keep_top_k: 5
+policy:
+  model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
+  # 20480 (this repo's usual context) OOMs with the drafter attached on this
+  # 30B EP32 layout.
+  max_total_sequence_length: 10240
+  # HybridEP requires the padded input width to be a multiple of 64.
+  make_sequence_length_divisible_by: 64
+  tokenizer:
+    # Instruct-2507 is a non-thinking checkpoint (no <think> toggle in its
+    # chat template, unlike the base Qwen3-30B-A3B); drop the inherited
+    # enable_thinking kwarg.
+    chat_template_kwargs: null
+  hf_config_overrides:
+    # Disable the MoE load-balancing aux loss for RL: Automodel otherwise
+    # injects router gradients that conflict with the policy objective and
+    # degrade accuracy. Keep as 0.0, not 0: Hugging Face strict config
+    # validation declares router_aux_loss_coef as float and rejects YAML's
+    # integer 0.
+    router_aux_loss_coef: 0.0
+  automodel_cfg:
+    tensor_parallel_size: 1
+    expert_parallel_size: 32
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        experts: gmm
+        # HybridEP, not plain DeepEP: this container's deep_ep is built with
+        # HYBRID_EP_MULTINODE=1 (NVIDIA-NeMo/RL#4038); plain "deepep" hangs
+        # with "DeepEP error: timeout (dispatch CPU)" on this EP=32,
+        # 4-node/32-rank layout under the new deep_ep pin
+        # (NVIDIA-NeMo/RL#3436). NVIDIA-NeMo/RL#4037 will make this the
+        # repo-wide default for AutoModel MoE recipes once merged.
+        dispatcher: hybridep
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+  draft:
+    enabled: true
+    # Fork of lmsys/SGLang-EAGLE3-Qwen3-30B-A3B-Instruct-2507-SpecForge-Nex:
+    # raises max_position_embeddings 2048 -> 40960 so vLLM does not clamp
+    # the drafter RoPE.
+    model_name: yuekai/SGLang-EAGLE3-Qwen3-30B-A3B-Instruct-2507-SpecForge-Nex
+    loss_weight: 1.0
+    # speculator_type/learning_rate/ttt_steps/ttt_step_loss_decay/
+    # train_embed_and_head all match the exemplar's eagle3 defaults, so
+    # they're inherited rather than repeated here (config_cli.py minimize).
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      tensor_parallel_size: 4
+    vllm_kwargs:
+      speculative_config:
+        method: "eagle3"
+        model: ${policy.draft.model_name}
+        # One proposal per TTT step the drafter is trained to unroll
+        # (checkpoint config.json: proposal_methods[0].speculative_tokens=3).
+        num_speculative_tokens: 3
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel-eagle3
