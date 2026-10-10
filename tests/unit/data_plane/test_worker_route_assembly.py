@@ -36,6 +36,7 @@ from nemo_rl.data_plane.schema import (  # noqa: E402
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
+from nemo_rl.experience.route_assembly import RouteLayout  # noqa: E402
 from nemo_rl.experience.route_plan import (  # noqa: E402
     ROUTE_PLAN_SCHEMA_VERSION,
     RouteAssemblyPlan,
@@ -80,12 +81,17 @@ class _RouteClient:
 
 
 class _Worker(TQWorkerMixin):
-    def __init__(self, client: _RouteClient) -> None:
+    def __init__(
+        self,
+        client: _RouteClient,
+        layout: RouteLayout = RouteLayout.compressed(num_moe_layers=1, top_k=2),
+    ) -> None:
         self._dp_client = client
         self._route_fallback_counts = Counter()
+        self._layout = layout
 
-    def _routed_experts_dimensions(self) -> tuple[int, int]:
-        return 1, 2
+    def _routed_experts_layout(self) -> RouteLayout:
+        return self._layout
 
 
 def _plan(
@@ -211,3 +217,55 @@ def test_tampered_fragment_falls_back_for_entire_rollout() -> None:
 
     assert bool(routed.eq(-1).all())
     assert worker._route_fallback_counts == Counter({"fragment_integrity": 1})
+
+
+def test_full_layer_fragment_keeps_only_moe_columns() -> None:
+    """vLLM stages one route column per transformer layer; a hybrid model
+    trains only its MoE layers, so the worker must select those columns
+    instead of rejecting the fragment as a model-shape mismatch."""
+    # 4 transformer layers, MoE at layers 2 and 4, top_k=2. Column values
+    # encode (layer, slot) so the selection is checkable by eye.
+    fragment = torch.tensor(
+        [
+            [[10, 11], [20, 21], [30, 31], [40, 41]],
+            [[12, 13], [22, 23], [32, 33], [42, 43]],
+        ],
+        dtype=torch.int16,
+    )
+    client = _RouteClient({"r/c0": fragment})
+    worker = _Worker(
+        client,
+        RouteLayout(moe_layer_numbers=(2, 4), total_num_layers=4, top_k=2),
+    )
+    plan = _plan((_span(client, "r/c0", 0, 2, 2),), expected=2, cleanup=("r/c0",))
+    meta, data = _meta([plan], [2])
+
+    routed = worker._maybe_assemble_routed_experts(meta, data)[ROUTED_EXPERTS_FIELD]
+
+    assert routed.shape == (1, 3, 2, 2)
+    assert routed[0, :2].tolist() == [
+        [[20, 21], [40, 41]],
+        [[22, 23], [42, 43]],
+    ]
+    assert bool(routed[0, 2].eq(-1).all())
+    assert not worker._route_fallback_counts
+
+
+def test_fragment_matching_neither_layout_falls_back() -> None:
+    # 3 layers matches neither the 2 MoE layers nor the 4 total layers.
+    fragment = torch.tensor(
+        [[[10, 11], [20, 21], [30, 31]], [[12, 13], [22, 23], [32, 33]]],
+        dtype=torch.int16,
+    )
+    client = _RouteClient({"r/c0": fragment})
+    worker = _Worker(
+        client,
+        RouteLayout(moe_layer_numbers=(2, 4), total_num_layers=4, top_k=2),
+    )
+    plan = _plan((_span(client, "r/c0", 0, 2, 2),), expected=2, cleanup=("r/c0",))
+    meta, data = _meta([plan], [2])
+
+    routed = worker._maybe_assemble_routed_experts(meta, data)[ROUTED_EXPERTS_FIELD]
+
+    assert bool(routed.eq(-1).all())
+    assert worker._route_fallback_counts == Counter({"fragment_model_shape": 1})

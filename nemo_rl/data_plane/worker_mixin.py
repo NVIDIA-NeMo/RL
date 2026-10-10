@@ -54,7 +54,11 @@ from nemo_rl.data_plane.schema import (
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
-from nemo_rl.experience.route_assembly import RouteFragment, execute_route_plan
+from nemo_rl.experience.route_assembly import (
+    RouteFragment,
+    RouteLayout,
+    execute_route_plan,
+)
 from nemo_rl.telemetry.instrumentation import accepts_trace_context
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
@@ -352,10 +356,10 @@ class TQWorkerMixin:
         """
         return None
 
-    def _routed_experts_dimensions(self) -> tuple[int, int]:
-        """Return model-owned ``(num_moe_layers, top_k)`` route dimensions."""
+    def _routed_experts_layout(self) -> RouteLayout:
+        """Return the model-owned route layout (MoE layer numbers, total layers, top-k)."""
         raise NotImplementedError(
-            "the router-replay policy worker must provide route dimensions"
+            "the router-replay policy worker must provide the route layout"
         )
 
     def _pad_value_dict(self) -> dict[str, Any]:
@@ -645,8 +649,11 @@ class TQWorkerMixin:
         plans = [decode_route_plan(plan) for plan in encoded_plans]
         fragments_by_row, _, _ = self._route_fragments_by_row(encoded_plans)
 
-        # The worker supplies real model dims — the authoritative shape check.
-        num_moe_layers, top_k = self._routed_experts_dimensions()
+        # The worker supplies the real model layout — the authoritative shape
+        # check, and what lets a full-layer vLLM fragment be reduced to the
+        # MoE columns a hybrid model trains.
+        layout = self._routed_experts_layout()
+        num_moe_layers, top_k = layout.dims
         input_ids = data["input_ids"]
         input_lengths = data["input_lengths"].reshape(-1)
         routed = torch.full(
@@ -665,7 +672,7 @@ class TQWorkerMixin:
             tensor, reason = execute_route_plan(
                 plan,
                 fragments,
-                dims=(num_moe_layers, top_k),
+                layout=layout,
                 canonical_len=canonical_len,
             )
             if tensor is None:

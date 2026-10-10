@@ -3130,6 +3130,32 @@ def test_setup_dtensor_fp8_kv_cache_guard(
     policy_init.assert_not_called()
 
 
+def test_setup_rejects_megatron_router_replay_before_side_effects(
+    mock_grpo_components,
+):
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["router_replay"] = {"enabled": True}
+    master_config.policy["generation"]["backend"] = "megatron"
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(
+            NotImplementedError,
+            match="only supported on the SingleController token-capture path",
+        ),
+    ):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+
+    mock_logger.assert_not_called()
+
+
 def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
     mock_grpo_components,
 ):

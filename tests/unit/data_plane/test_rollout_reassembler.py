@@ -29,7 +29,9 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -40,6 +42,7 @@ from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
     compute_staging_digest,
 )
 from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
+    CallRecord,
     StagedCallRecord,
 )
 
@@ -54,7 +57,11 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler  # noqa: E402
+from nemo_rl.experience.route_assembly import RouteLayout  # noqa: E402
 from nemo_rl.experience.route_plan import decode_route_plan  # noqa: E402
+from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
+    TQMegatronTokenStager,
+)
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
     build_fixture_artifacts,
     f32,
@@ -543,6 +550,151 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
     assert bool(placeholder.eq(-1).all().item())
 
 
+def _stage_minf_call(stager, admission, *, prompt, generated, routes):
+    """Stage one MInf call the way the serving worker does and return its coords."""
+    result = stager.stage(
+        f"minf-{admission.model_call_id}",
+        SimpleNamespace(
+            prompt_token_ids=prompt,
+            generated_token_ids=generated,
+            generated_log_probs=[-0.1] * len(generated),
+            # MInf hands routes over as a numpy int16 array, not a torch tensor.
+            routing_indices=routes,
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 4)]),
+        offload_params={"ng_capture": admission.model_dump(mode="json")},
+    )
+    assert result is not None
+    coords = result.response_metadata["ng_commit_coords"]
+    assert coords["disposition"] == "staged", coords
+    return coords
+
+
+def _manifest_from_coords(coords: dict, *, mode: str) -> CallRecord:
+    return CallRecord(
+        model_call_id=coords["model_call_id"],
+        parent_call_id=coords["parent_call_id"],
+        mode=mode,
+        prev_len=coords["prev_len"],
+        delta_len=coords["delta_len"],
+        cum_len=coords["cum_len"],
+        weight_version=coords["weight_version"],
+        digest=coords["digest"],
+        extras_digest=coords["extras_digest"],
+        staging_key=coords["staging_key"],
+        chain_hash=coords["chain_hash"],
+        cumulative_hash=coords["cumulative_hash"],
+        response_id=f"chatcmpl-{coords['model_call_id']}",
+    )
+
+
+def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
+    tq_client, r3_partitions
+):
+    """MInf ``[T - 1, L, K]`` routes survive stager -> TQ -> reassembler end to end.
+
+    Stages a two-call chain through TQMegatronTokenStager (the only path that
+    runs _delta_align_minf_routing_indices) and asserts the published
+    ``[B, S, L, K]`` tensor: each call contributes ``delta_len`` rows, the
+    last of which is the ``-1`` sentinel row for the token MInf never routed,
+    so a non-zero sentinel fraction is expected here (unlike the vLLM fixture).
+    """
+    group_id = "grpr3minf"
+    rollout_id = f"{group_id}_g0"
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=_R3_STAGING),
+        require_routed_experts=True,
+    )
+    # Call 1: text root, prompt [10, 11] + generated [12, 13] -> 4 tokens, 3 routed.
+    routes_c1 = np.arange(3 * 2 * 2, dtype=np.int16).reshape(3, 2, 2)
+    coords_c1 = _stage_minf_call(
+        stager,
+        nemo_gym.CaptureAdmission(
+            rollout_id=rollout_id, model_call_id="c1", mode="text"
+        ),
+        prompt=[10, 11],
+        generated=[12, 13],
+        routes=routes_c1,
+    )
+    # Call 2: continuation over the 4-token prefix plus a new user turn
+    # [20, 21] and generated [22] -> 7 tokens, 6 routed, delta rows 4..6.
+    routes_c2 = (100 + np.arange(6 * 2 * 2, dtype=np.int16)).reshape(6, 2, 2)
+    coords_c2 = _stage_minf_call(
+        stager,
+        nemo_gym.CaptureAdmission(
+            rollout_id=rollout_id,
+            model_call_id="c2",
+            parent_call_id="c1",
+            prev_len=4,
+            mode="token_in",
+            required_prefix_token_ids=[10, 11, 12, 13],
+            parent_chain_hash=coords_c1["chain_hash"],
+        ),
+        prompt=[10, 11, 12, 13, 20, 21],
+        generated=[22],
+        routes=routes_c2,
+    )
+    receipt = nemo_gym.RolloutReceipt(
+        rollout_id=rollout_id,
+        terminal_model_call_id="c2",
+        manifest=[
+            _manifest_from_coords(coords_c1, mode="text"),
+            _manifest_from_coords(coords_c2, mode="token_in"),
+        ],
+        terminal_selection="declared",
+    )
+
+    finalizer = RolloutReassembler(
+        tq_client,
+        partition_id=_R3_PARTITION,
+        staging_partition=_R3_STAGING,
+        pad_token_id=PAD,
+        max_seq_len=4096,
+        router_replay_enabled=True,
+    )
+    finalized = finalizer.finalize_group(
+        group_id,
+        [rollout_id],
+        [receipt.model_dump()],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=4,
+        prompt_idx=3,
+    )
+    assert not finalized.dropped
+    assert finalized.metrics["finalize/routed_experts_row_coverage"] == 1.0
+    # One sentinel row per call (the T-th token MInf never routes): 2 of 7.
+    assert finalized.metrics[
+        "finalize/routed_experts_sentinel_token_fraction"
+    ] == pytest.approx(2 / 7)
+
+    rows = tq_client.get_samples(
+        sample_ids=[rollout_id],
+        partition_id=_R3_PARTITION,
+        select_fields=["input_ids", "input_lengths", "routed_experts"],
+    )
+    seq_len = int(torch.as_tensor(rows["input_lengths"][0]).reshape(-1)[0])
+    assert seq_len == 7
+    assert torch.as_tensor(rows["input_ids"][0])[:seq_len].tolist() == [
+        10,
+        11,
+        12,
+        13,
+        20,
+        21,
+        22,
+    ]
+    sentinel = [[-1, -1], [-1, -1]]
+    published = torch.as_tensor(rows["routed_experts"][0]).reshape(-1, 2, 2)
+    assert published[:seq_len].tolist() == [
+        *routes_c1.tolist(),
+        sentinel,
+        routes_c2[4].tolist(),
+        routes_c2[5].tolist(),
+        sentinel,
+    ]
+
+
 def test_finalize_group_router_replay_without_routes_fails_loudly(
     tq_client, r3_partitions
 ):
@@ -636,8 +788,8 @@ class _DeferredRouteWorker(TQWorkerMixin):
         self._dp_client = client
         self._route_fallback_counts = Counter()
 
-    def _routed_experts_dimensions(self) -> tuple[int, int]:
-        return 2, 2
+    def _routed_experts_layout(self) -> RouteLayout:
+        return RouteLayout.compressed(num_moe_layers=2, top_k=2)
 
 
 def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
@@ -756,7 +908,7 @@ def test_direct_and_deferred_build_identical_plans_and_tensors(
 ):
     """Both modes construct byte-identical plans; the shared executor driven
     from the worker's inputs reproduces the direct-mode tensor exactly."""
-    from nemo_rl.experience.route_assembly import execute_route_plan
+    from nemo_rl.experience.route_assembly import RouteLayout, execute_route_plan
     from nemo_rl.experience.route_plan import encode_route_plan
 
     rollout_id = "unified_g0"
@@ -801,7 +953,7 @@ def test_direct_and_deferred_build_identical_plans_and_tensors(
     tensor, reason = execute_route_plan(
         deferred_row.route_plan,
         fragments,
-        dims=(2, 2),
+        layout=RouteLayout.compressed(num_moe_layers=2, top_k=2),
         canonical_len=len(expected.token_ids),
     )
     assert reason is None
