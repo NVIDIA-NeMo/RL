@@ -14,7 +14,7 @@
 """Diffusion policy worker (Ray actor).
 
 Mirrors the *shape* of
-:class:`nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorkerImpl`
+:class:`nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorkerImpl`
 but does not inherit from it — the parent's API targets a HF causal-LM
 ``forward``. Methods exposed to ``FlowGRPOPolicy``:
 

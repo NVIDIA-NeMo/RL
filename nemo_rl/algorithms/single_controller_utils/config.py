@@ -39,7 +39,6 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
     GRPOConfig,
-    GRPOLoggerConfig,
     RewardPenaltyConfig,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -67,6 +66,7 @@ from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 # ── User-facing SingleController configs ────────────────────────────────────
 
@@ -502,6 +502,18 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_buffered_rollouts: int = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+    # CPU actors that run the advantage stage. 0 keeps it in the controller
+    # process, which is the historical behaviour and is correct, but it both
+    # holds a whole cohort's advantage inputs in the controller's heap and
+    # blocks the controller's event loop for the duration of the computation --
+    # long enough at Ultra scale to miss Ray's actor liveness ping. A positive
+    # value moves both costs onto dedicated CPU actors. Only grpo and opd are
+    # sharded across the pool; other estimators run as one call on one actor.
+    # Under data_plane.backend=mooncake_cpu each worker is its own TQ client and
+    # mounts a full global_segment_size + local_buffer_size, like each
+    # token-capture finalizer; budget it on top of
+    # gpus_per_node x (segment + buffer).
+    num_advantage_workers: NonNegativeInt = 0
 
     @model_validator(mode="after")
     def _reject_renamed_blocks(self) -> "AsyncRLConfig":
@@ -821,7 +833,7 @@ class MasterConfig(BaseModel, extra="allow"):
     # common configs
     env: dict[str, Any]
     data: DataConfig
-    logger: GRPOLoggerConfig
+    logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
@@ -1108,6 +1120,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
             ("reward_scaling", algo_cfg.reward_scaling.enabled),
             ("reward_shaping", algo_cfg.reward_shaping.enabled),
+            # getattr: PPO's config has no length_penalty field.
+            ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
         )
         if enabled
     ]
@@ -1117,6 +1131,20 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             f"{names} not supported on the SingleController path, which "
             "implements none of them -- the run would silently skip the "
             "shaping. Disable them."
+        )
+
+    # Rejected here rather than at the first advantage call, which is a whole
+    # round of rollouts and logprobs later: gdpo needs one reward column per
+    # component and SC's payload writes a single total_reward, with
+    # AdvantageConfig.repeated_batch_fields never populated.
+    if algo_cfg.adv_estimator.name == "gdpo":
+        raise NotImplementedError(
+            "adv_estimator 'gdpo' is not supported on the SingleController "
+            "path. It needs per-component reward columns (reward/<name>), and "
+            "the SC payload writes only total_reward, so the first advantage "
+            "call would raise 'GDPO requires multiple reward components' after "
+            "the run had already paid for a full step of rollouts. Set "
+            "adv_estimator.name to 'grpo'."
         )
 
     async_config = master_config.async_rl
@@ -1188,7 +1216,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
     # setup_data_plane unconditionally, so a DTensor critic dies in Ray with the
-    # model already on GPU. ppo_math_1B.yaml ships dtensor_cfg.enabled=true.
+    # model already on GPU. ppo_math_1B.yaml ships automodel_cfg.enabled=true.
     value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
     if not value_megatron_cfg.get("enabled"):
         raise ValueError(
@@ -1246,10 +1274,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     sampler_name = async_config.sampler.name
-    if sampler_name != "in_order":
+    if sampler_name not in ("in_order", "ready_first"):
         raise ValueError(
             "PPO on the SingleController path only supports "
-            f"async_rl.sampler.name='in_order', but got '{sampler_name}'. "
+            f"async_rl.sampler.name in ('in_order', 'ready_first'), but got '{sampler_name}'. "
             "Other samplers are not supported yet (in particular during critic "
             "warmup) (#2625)."
         )
@@ -1377,15 +1405,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "async_rl.max_buffered_rollouts; excess finalizer actors cannot be busy",
             stacklevel=2,
         )
-    if token_capture_config.enabled and reward_penalties_enabled:
-        warnings.warn(
-            "reward_penalties are enabled but token-capture receipt rollouts "
-            "carry no generated tokens/text at rollout time, so the penalty "
-            "checks are skipped and capture-path rewards stay unpenalized "
-            "(penalty-rate metrics will read 0). Disable the reward_penalties "
-            "flags to make this explicit, or run without token capture to "
-            "train with penalized rewards.",
-            stacklevel=2,
+    if (
+        token_capture_config.enabled
+        and master_config.reward_penalties.penalize_malformed_think_tag
+    ):
+        raise ValueError(
+            "token_capture.enabled does not support reward_penalties.penalize_malformed_think_tag"
         )
     if (
         token_capture_config.enabled
@@ -1571,7 +1596,6 @@ class AdvantageConfig:
     """Internal DataPlane field mapping for advantage calculation."""
 
     output_field: str = "advantages"
-    prompt_ids_field: str = "prompt_ids_for_adv"
     reward_field: str = "total_reward"
     token_mask_field: str = "token_mask"
     sample_mask_field: str = "sample_mask"
@@ -1588,3 +1612,7 @@ class AdvantageConfig:
     # regression target for it (output).
     values_field: str = "values"
     returns_field: str = "returns"
+    # Dump-only. The estimators key their baseline on the group-id tag now, so
+    # nothing else fetches the raw prompt tokens; the training dump still
+    # records them per row.
+    prompt_ids_field: str = "prompt_ids_for_adv"

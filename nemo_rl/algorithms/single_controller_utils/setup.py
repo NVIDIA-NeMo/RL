@@ -51,6 +51,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
+    RewardPenaltyConfig,
     _get_effort_config,
     _get_grpo_save_state,
 )
@@ -63,6 +64,9 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
+    AdvantageStageConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
@@ -169,6 +173,7 @@ class SingleControllerActorArgs:
     save_state: GRPOSaveState
     last_checkpoint_path: Optional[str]
     finalizer_actors: list[Any]
+    advantage_actors: list[Any]
     # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     partition_includes_multimodal_fields: bool = False
@@ -1300,7 +1305,7 @@ def setup_single_controller(
         if token_capture_cfg.capture_dir is None:
             token_capture_cfg.capture_dir = os.path.abspath(
                 os.path.join(
-                    master_config.logger.get("log_dir") or "logs",
+                    master_config.logger.log_dir or "logs",
                     "gym_token_capture",
                 )
             )
@@ -2002,6 +2007,10 @@ def setup_single_controller(
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
+                effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
+                reward_penalty_config=RewardPenaltyConfig.model_validate(
+                    resolved_reward_penalty_config
+                ),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
@@ -2010,6 +2019,20 @@ def setup_single_controller(
             # until every finalizer's process-local TQ client has attached and
             # registered its checkpoint participant.
             ray.get([actor.__ray_ready__.remote() for actor in finalizer_actors])
+
+    advantage_actors: list[Any] = []
+    if master_config.async_rl.num_advantage_workers > 0:
+        from nemo_rl.algorithms.advantage_actor import create_advantage_actors
+
+        # Same ordering constraint as the finalizers above: these attach their
+        # own TQ clients, so they have to exist before the controller configures
+        # checkpoint participants and before any Mooncake restore.
+        advantage_actors = create_advantage_actors(
+            dp_config,
+            AdvantageStageConfig.from_master_config(master_config),
+            advantage_estimator,
+            num_workers=master_config.async_rl.num_advantage_workers,
+        )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -2022,8 +2045,8 @@ def setup_single_controller(
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
         log_full_result_tables=should_log_nemo_gym_full_result_tables(
-            wandb_enabled=master_config.logger["wandb_enabled"],
-            wandb_config=master_config.logger["wandb"],
+            wandb_enabled=master_config.logger.wandb_enabled,
+            wandb_config=master_config.logger.wandb,
         ),
         reward_penalty_config=resolved_reward_penalty_config,
         tq_buffer=tq_buffer,
@@ -2064,6 +2087,7 @@ def setup_single_controller(
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,
+        advantage_actors=advantage_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,
         teacher_worker_groups=teacher_worker_groups,

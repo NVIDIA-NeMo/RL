@@ -291,10 +291,6 @@ def _apply_ppo_seq_logprob_error_masking(
     return advantage_mask, metrics
 
 
-class PPOLoggerConfig(LoggerConfig):
-    num_val_samples_to_print: int  # number of val samples to print to stdout
-
-
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     value: ValueConfig
@@ -303,7 +299,7 @@ class MasterConfig(BaseModel, extra="allow"):
     env: dict[str, Any]
     data: DataConfig
     ppo: PPOConfig
-    logger: PPOLoggerConfig
+    logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     telemetry: Optional[TelemetryConfig] = None
@@ -413,15 +409,15 @@ def setup(
             )
     else:
         # DTensor PPO value model currently doesn't support sequence packing and CP.
-        assert value_config["dtensor_cfg"]["enabled"], (
-            "Exactly one of value.megatron_cfg.enabled or value.dtensor_cfg.enabled "
+        assert (value_config.get("automodel_cfg") or {}).get("enabled"), (
+            "Exactly one of value.megatron_cfg.enabled or value.automodel_cfg.enabled "
             "must be true for the PPO value model."
         )
         assert value_config["sequence_packing"]["enabled"] is False, (
             "Sequence packing is currently not supported for the DTensor PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
-        assert value_config["dtensor_cfg"]["context_parallel_size"] == 1, (
+        assert value_config["automodel_cfg"]["context_parallel_size"] == 1, (
             "Context parallelism (CP>1) is currently not supported for the DTensor PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
@@ -905,7 +901,7 @@ def setup(
                 "FP8 KV cache can only be used together with FP8 model weights."
             )
             # FP8 KV cache compatibility checks
-            assert policy_config["dtensor_cfg"]["enabled"] == False, (
+            assert not (policy_config.get("automodel_cfg") or {}).get("enabled"), (
                 "DTensor backend is not supported with kv cache fp8 enabled."
             )
             assert not should_use_async_rollouts(generation_config), (
@@ -1508,8 +1504,8 @@ def ppo_train(
                                 master_config.ppo.num_generations_per_prompt
                             ),
                             log_full_result_tables=should_log_nemo_gym_full_result_tables(
-                                wandb_enabled=master_config.logger["wandb_enabled"],
-                                wandb_config=master_config.logger["wandb"],
+                                wandb_enabled=master_config.logger.wandb_enabled,
+                                wandb_config=master_config.logger.wandb,
                             ),
                             max_rollout_turns=None,
                             greedy=False,
@@ -1659,12 +1655,16 @@ def ppo_train(
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
+                            "token_mask": train_data["token_mask"],
+                            "sample_mask": train_data["sample_mask"],
                             **extra_multimodal_data,
                         }
                     )
-                    train_data["prev_logprobs"] = policy.get_logprobs(
-                        logprob_data, timer=timer
-                    )["logprobs"]
+                    prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
+                    train_data["prev_logprobs"] = prev_lp_result["logprobs"]
+                    # Propagate the top-k/top-p neginf mask so the loss skips these positions.
+                    if "token_mask" in prev_lp_result:
+                        train_data["token_mask"] = prev_lp_result["token_mask"]
 
                     if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
@@ -1979,12 +1979,6 @@ def ppo_train(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -2685,12 +2679,16 @@ def async_ppo_train(
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
+                            "token_mask": train_data["token_mask"],
+                            "sample_mask": train_data["sample_mask"],
                             **extra_multimodal_data,
                         }
                     )
-                    train_data["prev_logprobs"] = policy.get_logprobs(
-                        logprob_data, timer=timer
-                    )["logprobs"]
+                    prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
+                    train_data["prev_logprobs"] = prev_lp_result["logprobs"]
+                    # Propagate the top-k/top-p neginf mask so the loss skips these positions.
+                    if "token_mask" in prev_lp_result:
+                        train_data["token_mask"] = prev_lp_result["token_mask"]
                     if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
                             policy.get_reference_policy_logprobs(
@@ -2966,12 +2964,6 @@ def async_ppo_train(
                     # sync ppo_train and async_grpo_train).
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -3274,7 +3266,7 @@ def validate(
                 all_message_logs,
                 total_rewards,
                 num_samples=min(
-                    master_config.logger["num_val_samples_to_print"],
+                    master_config.logger.num_val_samples_to_print,
                     len(all_message_logs),
                 ),
                 step=step,

@@ -35,6 +35,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.logger import LoggerConfig
 
 
 def _make_loss_config(
@@ -1513,7 +1514,7 @@ def _make_noncolocated_setup_config(
             "model_name": "fake-model",
             "train_global_batch_size": 1,
             "train_micro_batch_size": 1,
-            "dtensor_cfg": {"enabled": True},
+            "automodel_cfg": {"enabled": True},
             "megatron_cfg": {"enabled": False},
             "generation": {
                 "backend": backend,
@@ -1566,7 +1567,7 @@ def _make_noncolocated_setup_config(
             reward_scaling={"enabled": False},
             adv_estimator={"name": "raw_reward"},
         ),
-        logger={"num_val_samples_to_print": 0},
+        logger=LoggerConfig.model_construct(),
         cluster=ClusterConfig(
             num_nodes=total_nodes,
             gpus_per_node=total_gpus_per_node,
@@ -2183,7 +2184,7 @@ def test_megatron_train_iters_matches_ppo_training_limit(
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
 
     config = _make_noncolocated_setup_config()
-    config.policy["dtensor_cfg"]["enabled"] = False
+    config.policy["automodel_cfg"]["enabled"] = False
     config.policy["megatron_cfg"]["enabled"] = True
     config.ppo.max_num_steps = 10
     config.ppo.max_num_epochs = -1 if async_enabled else 1
@@ -2839,7 +2840,7 @@ def test_validate_dispatches_rollout_by_engine_mode(monkeypatch, async_engine):
     config.ppo.max_val_samples = 1
     config.ppo.val_batch_size = 1
     config.ppo.max_rollout_turns = 1
-    config.logger = {"num_val_samples_to_print": 0}
+    config.logger = LoggerConfig.model_construct()
 
     ppo.validate(
         policy_generation=MagicMock(),

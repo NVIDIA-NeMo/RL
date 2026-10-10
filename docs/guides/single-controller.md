@@ -105,6 +105,70 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 6. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step. `ppo.warm_start_value_checkpoint` seeds that critic from another run's checkpoint instead, so a fresh run can skip the online warmup entirely — see [Warm-Starting the Critic](./ppo.md#warm-starting-the-critic).
 
+## Reward penalties and effort shaping with token capture
+
+With NeMo-Gym and `token_capture.enabled: true`, the following existing settings
+work the same way as in non-capture rollouts:
+
+```yaml
+reward_penalties:
+  penalize_duplicated_reasoning: true
+  penalize_empty_final_answer: true
+  penalize_unwanted_tokens: true
+  token_ids:
+    unwanted: [12345]  # Replace with IDs from your model's tokenizer.
+env:
+  nemo_gym:
+    effort_levels:
+      low_weight: 1.0
+      low_penalty: 1.0
+      low_ub: 1000
+      low_string: "<budget>"
+```
+
+The manager checks the scored `response.output` and classifies the original
+prompt using the last user message. The finalizer shapes the raw reward using
+**the terminal call's generated length**, then sets it to `0.0` if any enabled
+penalty matches, including when the shaped reward is negative. Unwanted IDs are
+checked across all selected generated spans, including terminal tokens; prompt,
+tool, and abandoned-branch tokens do not count. The final-function-call exception
+for empty answers is preserved. Token IDs, logprobs, and training masks keep their
+existing behavior.
+
+Both paths share the classification, text checks, token membership check, and
+shaping formula. For low-effort prompts:
+
+```text
+term = min(1, low_weight * (1 - terminal_generation_length / low_ub))
+reward = raw_reward + raw_reward * max(term, 0) + low_penalty * min(term, 0)
+```
+
+Setting `low_weight <= 0` or an empty `low_string` disables shaping. Active
+shaping requires `low_ub > 0`. High-effort rewards remain unchanged. A 900-token
+call followed by a 100-token call uses 100 tokens for shaping in both paths.
+
+Recovery saves raw rewards and three Boolean checks per unfinished rollout, and
+reward settings once per checkpoint. A versioned, validated projection compares
+the active reward rules: irrelevant config extras, inactive parameters and the
+order or duplication of unwanted IDs do not prevent resume. Changes to active
+rules fail before replay and identify the differing settings. Finalized rows
+retain their saved rewards. Recovery schema 3 also preserves pending reward
+observations and optional agent log context. Only the current schema is
+readable; a checkpoint saved with token capture disabled cannot be resumed with
+token capture enabled.
+
+Penalty rates and final reward statistics use valid finalized rows. Reward mean,
+standard deviation, minimum, maximum, exact median and histogram are pooled from
+individual final rewards for the groups consumed by each training step. Agent
+reward statistics use those same final values. When full-result table logging is
+enabled, agent results retain their context and sample identity with the final
+reward substituted after shaping and penalties. This retains one reward
+observation per valid row, plus optional table data, in pending checkpoint state.
+Existing low/high effort means and exact length medians are preserved; `mean_reward_low`
+measures the shaped reward before penalties. Pending statistics survive recovery
+and are consumed once. Malformed-thinking penalties and message-level advantage
+overrides remain unsupported with capture and fail at setup.
+
 ## Checkpointing and Replay Recovery
 
 With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:
@@ -283,12 +347,14 @@ Pick one of five modes with `sampler.name`. Each mode takes its own knobs, liste
 
 | `sampler.name` | Rollout gating                                                                                                          | Train selection                                                                                                   | Typical use                                                                                                  |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `in_order`     | Dispatch may lead the trainer by up to `max_lookahead_versions` batches. Each dispatch is stamped with a `target_step`. | Consume the group whose `target_step == current_train_weight`.                                                    | Sync mode (`max_lookahead_versions=0`) and legacy-async exact-batch semantics (`max_lookahead_versions>=1`). The only mode supported on a PPO run. |
+| `in_order`     | Dispatch may lead the trainer by up to `max_lookahead_versions` batches. Each dispatch is stamped with a `target_step`. | Consume the group whose `target_step == current_train_weight`.                                                    | Sync mode (`max_lookahead_versions=0`) and legacy-async exact-batch semantics (`max_lookahead_versions>=1`). |
 | `weight_fifo`  | Same gate as `in_order` (`max_staleness_versions` of lookahead).                                                        | Drain the oldest in-window `start_weight` first, waiting for that weight's batch to fill.                         | Strict weight-version FIFO under a bounded lookahead.                                                        |
 | `ready_first`  | Same gate as `weight_fifo` (`max_staleness_versions` of lookahead).                                                     | Take any ready group generated by a policy version no newer than the trainer, including late stragglers.         | Completion-order streaming without stale-group eviction.                                                    |
 | `windowed`     | Ungated — rollout keeps producing until the buffer fills.                                                               | Take any ready group with `start_weight` in `[train - max_staleness_versions, train]`, optionally freshest-first. | Over-sampled streaming; aged groups outside the window are evicted (wasted compute).                         |
 | `custom`       | Determined by the imported class.                                                                                       | Determined by the imported class.                                                                                 | `target: "module:ClassName"` — bring your own `PromptGroupSampler`.                                          |
 
+
+PPO supports `in_order` and `ready_first`, both with full-step batches. For `ready_first`, set `loss_fn.use_importance_sampling_correction: true` and `loss_fn.force_on_policy_ratio: false`; its `max_staleness_versions` controls admission lookahead, while already-admitted rollouts remain selectable.
 
 ### Config → behavior map
 
@@ -308,7 +374,9 @@ Field definitions:
 
 - `max_buffered_rollouts` — hard cap on unconsumed rollout groups buffered in the data plane. Validated at setup against the gated sampler's required capacity; a value too small deadlocks the rollout pump, so setup raises instead of silently blocking. Sized from the widest window the run ever uses, so `warmup_lookahead_versions` rather than `max_lookahead_versions` when it is set.
 - `min_groups_for_streaming_train` — minimum ready groups the trainer waits for before dispatching a batch. Set to `num_prompts_per_step` for sync/legacy semantics; lower for streaming. (PPO) Must equal `num_prompts_per_step` — the critic has no split train API, so each critic epoch calls the full-step `train_from_meta` once per chunk. Splitting an RL step across chunks would multiply both models' configured optimizer updates by the number of chunks.
-- `sampler.warmup_lookahead_versions` (PPO) — lookahead used while `ppo.policy_training_start_step` critic warmup is in progress, shrinking back to `max_lookahead_versions` afterwards. The SC equivalent of `ppo.async_ppo.warmup_generation_lead_steps`.
+- `sampler.warmup_lookahead_versions` (PPO, `in_order` only) — lookahead used while `ppo.policy_training_start_step` critic warmup is in progress, shrinking back to `max_lookahead_versions` afterwards. The SC equivalent of `ppo.async_ppo.warmup_generation_lead_steps`.
+- `num_advantage_workers` — CPU Ray actors that run the advantage stage. `0` (the default) keeps it in the controller process, which is correct but both holds a whole cohort's advantage inputs in the controller's heap and blocks the controller's event loop for the duration of the computation — long enough at Ultra scale to miss Ray's actor liveness ping. A positive value moves both costs onto dedicated actors, placed off the dedicated Ray head so their host-memory peak does not land beside the controller. Only `grpo` and `opd` are sharded across the pool: every other `adv_estimator` also reduces over the whole batch, which a shard is not, so those run as one call on one actor and a larger pool buys them nothing. Each stage logs `advantage stage: N row(s) over M shard(s), pool=P` with the reason whenever `M` is 1. Under `data_plane.backend: mooncake_cpu` each actor is its own TransferQueue client and mounts a full `global_segment_size + local_buffer_size`, like each token-capture finalizer, so budget it on top of `gpus_per_node × (segment + buffer)`.
+- `log_full_train_data` — writes every consumed sample to `train_data_step<N>.jsonl` in the log dir. The advantage stage is what holds the untruncated tensors, so the stage writes the dump wherever it runs: with a pool each shard writes its own `train_data_step<N>.jsonl.part-<shard>` and the controller merges them in shard order on a completed optimizer step, assigning `idx` across the merged file. That requires the pool to share a filesystem with the controller: the log dir was controller-only before this, so a node-local one worked and now would not. The controller checks the merged row count against what the shards reported and fails the step rather than publishing a dump that is short a shard. The JSON serialization is the expensive part and scales with batch size × sequence length, so a pool also moves that cost off the controller; it is reported back per call and still shows up under the `train_data_dump` timer. Debug-only — leave it `false` for production runs.
 
 ## Implementation Structure
 

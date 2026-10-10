@@ -43,6 +43,7 @@ from nemo_rl.distributed.model_utils import (
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
 )
+from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
@@ -270,9 +271,16 @@ def prepare_loss_input(
             # mask out negative infinity logprobs
             # prev_logprobs is already masked out in the previous step
             mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-            logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+            logprobs, curr_finite_mask = mask_out_neg_inf_logprobs(
+                logprobs, mask[:, 1:], "curr_logprobs"
+            )
+            # Propagate the neg-inf mask so the loss reduction skips these positions.
+            # Without this change, the IS weight exp(prev-gen) becomes exp(-gen).
+            data["token_mask"] = data["token_mask"].clone()
+            data["token_mask"][:, 1:] = data["token_mask"][:, 1:] * curr_finite_mask
 
-            # compute unfiltered logprobs for reference policy KL penalty
+            # compute unfiltered logprobs for the reference-KL penalty;
+            # -inf positions were dropped from token_mask above, so the KL skips them.
             if (
                 hasattr(loss_fn, "reference_policy_kl_penalty")
                 and loss_fn.reference_policy_kl_penalty != 0
@@ -383,7 +391,7 @@ def prepare_loss_input(
                     "context parallel size, but got "
                     f"sequence_length={full_seq_len}, cp_size={cp_size}. "
                     "Set policy.make_sequence_length_divisible_by to a multiple of "
-                    "policy.dtensor_cfg.context_parallel_size."
+                    "policy.automodel_cfg.context_parallel_size."
                 )
             cp_rank = (
                 torch.distributed.get_rank(context_parallel_group)
@@ -439,8 +447,8 @@ def prepare_packed_loss_input(
     logits: torch.Tensor,
     data: BatchedDataDict[Any],
     loss_fn: LossFunction,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_q_padded: torch.Tensor,
+    cu_seqlens_q: CpuIntTuple,
+    cu_seqlens_q_padded: CpuIntTuple,
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -459,8 +467,10 @@ def prepare_packed_loss_input(
         logits: Packed logits from the model [1, T_packed // CP, V // TP].
         data: Microbatch data (unpacked, [B, S]).
         loss_fn: Loss function (must have input_type == LossInputType.LOGPROB).
-        cu_seqlens_q: Unpadded cumulative sequence lengths [B+1].
-        cu_seqlens_q_padded: Padded cumulative sequence lengths [B+1].
+        cu_seqlens_q: Unpadded cumulative sequence lengths [B+1]. CPU-resident
+            integer tuples are required at this host-side loss boundary.
+        cu_seqlens_q_padded: Padded cumulative sequence lengths [B+1]. CPU-resident
+            integer tuples are required at this host-side loss boundary.
         vocab_parallel_rank: Vocab parallel rank.
         vocab_parallel_group: Vocab parallel group.
         context_parallel_group: Context parallel group.
@@ -539,9 +549,14 @@ def prepare_packed_loss_input(
 
     # Match prepare_loss_input behavior for top-k/top-p filtered training:
     # use filtered curr_logprobs for actor loss, but keep unfiltered values for KL.
+    # Note that `-inf` positions are dropped from `token_mask`, so terms like KL skip them.
     if need_top_k_or_top_p_filtering(sampling_params):
         mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-        logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+        logprobs, curr_finite_mask = mask_out_neg_inf_logprobs(
+            logprobs, mask[:, 1:], "curr_logprobs"
+        )
+        data["token_mask"] = data["token_mask"].clone()
+        data["token_mask"][:, 1:] = data["token_mask"][:, 1:] * curr_finite_mask
 
         if (
             hasattr(loss_fn, "reference_policy_kl_penalty")

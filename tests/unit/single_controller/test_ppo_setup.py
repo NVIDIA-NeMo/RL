@@ -54,6 +54,8 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 _NUM_PROMPTS_PER_STEP = 4
 _NUM_GENERATIONS_PER_PROMPT = 2
@@ -72,7 +74,7 @@ def _value_config(
         "train_micro_batch_size": 1,
         "max_total_sequence_length": 32,
         "megatron_cfg": {"enabled": megatron_enabled},
-        "dtensor_cfg": {"enabled": not megatron_enabled},
+        "automodel_cfg": {"enabled": not megatron_enabled},
     }
 
 
@@ -137,7 +139,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
-        logger={"wandb_enabled": False, "wandb": {}},
+        logger=LoggerConfig.model_construct(),
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
         cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
@@ -308,7 +310,7 @@ class TestPPOValidation:
 
     @pytest.mark.parametrize(
         "sampler_config",
-        [WindowedSamplerConfig(), ReadyFirstSamplerConfig(), WeightFifoSamplerConfig()],
+        [WindowedSamplerConfig(), WeightFifoSamplerConfig()],
         ids=lambda cfg: cfg.name,
     )
     def test_rejects_samplers_that_drop_rollouts_by_weight_version(
@@ -321,8 +323,41 @@ class TestPPOValidation:
 
         with pytest.raises(
             ValueError,
-            match=rf"sampler.name='in_order', but got '{sampler_config.name}'",
+            match=rf"but got '{sampler_config.name}'",
         ):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("warmup_steps", [0, 2])
+    def test_accepts_ready_first_with_importance_sampling(
+        self, warmup_steps: int
+    ) -> None:
+        mc = _ppo_master_config()
+        mc.ppo.policy_training_start_step = warmup_steps
+        mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = True
+        mc.loss_fn.force_on_policy_ratio = False
+
+        validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        ("importance_correction", "force_on_policy_ratio", "match"),
+        [
+            (False, False, "use_importance_sampling_correction=true"),
+            (True, True, "force_on_policy_ratio=false"),
+        ],
+    )
+    def test_ready_first_requires_sampling_policy_correction(
+        self,
+        importance_correction: bool,
+        force_on_policy_ratio: bool,
+        match: str,
+    ) -> None:
+        mc = _ppo_master_config()
+        mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = importance_correction
+        mc.loss_fn.force_on_policy_ratio = force_on_policy_ratio
+
+        with pytest.raises(ValueError, match=match):
             validate_single_controller_config(mc)
 
     @staticmethod
@@ -370,6 +405,27 @@ class TestPPOValidation:
             NotImplementedError, match="not supported on the SingleController"
         ):
             validate_single_controller_config(mc)
+
+    def test_rejects_length_penalty_until_sc_applies_it(self):
+        # The SC path has no length-penalty hook yet; fail at setup rather
+        # than silently training on unadjusted rewards.
+        mc = _make_master_config()
+        mc.grpo.length_penalty = LengthPenaltyConfig.model_validate(
+            {"default": {"total_bonus": 0.1}}
+        )
+
+        with pytest.raises(NotImplementedError, match="length_penalty"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
+    def test_accepts_absent_length_penalty(self, algorithm: str):
+        # GRPO with length_penalty: null, and PPO (whose config has no such
+        # field) both pass.
+        mc = _make_master_config() if algorithm == "grpo" else _ppo_master_config()
+        if algorithm == "grpo":
+            mc.grpo.length_penalty = None
+
+        validate_single_controller_config(mc)
 
     @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
     def test_accepts_overlong_filtering(self, algorithm: str):

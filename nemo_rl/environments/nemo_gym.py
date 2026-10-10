@@ -1580,7 +1580,8 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
     # Enable the backend's OpenAI-compatible server.
-    if generation_config["backend"] == "vllm":
+    if generation_config["backend"] in ("vllm", "dynamo"):
+        # Dynamo uses these flags to expose its token wrapper to Gym.
         generation_config["vllm_cfg"]["async_engine"] = True
         generation_config["vllm_cfg"]["expose_http_server"] = True
     elif generation_config["backend"] == "megatron":
@@ -1589,7 +1590,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         generation_config["mcore_generation_config"]["expose_http_server"] = True
     else:
         raise ValueError(
-            "NeMo-Gym setup supports vllm or megatron generation; got "
+            "NeMo-Gym setup supports vllm, dynamo, or megatron generation; got "
             f"{generation_config['backend']!r}"
         )
 
