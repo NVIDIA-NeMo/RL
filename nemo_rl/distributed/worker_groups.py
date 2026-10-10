@@ -31,6 +31,10 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_group_utils import recursive_merge_options
+from nemo_rl.telemetry.host_memory import (
+    forget_worker_group_nodes,
+    register_worker_group_placement,
+)
 from nemo_rl.utils.venvs import (
     add_hf_modules_cache_to_pythonpath,
     create_local_venv_on_each_node,
@@ -728,6 +732,14 @@ class RayWorkerGroup:
                 }
             )
 
+        # Here rather than anywhere in telemetry: the host-memory monitor
+        # scrapes raylets, which know about nodes and nothing about worker
+        # groups, so the only process that can relate the two is this one.
+        register_worker_group_placement(
+            self.name_prefix,
+            [(spec["pg"], spec["bundle_idx"]) for spec in self._worker_specs.values()],
+        )
+
     def log_worker_gpu_state(
         self, worker_idx: int, *, label: str, timeout_s: float = 30.0
     ) -> None:
@@ -1282,5 +1294,8 @@ class RayWorkerGroup:
         # Clear worker lists
         self._workers = []
         self._worker_metadata = []
+        # So the host-memory monitor stops attributing nodes to a group that no
+        # longer occupies them -- a teacher group torn down mid-run, say.
+        forget_worker_group_nodes(self.name_prefix)
 
         return success

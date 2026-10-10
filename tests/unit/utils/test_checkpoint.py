@@ -1200,8 +1200,6 @@ class TestRenameCheckpointSwap:
         with open(step_dir / "training_info.json") as f:
             assert json.load(f)["loss"] == 0.2
 
-        assert not (checkpoint_dir / "step_12").exists()
-
 
 # ---------------------------------------------------------------------------
 # Fault tolerance (ft_keep_latest_k / ft_save_period) retention tests

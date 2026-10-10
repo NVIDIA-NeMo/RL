@@ -530,6 +530,32 @@ def init_telemetry_driver(
 
         setup_logging_bridge()
 
+    if handle.is_exporting:
+        # Deferred to break the cycle: host_memory reads get_telemetry_handle
+        # from this module.
+        from nemo_rl.telemetry.host_memory import (
+            DEFAULT_COLLECTION_INTERVAL,
+            start_host_memory_monitoring,
+        )
+
+        # Here rather than in ``Logger`` beside the GPU monitor, even though the
+        # two sample the same endpoints: the host-memory series is labelled with
+        # the worker groups each node holds, and that map is a module global
+        # only the driver writes. The single-controller entry points run their
+        # ``Logger`` inside the controller actor, which would label every host
+        # as holding no group at all.
+        #
+        # Shares the GPU monitor's cadence so the two line up on a dashboard,
+        # read from the logger config rather than restated -- but not *gated* on
+        # ``monitor_gpus``, which decides what reaches W&B and has no business
+        # deciding whether an OTel series exists.
+        interval = _dig(
+            master_config, "logger", "gpu_monitoring", "collection_interval"
+        )
+        start_host_memory_monitoring(
+            collection_interval=interval or DEFAULT_COLLECTION_INTERVAL
+        )
+
     # Every resolved field, not just the headline ones: the env projection uses
     # setdefault, so a stray NEMO_RL_OTEL_* in the shell silently overrides the
     # YAML. Logging what was actually resolved keeps "how was this run
@@ -800,6 +826,16 @@ def shutdown_telemetry(timeout_ms: int = 5000) -> None:
     spans an unreachable collector was going to lose anyway, and being a daemon
     it never holds up process exit.
     """
+    # Deferred to break the cycle: host_memory reads get_telemetry_handle from
+    # this module.
+    from nemo_rl.telemetry.host_memory import stop_host_memory_monitoring
+
+    # Called before the early return below, and before the flush: the monitor
+    # records through the providers this is about to shut down, so leaving it
+    # sampling would have it writing into a closed meter for a whole interval.
+
+    stop_host_memory_monitoring()
+
     global _TELEMETRY_HANDLE
     handle = _TELEMETRY_HANDLE
     if handle is None:
