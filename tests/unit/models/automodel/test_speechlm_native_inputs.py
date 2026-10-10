@@ -107,7 +107,7 @@ class NativeFixture(SpeechLMPolicy):
             backend=backend,
             num_nextn_predict_layers=2,
             mtp_use_repeated_layer=True,
-        )
+        ).float()  # Older native constructor defaults linear storage to BF16.
         self.llm.mtp.requires_grad_(False)
         self.llm.lm_head.requires_grad_(False)
         self.perception = Perception(config.hidden_size)
