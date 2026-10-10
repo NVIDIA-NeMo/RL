@@ -334,3 +334,58 @@ def test_get_replica_group_default_is_none():
         pass
 
     assert _Stub()._get_replica_group() is None
+
+
+def _int16_byte_round_trip_body(rank: int):
+    values = torch.tensor([-32768, -1, 0, 1, 32767], dtype=torch.int16)
+    data = (
+        BatchedDataDict(
+            {
+                "dense_routes": values.clone(),
+                "packed_routes": PackedTensor(
+                    [values, None, values.flip(0)], dim_to_pack=0
+                ),
+            }
+        )
+        if rank == 0
+        else None
+    )
+    original_broadcast = dist.broadcast
+    calls = 0
+
+    def broadcast_bytes(tensor, *args, **kwargs):
+        nonlocal calls
+        assert tensor.dtype == torch.uint8
+        if rank == 0 and calls == 0:
+            assert tensor.data_ptr() == data["dense_routes"].data_ptr()
+        calls += 1
+        return original_broadcast(tensor, *args, **kwargs)
+
+    dist.broadcast = broadcast_bytes
+    try:
+        out = _broadcast_batched_data_dict(
+            data, is_leader=(rank == 0), src=0, group=dist.group.WORLD
+        )
+    finally:
+        dist.broadcast = original_broadcast
+    assert calls == 2
+    assert out["dense_routes"].dtype == torch.int16
+    assert torch.equal(out["dense_routes"].cpu(), values)
+    expected = PackedTensor([values, None, values.flip(0)], dim_to_pack=0)
+    assert out["packed_routes"].tensors[1] is None
+    assert out["packed_routes"].tensors[0].dtype == torch.int16
+    assert torch.equal(out["packed_routes"].as_tensor().cpu(), expected.as_tensor())
+
+
+def test_int16_routes_broadcast_without_dtype_conversion(tmp_path):
+    _run_two_ranks(_int16_byte_round_trip_body, str(tmp_path / "init_bytes"))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="two CUDA devices are required for NCCL broadcast",
+)
+def test_int16_routes_byte_broadcast_nccl(tmp_path):
+    _run_two_ranks(
+        _int16_byte_round_trip_body, str(tmp_path / "init_bytes_nccl"), backend="nccl"
+    )
