@@ -324,6 +324,14 @@ def validate_and_prepare_config(
         else ("sdpa" if cp_size_cfg > 1 else None)
     )
 
+    native_model = config.get("native_model")
+    if native_model is not None:
+        if enable_seq_packing or config["dtensor_cfg"].get("tensor_parallel_size", 1) != 1 or cp_size_cfg != 1:
+            raise ValueError("Native SpeechLM requires unpacked sequences with TP=CP=1")
+        from nemo_rl.models.automodel.speechlm import register_speechlm_config
+
+        register_speechlm_config()
+
     # Load model config
     model_config = AutoConfig.from_pretrained(
         model_name,
@@ -373,7 +381,14 @@ def validate_and_prepare_config(
         else:
             raise ValueError(f"Unknown reward model type: {rm_type}")
     else:
-        model_class = resolve_model_class(model_config.model_type)
+        if native_model is not None:
+            if model_config.model_type != "nemo_speechlm":
+                raise ValueError("policy.native_model requires a native nemo_speechlm checkpoint")
+            from nemo_rl.models.automodel.speechlm import SpeechLMPolicy
+
+            model_class = SpeechLMPolicy
+        else:
+            model_class = resolve_model_class(model_config.model_type)
 
     # Get parallelization sizes
     tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
@@ -746,11 +761,15 @@ def setup_model_and_optimizer(
 
     # Auto-set force_hf if the custom model's adapter doesn't support per-tensor
     # HF conversion (required for weight syncing).
-    _maybe_set_force_hf(automodel_kwargs, model_config)
+    if config.get("native_model") is None:
+        _maybe_set_force_hf(automodel_kwargs, model_config)
 
     # Keep fp32 master weights: stop Automodel from restoring loaded params to the bf16
     # checkpoint dtype, which would break optimizer master-weight precision (see helper).
-    _disable_automodel_checkpoint_dtype_restore()
+    if config.get("native_model") is None:
+        _disable_automodel_checkpoint_dtype_restore()
+    else:
+        from_pretrained_kwargs["native_model"] = config["native_model"]
 
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
@@ -774,12 +793,15 @@ def setup_model_and_optimizer(
 
     # Compute model metadata after from_pretrained
     model_state_dict_keys = list(model.state_dict().keys())
-    is_moe_model = any(["expert" in key for key in model_state_dict_keys])
-    is_hf_model = (
-        model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
-    )
-    # Autocast is disabled for custom MoE models (non-HF) to avoid numerical issues
-    autocast_enabled = not (is_moe_model and not is_hf_model)
+    if config.get("native_model") is not None:
+        is_moe_model, is_hf_model, autocast_enabled = False, False, True
+    else:
+        is_moe_model = any(["expert" in key for key in model_state_dict_keys])
+        is_hf_model = (
+            model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
+        )
+        # Autocast is disabled for custom MoE models (non-HF) to avoid numerical issues
+        autocast_enabled = not (is_moe_model and not is_hf_model)
 
     # Set pad token ID if needed. Some model configs (e.g. Gemma3 in transformers v5)
     # don't have pad_token_id as a direct attribute.
