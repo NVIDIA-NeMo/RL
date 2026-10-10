@@ -53,6 +53,8 @@ class ReassemblyRequest:
     loss_multiplier: float = 1.0
     reward_checks: tuple[RewardChecks | None, ...] | None = None
     reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
+    # Resolved by Gym and persisted with the sealed receipts for teacher routing.
+    resolved_agent_name: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -185,6 +185,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "prompt_idx",
         "mask_sample",
         "loss_multiplier",
+        "resolved_agent_name",
         "reward_checks",
         "reward_log_contexts",
     }

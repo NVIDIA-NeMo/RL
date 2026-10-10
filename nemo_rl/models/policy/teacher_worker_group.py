@@ -30,6 +30,7 @@ import ray
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.opd import TeacherResourceConfig
+from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
 from nemo_rl.data_plane.column_io import round_up
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
@@ -176,7 +177,7 @@ class TeacherWorkerGroup:
             cfg["megatron_cfg"]["peft"]["enabled"] = False
         cfg.pop("draft", None)
         # Router replay keeps the student's rollout and training logprobs
-        # consistent. A frozen teacher has no training pass, and its text-only
+        # consistent. A frozen teacher has no training pass, and its
         # TQ fetch does not carry routed_experts, so replay must stay off.
         if "router_replay" in cfg:
             cfg["router_replay"]["enabled"] = False
@@ -318,7 +319,7 @@ class TeacherWorkerGroup:
         teacher_meta = replace(
             meta,
             task_name=f"teacher_lp:{self.alias}",
-            fields=list(TEACHER_LP_FIELDS),
+            fields=[*TEACHER_LP_FIELDS, *present_multimodal_fields(meta)],
             extra_info={
                 **dict(meta.extra_info or {}),
                 GLOBAL_FORWARD_PAD_SEQLEN: round_up(
