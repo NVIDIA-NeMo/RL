@@ -40,10 +40,10 @@ def _tolerate_dummy_weight_nan_amax():
 
     The dummy-calibration amax is *meant* to be discarded — the prolog
     sentinels every enabled quantizer's `_amax` to `-1.0` immediately
-    afterwards, and Megatron's real amax is loaded via
-    `vllm_quant_backend.input_amax_loader` during refit (`max(-1.0,
-    real)=real`). So a fully-NaN input here should produce zero amax
-    rather than crash the prolog.
+    afterwards, and Megatron's real amax is loaded by the temporary loaders
+    attached in `VllmQuantInternalWorkerExtension` during refit
+    (`max(-1.0, real)=real`). So a fully-NaN input here should produce zero
+    amax rather than crash the prolog.
 
     Scoping this monkey-patch to the prolog (instead of editing
     `MaxCalibrator.collect` in modelopt) keeps modelopt's source pristine
@@ -239,6 +239,29 @@ def _fakequant_run_prolog_worker(self) -> None:
             # we disable weight quantizers for CUDA graph capture.
             if name.endswith("weight_quantizer"):
                 module.disable()
+
+
+def _make_nvfp4_moe_input_scales_writable(model: torch.nn.Module) -> None:
+    """Backport writable shared NVFP4 MoE scales for vLLM 0.25.1."""
+    scale_names = ("w13_input_scale", "w2_input_scale")
+    for module in model.modules():
+        for name in scale_names:
+            scale = getattr(module, name, None)
+            if not isinstance(scale, torch.nn.Parameter) or 0 not in scale.stride():
+                continue
+
+            scale.data = scale.detach().clone()
+
+
+class RealQuantWorker(NixlVllmWorker):
+    """vLLM worker with the NVFP4 MoE reload fix missing from vLLM 0.25.1."""
+
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        super().load_model(load_dummy_weights=load_dummy_weights)
+        model = self.model_runner.model
+        if hasattr(model, "unwrap"):
+            model = model.unwrap()
+        _make_nvfp4_moe_input_scales_writable(model)
 
 
 class FakeQuantWorker(NixlVllmWorker):

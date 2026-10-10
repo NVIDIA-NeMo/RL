@@ -1,0 +1,60 @@
+# Small end-to-end QA-GRPO example for native ModelOpt real-quant vLLM rollout.
+#
+# Example usage (1 node, 4 GPUs):
+#   uv run examples/run_grpo.py \
+#     --config examples/modelopt/qa_grpo_qwen2_5_0p5b_megatron_real_quant.yaml
+
+defaults: "../configs/grpo_math_1B_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_steps: 10
+  val_period: 0
+
+policy:
+  model_name: "Qwen/Qwen2.5-0.5B"
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 32
+  train_micro_batch_size: 2
+  logprob_batch_size: 4
+  max_total_sequence_length: 2048
+  disable_modelopt_layer_spec: true
+
+  quant_cfg: "W4A16_NVFP4_CFG"
+  quant_calib_data: "cnn_dailymail"
+  quant_calib_size: 128
+  quant_batch_size: 1
+  quant_sequence_length: 1024
+
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    gradient_accumulation_fusion: false
+
+  generation:
+    max_new_tokens: 1536
+    real_quant: true
+    real_quant_export_cpu_offload: false
+    vllm_cfg:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.5
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+
+data:
+  max_input_seq_length: 512
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "results/qa_grpo_qwen2_5_0p5b_megatron_real_quant"
+
+logger:
+  log_dir: "logs/qa_grpo_qwen2_5_0p5b_megatron_real_quant"
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: false
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1

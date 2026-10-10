@@ -299,19 +299,55 @@ def test_local_refit_names_require_safe_views_from_every_grouped_task() -> None:
     tasks = [
         SimpleNamespace(
             hf_param_names=(grouped_name,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (object(),),
         ),
         SimpleNamespace(
             hf_param_names=(grouped_name,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (),
         ),
         SimpleNamespace(
             hf_param_names=(safe_name,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (object(),),
         ),
     ]
 
     assert _collect_local_refit_hf_names(tasks) == {safe_name}
+
+
+@pytest.mark.parametrize("projection", ["fc1", "fc2"])
+@pytest.mark.parametrize("transpose_on_export", [False, True])
+def test_local_refit_names_keep_transposed_grouped_experts_on_bridge_path(
+    projection: str, transpose_on_export: bool
+) -> None:
+    from megatron.bridge.models.conversion.param_mapping import (
+        FusedExpertMapping,
+        FusedGatedExpertMapping,
+    )
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _collect_local_refit_hf_names,
+    )
+
+    hf_name = f"model.layers.0.mlp.experts.{'gate_up_proj' if projection == 'fc1' else 'down_proj'}"
+    mapping_cls = FusedGatedExpertMapping if projection == "fc1" else FusedExpertMapping
+    mapping = mapping_cls(
+        f"decoder.layers.0.mlp.experts.linear_{projection}.weight0",
+        hf_name,
+        transpose_on_export=transpose_on_export,
+    )
+    assert mapping.local_hf_param_specs()
+    task = SimpleNamespace(
+        mapping=mapping,
+        hf_param_names=(hf_name,),
+        local_hf_param_specs=mapping.local_hf_param_specs,
+    )
+
+    assert _collect_local_refit_hf_names([task]) == (
+        set() if transpose_on_export else {hf_name}
+    )
 
 
 def test_local_refit_names_are_expert_parallel_invariant(monkeypatch) -> None:
@@ -362,10 +398,12 @@ def test_local_refit_names_are_expert_parallel_invariant(monkeypatch) -> None:
     tasks = [
         SimpleNamespace(
             hf_param_names=(expert0,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (object(),),
         ),
         SimpleNamespace(
             hf_param_names=(unsafe,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (),
         ),
     ]
@@ -1493,8 +1531,9 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     worker = object.__new__(MegatronPolicyWorkerImpl)
     _disable_opd_full(worker)
     worker.model = object()
-    worker.optimizer = None
+    worker.optimizer = object()
     worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_refit = False
     worker.fp8_cfg = None
     worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
@@ -1596,6 +1635,7 @@ def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
     worker.model = object()
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
+    worker.should_disable_forward_pre_hook = False
     worker.offload_optimizer_for_refit = offload_optimizer
     worker.fp8_cfg = None
     worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
@@ -1655,8 +1695,14 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     move_kwargs = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
     _disable_opd_full(worker)
-    worker.model = _FakeTrainableModel()
+
+    class _FakeDDP(_FakeTrainableModel):
+        def reset_param_sync_dispatch_state(self):
+            events.append("reset_param_sync_dispatch_state")
+
+    worker.model = _FakeDDP()
     worker.model.eval = lambda: events.append("eval")
+    worker.should_disable_forward_pre_hook = True
     worker.cfg = (
         {"generation": {"backend": generation_backend}} if generation_backend else {}
     )
@@ -1685,6 +1731,10 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
         lambda *args, **kwargs: events.append("memory_reserved") or 0,
     )
     monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.megatron_policy_worker.DistributedDataParallel",
+        _FakeDDP,
+    )
 
     MegatronPolicyWorkerImpl.offload_after_refit(worker)
 
@@ -1692,6 +1742,13 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     assert events.index("finalize_async_save") < events.index("move_model")
     assert events.index("eval") < events.index("move_model")
     assert move_kwargs[0]["move_params"] is expect_move_params
+    assert "offload_before_refit" in events
+    if shared_buffer:
+        assert "reset_param_sync_dispatch_state" not in events
+    else:
+        assert events.index("offload_before_refit") < events.index(
+            "reset_param_sync_dispatch_state"
+        )
     assert move_kwargs[0]["move_grads"] is expect_move_grads
 
 
@@ -1719,7 +1776,8 @@ def test_megatron_finish_inference_evals_before_model_offload(monkeypatch):
     assert move_kwargs == [{"move_params": True, "move_grads": False}]
 
 
-def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
+@pytest.mark.parametrize("hook_enabled", [False, True])
+def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch, hook_enabled):
     """Params offloaded by colocated generation must be onloaded before the save walks them."""
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
@@ -1734,7 +1792,10 @@ def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
     worker.optimizer = object()
     worker.scheduler = None
     worker.optimizer_cpu_offload = False
-    worker.should_disable_forward_pre_hook = False
+    worker.should_disable_forward_pre_hook = True
+    worker._forward_pre_hook_enabled = lambda: hook_enabled
+    worker.disable_forward_pre_hook = lambda: events.append("disable_hook")
+    worker.enable_forward_pre_hook = lambda: events.append("enable_hook")
     worker.checkpointing_context = None
     worker.mcore_state = SimpleNamespace(
         cfg=SimpleNamespace(
@@ -1766,6 +1827,9 @@ def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
     assert events.index("move_model_cuda") < events.index("mcore_save")
     assert events.index("move_optimizer_cuda") < events.index("mcore_save")
     assert events.index("synchronize") < events.index("mcore_save")
+    assert [event for event in events if event.endswith("_hook")] == (
+        ["disable_hook", "enable_hook"] if hook_enabled else []
+    )
     assert worker.mcore_state.cfg.checkpoint.save == "original_path"
 
 
@@ -1958,14 +2022,16 @@ def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(monkeypatch)
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
     worker.offload_optimizer_for_logprob = False
+    worker.should_disable_forward_pre_hook = True
+    worker._forward_pre_hook_enabled = lambda: True
     worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
     worker._log_gpu_mem = lambda *_args, **_kwargs: None
     worker.move_model = lambda model, device, **kwargs: (
         move_calls.append((device, kwargs)) or model
     )
     stage_calls = []
-    worker._copy_main_params_to_param_buffer = lambda zero_grad_buffer=False: (
-        stage_calls.append(zero_grad_buffer)
+    worker._disable_forward_pre_hook_until_next_train_step = (
+        lambda *, param_sync=False: (stage_calls.append(param_sync))
     )
 
     class _AllocatorWakeup:
@@ -2149,6 +2215,30 @@ def test_disable_forward_pre_hook_until_next_step_uses_worker_override(
     assert worker._first_train_step_param_sync_func == "sync"
     assert model_config.param_sync_func is None
     assert worker._first_train_step_forward_pre_hook_disabled is True
+
+
+@pytest.mark.parametrize("hook_enabled", [False, True])
+def test_use_reference_model_preserves_forward_pre_hook_state(hook_enabled) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.should_disable_forward_pre_hook = True
+    worker._forward_pre_hook_enabled = lambda: hook_enabled
+    hook_events = []
+    worker.disable_forward_pre_hook = lambda: hook_events.append("disable")
+    worker.enable_forward_pre_hook = lambda: hook_events.append("enable")
+    worker.model = SimpleNamespace(state_dict=lambda: {})
+    worker.reference_state_dict = {}
+    worker._apply_state_dict_to_model = lambda *_args, **_kwargs: None
+    worker.sampling_params = None
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+
+    with worker.use_reference_model():
+        pass
+
+    assert hook_events == (["disable", "enable"] if hook_enabled else [])
 
 
 @pytest.mark.parametrize("update_successful", [False, True])

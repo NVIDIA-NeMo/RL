@@ -1185,6 +1185,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "or collective refit with refit_with_reload_api=False."
             )
 
+    def _get_native_layerwise_reload_targets(self) -> list[torch.nn.Module]:
+        """Select modules whose runtime layout must be restored before loading."""
+        model = self.model_runner.model
+        if self._uses_deepseek_v4_fp8_refit():
+            return [model]
+        # Keep BF16 TRTLLM reload scoped so other MXFP8 metadata survives.
+        return _unquantized_flashinfer_trtllm_modules(model)
+
     @contextmanager
     def _weight_update_lifecycle(
         self, transport: WeightUpdateTransport
@@ -1210,13 +1218,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
 
             model = self.model_runner.model
-            # DSV4 needs a full-model reload; BF16 TRTLLM reload stays scoped
-            # to its realized modules so mixed-model MXFP8 metadata survives.
-            reload_targets = (
-                [model]
-                if use_deepseek_v4_fp8
-                else _unquantized_flashinfer_trtllm_modules(model)
-            )
+            reload_targets = self._get_native_layerwise_reload_targets()
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
             added_skip_tensors: Any = None
             if use_deepseek_v4_fp8:
