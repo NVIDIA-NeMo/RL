@@ -195,9 +195,10 @@ def _bytes_tensor(value: bytes) -> torch.Tensor:
     """Encode non-empty bytes as one jagged TQ row."""
     if not value:
         raise ValueError("staging byte fields must be non-empty")
-    # Own a writable buffer so Torch never views immutable bytes. This avoids
-    # materializing a Python integer for every byte in identity/digest columns.
-    return torch.from_numpy(np.frombuffer(bytearray(value), dtype=np.uint8)).unsqueeze(0)
+    # Own writable storage without expanding bytes into a Python list.
+    return torch.from_numpy(np.frombuffer(bytearray(value), dtype=np.uint8)).unsqueeze(
+        0
+    )
 
 
 def _optional_digest_fields(value: str | None) -> tuple[torch.Tensor, torch.Tensor]:
