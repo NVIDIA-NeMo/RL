@@ -198,7 +198,7 @@ def _patch_megatron_training_hook_mode() -> None:
 
 
 def _apply_sglang_compat_patches() -> None:
-    # Remove with nemo_rl.transformers_compat once Transformers >= 5.13 is required.
+    # Keep while nemo_rl.transformers_compat installs any patch; the torch-FX helper outlives Transformers 5.13.
     _patch_sglang_transformers_compat_bootstrap()
     _patch_sglang_safe_unpickler()
     _override_sglang_imbalance_check_env()

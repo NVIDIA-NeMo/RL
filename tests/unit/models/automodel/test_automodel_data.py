@@ -408,6 +408,26 @@ class TestProcessMicrobatch:
         # When multimodal inputs are present, position_ids should be None
         assert result.position_ids is None
 
+    def test_media_token_validity_mask_kept_in_vlm_kwargs(self, mock_tokenizer):
+        result = process_microbatch(
+            mb=BatchedDataDict(
+                {
+                    "input_ids": torch.randint(0, 1000, (2, 64)),
+                    "sample_mask": torch.ones(2, dtype=torch.bool),
+                    "pixel_values": PackedTensor(
+                        torch.randn(2, 3, 224, 224), dim_to_pack=0
+                    ),
+                    "media_token_validity_mask": torch.zeros(2, 64, dtype=torch.bool),
+                }
+            ),
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=False,
+            cfg={"automodel_cfg": {"sequence_parallel": False}},
+        )
+
+        assert "pixel_values" in result.vlm_kwargs
+        assert "media_token_validity_mask" in result.vlm_kwargs
+
     def test_sequence_packing_with_multimodal_raises_error(self, mock_tokenizer):
         # Create test microbatch with multimodal data
         mb = BatchedDataDict(

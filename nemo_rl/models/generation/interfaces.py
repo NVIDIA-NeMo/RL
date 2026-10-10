@@ -233,6 +233,7 @@ class GenerationConfig(TypedDict):
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
     bad_words: NotRequired[list[str] | None]
+    ignore_eos: NotRequired[bool]
     colocated: NotRequired[ColocationConfig]
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]

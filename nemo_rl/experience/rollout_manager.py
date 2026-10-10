@@ -65,6 +65,7 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.reward_penalties import RewardLogContext, compute_reward_checks
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     PromptGroupStatus,
@@ -1192,16 +1193,27 @@ class AsyncNemoGymRolloutImpl:
                 raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
             received.add(rowidx)
             inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
-            # A streamed completion may become durable recovery ownership before
-            # the rest of its prompt group finishes. Shape its reward first so a
-            # checkpoint never preserves a raw reward that finalization will later
-            # train on. The shaping rule is row-local; aggregation below is metrics
-            # only.
-            shaping_by_rowidx[rowidx] = _apply_effort_shaping(
-                [result],
-                [inputs_by_rowidx[rowidx]],
-                self._effort_config,
-            )
+            if "receipt" in result:
+                result["reward_checks"] = compute_reward_checks(
+                    result["full_result"], inputs_by_rowidx[rowidx], self._effort_config
+                )
+                result["reward_log_context"] = RewardLogContext(
+                    agent_name=_nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
+                    full_result_json=json.dumps(
+                        {
+                            key: value
+                            for key, value in result["full_result"].items()
+                            if key != "reward"
+                        },
+                        separators=(",", ":"),
+                    )
+                    if self._log_full_result_tables
+                    else None,
+                )
+            else:
+                shaping_by_rowidx[rowidx] = _apply_effort_shaping(
+                    [result], [inputs_by_rowidx[rowidx]], self._effort_config
+                )
             results[rowidx] = result
             if on_completion is not None:
                 # Use the same conversion path as completed groups so streamed
@@ -1383,7 +1395,8 @@ class AsyncNemoGymRolloutImpl:
             rollout_metrics.update(_effort_shaping_metrics(shaping))
             rollout_metrics.update(
                 self._compute_reward_penalty_metrics(
-                    penalty_counts, len(completed_results)
+                    penalty_counts,
+                    sum("receipt" not in result for result in completed_results),
                 )
             )
 
@@ -1433,6 +1446,8 @@ class AsyncNemoGymRolloutImpl:
                 env_extras = dict(result["full_result"])
                 env_extras["ng_receipt"] = result["receipt"]
                 env_extras["ng_rollout_id"] = result["rollout_id"]
+                env_extras["ng_reward_checks"] = result.get("reward_checks")
+                env_extras["ng_reward_log_context"] = result.get("reward_log_context")
                 completions.append(
                     Completion(
                         message_log=result["message_log"],
@@ -1540,7 +1555,11 @@ class AsyncNemoGymRolloutImpl:
         n = len(completions)
         truncation_rate = sum(truncated) / n
         rollout_metrics: dict[str, Any] = {
-            **calculate_single_metric(total_reward, n, "total_reward"),
+            **(
+                calculate_single_metric(total_reward, n, "total_reward")
+                if not receipt_mode
+                else {}
+            ),
             # turn metrics
             **calculate_single_metric(turn_count, n, "turns_per_sample"),
             "turns_per_sample/p95": pct(turn_count, 95),
@@ -1561,7 +1580,12 @@ class AsyncNemoGymRolloutImpl:
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
         agent_extras = [
-            {k: v for k, v in (c.env_extras or {}).items() if k not in ("ng_receipt",)}
+            {
+                k: v
+                for k, v in (c.env_extras or {}).items()
+                if k not in ("ng_receipt", "ng_reward_checks", "ng_reward_log_context")
+                and not (receipt_mode and k == "reward")
+            }
             for c in completions
         ]
         for key in agent_extras[0].keys():
@@ -1588,7 +1612,7 @@ class AsyncNemoGymRolloutImpl:
                 assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
             )
         )
-        if self._log_full_result_tables:
+        if self._log_full_result_tables and not receipt_mode:
             rollout_metrics[f"{agent_name}/full_result"] = Table(
                 data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
                 columns=["Full result"],
@@ -2319,6 +2343,8 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    reward_checks=env_extras.get("ng_reward_checks"),
+                    reward_log_context=env_extras.get("ng_reward_log_context"),
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2348,6 +2374,8 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    reward_checks=env_extras.get("ng_reward_checks"),
+                    reward_log_context=env_extras.get("ng_reward_log_context"),
                 )
 
         try:
@@ -2379,12 +2407,16 @@ class RolloutManager:
                 receipts,
                 rewards,
                 mask_sample,
+                reward_checks,
+                reward_log_contexts,
             ) = self._recovery_ledger.finalization_inputs(group_id)
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
                 canonical_sample_ids=tuple(canonical_sample_ids),
                 receipts=tuple(receipts),
+                reward_checks=tuple(reward_checks),
+                reward_log_contexts=tuple(reward_log_contexts),
                 rewards=tuple(rewards),
                 fallback_weight_version=start_version,
                 prompt_idx=int(recovery_group.prompt_id),

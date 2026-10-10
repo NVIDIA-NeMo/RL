@@ -67,6 +67,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     _warn_unsupported_in_flight_refit_pause_once,
 )
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
 
 
@@ -3278,7 +3279,7 @@ class TestAsyncTrajectoryCollector:
     def test_nemo_gym_batch_retry_forwards_effort_config_without_duplicates(
         self, monkeypatch
     ):
-        """Retries preserve effort shaping and do not re-enqueue buffered groups."""
+        """Retries preserve effort shaping and length penalties without re-enqueueing buffered groups."""
 
         class _ReadyResult:
             def __init__(self, value):
@@ -3317,6 +3318,10 @@ class TestAsyncTrajectoryCollector:
                 "low_string": "{reasoning effort: efficient}",
             }
         }
+        length_penalty_cfg = LengthPenaltyConfig.model_validate(
+            {"default": {"total_bonus": 0.1, "top_percentile": 0.5}}
+        )
+        collector.master_config.grpo.length_penalty = length_penalty_cfg
         target_weight = 15
         collector._generating_targets.add(target_weight)
         repeated_batch = BatchedDataDict(
@@ -3350,6 +3355,8 @@ class TestAsyncTrajectoryCollector:
                 low_ub=15_000,
                 low_string="{reasoning effort: efficient}",
             )
+            # The collector forwards the typed grpo.length_penalty block.
+            assert kwargs["length_penalty_config"] is length_penalty_cfg
             rollout_calls += 1
             task_indices = [
                 row["_ng_task_index"] for row in kwargs["input_batch"]["extra_env_info"]
@@ -4036,6 +4043,135 @@ class TestPromptExtraction:
         assert torch.equal(
             full_message_log[3]["generation_logprobs"], generated_logprobs
         )
+
+    def test_grpo_media_validity_comes_from_message_owned_payload(self):
+        """Media ownership, not loss ownership or token shape, defines anchors."""
+        message_log = [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor([7, 7]),
+                "pixel_values": PackedTensor(torch.ones(1, 3, 2, 2), dim_to_pack=0),
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor([7]),
+                "generation_logprobs": torch.tensor([0.1]),
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        torch.testing.assert_close(
+            message_log[0]["media_token_validity_mask"],
+            torch.tensor([True, True]),
+        )
+        torch.testing.assert_close(
+            message_log[1]["media_token_validity_mask"],
+            torch.tensor([False]),
+        )
+
+    def test_grpo_preserves_processor_owned_media_validity(self):
+        """Processor provenance survives mixed-message GRPO mask construction."""
+        processor_mask = torch.tensor([False, True, True, False])
+        message_log = [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor([1, 7, 7, 2]),
+                "media_token_validity_mask": processor_mask,
+                "pixel_values": PackedTensor(torch.ones(1, 3, 2, 2), dim_to_pack=0),
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor([7]),
+                "generation_logprobs": torch.tensor([0.1]),
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        torch.testing.assert_close(
+            message_log[0]["media_token_validity_mask"], processor_mask
+        )
+        torch.testing.assert_close(
+            message_log[1]["media_token_validity_mask"], torch.tensor([False])
+        )
+
+    def test_grpo_empty_media_payload_does_not_claim_token_ownership(self):
+        """Filtered PackedTensor rows in a batch with real media are not anchors."""
+        template = PackedTensor(torch.ones(1, 3, 2, 2), dim_to_pack=0)
+        filtered_log = [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor([7, 7]),
+                "pixel_values": PackedTensor.empty_like(template),
+            },
+        ]
+        media_log = [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor([7]),
+                "pixel_values": template,
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([filtered_log, media_log])
+
+        torch.testing.assert_close(
+            filtered_log[0]["media_token_validity_mask"],
+            torch.tensor([False, False]),
+        )
+        torch.testing.assert_close(
+            media_log[0]["media_token_validity_mask"], torch.tensor([True])
+        )
+
+    @pytest.mark.parametrize("emptied_media", [False, True])
+    def test_grpo_drops_media_validity_without_media_segments(self, emptied_media):
+        """A batch with no media segments carries no media-validity field."""
+        message = {
+            "role": "user",
+            "content": "",
+            "token_ids": torch.tensor([1, 7, 2]),
+            "media_token_validity_mask": torch.tensor([False, True, False]),
+        }
+        if emptied_media:
+            message["pixel_values"] = PackedTensor.empty_like(
+                PackedTensor(torch.ones(1, 3, 2, 2), dim_to_pack=0)
+            )
+        message_log = [
+            message,
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor([7]),
+                "generation_logprobs": torch.tensor([0.1]),
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        assert all("media_token_validity_mask" not in m for m in message_log)
+        assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([1]))
+
+    def test_grpo_ignores_unregistered_packed_message_metadata(self):
+        """Only registered multimodal PackedTensor fields activate media masks."""
+        message_log = [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor([7]),
+                "unrelated_packed_metadata": PackedTensor(torch.ones(1), dim_to_pack=0),
+            }
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        assert "media_token_validity_mask" not in message_log[0]
 
     def test_grpo_loss_mask_uses_generation_logprobs_marker(self):
         """Test that only assistant messages with generation logprobs are trainable."""
