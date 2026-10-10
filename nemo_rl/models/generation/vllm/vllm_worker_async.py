@@ -57,6 +57,7 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
+from nemo_rl.models.generation.vllm.engine_loop import EngineOwnerLoop, on_engine_loop
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
@@ -227,6 +228,9 @@ class VllmAsyncGenerationWorkerImpl(
         self.http_server = None
         self._engine_loop = None
         self._http_engine_client = None
+        # Set by _create_engine when vllm_cfg.engine_owner_loop is enabled.
+        self._engine_owner_loop: EngineOwnerLoop | None = None
+        self.http_server_task: asyncio.Task[None] | None = None
 
         # Ledger-authoritative token capture (dormant until the
         # setup_token_capture fan-out runs). The weight
@@ -347,9 +351,27 @@ class VllmAsyncGenerationWorkerImpl(
             if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
             else []
         )
-        self.llm = AsyncLLM.from_engine_args(
-            self.llm_async_engine_args, stat_loggers=self.stat_loggers
-        )
+        if self.cfg["vllm_cfg"].get("engine_owner_loop"):
+            # AsyncLLM binds its output handler to the loop that constructs it,
+            # so build it on the dedicated owner loop that will run every
+            # engine operation and the HTTP server.
+            self._engine_owner_loop = EngineOwnerLoop()
+
+            async def construct_engine() -> Any:
+                return AsyncLLM.from_engine_args(
+                    self.llm_async_engine_args, stat_loggers=self.stat_loggers
+                )
+
+            try:
+                self.llm = self._engine_owner_loop.run(construct_engine())
+            except BaseException:
+                self._engine_owner_loop.shutdown()
+                self._engine_owner_loop = None
+                raise
+        else:
+            self.llm = AsyncLLM.from_engine_args(
+                self.llm_async_engine_args, stat_loggers=self.stat_loggers
+            )
 
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only
@@ -475,9 +497,29 @@ class VllmAsyncGenerationWorkerImpl(
             self.generation_tokens = []
 
     async def post_init_async(self):
-        self._engine_loop = asyncio.get_running_loop()
+        if getattr(self, "_engine_owner_loop", None) is not None:
+            self._engine_loop = self._engine_owner_loop.loop
+        else:
+            self._engine_loop = asyncio.get_running_loop()
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.set_async_loop(self._engine_loop)
+        await self._post_init_engine_async()
+        if self.llm is not None and self.cfg["vllm_cfg"].get("expose_http_server"):
+            if getattr(self, "_engine_owner_loop", None) is not None:
+                # The server shares the engine's loop, so handlers call the
+                # engine directly instead of hopping threads per chunk.
+                self._http_engine_client = self.llm
+                await self._start_vllm_server_on_engine_loop()
+            else:
+                self._http_engine_client = _AsyncLLMHTTPClient(
+                    self.llm, self._engine_loop
+                )
+                self.server_thread, self.base_url, self.http_server = (
+                    self._setup_vllm_server()
+                )
+
+    @on_engine_loop
+    async def _post_init_engine_async(self) -> None:
         if self.llm is not None:
             await self.llm.collective_rpc("bind_numa", args=tuple())
             if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
@@ -504,11 +546,6 @@ class VllmAsyncGenerationWorkerImpl(
         if self._sparse_refit_receiver is not None:
             hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
             self._sparse_refit_receiver.set_worker_hostnames(hostnames)
-        if self.llm is not None and self.cfg["vllm_cfg"].get("expose_http_server"):
-            self._http_engine_client = _AsyncLLMHTTPClient(self.llm, self._engine_loop)
-            self.server_thread, self.base_url, self.http_server = (
-                self._setup_vllm_server()
-            )
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -1577,6 +1614,58 @@ class VllmAsyncGenerationWorkerImpl(
 
     def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
         import threading
+
+        server, base_url, reserved_sock = self._build_vllm_server()
+
+        if reserved_sock is not None:
+            # Hand the pre-bound listening socket directly to uvicorn's asyncio
+            # server via server.serve(sockets=). No close-and-rebind needed.
+            def _run_with_socket() -> None:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(server.serve(sockets=[reserved_sock]))
+
+            thread = threading.Thread(target=_run_with_socket, daemon=True)
+        else:
+            thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        return thread, base_url, server
+
+    @on_engine_loop
+    async def _start_vllm_server_on_engine_loop(self) -> None:
+        """Serve HTTP as a task on the engine owner loop."""
+        assert self._engine_owner_loop is not None
+        self._engine_owner_loop.assert_owner()
+        server, base_url, reserved_sock = self._build_vllm_server()
+        sockets = [reserved_sock] if reserved_sock is not None else None
+        task = asyncio.create_task(
+            server.serve(sockets=sockets), name="vllm-openai-api-server"
+        )
+
+        def report_server_exit(done: "asyncio.Task[None]") -> None:
+            if done.cancelled():
+                outcome = "cancelled"
+            elif error := done.exception():
+                outcome = f"error:{type(error).__name__}:{error}"
+            elif server.should_exit:
+                outcome = "shutdown"
+            else:
+                outcome = "unexpected_return"
+            LOGGER.info("vLLM HTTP server on %s exited: %s", base_url, outcome)
+
+        task.add_done_callback(report_server_exit)
+        self.base_url, self.http_server, self.http_server_task = base_url, server, task
+
+    @on_engine_loop
+    async def _stop_vllm_server_on_engine_loop(self) -> None:
+        if getattr(self, "http_server_task", None) is None:
+            return
+        self.http_server.should_exit = True
+        await self.http_server_task
+        self.http_server_task = None
+
+    def _build_vllm_server(self) -> "tuple[uvicorn.Server, str, Any]":
         from logging import Filter as LoggingFilter
         from logging import LogRecord, getLogger
 
@@ -1637,21 +1726,21 @@ class VllmAsyncGenerationWorkerImpl(
         uvicorn_logger = getLogger("uvicorn.access")
         uvicorn_logger.addFilter(No200Filter())
 
-        if reserved_sock is not None:
-            # Hand the pre-bound listening socket directly to uvicorn's asyncio
-            # server via server.serve(sockets=). No close-and-rebind needed.
-            def _run_with_socket() -> None:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(server.serve(sockets=[reserved_sock]))
+        return server, base_url, reserved_sock
 
-            thread = threading.Thread(target=_run_with_socket, daemon=True)
-        else:
-            thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
+    def _engine_generate(self, *args: Any, **kwargs: Any) -> AsyncGenerator[Any, None]:
+        """Start an engine request from the Ray actor loop.
 
-        return thread, base_url, server
+        With an owner loop, each output step runs on that loop and an
+        unfinished request is aborted there.
+        """
+        if getattr(self, "_engine_owner_loop", None) is None:
+            return self.llm.generate(*args, **kwargs)
+        return _AsyncLLMHTTPClient(self.llm, self._engine_owner_loop.loop).generate(
+            *args, **kwargs
+        )
 
+    @on_engine_loop
     async def init_collective_async(
         self,
         rank_prefix: int,
@@ -1794,7 +1883,7 @@ class VllmAsyncGenerationWorkerImpl(
             request_id = str(uuid.uuid4())
 
             # Generate using vLLM async engine
-            vllm_request_generator = self.llm.generate(
+            vllm_request_generator = self._engine_generate(
                 prompt=prompt,
                 sampling_params=sampling_params_for_request,
                 request_id=request_id,
@@ -2024,7 +2113,7 @@ class VllmAsyncGenerationWorkerImpl(
             request_id = str(uuid.uuid4())
 
             # Generate using vLLM async engine
-            vllm_request_generator = self.llm.generate(
+            vllm_request_generator = self._engine_generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -2064,6 +2153,7 @@ class VllmAsyncGenerationWorkerImpl(
                     task.cancel()
             await asyncio.gather(*prompt_tasks, return_exceptions=True)
 
+    @on_engine_loop
     async def report_device_id_async(self) -> list[str]:
         """Async version of report_device_id."""
         assert self.llm is not None, (
@@ -2084,10 +2174,12 @@ class VllmAsyncGenerationWorkerImpl(
 
         return cast(list[str], list_of_worker_results)
 
+    @on_engine_loop
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    @on_engine_loop
     async def _reset_encoder_cache_after_weight_update(self) -> None:
         """Invalidate weight-dependent multimodal encoder outputs when enabled."""
         if not self.cfg["vllm_cfg"].get(
@@ -2097,6 +2189,7 @@ class VllmAsyncGenerationWorkerImpl(
         assert self.llm is not None
         await self.llm.reset_encoder_cache()
 
+    @on_engine_loop
     async def update_weights_via_ipc_zmq_async(
         self,
     ) -> bool:
@@ -2138,6 +2231,7 @@ class VllmAsyncGenerationWorkerImpl(
             traceback.print_exc()
             return False
 
+    @on_engine_loop
     async def update_weights_from_collective_async(
         self, refit_timeout_s: float | None = None
     ) -> bool:
@@ -2191,6 +2285,7 @@ class VllmAsyncGenerationWorkerImpl(
             traceback.print_exc()
             return False
 
+    @on_engine_loop
     async def init_nccl_reshard_comm_group_async(
         self,
         rank_prefix: int,
@@ -2213,12 +2308,14 @@ class VllmAsyncGenerationWorkerImpl(
             ),
         )
 
+    @on_engine_loop
     async def prepare_nccl_reshard_refit_info_async(self, refit_info: dict) -> None:
         """Async version of prepare_nccl_reshard_refit_info."""
         await self.llm.collective_rpc(
             "prepare_nccl_reshard_refit_info", args=(refit_info,)
         )
 
+    @on_engine_loop
     async def nccl_reshard_refit_async(
         self, refit_timeout_s: Optional[float] = None
     ) -> bool:
@@ -2266,6 +2363,7 @@ class VllmAsyncGenerationWorkerImpl(
             traceback.print_exc()
             return False
 
+    @on_engine_loop
     async def reset_prefix_cache_async(self):
         """Async version of reset_prefix_cache."""
         assert self.llm is not None, (
@@ -2281,6 +2379,7 @@ class VllmAsyncGenerationWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
 
+    @on_engine_loop
     async def pause_generation_async(self, *, clear_cache: bool) -> bool:
         """Pause vLLM generation for an in-flight weight update."""
         assert self.llm is not None, (
@@ -2295,6 +2394,7 @@ class VllmAsyncGenerationWorkerImpl(
         await self.llm.pause_generation(mode="keep", clear_cache=clear_cache)
         return True
 
+    @on_engine_loop
     async def resume_generation_async(self) -> bool:
         """Resume vLLM generation after an in-flight weight update."""
         assert self.llm is not None, (
@@ -2309,6 +2409,7 @@ class VllmAsyncGenerationWorkerImpl(
         await self.llm.resume_generation()
         return True
 
+    @on_engine_loop
     async def sleep_async(self):
         """Async version of sleep."""
         assert self.llm is not None, (
@@ -2333,6 +2434,7 @@ class VllmAsyncGenerationWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
 
+    @on_engine_loop
     async def wake_up_async(self, **kwargs):
         """Async version of wake_up."""
         assert self.llm is not None, (
@@ -2352,6 +2454,19 @@ class VllmAsyncGenerationWorkerImpl(
 
         await self.llm.wake_up(**wake_up_args)
 
+    @on_engine_loop
+    async def _shutdown_engine_async(self) -> None:
+        # Clean up extension resources (e.g., ZMQ sockets)
+        await self.llm.collective_rpc("cleanup", args=tuple())
+        try:
+            self.llm.shutdown()
+        except Exception as e_stop:
+            print(f"Error calling shutdown_background_loop: {e_stop}")
+
+        # Explicitly delete the engine. This may trigger its __del__ method.
+        del self.llm
+        self.llm = None
+
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
@@ -2359,22 +2474,19 @@ class VllmAsyncGenerationWorkerImpl(
                 self.http_server.should_exit = True
                 await asyncio.to_thread(self.server_thread.join)
                 self.server_thread = None
+            await self._stop_vllm_server_on_engine_loop()
 
             if self._sparse_refit_receiver is not None:
                 await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
 
             if self.llm is not None:
-                # Clean up extension resources (e.g., ZMQ sockets)
-                await self.llm.collective_rpc("cleanup", args=tuple())
-                try:
-                    self.llm.shutdown()
-                except Exception as e_stop:
-                    print(f"Error calling shutdown_background_loop: {e_stop}")
-
-                # Explicitly delete the engine. This may trigger its __del__ method.
-                del self.llm
+                await self._shutdown_engine_async()
 
             self.llm = None
+            owner_loop = getattr(self, "_engine_owner_loop", None)
+            if owner_loop is not None:
+                owner_loop.shutdown()
+                self._engine_owner_loop = None
             self.tokenizer = None
 
             # Force garbage collection

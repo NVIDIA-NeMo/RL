@@ -188,6 +188,28 @@ The flow is:
 
 Data parallel vLLM workers each expose their own HTTP server. NeMo Gym's Model Server load-balances requests across them.
 
+### Engine loop ownership
+
+vLLM's `AsyncLLM` binds its output handler and request state to the event loop that constructs it, so every engine call must run on that loop. The async worker supports two layouts:
+
+| | Default | `vllm_cfg.engine_owner_loop: true` |
+|---|---|---|
+| Engine loop | Ray actor loop | Dedicated owner thread and loop |
+| HTTP server | Separate uvicorn thread; each output step hops to the engine loop through `_AsyncLLMHTTPClient` | Task on the owner loop; handlers call the engine directly |
+| Refit, collective RPCs, `generate_async` | Run on the actor loop | Hop to the owner loop (`on_engine_loop`) |
+| Actor-loop stalls | Delay HTTP output steps | Do not touch the HTTP server or engine |
+
+The owner loop suits long multi-turn rollouts that hold HTTP streams open for many output steps while refits and validation run. It is opt-in; the default is unchanged.
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+      engine_owner_loop: true
+```
+
 ## Initialization Sequence
 
 ```mermaid

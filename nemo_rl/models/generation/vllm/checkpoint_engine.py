@@ -26,6 +26,7 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
+from nemo_rl.models.generation.vllm.engine_loop import on_engine_loop
 
 if TYPE_CHECKING:
     from nemo_rl.utils.checkpoint_engines.base import CheckpointEngine
@@ -192,6 +193,7 @@ class VllmCheckpointEngineRpcMixin:
 class VllmAsyncCheckpointEngineRpcMixin:
     """Dispatch checkpoint-engine calls through an asynchronous vLLM engine."""
 
+    @on_engine_loop
     async def checkpoint_engine_rpc_async(
         self, checkpoint_method: str, method_args: tuple[Any, ...] = ()
     ) -> Any:  # pragma: no cover
