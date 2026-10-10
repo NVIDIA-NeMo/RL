@@ -1,0 +1,119 @@
+defaults: ../../ppo_math_1B_megatron_single_controller.yaml
+
+ppo:
+  num_prompts_per_step: 6
+  num_generations_per_prompt: 4
+  max_num_epochs: 1000
+  max_num_steps: 50
+  ppo_epochs: 1
+  critic_ppo_epochs: 1
+  policy_training_start_step: 0
+  skip_reference_policy_logprobs_calculation: true
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/vlm_ppo-qwen2.5-vl-3b-geometry3k-megatron-single-controller
+  metric_name: null
+  save_period: 10
+  save_data_plane: true
+
+policy:
+  model_name: Qwen/Qwen2.5-VL-3B-Instruct
+  is_vlm: true
+  train_global_batch_size: 24
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 3072
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    sequence_parallel: false
+    activation_checkpointing: true
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    optimizer:
+      lr: 5.0e-7
+      min_lr: 5.0e-8
+    scheduler:
+      lr_warmup_iters: 5
+      lr_warmup_init: 5.0e-8
+  generation:
+    backend: vllm
+    max_new_tokens: 2048
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+        num_nodes: 1
+    vllm_cfg:
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.8
+      max_model_len: 3072
+    vllm_kwargs:
+      mm_processor_cache_gb: 0
+
+value:
+  model_name: ${policy.model_name}
+  train_global_batch_size: ${policy.train_global_batch_size}
+  train_micro_batch_size: 1
+  max_total_sequence_length: ${policy.max_total_sequence_length}
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: ${value.megatron_cfg.tensor_model_parallel_size}
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    sequence_parallel: false
+    activation_checkpointing: true
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    optimizer:
+      lr: 2.0e-6
+      min_lr: 1.0e-7
+    scheduler:
+      lr_warmup_iters: 5
+      lr_warmup_init: 1.0e-7
+
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: geometry3k
+    split: train
+  validation:
+    dataset_name: geometry3k
+    split: validation
+  default:
+    prompt_file: examples/prompts/geo3k.txt
+    processor: vlm_hf_data_processor
+    env_name: geometry3k
+
+env:
+  geometry3k:
+    num_workers: 8
+    reward_functions:
+      - name: format
+        weight: 0.1
+      - name: math_expr
+        weight: 0.9
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: nemo-rl
+    name: vlm-ppo-qwen2.5-vl-3b-geometry3k-megatron-single-controller
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
