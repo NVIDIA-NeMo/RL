@@ -145,7 +145,7 @@ def _bytes_tensor(value: bytes) -> torch.Tensor:
     """Encode non-empty bytes as one jagged TQ row."""
     if not value:
         raise ValueError("staging byte fields must be non-empty")
-    # Own writable storage without allocating a Python int for every byte.
+    # Own writable storage without expanding bytes into a Python list.
     return torch.from_numpy(np.frombuffer(bytearray(value), dtype=np.uint8)).unsqueeze(
         0
     )
