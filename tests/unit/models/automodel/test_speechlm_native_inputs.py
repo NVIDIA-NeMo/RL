@@ -208,7 +208,14 @@ def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient():
     sampling = TrainingSamplingParams(temperature=0.8)
     old, metrics, returned = forward_with_post_processing_fn(
         model=model,
-        post_processing_fn=LogprobsPostProcessor({}, sampling_params=sampling),
+        post_processing_fn=LogprobsPostProcessor(
+            cfg={},
+            device_mesh=None,
+            cp_mesh=None,
+            tp_mesh=None,
+            cp_size=1,
+            sampling_params=sampling,
+        ),
         processed_mb=microbatch,
         global_valid_seqs=None,
         global_valid_toks=None,
@@ -216,7 +223,35 @@ def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient():
     )
     assert returned is microbatch
     torch.testing.assert_close(metrics["logprobs"], old)
-    data["prev_logprobs"] = F.pad(old.detach(), (1, 0))
+    assert old.shape == ids.shape
+    assert torch.count_nonzero(old[:, 0]) == 0
+    assert torch.count_nonzero(old[~mask.bool()]) == 0
+    with torch.no_grad():
+        expanded = model.prepare_inputs(
+            {
+                "input_ids": ids,
+                "audios": processed.vlm_kwargs["audio_samples"],
+                "audio_lens": processed.vlm_kwargs["audio_lengths"].flatten(),
+                "loss_mask": mask.bool(),
+            },
+            include_mtp_inputs=False,
+        )
+        dense = model.llm(
+            inputs_embeds=expanded["input_embeds"],
+            attention_mask=expanded["attention_mask"],
+            compute_mtp=False,
+        ).logits
+        values = -F.cross_entropy(
+            (dense / sampling.temperature).flatten(0, 1),
+            expanded["target_ids"].flatten(),
+            reduction="none",
+        ).reshape_as(expanded["target_ids"])
+        expected = torch.zeros_like(ids, dtype=values.dtype)
+        expected[:, 1:] = torch.zeros_like(old[:, 1:]).masked_scatter(
+            mask[:, 1:].bool(), values[expanded["target_ids"] != -100]
+        )
+    torch.testing.assert_close(old, expected)
+    data["prev_logprobs"] = old.detach()
     data["generation_logprobs"] = data["prev_logprobs"].clone()
     data["advantages"] = torch.tensor([[1.0], [-0.5]]).expand_as(ids)
     loss_fn = ClippedPGLossFn(
@@ -231,7 +266,14 @@ def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient():
     loss, _, returned = forward_with_post_processing_fn(
         model=model,
         post_processing_fn=LossPostProcessor(
-            loss_fn, {}, None, 1, 1, sampling_params=sampling
+            loss_fn=loss_fn,
+            cfg={},
+            device_mesh=None,
+            cp_mesh=None,
+            tp_mesh=None,
+            cp_size=1,
+            dp_size=1,
+            sampling_params=sampling,
         ),
         processed_mb=microbatch,
         global_valid_seqs=torch.tensor(2.0),

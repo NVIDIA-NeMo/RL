@@ -356,6 +356,9 @@ def forward_with_post_processing_fn(
             data_dict["token_mask"], sampling_params
         )
         if isinstance(post_processing_fn, LogprobsPostProcessor):
+            # The worker returns token i at position i, with token0 assigned
+            # zero. Loss functions instead consume next-token values [B,S-1].
+            logprobs = torch.cat([torch.zeros_like(logprobs[:, :1]), logprobs], dim=1)
             return logprobs, {"logprobs": logprobs}, processed_mb
         if post_processing_fn.loss_fn.input_type != LossInputType.LOGPROB:
             raise ValueError("Native SpeechLM requires a logprob loss")
