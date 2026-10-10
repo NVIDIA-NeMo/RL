@@ -48,6 +48,8 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
+    check_http_server_reasoning_parser,
+    resolve_thinking_token_budget,
 )
 from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
 from nemo_rl.models.generation.vllm.utils import (
@@ -125,6 +127,8 @@ class VllmGeneration(GenerationInterface):
         """Reject pure-config vLLM settings the SC entrypoint cannot honor."""
         generation_config = cast(VllmConfig, master_config.policy["generation"])
         assert_reload_refit_config_supported(generation_config)
+        resolve_thinking_token_budget(generation_config)
+        check_http_server_reasoning_parser(generation_config)
 
     @staticmethod
     def init_cluster_placement_groups(
@@ -241,6 +245,10 @@ class VllmGeneration(GenerationInterface):
         )
 
         assert_reload_refit_config_supported(self.cfg)
+        # Fails here rather than on the first rollout request, which is where
+        # vLLM would otherwise reject a budget without a reasoning parser.
+        resolve_thinking_token_budget(self.cfg)
+        check_http_server_reasoning_parser(self.cfg)
 
         extension_fqn = self.cfg.get("worker_extension_cls_fqn")
         if extension_fqn is not None and self.cfg.get("quant_cfg") is not None:
