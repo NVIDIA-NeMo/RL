@@ -197,6 +197,7 @@ def test_rollout_pump_stamps_target_steps(
     ctrl = object.__new__(controller_cls)
     ctrl._buffer = buffer
     ctrl._async_cfg = SimpleNamespace(
+        seeded_rollouts=False,
         max_inflight_prompts=2,
         diagnostics=False,
         rollout_failure=_failure_cfg(),
@@ -260,7 +261,10 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._async_cfg = SimpleNamespace(
-        max_inflight_prompts=2, diagnostics=False, rollout_failure=_failure_cfg()
+        seeded_rollouts=False,
+        max_inflight_prompts=2,
+        diagnostics=False,
+        rollout_failure=_failure_cfg(),
     )
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
@@ -371,7 +375,10 @@ def test_rollout_pump_credits_shortfall_only_for_stamped_prompts(
     ctrl = object.__new__(controller_cls)
     ctrl._buffer = buffer
     ctrl._async_cfg = SimpleNamespace(
-        max_inflight_prompts=2, diagnostics=False, rollout_failure=_failure_cfg()
+        seeded_rollouts=False,
+        max_inflight_prompts=2,
+        diagnostics=False,
+        rollout_failure=_failure_cfg(),
     )
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_epochs=1)
@@ -444,6 +451,7 @@ def _pump_controller(
     ctrl = object.__new__(controller_cls)
     ctrl._buffer = buffer
     ctrl._async_cfg = SimpleNamespace(
+        seeded_rollouts=False,
         max_inflight_prompts=2,
         diagnostics=False,
         rollout_failure=_failure_cfg(
@@ -691,10 +699,11 @@ class TestTakeReplacement:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
         ctrl._async_cfg = SimpleNamespace(
+            seeded_rollouts=False,
             rollout_failure=_failure_cfg(
                 on_dropped_prompt=on_dropped_prompt,
                 max_replacement_attempts=max_replacement_attempts,
-            )
+            ),
         )
         ctrl._replacement_reserve = deque(_batch(f"spare{i}") for i in range(spares))
         return ctrl
@@ -742,7 +751,8 @@ class TestTargetGroupsForStep:
         )
         ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._async_cfg = SimpleNamespace(
-            rollout_failure=SimpleNamespace(min_step_batch_fraction=fraction)
+            seeded_rollouts=False,
+            rollout_failure=SimpleNamespace(min_step_batch_fraction=fraction),
         )
         ctrl._batch_shortfall = dict(shortfall)
         return ctrl
@@ -998,6 +1008,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
         ctrl._async_cfg = SimpleNamespace(
+            seeded_rollouts=False,
             max_inflight_prompts=2,
             diagnostics=False,
             rollout_failure=_failure_cfg(),
@@ -1088,6 +1099,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
         ctrl._async_cfg = SimpleNamespace(
+            seeded_rollouts=False,
             max_inflight_prompts=1,
             diagnostics=False,
             rollout_failure=_failure_cfg(),
@@ -1165,6 +1177,7 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
         ctrl._async_cfg = SimpleNamespace(
+            seeded_rollouts=False,
             max_inflight_prompts=1,
             diagnostics=False,
             rollout_failure=_failure_cfg(),
@@ -1281,6 +1294,7 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
         ctrl._async_cfg = SimpleNamespace(
+            seeded_rollouts=False,
             max_inflight_prompts=1,
             diagnostics=False,
             rollout_failure=_failure_cfg(),
