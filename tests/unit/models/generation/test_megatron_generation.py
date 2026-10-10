@@ -780,6 +780,7 @@ def test_direct_megatron_multimodal_generate_round_trip(
             prompt_tokens=torch.tensor([10, 99, 99, 20]),
             generated_tokens=[71, 72],
             generated_log_probs=[-0.25, -0.5],
+            finish_reason="stop",
         )
     ]
     worker._generate_with_persistent_engine = mock_generate
