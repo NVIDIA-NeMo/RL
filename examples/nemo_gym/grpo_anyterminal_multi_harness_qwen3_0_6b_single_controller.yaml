@@ -1,0 +1,222 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Two-GPU async-GRPO smoke recipe for the companion NeMo-Gym multi-harness
+# AnyTerminal profile. Prepare the dataset with the Gym PR first:
+#
+#   ng_prepare_data \
+#     '+config_paths=[responses_api_agents/anyterminal_agent/configs/anyterminal_multi_harness_enroot.yaml]' \
+#     +output_dirpath=data/anyterminal_multi_harness \
+#     +mode=train_preparation +should_download=false
+#
+# Then run this recipe with examples/run_grpo_single_controller.py. One GPU
+# trains Qwen3-0.6B and one serves vLLM. Every source task fans out into four
+# prompt groups: OpenCode, OpenClaw, Pi, and Hermes. Both generations in each
+# prompt group stay on the same harness.
+defaults: "../configs/grpo_math_1B.yaml"
+
+grpo:
+  # Treat the scheduler allocation as the run boundary; do not stop after a
+  # short fixed number of dataset passes.
+  max_num_epochs: 1000000
+  max_num_steps: 1000000
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 2
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  skip_reference_policy_logprobs_calculation: true
+  # SingleController owns async scheduling; the legacy async-GRPO block must be absent.
+  async_grpo: null
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+
+checkpointing:
+  enabled: false
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: false
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # External coding harnesses include large tool schemas in the first model
+  # request. 16K avoids rejecting those prompts before any token is generated.
+  max_total_sequence_length: 16384
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    # SingleController's TransferQueue streaming path uses the split training
+    # lifecycle implemented by the Megatron worker (begin/microbatch/finish).
+    enabled: true
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+
+  sequence_packing:
+    enabled: false
+
+  make_sequence_length_divisible_by: 1
+
+  generation:
+    backend: vllm
+    max_new_tokens: 512
+    # Keep the trainer, Gym proxy, and external harnesses on one sampling
+    # contract. The model-server overrides below enforce these values even
+    # when a harness supplies serving-oriented defaults.
+    temperature: 1.0
+    top_p: 1.0
+    # NeMo RL's Gym rollout manager requires its trainer-side top_k to remain
+    # unset. The model-server override below uses vLLM's equivalent -1 value
+    # for model calls made by external harnesses.
+    top_k: null
+    vllm_cfg:
+      async_engine: true
+      logprobs_mode: raw_logprobs
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      expose_http_server: true
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 1
+        gpus_per_node: 1
+
+data:
+  # The parent is a math recipe. Replace its whole data block so none of the
+  # OpenMath-only split/download keys leak into NemoGymDataset.
+  _override_: true
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    dataset_name: NemoGymDataset
+    data_path: 3rdparty/Gym-workspace/Gym/data/anyterminal_multi_harness/train.jsonl
+  validation: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    port_range_low: 5000
+    port_range_high: 5999
+    is_trajectory_collection: false
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/anyterminal_agent/configs/anyterminal_multi_harness_enroot.yaml
+    # Expand every source example once per harness before dataloader batching.
+    # This produces one independent GRPO prompt group per task/harness pair.
+    fan_out:
+      anyterminal_multi_harness:
+        - anyterminal_opencode
+        - anyterminal_openclaw
+        - anyterminal_pi
+        - anyterminal_hermes
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          sampling_overrides:
+            temperature: ${policy.generation.temperature}
+            top_p: ${policy.generation.top_p}
+            top_k: -1
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
+    # Keep this smoke bounded even when a small model does not terminate an
+    # agent loop naturally. Raise these for a quality or convergence run.
+    anyterminal_opencode:
+      responses_api_agents:
+        anyterminal_agent:
+          global_agent_timeout: 300
+          # Keep OpenCode's compaction boundary below the backing vLLM
+          # context limit. The input ceiling reserves a 4K call plus a
+          # 512-token guard; OpenCode compacts before reaching that ceiling.
+          agent_kwargs:
+            context_window: ${add:${policy.max_total_sequence_length},-512}
+            max_input_tokens: ${add:${policy.max_total_sequence_length},-4608}
+            max_output_tokens: 4096
+    anyterminal_openclaw:
+      responses_api_agents:
+        anyterminal_agent:
+          global_agent_timeout: 300
+          agent_kwargs:
+            # Reserve enough input space for OpenClaw's fixed system prompt in
+            # addition to keeping its boundary below vLLM's hard 16K limit.
+            context_window: ${add:${policy.max_total_sequence_length},-512}
+            max_output_tokens: 4096
+    anyterminal_pi:
+      responses_api_agents:
+        anyterminal_agent:
+          global_agent_timeout: 300
+    anyterminal_hermes:
+      responses_api_agents:
+        anyterminal_agent:
+          global_agent_timeout: 300
+          agent_kwargs:
+            max_turns: 3
+            context_window: ${add:${policy.max_total_sequence_length},-512}
+
+logger:
+  log_dir: logs/grpo-anyterminal-multi-harness-qwen3-0.6b
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    entity: adlr
+    project: multi-harness-RL
+    name: anyterminal-multi-harness-qwen3-0.6b
+    log_nemo_gym_full_result_tables: true
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 2
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: 2
+
+# External CLI harnesses make their own model calls. Stage every call's token
+# ids/logprobs in Gym's ledger and let SingleController rebuild a canonical
+# trainable trajectory after it selects the terminal call.
+token_capture:
+  enabled: true
+  staging_partition: rollout_staging
+  min_valid_fraction_per_group: 1.0
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${mul:${grpo.num_prompts_per_step}, 2}
+  max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}

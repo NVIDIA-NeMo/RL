@@ -26,7 +26,12 @@ from nemo_rl.environments.nemo_gym_shards import (
     apply_shard_overlay,
     build_route_shard_map,
     find_gym_config_entries,
+    parse_agent_pool,
+    parse_fan_out,
     parse_shard_plan,
+    validate_agent_pool_targets,
+    validate_agent_routing_modes,
+    validate_fan_out_targets,
 )
 
 
@@ -46,6 +51,39 @@ def _sharded_config(**overrides):
 def test_unsharded_config_returns_no_plan():
     """config_paths without shards is the pre-sharding path and must stay working."""
     assert parse_shard_plan({"config_paths": ["gym.yaml"], "num_gpu_nodes": 1}) is None
+
+
+def test_parse_agent_pool_accepts_the_gym_route_mapping():
+    assert parse_agent_pool(OmegaConf.create({"reasoning": ["opencode", "codex"]})) == {
+        "reasoning": ["opencode", "codex"]
+    }
+
+
+@pytest.mark.parametrize(
+    ("agent_pool", "expected"),
+    [
+        ([], "must be a mapping"),
+        ({"": ["opencode"]}, "keys must be non-empty strings"),
+        ({"reasoning": []}, "must be a non-empty list"),
+        ({"reasoning": ["opencode", "opencode"]}, "duplicate agents"),
+    ],
+)
+def test_parse_agent_pool_rejects_invalid_routes(agent_pool, expected):
+    with pytest.raises(ShardConfigError, match=expected):
+        parse_agent_pool(agent_pool)
+
+
+def test_parse_fan_out_accepts_the_gym_route_mapping():
+    assert parse_fan_out(OmegaConf.create({"reasoning": ["opencode", "codex"]})) == {
+        "reasoning": ["opencode", "codex"]
+    }
+
+
+def test_agent_pool_and_fan_out_cannot_share_a_route():
+    with pytest.raises(ShardConfigError, match="configure only one mode"):
+        validate_agent_routing_modes(
+            {"reasoning": ["opencode"]}, {"reasoning": ["codex"]}
+        )
 
 
 @pytest.mark.parametrize(
@@ -73,6 +111,24 @@ def test_parse_shard_plan_reads_shards_and_common_settings():
     assert plan.shards[1].config_paths == ["proxy.yaml", "tools.yaml"]
     assert plan.common_overrides == {"policy_model": {"num_workers": 4}}
     assert plan.allowed_duplicate_entries == frozenset({"policy_model"})
+
+
+def test_agent_pool_is_not_misclassified_as_an_inherited_server_overlay():
+    config = _sharded_config(agent_pool={"reasoning": ["opencode", "codex"]})
+
+    plan = parse_shard_plan(config)
+
+    assert plan is not None
+    assert "agent_pool" not in find_gym_config_entries(config)
+
+
+def test_fan_out_is_not_misclassified_as_an_inherited_server_overlay():
+    config = _sharded_config(fan_out={"reasoning": ["opencode", "codex"]})
+
+    plan = parse_shard_plan(config)
+
+    assert plan is not None
+    assert "fan_out" not in find_gym_config_entries(config)
 
 
 def test_parse_shard_plan_accepts_omegaconf_input():
@@ -600,6 +656,60 @@ def test_task_sources_are_never_allowlisted_for_duplication():
             },
             allowed_duplicate_entries={"math_env"},
         )
+
+
+def test_pooled_task_source_can_be_replicated_beside_each_harness():
+    route_to_shard = build_route_shard_map(
+        {
+            "opencode": {
+                "reasoning": ["resources_servers"],
+                "opencode_agent": ["responses_api_agents"],
+            },
+            "codex": {
+                "reasoning": ["resources_servers"],
+                "codex_agent": ["responses_api_agents"],
+            },
+        },
+        pooled_routes={"reasoning"},
+    )
+
+    assert route_to_shard == {
+        "opencode_agent": "opencode",
+        "codex_agent": "codex",
+    }
+
+
+def test_pooled_route_does_not_allow_a_duplicate_agent():
+    with pytest.raises(ShardSetupError, match="hosted by both shard"):
+        build_route_shard_map(
+            {
+                "left": {"shared": ["responses_api_agents"]},
+                "right": {"shared": ["responses_api_agents"]},
+            },
+            pooled_routes={"shared"},
+        )
+
+
+def test_agent_pool_targets_must_be_agents_hosted_by_the_shards():
+    entries = {
+        "left": {"opencode": ["responses_api_agents"]},
+        "right": {"reasoning": ["resources_servers"]},
+    }
+
+    validate_agent_pool_targets(entries, {"reasoning": ["opencode"]})
+    with pytest.raises(ShardSetupError, match=r"agents no shard hosts.*codex"):
+        validate_agent_pool_targets(entries, {"reasoning": ["opencode", "codex"]})
+
+
+def test_fan_out_targets_must_be_agents_hosted_by_the_shards():
+    entries = {
+        "left": {"opencode": ["responses_api_agents"]},
+        "right": {"reasoning": ["resources_servers"]},
+    }
+
+    validate_fan_out_targets(entries, {"reasoning": ["opencode"]})
+    with pytest.raises(ShardSetupError, match=r"agents no shard hosts.*hermes"):
+        validate_fan_out_targets(entries, {"reasoning": ["opencode", "hermes"]})
 
 
 def test_build_route_shard_map_rejects_an_unlisted_duplicate_entry():

@@ -24,7 +24,11 @@ from threading import Event, Lock
 import pytest
 from ray import cloudpickle
 
-from nemo_rl.environments.nemo_gym import NemoGymShardSet, as_nemo_gym_shard_set
+from nemo_rl.environments.nemo_gym import (
+    NemoGymShardSet,
+    apply_nemo_gym_agent_pool,
+    as_nemo_gym_shard_set,
+)
 from nemo_rl.environments.nemo_gym_shards import ShardSetupError
 from nemo_rl.experience.rollouts import (
     _bucket_nemo_gym_rows_by_instance,
@@ -119,6 +123,116 @@ def _shard_set(handles, route_to_shard):
         route_to_shard=route_to_shard,
         placement_group=object(),
     )
+
+
+def test_agent_pool_selects_one_harness_per_prompt_before_shard_routing():
+    left, right = _FakeActor("left"), _FakeActor("right")
+    shard_set = _shard_set(
+        {"left": [left], "right": [right]},
+        {"opencode": "left", "codex": "right"},
+    )
+    shard_set.agent_pool = {"reasoning": ["opencode", "codex"]}
+    rows = [
+        {
+            "task_source": "reasoning",
+            "_ng_agent_pool_index": prompt_index,
+            "_rowidx": prompt_index * 2 + rollout_index,
+        }
+        for prompt_index in range(3)
+        for rollout_index in range(2)
+    ]
+
+    apply_nemo_gym_agent_pool(rows, shard_set.agent_pool)
+    buckets = _bucket_nemo_gym_rows_by_instance(rows, shard_set, num_generations=2)
+
+    assert [row["agent_ref"]["name"] for row in rows] == [
+        "opencode",
+        "opencode",
+        "codex",
+        "codex",
+        "opencode",
+        "opencode",
+    ]
+    assert [row["_ng_agent_pool_assignment"] for row in rows] == [
+        row["agent_ref"]["name"] for row in rows
+    ]
+    by_shard = {name: bucket_rows for name, _, bucket_rows in buckets}
+    assert [row["_rowidx"] for row in by_shard["left"]] == [0, 1, 4, 5]
+    assert [row["_rowidx"] for row in by_shard["right"]] == [2, 3]
+
+
+def test_recorded_agent_pool_assignment_survives_pool_reordering():
+    rows = [
+        {
+            "task_source": "reasoning",
+            "agent_ref": {"name": "codex"},
+            "_ng_agent_pool_index": 0,
+            "_ng_agent_pool_assignment": "codex",
+        }
+    ]
+
+    apply_nemo_gym_agent_pool(rows, {"reasoning": ["opencode", "codex"]})
+
+    assert rows[0]["agent_ref"]["name"] == "codex"
+
+
+def test_agent_pool_content_fallback_ignores_retry_coordinates():
+    first = {
+        "task_source": "reasoning",
+        "responses_create_params": {"input": [{"role": "user", "content": "2+2"}]},
+        "_rowidx": 0,
+        "_ng_group_attempt": 0,
+    }
+    retry = {
+        **first,
+        "_rowidx": 19,
+        "_ng_group_attempt": 3,
+        "_ng_attempt_index": 3,
+    }
+    pool = {"reasoning": ["opencode", "codex", "mini_swe"]}
+
+    apply_nemo_gym_agent_pool([first], pool)
+    apply_nemo_gym_agent_pool([retry], pool)
+
+    assert first["agent_ref"] == retry["agent_ref"]
+
+
+@pytest.mark.parametrize("selection_index", [-1, True, "1"])
+def test_agent_pool_rejects_invalid_selection_indices(selection_index):
+    rows = [
+        {
+            "task_source": "reasoning",
+            "_ng_agent_pool_index": selection_index,
+        }
+    ]
+
+    with pytest.raises(ValueError, match="must be non-negative integers"):
+        apply_nemo_gym_agent_pool(rows, {"reasoning": ["opencode"]})
+
+
+def test_agent_pool_rejects_a_conflicting_recorded_assignment():
+    rows = [
+        {
+            "task_source": "reasoning",
+            "agent_ref": {"name": "opencode"},
+            "_ng_agent_pool_assignment": "codex",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="records 'codex'"):
+        apply_nemo_gym_agent_pool(rows, {"reasoning": ["opencode", "codex"]})
+
+
+def test_agent_pool_does_not_override_environment_server_routing():
+    row = {
+        "task_source": "reasoning",
+        "_ng_environment_server": "native_environment",
+        "_ng_agent_pool_index": 0,
+    }
+
+    apply_nemo_gym_agent_pool([row], {"reasoning": ["opencode"]})
+
+    assert "agent_ref" not in row
 
 
 def test_unsharded_dispatch_keeps_one_bucket_holding_the_whole_batch():

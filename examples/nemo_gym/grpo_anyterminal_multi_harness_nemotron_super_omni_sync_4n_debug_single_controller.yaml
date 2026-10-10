@@ -1,0 +1,24 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Four-node synchronous debug topology for the Super Omni AnyTerminal recipe.
+# Two nodes train (the minimum 16 ranks required by TP=8 and CP=2) and two
+# nodes serve rollouts. Keep the parent recipe's 16K context and generation
+# limits: terminal-agent tool histories can exceed the 4K limit used by short
+# multimodal smoke tests.
+defaults: ./grpo_anyterminal_multi_harness_nemotron_super_omni_sync_8n_single_controller.yaml
+
+cluster:
+  num_nodes: 4
+
+policy:
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 8
+        num_nodes: 2
+
+logger:
+  log_dir: logs/grpo-anyterminal-multi-harness-super-omni-sync-4n-debug
+  wandb:
+    name: anyterminal-multi-harness-super-omni-sync-4n-debug

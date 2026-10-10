@@ -117,6 +117,35 @@ def test_nemo_gym_dataset_records_source_without_parsing_rows(tmp_path):
     assert len(dataset.dataset) == 400
 
 
+def test_nemo_gym_dataset_fans_every_matching_task_out_to_each_agent(tmp_path):
+    data_path = tmp_path / "gym.jsonl"
+    rows = [
+        {"task_source": "shared", "responses_create_params": {"input": []}},
+        {"task_source": "other", "responses_create_params": {"input": []}},
+        {
+            "task_source": "shared",
+            "_ng_environment_server": "native",
+            "responses_create_params": {"input": []},
+        },
+    ]
+    data_path.write_text("".join(f"{json.dumps(row)}\n" for row in rows))
+
+    dataset = NemoGymDataset(
+        str(data_path), fan_out={"shared": ["opencode", "hermes"]}
+    )
+    expanded = [json.loads(row["extra_env_info"]) for row in dataset.dataset]
+
+    assert len(expanded) == 4
+    assert [row.get("agent_ref", {}).get("name") for row in expanded] == [
+        "opencode",
+        "hermes",
+        None,
+        None,
+    ]
+    assert [row.get("_ng_fan_out_index") for row in expanded[:2]] == [0, 1]
+    assert dataset.agent_name_sources is None
+
+
 @pytest.mark.parametrize(
     "input_key,output_key", [("input", "output"), ("question", "answer")]
 )

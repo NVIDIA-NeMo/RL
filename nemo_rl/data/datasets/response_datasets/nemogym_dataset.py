@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
+from collections.abc import Mapping
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import load_dataset_from_path
 from nemo_rl.data.interfaces import NemoGymSourceIdentity
+from nemo_rl.environments.nemo_gym_shards import parse_fan_out
 
 
 class NemoGymDataset(RawDataset):
@@ -27,7 +30,14 @@ class NemoGymDataset(RawDataset):
         repeat: Number of times to repeat the dataset, default is 1
     """
 
-    def __init__(self, data_path: str, repeat: int = 1, **kwargs) -> None:
+    def __init__(
+        self,
+        data_path: str,
+        repeat: int = 1,
+        fan_out: Mapping[str, list[str]] | None = None,
+        **kwargs,
+    ) -> None:
+        fan_out = parse_fan_out(fan_out)
         self.task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
         if self.task_name[0] == "-":
             self.task_name = self.task_name[1:]
@@ -71,6 +81,48 @@ class NemoGymDataset(RawDataset):
                 "A NeMo-Gym dataset must contain an 'extra_env_info' or 'text' "
                 f"column, but {data_path!r} contains {self.dataset.column_names}."
             )
+
+        if fan_out:
+
+            def expand_batch(batch: Mapping[str, list[str]]) -> dict[str, list[str]]:
+                expanded_rows: list[str] = []
+                for raw_line in batch["extra_env_info"]:
+                    row = json.loads(raw_line)
+                    # Explicit Environment Server routing is not agent routing and
+                    # therefore must never be multiplied across agent harnesses.
+                    if "_ng_environment_server" in row:
+                        expanded_rows.append(raw_line)
+                        continue
+                    agent_ref = row.get("agent_ref")
+                    agent_name = (
+                        agent_ref.get("name")
+                        if isinstance(agent_ref, Mapping)
+                        else None
+                    )
+                    route = (
+                        agent_name if agent_name is not None else row.get("task_source")
+                    )
+                    targets = fan_out.get(route) if isinstance(route, str) else None
+                    if targets is None:
+                        expanded_rows.append(raw_line)
+                        continue
+                    for fan_out_index, target in enumerate(targets):
+                        copy = dict(row)
+                        copy["agent_ref"] = {"name": target}
+                        copy["_ng_fan_out_index"] = fan_out_index
+                        expanded_rows.append(json.dumps(copy))
+                return {"extra_env_info": expanded_rows}
+
+            self.dataset = self.dataset.map(
+                expand_batch,
+                batched=True,
+                remove_columns=self.dataset.column_names,
+                desc="Expanding NeMo Gym harness fan-out",
+            )
+            # Coverage checks must inspect the expanded rows rather than the
+            # unexpanded source file recorded above.
+            self.agent_name_sources = None
+
         self.dataset = self.dataset.add_column(
             "task_name", [self.task_name] * len(self.dataset)
         )
