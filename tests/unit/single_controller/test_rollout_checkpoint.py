@@ -212,7 +212,9 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
             "sampler": {"name": "windowed", "max_staleness_versions": 1},
             "stall_watchdog": {"interval_s": 30},
         },
-        "checkpointing": CheckpointingConfig.model_construct(**{"checkpoint_dir": "/run/one/checkpoints"}),
+        "checkpointing": CheckpointingConfig.model_construct(
+            **{"checkpoint_dir": "/run/one/checkpoints"}
+        ),
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 120},
         "cluster": {"num_nodes": 2},
         "logger": LoggerConfig(log_dir="/run/one"),
@@ -241,7 +243,9 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
             **base["async_rl"],
             "stall_watchdog": {"interval_s": 5},
         },
-        "checkpointing": CheckpointingConfig.model_construct(**{"checkpoint_dir": "/run/two/checkpoints"}),
+        "checkpointing": CheckpointingConfig.model_construct(
+            **{"checkpoint_dir": "/run/two/checkpoints"}
+        ),
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 300},
         "cluster": {"num_nodes": 8},
         "logger": LoggerConfig(log_dir="/run/two"),
