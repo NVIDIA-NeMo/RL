@@ -360,7 +360,6 @@ policy:
       env_vars:
         VLLM_USE_DEEP_GEMM: '0'
         VLLM_PLUGINS: nemo_speechlm
-        NEMO_SPEECHLM2_VLLM_ONLY: '1'
     vllm_kwargs:
       limit_mm_per_prompt:
         audio:

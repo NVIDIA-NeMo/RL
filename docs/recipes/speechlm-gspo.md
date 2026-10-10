@@ -22,10 +22,12 @@ NeMo-Skills `evaluate_cer` with standard normalization. Other tasks use WER.
 
 The ASR environment requires `rapidfuzz`; Mandarin CER additionally requires
 public NeMo-Skills with the Han-adjacent whitespace option. Install these in the
-policy/system actor environments from public repositories. The implementation uses normal package installation and does not replace
-framework modules. A prepared image can retain its existing actor interpreters
-and compiled dependencies while installing the public Speech and Skills core
-packages with constraints for each environment.
+driver/generation environment where rewards run. Policy training and canonical
+export require Speech and Automodel but do not require Skills. The implementation
+uses normal package installation and does not replace framework modules. A
+prepared image can retain its existing actor interpreters and compiled
+dependencies while installing public Speech and, where needed, Skills core with
+constraints for each environment.
 
 Optional `responses_create_params.max_output_tokens` is a positive integer; a
 null value retains the rollout configuration cap. A request cap is clamped to
