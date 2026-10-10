@@ -184,7 +184,6 @@ def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient():
         LossPostProcessor,
         LogprobsPostProcessor,
         forward_with_post_processing_fn,
-        prepare_model_forward,
     )
 
     torch.manual_seed(42)
@@ -202,16 +201,6 @@ def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient():
             "audio_lengths": torch.tensor([[6], [4]]),
         },
     )
-    prepared = prepare_model_forward(
-        model,
-        processed,
-        device_mesh=None,
-        cp_size=1,
-        padding_token_id=0,
-        is_reward_model=False,
-        allow_flash_attn_args=True,
-    )
-    assert set(processed.vlm_kwargs).issubset(prepared.model_batch)
     data = BatchedDataDict(
         {"input_ids": ids, "token_mask": mask, "sample_mask": torch.ones(2)}
     )
@@ -219,7 +208,6 @@ def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient():
     sampling = TrainingSamplingParams(temperature=0.8)
     old, metrics, returned = forward_with_post_processing_fn(
         model=model,
-        prepared=prepared,
         post_processing_fn=LogprobsPostProcessor({}, sampling_params=sampling),
         processed_mb=microbatch,
         global_valid_seqs=None,
@@ -242,7 +230,6 @@ def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient():
     )
     loss, _, returned = forward_with_post_processing_fn(
         model=model,
-        prepared=prepared,
         post_processing_fn=LossPostProcessor(
             loss_fn, {}, None, 1, 1, sampling_params=sampling
         ),
