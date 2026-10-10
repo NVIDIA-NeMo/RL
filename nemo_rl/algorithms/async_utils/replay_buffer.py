@@ -144,6 +144,7 @@ class DataPlaneCheckpointMetadata(TypedDict):
     rollout_recovery_schema_version: NotRequired[int]
     rollout_recovery_payload_sha256: NotRequired[str]
     rollout_recovery_group_count: NotRequired[int]
+    routed_experts_boundary_schema_version: NotRequired[int]
     # opd_full only: checkpoint path per teacher_index.
     opd_full_teacher_checkpoints: NotRequired[list[str]]
 

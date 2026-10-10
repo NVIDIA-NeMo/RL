@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from nemo_rl.experience.route_plan import (
@@ -128,3 +130,45 @@ def test_placeholder_plan_can_carry_length_without_route_reads() -> None:
         expected_token_length=7,
     )
     assert decode_route_plan(encode_route_plan(placeholder)) == placeholder
+
+
+def test_route_plan_boundary_round_trip() -> None:
+    plan = _plan()
+    repaired = replace(
+        plan.spans[1], boundary_token_index=3, repair_previous_token=True
+    )
+    plan = replace(plan, spans=(plan.spans[0], repaired, *plan.spans[2:]))
+    assert decode_route_plan(encode_route_plan(plan)) == plan
+
+
+def test_legacy_v2_plan_preserves_legacy_semantics() -> None:
+    plan = replace(_plan(), schema_version=2)
+    encoded = encode_route_plan(plan)
+    assert all("repair_previous_token" not in span for span in encoded["spans"])
+    decoded = decode_route_plan(encoded)
+    assert decoded == plan
+    assert all(not span.repair_previous_token for span in decoded.spans)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"boundary_token_index": True},
+        {"boundary_token_index": -1},
+        {"boundary_token_index": 4},
+        {"repair_previous_token": 1},
+        {"repair_previous_token": True},
+    ],
+)
+def test_invalid_boundary_plan_is_not_silently_legacy(updates: dict) -> None:
+    encoded = encode_route_plan(_plan())
+    encoded["spans"][1].update(updates)
+    with pytest.raises((TypeError, ValueError), match="boundary|repair_previous_token"):
+        decode_route_plan(encoded)
+
+
+def test_root_cannot_repair_a_previous_token() -> None:
+    encoded = encode_route_plan(_plan())
+    encoded["spans"][0].update(boundary_token_index=0, repair_previous_token=True)
+    with pytest.raises(ValueError, match="boundary token index"):
+        decode_route_plan(encoded)

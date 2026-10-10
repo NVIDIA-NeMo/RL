@@ -53,6 +53,7 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXTRAS_METADATA_FIELD,
     Layout,
 )
+from nemo_rl.data_plane.tq_token_sink import fetch_route_boundaries
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
 from nemo_rl.experience.route_assembly import RouteFragment, execute_route_plan
 from nemo_rl.telemetry.instrumentation import accepts_trace_context
@@ -521,8 +522,9 @@ class TQWorkerMixin:
         *,
         keys: list[str],
         partition_id: str,
+        boundary_keys: list[str],
     ) -> dict[str, RouteFragment]:
-        """Fetch a unique key set in one request and preserve request identity."""
+        """Fetch delta fragments and, separately, only the declared sidecars."""
         if not keys:
             return {}
         rows = self._require_dp_client().get_samples(
@@ -542,6 +544,11 @@ class TQWorkerMixin:
         metadata_column = rows.get(ROUTED_EXTRAS_METADATA_FIELD)
         if route_column is None or encoding_column is None or metadata_column is None:
             raise KeyError("deferred route row is missing integrity metadata")
+        boundaries = fetch_route_boundaries(
+            self._require_dp_client(),
+            staging_partition=partition_id,
+            staging_keys=boundary_keys,
+        )
         return {
             key: RouteFragment(
                 routes=route_column[index],
@@ -549,6 +556,7 @@ class TQWorkerMixin:
                 extras_metadata_json=bytes(
                     int(value) for value in metadata_column[index].reshape(-1).tolist()
                 ),
+                boundary_routes=boundaries.get(key),
             )
             for index, key in enumerate(keys)
         }
@@ -557,7 +565,7 @@ class TQWorkerMixin:
         self,
         plans: list[Any],
     ) -> tuple[list[dict[str, RouteFragment]], int, float]:
-        """Use one normal-path batch read; isolate error retries per rollout."""
+        """Batch each payload column's reads; isolate error retries per rollout."""
         from nemo_rl.experience.route_plan import decode_route_plan
 
         decoded = [decode_route_plan(plan) for plan in plans]
@@ -575,11 +583,20 @@ class TQWorkerMixin:
                 if span.staged_route_len > 0
             )
         )
+        boundary_keys = list(
+            dict.fromkeys(
+                span.staging_key
+                for plan in decoded
+                for span in plan.spans
+                if span.boundary_token_index is not None
+            )
+        )
         fetch_start = time.perf_counter()
         try:
             fragments = self._fetch_route_fragments(
                 keys=keys,
                 partition_id=partition_id,
+                boundary_keys=boundary_keys,
             )
         except Exception as batch_error:  # noqa: BLE001 - isolate fallback by rollout
             logging.getLogger(__name__).warning(
@@ -600,6 +617,11 @@ class TQWorkerMixin:
                         self._fetch_route_fragments(
                             keys=row_keys,
                             partition_id=partition_id,
+                            boundary_keys=[
+                                span.staging_key
+                                for span in plan.spans
+                                if span.boundary_token_index is not None
+                            ],
                         )
                     )
                 except Exception:  # noqa: BLE001 - this rollout becomes sentinel
