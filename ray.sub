@@ -41,21 +41,30 @@ trap _nrl_log_exit EXIT TERM HUP INT
 # Function to detect if SLURM cluster uses GRES
 ########################################################
 maybe_gres_arg() {
-  # Check if any nodes in the partition have GRES configured
-  # Assumes a homogeneous allocation (not a heterogeneous job)
-  if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
-    # Do a quick assert here that gpus:8 == gpus:$GPUS_PER_NODE. It is probably a user error if someone isn't using GPUS_PER_NODE=8 on our clusters if it supports --gres=gpu:8 or gpu:a100:8
-    # Some clusters append socket specs like "(S:0-3)" to the GRES string.
-    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | cut -d'(' -f1 | awk -F: '{print $NF}') ]]; then
-      echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:") meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
-      exit 1
-    fi
-    echo "--gres=gpu:${GPUS_PER_NODE}"
+  # Under "#SBATCH --exclusive" a job step is not handed the job's generic
+  # resources implicitly, so every srun step below must request its GPUs with
+  # --gres. The count is read from the nodes of this allocation, not from the
+  # whole partition: a partition may mix node types, and a step can only be
+  # placed when every allocated node has the GPUs the step asks for. A node's
+  # GRES string may list several types and carry a socket suffix
+  # ("gpu:8(S:0-3),shard:64"); only the gpu entry's count is read.
+  local gres_lines gres_counts
+  gres_lines=$(sinfo -N -n "$SLURM_JOB_NODELIST" -h -o "%G" | grep "gpu:" || true)
+  if [[ -z "$gres_lines" ]]; then
+    # No GRES support detected
+    echo ""
     return
   fi
-  
-  # No GRES support detected
-  echo ""
+  gres_counts=$(printf '%s\n' "$gres_lines" | grep -o 'gpu:[^,(]*' | awk -F: '{print $NF}' | sort -un)
+  if [[ $(printf '%s\n' "$gres_counts" | wc -l) -gt 1 ]]; then
+    echo "Error: the allocated nodes advertise mixed GPU counts ($(printf '%s' "$gres_counts" | tr '\n' ' ')); NUM_ACTORS and worker_units assume GPUS_PER_NODE GPUs on every node. Request uniform nodes with sbatch --gres=gpu:$GPUS_PER_NODE. GRES lines: $(printf '%s' "$gres_lines" | tr '\n' ' ')" >&2
+    exit 1
+  fi
+  if [[ $GPUS_PER_NODE -ne $gres_counts ]]; then
+    echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but the allocated nodes advertise gpu:$gres_counts (GRES lines: $(printf '%s' "$gres_lines" | tr '\n' ' ')), meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
+    exit 1
+  fi
+  echo "--gres=gpu:${GPUS_PER_NODE}"
 }
 
 ########################################################
