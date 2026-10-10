@@ -65,6 +65,9 @@ _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
 _GLM_DSA_SOURCE = "model_executor/models/deepseek_v2.py"
 _GLM_DSA_PATCH_FN = "_patch_vllm_glm_decoder_sequence_parallel_moe"
 _GLM_DSA_MARKER = 'getattr(config, "model_type", None) != "glm_moe_dsa"'
+_GLM52_KERNELS_SOURCE = "models/deepseek_v32/common/kernels.py"
+_GLM52_BF16_PATCH_FN = "_patch_vllm_glm52_dsa_bf16_round_points"
+_GLM52_BF16_MARKER = "NeMo-RL patch: restore GLM Indexer BF16 materialization"
 _NEMOTRON_H_SOURCE = """import torch
 from torch import nn
 
@@ -338,6 +341,19 @@ def patched_glm_dsa_source(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def patched_glm52_kernels_source(tmp_path, monkeypatch):
+    """The installed vLLM 0.29 DSA kernels, unpatched then patched in tmp."""
+    copied = write_unpatched_copy(
+        _GLM52_KERNELS_SOURCE,
+        _GLM52_BF16_PATCH_FN,
+        tmp_path / "kernels.py",
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    assert patches._patch_vllm_glm52_dsa_bf16_round_points(logging.getLogger(__name__))
+    return copied
+
+
+@pytest.fixture
 def patched_nemotron_h_source(tmp_path, monkeypatch):
     source = tmp_path / "nemotron_h.py"
     source.write_text(_NEMOTRON_H_SOURCE)
@@ -499,6 +515,48 @@ def test_glm_decoder_sp_moe_patch_warns_on_unknown_source(
 
     assert model_source.read_text() == "class DeepseekV2DecoderLayer:\n    pass\n"
     assert "vLLM 0.25.1 source shape was not found" in caplog.text
+
+
+@pytest.mark.vllm
+def test_glm52_bf16_rounding_patch_matches_installed_vllm(
+    patched_glm52_kernels_source,
+):
+    content = patched_glm52_kernels_source.read_text()
+    assert content.count(_GLM52_BF16_MARKER) == 2
+    assert content.count("if INDEX_ROPE_INTERLEAVE:") >= 5
+    assert content.count(".to(tl.bfloat16).to(tl.float32)") >= 4
+    ast.parse(content)
+
+
+@pytest.mark.vllm
+def test_glm52_bf16_rounding_patch_is_idempotent(
+    patched_glm52_kernels_source, monkeypatch
+):
+    before = patched_glm52_kernels_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_glm52_kernels_source)
+    )
+
+    assert patches._patch_vllm_glm52_dsa_bf16_round_points(logging.getLogger(__name__))
+    assert patched_glm52_kernels_source.read_text() == before
+
+
+def test_glm52_bf16_rounding_patch_fails_closed_on_unknown_source(
+    monkeypatch, tmp_path, caplog
+):
+    kernels_source = tmp_path / "kernels.py"
+    kernels_source.write_text("def fused_q():\n    pass\n")
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(kernels_source)
+    )
+
+    with caplog.at_level(logging.ERROR):
+        assert not patches._patch_vllm_glm52_dsa_bf16_round_points(
+            logging.getLogger(__name__)
+        )
+
+    assert kernels_source.read_text() == "def fused_q():\n    pass\n"
+    assert "expected vLLM 0.29 source anchors were not found" in caplog.text
 
 
 @pytest.mark.vllm
@@ -783,8 +841,9 @@ def _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars):
         "_patch_vllm_shm_broadcast_bind_retry",
         "_patch_vllm_radio_layerscale_loader",
         "_patch_vllm_glm_decoder_sequence_parallel_moe",
+        "_patch_vllm_glm52_dsa_bf16_round_points",
     ):
-        monkeypatch.setattr(patches, patch_name, lambda _logger: None)
+        monkeypatch.setattr(patches, patch_name, lambda _logger: True)
     monkeypatch.setattr(
         patches,
         "_patch_vllm_moe_routed_experts_capture",
@@ -877,6 +936,17 @@ def test_apply_vllm_patches_raises_when_nemotron_h_fp32_lm_head_patch_fails(
 
     with pytest.raises(RuntimeError, match="could not be applied"):
         patches._apply_vllm_patches("py", nemotron_h_fp32_lm_head=True)
+
+
+def test_apply_vllm_patches_raises_when_glm52_bf16_patch_fails(monkeypatch):
+    _install_fake_vllm_modules(monkeypatch)
+    _stub_non_fp32_vllm_patches(monkeypatch, [])
+    monkeypatch.setattr(
+        patches, "_patch_vllm_glm52_dsa_bf16_round_points", lambda _logger: False
+    )
+
+    with pytest.raises(RuntimeError, match="GLM-5.2 DSA BF16-rounding patch"):
+        patches._apply_vllm_patches("py")
 
 
 @pytest.mark.parametrize("require_capture", [False, True])

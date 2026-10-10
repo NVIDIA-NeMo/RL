@@ -653,6 +653,113 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
     logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
 
 
+def _patch_vllm_glm52_dsa_bf16_round_points(logger) -> bool:
+    """Restore the pre-FP8 BF16 materialization used by the GLM-5.2 Indexer.
+
+    vLLM 0.29 fuses GLM's Indexer LayerNorm, RoPE, and FP8 quantization in
+    Triton, keeping the intermediate values in FP32 registers. Megatron's
+    regular DSA path materializes the LayerNorm and RoPE outputs as BF16 before
+    quantization. Those different rounding points can reorder scores around
+    the sparse top-k boundary.
+
+    The patch is restricted to the interleaved Indexer-RoPE specialization
+    used by GLM. DeepSeek's NeoX-layout specialization is left unchanged. On
+    SM90 this Triton kernel is the production path; vLLM's fused-Q CuTeDSL
+    alternative is SM100-only.
+
+    Returns:
+        Whether the expected vLLM 0.29 source was patched (or was already
+        patched). A false result is logged loudly because silently running the
+        unpatched GLM path can reintroduce rollout/training mismatch.
+    """
+    try:
+        file_to_patch = _get_vllm_file("models/deepseek_v32/common/kernels.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate deepseek_v32/common/kernels.py for the GLM-5.2 "
+            "DSA BF16-rounding patch."
+        )
+        return False
+
+    marker = "NeMo-RL patch: restore GLM Indexer BF16 materialization"
+    k_norm_old = (
+        "        normed = (index_k - mean) * rstd * index_k_w + index_k_b\n"
+        "\n"
+        "        # 2. RoPE on the rotation region."
+    )
+    k_norm_new = (
+        "        normed = (index_k - mean) * rstd * index_k_w + index_k_b\n"
+        "        # NeMo-RL patch: restore GLM Indexer BF16 materialization\n"
+        "        # between LayerNorm and RoPE, matching the unfused path.\n"
+        "        if INDEX_ROPE_INTERLEAVE:\n"
+        "            normed = normed.to(tl.bfloat16).to(tl.float32)\n"
+        "\n"
+        "        # 2. RoPE on the rotation region."
+    )
+    k_partner_old = (
+        "        normed_partner = (raw_partner - mean) * rstd * w_partner + b_partner\n"
+        "        roped = normed * cos_full + sign * normed_partner * sin_full\n"
+        "        result = tl.where(in_rope, roped, normed)\n"
+    )
+    k_partner_new = (
+        "        normed_partner = (raw_partner - mean) * rstd * w_partner + b_partner\n"
+        "        if INDEX_ROPE_INTERLEAVE:\n"
+        "            normed_partner = normed_partner.to(tl.bfloat16).to(tl.float32)\n"
+        "        roped = normed * cos_full + sign * normed_partner * sin_full\n"
+        "        result = tl.where(in_rope, roped, normed)\n"
+        "        # Match the BF16 RoPE output consumed by the unfused FP8 quantizer.\n"
+        "        if INDEX_ROPE_INTERLEAVE:\n"
+        "            result = result.to(tl.bfloat16).to(tl.float32)\n"
+    )
+    q_old = (
+        "        roped = index_q * cos_full + sign * partner * sin_full\n"
+        "        index_q = tl.where(in_rope, roped, index_q)\n"
+        "\n"
+        "        # Index Q Quantize (from registers)"
+    )
+    q_new = (
+        "        roped = index_q * cos_full + sign * partner * sin_full\n"
+        "        index_q = tl.where(in_rope, roped, index_q)\n"
+        "        # NeMo-RL patch: restore GLM Indexer BF16 materialization\n"
+        "        # after RoPE and before dynamic FP8 quantization.\n"
+        "        if INDEX_ROPE_INTERLEAVE:\n"
+        "            index_q = index_q.to(tl.bfloat16).to(tl.float32)\n"
+        "\n"
+        "        # Index Q Quantize (from registers)"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("vLLM GLM-5.2 DSA BF16-rounding patch already applied.")
+            return True
+        missing = [
+            name
+            for name, snippet in (
+                ("K LayerNorm", k_norm_old),
+                ("K RoPE", k_partner_old),
+                ("Q RoPE", q_old),
+            )
+            if snippet not in content
+        ]
+        if missing:
+            logger.error(
+                "Could not apply vLLM GLM-5.2 DSA BF16-rounding patch: "
+                "expected vLLM 0.29 source anchors were not found for %s in %s.",
+                ", ".join(missing),
+                file_to_patch,
+            )
+            return False
+        content = content.replace(k_norm_old, k_norm_new, 1)
+        content = content.replace(k_partner_old, k_partner_new, 1)
+        content = content.replace(q_old, q_new, 1)
+        write_back(content)
+
+    logger.info(
+        "Restored GLM-5.2 Indexer BF16 round points before vLLM FP8 quantization."
+    )
+    return True
+
+
 def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) -> bool:
     """Fire the routed-experts capture hook on the monolithic fused-MoE path.
 
@@ -1026,6 +1133,11 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+    if not _patch_vllm_glm52_dsa_bf16_round_points(patch_logger):
+        raise RuntimeError(
+            "The required vLLM 0.29 GLM-5.2 DSA BF16-rounding patch could not "
+            "be applied. Update its source anchors before running generation."
+        )
 
 
 def _apply_vllm_patches(
@@ -1092,6 +1204,11 @@ def _apply_vllm_patches(
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+    if not _patch_vllm_glm52_dsa_bf16_round_points(patch_logger):
+        raise RuntimeError(
+            "The required vLLM 0.29 GLM-5.2 DSA BF16-rounding patch could not "
+            "be applied. Update its source anchors before running generation."
+        )
     if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
         patch_logger
     ):
