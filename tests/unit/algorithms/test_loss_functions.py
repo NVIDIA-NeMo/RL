@@ -3067,6 +3067,7 @@ class TestMetricNormalizationAdvertisement:
             "loss": grad_normalizer,
             "kl_penalty": grad_normalizer,
             "num_valid_samples": MetricNormalizer.NONE,
+            "policy_support_excluded_tokens": MetricNormalizer.NONE,
             "positive_nll_loss": MetricNormalizer.NONE,
             "token_mult_prob_error": MetricNormalizer.TOKENS,
         }
