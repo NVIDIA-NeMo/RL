@@ -1117,6 +1117,200 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
         assert "reward" not in json.loads(context.full_result_json)
 
 
+def test_nemo_gym_stream_rows_leaves_the_infra_marker_slot_empty():
+    """The Gym actor reports a row whose /run failed at the infrastructure level
+    as a marker. Its slot stays None so the attempt loop dispatches it again,
+    and the stream keeps delivering the other rows."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            del pending, timer_prefix, per_prompt
+
+            async def marker_ref():
+                return (
+                    1,
+                    {"name": "resolved-agent"},
+                    {
+                        GYM_INFRA_FAILURE_KEY: (
+                            "NeMo-Gym /run failed with HTTP 503: down"
+                        )
+                    },
+                    None,
+                )
+
+            async def result_ref():
+                return (
+                    0,
+                    {"name": "resolved-agent"},
+                    _mask_gate_receipt_result(),
+                    {"timing/remote": 1.0},
+                )
+
+            async def stream():
+                yield marker_ref()
+                yield result_ref()
+
+            return stream()
+
+    impl = _nemo_gym_impl(False)
+    env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    pending = [{"_rowidx": 0}, {"_rowidx": 1}]
+    results = [None, None]
+    shaping = [None, None]
+    failures: dict[int, str] = {}
+
+    timing = _run(
+        impl._stream_rows(
+            env, pending, results, shaping, 2, "timing/test", infra_failures=failures
+        )
+    )
+
+    # Row 0 landed after the marker, so the stream was drained; row 1's slot
+    # stays empty for the attempt loop, untouched by shaping and hydration,
+    # and the marker's detail is recorded for the final error.
+    assert results[0] is not None
+    assert results[1] is None
+    assert shaping[1] is None
+    assert "agent_ref" not in pending[1]
+    assert timing == {"timing/remote": 1.0}
+    assert failures == {1: "NeMo-Gym /run failed with HTTP 503: down"}
+
+
+class _ScriptedGymEnv:
+    """A NemoGym environment whose run_rollouts yields one scripted item list
+    per dispatch and records the dispatched row indices."""
+
+    def __init__(self, scripts):
+        self.scripts = list(scripts)
+        self.dispatched = []
+        env = self
+
+        class _RunRollouts:
+            def options(self, *, num_returns):
+                assert num_returns == "streaming"
+                return self
+
+            def remote(self, pending, timer_prefix, per_prompt=False):
+                del timer_prefix, per_prompt
+                env.dispatched.append([row["_rowidx"] for row in pending])
+                items = env.scripts.pop(0)
+
+                async def stream():
+                    for item in items:
+
+                        async def ref(item=item):
+                            return item
+
+                        yield ref()
+
+                return stream()
+
+        self.run_rollouts = _RunRollouts()
+
+
+def _streamed_gym_result():
+    """One streamed row as _run_rollouts consumes it: a receipt result plus the
+    input message log the returned prompt is rebuilt from."""
+    return {**_mask_gate_receipt_result(), "input_message_log": [{"token_ids": [1]}]}
+
+
+def _run_rollouts_impl(env, max_attempts):
+    """AsyncNemoGymRolloutImpl wired to a scripted two-row group."""
+    impl = _nemo_gym_impl(False)
+    impl._num_generations_per_prompt = 2
+    impl._max_gym_row_attempts = max_attempts
+    impl._task_to_env = {"nemo_gym": env}
+    impl._results_to_completions = lambda results: ([object()] * len(results), {})
+    impl._compute_rollout_metrics = lambda *args: {}
+    impl._compute_reward_penalty_metrics = lambda *args: {}
+    return impl
+
+
+def test_nemo_gym_run_rollouts_redispatches_only_the_infra_failed_row():
+    """With an attempt budget above one, a failure marker's row is dispatched
+    again by itself and the group completes from both attempts."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _streamed_gym_result(), None),
+                (
+                    1,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                ),
+            ],
+            [(1, {"name": "agent"}, _streamed_gym_result(), None)],
+        ]
+    )
+    impl = _run_rollouts_impl(env, max_attempts=2)
+
+    completions, _message_log, _metrics = _run(
+        impl._run_rollouts(
+            inputs=[
+                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+            ],
+            timer=Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert env.dispatched == [[0, 1], [1]]
+    assert len(completions) == 2
+
+
+def test_nemo_gym_run_rollouts_names_the_infra_failure_when_attempts_run_out():
+    """When the budget is one attempt, a marker row's slot stays empty and the
+    final error carries the marker's detail instead of claiming the stream
+    ended early: the stream ended normally, one row short."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+    from nemo_rl.experience.failures import GymTransportError
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _streamed_gym_result(), None),
+                (
+                    1,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                ),
+            ]
+        ]
+    )
+    impl = _run_rollouts_impl(env, max_attempts=1)
+
+    with pytest.raises(
+        GymTransportError,
+        match=(
+            r"rows \[1\] of 2 failed at the infrastructure level on every "
+            r"attempt \(1\): row 1: NeMo-Gym /run failed with HTTP 503: down"
+        ),
+    ):
+        _run(
+            impl._run_rollouts(
+                inputs=[
+                    {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                    {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+                ],
+                timer=Timer(),
+                timer_prefix="timing/test",
+            )
+        )
+    assert env.dispatched == [[0, 1]]
+
+
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
 def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     impl = _nemo_gym_impl(True, log_full_result_tables=log_full_result_tables)
