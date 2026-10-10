@@ -22,6 +22,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
+    reasoning_span_mask,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 
@@ -430,3 +431,260 @@ def test_contrast_fields_are_validated(kwargs):
 def test_contrast_fields_are_rejected_on_other_estimators():
     with pytest.raises(ValidationError, match="only apply to name='opd'"):
         AdvEstimatorConfig(name="grpo", contrast_teacher=True)
+
+
+# ---------------------------------------------------------------------------
+# Where the distillation term applies: trajectory gate and action-token scope
+# ---------------------------------------------------------------------------
+
+THINK, END_THINK = 12, 13
+
+
+def test_reasoning_span_mask_covers_markers_and_unclosed_spans():
+    ids = torch.tensor(
+        [
+            # prompt, <think> a b </think> call, <think> c (never closed)
+            [1, THINK, 5, 6, END_THINK, 7, THINK, 8],
+            # stray close marker outside a span is ignored; a second span works
+            [END_THINK, 9, THINK, END_THINK, 9, THINK, 5, END_THINK],
+        ]
+    )
+    expected = torch.tensor(
+        [
+            [False, True, True, True, True, False, True, True],
+            [False, False, True, True, False, True, True, True],
+        ]
+    )
+    torch.testing.assert_close(reasoning_span_mask(ids, THINK, END_THINK), expected)
+
+
+def _scoped_inputs():
+    prompt_ids, rewards, mask, teacher, negative, prev = _contrast_inputs()
+    truncated = torch.tensor([False, False, True, False])
+    # Row 0: reasoning span over tokens 0-1, action token 2. Row 1: all actions.
+    # Row 2: resolved but truncated. Row 3: failed, all actions.
+    input_ids = torch.tensor(
+        [[THINK, END_THINK, 40], [41, 42, 43], [44, 45, 46], [47, 48, 49]]
+    )
+    return prompt_ids, rewards, mask, teacher, negative, prev, truncated, input_ids
+
+
+def test_distill_gate_keeps_the_term_on_resolved_untruncated_rollouts_only():
+    cfg = AdvEstimatorConfig(
+        name="opd",
+        contrast_teacher=True,
+        contrast_alpha=0.5,
+        distillation_advantage_weight=1.0,
+        outcome_advantage_weight=1.0,
+        distill_gate="resolved_untruncated",
+    )
+    est = OPDAdvantageEstimator(cfg, ClippedPGLossConfig())
+    prompt_ids, rewards, mask, teacher, negative, prev, truncated, _ = _scoped_inputs()
+    parts = est.compute_advantage_parts(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=prev,
+        negative_teacher_logprobs=negative,
+        truncated=truncated,
+    )
+    gate = torch.tensor([True, False, False, False])
+    torch.testing.assert_close(parts.distill_gate, gate)
+    expected = 0.5 * (teacher - negative) * gate.unsqueeze(-1).float()
+    torch.testing.assert_close(parts.distillation, expected)
+    # The outcome term is never gated: failed and truncated rows keep theirs.
+    assert parts.outcome is not None
+    assert parts.outcome[1].abs().sum() > 0 and parts.outcome[3].abs().sum() > 0
+    torch.testing.assert_close(parts.advantages, parts.distillation + parts.outcome)
+    est.compute_advantage(
+        prompt_ids,
+        rewards,
+        mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=prev,
+        negative_teacher_logprobs=negative,
+        truncated=truncated,
+    )
+    assert est.last_metrics["on_policy_distillation/distill_gated_seq_frac"] == 0.25
+    assert est.last_metrics["on_policy_distillation/distill_active_token_frac"] == 0.25
+
+
+def test_distill_gate_resolved_ignores_truncation():
+    cfg = AdvEstimatorConfig(name="opd", distill_gate="resolved")
+    est = OPDAdvantageEstimator(cfg, ClippedPGLossConfig())
+    prompt_ids, rewards, mask, teacher, _, prev, _, _ = _scoped_inputs()
+    parts = est.compute_advantage_parts(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=prev,
+    )
+    torch.testing.assert_close(parts.distill_gate, rewards > 0)
+
+
+def test_distill_gate_resolved_untruncated_requires_the_truncated_column():
+    cfg = AdvEstimatorConfig(name="opd", distill_gate="resolved_untruncated")
+    est = OPDAdvantageEstimator(cfg, ClippedPGLossConfig())
+    prompt_ids, rewards, mask, teacher, _, prev, _, _ = _scoped_inputs()
+    with pytest.raises(ValueError, match="truncated"):
+        est.compute_advantage_parts(
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            mask=mask,
+            teacher_logprobs=teacher,
+            prev_logprobs=prev,
+        )
+
+
+def test_distill_token_scope_actions_skips_reasoning_tokens():
+    cfg = AdvEstimatorConfig(
+        name="opd",
+        contrast_teacher=True,
+        distill_token_scope="actions",
+        reasoning_span_token_ids=(THINK, END_THINK),
+    )
+    est = OPDAdvantageEstimator(cfg, ClippedPGLossConfig())
+    prompt_ids, rewards, mask, teacher, negative, prev, _, input_ids = _scoped_inputs()
+    parts = est.compute_advantage_parts(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=prev,
+        negative_teacher_logprobs=negative,
+        input_ids=input_ids,
+    )
+    action_mask = torch.ones(4, 3, dtype=torch.bool)
+    action_mask[0, :2] = False
+    torch.testing.assert_close(parts.action_mask, action_mask)
+    torch.testing.assert_close(parts.distill_active, action_mask)
+    torch.testing.assert_close(parts.distillation, (teacher - negative) * action_mask)
+    # The diagnostic contrast gap is still reported on every valid token.
+    torch.testing.assert_close(parts.contrast_gap, teacher - negative)
+    est.compute_advantage(
+        prompt_ids,
+        rewards,
+        mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=prev,
+        negative_teacher_logprobs=negative,
+        input_ids=input_ids,
+    )
+    metrics = est.last_metrics
+    assert metrics["on_policy_distillation/action_token_frac"] == pytest.approx(10 / 12)
+    assert "on_policy_distillation/contrast_gap_actions_abs_mean" in metrics
+    assert "on_policy_distillation/contrast_gap_reasoning_abs_mean" in metrics
+
+
+def test_distill_token_scope_actions_requires_input_ids():
+    cfg = AdvEstimatorConfig(
+        name="opd",
+        distill_token_scope="actions",
+        reasoning_span_token_ids=(THINK, END_THINK),
+    )
+    est = OPDAdvantageEstimator(cfg, ClippedPGLossConfig())
+    prompt_ids, rewards, mask, teacher, _, prev, _, _ = _scoped_inputs()
+    with pytest.raises(ValueError, match="input_ids"):
+        est.compute_advantage_parts(
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            mask=mask,
+            teacher_logprobs=teacher,
+            prev_logprobs=prev,
+        )
+
+
+def test_gate_and_scope_compose():
+    cfg = AdvEstimatorConfig(
+        name="opd",
+        contrast_teacher=True,
+        distill_gate="resolved_untruncated",
+        distill_token_scope="actions",
+        reasoning_span_token_ids=(THINK, END_THINK),
+    )
+    est = OPDAdvantageEstimator(cfg, ClippedPGLossConfig())
+    prompt_ids, rewards, mask, teacher, negative, prev, truncated, input_ids = (
+        _scoped_inputs()
+    )
+    parts = est.compute_advantage_parts(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=prev,
+        negative_teacher_logprobs=negative,
+        truncated=truncated,
+        input_ids=input_ids,
+    )
+    # Only row 0 passes the gate, and only its third token is an action.
+    active = torch.zeros(4, 3, dtype=torch.bool)
+    active[0, 2] = True
+    torch.testing.assert_close(parts.distill_active, active)
+    torch.testing.assert_close(parts.distillation, (teacher - negative) * active)
+
+
+def test_default_scope_leaves_the_term_everywhere():
+    cfg = AdvEstimatorConfig(name="opd", contrast_teacher=True)
+    est = OPDAdvantageEstimator(cfg, ClippedPGLossConfig())
+    prompt_ids, rewards, mask, teacher, negative, prev = _contrast_inputs()
+    mask[3, 2] = 0.0
+    parts = est.compute_advantage_parts(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=prev,
+        negative_teacher_logprobs=negative,
+    )
+    # Nothing narrowed the term, so nothing extra is reported (metrics unchanged).
+    assert parts.distill_active is None
+    assert parts.distill_gate is None
+    assert parts.action_mask is None
+    torch.testing.assert_close(parts.distillation, (teacher - negative) * mask)
+    est.compute_advantage(
+        prompt_ids,
+        rewards,
+        mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=prev,
+        negative_teacher_logprobs=negative,
+    )
+    assert "on_policy_distillation/distill_active_token_frac" not in est.last_metrics
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"distill_token_scope": "actions"},
+        {"reasoning_span_token_ids": (THINK, END_THINK)},
+        {
+            "distill_token_scope": "actions",
+            "reasoning_span_token_ids": (THINK, THINK),
+        },
+        {
+            "distill_gate": "resolved",
+            "distillation_advantage_weight": 0.0,
+            "outcome_advantage_weight": 1.0,
+        },
+    ],
+)
+def test_scope_fields_are_validated(kwargs):
+    with pytest.raises(ValidationError):
+        AdvEstimatorConfig(name="opd", **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"distill_gate": "resolved"},
+        {
+            "distill_token_scope": "actions",
+            "reasoning_span_token_ids": (THINK, END_THINK),
+        },
+    ],
+)
+def test_scope_fields_are_rejected_on_other_estimators(kwargs):
+    with pytest.raises(ValidationError, match="only apply to name='opd'"):
+        AdvEstimatorConfig(name="grpo", **kwargs)

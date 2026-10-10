@@ -50,6 +50,12 @@ grpo:
     contrast_teacher: false
     contrast_alpha: 1.0
     contrast_clip: null
+    # Where the distillation term applies: distill_gate none / resolved / resolved_untruncated
+    #   (rollouts with reward > 0, optionally not truncated); distill_token_scope all / actions
+    #   (actions = generated tokens outside the reasoning span given by reasoning_span_token_ids).
+    distill_gate: none
+    distill_token_scope: all
+    reasoning_span_token_ids: null
   reward_scaling:
     enabled: false
     source_min: 0.0

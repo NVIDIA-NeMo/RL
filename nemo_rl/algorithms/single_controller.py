@@ -169,6 +169,7 @@ from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
     GENERATION_TOPK_FIELDS,
+    INPUT_IDS,
     INPUT_LENGTHS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
@@ -328,8 +329,30 @@ def _accumulate_opd_term_moments(
         terms["outcome_adv"] = parts.outcome
     if parts.contrast_gap is not None:
         terms["contrast_gap"] = parts.contrast_gap
+    if parts.distill_active is not None:
+        # Mean over valid tokens = the fraction the distillation term applied to.
+        terms["distill_active"] = parts.distill_active.to(torch.float32)
     for name, values in terms.items():
         moments.setdefault(name, _OPDMoments()).add(torch.masked_select(values, valid))
+    if parts.distill_gate is not None:
+        # Per rollout, over rows with any valid token: the gated fraction.
+        rows = valid.any(dim=-1)
+        moments.setdefault("distill_gated_seq", _OPDMoments()).add(
+            torch.masked_select(parts.distill_gate.to(torch.float32), rows)
+        )
+    if parts.action_mask is not None:
+        action_tokens = parts.action_mask & valid
+        moments.setdefault("action_token", _OPDMoments()).add(
+            torch.masked_select(parts.action_mask.to(torch.float32), valid)
+        )
+        if parts.contrast_gap is not None:
+            # Is the teacher's RL-induced preference concentrated in the actions?
+            moments.setdefault("contrast_gap_actions", _OPDMoments()).add(
+                torch.masked_select(parts.contrast_gap, action_tokens)
+            )
+            moments.setdefault("contrast_gap_reasoning", _OPDMoments()).add(
+                torch.masked_select(parts.contrast_gap, valid & ~parts.action_mask)
+            )
 
 
 def _pooled_opd_term_metrics(moments: dict[str, _OPDMoments]) -> dict[str, float]:
@@ -518,6 +541,13 @@ class SingleControllerActor:
         self._dataloader = actor_args.dataloader
         self._weight_synchronizer = actor_args.weight_synchronizer
         self._advantage_estimator = actor_args.advantage_estimator
+        # OPD with distill_token_scope="actions" finds the reasoning spans in the
+        # token ids, so the advantage stage fetches input_ids too.
+        self._distill_actions_required = bool(
+            isinstance(self._advantage_estimator, OPDAdvantageEstimator)
+            and getattr(self._advantage_estimator, "distill_token_scope", "all")
+            == "actions"
+        )
         self._loss_fn = actor_args.loss_fn
         self._value_loss_fn = getattr(actor_args, "value_loss_fn", None)
         self._buffer = actor_args.tq_buffer
@@ -5293,6 +5323,12 @@ class SingleControllerActor:
                 prev_logprobs=kwargs["prev_logprobs"],
                 valid_mask=baseline_mask,
                 negative_teacher_logprobs=kwargs.get("negative_teacher_logprobs"),
+                truncated=truncated,
+                input_ids=(
+                    tensor_field(data, INPUT_IDS)
+                    if self._distill_actions_required
+                    else None
+                ),
             )
             result = opd_parts.advantages
         elif has_valid_training_tokens:
@@ -5446,6 +5482,9 @@ class SingleControllerActor:
             fields.append(adv_cfg.teacher_logprobs_field)
         if self._contrast_logprobs_required:
             fields.append(adv_cfg.negative_teacher_logprobs_field)
+        if self._distill_actions_required:
+            # The estimator finds the reasoning spans in the token ids.
+            fields.append(INPUT_IDS)
         if self._is_ppo:
             fields.append(adv_cfg.values_field)
         return list(dict.fromkeys(fields))

@@ -83,6 +83,16 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     contrast_teacher: bool = False
     contrast_alpha: Annotated[float, Field(gt=0.0)] = 1.0
     contrast_clip: Optional[Annotated[float, Field(gt=0.0)]] = None
+    # OPD specific, where the distillation term applies (the outcome term is never
+    # gated). distill_gate keeps it to rollouts that earned their reward: "resolved" =
+    # total reward > 0, "resolved_untruncated" additionally not truncated, so a
+    # per-token teacher push never lands on failed, looping or cut-off trajectories.
+    # distill_token_scope="actions" keeps it off reasoning tokens -- everything inside
+    # the reasoning_span_token_ids pair (open, close), e.g. <think> / </think> --
+    # leaving tool calls and final messages. A span left open runs to the end.
+    distill_gate: Literal["none", "resolved", "resolved_untruncated"] = "none"
+    distill_token_scope: Literal["all", "actions"] = "all"
+    reasoning_span_token_ids: Optional[tuple[int, int]] = None
 
     @model_validator(mode="after")
     def validate_opd_fields(self) -> "AdvEstimatorConfig":
@@ -99,6 +109,12 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
                 ("contrast_teacher", self.contrast_teacher),
                 ("contrast_alpha", self.contrast_alpha != 1.0),
                 ("contrast_clip", self.contrast_clip is not None),
+                ("distill_gate", self.distill_gate != "none"),
+                ("distill_token_scope", self.distill_token_scope != "all"),
+                (
+                    "reasoning_span_token_ids",
+                    self.reasoning_span_token_ids is not None,
+                ),
             )
             if is_changed
         ]
@@ -107,6 +123,28 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
                 f"grpo.adv_estimator.{', '.join(changed)} only apply to name='opd' "
                 f"(got name={self.name!r}); the {self.name} estimator would ignore them."
             )
+        if (self.distill_token_scope == "actions") != (
+            self.reasoning_span_token_ids is not None
+        ):
+            raise ValueError(
+                "grpo.adv_estimator.distill_token_scope='actions' and "
+                "reasoning_span_token_ids go together: the scope needs the (open, close) "
+                "token ids of the reasoning span, and the ids do nothing without it."
+            )
+        if (
+            self.reasoning_span_token_ids is not None
+            and self.reasoning_span_token_ids[0] == self.reasoning_span_token_ids[1]
+        ):
+            raise ValueError(
+                "grpo.adv_estimator.reasoning_span_token_ids must be two different ids "
+                "(open, close)."
+            )
+        if self.name == "opd" and self.distillation_advantage_weight == 0.0 and changed:
+            if self.distill_gate != "none" or self.distill_token_scope != "all":
+                raise ValueError(
+                    "grpo.adv_estimator.distill_gate / distill_token_scope shape a "
+                    "distillation term whose weight is 0."
+                )
         if not self.contrast_teacher and (
             self.contrast_alpha != 1.0 or self.contrast_clip is not None
         ):
@@ -715,6 +753,12 @@ class OPDAdvantageParts:
         advantages: ``distillation`` plus ``outcome``: what the loss trains on.
         contrast_gap: Raw ``log p_teacher - log p_contrast`` of the sampled tokens
             (what RL taught the teacher), or None without a contrast teacher.
+        distill_active: ``[B, S]`` bool, the tokens the distillation term was applied
+            to (``mask`` narrowed by ``distill_gate`` and ``distill_token_scope``).
+        distill_gate: ``[B]`` bool, the rollouts that passed ``distill_gate`` (all
+            True when the gate is "none").
+        action_mask: ``[B, S]`` bool, the tokens outside the reasoning span, or None
+            when ``distill_token_scope`` is "all" (diagnostics split on it).
     """
 
     teacher_student_gap: torch.Tensor
@@ -722,6 +766,40 @@ class OPDAdvantageParts:
     outcome: Optional[torch.Tensor]
     advantages: torch.Tensor
     contrast_gap: Optional[torch.Tensor] = None
+    distill_active: Optional[torch.Tensor] = None
+    distill_gate: Optional[torch.Tensor] = None
+    action_mask: Optional[torch.Tensor] = None
+
+
+def reasoning_span_mask(
+    input_ids: torch.Tensor, open_id: int, close_id: int
+) -> torch.Tensor:
+    """``[B, S]`` bool: tokens inside a reasoning span, both markers included.
+
+    A span runs from its open marker to the next close marker; a span never closed
+    (the rollout was cut off while reasoning) runs to the end of the row. Open
+    markers inside a span and close markers outside one are ignored, so a stray
+    marker cannot flip the rest of the row. Walks the markers only (a few dozen per
+    row), never the tokens.
+    """
+    inside = torch.zeros_like(input_ids, dtype=torch.bool)
+    is_marker = (input_ids == open_id) | (input_ids == close_id)
+    ids = input_ids
+    for b in range(ids.shape[0]):
+        marker_positions = (
+            torch.nonzero(is_marker[b], as_tuple=False).flatten().tolist()
+        )
+        open_at: Optional[int] = None
+        for pos in marker_positions:
+            if open_at is None:
+                if int(ids[b, pos]) == open_id:
+                    open_at = pos
+            elif int(ids[b, pos]) == close_id:
+                inside[b, open_at : pos + 1] = True
+                open_at = None
+        if open_at is not None:
+            inside[b, open_at:] = True
+    return inside
 
 
 class OPDAdvantageEstimator:
@@ -766,6 +844,9 @@ class OPDAdvantageEstimator:
         self.contrast_teacher = estimator_config.contrast_teacher
         self.contrast_alpha = estimator_config.contrast_alpha
         self.contrast_clip = estimator_config.contrast_clip
+        self.distill_gate = estimator_config.distill_gate
+        self.distill_token_scope = estimator_config.distill_token_scope
+        self.reasoning_span_token_ids = estimator_config.reasoning_span_token_ids
         # The outcome term is exactly the GRPO estimator on the same block's
         # normalize_rewards / use_leave_one_out_baseline settings.
         self._outcome_estimator: Optional[GRPOAdvantageEstimator] = (
@@ -785,12 +866,14 @@ class OPDAdvantageEstimator:
         prev_logprobs: Optional[torch.Tensor],
         valid_mask: Optional[torch.Tensor] = None,
         negative_teacher_logprobs: Optional[torch.Tensor] = None,
+        truncated: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> OPDAdvantageParts:
         """Compute the OPD advantage and its terms.
 
         Args:
             prompt_ids: [B, L] prompt ids; equal rows form one group for the outcome term.
-            rewards: [B] rollout rewards (used only by the outcome term).
+            rewards: [B] rollout rewards (the outcome term and ``distill_gate``).
             mask: [B, S] token mask; every returned term is multiplied by it.
             teacher_logprobs: [B, S] teacher model logprobs (required).
             prev_logprobs: [B, S] student training-engine logprobs (required).
@@ -798,6 +881,9 @@ class OPDAdvantageEstimator:
                 outcome term's per-prompt baseline/std (see GRPOAdvantageEstimator).
             negative_teacher_logprobs: [B, S] contrast teacher logprobs; required
                 with ``contrast_teacher`` and ignored otherwise.
+            truncated: [B] bool, rollouts cut off by the length limit; required with
+                ``distill_gate="resolved_untruncated"``.
+            input_ids: [B, S] token ids; required with ``distill_token_scope="actions"``.
 
         Returns:
             The masked per-token terms; ``advantages`` is the training advantage.
@@ -806,6 +892,9 @@ class OPDAdvantageEstimator:
             raise ValueError("OPD requires teacher_logprobs")
         if prev_logprobs is None:
             raise ValueError("OPD requires prev_logprobs")
+        distill_active, gate, action_mask = self._distill_scope(
+            rewards=rewards, mask=mask, truncated=truncated, input_ids=input_ids
+        )
 
         # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
         gap = (teacher_logprobs - prev_logprobs).detach()
@@ -833,7 +922,11 @@ class OPDAdvantageEstimator:
                 prev_logprobs + math.log1p(-alpha),
             )
             distillation = (proximal_teacher_logprobs - prev_logprobs).detach()
-        distillation = self.distillation_advantage_weight * distillation * mask
+        distillation = (
+            self.distillation_advantage_weight
+            * distillation
+            * distill_active.to(dtype=distillation.dtype)
+        )
         advantages = distillation
 
         outcome: Optional[torch.Tensor] = None
@@ -854,7 +947,54 @@ class OPDAdvantageEstimator:
             outcome=outcome,
             advantages=advantages,
             contrast_gap=None if contrast_gap is None else contrast_gap * mask,
+            # Reported only when a gate or scope narrowed the term.
+            distill_active=(
+                distill_active
+                if (gate is not None or action_mask is not None)
+                else None
+            ),
+            distill_gate=gate,
+            action_mask=action_mask,
         )
+
+    def _distill_scope(
+        self,
+        *,
+        rewards: torch.Tensor,
+        mask: torch.Tensor,
+        truncated: Optional[torch.Tensor],
+        input_ids: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Where the distillation term applies: (active [B, S], gate [B], action_mask).
+
+        With the defaults (no gate, every token) ``gate`` and ``action_mask`` are None
+        and ``active`` is just ``mask``, so nothing new is reported.
+        """
+        active = mask.bool()
+        gate: Optional[torch.Tensor] = None
+        if self.distill_gate != "none":
+            gate = rewards.reshape(-1).to(device=mask.device) > 0
+            if self.distill_gate == "resolved_untruncated":
+                if truncated is None:
+                    raise ValueError(
+                        "distill_gate='resolved_untruncated' requires the truncated column"
+                    )
+                gate = gate & ~truncated.reshape(-1).to(device=mask.device).bool()
+            active = active & gate.unsqueeze(-1)
+        action_mask: Optional[torch.Tensor] = None
+        if self.distill_token_scope == "actions":
+            if input_ids is None:
+                raise ValueError(
+                    "distill_token_scope='actions' requires input_ids to find the "
+                    "reasoning spans"
+                )
+            assert self.reasoning_span_token_ids is not None  # validated config
+            open_id, close_id = self.reasoning_span_token_ids
+            action_mask = ~reasoning_span_mask(
+                input_ids.to(device=mask.device), open_id, close_id
+            )
+            active = active & action_mask
+        return active, gate, action_mask
 
     def compute_advantage(
         self,
@@ -865,18 +1005,22 @@ class OPDAdvantageEstimator:
         prev_logprobs=None,
         valid_mask=None,
         negative_teacher_logprobs=None,
+        truncated=None,
+        input_ids=None,
         **kwargs,
     ):
         """Compute OPD advantages (see compute_advantage_parts for the terms).
 
         Args:
             prompt_ids: [B, L] prompt ids; equal rows form one group for the outcome term.
-            rewards: [B] rewards (used only when outcome_advantage_weight > 0).
+            rewards: [B] rewards (the outcome term and ``distill_gate``).
             mask: [B, S] token mask
             teacher_logprobs: [B, S] teacher model logprobs (required)
             prev_logprobs: [B, S] student training-engine logprobs (required)
             valid_mask: Optional [B] rollouts that enter the outcome baseline.
             negative_teacher_logprobs: [B, S] contrast teacher logprobs (contrast_teacher).
+            truncated: [B] bool rollout truncation flags (distill_gate).
+            input_ids: [B, S] token ids (distill_token_scope="actions").
             **kwargs: Arguments of other estimators (unused).
 
         Returns:
@@ -890,6 +1034,8 @@ class OPDAdvantageEstimator:
             prev_logprobs=prev_logprobs,
             valid_mask=valid_mask,
             negative_teacher_logprobs=negative_teacher_logprobs,
+            truncated=truncated,
+            input_ids=input_ids,
         )
         self._compute_metrics(parts, mask)
         return parts.advantages
@@ -914,6 +1060,36 @@ class OPDAdvantageEstimator:
             "on_policy_distillation/distill_adv_mean": distill_mean,
             "on_policy_distillation/distill_adv_std": distill_std,
         }
+        if parts.distill_active is not None:
+            valid_count = float(valid_bool.sum().item())
+            active_count = float((parts.distill_active & valid_bool).sum().item())
+            self.last_metrics["on_policy_distillation/distill_active_token_frac"] = (
+                active_count / valid_count if valid_count > 0 else 0.0
+            )
+        if parts.distill_gate is not None:
+            rows = valid_bool.any(dim=-1)
+            row_count = float(rows.sum().item())
+            self.last_metrics["on_policy_distillation/distill_gated_seq_frac"] = (
+                float((parts.distill_gate & rows).sum().item()) / row_count
+                if row_count > 0
+                else 0.0
+            )
+        if parts.action_mask is not None:
+            action_tokens = parts.action_mask & valid_bool
+            self.last_metrics["on_policy_distillation/action_token_frac"] = (
+                float(action_tokens.sum().item()) / float(valid_bool.sum().item())
+                if valid_bool.any()
+                else 0.0
+            )
+            if parts.contrast_gap is not None:
+                for name, selector in (
+                    ("actions", action_tokens),
+                    ("reasoning", valid_bool & ~parts.action_mask),
+                ):
+                    selected = torch.masked_select(parts.contrast_gap, selector)
+                    self.last_metrics[
+                        f"on_policy_distillation/contrast_gap_{name}_abs_mean"
+                    ] = selected.abs().mean().item() if selected.numel() > 0 else 0.0
         if parts.outcome is not None:
             outcome_mean, outcome_std = mean_and_std(parts.outcome)
             self.last_metrics["on_policy_distillation/outcome_adv_mean"] = outcome_mean

@@ -823,6 +823,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._contrast_logprobs_required = False
+    ctrl._distill_actions_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
@@ -924,6 +925,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._contrast_logprobs_required = False
+    ctrl._distill_actions_required = False
     ctrl._is_ppo = False
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._algo_cfg = GRPOConfig(
@@ -990,6 +992,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._contrast_logprobs_required = False
+    ctrl._distill_actions_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(seq_logprob_error_threshold=None)
@@ -1057,6 +1060,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._contrast_logprobs_required = False
+    ctrl._distill_actions_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
@@ -1126,6 +1130,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._contrast_logprobs_required = False
+    ctrl._distill_actions_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(seq_logprob_error_threshold=2.0)
@@ -1189,6 +1194,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._contrast_logprobs_required = False
+    ctrl._distill_actions_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(seq_logprob_error_threshold=None)
@@ -1271,6 +1277,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
     ctrl._contrast_logprobs_required = False
+    ctrl._distill_actions_required = False
     ctrl._is_ppo = False
     ctrl._dp_client = FakeDataPlane()
     ctrl._master_config = SimpleNamespace(
@@ -1420,6 +1427,7 @@ def test_opd_advantage_stage_trains_on_tropd_plus_outcome_advantage() -> None:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
     ctrl._contrast_logprobs_required = False
+    ctrl._distill_actions_required = False
     ctrl._is_ppo = False
     ctrl._dp_client = FakeDataPlane()
     ctrl._master_config = SimpleNamespace(
@@ -1770,6 +1778,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._contrast_logprobs_required = False
+    ctrl._distill_actions_required = False
     ctrl._train_fields = single_controller._train_fields_for_step(
         policy_logprobs_required=False,
         reference_logprobs_required=False,
@@ -2728,6 +2737,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._contrast_logprobs_required = False
+    ctrl._distill_actions_required = False
     ctrl._is_ppo = True
     ctrl._master_config = SimpleNamespace(
         ppo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
