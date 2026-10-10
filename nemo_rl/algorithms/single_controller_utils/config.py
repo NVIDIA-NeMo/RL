@@ -318,8 +318,9 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # with RefitAborted -- still far better than hanging forever inside NCCL, but choose
     # the deadline knowing there is no second chance.
     #
-    # None disarms it: no watchdog thread is started and the refit path is byte-identical
-    # to before. Set it well above a healthy refit, because the cost of firing early is
+    # None disables the collective watchdog and controller's transfer deadline.
+    # Generation pause/resume still have a 360s timeout. Set this well above a healthy
+    # refit, because the cost of firing early is
     # aborting a run that was merely slow, while the cost of firing late is only that a
     # wedge lasts longer before it is broken.
     #
