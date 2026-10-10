@@ -15,6 +15,11 @@
 
 # Public shell interface for registering external Gym vLLM pools before sbatch.
 
+# Token a submission command must contain; run_in_allocation.sh replaces it with
+# the Hydra override that gates Gym rollouts on external pool health. Keep in
+# sync with run_in_allocation.sh.
+EXTERNAL_SERVICE_READINESS_PLACEHOLDER="__EXTERNAL_SERVICE_READINESS__"
+
 _external_vllm_set() {
   local pool="$1" suffix="$2" value="$3"
   printf -v "${pool}_${suffix}" '%s' "${value}"
@@ -258,6 +263,10 @@ validate_external_vllm_submission() {
       return 2
     fi
   done
+  if [[ "${command}" != *"${EXTERNAL_SERVICE_READINESS_PLACEHOLDER}"* ]]; then
+    echo "ERROR: submission command is missing ${EXTERNAL_SERVICE_READINESS_PLACEHOLDER} for the external-service readiness gate" >&2
+    return 2
+  fi
 
   for variable_name in BASE_LOG_DIR EXTERNAL_VLLM_TOOLS_DIR_HOST; do
     path="${!variable_name-}"

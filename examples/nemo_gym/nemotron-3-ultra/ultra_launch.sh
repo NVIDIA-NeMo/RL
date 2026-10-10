@@ -855,6 +855,13 @@ export SETUP_COMMAND
 # learning rate, etc.) live in CONFIG_PATH. The launcher only passes the
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
+# run_in_allocation.sh replaces this token with the gate that holds rollouts
+# until every external pool is healthy. Without external pools there is nothing
+# to gate, and ray.sub would pass the literal token to Hydra.
+EXTERNAL_SERVICE_READINESS_ARG=""
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+  EXTERNAL_SERVICE_READINESS_ARG="${EXTERNAL_SERVICE_READINESS_PLACEHOLDER}"
+fi
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
@@ -887,6 +894,7 @@ data.train.data_path=${TRAIN_PATH} \
 data.validation.data_path=${VAL_PATH} \
 ${GENRM_OVERRIDE:+${GENRM_OVERRIDE}} \
 ${NL2BASH_OVERRIDE:+${NL2BASH_OVERRIDE}} \
+${EXTERNAL_SERVICE_READINESS_ARG} \
 ${SAFETY_JUDGE_MODEL:+env.nemo_gym.safety_judge_model.responses_api_models.local_vllm_model.model=${SAFETY_JUDGE_MODEL}} \
 ${SIF_DIR:+sif_dir=${SIF_DIR}} \
 env.nemo_gym.nemo_gym_log_dir=${LOG_DIR}/nemo_gym \
