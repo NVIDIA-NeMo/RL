@@ -13,6 +13,7 @@
 # limitations under the License.
 import copy
 import gc
+import inspect
 import logging
 import os
 import re
@@ -95,6 +96,7 @@ from nemo_rl.models.megatron.draft.step_state import (
     DraftStepPayload,
     DraftStepState,
 )
+from nemo_rl.models.megatron.hybridep import uses_hybridep_flex_dispatcher
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -244,6 +246,67 @@ def _unwrapped_chunks(model: Any) -> list[Any]:
 
     unwrapped = unwrap_model(model)
     return list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+
+
+def _model_has_chunkwise_cp(model: Any) -> bool:
+    return any(
+        getattr(
+            getattr(owner, "decoder", None),
+            "_has_linear_layer_with_chunkwise_cp",
+            False,
+        )
+        for chunk in _unwrapped_chunks(model)
+        for owner in (chunk, getattr(chunk, "language_model", None))
+    )
+
+
+def _model_needs_router_padding_mask(
+    model: Any,
+    *,
+    pack_sequences: bool = False,
+    allow_unmasked_chunkwise_cp: bool = False,
+) -> bool:
+    """Resolve masks once for nonzero, unfrozen expert-bias updates."""
+    chunks = _unwrapped_chunks(model)
+    # Training/eval mode is transient at setup; rate and frozen buffers define
+    # whether subsequent training can update any expert bias.
+    if not any(
+        getattr(chunk.config, "moe_router_enable_expert_bias", False)
+        and getattr(chunk.config, "moe_router_bias_update_rate", 0.0) != 0.0
+        and any(
+            getattr(module, "expert_bias", None) is not None
+            and not getattr(module, "frozen_expert_bias", False)
+            for module in chunk.modules()
+        )
+        for chunk in chunks
+    ):
+        return False
+    if pack_sequences and _model_self_packs_for_cp(model):
+        raise ValueError(
+            "Expert-bias padding masks are unsupported with model-owned sequence "
+            "packing. Disable sequence packing or expert-bias updates; the model "
+            "does not preserve real-token validity through delegated packing."
+        )
+    for chunk in chunks:
+        if "padding_mask" not in inspect.signature(chunk.forward).parameters:
+            raise ValueError(
+                "Expert-bias padding masks require a model forward that "
+                f"explicitly accepts padding_mask; got {type(chunk).__name__}."
+            )
+    if _model_has_chunkwise_cp(model):
+        if allow_unmasked_chunkwise_cp:
+            log.warning(
+                "HybridBlock chunkwise context parallelism does not support padding "
+                "masks. Proceeding with padding_mask=None for prepacked HybridEP "
+                "training, keeping expert bias enabled. Padding tokens will contribute "
+                "to expert-load counts and may affect bias updates."
+            )
+            return False
+        raise ValueError(
+            "Expert-bias padding masks are unsupported for "
+            "HybridBlock chunkwise context parallelism."
+        )
+    return True
 
 
 def _model_media_placeholder_token_id(model: Any) -> Optional[int]:
@@ -799,6 +862,17 @@ class MegatronPolicyWorkerImpl(
         # (mbridge VLM wrappers like Qwen3VL). If so, NeMo-RL must hand it an
         # unpacked [B, S] batch rather than pre-packing + CP-sharding itself.
         self.delegate_pack_to_model = _model_self_packs_for_cp(self.model)
+        self.allow_unmasked_chunkwise_cp = (
+            _model_has_chunkwise_cp(self.model)
+            and uses_hybridep_flex_dispatcher(self.cfg["megatron_cfg"])
+            and self.cfg["sequence_packing"]["enabled"]
+            and self.cfg["sequence_packing"].get("fuse_loss", False)
+        )
+        self.create_router_padding_mask = _model_needs_router_padding_mask(
+            self.model,
+            pack_sequences=self.cfg["sequence_packing"]["enabled"],
+            allow_unmasked_chunkwise_cp=self.allow_unmasked_chunkwise_cp,
+        )
         self.delegate_mtp_loss_mask_to_model = _model_self_packs_mtp_loss_mask(
             self.model
         )
@@ -1177,6 +1251,8 @@ class MegatronPolicyWorkerImpl(
                     delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
                     model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                     mtp_enabled=self.mtp_enabled,
+                    create_router_padding_mask=self.create_router_padding_mask,
+                    allow_unmasked_chunkwise_cp=self.allow_unmasked_chunkwise_cp,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -1870,6 +1946,8 @@ class MegatronPolicyWorkerImpl(
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
             mtp_enabled=self.mtp_enabled,
+            create_router_padding_mask=self.create_router_padding_mask,
+            allow_unmasked_chunkwise_cp=self.allow_unmasked_chunkwise_cp,
         )
         state["total_num_microbatches"] += int(num_microbatches)
 
