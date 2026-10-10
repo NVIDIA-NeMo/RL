@@ -31,7 +31,12 @@ never imported (``ppo.py`` in a GRPO run) simply declares nothing.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
+
+if TYPE_CHECKING:
+    # Behind the guard to keep the no-runtime-imports promise above: an owner
+    # declaring a row must not have to have OTel installed to do it.
+    from opentelemetry.metrics import CallbackT
 
 #: Prefix every NeMo-RL series carries, stripped to form the registry key.
 METRIC_NAME_PREFIX = "rl."
@@ -80,15 +85,26 @@ class RecordedMetric:
 
     Attributes:
         name: OTel series name emitted; :func:`registry_key` derives the key.
-        kind: One of lens's ``gauge`` / ``counter`` / ``histogram`` / ``up_down_counter``.
+        kind: One of lens's ``gauge`` / ``counter`` / ``histogram`` /
+            ``up_down_counter``, or one of its observable kinds
+            (``observable_gauge`` / ``observable_counter`` /
+            ``observable_up_down_counter``), which require *callback*.
         unit: UCUM-ish unit string, or empty when dimensionless.
         description: Help text carried to the backend.
+        callback: For the observable kinds only, what the exporter calls to
+            read the series. Each cycle's points are exactly what it returns,
+            so an attribute set it stops yielding stops being exported -- which
+            is the reason to choose an observable kind over pushing to a gauge,
+            whose last value per attribute set is otherwise re-exported for the
+            rest of the run. Must be a function that outlives the process's
+            first export, not a closure built per call.
     """
 
     name: str
     kind: str = "gauge"
     unit: str = ""
     description: str = ""
+    callback: Optional[CallbackT] = None
 
     @property
     def key(self) -> str:
@@ -142,8 +158,12 @@ def _check_not_frozen(name: str) -> None:
         raise RuntimeError(
             f"{name!r} was declared after the metric group was registered with "
             "lens, so it has no instrument and would be silently dropped. "
-            "Import the module that declares it before the first metric is "
-            "recorded -- at startup, not lazily from inside the training loop."
+            "Import the module that declares it before init_telemetry_driver "
+            "runs, which is where registration now happens -- the observable "
+            "host-memory series have to have their instruments built at "
+            "startup, because nothing records them into existence later. "
+            "Declare at import time from a module the entry point already "
+            "imports, not lazily from inside the training loop."
         )
 
 

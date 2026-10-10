@@ -340,7 +340,7 @@ nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2
 # actually reconciles the two revs; the floor in [dependencies] stays above the
 # newest PyPI release so dropping either one fails to resolve instead of
 # falling back to 0.1.0.
-nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "7bcc03ce3565d2be6858b819b049bcc4c3ec05b4" }
+nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "4d045c03186b90afdc815db46b671f6a21bc7e98" }
 sglang = { git = "https://github.com/sgl-project/sglang.git", rev = "3003d70f680d41c59d1b7acbf65cb47795dfd19e", subdirectory = "python" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
@@ -509,12 +509,14 @@ override-dependencies = [
   "mamba-ssm==2.3.2.post1",
   # megatron-core still pins lens v0.2.0 in its own [tool.uv.sources]; without an
   # override the two git URLs are a hard conflict, since the workspace resolves a
-  # single nemo-lens. The rev here is the v0.3.0 tag, which we need for
+  # single nemo-lens. The rev here is lens main past v0.3.0, which we need for
   # `SpanRegistry` (which replaced the shipped `SpanGroup` class), the
-  # consumer-driven metric registry (`MetricSpec`/`register_metric_group`) and
-  # the scoped span attributes behind `rl.iteration`. Drop this once Megatron-LM
-  # bumps to the same or newer rev.
-  "nemo-lens[sdk,aiohttp] @ git+https://github.com/NVIDIA-NeMo/Lens.git@7bcc03ce3565d2be6858b819b049bcc4c3ec05b4",
+  # consumer-driven metric registry (`MetricSpec`/`register_metric_group`), the
+  # scoped span attributes behind `rl.iteration`, and the observable metric
+  # kinds behind `rl.host.memory.*` -- a rev rather than a tag because there is
+  # no release carrying the last of those yet. Drop this once Megatron-LM bumps
+  # to the same or newer rev.
+  "nemo-lens[sdk,aiohttp] @ git+https://github.com/NVIDIA-NeMo/Lens.git@4d045c03186b90afdc815db46b671f6a21bc7e98",
 ]
 
 # CVE fixes

@@ -221,7 +221,20 @@ def _metric_specs() -> list[MetricSpec]:
             unit=row.unit,
             description=row.description,
         )
-        for row in (*teed_metrics(), *recorded_metrics())
+        for row in teed_metrics()
+    )
+    specs.extend(
+        MetricSpec(
+            row.key,
+            row.name,
+            row.kind,
+            unit=row.unit,
+            description=row.description,
+            # Only the recorded rows can carry one; a teed row is pushed by
+            # definition, since its value arrives through Logger.log_metrics.
+            callback=row.callback,
+        )
+        for row in recorded_metrics()
     )
     return specs
 
@@ -298,6 +311,32 @@ def record_rl_metrics(
     if not ensure_metric_group_registered():
         return
     _record(handle.meter, values, attributes)
+
+
+def create_rl_metric_instruments() -> None:
+    """Build the ``rl`` group's instruments now. No-op unless exporting.
+
+    Only the observable rows need this. A synchronous series gets its
+    instrument on the first :func:`record_rl_metrics` that names it, but an
+    observable one is never recorded to -- the exporter pulls it through the
+    callback -- so without this nothing ever creates it and it is simply never
+    exported. Call it once from the owner that declared the callback, after
+    telemetry is up.
+
+    Because this registers the group, it also closes declaration (see
+    ``freeze_metrics``). That makes telemetry startup the deadline for
+    declaring a row, where it used to be the first metric recorded, so a module
+    that declares one has to be imported by then -- which every entry point
+    already does.
+    """
+    handle = get_telemetry_handle()
+    if handle is None or not handle.is_exporting:
+        return
+    if not ensure_metric_group_registered():
+        return
+    from nemo.lens.instruments import create_metric_instruments
+
+    create_metric_instruments(handle.meter, RL_METRIC_GROUP)
 
 
 def efficiency_measurements() -> dict[str, str]:

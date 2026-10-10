@@ -203,6 +203,48 @@ These overlap with `rl.vllm.*` on token counts but are not redundant: `gen_ai.*`
 
 These ride the normal `http/protobuf` OTLP path and reach the same backend as everything else. They are distinct from vLLM's **native** engine tracing (opt-in, and exported over vLLM's own gRPC-by-default exporter) — see [vLLM Tracing](vllm-tracing.md).
 
+## Host memory (`rl.host.memory.*`)
+
+Every raylet publishes its node's memory on its own Prometheus endpoint. `HostMemoryMonitor` in `nemo_rl/telemetry/host_memory.py` scrapes all of them from the driver on a timer and records one point per node — the same source `RayGpuMonitorLogger` already reads for the W&B `ray/node.*.mem_gb` rows, but keeping the node's identity instead of flattening it into the metric name.
+
+| Metric | Type | Attributes | Source series |
+|---|---|---|---|
+| `rl.host.memory.used` | Observable gauge (`By`) | `host.name`, `rl.worker_groups` | `ray_node_mem_used` |
+| `rl.host.memory.total` | Observable gauge (`By`) | `host.name`, `rl.worker_groups` | `ray_node_mem_total` |
+
+Bytes, not the gigabytes the W&B path reports. The interval follows `logger.gpu_monitoring.collection_interval` so the host-memory and GPU series line up, but collection is **not** gated on `logger.monitor_gpus`: that flag governs what reaches W&B, and an OTel series should not vanish when someone turns off an unrelated W&B feature. It is gated on telemetry exporting, and on nothing else.
+
+The monitor is started by `init_telemetry_driver` and stopped by `shutdown_telemetry`, which puts it in the **driver** process on every entry point. That placement is load-bearing rather than incidental — see `rl.worker_groups` below — which is why it does not live in `Logger` beside the GPU monitor it otherwise resembles.
+
+### Why these are observable rather than pushed
+
+A host's `rl.worker_groups` label changes during a run: it is `none` until the worker groups are built, which is minutes in, and changes again when they regroup or shut down. Pushed to an ordinary gauge that would be a permanent error, not a transient one — the SDK keeps a synchronous gauge's last value *per attribute set* and re-exports it every cycle, and nothing in the OTel API can retract an attribute set. Every host's startup-time `none` point would sit next to its correctly labelled one for the rest of the run, so `sum by (host.name)` would count each host twice and filtering on `none` would show every training host as idle.
+
+An observable gauge is rebuilt from its callback on each collection cycle, so a label the callback stops reporting simply ends. The monitor therefore scrapes on its own timer into a snapshot that it *replaces* wholesale, and the callbacks return whatever is in it. Three consequences worth knowing:
+
+- Scraping stays on the monitor's thread rather than inside the callback, so the exporter never blocks on HTTP to an unreachable node — a wait that would otherwise hold up every other metric in the process and grow with the cluster.
+- The scrape and export intervals are independent, so a point can be up to one collection interval old, and scrapes taken between two export cycles are never seen. Both are normal for a gauge.
+- A node that fails a scrape leaves a gap rather than a flat line at its last known value, because the snapshot is replaced and not merged. For "how much memory does this host have in use right now" a gap is the honest answer.
+
+The instruments are created by `create_rl_metric_instruments()` when the monitor starts. This is not optional bookkeeping: nothing ever records these series, so without that call no instrument exists and the callbacks are never polled.
+
+`host.name` is a metric attribute here, not the resource attribute of the same name that lens already sets. The resource one names the host the *emitting* process runs on, which for every one of these points is the head node; the driver is reporting about other hosts. It prefers Ray's `NodeManagerHostname` and falls back to `NodeManagerAddress` (the IP) when Ray resolved no hostname.
+
+### `rl.worker_groups` is a descriptor, not a partition key
+
+It lists the worker groups resident on the host, sorted and comma-joined (`lm_policy,vllm_policy`), or `none` for a host running no group — the head node, or any node whose groups had not been built when the sample was taken. `RayWorkerGroup` registers its placement as it is created, resolving bundles to nodes through `placement_group_table`, so no worker is asked anything.
+
+There is exactly one point per `host.name` per cycle. That matters where several raylets share a machine, as in a local multi-node cluster: each publishes the same whole-host memory on its own endpoint, so the monitor scrapes a host once and merges the worker groups of every node on it, rather than emitting a point per node that `sum by (host.name)` would add together.
+
+That registry is an ordinary module global, so it is visible only to the process that wrote it, and the writer is always the driver. This is why the monitor has to run there too: the single-controller entry points (`run_grpo_single_controller.py`, `run_sft_v2.py`) build their worker groups on the driver but their `Logger` inside the controller actor, so a monitor owned by the `Logger` would read an empty map and label every host `none` — right numbers, wrong label, on every point.
+
+**Do not aggregate on it.** The value it labels is the *whole host's* memory:
+
+- Under colocation `lm_policy` and `vllm_policy` share GPUs and therefore a host, so `sum by (rl.worker_groups)` would count that host's memory once per group.
+- No worker group owns the raylet, the Ray **object store** (often tens of GB, and frequently the thing that actually ran a node out of memory) or — on the head node — the driver, yet all of them are in the number.
+
+Group on it to decide *which* hosts to look at; read `host.name` for the number itself. There is no breakdown inside `ray_node_mem_used`: getting one means per-process sampling (`psutil` RSS from inside each worker, where `rl.worker_group` and `nv.dl.rank` are already on the resource and nothing has to be inferred), and attributing a single process's RSS to tensors versus pinned buffers versus allocator arenas is a profiler's job, not a metric's.
+
 ## Metric vs span tag vs resource attribute
 
 The one rule that trips people up. Classify each value before you emit it:
