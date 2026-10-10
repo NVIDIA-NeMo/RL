@@ -139,3 +139,29 @@ def test_direct_packed_rows_reject_draft_training():
 
     with pytest.raises(NotImplementedError, match="draft training"):
         policy.train(_direct_batch(), MagicMock())
+
+
+def test_direct_packed_rows_honor_microbatch_override():
+    policy = _policy(mbs=2)
+    policy.train(_direct_batch(), MagicMock(), mbs=1)
+    call = policy.worker_group.run_all_workers_sharded_data.call_args
+    assert call.kwargs["common_kwargs"]["mbs"] == 1
+    assert [shard["input_ids"].flatten().tolist() for shard in call.kwargs["data"]] == [
+        [0, 2],
+        [1, 3],
+    ]
+
+
+def test_direct_packed_rows_reject_invalid_microbatch_override():
+    policy = _policy(mbs=1)
+    with pytest.raises(ValueError, match="micro batch size 1"):
+        policy.train(_direct_batch(), MagicMock(), mbs=2)
+    policy.worker_group.run_all_workers_sharded_data.assert_not_called()
+
+
+def test_direct_packed_rows_do_not_use_contiguous_deferred_teacher_layout():
+    student = _policy()
+    teacher = _policy()
+    student.use_sequence_packing = False
+    teacher.use_sequence_packing = False
+    assert not student.can_consume_deferred_topk_from(teacher, _direct_batch(), 4)
