@@ -160,6 +160,7 @@ def _make_master_config(
     if backend == "megatron":
         # The megatron build path reads these before any generation factory runs.
         generation_config["mcore_generation_config"] = {
+            "logprobs_mode": "processed_logprobs",
             "expose_http_server": False,
             "kv_cache_management_mode": "persist",
         }

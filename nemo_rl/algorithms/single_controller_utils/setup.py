@@ -54,6 +54,7 @@ from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
     _get_effort_config,
     _get_grpo_save_state,
+    _validate_generation_logprob_mode,
 )
 from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
@@ -1053,6 +1054,7 @@ def setup_single_controller(
         logged by the SC actor).
     """
     validate_single_controller_config(master_config)
+    _validate_generation_logprob_mode(master_config.policy)
     resolved_reward_penalty_config = resolve_reward_penalty_config(
         master_config.reward_penalties,
         tokenizer,

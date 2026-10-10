@@ -3888,6 +3888,7 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
             "resources": {"gpus_per_node": 1, "num_nodes": 1},
         },
         "mcore_generation_config": {
+            "logprobs_mode": "processed_logprobs",
             "expose_http_server": True,
             "kv_cache_management_mode": "persist",
         },
@@ -6002,7 +6003,11 @@ class TestValidateFunction:
         # Non-gym rollouts (env has no nemo_gym) with validation sampling
         # different from training must be rejected at setup time.
         master_config.policy["generation"].update(
-            {"backend": "megatron", "val_temperature": 0.1}
+            {
+                "backend": "megatron",
+                "val_temperature": 0.1,
+                "mcore_generation_config": {"logprobs_mode": "processed_logprobs"},
+            }
         )
         master_config.env = {}
 
