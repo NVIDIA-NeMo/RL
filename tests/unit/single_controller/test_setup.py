@@ -4806,3 +4806,31 @@ def test_generation_top_logprobs_requires_score_centering():
     mc.policy["generation"]["top_logprobs"] = 4
     with pytest.raises(ValueError, match="only read by loss_fn.score_centering"):
         validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize("target_level", ["sibling", "turn", "prompt_group"])
+def test_background_prefix_cleanup_requires_prefix_target(target_level):
+    with pytest.raises(ValueError, match="requires target_level=prefix"):
+        RolloutRecoveryConfig.model_validate(
+            {
+                "target_level": target_level,
+                "generation_prefix_cleanup": {"enabled": True},
+            }
+        )
+
+
+def test_background_prefix_cleanup_defaults_and_prefix_override():
+    assert not RolloutRecoveryConfig().generation_prefix_cleanup.enabled
+    config = RolloutRecoveryConfig.model_validate(
+        {
+            "target_level": "prefix",
+            "generation_prefix_cleanup": {
+                "enabled": True,
+                "batch_size": 8,
+                "max_pending": 16,
+                "wait_seconds": 0.002,
+            },
+        }
+    )
+    assert config.generation_prefix_cleanup.batch_size == 8
+    assert config.generation_prefix_cleanup.max_pending == 16
