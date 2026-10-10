@@ -177,6 +177,13 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # If False (default), correction is applied at the token level as in the
     # original GRPO paper.
     sequence_level_importance_ratios: bool = False
+    # Whether the incoming log probabilities are position-aligned (position i
+    # scores token i, so the tensor is as long as the sequence) rather than
+    # next-token (position i scores token i+1, one shorter). Masked diffusion
+    # policies produce the former; autoregressive policies the latter. It
+    # decides whether the other per-token tensors drop their first column to
+    # line up, so a wrong value is a silent off-by-one across every position.
+    position_aligned_logprobs: bool = False
 
     # --- Clipping ---
     ratio_clip_min: float = 0.2
@@ -303,6 +310,7 @@ class ClippedPGLossFn(LossFunction):
         use_fused_linear_logprobs: bool = False,
         opd_full: Optional["OnPolicyDistillationFullConfig"] = None,
         *,
+        generation_logprobs_available: bool = True,
         seq_logprob_error_threshold: float | None = None,
     ):
         """Initialize the loss and its worker normalization requirements.
@@ -311,6 +319,9 @@ class ClippedPGLossFn(LossFunction):
             cfg: Policy-gradient loss configuration.
             use_fused_linear_logprobs: Whether the model returns precomputed
                 next-token logprobs instead of logits.
+            generation_logprobs_available: Whether the generation backend
+                returns real per-token logprobs. When False, metrics that
+                compare generation and policy logprobs are reported as zero.
             opd_full: Optional full-vocabulary distillation configuration.
             seq_logprob_error_threshold: Required when
                 ``cfg.seq_logprob_error_in_loss`` is enabled; otherwise unused.
@@ -334,11 +345,20 @@ class ClippedPGLossFn(LossFunction):
                 )
             if cfg.positive_example_nll_weight != 0:
                 raise ValueError("In-loss sequence filtering does not support NLL")
+            if not generation_logprobs_available:
+                raise ValueError(
+                    "In-loss sequence filtering requires generation logprobs"
+                )
         # When True, the model forward is patched to return precomputed next-token
         # logprobs (via chunked linear CE fusion) instead of full logits. This is
         # consumed by prepare_loss_input, which short-circuits the logits->logprobs
         # conversion. See nemo_rl/distributed/model_utils.py for the fused forward.
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
+        self.generation_logprobs_available = generation_logprobs_available
+        if not generation_logprobs_available and cfg.use_importance_sampling_correction:
+            raise ValueError(
+                "Importance sampling correction requires generation logprobs"
+            )
         self.opd_full = opd_full if opd_full is not None and opd_full.enabled else None
         self.input_type = (
             LossInputType.OPD_FULL
@@ -376,6 +396,7 @@ class ClippedPGLossFn(LossFunction):
 
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
+        self.position_aligned_logprobs = cfg.position_aligned_logprobs
         self.positive_example_nll_weight = cfg.positive_example_nll_weight
         self.metrics_level = cfg.metrics_level
         self.enable_torch_compile = cfg.enable_torch_compile
@@ -597,24 +618,30 @@ class ClippedPGLossFn(LossFunction):
             "ClippedPGLossFn requires next_token_logprobs"
         )
         curr_logprobs = next_token_logprobs
-        token_mask = data["token_mask"][:, 1:]
+        # Next-token log probabilities are one shorter than the sequence, so
+        # every other per-token tensor drops its first column to line up.
+        # Position-aligned log probabilities keep every position, so nothing is
+        # dropped -- see ClippedPGLossConfig.position_aligned_logprobs.
+        aligned = slice(None) if self.position_aligned_logprobs else slice(1, None)
+        token_mask = data["token_mask"][:, aligned]
         sample_mask = data["sample_mask"]
-        advantages = data["advantages"][:, 1:]
+        advantages = data["advantages"][:, aligned]
         # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
         prev_logprobs = (
-            None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+            None if self.force_on_policy_ratio else data["prev_logprobs"][:, aligned]
         )
-        generation_logprobs = data["generation_logprobs"][:, 1:]
+        generation_logprobs = data["generation_logprobs"][:, aligned]
         if self.reference_policy_kl_penalty != 0:
-            reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
+            reference_policy_logprobs = data["reference_policy_logprobs"][:, aligned]
             curr_logprobs_unfiltered = data.get(
                 "curr_logprobs_unfiltered", curr_logprobs
             )
 
         mask = token_mask * sample_mask.unsqueeze(-1)
         full_metrics = self.metrics_level == "full"
+        emit_importance_metric = full_metrics or self.use_importance_sampling_correction
         need_importance_weights = (
-            full_metrics or self.use_importance_sampling_correction
+            self.generation_logprobs_available and emit_importance_metric
         )
 
         # For truly on-policy training, use curr_logprobs as prev_logprobs
@@ -854,8 +881,10 @@ class ClippedPGLossFn(LossFunction):
 
         # Metric: sampling importance ratio (mean over samples)
         # See: docs/guides/grpo.md#sampling-importance-ratio
-        if need_importance_weights:
-            if self.sequence_level_importance_ratios:
+        if emit_importance_metric:
+            if not self.generation_logprobs_available:
+                sample_importance_ratio = curr_logprobs.new_zeros(())
+            elif self.sequence_level_importance_ratios:
                 sample_importance_ratio = masked_mean(
                     actor_importance_weights.squeeze(-1),
                     sample_mask,
@@ -897,26 +926,42 @@ class ClippedPGLossFn(LossFunction):
         # To get the true metric, you'll need to sum over the microbatch.
         metric_tensors = {"loss": loss.detach()}
         with torch.no_grad():
-            lp_error = torch.abs(generation_logprobs - prev_logprobs)
-            metric_tensors["token_mult_prob_error"] = masked_mean(
-                torch.exp(lp_error * mask),
-                mask,
-                global_normalization_factor=global_valid_toks,
-            )
-        if full_metrics:
-            metric_tensors.update(
-                clipped_pg_diagnostic_metrics(
-                    curr_logprobs=curr_logprobs,
-                    prev_logprobs=prev_logprobs,
-                    generation_logprobs=generation_logprobs,
-                    ratios=ratios,
-                    ratios_clamped=ratios_clamped,
-                    mask=mask,
-                    global_valid_toks=global_valid_toks,
-                    reference_policy_kl_type=self.reference_policy_kl_type,
+            if self.generation_logprobs_available:
+                lp_error = torch.abs(generation_logprobs - prev_logprobs)
+                token_mult_prob_error = masked_mean(
+                    torch.exp(lp_error * mask),
+                    mask,
+                    global_normalization_factor=global_valid_toks,
                 )
+            else:
+                token_mult_prob_error = curr_logprobs.new_zeros(())
+            metric_tensors["token_mult_prob_error"] = token_mult_prob_error
+        if full_metrics:
+            diagnostic_metrics = clipped_pg_diagnostic_metrics(
+                curr_logprobs=curr_logprobs,
+                prev_logprobs=prev_logprobs,
+                generation_logprobs=(
+                    generation_logprobs
+                    if self.generation_logprobs_available
+                    else prev_logprobs
+                ),
+                ratios=ratios,
+                ratios_clamped=ratios_clamped,
+                mask=mask,
+                global_valid_toks=global_valid_toks,
+                reference_policy_kl_type=self.reference_policy_kl_type,
             )
-        if need_importance_weights:
+            if not self.generation_logprobs_available:
+                zero = curr_logprobs.new_zeros(())
+                for name in (
+                    "gen_kl_error",
+                    "policy_kl_error",
+                    "js_divergence_error",
+                    APPROX_ENTROPY_KEY,
+                ):
+                    diagnostic_metrics[name] = zero
+            metric_tensors.update(diagnostic_metrics)
+        if emit_importance_metric:
             metric_tensors["sampling_importance_ratio"] = sample_importance_ratio
 
         metric_tensors.update(
