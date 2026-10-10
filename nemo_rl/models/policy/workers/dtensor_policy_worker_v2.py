@@ -229,8 +229,16 @@ class DTensorPolicyWorkerV2Impl(
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorkerV2."""
-        # Apply TE patch until TE is upgraded to 2.10.0
-        apply_transformer_engine_patch()
+        # The native Speech path uses the image's TE >= 2.10, which already
+        # contains this fix. Preserve legacy patch behavior for other policies.
+        if config.get("native_model") is None:
+            apply_transformer_engine_patch()
+        else:
+            from importlib.metadata import version
+            from packaging.version import Version
+
+            if Version(version("transformer-engine")) < Version("2.10.0"):
+                raise ValueError("Native SpeechLM requires Transformer Engine >= 2.10 without source rewriting")
 
         from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
 
