@@ -2766,3 +2766,36 @@ def test_get_module_still_uses_unambiguous_packed_mapping(fp8_module):
         model, "model.layers.0.self_attn.k_proj.weight"
     )
     assert module is model.model.layers[0].self_attn.qkv_proj
+
+
+def test_deepseek_parameter_names_do_not_import_legacy_remote_code(fp8_module):
+    from transformers import PretrainedConfig
+
+    # A remote config with stale auto_map entries must not import its modeling
+    # module just to enumerate the MLA projections excluded from FP8.
+    class RemoteDeepseekV3Config(PretrainedConfig):
+        model_type = "deepseek_v3"
+
+    config = RemoteDeepseekV3Config(
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        q_lora_rank=16,
+        kv_lora_rank=16,
+        qk_nope_head_dim=16,
+        qk_rope_head_dim=16,
+        v_head_dim=16,
+        vocab_size=128,
+        first_k_dense_replace=1,
+        auto_map={"AutoModel": "missing_legacy_module.DeepseekV3Model"},
+    )
+    names = fp8_module._get_fp8_parameter_names(config)
+    for layer in range(2):
+        for projection in ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]:
+            assert f"layers.{layer}.self_attn.{projection}.weight" in names
