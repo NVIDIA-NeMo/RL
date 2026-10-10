@@ -17,14 +17,16 @@
 
 import asyncio
 import copy
+import importlib
 import json
+import logging
 import statistics
 import uuid
 import warnings
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import ray
 import torch
@@ -59,11 +61,13 @@ from nemo_rl.environments.interfaces import (
 )
 from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
+    GYM_INFRA_FAILURE_KEY,
     NemoGymShardSet,
     as_nemo_gym_shard_set,
     get_nemo_gym_route_name,
     get_pad_dynamic_image_shapes,
 )
+from nemo_rl.experience.failures import GymTransportError
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -97,6 +101,8 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.timer import Timer
+
+logger = logging.getLogger(__name__)
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -1851,7 +1857,9 @@ class _NemoGymStreamAccumulator:
 
     NeMo Gym returns rows in completion order. This accumulator owns all ordering
     and completeness rules so the rollout loop only needs to postprocess completed
-    groups.
+    groups. It also keeps the per-row budget of infrastructure attempts: a row
+    whose ``/run`` failed at the transport level may be dispatched again, as a
+    fresh session, up to ``max_infra_attempts`` times in total.
     """
 
     def __init__(
@@ -1859,24 +1867,32 @@ class _NemoGymStreamAccumulator:
         rows: list[dict],
         num_generations: int,
         allow_mixed_agents: bool,
+        max_infra_attempts: int = 1,
     ) -> None:
+        if max_infra_attempts < 1:
+            raise ValueError(
+                f"max_infra_attempts must be at least 1, got {max_infra_attempts}"
+            )
         self._rows = rows
         self._num_generations = num_generations
         self._allow_mixed_agents = allow_mixed_agents
+        self._max_infra_attempts = max_infra_attempts
         self._received_row_indices: set[int] = set()
         self._pending_results: dict[int, dict[int, dict]] = defaultdict(dict)
+        # Row index -> number of infrastructure failures recorded for it so far.
+        self._infra_failures: dict[int, int] = defaultdict(int)
 
     @property
     def is_complete(self) -> bool:
         return len(self._received_row_indices) == len(self._rows)
 
-    def add(
-        self,
-        row_index: int,
-        result: dict,
-        resolved_agent_ref: dict,
-    ) -> _CompletedNemoGymGroup | None:
-        """Add one streamed row and return its group when that group is complete."""
+    @property
+    def infra_redispatches(self) -> int:
+        """How many times a row was dispatched again after an infrastructure failure."""
+        return sum(self._infra_failures.values())
+
+    def _check_row_index(self, row_index: int) -> None:
+        """Reject a row index the stream must never produce."""
         if not isinstance(row_index, int):
             raise TypeError(
                 f"NeMo-Gym row index must be an int, got {type(row_index).__name__}"
@@ -1886,6 +1902,37 @@ class _NemoGymStreamAccumulator:
                 f"NeMo-Gym returned row index {row_index} outside the expected "
                 f"range [0, {len(self._rows)})"
             )
+
+    def record_infra_failure(self, row_index: int, detail: str) -> dict:
+        """Account one infrastructure failure of a row and return the row to dispatch again.
+
+        The first failure is the row's first attempt gone wrong; with
+        ``max_infra_attempts`` of N, the row is returned for re-dispatch after each of
+        its first N-1 failures and the Nth failure raises ``GymTransportError``
+        carrying ``detail``, so the step fails the way an unretried failure does.
+        """
+        self._check_row_index(row_index)
+        if row_index in self._received_row_indices:
+            raise ValueError(
+                f"NeMo-Gym reported a failure for row index {row_index} after its result"
+            )
+        failures = self._infra_failures[row_index] + 1
+        if failures >= self._max_infra_attempts:
+            raise GymTransportError(
+                f"NeMo-Gym row {row_index} failed at the infrastructure level on all "
+                f"{failures} attempt(s): {detail}"
+            )
+        self._infra_failures[row_index] = failures
+        return self._rows[row_index]
+
+    def add(
+        self,
+        row_index: int,
+        result: dict,
+        resolved_agent_ref: dict,
+    ) -> _CompletedNemoGymGroup | None:
+        """Add one streamed row and return its group when that group is complete."""
+        self._check_row_index(row_index)
         if row_index in self._received_row_indices:
             raise ValueError(f"NeMo-Gym returned duplicate row index {row_index}")
 
@@ -1944,6 +1991,191 @@ def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
     if isinstance(nemo_gym_config, dict) and nemo_gym_config.get("thinking_tags"):
         return list(nemo_gym_config["thinking_tags"])
     return list(DEFAULT_THINKING_TAGS)
+
+
+# A row is dispatched once and never again after an infrastructure failure unless
+# env.nemo_gym.max_infra_attempts_per_rollout raises the budget.
+DEFAULT_MAX_INFRA_ATTEMPTS_PER_ROLLOUT = 1
+
+
+def get_nemo_gym_health_check_interval(env_config: dict[str, Any]) -> Optional[float]:
+    """Seconds between health checks of the Gym actor while rollouts are awaited.
+
+    Reads ``env.nemo_gym.health_check_interval_seconds``. None, the value when the
+    key is absent or null, turns the polling off; a set value must be positive.
+    """
+    nemo_gym_config = env_config.get("nemo_gym")
+    value = (
+        nemo_gym_config.get("health_check_interval_seconds")
+        if isinstance(nemo_gym_config, dict)
+        else None
+    )
+    if value is None:
+        return None
+    interval = float(value)
+    if interval <= 0:
+        raise ValueError(
+            f"env.nemo_gym.health_check_interval_seconds must be positive, got {value}"
+        )
+    return interval
+
+
+def get_nemo_gym_max_infra_attempts(env_config: dict[str, Any]) -> int:
+    """How many times one row may be dispatched before an infrastructure failure ends the step.
+
+    Reads ``env.nemo_gym.max_infra_attempts_per_rollout``; an absent or null key
+    means ``DEFAULT_MAX_INFRA_ATTEMPTS_PER_ROLLOUT``. The value must be at least 1.
+
+    This budget governs the driver path (``run_async_nemo_gym_rollout``) only.
+    The asynchronous collector re-dispatches a failure-marker row through its
+    own attempt loop, budgeted by ``rollout_manager.RolloutRetryPolicy``'s
+    ``max_gym_row_attempts``, and whole-attempt failures there are budgeted by
+    its ``max_attempts_per_prompt``; the three are deliberately separate knobs.
+    """
+    nemo_gym_config = env_config.get("nemo_gym")
+    value = (
+        nemo_gym_config.get("max_infra_attempts_per_rollout")
+        if isinstance(nemo_gym_config, dict)
+        else None
+    )
+    if value is None:
+        return DEFAULT_MAX_INFRA_ATTEMPTS_PER_ROLLOUT
+    attempts = int(value)
+    if attempts < 1:
+        raise ValueError(
+            f"env.nemo_gym.max_infra_attempts_per_rollout must be at least 1, got {value}"
+        )
+    return attempts
+
+
+# A step-metrics hook: takes one rollout group's input rows and, aligned with
+# them, each rollout's ``full_result`` mapping, and returns metrics to merge
+# into the group's rollout metrics after every built-in metric.
+RolloutMetricsHook = Callable[
+    [list[dict[str, Any]], list[dict[str, Any]]], dict[str, float]
+]
+
+# Rollout-metrics hooks that have already failed once in this process, by
+# qualified name; the failure is reported the first time only, since it would
+# otherwise repeat for every prompt group of every step.
+_ROLLOUT_METRICS_HOOK_WARNED: set[str] = set()
+
+# Hooks whose returned keys collided with a built-in metric key, by qualified
+# name; reported once for the same reason.
+_ROLLOUT_METRICS_HOOK_COLLISION_WARNED: set[str] = set()
+
+
+def apply_nemo_gym_rollout_metrics_hook(
+    hook: Optional[RolloutMetricsHook],
+    rows: list[dict[str, Any]],
+    full_results: list[dict[str, Any]],
+    rollout_metrics: dict[str, Any],
+) -> None:
+    """Merge the hook's metrics for one rollout group into ``rollout_metrics``.
+
+    Called after every built-in metric writer on both rollout paths, so on a
+    key collision the hook's value wins and the collision is warned once per
+    hook rather than silently reabsorbed. A failing hook is warned once and
+    can never fail the rollout.
+    """
+    if hook is None:
+        return
+    hook_name = getattr(hook, "__qualname__", repr(hook))
+    try:
+        hook_metrics = hook(rows, full_results)
+    except Exception:
+        if hook_name not in _ROLLOUT_METRICS_HOOK_WARNED:
+            _ROLLOUT_METRICS_HOOK_WARNED.add(hook_name)
+            logger.warning(
+                "NeMo-Gym rollout metrics hook %s raised; its metrics are "
+                "skipped for this and later prompt groups (reported once)",
+                hook_name,
+                exc_info=True,
+            )
+        return
+    collisions = rollout_metrics.keys() & hook_metrics.keys()
+    if collisions and hook_name not in _ROLLOUT_METRICS_HOOK_COLLISION_WARNED:
+        _ROLLOUT_METRICS_HOOK_COLLISION_WARNED.add(hook_name)
+        logger.warning(
+            "NeMo-Gym rollout metrics hook %s overrides built-in metric key(s) "
+            "%s (reported once)",
+            hook_name,
+            sorted(collisions),
+        )
+    rollout_metrics.update(hook_metrics)
+
+
+def get_nemo_gym_rollout_metrics_hook(
+    env_config: dict[str, Any],
+) -> Optional[RolloutMetricsHook]:
+    """Import the hook ``env.nemo_gym.rollout_metrics_hook`` names, or None when unset.
+
+    The value is the dotted import path of a callable,
+    ``package.module.function``, imported in the process that runs the rollout
+    loop (under asynchronous GRPO that is the trajectory collector actor, so
+    the module must be importable there). The hook is called once per rollout
+    group as ``hook(rows, full_results)`` and returns a mapping merged into
+    the group's rollout metrics after every built-in metric
+    (``apply_nemo_gym_rollout_metrics_hook``). Facts a hook author needs:
+
+    - ``rows`` are the group's input rows in rollout order; each carries
+      ``agent_ref["name"]`` and the ``_ng_group_id`` prompt-group key, which
+      is how a hook recovers prompt boundaries and agent identity.
+    - ``full_results`` align with ``rows``: each is that rollout's
+      ``full_result`` mapping, whose ``reward`` is the trained value, already
+      rewritten by effort shaping and reward penalties.
+    - The group differs by caller: one prompt's rollouts under the
+      asynchronous collector and the single-controller path, but the whole
+      step batch (mixed prompts, possibly mixed agents) under
+      ``run_nemo_gym_rollout_sync``.
+    - Under asynchronous GRPO, ``aggregate_rollout_metrics`` averages a
+      returned key over prompt groups with equal weight (``/min``, ``/max``
+      and histogram keys aside), so a per-group value aggregates to a mean of
+      group values.
+
+    The per-agent aggregation in ``_postprocess_single_nemo_gym_group`` already
+    logs the mean of every numeric result field over all rollouts; the hook is
+    where an environment derives what that cannot express, such as pass-at-k
+    over a prompt group. Raises ``ValueError`` when the path does not
+    resolve to a callable.
+    """
+    nemo_gym_config = env_config.get("nemo_gym")
+    path = (
+        nemo_gym_config.get("rollout_metrics_hook")
+        if isinstance(nemo_gym_config, dict)
+        else None
+    )
+    if not path:
+        return None
+    module_name, _, attribute = str(path).rpartition(".")
+    if not module_name:
+        raise ValueError(
+            f"env.nemo_gym.rollout_metrics_hook must be a dotted import path "
+            f"(package.module.function), got {path!r}"
+        )
+    hook = getattr(importlib.import_module(module_name), attribute, None)
+    if not callable(hook):
+        raise ValueError(
+            f"env.nemo_gym.rollout_metrics_hook {path!r} does not name a callable"
+        )
+    return cast(RolloutMetricsHook, hook)
+
+
+async def _nemo_gym_rollout_config(nemo_gym_environment: Any) -> dict[str, Any]:
+    """Fetch the ``env.nemo_gym`` keys the rollout loop reads from the Gym actors.
+
+    ``_build_gym_actor_config`` keeps those keys (``DRIVER_ROLLOUT_KEYS`` in
+    ``nemo_rl.environments.nemo_gym``) as top-level fields of every actor's
+    configuration and out of Gym's global configuration, and an actor hands
+    them back through ``rollout_config``. The environment is unwrapped through
+    ``as_nemo_gym_shard_set`` and one actor is asked: every shard is built from
+    the same env mapping, so the driver keys agree across the set. The mapping
+    is returned in the ``master_config.env`` layout the ``get_nemo_gym_*``
+    readers take, so every caller of the rollout function, synchronous or not,
+    applies the same configured values without forwarding them.
+    """
+    handle = as_nemo_gym_shard_set(nemo_gym_environment).all_handles[0]
+    return {"nemo_gym": dict(await handle.rollout_config.remote())}
 
 
 def should_mask_flagged_samples(env_config: dict[str, Any]) -> bool:
@@ -2445,11 +2677,46 @@ def _bucket_nemo_gym_rows_by_instance(
     return bucket_list
 
 
+async def _check_nemo_gym_health(
+    shard_set: NemoGymShardSet, timeout_seconds: float
+) -> None:
+    """Raise ``GymTransportError`` when a Gym actor reports a dead process.
+
+    An actor that does not answer within ``timeout_seconds`` is reported the
+    same way: ``NemoGym`` is an asyncio actor, so a live actor whose event
+    loop is blocked, or whose process is stopped, never resolves the call,
+    and an unbounded probe would turn this watchdog into the hang it exists
+    to end. The single-controller watchdog bounds its probe for the same
+    reason (``_check_env_health``).
+    """
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                *(handle.health_check.remote() for handle in shard_set.all_handles)
+            ),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError as error:
+        raise GymTransportError(
+            "NeMo-Gym health check did not answer within "
+            f"{timeout_seconds}s while rollouts were in flight"
+        ) from error
+    except Exception as error:
+        raise GymTransportError(
+            f"NeMo-Gym health check failed while rollouts were in flight: {error}"
+        ) from error
+
+
 async def _merge_nemo_gym_instance_streams(
     buckets: list[tuple[str, Any, list[dict]]],
     timer_prefix: str,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    *,
+    shard_set: Optional[NemoGymShardSet] = None,
+    health_check_interval_seconds: Optional[float] = None,
+    record_infra_failure: Optional[Callable[[int, str], dict]] = None,
+    record_timing: Optional[Callable[[str, dict], None]] = None,
 ) -> AsyncGenerator[tuple[int, dict, dict, dict | None, str], None]:
     """Interleave K actor streams into one, yielding rows as they complete.
 
@@ -2458,13 +2725,47 @@ async def _merge_nemo_gym_instance_streams(
     accumulator that already exists. With a single bucket it degenerates to
     that one stream, which is what keeps the unsharded path unchanged.
 
+    While no row arrives for ``health_check_interval_seconds``, every actor in
+    ``shard_set`` is health-checked, so a dead server ends the rollout with
+    ``GymTransportError`` instead of waiting on it until the wall; the health
+    check is the one feature that needs ``shard_set``.
+
+    With ``record_infra_failure`` set, a failure-marker row
+    (``GYM_INFRA_FAILURE_KEY``) is not yielded: the accounted row is dispatched
+    again as a fresh single-row stream on the instance that produced the
+    failure, and ``record_infra_failure`` raises once the row's attempts are
+    used up. The retry stays on its own instance because bucketing is by
+    prompt group (see ``_bucket_nemo_gym_rows_by_instance``): a group split
+    across instances deadlocks any verifier that buffers whole groups. The
+    instance is also not the failed component in the dead-engine case -- every
+    instance holds the same engine ``base_urls`` and Gym picks the engine per
+    request.
+
+    With ``record_timing`` set, every timing payload a stream delivers is
+    handed to it under that stream's label as it arrives, failure markers
+    included; a marker is never yielded, so the callback is the only channel
+    that delivers a timing payload attached to one. A retry stream reports
+    under ``<instance_label>/retry<n>``, so a one-row retry never replaces its
+    bucket's totals.
+
     Yields:
         ``(row_index, resolved_agent_ref, result, timing_metrics, instance_label)``.
-        ``timing_metrics`` is non-None only on the last row of each bucket.
+        ``timing_metrics`` is non-None only on the last row of each stream.
     """
-    iterators = {}
-    streams_by_iterator = {}
-    for instance_label, handle, rows in buckets:
+    iterators: dict[Any, str] = {}
+    streams_by_iterator: dict[Any, Any] = {}
+    handles_by_iterator: dict[Any, Any] = {}
+    timing_labels_by_iterator: dict[Any, str] = {}
+    retry_counts: dict[str, int] = {}
+    active_iterators: set[Any] = set()
+    pending: dict[asyncio.Task, Any] = {}
+
+    def _start_stream(
+        instance_label: str,
+        handle: Any,
+        rows: list[dict],
+        timing_label: Optional[str] = None,
+    ) -> None:
         ray_arguments = (
             rows,
             timer_prefix,
@@ -2486,15 +2787,33 @@ async def _merge_nemo_gym_instance_streams(
         iterator = stream.__aiter__()
         iterators[iterator] = instance_label
         streams_by_iterator[iterator] = stream
+        handles_by_iterator[iterator] = handle
+        timing_labels_by_iterator[iterator] = timing_label or instance_label
+        active_iterators.add(iterator)
+        pending[asyncio.ensure_future(anext(iterator))] = iterator
 
-    pending = {
-        asyncio.ensure_future(anext(iterator)): iterator for iterator in iterators
-    }
-    active_iterators = set(iterators)
+    for instance_label, handle, rows in buckets:
+        _start_stream(instance_label, handle, rows)
+
     first_failure: tuple[str, Exception] | None = None
     try:
         while pending:
-            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(
+                pending,
+                timeout=health_check_interval_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                # No row arrived within the interval: confirm the Gym servers
+                # are alive instead of waiting on a dead one until the wall.
+                # The branch is only reachable with a configured interval, so
+                # it doubles as the probe's own bound.
+                if shard_set is not None:
+                    assert health_check_interval_seconds is not None
+                    await _check_nemo_gym_health(
+                        shard_set, health_check_interval_seconds
+                    )
+                continue
             for task in done:
                 iterator = pending.pop(task)
                 instance_label = iterators[iterator]
@@ -2516,6 +2835,27 @@ async def _merge_nemo_gym_instance_streams(
                         enabled=debug_payload_metrics,
                     )
                 )
+                if record_timing is not None and timing_metrics is not None:
+                    record_timing(timing_labels_by_iterator[iterator], timing_metrics)
+                if record_infra_failure is not None and GYM_INFRA_FAILURE_KEY in result:
+                    # Raises GymTransportError once the row's attempts are used up.
+                    row = record_infra_failure(row_index, result[GYM_INFRA_FAILURE_KEY])
+                    print(
+                        f"NeMo-Gym row {row_index} failed at the infrastructure "
+                        f"level; dispatching it again as a fresh session: "
+                        f"{result[GYM_INFRA_FAILURE_KEY]}",
+                        flush=True,
+                    )
+                    retries = retry_counts.get(instance_label, 0) + 1
+                    retry_counts[instance_label] = retries
+                    _start_stream(
+                        instance_label,
+                        handles_by_iterator[iterator],
+                        [row],
+                        timing_label=f"{instance_label}/retry{retries}",
+                    )
+                    pending[asyncio.ensure_future(anext(iterator))] = iterator
+                    continue
                 yield (
                     row_index,
                     resolved_agent_ref,
@@ -2612,6 +2952,8 @@ async def run_async_nemo_gym_rollout(
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
     identity_num_generations: Optional[int] = None,
+    health_check_interval_seconds: Optional[float] = None,
+    max_infra_attempts_per_rollout: Optional[int] = None,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2619,6 +2961,16 @@ async def run_async_nemo_gym_rollout(
     validated and restored to input order within each ``num_generations`` group
     before the group is postprocessed and yielded. Synchronous call sites should
     use :func:`run_nemo_gym_rollout_sync`.
+
+    After any interval of ``health_check_interval_seconds`` in which no row
+    completed, every Gym actor's ``health_check`` runs, and a failure or an
+    unanswered probe ends the rollout with ``GymTransportError``.
+    A row whose ``/run`` failed at the infrastructure level arrives as a failure
+    marker (``GYM_INFRA_FAILURE_KEY``) and is dispatched again as a fresh session
+    while the other rows keep running, until it has used
+    ``max_infra_attempts_per_rollout`` attempts; then the same error ends the
+    rollout. Data failures (a 4xx that describes the request) are raised by the
+    actor and end the rollout at once.
 
     Args:
         policy_generation: Generation interface whose configuration supplies the
@@ -2659,11 +3011,19 @@ async def run_async_nemo_gym_rollout(
             prompt-group identity. Defaults to ``num_generations``. Synchronous
             callers set this independently because they collect the full batch as
             one result while preserving per-prompt GenRM cohort identities.
+        health_check_interval_seconds: Seconds between health checks of the Gym
+            actors while no row has arrived. None applies the environment's
+            configured ``env.nemo_gym.health_check_interval_seconds``, whose
+            absence turns the polling off.
+        max_infra_attempts_per_rollout: Total dispatches one row may use before
+            an infrastructure failure ends the rollout; 1 disables re-dispatch.
+            None applies the configured ``env.nemo_gym.max_infra_attempts_per_rollout``.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
         inside each result are restored to input order. The final result also
-        carries actor-wide and rollout-wide timing metrics.
+        carries actor-wide and rollout-wide timing metrics and, when a row was
+        dispatched again, the ``nemo_gym_infra_redispatches`` count.
 
     Raises:
         AssertionError: If an unsupported generation option is requested.
@@ -2676,6 +3036,8 @@ async def run_async_nemo_gym_rollout(
             indices disagree.
         RuntimeError: If the actor fails, returns NaN generation logprobs, ends the
             stream before all expected rows arrive, or produces no final group.
+        GymTransportError: If a health check fails or a row exhausts its
+            infrastructure attempts.
     """
     # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
     # still relies on the underlying model server's configured context/window limits.
@@ -2758,6 +3120,22 @@ async def run_async_nemo_gym_rollout(
     total_timer_label = f"{timer_prefix}/total"
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
+    shard_set = as_nemo_gym_shard_set(task_to_env["nemo_gym"])
+    # The reliability knobs and the metrics hook come from the environment's own
+    # configuration unless the caller passes them, so every caller of this
+    # function (synchronous GRPO, the asynchronous collector, PPO, distillation)
+    # applies the same configured values.
+    rollout_env_config = await _nemo_gym_rollout_config(shard_set)
+    if health_check_interval_seconds is None:
+        health_check_interval_seconds = get_nemo_gym_health_check_interval(
+            rollout_env_config
+        )
+    if max_infra_attempts_per_rollout is None:
+        max_infra_attempts_per_rollout = get_nemo_gym_max_infra_attempts(
+            rollout_env_config
+        )
+    rollout_metrics_hook = get_nemo_gym_rollout_metrics_hook(rollout_env_config)
+
     with timer.time(total_timer_label):
         _prepare_nemo_gym_rows(
             nemo_gym_rows,
@@ -2769,10 +3147,10 @@ async def run_async_nemo_gym_rollout(
             rows=nemo_gym_rows,
             num_generations=num_generations,
             allow_mixed_agents=returns_entire_batch,
+            max_infra_attempts=max_infra_attempts_per_rollout,
         )
         final_rollout_result: NemoGymRolloutResult | None = None
         actor_timing_by_instance: dict[str, dict[str, Any]] = {}
-        shard_set = as_nemo_gym_shard_set(task_to_env["nemo_gym"])
         with timer.time(run_rollouts_timer_label):
             buckets = _bucket_nemo_gym_rows_by_instance(
                 nemo_gym_rows, shard_set, routing_group_size
@@ -2782,6 +3160,14 @@ async def run_async_nemo_gym_rollout(
                 timer_prefix,
                 deduplicate_multimodal_data,
                 debug_payload_metrics,
+                shard_set=shard_set,
+                health_check_interval_seconds=health_check_interval_seconds,
+                record_infra_failure=accumulator.record_infra_failure,
+                # The merge owns the timing dict: a failure marker can carry a
+                # stream's timing payload without ever being yielded, and a
+                # retry stream reports under its own label instead of
+                # replacing its bucket's totals.
+                record_timing=actor_timing_by_instance.__setitem__,
             )
     while True:
         stream_finished = False
@@ -2793,16 +3179,13 @@ async def run_async_nemo_gym_rollout(
                         rowidx,
                         resolved_agent_ref,
                         result,
-                        timing_metrics,
-                        instance_label,
+                        _timing_metrics,
+                        _instance_label,
                     ) = await anext(rollout_iterator)
                 except StopAsyncIteration:
                     stream_finished = True
 
             if not stream_finished:
-                if timing_metrics is not None:
-                    actor_timing_by_instance[instance_label] = timing_metrics
-
                 _tensorize_nemo_gym_result(result)
                 completed_group = accumulator.add(
                     rowidx, result, resolved_agent_ref=resolved_agent_ref
@@ -2831,6 +3214,7 @@ async def run_async_nemo_gym_rollout(
                         length_penalty_config=length_penalty_config,
                         thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
+                        rollout_metrics_hook=rollout_metrics_hook,
                         group_size=identity_num_generations,
                     )
                     if accumulator.is_complete:
@@ -2853,6 +3237,10 @@ async def run_async_nemo_gym_rollout(
     final_rollout_result.rollout_metrics.update(
         _merge_nemo_gym_timing_metrics(actor_timing_by_instance, timer_prefix)
     )
+    if accumulator.infra_redispatches:
+        final_rollout_result.rollout_metrics["nemo_gym_infra_redispatches"] = (
+            accumulator.infra_redispatches
+        )
     final_rollout_result.rollout_metrics.update(timer.get_timing_metrics("sum"))
     yield final_rollout_result
 
@@ -2877,6 +3265,8 @@ def run_nemo_gym_rollout_sync(
     mask_env_flagged_samples: bool = True,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    health_check_interval_seconds: Optional[float] = None,
+    max_infra_attempts_per_rollout: Optional[int] = None,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -2915,6 +3305,13 @@ def run_nemo_gym_rollout_sync(
         deduplicate_multimodal_data: Omit initial policy-ready media from the
             remote Gym return and restore it from the input batch.
         debug_payload_metrics: Emit exact Gym Ray-boundary media payload metrics.
+        health_check_interval_seconds: Seconds between health checks of the Gym
+            actor while no row has arrived. None applies the environment's
+            configured ``env.nemo_gym.health_check_interval_seconds``, whose
+            absence turns the polling off.
+        max_infra_attempts_per_rollout: Total dispatches one row may use before
+            an infrastructure failure ends the rollout; 1 disables re-dispatch.
+            None applies the configured ``env.nemo_gym.max_infra_attempts_per_rollout``.
 
     Returns:
         The fully postprocessed NeMo-Gym rollout batch in input-row order.
@@ -2927,6 +3324,9 @@ def run_nemo_gym_rollout_sync(
             :func:`run_async_nemo_gym_rollout`.
         RuntimeError: If called from a running event loop, the actor or stream fails,
             or NeMo-Gym returns no complete rollout batch.
+        GymTransportError: If a health check fails or a row exhausts its
+            infrastructure attempts. The synchronous call sites have no retry
+            around this function, so the error ends the run.
     """
 
     async def _consume_rollout() -> NemoGymRolloutResult:
@@ -2953,6 +3353,8 @@ def run_nemo_gym_rollout_sync(
             sampling_params=sampling_params,
             deduplicate_multimodal_data=deduplicate_multimodal_data,
             debug_payload_metrics=debug_payload_metrics,
+            health_check_interval_seconds=health_check_interval_seconds,
+            max_infra_attempts_per_rollout=max_infra_attempts_per_rollout,
         ):
             pass
         if rollout_result is None:
@@ -2976,6 +3378,7 @@ def _postprocess_single_nemo_gym_group(
     length_penalty_config: LengthPenaltyConfig | dict[str, Any] | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
+    rollout_metrics_hook: RolloutMetricsHook | None = None,
     group_size: Optional[int] = None,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream.
@@ -3121,6 +3524,13 @@ def _postprocess_single_nemo_gym_group(
             agent_to_sample_metrics[agent_name].append(sample_metrics)
             result["agent_ref"] = agent_ref
 
+        def _environment_masked(result: dict) -> bool:
+            """Whether the environment marked this rollout's reward as not a valid measurement."""
+            return bool(
+                result.get("mask_sample")
+                or (result.get("instance_config") or {}).get("mask_sample")
+            )
+
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
             agent_sample_metrics = agent_to_sample_metrics[agent_name]
@@ -3129,17 +3539,26 @@ def _postprocess_single_nemo_gym_group(
                 agent_truncations
             ) / len(agent_truncations)
 
-            keys = agent_results[0].keys()
+            # Union of keys in first-seen order: a field present only on some
+            # rollouts (a masked sample's flag, for example) is still aggregated.
+            keys = list(dict.fromkeys(key for r in agent_results for key in r))
+            # An environment-masked rollout carries placeholder values (its
+            # reward is not a measurement), so it votes in no value metric,
+            # the checkpoint-ranking key train:<agent>/correctness/mean
+            # included. The one exception is the mask flag itself, whose mean
+            # over every rollout is the masked share.
+            unmasked = [r for r in agent_results if not _environment_masked(r)]
             for key in keys:
+                source = agent_results if key == "mask_sample" else unmasked
                 values = [
                     float(r[key])
-                    for r in agent_results
+                    for r in source
                     if isinstance(r.get(key), (bool, int, float))
                 ]
                 if values:
                     per_agent_metrics.update(
                         calculate_single_metric(
-                            values, len(agent_results), f"{agent_name}/{key}"
+                            values, len(source), f"{agent_name}/{key}"
                         )
                     )
 
@@ -3227,6 +3646,22 @@ def _postprocess_single_nemo_gym_group(
             len(results),
             resolved_reward_penalty_config,
         )
+    )
+
+    # Metrics the configured hook derives from the group's rows and full
+    # results (see get_nemo_gym_rollout_metrics_hook). Applied after every
+    # built-in metric writer above, so a hook key wins a collision and the
+    # collision is warned instead of the per-agent means silently reabsorbing
+    # it. A failing hook is reported and cannot fail the rollout.
+    hook_rows: list[dict[str, Any]] = []
+    hook_full_results: list[dict[str, Any]] = []
+    for nemo_gym_row, result in zip(nemo_gym_rows, results):
+        full_result = result.get("full_result")
+        if isinstance(full_result, dict):
+            hook_rows.append(nemo_gym_row)
+            hook_full_results.append(full_result)
+    apply_nemo_gym_rollout_metrics_hook(
+        rollout_metrics_hook, hook_rows, hook_full_results, rollout_metrics
     )
 
     # Expose per-component rewards as `reward/<name>` batch keys for multi-reward NeMo
