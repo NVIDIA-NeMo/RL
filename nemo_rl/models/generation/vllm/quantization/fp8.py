@@ -14,6 +14,7 @@
 
 import os
 import warnings
+import weakref
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -60,6 +61,11 @@ MXFP8_BLOCK_QUANT_KWARGS = {
 }
 
 DEFAULT_QUANTIZATION_IGNORED_LAYERS = ("lm_head",)
+_NATIVE_MXFP8_LINEAR_REFIT_KERNELS = {
+    "FlashInferCutedslMxfp8LinearKernel",
+    "FlashInferTrtllmMxfp8LinearKernel",
+}
+_MXFP8_CHECKPOINT_SCALE_SUFFIX = "_scale_from_checkpoint"
 
 
 @dataclass(frozen=True)
@@ -558,6 +564,22 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return value, scale
 
 
+def _is_mxfp8_linear_kernel(kernel: object, kernel_name: str) -> bool:
+    from vllm.model_executor.kernels.linear.mxfp8 import flashinfer
+
+    kernel_type = getattr(flashinfer, kernel_name, None)
+    return isinstance(kernel_type, type) and isinstance(kernel, kernel_type)
+
+
+def uses_native_mxfp8_linear_refit(module: torch.nn.Module) -> bool:
+    quant_method = getattr(module, "quant_method", None)
+    kernel = getattr(quant_method, "kernel", None)
+    return any(
+        _is_mxfp8_linear_kernel(kernel, kernel_name)
+        for kernel_name in _NATIVE_MXFP8_LINEAR_REFIT_KERNELS
+    )
+
+
 def get_quantized_weight_iterator(
     weights: Iterable[tuple[str, torch.Tensor]],
     model_runner: Any,
@@ -568,6 +590,17 @@ def get_quantized_weight_iterator(
     model = model_runner.model
 
     for k, v in weights:
+        if (
+            global_fp8_config is not None
+            and global_fp8_config.is_mx
+            and k.endswith(_MXFP8_CHECKPOINT_SCALE_SUFFIX)
+        ):
+            weight_name = k.removesuffix(_MXFP8_CHECKPOINT_SCALE_SUFFIX)
+            module = get_module_from_param_name(model, weight_name)
+            if module is not None and uses_native_mxfp8_linear_refit(module):
+                yield weight_name + "_scale", v
+                continue
+
         # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix
         # (so `_is_fp8_weight` would skip them) and vLLM's grouped loader cannot
         # load their scales. Expand them into the per-expert projection layout so
@@ -604,12 +637,14 @@ def get_quantized_weight_iterator(
             )
         param_scale = torch.squeeze(param_scale, dim=-1)
         if is_mx:
-            if refit_with_reload_api:
-                yield k, param_lp
-                yield k + "_scale", param_scale
-            else:
-                yield k, param_lp
-                yield k + "_scale_from_checkpoint", param_scale
+            module = get_module_from_param_name(model, k)
+            scale_suffix = (
+                "_scale"
+                if refit_with_reload_api or uses_native_mxfp8_linear_refit(module)
+                else "_scale_from_checkpoint"
+            )
+            yield k, param_lp
+            yield k + scale_suffix, param_scale
         else:
             yield k, param_lp
             yield k + "_scale_inv", param_scale
@@ -973,30 +1008,50 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
     else:
         kernel = getattr(self, "kernel", None)
         kernel_name = type(kernel).__name__ if kernel is not None else None
-        if kernel_name == "FlashInferCutedslMxfp8LinearKernel":
-            # vLLM 0.25 prefers the CuTe-DSL kernel, but it stores the weight
-            # column-major [K, N] while this refit-friendly override (and the
-            # MXFP8 refit loader) keeps the canonical [N, K] layout. The
-            # CUTLASS kernel consumes [N, K] and is supported wherever
-            # CuTe-DSL is (both require SM100), so swap it in.
-            from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
-                FlashInferCutlassMxfp8LinearKernel,
-            )
+        if _is_mxfp8_linear_kernel(kernel, "FlashInferCutedslMxfp8LinearKernel"):
+            from vllm.config import get_current_vllm_config_or_none
 
-            kernel = FlashInferCutlassMxfp8LinearKernel(kernel.config)
-            self.kernel = kernel
-            kernel_name = type(kernel).__name__
-            # Record it: this demotes vLLM's first-choice MXFP8 linear kernel
-            # on every such layer, so anyone comparing NeMo-RL rollout
-            # throughput against a plain vLLM MXFP8 serve has an explanation
-            # in the log rather than only in this comment.
-            logger.warning_once(
-                "NeMo-RL MXFP8 refit requires the [N, K] weight layout; "
-                "replacing vLLM's preferred FlashInferCutedslMxfp8LinearKernel "
-                "with FlashInferCutlassMxfp8LinearKernel. Expect a rollout "
-                "throughput difference vs. plain vLLM serving."
+            vllm_config = get_current_vllm_config_or_none()
+            linear_backend = (
+                vllm_config.kernel_config.linear_backend
+                if vllm_config is not None
+                else "auto"
             )
-        if kernel_name != "FlashInferCutlassMxfp8LinearKernel":
+            if linear_backend == "auto":
+                from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+                    FlashInferCutlassMxfp8LinearKernel,
+                )
+
+                kernel = FlashInferCutlassMxfp8LinearKernel(kernel.config)
+                self.kernel = kernel
+                kernel_name = type(kernel).__name__
+                logger.warning_once(
+                    "NeMo-RL MXFP8 refit keeps FlashInfer CUTLASS as the default "
+                    "linear backend. Set linear_backend=flashinfer_cutedsl to "
+                    "select vLLM's CuTe-DSL kernel explicitly."
+                )
+
+        if uses_native_mxfp8_linear_refit(layer):
+            runtime = getattr(layer, "_nrl_mxfp8_runtime_parameters", None)
+            if runtime is not None:
+                runtime_kernel, runtime_weight, runtime_scale = runtime
+                if (
+                    runtime_kernel is type(kernel)
+                    and runtime_weight() is layer.weight
+                    and runtime_scale() is layer.weight_scale
+                ):
+                    return
+
+            kernel.process_weights_after_loading(layer)
+            if runtime is None:
+                layer._nrl_mxfp8_runtime_parameters = (
+                    type(kernel),
+                    weakref.ref(layer.weight),
+                    weakref.ref(layer.weight_scale),
+                )
+            return
+
+        if not _is_mxfp8_linear_kernel(kernel, "FlashInferCutlassMxfp8LinearKernel"):
             raise AssertionError(
                 f"Unsupported MXFP8 linear kernel for refit: {kernel_name}"
             )
