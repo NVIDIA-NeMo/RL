@@ -2154,6 +2154,52 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     assert rollout_result.rollout_metrics["agent/truncation_rate"] == 0.0
 
 
+def test_per_agent_value_metrics_exclude_environment_masked_rollouts():
+    """An environment-masked rollout carries placeholder values, so it votes in
+    no per-agent value metric (the correctness ranking key included), while the
+    mask flag itself still averages over every rollout as the masked share."""
+    rows = [{"agent_ref": {"name": "agent"}} for _ in range(3)]
+
+    def result(**extras):
+        input_message = {"role": "user", "content": "", "token_ids": torch.tensor([1])}
+        return {
+            "input_message_log": [input_message],
+            "message_log": [
+                input_message,
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "token_ids": torch.tensor([2]),
+                    "generation_logprobs": torch.tensor([-0.1]),
+                },
+            ],
+            "full_result": {"reward": 0.0, **extras},
+        }
+
+    results = [
+        result(correctness=1.0, speedup=4.0, mask_sample=False),
+        result(correctness=0.0, speedup=2.0, mask_sample=False),
+        # The masked rollout's values are placeholders, not measurements.
+        result(correctness=0.0, speedup=0.0, mask_sample=True),
+    ]
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration", (), {"cfg": {"vllm_cfg": {"max_model_len": 128}}}
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(3)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+    )
+    metrics = rollout_result.rollout_metrics
+    assert metrics["agent/correctness/mean"] == pytest.approx(0.5)
+    assert metrics["agent/speedup/mean"] == pytest.approx(3.0)
+    assert metrics["agent/mask_sample/mean"] == pytest.approx(1 / 3)
+
+
 def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     agent_names = ["agent-a", "agent-a", "agent-b", "agent-b"]
     is_truncated = [True, False, True, True]

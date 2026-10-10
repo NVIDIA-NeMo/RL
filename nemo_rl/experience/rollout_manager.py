@@ -1658,16 +1658,28 @@ class AsyncNemoGymRolloutImpl:
         ]
         # Union of keys in first-seen order: a field present only on some
         # rollouts (a masked sample's flag, for example) is still aggregated,
-        # exactly as _postprocess_single_nemo_gym_group aggregates it.
+        # exactly as _postprocess_single_nemo_gym_group aggregates it. An
+        # environment-masked rollout carries placeholder values, so it votes in
+        # no value metric; the mask flag itself averages over every rollout as
+        # the masked share.
+        unmasked = [
+            r
+            for r in agent_extras
+            if not (
+                r.get("mask_sample")
+                or (r.get("instance_config") or {}).get("mask_sample")
+            )
+        ]
         for key in dict.fromkeys(key for r in agent_extras for key in r):
+            source = agent_extras if key == "mask_sample" else unmasked
             values = [
                 float(r[key])  # type: ignore
-                for r in agent_extras
+                for r in source
                 if isinstance(r.get(key), (bool, int, float))
             ]
             if values:
                 rollout_metrics.update(
-                    calculate_single_metric(values, n, f"{agent_name}/{key}")
+                    calculate_single_metric(values, len(source), f"{agent_name}/{key}")
                 )
 
         # Emit authoritative live token metrics after full-result metrics so

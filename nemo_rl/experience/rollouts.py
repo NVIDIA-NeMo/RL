@@ -3488,6 +3488,13 @@ def _postprocess_single_nemo_gym_group(
             agent_to_sample_metrics[agent_name].append(sample_metrics)
             result["agent_ref"] = agent_ref
 
+        def _environment_masked(result: dict) -> bool:
+            """Whether the environment marked this rollout's reward as not a valid measurement."""
+            return bool(
+                result.get("mask_sample")
+                or (result.get("instance_config") or {}).get("mask_sample")
+            )
+
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
             agent_sample_metrics = agent_to_sample_metrics[agent_name]
@@ -3499,16 +3506,23 @@ def _postprocess_single_nemo_gym_group(
             # Union of keys in first-seen order: a field present only on some
             # rollouts (a masked sample's flag, for example) is still aggregated.
             keys = list(dict.fromkeys(key for r in agent_results for key in r))
+            # An environment-masked rollout carries placeholder values (its
+            # reward is not a measurement), so it votes in no value metric,
+            # the checkpoint-ranking key train:<agent>/correctness/mean
+            # included. The one exception is the mask flag itself, whose mean
+            # over every rollout is the masked share.
+            unmasked = [r for r in agent_results if not _environment_masked(r)]
             for key in keys:
+                source = agent_results if key == "mask_sample" else unmasked
                 values = [
                     float(r[key])
-                    for r in agent_results
+                    for r in source
                     if isinstance(r.get(key), (bool, int, float))
                 ]
                 if values:
                     per_agent_metrics.update(
                         calculate_single_metric(
-                            values, len(agent_results), f"{agent_name}/{key}"
+                            values, len(source), f"{agent_name}/{key}"
                         )
                     )
 
