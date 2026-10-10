@@ -618,9 +618,11 @@ def test_validate_kl_accepts_a_valid_config_without_touching_the_environment(
     monkeypatch.setattr(
         zgm, "_validate_packages", lambda out: pytest.fail("driver checks packages")
     )
-    monkeypatch.setattr(
-        zgm, "_validate_platform", lambda *a, **k: pytest.fail("driver checks GPU")
-    )
+
+    def _platform(out, *, check_device):
+        assert not check_device, "driver checks GPU"
+
+    monkeypatch.setattr(zgm, "_validate_platform", _platform)
     config = _policy_config()
     before = copy.deepcopy(config)
     zgm.validate_zero_train_gen_kl(config, check_environment=False)
@@ -631,10 +633,12 @@ def test_validate_kl_checks_the_environment_on_workers(monkeypatch):
     seen: list[str] = []
     monkeypatch.setattr(zgm, "_validate_packages", lambda out: seen.append("packages"))
     monkeypatch.setattr(
-        zgm, "_validate_platform", lambda out, **k: seen.append("platform")
+        zgm,
+        "_validate_platform",
+        lambda out, *, check_device: seen.append(f"platform={check_device}"),
     )
     zgm.validate_zero_train_gen_kl(_policy_config(), check_environment=True)
-    assert seen == ["platform", "packages"]
+    assert seen == ["platform=True", "packages"]
 
 
 def test_validate_kl_raises_on_an_invalid_preset():
