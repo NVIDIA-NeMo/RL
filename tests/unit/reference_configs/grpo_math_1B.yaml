@@ -74,6 +74,10 @@ grpo:
     max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
     recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates.
+    # Run periodic validation in the background while training continues; results
+    # are logged at the step they finish, with validation/start_step. Requires the
+    # vLLM backend, in_flight_weight_updates: true and non-colocated generation.
+    overlap_validation: false
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:

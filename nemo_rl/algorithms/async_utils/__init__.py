@@ -12,10 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo_rl.algorithms.async_utils.background_validator import (
+    BackgroundValidationResult,
+    BackgroundValidator,
+)
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBuffer
 from nemo_rl.algorithms.async_utils.trajectory_collector import AsyncTrajectoryCollector
 
 __all__ = [
+    "BackgroundValidationResult",
+    "BackgroundValidator",
     "ReplayBuffer",
     "AsyncTrajectoryCollector",
 ]

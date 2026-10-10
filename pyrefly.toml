@@ -55,6 +55,7 @@ project-includes = [
   "nemo_rl/algorithms/advantage_actor.py",
   "nemo_rl/algorithms/advantage_estimator.py",
   "nemo_rl/algorithms/async_utils/__init__.py",
+  "nemo_rl/algorithms/async_utils/background_validator.py",
   "nemo_rl/algorithms/async_utils/interfaces.py",
   "nemo_rl/algorithms/async_utils/replay_buffer.py",
   "nemo_rl/algorithms/async_utils/staleness_sampler.py",

@@ -161,6 +161,7 @@ from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
+    ValStatus,
 )
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import (
@@ -286,6 +287,9 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: bool = False
+    # Runs validation in the background while training continues; results
+    # are logged at the step they finish.
+    overlap_validation: bool = False
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
@@ -509,6 +513,40 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
         )
 
 
+def _validate_overlap_validation(master_config: MasterConfig) -> None:
+    """Reject grpo.async_grpo.overlap_validation where it cannot work."""
+    async_config = master_config.grpo.async_grpo
+    if async_config is None or not async_config.overlap_validation:
+        return
+    if not async_config.enabled:
+        raise ValueError(
+            "grpo.async_grpo.overlap_validation requires grpo.async_grpo.enabled=true."
+        )
+    if not async_config.in_flight_weight_updates:
+        raise ValueError(
+            "grpo.async_grpo.overlap_validation requires "
+            "grpo.async_grpo.in_flight_weight_updates=true: refits run while "
+            "validation requests are still in flight."
+        )
+    if master_config.policy["generation"]["backend"] != "vllm":
+        raise NotImplementedError(
+            "grpo.async_grpo.overlap_validation is currently qualified only "
+            "with policy.generation.backend=vllm."
+        )
+    if master_config.policy["generation"]["colocated"]["enabled"]:
+        raise ValueError(
+            "grpo.async_grpo.overlap_validation requires "
+            "policy.generation.colocated.enabled=false: a colocated engine "
+            "cannot serve validation while the policy trains."
+        )
+    if master_config.grpo.debug_payload_metrics:
+        raise ValueError(
+            "grpo.async_grpo.overlap_validation does not support "
+            "grpo.debug_payload_metrics=true: background validation traffic "
+            "cannot be separated from training traffic."
+        )
+
+
 def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
     """Reject configurations whose media transfer path is not qualified."""
     if not master_config.grpo.deduplicate_multimodal_data:
@@ -635,6 +673,7 @@ def setup(
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
+    _validate_overlap_validation(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -4032,10 +4071,16 @@ def _grpo_train_impl(
                     grpo_save_state.total_steps = total_steps + 1
                     grpo_save_state.current_epoch = current_epoch
                     grpo_save_state.total_valid_tokens = total_valid_tokens
+                    # Checkpoint-only metadata, not restored on resume.
+                    val_status: ValStatus
+                    val_end_step: Optional[int]
                     if val_metrics is not None:
                         grpo_save_state.val_reward = val_metrics["accuracy"]
-                    elif hasattr(grpo_save_state, "val_reward"):
-                        delattr(grpo_save_state, "val_reward")
+                        val_status, val_end_step = "finished", total_steps + 1
+                    else:
+                        if hasattr(grpo_save_state, "val_reward"):
+                            delattr(grpo_save_state, "val_reward")
+                        val_status, val_end_step = "skipped", None
                     grpo_save_state.consumed_samples = consumed_samples
 
                     full_metric_name = master_config.checkpointing["metric_name"]
@@ -4078,7 +4123,13 @@ def _grpo_train_impl(
                             flush=True,
                         )
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, vars(grpo_save_state), master_config
+                            total_steps + 1,
+                            {
+                                **vars(grpo_save_state),
+                                "val_status": val_status,
+                                "val_end_step": val_end_step,
+                            },
+                            master_config,
                         )
                         policy.save_checkpoint(
                             weights_path=os.path.join(
@@ -4780,7 +4831,12 @@ def async_grpo_train(
             )
 
     # Import async utilities only when needed
-    from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
+    from nemo_rl.algorithms.async_utils import (
+        AsyncTrajectoryCollector,
+        BackgroundValidationResult,
+        BackgroundValidator,
+        ReplayBuffer,
+    )
 
     timer = Timer(context={"worker": "driver"})
     _telemetry = get_telemetry_handle()
@@ -4823,6 +4879,7 @@ def async_grpo_train(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
+    overlap_validation = master_config.grpo.async_grpo.overlap_validation
 
     assert (not colocated_inference) or (
         isinstance(policy_generation, MegatronGeneration)
@@ -5053,6 +5110,73 @@ def async_grpo_train(
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
+    # overlap_validation: validations run in the background while training
+    # continues. weight_version counts refits, one per training step, so it is
+    # the training step reached when a validation finishes.
+    background_validator = BackgroundValidator(
+        validate_fn=lambda val_step: validate(
+            policy_generation,
+            val_dataloader,
+            tokenizer,
+            val_task_to_env,
+            step=val_step,
+            master_config=master_config,
+            logger=logger,
+            processor=processor,
+        ),
+        current_step_fn=lambda: weight_version,
+    )
+
+    def record_overlapped_validation(
+        results: list[BackgroundValidationResult], log_step: int
+    ) -> Optional[str]:
+        """Log background validations and fill in their checkpoints.
+
+        Results are logged at ``log_step``, the step they are collected at, with
+        "validation/start_step" set to the step each validation started at.
+
+        Returns the first early-stop message from a validation that reached the
+        threshold, if any.
+        """
+        if len(results) > 1:
+            warnings.warn(
+                f"Validations started at steps {[r.val_step for r in results]} "
+                f"finished in the same step and are all logged at step {log_step}; "
+                "the W&B row keeps only the last. Use a longer grpo.val_period.",
+                stacklevel=2,
+            )
+        early_stop_message = None
+        for result in results:
+            stop_message = _record_overlapped_validation(result, log_step)
+            if early_stop_message is None:
+                early_stop_message = stop_message
+        return early_stop_message
+
+    def _record_overlapped_validation(
+        result: BackgroundValidationResult, log_step: int
+    ) -> Optional[str]:
+        val_metrics = result.metrics
+        logger.log_metrics(
+            {**val_metrics, "start_step": result.val_step},
+            log_step,
+            prefix="validation",
+        )
+        logger.log_metrics(result.timings, log_step, prefix="timing/validation")
+        if result.checkpoint_pending:
+            val_info = {"val_reward": val_metrics["accuracy"]}
+            full_metric_name = master_config.checkpointing["metric_name"]
+            if full_metric_name is not None and full_metric_name.startswith("val:"):
+                metric_name = full_metric_name.split(":", 1)[1]
+                if metric_name not in val_metrics:
+                    raise ValueError(f"Metric {metric_name} not found in val metrics")
+                val_info[full_metric_name] = val_metrics[metric_name]
+            checkpointer.record_validation(result.val_step, result.end_step, val_info)
+        return _validation_early_stop_message(
+            val_metrics,
+            stop_at_validation_threshold,
+            stop_at_validation_metric,
+        )
+
     # Run validation at start if configured
     if val_at_start and step == 0:
         print("\n🔍 Running initial validation...")
@@ -5205,6 +5329,9 @@ def async_grpo_train(
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
+
+    if master_config.checkpointing["enabled"]:
+        checkpointer.clear_stale_pending_validations()
 
     # Main training loop
     try:
@@ -5750,8 +5877,29 @@ def async_grpo_train(
                     and (step + 1) % val_period == 0
                 ) or (val_at_end and is_last_step)
 
+                if overlap_validation:
+                    # Record background validations that have finished.
+                    stop_message = record_overlapped_validation(
+                        background_validator.collect_finished(), step + 1
+                    )
+                    if early_stop_message is None:
+                        early_stop_message = stop_message
+                    if early_stop_message is not None:
+                        # Exit at the end of this step, after checkpointing.
+                        print(early_stop_message, flush=True)
+                        saving_this_step = master_config.checkpointing["enabled"]
+
+                if (
+                    overlap_validation
+                    and should_run_validation
+                    and early_stop_message is None
+                ):
+                    # Training continues while validation runs; the result is
+                    # recorded at a later step (above) or before training stops.
+                    background_validator.launch(step + 1)
+
                 payload_metrics: dict[str, int | float] = {}
-                if should_run_validation:
+                if should_run_validation and not overlap_validation:
                     # Stop new dispatch before separating the training and
                     # validation payload-metric intervals.
                     ray.get(trajectory_collector.pause.remote())
@@ -5766,7 +5914,7 @@ def async_grpo_train(
                         )
 
                 # Run validation if it's a validation step or last step with val_at_end
-                if should_run_validation:
+                if should_run_validation and not overlap_validation:
                     # Timer only, no efficiency_span: validate() accounts this
                     # window as overhead (see the bucket_scope in validate), so
                     # an idle-bucketed span over the same interval would both
@@ -5915,10 +6063,22 @@ def async_grpo_train(
                     grpo_save_state.current_step = step + 1
                     grpo_save_state.total_steps = step + 1
                     grpo_save_state.total_valid_tokens = total_valid_tokens
+                    # Checkpoint-only metadata, not restored on resume.
+                    val_status: ValStatus
+                    val_end_step: Optional[int]
                     if val_metrics is not None:
                         grpo_save_state.val_reward = val_metrics["accuracy"]
-                    elif hasattr(grpo_save_state, "val_reward"):
-                        delattr(grpo_save_state, "val_reward")
+                        val_status, val_end_step = "finished", step + 1
+                    else:
+                        if hasattr(grpo_save_state, "val_reward"):
+                            delattr(grpo_save_state, "val_reward")
+                        if background_validator.is_pending(step + 1):
+                            # Filled in by checkpointer.record_validation() later.
+                            val_status = "pending"
+                            background_validator.mark_checkpoint_pending(step + 1)
+                        else:
+                            val_status = "skipped"
+                        val_end_step = None
                     grpo_save_state.consumed_samples = consumed_samples
 
                     full_metric_name = master_config.checkpointing["metric_name"]
@@ -5926,11 +6086,12 @@ def async_grpo_train(
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
-                            warnings.warn(
-                                f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
-                                "This checkpoint will not be saved as top-k.",
-                                stacklevel=2,
-                            )
+                            if val_status != "pending":
+                                warnings.warn(
+                                    f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
+                                    "This checkpoint will not be saved as top-k.",
+                                    stacklevel=2,
+                                )
                             if hasattr(grpo_save_state, full_metric_name):
                                 delattr(grpo_save_state, full_metric_name)
                         elif metric_name not in metrics_source:
@@ -5958,7 +6119,13 @@ def async_grpo_train(
 
                         print(f"Saving checkpoint for step {step + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            step + 1, vars(grpo_save_state), master_config
+                            step + 1,
+                            {
+                                **vars(grpo_save_state),
+                                "val_status": val_status,
+                                "val_end_step": val_end_step,
+                            },
+                            master_config,
                         )
                         policy.save_checkpoint(
                             weights_path=os.path.join(
@@ -6049,6 +6216,18 @@ def async_grpo_train(
                         policy.offload_after_refit()
                         policy_generation.prepare_for_generation()
                         ray.get(trajectory_collector.resume_after_refit.remote())
+
+                if background_validator.pending_steps and (
+                    is_last_step
+                    or should_save_by_timeout
+                    or early_stop_message is not None
+                ):
+                    # Training stops after this step: wait for every background
+                    # validation, including this step's, and record its result.
+                    with timer.time("idle/validation"):
+                        record_overlapped_validation(
+                            background_validator.wait_all(), step + 1
+                        )
 
             # Logging
             # Log training data (match sync GRPO logging payload for parity).
@@ -6224,6 +6403,11 @@ def async_grpo_train(
         raise
 
     finally:
+        if background_validator.pending_steps:
+            print(
+                f"⚠️ Validations started at steps {background_validator.pending_steps} "
+                "did not finish before training stopped"
+            )
         # Finalize any pending async checkpoint before tearing down workers.
         try:
             checkpointer.shutdown()
