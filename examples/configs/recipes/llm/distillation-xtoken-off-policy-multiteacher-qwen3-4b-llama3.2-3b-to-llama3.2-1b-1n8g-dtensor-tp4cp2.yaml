@@ -11,7 +11,7 @@ data:
 policy:
   train_global_batch_size: 8
   max_total_sequence_length: 1024
-  dtensor_cfg:
+  automodel_cfg:
     tensor_parallel_size: 4
     context_parallel_size: 2
   scheduler:
@@ -52,7 +52,7 @@ teachers:
     precision: "bfloat16"
     logprob_chunk_size: null
     offload_optimizer_for_logprob: false
-    dtensor_cfg:
+    automodel_cfg:
       enabled: true
       checkpoint:
         model_save_format: "safetensors"
@@ -97,7 +97,7 @@ teachers:
     precision: "bfloat16"
     logprob_chunk_size: null
     offload_optimizer_for_logprob: false
-    dtensor_cfg:
+    automodel_cfg:
       enabled: true
       checkpoint:
         model_save_format: "safetensors"

@@ -11,6 +11,8 @@
 
 ## 📣 News
 
+* [09/21/2026] DeepSeek V4.1 Flash RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/deepseek-v4.1-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/deepseek-v4.1-support/docs/guides/models/deepseek/deepseek-v4.1-flash.md).
+* [08/26/2026] Qwen3.8-Flash-Next RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/qwen3-8-flash-next-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/qwen3-8-flash-next-support/docs/guides/models/qwen/qwen3-8-flash-next.md).
 * [08/12/2026] MuseGlimmer RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/muse-glimmer-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/muse-glimmer-support/docs/guides/models/muse-glimmer.md).
 * [08/11/2026] Nemotron-3.5-lightning is released. Trained natively using NeMo RL. Check out [reproducible recipes](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/nemo_gym/nemotron-3.5-lightning).
 * [07/25/2026] [Release v0.7.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.7.0): PPO, MOPD, Cross-tokenizer, Router-replay, CISPO, model support for Qwen3-Omni, Nemotron Nano v3 Omni, Gemma 4, GLM 5.1 and many more!
@@ -397,7 +399,7 @@ HF_HOME=/path/to/hf_home huggingface-cli download Qwen/Qwen2.5-32B
 
 # Ensure HF_HOME is included in your MOUNTS
 HF_HOME=/path/to/hf_home \
-COMMAND="uv run ./examples/run_grpo.py --config examples/configs/grpo_math_8B.yaml policy.model_name='Qwen/Qwen2.5-32B' policy.generation.vllm_cfg.tensor_parallel_size=4 policy.max_total_sequence_length=16384 cluster.num_nodes=${NUM_ACTOR_NODES} policy.dtensor_cfg.enabled=True policy.dtensor_cfg.tensor_parallel_size=8 policy.dtensor_cfg.sequence_parallel=True policy.dtensor_cfg.activation_checkpointing=True checkpointing.checkpoint_dir='results/qwen2.5-32b' logger.wandb_enabled=True logger.wandb.name='qwen2.5-32b'" \
+COMMAND="uv run ./examples/run_grpo.py --config examples/configs/grpo_math_8B.yaml policy.model_name='Qwen/Qwen2.5-32B' policy.generation.vllm_cfg.tensor_parallel_size=4 policy.max_total_sequence_length=16384 cluster.num_nodes=${NUM_ACTOR_NODES} policy.automodel_cfg.enabled=True policy.automodel_cfg.tensor_parallel_size=8 policy.automodel_cfg.sequence_parallel=True policy.automodel_cfg.activation_checkpointing=True checkpointing.checkpoint_dir='results/qwen2.5-32b' logger.wandb_enabled=True logger.wandb.name='qwen2.5-32b'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
@@ -792,7 +794,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
   ```yaml
   policy:
     # ...
-    dtensor_cfg:
+    automodel_cfg:
       env_vars:
         PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
   ```

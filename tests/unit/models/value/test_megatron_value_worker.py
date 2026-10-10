@@ -141,7 +141,7 @@ def _create_value_test_config(
             "enabled": False,
             "reward_model_type": "regression",
         },
-        "dtensor_cfg": {"enabled": False},
+        "automodel_cfg": {"enabled": False},
         "dynamic_batching": {"enabled": False},
         "sequence_packing": {"enabled": False},
         "megatron_cfg": {

@@ -1086,7 +1086,7 @@ class FullLogitsPostProcessor:
                     "teacher context parallel size, but got "
                     f"sequence_length={full_seq_len}, cp_size={self.cp_size}. "
                     "Set the teacher's make_sequence_length_divisible_by to a "
-                    "multiple of its dtensor_cfg.context_parallel_size."
+                    "multiple of its automodel_cfg.context_parallel_size."
                 )
             local_len = full_seq_len // self.cp_size
             cp_rank = torch.distributed.get_rank(self.cp_mesh.get_group())
