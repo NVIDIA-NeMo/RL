@@ -1143,11 +1143,42 @@ def test_process_mxfp8_moe_refit_rejects_non_flashinfer_backend(fp8_module):
         fp8_module.process_weights_after_loading_mxfp8_moe(quant_method, object())
 
 
+def test_create_mxfp8_moe_initializes_dummy_scales(fp8_module, monkeypatch):
+    import vllm.config
+    from vllm.model_executor import parameter as vllm_parameter
+
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config",
+        lambda: types.SimpleNamespace(
+            load_config=types.SimpleNamespace(load_format="dummy")
+        ),
+    )
+    monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vllm_parameter, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    layer = torch.nn.Module()
+    method = types.SimpleNamespace(moe=types.SimpleNamespace(is_act_and_mul=True))
+
+    fp8_module.create_weights_mxfp8_moe(
+        method,
+        layer,
+        num_experts=2,
+        hidden_size=32,
+        intermediate_size_per_partition=32,
+        params_dtype=torch.bfloat16,
+        weight_loader=lambda *_args, **_kwargs: None,
+    )
+
+    assert torch.all(layer.w13_weight_scale == 127)
+    assert torch.all(layer.w2_weight_scale == 127)
+
+
 @pytest.mark.parametrize("load_format", ["dummy", "safetensors"])
 def test_process_mxfp8_moe_initializes_kernel_once(
     fp8_module, monkeypatch, load_format
 ):
-    import vllm.config
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
     fp8 = fp8_module
@@ -1160,7 +1191,9 @@ def test_process_mxfp8_moe_initializes_kernel_once(
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(torch.zeros(2, 128, 512), requires_grad=False)
     layer.w2_weight = torch.nn.Parameter(torch.zeros(2, 512, 128), requires_grad=False)
-    initial_scale = 255 if load_format == "dummy" else 3
+    # create_weights_mxfp8_moe initializes dummy-loaded E8M0 scales before
+    # this post-load hook runs.
+    initial_scale = 127 if load_format == "dummy" else 3
     layer.w13_weight_scale = torch.nn.Parameter(
         torch.full((2, 128, 16), initial_scale, dtype=torch.uint8),
         requires_grad=False,
@@ -1212,23 +1245,13 @@ def test_process_mxfp8_moe_initializes_kernel_once(
         return kernel
 
     monkeypatch.setattr(vllm_fp8, "make_fp8_moe_kernel", make_kernel)
-    monkeypatch.setattr(
-        vllm.config,
-        "get_current_vllm_config",
-        lambda: types.SimpleNamespace(
-            load_config=types.SimpleNamespace(load_format=load_format)
-        ),
-    )
-
     fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
 
     expected_checkpoint_scale = 127 if load_format == "dummy" else initial_scale
     assert torch.all(
         layer.w13_weight_scale_from_checkpoint == expected_checkpoint_scale
     )
-    assert torch.all(
-        layer.w2_weight_scale_from_checkpoint == expected_checkpoint_scale
-    )
+    assert torch.all(layer.w2_weight_scale_from_checkpoint == expected_checkpoint_scale)
 
     runtime_parameters = (
         layer.w13_weight,
@@ -1239,11 +1262,6 @@ def test_process_mxfp8_moe_initializes_kernel_once(
     parameter_ids = tuple(id(parameter) for parameter in runtime_parameters)
     storage_ptrs = tuple(parameter.data_ptr() for parameter in runtime_parameters)
 
-    monkeypatch.setattr(
-        vllm.config,
-        "get_current_vllm_config",
-        lambda: pytest.fail("Refit must not reinitialize dummy scales"),
-    )
     layer.w13_weight_scale_from_checkpoint.data.fill_(2)
     layer.w2_weight_scale_from_checkpoint.data.fill_(2)
     fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
