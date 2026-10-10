@@ -597,6 +597,174 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
     logger.info("Successfully patched vLLM RADIO LayerScale loading.")
 
 
+def _patch_vllm_radio_native_loader(logger) -> None:
+    """Accept transformers-native RADIO weight names in vLLM's RADIO loader.
+
+    vLLM's ``RadioModel.load_weights`` only understands the legacy timm-style
+    layout (``radio_model.model.blocks.N.attn.qkv`` with a fused qkv). Nemotron
+    3.5 Super VL ships transformers-native remote code, so the Automodel policy
+    holds ``encoder.layer.N.attention.attention.{query,key,value}`` and
+    ``layer_scale{1,2}.lambda1`` parameters. Its per-tensor refit path cannot
+    fuse the three attention tensors back into one ``attn.qkv``, so those names
+    reach vLLM unchanged (Automodel main) or under the legacy block prefix
+    (Automodel r0.6.0: ``radio_model.model.blocks.N.attention.attention.query``).
+    Stock vLLM silently drops both forms and keeps generating with stale vision
+    weights once the vision tower is trained.
+
+    Port the native branch of the ``super_vl_rl_v0.25.1`` fork loader
+    (TomerBN-Nvidia/vllm commit 436aefb8): map native embedding and encoder
+    names onto vLLM's keys and write q/k/v as shards of the fused
+    ``QKVParallelLinear``. Legacy names keep the stock code path, so the
+    LayerScale loader patch and its anchors are unaffected.
+    """
+    try:
+        radio_file = _get_vllm_file("model_executor/models/radio.py")
+        vl_file = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate the RADIO model files for the native loader patch."
+        )
+        return
+
+    radio_replacements = (
+        (
+            """    def load_weights(self, weights) -> set[str]:
+        loaded_params: set[str] = set()
+        params_dict = dict(self.named_parameters())
+""",
+            """    def load_weights(self, weights) -> set[str]:
+        loaded_params: set[str] = set()
+        params_dict = dict(self.named_parameters())
+
+        def native_to_vllm(sub: str) -> tuple[str, str | None] | None:
+            # transformers-native RadioModel names -> vLLM keys (+ qkv shard).
+            # Returns None for names the legacy code path below handles.
+            for source, target in (
+                ("embeddings.patch_projection.", "model.patch_generator.embedder."),
+                (
+                    "embeddings.video_patch_projection.",
+                    "model.patch_generator.video_embedder.",
+                ),
+                ("embeddings.position_embedding", "model.patch_generator.pos_embed"),
+                ("embeddings.cls_register_token", "model.patch_generator.cls_token.token"),
+            ):
+                if sub.startswith(source):
+                    return target + sub[len(source) :], None
+            for prefix in ("encoder.layer.", "model.blocks."):
+                if not sub.startswith(prefix):
+                    continue
+                layer_idx, _, suffix = sub[len(prefix) :].partition(".")
+                for source, (target, shard_id) in (
+                    ("attention.attention.query.", ("attn.qkv.", "q")),
+                    ("attention.attention.key.", ("attn.qkv.", "k")),
+                    ("attention.attention.value.", ("attn.qkv.", "v")),
+                    ("attention.output.dense.", ("attn.proj.", None)),
+                    ("layer_scale1.lambda1", ("ls1", None)),
+                    ("layer_scale2.lambda1", ("ls2", None)),
+                ):
+                    if suffix.startswith(source):
+                        vllm_suffix = target + suffix[len(source) :]
+                        return f"model.encoder.layers.{layer_idx}.{vllm_suffix}", shard_id
+                if prefix == "encoder.layer.":
+                    return f"model.encoder.layers.{layer_idx}.{suffix}", None
+                return None
+            return None
+""",
+        ),
+        (
+            """        for name, weight in weights_list:
+            if not name.startswith("radio_model."):
+                # Skip non-radio weights
+                continue
+
+            sub = name[len("radio_model.") :]  # drop "radio_model." prefix
+
+            # Skip buffers not used in vLLM
+            if sub in {"summary_idxs"}:
+                continue
+            if sub.startswith("input_conditioner."):
+                # we normalize in the input processor,
+                # based on norm and std values from the config
+                continue
+
+            vllm_key = None
+            if sub.startswith("model.patch_generator."):
+""",
+            """        for name, weight in weights_list:
+            is_legacy = name.startswith("radio_model.")
+            sub = name.removeprefix("radio_model.")  # drop "radio_model." prefix
+            if not is_legacy and not sub.startswith(("embeddings.", "encoder.layer.")):
+                # Skip non-radio weights
+                continue
+
+            # Skip buffers not used in vLLM
+            if sub in {"summary_idxs"}:
+                continue
+            if sub.startswith("input_conditioner."):
+                # we normalize in the input processor,
+                # based on norm and std values from the config
+                continue
+
+            native = native_to_vllm(sub)
+            if native is not None:
+                vllm_key, shard_id = native
+                param = params_dict.get(vllm_key)
+                if param is not None:
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    if shard_id is None:
+                        weight_loader(param, weight)
+                    else:
+                        weight_loader(param, weight, shard_id)
+                    loaded_params.add(vllm_key)
+                continue
+
+            vllm_key = None
+            if sub.startswith("model.patch_generator."):
+""",
+        ),
+    )
+    vl_replacements = (
+        (
+            """        def is_vision_weights(name: str) -> bool:
+            return name.startswith("vision_model.radio_model.")
+""",
+            """        def is_vision_weights(name: str) -> bool:
+            # Legacy "vision_model.radio_model.*" and transformers-native
+            # "vision_model.{embeddings,encoder}.*" RADIO names.
+            return name.startswith("vision_model.")
+""",
+        ),
+    )
+
+    for file_to_patch, replacements in (
+        (radio_file, radio_replacements),
+        (vl_file, vl_replacements),
+    ):
+        with _locked_file_patch(file_to_patch) as (content, write_back):
+            if all(new in content for _, new in replacements):
+                logger.info(
+                    "vLLM RADIO native-name loader patch already applied to %s.",
+                    file_to_patch,
+                )
+                continue
+            if any(content.count(old) != 1 for old, _ in replacements):
+                logger.warning(
+                    "Could not apply vLLM RADIO native-name loader patch: expected "
+                    "vLLM 0.29 source shape was not found in %s. Refit of a "
+                    "transformers-native RADIO vision tower (Nemotron 3.5 Super VL) "
+                    "would be silently dropped by vLLM.",
+                    file_to_patch,
+                )
+                return
+            for old, new in replacements:
+                content = content.replace(old, new, 1)
+            write_back(content)
+        logger.info(
+            "Successfully patched vLLM RADIO loader for native weight names in %s.",
+            file_to_patch,
+        )
+
+
 def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
     """Restore the vLLM 0.24 decoder boundary for GLM DSA models.
 
@@ -1025,6 +1193,7 @@ def ensure_vllm_source_compat() -> None:
     patch_logger = init_logger("vllm_patch")
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+    _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
 
 
@@ -1091,6 +1260,7 @@ def _apply_vllm_patches(
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+    _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
     if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
         patch_logger
