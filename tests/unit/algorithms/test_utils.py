@@ -28,6 +28,7 @@ from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
+    compute_token_logprob_error_tail_metrics,
     get_tokenizer,
     mask_out_neg_inf_logprobs,
     maybe_pad_last_batch,
@@ -1078,6 +1079,99 @@ def test_mask_out_neg_inf_logprobs_finite_mask_and_zeroing(capsys):
     assert torch.equal(masked[effective == 1], logprobs[effective == 1])
     # The warning counts only -inf positions the caller's mask still treats as valid.
     assert "2/6 valid tokens have -inf in curr_logprobs" in capsys.readouterr().out
+
+
+def test_compute_token_logprob_error_tail_metrics():
+    # Sample 0: 2000 valid tokens, 1998 off by 0.1 nats, one by 8 nats and one 30-nat
+    # spike; its two trailing positions are masked out (one -inf). Sample 1 is masked
+    # out entirely.
+    generation_logprobs = torch.full((2, 2002), -1.0)
+    prev_logprobs = torch.full((2, 2002), -1.1)
+    prev_logprobs[0, 500] = -9.0
+    prev_logprobs[0, 1500] = -31.0
+    prev_logprobs[0, 2000] = -float("inf")
+    prev_logprobs[1] = -50.0
+    token_mask = torch.ones(2, 2002)
+    token_mask[0, 2000:] = 0
+    sample_mask = torch.tensor([1.0, 0.0])
+
+    metrics = compute_token_logprob_error_tail_metrics(
+        generation_logprobs=generation_logprobs,
+        prev_logprobs=prev_logprobs,
+        token_mask=token_mask,
+        sample_mask=sample_mask,
+    )
+    # The 99.9th percentile skips the worst two of 2000 tokens.
+    assert metrics["token_mult_prob_error_p999"] == pytest.approx(math.exp(0.1))
+    # Only the valid 30-nat token is a spike.
+    assert metrics["num_tokens_logprob_error_above_10_nats"] == 1
+    assert metrics.keys() == {
+        "token_mult_prob_error_p999",
+        "num_tokens_logprob_error_above_10_nats",
+    }
+
+    # Errors beyond float range (e.g. a -9999 logprob floor) saturate to inf.
+    huge = compute_token_logprob_error_tail_metrics(
+        generation_logprobs=torch.zeros(1, 4),
+        prev_logprobs=torch.full((1, 4), -9999.0),
+        token_mask=torch.ones(1, 4),
+        sample_mask=torch.ones(1),
+    )
+    assert huge["token_mult_prob_error_p999"] == math.inf
+    assert huge["num_tokens_logprob_error_above_10_nats"] == 4
+
+    # With no valid token there is nothing to report.
+    assert (
+        compute_token_logprob_error_tail_metrics(
+            generation_logprobs=generation_logprobs,
+            prev_logprobs=prev_logprobs,
+            token_mask=token_mask,
+            sample_mask=torch.zeros(2),
+        )
+        == {}
+    )
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -float("inf")])
+def test_token_logprob_tail_metrics_do_not_hide_nonfinite_tokens(
+    invalid: float,
+) -> None:
+    # One bad token is below the percentile's 0.1% tail and the severe-token cap.
+    # It must still fail the nightly's finite-value check.
+    generation = torch.zeros(1, 2000)
+    previous = torch.zeros_like(generation)
+    previous[0, -1] = invalid
+    token_mask = torch.ones_like(generation)
+    metrics = compute_token_logprob_error_tail_metrics(
+        generation_logprobs=generation,
+        prev_logprobs=previous,
+        token_mask=token_mask,
+        sample_mask=torch.ones(1),
+    )
+    assert metrics["token_mult_prob_error_p999"] == math.inf
+
+    # Invalid values outside the loss mask do not affect the metrics.
+    token_mask[0, -1] = 0
+    metrics = compute_token_logprob_error_tail_metrics(
+        generation_logprobs=generation,
+        prev_logprobs=previous,
+        token_mask=token_mask,
+        sample_mask=torch.ones(1),
+    )
+    assert metrics == {
+        "token_mult_prob_error_p999": 1.0,
+        "num_tokens_logprob_error_above_10_nats": 0,
+    }
+
+
+def test_token_logprob_tail_metrics_count_strictly_above_ten_nats() -> None:
+    metrics = compute_token_logprob_error_tail_metrics(
+        generation_logprobs=torch.zeros(1, 4),
+        prev_logprobs=torch.tensor([[-10.0, 10.0, -10.01, 10.01]]),
+        token_mask=torch.ones(1, 4),
+        sample_mask=torch.ones(1),
+    )
+    assert metrics["num_tokens_logprob_error_above_10_nats"] == 2
 
 
 class TestPrintEfficiencySummary:

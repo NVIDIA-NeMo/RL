@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import shlex
 import sys
 from pathlib import Path
 
@@ -30,6 +31,57 @@ from check_metrics import (
     min,
     ratio_above,
 )
+
+
+class TestNano35PerStepChecks:
+    """Exercise the nightly's actual expressions, including non-final steps."""
+
+    @pytest.fixture
+    def nightly_checks(self) -> list[str]:
+        script = (
+            tests_dir / "test_suites/llm/dapo-nanov3.5-30BA3B-4n8g-automodel.sh"
+        ).read_text()
+        arguments = script.split("uv run tests/check_metrics.py $JSON_METRICS", 1)[1]
+        return shlex.split(arguments.split("\n\n", 1)[0].replace("\\\n", " "))
+
+    @pytest.fixture
+    def metrics(self) -> dict[str, dict[str, float]]:
+        return {
+            "validation/accuracy": {"20": 0.45},
+            "train/token_mult_prob_error_p999": {
+                str(step): 1.50 for step in range(1, 21)
+            },
+            "train/num_tokens_logprob_error_above_10_nats": {
+                str(step): 3 for step in range(1, 21)
+            },
+            "train/gen_kl_error": {str(step): 0.00083 for step in range(1, 21)},
+        }
+
+    def test_all_steps_within_limits(self, nightly_checks, metrics) -> None:
+        assert all(evaluate_check(metrics, check)[0] for check in nightly_checks)
+
+    @pytest.mark.parametrize("step", ["1", "7", "20"])
+    @pytest.mark.parametrize(
+        "metric,value",
+        [
+            ("train/token_mult_prob_error_p999", 1.55),
+            ("train/token_mult_prob_error_p999", float("nan")),
+            ("train/token_mult_prob_error_p999", float("inf")),
+            ("train/token_mult_prob_error_p999", None),
+            ("train/num_tokens_logprob_error_above_10_nats", 4),
+            ("train/num_tokens_logprob_error_above_10_nats", float("nan")),
+            ("train/num_tokens_logprob_error_above_10_nats", float("inf")),
+            ("train/num_tokens_logprob_error_above_10_nats", None),
+        ],
+    )
+    def test_rejects_bad_or_missing_step(
+        self, nightly_checks, metrics, step: str, metric: str, value: float | None
+    ) -> None:
+        if value is None:
+            del metrics[metric][step]
+        else:
+            metrics[metric][step] = value
+        assert not all(evaluate_check(metrics, check)[0] for check in nightly_checks)
 
 
 class TestMeanFunction:
