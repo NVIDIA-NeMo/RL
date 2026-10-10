@@ -1,0 +1,39 @@
+# Prefetch config for the GenRM + h2-ping-sidecar example: bakes the Gym server venvs it needs into the image.
+#   docker buildx build -f docker/Dockerfile \
+#     --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_genrm_sidecar.yaml" .
+# Only env.nemo_gym is read (dry-run NemoGym._spinup); the dummy values satisfy the bundled configs'
+# interpolations during the dry run.
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+
+    policy_model_name: dummy-model
+    policy_base_url: http://localhost:8000/v1
+    policy_api_key: dummy
+
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/genrm_compare/configs/genrm_compare.yaml
+
+    # genrm_compare.yaml also defines an agent that points at this server
+    policy_model_reasoning_off:
+      _copy: policy_model
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs:
+            enable_thinking: false
+
+    # An external endpoint: Gym skips the local vLLM launch but still builds the server's venv.
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          base_url: ["https://prefetch.invalid/v1"]
+          api_key: prefetch
+          model: prefetch
+          uses_reasoning_parser: true
+
+    sidecar:
+      enabled: false
