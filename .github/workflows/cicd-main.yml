@@ -908,6 +908,7 @@ jobs:
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
           image: ${{ vars.CI_CONTAINER_NAME }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
+          image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           script: ${{ matrix.script }}
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
           megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
