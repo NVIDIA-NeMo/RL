@@ -1,0 +1,7 @@
+python-version = "3.13.14"
+search-path = [".", "../.."]
+project-includes = ["logra/**/*.py", "run_grpo.py"]
+replace-imports-with-any = ["nemo_automodel.*", "ray.*", "transformers.*"]
+
+[errors]
+missing-attribute = false
