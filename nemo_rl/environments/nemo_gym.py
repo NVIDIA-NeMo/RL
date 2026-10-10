@@ -276,11 +276,15 @@ def _typed_gym_failure(failure_row: dict) -> GymTransportError | RolloutDataFail
 
     A 5xx or a retriable 4xx (408, 429) means the endpoint is unwell and becomes
     ``GymTransportError``, as does a row without a status (a connection failure or a
-    timeout before any reply). Any other status describes the request itself and
-    becomes ``RolloutDataFailure``. Both take a single str, so they pickle cleanly
-    across the actor boundary and ``classify_rollout_failure``'s explicit-class
-    fast path wins on the far side. The recorded response body (already capped by
-    Gym) rides in the detail, so a 4xx explains what the server rejected.
+    timeout before any reply). Only a non-retriable 4xx describes the request itself
+    and becomes ``RolloutDataFailure``: a failure row carrying a status below 400
+    means the reply broke after its status line (the body read or parse failed, as
+    when a relayed multi-megabyte response is cut mid-body), which is the transport's
+    trouble, so that row is re-dispatched instead of ending the step. Both take a
+    single str, so they pickle cleanly across the actor boundary and
+    ``classify_rollout_failure``'s explicit-class fast path wins on the far side. The
+    recorded response body (already capped by Gym) rides in the detail, so a 4xx
+    explains what the server rejected.
     """
     status = failure_row.get(GYM_FAILURE_STATUS_KEY)
     message = failure_row.get(GYM_FAILURE_MESSAGE_KEY)
@@ -288,7 +292,7 @@ def _typed_gym_failure(failure_row: dict) -> GymTransportError | RolloutDataFail
     body_suffix = f" (response body: {body})" if body else ""
     if isinstance(status, int):
         detail = f"NeMo-Gym /run failed with HTTP {status}: {message}{body_suffix}"
-        if not http_status_is_infra(status):
+        if 400 <= status < 500 and not http_status_is_infra(status):
             return RolloutDataFailure(detail)
         return GymTransportError(detail)
     failure_type = failure_row.get(GYM_FAILURE_TYPE_KEY)
