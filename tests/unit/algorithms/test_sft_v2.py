@@ -629,3 +629,53 @@ def test_setup_propagates_pretrained_checkpoint_before_validation(pretrained):
     with pytest.raises(ValueError, match="data.backend=energon"):
         setup_sft_v2(config, MagicMock())
     assert config.policy.get("pretrained_checkpoint") == pretrained
+
+
+@pytest.mark.parametrize("dispatch_padding", [None, False, True])
+def test_setup_requires_uneven_dispatch_padding_for_packed_hybridep(
+    dispatch_padding: bool | None,
+) -> None:
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    overrides = (
+        {}
+        if dispatch_padding is None
+        else {"moe_hybridep_pad_uneven_dispatch_inputs": dispatch_padding}
+    )
+    config = _valid_setup_config(
+        data_overrides={
+            "max_input_seq_length": 130,
+            "energon": SimpleNamespace(
+                task_encoder=SimpleNamespace(
+                    packing=SimpleNamespace(
+                        name="greedy_knapsack",
+                        options=SimpleNamespace(
+                            max_sequence_length=130,
+                            sequence_length_pad_multiple=4,
+                        ),
+                    )
+                )
+            ),
+        },
+        policy_overrides={
+            "megatron_cfg": {
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
+                "model_overrides": overrides,
+            },
+            "sequence_packing": {
+                "enabled": True,
+                "fuse_loss": True,
+                "algorithm": "greedy_knapsack",
+            },
+        },
+    )
+    config.policy["make_sequence_length_divisible_by"] = 4
+    # A padded HybridEP request reaches the existing alignment check after this gate.
+    message = (
+        "max_input_seq_length to be divisible"
+        if dispatch_padding
+        else "moe_hybridep_pad_uneven_dispatch_inputs=true"
+    )
+    with pytest.raises(ValueError, match=re.escape(message)):
+        setup_sft_v2(config, MagicMock())

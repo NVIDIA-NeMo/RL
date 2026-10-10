@@ -506,7 +506,14 @@ def setup_sft_v2(
             megatron_cfg.get("moe_token_dispatcher_type") == "flex"
             and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
         ):
-            raise ValueError("Energon packing does not support HybridEP flex dispatch.")
+            # Packed batches can have different physical lengths across EP ranks.
+            model_overrides = megatron_cfg.get("model_overrides") or {}
+            if not model_overrides.get("moe_hybridep_pad_uneven_dispatch_inputs"):
+                raise ValueError(
+                    "Energon packing with HybridEP requires "
+                    "policy.megatron_cfg.model_overrides."
+                    "moe_hybridep_pad_uneven_dispatch_inputs=true."
+                )
 
         pad_multiple = packing.options.sequence_length_pad_multiple
         if pad_multiple != master_config.policy["make_sequence_length_divisible_by"]:
