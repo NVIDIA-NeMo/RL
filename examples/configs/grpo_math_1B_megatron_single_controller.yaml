@@ -22,6 +22,8 @@ reward_penalties:
   # token_ids: {unwanted: [2], think_open: 12, think_close: 13}
 
 async_rl:
+  # Optional stable episode seeds; requires a seed-aware NeMo Gym SWE agent.
+  seeded_rollouts: false
   sampler:
     name: in_order
     # How far generation may run ahead of the trainer.

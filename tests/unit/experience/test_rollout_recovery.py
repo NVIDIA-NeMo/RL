@@ -1116,6 +1116,53 @@ def test_restore_rejects_inconsistent_shared_admission_state() -> None:
         _load(RolloutRecoveryLedger(), state)
 
 
+@pytest.mark.parametrize("seed", [0, 12345, 2**63 - 1])
+def test_sampling_seed_survives_recovery_ledger(seed):
+    prompt = {**_prompt(), "sampling_seed": seed}
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="seeded",
+        prompt_id="7",
+        prompt_payload=prompt,
+        expected_generations=2,
+        target_step=1,
+        start_weight_version=0,
+    )
+    restored = RolloutRecoveryLedger()
+    _load(restored, ledger.state_dict())
+    assert restored.get_group("seeded").prompt_ref.sampling_seed == seed
+    with pytest.raises(ValueError, match="sampling seed"):
+        _bind(restored, "seeded", _prompt())
+    _bind(restored, "seeded", prompt)
+    assert restored.state_dict() == ledger.state_dict()
+
+
+def test_old_unseeded_prompt_reference_remains_readable():
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="old",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=1,
+        start_weight_version=0,
+    )
+    state = ledger.state_dict()
+    state["groups"][0]["prompt_ref"].pop("sampling_seed", None)
+    restored = RolloutRecoveryLedger()
+    _load(restored, state)
+    _bind(restored, "old", _prompt())
+    assert restored.get_group("old").prompt_ref.sampling_seed is None
+
+
+@pytest.mark.parametrize("seed", [-1, 2**63, True, 1.0, "1"])
+def test_prompt_reference_rejects_invalid_sampling_seed(seed):
+    with pytest.raises(ValueError, match="sampling_seed"):
+        PromptRef(sample_id="7", sampling_seed=seed)
+
+
 @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
 def test_reward_checks_seals_and_survives_checkpoint(granularity):
     from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext

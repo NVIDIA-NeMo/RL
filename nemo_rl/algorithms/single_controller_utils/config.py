@@ -58,6 +58,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
@@ -471,6 +472,9 @@ class WatchdogConfig(BaseModel, extra="allow"):
 
 
 class AsyncRLConfig(BaseModel, extra="allow"):
+    # Supply stable episode seeds to a seed-aware NeMo Gym SWE agent.
+    seeded_rollouts: bool = False
+
     # Stream every consumed sample's untruncated token tensors to JSONL. Files
     # are published only after the optimizer step completes; disabled by default.
     log_full_train_data: bool = False
@@ -1303,6 +1307,28 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "its advantage baselines depend on the pre-training sequence mask. "
             "Use the non-streaming GRPO trainer."
         )
+    if master_config.async_rl.seeded_rollouts:
+        if not should_use_nemo_gym(master_config):
+            raise ValueError("async_rl.seeded_rollouts requires the NeMo Gym SWE path")
+        if not master_config.checkpointing.get("load_replay_buffer", True):
+            raise ValueError(
+                "seeded_rollouts requires checkpointing.load_replay_buffer=true: "
+                "completed replay groups do not retain their original sampling seeds"
+            )
+        generation = master_config.policy["generation"]
+        if generation["backend"] == "megatron":
+            mcore_config = cast(MCoreGenerationConfig, generation)[
+                "mcore_generation_config"
+            ]
+            if mcore_config.get("sampling_backend") != "torch":
+                raise ValueError(
+                    "seeded_rollouts with Megatron requires "
+                    "policy.generation.mcore_generation_config.sampling_backend=torch"
+                )
+            if mcore_config["num_speculative_tokens"]:
+                raise ValueError(
+                    "seeded_rollouts does not support speculative decoding"
+                )
     _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl
