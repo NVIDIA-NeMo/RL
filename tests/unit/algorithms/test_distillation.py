@@ -1142,6 +1142,43 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
             assert DummyVllmGeneration.collective_calls
 
 
+def test_distillation_setup_rejects_nemo_gym_truncation_with_router_replay():
+    master_config = MasterConfig.model_construct(
+        policy={
+            "model_name": "test-policy",
+            "router_replay": {"enabled": True},
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {
+                    "async_engine": True,
+                    "expose_http_server": True,
+                },
+            },
+        },
+        teacher={},
+        loss_fn={},
+        env={
+            "should_use_nemo_gym": True,
+            "nemo_gym": {"truncate_noncontiguous_episodes": True},
+        },
+        data={},
+        distillation=DistillationConfig(),
+        logger={},
+        cluster={},
+        checkpointing={},
+    )
+
+    with (
+        patch.object(distil_mod, "VllmGeneration") as mock_vllm,
+        patch.object(distil_mod, "build_nemo_gym_actors") as mock_build_nemo_gym,
+        pytest.raises(ValueError, match="not compatible with router replay"),
+    ):
+        distil_mod.setup(master_config, MagicMock(), MagicMock(), None)
+
+    mock_vllm.assert_not_called()
+    mock_build_nemo_gym.assert_not_called()
+
+
 @pytest.mark.parametrize("vllm_start_fails", [False, True])
 def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_fails):
     import nemo_rl.algorithms.distillation as distil_mod
@@ -1150,6 +1187,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         "num_gpu_nodes": 1,
         "invalid_tool_call_patterns": ["bad_call"],
         "thinking_tags": ["<think>"],
+        "truncate_noncontiguous_episodes": True,
         "config_paths": ["gym.yaml"],
     }
 
