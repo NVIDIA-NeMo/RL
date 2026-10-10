@@ -131,15 +131,17 @@ def _make_master_config(
                 "colocated": {"enabled": False, "resources": {}},
             },
         },
-        checkpointing=CheckpointingConfig.model_construct(**{
-            "enabled": False,
-            "checkpoint_dir": "results/_sc_ppo_setup_test_ckpt",
-            "metric_name": None,
-            "higher_is_better": False,
-            "keep_top_k": None,
-            "save_period": 10,
-            "save_optimizer": False,
-        }),
+        checkpointing=CheckpointingConfig.model_construct(
+            **{
+                "enabled": False,
+                "checkpoint_dir": "results/_sc_ppo_setup_test_ckpt",
+                "metric_name": None,
+                "higher_is_better": False,
+                "keep_top_k": None,
+                "save_period": 10,
+                "save_optimizer": False,
+            }
+        ),
         logger=LoggerConfig.model_construct(),
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},

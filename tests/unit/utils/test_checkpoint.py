@@ -22,7 +22,6 @@ import numpy as np
 import pytest
 import torch
 import yaml
-from omegaconf import OmegaConf
 
 import nemo_rl.utils.checkpoint as checkpoint_module
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager

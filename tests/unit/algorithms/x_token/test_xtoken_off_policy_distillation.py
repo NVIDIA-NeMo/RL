@@ -209,12 +209,14 @@ def _make_master_config(
             },
             "logger": LoggerConfig(log_dir="/tmp/logger"),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
-            "checkpointing": CheckpointingConfig.model_construct(**{
-                "enabled": save_enabled,
-                "checkpoint_must_save_by": None,
-                "save_period": 100,
-                "metric_name": None,
-            }),
+            "checkpointing": CheckpointingConfig.model_construct(
+                **{
+                    "enabled": save_enabled,
+                    "checkpoint_must_save_by": None,
+                    "save_period": 100,
+                    "metric_name": None,
+                }
+            ),
         }
     )
 

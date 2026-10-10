@@ -772,19 +772,21 @@ def _actor_master_config(
         ),
         logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
         cluster=ClusterConfig(num_nodes=1, gpus_per_node=1),
-        checkpointing=CheckpointingConfig.model_construct(**{
-            "enabled": enabled,
-            "checkpoint_dir": str(tmp_path / "checkpoints"),
-            "metric_name": metric_name,
-            "higher_is_better": True,
-            "keep_top_k": None,
-            "save_period": save_period,
-            "save_optimizer": save_optimizer,
-            "save_data_plane": data_plane_checkpoint,
-            "load_replay_buffer": load_replay_buffer,
-            "checkpoint_must_save_by": checkpoint_must_save_by,
-            "ft_save_period": ft_save_period,
-        }),
+        checkpointing=CheckpointingConfig.model_construct(
+            **{
+                "enabled": enabled,
+                "checkpoint_dir": str(tmp_path / "checkpoints"),
+                "metric_name": metric_name,
+                "higher_is_better": True,
+                "keep_top_k": None,
+                "save_period": save_period,
+                "save_optimizer": save_optimizer,
+                "save_data_plane": data_plane_checkpoint,
+                "load_replay_buffer": load_replay_buffer,
+                "checkpoint_must_save_by": checkpoint_must_save_by,
+                "ft_save_period": ft_save_period,
+            }
+        ),
         data_plane={
             "enabled": True,
             "impl": "transfer_queue",
@@ -2562,7 +2564,9 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     )
     actor._sampler = _FakeSampler()
     actor._master_config = SimpleNamespace(
-        checkpointing=CheckpointingConfig.model_construct(**{"metric_name": None, "save_data_plane": False}),
+        checkpointing=CheckpointingConfig.model_construct(
+            **{"metric_name": None, "save_data_plane": False}
+        ),
         data_plane={},
     )
     actor._dataloader = SimpleNamespace(state_dict=lambda: {})
@@ -2825,17 +2829,19 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             min_groups_for_streaming_train=4,
             max_buffered_rollouts=8,
         ),
-        checkpointing=CheckpointingConfig.model_construct(**{
-            "enabled": True,
-            "checkpoint_dir": checkpoint_dir,
-            "metric_name": None,
-            "higher_is_better": True,
-            "keep_top_k": None,
-            "save_period": 2,
-            "save_optimizer": True,
-            "save_data_plane": True,
-            "checkpoint_must_save_by": None,
-        }),
+        checkpointing=CheckpointingConfig.model_construct(
+            **{
+                "enabled": True,
+                "checkpoint_dir": checkpoint_dir,
+                "metric_name": None,
+                "higher_is_better": True,
+                "keep_top_k": None,
+                "save_period": 2,
+                "save_optimizer": True,
+                "save_data_plane": True,
+                "checkpoint_must_save_by": None,
+            }
+        ),
     )
 
 

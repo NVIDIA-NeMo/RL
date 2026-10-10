@@ -542,11 +542,13 @@ def mock_grpo_components():
             "loss_fn": ClippedPGLossConfig(
                 use_importance_sampling_correction=True  # Required for async mode
             ),
-            "checkpointing": CheckpointingConfig.model_construct(**{
-                "enabled": False,
-                "checkpoint_must_save_by": None,
-                "save_period": 10,
-            }),
+            "checkpointing": CheckpointingConfig.model_construct(
+                **{
+                    "enabled": False,
+                    "checkpoint_must_save_by": None,
+                    "save_period": 10,
+                }
+            ),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
             "logger": LoggerConfig.model_construct(num_val_samples_to_print=5),
             "data": {

@@ -192,15 +192,17 @@ def _make_master_config(
         # Full block: setup builds a CheckpointManager unconditionally (resume
         # lookup), which indexes these keys directly. Nothing is written while
         # enabled=False and the dir doesn't exist.
-        checkpointing=CheckpointingConfig.model_construct(**{
-            "enabled": False,
-            "checkpoint_dir": "results/_sc_setup_test_ckpt",
-            "metric_name": None,
-            "higher_is_better": False,
-            "keep_top_k": None,
-            "save_period": 10,
-            "save_optimizer": False,
-        }),
+        checkpointing=CheckpointingConfig.model_construct(
+            **{
+                "enabled": False,
+                "checkpoint_dir": "results/_sc_setup_test_ckpt",
+                "metric_name": None,
+                "higher_is_better": False,
+                "keep_top_k": None,
+                "save_period": 10,
+                "save_optimizer": False,
+            }
+        ),
         logger=LoggerConfig(log_dir="/tmp/test-logs"),
         cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
