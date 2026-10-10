@@ -24,7 +24,6 @@ from examples import run_grpo_single_controller
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
-    AsyncRLConfig,
     MasterConfig,
 )
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
