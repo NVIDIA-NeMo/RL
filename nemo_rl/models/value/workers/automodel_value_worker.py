@@ -54,24 +54,13 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
+from nemo_rl.models.value.utils import right_shift_values
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.tensor_ops import pad_and_concat
-
-
-def right_shift_values(values: torch.Tensor) -> torch.Tensor:
-    """Shift values right by 1 along the sequence dim (V(s_{t+1}) -> V(s_t)).
-
-    Aligns value predictions with the Megatron value worker convention so GAE
-    (rewards, returns), value targets, and value clipping all see the same
-    V(s_t) semantics across backends. Preserves the input tensor shape: the
-    first column becomes zeros and column t (t>=1) takes the value from
-    column t-1.
-    """
-    return torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
 
 
 class RightShiftLossWrapper:
@@ -118,14 +107,6 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
 
         Note: Value models don't need a reference model since they don't compute KL divergence.
         """
-        if config["automodel_cfg"]["context_parallel_size"] > 1:
-            raise NotImplementedError(
-                "AutomodelValueWorker cannot be initialized with "
-                "context_parallel_size > 1 because its get_values() scoring path "
-                "does not support context parallelism. Set "
-                "value.automodel_cfg.context_parallel_size=1."
-            )
-
         # Apply patches
         apply_transformer_engine_patch()
 
@@ -353,7 +334,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
                     autocast_context_factory=self._autocast_context,
                     forward_only=eval_mode,
                     is_reward_model=True,  # Value models use reward model architecture
-                    allow_flash_attn_args=False,  # Typically False for value models
+                    allow_flash_attn_args=self.allow_flash_attn_args,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
                     sequence_dim=sequence_dim,
@@ -443,6 +424,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         # Create value post-processor
         value_post_processor = ScorePostProcessor(
             cfg=self.cfg,
+            enable_seq_packing=self.enable_seq_packing,
         )
 
         with torch.no_grad():
@@ -465,7 +447,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
                     cp_size=self.cp_size,
                     padding_token_id=self.tokenizer.pad_token_id or 0,
                     is_reward_model=True,
-                    allow_flash_attn_args=False,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
                 )
 
                 with prepared.model_context_factory(), self._autocast_context():
@@ -477,8 +459,9 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
                         processed_mb=processed_mb,
                         sequence_dim=sequence_dim,
                     )
-                    # Mirror train()'s right-shift so GAE / value clipping /
-                    # value targets all see V(s_t) semantics (megatron parity).
+                    # ScorePostProcessor has already restored the canonical CP
+                    # order. Shift only after that gather so cross-shard token
+                    # boundaries match the Megatron value convention.
                     values = right_shift_values(values)
 
                 # Skip dummy batches
