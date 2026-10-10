@@ -86,6 +86,7 @@ policy:
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false
+      save_consolidated: "false" # "false" | "final": inline HF-format export of the final checkpoint
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1
     activation_checkpointing: false

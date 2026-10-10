@@ -315,6 +315,7 @@ from nemo_rl.models.megatron.config import (
     RuntimeConfig,
 )
 from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
+from nemo_rl.models.megatron.hf_export import validate_hf_export_config
 from nemo_rl.models.megatron.draft.utils import (
     find_draft_owner_chunk,
     get_attached_draft_model,
@@ -941,6 +942,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
 
 def validate_megatron_config(megatron_cfg: Any, config: Mapping[str, Any]) -> None:
     """Validate Bridge config, then preserve explicit NeMo-RL prepadding."""
+    validate_hf_export_config(config["megatron_cfg"])
     megatron_cfg.validate()
 
     if config["megatron_cfg"].get("moe_hybridep_prepad_packed_inputs"):

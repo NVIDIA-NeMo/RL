@@ -95,6 +95,10 @@ from nemo_rl.models.megatron.draft.step_state import (
     DraftStepPayload,
     DraftStepState,
 )
+from nemo_rl.models.megatron.hf_export import (
+    export_final_hf_checkpoint,
+    save_tokenizer_sidecar,
+)
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -730,6 +734,17 @@ class MegatronPolicyWorkerImpl(
 
         # Validate configuration
         validate_megatron_config(self.megatron_cfg, self.cfg)
+
+        # Inline HF export state for megatron_cfg.checkpoint.save_consolidated.
+        self._pending_hf_export: Optional[tuple[str, Optional[str]]] = None
+        if self._get_save_consolidated() == "final":
+            log.warning(
+                "save_consolidated='final' is enabled: after the final "
+                "checkpoint save, rank 0 runs an inline CPU conversion to "
+                "Hugging Face format whose duration scales with model size. "
+                "Use examples/converters/convert_megatron_to_hf.py to convert "
+                "offline instead."
+            )
 
         # Step 4: Setup Megatron model and components
         assert not (skip_weight_load and (init_optimizer or init_reference_model)), (
@@ -4648,6 +4663,9 @@ class MegatronPolicyWorkerImpl(
         self,
         weights_path: str,
         optimizer_path: Optional[str] = None,
+        *,
+        is_final_checkpoint: bool = False,
+        tokenizer_path: Optional[str] = None,
         **kwargs,
     ):
         """Save a training checkpoint.
@@ -4662,6 +4680,10 @@ class MegatronPolicyWorkerImpl(
         Args:
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
+            is_final_checkpoint: Whether this save completes the training run. Only
+                then does ``save_consolidated="final"`` trigger the inline HF export.
+            tokenizer_path: If not None, the tokenizer is saved to this directory
+                (rank 0 only), mirroring the DTensor checkpoint layout.
         """
         if not torch.distributed.is_initialized():
             raise RuntimeError(
@@ -4757,6 +4779,37 @@ class MegatronPolicyWorkerImpl(
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
 
+        # Everything HF-related runs strictly after the native checkpoint is
+        # fully on disk (and finalized for async saves), so a preemption or a
+        # failed export only costs the HF copy, never resumability.
+        if tokenizer_path is not None and self.rank == 0:
+            save_tokenizer_sidecar(self.tokenizer, tokenizer_path)
+        if self._get_save_consolidated() == "final" and is_final_checkpoint:
+            if is_async:
+                # Deferred to finalize_async_save(), which the caller invokes
+                # before renaming the checkpoint directory.
+                self._pending_hf_export = (weights_path, tokenizer_path)
+            else:
+                self._finalize_hf_export(weights_path, tokenizer_path)
+
+    def _get_save_consolidated(self) -> Optional[str]:
+        """The ``megatron_cfg.checkpoint.save_consolidated`` value, if set."""
+        checkpoint_cfg = self.cfg["megatron_cfg"].get("checkpoint", None) or {}
+        return checkpoint_cfg.get("save_consolidated", None)
+
+    def _finalize_hf_export(self, weights_path: str, tokenizer_path: Optional[str]):
+        """Run the rank-0 inline HF export and resynchronize all ranks."""
+        barrier = (
+            torch.distributed.barrier if torch.distributed.is_initialized() else None
+        )
+        export_final_hf_checkpoint(
+            hf_model_name=self.cfg["model_name"],
+            weights_path=weights_path,
+            tokenizer_dir=tokenizer_path,
+            is_rank0=self.rank == 0,
+            barrier=barrier,
+        )
+
     def _requires_nvrx_cuda_cache_release(self) -> bool:
         """Whether checkpoint finalization must also drop cached CUDA IPC handles."""
         ckpt_cfg = self.mcore_state.cfg.checkpoint
@@ -4795,6 +4848,14 @@ class MegatronPolicyWorkerImpl(
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
             self._async_checkpoint_cuda_cache_active = False
+
+        # The native save is fully finalized at this point, and the caller
+        # renames the checkpoint directory only after this returns, so the
+        # exported files land inside the promoted checkpoint.
+        pending = self._pending_hf_export
+        if pending is not None:
+            self._pending_hf_export = None
+            self._finalize_hf_export(*pending)
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a training checkpoint.
