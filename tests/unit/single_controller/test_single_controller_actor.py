@@ -948,7 +948,10 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     )
 
 
-def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
+@pytest.mark.parametrize("support_mismatch", ["none", "token", "sample"])
+def test_advantage_stage_reports_seq_logprob_metrics_without_masking(
+    support_mismatch,
+) -> None:
     batch_size, sequence_length = 2, 5
     generation_logprobs = torch.zeros(batch_size, sequence_length)
     generation_logprobs[1, 1:] = 1.0
@@ -968,6 +971,10 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
         batch_size=[batch_size],
     )
     data_plane = _AdvantageDataPlane(data)
+    if support_mismatch == "token":
+        data["prev_logprobs"][0, 1] = -float("inf")
+    elif support_mismatch == "sample":
+        data["prev_logprobs"][0, 1:] = -float("inf")
     estimator = _MaskRecordingAdvantageEstimator()
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -1007,15 +1014,47 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     assert "prev_logprobs" in data_plane.selected_fields
     assert "generation_logprobs" in data_plane.selected_fields
     assert data_plane.written_fields is not None
-    assert "sample_mask" not in data_plane.written_fields
     assert estimator.mask is not None
-    assert estimator.mask.all()
+    if support_mismatch != "none":
+        expected_mask = torch.ones(batch_size, sequence_length)
+        if support_mismatch == "sample":
+            expected_mask[0, 1:] = 0
+        else:
+            expected_mask[0, 1] = 0
+        torch.testing.assert_close(
+            data_plane.written_fields["token_mask"], expected_mask
+        )
+        if support_mismatch == "sample":
+            torch.testing.assert_close(
+                data_plane.written_fields["sample_mask"], torch.tensor([0.0, 1.0])
+            )
+            expected_mask[0] = 0
+        torch.testing.assert_close(estimator.mask, expected_mask)
+    else:
+        assert estimator.mask.all()
+        assert "token_mask" not in data_plane.written_fields
+    if support_mismatch != "sample":
+        assert "sample_mask" not in data_plane.written_fields
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
     assert metrics[0]["num_masked_seqs_by_logprob_error"] == 0
     assert ctrl._step_log_dict["num_mask_sample_filtered"] == [0]
     assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(math.e)
+    valid_seqs = 1 if support_mismatch == "sample" else 2
+    assert metrics[0]["_num_valid_seqs_before"] == valid_seqs
+    assert metrics[0]["_num_valid_seqs_after"] == valid_seqs
+    if support_mismatch == "sample":
+        # A second chunk has two valid rows with probability error 1.
+        data["prev_logprobs"].zero_()
+        data["generation_logprobs"].zero_()
+        asyncio.run(ctrl._advantage_stage(meta))
+        reduced = single_controller.reduce_advantage_pump_metrics(**ctrl._step_log_dict)
+        expected_mean = (math.e + 2) / 3
+        assert reduced["mean_seq_mult_prob_error"] == pytest.approx(expected_mean)
+        assert reduced["mean_seq_mult_prob_error_after_mask"] == pytest.approx(
+            expected_mean
+        )
 
 
 def test_advantage_stage_clips_training_values_and_metrics() -> None:
@@ -1212,7 +1251,19 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     assert "advantages" in (result_meta.fields or [])
 
 
-def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
+@pytest.mark.parametrize(
+    ("tokenless_sample", "support_mismatch", "full_vocab"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, True, True),
+        (True, True, True),
+    ],
+)
+def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
+    tokenless_sample, support_mismatch, full_vocab
+) -> None:
     """SC passes the TQ teacher column under OPD's estimator contract."""
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
@@ -1235,12 +1286,18 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
                 {
                     "prompt_ids_for_adv": torch.zeros(2, 3, dtype=torch.long),
                     "total_reward": torch.zeros(2),
-                    "token_mask": torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]]),
+                    "token_mask": torch.tensor(
+                        [[0.0, 1.0, 1.0], [1.0, 0.0, 0.0]]
+                        if tokenless_sample
+                        else [[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]
+                    ),
                     "sample_mask": torch.ones(2),
                     "mask_sample": torch.zeros(2, dtype=torch.bool),
                     "truncated": torch.zeros(2, dtype=torch.bool),
                     "generation_logprobs": torch.full((2, 3), 0.5),
-                    "prev_logprobs": torch.full((2, 3), 0.5),
+                    "prev_logprobs": torch.full(
+                        (2, 3), -float("inf") if support_mismatch else 0.5
+                    ),
                     "teacher_reference_logprobs": torch.full((2, 3), 0.75),
                 },
                 batch_size=(2,),
@@ -1262,7 +1319,8 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         grpo=GRPOConfig(
             seq_logprob_error_threshold=None,
             advantage_clip_high=0.1,
-        )
+        ),
+        on_policy_distillation={"enabled": True, "full": {"enabled": full_vocab}},
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -1287,7 +1345,34 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
 
     enriched, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
 
-    assert has_valid_training_tokens
+    assert has_valid_training_tokens == (not support_mismatch or full_vocab)
+    assert ctrl._dp_client.put_fields is not None
+    if support_mismatch:
+        # Sampled diagnostics have no supported target, but exact KL retains
+        # every original loss-active position, even when the whole batch misses.
+        assert not captured_kwargs
+        fields = ctrl._dp_client.put_fields
+        torch.testing.assert_close(
+            single_controller.tensor_field(fields, "advantages"), torch.zeros(2, 3)
+        )
+        expected_sample_mask = (
+            torch.tensor([1.0, 0.0]) if tokenless_sample else torch.ones(2)
+        )
+        if full_vocab:
+            assert "token_mask" not in fields
+            if tokenless_sample:
+                torch.testing.assert_close(fields["sample_mask"], expected_sample_mask)
+            else:
+                assert "sample_mask" not in fields
+        else:
+            expected_sample_mask.zero_()
+            assert not fields["token_mask"].any()
+            torch.testing.assert_close(fields["sample_mask"], expected_sample_mask)
+        torch.testing.assert_close(
+            ctrl._step_log_dict["sample_masks"][0], expected_sample_mask
+        )
+        assert ctrl._opd_stat_count == 0
+        return
     assert set(captured_kwargs) >= {
         "teacher_logprobs",
         "prev_logprobs",
@@ -1297,22 +1382,32 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         "repeated_batch",
     }
     assert "logprobs_policy" not in captured_kwargs
-    assert torch.allclose(
-        captured_kwargs["teacher_logprobs"] - captured_kwargs["prev_logprobs"],
-        torch.full((2, 3), 0.25),
+    valid_mask = captured_kwargs["mask"].bool()
+    num_valid_tokens = 2 if tokenless_sample else 4
+    torch.testing.assert_close(
+        (captured_kwargs["teacher_logprobs"] - captured_kwargs["prev_logprobs"])[
+            valid_mask
+        ],
+        torch.full((num_valid_tokens,), 0.25),
     )
     assert "advantages" in (enriched.fields or [])
-    assert ctrl._opd_stat_sum == pytest.approx(1.0)
-    assert ctrl._opd_stat_sumsq == pytest.approx(0.25)
-    assert ctrl._opd_stat_count == 4
+    assert ctrl._opd_stat_sum == pytest.approx(0.25 * num_valid_tokens)
+    assert ctrl._opd_stat_sumsq == pytest.approx(0.25**2 * num_valid_tokens)
+    assert ctrl._opd_stat_count == num_valid_tokens
     assert ctrl._dp_client.put_fields is not None
-    written_advantages = ctrl._dp_client.put_fields["advantages"]
+    written_advantages = single_controller.tensor_field(
+        ctrl._dp_client.put_fields, "advantages"
+    )
     torch.testing.assert_close(
-        written_advantages,
-        torch.full_like(written_advantages, 0.1),
+        written_advantages[valid_mask],
+        torch.full((num_valid_tokens,), 0.1),
     )
     logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
-    torch.testing.assert_close(logged, torch.full((4,), 0.1))
+    torch.testing.assert_close(logged, torch.full((num_valid_tokens,), 0.1))
+    if tokenless_sample:
+        torch.testing.assert_close(
+            ctrl._dp_client.put_fields["sample_mask"], torch.tensor([1.0, 0.0])
+        )
 
 
 def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:

@@ -375,7 +375,7 @@ def _compute_seq_logprob_error_metrics(
     generation_logprobs: torch.Tensor,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: Optional[float],
-) -> tuple[torch.Tensor, dict[str, Any]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     # Thin BDD for the data-driven masking call: take
     # the slice you need, transform, write delta back.
     masking_data = BatchedDataDict[ClippedPGLossDataDict](
@@ -396,7 +396,12 @@ def _compute_seq_logprob_error_metrics(
         seq_logprob_error_metrics["num_masked_seqs_by_logprob_error"] = (
             seq_logprob_error_metrics.pop("num_masked_seqs")
         )
-    return masking_data["sample_mask"], seq_logprob_error_metrics
+    return (
+        masking_data["token_mask"],
+        masking_data["sample_mask"],
+        masking_data["prev_logprobs"],
+        seq_logprob_error_metrics,
+    )
 
 
 def _log_data_plane_metrics(
@@ -981,15 +986,18 @@ def grpo_train_sync(
                         else _placeholder_seq_logprob_error_metrics()
                     )
                 else:
-                    sample_mask, seq_logprob_error_metrics = (
-                        _compute_seq_logprob_error_metrics(
-                            token_mask=token_mask,
-                            sample_mask=loss_multiplier,
-                            prev_logprobs=prev_logprobs,
-                            generation_logprobs=generation_logprobs,
-                            rewards=rewards,
-                            seq_logprob_error_threshold=seq_logprob_error_threshold,
-                        )
+                    (
+                        token_mask,
+                        sample_mask,
+                        prev_logprobs,
+                        seq_logprob_error_metrics,
+                    ) = _compute_seq_logprob_error_metrics(
+                        token_mask=token_mask,
+                        sample_mask=loss_multiplier,
+                        prev_logprobs=prev_logprobs,
+                        generation_logprobs=generation_logprobs,
+                        rewards=rewards,
+                        seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
 
                 with timer.time("advantage_calculation"):
@@ -1031,16 +1039,13 @@ def grpo_train_sync(
                     del baseline_for_log
 
                 # ── Driver delta-write: advantages + (post-masking)
-                # sample_mask under the same meta.sample_ids so workers fetch
+                # token/sample masks under the same meta.sample_ids so workers fetch
                 # the union via train_presharded.
                 advantages = _clip_grpo_advantages(advantages, master_config.grpo)
-                policy.write_to_dataplane(
-                    meta,
-                    fields={
-                        "advantages": advantages,
-                        "sample_mask": sample_mask,
-                    },
-                )
+                fields_to_put = {"advantages": advantages, "sample_mask": sample_mask}
+                if not torch.equal(token_mask, extras_bdd["token_mask"]):
+                    fields_to_put["token_mask"] = token_mask
+                policy.write_to_dataplane(meta, fields=fields_to_put)
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)

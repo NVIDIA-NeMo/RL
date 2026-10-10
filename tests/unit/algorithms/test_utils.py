@@ -29,6 +29,7 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
     get_tokenizer,
+    mask_inactive_logprobs,
     maybe_pad_last_batch,
     print_efficiency_summary,
     print_performance_metrics,
@@ -37,6 +38,13 @@ from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.deepseek_v4_tokenizer import get_deepseek_v4_tokenizer
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def test_mask_inactive_logprobs_preserves_support_mismatch():
+    logprobs = torch.tensor([[0.0, -float("inf"), -float("inf"), -0.5]])
+    mask = torch.tensor([[1, 1, 0, 1]])
+    result = mask_inactive_logprobs(logprobs, mask)
+    torch.testing.assert_close(result, torch.tensor([[0.0, -float("inf"), 0.0, -0.5]]))
 
 
 @pytest.fixture

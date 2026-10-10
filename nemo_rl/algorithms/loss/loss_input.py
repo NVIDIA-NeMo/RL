@@ -28,7 +28,7 @@ from nemo_rl.algorithms.loss.utils import (
     map_teacher_logits_to_draft_vocab,
     reconstruct_opd_full_teacher_logits,
 )
-from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.algorithms.utils import mask_inactive_logprobs
 from nemo_rl.algorithms.x_token.loss_utils import (
     prepare_xtoken_cross_tokenizer_loss_input,
 )
@@ -267,10 +267,9 @@ def prepare_loss_input(
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
         if need_top_k_or_top_p_filtering(sampling_params):
-            # mask out negative infinity logprobs
-            # prev_logprobs is already masked out in the previous step
+            # Preserve -inf until the loss can update the token mask.
             mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-            logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+            logprobs = mask_inactive_logprobs(logprobs, mask[:, 1:])
 
             # compute unfiltered logprobs for reference policy KL penalty
             if (
@@ -541,7 +540,7 @@ def prepare_packed_loss_input(
     # use filtered curr_logprobs for actor loss, but keep unfiltered values for KL.
     if need_top_k_or_top_p_filtering(sampling_params):
         mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-        logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+        logprobs = mask_inactive_logprobs(logprobs, mask[:, 1:])
 
         if (
             hasattr(loss_fn, "reference_policy_kl_penalty")
