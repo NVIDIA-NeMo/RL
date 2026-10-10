@@ -261,16 +261,23 @@ class TrtllmGeneration(GenerationInterface):
             )
         return tied_groups
 
-    def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
+    def _report_dp_openai_server_base_urls(self) -> list[str]:
         """Collect HTTP server base URLs from each DP-rank-0 worker."""
         if not self.cfg["trtllm_cfg"].get("expose_http_server"):
-            urls = [cast(Optional[str], None)] * self.dp_size
-            return urls
+            # Empty rather than one None per DP rank: with no server running there is
+            # no per-rank slot to hold open, and the length said otherwise.
+            return []
         futures = self.worker_group.run_all_workers_single_data(
             "report_dp_openai_server_base_url",
             run_rank_0_only_axes=["tensor_parallel"],
         )
-        return ray.get(futures)
+        results = ray.get(futures)
+        # All-or-nothing, like the guarded branch above: expose_http_server is one
+        # config value for every worker. Collapsing the whole list rather than
+        # filtering keeps one entry per DP rank for anything that reads it by index.
+        if not any(results):
+            return []
+        return results
 
     def _report_device_id(self) -> list[list[str]]:
         futures = self.worker_group.run_all_workers_single_data(
