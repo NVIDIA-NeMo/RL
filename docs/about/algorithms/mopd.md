@@ -160,6 +160,44 @@ trainable) + 1 node vLLM generation (frozen) + 1 node teacher (frozen). Ten
 distinct teachers at 1 node each would instead add 10 nodes on top of the
 policy and generation nodes.
 
+### fp32 LM head
+
+`policy.megatron_cfg.fp32_lm_head` makes the student's LM head emit fp32 logits
+(pair it with `policy.generation.vllm_cfg.fp32_lm_head`). Teachers do not inherit
+it: each non-colocated teacher sets its own value, and setup rejects, before
+reserving any resources, a teacher whose setting differs from the student's.
+
+```yaml
+policy:
+  megatron_cfg:
+    fp32_lm_head: true
+  generation:
+    vllm_cfg:
+      fp32_lm_head: true
+
+on_policy_distillation:
+  non_colocated_teachers:
+    default_teacher_cfg:
+      fp32_lm_head: true  # required to match; never inherited from the student
+    # A per-alias override must match too:
+    # teacher_overrides: {<alias>: {fp32_lm_head: true}}
+```
+
+- `"tf32"` is accepted everywhere as an alias of `true`. The Megatron head always
+  runs Transformer Engine's GEMM on the bf16 operands with fp32 output, which is
+  at least as accurate as a TF32 GEMM at bf16-GEMM speed.
+- Set it as the teacher field above; `fp32_lm_head` inside
+  `megatron_cfg_overrides` is rejected.
+- [Full-vocabulary MOPD](#full-vocabulary-mopd): the student rebuilds the
+  teacher's logits from the `hidden_states` payload with the same fp32-output
+  GEMM (otherwise they are rounded to bf16), so self-distillation stays at zero
+  divergence. The rebuilt `[B, S/CP, V/TP]` teacher-logit tensor is held in fp32
+  for the backward pass (+1.2 GB per rank for the 8K-token Qwen3-1.7B recipe at
+  TP=2). The `logits` payload requires `on_policy_distillation.full.payload_dtype:
+  float32`.
+- With the fp32 head, `use_fused_linear_logprobs: true` on a teacher is rejected
+  on the top-k path: the fused kernel bypasses `output_layer`.
+
 ## Full-vocabulary MOPD
 
 `on_policy_distillation.full` replaces the sampled-token log-probability gap

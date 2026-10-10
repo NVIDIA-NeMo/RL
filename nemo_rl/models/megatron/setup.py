@@ -88,6 +88,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
 )
+from nemo_rl.utils.fp32_lm_head import fp32_lm_head_enabled
 
 _HF_CONFIG_PATCHED = False
 
@@ -1591,14 +1592,19 @@ def _apply_precision_config(
         "float16": torch.float16,
     }
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
-    if config["megatron_cfg"].get("fp32_lm_head"):
+    # Reached by the training policy and by every non-colocated MOPD teacher, so
+    # the messages name the megatron_cfg key rather than a particular owner.
+    if fp32_lm_head_enabled(
+        config["megatron_cfg"].get("fp32_lm_head"), key="megatron_cfg.fp32_lm_head"
+    ):
         if not hasattr(model_cfg, "logit_dtype"):
             raise ValueError(
-                "policy.megatron_cfg.fp32_lm_head requires a Megatron-Bridge "
+                "megatron_cfg.fp32_lm_head requires a Megatron-Bridge "
                 "provider that exposes logit_dtype; "
                 f"{type(model_cfg).__name__} does not."
             )
-        # Megatron-LM emits fp32 logits from a bf16 x bf16 tensor-core GEMM.
+        # Megatron-LM emits fp32 logits from a bf16 x bf16 tensor-core GEMM
+        # (Transformer Engine general_gemm with fp32 output); "tf32" maps here too.
         model_cfg.logit_dtype = torch.float32
 
     megatron_cfg = config["megatron_cfg"]

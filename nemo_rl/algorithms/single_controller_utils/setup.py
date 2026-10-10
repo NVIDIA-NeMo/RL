@@ -367,6 +367,34 @@ def _register_single_controller_partitions(
         )
 
 
+def _opd_full_transport(
+    master_config: MasterConfig,
+    opd_full_config: opd_module.OnPolicyDistillationFullConfig,
+) -> OnPolicyDistillationFullTransport:
+    """Assemble the resolved full-vocabulary MOPD settings the workers read.
+
+    model_dump() is typed dict[str, Any], so the envelope is assembled here and
+    cast: OnPolicyDistillationFullConfig stays the single source of the keys and
+    their defaults, and OnPolicyDistillationFullTransport mirrors it for the
+    workers that read it.
+    """
+    return cast(
+        OnPolicyDistillationFullTransport,
+        {
+            **opd_full_config.model_dump(),
+            "payload_field": opd_module.opd_full_payload_field(opd_full_config),
+            "teacher_index_field": opd_module.opd_full_teacher_index_field(
+                opd_full_config
+            ),
+            # Validated to match policy.megatron_cfg.fp32_lm_head: the student
+            # then rebuilds teacher logits with the teacher head's precision.
+            "teacher_fp32_lm_head": opd_module.resolve_teacher_fp32_lm_head(
+                master_config
+            ),
+        },
+    )
+
+
 def _non_colocated_teacher_node_count(master_config: MasterConfig) -> int:
     """Validate teacher GPU geometry and return its deduplicated node count."""
     if not opd_module.is_non_colocated_teachers_enabled(master_config):
@@ -381,6 +409,9 @@ def _non_colocated_teacher_node_count(master_config: MasterConfig) -> int:
     teacher_configs = create_teacher_configs_from_opd_config(
         opd_module._opd_cfg(master_config)
     )
+    # Fail before reserving any resources if a teacher's fp32 LM head does not
+    # match the student's.
+    opd_module.validate_teacher_fp32_lm_head(master_config, teacher_configs)
     cluster_gpus_per_node = master_config.cluster.gpus_per_node
     for teacher_config in teacher_configs:
         if teacher_config.gpus_per_node > cluster_gpus_per_node:
@@ -1315,19 +1346,8 @@ def setup_single_controller(
     # feature is off; workers must not re-derive a default.
     opd_full_config = opd_module.get_opd_full_config(master_config)
     if opd_full_config is not None:
-        # model_dump() is typed dict[str, Any], so the envelope is assembled here
-        # and cast: OnPolicyDistillationFullConfig stays the single source of the
-        # keys and their defaults, and OnPolicyDistillationFullTransport mirrors
-        # it for the workers that read it.
-        policy_config["on_policy_distillation_full"] = cast(
-            OnPolicyDistillationFullTransport,
-            {
-                **opd_full_config.model_dump(),
-                "payload_field": opd_module.opd_full_payload_field(opd_full_config),
-                "teacher_index_field": opd_module.opd_full_teacher_index_field(
-                    opd_full_config
-                ),
-            },
+        policy_config["on_policy_distillation_full"] = _opd_full_transport(
+            master_config, opd_full_config
         )
 
     set_seed(algo_cfg.seed)

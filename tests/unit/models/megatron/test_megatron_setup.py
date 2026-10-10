@@ -1310,6 +1310,34 @@ class TestApplyPrecisionConfig:
 
         assert model_cfg.logit_dtype is torch.float32
 
+    @pytest.mark.parametrize(
+        ("value", "expected"), [("tf32", torch.float32), (False, None)]
+    )
+    def test_fp32_lm_head_tf32_alias_maps_to_the_fp32_logit_dtype(
+        self, value, expected
+    ):
+        """The "tf32" alias runs the same bf16-operand, fp32-output head as true."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False, logit_dtype=None)
+        config = {"megatron_cfg": {"pipeline_dtype": "bfloat16", "fp32_lm_head": value}}
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.logit_dtype is expected
+
+    def test_fp32_lm_head_rejects_an_invalid_value(self):
+        """Teachers reach this without the Policy validator, so it must not guess."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False, logit_dtype=None)
+        config = {
+            "megatron_cfg": {"pipeline_dtype": "bfloat16", "fp32_lm_head": "fp16"}
+        }
+
+        with pytest.raises(ValueError, match='must be true, false, or "tf32"'):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
     def test_fp32_lm_head_requires_provider_logit_dtype(self):
         """Fail loudly when the Bridge provider cannot emit fp32 logits."""
         from nemo_rl.models.megatron.setup import _apply_precision_config

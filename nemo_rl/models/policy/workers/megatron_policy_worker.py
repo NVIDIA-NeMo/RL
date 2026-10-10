@@ -871,6 +871,15 @@ class MegatronPolicyWorkerImpl(
         self._opd_full_lm_head_lifecycle: Optional[str] = (
             opd_full_cfg["teacher_lm_head_lifecycle"] if opd_full_cfg else None
         )
+        # Output dtype of the student-side rebuild of teacher logits from the
+        # hidden-state payload: float32 when the teachers run an fp32 LM head, so
+        # the rebuilt logits match the teacher head's precision; None keeps the
+        # LM-head shard's dtype (the pre-fp32-head behavior).
+        self._opd_full_teacher_logits_dtype: Optional[torch.dtype] = (
+            torch.float32
+            if opd_full_cfg and opd_full_cfg["teacher_fp32_lm_head"]
+            else None
+        )
         self._opd_full_teacher_lm_heads: dict[int, torch.Tensor] = {}
         self._opd_full_teacher_checkpoint_paths: dict[int, str] = {}
         # Whether the ``evict`` lifecycle has dropped the shards and the next
@@ -1188,6 +1197,7 @@ class MegatronPolicyWorkerImpl(
                     sampling_params=self.sampling_params,
                     draft_model=self.draft_model,
                     teacher_output_layer_weight_by_index=self._opd_full_teacher_lm_heads,
+                    teacher_logits_dtype=self._opd_full_teacher_logits_dtype,
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
@@ -1881,6 +1891,7 @@ class MegatronPolicyWorkerImpl(
             draft_model=self.draft_model,
             defer_draft_normalization=True,
             teacher_output_layer_weight_by_index=self._opd_full_teacher_lm_heads,
+            teacher_logits_dtype=self._opd_full_teacher_logits_dtype,
         )
 
         # Placeholder N=1: loss returns un-normalized sums. ``backward``

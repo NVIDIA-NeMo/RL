@@ -953,6 +953,9 @@ def setup(
 
         opd_cfg = opd_module._opd_cfg(master_config)
         teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
+        # Fail before reserving any resources if a teacher's fp32 LM head does
+        # not match the student's.
+        opd_module.validate_teacher_fp32_lm_head(master_config, teacher_configs)
         for tcfg in teacher_configs:
             assert tcfg.gpus_per_node <= cluster_config.gpus_per_node, (
                 f"OPD teacher '{tcfg.alias}' requests gpus_per_node={tcfg.gpus_per_node} > "

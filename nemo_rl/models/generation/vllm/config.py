@@ -35,6 +35,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NvFp4PerTokenRolloutConfig,
     resolve_boundary_ignore_patterns,
 )
+from nemo_rl.utils.fp32_lm_head import Fp32LmHeadSetting, fp32_lm_head_enabled
 
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
@@ -74,8 +75,8 @@ class VllmSpecificArgs(TypedDict):
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
     # Nemotron-H only: compute vLLM Nemotron-H logits with an fp32 LM head.
     # Pair this with policy.megatron_cfg.fp32_lm_head when using a Megatron
-    # trainer.
-    fp32_lm_head: NotRequired[bool]
+    # trainer. "tf32" is accepted as an alias of true.
+    fp32_lm_head: NotRequired[Fp32LmHeadSetting]
     # Cap each request's generated tokens so the training prompt plus response
     # fits within max_model_len. This is needed when multimodal processing makes
     # the training prompt longer than its text-only representation.
@@ -130,8 +131,14 @@ class VllmSpecificArgs(TypedDict):
 def vllm_nemotron_h_fp32_lm_head_enabled(
     vllm_cfg: VllmSpecificArgs | dict[str, Any],
 ) -> bool:
-    """Return whether vLLM should run Nemotron-H logits with an fp32 head."""
-    return bool(vllm_cfg.get("fp32_lm_head"))
+    """Return whether vLLM should run Nemotron-H logits with an fp32 head.
+
+    Raises:
+        ValueError: If ``fp32_lm_head`` is not true, false, or ``"tf32"``.
+    """
+    return fp32_lm_head_enabled(
+        vllm_cfg.get("fp32_lm_head"), key="policy.generation.vllm_cfg.fp32_lm_head"
+    )
 
 
 class VllmDeltaCompressionConfig(BaseModel, extra="allow"):

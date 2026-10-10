@@ -216,6 +216,118 @@ def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatc
     assert policy_config["pretrained_checkpoint"]["path"] == "/ckpt/sft"
 
 
+def test_teacher_resource_config_fp32_lm_head_is_an_explicit_typed_field():
+    import pydantic
+
+    from nemo_rl.algorithms.opd import TeacherResourceConfig
+
+    assert TeacherResourceConfig().fp32_lm_head is False
+    assert TeacherResourceConfig(fp32_lm_head=True).fp32_lm_head is True
+    assert TeacherResourceConfig(fp32_lm_head="tf32").fp32_lm_head == "tf32"
+    with pytest.raises(pydantic.ValidationError):
+        TeacherResourceConfig(fp32_lm_head="fp16")
+    # A copy inside megatron_cfg_overrides would sidestep the student/teacher
+    # match check, so the typed field is the only place to set it.
+    with pytest.raises(
+        pydantic.ValidationError, match="not inside megatron_cfg_overrides"
+    ):
+        TeacherResourceConfig(megatron_cfg_overrides={"fp32_lm_head": True})
+
+
+def test_teacher_override_keeps_unset_fields_from_default_teacher_cfg():
+    """A per-alias override replaces only the keys it sets, on both config paths.
+
+    Real runs reach create_teacher_configs_from_opd_config through the parsed
+    MasterConfig, whose overrides are TeacherResourceConfig models. Dumping them
+    in full used to reset every default_teacher_cfg value (parallelism,
+    fp32_lm_head) to its class default for the overridden teacher.
+    """
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    raw = {
+        "enabled": True,
+        "teacher_model_by_agent_name": {"math": "/ckpt/math", "code": "/ckpt/code"},
+        "non_colocated_teachers": {
+            "enabled": True,
+            "default_teacher_cfg": {
+                "tensor_model_parallel_size": 4,
+                "fp32_lm_head": "tf32",
+            },
+            "teacher_overrides": {"code": {"num_nodes": 2}},
+        },
+    }
+    parsed = _opd_cfg({"on_policy_distillation": OnPolicyDistillationConfig(**raw)})
+
+    for opd_cfg in (raw, parsed):
+        configs = {c.alias: c for c in create_teacher_configs_from_opd_config(opd_cfg)}
+        assert configs["code"].num_nodes == 2
+        assert configs["code"].tensor_model_parallel_size == 4
+        assert configs["code"].fp32_lm_head == "tf32"
+        assert configs["math"].fp32_lm_head == "tf32"
+        assert "fp32_lm_head" not in configs["code"].megatron_cfg_overrides
+
+
+def test_teacher_worker_group_never_inherits_the_student_fp32_lm_head(monkeypatch):
+    """The deep-copied student config must not set the teacher's LM-head precision."""
+    import nemo_rl.distributed.worker_groups as worker_groups
+    from nemo_rl.models.policy.teacher_worker_group import (
+        TeacherConfig,
+        TeacherWorkerGroup,
+    )
+
+    captured = {}
+
+    class FakeWorkerBuilder:
+        def __init__(self, worker_path, cfg, **kwargs):
+            del worker_path, kwargs
+            captured["cfg"] = cfg
+
+    class FakeWorkerGroup:
+        def __init__(self, cluster, worker_builder, **kwargs):
+            del cluster, worker_builder, kwargs
+
+        def shutdown(self, **kwargs):
+            return True
+
+    monkeypatch.setattr(worker_groups, "RayWorkerBuilder", FakeWorkerBuilder)
+    monkeypatch.setattr(worker_groups, "RayWorkerGroup", FakeWorkerGroup)
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    policy_config = {
+        "model_name": "/ckpt/student",
+        "megatron_cfg": {"enabled": True, "fp32_lm_head": True},
+        "dtensor_cfg": {"enabled": False},
+        "sequence_packing": {"enabled": False},
+        "dynamic_batching": {"enabled": False},
+    }
+
+    for teacher_value in (False, True, "tf32"):
+        teacher_config = TeacherConfig(
+            alias="teacher",
+            model_name="/ckpt/teacher",
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+            num_nodes=1,
+            gpus_per_node=1,
+            precision="bf16",
+            micro_batch_size=1,
+            megatron_cfg_overrides={},
+            fp32_lm_head=teacher_value,
+        )
+        TeacherWorkerGroup(
+            teacher_config, cluster, policy_config, MagicMock(), teacher_index=0
+        )
+        assert captured["cfg"]["megatron_cfg"]["fp32_lm_head"] == teacher_value
+
+    # The student's own config is left alone.
+    assert policy_config["megatron_cfg"]["fp32_lm_head"] is True
+
+
 def _disable_opd_full(teacher) -> None:
     """Set the opd_full attributes to the state __init__ gives them when off.
 
