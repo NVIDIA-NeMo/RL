@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import pickle
 from typing import Any
 from unittest.mock import MagicMock
@@ -36,7 +37,12 @@ from nemo_rl.models.generation.dynamo.metrics import (
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
 
 
-def _config(*, tp: int = 1, expose_http_server: bool = False) -> dict[str, Any]:
+def _config(
+    *,
+    tp: int = 1,
+    expose_http_server: bool = False,
+    enable_multimodal: bool = False,
+) -> dict[str, Any]:
     return {
         "backend": "dynamo",
         "model_name": "Qwen/Qwen3-0.6B",
@@ -91,7 +97,7 @@ def _config(*, tp: int = 1, expose_http_server: bool = False) -> dict[str, Any]:
             "vllm_metrics_logger_interval": 1.0,
             "env_vars": None,
         },
-        "vllm_kwargs": {},
+        "vllm_kwargs": {"enable_multimodal": True} if enable_multimodal else {},
     }
 
 
@@ -202,24 +208,148 @@ def test_blocking_generate_is_rejected_and_async_generation_uses_http(
     assert "return_tokens_as_token_ids" not in requests[0][1]
 
 
-@pytest.mark.parametrize("prompt_key", ["vllm_content", "vllm_multi_modal_data"])
-def test_async_generate_rejects_multimodal_prompt_columns(
-    monkeypatch: pytest.MonkeyPatch, prompt_key: str
+def _multimodal_generation(**config_kwargs: Any) -> DynamoGeneration:
+    """Build a generation object whose worker opted into modality payloads."""
+    return DynamoGeneration(
+        cluster=object(), config=_config(enable_multimodal=True, **config_kwargs)
+    )
+
+
+def _run_async_generate(
+    generation: DynamoGeneration, data: BatchedDataDict
+) -> list[Any]:
+    async def collect() -> list[Any]:
+        return [item async for item in generation.generate_async(data)]
+
+    return asyncio.run(collect())
+
+
+_DESCRIPTOR = {"dtype": "float32-le", "shape": [2, 4], "data_base64": "AAAAAA=="}
+
+
+def test_async_generate_forwards_content_and_multimodal_data(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_runtime(monkeypatch)
-    post = MagicMock(
-        side_effect=AssertionError("Multimodal prompts must not reach HTTP")
-    )
+    requests = []
+
+    async def fake_post(url, payload, timeout_s):
+        requests.append((url, payload, timeout_s))
+        return _completion_response([8, 9])
+
+    monkeypatch.setattr(generation_module, "async_http_post_json", fake_post)
+    data = _data()
+    data["vllm_content"] = ["rendered <image> prompt"]
+    data["vllm_multi_modal_data"] = [{"custom_input": _DESCRIPTOR}]
+
+    outputs = _run_async_generate(_multimodal_generation(), data)
+
+    assert outputs[0][1]["output_ids"].tolist() == [[1, 2, 3, 8, 9]]
+    payload = requests[0][1]
+    assert payload["prompt"] == "rendered <image> prompt"
+    assert payload["multi_modal_data"] == {"custom_input": _DESCRIPTOR}
+    # The transport is JSON; a payload that cannot be encoded never reaches it.
+    json.dumps(payload)
+
+
+def test_async_generate_forwards_multimodal_data_without_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_runtime(monkeypatch)
+    requests = []
+
+    async def fake_post(url, payload, timeout_s):
+        requests.append((url, payload, timeout_s))
+        return _completion_response([8, 9])
+
+    monkeypatch.setattr(generation_module, "async_http_post_json", fake_post)
+    data = _data()
+    # Placeholder-style processors leave vllm_content unset so the expanded
+    # input_ids stay authoritative.
+    data["vllm_content"] = [None]
+    data["vllm_multi_modal_data"] = [{"custom_input": _DESCRIPTOR}]
+
+    outputs = _run_async_generate(_multimodal_generation(), data)
+
+    assert outputs[0][1]["output_ids"].tolist() == [[1, 2, 3, 8, 9]]
+    assert requests[0][1]["prompt"] == [1, 2, 3]
+    assert requests[0][1]["multi_modal_data"] == {"custom_input": _DESCRIPTOR}
+
+
+@pytest.mark.parametrize(
+    "multi_modal_row",
+    [None, {}, {"custom_input": None}, {"custom_input": []}],
+    ids=["absent", "empty-map", "none-value", "empty-sequence"],
+)
+def test_async_generate_keeps_token_prompt_without_modality_data(
+    monkeypatch: pytest.MonkeyPatch, multi_modal_row
+) -> None:
+    """A text-only row keeps the pre-tokenized prompt even when content is set.
+
+    ``format_prompt_for_vllm_generation`` applies the same rule, so both
+    backends tokenize such a row identically and the response splice in
+    ``_single_sample_output`` stays aligned with ``input_ids``.
+    """
+    _patch_runtime(monkeypatch)
+    requests = []
+
+    async def fake_post(url, payload, timeout_s):
+        requests.append((url, payload, timeout_s))
+        return _completion_response([8, 9])
+
+    monkeypatch.setattr(generation_module, "async_http_post_json", fake_post)
+    data = _data()
+    data["vllm_content"] = ["rendered prompt"]
+    data["vllm_multi_modal_data"] = [multi_modal_row]
+
+    _run_async_generate(_multimodal_generation(), data)
+
+    assert requests[0][1]["prompt"] == [1, 2, 3]
+    assert "multi_modal_data" not in requests[0][1]
+
+
+def test_async_generate_requires_worker_multimodal_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_runtime(monkeypatch)
+    post = MagicMock(side_effect=AssertionError("request must not be sent"))
     monkeypatch.setattr(generation_module, "async_http_post_json", post)
     generation = DynamoGeneration(cluster=object(), config=_config())
     data = _data()
-    data[prompt_key] = ["prompt" if prompt_key == "vllm_content" else {"image": "img"}]
+    data["vllm_multi_modal_data"] = [{"custom_input": _DESCRIPTOR}]
 
-    async def collect() -> list:
-        return [item async for item in generation.generate_async(data)]
+    with pytest.raises(ValueError, match="enable_multimodal"):
+        _run_async_generate(generation, data)
+    post.assert_not_called()
 
-    with pytest.raises(NotImplementedError, match="multimodal"):
-        asyncio.run(collect())
+
+def test_async_generate_rejects_non_json_modality_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Engine-native objects have no wire form on the completions transport."""
+    _patch_runtime(monkeypatch)
+    post = MagicMock(side_effect=AssertionError("request must not be sent"))
+    monkeypatch.setattr(generation_module, "async_http_post_json", post)
+    data = _data()
+    data["vllm_multi_modal_data"] = [{"image": object()}]
+
+    with pytest.raises(ValueError, match="not JSON-encodable"):
+        _run_async_generate(_multimodal_generation(), data)
+    post.assert_not_called()
+
+
+def test_async_generate_rejects_non_string_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_runtime(monkeypatch)
+    post = MagicMock(side_effect=AssertionError("request must not be sent"))
+    monkeypatch.setattr(generation_module, "async_http_post_json", post)
+    data = _data()
+    data["vllm_content"] = [[{"type": "text", "text": "hi"}]]
+    data["vllm_multi_modal_data"] = [{"custom_input": _DESCRIPTOR}]
+
+    with pytest.raises(ValueError, match="vllm_content"):
+        _run_async_generate(_multimodal_generation(), data)
     post.assert_not_called()
 
 
@@ -481,7 +611,7 @@ def test_completion_retry_eventually_succeeds(monkeypatch) -> None:
 
     token_ids, _, _ = asyncio.run(
         generation._post_completion_request(
-            prompt_token_ids=[1],
+            prompt=[1],
             greedy=False,
             stop_strings=None,
             max_new_tokens=1,
@@ -513,7 +643,7 @@ def test_completion_retry_stops_on_nonretryable_or_exhaustion(
     with pytest.raises(RuntimeError, match=f"HTTP {status}"):
         asyncio.run(
             generation._post_completion_request(
-                prompt_token_ids=[1],
+                prompt=[1],
                 greedy=False,
                 stop_strings=None,
                 max_new_tokens=1,
@@ -547,7 +677,7 @@ def test_direct_completions_are_not_limited_by_default_thread_pool(
         tasks = [
             asyncio.create_task(
                 generation._post_completion_request(
-                    prompt_token_ids=[1],
+                    prompt=[1],
                     greedy=False,
                     stop_strings=None,
                     max_new_tokens=1,
