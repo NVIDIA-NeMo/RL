@@ -643,6 +643,61 @@ def test_vllm_generation_rejects_partial_refit_pause_and_resume(
         generation.resume_generation_after_refit()
 
 
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        ([True, True], True),
+        ([True, False], False),
+        ([None, None], False),
+        ([], False),
+    ],
+)
+def test_invalidate_kv_cache_requires_a_reported_success(
+    monkeypatch: pytest.MonkeyPatch,
+    results: list[bool | None],
+    expected: bool,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": False}}
+    generation.worker_group = MagicMock()
+    monkeypatch.setattr(ray, "get", MagicMock(return_value=results))
+
+    assert generation.invalidate_kv_cache() is expected
+
+
+def test_reset_prefix_cache_returns_engine_bool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+    worker.llm = MagicMock()
+    worker.llm.llm_engine.reset_prefix_cache.return_value = False
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker.torch.cuda.empty_cache",
+        lambda: None,
+    )
+
+    assert worker.reset_prefix_cache() is False
+    worker.llm.llm_engine.reset_prefix_cache.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_reset_prefix_cache_async_returns_engine_bool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = MagicMock()
+    worker.llm.reset_prefix_cache = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.torch.cuda.empty_cache",
+        lambda: None,
+    )
+
+    assert await worker.reset_prefix_cache_async() is False
+    worker.llm.reset_prefix_cache.assert_awaited_once_with()
+
+
 def test_sampling_params_preserve_bad_words():
     worker = object.__new__(VllmGenerationWorkerImpl)
     worker.cfg = {

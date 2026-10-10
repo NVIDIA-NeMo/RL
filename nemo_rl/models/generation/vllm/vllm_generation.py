@@ -1661,7 +1661,7 @@ class VllmGeneration(GenerationInterface):
         """Invalidate reusable caches in vLLM (e.g., prefix/KV cache) after weight updates.
 
         For async_engine, calls reset_prefix_cache_async on workers. For sync, calls reset_prefix_cache.
-        Returns True if all workers report success.
+        Returns True only when at least one worker reports a result and every reported result succeeds.
         """
         try:
             method_name = (
@@ -1674,7 +1674,8 @@ class VllmGeneration(GenerationInterface):
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
             results = ray.get(futures)
-            return all(result for result in results if result is not None)
+            reported = [result for result in results if result is not None]
+            return bool(reported) and all(reported)
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")
             return False
