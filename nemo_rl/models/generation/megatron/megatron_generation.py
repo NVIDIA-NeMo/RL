@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
@@ -602,10 +603,14 @@ class MegatronGeneration(GenerationInterface):
         futures = worker.generate_async._remote(
             kwargs={"data": data, "greedy": greedy}, num_returns="streaming"
         )
-        async for result_ref in futures:
-            index, result_batch = await result_ref
-            result_batch["gen_leader_worker_idx"] = [0]
-            yield index, result_batch
+        try:
+            async for result_ref in futures:
+                index, result_batch = await result_ref
+                result_batch["gen_leader_worker_idx"] = [0]
+                yield index, result_batch
+        except (asyncio.CancelledError, GeneratorExit):
+            ray.cancel(futures)
+            raise
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Initialize / re-enter inference mode on every worker.
