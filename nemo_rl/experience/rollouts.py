@@ -18,6 +18,7 @@
 import asyncio
 import copy
 import json
+import logging
 import statistics
 import uuid
 import warnings
@@ -97,6 +98,8 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.timer import Timer
+
+logger = logging.getLogger(__name__)
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -961,6 +964,84 @@ def calculate_rewards(
     )
 
 
+# Task names whose environment hook has already failed once in this process. The
+# failure is reported the first time only: a hook that cannot run on the rollout
+# batch would otherwise repeat the same warning on every step.
+_ENV_METRICS_HOOK_WARNED: set[str] = set()
+
+
+def _env_metrics_enabled(task_to_env: dict[str, EnvironmentInterface]) -> bool:
+    """Whether any environment opts into metadata-based step metrics.
+
+    The ``aggregates_rollout_metadata`` marker is checked by name, so it works
+    on a Ray actor handle as well as a local instance.
+    """
+    return any(
+        hasattr(env, "aggregates_rollout_metadata") for env in task_to_env.values()
+    )
+
+
+def _aggregate_env_metrics(
+    rollout_metrics: dict[str, Any],
+    task_names: Optional[list[str]],
+    metadata_list: Optional[list[dict[str, Any] | None]],
+    task_to_env: dict[str, EnvironmentInterface],
+) -> None:
+    """Merge each opted-in environment's step metrics into ``rollout_metrics`` in place.
+
+    Groups the rows by ``task_name``, calls each environment's
+    ``global_post_process_and_metrics`` on a batch holding its rows' per-sample
+    ``metadata``, and merges what it returns as ``{task_name}/{metric}``.
+    Environments opt in by defining an ``aggregates_rollout_metadata`` marker
+    method (checked by name, so it works on a Ray actor handle); an
+    environment without the marker is never called here, because existing
+    implementations read trained-batch keys (``rewards``, ``is_end``,
+    ``text``) that this rollout-time batch does not carry. The call is best
+    effort: a hook that raises contributes nothing for the step, and the
+    error is reported once per task rather than on every step, so metric
+    aggregation can never crash a rollout.
+
+    All three native rollout paths call this: ``run_multi_turn_rollout``,
+    ``run_async_multi_turn_rollout``, and (per prompt group)
+    ``run_async_multi_turn_rollout_groups``. On the groups path,
+    ``aggregate_rollout_metrics`` later averages each returned key over groups
+    with equal weight, so means and rates aggregate exactly and counts do not.
+    """
+    if metadata_list is None or task_names is None:
+        return
+    task_to_indices: dict[str, list[int]] = {}
+    for idx, task_name in enumerate(task_names):
+        task_to_indices.setdefault(task_name, []).append(idx)
+
+    for task_name, indices in task_to_indices.items():
+        if task_name not in task_to_env:
+            continue
+        env = task_to_env[task_name]
+        if not hasattr(env, "aggregates_rollout_metadata"):
+            continue
+        try:
+            sub_batch = BatchedDataDict(
+                {"metadata": [metadata_list[i] for i in indices]}
+            )
+            # Envs are Ray actors in the training loop but may be local in tests.
+            post_process = env.global_post_process_and_metrics
+            if hasattr(post_process, "remote"):
+                _, env_metrics = ray.get(post_process.remote(sub_batch))
+            else:
+                _, env_metrics = post_process(sub_batch)
+            for k, v in env_metrics.items():
+                rollout_metrics[f"{task_name}/{k}"] = v
+        except Exception:
+            if task_name in _ENV_METRICS_HOOK_WARNED:
+                continue
+            _ENV_METRICS_HOOK_WARNED.add(task_name)
+            logger.warning(
+                "Error aggregating '%s' env metrics (reported once)",
+                task_name,
+                exc_info=True,
+            )
+
+
 def run_multi_turn_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -1009,6 +1090,9 @@ def run_multi_turn_rollout(
     sample_terminated = torch.zeros(batch_size, dtype=torch.bool)
     sample_truncated = torch.zeros(batch_size, dtype=torch.bool)
     sample_max_turns_reached = torch.zeros(batch_size, dtype=torch.bool)
+    # Track per-sample environment metadata (EnvironmentReturn.metadata) so
+    # global_post_process_and_metrics can aggregate env-specific online metrics.
+    sample_env_metadata: list[dict | None] = [None for _ in range(batch_size)]
 
     # Tracking per-turn metrics
     total_gen_tokens_per_turn = []
@@ -1103,6 +1187,9 @@ def run_multi_turn_rollout(
         truncation_mask = torch.zeros_like(env_output.terminateds, dtype=torch.bool)
         for i, global_idx in enumerate(active_indices.tolist()):
             env_obs_content = env_output.observations[i]["content"]
+            # Record the latest per-sample environment metadata so it can be
+            # aggregated by the env's global_post_process_and_metrics below.
+            sample_env_metadata[global_idx] = env_output.metadata[i]
             # Tokenize the raw content from the environment
             # TODO @sahilj: handle if we want these subsequent messages to have a chat template
             tokenized_obs = tokenizer(
@@ -1180,6 +1267,11 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
     current_batch["truncated"] = sample_truncated
+    # Attach per-sample environment metadata for _aggregate_env_metrics. Only
+    # when an environment opts in, so the batch layout is unchanged for
+    # environments that do not.
+    if _env_metrics_enabled(task_to_env):
+        current_batch["metadata"] = sample_env_metadata
     # Expose per-component rewards for multi-reward envs (e.g. GDPO advantage calculation).
     if multi_rewards is not None:
         for name, reward_tensor in multi_rewards.items():
@@ -1208,6 +1300,16 @@ def run_multi_turn_rollout(
             sample_env_token_counts.float().mean().item()
         ),
     }
+
+    # Merge per-environment step metrics derived from the rows' metadata
+    # (see _aggregate_env_metrics).
+    _aggregate_env_metrics(
+        rollout_metrics,
+        current_batch.get("task_name"),
+        current_batch.get("metadata"),
+        task_to_env,
+    )
+
     return current_batch, rollout_metrics
 
 
@@ -1346,6 +1448,9 @@ async def run_sample_multi_turn_rollout(
     terminated = False
     truncated = False
     max_turns_reached = False
+    # Latest env metadata for this sample (the per-sample scores an environment
+    # reports); collected for _aggregate_env_metrics.
+    last_env_metadata: dict | None = None
 
     # Track per-turn metrics
     turn_gen_tokens = []
@@ -1425,6 +1530,8 @@ async def run_sample_multi_turn_rollout(
         env_output = await asyncio.to_thread(
             calculate_rewards, sample_batch, task_to_env
         )
+        # Track the latest env metadata for _aggregate_env_metrics.
+        last_env_metadata = env_output.metadata[0]
         # Update total reward and optional per-component reward signals.
         if isinstance(env_output.rewards, dict):
             multi_reward_seen = True
@@ -1488,6 +1595,7 @@ async def run_sample_multi_turn_rollout(
         "total_reward": torch.tensor(total_reward),
         "stop_strings": current_stop_strings,
         "idx": sample_idx,
+        "metadata": last_env_metadata,
     }
     if multi_reward_seen:
         for name, acc in reward_acc_dict.items():
@@ -1681,6 +1789,15 @@ async def _run_multi_turn_rollout_async(
             ),
         }
     )
+    # Per-sample environment metadata, as in the synchronous path, so
+    # _aggregate_env_metrics can aggregate env-specific online metrics. Only
+    # when an environment opts in, so the batch layout is unchanged for
+    # environments that do not; a replay buffer saved without the column can
+    # then be extended by these batches on resume.
+    if _env_metrics_enabled(task_to_env):
+        final_batch["metadata"] = [
+            state.get("metadata") for state in final_sample_states
+        ]
 
     # Preserve named per-component rewards for GDPO. Mixed environment batches
     # use zero for samples that do not expose a given reward component.
@@ -1750,7 +1867,16 @@ def run_async_multi_turn_rollout(
             deduplicate_multimodal_data=deduplicate_multimodal_data,
         )
     )
-    return final_batch, _aggregate_multi_turn_rollout_metrics(sample_metrics)
+    rollout_metrics = _aggregate_multi_turn_rollout_metrics(sample_metrics)
+    # Merge per-environment step metrics derived from the rows' metadata
+    # (see _aggregate_env_metrics).
+    _aggregate_env_metrics(
+        rollout_metrics,
+        final_batch.get("task_name"),
+        final_batch.get("metadata"),
+        task_to_env,
+    )
+    return final_batch, rollout_metrics
 
 
 async def run_async_multi_turn_rollout_groups(
@@ -1809,12 +1935,23 @@ async def run_async_multi_turn_rollout_groups(
     )
     for group_index, start in enumerate(range(0, final_batch.size, num_generations)):
         end = start + num_generations
+        group_batch = final_batch.slice(start, end)
+        group_metrics = _aggregate_multi_turn_rollout_metrics(sample_metrics[start:end])
+        # Merge per-environment step metrics for this group's rows (see
+        # _aggregate_env_metrics). The hook may call a Ray actor with a
+        # blocking ray.get, so it runs off the event loop for the same reason
+        # calculate_rewards is wrapped above.
+        await asyncio.to_thread(
+            _aggregate_env_metrics,
+            group_metrics,
+            group_batch.get("task_name"),
+            group_batch.get("metadata"),
+            task_to_env,
+        )
         yield RolloutGroupResult(
             group_index=group_index,
-            final_batch=final_batch.slice(start, end),
-            rollout_metrics=_aggregate_multi_turn_rollout_metrics(
-                sample_metrics[start:end]
-            ),
+            final_batch=group_batch,
+            rollout_metrics=group_metrics,
         )
 
 

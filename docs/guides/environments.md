@@ -266,3 +266,28 @@ env:
 data:
   env_name: code_gen  # Use your registered environment name
 ```
+
+### Per-Step Metrics from Rollout Metadata
+
+An environment can derive step-level metrics from the per-sample `metadata` it
+returned during the rollout, without waiting for the trained batch. Opt in by
+defining a marker method named `aggregates_rollout_metadata` on the
+environment class. The marker's body is never called; the name is checked
+with `hasattr`, so it works across a Ray actor handle.
+
+After each native rollout batch, and after each prompt group on the grouped
+path that asynchronous GRPO uses, NeMo RL groups the rows by `task_name` and
+calls the opted-in environment's `global_post_process_and_metrics` with a
+batch holding exactly one column, `metadata`: that environment's rows' latest
+per-sample metadata, in row order. Every key of the returned metrics mapping
+is logged as `{task_name}/{metric}`. A hook that raises contributes nothing
+for that step, and the failure is reported once per task rather than on every
+step.
+
+Without the marker, the hook is never called at rollout time, because
+existing implementations read trained-batch keys (`rewards`, `is_end`,
+`text`) that the rollout-time batch does not carry; the batch layout is also
+unchanged, since the `metadata` column is only attached when an environment
+opts in. Under asynchronous GRPO the per-group values are averaged with equal
+weight across groups, so means and rates aggregate exactly while counts do
+not.
