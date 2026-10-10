@@ -56,6 +56,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_and_free_port,
     _init_ray,
     _reserve_data_plane_ports,
+    ray_runtime_env_excludes,
 )
 from nemo_rl.utils.venvs import create_local_venv
 from tests.unit.conftest import TEST_ASSETS_DIR
@@ -940,6 +941,42 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW > 1024
     assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
     assert DEFAULT_DATA_PLANE_PORT_RANGE_LOW > 1024
+
+
+def test_ray_runtime_env_excludes_come_from_the_launcher_variable():
+    assert ray_runtime_env_excludes({}) == []
+    assert ray_runtime_env_excludes({"NRL_RAY_RUNTIME_ENV_EXCLUDES": " , "}) == []
+    assert ray_runtime_env_excludes(
+        {"NRL_RAY_RUNTIME_ENV_EXCLUDES": "**/a/**, **/b/tests/**"}
+    ) == ["**/a/**", "**/b/tests/**"]
+
+
+def test_init_ray_puts_the_excludes_in_the_runtime_env_of_a_fresh_cluster():
+    """The fresh-local branch (attaching fails, the second ray.init starts a
+    cluster) is the one a bare-metal ``uv run`` takes; the variable reaches its
+    runtime environment and an unset variable leaves the key out."""
+    from nemo_rl.distributed.virtual_cluster import init_ray
+
+    with (
+        patch("ray.init", side_effect=[ConnectionError("no cluster"), None]) as init,
+        patch("ray.cluster_resources", return_value={"GPU": 1, "nrl_tag_0": 1}),
+        patch.dict(
+            os.environ,
+            {"CUDA_VISIBLE_DEVICES": "0", "NRL_RAY_RUNTIME_ENV_EXCLUDES": "data/**"},
+            clear=True,
+        ),
+    ):
+        init_ray()
+    assert init.call_count == 2
+    assert init.call_args_list[1].kwargs["runtime_env"]["excludes"] == ["data/**"]
+
+    with (
+        patch("ray.init", side_effect=[ConnectionError("no cluster"), None]) as init,
+        patch("ray.cluster_resources", return_value={"GPU": 1, "nrl_tag_0": 1}),
+        patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True),
+    ):
+        init_ray()
+    assert "excludes" not in init.call_args_list[1].kwargs["runtime_env"]
 
 
 _REGISTRY_PROBE = """

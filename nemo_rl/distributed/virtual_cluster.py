@@ -17,7 +17,7 @@ import random
 import socket
 import sys
 import time
-from typing import NamedTuple, Optional, Sequence
+from typing import Any, Mapping, NamedTuple, Optional, Sequence
 
 import ray
 from pydantic import BaseModel
@@ -377,6 +377,30 @@ def _get_free_consecutive_ports_local(
     )
 
 
+def ray_runtime_env_excludes(
+    environ: Mapping[str, str] | None = None,
+) -> list[str]:
+    """``.gitignore``-style patterns Ray leaves out of the working-directory package.
+
+    Ray packages a ``working_dir`` for its workers only while its ``uv run``
+    hook is active; importing ``nemo_rl`` switches that hook off, so a driver
+    that imports ``ray`` first (``examples/run_grpo_single_controller.py``) is
+    the one that packages its launch directory under ``uv run``. Such a launch
+    whose tree carries data no worker reads, and whose size would exceed Ray's
+    package upload limit, exports ``NRL_RAY_RUNTIME_ENV_EXCLUDES``, a
+    comma-separated list of ``.gitignore``-style patterns; ``init_ray`` puts
+    them in the runtime environment's ``excludes``. Empty when the variable is
+    unset or blank.
+    """
+    if environ is None:
+        environ = os.environ
+    return [
+        pattern.strip()
+        for pattern in environ.get("NRL_RAY_RUNTIME_ENV_EXCLUDES", "").split(",")
+        if pattern.strip()
+    ]
+
+
 def _reserve_data_plane_ports(count: int) -> list[int]:
     """Reserve *count* distinct ports for the data plane's driver-side servers.
 
@@ -468,9 +492,12 @@ def _init_ray(log_dir: Optional[str] = None) -> str:
     env_vars = add_hf_modules_cache_to_pythonpath(dict(os.environ))
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
 
-    runtime_env = {
+    runtime_env: dict[str, Any] = {
         "env_vars": env_vars,  # Pass thru all user environment variables
     }
+    excludes = ray_runtime_env_excludes()
+    if excludes:
+        runtime_env["excludes"] = excludes
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
     # sort cvd to ensure consistent tag

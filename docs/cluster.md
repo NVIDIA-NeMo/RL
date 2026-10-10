@@ -221,6 +221,25 @@ sbatch ray.sub \
 > The defaults above are the source-of-truth port layout defined in `ray.sub`;
 > keep this table in sync with that block if the defaults ever change.
 
+#### Bare-metal `uv run` drivers: `NRL_RAY_RUNTIME_ENV_EXCLUDES`
+
+A `working_dir` is packaged only while Ray's `uv run` hook is active. NeMo RL
+switches that hook off when `nemo_rl` is imported (`nemo_rl/__init__.py`), so
+`examples/run_grpo.py` and every `ray.sub` launch package nothing and ignore
+this variable; a driver that imports `ray` before `nemo_rl`, such as
+`examples/run_grpo_single_controller.py`, keeps the hook on and packages its
+launch directory when run with `uv run`. For those drivers,
+`NRL_RAY_RUNTIME_ENV_EXCLUDES` (unset by default) is a comma-separated list of
+`.gitignore`-style patterns that `init_ray` places in the Ray runtime
+environment's `excludes`, so Ray leaves the matching paths out of the package.
+Set it when the launch directory carries data no worker reads, such as vendored
+test data or local datasets, whose size would exceed Ray's package upload
+limit. A pattern with a slash at its start or inside it is anchored to the
+working directory (`data/**`); a bare name matches at any depth (`tests`), for
+example `NRL_RAY_RUNTIME_ENV_EXCLUDES="data/**,tests"`. Ray already excludes
+`.git`, `.venv`, `venv` and `__pycache__` and honors `.gitignore` and
+`.rayignore`.
+
 ### Topology-Aware Placement for MoE (avoiding cross-rack stalls)
 
 On clusters where one NVLink domain spans a fixed set of nodes (e.g. a GB200
