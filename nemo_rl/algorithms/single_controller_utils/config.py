@@ -1207,6 +1207,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 )
         return
 
+    algo_cfg = cast(PPOConfig, algo_cfg)
     for name in ("value", "value_loss_fn"):
         if getattr(master_config, name, None) is None:
             raise ValueError(
@@ -1225,20 +1226,53 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
-    # Each PPO epoch must consume the complete RL batch. Without this guard, every
-    # chunk would independently run the configured actor and critic optimizer steps.
-    if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
-        raise ValueError(
-            "PPO on the SingleController path requires "
-            "async_rl.min_groups_for_streaming_train "
-            f"({async_config.min_groups_for_streaming_train}) == "
-            f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) so that each RL "
-            "step is assembled from a single chunk. Otherwise each chunk would "
-            "run ppo.critic_ppo_epochs critic optimizer steps and ppo.ppo_epochs "
-            "policy optimizer steps on only part of the RL batch. Streaming PPO "
-            "needs a split train API on the value workers, which they do not have "
-            "yet (#2625)."
-        )
+    policy_megatron_cfg = master_config.policy.get("megatron_cfg")
+    if async_config.min_groups_for_streaming_train < algo_cfg.num_prompts_per_step:
+        # Policy chunks accumulate into one optimizer update; critic epochs
+        # still consume the complete batch after the final policy chunk.
+        if algo_cfg.ppo_epochs != 1:
+            raise ValueError(
+                "Streaming PPO requires ppo.ppo_epochs=1 when "
+                "async_rl.min_groups_for_streaming_train < ppo.num_prompts_per_step. "
+                f"Got ppo.ppo_epochs={algo_cfg.ppo_epochs}. Use a full-batch chunk "
+                "to run multiple policy epochs."
+            )
+        if not policy_megatron_cfg or not policy_megatron_cfg.get("enabled"):
+            raise ValueError(
+                "Streaming PPO requires a Megatron policy "
+                "(policy.megatron_cfg.enabled=true) to preserve accumulated "
+                "gradients across policy/value model switches."
+            )
+        policy_megatron_cfg = cast(MegatronConfig, policy_megatron_cfg)
+        ddp_config = policy_megatron_cfg.get("distributed_data_parallel_config")
+        if ddp_config is not None and (
+            ddp_config.get("use_custom_fsdp") or ddp_config.get("use_megatron_fsdp")
+        ):
+            raise ValueError(
+                "Streaming PPO requires classic Megatron DDP; policy gradient "
+                "offload during an open step does not support Megatron FSDP."
+            )
+        fp8_config = policy_megatron_cfg.get("fp8_cfg")
+        if (
+            fp8_config is not None
+            and fp8_config.get("enabled")
+            and fp8_config.get("fp8_param")
+            and fp8_config.get("fp8_recipe") == "mxfp8"
+            and policy_megatron_cfg["optimizer"]["use_distributed_optimizer"]
+        ):
+            raise ValueError(
+                "Streaming PPO does not support MXFP8 parameters with "
+                "the distributed optimizer: parameters and accumulated gradients "
+                "share storage even when overlap_param_gather=false. Disable "
+                "policy.megatron_cfg.fp8_cfg.fp8_param or use full-batch PPO."
+            )
+        if algo_cfg.adv_estimator.normalize_advantages:
+            warnings.warn(
+                "Streaming PPO with ppo.adv_estimator.normalize_advantages=true "
+                "normalizes GAE advantages per chunk instead of across the full "
+                "batch. Changing chunk boundaries can change normalized advantages.",
+                stacklevel=2,
+            )
 
     failure_config = async_config.rollout_failure
     drop_budget = (
@@ -1256,15 +1290,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "inside the value workers (#2625)."
         )
 
-    policy_megatron_cfg = master_config.policy.get("megatron_cfg", {})  # type: ignore
     if (
         getattr(algo_cfg, "policy_training_start_step", 0) > 0
         and master_config.checkpointing["enabled"]
         and master_config.checkpointing["save_optimizer"]
+        and policy_megatron_cfg is not None
         and policy_megatron_cfg.get("enabled")
-        and policy_megatron_cfg.get("checkpoint", {}).get(
-            "ckpt_assume_constant_structure"
-        )
+        and cast(MegatronConfig, policy_megatron_cfg)
+        .get("checkpoint", {})
+        .get("ckpt_assume_constant_structure")
     ):
         raise ValueError(
             "policy.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true "
@@ -1509,6 +1543,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "on_policy_distillation.enabled=true."
         )
     if opd_enabled:
+        algo_cfg = cast(GRPOConfig, algo_cfg)
         opd_config = master_config.on_policy_distillation
         assert opd_config is not None
         if algo_cfg.adv_estimator.name != "opd":
