@@ -152,6 +152,7 @@ class AdvEstimatorConfig(TypedDict):
     name: str  # "grpo", "gdpo", or "reinforce_plus_plus"
     # GRPO specific
     normalize_rewards: NotRequired[bool]
+    full_group_std: NotRequired[bool]
     use_leave_one_out_baseline: NotRequired[bool]
     # Reinforce++ specific
     minus_baseline: NotRequired[bool]
@@ -164,6 +165,7 @@ class GRPOConfig(TypedDict):
     max_num_steps: int
     max_rollout_turns: int
     normalize_rewards: bool
+    full_group_std: NotRequired[bool]
     # Clipping bounds for normalized advantages to prevent extreme values
     # When set, advantages are clipped to [advantage_clip_low, advantage_clip_high] after normalization
     # Default: null (no clipping)
@@ -1793,6 +1795,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         {
             "name": "grpo",
             "normalize_rewards": grpo_config.get("normalize_rewards", True),
+            "full_group_std": grpo_config.get("full_group_std", False),
             "use_leave_one_out_baseline": grpo_config.get(
                 "use_leave_one_out_baseline", False
             ),
@@ -2449,6 +2452,9 @@ def grpo_train(
                             leave_one_out_baseline=master_config.grpo[
                                 "use_leave_one_out_baseline"
                             ],
+                            full_group_std=master_config.grpo.get("adv_estimator", {}).get(
+                                "full_group_std", master_config.grpo.get("full_group_std", False)
+                            ),
                             std_rewards=(
                                 std_rewards.cuda(device_id)
                                 if std_rewards is not None
@@ -2466,6 +2472,9 @@ def grpo_train(
                                 "use_leave_one_out_baseline"
                             ],
                             std_rewards=std_rewards,
+                            full_group_std=master_config.grpo.get("adv_estimator", {}).get(
+                                "full_group_std", master_config.grpo.get("full_group_std", False)
+                            ),
                         )
 
                     # Apply dynamic sampling to filter prompts with non-zero std (DAPO algorithm)

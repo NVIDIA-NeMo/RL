@@ -106,6 +106,7 @@ def calculate_baseline_and_std_per_prompt(
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
     std_rewards: torch.Tensor | None = None,
+    full_group_std: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
 
@@ -122,6 +123,9 @@ def calculate_baseline_and_std_per_prompt(
                                   which needs std on the raw task metric for dynamic
                                   sampling filtering while keeping baseline on the
                                   shaped reward.
+
+    full_group_std: bool          Use centered full-valid-group sample std independently
+                                  of the leave-one-out mean. False preserves legacy behavior.
 
     Returns:
     tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
@@ -193,6 +197,13 @@ def calculate_baseline_and_std_per_prompt(
                 .sqrt()
                 .nan_to_num(0)
             )
+            if full_group_std:
+                valid_rewards = std_rewards[prompt_idx][valid_mask[prompt_idx].bool()]
+                std[prompt_idx] = torch.where(
+                    valid_rewards.amin() == valid_rewards.amax(),
+                    torch.zeros((), dtype=std.dtype, device=std.device),
+                    valid_rewards.std(correction=1),
+                )
 
     return baseline, std
 
