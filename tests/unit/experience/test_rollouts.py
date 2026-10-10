@@ -2844,7 +2844,7 @@ def _postprocess_rollouts(first_prompts, group_ids=None):
 
 
 def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog):
-    """Warn only when prompt-token baselines would split a logical prompt group.
+    """Warn only when the rollouts of one logical prompt group do not share a prompt.
 
     The comparison is distinct first prompts against logical prompt groups
     (``_ng_group_id``), so a validation batch with one rollout per prompt stays
@@ -2862,7 +2862,8 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog):
     assert shared.rollout_metrics["baseline_groups/samples"] == 2
     assert not warnings()
 
-    # One logical group split by per-rollout prompt strings: the failure.
+    # One logical group whose rollouts carry per-rollout prompt strings: the
+    # layout the diagnostic exists for.
     caplog.clear()
     with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
         distinct = _postprocess_rollouts([[1, 5, 7], [1, 5, 9]])
@@ -2871,7 +2872,7 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog):
     [record] = warnings()
     assert record.levelname == "WARNING"
     assert "form 1 logical prompt group(s) but have 2 distinct" in record.getMessage()
-    assert "prompt-token GRPO baselines split these groups" in record.getMessage()
+    assert "do not share a prompt prefix" in record.getMessage()
 
     # Validation layout: one rollout per prompt, one group id per row. Distinct
     # prompts are expected there and must not warn.

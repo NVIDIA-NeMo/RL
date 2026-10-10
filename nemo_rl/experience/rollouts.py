@@ -3151,10 +3151,14 @@ def _postprocess_single_nemo_gym_group(
         pad_value_dict={"token_ids": tokenizer.pad_token_id},
     )
     input_ids = batched_flat["token_ids"]
-    # Prompt-token GRPO baselines compare these first-prompt token rows
-    # (calculate_baseline_and_std_per_prompt). Per-rollout identifiers rendered
-    # by an agent harness can split a group into singleton baselines with zero
-    # advantages. Compare against the logical prompt groups rather than the row
+    # Within one logical prompt group every rollout should start from the same
+    # first prompt. An agent harness that renders a per-rollout identifier (an
+    # id, a URL, a timestamp) into its prompt gives each rollout a distinct
+    # first prompt instead: the group's prefix is never shared across the
+    # engine's prefix cache, and any consumer that keys on the first-prompt
+    # tokens (a per-prompt baseline, a cache, a dedup) sees one group per
+    # rollout. GRPO's baselines key on the explicit group id, so they are not
+    # affected. Compare against the logical prompt groups rather than the row
     # count: validation and distillation batches legitimately hold one rollout
     # per prompt. _prepare_nemo_gym_rows stamps one group id per logical prompt
     # group; rows handed in by a direct caller without the key form one group.
@@ -3166,9 +3170,9 @@ def _postprocess_single_nemo_gym_group(
     if distinct_first_prompts > logical_groups:
         logger.warning(
             "%d NeMo-Gym rollouts form %d logical prompt group(s) but have %d "
-            "distinct first prompts; prompt-token GRPO baselines split these "
-            "groups, and a singleton group gets zero advantage. Check that "
-            "per-rollout identifiers are not changing the agent harness prompt.",
+            "distinct first prompts, so the rollouts of a group do not share a "
+            "prompt prefix. Check that per-rollout identifiers are not changing "
+            "the agent harness prompt.",
             len(results),
             logical_groups,
             distinct_first_prompts,
