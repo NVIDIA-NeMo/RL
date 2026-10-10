@@ -1524,6 +1524,12 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         # Megatron Inference is always async; should_use_async_rollouts rejects
         # an explicit mcore_generation_config.async_engine key.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
+    elif backend == "trtllm":
+        # Same contract as vLLM, on trtllm_cfg. should_use_nemo_gym above already
+        # reads expose_http_server from this section, so leaving the backend out
+        # of this dispatch made every TRT-LLM Gym run die here.
+        generation_config["trtllm_cfg"]["async_engine"] = True
+        generation_config["trtllm_cfg"]["expose_http_server"] = True
     else:
         raise ValueError(
             "NeMo-Gym setup supports vllm, dynamo, or megatron generation; got "

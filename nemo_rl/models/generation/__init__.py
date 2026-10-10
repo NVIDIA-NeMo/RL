@@ -200,5 +200,10 @@ def configure_generation_config(
 
     elif config["backend"] == "trtllm":
         config = cast(TrtllmConfig, config)
+        # Same contract as vLLM above: the engine comes up on dummy weights
+        # and the initial refit installs the real ones before the collector
+        # is allowed to issue a request, so reading the checkpoint at startup
+        # would only be thrown away. Evaluation has no refit and must load.
+        config["trtllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
 
     return config
