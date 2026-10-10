@@ -21,7 +21,7 @@ from nemo_rl.data.energon.topology import (
     DefaultDataLoaderTopologyMapper,
     resolve_topology_mapper,
 )
-from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.named_sharding import GTP_WEIGHT_REMAT_AXIS, NamedSharding
 
 
 def _sharding(*, dp: int, pp: int = 1, cp: int = 1, tp: int = 1) -> NamedSharding:
@@ -75,3 +75,57 @@ def test_placement_hash_is_stable_and_layout_sensitive() -> None:
 def test_resolver_rejects_unknown_mapper() -> None:
     with pytest.raises(ValueError, match="Unknown data-loader topology mapper"):
         resolve_topology_mapper("mimo")
+
+
+def _gtp_sharding(
+    *, dp: int, gtp: int, pp: int = 1, cp: int = 1, tp: int = 1
+) -> NamedSharding:
+    world_size = dp * gtp * pp * cp * tp
+    return NamedSharding(
+        np.arange(world_size).reshape(pp, dp, gtp, cp, tp),
+        [
+            "pipeline_parallel",
+            "data_parallel",
+            GTP_WEIGHT_REMAT_AXIS,
+            "context_parallel",
+            "tensor_parallel",
+        ],
+    )
+
+
+@pytest.mark.parametrize("pp", [1, 2])
+def test_default_mapper_creates_one_copy_per_dp_gtp_lane(pp: int) -> None:
+    sharding = _gtp_sharding(dp=2, gtp=2, pp=pp, cp=2, tp=2)
+    plan = DefaultDataLoaderTopologyMapper().map(sharding)
+
+    assert plan.logical_world_size == 4
+    assert [copy.logical_rank for copy in plan.copies] == [0, 1, 2, 3]
+    for copy in plan.copies:
+        dp_rank, gtp_rank = divmod(copy.logical_rank, 2)
+        expected = tuple(
+            sharding.get_ranks_by_coord(
+                data_parallel=dp_rank, **{GTP_WEIGHT_REMAT_AXIS: gtp_rank}
+            )
+        )
+        assert copy.delivery_ranks == expected
+        owner_coords = sharding.get_worker_coords(copy.owner_rank)
+        assert owner_coords == {
+            "pipeline_parallel": 0,
+            "data_parallel": dp_rank,
+            GTP_WEIGHT_REMAT_AXIS: gtp_rank,
+            "context_parallel": 0,
+            "tensor_parallel": 0,
+        }
+        other_gtp = tuple(
+            sharding.get_ranks_by_coord(
+                data_parallel=dp_rank, **{GTP_WEIGHT_REMAT_AXIS: 1 - gtp_rank}
+            )
+        )
+        assert not set(copy.delivery_ranks) & set(other_gtp)
+
+
+def test_gtp_loader_delivery_covers_each_rank_once() -> None:
+    sharding = _gtp_sharding(dp=2, gtp=2, pp=2, cp=2, tp=2)
+    plan = DefaultDataLoaderTopologyMapper().map(sharding)
+    delivered = [rank for copy in plan.copies for rank in copy.delivery_ranks]
+    assert sorted(delivered) == list(range(32))
