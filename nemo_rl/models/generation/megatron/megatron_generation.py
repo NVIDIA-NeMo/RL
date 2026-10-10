@@ -20,6 +20,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_rl.data_plane.background_prefix_cleanup import GenerationPrefixCleanupConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import RemoteHeldPortReservation
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -645,8 +646,13 @@ class MegatronGeneration(GenerationInterface):
         generation_cut_control_timeout_s: float | None = None,
         generation_prefix_batch_size: int = 256,
         generation_prefix_batch_max_tokens: int = 4_194_304,
+        generation_prefix_cleanup: GenerationPrefixCleanupConfig | None = None,
     ) -> None:
         """Install MInf's canonical prompt and completion capture hooks."""
+        if generation_prefix_cleanup is not None and generation_prefix_cleanup.enabled:
+            raise NotImplementedError(
+                "background prefix cleanup requires vLLM prefix recovery"
+            )
         if generation_prefix_cuts_enabled:
             raise NotImplementedError(
                 "generation-prefix recovery is not implemented for Megatron inference"

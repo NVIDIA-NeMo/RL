@@ -2002,6 +2002,7 @@ def setup_single_controller(
             generation_prefix_batch_max_tokens=(
                 master_config.rollout_recovery.generation_prefix_batch_max_tokens
             ),
+            generation_prefix_cleanup=master_config.rollout_recovery.generation_prefix_cleanup,
         )
         generation.set_rollout_weight_version(0)
 

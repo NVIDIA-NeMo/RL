@@ -46,6 +46,7 @@ from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.data import DataConfig
+from nemo_rl.data_plane.background_prefix_cleanup import GenerationPrefixCleanupConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
@@ -695,6 +696,9 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     # never split; one row larger than the token limit is processed alone.
     generation_prefix_batch_size: Annotated[int, Field(gt=0)] = 256
     generation_prefix_batch_max_tokens: Annotated[int, Field(gt=0)] = 4_194_304
+    generation_prefix_cleanup: GenerationPrefixCleanupConfig = Field(
+        default_factory=GenerationPrefixCleanupConfig
+    )
     # Keyed by ``extra_env_info.task_source``, which is available before Gym
     # resolves the concrete agent used to execute the row.
     task_source_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
@@ -708,7 +712,14 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
 
     @model_validator(mode="after")
     def _validate_target_overrides(self) -> "RolloutRecoveryConfig":
-        """Reject removed keys and overrides finer than the global target."""
+        """Reject invalid cleanup targets and overrides finer than the global target."""
+        if (
+            self.generation_prefix_cleanup.enabled
+            and self.target_level != RecoveryTargetLevel.PREFIX
+        ):
+            raise ValueError(
+                "generation_prefix_cleanup.enabled requires target_level=prefix"
+            )
         removed = {
             "default_granularity",
             "task_granularity_overrides",
