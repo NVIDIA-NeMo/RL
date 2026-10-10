@@ -2037,6 +2037,7 @@ def setup_single_controller(
             generation_prefix_batch_max_tokens=(
                 master_config.rollout_recovery.generation_prefix_batch_max_tokens
             ),
+            generation_prefix_cleanup=master_config.rollout_recovery.generation_prefix_cleanup,
         )
         if capture_media and media_columns is None:
             raise RuntimeError(
