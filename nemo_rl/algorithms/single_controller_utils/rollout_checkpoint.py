@@ -92,6 +92,7 @@ _BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS = frozenset(
         "rollout_checkpointing",
         "rollout_recovery.generation_prefix_batch_max_tokens",
         "rollout_recovery.generation_prefix_batch_size",
+        "rollout_recovery.generation_prefix_cleanup",
         "rollout_recovery.gym_prepare_timeout_s",
         "token_capture.capture_dir",
         "token_capture.control_auth_token",

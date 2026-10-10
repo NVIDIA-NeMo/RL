@@ -47,6 +47,11 @@ from nemo_rl.data.captured_media import (
     verify_restored_media,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.background_prefix_cleanup import (
+    BackgroundPrefixCleanup,
+    CleanupReservation,
+    GenerationPrefixCleanupConfig,
+)
 from nemo_rl.data_plane.tq_token_sink import MediaMetadataIntegrityError
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -748,6 +753,7 @@ class VllmAsyncGenerationWorkerImpl(
         self._generation_cut_receipts: dict[tuple[str, str], Any] = {}
         self._capture_registry_lock = threading.Lock()
         self._capture_sink: Any | None = None
+        self._prefix_cleanup: BackgroundPrefixCleanup | None = None
         self._generation_prefix_cuts_enabled = False
         self._generation_cut_control_token: str | None = None
         self._generation_cut_control_timeout_s: float | None = None
@@ -1093,6 +1099,7 @@ class VllmAsyncGenerationWorkerImpl(
         generation_cut_control_timeout_s: float | None = None,
         generation_prefix_batch_size: int,
         generation_prefix_batch_max_tokens: int,
+        generation_prefix_cleanup: GenerationPrefixCleanupConfig | None = None,
     ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
@@ -1105,6 +1112,11 @@ class VllmAsyncGenerationWorkerImpl(
         """
         if not self.is_model_owner:
             return None
+        if generation_prefix_cleanup is not None and generation_prefix_cleanup.enabled:
+            if not generation_prefix_cuts_enabled:
+                raise ValueError(
+                    "background prefix cleanup requires generation-prefix cuts"
+                )
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
         from nemo_gym.token_id_capture.staging import install_capture
@@ -1164,6 +1176,12 @@ class VllmAsyncGenerationWorkerImpl(
             self._capture_patch_size = int(info.get_hf_config().patch_size)
         self._capture_media = capture_media
         self._capture_sink = sink
+        self._prefix_cleanup = (
+            BackgroundPrefixCleanup(sink.clear, config=generation_prefix_cleanup)
+            if generation_prefix_cleanup is not None
+            and generation_prefix_cleanup.enabled
+            else None
+        )
         self._generation_prefix_cuts_enabled = generation_prefix_cuts_enabled
         self._generation_cut_control_token = generation_cut_control_token
         self._generation_cut_control_timeout_s = generation_cut_control_timeout_s
@@ -1755,14 +1773,28 @@ class VllmAsyncGenerationWorkerImpl(
 
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Run terminal token staging outside an active checkpoint cut."""
-        self._token_capture_snapshot_gate.enter()
+        # Reserve outside the terminal gate: a paused, full cleanup queue must
+        # never hold a permit that the snapshot fence is trying to drain.
+        cleanup = self._prefix_cleanup
+        reservation = cleanup.reserve() if cleanup is not None else None
         try:
-            return self._finish_request_capture_after_snapshot_fence(request, content)
+            self._token_capture_snapshot_gate.enter()
+            try:
+                return self._finish_request_capture_after_snapshot_fence(
+                    request, content, cleanup_reservation=reservation
+                )
+            finally:
+                self._token_capture_snapshot_gate.exit()
         finally:
-            self._token_capture_snapshot_gate.exit()
+            if reservation is not None:
+                reservation.close()
 
     def _finish_request_capture_after_snapshot_fence(
-        self, request: Any, content: dict
+        self,
+        request: Any,
+        content: dict,
+        *,
+        cleanup_reservation: CleanupReservation | None = None,
     ) -> dict:
         """Stage one canonical terminal row and retire its prefix chunks."""
         state = self._get_request_capture(request)
@@ -1780,9 +1812,25 @@ class VllmAsyncGenerationWorkerImpl(
                     state, request, content
                 )
             )
-        GenerationCutCaptureMixin._clear_generation_cut_rows(
-            self, state.call.model_call_id, obsolete_staging_keys
-        )
+        if cleanup_reservation is not None and obsolete_staging_keys:
+            # Optional capture dependency, already loaded for this call.
+            from nemo_rl.data_plane.tq_token_sink import (
+                GENERATION_CUT_STAGING_PREFIX,
+            )
+
+            # Restored terminal-completion cuts can name a canonical row; that
+            # row may still be owned by Gym's imported ledger.
+            cleanup_reservation.submit(
+                [
+                    key
+                    for key in obsolete_staging_keys
+                    if key.startswith(GENERATION_CUT_STAGING_PREFIX)
+                ]
+            )
+        else:
+            GenerationCutCaptureMixin._clear_generation_cut_rows(
+                self, state.call.model_call_id, obsolete_staging_keys
+            )
         return content
 
     def _finish_request_capture_with_lifecycle_owned(
@@ -3659,9 +3707,16 @@ class VllmAsyncGenerationWorkerImpl(
         # Take the epoch on the loop, in call order with the matching end: if
         # the driver times out and releases first, the late close is a no-op.
         epoch = gate.begin_epoch()
+        cleanup = self._prefix_cleanup
+        if cleanup is not None:
+            cleanup.pause(epoch)
         await asyncio.get_running_loop().run_in_executor(
             self._token_capture_fence_executor, gate.close_and_wait, epoch
         )
+        if cleanup is not None:
+            await asyncio.get_running_loop().run_in_executor(
+                self._token_capture_fence_executor, cleanup.wait_paused, epoch
+            )
         return True
 
     async def resume_generation_async(self) -> bool:
@@ -3685,6 +3740,8 @@ class VllmAsyncGenerationWorkerImpl(
                 "end_token_capture_snapshot_fence_async requires async_engine=True"
             )
         self._token_capture_snapshot_gate.reopen()
+        if self._prefix_cleanup is not None:
+            self._prefix_cleanup.resume()
         return True
 
     async def sleep_async(self):
@@ -3745,6 +3802,9 @@ class VllmAsyncGenerationWorkerImpl(
             )
             if token_capture_snapshot_gate is not None:
                 token_capture_snapshot_gate.reopen()
+            prefix_cleanup = getattr(self, "_prefix_cleanup", None)
+            if prefix_cleanup is not None:
+                prefix_cleanup.resume()
             for executor_name in (
                 "_generation_cut_control_executor",
                 "_token_capture_fence_executor",
@@ -3757,6 +3817,8 @@ class VllmAsyncGenerationWorkerImpl(
                 self.http_server.should_exit = True
                 await asyncio.to_thread(self.server_thread.join)
                 self.server_thread = None
+            if prefix_cleanup is not None:
+                prefix_cleanup.close(wait=False)
 
             if self._sparse_refit_receiver is not None:
                 await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
