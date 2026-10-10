@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from examples.nemo_gym.prepare_osworld_context_compaction_data import (
+    osworld_task,
     prepare_osworld_rows,
     read_jsonl,
     task_id,
@@ -32,7 +33,7 @@ from examples.nemo_gym.prepare_osworld_context_compaction_data import (
 
 def is_stable_train_task(row: dict[str, Any]) -> bool:
     """Return whether a task belongs to the low-volatility training subset."""
-    metadata = row["verifier_metadata"]
+    metadata = osworld_task(row)
     return (
         metadata.get("proxy") is False
         and metadata.get("possibility_of_env_change") == "low"
@@ -41,7 +42,7 @@ def is_stable_train_task(row: dict[str, Any]) -> bool:
 
 def is_stable_eval_task(row: dict[str, Any]) -> bool:
     """Return whether a held-out task avoids known high-volatility cases."""
-    return row["verifier_metadata"].get("possibility_of_env_change") != "high"
+    return osworld_task(row).get("possibility_of_env_change") != "high"
 
 
 def sha256_path(path: Path) -> str:

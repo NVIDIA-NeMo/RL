@@ -53,7 +53,10 @@ def test_prepare_rows_adds_v2_routing_and_keeps_only_stable_provenance():
     ]
     for row in rows:
         assert row["context_compaction_task_id"] == "task-7"
-        assert row["verifier_metadata"] == original["verifier_metadata"]
+        assert row["verifier_metadata"] == {
+            "task_id": "task-7",
+            "osworld_task": original["verifier_metadata"],
+        }
         assert row["agent_ref"] == {
             "type": "responses_api_agents",
             "name": "osworld_nano_omni_agent",
@@ -70,6 +73,28 @@ def test_prepare_rows_adds_v2_routing_and_keeps_only_stable_provenance():
         assert "context_compaction_contract_version" not in row
         assert "context_compaction_rollout_index" not in row
         assert "context_compaction_attempt_index" not in row
+
+
+def test_prepare_rows_preserves_canonical_gym_metadata():
+    source = _row("task-8")
+    task = source["verifier_metadata"]
+    source["verifier_metadata"] = {
+        "task_id": "task-8",
+        "domain": "writer",
+        "osworld_task": task,
+    }
+
+    [prepared] = prepare.prepare_osworld_rows(
+        [source],
+        num_repeats=1,
+        agent_name="osworld_nano_omni_agent",
+        max_output_tokens=2048,
+        temperature=0.6,
+        top_p=0.95,
+    )
+
+    assert prepare.task_id(prepared) == "task-8"
+    assert prepared["verifier_metadata"] == source["verifier_metadata"]
 
 
 def test_read_jsonl_filters_in_source_order_and_rejects_missing_ids(tmp_path):

@@ -104,9 +104,49 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 
+_OSWORLD_LEGACY_IDENTITY_FIELDS = (
+    "context_compaction_contract_version",
+    "context_compaction_rollout_id",
+    "context_compaction_group_id",
+    "context_compaction_task_id",
+    "context_compaction_rollout_index",
+    "context_compaction_attempt_index",
+)
+
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
+
+
+def _osworld_task_id(row: Mapping[str, Any]) -> Optional[str]:
+    """Return a consistent OSWorld task id, or ``None`` for another route."""
+    agent_ref = row.get("agent_ref")
+    agent_name = agent_ref.get("name") if isinstance(agent_ref, Mapping) else None
+    metadata = row.get("verifier_metadata")
+    nested_task = (
+        metadata.get("osworld_task") if isinstance(metadata, Mapping) else None
+    )
+    legacy_task_id = row.get("context_compaction_task_id")
+    is_osworld = (
+        isinstance(nested_task, Mapping)
+        or legacy_task_id is not None
+        or (isinstance(agent_name, str) and "osworld" in agent_name.lower())
+    )
+    if not is_osworld:
+        return None
+
+    candidates = [
+        legacy_task_id,
+        metadata.get("task_id") if isinstance(metadata, Mapping) else None,
+        nested_task.get("id") if isinstance(nested_task, Mapping) else None,
+        metadata.get("id") if isinstance(metadata, Mapping) else None,
+    ]
+    task_ids = {value for value in candidates if isinstance(value, str) and value}
+    if len(task_ids) != 1:
+        raise ValueError(
+            "OSWorld trajectory identity requires one consistent non-empty task id"
+        )
+    return task_ids.pop()
 
 
 def _contains_post_write_enrichment_error(error: BaseException) -> bool:
@@ -1135,6 +1175,25 @@ class AsyncNemoGymRolloutImpl:
                 # derives the id from the run body and stamps /ng-rollout/<id>
                 # on every model call, so the TQ sample id IS the capture key.
                 row["_ng_rollout_id"] = rollout_ids[i]
+                task_id = _osworld_task_id(row)
+                if task_id is not None:
+                    if row.get("trajectory_identity") is not None:
+                        raise ValueError(
+                            "OSWorld trajectory_identity is runtime-owned and must not be present in dataset rows"
+                        )
+                    # Current Gym prefers its route-neutral identity envelope.
+                    # Remove partial legacy CC coordinates so it cannot mistake
+                    # dataset provenance for the old all-or-nothing contract.
+                    for field in _OSWORLD_LEGACY_IDENTITY_FIELDS:
+                        row.pop(field, None)
+                    row["trajectory_identity"] = {
+                        "schema_version": 1,
+                        "rollout_id": rollout_ids[i],
+                        "group_id": group_id,
+                        "task_id": task_id,
+                        "rollout_index": i,
+                        "attempt_index": group_attempt,
+                    }
             rows.append(row)
         return rows
 

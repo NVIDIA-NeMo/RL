@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/runtime_env.sh"
+"$SCRIPT_DIR/prepare_gym_agent.sh"
 cd "$OSWORLD_RL_ROOT"
 
 OVERRIDES=(

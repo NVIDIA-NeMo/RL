@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -47,13 +47,48 @@ _LEGACY_TRACE_FIELDS = frozenset(
 )
 
 
+def osworld_task(row: dict[str, Any]) -> Mapping[str, Any]:
+    """Return the OSWorld task from either raw or Gym-normalized metadata."""
+    verifier_metadata = row.get("verifier_metadata")
+    if not isinstance(verifier_metadata, Mapping):
+        raise ValueError("OSWorld row has no verifier_metadata object")
+
+    nested_task = verifier_metadata.get("osworld_task")
+    if nested_task is not None:
+        if not isinstance(nested_task, Mapping):
+            raise ValueError("OSWorld row verifier_metadata.osworld_task is not an object")
+        return nested_task
+
+    # Historical OSWorld exports put the task object directly in
+    # verifier_metadata. NeMo Gym's current route requires it under
+    # verifier_metadata.osworld_task, so prepare_osworld_rows normalizes this
+    # legacy form before writing output.
+    return verifier_metadata
+
+
 def task_id(row: dict[str, Any]) -> str:
     """Return the stable verifier task ID from an OSWorld row."""
-    verifier_metadata = row.get("verifier_metadata")
-    value = verifier_metadata.get("id") if isinstance(verifier_metadata, dict) else None
+    value = osworld_task(row).get("id")
     if not isinstance(value, str) or not value:
-        raise ValueError("OSWorld row has no non-empty verifier_metadata.id")
+        raise ValueError("OSWorld row has no non-empty OSWorld task id")
     return value
+
+
+def normalize_verifier_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    """Return metadata in the canonical NeMo Gym OSWorld route schema."""
+    verifier_metadata = row["verifier_metadata"]
+    if "osworld_task" in verifier_metadata:
+        return copy.deepcopy(verifier_metadata)
+
+    task = copy.deepcopy(verifier_metadata)
+    normalized: dict[str, Any] = {
+        "task_id": task_id(row),
+        "osworld_task": task,
+    }
+    snapshot = task.get("snapshot")
+    if isinstance(snapshot, str) and snapshot:
+        normalized["domain"] = snapshot
+    return normalized
 
 
 def validate_source_row(
@@ -142,6 +177,7 @@ def prepare_osworld_rows(
             validate_source_row(source_row, source=f"source row {source_index}")
             prepared = copy.deepcopy(source_row)
             current_task_id = task_id(prepared)
+            prepared["verifier_metadata"] = normalize_verifier_metadata(prepared)
 
             for field in _FRAMEWORK_OWNED_FIELDS | _LEGACY_TRACE_FIELDS:
                 prepared.pop(field, None)

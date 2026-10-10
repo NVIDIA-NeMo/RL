@@ -102,7 +102,10 @@ export NEMO_LENS_ENABLED=0
 export NRL_REFIT_BUFFER_MEMORY_RATIO="${NRL_REFIT_BUFFER_MEMORY_RATIO:-0.005}"
 export NRL_REFIT_NUM_BUFFERS="${NRL_REFIT_NUM_BUFFERS:-1}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+# The Gym agent prefetches task-specific OSWorld files from Hugging Face before
+# the first rollout. Override an offline setting inherited from the container;
+# fully cached deployments can opt back in explicitly.
+export HF_HUB_OFFLINE="${OSWORLD_HF_HUB_OFFLINE:-0}"
 
 export OSWORLD_POOL_REF="${OSWORLD_POOL_REF:-osworld-kvm}"
 case "${OSWORLD_RECIPE:-flash-b8n8-dr-grpo}" in

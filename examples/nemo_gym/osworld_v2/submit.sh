@@ -269,6 +269,7 @@ for script in \
   "$RAY_SUB" \
   "$SCRIPT_DIR/runtime_env.sh" \
   "$SCRIPT_DIR/node_setup.sh" \
+  "$SCRIPT_DIR/prepare_gym_agent.sh" \
   "$SCRIPT_DIR/$OSWORLD_DRIVER_SCRIPT"; do
   bash -n "$script"
 done

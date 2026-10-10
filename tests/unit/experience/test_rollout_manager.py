@@ -1365,6 +1365,52 @@ def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
 
 
+def test_nemo_gym_build_inputs_stamps_osworld_trajectory_identity():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+    input_sample = {
+        "extra_env_info": {
+            "agent_ref": {
+                "type": "responses_api_agents",
+                "name": "osworld_nano_omni_agent",
+            },
+            "responses_create_params": {},
+            "verifier_metadata": {
+                "task_id": "task-7",
+                "osworld_task": {"id": "task-7"},
+            },
+            "context_compaction_group_id": "dataset-provenance-group",
+            "context_compaction_task_id": "task-7",
+            NEMO_GYM_GROUP_ATTEMPT_KEY: 2,
+            NEMO_GYM_GROUP_ID_KEY: "runtime-group",
+        }
+    }
+
+    rows = impl._build_inputs(input_sample, rollout_ids=["owner-0", "owner-1"])
+
+    assert [row["trajectory_identity"] for row in rows] == [
+        {
+            "schema_version": 1,
+            "rollout_id": "owner-0",
+            "group_id": "runtime-group",
+            "task_id": "task-7",
+            "rollout_index": 0,
+            "attempt_index": 2,
+        },
+        {
+            "schema_version": 1,
+            "rollout_id": "owner-1",
+            "group_id": "runtime-group",
+            "task_id": "task-7",
+            "rollout_index": 1,
+            "attempt_index": 2,
+        },
+    ]
+    assert all(
+        not any(key.startswith("context_compaction_") for key in row) for row in rows
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests for AsyncRolloutManager (native async path)
 # ---------------------------------------------------------------------------
