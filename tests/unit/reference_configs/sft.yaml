@@ -276,6 +276,8 @@ data:
   # use_preserving_dataset: false            # If true, uses PreservingDataset to preserve heterogeneous schemas (e.g., tool calls with varying argument structures)
 
 logger:
+  log_conversations: false
+  conversation_label_field: null
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true

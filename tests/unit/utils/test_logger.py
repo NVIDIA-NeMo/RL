@@ -40,8 +40,12 @@ from nemo_rl.utils.logger import (
     TensorboardLogger,
     WandbConfig,
     WandbLogger,
+    _clip_middle,
+    build_conversation_table,
+    conversation_row_labels,
     flatten_dict,
     log_container_init_timing,
+    maybe_log_train_conversations,
     print_message_log_samples,
     should_log_nemo_gym_full_result_tables,
 )
@@ -2461,3 +2465,256 @@ def test_print_message_log_samples(capsys):
     assert "What is 2+2?" in captured.out
     assert "2+2 = 4" in captured.out
     assert "Sample 1 | Reward: 1.0000" in captured.out
+
+
+class TestBuildConversationTable:
+    """build_conversation_table renders both a text environment (real
+    ``content``) and the agentic NeMo-Gym path (empty ``content`` + token ids)."""
+
+    def _cols_row(self, columns, rows, i=0):
+        return {c: rows[i][j] for j, c in enumerate(columns)}
+
+    def test_single_turn_uses_content_no_tokenizer(self):
+        log = [
+            {"role": "user", "content": "Write a function that sums a list."},
+            {"role": "assistant", "content": "<think>plan</think>\nfunction body"},
+            {"role": "environment", "content": "Reward: 3.0\nTests passed: True"},
+        ]
+        columns, rows = build_conversation_table(
+            [log],
+            rewards=[3.0],
+            task_names=["math"],
+            step=1,
+            tokenizer=None,
+            thinking_tags=["<think>", "</think>"],
+        )
+        r = self._cols_row(columns, rows)
+        assert columns == [
+            "step",
+            "sample_idx",
+            "task_name",
+            "num_turns",
+            "conversation",
+            "total_reward",
+        ]
+        assert (
+            r["num_turns"] == 1
+            and r["task_name"] == "math"
+            and r["total_reward"] == 3.0
+        )
+        conv = r["conversation"]
+        assert "### prompt" in conv and "Write a function" in conv
+        assert "### turn 1 — assistant" in conv and "function body" in conv
+        assert "### tool/env result" in conv and "Tests passed: True" in conv
+
+    def test_vlm_list_content_is_flattened(self):
+        """VLM message logs store user content as typed chunks; the text chunks
+        are kept and the media chunks named, instead of the row failing to
+        format."""
+        log = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": "<pil>"},
+                    {"type": "text", "text": "What is in the picture?"},
+                ],
+            },
+            {"role": "assistant", "content": "A cat."},
+        ]
+        columns, rows = build_conversation_table(
+            [log], rewards=[1.0], task_names=["vlm"], step=1, tokenizer=None
+        )
+        r = self._cols_row(columns, rows)
+        assert r["num_turns"] == 1
+        assert "[image]" in r["conversation"]
+        assert "What is in the picture?" in r["conversation"]
+        assert "error formatting conversation" not in r["conversation"]
+
+    def test_agentic_decodes_empty_content_via_tokenizer(self):
+        # message log stores per-turn deltas with empty content + token ids
+        texts = [
+            "SYSTEM PROMPT ... user: optimize BAR",  # full prompt (msg 0)
+            "<think>"
+            + "z" * 4000
+            + '</think>\ntext\n<tool_call>{"name": "bash"}</tool_call>',
+            "<tool_response>ok</tool_response>",  # tool result delta
+        ]
+
+        class StubTok:
+            def __init__(self, seq):
+                self._seq = list(seq)
+
+            def batch_decode(self, batch):
+                # one call over exactly the empty-content messages, in order
+                assert len(batch) == len(self._seq)
+                return self._seq
+
+        log = [
+            {"role": "user", "content": "", "token_ids": torch.tensor([1, 2, 3])},
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor([4, 5]),
+                "is_invalid_tool_call": True,
+            },
+            {"role": "user", "content": "", "token_ids": torch.tensor([6])},
+        ]
+        columns, rows = build_conversation_table(
+            [log],
+            rewards=[1.0],
+            task_names=["simple_agent"],
+            step=2,
+            tokenizer=StubTok(texts),
+            thinking_tags=["<think>", "</think>"],
+        )
+        conv = self._cols_row(columns, rows)["conversation"]
+        assert "### prompt" in conv and "optimize BAR" in conv
+        assert "### turn 1 — assistant  [invalid_tool_call]" in conv
+        assert '<tool_call>{"name": "bash"}</tool_call>' in conv
+        assert "### tool/env result" in conv and "<tool_response>ok" in conv
+        # <think> folded, not shown in full
+        assert "z" * 4000 not in conv and "clipped" in conv
+        assert self._cols_row(columns, rows)["num_turns"] == 1
+
+    def test_agentic_without_tokenizer_shows_token_count_placeholder(self):
+        log = [
+            {"role": "user", "content": "", "token_ids": torch.tensor([1, 2, 3])},
+            {"role": "assistant", "content": "", "token_ids": torch.tensor([4, 5])},
+        ]
+        columns, rows = build_conversation_table([log], tokenizer=None)
+        conv = self._cols_row(columns, rows)["conversation"]
+        assert "[3 tokens]" in conv and "[2 tokens]" in conv
+
+
+def test_conversation_row_labels_read_the_configured_row_field():
+    """The label is the configured dotted field of each row; a row without it
+    reads "unknown"; without the setting (or with conversation logging off) the
+    caller falls back to the batch's task_name."""
+    rows = [
+        {"verifier_metadata": {"target_hardware": "B200"}},
+        {"verifier_metadata": {}},
+        None,
+    ]
+    # model_construct skips the W&B requirement; this test covers the labels.
+    config = LoggerConfig.model_construct(
+        log_dir="logs/test",
+        log_conversations=True,
+        conversation_label_field="verifier_metadata.target_hardware",
+    )
+    assert conversation_row_labels(config, rows) == ["B200", "unknown", "unknown"]
+    assert (
+        conversation_row_labels(
+            LoggerConfig.model_construct(log_dir="logs/test", log_conversations=True),
+            rows,
+        )
+        is None
+    )
+    assert (
+        conversation_row_labels(
+            config.model_copy(update={"log_conversations": False}), rows
+        )
+        is None
+    )
+    assert conversation_row_labels(config, []) is None
+
+
+def test_logger_config_requires_wandb_for_conversation_tables() -> None:
+    """Only the W&B backend renders tables, so the setting is refused without it
+    rather than decoding every rollout per step for nothing."""
+    with pytest.raises(ValueError, match="requires logger.wandb_enabled=true"):
+        LoggerConfig(log_dir="logs/test", log_conversations=True)
+    LoggerConfig(
+        log_dir="logs/test",
+        log_conversations=True,
+        wandb_enabled=True,
+        wandb=WandbConfig(project="p", name="n"),
+    )
+
+
+def _conversation_logger_config(enabled: bool) -> LoggerConfig:
+    # model_construct skips the W&B requirement; these tests cover the call
+    # sites, not the configuration check.
+    return LoggerConfig.model_construct(log_dir="logs/test", log_conversations=enabled)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_maybe_log_train_conversations_uses_logger_config(enabled: bool) -> None:
+    logger = MagicMock(spec=Logger)
+    config = _conversation_logger_config(enabled)
+    message_logs = [[{"role": "assistant", "content": "answer"}]]
+    batch = {
+        "message_log": message_logs,
+        "task_name": ["math"],
+        "total_reward": [1.0],
+    }
+
+    maybe_log_train_conversations(
+        logger,
+        config,
+        batch,
+        None,
+        tokenizer=None,
+        step=3,
+        thinking_tags=None,
+    )
+
+    if enabled:
+        logger.log_conversations_from_message_logs.assert_called_once_with(
+            message_logs=message_logs,
+            rewards=[1.0],
+            task_names=["math"],
+            step=3,
+            name="train/conversations",
+            tokenizer=None,
+            thinking_tags=None,
+        )
+    else:
+        logger.log_conversations_from_message_logs.assert_not_called()
+
+
+def test_maybe_log_train_conversations_labels_gym_rows_and_never_raises(
+    capsys,
+) -> None:
+    """A NeMo-Gym batch carries agent_ref and no task_name, so rows are labeled
+    by agent name; a table failure is printed, never raised."""
+    logger = MagicMock(spec=Logger)
+    config = _conversation_logger_config(True)
+    rewards = torch.tensor([1.0, 0.0])
+    batch = {
+        "message_log": [[{"role": "assistant", "content": "a"}] for _ in range(2)],
+        "agent_ref": [{"name": "simple_agent"}, None],
+        "total_reward": rewards,
+    }
+
+    maybe_log_train_conversations(
+        logger, config, batch, None, tokenizer=None, step=5, thinking_tags=None
+    )
+
+    kwargs = logger.log_conversations_from_message_logs.call_args.kwargs
+    assert kwargs["task_names"] == ["simple_agent", None]
+    assert kwargs["rewards"] is rewards
+
+    logger.log_conversations_from_message_logs.side_effect = RuntimeError("boom")
+    maybe_log_train_conversations(
+        logger, config, batch, None, tokenizer=None, step=6, thinking_tags=None
+    )
+    assert "Error logging conversations table: boom" in capsys.readouterr().out
+
+
+def test_clip_middle_with_a_zero_budget_hides_the_text():
+    clipped = _clip_middle("abcdefghij", 0)
+    assert "abcdefghij" not in clipped
+    assert "[clipped 10 chars]" in clipped
+    assert _clip_middle("abc", 3) == "abc"
+
+
+def test_build_conversation_table_prompt_clip_is_a_parameter():
+    log = [
+        {"role": "user", "content": "p" * 5000},
+        {"role": "assistant", "content": "ok"},
+    ]
+    columns, rows = build_conversation_table([log], prompt_clip=1000)
+    conversation = rows[0][columns.index("conversation")]
+    assert "p" * 5000 not in conversation and "[clipped 4000 chars]" in conversation
+    columns, rows = build_conversation_table([log])
+    assert "p" * 5000 in rows[0][columns.index("conversation")]

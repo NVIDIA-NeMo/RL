@@ -23,7 +23,7 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, Optional, TypedDict
+from typing import Any, Callable, Mapping, Optional, Sequence, TypedDict
 
 import mlflow
 import numpy as np
@@ -93,6 +93,16 @@ class GPUMonitoringConfig(BaseModel, extra="allow"):
     flush_interval: float = 10
 
 
+# Per-cell rendering budgets for the conversation table. W&B string columns
+# degrade past a few hundred KB, so each section is clipped and the whole cell
+# is capped. The prompt budget is the default of build_conversation_table's
+# ``prompt_clip``.
+_CONV_PROMPT_CLIP = 36_000  # the once-shown system + problem prompt
+_CONV_THINK_CLIP = 1200  # a per-turn <think> block
+_CONV_TURN_CLIP = 4000  # a per-turn assistant text / tool result
+_CONV_CELL_CAP = 150_000  # the whole conversation cell
+
+
 class LoggerConfig(BaseModel, extra="allow"):
     log_dir: str
     wandb_enabled: bool = False
@@ -106,6 +116,9 @@ class LoggerConfig(BaseModel, extra="allow"):
     monitor_gpus: bool = True
     gpu_monitoring: GPUMonitoringConfig = Field(default_factory=GPUMonitoringConfig)
     num_val_samples_to_print: int = 0
+    # Per-step sampled conversation tables are opt-in.
+    log_conversations: bool = False
+    conversation_label_field: Optional[str] = None
 
     @model_validator(mode="after")
     def _require_block_for_enabled_backends(self) -> "LoggerConfig":
@@ -119,6 +132,18 @@ class LoggerConfig(BaseModel, extra="allow"):
                 raise ValueError(
                     f"logger.{name}_enabled=true requires a logger.{name} block."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _require_wandb_for_conversation_tables(self) -> "LoggerConfig":
+        # Only the W&B backend implements log_table; without it the per-step
+        # table would be built (a full batch_decode of every rollout) and then
+        # dropped by every backend.
+        if self.log_conversations and not self.wandb_enabled:
+            raise ValueError(
+                "logger.log_conversations=true requires logger.wandb_enabled=true: "
+                "only the W&B backend renders tables."
+            )
         return self
 
 
@@ -1523,6 +1548,46 @@ class Logger(LoggerInterface):
         for logger in self.loggers:
             logger.log_plot(figure, step, name)
 
+    def log_conversations_from_message_logs(
+        self,
+        message_logs: list[LLMMessageLogType],
+        rewards: Optional[Any] = None,
+        task_names: Optional[Any] = None,
+        step: int = 0,
+        name: str = "train/conversations",
+        tokenizer: Optional[Any] = None,
+        thinking_tags: Optional[list[str]] = None,
+        prompt_clip: int = _CONV_PROMPT_CLIP,
+    ) -> None:
+        """Build and log a conversation table from message logs.
+
+        Args:
+            message_logs: List of per-sample message logs
+            rewards: Optional tensor/list of rewards aligned with message_logs
+            task_names: Optional list/tensor of task names aligned with message_logs
+            step: Global step for logging
+            name: Name of the table in the logger backend
+            tokenizer: Optional tokenizer used to decode messages that carry only
+                token ids (the agentic NeMo-Gym path stores ``content=""``)
+            thinking_tags: ``[open, close]`` reasoning-tag pair used to fold long
+                thinking blocks in the rendered conversation
+            prompt_clip: Character budget of the once-shown system + problem
+                prompt section of each rendered conversation
+        """
+        columns, rows = build_conversation_table(
+            message_logs=message_logs,
+            rewards=rewards,
+            task_names=task_names,
+            step=step,
+            tokenizer=tokenizer,
+            thinking_tags=thinking_tags,
+            prompt_clip=prompt_clip,
+        )
+        # Through the table seam, not log_metrics: a wandb.Table value handed
+        # to every backend makes TensorBoard warn, and MLflow and SwanLab fail
+        # on float(), every step. Backends without a table type skip it.
+        self.log_table(columns, rows, step, name)
+
     def log_plot_token_mult_prob_error(
         self, data: dict[str, Any], step: int, name: str
     ) -> None:
@@ -1916,6 +1981,307 @@ def print_message_log_samples(
         console.print("")  # Add some spacing
 
     console.rule("[bold bright_white on purple4]End of Samples")
+
+
+def _to_list_safe(x: Any) -> list[Any] | None:
+    """Convert tensors or sequences to a Python list if possible; otherwise None."""
+    if x is None:
+        return None
+    try:
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().tolist()
+        if isinstance(x, (list, tuple)):
+            return list(x)
+    except Exception:
+        pass
+    return None
+
+
+def _clip_middle(text: str, limit: int) -> str:
+    """Keep the head and tail of ``text`` when it exceeds ``limit``."""
+    if len(text) <= limit:
+        return text
+    head = limit * 2 // 3
+    tail = limit - head
+    # Sliced from the front: text[-0:] would be the whole string for limit 0.
+    return f"{text[:head]}\n…[clipped {len(text) - limit} chars]…\n{text[len(text) - tail :]}"
+
+
+def _fold_thinking(text: str, thinking_tags: Optional[list[str]]) -> str:
+    """Middle-clip the first ``<think>…</think>`` block, keeping the text after it visible."""
+    if not thinking_tags or len(thinking_tags) != 2:
+        return text
+    open_t, close_t = thinking_tags
+    start, end = text.find(open_t), text.find(close_t)
+    if start == -1 or end == -1 or end < start:
+        return text
+    inner = _clip_middle(text[start + len(open_t) : end].strip(), _CONV_THINK_CLIP)
+    return f"{text[:start]}{open_t}{inner}{close_t}{text[end + len(close_t) :]}"
+
+
+def _decode_empty_contents(
+    message_logs: list[LLMMessageLogType], tokenizer: Optional[Any]
+) -> dict[tuple[int, int], str]:
+    """Batch-decode every empty-``content`` message that carries token ids.
+
+    The agentic NeMo-Gym path stores per-turn token ids with ``content=""``
+    (the text is deliberately kept out of the Ray-shipped training batch), so
+    the text is recovered here, in a single ``batch_decode`` call, only when
+    the conversation table is actually built. Returns a
+    ``{(sample_idx, msg_idx): text}`` mapping; returns an empty mapping when
+    no tokenizer is supplied.
+    """
+    if tokenizer is None:
+        return {}
+    keys, batch = [], []
+    for i, conversation in enumerate(message_logs):
+        for j, msg in enumerate(conversation):
+            if (
+                isinstance(msg, dict)
+                and not msg.get("content")
+                and msg.get("token_ids") is not None
+            ):
+                keys.append((i, j))
+                batch.append(msg["token_ids"])
+    if not batch:
+        return {}
+    try:
+        return dict(zip(keys, tokenizer.batch_decode(batch)))
+    except Exception as e:
+        print(f"build_conversation_table: token-id decode failed ({e})")
+        return {}
+
+
+def maybe_log_train_conversations(
+    logger: "Logger",
+    logger_config: LoggerConfig,
+    repeated_batch: Any,
+    conv_task_names: Optional[list[Any]],
+    *,
+    tokenizer: Any,
+    step: int,
+    thinking_tags: Optional[list[str]],
+) -> None:
+    """Log the step's rollout conversations when ``logger.log_conversations`` is on.
+
+    Off by default: serializing full trajectories to the table backends every
+    step is expensive.
+    Labels fall back from the configured row field (``conv_task_names``, read
+    before the rollout) to the batch's ``task_name`` to the Gym agent name, so
+    the column is never empty. Any failure is printed, never raised, so a table
+    error cannot stop training.
+    """
+    if not logger_config.log_conversations:
+        return
+    try:
+        if conv_task_names is None:
+            conv_task_names = repeated_batch.get("task_name")
+        if conv_task_names is None and "agent_ref" in repeated_batch:
+            conv_task_names = [
+                (ar or {}).get("name") for ar in repeated_batch["agent_ref"]
+            ]
+        logger.log_conversations_from_message_logs(
+            message_logs=repeated_batch["message_log"],
+            rewards=repeated_batch.get("total_reward"),
+            task_names=conv_task_names,
+            step=step,
+            name="train/conversations",
+            # Decodes the agentic path's empty-content turns and folds <think>
+            # blocks for readability.
+            tokenizer=tokenizer,
+            thinking_tags=thinking_tags,
+        )
+    except Exception as e:
+        print(f"\n  ⚠️ Error logging conversations table: {str(e)}")
+
+
+def conversation_row_labels(
+    logger_config: LoggerConfig, rows: Optional[Sequence[Any]]
+) -> Optional[list[str]]:
+    """Per-row labels for the conversations table from a configured row field.
+
+    Reads ``logger.conversation_label_field``, the dotted path of a field in
+    each row's ``extra_env_info`` mapping (for example
+    ``verifier_metadata.target_hardware``), and returns its string value per
+    row, ``"unknown"`` where a row lacks it. Returns None when conversation
+    logging is off, when no field is configured, or when ``rows`` is empty, so
+    the caller falls back to the batch's ``task_name``.
+    """
+    field_path = logger_config.conversation_label_field
+    if not logger_config.log_conversations or not field_path or not rows:
+        return None
+    labels: list[str] = []
+    for row in rows:
+        value: Any = row
+        for key in str(field_path).split("."):
+            value = value.get(key) if isinstance(value, Mapping) else None
+        labels.append(str(value) if value is not None else "unknown")
+    return labels
+
+
+def build_conversation_table(
+    message_logs: list[LLMMessageLogType],
+    rewards: Optional[Any] = None,
+    task_names: Optional[Any] = None,
+    step: int = 0,
+    tokenizer: Optional[Any] = None,
+    thinking_tags: Optional[list[str]] = None,
+    prompt_clip: int = _CONV_PROMPT_CLIP,
+) -> tuple[list[str], list[list[Any]]]:
+    """Render per-sample rollouts into a readable conversation table.
+
+    Columns: step, sample_idx, task_name, num_turns, conversation, total_reward.
+    ``prompt_clip`` is the character budget of the once-shown system + problem
+    prompt section; longer prompts are middle-clipped to it.
+
+    Handles both a text environment (messages carry text ``content``) and the
+    agentic NeMo-Gym path (messages carry only ``token_ids`` with empty
+    ``content``, decoded here via ``tokenizer``). The leading non-assistant
+    messages (system + problem prompt) are shown once, then each assistant turn
+    is shown with the tool/environment result that follows it; ``<think>``
+    blocks are folded (``thinking_tags``) so the response after them stays
+    visible. Because the message log stores per-turn deltas, the prompt is
+    rendered once rather than repeated for every turn.
+
+    Args:
+        message_logs: Per-sample message logs (each a list of {role, content, ...})
+        rewards: Optional per-sample rewards aligned with message_logs
+        task_names: Optional per-sample task names aligned with message_logs
+        step: Current global step
+        tokenizer: Optional tokenizer used to decode messages that carry only
+            token ids (the agentic path stores ``content=""``)
+        thinking_tags: ``[open, close]`` reasoning delimiters, e.g.
+            ``["<think>", "</think>"]``
+
+    Returns:
+        Tuple of (columns, rows) for a ``wandb.Table`` logged through the metrics path.
+    """
+    rewards_list = _to_list_safe(rewards)
+    task_names_list = _to_list_safe(task_names)
+
+    num_samples = len(message_logs)
+    if rewards_list is not None and len(rewards_list) != num_samples:
+        print(
+            f"build_conversation_table: rewards length {len(rewards_list)} does not match samples {num_samples}; clipping"
+        )
+        num_samples = min(num_samples, len(rewards_list))
+    if task_names_list is not None and len(task_names_list) != num_samples:
+        print(
+            f"build_conversation_table: task_names length {len(task_names_list)} does not match samples; clipping"
+        )
+        num_samples = min(num_samples, len(task_names_list))
+
+    decoded = _decode_empty_contents(message_logs[:num_samples], tokenizer)
+
+    columns = [
+        "step",
+        "sample_idx",
+        "task_name",
+        "num_turns",
+        "conversation",
+        "total_reward",
+    ]
+
+    rows: list[list[Any]] = []
+    for i in range(num_samples):
+        try:
+            resolved = _resolve_message_texts(message_logs[i], decoded, i)
+            conversation_str, num_turns = _format_conversation(
+                resolved, thinking_tags, prompt_clip
+            )
+        except Exception as e:
+            conversation_str, num_turns = f"[error formatting conversation: {e}]", 0
+        task_name_val = task_names_list[i] if task_names_list is not None else None
+        reward_val = rewards_list[i] if rewards_list is not None else None
+        rows.append([step, i, task_name_val, num_turns, conversation_str, reward_val])
+
+    return columns, rows
+
+
+def _resolve_message_texts(
+    conversation: LLMMessageLogType,
+    decoded: dict[tuple[int, int], str],
+    sample_idx: int,
+) -> list[tuple[str, str, dict]]:
+    """Resolve each message to ``(role, display_text, raw_msg)``.
+
+    Display text is the message ``content`` when present (single-turn env),
+    else the batch-decoded token ids (agentic path stores ``content=""``),
+    else a token-count placeholder (agentic path with no tokenizer supplied).
+    """
+    resolved: list[tuple[str, str, dict]] = []
+    for j, msg in enumerate(conversation):
+        if not isinstance(msg, dict):
+            resolved.append(("unknown", str(msg), {}))
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            # VLM message logs store content as typed chunks (see
+            # nemo_rl/data/processors.py); keep the text ones and name the rest.
+            content = "\n".join(
+                chunk.get("text", "")
+                if chunk.get("type") == "text"
+                else f"[{chunk.get('type')}]"
+                for chunk in content
+                if isinstance(chunk, dict)
+            )
+        text = content or decoded.get((sample_idx, j))
+        if not text and msg.get("token_ids") is not None:
+            text = f"[{len(msg['token_ids'])} tokens]"
+        resolved.append((msg.get("role", "unknown"), text or "", msg))
+    return resolved
+
+
+def _format_conversation(
+    resolved: list[tuple[str, str, dict]],
+    thinking_tags: Optional[list[str]],
+    prompt_clip: int = _CONV_PROMPT_CLIP,
+) -> tuple[str, int]:
+    """Render resolved messages into one markdown cell; returns (text, num_turns).
+
+    The leading non-assistant messages (system + problem prompt) are grouped
+    into a single ``### prompt`` section shown once and middle-clipped to
+    ``prompt_clip`` characters; each assistant turn is numbered and
+    badge-annotated (invalid_tool_call / malformed_thinking, from the
+    per-message flags), with its ``<think>`` block folded; each following
+    non-assistant message renders as a tool/env result. Every section is
+    middle-clipped to its budget and the whole cell to ``_CONV_CELL_CAP``.
+    """
+    parts: list[str] = []
+    num_turns = 0
+
+    # The leading non-assistant messages are the system + problem prompt;
+    # group them into a single section rendered once.
+    k = 0
+    prompt_chunks: list[str] = []
+    while k < len(resolved) and resolved[k][0] != "assistant":
+        prompt_chunks.append(resolved[k][1])
+        k += 1
+    if prompt_chunks:
+        parts.append(
+            "### prompt\n" + _clip_middle("\n".join(prompt_chunks).strip(), prompt_clip)
+        )
+
+    for role, text, msg in resolved[k:]:
+        if role == "assistant":
+            num_turns += 1
+            flags = []
+            if msg.get("is_invalid_tool_call"):
+                flags.append("invalid_tool_call")
+            if msg.get("has_malformed_thinking"):
+                flags.append("malformed_thinking")
+            badge = f"  [{', '.join(flags)}]" if flags else ""
+            body = _clip_middle(
+                _fold_thinking(text.strip(), thinking_tags), _CONV_TURN_CLIP
+            )
+            parts.append(f"### turn {num_turns} — assistant{badge}\n{body}")
+        else:
+            label = (
+                "tool/env result" if role in ("user", "tool", "environment") else role
+            )
+            parts.append(f"### {label}\n{_clip_middle(text.strip(), _CONV_TURN_CLIP)}")
+
+    return _clip_middle("\n\n".join(parts).strip(), _CONV_CELL_CAP), num_turns
 
 
 def get_next_experiment_dir(base_log_dir: str) -> str:

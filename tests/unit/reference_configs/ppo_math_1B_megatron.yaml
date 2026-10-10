@@ -459,6 +459,8 @@ env:
     math_verify_impl: "dapo_math_verify"
 
 logger:
+  log_conversations: false
+  conversation_label_field: null
   log_dir: "logs"
   num_val_samples_to_print: 0
   wandb_enabled: false
