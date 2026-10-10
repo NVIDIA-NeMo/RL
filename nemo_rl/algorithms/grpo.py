@@ -4580,6 +4580,7 @@ def aggregate_rollout_metrics(
 
     Different metric types are aggregated according to their semantics:
     - Histogram observations: flattened into one step-level distribution
+    - Metrics ending with "/std_in_group": summarize the per-group values
     - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
     - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
     - "total_turns": summed
@@ -4598,6 +4599,10 @@ def aggregate_rollout_metrics(
             aggregated[k] = [observation for group in v for observation in group]
         elif not isinstance(v[0], (int, float)):
             aggregated[k] = v
+        elif k.endswith("/std_in_group"):
+            aggregated[f"{k}/mean"] = sum(v) / len(v)
+            aggregated[f"{k}/p05"] = float(np.percentile(v, 5))
+            aggregated[f"{k}/p95"] = float(np.percentile(v, 95))
         elif k.endswith("/min") or (k.startswith("min_") and not k.endswith("_rate")):
             aggregated[k] = min(v)
         elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):

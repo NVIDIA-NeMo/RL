@@ -147,6 +147,27 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
 
+def _count_structured_response_tokens(
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    reasoning_text: str,
+    answer_text: str,
+) -> tuple[int, int] | None:
+    """Count tokens in Gym-extracted reasoning and answer text."""
+    reasoning_text = reasoning_text.strip()
+    answer_text = answer_text.strip()
+    if not reasoning_text and not answer_text:
+        return None
+    return (
+        len(tokenizer.encode(reasoning_text, add_special_tokens=False))
+        if reasoning_text
+        else 0,
+        len(tokenizer.encode(answer_text, add_special_tokens=False))
+        if answer_text
+        else 0,
+    )
+
+
 def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
     """Fail readably when Gym did not stamp an agent_ref onto every row.
 
@@ -600,7 +621,8 @@ Depending on your data shape, you may want to change these values."""
 
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
-            "host": "0.0.0.0",
+            # Remote NeMo-Gym processes need a routable address, not 0.0.0.0.
+            "host": self.node_ip,
             "port": self.head_server_port,
         }
 
@@ -1212,6 +1234,11 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
+        response_token_counts = _count_structured_response_tokens(
+            tokenizer,
+            reasoning_text=nemo_gym_result.pop("reasoning_text", ""),
+            answer_text=nemo_gym_result.pop("answer_text", ""),
+        )
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -1406,7 +1433,12 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
+            "token_extraction_valid": response_token_counts is not None,
         }
+        (
+            result["reasoning_token_count"],
+            result["response_token_count"],
+        ) = response_token_counts or (None, None)
         if not include_initial_multimodal_data:
             result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
         return result
