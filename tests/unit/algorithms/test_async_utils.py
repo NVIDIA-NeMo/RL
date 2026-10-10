@@ -144,6 +144,33 @@ class TestReplayBufferImplCheckpointing:
     tests cover the checkpoint/restore helpers on the local implementation class.
     """
 
+    @pytest.mark.parametrize("max_age_steps", [1, 2, None])
+    def test_consumed_target_does_not_become_generation_work_again(
+        self, max_age_steps: int | None
+    ) -> None:
+        buffer = ReplayBufferImpl(max_size=4, drop_incomplete_targets_on_restore=False)
+        for i in range(2):
+            buffer.add(
+                {"batch": {"data": i}, "rollout_metrics": {}},
+                weight_version=0,
+                target_weight_version=0,
+            )
+        # The collector reads the frontier, then training consumes the target
+        # before the collector's separate deficit query arrives.
+        assert buffer.get_last_target_weight_already_generated() == -1
+        assert buffer.sample(2, current_weight_version=0, max_age_steps=1) is not None
+        assert buffer.get_last_target_weight_already_generated() == 0
+        assert buffer.get_trajectories_needed(0, 2, max_age_steps) == 0
+        assert buffer.get_trajectories_needed(1, 2, max_age_steps) == 2
+
+        # A future target still reports its actual remaining deficit.
+        buffer.add(
+            {"batch": {"data": 2}, "rollout_metrics": {}},
+            weight_version=1,
+            target_weight_version=1,
+        )
+        assert buffer.get_trajectories_needed(1, 2, max_age_steps) == 1
+
     def _state(
         self,
         trajectory_versions: list[int],
