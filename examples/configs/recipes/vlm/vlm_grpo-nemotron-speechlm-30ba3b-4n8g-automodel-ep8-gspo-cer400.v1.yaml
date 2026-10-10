@@ -35,6 +35,14 @@ policy:
       enable_thinking: false
     processor_class: nemo_rl.data.asr.SpeechLMProcessor
   native_model:
+    # Image Automodel's DeepEP token_permutation2 already dispatches synchronously.
+    model_config_overrides:
+      automodel_backend:
+        attn: te
+        linear: te
+        experts: gmm
+        dispatcher: deepep
+        dispatcher_num_sms: 32
     trainable_names:
     - llm.model.layers.0.mixer._fp32_params.A_log
     - llm.model.layers.0.mixer._fp32_params.D
