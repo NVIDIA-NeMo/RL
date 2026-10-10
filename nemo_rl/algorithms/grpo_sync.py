@@ -268,8 +268,8 @@ def validate_sync(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """TQ-mediated counterpart to :func:`nemo_rl.algorithms.grpo.validate`.
 
-    Per-batch: register the val partition → ``rollout_to_tq`` →
-    ``policy.read_from_dataplane`` for message logs → ``policy.finish_step``.
+    Per-batch: register the val partition → ``rollout_to_tq`` (turn_roles /
+    turn_contents returned in ``driver_carry``) → ``policy.finish_step``.
     Caller owns ``policy_generation.prepare_for_generation`` /
     ``finish_generation`` around the call; the actor's per-rollout
     ``finish_generation`` is suppressed so inference state stays warm
@@ -421,9 +421,9 @@ def _log_data_plane_metrics_impl(
 
     The prefix names the scope because the two differ by a lot: the driver
     issues about one op of each kind per step while the bulk traffic is the
-    workers' per-DP-rank ``get_samples``. Note that even the cluster view
-    omits the rollout actor, which builds its own client and is not on the
-    worker group -- so ``kv_first_write`` is not in these totals.
+    workers' per-DP-rank ``get_samples``. The cluster view also includes the
+    rollout actor (registered via ``add_data_plane_snapshot_source``), so
+    ``kv_first_write`` is in these totals.
     """
     get_metrics = getattr(policy, "get_data_plane_step_metrics", None)
     if not callable(get_metrics):
@@ -574,6 +574,7 @@ def grpo_train_sync(
         master_config=master_config,
         dp_cfg=dp_cfg,
     )
+    policy.add_data_plane_snapshot_source(rollout_actor)
 
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
