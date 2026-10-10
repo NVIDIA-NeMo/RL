@@ -24,6 +24,7 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/data_plane/background_prefix_cleanup.py",
   "tools/benchmark_tq_prefix_reads.py",
   "tools/benchmark_tq_prefix_writes.py",
   "nemo_rl/models/generation/prefix_read_batcher.py",
