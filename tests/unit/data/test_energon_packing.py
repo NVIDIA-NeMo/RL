@@ -35,6 +35,7 @@ from nemo_rl.data.energon.multimodal.task_encoders.generic_sft import (  # noqa:
 from nemo_rl.data.energon.multimodal.types import EncodedSFTSample  # noqa: E402
 from nemo_rl.data.multimodal_utils import PackedTensor  # noqa: E402
 from nemo_rl.data.packing import PackingAlgorithm, get_packer  # noqa: E402
+from nemo_rl.data_plane.adapters.local import local_batch_to_tensordict  # noqa: E402
 
 
 class _Tokenizer:
@@ -176,6 +177,85 @@ def test_preparation_backfills_multimodal_fields_across_packs() -> None:
         [0, 0, 0, 0],
         [1, 1, 1, 1],
     ]
+
+
+def test_task_encoder_consumes_precomputed_loss_mask_mode_for_packs() -> None:
+    sample = _sample("s0", 4)
+    sample.message_log[0]["token_loss_mask"] = torch.ones(2, dtype=torch.long)
+    sample.message_log[1]["token_loss_mask"] = torch.zeros(2, dtype=torch.long)
+    packed = pack_selected_samples(
+        [sample], pack_capacity=4, sequence_length_pad_multiple=1
+    )
+    encoder = GenericSFTTaskEncoder(
+        adapter=object(),
+        cooker_functions=[],
+        include_source_ids=True,
+        tokenizer=_Tokenizer(),
+        loss_mask_mode="precomputed",
+    )
+
+    prepared = encoder.batch([packed])
+    unpacked = encoder.batch([sample])
+
+    assert "loss_mask_mode" not in prepared
+    assert prepared["token_mask"].tolist() == [[0, 1, 0, 0]]
+    assert unpacked["loss_mask_mode"] == "precomputed"
+    fields = {key: value for key, value in prepared.items() if key != "source_ids"}
+    assert local_batch_to_tensordict(fields, batch_size=1).batch_size == torch.Size([1])
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize(
+    "case",
+    ["missing", "shape", "non_binary", "non_vector", "unsupported_mode", "final_only"],
+)
+def test_precomputed_loss_masks_reject_invalid_inputs(case: str, packed: bool) -> None:
+    # The unpacked validation lives in SFT, which imports the policy backends.
+    from nemo_rl.algorithms.sft import prepare_sft_batch
+
+    sample = _sample("s0", 4)
+    for message in sample.message_log:
+        message["token_loss_mask"] = torch.ones_like(message["token_ids"])
+    message = sample.message_log[0]
+    if case == "missing":
+        del message["token_loss_mask"]
+    elif case == "shape":
+        message["token_loss_mask"] = torch.ones(1)
+    elif case == "non_binary":
+        message["token_loss_mask"] = torch.tensor([0.0, 0.5])
+    elif case == "non_vector":
+        message["token_loss_mask"] = torch.ones(1, 2)
+    encoder = GenericSFTTaskEncoder(
+        adapter=object(),
+        cooker_functions=[],
+        include_source_ids=True,
+        tokenizer=_Tokenizer(),
+        loss_mask_mode="unsupported" if case == "unsupported_mode" else "precomputed",
+        only_unmask_final=case == "final_only",
+    )
+    error = (
+        "Unsupported"
+        if case == "unsupported_mode"
+        else "only_unmask_final"
+        if case == "final_only"
+        else "binary vectors"
+    )
+    with pytest.raises(ValueError, match=error):
+        if packed:
+            encoder.batch(
+                [
+                    pack_selected_samples(
+                        [sample], pack_capacity=4, sequence_length_pad_multiple=1
+                    )
+                ]
+            )
+        else:
+            prepare_sft_batch(
+                encoder.batch([sample]),
+                tokenizer=_Tokenizer(),
+                only_unmask_final=case == "final_only",
+                make_sequence_length_divisible_by=1,
+            )
 
 
 def test_shuffle_selection_restores_worker_seed(monkeypatch) -> None:

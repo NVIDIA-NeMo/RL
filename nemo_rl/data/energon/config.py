@@ -14,7 +14,7 @@
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 from nemo_rl.data.energon.multimodal.model_families import ModelFamily
 
@@ -28,24 +28,80 @@ class EnergonSourceConfig(BaseModel, extra="allow"):
     limit: Annotated[int, Field(ge=1)] | None = None
 
 
-class EnergonTaskEncoderConfig(BaseModel, extra="allow"):
-    """One task encoder selected by registry key."""
+class EnergonPackingOptions(BaseModel, extra="forbid"):
+    """Options for task-encoder-owned sequence packing."""
 
-    name: str = "generic_sft"
+    max_sequence_length: Annotated[int, Field(ge=1)]
+    sequence_length_pad_multiple: Annotated[int, Field(ge=1)]
+    max_sequences_per_bin: Annotated[int, Field(ge=1)] | None = None
+    balanced_knapsack_delta: Annotated[int, Field(ge=0)] | None = None
+
+    @model_validator(mode="after")
+    def _validate_alignment(self) -> "EnergonPackingOptions":
+        if self.max_sequence_length % self.sequence_length_pad_multiple:
+            raise ValueError(
+                "Energon pack capacity must be divisible by its padding multiple."
+            )
+        return self
+
+
+class EnergonPackingConfig(BaseModel, extra="allow"):
+    """One task-encoder-owned packing implementation."""
+
+    name: str
+    buffer_size: Annotated[int, Field(ge=1)]
+    options: EnergonPackingOptions
+
+
+class EnergonTaskEncoderConfig(BaseModel, extra="allow"):
+    """One built-in or file-backed task encoder and optional packing."""
+
+    name: str | None = "generic_sft"
+    python_file: str | None = None
+    object_name: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("object_name", "object"),
+        serialization_alias="object",
+    )
     options: dict[str, Any] = Field(default_factory=dict)
+    packing: EnergonPackingConfig | None = None
 
     @model_validator(mode="before")
     @classmethod
     def _from_registry_key(cls, value: Any) -> Any:
         if isinstance(value, str):
             return {"name": value}
+        if isinstance(value, dict) and "object_name" in value and "object" in value:
+            raise ValueError("Use only one of object_name or its legacy alias object.")
+        if isinstance(value, dict) and value.get("python_file") and "name" not in value:
+            return {**value, "name": None}
         return value
+
+    @model_validator(mode="after")
+    def _validate_component_reference(self) -> "EnergonTaskEncoderConfig":
+        if self.name is not None:
+            if self.python_file is not None or self.object_name is not None:
+                raise ValueError(
+                    "Task encoder must use either name or python_file and object_name."
+                )
+            return self
+        if not self.python_file or not self.object_name:
+            raise ValueError(
+                "File-backed task encoders require python_file and object_name."
+            )
+        return self
 
 
 class EnergonCookerConfig(BaseModel, extra="allow"):
-    """One source cooker selected by registry key."""
+    """One built-in or file-backed source cooker."""
 
-    name: str = "generic_conversation"
+    name: str | None = "generic_conversation"
+    python_file: str | None = None
+    object_name: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("object_name", "object"),
+        serialization_alias="object",
+    )
     options: dict[str, Any] = Field(default_factory=dict)
     has_subflavors: dict[str, str | int | float | bool | None] | None = None
 
@@ -54,7 +110,23 @@ class EnergonCookerConfig(BaseModel, extra="allow"):
     def _from_registry_key(cls, value: Any) -> Any:
         if isinstance(value, str):
             return {"name": value}
+        if isinstance(value, dict) and "object_name" in value and "object" in value:
+            raise ValueError("Use only one of object_name or its legacy alias object.")
+        if isinstance(value, dict) and value.get("python_file") and "name" not in value:
+            return {**value, "name": None}
         return value
+
+    @model_validator(mode="after")
+    def _validate_component_reference(self) -> "EnergonCookerConfig":
+        if self.name is not None:
+            if self.python_file is not None or self.object_name is not None:
+                raise ValueError(
+                    "Cooker must use either name or python_file and object_name."
+                )
+            return self
+        if not self.python_file or not self.object_name:
+            raise ValueError("File-backed cookers require python_file and object_name.")
+        return self
 
 
 class EnergonLoaderConfig(BaseModel, extra="allow"):
@@ -70,27 +142,14 @@ class EnergonLoaderConfig(BaseModel, extra="allow"):
             int,
             Field(
                 ge=1,
-                description=(
-                    "Maximum consecutive samples read from one shard before "
-                    "switching; this does not limit pack membership."
-                ),
+                description="Maximum sequential sample run used when sharding a dataset.",
             ),
         ]
         | None
     ) = None
-    packing_buffer_size: (
-        Annotated[
-            int,
-            Field(
-                ge=1,
-                description=(
-                    "Number of samples Energon buffers when forming packs; "
-                    "None disables Energon-owned packing."
-                ),
-            ),
-        ]
-        | None
-    ) = None
+    # Packing is configured by task_encoder.packing. Keep the old field in the
+    # resolved config so older recipes that set it to null remain loadable.
+    packing_buffer_size: None = None
     batch_grouping: Literal["auto"] = "auto"
     processor_adapter: Literal["hf_multimodal"] = "hf_multimodal"
     topology_mapper: Literal["default"] = "default"
@@ -104,3 +163,22 @@ class EnergonLoaderConfig(BaseModel, extra="allow"):
     prefetch_factor: Annotated[int, Field(ge=1)] = 2
     checkpoint_every_sec: Annotated[float, Field(gt=0)] = 60.0
     watchdog_timeout_seconds: Annotated[float, Field(gt=0)] | None = 60.0
+    nvdataset_cache_dir: str | None = Field(
+        default=None,
+        description=(
+            "Root used to resolve dss:// dataset paths. When set, this is "
+            "exported as NVDATASET_CACHE_DIR for Energon loader workers."
+        ),
+    )
+    cache_pool_max_gbytes: Annotated[float, Field(gt=0)] | None = Field(
+        default=None,
+        description="Maximum file-store cache size in GiB; None uses Energon's limit.",
+    )
+    cache_pool_num_workers: Annotated[int, Field(ge=1)] = Field(
+        default=1,
+        description="Number of FileStoreCachePool worker processes.",
+    )
+    gc_collect_every_n_steps: Annotated[int, Field(ge=1)] = Field(
+        default=100000,
+        description="Loader steps between forced Python garbage collections.",
+    )

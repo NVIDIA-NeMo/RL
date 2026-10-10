@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -35,8 +35,14 @@ def test_builtin_registries_resolve_lazily_with_stable_versions():
         "version": "1",
     }
     assert selected_registry_identity(
-        task_encoder="generic_sft",
-        cookers=["generic_conversation"],
+        task_encoder=SimpleNamespace(
+            name="generic_sft", python_file=None, object_name=None
+        ),
+        cookers=[
+            SimpleNamespace(
+                name="generic_conversation", python_file=None, object_name=None
+            )
+        ],
     ) == {
         "task_encoder": {"key": "generic_sft", "version": "1"},
         "cookers": [{"key": "generic_conversation", "version": "1"}],
@@ -104,3 +110,126 @@ def test_registry_does_not_import_component_during_registration(tmp_path, monkey
 
     assert "json" not in imported
     assert registry.resolve("json_loads") is not None
+
+
+def test_registry_resolves_and_fingerprints_file_backed_component(tmp_path):
+    component_file = tmp_path / "custom_cooker.py"
+    component_file.write_text(
+        "from nemo_rl.data.energon.multimodal.model_families import "
+        "supports_model_families\n\n"
+        "@supports_model_families('qwen')\n"
+        "def custom_cooker(sample, *, prefix=''):\n"
+        "    return prefix + sample\n"
+    )
+    registry = LazyRegistry("cooker")
+
+    resolved = registry.resolve_configured_for_model_family(
+        name=None,
+        python_file=str(component_file),
+        object_name="custom_cooker",
+        model_family="qwen",
+    )
+    identity = registry.configured_identity(
+        name=None,
+        python_file=str(component_file),
+        object_name="custom_cooker",
+    )
+
+    assert resolved("sample", prefix="custom-") == "custom-sample"
+    assert identity["python_file"] == str(component_file)
+    assert identity["object"] == "custom_cooker"
+    assert len(identity["sha256"]) == 64
+
+    component_file.write_text(component_file.read_text() + "\n# changed\n")
+    changed_identity = registry.configured_identity(
+        name=None,
+        python_file=str(component_file),
+        object_name="custom_cooker",
+    )
+    assert changed_identity["sha256"] != identity["sha256"]
+
+
+def test_registry_resolves_and_fingerprints_file_backed_package(tmp_path):
+    package = tmp_path / "custom_components"
+    package.mkdir()
+    init_file = package / "__init__.py"
+    init_file.write_text("from .cookers import custom_cooker\n")
+    cooker_file = package / "cookers.py"
+    cooker_file.write_text(
+        "from nemo_rl.data.energon.multimodal.model_families import "
+        "supports_model_families\n\n"
+        "@supports_model_families('qwen')\n"
+        "def custom_cooker(sample):\n"
+        "    return sample\n"
+    )
+    registry = LazyRegistry("cooker")
+
+    resolved = registry.resolve_configured_for_model_family(
+        name=None,
+        python_file=str(init_file),
+        object_name="custom_cooker",
+        model_family="qwen",
+    )
+    identity = registry.configured_identity(
+        name=None,
+        python_file=str(init_file),
+        object_name="custom_cooker",
+    )
+
+    assert resolved("sample") == "sample"
+    cooker_file.write_text(cooker_file.read_text() + "\n# changed\n")
+    changed_identity = registry.configured_identity(
+        name=None,
+        python_file=str(init_file),
+        object_name="custom_cooker",
+    )
+    assert changed_identity["sha256"] != identity["sha256"]
+
+
+def test_registry_rejects_invalid_file_backed_component_references(tmp_path):
+    registry = LazyRegistry("cooker")
+    component_file = tmp_path / "custom_cooker.py"
+    component_file.write_text("def custom_cooker(sample):\n    return sample\n")
+
+    with pytest.raises(ValueError, match="must be absolute"):
+        registry.resolve_configured(
+            name=None,
+            python_file="custom_cooker.py",
+            object_name="custom_cooker",
+        )
+    with pytest.raises(TypeError, match="does not resolve"):
+        registry.resolve_configured(
+            name=None,
+            python_file=str(component_file),
+            object_name="missing",
+        )
+
+
+@pytest.mark.mcore
+def test_registry_resolves_file_backed_task_encoder(tmp_path):
+    component_file = tmp_path / "custom_task_encoder.py"
+    component_file.write_text(
+        "from nemo_rl.data.energon.multimodal.model_families import "
+        "supports_model_families\n"
+        "from nemo_rl.data.energon.multimodal.task_encoders.base import "
+        "BaseSFTTaskEncoder\n\n"
+        "@supports_model_families('qwen')\n"
+        "class CustomTaskEncoder(BaseSFTTaskEncoder):\n"
+        "    def preencode_sample(self, sample):\n"
+        "        return sample\n\n"
+        "    def postencode_sample(self, sample):\n"
+        "        return sample\n\n"
+        "    def batch(self, samples):\n"
+        "        return samples\n\n"
+        "    def encode_batch(self, batch):\n"
+        "        return batch\n"
+    )
+
+    resolved = LazyRegistry("task_encoder").resolve_configured_for_model_family(
+        name=None,
+        python_file=str(component_file),
+        object_name="CustomTaskEncoder",
+        model_family="qwen",
+    )
+
+    assert resolved.__name__ == "CustomTaskEncoder"

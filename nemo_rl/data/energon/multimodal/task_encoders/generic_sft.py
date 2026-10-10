@@ -70,12 +70,12 @@ def _normalize_messages(
         materialize: Decode each media value and attach the payload. Set False
             to attach the ``MediaRef`` instead.
 
-    The Nemotron renderers replace every media part with text built from
-    metadata and then overwrite ``message["content"]`` wholesale, so decoding
-    for them is pure waste. It is also waste paid at the wrong time: this runs
-    in pre-encode, before ``select_samples_to_pack``, so rows that selection
-    discards are decoded too. Measured on video rows at 2771 ms against the
-    Megatron reference's 4.7 ms, which defers all frame work to post-encode.
+    Model-specific renderers may replace media parts with text built from
+    metadata and overwrite ``message["content"]`` wholesale, so decoding for
+    them is pure waste. It is also waste paid at the wrong time: this runs in
+    pre-encode, before ``select_samples_to_pack``, so rows that selection
+    discards are decoded too. Model-specific encoders can defer media work to
+    post-encode by setting ``materialize=False``.
 
     Only ``GenericSFTTaskEncoder.encode`` consumes the payload, via
     ``get_formatted_message_log``, so it keeps the default.
@@ -218,6 +218,7 @@ class HFMultimodalSFTProcessorAdapter:
             add_eos_token=self.add_eos,
             add_generation_prompt=self.add_generation_prompt,
             tools=sample.tools,
+            chat_template_preapplied=sample.chat_template_preapplied,
         )
         length = sum(len(message["token_ids"]) for message in message_log)
         loss_multiplier = 1.0
@@ -272,7 +273,24 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         tokenizer: Any | None = None,
         sequence_length_pad_multiple: int = 1,
         only_unmask_final: bool = False,
+        loss_mask_mode: str | None = None,
     ) -> None:
+        """Configure conversation encoding and optional sequence packing.
+
+        Args:
+            adapter: Processor adapter that encodes each conversation.
+            cooker_functions: Cookers that produce canonical SFT samples.
+            include_source_ids: Include source identifiers in each batch.
+            packer: Sequence packer, or None to batch individual conversations.
+            tokenizer: Tokenizer used to pad packed batches.
+            sequence_length_pad_multiple: Alignment for each source in a pack.
+            only_unmask_final: Train only on the final assistant turn in default mode.
+            loss_mask_mode: None builds assistant-role loss masks. "precomputed"
+                preserves each message's token_loss_mask, which must be a binary
+                one-dimensional tensor matching token_ids. Precomputed masks do
+                not support only_unmask_final=True. Both modes support packed
+                and unpacked conversations.
+        """
         super().__init__(cooker_functions=cooker_functions)
         self.adapter = adapter
         self.include_source_ids = include_source_ids
@@ -280,6 +298,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         self.tokenizer = tokenizer
         self.sequence_length_pad_multiple = sequence_length_pad_multiple
         self.only_unmask_final = only_unmask_final
+        self.loss_mask_mode = loss_mask_mode
 
     @stateless
     def preencode_sample(self, sample: CanonicalSFTSample) -> EncodedSFTSample:
@@ -329,6 +348,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
                 cast(list[PackedSFTSample], samples),
                 tokenizer=self.tokenizer,
                 only_unmask_final=self.only_unmask_final,
+                loss_mask_mode=self.loss_mask_mode,
             )
         if not all(isinstance(sample, EncodedSFTSample) for sample in samples):
             raise TypeError("Energon SFT batches accept only encoded samples.")
@@ -342,6 +362,8 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         }
         if self.include_source_ids:
             values["source_ids"] = [sample.sample_key for sample in encoded_samples]
+        if self.loss_mask_mode is not None:
+            values["loss_mask_mode"] = self.loss_mask_mode
         return BatchedDataDict(values)
 
     @stateless
