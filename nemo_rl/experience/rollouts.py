@@ -18,6 +18,7 @@
 import asyncio
 import copy
 import json
+import logging
 import statistics
 import uuid
 import warnings
@@ -97,6 +98,8 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.timer import Timer
+
+logger = logging.getLogger(__name__)
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -3186,6 +3189,32 @@ def _postprocess_single_nemo_gym_group(
         pad_value_dict={"token_ids": tokenizer.pad_token_id},
     )
     input_ids = batched_flat["token_ids"]
+    # Within one logical prompt group every rollout should start from the same
+    # first prompt. An agent harness that renders a per-rollout identifier (an
+    # id, a URL, a timestamp) into its prompt gives each rollout a distinct
+    # first prompt instead: the group's prefix is never shared across the
+    # engine's prefix cache, and any consumer that keys on the first-prompt
+    # tokens (a per-prompt baseline, a cache, a dedup) sees one group per
+    # rollout. GRPO's baselines key on the explicit group id, so they are not
+    # affected. Compare against the logical prompt groups rather than the row
+    # count: validation and distillation batches legitimately hold one rollout
+    # per prompt. _prepare_nemo_gym_rows stamps one group id per logical prompt
+    # group; rows handed in by a direct caller without the key form one group.
+    distinct_first_prompts = int(torch.unique(input_ids, dim=0).shape[0])
+    logical_groups = len({row.get(NEMO_GYM_GROUP_ID_KEY) for row in nemo_gym_rows})
+    rollout_metrics["baseline_groups/distinct_first_prompts"] = distinct_first_prompts
+    rollout_metrics["baseline_groups/logical_groups"] = logical_groups
+    rollout_metrics["baseline_groups/samples"] = len(results)
+    if distinct_first_prompts > logical_groups:
+        logger.warning(
+            "%d NeMo-Gym rollouts form %d logical prompt group(s) but have %d "
+            "distinct first prompts, so the rollouts of a group do not share a "
+            "prompt prefix. Check that per-rollout identifiers are not changing "
+            "the agent harness prompt.",
+            len(results),
+            logical_groups,
+            distinct_first_prompts,
+        )
 
     final_batch = BatchedDataDict[DatumSpec](
         {
