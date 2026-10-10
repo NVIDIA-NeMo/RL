@@ -18,6 +18,8 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
 class VllmSpecificArgs(TypedDict):
+    native_speechlm: NotRequired[bool]
+    load_base_weights_before_refit: NotRequired[bool]
     tensor_parallel_size: int
     pipeline_parallel_size: int
     expert_parallel_size: int
