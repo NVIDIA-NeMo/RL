@@ -486,11 +486,15 @@ env:
       responses_api_agents:
         opencode_sandboxed_agent: &legacy_opencode_agent
           opencode_version: 1.17.11
+          # Egress is blocked by the resources servers, which create this agent's sandbox
+          # (enforce_agent_no_network below); network_access here only applies to sandboxes the
+          # agent creates itself and rejects externally supplied ones.
           # The default installer downloads OpenCode from opencode.ai inside each sandbox and
           # needs curl, which ~1/3 of SWE-rebench images lack (those rollouts fail with
-          # "opencode: command not found"). For a network-free, libc-aware install, point these
-          # at a cached installer and glibc/musl binaries readable inside the sandbox (e.g. a
-          # read-only bucket mount).
+          # "opencode: command not found"); with agent egress blocked it cannot reach
+          # opencode.ai at all. For a network-free, libc-aware install, point these at a cached
+          # installer and glibc/musl binaries readable inside the sandbox (e.g. a read-only
+          # bucket mount).
           remote_opencode_install_script_path: null
           remote_opencode_binary_path: null
           remote_opencode_musl_binary_path: null
@@ -635,6 +639,15 @@ env:
           # Legacy swebench_tests_timeout.
           evaluation_timeout: 900
           apply_anti_cheating: true
+          # Agent sandbox egress allowlist = the policy model server only (evaluation sandboxes
+          # keep their network). With open egress PPO learned to fetch the task's upstream fix
+          # (pip download / npm view / GitHub raw+API via curl or Python urllib), rising from ~5%
+          # to ~45% of rewarded rollouts over 200 steps; the command deny-list was routed around.
+          # Requires the network-free OpenCode install (remote_opencode_*): opencode.ai is blocked.
+          enforce_agent_no_network: true
+          sandbox_model_server:
+            type: responses_api_models
+            name: policy_model
           sandbox_config:
             resources:
               memory_mib: 65536
