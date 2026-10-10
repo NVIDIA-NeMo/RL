@@ -239,7 +239,9 @@ class UnitSlabStore:
                         timeout_s=self.timeout_s,
                     )
                 except TransferError as e:
-                    self.ctl.notify(u["zmq"], "abort", blob_id=blob_id)
+                    self.ctl.notify(
+                        u["zmq"], "abort", blob_id=blob_id, in_flight=e.in_flight
+                    )
                     last_err = e
                     continue
                 self._blob_unit[blob_id] = unit_id
@@ -308,7 +310,11 @@ class UnitSlabStore:
                 self.ep.transfer(
                     "READ", loc, rem, uinfo["agent_name"], timeout_s=self.timeout_s
                 )
-            except TransferError:
+            except TransferError as e:
+                if e.in_flight:
+                    # The READ may still land in these local ranges, so they
+                    # cannot be refilled by the pinned path; fail the read.
+                    raise LostBlobs(blobs, str(e)) from e
                 retry.update({b: requests[b] for b in blobs})
                 continue
             for b in blobs:
@@ -414,6 +420,11 @@ class FileStore:
     No storage actors. The BlobDirectory keeps per-blob refcounts so the last
     ``release`` deletes the file. Registered fds are cached per process with
     an LRU cap so reads of hot blobs skip the open+register cost.
+
+    A blob whose WRITE or READ failed short of DONE moves to ``retained``:
+    the transfer may still use its fd, so the fd stays open and registered
+    and the file stays in place until the process exits (never evicted,
+    released or closed).
     """
 
     def __init__(
@@ -436,6 +447,7 @@ class FileStore:
         self._open: OrderedDict[str, tuple[int, int]] = (
             OrderedDict()
         )  # blob → (fd, nbytes)
+        self.retained: dict[str, tuple[int, int]] = {}  # blob → (fd, nbytes)
 
     def path(self, blob_id: str) -> str:
         return os.path.join(self.root, f"{blob_id}.blob")
@@ -465,6 +477,11 @@ class FileStore:
         finally:
             os.close(fd)
 
+    def _retain(self, blob_id: str) -> None:
+        item = self._open.pop(blob_id, None)
+        if item is not None:
+            self.retained[blob_id] = item
+
     def _forget(self, blob_id: str) -> None:
         item = self._open.pop(blob_id, None)
         if item is not None:
@@ -486,7 +503,10 @@ class FileStore:
                 remote_mem="FILE",
                 remote_dev=fd,
             )
-        except TransferError:
+        except TransferError as e:
+            if e.in_flight:
+                self._retain(blob_id)  # the WRITE may still land in the file
+                raise
             self._forget(blob_id)
             try:
                 os.remove(self.path(blob_id))
@@ -520,6 +540,8 @@ class FileStore:
                     remote_dev=fd,
                 )
             except TransferError as e:
+                if e.in_flight:
+                    self._retain(b)  # the READ may still use the fd
                 raise LostBlobs([b], str(e))
 
     def release(
@@ -527,6 +549,8 @@ class FileStore:
     ) -> None:
         gone = ray.get(self.directory.release.remote(list(counts.items())))
         for b in gone:
+            if b in self.retained:
+                continue  # a failed transfer may still use the file
             self._forget(b)
             try:
                 os.remove(self.path(b))

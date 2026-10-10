@@ -56,7 +56,17 @@ class DataPlaneLostKeys(Exception):
 
 
 class TransferError(Exception):
-    """A NIXL transfer finished in the ERR state or timed out."""
+    """A NIXL transfer finished in the ERR state or timed out.
+
+    ``in_flight`` is True when the transfer was posted and never seen DONE.
+    Releasing its handle does not stop it (UCX cancels asynchronously, POSIX
+    just drops the handle), so its destination may still be written later and
+    must not be reused.
+    """
+
+    def __init__(self, msg: str = "", *, in_flight: bool = False) -> None:
+        super().__init__(msg)
+        self.in_flight = in_flight
 
 
 class StaleRead(Exception):

@@ -123,6 +123,7 @@ class NixlStorageUnit:
         self.slab_base = self.ep.register(self.slab)
         self.blobs: dict[str, BlobRec] = {}
         self._pins: dict[str, list[str]] = {}  # pin_id → blob_ids
+        self.retired_bytes = 0  # regions of WRITEs that never reached DONE
         self._directory = directory  # admin/restore only; never on the op path
         self.node_id = ray.get_runtime_context().get_node_id()
         self._mu = threading.RLock()
@@ -173,10 +174,19 @@ class NixlStorageUnit:
         return off
 
     @_locked
-    def abort(self, blob_id: str) -> None:
-        """Drop a blob whose WRITE failed; nothing was published, free at once."""
+    def abort(self, blob_id: str, in_flight: bool = True) -> None:
+        """Drop a blob whose WRITE failed; nothing was published.
+
+        If the WRITE may still be running (``in_flight``), the region is never
+        freed: a late WRITE would land in whatever blob reused it. The leak is
+        counted in ``retired_bytes``.
+        """
         rec = self.blobs.pop(blob_id, None)
-        if rec is not None:
+        if rec is None:
+            return
+        if in_flight:
+            self.retired_bytes += rec.nbytes
+        else:
             self.alloc_.free(rec.off, rec.nbytes)
 
     @_locked
@@ -282,6 +292,7 @@ class NixlStorageUnit:
             "quarantined_bytes": self.alloc_.quarantined_bytes,
             "fragments": self.alloc_.fragments,
             "pins": len(self._pins),
+            "retired_bytes": self.retired_bytes,
         }
 
     @_locked

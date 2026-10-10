@@ -135,6 +135,16 @@ class NixlEndpoint:
                 self.backends.append(b)
         self._regs: dict[Any, tuple[Any, list[str]]] = {}
         self._remotes: set[str] = set()
+        # Local (addr, nbytes) ranges of transfers that failed without reaching
+        # DONE: a READ may still write them, a WRITE may still read them. Never
+        # cleared: no NIXL call proves such a transfer has stopped.
+        self.unfinished: list[tuple[int, int]] = []
+        # Their handles and descriptor lists, kept alive and never released.
+        self.unfinished_handles: list[tuple[Any, Any, Any]] = []
+
+    def touches_unfinished(self, addr: int, nbytes: int) -> bool:
+        """True if ``[addr, addr+nbytes)`` overlaps a transfer that may still run."""
+        return any(a < addr + nbytes and addr < a + n for a, n in self.unfinished)
 
     # ------------------------------------------------------------------ registration
     def register(self, arr: np.ndarray) -> int:
@@ -232,31 +242,53 @@ class NixlEndpoint:
             raise TransferError(
                 f"{op} to {remote_agent}: {type(e).__name__}: {e}"
             ) from e
+        # From here on the transfer may be posted. Anything short of DONE leaves
+        # it possibly still running, so its local ranges go on ``unfinished``
+        # for good: a READ's are its destination, a WRITE's its source, whose
+        # memory and registration must outlive it too (BufferPool and the
+        # zero-copy put check them). A failed WRITE's destination is remote;
+        # the caller retires it on the unit. The handle is kept too, never
+        # released: POSIX hands the request object to its I/O callbacks and
+        # deleting it under a pending I/O is a use-after-free.
         try:
             state = self.agent.transfer(h)
             deadline = time.monotonic() + timeout_s
             while state == "PROC":
                 if time.monotonic() > deadline:
                     raise TransferError(
-                        f"{op} to {remote_agent} timed out after {timeout_s}s"
+                        f"{op} to {remote_agent} timed out after {timeout_s}s",
+                        in_flight=True,
                     )
                 state = self.agent.check_xfer_state(h)
             if state != "DONE":
-                raise TransferError(f"{op} to {remote_agent} ended in state {state}")
-        except TransferError:
-            raise
+                raise TransferError(
+                    f"{op} to {remote_agent} ended in state {state}", in_flight=True
+                )
         except Exception as e:  # noqa: BLE001
+            self.unfinished_handles.append((h, ldesc, rdesc))
+            self.unfinished.extend(local)
+            if isinstance(e, TransferError):
+                raise
             raise TransferError(
-                f"{op} to {remote_agent}: {type(e).__name__}: {e}"
+                f"{op} to {remote_agent}: {type(e).__name__}: {e}", in_flight=True
             ) from e
-        finally:
-            try:
-                self.agent.release_xfer_handle(h)
-            except Exception:  # noqa: BLE001 - the handle of a failed peer may be gone
-                pass
+        try:
+            self.agent.release_xfer_handle(h)
+        except Exception:  # noqa: BLE001 - nothing is pending on a DONE handle
+            pass
 
     # ------------------------------------------------------------------ lifecycle
     def close(self) -> None:
+        if self.unfinished_handles:
+            # A transfer may still be running: keep the agent, remotes and
+            # registrations alive until the process exits.
+            log.warning(
+                "nixl endpoint %s: %d unfinished transfer(s); leaving NIXL state "
+                "registered until exit",
+                self.name,
+                len(self.unfinished_handles),
+            )
+            return
         for name in list(self._remotes):
             self.remove_remote(name)
         for key in list(self._regs):

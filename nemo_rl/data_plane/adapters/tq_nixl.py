@@ -173,6 +173,10 @@ class NixlKVClient(StorageKVClient):
         # Pays off only where registration is cheap (UCX caches reused heap
         # ranges): ~0.02 ms at 16 MB, but ~70 ms per fresh 1 GiB mapping, where a
         # parallel copy into a pooled buffer takes ~10 ms. Hence a size window.
+        # Zero-copy sources of WRITEs that failed short of DONE, kept registered
+        # and referenced until the process exits (see _put_segments).
+        self.retained_sources: list[tuple[int, np.ndarray, Any]] = []
+        self.retained_source_bytes = 0
         self.zero_copy_min = int(cfg.get("zero_copy_min_bytes", 1 << 20))
         self.zero_copy_max = int(cfg.get("zero_copy_max_bytes", 32 << 20))
         self.parallel_copy_min = int(cfg.get("parallel_copy_min_bytes", 16 << 20))
@@ -258,11 +262,11 @@ class NixlKVClient(StorageKVClient):
         Big values go zero-copy, the rest (small values, the index and the footer) is packed into one pool buffer.
         """
         zero = [
-            (e, mv)
+            (e, mv, owner)
             for e, mv, owner in zip(p.entries, p.buffers, p.keepalive)
             if e.len and self._zero_copy_ok(e, mv, owner)
         ]
-        zero_ids = {id(e) for e, _ in zero}
+        zero_ids = {id(e) for e, _, _ in zero}
         packed = [
             (e, mv)
             for e, mv in zip(p.entries, p.buffers)
@@ -276,7 +280,7 @@ class NixlKVClient(StorageKVClient):
         tail_off = cur
         packed_bytes = tail_off + tail
 
-        regs: list[int] = []
+        regs: list[tuple[int, np.ndarray, Any]] = []
         try:
             with self.pool.acquire(packed_bytes) as (base, buf):
                 segments: list[tuple[int, int, int]] = []
@@ -288,10 +292,10 @@ class NixlKVClient(StorageKVClient):
                 blob_format.write_tail(p, memoryview(buf)[tail_off : tail_off + tail])
                 segments.append((base + tail_off, p.index_off, tail))
                 with self._lock:
-                    for e, mv in zero:
+                    for e, mv, owner in zero:
                         arr = np.frombuffer(mv.cast("B"), dtype=np.uint8)
                         addr = self.ep.register(arr)
-                        regs.append(addr)
+                        regs.append((addr, arr, owner))
                         segments.append((addr, e.off, e.len))
                     return self.store.put_segments(
                         segments, p.nbytes, len(p.entries), blob_id=blob_id
@@ -299,8 +303,14 @@ class NixlKVClient(StorageKVClient):
         finally:
             if regs:
                 with self._lock:
-                    for addr in regs:
-                        self.ep.deregister(addr)
+                    for addr, arr, owner in regs:
+                        if self.ep.touches_unfinished(addr, arr.nbytes):
+                            # A failed WRITE may still read this memory: keep it
+                            # registered and alive. The caller may overwrite it.
+                            self.retained_sources.append((addr, arr, owner))
+                            self.retained_source_bytes += arr.nbytes
+                        else:
+                            self.ep.deregister(addr)
 
     # ------------------------------------------------------------------ get
     def get(
