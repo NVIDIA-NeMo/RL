@@ -888,11 +888,13 @@ def setup(
     )
     nemo_gym_actor = None
 
-    def _spinup_nemo_gym(base_urls, model_name):
+    def _spinup_nemo_gym(base_urls, model_name, policy_api_key=None):
         """Spin up the NeMo Gym stack against the given generation server URLs.
 
         Returns a shard set, which is the one actor of an unsharded job as much
-        as it is the K of a sharded one.
+        as it is the K of a sharded one. ``policy_api_key`` is the bearer token
+        the generation server requires on its OpenAI routes (the vLLM backend's
+        ``http_server_api_key``), or None when the server checks none.
         """
         t0 = time.perf_counter()
         shard_set = build_nemo_gym_actors(
@@ -902,6 +904,7 @@ def setup(
             tokenizer=tokenizer,
             enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+            policy_api_key=policy_api_key,
         )
         train_splits = (
             {f"train[{name}]": split for name, split in dataset.items()}
@@ -1660,6 +1663,7 @@ def setup(
                 return _spinup_nemo_gym(
                     deferred_vllm.dp_openai_server_base_urls,
                     generation_config["model_name"],
+                    policy_api_key=deferred_vllm.http_server_api_key,
                 )
 
             # Colocated: vLLM + policy share GPUs -> sequential; otherwise parallel.

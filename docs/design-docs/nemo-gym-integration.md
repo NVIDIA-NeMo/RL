@@ -47,6 +47,24 @@ the async replay buffer and avoids uploading them to W&B. Numeric per-agent
 rollout metrics are unaffected. Set the flag to `true` only when the complete
 Gym result payloads are needed for a short debugging run.
 
+The exposed vLLM HTTP server binds every interface of its node and, by default,
+checks no credential on its OpenAI routes; the NeMo Gym model server sends the
+placeholder key `dummy_key`. Set `policy.generation.vllm_cfg.http_server_api_key_required: true`
+to require a bearer token instead: NeMo RL generates one random key per job,
+every vLLM worker refuses a `/v1/*` or `/tokenize` request without
+`Authorization: Bearer <key>` (HTTP 401), and the same key reaches the NeMo Gym
+model server as `policy_api_key`. The saved and logged job configuration never
+carries the key: the vLLM workers receive it in their own configuration copy,
+and the Gym servers receive it as an environment variable
+(`NEMO_RL_POLICY_API_KEY`) that each server resolves in its own process, so
+Gym's serialized global config, its head server's `/global_config_dict_yaml`
+endpoint and the server command lines carry only the variable name. The
+residual exposure is the server processes' environment and the Gym actor's
+constructor arguments, the same as for the token-capture secret. The setting
+covers the vLLM backend only: the Megatron, TRT-LLM and Dynamo exposed servers
+check no credential and their Gym actors keep `dummy_key` (Dynamo rejects the
+setting at configuration time rather than ignoring it).
+
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
 ### Shard NeMo Gym across nodes

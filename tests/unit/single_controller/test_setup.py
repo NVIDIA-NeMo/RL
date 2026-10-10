@@ -1901,6 +1901,8 @@ class TestSetup:
             tokenizer=tokenizer,
             enable_router_replay=False,
             use_fastokens=False,
+            # The vLLM server's bearer token, handed to the Gym model server.
+            policy_api_key=patched_factories["fake_gen"].http_server_api_key,
             token_capture=None,
         )
         mock_validate.assert_called_once_with(
@@ -2479,6 +2481,9 @@ class TestSetup:
         assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
             "megatron"
         )
+        # The Megatron exposed server checks no bearer token, so Gym's model
+        # server keeps the placeholder key.
+        assert mock_spinup.call_args.kwargs["policy_api_key"] is None
         mock_create_finalizer_actors.assert_called_once()
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 
