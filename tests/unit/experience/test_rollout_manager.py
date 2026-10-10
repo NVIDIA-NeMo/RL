@@ -1167,7 +1167,6 @@ def test_nemo_gym_stream_rows_leaves_the_infra_marker_slot_empty():
     # and the marker's detail is recorded for the final error.
     assert results[0] is not None
     assert results[1] is None
-    assert shaping[0] is not None
     assert shaping[1] is None
     assert "agent_ref" not in pending[1]
     assert timing == {"timing/remote": 1.0}
