@@ -179,12 +179,14 @@ def mock_components():
             },
             "logger": LoggerConfig.model_construct(num_val_samples_to_print=5),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
-            "checkpointing": CheckpointingConfig.model_construct(**{
-                "enabled": False,
-                "checkpoint_must_save_by": None,
-                "save_period": 10,
-                "metric_name": None,
-            }),
+            "checkpointing": CheckpointingConfig.model_construct(
+                **{
+                    "enabled": False,
+                    "checkpoint_must_save_by": None,
+                    "save_period": 10,
+                    "metric_name": None,
+                }
+            ),
         }
     )
 
