@@ -2855,6 +2855,7 @@ class SingleControllerActor:
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
             min_sample_version = None
+            step_staleness: list[int] = []
             step_open = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
@@ -3263,10 +3264,17 @@ class SingleControllerActor:
 
                     # ---- 4. Clear the batch ----
                     # Refresh min_sample_version
-                    curr_min_sample_version = min(
+                    chunk_weight_versions = [
                         t["weight_version"]
                         for t in train_meta.tags  # type: ignore
+                    ]
+                    # Count each trajectory once across all streaming chunks,
+                    # relative to the weights used to train this step.
+                    step_staleness.extend(
+                        version_during_step - sample_version
+                        for sample_version in chunk_weight_versions
                     )
+                    curr_min_sample_version = min(chunk_weight_versions)
                     if min_sample_version is not None:
                         min_sample_version = min(
                             min_sample_version, curr_min_sample_version
@@ -3339,7 +3347,11 @@ class SingleControllerActor:
                     self._optimizer_commit_in_progress = True
 
                 # Aggregate step metrics
-                step_metrics = {}
+                step_metrics: dict[str, Any] = {
+                    "staleness_min": min(step_staleness),
+                    "staleness_mean": statistics.fmean(step_staleness),
+                    "staleness_max": max(step_staleness),
+                }
                 if policy_result is not None:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:
