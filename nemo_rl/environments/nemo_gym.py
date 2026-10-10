@@ -100,13 +100,15 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
 
-# The three server-type keys Gym nests under a top-level config entry. Gym's
+# The four server-type keys Gym nests under a top-level config entry. Gym's
 # constant is private (nemo_gym.discovery._SERVER_GROUP_KEYS), and the literal
 # list also appears in global_config.py, config_types.py, and cli/env.py.
+# tests/unit/environments/test_nemo_gym_server_keys.py checks the two agree.
 GYM_SERVER_TYPE_KEYS = (
     "responses_api_agents",
     "responses_api_models",
     "resources_servers",
+    "environment_servers",
 )
 
 # Shard name used when the job is unsharded, so a single actor and a sharded
