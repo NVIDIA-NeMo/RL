@@ -54,6 +54,14 @@ from nemo.lens import (
 from nemo.lens import (
     safe_set_span_attributes as _safe_set_span_attributes,
 )
+from nemo.lens import (
+    span_attributes as _span_attributes,
+)
+
+# Span-attribute key lens declares itself. Re-exported so call sites take every
+# ``rl.*`` key from this one module, and so a rename lands in lens's semconv
+# instead of in a string literal scattered across the algorithms.
+from nemo.lens.semconv import RL_ALGORITHM
 
 from nemo_rl.telemetry.span_groups import UMBRELLA_GROUP_VALUES, RLSpanGroup
 from nemo_rl.telemetry.vocabulary import (
@@ -73,11 +81,24 @@ RL_BUCKET_ATTR = "rl.bucket"
 # without parsing it back out of the span name.
 RL_EFFICIENCY_CATEGORY_ATTR = "rl.efficiency.category"
 
+# Training step the span belongs to, 1-based and counted across the whole run
+# rather than reset per epoch. Set once per step by :func:`iteration_scope`, so
+# a leaf does not have to be threaded the counter to be filterable by step.
+RL_ITERATION_ATTR = "rl.iteration"
+
 # Retry count for a wait that one span covers rather than one span per poll.
 # Without it the coalesced span's duration is unreadable: the same ten seconds
 # could be two thousand clean 5ms polls or two hundred polls whose selection
 # work ran long, which are opposite diagnoses.
 RL_IDLE_POLLS_ATTR = "rl.idle.polls"
+
+# Whether a checkpoint's bytes were still being written when the training loop
+# moved on. Distinguishes the two shapes ``rl.checkpoint.finalize`` can take:
+# with async save it spans a real wait on the writer processes, with sync save
+# the write already finished inside the staging span and this is just a rename.
+# Same span either way, so without this a near-zero duration is ambiguous
+# between "sync save" and "async save that had already landed".
+RL_CHECKPOINT_ASYNC_ATTR = "rl.checkpoint.async_save"
 
 __all__ = [
     "NO_SPAN",
@@ -102,6 +123,7 @@ __all__ = [
     "accepts_trace_context",
     "TRACE_CARRIER_KWARG",
     "bucket_scope",
+    "iteration_scope",
     "per_prompt_scope",
     "in_per_prompt_scope",
     "efficiency_span",
@@ -109,8 +131,12 @@ __all__ = [
     "startup_span",
     "setup_span",
     "evaluate_span",
+    "checkpoint_finalize_span",
+    "RL_ALGORITHM",
+    "RL_CHECKPOINT_ASYNC_ATTR",
     "RL_EFFICIENCY_CATEGORY_ATTR",
     "RL_IDLE_POLLS_ATTR",
+    "RL_ITERATION_ATTR",
 ]
 
 
@@ -309,6 +335,31 @@ def bucket_scope(bucket: Bucket) -> Iterator[None]:
         yield
     finally:
         _BUCKET_OVERRIDE.reset(token)
+
+
+@contextmanager
+def iteration_scope(iteration: int) -> Iterator[None]:
+    """Stamp :data:`RL_ITERATION_ATTR` on every span opened inside this block.
+
+    Wrap a training step once and its whole subtree -- leaves, checkpointing,
+    rollout and generation spans -- becomes filterable by step. Threading the
+    counter into each call site instead leaves the answer to "what else was
+    happening in step 412" dependent on which sites remembered to pass it, and
+    silently excludes every span added afterwards.
+
+    A span that passes the attribute itself keeps its own value: lens applies
+    the scope in a span processor that skips keys already set. ``evaluate_span``
+    relies on that, since validation also runs once before training and reports
+    iteration 0 there.
+
+    Only spans from the provider lens builds are stamped, which is every span
+    NeMo-RL opens. Propagates like any :class:`~contextvars.ContextVar`: to
+    nested calls and to coroutines started inside the block, but not to raw
+    threads or other processes -- a worker's ``rl.policy.load_model`` is a root
+    span in another process and is outside any step besides.
+    """
+    with _span_attributes({RL_ITERATION_ATTR: iteration}):
+        yield
 
 
 # Marks a region as per-prompt work, for spans opened below the caller.
@@ -912,6 +963,57 @@ def evaluate_span(
         ) as span,
         bucket_scope(Bucket.OVERHEAD),
     ):
+        yield span
+
+
+@contextmanager
+def checkpoint_finalize_span(
+    iteration: Optional[int],
+    *,
+    async_save: bool,
+    tracer: Optional[Tracer] = None,
+    **attributes: Any,
+) -> Iterator[Any]:
+    """The asynchronous tail of a checkpoint, named ``rl.checkpoint.finalize``.
+
+    Closes when the checkpoint is durable -- every rank's writer has flushed and
+    ``tmp_step_N`` has been renamed to ``step_N`` -- which is the moment a
+    checkpoint can actually be resumed from. ``rl.<algo>.checkpointing`` cannot
+    answer that: it ends when the training loop is released, which with async
+    save is after D2H staging only, with the bytes still in flight.
+
+    *iteration* is passed rather than inherited, and that is the point of the
+    helper. The work runs on a daemon thread spawned by ``begin_finalization``
+    and routinely outlives the step that triggered it, so the enclosing
+    :func:`iteration_scope` is both unreachable (a raw thread starts with an
+    empty context) and wrong by the time the span closes (the loop has moved
+    on). Stamping it explicitly keeps the span filed under the step whose
+    weights it holds, not whichever step happened to be running at the rename.
+    Set directly rather than left to the scope because lens's span processor
+    skips keys already present, so an explicit value wins over an inherited one.
+
+    Unbucketed, like the collector's waits and for the same reason: it overlaps
+    the next step's productive spans, so an ``overhead`` tag here would charge
+    one stretch of wall clock to two buckets at once. Reached through
+    ``_managed_span`` rather than :func:`managed_span` to get that -- the group
+    stays ``checkpoint`` so one group switch still turns every checkpoint span
+    on or off together.
+
+    Args:
+        iteration: Step the checkpoint was triggered at, or None when it cannot
+            be recovered from the directory name.
+        async_save: Whether the caller handed a wait function, i.e. whether
+            bytes were still being written when the training loop resumed.
+    """
+    attrs: dict[str, Any] = {RL_CHECKPOINT_ASYNC_ATTR: async_save, **attributes}
+    if iteration is not None:
+        attrs[RL_ITERATION_ATTR] = iteration
+    with _managed_span(
+        RLSpanGroup.CHECKPOINT,
+        "rl.checkpoint.finalize",
+        tracer=tracer,
+        **attrs,
+    ) as span:
         yield span
 
 

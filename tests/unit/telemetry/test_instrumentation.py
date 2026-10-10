@@ -17,14 +17,17 @@ Two layers:
 import asyncio
 import inspect
 import logging
+import threading
 
 import pytest
 
 from nemo_rl.telemetry.instrumentation import (
     EFFICIENCY_CATEGORY_BUCKET,
     RL_BUCKET_ATTR,
+    RL_CHECKPOINT_ASYNC_ATTR,
     RL_EFFICIENCY_CATEGORY_ATTR,
     RL_IDLE_POLLS_ATTR,
+    RL_ITERATION_ATTR,
     TRACE_CARRIER_KWARG,
     UMBRELLA_GROUPS,
     Bucket,
@@ -32,17 +35,20 @@ from nemo_rl.telemetry.instrumentation import (
     bucket_for_efficiency_category,
     bucket_for_span_group,
     bucket_scope,
+    checkpoint_finalize_span,
     current_trace_carrier,
     dispatch_with_trace_context,
     efficiency_span,
     goodput_span_attributes,
     in_per_prompt_scope,
+    iteration_scope,
     managed_span,
     per_prompt_scope,
     remote_trace_context,
     start_efficiency_span,
     trace_context_kwargs,
     trace_fn,
+    umbrella_span,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 
@@ -1131,3 +1137,211 @@ def test_step_nests_under_job():
     step, job = spans["rl.grpo.step"], spans["rl.grpo.job"]
     assert step.parent is not None
     assert step.parent.span_id == job.context.span_id
+
+
+@requires_lens
+def test_iteration_scope_reaches_leaf_and_checkpoint_spans():
+    """The point of the scope: one filter selects a whole step.
+
+    Threading the counter per call site is what left the checkpoint spans and
+    most leaves untagged, so the assertion is deliberately about the spans that
+    never passed it themselves rather than about the step umbrella.
+    """
+    handle, exporter = _setup("all")
+    with iteration_scope(412):
+        with umbrella_span(RLSpanGroup.U_STEP, "rl.grpo.step", tracer=handle.tracer):
+            with managed_span(
+                RLSpanGroup.POLICY_UPDATE,
+                "rl.grpo.policy_training",
+                tracer=handle.tracer,
+            ):
+                pass
+            with managed_span(
+                RLSpanGroup.CHECKPOINT,
+                "rl.grpo.checkpointing",
+                tracer=handle.tracer,
+            ):
+                pass
+    handle.shutdown()
+
+    emitted = {s.name: s for s in exporter.get_finished_spans()}
+    assert set(emitted) == {
+        "rl.grpo.step",
+        "rl.grpo.policy_training",
+        "rl.grpo.checkpointing",
+    }
+    for span in emitted.values():
+        assert span.attributes[RL_ITERATION_ATTR] == 412
+
+
+@requires_lens
+def test_iteration_scope_does_not_override_an_explicit_value():
+    """``rl.<algo>.evaluate`` depends on this.
+
+    Validation also runs once before training, where it reports iteration 0. If
+    the scope overwrote what a span passed, a baseline validation that happened
+    to be called from inside a step would be renumbered into that step.
+    """
+    handle, exporter = _setup("all")
+    with iteration_scope(412):
+        with managed_span(
+            RLSpanGroup.CHECKPOINT,
+            "rl.grpo.checkpointing",
+            tracer=handle.tracer,
+            **{RL_ITERATION_ATTR: 0},
+        ):
+            pass
+    handle.shutdown()
+
+    (emitted,) = exporter.get_finished_spans()
+    assert emitted.attributes[RL_ITERATION_ATTR] == 0
+
+
+@requires_lens
+def test_iteration_scope_does_not_leak_past_the_step():
+    """``rl.<algo>.job`` outlives every step, so it must stay unstamped."""
+    handle, exporter = _setup("all")
+    with umbrella_span(RLSpanGroup.U_JOB, "rl.grpo.job", tracer=handle.tracer):
+        with iteration_scope(1):
+            pass
+        with managed_span(
+            RLSpanGroup.CHECKPOINT, "rl.grpo.checkpointing", tracer=handle.tracer
+        ):
+            pass
+    handle.shutdown()
+
+    for span in exporter.get_finished_spans():
+        assert RL_ITERATION_ATTR not in span.attributes
+
+
+# --------------------------------------------------------------------------- #
+# Durable-checkpoint span                                                     #
+# --------------------------------------------------------------------------- #
+@requires_lens
+def test_checkpoint_finalize_span_outlives_the_step_that_triggered_it():
+    """The reason the span exists: ``rl.<algo>.checkpointing`` ends too early.
+
+    Mirrors ``begin_finalization``: the loop is released after staging and runs
+    another step while the writers drain, so the finalize span must still be
+    open once the next step's span has closed.
+    """
+    handle, exporter = _setup("all")
+    writers_done = threading.Event()
+
+    def finalize(carrier):
+        with (
+            remote_trace_context(carrier),
+            checkpoint_finalize_span(7, async_save=True, tracer=handle.tracer),
+        ):
+            writers_done.wait(5)
+
+    with iteration_scope(7):
+        with managed_span(
+            RLSpanGroup.CHECKPOINT, "rl.grpo.checkpointing", tracer=handle.tracer
+        ):
+            # begin_finalization is called from inside the staging span.
+            worker = threading.Thread(target=finalize, args=(current_trace_carrier(),))
+            worker.start()
+
+    with iteration_scope(8):
+        with managed_span(
+            RLSpanGroup.POLICY_UPDATE, "rl.grpo.policy_update", tracer=handle.tracer
+        ):
+            pass
+    writers_done.set()
+    worker.join(5)
+    handle.shutdown()
+
+    staging = _named(exporter, "rl.grpo.checkpointing")
+    next_step = _named(exporter, "rl.grpo.policy_update")
+    durable = _named(exporter, "rl.checkpoint.finalize")
+    assert durable.end_time > staging.end_time
+    assert durable.end_time > next_step.end_time
+
+
+@requires_lens
+def test_checkpoint_finalize_span_is_filed_under_the_triggering_step():
+    """Not the step that happens to be running when the rename lands.
+
+    The thread is started under step 7 but the span closes while the driver is
+    inside ``iteration_scope(8)``, which is the case that makes an inherited
+    iteration wrong.
+    """
+    handle, exporter = _setup("all")
+    started = threading.Event()
+    release = threading.Event()
+
+    def finalize(carrier):
+        with (
+            remote_trace_context(carrier),
+            checkpoint_finalize_span(7, async_save=True, tracer=handle.tracer),
+        ):
+            started.set()
+            release.wait(5)
+
+    with iteration_scope(7):
+        worker = threading.Thread(target=finalize, args=(current_trace_carrier(),))
+        worker.start()
+        started.wait(5)
+
+    with iteration_scope(8):
+        release.set()
+        worker.join(5)
+    handle.shutdown()
+
+    durable = _named(exporter, "rl.checkpoint.finalize")
+    assert durable.attributes[RL_ITERATION_ATTR] == 7
+    assert durable.attributes[RL_CHECKPOINT_ASYNC_ATTR] is True
+
+
+@requires_lens
+def test_checkpoint_finalize_span_is_parented_to_the_run():
+    """A bare ``Thread`` starts with an empty context and would re-root here."""
+    handle, exporter = _setup("all")
+
+    def finalize(carrier):
+        with (
+            remote_trace_context(carrier),
+            checkpoint_finalize_span(7, async_save=False, tracer=handle.tracer),
+        ):
+            pass
+
+    with umbrella_span(RLSpanGroup.U_JOB, "rl.grpo.job", tracer=handle.tracer) as job:
+        job_id = job.get_span_context().span_id
+        worker = threading.Thread(target=finalize, args=(current_trace_carrier(),))
+        worker.start()
+        worker.join(5)
+    handle.shutdown()
+
+    assert _named(exporter, "rl.checkpoint.finalize").parent.span_id == job_id
+
+
+@requires_lens
+def test_checkpoint_finalize_span_carries_no_bucket():
+    """It overlaps the next step, so a bucket would double-count wall clock.
+
+    The staging span it follows is bucketed, because that one does block.
+    """
+    handle, exporter = _setup("all")
+    with managed_span(
+        RLSpanGroup.CHECKPOINT, "rl.grpo.checkpointing", tracer=handle.tracer
+    ):
+        pass
+    with checkpoint_finalize_span(7, async_save=True, tracer=handle.tracer):
+        pass
+    handle.shutdown()
+
+    assert RL_BUCKET_ATTR not in _named(exporter, "rl.checkpoint.finalize").attributes
+    staging = _named(exporter, "rl.grpo.checkpointing")
+    assert staging.attributes[RL_BUCKET_ATTR] == Bucket.OVERHEAD.value
+
+
+@requires_lens
+def test_checkpoint_finalize_span_follows_the_checkpoint_group():
+    """One switch turns staging and finalization on or off together."""
+    handle, exporter = _setup("generation")
+    with checkpoint_finalize_span(7, async_save=True, tracer=handle.tracer):
+        pass
+    handle.shutdown()
+
+    assert exporter.get_finished_spans() == ()

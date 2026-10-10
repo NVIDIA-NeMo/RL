@@ -161,13 +161,17 @@ For a hot path where you want minimal cost when the group is disabled:
 
 ```python
 with umbrella_span(RLSpanGroup.U_ROLLOUT, "rl.grpo.generation",
-                   **{"rl.iteration": iteration}) as span:
+                   **{"rl.num_prompt_groups": n_groups}) as span:
     result = collect()
     if span is not None:
         span.set_attribute("rl.num_generations_per_prompt", n)
 ```
 
 Both yield `None` when the group is disabled; the body still runs, so guard attribute-setting with `if span is not None`.
+
+Do not pass `rl.iteration` here. The training loops set it once per step with
+`iteration_scope`, so any span opened inside a step already carries it — see
+[`rl.iteration` is set once per step](span-groups.md#rliteration-is-set-once-per-step).
 
 ### Always-on block — `span_cm`
 
@@ -186,10 +190,14 @@ if telemetry is not None:
 |---|---|---|
 | Span name | `rl.<algorithm>.<phase>`, matching the block's `Timer` key (the two umbrella spans excepted — see [span groups](span-groups.md#per-algorithm-span-names)) | `rl.grpo.generation` |
 | Span tag | `rl.<attr>` categorical | `rl.iteration`, `rl.backend` |
-| Resource attribute | `rl.<attr>` / shared `dl.<attr>` | `rl.model`, `dl.tensor_parallel.size` |
+| Resource attribute | `rl.<attr>` for RL's own, shared `nv.dl.<attr>` for anything a distributed training job has | `rl.model`, `nv.dl.topology.size.tp` |
 | Metric name | `rl.<subsystem>.<metric>` (application scope) | `rl.efficiency.seconds` |
 
-Metric names use the **application scope** (`rl.*`) — never `dl.*`. NeMo-RL names its own attributes, in `nemo_rl/telemetry/`, rather than importing them from `nemo.lens.semconv`: they describe RL's properties, so RL is where a rename has to happen. The lens constants are for the few attributes lens itself sets, such as `nv.dl.rank`.
+**Metric names use the application scope (`rl.*`) — never `dl.*`.** This is not a style preference: lens registers a `dl.*` series for the trainer that owns the step, so an RL job publishing `dl.grad_norm` would be writing into a co-resident Megatron trainer's series. `rl.grad_norm` and `rl.learning_rate` are deliberate spelling matches for exactly that reason, so query the two by their own names rather than by swapping the prefix. Lens's own semconv file says the same: RL's metric series are declared through `register_metric_group` in this tree and are deliberately not defined there.
+
+**Attributes split by who owns the name.** If lens declares it, import the constant from `nemo.lens.semconv` — a typo then fails as an `ImportError` instead of becoming silent data loss. That covers the shared `nv.dl.*` resource surface and the handful of `rl.*` span attributes lens itself declares (`rl.algorithm`, `rl.reward`, `rl.generation.backend`, `rl.num_rollouts`; `RL_ALGORITHM` is re-exported from `nemo_rl/telemetry/instrumentation.py` so call sites take every `rl.*` key from one module). Everything else — `rl.iteration`, `rl.bucket`, `rl.worker_group` — describes RL's own properties, so it is named in `nemo_rl/telemetry/` where a rename can land.
+
+Mind the scope when picking a shared name: `nv.dl.topology.size.tp` is the resource-scoped parallelism size, typed by lens's `DL_RESOURCE_TYPES` registry, while `dl.tensor_parallel.size` is the span and metric spelling of the same quantity.
 
 ## Choosing a span group
 
