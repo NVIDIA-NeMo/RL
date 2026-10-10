@@ -108,8 +108,11 @@ def _add_otel_resource_attributes(additions: dict[str, Any]) -> None:
     """Add *additions* to this process's ``OTEL_RESOURCE_ATTRIBUTES``.
 
     Keys already present win, so a value the launcher exported is never replaced.
-    The merge uses lens's parse and format helpers rather than its ``extend`` helper.
-    The ``extend`` helper's signature differs between the lens revisions NeMo-RL may pin.
+    Lens's ``set_otel_resource_attributes`` merges the same way at the current pin.
+    From lens v0.3.0 on, it replaces the whole variable instead.
+    Calling it from the ``NemoGym`` actor would then discard the Slurm attributes the driver exported.
+    Lens's ``extend_otel_resource_attributes`` keeps the merge, but its signature differs between those revisions.
+    The merge therefore uses lens's parse and format helpers, which behave the same on both.
     """
     from nemo.lens.resources.attributes import (
         format_otel_resource_attributes,
