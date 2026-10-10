@@ -6,6 +6,7 @@ PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)
 git config --global --add safe.directory $PROJECT_ROOT
 
 set -eou pipefail
+trap 'printf "CI exit trace: line=%s status=%s pipeline=[%s] command=%s\n" "$LINENO" "$?" "${PIPESTATUS[*]}" "$BASH_COMMAND" >&2' ERR
 
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
