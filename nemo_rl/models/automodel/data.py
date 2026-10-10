@@ -32,6 +32,10 @@ from nemo_rl.models.huggingface.common import (
     pack_sequences,
 )
 
+# Passed only to forwards that name them explicitly; ``**kwargs`` forwards would
+# leak them into submodules that do not expect them.
+_EXPLICIT_ONLY_FORWARD_KWARGS = frozenset({"media_token_validity_mask"})
+
 
 @cache
 def _accepted_forward_kwargs(
@@ -48,6 +52,16 @@ def _accepted_forward_kwargs(
     return frozenset(
         parameter.name for parameter in parameters if parameter.name != "self"
     )
+
+
+def drop_explicit_only_kwargs_not_in_forward(
+    model: nn.Module, kwargs: dict[str, Any]
+) -> None:
+    """Remove ``_EXPLICIT_ONLY_FORWARD_KWARGS`` that ``model.forward`` does not name."""
+    accepted_kwargs = _accepted_forward_kwargs(type(model))
+    for key in _EXPLICIT_ONLY_FORWARD_KWARGS:
+        if accepted_kwargs is None or key not in accepted_kwargs:
+            kwargs.pop(key, None)
 
 
 def _all_image_sizes_equal(imgs_sizes: torch.Tensor) -> bool:

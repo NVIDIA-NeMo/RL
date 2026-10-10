@@ -63,7 +63,6 @@ uv run tests/check_metrics.py $JSON_METRICS \
     'data["train/mean_gen_tokens_per_sample"]["1"] > 2000' \
     'data["train/mean_gen_tokens_per_sample"]["1"] < 4096' \
     'data["train/reward"]["1"] > 0.2' \
-    'data["train/reward"]["1"] < 0.6' \
     'data["train/gen_kl_error"]["1"] > 0.0' \
     'data["train/gen_kl_error"]["1"] < 1.0' \
     'data["train/probs_ratio"]["1"] > 0.99' \

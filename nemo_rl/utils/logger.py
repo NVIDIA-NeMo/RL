@@ -611,7 +611,12 @@ class WandbLogger(LoggerInterface):
     def log_table(
         self, columns: list[str], rows: list[list[Any]], step: int, name: str
     ) -> None:
-        """Log a table to wandb.
+        """Log one step's rows as a table, with a leading ``step`` column.
+
+        Each step logs its own table under ``name`` (like ``log_plot``), so the
+        per-step cost stays constant. The ``step`` column keeps rows
+        distinguishable when steps are viewed together, e.g. a query panel
+        concatenating the key's history.
 
         Args:
             columns: Column headers
@@ -620,8 +625,11 @@ class WandbLogger(LoggerInterface):
             name: Panel name
         """
         with self._log_lock:
+            table = wandb.Table(
+                columns=["step", *columns], data=[[step, *row] for row in rows]
+            )
             self._buffer_step_metrics_locked(
-                {name: wandb.Table(columns=columns, data=rows)},
+                {name: table},
                 step=step,
                 step_finished=False,
             )

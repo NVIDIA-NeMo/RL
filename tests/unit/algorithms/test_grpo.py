@@ -49,6 +49,7 @@ from nemo_rl.algorithms.grpo import (
     _initial_policy_generation_stale,
     _maybe_restore_async_replay_buffer_checkpoint,
     _needs_hf_refit_handshake,
+    _raise_if_length_penalty_enabled_without_nemo_gym,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
@@ -80,6 +81,8 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.interfaces import (
@@ -103,6 +106,7 @@ from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig, WandbConfig
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
@@ -920,6 +924,44 @@ def test_raise_if_reward_penalties_enabled_without_nemo_gym_allows_nemo_gym(
     )
 
 
+def test_raise_if_length_penalty_enabled_without_nemo_gym_noops_when_unset(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.length_penalty = None
+
+    _raise_if_length_penalty_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=False
+    )
+
+
+def test_raise_if_length_penalty_enabled_without_nemo_gym_raises(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.length_penalty = LengthPenaltyConfig.model_validate(
+        {"default": {"total_bonus": 0.1}}
+    )
+
+    with pytest.raises(ValueError, match="grpo.length_penalty requires the NeMo-Gym"):
+        _raise_if_length_penalty_enabled_without_nemo_gym(
+            master_config, enable_nemo_gym=False
+        )
+
+
+def test_raise_if_length_penalty_enabled_without_nemo_gym_allows_nemo_gym(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.length_penalty = LengthPenaltyConfig.model_validate(
+        {"default": {"total_bonus": 0.1}}
+    )
+
+    _raise_if_length_penalty_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=True
+    )
+
+
 def test_raise_if_message_level_advantage_penalties_enabled_noops_when_unset(
     mock_grpo_components,
 ):
@@ -1476,15 +1518,19 @@ def mock_sync_grpo_infrastructure(policy):
     driver_carry = BatchedDataDict(
         {
             "total_reward": torch.tensor([1.0]),
-            "prompt_ids_for_adv": torch.tensor([[1, 2, 3]]),
             "input_lengths": torch.tensor([4]),
             "loss_multiplier": torch.tensor([1.0]),
             "truncated": torch.tensor([False]),
             "length": torch.tensor([3]),
         }
     )
-    meta = MagicMock()
-    meta.fields = ["input_ids"]
+    meta = KVBatchMeta(
+        sample_ids=["rollout_g0"],
+        partition_id="train",
+        task_name="train",
+        fields=["input_ids"],
+        tags=[{GROUP_ID_TAG: "rollout"}],
+    )
     rollout_metrics = {
         "mean_gen_tokens_per_sample": 10.0,
         "max_gen_tokens": 20,
@@ -6565,6 +6611,42 @@ def test_single_forward_sync_dataplane_skips_logprob_dispatch(mock_grpo_componen
     policy.get_reference_policy_logprobs_from_meta.assert_not_called()
     policy.prepare_for_lp_inference.assert_not_called()
     policy.train_from_meta.assert_called_once()
+
+
+def test_grpo_train_sync_applies_length_penalty_to_training_rollouts(
+    mock_grpo_components,
+):
+    """Training rollouts opt in to grpo.length_penalty via rollout_to_tq."""
+    import nemo_rl.algorithms.grpo_sync as grpo_sync_module
+
+    config = mock_grpo_components["master_config"]
+    config.data_plane = {"enabled": True}
+    config.grpo.max_num_steps = 1
+    config.grpo.val_period = 0
+    config.grpo.val_at_start = False
+    config.grpo.val_at_end = False
+    policy = mock_grpo_components["policy"]
+    with mock_sync_grpo_infrastructure(policy):
+        grpo_train_sync(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            config,
+        )
+        rollout_actor = (
+            grpo_sync_module.SyncRolloutActor.options.return_value.remote.return_value
+        )
+    calls = rollout_actor.rollout_to_tq.remote.call_args_list
+    assert calls
+    assert all(call.kwargs["apply_length_penalty"] is True for call in calls)
 
 
 def test_in_loss_threshold_skips_policy_forward_without_disabling_threshold():
