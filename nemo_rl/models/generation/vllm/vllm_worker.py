@@ -231,12 +231,11 @@ class BaseVllmGenerationWorker:
         self.py_executable = sys.executable
 
         if self.cfg["vllm_cfg"].get("native_speechlm", False):
-            if self.tensor_parallel_size != 1 or self.pipeline_parallel_size != 1 or self.expert_parallel_size != 1:
-                raise ValueError("Native SpeechLM GSPO generation requires single-GPU executors")
             if self.cfg["vllm_cfg"]["async_engine"] or self.cfg.get("vllm_kwargs", {}).get("speculative_config"):
                 raise ValueError("Native SpeechLM GSPO requires synchronous generation with MTP off")
-            # This normal uniprocess executor uses neither Ray-internal workers,
-            # Eagle3 nor tool parsing. Do not rewrite installed source for them.
+            # Launch Ray with this same public vLLM environment so its standard
+            # TP workers inherit the correct Python. Eagle3/tool parser rewrites
+            # are irrelevant to this synchronous MTP-off ASR path.
             from nemo.collections.speechlm2.vllm.salm import register
 
             register()
