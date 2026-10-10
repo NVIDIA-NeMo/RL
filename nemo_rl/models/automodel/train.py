@@ -49,7 +49,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
-from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
@@ -390,11 +390,7 @@ def forward_with_post_processing_fn(
             sequence_dim=sequence_dim,
         )
         if isinstance(post_processing_fn, LogprobsPostProcessor):
-            logprobs_result, updated_token_mask = result
-            result = logprobs_result
-            metrics = {"logprobs": logprobs_result}
-            if updated_token_mask is not None:
-                metrics["token_mask"] = updated_token_mask
+            metrics = {"logprobs": result}
         else:
             vals, idx = result
             metrics = {"topk_logits": vals, "topk_indices": idx}
@@ -716,7 +712,7 @@ class LogprobsPostProcessor:
         *,
         cp_sharder: Optional[ContextParallelSharder],
         sequence_dim: int = 1,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> torch.Tensor:
         """Compute token log probabilities from logits.
 
         Args:
@@ -730,9 +726,8 @@ class LogprobsPostProcessor:
             sequence_dim: Sequence dimension
 
         Returns:
-            (token log probabilities tensor [batch_size, seq_length],
-             updated token_mask [batch_size, seq_length] with -inf positions zeroed,
-             or None when top-k/top-p filtering is disabled).
+            Token log probabilities [batch_size, seq_length]. Filtering leaves
+            policy support information in logprobs for the actor loss.
         """
         input_lengths = data_dict["input_lengths"]
 
@@ -801,20 +796,16 @@ class LogprobsPostProcessor:
             for i, length in enumerate(input_lengths):
                 # For right-padded sequence, set 1s at the beginning of the sequence
                 post_attention_mask[i, :length] = 1
-            token_logprobs = token_logprobs * post_attention_mask
+            # torch.where: multiplying a filtered -inf by the mask would give NaN.
+            token_logprobs = torch.where(post_attention_mask, token_logprobs, 0.0)
 
-        # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
-        updated_token_mask: Optional[torch.Tensor] = None
+        # Preserve -inf only on valid tokens outside the policy support. The
+        # actor loss excludes these positions before sanitizing logprobs.
         if need_top_k_or_top_p_filtering(self.sampling_params):
             mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
-            token_logprobs, finite_mask = mask_out_neg_inf_logprobs(
-                token_logprobs, mask, "prev_logprobs"
-            )
-            updated_token_mask = (data_dict["token_mask"] * finite_mask).to(
-                data_dict["token_mask"].dtype
-            )
+            token_logprobs = mask_filtered_logprobs_outside_tokens(token_logprobs, mask)
 
-        return token_logprobs, updated_token_mask
+        return token_logprobs
 
     def _compute_local_logprobs(
         self,

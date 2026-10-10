@@ -89,20 +89,12 @@ def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch, top_k
     )
 
     assert prepared_data is data
-    if top_k is None:
-        assert torch.equal(loss_input["next_token_logprobs"], expected)
-        assert torch.equal(
-            prepared_data["token_mask"], torch.tensor([[0, 1, 1, 0, 0, 1, 0, 0]])
-        )
-    else:
-        # mask_out_neg_inf_logprobs zeroes logprobs outside token_mask * finite_mask
-        assert torch.equal(
-            loss_input["next_token_logprobs"],
-            torch.tensor([[0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0]]),
-        )
-        assert torch.equal(
-            prepared_data["token_mask"], torch.tensor([[0, 1, 0, 0, 0, 1, 0, 0]])
-        )
+    # Preserve filtered support until the actor loss constructs its own mask;
+    # the shared mask must remain available to the unfiltered reference KL.
+    assert torch.equal(loss_input["next_token_logprobs"], expected)
+    assert torch.equal(
+        prepared_data["token_mask"], torch.tensor([[0, 1, 1, 0, 0, 1, 0, 0]])
+    )
     assert torch.equal(call["target"], input_ids)
     assert call["padded_boundaries"] == cu_seqlens_padded_cpu
     assert call["unpacked_seqlen"] == input_ids.shape[1]

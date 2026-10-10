@@ -43,6 +43,10 @@ from nemo_rl.algorithms.grpo import (
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
 )
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
@@ -96,6 +100,7 @@ class AdvantageStageConfig:
     # the untruncated tensors: the controller stopped fetching them when the
     # computation moved here.
     train_data_dump_dir: Optional[str]
+    filtering_on: bool = False
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -118,6 +123,12 @@ class AdvantageStageConfig:
         algo_cfg = algo_config(master_config)
         loss_cfg = master_config.loss_fn
         return cls(
+            filtering_on=need_top_k_or_top_p_filtering(
+                TrainingSamplingParams(
+                    top_k=master_config.policy["generation"]["top_k"],
+                    top_p=master_config.policy["generation"]["top_p"],
+                )
+            ),
             advantage=AdvantageConfig(),
             algo=algo_cfg,
             is_ppo=is_ppo,
@@ -378,6 +389,7 @@ class AdvantageComputer:
                 train_data=masking_data,
                 rewards=rewards,
                 seq_logprob_error_threshold=cfg.algo.seq_logprob_error_threshold,
+                filtering_on=cfg.filtering_on,
             )
             final_sample_mask = masking_data["sample_mask"]
             num_valid_seqs_after = float(

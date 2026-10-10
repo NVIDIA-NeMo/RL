@@ -333,7 +333,11 @@ def test_train_pump_drives_mcore_training_step(
             },
             policy={
                 "train_global_batch_size": train_gbs,
-                "generation": {"colocated": {"enabled": False}},
+                "generation": {
+                    "top_k": None,
+                    "top_p": 1.0,
+                    "colocated": {"enabled": False},
+                },
             },
             # _sync_weights gates stale-abort on should_use_nemo_gym(env); empty
             # env -> native path (nemo_gym disabled).

@@ -53,7 +53,7 @@ from nemo_rl.algorithms.loss import (
 from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
-from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.data.megatron_sft_packed import is_direct_packed_row
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -904,8 +904,7 @@ class LogprobsPostProcessor:
             original_seq_length: Sequence width before dense padding was applied
 
         Returns:
-            Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs}),
-                plus a "token_mask" entry narrowed at -inf positions when top-k/top-p filtering is on
+            Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
         """
         unpacked_input_ids = data_dict["input_ids"]
         cu_seqlens_padded_cpu = None
@@ -955,19 +954,16 @@ class LogprobsPostProcessor:
                 [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
             )
 
-            # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
-            result_dict: dict[str, torch.Tensor] = {}
+            # Preserve -inf only on valid tokens outside the policy support. The
+            # actor loss excludes these positions before sanitizing logprobs.
             if need_top_k_or_top_p_filtering(self.sampling_params):
                 mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
-                token_logprobs, finite_mask = mask_out_neg_inf_logprobs(
-                    token_logprobs, mask, "prev_logprobs"
+                token_logprobs = mask_filtered_logprobs_outside_tokens(
+                    token_logprobs, mask
                 )
-                result_dict["token_mask"] = (data_dict["token_mask"] * finite_mask).to(
-                    data_dict["token_mask"].dtype
-                )[:, :original_seq_length]
 
             token_logprobs = token_logprobs[:, :original_seq_length]
-            result_dict["logprobs"] = token_logprobs
+            result_dict = {"logprobs": token_logprobs}
 
             return torch.tensor(0.0, device=token_logprobs.device), result_dict
 

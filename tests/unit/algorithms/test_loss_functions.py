@@ -951,8 +951,8 @@ def test_calculate_kl_output_clamp_includes_importance_sampling_weight():
         # top_k=1 keeps only the argmax token
         # _create_exact_logits puts the target at logit 0 and one distractor at log(exp(-lp) - 1),
         # so the target is the argmax only where lp > log(0.5): position 0 (lp=0) survives,
-        # positions 1 (lp=-1) and 2 (lp=-2) become -inf and are dropped from token_mask.
-        (1, [0], [[0, 1, 0, 0]], 0.0368),
+        # positions 1 and 2 become -inf for the actor; unfiltered KL keeps all positions.
+        (1, [0, 1, 2], [[0, 1, 1, 1]], 0.0362),
     ],
 )
 def test_clipped_pg_loss_kl_penalty(
@@ -991,7 +991,7 @@ def test_clipped_pg_loss_kl_penalty(
         kl_term_per_token, torch.tensor([[0.368, 0.0, 0.718]], device=device), rtol=1e-3
     )
 
-    # KL mean 0.362 over all positions or 0.368 over position 0 alone -> loss 0.0362 / 0.0368
+    # Unfiltered reference KL uses all positions regardless of actor support.
     expected_kl_mean = torch.mean(kl_term_per_token[0, kept_positions])
     expected_loss = cfg.reference_policy_kl_penalty * expected_kl_mean
     assert torch.allclose(
@@ -1005,8 +1005,7 @@ def test_clipped_pg_loss_kl_penalty(
     loss_input, data = prepare_loss_input(
         dummy_logits, data, loss_fn, sampling_params=sampling_params
     )
-    # Filtering narrows token_mask where the sampled token left the top-k set, so the
-    # -inf positions drop out of the KL reduction and of global_valid_toks below.
+    # Actor support filtering does not narrow the shared reference-KL mask.
     assert torch.equal(
         data["token_mask"], torch.tensor(expected_token_mask, device=device)
     )
@@ -3068,6 +3067,7 @@ class TestMetricNormalizationAdvertisement:
             "loss": grad_normalizer,
             "kl_penalty": grad_normalizer,
             "num_valid_samples": MetricNormalizer.NONE,
+            "policy_support_excluded_tokens": MetricNormalizer.NONE,
             "positive_nll_loss": MetricNormalizer.NONE,
             "token_mult_prob_error": MetricNormalizer.TOKENS,
         }
