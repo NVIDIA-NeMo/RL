@@ -1177,17 +1177,31 @@ def test_task_source_is_validated_before_gym_resolves_agent_ref():
     nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
 
 
-def test_an_unsharded_job_is_not_scanned_at_all():
-    """One actor hosts everything, so parsing every row would buy nothing."""
-    dataset = MagicMock()
+def test_an_unsharded_job_is_checked_against_the_actors_entries():
+    """The lone actor is asked which entries it spawned, and rows must name one.
 
-    with patch.object(nemo_gym_mod, "_load_agent_names_from_source") as load_names:
+    A stale name, such as a renamed agent or a typo, would otherwise fail only
+    at its first dispatched batch, after every server has started.
+    """
+    handle = MagicMock()
+    shard_set = nemo_gym_mod.as_nemo_gym_shard_set(handle)
+
+    with patch.object(nemo_gym_mod.ray, "get") as ray_get:
+        ray_get.return_value = {
+            "math_agent": ["responses_api_agents"],
+            "math_tools": ["resources_servers"],
+        }
         nemo_gym_mod.validate_dataset_agent_coverage(
-            nemo_gym_mod.as_nemo_gym_shard_set(MagicMock()), {"train": dataset}
+            shard_set, {"train": _gym_dataset("math_agent"), "validation": None}
         )
+        with pytest.raises(nemo_gym_mod.ShardSetupError) as excinfo:
+            nemo_gym_mod.validate_dataset_agent_coverage(
+                shard_set, {"train": _gym_dataset("search_agent")}
+            )
 
-    load_names.assert_not_called()
-    dataset.__iter__.assert_not_called()
+    ray_get.assert_called_with(handle.list_entries.remote.return_value)
+    assert "['search_agent']" in str(excinfo.value)
+    assert "math_agent" in str(excinfo.value)
 
 
 def test_the_wrapped_dataset_is_unwrapped_before_scanning():
