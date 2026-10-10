@@ -2,6 +2,9 @@ defaults: ./grpo-qwen3-32b-8n4g-async-1off.yaml
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-32b-8n4g-async-1off-mxfp8-rollout
 policy:
+  megatron_cfg:
+    optimizer:
+      lr: 1.0e-7
   generation:
     vllm_cfg:
       async_engine: true
@@ -9,6 +12,11 @@ policy:
       gpu_memory_utilization: 0.8
       precision: "fp8"
       is_mx: true
+      # Preserve the BF16 boundary fraction used by
+      # grpo-qwen3-235b-16n4g-mxfp8-rollout.yaml while keeping 49 of this
+      # model's 64 layers in MXFP8.
+      num_first_layers_in_bf16: 3
+      num_last_layers_in_bf16: 12
       quantization_ignore_patterns:
         - model.layers.*.self_attn.*
         - lm_head

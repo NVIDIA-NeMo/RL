@@ -915,6 +915,20 @@ def process_weights_after_loading(self, layer) -> None:
         layer.input_scale = None
 
 
+def _initialize_dummy_mxfp8_scales(*scales: torch.Tensor) -> None:
+    """Give vLLM dummy-load E8M0 scales a finite neutral value."""
+    from vllm.config import get_current_vllm_config
+
+    if get_current_vllm_config().load_config.load_format != "dummy":
+        return
+
+    # vLLM's dummy loader skips integer parameters. MXFP8 scale tensors would
+    # otherwise retain uninitialized bytes, where 255 encodes NaN. The E8M0
+    # byte encoding for 1.0 is 127.
+    for scale in scales:
+        scale.data.fill_(127)
+
+
 def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         swizzle_mxfp8_scale,
@@ -975,6 +989,7 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
 
     first_load = not hasattr(layer, "weight_scale_from_checkpoint")
     if first_load:
+        _initialize_dummy_mxfp8_scales(layer.weight_scale)
         layer.weight_scale_from_checkpoint = ModelWeightParameter(
             data=layer.weight_scale.data,
             input_dim=1,
@@ -1105,6 +1120,10 @@ def create_weights_mxfp8_moe(
         layer.w2_weight_scale,
         {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
     )
+
+    # Initialize the parameters created by this override directly instead of
+    # assuming every later layer implementation exposes these attribute names.
+    _initialize_dummy_mxfp8_scales(w13_weight_scale, w2_weight_scale)
 
 
 def process_weights_after_loading_moe(self, layer) -> None:
