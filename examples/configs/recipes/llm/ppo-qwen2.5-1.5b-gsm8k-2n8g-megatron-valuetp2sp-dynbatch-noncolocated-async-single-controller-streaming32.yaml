@@ -16,6 +16,8 @@ ppo:
 
 async_rl:
   sampler:
+    # The zero warmup lookahead must not be below the normal lookahead.
+    max_lookahead_versions: 0
     # Keep warmup from pre-filling the first policy step's entire batch.
     warmup_lookahead_versions: 0
   # Stream policy backward in chunks of at least 32 of the 256 prompt groups.
