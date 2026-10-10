@@ -183,7 +183,7 @@ class CheckpointingConfig(TypedDict):
     ft_keep_latest_k: NotRequired[int | None]
     ft_save_period: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
-    pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
+    pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig | None]
     save_optimizer: NotRequired[bool]  # Default: True
     save_data_plane: NotRequired[bool]
     load_replay_buffer: NotRequired[bool]  # Default: True

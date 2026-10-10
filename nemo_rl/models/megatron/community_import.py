@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import pickle
 import shutil
 import threading
 import uuid
@@ -71,8 +72,22 @@ def to_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
 
 def megatron_conversion_is_complete(pretrained_path: str) -> bool:
     """Whether a completed HF->Megatron conversion exists at `pretrained_path`."""
-    return os.path.exists(
-        os.path.join(pretrained_path, "iter_0000000", "run_config.yaml")
+    iteration_path = os.path.join(pretrained_path, "iter_0000000")
+    if not os.path.isfile(os.path.join(iteration_path, "run_config.yaml")):
+        return False
+    try:
+        with open(os.path.join(iteration_path, ".metadata"), "rb") as metadata_file:
+            metadata = pickle.load(metadata_file)
+    except (OSError, EOFError, pickle.UnpicklingError):
+        return False
+
+    storage_data = getattr(metadata, "storage_data", None)
+    if not storage_data:
+        return False
+    return all(
+        os.path.isfile(os.path.join(iteration_path, item.relative_path))
+        and os.path.getsize(os.path.join(iteration_path, item.relative_path)) > 0
+        for item in storage_data.values()
     )
 
 
