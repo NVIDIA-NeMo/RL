@@ -141,6 +141,10 @@ async_rl:
   sampler:
     name: in_order
     max_lookahead_versions: 0
+  # A slow or failed harness should not discard an otherwise trainable
+  # three-harness batch during multi-harness debugging.
+  rollout_failure:
+    min_step_batch_fraction: 0.75
   recompute_kv_cache_after_weight_updates: true
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
   max_inflight_prompts: ${grpo.num_prompts_per_step}

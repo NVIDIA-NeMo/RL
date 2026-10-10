@@ -30,6 +30,7 @@ ULTRA_CONFIG_PATHS = [
     "examples/nemo_gym/nemotron-3-ultra/mopd.yaml",
 ]
 NEMO_GYM_CONFIG_PATHS = ULTRA_CONFIG_PATHS + [
+    "examples/nemo_gym/grpo_anyterminal_multi_harness_nemotron_nano_omni_sync_2n_debug_single_controller.yaml",
     "examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml",
 ]
 # Select by content: every example that pins a service port range must stay
