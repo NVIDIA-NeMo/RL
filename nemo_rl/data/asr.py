@@ -112,3 +112,18 @@ def asr_data_processor(
             "audio": (np.array(waveform, copy=True), sampling_rate)
         },
     }
+
+
+class SpeechLMProcessor:
+    """Expose a native HF tokenizer without loading the speech encoder."""
+
+    model_input_names = ["input_ids", "audio_samples", "audio_lengths"]
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    @classmethod
+    def from_pretrained(cls, name, **kwargs):
+        from transformers import AutoTokenizer
+
+        return cls(AutoTokenizer.from_pretrained(name, **kwargs))

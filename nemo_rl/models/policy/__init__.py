@@ -439,6 +439,7 @@ class DraftConfig(TypedDict):
 
 
 class TokenizerConfig(TypedDict):
+    processor_class: NotRequired[str]
     name: str
     chat_template: NotRequired[str]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true

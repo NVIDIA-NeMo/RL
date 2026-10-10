@@ -184,7 +184,12 @@ def get_tokenizer(
     processor = None
 
     if get_processor:
-        processor = AutoProcessor.from_pretrained(
+        processor_type = AutoProcessor
+        if tokenizer_config.get("processor_class") is not None:
+            from hydra.utils import get_class
+
+            processor_type = get_class(tokenizer_config["processor_class"])
+        processor = processor_type.from_pretrained(
             tokenizer_config["name"], trust_remote_code=True, use_fast=True
         )
         tokenizer = processor.tokenizer
