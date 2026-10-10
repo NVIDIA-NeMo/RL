@@ -25,6 +25,7 @@ These tests run on CPU tensors with a stub socket -- no GPU, no Ray -- because
 the packing/hand-off logic is plain Python around a byte buffer.
 """
 
+import pytest
 import torch
 
 from nemo_rl.models.policy import utils
@@ -119,6 +120,47 @@ def test_oversized_parameter_is_streamed_instead_of_aborting(monkeypatch):
         names for names, _ in socket.payloads if "model.embed_tokens.weight" in names
     ]
     assert oversized_group == [["model.embed_tokens.weight"]]
+
+
+def test_cpu_oversized_parameter_uses_staging_copy(monkeypatch):
+    """CPU fallback output must be copied to a CUDA-compatible staging tensor."""
+    allocations = []
+    real_empty = torch.empty
+
+    def tracked_empty(size, *args, **kwargs):
+        if size == 3072:
+            allocations.append((size, kwargs.get("device")))
+        return real_empty(size, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", tracked_empty)
+
+    socket = _stream(monkeypatch, [_param("model.embed_tokens.weight", 3072)])
+
+    assert allocations == [(3072, torch.device("cpu"))]
+    assert socket.payloads == [(["model.embed_tokens.weight"], 3072)]
+    assert socket.pending_acks == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA IPC requires a GPU")
+def test_cuda_contiguous_oversized_parameter_uses_storage_directly(monkeypatch):
+    """A large contiguous CUDA parameter must not require an equal-sized copy."""
+    parameter = (
+        "model.embed_tokens.weight",
+        torch.zeros(3072, dtype=torch.uint8, device="cuda"),
+    )
+    real_empty = torch.empty
+
+    def guarded_empty(size, *args, **kwargs):
+        if size == 3072:
+            raise AssertionError("oversized staging allocation is forbidden")
+        return real_empty(size, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", guarded_empty)
+
+    socket = _stream(monkeypatch, [parameter])
+
+    assert socket.payloads == [(["model.embed_tokens.weight"], 3072)]
+    assert socket.pending_acks == 0
 
 
 def test_oversized_parameter_alone(monkeypatch):
