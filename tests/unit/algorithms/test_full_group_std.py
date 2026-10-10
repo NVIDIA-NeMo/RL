@@ -65,3 +65,29 @@ def test_full_group_constant_or_undersized_advantages_are_exactly_zero(valid):
         valid_mask=torch.tensor(valid),
     )
     assert torch.equal(advantage, torch.zeros_like(advantage))
+
+
+def test_explicit_groups_separate_identical_audio_instructions():
+    prompts = torch.ones(6, 4, dtype=torch.long)
+    rewards = torch.tensor([0., 1., 2., 10., 10., 10.])
+    groups = torch.tensor([0, 0, 0, 1, 1, 1])
+    baseline, std = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, torch.ones_like(rewards), full_group_std=True,
+        prompt_group_ids=groups,
+    )
+    torch.testing.assert_close(baseline, torch.tensor([1.5, 1., .5, 10., 10., 10.]))
+    torch.testing.assert_close(std, torch.tensor([1., 1., 1., 0., 0., 0.]))
+    with pytest.raises(ValueError, match="one identity per reward"):
+        calculate_baseline_and_std_per_prompt(prompts, rewards, torch.ones_like(rewards), prompt_group_ids=groups[:-1])
+
+
+def test_group_ids_survive_repetition_filter_refill_and_slice():
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    offered = BatchedDataDict({"prompt_group_ids": torch.arange(4), "source_idx": torch.arange(10, 14)})
+    repeated = offered.repeat_interleave(3)
+    accepted = repeated.select_indices(torch.tensor([0, 1, 2, 6, 7, 8]))
+    refill = BatchedDataDict({"prompt_group_ids": torch.arange(4, 6), "source_idx": torch.arange(14, 16)}).repeat_interleave(3)
+    combined = BatchedDataDict.from_batches([accepted, refill]).slice(0, 9)
+    assert combined["prompt_group_ids"].tolist() == [0, 0, 0, 2, 2, 2, 4, 4, 4]
+    assert combined["source_idx"].tolist() == [10, 10, 10, 12, 12, 12, 14, 14, 14]

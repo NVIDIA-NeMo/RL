@@ -2228,6 +2228,7 @@ def grpo_train(
             "See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details."
         )
 
+    next_prompt_group_id = 0
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
@@ -2262,6 +2263,13 @@ def grpo_train(
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
                 with timer.time("data_processing"):
+                    # Assign identities before repetition. Audio recordings can have
+                    # identical text prompts; refill batches must not share identities.
+                    batch["prompt_group_ids"] = torch.arange(
+                        next_prompt_group_id, next_prompt_group_id + batch.size,
+                        dtype=torch.int64,
+                    )
+                    next_prompt_group_id += batch.size
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
@@ -2446,7 +2454,7 @@ def grpo_train(
                         # Just fix the device id for now
                         device_id = 0
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids.cuda(device_id),
+                            repeated_batch["prompt_group_ids"].unsqueeze(-1).cuda(device_id),
                             rewards.cuda(device_id),
                             torch.ones_like(rewards).cuda(device_id),
                             leave_one_out_baseline=master_config.grpo[
@@ -2465,7 +2473,7 @@ def grpo_train(
                         std = std.cpu()
                     else:
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids,
+                            repeated_batch["prompt_group_ids"].unsqueeze(-1),
                             rewards,
                             torch.ones_like(rewards),
                             leave_one_out_baseline=master_config.grpo[
@@ -2523,7 +2531,11 @@ def grpo_train(
                         initial_prompt_message_logs,
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                    prompt_ids_for_adv = (
+                        repeated_batch["prompt_group_ids"].unsqueeze(-1)
+                        if "prompt_group_ids" in repeated_batch
+                        else prompt_batched_flat["token_ids"]
+                    )
                     del initial_prompt_message_logs
                     del prompt_batched_flat
                     del input_ids
@@ -3773,7 +3785,11 @@ def async_grpo_train(
                         initial_prompt_message_logs,
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                    prompt_ids_for_adv = (
+                        repeated_batch["prompt_group_ids"].unsqueeze(-1)
+                        if "prompt_group_ids" in repeated_batch
+                        else prompt_batched_flat["token_ids"]
+                    )
                     del initial_prompt_message_logs
                     del prompt_batched_flat
 
