@@ -42,6 +42,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    _refuse_empty_server_mappings,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
@@ -2074,3 +2075,77 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
             f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
             f"got {null_resp.status_code}: {null_resp.text}"
         )
+
+
+def test_spinup_refuses_an_empty_server_mapping_by_name():
+    """An empty server entry, or an entry whose first server-type group is
+    empty, would crash NeMo-Gym's launcher with a bare IndexError at one of
+    its two index levels."""
+    from omegaconf import DictConfig
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"empty server mapping\(s\) "
+            r"\['judge_model', 'policy_model\.responses_api_models', 'tools'\]"
+        ),
+    ):
+        _refuse_empty_server_mappings(
+            {
+                "tools": {},
+                "policy_model": {"responses_api_models": {}},
+                "judge_model": DictConfig({}),
+                "telemetry": {},
+            },
+            reserved_keys=("telemetry",),
+        )
+
+    # A third-level empty mapping is a server's own settings, which the
+    # launcher never indexes; a reserved key is skipped even when empty; and
+    # scalars and lists are not server entries at all.
+    _refuse_empty_server_mappings(
+        {
+            "policy_model": {"responses_api_models": {"vllm_model": {}}},
+            "telemetry": {},
+            "default_host": "h",
+            "x": [],
+        },
+        reserved_keys=("telemetry", "default_host"),
+    )
+
+
+def test_spinup_guards_the_merged_config_before_starting_gym(monkeypatch):
+    """_spinup runs the guard on the config Gym merges (config_paths YAMLs
+    first, the initial dict on top) and aborts before RunHelper exists, so a
+    refused config leaves no half-started servers behind."""
+    import nemo_gym.global_config as gym_global_config
+    from omegaconf import DictConfig
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    seen_parser_configs = []
+
+    def fake_merged_config(parser_config=None, **_kwargs):
+        # Stands in for Gym's merge, which would also cache the result for
+        # the whole process; the guard must see this merged mapping.
+        seen_parser_configs.append(parser_config)
+        return DictConfig({"tools": {}, "default_host": "127.0.0.1", "telemetry": {}})
+
+    monkeypatch.setattr(gym_global_config, "get_global_config_dict", fake_merged_config)
+    monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    gym = NemoGym.__ray_metadata__.modified_class(
+        {
+            "initial_global_config_dict": {"tools": {}},
+            "model_name": "policy",
+            "base_urls": ["http://127.0.0.1:1/v1"],
+        }
+    )
+
+    with pytest.raises(ValueError, match=r"empty server mapping\(s\) \['tools'\]"):
+        gym._spinup()
+
+    assert gym.rh is None
+    # The guard read Gym's merged config built from the same parser config
+    # RunHelper.start would have received.
+    assert len(seen_parser_configs) == 1
+    assert seen_parser_configs[0].initial_global_config_dict["tools"] == {}

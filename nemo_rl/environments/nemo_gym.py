@@ -19,7 +19,7 @@ import subprocess
 import sys
 import threading
 from collections import Counter
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Collection, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -279,6 +279,43 @@ def _typed_gym_failure(error: Exception) -> Optional[Exception]:
     if http_status_is_infra(status):
         return GymTransportError(detail)
     return RolloutDataFailure(detail)
+
+
+def _refuse_empty_server_mappings(
+    global_config_dict: Mapping[str, Any],
+    *,
+    reserved_keys: Collection[str] = (),
+) -> None:
+    """Raise ``ValueError`` when a server entry of the merged Gym global config is empty.
+
+    NeMo-Gym's launcher (``RunHelper.start`` in ``nemo_gym/cli/env.py``) treats
+    every non-reserved top-level mapping of the global config as a server
+    entry and indexes into it twice: the entry's first key is a server-type
+    group, and that group's first key is a server. An empty mapping at either
+    level (``some_server: {}`` or ``some_server: {responses_api_models: {}}``)
+    crashes spin-up with a bare ``IndexError``. Refusing it here names the
+    offending key; a "use the defaults" knob must be omitted entirely rather
+    than left empty. ``reserved_keys`` are the top-level keys the launcher
+    skips (Gym's ``NEMO_GYM_RESERVED_TOP_LEVEL_KEYS``), for which an empty
+    mapping such as ``telemetry: {}`` is a valid "all defaults" spelling.
+    """
+    empty_mappings: list[str] = []
+    for key, value in global_config_dict.items():
+        if key in reserved_keys or not isinstance(value, Mapping):
+            continue
+        if len(value) == 0:
+            empty_mappings.append(key)
+            continue
+        # The launcher indexes only the entry's first key.
+        first_key, first_value = next(iter(value.items()))
+        if isinstance(first_value, Mapping) and len(first_value) == 0:
+            empty_mappings.append(f"{key}.{first_key}")
+    if empty_mappings:
+        raise ValueError(
+            f"env.nemo_gym contains empty server mapping(s) {sorted(empty_mappings)}, "
+            "which NeMo-Gym's launcher cannot start as servers. Remove the "
+            "key(s) or fill them."
+        )
 
 
 def get_nemo_gym_uv_cache_dir() -> str | None:
@@ -649,15 +686,29 @@ Depending on your data shape, you may want to change these values."""
                 token_capture.get("control_timeout_s") or 60.0
             )
 
-        self.rh = RunHelper()
-        self.rh.start(
-            global_config_dict_parser_config=GlobalConfigDictParserConfig(
-                dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute()
-                / "nemo_gym_env.yaml",
-                initial_global_config_dict=DictConfig(initial_global_config_dict),
-                skip_load_from_cli=True,
-            )
+        from nemo_gym.global_config import (
+            NEMO_GYM_RESERVED_TOP_LEVEL_KEYS,
+            get_global_config_dict,
         )
+
+        parser_config = GlobalConfigDictParserConfig(
+            dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute()
+            / "nemo_gym_env.yaml",
+            initial_global_config_dict=DictConfig(initial_global_config_dict),
+            skip_load_from_cli=True,
+        )
+        # Guard the config the launcher will actually see: Gym merges the
+        # config_paths YAMLs first and this initial dict on top, so an empty
+        # overlay over a YAML-defined entry is complete after the merge and
+        # must pass. get_global_config_dict resolves the merged config once
+        # and caches it; RunHelper.start below reuses the cache.
+        _refuse_empty_server_mappings(
+            get_global_config_dict(parser_config),
+            reserved_keys=NEMO_GYM_RESERVED_TOP_LEVEL_KEYS,
+        )
+
+        self.rh = RunHelper()
+        self.rh.start(global_config_dict_parser_config=parser_config)
 
         # Setup for rollout collection
         self.head_server_config = BaseServerConfig(
