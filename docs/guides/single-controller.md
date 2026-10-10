@@ -519,3 +519,44 @@ partial file is not proof of a completed training step.
 The per-step `timing/train/train_data_dump` metric reports wall-clock seconds
 summed across chunk preparation/writes and final-file publication. Chunk dump
 time is also included in `advantage_calculation`; these timings overlap.
+
+
+### Background prefix cleanup
+
+With vLLM generation-prefix recovery, completed calls can retire their obsolete
+prefix chunks in a bounded background queue instead of waiting for a separate
+TQ CLEAR on every terminal response. This is independent of terminal PUT batching:
+
+```yaml
+rollout_recovery:
+  target_level: prefix
+  generation_prefix_cleanup:
+    enabled: true
+    batch_size: 32
+    max_pending: 128
+    wait_seconds: 0.01
+```
+
+Cleanup is disabled by default. `batch_size` is the maximum number of completed
+calls grouped into one CLEAR, not the number of chunk keys. `max_pending` bounds
+reserved, queued, and active cleanup requests per generation owner and must be at
+least `batch_size`. `wait_seconds` is a finite, nonnegative collection window from
+the oldest queued request; a full batch flushes immediately. These are runtime
+settings and do not change the rollout-checkpoint bootstrap fingerprint.
+
+The worker acquires queue capacity outside the terminal snapshot gate and enqueues
+only after TQ acknowledges the replacement terminal row. Only generation-cut keys
+enter the background queue; canonical keys carried through terminal-completion
+restore remain live. Failed terminal staging retains the prefix rows. When a
+checkpoint fence begins, new delete batches pause and the fence waits for the
+active CLEAR, alongside existing terminal writes. Queued deletes resume after the
+checkpoint succeeds or is aborted.
+
+A delete failure is logged and latched: future reservations and snapshot-fence
+waits fail, rather than silently proceeding with a broken cleanup worker. A failed
+batch is not retried automatically because a transport failure may represent a
+partially completed CLEAR. The queue is process-local and is not restored from a
+checkpoint. Losing queued work leaves extra obsolete rows; it does not delete
+required recovery state. Actor teardown requests a nonblocking cleanup close, so
+a stalled delete cannot indefinitely block shutdown. This does not add orphan
+collection or change the TQ checkpoint format.

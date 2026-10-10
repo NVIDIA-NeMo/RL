@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, NotRequired, Optional, TypedDict
 import ray
 import torch
 
+from nemo_rl.data_plane.background_prefix_cleanup import GenerationPrefixCleanupConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 # The universal contract is hf_export: the source exports an HF-named,
@@ -623,6 +624,7 @@ class GenerationInterface(ABC):
         generation_cut_control_timeout_s: float | None = None,
         generation_prefix_batch_size: int = 256,
         generation_prefix_batch_max_tokens: int = 4_194_304,
+        generation_prefix_cleanup: GenerationPrefixCleanupConfig | None = None,
     ) -> None:
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -641,6 +643,8 @@ class GenerationInterface(ABC):
                 coordinator to authorize generation-cut requests.
             generation_cut_control_timeout_s: Bound on one generation-cut
                 request; calls not cut by then are acknowledged as failures.
+            generation_prefix_cleanup: Optional checkpoint-coordinated background
+                deletion of obsolete prefix keys (vLLM prefix recovery only).
             generation_prefix_batch_size: Maximum active calls per cut-time TQ put.
             generation_prefix_batch_max_tokens: Maximum token rows accumulated in
                 one cut-time TQ put; a single larger row is not split.

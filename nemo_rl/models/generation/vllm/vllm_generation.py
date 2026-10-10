@@ -31,6 +31,7 @@ import numpy as np
 import ray
 from ray.util.placement_group import PlacementGroup
 
+from nemo_rl.data_plane.background_prefix_cleanup import GenerationPrefixCleanupConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
@@ -645,6 +646,7 @@ class VllmGeneration(GenerationInterface):
         generation_cut_control_timeout_s: float | None = None,
         generation_prefix_batch_size: int = 256,
         generation_prefix_batch_max_tokens: int = 4_194_304,
+        generation_prefix_cleanup: GenerationPrefixCleanupConfig | None = None,
     ) -> None:
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -666,6 +668,7 @@ class VllmGeneration(GenerationInterface):
             generation_cut_control_timeout_s=generation_cut_control_timeout_s,
             generation_prefix_batch_size=generation_prefix_batch_size,
             generation_prefix_batch_max_tokens=generation_prefix_batch_max_tokens,
+            generation_prefix_cleanup=generation_prefix_cleanup,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         ray.get(futures)

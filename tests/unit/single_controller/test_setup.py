@@ -3190,3 +3190,31 @@ def test_load_opd_full_teacher_lm_heads_loads_one_head_per_unique_teacher(monkey
         "Qwen/teacher-a",
         "Qwen/teacher-b",
     ]
+
+
+@pytest.mark.parametrize("target_level", ["sibling", "turn", "prompt_group"])
+def test_background_prefix_cleanup_requires_prefix_target(target_level):
+    with pytest.raises(ValueError, match="requires target_level=prefix"):
+        RolloutRecoveryConfig.model_validate(
+            {
+                "target_level": target_level,
+                "generation_prefix_cleanup": {"enabled": True},
+            }
+        )
+
+
+def test_background_prefix_cleanup_defaults_and_prefix_override():
+    assert not RolloutRecoveryConfig().generation_prefix_cleanup.enabled
+    config = RolloutRecoveryConfig.model_validate(
+        {
+            "target_level": "prefix",
+            "generation_prefix_cleanup": {
+                "enabled": True,
+                "batch_size": 8,
+                "max_pending": 16,
+                "wait_seconds": 0.002,
+            },
+        }
+    )
+    assert config.generation_prefix_cleanup.batch_size == 8
+    assert config.generation_prefix_cleanup.max_pending == 16

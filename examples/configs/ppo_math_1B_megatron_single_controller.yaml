@@ -276,6 +276,12 @@ rollout_recovery:
   # Per-generation-owner bounds for coalescing prefix TQ PUTs and restore GETs.
   generation_prefix_batch_size: 256
   generation_prefix_batch_max_tokens: 4194304
+  # Opt-in deletion after terminal acknowledgement; vLLM target_level=prefix only.
+  generation_prefix_cleanup:
+    enabled: false
+    batch_size: 32       # completed calls per CLEAR, not number of keys
+    max_pending: 128     # reserved + queued + active completed calls per owner
+    wait_seconds: 0.01   # maximum coalescing window; finite and nonnegative
   # Per-Gym-task-source coarsening override, keyed on extra_env_info.task_source.
   # Until Gym advertises group-scoring capability, configure GenRM explicitly:
   #   task_source_target_level_overrides:
