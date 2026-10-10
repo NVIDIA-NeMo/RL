@@ -22,9 +22,19 @@ NeMo-Skills `evaluate_cer` with standard normalization. Other tasks use WER.
 
 The ASR environment requires `rapidfuzz`; Mandarin CER additionally requires
 public NeMo-Skills with the Han-adjacent whitespace option. Install these in the
-policy/system actor environments from public repositories. The implementation
-does not install packages at job startup or replace framework modules.
+policy/system actor environments from public repositories. The implementation uses normal package installation and does not replace
+framework modules. A prepared image can retain its existing actor interpreters
+and compiled dependencies while installing the public Speech and Skills core
+packages with constraints for each environment.
 
 Optional `responses_create_params.max_output_tokens` is a positive integer; a
 null value retains the rollout configuration cap. A request cap is clamped to
 the global cap and remaining context by the standard vLLM worker.
+
+The CER400 recipe is in `examples/configs/recipes/vlm/`. Its 20-update plus
+two-update resume driver is in `tests/test_suites/vlm/`. Set
+`SPEECHLM_GSPO_MODEL`, `SPEECHLM_GSPO_DATA`, `SPEECHLM_GSPO_OUTPUT_DIR` and
+`SPEECHLM_GSPO_PYTHON` to the seed, consumer Parquet, output root and prepared
+generation actor interpreter. The driver uses the existing multimodal entrypoint,
+saves native weights/optimizer/dataloader state and verifies the restored cursor,
+optimizer/scheduler state and exactly two resumed updates.

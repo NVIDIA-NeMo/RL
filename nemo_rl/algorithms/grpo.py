@@ -1256,6 +1256,16 @@ def setup(
 # ===============================================================================
 
 
+def _rollout_identity_log_data(batch: BatchedDataDict[DatumSpec]) -> dict[str, Any]:
+    """Keep recording identities while the JSONL logger owns its row-number idx."""
+    identities = {}
+    if "idx" in batch:
+        identities["source_idx"] = batch["idx"]
+    if "prompt_group_ids" in batch:
+        identities["prompt_group_ids"] = batch["prompt_group_ids"].tolist()
+    return identities
+
+
 def dynamic_sampling(
     repeated_batch: BatchedDataDict[DatumSpec],
     std: torch.Tensor,
@@ -2991,7 +3001,7 @@ def grpo_train(
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
             if not _should_log_nemo_gym_responses(master_config):
-                log_data = {}
+                log_data = _rollout_identity_log_data(repeated_batch)
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
                 log_data["content"] = flat_messages["content"]
@@ -4231,7 +4241,7 @@ def async_grpo_train(
 
             # Logging
             # Log training data (match sync GRPO logging payload for parity)
-            log_data = {}
+            log_data = _rollout_identity_log_data(repeated_batch)
             if "agent_ref" in repeated_batch:
                 log_data["agent_ref"] = repeated_batch["agent_ref"]
             log_data["content"] = flat_messages_content
