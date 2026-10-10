@@ -23,6 +23,8 @@ business logic. Backend init is lifted from
 from __future__ import annotations
 
 import contextlib
+import copy
+import ctypes
 import glob
 import importlib
 import ipaddress
@@ -38,7 +40,6 @@ import weakref
 from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
-from queue import Empty, SimpleQueue
 from typing import Any, cast
 
 import torch
@@ -56,6 +57,7 @@ from nemo_rl.data_plane.interfaces import (
     KVBatchMeta,
     backend_config,
     data_plane_supports_checkpointing,
+    storage_unit_placement,
 )
 from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
 
@@ -137,9 +139,11 @@ def _mooncake_transport_config() -> dict:
     if not devices:
         raise RuntimeError(
             "data_plane.backend='mooncake_cpu' requires RDMA, but no usable "
-            "mlx5 device was found. Check that /dev/infiniband/uverbs* exists "
-            "(a container does not inherit it from the host even though it "
-            "does see /sys/class/infiniband) — name a device with "
+            "device was found: only devices under /sys/class/infiniband whose "
+            "port 1 reports ACTIVE are usable, since mooncake's RDMA transport uses "
+            "port 1 by default (MC_IB_PORT). Check that /dev/infiniband/uverbs* exists (a container does "
+            "not inherit it from the host even though it does see "
+            "/sys/class/infiniband) — name a device with "
             "MC_MOONCAKE_DEVICE=<dev>, or use data_plane.backend='simple'."
         )
     return {"protocol": "rdma", "device_name": devices}
@@ -182,33 +186,40 @@ def _register_checked(store: Any, ptr: int, nbytes: int) -> None:
         )
 
 
-class _StagingPool:
-    """RDMA-registered host buffers, owned by one mooncake client.
+class _NativeStagingPool:
+    """Staging buffers leased from ``mooncake.store.BufferPool``.
 
-    Not thread-local: the ``ThreadPoolExecutor`` is rebuilt inside each
-    get/put, so thread-local buffers would be discarded every call. Sized to
-    the executor width so no worker normally waits for a slot.
+    The pool registers its regions once and leases slices, so acquire and
+    release never enter the kernel. It carves slots out of the client's local
+    buffer (``local_buffer_size``).
 
-    A slot's buffer is registered for as long as the pool holds it. The
-    invariant that matters is the converse: **no buffer is ever freed while
-    still registered**, because mooncake would keep a mapping over an address
-    the allocator immediately hands to the next caller.
+    The call sites want a torch ``uint8`` tensor — they slice it, ``view`` it
+    to the payload dtype and read ``data_ptr()``. Build that over
+    ``lease.ptr`` through ``ctypes``, not over ``lease.buffer``: wrapping the
+    buffer-protocol object exports a view that outlives this frame (the
+    caller still holds the yielded tensor when ``__exit__`` runs), and the
+    lease then refuses to release with "cannot release buffer while exported
+    views exist". A ``ctypes`` array built ``from_address`` carries no such
+    export — the same construction :mod:`tq_mooncake_checkpoint` uses to read
+    pinned allocations.
+
+    ``block_on_exhaustion`` with ``default_timeout`` reproduces the bounded
+    wait: a slot held for exactly one transfer means a long wait diagnoses
+    over-concurrency, not a slow transfer.
+
+    A payload bigger than the whole pool (``budget``) cannot be leased at all,
+    so it gets its own registration for this one transfer instead.
     """
 
-    def __init__(self, store: Any, n_slots: int, max_bytes: int) -> None:
+    def __init__(self, pool: Any, store: Any, budget: int) -> None:
+        self._pool = pool
         self._store = store
-        self._free: SimpleQueue = SimpleQueue()
-        for _ in range(n_slots):
-            self._free.put(None)  # allocated on first use
-        self._n_slots = n_slots
-        self._max_bytes = max_bytes
+        self._budget = budget
 
     @contextlib.contextmanager
     def buffer(self, nbytes: int):
-        # Outliers bypass the pool: slots only ever grow, so admitting one
-        # long-sequence sample would pin that size in every slot for the
-        # rest of the run. Registering it transiently is the cheaper trade.
-        if nbytes > self._max_bytes:
+        if nbytes > self._budget:
+            # Bigger than the whole pool: register this one transfer.
             tmp = torch.empty(nbytes, dtype=torch.uint8)
             _register_checked(self._store, tmp.data_ptr(), tmp.nbytes)
             try:
@@ -217,37 +228,20 @@ class _StagingPool:
                 self._store.unregister_buffer(tmp.data_ptr())
             return
         try:
-            buf = self._free.get(timeout=_STAGING_SLOT_TIMEOUT_S)
-        except Empty:
+            # BufferPool.buffer() acquires here, not at __enter__, so its
+            # timeout and capacity errors are raised by this call.
+            lease = self._pool.buffer(nbytes)
+        except RuntimeError as e:
             raise RuntimeError(
-                f"No mooncake staging slot free after {_STAGING_SLOT_TIMEOUT_S}s. "
-                f"The pool has {self._n_slots} slots, sized to one TQ worker "
-                "pool, so this means overlapping put/get calls in this process. "
-                "Set data_plane.mooncake_cpu.reuse_registered_buffers=false to "
-                "fall back to upstream's per-call registration."
-            ) from None
-        try:
-            if buf is None or buf.nbytes < nbytes:
-                if buf is not None:
-                    status = self._store.unregister_buffer(buf.data_ptr())
-                    if status is not None and status != 0:
-                        # Dropping it now would hand memory the NIC may still
-                        # map back to the allocator — see _register_checked.
-                        raise RuntimeError(
-                            f"mooncake unregister_buffer(0x{buf.data_ptr():x}) "
-                            f"failed with status {status}; refusing to free a "
-                            "buffer that may still be registered."
-                        )
-                    # Empty the slot before allocating: if the registration
-                    # below fails, the slot must come back empty rather than
-                    # holding a buffer the NIC no longer maps.
-                    buf = None
-                grown = torch.empty(nbytes, dtype=torch.uint8)
-                _register_checked(self._store, grown.data_ptr(), grown.nbytes)
-                buf = grown
-            yield buf
-        finally:
-            self._free.put(buf)
+                f"mooncake staging pool could not lease {nbytes} bytes: {e}. "
+                "A timeout means more overlapping put/get calls in this process "
+                "than the pool has slots; raise "
+                "data_plane.mooncake_cpu.local_buffer_size / staging_buffer_size, "
+                "or set reuse_registered_buffers=false."
+            ) from e
+        with lease:
+            allocation = (ctypes.c_ubyte * nbytes).from_address(lease.ptr)
+            yield torch.frombuffer(allocation, dtype=torch.uint8)
 
 
 class _StagingPoolRegistry:
@@ -262,11 +256,35 @@ class _StagingPoolRegistry:
         self._n_slots = n_slots
         self._max_bytes = max_bytes
         self._lock = threading.Lock()
-        self._pools: weakref.WeakKeyDictionary[Any, _StagingPool] = (
+        self._pools: weakref.WeakKeyDictionary[Any, _NativeStagingPool] = (
             weakref.WeakKeyDictionary()
         )
 
-    def pool_for(self, client: Any) -> _StagingPool:
+    def _build(self, client: Any) -> _NativeStagingPool:
+        # Deferred: mooncake.store is a compiled extension, absent without the wheel.
+        from mooncake.store import BufferPool  # pyrefly: ignore[import-error]
+
+        pool_bytes = self._n_slots * self._max_bytes
+        if client.local_buffer_size < pool_bytes:
+            raise ValueError(
+                f"data_plane.mooncake_cpu.local_buffer_size "
+                f"({client.local_buffer_size}) must be >= {self._n_slots} x "
+                f"staging_buffer_size ({pool_bytes}): the staging pool is carved "
+                "out of it. Or set reuse_registered_buffers=false."
+            )
+        return _NativeStagingPool(
+            BufferPool(
+                client._store,
+                max_bytes=pool_bytes,
+                block_on_exhaustion=True,
+                default_timeout=_STAGING_SLOT_TIMEOUT_S,
+            ),
+            client._store,
+            # BufferPool's ceiling, max(max_bytes, local buffer), checked above.
+            client.local_buffer_size,
+        )
+
+    def pool_for(self, client: Any) -> _NativeStagingPool:
         """Return ``client``'s pool, building it at most once across threads.
 
         Locked because ``put``/``get`` drive the thread workers from a
@@ -282,9 +300,7 @@ class _StagingPoolRegistry:
         with self._lock:
             pool = self._pools.get(client)
             if pool is None:
-                pool = self._pools[client] = _StagingPool(
-                    client._store, self._n_slots, self._max_bytes
-                )
+                pool = self._pools[client] = self._build(client)
             return pool
 
 
@@ -730,13 +746,91 @@ def _connect_existing() -> None:
     tq.init()
 
 
-def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
-    """Driver-process path: bootstrap the TQ controller for the chosen backend."""
+def _connect_existing_with_segment_size(segment_size: int) -> None:
+    """:func:`_connect_existing`, owning ``segment_size`` bytes of Mooncake memory.
+
+    Replaces the controller's MooncakeStore ``global_segment_size`` for this
+    process only. ``tq.init()`` ignores any config once a controller exists,
+    so the client is attached from a copy of the controller's config.
+    """
+    import ray
+    from transfer_queue import interface as tq_interface
+
+    controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
+    conf = None
+    while conf is None:  # the controller publishes its config once bootstrapped
+        conf = ray.get(controller.get_config.remote())
+        if conf is None:
+            time.sleep(1)
+    conf = copy.deepcopy(conf)  # leave the controller's published config untouched
+    conf.backend.MooncakeStore.global_segment_size = segment_size
+    tq_interface._maybe_create_tq_client(conf)
+
+
+_STORAGE_UNITS_SC_ONLY = (
+    "data_plane.mooncake_cpu.storage_unit_segment_size > 0 and "
+    "data_plane.simple.storage_unit_placement are only supported by the "
+    "SingleController entrypoint, which starts and places the storage units."
+)
+
+
+def _pin_simple_storage_units(node_ids: list[str]) -> None:
+    """Make TQ's SimpleStorage bootstrap start unit ``i`` on ``node_ids[i]``.
+
+    TQ (pin c51614308b) always places units with a SPREAD placement group,
+    which leaves the count per node to Ray. This replaces that registered
+    provider for this process; the rest mirrors TQ's
+    ``initialize_simple_storage``.
+    """
+    import math
+
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+    from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+    from transfer_queue.storage.simple_storage import SimpleStorageUnit
+    from transfer_queue.utils.zmq_utils import process_zmq_server_info
+
+    @StorageBootstrapProvider.register_provider("SimpleStorage")
+    def initialize_simple_storage(conf: Any) -> dict[str, Any]:
+        simple = conf.backend.SimpleStorage
+        num_units = simple.num_data_storage_units
+        if len(node_ids) != num_units:
+            raise ValueError(
+                f"{len(node_ids)} node IDs for {num_units} SimpleStorage units"
+            )
+        total = simple.get("total_storage_size", None)
+        unit_size = math.ceil(total / num_units) if total is not None else None
+        handles = {}
+        for rank, node_id in enumerate(node_ids):
+            name = f"TransferQueueStorageUnit#{rank}"
+            handles[name] = SimpleStorageUnit.options(  # type: ignore[attr-defined]
+                name=name,
+                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False),
+            ).remote(storage_unit_size=unit_size)
+        simple.zmq_info = process_zmq_server_info(handles)
+        return handles
+
+
+def _init_tq(
+    cfg: DataPlaneConfig,
+    *,
+    checkpointing: bool = False,
+    storage_unit_node_ids: list[str] | None = None,
+) -> None:
+    """Driver-process path: bootstrap the TQ controller for the chosen backend.
+
+    ``storage_unit_node_ids`` is the storage-unit plan (one Ray node ID per
+    unit) from :func:`~nemo_rl.data_plane.mooncake_storage_unit.plan_storage_unit_nodes`.
+    Only the SingleController makes one; storage-unit settings without it fail
+    here rather than run with no memory owner (mooncake) or silently unpinned
+    (simple).
+    """
     from omegaconf import OmegaConf
 
     base = OmegaConf.load(str(resources.files("transfer_queue") / "config.yaml"))
 
     backend = cfg["backend"]
+    if storage_unit_node_ids is None and storage_unit_placement(cfg) is not None:
+        raise ValueError(_STORAGE_UNITS_SC_ONLY)
 
     # polling_mode=True: controller returns empty BatchMeta instead of raising
     # TimeoutError when no samples are ready yet. The client-side blocking
@@ -759,6 +853,8 @@ def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
                 },
             },
         }
+        if storage_unit_node_ids is not None:
+            _pin_simple_storage_units(storage_unit_node_ids)
     elif backend == "mooncake_cpu":
         # The mooncake-transfer-engine wheel ships `mooncake_master` at
         # <site-packages>/mooncake/, NOT on $PATH. TQ's
@@ -809,7 +905,11 @@ def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
             "backend": {
                 "storage_backend": "MooncakeStore",
                 "MooncakeStore": {
-                    "global_segment_size": int(mooncake_cfg.global_segment_size),
+                    # With storage units on, every client mounts 0; only the
+                    # units override it (see mooncake_storage_unit.py).
+                    "global_segment_size": 0
+                    if mooncake_cfg.storage_unit_segment_size
+                    else int(mooncake_cfg.global_segment_size),
                     "local_buffer_size": int(mooncake_cfg.local_buffer_size),
                     # _init_tq runs on the driver only — driver IS the
                     # head, so local_ip here is also the head's IP that
@@ -929,6 +1029,8 @@ class TQDataPlaneClient(DataPlaneClient):
         *,
         bootstrap: bool = True,
         checkpointing: bool = False,
+        segment_size: int | None = None,
+        storage_unit_node_ids: list[str] | None = None,
     ) -> None:
         """Construct a TQ-backed client.
 
@@ -941,6 +1043,10 @@ class TQDataPlaneClient(DataPlaneClient):
                 knobs (poll interval).
             checkpointing: Whether the caller will save or restore data-plane
                 state. Used only at bootstrap; workers inherit the mode from TQ.
+            segment_size: Mooncake memory this worker process owns, in place of
+                the controller's ``global_segment_size``; ``None`` keeps it.
+            storage_unit_node_ids: Bootstrap only: the storage-unit plan, one
+                Ray node ID per unit (see :func:`_init_tq`).
         """
         # Ray serializes this driver-built client into the SingleController
         # actor; retain the config so process-local hooks can be reinstalled.
@@ -996,9 +1102,17 @@ class TQDataPlaneClient(DataPlaneClient):
         self._gdr_put_confirmed = False
 
         if bootstrap:
-            _init_tq(cfg, checkpointing=checkpointing)
-        else:
+            _init_tq(
+                cfg,
+                checkpointing=checkpointing,
+                storage_unit_node_ids=storage_unit_node_ids,
+            )
+        elif segment_size is None or self._backend != "mooncake_cpu":
+            # Only mooncake_cpu processes own a segment; other backends attach
+            # with the controller's conf unchanged.
             _connect_existing()
+        else:
+            _connect_existing_with_segment_size(segment_size)
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False
         # TQ restore is non-transactional and requires a globally clean system.

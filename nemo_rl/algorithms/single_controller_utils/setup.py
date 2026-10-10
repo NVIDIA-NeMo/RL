@@ -179,6 +179,8 @@ class SingleControllerActorArgs:
     partition_includes_multimodal_fields: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
+    # MooncakeStorageUnit actors; empty unless storage_unit_segment_size > 0.
+    storage_units: tuple[Any, ...] = ()
     # None when async_rl.generation_fleet_health is disabled; the SingleController
     # drives the probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
@@ -684,6 +686,7 @@ def _build_trainer(
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
     checkpointing: bool,
+    storage_unit_node_ids: Optional[list[str]] = None,
     reserved_http_server_ports: Optional[dict[int, int]] = None,
 ) -> tuple[Any, float]:
     """Build the TQ-mediated trainer (driver-side TQPolicy).
@@ -696,6 +699,8 @@ def _build_trainer(
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
         checkpointing: Whether data-plane checkpoint save or restore is needed.
+        storage_unit_node_ids: Storage-unit plan for TQ's bootstrap, one Ray
+            node ID per unit; None when storage units are off.
         reserved_http_server_ports: Pre-published OpenAI server ports for NeMo Gym,
             keyed by the colocated Megatron trainer rank that adopts each one.
 
@@ -716,6 +721,7 @@ def _build_trainer(
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
         checkpointing=checkpointing,
+        storage_unit_node_ids=storage_unit_node_ids,
         reserved_http_server_ports=reserved_http_server_ports,
     )
     return trainer, time.perf_counter() - t0
@@ -1542,6 +1548,22 @@ def setup_single_controller(
         )
         setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0
 
+    # Storage-unit plan, one Ray node ID per unit (None: units off). Made once,
+    # after the train/teacher claims above, and used twice: TQ's bootstrap in
+    # the trainer pins SimpleStorageUnits to it, and start_storage_units below
+    # starts the Mooncake units on it.
+    from nemo_rl.data_plane.mooncake_storage_unit import (
+        plan_storage_unit_nodes,
+        start_storage_units,
+    )
+
+    clusters_by_name: dict[str, RayVirtualCluster] = {
+        "train": train_cluster,
+        "inference": inference_cluster,
+        **{f"teacher:{name}": c for name, c in teacher_clusters.items()},
+    }
+    storage_unit_node_ids = plan_storage_unit_nodes(dp_config, clusters_by_name)
+
     # Create build tasks for generation / trainer / (nemo-gym) workers
     build_tasks: dict[str, Callable[[], Any]] = {}
     generation = None
@@ -1593,6 +1615,7 @@ def setup_single_controller(
                     and master_config.checkpointing.get("save_data_plane")
                 )
             ),
+            storage_unit_node_ids=storage_unit_node_ids,
             reserved_http_server_ports=reserved_http_server_ports,
         )
         if not is_ppo_run(master_config):
@@ -1936,6 +1959,8 @@ def setup_single_controller(
             partition_id=partition_id,
             include_multimodal_fields=processor is not None,
         )
+    # Mooncake memory owners when storage_unit_segment_size > 0.
+    storage_units = start_storage_units(dp_config, storage_unit_node_ids)
     if token_capture_cfg.enabled:
         # Both active backends stage canonical Gym rows in serving workers;
         # only vLLM workers stage captured media beside them (capture_media).
@@ -2087,6 +2112,7 @@ def setup_single_controller(
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,
+        storage_units=storage_units,
         advantage_actors=advantage_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,

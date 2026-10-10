@@ -35,14 +35,23 @@ def fake_fabric(monkeypatch):
     availability and the link_layer glob enumerates.
     """
 
-    def _install(layers: dict[str, str], *, uverbs: bool = True):
+    def _install(
+        layers: dict[str, str],
+        *,
+        uverbs: bool = True,
+        inactive: frozenset[str] = frozenset(),
+    ):
         def fake_glob(pattern: str):
             if pattern.startswith("/dev/infiniband/uverbs"):
                 return ["/dev/infiniband/uverbs0"] if uverbs else []
-            return [f"/sys/class/infiniband/{d}/ports/1/link_layer" for d in layers]
+            # The scan enumerates ports/1/state and reads link_layer beside it.
+            return [f"/sys/class/infiniband/{d}/ports/1/state" for d in layers]
 
         def fake_read_text(path, *args, **kwargs):
-            return layers[path.parents[2].name]
+            device = path.parents[2].name
+            if path.name == "state":
+                return "4: DOWN" if device in inactive else "4: ACTIVE"
+            return layers[device]
 
         monkeypatch.setattr(tq_env.glob, "glob", fake_glob)
         monkeypatch.setattr(tq_env.Path, "read_text", fake_read_text)
@@ -83,6 +92,23 @@ def test_prefers_infiniband_and_excludes_roce(fake_fabric):
 def test_falls_back_to_roce_only_when_no_ib(fake_fabric):
     fake_fabric({"mlx5_0": "Ethernet", "mlx5_1": "Ethernet"})
     assert tq_adapter.rdma_devices() == "mlx5_0,mlx5_1"
+
+
+def test_any_device_name_with_an_active_port_one_is_offered(fake_fabric):
+    """Selection is by port-1 state, not by an ``mlx5_*`` name.
+
+    The rails with an inactive port 1 are left out (mooncake only checks port
+    1), and non-mlx5 names such as ``rdma_vf_rail*`` are kept.
+    """
+    fake_fabric(
+        {
+            "rdma_rail0": "Ethernet",
+            "rdma_vf_rail0": "Ethernet",
+            "rdma_vf_rail1": "Ethernet",
+        },
+        inactive=frozenset({"rdma_rail0"}),
+    )
+    assert tq_adapter.rdma_devices() == "rdma_vf_rail0,rdma_vf_rail1"
 
 
 def test_every_roce_rail_is_offered(fake_fabric):

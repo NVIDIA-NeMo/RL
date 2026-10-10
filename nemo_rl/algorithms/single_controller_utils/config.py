@@ -512,7 +512,8 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Under data_plane.backend=mooncake_cpu each worker is its own TQ client and
     # mounts a full global_segment_size + local_buffer_size, like each
     # token-capture finalizer; budget it on top of
-    # gpus_per_node x (segment + buffer).
+    # gpus_per_node x (segment + buffer). With storage units on
+    # (storage_unit_segment_size > 0) the segment is 0; only the buffer remains.
     num_advantage_workers: NonNegativeInt = 0
 
     @model_validator(mode="after")

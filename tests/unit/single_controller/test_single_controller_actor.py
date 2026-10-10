@@ -182,6 +182,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
         finalizer_actors=[],
+        storage_units=(),
         advantage_actors=[],
         data_plane_checkpoint_metadata=None,
         partition_includes_multimodal_fields=False,
@@ -384,7 +385,7 @@ def test_mooncake_checkpoint_workers_configured_before_restore(
     master_config.data_plane = _data_plane_config("mooncake_cpu")
     master_config.token_capture.enabled = token_capture
     master_config.checkpointing.update(enabled=True, save_data_plane=True)
-    workers = [object() for _ in range(9)]
+    workers = [object() for _ in range(10)]
 
     def group(members: list[object], leaders: tuple[int, ...] = ()) -> SimpleNamespace:
         return SimpleNamespace(
@@ -399,7 +400,10 @@ def test_mooncake_checkpoint_workers_configured_before_restore(
         value_handle=group(workers[2:3]),
         teacher_worker_groups={"teacher": group(workers[3:4])},
         gen_handle=group(workers[4:8], leaders=(0, 2)),
-        finalizer_actors=workers[8:],
+        finalizer_actors=workers[8:9],
+        # With storage units on they are the only memory owners, so a save
+        # that dropped them would write no data-plane payload.
+        storage_units=(workers[9],),
     )
 
     def stop_after_restore(**kwargs):
