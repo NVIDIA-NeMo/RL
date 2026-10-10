@@ -91,3 +91,36 @@ def test_group_ids_survive_repetition_filter_refill_and_slice():
     combined = BatchedDataDict.from_batches([accepted, refill]).slice(0, 9)
     assert combined["prompt_group_ids"].tolist() == [0, 0, 0, 2, 2, 2, 4, 4, 4]
     assert combined["source_idx"].tolist() == [10, 10, 10, 12, 12, 12, 14, 14, 14]
+
+
+def test_dynamic_sampling_keeps_first_twenty_nonconstant_groups_across_refill():
+    from types import SimpleNamespace
+    from nemo_rl.algorithms.grpo import dynamic_sampling
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.utils.timer import Timer
+
+    config = SimpleNamespace(grpo={"num_prompts_per_step": 20, "num_generations_per_prompt": 64,
+                                  "use_dynamic_sampling": True, "dynamic_sampling_max_gen_batches": 10})
+
+    def offer(first, count, nonconstant):
+        identities = torch.arange(first, first + count).repeat_interleave(64)
+        rewards = torch.ones(count * 64)
+        for group in nonconstant:
+            rewards[(group - first) * 64] = 2.
+        batch = BatchedDataDict({"prompt_group_ids": identities, "idx": identities.clone(), "total_reward": rewards})
+        mean, std = calculate_baseline_and_std_per_prompt(
+            torch.ones(count * 64, 3, dtype=torch.long), rewards, torch.ones_like(rewards),
+            full_group_std=True, prompt_group_ids=identities,
+        )
+        return batch, mean, std
+
+    first, baseline, std = offer(0, 40, list(range(0, 30, 2)))
+    accepted, complete, cache, _ = dynamic_sampling(first, std, baseline, 1, config, Timer())
+    assert not complete
+    assert accepted["prompt_group_ids"].unique_consecutive().tolist() == list(range(0, 30, 2))
+    refill, baseline, std = offer(40, 10, list(range(40, 50)))
+    accepted, complete, _, _ = dynamic_sampling(refill, std, baseline, 2, config, Timer(), cache)
+    assert complete
+    assert accepted["prompt_group_ids"].unique_consecutive().tolist() == list(range(0, 30, 2)) + list(range(40, 45))
+    assert accepted.size == 20 * 64
+    assert torch.all(accepted["std"] > 0)
