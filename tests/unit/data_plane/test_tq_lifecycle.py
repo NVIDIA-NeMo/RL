@@ -503,6 +503,43 @@ def test_smoke_round_trip(tq_client) -> None:
     tq_client.clear_samples(sample_ids=None, partition_id="smoke")
 
 
+def test_get_samples_rejects_batch_missing_a_requested_column(tq_client) -> None:
+    """TQ answers a batch fetch with only the columns every key produced, so a
+    key that never wrote ``y`` would silently strip it from the other rows;
+    the adapter must fail loudly instead."""
+    tq_client.register_partition(
+        partition_id="narrowing",
+        fields=["x", "y"],
+        num_samples=4,
+        consumer_tasks=["read"],
+    )
+    tq_client.put_samples(
+        sample_ids=["full"],
+        partition_id="narrowing",
+        fields=TensorDict(
+            {"x": torch.tensor([1]), "y": torch.tensor([10])}, batch_size=[1]
+        ),
+    )
+    tq_client.put_samples(
+        sample_ids=["partial"],
+        partition_id="narrowing",
+        fields=TensorDict({"x": torch.tensor([2])}, batch_size=[1]),
+    )
+    # Alone, the full row still serves both columns ...
+    full = tq_client.get_samples(
+        sample_ids=["full"], partition_id="narrowing", select_fields=["x", "y"]
+    )
+    assert full["y"].tolist() == [10]
+    # ... but batched with a key that never wrote ``y``, TQ drops the column.
+    with pytest.raises(KeyError, match=r"returned no \['y'\] column"):
+        tq_client.get_samples(
+            sample_ids=["full", "partial"],
+            partition_id="narrowing",
+            select_fields=["x", "y"],
+        )
+    tq_client.clear_samples(sample_ids=None, partition_id="narrowing")
+
+
 def test_smoke_round_trip_backends(tq_client_backends) -> None:
     """Smoke round-trip parameterized over both backends.
 

@@ -28,6 +28,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
     RefitPayloadMode,
+    agreed_media_columns,
     reject_unenforceable_refit_deadline,
 )
 from nemo_rl.models.generation.megatron.config import (
@@ -40,6 +41,7 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data.captured_media import MediaColumnSpec
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
     from nemo_rl.distributed.worker_groups import RayWorkerGroup
     from nemo_rl.models.policy.lm_policy import Policy
@@ -646,13 +648,12 @@ class MegatronGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
-    ) -> None:
-        """Install MInf's canonical prompt and completion capture hooks."""
-        if capture_media:
-            raise NotImplementedError(
-                "Media token capture is only implemented for the vLLM generation "
-                "backend; the MInf stager writes text-only rows"
-            )
+    ) -> "Optional[MediaColumnSpec]":
+        """Install MInf's canonical prompt and completion capture hooks.
+
+        Returns the media column spec the coordinators pinned (``None`` for
+        text-only capture).
+        """
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(
                 "Megatron token capture requires mcore_generation_config."
@@ -662,8 +663,9 @@ class MegatronGeneration(GenerationInterface):
             "setup_token_capture",
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
+            capture_media=capture_media,
         )
-        ray.get(futures)
+        return agreed_media_columns(ray.get(futures))
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the policy epoch stamped by MInf on subsequent requests."""

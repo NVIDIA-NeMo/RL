@@ -33,6 +33,7 @@ from nemo_rl.data.captured_media import (
     CapturedMedia,
     CapturedMediaItem,
     MediaCaptureRejected,
+    MediaColumnSpec,
     capture_processed_media,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
@@ -529,17 +530,18 @@ class VllmAsyncGenerationWorkerImpl(
         staging_partition: str,
         *,
         capture_media: bool = False,
-    ) -> bool:
+    ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
         Fan-out target (token_capture.enabled only): builds the in-worker
         data-plane client and TQTokenSink, then makes the single
         ``install_capture`` call wiring Gym's engine-blind capture core +
-        vLLM adapter into this worker. Returns whether capture was installed
-        (False on non-model-owner ranks, which serve no HTTP).
+        vLLM adapter into this worker. Returns the media column spec this
+        worker pinned the staging column to (``None`` for text-only capture
+        and on non-model-owner ranks, which serve no HTTP and install nothing).
         """
         if not self.is_model_owner:
-            return False
+            return None
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
         from nemo_gym.token_id_capture.staging import install_capture
@@ -600,7 +602,11 @@ class VllmAsyncGenerationWorkerImpl(
             weight_version_fn=lambda: self._rollout_weight_version,
             adapter=VLLMCaptureAdapter(),
         )
-        return True
+        if not capture_media:
+            return None
+        return MediaColumnSpec(
+            pixel_dtype=pixel_dtype, patch_size=self._capture_patch_size
+        )
 
     async def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """Run owner-local checkpoint I/O without blocking the actor event loop."""

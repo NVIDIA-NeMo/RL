@@ -76,6 +76,7 @@ from torch.distributed.distributed_c10d import (
     _world,
 )
 
+from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import CACHED_VIDEO_FRAME_MANIFEST_MAGIC
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import receive_held_socket
@@ -286,6 +287,7 @@ class MegatronGenerationMixin:
     processor: Optional[Any] = None
     inference_model = None
     _colocated_reshard_plan = None
+    _image_preprocessing_config: Optional[Any] = None
 
     def _gen_model(self) -> MegatronModule:
         """The model the inference engine wraps.
@@ -368,6 +370,21 @@ class MegatronGenerationMixin:
         ):
             return model, None
         return model.language_model, model
+
+    def _vision_pixel_dtype(self) -> torch.dtype:
+        """The dtype the vision encoder casts pixels to before encoding them.
+
+        Read from the encoder's own parameters rather than the policy dtype:
+        a config may keep the vision tower in fp32 under a bf16 language model.
+        """
+        _, media_model = self._inference_model_and_media_parts()
+        vision_model = getattr(media_model, "vision_model", None)
+        if vision_model is None:
+            raise RuntimeError(
+                "Megatron media capture requires the vision encoder on the "
+                "coordinator's model-parallel stage"
+            )
+        return next(vision_model.parameters()).dtype
 
     def _build_image_preprocessing_config(self, generation_config: dict[str, Any]):
         """Build raw-image preprocessing settings."""
@@ -575,6 +592,7 @@ class MegatronGenerationMixin:
         image_preprocessing_config = self._build_image_preprocessing_config(
             mcore_generation_config
         )
+        self._image_preprocessing_config = image_preprocessing_config
         video_preprocessing_config = build_video_preprocessing_config(
             image_preprocessing_config,
             mcore_generation_config,
@@ -789,6 +807,12 @@ class MegatronGenerationMixin:
         if "http_server_num_replicas" in gen_cfg:
             server_kwargs["num_replicas"] = int(gen_cfg["http_server_num_replicas"])
 
+        # Server defaults for fields a chat request omits (Gym never sends top_k);
+        # unset, newer Megatron-LM reads generation_config.json and samples off-policy.
+        sampling_cfg = self.cfg["generation"]
+        top_p = sampling_cfg["top_p"]
+        top_k = sampling_cfg["top_k"]
+
         start_text_gen_server(
             coordinator_addr=self.coordinator_addr,
             tokenizer=self.megatron_tokenizer,
@@ -804,6 +828,9 @@ class MegatronGenerationMixin:
             # granularity and must match the engine's.
             block_size_tokens=gen_cfg["block_size_tokens"],
             prefix_caching_coordinator_policy=coordinator_policy,
+            default_temperature=float(sampling_cfg["temperature"]),
+            default_top_p=float(top_p) if top_p is not None else 1.0,
+            default_top_k=int(top_k) if top_k is not None else 0,
             **server_kwargs,
         )
 
@@ -1003,13 +1030,29 @@ class MegatronGenerationMixin:
         return self.base_url
 
     def setup_token_capture(
-        self, dp_cfg: "DataPlaneConfig", staging_partition: str
-    ) -> bool:
-        """Install canonical TQ capture on each MInf model-parallel leader."""
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
+    ) -> MediaColumnSpec | None:
+        """Install canonical TQ capture on each MInf model-parallel leader.
+
+        ``capture_media`` builds the sink/source against the media-enabled
+        staging schema so the stager can hand the engine's media tensors to
+        TQ beside each call's tokens. Returns the media column spec the
+        coordinator pinned the staging column to (``None`` for text-only
+        capture and on followers, which host no hooks).
+        """
         engine = self.dynamic_inference_engine
         if engine is None:
             raise RuntimeError(
                 "Megatron token capture requires an initialized inference engine"
+            )
+        if capture_media and self._image_preprocessing_config is None:
+            raise ValueError(
+                "Megatron media capture requires an image-capable inference wrapper "
+                "(mcore_generation_config.megatron_inference_wrapper)"
             )
         missing = [
             name
@@ -1023,7 +1066,7 @@ class MegatronGenerationMixin:
             )
         self._token_capture_enabled = True
         if not engine.is_mp_coordinator:
-            return False
+            return None
 
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
@@ -1033,17 +1076,36 @@ class MegatronGenerationMixin:
         )
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        # MInf emits float32 pixels and the trainer casts them to the vision
+        # encoder's weight dtype before encoding, so the stager casts first and
+        # the media column is pinned to that dtype (the rule vLLM follows).
+        pixel_dtype = self._vision_pixel_dtype() if capture_media else None
         prompt_preparer = TQMegatronPromptPreparer(
-            TQTokenSource(dp_client, staging_partition=staging_partition)
+            TQTokenSource(
+                dp_client,
+                staging_partition=staging_partition,
+                capture_media=capture_media,
+            )
         )
         engine.prompt_preparer = prompt_preparer
         self._request_prompt_preparer = prompt_preparer
         stager = TQMegatronTokenStager(
-            TQTokenSink(dp_client, staging_partition=staging_partition)
+            TQTokenSink(
+                dp_client,
+                staging_partition=staging_partition,
+                capture_media=capture_media,
+                media_pixel_dtype=pixel_dtype,
+            )
         )
         engine.payload_stager = stager
         self._request_payload_stager = stager
-        return True
+        if not capture_media:
+            return None
+        assert pixel_dtype is not None
+        return MediaColumnSpec(
+            pixel_dtype=pixel_dtype,
+            patch_size=int(self._image_preprocessing_config.patch_dim),
+        )
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Stamp subsequent MInf requests with the trainer weight version."""

@@ -15,8 +15,13 @@
 """Default behaviour of the optional hooks declared on GenerationInterface."""
 
 import pytest
+import torch
 
-from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.data.captured_media import MediaColumnSpec
+from nemo_rl.models.generation.interfaces import (
+    GenerationInterface,
+    agreed_media_columns,
+)
 
 
 class _MinimalGeneration(GenerationInterface):
@@ -48,3 +53,24 @@ def test_set_rollout_weight_version_default_names_the_backend():
     """The per-step version rotation is rejected the same way as setup."""
     with pytest.raises(NotImplementedError, match="_MinimalGeneration"):
         _MinimalGeneration().set_rollout_weight_version(1)
+
+
+def test_agreed_media_columns_returns_the_one_spec_or_none():
+    """Text-only workers and ranks without capture report nothing; the one
+    spec the media workers pinned comes back, else ``None``."""
+    spec = MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=16)
+    assert agreed_media_columns([None, spec, None]) == spec
+    assert agreed_media_columns([None, None]) is None
+    assert agreed_media_columns([]) is None
+
+
+def test_agreed_media_columns_rejects_disagreeing_workers():
+    """Two dtypes or widths on one column would be a TransferQueue schema
+    conflict found mid-run; it is refused at setup instead."""
+    with pytest.raises(RuntimeError, match="different media column specs"):
+        agreed_media_columns(
+            [
+                MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=16),
+                MediaColumnSpec(pixel_dtype=torch.float32, patch_size=16),
+            ]
+        )
