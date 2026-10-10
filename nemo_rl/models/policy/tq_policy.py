@@ -177,6 +177,9 @@ class TQPolicy(TQDriverMixin, Policy):
         # process cannot interleave one baseline; the driver's own baseline
         # stays on the client, which covers a different set of processes.
         self._prev_cluster_snapshot: dict[str, Any] = {}
+        # Data-plane clients outside the worker group (e.g. the rollout
+        # actor); Ray actor handles exposing ``get_data_plane_snapshot``.
+        self._extra_snapshot_sources: list[Any] = []
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -285,6 +288,11 @@ class TQPolicy(TQDriverMixin, Policy):
             # reset_step_window: this call is the once-per-step reader, and
             # a max only scopes to a step by being reset by its reader.
             snapshots.append(client.snapshot(reset_step_window=True))
+        # Submitted before the worker fan-out blocks, so the round trips overlap.
+        extra_refs = [
+            source.get_data_plane_snapshot.remote()
+            for source in self._extra_snapshot_sources
+        ]
         try:
             # ``Policy.run_all_workers_single_data`` already does the
             # ``ray.get``. Pairing the worker-group call with
@@ -297,7 +305,17 @@ class TQPolicy(TQDriverMixin, Policy):
             logger.warning("data-plane snapshot fan-out failed: %s", exc)
         else:
             snapshots.extend(s for s in ranks if s)
+        try:
+            extra = ray.get(extra_refs)
+        except Exception as exc:  # noqa: BLE001 - metrics must never fail a step
+            logger.warning("data-plane snapshot from extra sources failed: %s", exc)
+        else:
+            snapshots.extend(s for s in extra if s)
         return snapshots
+
+    def add_data_plane_snapshot_source(self, actor: Any) -> None:
+        """Include a non-worker actor's data-plane client in the cluster view."""
+        self._extra_snapshot_sources.append(actor)
 
     def get_data_plane_step_metrics(
         self, step_time_s: float

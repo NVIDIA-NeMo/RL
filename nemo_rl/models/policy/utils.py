@@ -52,7 +52,7 @@ class IPCProtocol(Enum):
 # worker classes.
 POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
-    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
+    "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": "nemo_rl.modelopt.models.policy.workers.automodel_quant_policy_worker.AutomodelQuantPolicyWorker",
 }
 
 _NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
@@ -123,7 +123,7 @@ def validate_fp32_lm_head_config(
     config: "PolicyConfig",
     *,
     megatron_enabled: bool,
-    dtensor_enabled: bool,
+    automodel_enabled: bool,
     model_config: object | None = None,
 ) -> None:
     """Reject fp32 LM-head settings that the selected backends cannot match."""
@@ -171,11 +171,11 @@ def validate_fp32_lm_head_config(
         )
 
     vllm_fp32 = vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg)
-    if dtensor_enabled and vllm_fp32:
+    if automodel_enabled and vllm_fp32:
         raise ValueError(
             "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
             "with the Megatron trainer because DTensor has no matching "
-            "policy.dtensor_cfg fp32 LM-head implementation."
+            "policy.automodel_cfg fp32 LM-head implementation."
         )
     if megatron_enabled and megatron_fp32 != vllm_fp32:
         raise ValueError(

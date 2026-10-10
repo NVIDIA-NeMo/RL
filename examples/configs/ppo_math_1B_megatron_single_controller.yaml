@@ -200,7 +200,7 @@ policy:
   # pause_train_step_with_offloading.
   offload_optimizer_for_logprob: true
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true
