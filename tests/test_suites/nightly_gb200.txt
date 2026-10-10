@@ -29,6 +29,10 @@ tests/test_suites/llm/grpo-qwen3.5-35ba3b-6n4g-async-1off-bf16-trtllm.sh
 # TRT-LLM generation backend
 tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-fsdp2-trtllm.sh
 tests/test_suites/llm/grpo-qwen2.5-0.5b-1n4g-megatron-trtllm-noncolocated-async.sh
+# The only job that runs TRT-LLM behind NeMo-Gym, and the only one that
+# exercises prefill/decode disaggregation. Uses the SWE pivot single-step
+# environment, so it needs no Apptainer or per-instance SIFs.
+tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1.sh
 
 # Functional moonlight run
 tests/test_suites/llm/grpo-moonlight-16ba3b-4n4g-megatron.sh

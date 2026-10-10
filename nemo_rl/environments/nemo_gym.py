@@ -1524,10 +1524,17 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         # Megatron Inference is always async; should_use_async_rollouts rejects
         # an explicit mcore_generation_config.async_engine key.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
+    elif generation_config["backend"] == "trtllm":
+        # Must stay in sync with should_use_nemo_gym, which reads
+        # trtllm_cfg.expose_http_server to decide Gym owns the rollouts. Under
+        # disaggregation the server is also what the disagg frontend reaches
+        # each engine on, so there is no non-HTTP Gym path for this backend.
+        generation_config["trtllm_cfg"]["async_engine"] = True
+        generation_config["trtllm_cfg"]["expose_http_server"] = True
     else:
         raise ValueError(
-            "NeMo-Gym setup supports vllm, dynamo, or megatron generation; got "
-            f"{generation_config['backend']!r}"
+            "NeMo-Gym setup supports vllm, dynamo, megatron, or trtllm "
+            f"generation; got {generation_config['backend']!r}"
         )
 
     # Stop strings or token ids are not supported

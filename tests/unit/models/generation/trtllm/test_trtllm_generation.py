@@ -18,15 +18,22 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.trtllm import trtllm_generation
+from nemo_rl.models.generation.interfaces import DisaggConfig
+from nemo_rl.models.generation.trtllm.config import (
+    TrtllmDisaggServerConfig,
+    resolve_disagg_layout,
+    resolve_disagg_server_config,
+)
 from nemo_rl.models.generation.trtllm.trtllm_generation import TrtllmGeneration
 
 pytestmark = pytest.mark.trtllm
 
 
-def _config(**trtllm_overrides):
+def _config(disaggregation=None, **trtllm_overrides):
     trtllm_cfg = {
         "tensor_parallel_size": 1,
         "max_model_len": 128,
@@ -54,6 +61,7 @@ def _config(**trtllm_overrides):
             "resources": {"gpus_per_node": None, "num_nodes": None},
         },
         "trtllm_cfg": trtllm_cfg,
+        **({} if disaggregation is None else {"disaggregation": disaggregation}),
     }
 
 
@@ -76,6 +84,15 @@ def _bare_generation(*, colocated=True, dp_size=2, **trtllm_overrides):
     generation.worker_group = MagicMock()
     generation.worker_group.dp_size = dp_size
     generation.worker_group.workers = [object()] * dp_size
+    # Aggregated shape: a replica is one engine, one worker wide, so engine i
+    # is owned by worker i. __init__ derives these; these tests bypass it.
+    generation._disagg = resolve_disagg_layout(generation.cfg)
+    generation._disagg_server = resolve_disagg_server_config(generation.cfg)
+    generation.num_replicas = dp_size
+    generation.num_engines = dp_size
+    generation._engine_tps = [1] * dp_size
+    generation._engine_owner_indices = list(range(dp_size))
+    generation._replica_owner_indices = list(range(dp_size))
     return generation
 
 
@@ -149,6 +166,9 @@ def test_init_cluster_placement_groups_rejects_colocated_cross_node_tp():
 def test_cross_node_tp_replicas_use_unified_placement_group():
     generation = TrtllmGeneration.__new__(TrtllmGeneration)
     generation.model_parallel_size = 8
+    # Bundles are handed out engine by engine, so the widths are what the
+    # slicing follows -- two engines of 8 across the 16-bundle unified PG.
+    generation._engine_tps = [8, 8]
     generation.worker_group = MagicMock()
 
     unified_pg = MagicMock()
@@ -173,7 +193,10 @@ def test_cross_node_tp_replicas_use_unified_placement_group():
 @pytest.mark.asyncio
 async def test_generate_async_dispatches_round_robin_and_returns_leader_index():
     generation = _bare_generation(dp_size=2)
-    generation.worker_group.get_dp_leader_worker_idx.side_effect = [3, 7]
+    # Dispatch follows _engine_owner_indices, not the worker group's DP
+    # leaders: the grid cannot model engines of differing width. Non-identity
+    # owners so a regression to worker_idx == engine_idx would show.
+    generation._engine_owner_indices = [3, 7]
 
     async def worker_result():
         return BatchedDataDict(
@@ -275,26 +298,29 @@ async def test_generate_async_surfaces_timeout(monkeypatch):
 def test_generation_lifecycle_routes_by_colocation(
     monkeypatch, colocated, prepare_method, finish_method
 ):
-    generation = _bare_generation(colocated=colocated)
-    generation.worker_group.run_all_workers_single_data.return_value = [True, True]
+    generation = _bare_generation(colocated=colocated, dp_size=2)
+    run_one = generation.worker_group.run_single_worker_single_data
+    run_one.side_effect = lambda **_: True
     monkeypatch.setattr(trtllm_generation.ray, "get", lambda values: values)
 
     assert generation.prepare_for_generation(tags=["weights"]) is True
     if prepare_method is None:
-        generation.worker_group.run_all_workers_single_data.assert_not_called()
+        run_one.assert_not_called()
     else:
-        generation.worker_group.run_all_workers_single_data.assert_called_once_with(
-            prepare_method,
-            run_rank_0_only_axes=["tensor_parallel"],
-            tags=["weights"],
-        )
+        # One call per engine, each addressed to that engine's owner.
+        assert [c.kwargs["method_name"] for c in run_one.call_args_list] == [
+            prepare_method
+        ] * 2
+        assert [c.kwargs["worker_idx"] for c in run_one.call_args_list] == [0, 1]
+        assert all(c.kwargs["tags"] == ["weights"] for c in run_one.call_args_list)
+        assert not generation.worker_group.run_all_workers_single_data.called
 
-    generation.worker_group.run_all_workers_single_data.reset_mock()
+    run_one.reset_mock()
     assert generation.finish_generation() is True
-    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
-        finish_method,
-        run_rank_0_only_axes=["tensor_parallel"],
-    )
+    assert [c.kwargs["method_name"] for c in run_one.call_args_list] == [
+        finish_method
+    ] * 2
+    assert [c.kwargs["worker_idx"] for c in run_one.call_args_list] == [0, 1]
 
 
 @pytest.mark.parametrize(
@@ -306,33 +332,164 @@ def test_collective_refit_forwards_async_update_policy(
 ):
     generation = _bare_generation(
         colocated=False,
+        dp_size=2,
         in_flight_weight_updates=in_flight,
         recompute_kv_cache_after_weight_updates=recompute_kv,
     )
-    expected = [SimpleNamespace()]
-    generation.worker_group.run_all_workers_single_data.return_value = expected
+    refs = [SimpleNamespace(), SimpleNamespace()]
+    run_one = generation.worker_group.run_single_worker_single_data
+    run_one.side_effect = refs
 
-    assert generation.update_weights_from_collective() is expected
-    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
-        "update_weights_from_collective_async",
-        run_rank_0_only_axes=["tensor_parallel"],
-        drain=expected_drain,
-        recompute_kv=recompute_kv,
-    )
+    assert generation.update_weights_from_collective() == refs
+    # One call per engine: drain and recompute_kv are the same for all of them,
+    # but the owner is not, so the fan-out has to be per engine.
+    assert [c.kwargs["method_name"] for c in run_one.call_args_list] == [
+        "update_weights_from_collective_async"
+    ] * 2
+    assert [c.kwargs["worker_idx"] for c in run_one.call_args_list] == [0, 1]
+    for call in run_one.call_args_list:
+        assert call.kwargs["drain"] is expected_drain
+        assert call.kwargs["recompute_kv"] is recompute_kv
 
 
 def test_ipc_refit_and_missing_worker_group():
-    generation = _bare_generation(colocated=True)
-    expected = [SimpleNamespace()]
-    generation.worker_group.run_all_workers_single_data.return_value = expected
+    generation = _bare_generation(colocated=True, dp_size=2)
+    refs = [SimpleNamespace(), SimpleNamespace()]
+    run_one = generation.worker_group.run_single_worker_single_data
+    run_one.side_effect = refs
 
-    assert generation.update_weights_via_ipc_zmq() is expected
-    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
-        "update_weights_via_ipc_zmq_async",
-        run_rank_0_only_axes=["tensor_parallel"],
-    )
+    assert generation.update_weights_via_ipc_zmq() == refs
+    assert [c.kwargs["method_name"] for c in run_one.call_args_list] == [
+        "update_weights_via_ipc_zmq_async"
+    ] * 2
+    assert [c.kwargs["worker_idx"] for c in run_one.call_args_list] == [0, 1]
 
     broken = _bare_generation(colocated=True)
     broken.worker_group.workers = []
     with pytest.raises(RuntimeError, match="Worker group not initialised"):
         broken.update_weights_via_ipc_zmq()
+
+
+# -------------------------------------------------------------------------- #
+#  Disaggregation config and engine planning
+# -------------------------------------------------------------------------- #
+
+
+def test_disagg_defaults_come_from_the_schema_not_the_call_sites():
+    # Absent and present-but-empty must agree: every default lives on the model,
+    # so no consumer has to re-derive one per key.
+    for raw in (None, {}):
+        cfg = _config(disaggregation=raw) if raw is not None else _config()
+        layout = resolve_disagg_layout(cfg)
+        assert layout.enabled is False
+        assert layout.num_prefill_engines == 1
+        assert layout.num_decode_engines == 1
+        assert layout.num_frontend_workers == 1
+        assert layout.frontend_tokenize is False
+        assert layout.frontend_base_port == 17300
+
+        server = resolve_disagg_server_config(cfg)
+        assert server.ctx_router == "conversation"
+        assert server.gen_router == "load_balancing"
+        assert server.gen_tokids_ctxbytes is False
+        assert server.gen_strip_message_history is False
+
+        assert "prefill_engine" not in cfg["trtllm_cfg"]
+
+
+def test_the_layout_and_the_server_block_carry_disjoint_keys():
+    # The two schemas describe different things, so neither should be able to
+    # declare the other's keys -- a layout key under disagg_server would read as
+    # configuration while nothing applied it.
+    assert not set(DisaggConfig.model_fields) & set(
+        TrtllmDisaggServerConfig.model_fields
+    )
+
+
+def test_a_layout_key_under_disagg_server_is_rejected():
+    # extra="allow" would otherwise swallow it silently.
+    with pytest.raises(ValueError, match="generation.disaggregation"):
+        resolve_disagg_server_config(
+            _config(disagg_server={"num_prefill_engines": 2})
+        )
+
+
+def test_a_plausible_but_wrong_router_is_rejected():
+    # round_robin parses as a str but silently discards the prefix affinity the
+    # prefill engines depend on, so the schema has to reject it.
+    with pytest.raises(ValidationError):
+        resolve_disagg_server_config(
+            _config(disagg_server={"ctx_router": "round_robin"})
+        )
+
+
+def test_unknown_disagg_keys_are_preserved_for_older_configs():
+    layout = resolve_disagg_layout(
+        _config(disaggregation={"enabled": True, "some_future_key": 3})
+    )
+    assert layout.enabled is True
+    assert layout.model_extra["some_future_key"] == 3
+
+
+@pytest.mark.parametrize(
+    "trtllm_overrides, world_size, expected_roles, expected_tps, expected_replicas",
+    [
+        # Disabled: a replica is an engine, so the count follows TP as before.
+        ({}, 8, ["aggregated"] * 8, [1] * 8, 8),
+        # Enabled, 1:1 at TP1 -- the exemplar's defaults on one 8-GPU node.
+        (
+            {"disaggregation": {"enabled": True}},
+            8,
+            ["prefill", "decode"] * 4,
+            [1, 1] * 4,
+            4,
+        ),
+        # Per-role TP and engine counts are independent, and same-role engines
+        # stay contiguous within a replica. The role overrides sit beside the
+        # shared engine config, not under disaggregation.
+        (
+            {
+                "disaggregation": {
+                    "enabled": True,
+                    "num_prefill_engines": 2,
+                    "num_decode_engines": 1,
+                },
+                "prefill_engine": {"tensor_parallel_size": 1},
+                "decode_engine": {"tensor_parallel_size": 2},
+            },
+            8,
+            ["prefill", "prefill", "decode"] * 2,
+            [1, 1, 2] * 2,
+            2,
+        ),
+    ],
+)
+def test_plan_engines_lays_replicas_out_contiguously(
+    trtllm_overrides, world_size, expected_roles, expected_tps, expected_replicas
+):
+    cfg = _config(**trtllm_overrides)
+    generation = TrtllmGeneration.__new__(TrtllmGeneration)
+    generation.cfg = cfg
+    generation.tp_size = cfg["trtllm_cfg"]["tensor_parallel_size"]
+    generation._disagg = resolve_disagg_layout(cfg)
+
+    roles, tps, num_replicas = generation._plan_engines(world_size)
+
+    assert roles == expected_roles
+    assert tps == expected_tps
+    assert num_replicas == expected_replicas
+
+
+def test_plan_engines_rejects_a_replica_width_that_does_not_tile_the_cluster():
+    cfg = _config(
+        disaggregation={"enabled": True},
+        prefill_engine={"tensor_parallel_size": 2},
+        decode_engine={"tensor_parallel_size": 1},
+    )
+    generation = TrtllmGeneration.__new__(TrtllmGeneration)
+    generation.cfg = cfg
+    generation.tp_size = cfg["trtllm_cfg"]["tensor_parallel_size"]
+    generation._disagg = resolve_disagg_layout(cfg)
+
+    with pytest.raises(AssertionError, match="replica width 3 GPUs"):
+        generation._plan_engines(8)
