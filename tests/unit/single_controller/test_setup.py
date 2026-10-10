@@ -1861,6 +1861,162 @@ class TestSetup:
 
         assert "train_iters" not in mc.policy.get("megatron_cfg", {})
 
+    def test_megatron_train_iters_helper_reads_without_writing(self):
+        """The trainer thread reads the config while this runs, so it must not write it."""
+        mc = _make_master_config(megatron_enabled=True, max_num_steps=7)
+        assert sc_setup_mod._megatron_train_iters(mc) == (7, None)
+        assert "train_iters" not in mc.policy["megatron_cfg"]
+
+        mc = _make_master_config(megatron_enabled=False, max_num_steps=7)
+        assert sc_setup_mod._megatron_train_iters(mc) == (None, None)
+
+    @staticmethod
+    def _gym_vllm_config(**kwargs: Any) -> MasterConfig:
+        """NeMo-Gym + vLLM + non-colocated: the path that overlaps the dataset load."""
+        mc = _make_master_config(backend="vllm", **kwargs)
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+            }
+        )
+        return mc
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _gym_patches(gym_shards: Any = None):
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod,
+                "build_nemo_gym_actors",
+                return_value=gym_shards if gym_shards is not None else MagicMock(),
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            yield
+
+    def test_gym_vllm_loads_dataset_while_trainer_builds(self, patched_factories):
+        """The dataset load waits for the trainer build to start; in the old order
+        (load first, then build) it would time out."""
+        mc = self._gym_vllm_config()
+        trainer_started = threading.Event()
+        fake_policy = patched_factories["fake_policy"]
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            trainer_started.set()
+            return fake_policy, 0.0
+
+        def _setup_response_data(*args: Any, **kwargs: Any) -> tuple[list[int], None]:
+            assert trainer_started.wait(timeout=30), (
+                "dataset loaded before the trainer build started"
+            )
+            return list(range(8)), None
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+        patched_factories["setup_response_data"].side_effect = _setup_response_data
+
+        with self._gym_patches():
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.dataloader is patched_factories["dataloader"]
+        assert patched_factories["_build_trainer"].call_count == 1
+
+    def test_native_path_loads_dataset_before_building(self, patched_factories):
+        """Outside NeMo-Gym + vLLM + non-colocated, the original order is kept."""
+        mc = _make_master_config(megatron_enabled=True)
+        trainer_started_before_load: list[bool] = []
+        trainer_started = threading.Event()
+        fake_policy = patched_factories["fake_policy"]
+        fake_return = patched_factories["setup_response_data"].return_value
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            trainer_started.set()
+            return fake_policy, 0.0
+
+        def _setup_response_data(*args: Any, **kwargs: Any) -> Any:
+            trainer_started_before_load.append(trainer_started.is_set())
+            return fake_return
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+        patched_factories["setup_response_data"].side_effect = _setup_response_data
+
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert trainer_started_before_load == [False]
+
+    def test_gym_vllm_keeps_speculative_trainer_when_clamp_does_not_bind(
+        self, patched_factories
+    ):
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=2, max_num_epochs=1
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        train_iters_at_build: list[int] = []
+        fake_policy = patched_factories["fake_policy"]
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            return fake_policy, 0.0
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+
+        with self._gym_patches():
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # patched dataloader has len() == 4, so 2 steps fit: no rebuild.
+        assert train_iters_at_build == [2]
+        fake_policy.shutdown.assert_not_called()
+        assert mc.policy["megatron_cfg"]["train_iters"] == 2
+
+    def test_gym_vllm_rebuilds_trainer_when_clamp_binds(
+        self, patched_factories, capsys
+    ):
+        """More steps than the data holds: the speculative trainer is replaced."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        train_iters_at_build: list[int] = []
+        stale_policy = MagicMock(name="stale_policy")
+        final_policy = patched_factories["fake_policy"]
+        policies = iter([stale_policy, final_policy])
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            return next(policies), 0.0
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+
+        with self._gym_patches():
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
+        assert train_iters_at_build == [1000, 8]
+        stale_policy.shutdown.assert_called_once()
+        final_policy.shutdown.assert_not_called()
+        assert mc.grpo.max_num_steps == 8
+        assert mc.policy["megatron_cfg"]["train_iters"] == 8
+        assert "Rebuilding the trainer" in capsys.readouterr().out
+
+    def test_gym_vllm_dataset_load_failure_shuts_down_gym(self, patched_factories):
+        mc = self._gym_vllm_config()
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
+        patched_factories["setup_response_data"].side_effect = RuntimeError(
+            "bad data path"
+        )
+
+        with (
+            self._gym_patches(fake_gym_shards),
+            pytest.raises(RuntimeError, match="bad data path"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        fake_gym_shards.shutdown.assert_called_once()
+
     def test_nemo_gym_wires_env_handle(self, patched_factories):
         """When enabled, the NeMo-Gym shard set is spun up and stored."""
         mc = _make_master_config(backend="vllm")
