@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import os
 import traceback
-from dataclasses import fields
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -37,7 +36,6 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     _SPARSE_PROJECTION_CACHE,
     _TOPK_PROJECTION_CACHE,
     _try_zero_copy_teacher_logits,
-    alignment_from_flat_batch,
     assemble_teacher_logits_from_shards,
     build_exact_token_map,
     chunk_average_log_probs,
@@ -50,7 +48,6 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     slice_sparse_projection_cols,
     valid_chunk_mask,
 )
-from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 from nemo_rl.distributed.model_utils import group_all_reduce_sum_with_grad
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -59,47 +56,6 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
-
-# ---------------------------------------------------------------------------
-# alignment_from_flat_batch
-# ---------------------------------------------------------------------------
-
-
-class TestAlignmentFromFlatBatch:
-    def _flat(self, B: int = 1, T_s: int = 4, T_t: int = 4, P: int = 2) -> dict:
-        return {
-            "alignment_pair_valid": torch.ones((B, P), dtype=torch.bool),
-            "alignment_pair_is_correct": torch.ones((B, P), dtype=torch.bool),
-            "alignment_student_exact_partition_mask": torch.zeros(
-                (B, T_s), dtype=torch.bool
-            ),
-            "alignment_teacher_exact_partition_mask": torch.zeros(
-                (B, T_t), dtype=torch.bool
-            ),
-            "alignment_student_chunk_id": torch.zeros((B, T_s), dtype=torch.long),
-            "alignment_teacher_chunk_id": torch.zeros((B, T_t), dtype=torch.long),
-            "alignment_num_chunks": torch.tensor([P] * B, dtype=torch.long),
-        }
-
-    def test_returns_alignment_batch_with_all_fields(self):
-        ab = alignment_from_flat_batch(self._flat())
-        assert isinstance(ab, AlignmentBatch)
-        for f in fields(AlignmentBatch):
-            assert getattr(ab, f.name) is not None
-
-    def test_field_set_matches_dataclass_schema(self):
-        # Schema-drift detector: if AlignmentBatch grows / loses a field,
-        # the helper consumes that change automatically, but the flat
-        # keys must follow.
-        flat = self._flat()
-        expected_keys = {f"alignment_{f.name}" for f in fields(AlignmentBatch)}
-        assert expected_keys.issubset(flat.keys())
-
-    def test_values_are_tensor_identity_preserved(self):
-        flat = self._flat()
-        ab = alignment_from_flat_batch(flat)
-        assert ab.pair_valid is flat["alignment_pair_valid"]
-        assert ab.num_chunks is flat["alignment_num_chunks"]
 
 
 def test_automodel_cp_layout_localizes_xtoken_windows_after_global_shift():
