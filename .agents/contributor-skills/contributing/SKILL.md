@@ -1,7 +1,6 @@
 ---
 name: contributing
-description: Contribution conventions for NeMo-RL. Covers PR title format, commit sign-off, and CI triggering.
-when_to_use: Opening a PR; writing a commit message; triggering CI; 'PR title format', 'sign-off', 'conventional commits', 'how do I trigger CI', during code review of PR process.
+description: Contribution conventions for NeMo-RL. Covers PR title format, commit sign-off, and CI triggering. Use when opening a PR; writing a commit message; triggering CI; 'PR title format', 'sign-off', 'conventional commits', 'how do I trigger CI', during code review of PR process.
 ---
 
 # Contributing Conventions
