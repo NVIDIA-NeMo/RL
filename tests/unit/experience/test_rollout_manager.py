@@ -1023,6 +1023,29 @@ def test_result_to_completion_keeps_mask_flag_when_gate_on():
     assert completion.env_extras["instance_config"]["mask_sample"] is True
 
 
+@pytest.mark.parametrize(
+    "response, expected",
+    [
+        # A budget cut carries the Responses API's cause field.
+        (
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+            True,
+        ),
+        # Gym's agent stop-token case: incomplete status, no details.
+        ({"status": "incomplete", "incomplete_details": None}, False),
+        ({"status": "completed"}, False),
+    ],
+)
+def test_result_to_completion_reads_terminal_truncation_status(response, expected):
+    result = _mask_gate_result()
+    result["full_result"]["response"] = response
+    completion = _nemo_gym_impl(True)._results_to_completions([result])[0][0]
+    assert completion.truncated is expected
+
+
 def test_result_to_completion_drops_mask_flag_when_gate_off():
     completion = _nemo_gym_impl(False)._results_to_completions([_mask_gate_result()])[
         0

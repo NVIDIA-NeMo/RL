@@ -82,6 +82,7 @@ from nemo_rl.experience.rollouts import (
     _effort_shaping_metrics,
     _EffortShapingMetrics,
     _find_routed_experts_template,
+    _nemo_gym_sample_truncated,
     _tensorize_by_key,
     apply_reward_penalties,
     attach_static_multimodal_payload,
@@ -1452,10 +1453,7 @@ class AsyncNemoGymRolloutImpl:
                     )
                 )
                 continue
-            truncated = (
-                sum(len(m["token_ids"]) for m in result["message_log"])
-                == self._max_seq_len
-            )
+            truncated = _nemo_gym_sample_truncated(result, self._max_seq_len)
             completions.append(
                 Completion(
                     message_log=result["message_log"],

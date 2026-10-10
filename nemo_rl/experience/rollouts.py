@@ -2926,6 +2926,28 @@ def run_nemo_gym_rollout_sync(
     return asyncio.run(_consume_rollout())
 
 
+def _nemo_gym_sample_truncated(result: dict, max_total_tokens_per_sample: int) -> bool:
+    """Whether a Gym rollout ended by a length limit rather than by the agent's own stop.
+
+    Two signals mark the sample truncated. The message log's token count equals
+    the generation engine's window (``max_total_tokens_per_sample``). Or the
+    terminal response carries ``incomplete_details.reason:
+    "max_output_tokens"``, the Responses API's cause field for a completion
+    cut at the output-token budget. ``status: "incomplete"`` alone is not
+    truncation: Gym's agents also set that status for an agent-level stop (an
+    EOS with no assistant message or tool call, or a harness that did not
+    finish) with ``incomplete_details`` unset, and counting those as length
+    cuts would take away the only gradient against producing them.
+    """
+    total_tokens = sum(len(m["token_ids"]) for m in result["message_log"])
+    response = result["full_result"].get("response") or {}
+    incomplete_details = response.get("incomplete_details") or {}
+    return (
+        total_tokens == max_total_tokens_per_sample
+        or incomplete_details.get("reason") == "max_output_tokens"
+    )
+
+
 def _postprocess_single_nemo_gym_group(
     nemo_gym_rows: list[dict],
     results: list[dict],
@@ -3007,8 +3029,9 @@ def _postprocess_single_nemo_gym_group(
                 ),
                 "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
-                == max_total_tokens_per_sample,
+                "hit_max_tokens": _nemo_gym_sample_truncated(
+                    r, max_total_tokens_per_sample
+                ),
                 # max_gen_tokens_per_turn: Diagnostic for long single generations
                 "max_gen_tokens_per_turn": max(
                     (
@@ -3167,7 +3190,8 @@ def _postprocess_single_nemo_gym_group(
             # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
             # Extra information not in the DatumSpec used by the GRPO algorithm
             "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
-            # Add truncated field to match other rollout paths (reusing hit_max_tokens logic)
+            # The same per-sample verdict as the truncation metrics above; with
+            # grpo.overlong_filtering these samples get a zero loss weight.
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
             ),
