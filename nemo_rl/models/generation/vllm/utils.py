@@ -139,7 +139,10 @@ def _as_routed_experts_tensor(
     global G_ROUTED_EXPERTS_RANGE_CHECKED
     tensor = torch.as_tensor(value, device=device)
     if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
-        max_id = int(tensor.max())
+        # Reduce in int64: torch has no max() kernel for the unsigned carry
+        # dtypes (uint16/uint32) that models with more than 255 experts use, so
+        # ``tensor.max()`` raises NotImplementedError("max_all" ...) on them.
+        max_id = int(tensor.to(torch.int64).max())
         limit = torch.iinfo(dtype).max
         if max_id > limit:
             raise ValueError(

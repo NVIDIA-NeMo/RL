@@ -2930,6 +2930,13 @@ class SingleControllerActor:
                         max_prompt_groups = target_groups - groups_dispatched
                         if max_prompt_groups <= 0:
                             break
+                        # Optional cap on one chunk. The sampler is greedy up to
+                        # max_prompt_groups, so without it a chunk is whatever is
+                        # ready up to the step remainder; with router replay that
+                        # is the host-memory peak of the DP-leader fetch.
+                        chunk_cap = self._async_cfg.max_groups_for_streaming_train
+                        if chunk_cap is not None:
+                            max_prompt_groups = min(max_prompt_groups, chunk_cap)
                         # For a colocated engine this is max_prompt_groups, pinned inside setup.
                         min_prompt_groups = min(
                             self._async_cfg.min_groups_for_streaming_train,
