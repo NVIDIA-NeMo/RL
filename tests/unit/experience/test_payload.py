@@ -281,6 +281,34 @@ def test_multimodal_packed_tensor_round_trips_through_tq_payload() -> None:
     assert torch.equal(restored_media.as_tensor(), media)
 
 
+def test_emptied_media_group_writes_no_multimodal_fields() -> None:
+    """Overlength media groups must match text-only groups on the wire."""
+    completions = [
+        _completion(route_start=10, reward=1.0, with_routes=False),
+        _completion(route_start=30, reward=2.0, with_routes=False),
+    ]
+    template = PackedTensor(torch.ones(2, 4), dim_to_pack=0)
+    for completion in completions:
+        user_message = completion.message_log[0]
+        user_message["pixel_values"] = PackedTensor.empty_like(template)
+        user_message["media_token_validity_mask"] = torch.zeros_like(
+            user_message["token_ids"], dtype=torch.bool
+        )
+
+    train_batch = record_to_train_batch(
+        _record(completions),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+    _, fields, _ = pack_payload(
+        train_batch, weight_version=0, group_id="group", prompt_idx=0
+    )
+
+    assert "media_token_validity_mask" not in train_batch
+    assert "pixel_values" not in fields
+    assert "media_token_validity_mask" not in fields
+
+
 def test_per_token_multimodal_field_is_packed_with_sequence_lengths() -> None:
     train_batch = {
         "input_lengths": torch.tensor([3, 2], dtype=torch.int32),

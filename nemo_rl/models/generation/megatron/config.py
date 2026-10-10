@@ -14,6 +14,8 @@
 
 from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
+from pydantic import BaseModel, ConfigDict
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy import Fp8Config, PolicyConfig
 from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
@@ -29,6 +31,30 @@ def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
             "refit_execution_batch_bytes must be positive or null."
         )
     return configured_bytes
+
+
+class MediaPromptSpecOverrides(BaseModel):
+    """Partial MCore `MediaPromptSpec`. Omitted fields keep the wrapper's defaults."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_token: Optional[str] = None
+    prefix: Optional[str] = None
+    suffix: Optional[str] = None
+    input_marker: Optional[str] = None
+    content_part_separator: Optional[str] = None
+    expansion_mode: Optional[Literal["single", "temporal_patch"]] = None
+    include_frame_timestamps_for_nemotron_vl: Optional[bool] = None
+
+
+class MultimodalPromptConfigOverrides(BaseModel):
+    """Partial MCore `MultimodalPromptConfig`. Omitted fields keep the wrapper's defaults."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    image_spec: Optional[MediaPromptSpecOverrides] = None
+    video_spec: Optional[MediaPromptSpecOverrides] = None
+    content_part_order: Optional[Literal["preserve", "media_first"]] = None
 
 
 class MCoreGenerationSpecificArgs(TypedDict):
@@ -119,6 +145,16 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # `video_num_frames` is required for video.
     vision_model_type: NotRequired[str]
     image_dynamic_resolution: NotRequired[bool]
+    # Image token budget; overrides the HF processor's `max_model_len`.
+    image_dynamic_resolution_model_length: NotRequired[int]
+    # MCore default: 'ceil'. HF processors use 'round_plus_half'.
+    image_dynamic_resolution_rounding_mode: NotRequired[
+        Literal["ceil", "round_plus_half"]
+    ]
+    # MCore default: 'pil'. Torch-based HF processors use 'torch_bicubic_antialias'.
+    image_dynamic_resolution_resize_mode: NotRequired[
+        Literal["pil", "torch_bicubic_antialias"]
+    ]
     video_num_frames: NotRequired[int]  # Frames sampled per video.
     video_temporal_patch_size: NotRequired[int]  # Frames per temporal patch.
     video_target_num_patches: NotRequired[int]  # Overrides the image max-patch budget.
@@ -131,6 +167,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # attributes gate which modalities are preprocessed. Not media preprocessing
     # itself, and used on the direct generate path as well as the HTTP endpoint.
     megatron_inference_wrapper: NotRequired[str]
+    # Partial MultimodalPromptConfig overrides applied on top of the wrapper's
+    # default image/video prompt contracts.
+    multimodal_prompt_config: NotRequired[MultimodalPromptConfigOverrides]
 
     # KV cache lifecycle across suspend/resume:
     # - "persist": cache stays allocated; CUDA graphs remain valid (default)

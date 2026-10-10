@@ -224,6 +224,7 @@ class MegatronGeneration(GenerationInterface):
         mcore_cfg = cast(MCoreGenerationConfig, policy_config["generation"])[
             "mcore_generation_config"
         ]
+
         # Recompute-after-refit is implemented engine-side (kv_cache_management_mode="recompute");
         # the loop-level flag must agree with that mode, and setup errors on a mismatch.
         kv_cache_mode = mcore_cfg["kv_cache_management_mode"]
