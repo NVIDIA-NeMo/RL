@@ -26,6 +26,7 @@ module tree, inspect consumer configuration, and exercise captured raw responses
 """
 
 import sys
+import threading
 import types
 from collections.abc import AsyncIterator
 from typing import Any
@@ -33,6 +34,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from nemo_rl.models.generation.generation_cut_capture import _RequestCaptureState
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
@@ -175,11 +177,13 @@ def _install_fake_vllm(monkeypatch):
         built.clear()
 
 
-def _build_server(monkeypatch, serving_chat_kwargs):
+def _build_server(monkeypatch, serving_chat_kwargs, *, prefix_cuts_enabled=False):
     """Run the real server setup and hand back the three consumer stubs."""
     _install_fake_vllm(monkeypatch)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._generation_prefix_cuts_enabled = prefix_cuts_enabled
+    worker._capture_registry_lock = threading.Lock()
     worker.cfg = {
         "temperature": 1.0,
         "top_p": 1.0,
@@ -200,6 +204,7 @@ def _build_server(monkeypatch, serving_chat_kwargs):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prefix_cuts", [False, True])
 @pytest.mark.parametrize(
     "admitted,marker,stream,token_ids,default_token_ids,logprobs,bypass,invalid_raw",
     [
@@ -225,6 +230,7 @@ def _build_server(monkeypatch, serving_chat_kwargs):
 )
 async def test_captured_chat_logprobs_bypass(
     monkeypatch: Any,
+    prefix_cuts: bool,
     admitted: bool,
     marker: bool,
     stream: bool,
@@ -235,7 +241,7 @@ async def test_captured_chat_logprobs_bypass(
     invalid_raw: bool,
 ) -> None:
     """Drive the real serving MRO and retain engine-native arrays unchanged."""
-    _, chats, _ = _build_server(monkeypatch, {})
+    _, chats, _ = _build_server(monkeypatch, {}, prefix_cuts_enabled=prefix_cuts)
     serving = chats[0]
     serving.return_tokens_as_token_ids = default_token_ids
     serving.renderer = types.SimpleNamespace(tokenizer=None)
@@ -254,9 +260,13 @@ async def test_captured_chat_logprobs_bypass(
         logprobs=logprobs,
         top_logprobs=0,
         return_tokens_as_token_ids=token_ids,
+        _restored_generation_token_ids=[],
+        _restored_prefix_terminal=None,
     )
     if admitted:
-        capture_calls[id(request)] = object()
+        capture_calls[id(request)] = _RequestCaptureState(
+            call=types.SimpleNamespace(), prompt_token_ids=[1, 2]
+        )
     original_request_fields = vars(request).copy()
     ordinary_logprobs = object()
     builder = MagicMock(return_value=ordinary_logprobs)
