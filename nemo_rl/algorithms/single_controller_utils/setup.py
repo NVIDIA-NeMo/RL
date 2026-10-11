@@ -499,22 +499,8 @@ def _build_clusters(
                     "pipeline_parallel_size", 1
                 )
             elif backend == "trtllm":
-                trtllm_cfg = generation_config_dict["trtllm_cfg"]
-                disagg = trtllm_cfg.get("disaggregation") or {}
-                engine_tp = trtllm_cfg["tensor_parallel_size"]
-                if disagg.get("enabled"):
-                    engine_tp = max(
-                        int(
-                            (disagg.get(f"{role}_trtllm_kwargs") or {}).get(
-                                "tensor_parallel_size", engine_tp
-                            )
-                        )
-                        for role in ("ctx", "gen")
-                    )
-                # Match TRT-LLM placement: a tied actor group is one engine,
-                # not the sum of the prefill/decode widths in a PD replica.
-                gpus_per_instance = engine_tp * trtllm_cfg.get(
-                    "pipeline_parallel_size", 1
+                gpus_per_instance = TrtllmGeneration.gpus_per_instance(
+                    cast(TrtllmConfig, generation_config_dict)
                 )
             elif backend == "sglang":
                 gpus_per_instance = generation_config_dict["sglang_cfg"].get(
@@ -1324,13 +1310,19 @@ def setup_single_controller(
         Optional[dict[str, Any]],
         checkpointer.load_training_info(trainer_checkpoint_path),
     )
-    if (loaded_state and loaded_state.get("evaluation_only")) or (
-        trainer_checkpoint_path is not None
-        and evaluation_only_checkpoints(master_config)
+    if loaded_state and loaded_state.get("evaluation_only"):
+        raise ValueError(
+            "The checkpoint is an evaluation-only deferred-evaluation endpoint "
+            "(weights only, no recovery state) and cannot resume SingleController "
+            "training; use a fresh checkpoint_dir."
+        )
+    if trainer_checkpoint_path is not None and evaluation_only_checkpoints(
+        master_config
     ):
         raise ValueError(
-            "Evaluation-only checkpoints cannot resume SingleController training; "
-            "use a fresh checkpoint_dir or a full recovery checkpoint."
+            "grpo.deferred_evaluation.weights_only does not support resuming, "
+            "including a requeue after a timeout; use a fresh checkpoint_dir, or "
+            "disable weights_only for a resumable run."
         )
     save_state = _get_grpo_save_state(loaded_state)
     weights_path, optimizer_path = checkpointer.get_resume_paths(

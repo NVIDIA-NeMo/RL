@@ -22,7 +22,7 @@ to time-multiplex GPU memory between training and inference phases.
 import asyncio
 import os
 from collections import defaultdict
-from typing import Any, AsyncGenerator, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union, cast
 
 import numpy as np
 import ray
@@ -39,12 +39,15 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.trtllm.config import TrtllmConfig
 
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+
 
 class TrtllmGeneration(GenerationInterface):
     """TRT-LLM generation backend (requires trtllm_cfg.async_engine=true)."""
 
     @classmethod
-    def validate_settings(cls, master_config: Any) -> None:
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
         """Reject SC options that require unsupported TRT-LLM lifecycle APIs.
 
         SC can use the existing fixed-fleet PD HTTP and weight-update paths.
@@ -53,7 +56,7 @@ class TrtllmGeneration(GenerationInterface):
         """
         generation = master_config.policy["generation"]
         trtllm_cfg = generation["trtllm_cfg"]
-        if not trtllm_cfg["async_engine"]:
+        if not trtllm_cfg.get("async_engine", False):
             raise ValueError("SC TRT-LLM requires trtllm_cfg.async_engine=true")
         if generation["colocated"]["enabled"]:
             raise ValueError("SC TRT-LLM requires non-colocated generation")
@@ -77,9 +80,45 @@ class TrtllmGeneration(GenerationInterface):
                 )
         if (
             master_config.env.get("should_use_nemo_gym")
-            and not trtllm_cfg["expose_http_server"]
+            and not trtllm_cfg.get("expose_http_server", False)
         ):
             raise ValueError("SC NeMo-Gym requires trtllm_cfg.expose_http_server=true")
+
+    @staticmethod
+    def gpus_per_instance(config: TrtllmConfig) -> int:
+        """GPUs one topology-pinned generation instance spans.
+
+        Under PD disaggregation the unit to keep inside one NVLink domain is the
+        whole *replica*, not an engine: an engine's TP group all-reduces
+        internally, but the KV cache handed from the replica's context engines to
+        its generation engines crosses the transceiver on every turn. Sizing by
+        the engine instead yields one node per instance whenever an engine fits
+        in a node, which skips domain pinning and lets a replica straddle racks,
+        demoting the KV transfer from NVLink to InfiniBand.
+
+        Without disaggregation a replica is a single engine. There is no
+        pipeline_parallel_size factor under PD: this backend asserts pp == 1, so
+        folding it in would only suggest a dimension it does not have.
+        """
+        trtllm_cfg = config.get("trtllm_cfg", {})
+        disagg_cfg = trtllm_cfg.get("disaggregation") or {}
+        if not disagg_cfg.get("enabled"):
+            return trtllm_cfg["tensor_parallel_size"] * trtllm_cfg.get(
+                "pipeline_parallel_size", 1
+            )
+
+        def role_tp(role: str) -> int:
+            overrides = disagg_cfg.get(f"{role}_trtllm_kwargs") or {}
+            return int(
+                overrides.get(
+                    "tensor_parallel_size", trtllm_cfg["tensor_parallel_size"]
+                )
+            )
+
+        return int(
+            disagg_cfg["num_context_engines"] * role_tp("ctx")
+            + disagg_cfg["num_generation_engines"] * role_tp("gen")
+        )
 
     @staticmethod
     def init_cluster_placement_groups(
