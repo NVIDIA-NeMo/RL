@@ -1310,6 +1310,53 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    @pytest.mark.parametrize(
+        ("overrides", "error", "match"),
+        [
+            (
+                {"backend": "sglang"},
+                NotImplementedError,
+                "target_level='turn' currently supports only the vllm",
+            ),
+            (
+                {"use_gym": False},
+                ValueError,
+                "target_level='turn' requires the NeMo-Gym",
+            ),
+            (
+                {"token_capture": False},
+                ValueError,
+                r"target_level='turn' requires token_capture\.enabled=true",
+            ),
+            (
+                {"restore_mode": "trainer_checkpoint"},
+                ValueError,
+                "target_level='turn' requires rollout_checkpointing.restore_mode",
+            ),
+        ],
+        ids=["non-vllm", "no-gym", "no-token-capture", "trainer-restore"],
+    )
+    def test_turn_recovery_rejects_each_missing_prerequisite(
+        self, overrides, error, match
+    ):
+        mc = _make_master_config(
+            env={"should_use_nemo_gym": overrides.pop("use_gym", True)},
+            backend=overrides.pop("backend", "vllm"),
+        )
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.token_capture.enabled = overrides.pop("token_capture", True)
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            restore_mode=overrides.pop("restore_mode", "latest"),
+        )
+
+        with pytest.raises(error, match=match):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
     def test_periodic_checkpointing_warns_without_per_step_trainer_anchors(
         self,
         tmp_path: Path,

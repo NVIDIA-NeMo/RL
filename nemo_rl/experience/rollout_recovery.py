@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
 
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
 from nemo_rl.experience.reward_penalties import (
     CaptureRewardSettings,
     FinalizedReward,
@@ -67,7 +68,6 @@ _GROUP_STATE_FIELDS = frozenset(
         "prompt_ref",
         "task_source",
         "resolved_agent_name",
-        "recovery_granularity",
         "restore_level",
         "expected_generations",
         "target_step",
@@ -130,6 +130,15 @@ class RecoveryTargetLevel(StrEnum):
     TURN = "turn"
     SIBLING = "sibling"
     PROMPT_GROUP = "prompt_group"
+
+    @property
+    def granularity(self) -> RecoveryGranularity:
+        """``prompt_group`` retries every sibling; finer levels keep sealed ones."""
+        return (
+            RecoveryGranularity.PROMPT_GROUP
+            if self is RecoveryTargetLevel.PROMPT_GROUP
+            else RecoveryGranularity.SIBLING
+        )
 
 
 class RolloutAttemptStatus(StrEnum):
@@ -216,6 +225,13 @@ class RolloutAttemptRecord:
         """Return the compact external representation of this attempt UUID."""
         return self.attempt_uuid.hex
 
+    @property
+    def holds_gym_state(self) -> bool:
+        """A dispatched attempt, or a reserved restored one, may have live Gym state."""
+        return self.status is RolloutAttemptStatus.DISPATCHED or (
+            self.status is RolloutAttemptStatus.RESERVED and self.gym_attempt > 0
+        )
+
 
 @dataclass
 class RolloutSiblingRecord:
@@ -242,7 +258,6 @@ class PromptGroupRecoveryRecord:
     prompt_id: str
     prompt_ref: PromptRef
     task_source: Optional[str]
-    recovery_granularity: RecoveryGranularity
     restore_level: RecoveryTargetLevel
     runtime_prompt_payload: Optional[DatumSpec]
     expected_generations: int
@@ -254,6 +269,11 @@ class PromptGroupRecoveryRecord:
     # Gym's authoritative route, sealed with receipts rather than inferred from
     # task_source. Needed when recovery can reuse every sibling without rollout.
     resolved_agent_name: Optional[str] = None
+
+    @property
+    def recovery_granularity(self) -> RecoveryGranularity:
+        """The unit retried after a live failure, set by the restore level."""
+        return self.restore_level.granularity
 
     @property
     def prompt_payload(self) -> DatumSpec:
@@ -285,24 +305,16 @@ class PromptGroupRecoveryRecord:
     def gate_rollout_id(self, generation_index: int) -> str:
         """Return the legacy string carrier for one structured Gym episode.
 
-        Durable checkpoint state uses :meth:`gym_episode`. Keep this transport
-        encoding synchronized with Gym's ``EpisodeId`` contract; the NeMo-Gym
-        test suite checks the two implementations against each other.
+        Durable checkpoint state uses :meth:`gym_episode`; this is its capture
+        key, which RL's ``test_rollout_capture_key_matches_gym_episode_identity``
+        checks against Gym's ``EpisodeId``.
         """
-        sibling = self.siblings[generation_index]
-        base_rollout_id = (
-            f"{self.logical_rollout_id(generation_index)}"
-            f"_a{sibling.current_attempt.attempt_id}"
-        )
-        gym_attempt = sibling.current_attempt.gym_attempt
-        return (
-            base_rollout_id if gym_attempt == 0 else f"{base_rollout_id}-a{gym_attempt}"
-        )
+        return self.gym_episode(generation_index).capture_key
 
-    def gym_episode(self, generation_index: int) -> tuple[str, int]:
+    def gym_episode(self, generation_index: int) -> GymCheckpointEpisode:
         """Return Gym's base rollout ID and attempt number for one sibling."""
         sibling = self.siblings[generation_index]
-        return (
+        return GymCheckpointEpisode(
             f"{self.logical_rollout_id(generation_index)}"
             f"_a{sibling.current_attempt.attempt_id}",
             sibling.current_attempt.gym_attempt,
@@ -494,7 +506,7 @@ class RolloutRecoveryLedger:
         # Gym episodes RL dropped after Gym may have admitted them, by owning
         # Gym instance. In memory only: they belong to this process's Gym
         # executions and must be retired before the next checkpoint commit.
-        self._gym_retirements: dict[str, set[tuple[str, int]]] = {}
+        self._gym_retirements: dict[str, set[GymCheckpointEpisode]] = {}
 
     def groups(self) -> list[PromptGroupRecoveryRecord]:
         return [self._copy_group(group) for group in self._groups.values()]
@@ -509,8 +521,7 @@ class RolloutRecoveryLedger:
         target_step: Optional[int],
         start_weight_version: int,
         task_source: Optional[str] = None,
-        recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
-        restore_level: Optional[RecoveryTargetLevel] = None,
+        restore_level: RecoveryTargetLevel = RecoveryTargetLevel.SIBLING,
         admitted: bool = True,
         group_id: Optional[str] = None,
         admission_id: Optional[str] = None,
@@ -538,13 +549,6 @@ class RolloutRecoveryLedger:
         admission_id = admission_id or group_id
         if not admission_id:
             raise ValueError("admission_id must not be empty")
-        if restore_level is None:
-            restore_level = (
-                RecoveryTargetLevel.PROMPT_GROUP
-                if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
-                else RecoveryTargetLevel.SIBLING
-            )
-
         siblings = []
         for generation_index in range(expected_generations):
             siblings.append(
@@ -559,7 +563,6 @@ class RolloutRecoveryLedger:
             prompt_id=prompt_id,
             prompt_ref=prompt_ref,
             task_source=task_source,
-            recovery_granularity=recovery_granularity,
             restore_level=restore_level,
             # Retain the immutable dataloader sample by reference instead of copying
             # a potentially 131k-token payload. This cache is never serialized and
@@ -636,13 +639,11 @@ class RolloutRecoveryLedger:
                         attempt = sibling.current_attempt
                         if attempt.status is RolloutAttemptStatus.SEALED:
                             continue
-                        rollout_id, gym_attempt = record.gym_episode(
-                            sibling.generation_index
-                        )
+                        episode = record.gym_episode(sibling.generation_index)
                         restore_key = (
                             attempt.gym_instance_id or "",
-                            rollout_id,
-                            gym_attempt,
+                            episode.rollout_id,
+                            episode.attempt,
                         )
                         if (
                             record.restore_level is RecoveryTargetLevel.TURN
@@ -733,9 +734,9 @@ class RolloutRecoveryLedger:
     def gym_checkpoint_inventory(
         self,
         instance_ids: set[str] | frozenset[str],
-    ) -> dict[str, tuple[tuple[str, int], ...]]:
+    ) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
         """Return active turn-level Gym episodes grouped by owning actor."""
-        inventory: dict[str, list[tuple[str, int]]] = {
+        inventory: dict[str, list[GymCheckpointEpisode]] = {
             instance_id: [] for instance_id in instance_ids
         }
         for record in self._groups.values():
@@ -746,11 +747,7 @@ class RolloutRecoveryLedger:
                 continue
             for sibling in record.siblings:
                 attempt = sibling.current_attempt
-                owns_gym_state = attempt.status is RolloutAttemptStatus.DISPATCHED or (
-                    attempt.status is RolloutAttemptStatus.RESERVED
-                    and attempt.gym_attempt > 0
-                )
-                if not owns_gym_state:
+                if not attempt.holds_gym_state:
                     continue
                 instance_id = attempt.gym_instance_id
                 if instance_id is None:
@@ -781,11 +778,7 @@ class RolloutRecoveryLedger:
         """
         for sibling in record.siblings:
             attempt = sibling.current_attempt
-            holds_gym_state = attempt.status is RolloutAttemptStatus.DISPATCHED or (
-                attempt.status is RolloutAttemptStatus.RESERVED
-                and attempt.gym_attempt > 0
-            )
-            if not holds_gym_state or attempt.gym_instance_id is None:
+            if not attempt.holds_gym_state or attempt.gym_instance_id is None:
                 continue
             self._gym_retirements.setdefault(attempt.gym_instance_id, set()).add(
                 record.gym_episode(sibling.generation_index)
@@ -794,7 +787,7 @@ class RolloutRecoveryLedger:
     def gym_checkpoint_retirements(
         self,
         instance_ids: set[str] | frozenset[str],
-    ) -> dict[str, tuple[tuple[str, int], ...]]:
+    ) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
         """Return dropped Gym episodes to retire before the next commit."""
         unknown = set(self._gym_retirements) - set(instance_ids)
         if unknown:
@@ -807,7 +800,7 @@ class RolloutRecoveryLedger:
         }
 
     def mark_gym_retired(
-        self, retired: Mapping[str, Iterable[tuple[str, int]]]
+        self, retired: Mapping[str, Iterable[GymCheckpointEpisode]]
     ) -> None:
         """Forget episodes Gym has retired; later drops stay pending."""
         for instance_id, episodes in retired.items():
@@ -1294,7 +1287,6 @@ class RolloutRecoveryLedger:
                     },
                     "task_source": record.task_source,
                     "resolved_agent_name": record.resolved_agent_name,
-                    "recovery_granularity": record.recovery_granularity.value,
                     "restore_level": record.restore_level.value,
                     "expected_generations": record.expected_generations,
                     "target_step": record.target_step,
@@ -1426,7 +1418,6 @@ class RolloutRecoveryLedger:
         prompt_id = raw_group.get("prompt_id")
         task_source = raw_group.get("task_source")
         resolved_agent_name = raw_group.get("resolved_agent_name")
-        raw_recovery_granularity = raw_group.get("recovery_granularity")
         raw_restore_level = raw_group.get("restore_level")
         expected_generations = raw_group.get("expected_generations")
         siblings_state = raw_group.get("siblings")
@@ -1442,14 +1433,6 @@ class RolloutRecoveryLedger:
             not isinstance(resolved_agent_name, str) or not resolved_agent_name
         ):
             raise ValueError("resolved_agent_name must be a non-empty string or None")
-        if not isinstance(raw_recovery_granularity, str):
-            raise ValueError("recovery_granularity must be a string")
-        try:
-            recovery_granularity = RecoveryGranularity(raw_recovery_granularity)
-        except ValueError as error:
-            raise ValueError(
-                f"invalid recovery_granularity={raw_recovery_granularity!r}"
-            ) from error
         if not isinstance(raw_restore_level, str):
             raise ValueError("restore_level must be a string")
         try:
@@ -1574,11 +1557,7 @@ class RolloutRecoveryLedger:
                     raise ValueError("gym_attempt must be a non-negative integer")
                 if gym_attempt > 0 and gym_instance_id is None:
                     raise ValueError("resumed Gym attempts require gym_instance_id")
-                gate_id = (
-                    base_gate_id
-                    if gym_attempt == 0
-                    else f"{base_gate_id}-a{gym_attempt}"
-                )
+                gate_id = GymCheckpointEpisode(base_gate_id, gym_attempt).capture_key
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
                 ):
@@ -1683,7 +1662,6 @@ class RolloutRecoveryLedger:
             prompt_id=prompt_id,
             prompt_ref=PromptRef(sample_id=sample_id, task_name=task_name),
             task_source=task_source,
-            recovery_granularity=recovery_granularity,
             restore_level=restore_level,
             runtime_prompt_payload=None,
             expected_generations=expected_generations,

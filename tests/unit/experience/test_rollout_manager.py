@@ -729,7 +729,7 @@ class TestGenerateAndPushFlow:
                 target_step=0,
                 start_weight_version=0,
                 task_source=None,
-                recovery_granularity=RecoveryGranularity.SIBLING,
+                restore_level=RecoveryTargetLevel.SIBLING,
                 admitted=True,
             ),
         )
@@ -2160,6 +2160,8 @@ def _make_capture_manager(
             generation_indices=None,
             on_completion=None,
             recovery_granularity=RecoveryGranularity.SIBLING,
+            gym_instance_id=None,
+            dispatch_recorder=None,
         ):
             self.seen_rollout_ids = rollout_ids
             self.seen_generation_indices = list(generation_indices or [])
@@ -2329,6 +2331,8 @@ class TestGenerateForFinalizationFlow:
                 generation_indices=None,
                 on_completion=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
+                gym_instance_id=None,
+                dispatch_recorder=None,
             ):
                 del _sample, recovery_granularity
                 generation_index = generation_indices[0]
@@ -2442,6 +2446,8 @@ class TestGenerateForFinalizationFlow:
                 generation_indices=None,
                 on_completion=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
+                gym_instance_id=None,
+                dispatch_recorder=None,
             ):
                 indices = list(generation_indices)
                 self.generation_indices.append(indices)
@@ -2580,7 +2586,9 @@ def test_capture_manager_seals_checks_and_forwards_them_to_reassembly(
     monkeypatch.setattr(f"{__name__}._receipt_record", with_checks)
     mgr = _make_capture_manager(
         _FakeCaptureBuffer(),
-        recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+        recovery_config=RolloutRecoveryConfig(
+            target_level=RecoveryTargetLevel(granularity.value)
+        ),
     )
     request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
     assert request.rewards == (0.5, 0.5)

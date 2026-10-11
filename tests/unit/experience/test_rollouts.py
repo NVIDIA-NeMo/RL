@@ -47,6 +47,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.environments.interfaces import EnvironmentReturn
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -3326,3 +3327,49 @@ def test_mask_sample_flags_read_either_form_of_the_flag():
         ]
     )
     assert flags.tolist() == [True, True, True, False, False, False]
+
+
+@pytest.mark.nemo_gym
+def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
+    """A restored turn continues only on the replica that holds its Gym state."""
+    first, second = object(), object()
+    selected = []
+    impl = object.__new__(AsyncNemoGymRolloutImpl)
+    impl._dispatch_admission_gate = None
+    impl._timeouts = RolloutTimeouts()
+    impl._max_gym_row_attempts = 1
+    impl._deadline_registry = None
+    impl._num_generations_per_prompt = 1
+    impl._task_to_env = {
+        "nemo_gym": NemoGymShardSet(
+            handles={"tools": [first, second]}, route_to_shard={"agent": "tools"}
+        )
+    }
+    impl._tokenizer = None
+    impl._effort_config = None
+
+    async def fake_stream_rows(environment, pending, results, shaping, *_a, **_k):
+        selected.append(environment)
+        for row in pending:
+            results[row["_rowidx"]] = {"input_message_log": [{"token_ids": [1]}]}
+            shaping[row["_rowidx"]] = SimpleNamespace(
+                length_rewards_low=[], rewards_low=[], low_lengths=[], high_lengths=[]
+            )
+
+    impl._stream_rows = fake_stream_rows
+    impl._results_to_completions = lambda _results: ([object()], {})
+    impl._compute_rollout_metrics = lambda *_args: {}
+    impl._compute_reward_penalty_metrics = lambda *_args: {}
+    owner = GymCheckpointInstance("tools", 1).instance_id
+
+    for _ in range(3):
+        asyncio.run(
+            impl._run_rollouts(
+                inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
+                timer=rollouts_mod.Timer(),
+                timer_prefix="timing/test",
+                gym_instance_id=owner,
+            )
+        )
+
+    assert selected == [second, second, second]
