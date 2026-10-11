@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -29,8 +30,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from nemo_rl.data.multimodal_utils import PackedTensor
-from nemo_rl.data_plane.worker_mixin import _broadcast_batched_data_dict
+from nemo_rl.data_plane.worker_mixin import (
+    _broadcast_batched_data_dict,
+    _pack_route_fragments,
+    _unpack_route_fragments,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.route_assembly import RouteFragment
 
 
 def _in_group(body, rank: int, world_size: int, tmp_init_file: str, q, backend):
@@ -455,3 +461,65 @@ def test_get_replica_group_default_is_none():
         pass
 
     assert _Stub()._get_replica_group() is None
+
+
+def _route_case():
+    fragments = {
+        "a": RouteFragment(
+            torch.arange(12, dtype=torch.int16).reshape(3, 2, 2), 1, b'{"a": 1}'
+        ),
+        "b": RouteFragment(
+            torch.arange(5, dtype=torch.uint8).reshape(5, 1, 1), 2, b"{}"
+        ),
+        "c": RouteFragment(
+            torch.arange(6, dtype=torch.int64).reshape(3, 2, 1), 3, b"{}"
+        ),
+    }
+    plans = [
+        SimpleNamespace(spans=[SimpleNamespace(staging_key=k) for k in keys])
+        for keys in (["a"], ["b", "c", "not-staged"], ["a", "c"], ["a"])
+    ]
+    # The last row lost its fetch, as in the per-rollout fallback path.
+    return plans, [fragments, fragments, fragments, {}], fragments
+
+
+def _assert_route_rows(rows, fragments):
+    assert [list(row) for row in rows] == [["a"], ["b", "c"], ["a", "c"], []]
+    for row in rows:
+        for key, got in row.items():
+            assert got.routes.dtype == fragments[key].routes.dtype
+            assert got.routes.device.type == "cpu"
+            assert torch.equal(got.routes, fragments[key].routes)
+            assert got.encoding == fragments[key].encoding
+            assert got.extras_metadata_json == fragments[key].extras_metadata_json
+
+
+def test_route_fragments_pack_round_trip():
+    plans, fragments_by_row, fragments = _route_case()
+    blob, index = _pack_route_fragments(plans, fragments_by_row)
+
+    # Each fragment is stored once; "c" (int64) is padded to an 8-byte offset.
+    assert blob.numel() == 24 + 5 + 3 + 48
+    _assert_route_rows(_unpack_route_fragments(blob, index), fragments)
+
+
+def _route_fragments_broadcast_body(rank: int):
+    plans, fragments_by_row, fragments = _route_case()
+    data = None
+    if rank == 0:
+        blob, index = _pack_route_fragments(plans, fragments_by_row)
+        data = BatchedDataDict({"blob": blob, "index": index})
+    out = _broadcast_batched_data_dict(
+        data, is_leader=(rank == 0), src=0, group=dist.group.WORLD
+    )
+    _assert_route_rows(_unpack_route_fragments(out["blob"], out["index"]), fragments)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="two CUDA devices are required for NCCL broadcast",
+)
+def test_route_fragments_survive_nccl_leader_broadcast(tmp_path):
+    _run_two_ranks(
+        _route_fragments_broadcast_body, str(tmp_path / "init_routes"), backend="nccl"
+    )
