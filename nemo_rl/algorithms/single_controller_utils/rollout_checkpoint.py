@@ -37,6 +37,9 @@ BOOTSTRAP_DIRNAME = "bootstrap"
 BOOTSTRAP_MANIFEST_FILENAME = "manifest.json"
 ROLLOUT_SNAPSHOTS_DIRNAME = "rollout_snapshots"
 ROLLOUT_SNAPSHOT_MANIFEST_FILENAME = "manifest.json"
+# Present in a turn-level trainer checkpoint, which never pauses Gym: Gym state
+# lives only in the rollout snapshots taken after it.
+GYM_RESTART_FALLBACK_FILENAME = "gym_restart_fallback.json"
 
 RolloutCheckpointAttemptOutcome = Literal["completed", "failed", "skipped"]
 ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES: tuple[RolloutCheckpointAttemptOutcome, ...] = (
@@ -204,6 +207,53 @@ def _drop_excluded_paths(
             )
         return projected_list
     return value
+
+
+def _gym_restart_fallback(*, train_step: int, trainer_version: int) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "mode": "restart_unfinished",
+        "base_train_step": train_step,
+        "trainer_version": trainer_version,
+    }
+
+
+def write_gym_restart_fallback(
+    checkpoint_path: Path, *, train_step: int, trainer_version: int
+) -> None:
+    """Mark an unpublished trainer checkpoint as holding no Gym state.
+
+    Restored without a later rollout snapshot, its unfinished turn-level
+    rollouts restart from their tasks instead of continuing in Gym.
+    """
+    (Path(checkpoint_path) / GYM_RESTART_FALLBACK_FILENAME).write_text(
+        json.dumps(
+            _gym_restart_fallback(
+                train_step=train_step, trainer_version=trainer_version
+            ),
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def has_gym_restart_fallback(
+    checkpoint_path: Path, *, train_step: int, trainer_version: int
+) -> bool:
+    """Whether a checkpoint says its unfinished turns restart without Gym state."""
+    path = Path(checkpoint_path) / GYM_RESTART_FALLBACK_FILENAME
+    if not path.is_file():
+        return False
+    marker = json.loads(path.read_text())
+    expected = _gym_restart_fallback(
+        train_step=train_step, trainer_version=trainer_version
+    )
+    if marker != expected:
+        raise ValueError(
+            "Gym restart fallback does not match its trainer checkpoint: "
+            f"marker={marker!r}, expected={expected!r}"
+        )
+    return True
 
 
 def _fsync_file(path: Path) -> None:
