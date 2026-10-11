@@ -1332,16 +1332,7 @@ class SingleControllerActor:
                         load_gym_checkpoint_manifest,
                         self._last_checkpoint_path,
                     )
-                    expected_raw_inventory = recovery_ledger.gym_checkpoint_inventory(
-                        coordinator.instance_ids
-                    )
-                    expected_inventory = {
-                        instance_id: tuple(
-                            GymCheckpointEpisode(rollout_id, attempt)
-                            for rollout_id, attempt in episodes
-                        )
-                        for instance_id, episodes in expected_raw_inventory.items()
-                    }
+                    expected_inventory = self._gym_checkpoint_inventory(coordinator)
                     if manifest.instances != expected_inventory:
                         raise ValueError(
                             "Gym checkpoint manifest does not match the rollout "
@@ -4814,31 +4805,22 @@ class SingleControllerActor:
     def _gym_checkpoint_inventory(
         self, coordinator: GymCheckpointCoordinator
     ) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
-        """Return Gym-owned episode attempts using the coordinator wire type."""
-        raw_inventory = self._rollout_recovery_ledger.gym_checkpoint_inventory(
+        """Return the Gym-owned episode attempts of every live deployment."""
+        return self._rollout_recovery_ledger.gym_checkpoint_inventory(
             coordinator.instance_ids
         )
-        return {
-            instance_id: tuple(
-                GymCheckpointEpisode(rollout_id, attempt)
-                for rollout_id, attempt in episodes
-            )
-            for instance_id, episodes in raw_inventory.items()
-        }
 
     def _queued_gym_retirements(
         self, coordinator: GymCheckpointCoordinator
     ) -> dict[str, frozenset[GymCheckpointEpisode]]:
         """Return dropped episodes Gym may still hold, awaiting their retire."""
-        raw = self._rollout_recovery_ledger.gym_checkpoint_retirements(
-            coordinator.instance_ids
-        )
         return {
-            instance_id: frozenset(
-                GymCheckpointEpisode(rollout_id, attempt)
-                for rollout_id, attempt in episodes
+            instance_id: frozenset(episodes)
+            for instance_id, episodes in (
+                self._rollout_recovery_ledger.gym_checkpoint_retirements(
+                    coordinator.instance_ids
+                ).items()
             )
-            for instance_id, episodes in raw.items()
         }
 
     async def _retire_dropped_gym_episodes(
@@ -4855,21 +4837,12 @@ class SingleControllerActor:
         leaves it out of the saved manifest, and a later retire stops it.
         """
         ledger = self._rollout_recovery_ledger
-        raw = ledger.gym_checkpoint_retirements(coordinator.instance_ids)
-        if not any(raw.values()):
+        retirements = ledger.gym_checkpoint_retirements(coordinator.instance_ids)
+        if not any(retirements.values()):
             return
-        await coordinator.retire(
-            checkpoint_id,
-            {
-                instance_id: tuple(
-                    GymCheckpointEpisode(rollout_id, attempt)
-                    for rollout_id, attempt in episodes
-                )
-                for instance_id, episodes in raw.items()
-            },
-        )
+        await coordinator.retire(checkpoint_id, retirements)
         # Only what was retired: a drop recorded meanwhile stays for next time.
-        ledger.mark_gym_retired(raw)
+        ledger.mark_gym_retired(retirements)
 
     async def _drain_non_exported_gym_candidates(
         self,
@@ -5025,15 +4998,7 @@ class SingleControllerActor:
                     dropped = self._queued_gym_retirements(coordinator)
                     scope = {
                         instance_id: episodes
-                        + tuple(
-                            sorted(
-                                dropped[instance_id] - set(episodes),
-                                key=lambda episode: (
-                                    episode.rollout_id,
-                                    episode.attempt,
-                                ),
-                            )
-                        )
+                        + tuple(sorted(dropped[instance_id] - set(episodes)))
                         for instance_id, episodes in candidates.items()
                     }
                     commit = await coordinator.commit(
@@ -5593,6 +5558,18 @@ class SingleControllerActor:
                 is_final_checkpoint=is_final_checkpoint,
             )
 
+    def _fill_save_state(self, save_state: Any) -> None:
+        """Copy the controller counters a trainer checkpoint records."""
+        save_state.current_step = self._train_steps
+        save_state.total_steps = self._train_steps
+        save_state.trainer_version = self._trainer_version
+        save_state.current_epoch = self._current_epoch
+        save_state.consumed_samples = self._consumed_samples
+        save_state.total_valid_tokens = self._total_valid_tokens
+        _save_adaptive_loss_state(save_state, self._loss_fn)
+        save_state.sampler_name = self._async_cfg.sampler.name
+        save_state.sampler_dispatch_index = self._sampler.dispatch_index
+
     async def _save_checkpoint_impl(
         self,
         step_metrics: dict[str, Any],
@@ -5645,15 +5622,7 @@ class SingleControllerActor:
         # Seed the temporary trainer directory before the data-plane cut, then
         # atomically refresh its training_info.json with the exact controller
         # values captured below.
-        save_state.current_step = self._train_steps
-        save_state.total_steps = self._train_steps
-        save_state.trainer_version = self._trainer_version
-        save_state.current_epoch = self._current_epoch
-        save_state.consumed_samples = self._consumed_samples
-        save_state.total_valid_tokens = self._total_valid_tokens
-        _save_adaptive_loss_state(save_state, self._loss_fn)
-        save_state.sampler_name = self._async_cfg.sampler.name
-        save_state.sampler_dispatch_index = self._sampler.dispatch_index
+        self._fill_save_state(save_state)
         checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
             self._checkpointer.init_tmp_checkpoint,
             self._train_steps,
@@ -5666,15 +5635,7 @@ class SingleControllerActor:
         # writes all take the mutation side of this barrier. Gym keeps running:
         # its state lives only in rollout snapshots taken after this checkpoint.
         async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
-            save_state.current_step = self._train_steps
-            save_state.total_steps = self._train_steps
-            save_state.trainer_version = self._trainer_version
-            save_state.current_epoch = self._current_epoch
-            save_state.consumed_samples = self._consumed_samples
-            save_state.total_valid_tokens = self._total_valid_tokens
-            _save_adaptive_loss_state(save_state, self._loss_fn)
-            save_state.sampler_name = self._async_cfg.sampler.name
-            save_state.sampler_dispatch_index = self._sampler.dispatch_index
+            self._fill_save_state(save_state)
             await asyncio.to_thread(
                 _write_training_info,
                 checkpoint_path,

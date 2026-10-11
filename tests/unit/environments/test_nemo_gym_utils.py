@@ -988,10 +988,10 @@ def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs
     assert config["token_capture"]["capture_dir"] == (
         "/capture/gym-instances/nemo_gym/replica-0"
     )
-    assert config["initial_global_config_dict"]["checkpoint"] == {
-        "enabled": True,
-        "control_auth_token": "secret",
-    }
+    checkpoint = config["initial_global_config_dict"]["checkpoint"]
+    assert checkpoint["enabled"] is True
+    # Gym serves its global config unauthenticated: never the capture secret.
+    assert checkpoint["control_auth_token"] not in {"", "secret"}
     assert (
         config["initial_global_config_dict"]["policy_model"]["responses_api_models"][
             "vllm_model"
@@ -999,6 +999,56 @@ def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs
         is True
     )
     assert token_capture["capture_dir"] == "/capture"
+
+
+def test_checkpointing_leaves_the_callers_policy_model_untouched(detected_uv_dirs):
+    env_configs = _env_configs()
+    env_configs["nemo_gym"]["policy_model"] = {
+        "responses_api_models": {"vllm_model": {"uses_reasoning_parser": False}}
+    }
+    env_configs_before = copy.deepcopy(env_configs)
+
+    cfg = build_nemo_gym_config(
+        env_configs,
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=True,
+        token_capture={
+            "enabled": True,
+            "capture_dir": "/capture",
+            "control_auth_token": "secret",
+        },
+    )
+
+    vllm_model = cfg["initial_global_config_dict"]["policy_model"][
+        "responses_api_models"
+    ]["vllm_model"]
+    assert vllm_model == {"uses_reasoning_parser": False, "checkpoint_policy": True}
+    assert env_configs == env_configs_before
+
+
+@pytest.mark.parametrize("as_omegaconf", [False, True])
+def test_turn_recovery_rejects_typed_environment_servers(as_omegaconf):
+    """A typed environment server rejects the attempt-qualified ``<id>-a<N>``."""
+    from omegaconf import OmegaConf
+
+    relay = {
+        "policy_model": {"responses_api_models": {"vllm_model": {}}},
+        "env": {"environment_servers": {"legacy_agent": {"entrypoint": "app.py"}}},
+    }
+    typed = {
+        **relay,
+        "tool_env": {"environment_servers": {"single_agent_turn_legacy": {}}},
+    }
+
+    def as_config(config):
+        return OmegaConf.create(config) if as_omegaconf else config
+
+    nemo_gym_mod._reject_typed_environment_servers(as_config(relay))
+    with pytest.raises(ValueError, match="tool_env=single_agent_turn_legacy"):
+        nemo_gym_mod._reject_typed_environment_servers(as_config(typed))
 
 
 def test_checkpointing_requires_token_capture(detected_uv_dirs):

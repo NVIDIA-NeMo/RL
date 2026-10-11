@@ -632,6 +632,7 @@ class AsyncRolloutImpl:
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
         gym_instance_id: Optional[str] = None,
+        dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
@@ -656,6 +657,9 @@ class AsyncRolloutImpl:
         )
         assert gym_instance_id is None, (
             "Gym checkpoint ownership is only supported on the NeMo-Gym path"
+        )
+        assert dispatch_recorder is None, (
+            "dispatch recording is only supported on the NeMo-Gym path"
         )
         timer = Timer()
         timer_prefix = "timing/rollout"
@@ -1355,6 +1359,8 @@ class AsyncNemoGymRolloutImpl:
                 await dispatch_recorder.refused(rowidx)
                 assert admission_closed_rows is not None
                 admission_closed_rows.add(rowidx)
+                if item.timing_metrics is not None:
+                    env_timing_metrics = item.timing_metrics
                 continue
             rowidx, resolved_agent_ref, result, timing_metrics = item
             # Validated against the original group, not the pending subset: on a
@@ -2138,7 +2144,6 @@ class RolloutManager:
             target_step=target_step,
             start_weight_version=self._weight_version,
             task_source=recovery_policy.task_source,
-            recovery_granularity=recovery_policy.granularity,
             restore_level=recovery_policy.restore_level,
             admitted=admitted,
             admission_id=admission_id,
@@ -2195,18 +2200,14 @@ class RolloutManager:
             assert dispatch_recorder is None
             # Legacy path: keep the impl call signature byte-identical.
             return await self._impl.run_rollout(input_sample)
-        checkpoint_ownership: dict[str, Any] = (
-            {"gym_instance_id": gym_instance_id} if gym_instance_id is not None else {}
-        )
-        if dispatch_recorder is not None:
-            checkpoint_ownership["dispatch_recorder"] = dispatch_recorder
         return await self._impl.run_rollout(
             input_sample,
             rollout_ids=rollout_ids,
             generation_indices=generation_indices,
             on_completion=on_completion,
             recovery_granularity=recovery_granularity,
-            **checkpoint_ownership,
+            gym_instance_id=gym_instance_id,
+            dispatch_recorder=dispatch_recorder,
         )
 
     async def generate_and_push(
