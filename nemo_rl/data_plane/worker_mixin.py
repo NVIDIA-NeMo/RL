@@ -40,6 +40,7 @@ import torch
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.codec import pad_batch
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
 from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
@@ -47,6 +48,7 @@ from nemo_rl.data_plane.schema import (
     GLOBAL_FORWARD_PAD_SEQLEN,
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
+    MICROBATCH_PADDED_FIELDS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
     ROUTED_EXPERTS_ENCODING_FIELD,
@@ -166,7 +168,18 @@ def _broadcast_batched_data_dict(
             assert data is not None, "leader must provide non-None data"
             descriptor: list[Any] = []
             for k, v in data.items():
-                if isinstance(v, torch.Tensor):
+                if isinstance(v, torch.Tensor) and v.is_nested:
+                    descriptor.append(
+                        (
+                            k,
+                            "nested",
+                            str(v.dtype),
+                            tuple(v.values().shape),
+                            v.offsets().cpu(),
+                            str(v.device),
+                        )
+                    )
+                elif isinstance(v, torch.Tensor):
                     descriptor.append(
                         (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
                     )
@@ -248,6 +261,25 @@ def _broadcast_batched_data_dict(
                     tensor = tensor.to(src_device)
                 out[key] = tensor
             del tensor
+        elif kind == "nested":
+            dtype_str, shape, offsets, src_device = entry[2:]
+            if is_leader:
+                values = out[key].values().to(bcast_device)
+            else:
+                dtype = getattr(torch, dtype_str.split(".")[-1])
+                values = torch.empty(shape, dtype=dtype, device=bcast_device)
+            if values.numel():
+                wire = (
+                    values.view(torch.uint8) if values.dtype == torch.int16 else values
+                )
+                torch.distributed.broadcast(wire, src=src, group=group)
+                del wire
+            if not is_leader:
+                values = values.to(src_device)
+                out[key] = torch.nested.nested_tensor_from_jagged(
+                    values, offsets.to(values.device)
+                )
+            del values
         elif kind == "packed_tensor":
             header, shapes, dtype_str, source_device = entry[2:]
             if is_leader:
@@ -508,11 +540,17 @@ class TQWorkerMixin:
             leader = torch.distributed.get_global_rank(replica_group, 0)
             # Ship route fragments (~valid tokens) instead of the padded table
             # and let every rank assemble locally; see _pack_route_fragments.
+            route_passthrough = bool(
+                (meta.extra_info or {}).get(ROUTE_PASSTHROUGH_FLAG)
+            )
             ship_fragments = (
-                bool((meta.extra_info or {}).get(ROUTE_PASSTHROUGH_FLAG))
+                route_passthrough
                 and os.environ.get("NRL_ROUTE_BCAST", "fragments") != "dense"
             )
             plans = self._route_plans(meta) if ship_fragments else []
+            wire_layout = (
+                "padded" if route_passthrough and not ship_fragments else "jagged"
+            )
             if is_leader:
                 dp_client = self._require_dp_client()
                 if local_batch:
@@ -529,7 +567,7 @@ class TQWorkerMixin:
                 data = _materialize_fetched(
                     td,
                     local_batch=local_batch,
-                    layout=layout,
+                    layout=wire_layout,
                     pad_value_dict=pad_value_dict,
                     pad_to_seqlen=pad_to_seqlen,
                     tags=meta.tags,
@@ -549,6 +587,10 @@ class TQWorkerMixin:
                 src=leader,
                 group=replica_group,
             )
+            if wire_layout != layout:
+                data = pad_batch(
+                    data, pad_value_dict, pad_to_seqlen, skip=MICROBATCH_PADDED_FIELDS
+                )
             if ship_fragments:
                 fragments_by_row = _unpack_route_fragments(
                     data.pop(_ROUTE_BLOB), data.pop(_ROUTE_INDEX)
@@ -741,21 +783,16 @@ class TQWorkerMixin:
 
         # The worker supplies real model dims — the authoritative shape check.
         num_moe_layers, top_k = self._routed_experts_dimensions()
-        input_ids = data["input_ids"]
-        input_lengths = data["input_lengths"].reshape(-1)
-        routed = torch.full(
-            (
-                len(meta.sample_ids),
-                int(input_ids.shape[1]),
-                num_moe_layers,
-                top_k,
-            ),
+        input_lengths = data["input_lengths"].reshape(-1).cpu().long()
+        offsets = torch.nn.functional.pad(input_lengths.cumsum(0), (1, 0))
+        values = torch.full(
+            (int(offsets[-1]), num_moe_layers, top_k),
             ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
             dtype=torch.int16,
         )
         request_fallbacks: Counter[str] = Counter()
         for row_index, (plan, fragments) in enumerate(zip(plans, fragments_by_row)):
-            canonical_len = int(input_lengths[row_index].item())
+            canonical_len = int(input_lengths[row_index])
             tensor, reason = execute_route_plan(
                 plan,
                 fragments,
@@ -767,7 +804,8 @@ class TQWorkerMixin:
                 # router for exactly these positions (counted, not fatal).
                 request_fallbacks[reason or "unknown"] += 1
             else:
-                routed[row_index, :canonical_len] = tensor
+                start = int(offsets[row_index])
+                values[start : start + canonical_len] = tensor
 
         if record_fallbacks:
             self._route_fallback_counts.update(request_fallbacks)
@@ -778,7 +816,9 @@ class TQWorkerMixin:
                     len(plans),
                     dict(request_fallbacks),
                 )
-        data[ROUTED_EXPERTS_FIELD] = routed
+        data[ROUTED_EXPERTS_FIELD] = torch.nested.nested_tensor_from_jagged(
+            values, offsets
+        )
         return data
 
     def _apply_packing_prep(self, data: BatchedDataDict[Any]) -> BatchedDataDict[Any]:
