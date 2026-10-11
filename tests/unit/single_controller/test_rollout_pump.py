@@ -1278,6 +1278,7 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
 
     async def _main() -> None:
         manager = _RecoveryCaptureManager()
+        manager.record_finalizer_dropped_prompt = MagicMock()
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
         ctrl._async_cfg = SimpleNamespace(
@@ -1523,3 +1524,43 @@ def test_rollout_pump_writes_expected_tq_data(
             "num_assistant_messages",
             "num_routed_experts_backfilled",
         }
+
+
+@pytest.mark.parametrize("replacement_succeeds", [False, True])
+def test_actor_structural_drop_uses_replacement_budget(replacement_succeeds):
+    async def main():
+        seen = []
+        manager = SimpleNamespace(
+            stats=SimpleNamespace(committed=0),
+            record_finalizer_dropped_prompt=MagicMock(),
+        )
+
+        async def generate(prompt, **kwargs):
+            seen.append(prompt["message_log"][0]["content"])
+            return SimpleNamespace(group_id=f"g{len(seen)}")
+
+        async def finalize(request):
+            if request.group_id == "g1" or not replacement_succeeds:
+                return None
+            return SimpleNamespace(total_row_count=2, valid_row_count=2)
+
+        manager.generate_for_finalization = generate
+        ctrl = _pump_controller(manager, [_batch("original")])
+        ctrl._master_config.token_capture = SimpleNamespace(
+            min_valid_fraction_per_group=1.0
+        )
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = finalize
+        ctrl._replacement_reserve = deque(
+            [{"message_log": [{"role": "user", "content": "spare"}]}]
+        )
+
+        await asyncio.wait_for(ctrl._rollout_pump(), timeout=1)
+
+        assert seen == ["original", "spare"]
+        assert manager.stats.committed == int(replacement_succeeds)
+        assert ctrl._batch_shortfall == ({} if replacement_succeeds else {0: 1})
+        assert ctrl._inflight_rollouts == 0
+        assert ctrl._buffer_capacity._value == (3 if replacement_succeeds else 4)
+
+    asyncio.run(main())
