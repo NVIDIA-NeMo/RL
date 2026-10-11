@@ -32,10 +32,10 @@ from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_EXECUTION_SLOT,
     SHARED_PREFIX_PROMPT_LENGTHS,
 )
+from nemo_rl.data_plane.grouping import row_group_ids
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
-    GROUP_ID_TAG,
     INPUT_IDS,
     INPUT_LENGTHS,
     META_IDX,
@@ -106,14 +106,9 @@ def shard_meta_for_dp(
             raise ValueError(
                 "shared-prefix group sharding does not support dynamic batching"
             )
-        # The explicit row tag, like the advantage baseline, rather than the
+        # The explicit row tag the advantage baseline reads, rather than the
         # "{group_id}_g{i}" sample-id naming convention.
-        if meta.tags is None or any(GROUP_ID_TAG not in tag for tag in meta.tags):
-            raise ValueError(
-                f"shared-prefix group sharding requires a {GROUP_ID_TAG!r} tag on "
-                "every row"
-            )
-        group_ids = [tag[GROUP_ID_TAG] for tag in meta.tags]
+        group_ids = row_group_ids(meta)
         if sequence_packing_args is None:
             raise ValueError(
                 "shared-prefix group sharding requires sequence-packing arguments"

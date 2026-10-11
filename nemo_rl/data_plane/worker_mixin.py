@@ -81,8 +81,11 @@ def _broadcast_batched_data_dict(
     Two-phase to avoid pickling tensor payloads on the hot path: a small
     descriptor (per-key dtype/shape) ships via ``broadcast_object_list``
     first, then each tensor's data ships via ``broadcast`` on its
-    current device. The leader supplies ``data``; non-leaders pass
+    transport device. The leader supplies ``data``; non-leaders pass
     ``None`` and get an empty BatchedDataDict filled in-place.
+
+    Int16 payloads use byte views because Gloo and NCCL do not support that
+    collective dtype. This preserves the original storage without widening.
     """
     # NCCL groups can only broadcast CUDA tensors; pick the broadcast
     # device from the group backend so CPU TQ outputs are moved to GPU
@@ -158,31 +161,30 @@ def _broadcast_batched_data_dict(
         kind = entry[1]
         if kind == "tensor":
             dtype_str, shape, src_device = entry[2], entry[3], entry[4]
+            dtype = getattr(torch, dtype_str.split(".")[-1])
             if is_leader:
-                tensor = out[key]
-                if tensor.device.type != torch.device(bcast_device).type:
-                    tensor = tensor.to(bcast_device)
-                    out[key] = tensor
+                # Send logical order without replacing the leader's original view.
+                tensor = (
+                    out[key]
+                    .to(
+                        device=bcast_device,
+                        memory_format=torch.contiguous_format,
+                    )
+                    .contiguous()
+                )
             else:
-                dtype = getattr(torch, dtype_str.split(".")[-1])
                 tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
+            # Flatten first so scalars also support dtype reinterpretation.
+            wire = (
+                tensor.reshape(-1).view(torch.uint8) if dtype == torch.int16 else tensor
+            )
+            torch.distributed.broadcast(wire, src=src, group=group)
+            del wire
+            if not is_leader:
+                if torch.device(src_device).type != torch.device(bcast_device).type:
+                    tensor = tensor.to(src_device)
                 out[key] = tensor
-            # NCCL has no int16 ("Short") type; ship as int32 and narrow back
-            # (routed_experts rides TQ as int16).
-            if tensor.dtype == torch.int16:
-                wire = tensor.to(torch.int32)
-                torch.distributed.broadcast(wire, src=src, group=group)
-                tensor = wire.to(torch.int16)
-                out[key] = tensor
-            else:
-                torch.distributed.broadcast(tensor, src=src, group=group)
-            # Restore non-leader tensors to the leader's source device
-            # so downstream code sees the same layout pre-broadcast.
-            if (
-                not is_leader
-                and torch.device(src_device).type != torch.device(bcast_device).type
-            ):
-                out[key] = tensor.to(src_device)
+            del tensor
         elif kind == "packed_tensor":
             header, shapes, dtype_str, source_device = entry[2:]
             if is_leader:
@@ -208,13 +210,11 @@ def _broadcast_batched_data_dict(
                 )
                 tensor = torch.empty(numel, dtype=dtype, device=bcast_device)
             if tensor.numel():
-                if tensor.dtype == torch.int16:
-                    wire = tensor.to(torch.int32)
-                    torch.distributed.broadcast(wire, src=src, group=group)
-                    tensor = wire.to(torch.int16)
-                    del wire
-                else:
-                    torch.distributed.broadcast(tensor, src=src, group=group)
+                wire = (
+                    tensor.view(torch.uint8) if tensor.dtype == torch.int16 else tensor
+                )
+                torch.distributed.broadcast(wire, src=src, group=group)
+                del wire
             if not is_leader:
                 if torch.device(source_device).type != torch.device(bcast_device).type:
                     tensor = tensor.to(source_device)
@@ -929,7 +929,8 @@ class TQWorkerMixin:
         """Per-rank logprob entrypoint. Fetch → packing prep → run → write back.
 
         Returns ``None`` — the per-token tensor is committed to TQ via
-        :meth:`_write_back_result_field` under ``prev_logprobs``.
+        :meth:`_write_back_result_field` under ``prev_logprobs``;
+        when the worker narrows ``token_mask``, that column is rewritten too.
         Callers fetch it through :meth:`TQPolicy.read_from_dataplane` —
         skipping the Ray plasma roundtrip on the (B, S) tensor.
         ``del result`` drops the local reference before returning so the
@@ -947,6 +948,14 @@ class TQWorkerMixin:
             result_key="logprobs",
             tq_field="prev_logprobs",
         )
+        # Top-k/top-p filtering narrows token_mask at -inf positions.
+        if "token_mask" in result:
+            self._write_back_result_field(
+                meta,
+                result,
+                result_key="token_mask",
+                tq_field="token_mask",
+            )
         del result
 
     @accepts_trace_context

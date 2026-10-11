@@ -121,7 +121,9 @@ def calculate_baseline_and_std_per_prompt(
     The same baseline is calculated for each prompt. Samples set to 0 in 'valid_mask'
     are not included in the baseline calculation.
 
-    prompts:    tensor (b, s)     Tensor of prompts the model used. May be on any device
+    prompts:    tensor (b, k)     Row equality keys defining prompt groups. GRPO uses
+                                  explicit rollout-group ids with shape (b, 1), not
+                                  prompt tokens. May be on any device.
     rewards:    tensor (b,)       Float-valued rewards. May be on any device
     valid_mask: tensor (b,)       Vector of 0/1, where 0 is to ignore and 1 is to keep
     leave_one_out_baseline: bool  Compute an unbiased baseline by leaving out the sample that
@@ -300,7 +302,7 @@ def masked_mean(
 
 def mask_out_neg_inf_logprobs(
     logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Mask out negative infinity log probabilities.
 
     Handling sampling mask mismatch:
@@ -315,7 +317,7 @@ def mask_out_neg_inf_logprobs(
         logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
 
     Returns:
-        Masked log probabilities.
+        Tuple of (masked log probabilities, finite-position indicator).
     """
     is_neginf = torch.isinf(logprobs)
     neginf_count = (is_neginf & mask.bool()).sum().item()
@@ -325,10 +327,11 @@ def mask_out_neg_inf_logprobs(
             "(policy top-k/top-p mismatch). Masking out these positions."
         )
 
-    mask = mask * (~is_neginf).float()
-    logprobs = torch.where(mask.bool(), logprobs, 0.0)
+    finite_mask = (~is_neginf).float()
+    effective_mask = mask * finite_mask
+    logprobs = torch.where(effective_mask.bool(), logprobs, 0.0)
 
-    return logprobs
+    return logprobs, finite_mask
 
 
 def masked_var(

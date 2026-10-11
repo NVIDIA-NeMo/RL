@@ -54,6 +54,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
 
 _NUM_PROMPTS_PER_STEP = 4
@@ -73,7 +74,7 @@ def _value_config(
         "train_micro_batch_size": 1,
         "max_total_sequence_length": 32,
         "megatron_cfg": {"enabled": megatron_enabled},
-        "dtensor_cfg": {"enabled": not megatron_enabled},
+        "automodel_cfg": {"enabled": not megatron_enabled},
     }
 
 
@@ -404,6 +405,27 @@ class TestPPOValidation:
             NotImplementedError, match="not supported on the SingleController"
         ):
             validate_single_controller_config(mc)
+
+    def test_rejects_length_penalty_until_sc_applies_it(self):
+        # The SC path has no length-penalty hook yet; fail at setup rather
+        # than silently training on unadjusted rewards.
+        mc = _make_master_config()
+        mc.grpo.length_penalty = LengthPenaltyConfig.model_validate(
+            {"default": {"total_bonus": 0.1}}
+        )
+
+        with pytest.raises(NotImplementedError, match="length_penalty"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
+    def test_accepts_absent_length_penalty(self, algorithm: str):
+        # GRPO with length_penalty: null, and PPO (whose config has no such
+        # field) both pass.
+        mc = _make_master_config() if algorithm == "grpo" else _ppo_master_config()
+        if algorithm == "grpo":
+            mc.grpo.length_penalty = None
+
+        validate_single_controller_config(mc)
 
     @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
     def test_accepts_overlong_filtering(self, algorithm: str):

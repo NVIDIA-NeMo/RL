@@ -121,7 +121,7 @@ policy:
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
@@ -244,7 +244,7 @@ policy:
     microbatch_order: "packer"
     sequence_length_round: 64
 
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.automodel_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
 
   optimizer:
@@ -335,14 +335,14 @@ value:
   train_global_batch_size: ${policy.train_global_batch_size}
   train_micro_batch_size: ${policy.train_micro_batch_size}
   max_total_sequence_length: ${policy.max_total_sequence_length}
-  make_sequence_length_divisible_by: ${value.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${value.automodel_cfg.tensor_parallel_size}
   precision: "bfloat16"
 
   reward_model_cfg:
     enabled: true  # DTensor V2 value worker requires reward_model_cfg.enabled=true
     reward_model_type: "regression"
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
     checkpoint:
       model_save_format: "safetensors"

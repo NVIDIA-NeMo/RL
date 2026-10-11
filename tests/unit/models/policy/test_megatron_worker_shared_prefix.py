@@ -376,7 +376,7 @@ def test_shared_prefix_dispatch_requires_group_id_tags() -> None:
     worker = _bare_worker(mode="logprobs")
     meta = _tq_meta(2, tags=[{GROUP_ID_TAG: "a"}, {}])
 
-    with pytest.raises(ValueError, match="tag on every row"):
+    with pytest.raises(ValueError, match="carry no 'group_id' tag"):
         worker._attach_or_repack_pack_metadata(_batch(), meta, stage="logprobs")
 
 

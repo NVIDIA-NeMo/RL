@@ -231,7 +231,7 @@ def test_shard_meta_for_dp_shared_prefix_requires_group_id_tags():
     meta = _tagged_group_meta([2, 2])
     meta.tags[1] = {}
 
-    with pytest.raises(ValueError, match="tag on every row"):
+    with pytest.raises(ValueError, match="carry no 'group_id' tag"):
         shard_meta_for_dp(
             meta,
             dp_world=2,

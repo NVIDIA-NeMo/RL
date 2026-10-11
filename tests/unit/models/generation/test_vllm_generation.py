@@ -35,6 +35,7 @@ from pydantic import ValidationError
 from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data.captured_media import MediaCaptureRejected
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
@@ -197,7 +198,7 @@ def test_nvfp4_pertoken_warns_on_an_entry_point_without_end_to_end_coverage():
     assert not [w for w in caught if "has end-to-end coverage" in str(w.message)]
 
 
-basic_dtensor_test_config: PolicyConfig = {
+basic_automodel_test_config: PolicyConfig = {
     "model_name": basic_vllm_test_config["model_name"],
     "tokenizer": {
         "name": basic_vllm_test_config["tokenizer"]["name"],
@@ -220,7 +221,7 @@ basic_dtensor_test_config: PolicyConfig = {
             "eps": 1e-8,
         },
     },
-    "dtensor_cfg": {
+    "automodel_cfg": {
         "enabled": True,
         "checkpoint": {
             "model_save_format": "safetensors",
@@ -787,7 +788,10 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class VLLMValidationError(ValueError):
+    # Not a ValueError, matching vLLM 0.29 (VLLMValidationError -> VLLMClientError
+    # -> VLLMError -> Exception). A ValueError fake would fall into the handler's
+    # plain-ValueError overflow branch and mask a missing VLLMValidationError clause.
+    class VLLMValidationError(Exception):
         def __init__(self, message, *, parameter=None, value=None):
             super().__init__(message)
             self.parameter = parameter
@@ -930,9 +934,8 @@ def _nemo_gym_recognizes_context_overflow(
     )
 
 
-@pytest.mark.asyncio
-async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
-    """Overflow from _clamp_max_tokens must be HTTP 400 that NeMo Gym recognizes."""
+def _setup_fake_vllm_chat_handler(monkeypatch):
+    """Build the /v1/chat/completions handler against the fake vLLM modules."""
     _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
@@ -954,30 +957,44 @@ async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
 
     app = _FakeFastAPIApp()
     worker._setup_vllm_openai_api_server(app)
-
-    max_model_len = 128
-    renderer = openai_serving_chat.instances[0].kwargs["online_renderer"]
-    renderer.model_config = types.SimpleNamespace(max_model_len=max_model_len)
-    serving_chat = openai_serving_chat.instances[0]
     chat_handler = next(
         handler for path, handler in app.routes if path == "/v1/chat/completions"
     )
+    return worker, openai_serving_chat.instances[0], chat_handler
+
+
+def _fake_chat_request():
+    return types.SimpleNamespace(
+        top_k=-1,
+        top_p=1.0,
+        temperature=1.0,
+        max_tokens=1,
+        max_completion_tokens=None,
+    )
+
+
+def _track_request_capture(worker, request):
+    """Register in-flight capture state for request; return the fake capture sink."""
+    worker._capture_calls[id(request)] = types.SimpleNamespace(call="call")
+    worker.token_capture = MagicMock()
+    return worker.token_capture
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
+    """Overflow from _clamp_max_tokens must be HTTP 400 that NeMo Gym recognizes."""
+    _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+
+    max_model_len = 128
+    renderer = serving_chat.kwargs["online_renderer"]
+    renderer.model_config = types.SimpleNamespace(max_model_len=max_model_len)
     overflow_prompt = [0] * max_model_len
 
     async def create_chat_completion(request, _raw_request):
         renderer._clamp_max_tokens(request, request.max_tokens, overflow_prompt)
 
     serving_chat.create_chat_completion = create_chat_completion
-    response = await chat_handler(
-        types.SimpleNamespace(
-            top_k=-1,
-            top_p=1.0,
-            temperature=1.0,
-            max_tokens=1,
-            max_completion_tokens=None,
-        ),
-        MagicMock(),
-    )
+    response = await chat_handler(_fake_chat_request(), MagicMock())
 
     response_content = response.body.decode()
     assert response.status_code == 400
@@ -991,6 +1008,71 @@ async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
     assert error["type"] == "invalid_request_error"
     assert error["param"] == "input_tokens"
     assert error["code"] == 400
+
+
+@pytest.mark.asyncio
+async def test_plain_value_error_context_overflow_returns_http_400(monkeypatch):
+    """vLLM's get_max_tokens overflow is a plain ValueError; it must still be a 400."""
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    # Verbatim from vllm/entrypoints/serve/utils/api_utils.py::get_max_tokens.
+    message = "Input length (196609) exceeds model's maximum context length (196608)."
+
+    async def create_chat_completion(_request, _raw_request):
+        raise ValueError(message)
+
+    serving_chat.create_chat_completion = create_chat_completion
+    request = _fake_chat_request()
+    token_capture = _track_request_capture(worker, request)
+    response = await chat_handler(request, MagicMock())
+
+    response_content = response.body.decode()
+    assert response.status_code == 400
+    assert _nemo_gym_recognizes_context_overflow(
+        status=response.status_code,
+        response_content=response_content,
+    )
+    assert json.loads(response_content)["error"] == {
+        "message": message,
+        "type": "invalid_request_error",
+        "param": "input_tokens",
+        "code": 400,
+    }
+    token_capture.fail_call.assert_called_once_with("call", reason="context_length")
+
+
+@pytest.mark.asyncio
+async def test_unrelated_value_error_is_reraised(monkeypatch):
+    """Only context overflow is a client error; other ValueErrors stay loud."""
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+
+    async def create_chat_completion(_request, _raw_request):
+        raise ValueError("unexpected internal failure")
+
+    serving_chat.create_chat_completion = create_chat_completion
+    request = _fake_chat_request()
+    token_capture = _track_request_capture(worker, request)
+    with pytest.raises(ValueError, match="unexpected internal failure"):
+        await chat_handler(request, MagicMock())
+    token_capture.fail_call.assert_called_once_with("call", reason="engine_error")
+
+
+@pytest.mark.asyncio
+async def test_media_capture_rejected_keeps_its_own_code(monkeypatch):
+    """MediaCaptureRejected is a ValueError; the overflow handler must not shadow it."""
+    _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+
+    async def create_chat_completion(_request, _raw_request):
+        raise MediaCaptureRejected(
+            "retained image was re-tiled", code="retained_media_changed"
+        )
+
+    serving_chat.create_chat_completion = create_chat_completion
+    response = await chat_handler(_fake_chat_request(), MagicMock())
+
+    assert response.status_code == 400
+    error = json.loads(response.body)["error"]
+    assert error["code"] == "retained_media_changed"
+    assert error["param"] == "messages"
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
@@ -1621,7 +1703,7 @@ def get_basic_megatron_test_config(
         "logprob_batch_size": 2,
         "precision": precision,
         "offload_optimizer_for_logprob": False,
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },
         "dynamic_batching": {
@@ -2038,7 +2120,7 @@ async def test_vllm_policy_generation_async(
         vllm_config["vllm_cfg"]["async_engine"] = True
         vllm_config["vllm_cfg"]["tensor_parallel_size"] = tensor_parallel_size
         vllm_config["vllm_cfg"]["pipeline_parallel_size"] = pipeline_parallel_size
-        dtensor_config = basic_dtensor_test_config
+        automodel_config = basic_automodel_test_config
         from nemo_rl.models.policy.lm_policy import Policy
 
         print("creating vllm policy...")
@@ -2046,7 +2128,7 @@ async def test_vllm_policy_generation_async(
         async_policy.finish_generation()
 
         print("creating lm policy...")
-        lm_policy = Policy(cluster, dtensor_config, tokenizer)
+        lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print("preparing refit info...")
         state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
@@ -2147,8 +2229,8 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
     from nemo_rl.models.policy.lm_policy import Policy
 
-    dtensor_config = basic_dtensor_test_config
-    lm_policy = Policy(cluster, dtensor_config, tokenizer)
+    automodel_config = basic_automodel_test_config
+    lm_policy = Policy(cluster, automodel_config, tokenizer)
 
     state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
     policy.prepare_refit_info(state_dict_info)
@@ -2466,12 +2548,12 @@ async def test_vllm_generation_with_hf_training_colocated(
 
     # Create Policy
     print("Creating DTensor policy...")
-    dtensor_config = deepcopy(basic_dtensor_test_config)
-    dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
-    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
-    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
-    dtensor_config["train_global_batch_size"] = 4
-    lm_policy = Policy(cluster, dtensor_config, tokenizer)
+    automodel_config = deepcopy(basic_automodel_test_config)
+    automodel_config["automodel_cfg"]["cpu_offload"] = cpu_offload
+    automodel_config["automodel_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    automodel_config["automodel_cfg"]["lora_cfg"]["enabled"] = enable_lora
+    automodel_config["train_global_batch_size"] = 4
+    lm_policy = Policy(cluster, automodel_config, tokenizer)
 
     # Prepare refit info
     print("Preparing refit info...")
@@ -2541,13 +2623,13 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     )
     # Create Policy
     print("Creating DTensor policy...")
-    dtensor_config = deepcopy(basic_dtensor_test_config)
-    dtensor_config["generation"]["colocated"]["enabled"] = False
-    dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
-    dtensor_config["train_global_batch_size"] = 4
-    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
-    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
-    lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
+    automodel_config = deepcopy(basic_automodel_test_config)
+    automodel_config["generation"]["colocated"]["enabled"] = False
+    automodel_config["automodel_cfg"]["cpu_offload"] = cpu_offload
+    automodel_config["train_global_batch_size"] = 4
+    automodel_config["automodel_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    automodel_config["automodel_cfg"]["lora_cfg"]["enabled"] = enable_lora
+    lm_policy = Policy(policy_cluster_separate, automodel_config, tokenizer)
 
     # Refit
     # initialize collective communication for update weights
@@ -3210,14 +3292,14 @@ def test_vllm_weight_update_and_prefix_cache_reset(
     if tensor_parallel_size > 1:
         vllm_config["vllm_kwargs"] = {"distributed_executor_backend": "ray"}
 
-    dtensor_config = basic_dtensor_test_config
+    automodel_config = basic_automodel_test_config
 
     # Create policies
     vllm_policy = None
     lm_policy = None
     try:
         print(f"Creating DTensor policy for TP={tensor_parallel_size}...")
-        lm_policy = Policy(cluster, dtensor_config, tokenizer)
+        lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print(f"Creating vLLM policy for TP={tensor_parallel_size}...")
         vllm_policy = VllmGeneration(cluster, vllm_config)
@@ -3328,7 +3410,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
 
     print("Creating Training Policy...")
     if train_backend == "dtensor":
-        train_config = deepcopy(basic_dtensor_test_config)
+        train_config = deepcopy(basic_automodel_test_config)
     elif train_backend == "megatron":
         train_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
     else:
@@ -3406,8 +3488,8 @@ def test_vllm_generation_with_stop(cluster, test_input_data, tokenizer, is_eval)
         vllm_generation.finish_generation()
 
         print("Creating DTensor policy...")
-        dtensor_config = basic_dtensor_test_config
-        lm_policy = Policy(cluster, dtensor_config, tokenizer)
+        automodel_config = basic_automodel_test_config
+        lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print("preparing refit info...")
         state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
@@ -3507,7 +3589,7 @@ async def test_vllm_refit_non_colocated_update_weights(
 
     # Get policy config
     if policy_type == "dtensor":
-        lm_config = deepcopy(basic_dtensor_test_config)
+        lm_config = deepcopy(basic_automodel_test_config)
     else:
         assert policy_type == "megatron"
         lm_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")

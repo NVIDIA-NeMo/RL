@@ -30,6 +30,12 @@ move the key here once it is actually removed.
 
 One `reject_outdated_*` function per removal, called from `check_outdated_config`:
 
+**"A removal" means one migration the user performs, not one key.** Renaming a block and dropping a
+key inside it is a single migration when the same user hits both in one edit -- keep them in one
+function, since they share the guards and the order they must be reported in (the name first, then
+the key under the new name), and name the function after the block rather than one key. Split them
+only when the two can be hit independently.
+
 ```python
 def reject_outdated_<thing>(config: dict[str, Any]) -> None:
     """Fail when <the old shape> is still present.

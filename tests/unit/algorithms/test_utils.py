@@ -29,6 +29,7 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
     get_tokenizer,
+    mask_out_neg_inf_logprobs,
     maybe_pad_last_batch,
     print_efficiency_summary,
     print_performance_metrics,
@@ -374,6 +375,70 @@ def test_maybe_pad_last_batch_preserves_multimodal_rows():
     shards = result.shard_by_batch_size(shards=8, batch_size=24)
     assert len(shards) == 8
     assert all(shard.size == 3 for shard in shards)
+
+
+def _single_direct_packed_validation_row() -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+            "target_ids": torch.tensor([[2, 3, 4, -100]]),
+            "token_mask": torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+            "position_ids": torch.tensor([[0, 1, 2, 3]]),
+            "input_lengths": torch.tensor([4]),
+            "sample_mask": torch.tensor([1.0]),
+            "packed_cu_seqlens": torch.tensor([[0, 2, 4]], dtype=torch.int32),
+            "packed_cu_seqlens_lengths": torch.tensor([3]),
+            "packed_max_seqlen": torch.tensor([2]),
+            "idx": ["row-0"],
+            "task_name": ["sft"],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "input_ids",
+        "target_ids",
+        "token_mask",
+        "position_ids",
+        "input_lengths",
+        "packed_cu_seqlens",
+        "packed_cu_seqlens_lengths",
+        "packed_max_seqlen",
+    ],
+)
+def test_maybe_pad_last_direct_packed_batch_duplicates_tensor_row_fields(key: str):
+    result = maybe_pad_last_batch(
+        _single_direct_packed_validation_row(), dp_size=2, mbs=1
+    )
+
+    assert torch.equal(result[key][1], result[key][0])
+
+
+@pytest.mark.parametrize("key", ["idx", "task_name"])
+def test_maybe_pad_last_direct_packed_batch_duplicates_list_row_fields(key: str):
+    result = maybe_pad_last_batch(
+        _single_direct_packed_validation_row(), dp_size=2, mbs=1
+    )
+
+    assert result[key] == [result[key][0], result[key][0]]
+
+
+def test_maybe_pad_last_direct_packed_batch_marks_padding_row_invalid():
+    result = maybe_pad_last_batch(
+        _single_direct_packed_validation_row(), dp_size=2, mbs=1
+    )
+
+    assert torch.equal(result["sample_mask"], torch.tensor([1.0, 0.0]))
+
+
+def test_maybe_pad_last_direct_packed_batch_rejects_unaligned_field():
+    batch = _single_direct_packed_validation_row()
+    batch["metadata"] = object()
+
+    with pytest.raises(TypeError, match="Unsupported type .* for index selection"):
+        maybe_pad_last_batch(batch, dp_size=2, mbs=1)
 
 
 # Performance Metrics Tests
@@ -994,6 +1059,25 @@ def test_calculate_baseline_and_std_per_prompt_numerical_precision():
     # Std values should be finite and not NaN
     assert torch.isfinite(std).all()
     assert not torch.isnan(std).any()
+
+
+def test_mask_out_neg_inf_logprobs_finite_mask_and_zeroing(capsys):
+    """finite_mask ignores the caller's mask; logprobs are zeroed where mask * finite_mask is 0."""
+    neg_inf = -float("inf")
+    logprobs = torch.tensor(
+        [[-0.5, neg_inf, -1.0, -2.0], [neg_inf, -0.1, -0.2, neg_inf]]
+    )
+    mask = torch.tensor([[1.0, 1.0, 0.0, 1.0], [0.0, 1.0, 1.0, 1.0]])
+
+    masked, finite_mask = mask_out_neg_inf_logprobs(logprobs, mask, "curr_logprobs")
+
+    # finite_mask is 0 exactly at -inf positions, whether or not the mask keeps them.
+    assert torch.equal(finite_mask, (~torch.isinf(logprobs)).float())
+    effective = mask * finite_mask
+    assert torch.all(masked[effective == 0] == 0)
+    assert torch.equal(masked[effective == 1], logprobs[effective == 1])
+    # The warning counts only -inf positions the caller's mask still treats as valid.
+    assert "2/6 valid tokens have -inf in curr_logprobs" in capsys.readouterr().out
 
 
 class TestPrintEfficiencySummary:
