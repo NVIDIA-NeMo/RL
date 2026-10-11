@@ -137,6 +137,7 @@ class GenerationConfig(TypedDict):
 
 
 class GenerationDatumSpec(TypedDict):
+    max_output_tokens: NotRequired[list[int | None]]
     """Specification for input data required by generation models.
 
     - input_ids: Tensor of token IDs representing the input sequences (right padded)

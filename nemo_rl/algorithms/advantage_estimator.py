@@ -49,6 +49,7 @@ class GRPOAdvantageEstimator:
     def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
         self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
         self.normalize_rewards = estimator_config["normalize_rewards"]
+        self.full_group_std = estimator_config.get("full_group_std", False)
 
     def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
         """Compute GRPO advantages.
@@ -63,11 +64,13 @@ class GRPOAdvantageEstimator:
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
+        valid = kwargs.get("valid_mask", torch.ones_like(rewards))
         baseline, std = calculate_baseline_and_std_per_prompt(
             prompt_ids,
             rewards,
-            torch.ones_like(rewards),
+            valid,
             leave_one_out_baseline=self.use_leave_one_out_baseline,
+            full_group_std=self.full_group_std,
         )
         advantages = (rewards - baseline).unsqueeze(-1)
 
@@ -78,6 +81,12 @@ class GRPOAdvantageEstimator:
             advantages[non_zero_std_mask] = advantages[non_zero_std_mask] / (
                 std.unsqueeze(-1)[non_zero_std_mask] + epsilon
             )
+            if self.full_group_std:
+                advantages = torch.where(
+                    (non_zero_std_mask & valid.bool()).unsqueeze(-1),
+                    advantages,
+                    torch.zeros_like(advantages),
+                )
 
         return advantages.expand(mask.shape)
 

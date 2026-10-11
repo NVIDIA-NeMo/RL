@@ -106,6 +106,8 @@ def calculate_baseline_and_std_per_prompt(
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
     std_rewards: torch.Tensor | None = None,
+    full_group_std: bool = False,
+    prompt_group_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
 
@@ -123,11 +125,20 @@ def calculate_baseline_and_std_per_prompt(
                                   sampling filtering while keeping baseline on the
                                   shaped reward.
 
+    full_group_std: bool          Use centered full-valid-group sample std independently
+                                  of the leave-one-out mean. False preserves legacy behavior.
+
+    prompt_group_ids: optional (b,) identities independent of prompt tokens.
+
     Returns:
     tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
     """
     if std_rewards is None:
         std_rewards = rewards
+    if prompt_group_ids is not None:
+        if prompt_group_ids.ndim != 1 or prompt_group_ids.numel() != rewards.numel():
+            raise ValueError("prompt_group_ids must contain one identity per reward")
+        prompts = prompt_group_ids.to(prompts.device).unsqueeze(-1)
     unique_prompts = torch.unique(prompts, dim=0)
 
     baseline = torch.zeros_like(rewards)
@@ -193,6 +204,13 @@ def calculate_baseline_and_std_per_prompt(
                 .sqrt()
                 .nan_to_num(0)
             )
+            if full_group_std:
+                valid_rewards = std_rewards[prompt_idx][valid_mask[prompt_idx].bool()]
+                std[prompt_idx] = torch.where(
+                    valid_rewards.amin() == valid_rewards.amax(),
+                    torch.zeros((), dtype=std.dtype, device=std.device),
+                    valid_rewards.std(correction=1),
+                )
 
     return baseline, std
 
@@ -358,7 +376,12 @@ def get_tokenizer(
     processor = None
 
     if get_processor:
-        processor = AutoProcessor.from_pretrained(
+        processor_type = AutoProcessor
+        if tokenizer_config.get("processor_class") is not None:
+            from hydra.utils import get_class
+
+            processor_type = get_class(tokenizer_config["processor_class"])
+        processor = processor_type.from_pretrained(
             tokenizer_config["name"], trust_remote_code=True, use_fast=True
         )
         tokenizer = processor.tokenizer

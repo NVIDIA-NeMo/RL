@@ -152,6 +152,7 @@ class AdvEstimatorConfig(TypedDict):
     name: str  # "grpo", "gdpo", or "reinforce_plus_plus"
     # GRPO specific
     normalize_rewards: NotRequired[bool]
+    full_group_std: NotRequired[bool]
     use_leave_one_out_baseline: NotRequired[bool]
     # Reinforce++ specific
     minus_baseline: NotRequired[bool]
@@ -164,6 +165,7 @@ class GRPOConfig(TypedDict):
     max_num_steps: int
     max_rollout_turns: int
     normalize_rewards: bool
+    full_group_std: NotRequired[bool]
     # Clipping bounds for normalized advantages to prevent extreme values
     # When set, advantages are clipped to [advantage_clip_low, advantage_clip_high] after normalization
     # Default: null (no clipping)
@@ -1020,8 +1022,11 @@ def setup(
         configure_vllm_for_router_replay(policy_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
 
-        ## make vllm hf overrides match the training policy
-        vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
+        # Keep generation-only configuration; shared model fields follow policy.
+        vllm_kwargs["hf_overrides"] = {
+            **(vllm_kwargs.get("hf_overrides") or {}),
+            **(policy_config.get("hf_config_overrides") or {}),
+        }
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
@@ -1252,6 +1257,16 @@ def setup(
 # ===============================================================================
 # Core Algorithm Functions
 # ===============================================================================
+
+
+def _rollout_identity_log_data(batch: BatchedDataDict[DatumSpec]) -> dict[str, Any]:
+    """Keep recording identities while the JSONL logger owns its row-number idx."""
+    identities = {}
+    if "idx" in batch:
+        identities["source_idx"] = batch["idx"]
+    if "prompt_group_ids" in batch:
+        identities["prompt_group_ids"] = batch["prompt_group_ids"].tolist()
+    return identities
 
 
 def dynamic_sampling(
@@ -1793,6 +1808,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         {
             "name": "grpo",
             "normalize_rewards": grpo_config.get("normalize_rewards", True),
+            "full_group_std": grpo_config.get("full_group_std", False),
             "use_leave_one_out_baseline": grpo_config.get(
                 "use_leave_one_out_baseline", False
             ),
@@ -2225,6 +2241,7 @@ def grpo_train(
             "See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details."
         )
 
+    next_prompt_group_id = 0
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
@@ -2259,6 +2276,13 @@ def grpo_train(
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
                 with timer.time("data_processing"):
+                    # Assign identities before repetition. Audio recordings can have
+                    # identical text prompts; refill batches must not share identities.
+                    batch["prompt_group_ids"] = torch.arange(
+                        next_prompt_group_id, next_prompt_group_id + batch.size,
+                        dtype=torch.int64,
+                    )
+                    next_prompt_group_id += batch.size
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
@@ -2443,12 +2467,15 @@ def grpo_train(
                         # Just fix the device id for now
                         device_id = 0
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids.cuda(device_id),
+                            repeated_batch["prompt_group_ids"].unsqueeze(-1).cuda(device_id),
                             rewards.cuda(device_id),
                             torch.ones_like(rewards).cuda(device_id),
                             leave_one_out_baseline=master_config.grpo[
                                 "use_leave_one_out_baseline"
                             ],
+                            full_group_std=master_config.grpo.get("adv_estimator", {}).get(
+                                "full_group_std", master_config.grpo.get("full_group_std", False)
+                            ),
                             std_rewards=(
                                 std_rewards.cuda(device_id)
                                 if std_rewards is not None
@@ -2459,13 +2486,16 @@ def grpo_train(
                         std = std.cpu()
                     else:
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids,
+                            repeated_batch["prompt_group_ids"].unsqueeze(-1),
                             rewards,
                             torch.ones_like(rewards),
                             leave_one_out_baseline=master_config.grpo[
                                 "use_leave_one_out_baseline"
                             ],
                             std_rewards=std_rewards,
+                            full_group_std=master_config.grpo.get("adv_estimator", {}).get(
+                                "full_group_std", master_config.grpo.get("full_group_std", False)
+                            ),
                         )
 
                     # Apply dynamic sampling to filter prompts with non-zero std (DAPO algorithm)
@@ -2514,7 +2544,11 @@ def grpo_train(
                         initial_prompt_message_logs,
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                    prompt_ids_for_adv = (
+                        repeated_batch["prompt_group_ids"].unsqueeze(-1)
+                        if "prompt_group_ids" in repeated_batch
+                        else prompt_batched_flat["token_ids"]
+                    )
                     del initial_prompt_message_logs
                     del prompt_batched_flat
                     del input_ids
@@ -2970,7 +3004,7 @@ def grpo_train(
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
             if not _should_log_nemo_gym_responses(master_config):
-                log_data = {}
+                log_data = _rollout_identity_log_data(repeated_batch)
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
                 log_data["content"] = flat_messages["content"]
@@ -3764,7 +3798,11 @@ def async_grpo_train(
                         initial_prompt_message_logs,
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                    prompt_ids_for_adv = (
+                        repeated_batch["prompt_group_ids"].unsqueeze(-1)
+                        if "prompt_group_ids" in repeated_batch
+                        else prompt_batched_flat["token_ids"]
+                    )
                     del initial_prompt_message_logs
                     del prompt_batched_flat
 
@@ -4206,7 +4244,7 @@ def async_grpo_train(
 
             # Logging
             # Log training data (match sync GRPO logging payload for parity)
-            log_data = {}
+            log_data = _rollout_identity_log_data(repeated_batch)
             if "agent_ref" in repeated_batch:
                 log_data["agent_ref"] = repeated_batch["agent_ref"]
             log_data["content"] = flat_messages_content

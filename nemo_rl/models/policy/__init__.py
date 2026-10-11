@@ -439,6 +439,7 @@ class DraftConfig(TypedDict):
 
 
 class TokenizerConfig(TypedDict):
+    processor_class: NotRequired[str]
     name: str
     chat_template: NotRequired[str]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
@@ -490,8 +491,20 @@ class RouterReplayConfig(TypedDict):
     enabled: Literal[True]
 
 
+class SpeechLMNativeConfig(TypedDict):
+    trainable_names: list[str]
+    expected_trainable_tensors: int
+    expected_trainable_scalars: int
+    max_expanded_sequence_length: int
+    projection_chunk_size: NotRequired[int]
+    deterministic_perception: NotRequired[bool]
+    activation_checkpointing_perception: NotRequired[bool]
+    model_config_overrides: NotRequired[dict[str, Any]]
+
+
 class PolicyConfig(TypedDict):
     model_name: str
+    native_model: NotRequired[SpeechLMNativeConfig]
     tokenizer: TokenizerConfig
     train_global_batch_size: int
     train_micro_batch_size: int

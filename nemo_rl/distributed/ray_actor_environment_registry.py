@@ -28,6 +28,8 @@ MCORE_EXECUTABLE = (
 )
 
 ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
+    "nemo_rl.environments.asr_environment.ASREnvironment": PY_EXECUTABLES.SYSTEM,
+    "nemo_rl.environments.asr_environment.ASRRewardWorker": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": VLLM_EXECUTABLE,
     "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": VLLM_EXECUTABLE,
     "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": SGLANG_EXECUTABLE,

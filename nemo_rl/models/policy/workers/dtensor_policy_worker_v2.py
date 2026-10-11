@@ -40,6 +40,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
+from nemo_rl.models.automodel.refit import refit_state_dict
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
     get_microbatch_iterator,
@@ -94,7 +95,7 @@ def dtensor_params_generator(
         Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
     """
     module_map = dict(model.named_modules())
-    for name, tensor in model.state_dict().items():
+    for name, tensor in refit_state_dict(model).items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
@@ -228,8 +229,16 @@ class DTensorPolicyWorkerV2Impl(
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorkerV2."""
-        # Apply TE patch until TE is upgraded to 2.10.0
-        apply_transformer_engine_patch()
+        # The native Speech path uses the image's TE >= 2.10, which already
+        # contains this fix. Preserve legacy patch behavior for other policies.
+        if config.get("native_model") is None:
+            apply_transformer_engine_patch()
+        else:
+            from importlib.metadata import version
+            from packaging.version import Version
+
+            if Version(version("transformer-engine")) < Version("2.10.0"):
+                raise ValueError("Native SpeechLM requires Transformer Engine >= 2.10 without source rewriting")
 
         from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
 
@@ -1056,7 +1065,7 @@ class DTensorPolicyWorkerV2Impl(
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
-        for name, tensor in self.model.state_dict().items():
+        for name, tensor in refit_state_dict(self.model).items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
                 continue
             full_tensor = (

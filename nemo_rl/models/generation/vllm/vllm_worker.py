@@ -35,6 +35,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.output_limits import per_request_output_limits
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
@@ -229,7 +230,17 @@ class BaseVllmGenerationWorker:
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
-        _apply_vllm_patches(self.py_executable, extra_env_vars=extra_env_vars)
+        if self.cfg["vllm_cfg"].get("native_speechlm", False):
+            if self.cfg["vllm_cfg"]["async_engine"] or self.cfg.get("vllm_kwargs", {}).get("speculative_config"):
+                raise ValueError("Native SpeechLM GSPO requires synchronous generation with MTP off")
+            # Launch Ray with this same public vLLM environment so its standard
+            # TP workers inherit the correct Python. Eagle3/tool parser rewrites
+            # are irrelevant to this synchronous MTP-off ASR path.
+            from nemo.collections.speechlm2.vllm.salm import register
+
+            register()
+        else:
+            _apply_vllm_patches(self.py_executable, extra_env_vars=extra_env_vars)
 
         # Skip model loading if we're not the model owner
         if not self.is_model_owner:
@@ -667,6 +678,17 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             greedy=greedy,
             stop_strings=stop_strings,
         )
+
+        if data.get("max_output_tokens") is not None:
+            limits = per_request_output_limits(
+                data["max_output_tokens"], input_lengths.tolist(),
+                configured_max_new_tokens=int(self.cfg["max_new_tokens"]),
+                max_model_len=int(self.cfg["vllm_cfg"]["max_model_len"]),
+            )
+            sampling_params = [
+                self._build_sampling_params(greedy=greedy, stop_strings=stop_strings, max_new_tokens=limit)
+                for limit in limits
+            ]
 
         # verify inputs have correct padding
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
