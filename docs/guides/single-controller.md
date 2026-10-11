@@ -177,8 +177,8 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - A native TQ snapshot containing rollout tensor payloads and TQ state.
 - A metadata-only replay index describing the completed rollout groups stored in TQ.
 - A `rollout_recovery.pt` ownership ledger describing unfinished prompt groups that must be redispatched after a restart.
-- With `rollout_recovery.target_level: turn`, a `gym_checkpoint.json` manifest
-  and per-Gym-instance participant snapshots for unfinished episodes.
+- With `rollout_recovery.target_level: turn`, a `gym_restart_fallback.json`
+  marker: Gym state is saved only in the rollout snapshots taken after it.
 - A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, when applicable.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
@@ -314,7 +314,7 @@ restart boundary:
 `prompt_group` when every generation in a recovered group must come from the
 policy weights live at redispatch.
 
-Turn recovery coordinates Gym and RL as one checkpoint cut. Each prompt group
+Turn recovery coordinates Gym and RL as one rollout-snapshot cut. Each prompt group
 is pinned to the Gym shard replica that accepted it. SC first closes its narrow
 `/run` dispatch admission gate; already-submitted requests, completion callbacks,
 finalization, and TQ writes remain live. Gym parks its participants and commits
@@ -327,6 +327,17 @@ candidate is neither exported by Gym nor drained before the deadline, the
 checkpoint aborts. Gym leases are renewed throughout and all deployments are
 resumed after the cut succeeds or aborts.
 
+`rollout_recovery.gym_prepare_timeout_s` (default 300 seconds) bounds how long
+Gym gets to park its in-flight steps; raise it for long agent or environment
+steps. Every other Gym control call keeps `token_capture.control_timeout_s`. A
+snapshot whose Gym cannot park in time, or is unavailable, is skipped and
+retried under the `max_consecutive_failures` budget.
+
+Gym state is saved only in rollout snapshots. A trainer checkpoint never pauses
+Gym, so a slow or unavailable Gym cannot fail it. It records
+`gym_restart_fallback.json` to say it holds no Gym state and wakes the snapshot
+loop, which captures Gym anchored to it as soon as the checkpoint is durable.
+
 On restart, SC validates that `gym_checkpoint.json` names exactly the episodes
 owned by the rollout ledger and that the saved Gym actor topology matches the
 live one. It restores Gym before starting rollout dispatch, advances each
@@ -337,6 +348,11 @@ Ray reply where the remote restore may actually have succeeded, so a partially
 restored topology is never released for execution. A second checkpoint taken
 after restore but before redispatch includes the unclaimed restored attempt, so
 another crash does not lose the saved turn boundary.
+
+If no rollout snapshot follows the newest trainer checkpoint, SC restores that
+checkpoint on its own: completed groups come back from TQ and unfinished
+turn-level rollouts restart from their tasks. A checkpoint with neither Gym
+state nor the `gym_restart_fallback.json` marker is refused.
 
 The `turn` target currently requires vLLM generation, NeMo Gym, token capture,
 periodic rollout snapshots, `restore_mode: latest`, and the same named Gym
