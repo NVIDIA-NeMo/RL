@@ -22,7 +22,9 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 pytest.importorskip("megatron.energon")
 pytestmark = pytest.mark.mcore
 
-from nemo_rl.data.energon.multimodal.cookers.generic import cook_conversation  # noqa: E402
+from nemo_rl.data.energon.multimodal.cookers.generic import (
+    cook_conversation,  # noqa: E402
+)
 from nemo_rl.data.energon.multimodal.task_encoders.generic_sft import (  # noqa: E402
     HFMultimodalSFTProcessorAdapter,
 )

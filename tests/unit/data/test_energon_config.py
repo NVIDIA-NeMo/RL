@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pydantic import ValidationError
 import pytest
+from pydantic import ValidationError
 
 from nemo_rl.data.energon.config import EnergonCookerConfig, EnergonTaskEncoderConfig
 from nemo_rl.data.energon.multimodal.registry import (
