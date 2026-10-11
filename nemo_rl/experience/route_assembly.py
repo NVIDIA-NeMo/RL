@@ -38,6 +38,7 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_FIELD,
 )
 from nemo_rl.experience.route_plan import RouteAssemblyPlan
+from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 
 # Gym's router-replay missing-route wire sentinel (== nemo_gym
 # MISSING_ROUTE_SENTINEL, restated so this module imports without the
@@ -54,6 +55,7 @@ ROUTE_FAILURE_RANK = "fragment_rank"
 ROUTE_FAILURE_LENGTH = "fragment_length"
 ROUTE_FAILURE_MODEL_SHAPE = "fragment_model_shape"
 ROUTE_FAILURE_ASSEMBLED_LENGTH = "assembled_length_mismatch"
+ROUTE_FAILURE_PREFIX_BOUNDARY = "prefix_boundary_mismatch"
 
 
 @dataclass(frozen=True)
@@ -167,6 +169,18 @@ def execute_route_plan(
                 return None, ROUTE_FAILURE_LENGTH
             if tuple(routes.shape[1:]) != (num_moe_layers, top_k):
                 return None, ROUTE_FAILURE_MODEL_SHAPE
+            metadata = json.loads(fragment.extras_metadata_json.decode("utf-8"))
+            boundary = (metadata or {}).get("routed_experts_prefix_boundary")
+            if boundary is not None:
+                if position == 0:
+                    return None, ROUTE_FAILURE_PREFIX_BOUNDARY
+                try:
+                    previous_route = decode_routed_experts(boundary, torch.int16)
+                except (TypeError, ValueError):
+                    return None, ROUTE_FAILURE_PREFIX_BOUNDARY
+                if previous_route.shape != (1, num_moe_layers, top_k):
+                    return None, ROUTE_FAILURE_PREFIX_BOUNDARY
+                routed[position - 1] = previous_route[0]
             if mode == "full":
                 routed[position : position + contribution] = routes.to(torch.int16)
             else:

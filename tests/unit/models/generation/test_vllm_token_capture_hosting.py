@@ -576,3 +576,28 @@ def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
             )
         )
         assert worker._capture_image_token_id == 18
+
+
+def test_uncaptured_inference_does_not_expose_routes_without_token_bundle():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _FakeRequest(stream=False)
+    content = _served_content([3], [-0.1])
+    message = content["choices"][0]["message"]
+    message["routed_experts"] = "opaque-route-payload"
+    assert not any(
+        field in message
+        for field in (
+            "prompt_token_ids",
+            "generation_token_ids",
+            "generation_log_probs",
+        )
+    )
+
+    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, content
+    )
+
+    assert "routed_experts" not in out["choices"][0]["message"]
+    assert "ng_commit_coords" not in out
+    assert sink.records == []

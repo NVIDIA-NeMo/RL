@@ -818,6 +818,13 @@ class VllmAsyncGenerationWorkerImpl(
                     f"route length {experts.shape[0]} does not match engine sequence "
                     f"length {expected_full_len}"
                 )
+            # The previous call's last generated token has only a padding
+            # route. This prefill computed its real route; retain it beside
+            # the delta so assembly can repair the multi-turn boundary.
+            if prev_len > 0:
+                message["routed_experts_prefix_boundary"] = encode_routed_experts(
+                    experts[prev_len - 1 : prev_len]
+                )
             message["routed_experts"] = encode_routed_experts(experts[prev_len:])
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
@@ -838,6 +845,20 @@ class VllmAsyncGenerationWorkerImpl(
         """
         state = self._capture_calls.pop(id(request), None)
         if state is None:
+            if self.token_capture is not None:
+                # Auxiliary inference calls have no capture admission or token
+                # bundle. Standalone routes violate Gym's metadata contract.
+                for choice in content.get("choices") or []:
+                    message = choice.get("message")
+                    if isinstance(message, dict) and not all(
+                        message.get(field) is not None
+                        for field in (
+                            "prompt_token_ids",
+                            "generation_token_ids",
+                            "generation_log_probs",
+                        )
+                    ):
+                        message.pop("routed_experts", None)
             return content
         call, prompt_token_ids = state.call, state.prompt_token_ids
         payload = dict(content)
