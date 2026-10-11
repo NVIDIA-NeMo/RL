@@ -129,7 +129,7 @@ class GymCheckpointCommitSummary:
     unowned_live_episodes: tuple[GymCheckpointEpisode, ...] = ()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class GymCheckpointEpisode:
     """Serializable identity of one physical Gym episode attempt."""
 
@@ -145,6 +145,15 @@ class GymCheckpointEpisode:
             or self.attempt < 0
         ):
             raise ValueError("Gym checkpoint attempt must be non-negative")
+
+    @property
+    def capture_key(self) -> str:
+        """Gym's attempt-qualified key: ``EpisodeId.capture_key``, mirrored."""
+        return (
+            self.rollout_id
+            if self.attempt == 0
+            else f"{self.rollout_id}-a{self.attempt}"
+        )
 
     def next_attempt(self) -> GymCheckpointEpisode:
         """Return the physical episode Gym creates when this one is restored."""

@@ -1133,13 +1133,18 @@ class TestGymAdmissionClosedRows:
                     dispatch_recorder=recorder,
                 )
             )
+
             # Both rows start RESERVED and are marked together, so this only
             # holds once Gym's refusal of row 1 has been unwound.
-            while not (
-                status(0) is RolloutAttemptStatus.DISPATCHED
-                and status(1) is RolloutAttemptStatus.RESERVED
-            ):
-                await asyncio.sleep(0.001)
+            async def refusal_unwound() -> None:
+                while not (
+                    status(0) is RolloutAttemptStatus.DISPATCHED
+                    and status(1) is RolloutAttemptStatus.RESERVED
+                ):
+                    await asyncio.sleep(0.001)
+
+            # Bounded: a regressed unwind fails here instead of hanging the job.
+            await asyncio.wait_for(refusal_unwound(), timeout=5.0)
 
             async def checkpoint() -> tuple:
                 async with gate.closed():

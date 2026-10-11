@@ -30,6 +30,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
 from nemo_rl.experience import rollout_reassembler
 from nemo_rl.experience.rollout_reassembler import ActionOutputFlags, RolloutSelection
 from nemo_rl.experience.rollout_recovery import (
@@ -379,7 +380,7 @@ def test_ledger_round_trip_preserves_group_ownership() -> None:
         target_step=7,
         start_weight_version=6,
         task_source=None,
-        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.SIBLING,
         admitted=True,
     )
 
@@ -768,7 +769,7 @@ def test_checkpoint_cut_can_guard_a_ledger_mutation() -> None:
 
 def test_recovery_config_resolves_agent_then_task_source_then_default() -> None:
     config = RolloutRecoveryConfig(
-        target_level=RecoveryTargetLevel.TURN,
+        target_level=RecoveryTargetLevel.SIBLING,
         task_source_target_level_overrides={
             "genrm_compare": RecoveryTargetLevel.PROMPT_GROUP,
         },
@@ -815,7 +816,7 @@ def test_recovery_config_resolves_agent_then_task_source_then_default() -> None:
     assert agent_policy.restore_level is RecoveryTargetLevel.SIBLING
     assert default_policy.task_source == "other"
     assert default_policy.granularity is RecoveryGranularity.SIBLING
-    assert default_policy.restore_level is RecoveryTargetLevel.TURN
+    assert default_policy.restore_level is RecoveryTargetLevel.SIBLING
     assert legacy_policy.task_source is None
     assert legacy_policy.granularity is RecoveryGranularity.PROMPT_GROUP
     assert legacy_policy.restore_level is RecoveryTargetLevel.PROMPT_GROUP
@@ -855,6 +856,19 @@ def test_recovery_config_rejects_malformed_prompt_identity(
         RolloutRecoveryConfig().resolve_for_prompt(prompt)
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"task_source_target_level_overrides": {"genrm_compare": "prompt_group"}},
+        {"agent_target_level_overrides": {"genrm_agent": "prompt_group"}},
+    ],
+)
+def test_turn_recovery_rejects_target_overrides(overrides: dict[str, Any]) -> None:
+    """A coarser route on a checkpointing Gym would fall outside the commit scope."""
+    with pytest.raises(ValueError, match="not supported with target_level='turn'"):
+        RolloutRecoveryConfig(target_level=RecoveryTargetLevel.TURN, **overrides)
+
+
 def test_recovery_config_rejects_removed_task_name_override() -> None:
     with pytest.raises(ValueError, match="target_level"):
         RolloutRecoveryConfig(
@@ -886,7 +900,7 @@ def test_target_step_none_does_not_mean_unadmitted() -> None:
         target_step=None,
         start_weight_version=6,
         task_source=None,
-        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.SIBLING,
         admitted=True,
     )
 
@@ -906,7 +920,7 @@ def test_reserved_group_can_be_admitted_exactly_once() -> None:
         target_step=None,
         start_weight_version=6,
         task_source=None,
-        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.SIBLING,
         admitted=False,
     )
 
@@ -943,7 +957,7 @@ def test_canonical_groups_are_discarded_without_touching_unfinished_groups() -> 
             target_step=7,
             start_weight_version=7,
             task_source=None,
-            recovery_granularity=RecoveryGranularity.SIBLING,
+            restore_level=RecoveryTargetLevel.SIBLING,
             admitted=True,
         )
 
@@ -964,7 +978,7 @@ def test_state_dict_stores_a_prompt_ref_without_the_full_payload() -> None:
         target_step=7,
         start_weight_version=7,
         task_source=None,
-        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.SIBLING,
         admitted=True,
     )
 
@@ -993,7 +1007,7 @@ def test_bind_runtime_prompt_accepts_changed_content_with_the_same_identity() ->
         target_step=7,
         start_weight_version=7,
         task_source=None,
-        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.SIBLING,
         admitted=True,
     )
     restored = RolloutRecoveryLedger()
@@ -1018,7 +1032,7 @@ def test_bind_runtime_prompt_rejects_the_wrong_dataset_sample() -> None:
         target_step=7,
         start_weight_version=7,
         task_source=None,
-        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.SIBLING,
         admitted=True,
     )
     restored = RolloutRecoveryLedger()
@@ -1047,7 +1061,7 @@ def test_prompt_ref_rehydrates_through_a_restored_shuffled_dataloader() -> None:
         target_step=1,
         start_weight_version=0,
         task_source=None,
-        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.SIBLING,
         admitted=True,
     )
     ledger_state = ledger.state_dict()
@@ -1081,7 +1095,7 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
         target_step=7,
         start_weight_version=6,
         task_source=None,
-        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.SIBLING,
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
@@ -1133,7 +1147,6 @@ def test_turn_restart_preserves_sealed_sibling_and_restores_other_from_gym() -> 
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        recovery_granularity=RecoveryGranularity.SIBLING,
         restore_level=RecoveryTargetLevel.TURN,
         admitted=True,
     )
@@ -1169,7 +1182,11 @@ def test_turn_restart_preserves_sealed_sibling_and_restores_other_from_gym() -> 
         lambda cut: restored.prepare_for_restart(
             cut,
             restored_gym_episodes={
-                ("tools/replica-0", *unfinished_episode),
+                (
+                    "tools/replica-0",
+                    unfinished_episode.rollout_id,
+                    unfinished_episode.attempt,
+                ),
             },
         )
     )
@@ -1206,7 +1223,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
         target_step=7,
         start_weight_version=6,
         task_source=None,
-        recovery_granularity=recovery_granularity,
+        restore_level=RecoveryTargetLevel(recovery_granularity.value),
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
@@ -1287,14 +1304,15 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
         target_step=7,
         start_weight_version=6,
         task_source="genrm_compare",
-        recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
+        restore_level=RecoveryTargetLevel.PROMPT_GROUP,
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
 
     state = ledger.state_dict()
     assert state["groups"][0]["task_source"] == "genrm_compare"
-    assert state["groups"][0]["recovery_granularity"] == "prompt_group"
+    # Granularity follows from the restore level, so only the level is saved.
+    assert "recovery_granularity" not in state["groups"][0]
     assert state["groups"][0]["restore_level"] == "prompt_group"
 
     restored = RolloutRecoveryLedger.from_state_dict(state)
@@ -1328,13 +1346,11 @@ def test_turn_restore_target_is_persisted_separately_from_live_retry() -> None:
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        recovery_granularity=RecoveryGranularity.SIBLING,
         restore_level=RecoveryTargetLevel.TURN,
         admitted=True,
     )
 
     state = ledger.state_dict()
-    assert state["groups"][0]["recovery_granularity"] == "sibling"
     assert state["groups"][0]["restore_level"] == "turn"
 
     restored = RolloutRecoveryLedger.from_state_dict(state).get_group("g7")
@@ -1356,7 +1372,7 @@ def test_old_rollout_recovery_schemas_are_rejected(
         expected_generations=1,
         target_step=7,
         start_weight_version=6,
-        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.SIBLING,
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
@@ -1379,7 +1395,6 @@ def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
         expected_generations=1,
         target_step=7,
         start_weight_version=6,
-        recovery_granularity=RecoveryGranularity.SIBLING,
         restore_level=RecoveryTargetLevel.TURN,
         admitted=True,
     )
@@ -1400,7 +1415,8 @@ def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
     inventory = restored.gym_checkpoint_inventory(
         {"judge/replica-0", "tools/replica-1"}
     )
-    ((rollout_id, attempt),) = inventory["tools/replica-1"]
+    (episode,) = inventory["tools/replica-1"]
+    rollout_id, attempt = episode.rollout_id, episode.attempt
     assert inventory["judge/replica-0"] == ()
     assert attempt == 0
 
@@ -1422,7 +1438,9 @@ def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
     repeated_inventory = restored.gym_checkpoint_inventory(
         {"judge/replica-0", "tools/replica-1"}
     )
-    assert repeated_inventory["tools/replica-1"] == ((rollout_id, 1),)
+    assert repeated_inventory["tools/replica-1"] == (
+        GymCheckpointEpisode(rollout_id, 1),
+    )
 
     _mutate(
         lambda cut: restored.prepare_for_restart(
@@ -1460,7 +1478,6 @@ def test_turn_restart_without_gym_state_starts_a_restored_attempt_over() -> None
         expected_generations=1,
         target_step=7,
         start_weight_version=6,
-        recovery_granularity=RecoveryGranularity.SIBLING,
         restore_level=RecoveryTargetLevel.TURN,
         admitted=True,
     )
@@ -1469,7 +1486,8 @@ def test_turn_restart_without_gym_state_starts_a_restored_attempt_over() -> None
             cut, "g7", gym_instance_id="tools/replica-0"
         )
     )
-    rollout_id, attempt = ledger.get_group("g7").gym_episode(0)
+    episode = ledger.get_group("g7").gym_episode(0)
+    rollout_id, attempt = episode.rollout_id, episode.attempt
     _mutate(
         lambda cut: ledger.prepare_for_restart(
             cut,
@@ -1497,7 +1515,6 @@ def test_turn_restart_falls_back_to_sibling_when_gym_episode_is_absent() -> None
         expected_generations=1,
         target_step=7,
         start_weight_version=6,
-        recovery_granularity=RecoveryGranularity.SIBLING,
         restore_level=RecoveryTargetLevel.TURN,
         admitted=True,
     )
@@ -1546,7 +1563,7 @@ def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
         target_step=7,
         start_weight_version=6,
         task_source="genrm_compare",
-        recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
+        restore_level=RecoveryTargetLevel.PROMPT_GROUP,
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
@@ -1591,7 +1608,7 @@ def test_prompt_group_seal_is_atomic() -> None:
         target_step=7,
         start_weight_version=6,
         task_source="genrm_compare",
-        recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
+        restore_level=RecoveryTargetLevel.PROMPT_GROUP,
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
@@ -1632,7 +1649,7 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
         target_step=7,
         start_weight_version=6,
         task_source=None,
-        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.SIBLING,
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
@@ -1662,8 +1679,6 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
 @pytest.mark.parametrize(
     ("field", "value", "error_fragment"),
     [
-        ("recovery_granularity", "banana", "invalid recovery_granularity"),
-        ("recovery_granularity", None, "recovery_granularity must be a string"),
         ("restore_level", "banana", "invalid restore_level"),
         ("restore_level", None, "restore_level must be a string"),
         ("task_source", 123, "task_source must be a string or None"),
@@ -1683,7 +1698,7 @@ def test_restore_rejects_malformed_recovery_policy_fields(
         target_step=7,
         start_weight_version=6,
         task_source=None,
-        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.SIBLING,
         admitted=True,
     )
     state = ledger.state_dict()
@@ -1769,7 +1784,7 @@ def test_seal_rejects_conflicting_agent_names_atomically(granularity) -> None:
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        recovery_granularity=granularity,
+        restore_level=RecoveryTargetLevel(granularity),
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
@@ -1880,7 +1895,7 @@ def test_reward_checks_seals_and_survives_checkpoint(granularity):
         target_step=0,
         start_weight_version=4,
         group_id="g7",
-        recovery_granularity=granularity,
+        restore_level=RecoveryTargetLevel(granularity.value),
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
     rollout_id = group.gate_rollout_ids[0]
@@ -1983,7 +1998,7 @@ def test_restore_rejects_malformed_reward_checks(raw_checks):
         target_step=0,
         start_weight_version=4,
         group_id="g7",
-        recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
+        restore_level=RecoveryTargetLevel.PROMPT_GROUP,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
     rollout_id = group.gate_rollout_ids[0]
@@ -2069,7 +2084,6 @@ def _dispatched_turn_group(ledger: RolloutRecoveryLedger) -> PromptGroupRecovery
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        recovery_granularity=RecoveryGranularity.SIBLING,
         restore_level=RecoveryTargetLevel.TURN,
         admitted=True,
     )
@@ -2129,7 +2143,8 @@ def test_refused_restored_turn_stays_gym_owned() -> None:
         lambda cut: restored.prepare_for_restart(
             cut,
             restored_gym_episodes={
-                ("tools/replica-0", *episode) for episode in episodes
+                ("tools/replica-0", episode.rollout_id, episode.attempt)
+                for episode in episodes
             },
         )
     )
@@ -2197,7 +2212,6 @@ def test_attempts_that_never_reached_gym_are_not_retired() -> None:
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        recovery_granularity=RecoveryGranularity.SIBLING,
         restore_level=RecoveryTargetLevel.TURN,
         admitted=True,
     )
@@ -2217,7 +2231,8 @@ def test_dropping_a_restored_reserved_attempt_retires_its_restored_gym_state() -
         lambda cut: restored.prepare_for_restart(
             cut,
             restored_gym_episodes={
-                ("tools/replica-0", *episode) for episode in episodes
+                ("tools/replica-0", episode.rollout_id, episode.attempt)
+                for episode in episodes
             },
         )
     )
@@ -2229,7 +2244,7 @@ def test_dropping_a_restored_reserved_attempt_retires_its_restored_gym_state() -
         "tools/replica-0"
     ]
     assert set(retired) == {group.gym_episode(index) for index in (0, 1)}
-    assert {attempt for _, attempt in retired} == {1}
+    assert {episode.attempt for episode in retired} == {1}
 
 
 def test_mark_gym_retired_keeps_drops_recorded_after_the_retire_was_sent() -> None:

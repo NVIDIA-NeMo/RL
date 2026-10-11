@@ -720,8 +720,11 @@ class TaskSourceRecoveryGranularity:
     """
 
     task_source: Optional[str]
-    granularity: RecoveryGranularity
     restore_level: RecoveryTargetLevel
+
+    @property
+    def granularity(self) -> RecoveryGranularity:
+        return self.restore_level.granularity
 
 
 _RECOVERY_TARGET_RANK = {
@@ -786,6 +789,13 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
                     f"{mapping_name} may only force a coarser recovery level than "
                     f"target_level={self.target_level.value!r}; invalid={finer!r}"
                 )
+            if self.target_level is RecoveryTargetLevel.TURN and overrides:
+                # A checkpointing Gym deployment exports every live episode, so
+                # a coarser route on it would fall outside the commit scope.
+                raise ValueError(
+                    f"{mapping_name} is not supported with target_level='turn' "
+                    f"yet; got {sorted(overrides)!r}"
+                )
         return self
 
     @property
@@ -834,14 +844,8 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
             target_level = self.task_source_target_level_overrides.get(
                 task_source, target_level
             )
-        granularity = (
-            RecoveryGranularity.PROMPT_GROUP
-            if target_level is RecoveryTargetLevel.PROMPT_GROUP
-            else RecoveryGranularity.SIBLING
-        )
         return TaskSourceRecoveryGranularity(
             task_source=task_source,
-            granularity=granularity,
             restore_level=target_level,
         )
 

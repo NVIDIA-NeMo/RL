@@ -21,6 +21,7 @@ retries a doomed prompt; misclassifying infra as data fails a recoverable run.
 
 import asyncio
 import sys
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
@@ -29,7 +30,11 @@ from multidict import CIMultiDict, CIMultiDictProxy
 from ray import cloudpickle as ray_cloudpickle
 from yarl import URL
 
-from nemo_rl.environments.nemo_gym import _gym_failure_row_error, _typed_gym_failure
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    _gym_failure_row_error,
+    _typed_gym_failure,
+)
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -352,6 +357,60 @@ class TestGymFailureRowsKeepTheirRow:
         )
         assert isinstance(transport, GymTransportError)
         assert type(undecodable) is RolloutDataFailure
+
+    def test_a_reply_whose_body_broke_off_after_200_is_re_sent(self):
+        """Gym stamps the reply's own 200 when only reading its body failed."""
+        failure = _gym_failure_row_error(
+            {"_rowidx": 0},
+            _gym_failure_row(status=200, failure_type="ClientPayloadError"),
+        )
+        assert isinstance(failure, GymTransportError)
+
+    @pytest.mark.parametrize(
+        ("terminal", "expected"),
+        [(True, RolloutDataFailure), (False, GymTransportError)],
+    )
+    def test_an_environment_server_failure_is_re_sent_unless_terminal(
+        self, terminal, expected
+    ):
+        """Gym says a terminal episode must not be attempted again."""
+        failure = _gym_failure_row_error(
+            {"_rowidx": 0},
+            {
+                "_ng_failure_class": "environment_server_failed",
+                "_ng_failure_terminal": terminal,
+                "_ng_failure_message": "Unhandled environment server error",
+            },
+        )
+        assert type(failure) is expected
+        assert "environment server failed the episode" in str(failure)
+
+    def test_a_refusal_as_the_run_s_last_row_still_closes_the_run(self):
+        """The run's timing rides on the refusal when no completed row is left."""
+        actor = object.__new__(NemoGym.__ray_metadata__.modified_class)
+        actor._require_spinup = lambda: None
+        actor._tokenizer = object()
+        actor.cfg = {}
+        actor.head_server_config = None
+        actor._token_capture_enabled = False
+        actor._forest_training = False
+        rows = [{"_rowidx": 0, "agent_ref": {"name": "agent"}}]
+
+        async def refused():
+            return rows[0], _gym_failure_row(status=409, body=_ADMISSION_CLOSED_BODY)
+
+        actor.rch = SimpleNamespace(run_examples=lambda **_: [refused()])
+
+        async def stream() -> list:
+            return [item async for item in actor._stream_rollouts(rows, "timing/t")]
+
+        (item,) = asyncio.run(stream())
+
+        assert isinstance(item, GymAdmissionClosed)
+        assert item.rowidx == 0
+        assert item.timing_metrics is not None
+        assert "timing/t/await_results" in item.timing_metrics
+        assert "timing/t/postprocess_results_pct" not in item.timing_metrics
 
     def test_a_row_that_ran_is_not_a_failure(self):
         assert _gym_failure_row_error({"_rowidx": 0}, {"reward": 1.0}) is None

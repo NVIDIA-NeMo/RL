@@ -42,7 +42,7 @@ an actor are converted to a picklable member of this taxonomy *before* they cros
 from __future__ import annotations
 
 import enum
-from typing import Final, Optional
+from typing import Any, Final, Optional
 
 import ray.exceptions
 
@@ -119,11 +119,18 @@ class GymAdmissionClosed(RolloutInfraFailure):
     raises it retries the row instead of charging the prompt a data failure.
     """
 
-    def __init__(self, detail: str, rowidx: int) -> None:
-        # Both values ride in ``args`` so the exception pickles across Ray.
-        super().__init__(detail, rowidx)
+    def __init__(
+        self,
+        detail: str,
+        rowidx: int,
+        timing_metrics: Optional[dict[str, Any]] = None,
+    ) -> None:
+        # Every value rides in ``args`` so the exception pickles across Ray.
+        super().__init__(detail, rowidx, timing_metrics)
         self.detail = detail
         self.rowidx = rowidx
+        # The ``/run`` timing, when this refusal was the run's last row.
+        self.timing_metrics = timing_metrics
 
     def __str__(self) -> str:
         return self.detail
