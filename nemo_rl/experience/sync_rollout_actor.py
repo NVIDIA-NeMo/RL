@@ -49,6 +49,7 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -218,10 +219,7 @@ class SyncRolloutActor:
         # ``_policy_dtype`` sizes the VLM pixel tensors below.
         from nemo_rl.algorithms.grpo import _policy_dtype
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
-        from nemo_rl.data.llm_message_utils import (
-            MESSAGE_LOG_BULK_FIELDS,
-            decompose_message_log,
-        )
+        from nemo_rl.data.llm_message_utils import decompose_message_log
         from nemo_rl.environments.nemo_gym import should_use_nemo_gym
         from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 
@@ -341,25 +339,9 @@ class SyncRolloutActor:
         if "content" in flat:
             bulk_batch["content"] = np.asarray(flat["content"], dtype=object)
 
-        # Split `message_log` into per-field arrays instead of pickling
-        # the list-of-dicts-with-tensors per row. Consumer rebuilds
-        # `message_log` on read; external API stays the same.
+        # Decomposed only for ``driver_carry``; turn_* and the non-tensor fb
+        # columns are not written to TQ (no reader fetches them).
         decomposed = decompose_message_log(fb["message_log"])
-        for k in MESSAGE_LOG_BULK_FIELDS:
-            bulk_batch[k] = decomposed[k]
-
-        # Pass through remaining non-tensor fb fields as object arrays;
-        # `message_log` is excluded since its tensors live in the
-        # decomposed fields above (per-row pickle of dict-with-tensors
-        # would smuggle aliased views into the wire).
-        for k, v in fb.items():
-            if isinstance(v, torch.Tensor) or k in bulk_batch or k == "message_log":
-                continue
-            bulk_batch[k] = (
-                v
-                if isinstance(v, np.ndarray) and v.dtype == object
-                else np.asarray(v, dtype=object)
-            )
 
         # Slice — only what the driver can't derive from a TQ slice fetch
         # (anything containing `message_log` or per-token data would
@@ -438,6 +420,11 @@ class SyncRolloutActor:
         else:
             gen_metrics = None
         return meta, BatchedDataDict(driver_carry), rollout_metrics, gen_metrics
+
+    def get_data_plane_snapshot(self) -> "dict[str, Any] | None":
+        if not is_metrics_client(self._dp_client):
+            return None
+        return self._dp_client.snapshot(reset_step_window=True)
 
     def shutdown(self) -> None:
         try:

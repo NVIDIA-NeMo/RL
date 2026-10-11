@@ -32,6 +32,7 @@ MXFP8_CASES = {
         "segment_size": 16,
         "async_engine": True,
         "tensor_parallel_size": 32,
+        "gpu_memory_utilization": 0.4,
         "moe_backend": "flashinfer_trtllm",
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
@@ -274,6 +275,8 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
             config["policy"]["generation"]["colocated"]["discard_weights_on_sleep"]
             is expected["discard_weights_on_sleep"]
         )
+    if expected.get("gpu_memory_utilization") is not None:
+        assert vllm_cfg["gpu_memory_utilization"] == expected["gpu_memory_utilization"]
     if expected["async_engine"] is not None:
         assert vllm_cfg["async_engine"] is expected["async_engine"]
     assert (

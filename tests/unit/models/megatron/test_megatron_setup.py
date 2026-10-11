@@ -886,6 +886,20 @@ class TestApplyMoeConfig:
         _apply_moe_config(model_cfg, config)
 
         assert not hasattr(model_cfg, "moe_grouped_gemm")
+        assert not hasattr(model_cfg, "inference_flashinfer_mxfp8_token_capacity")
+
+    def test_flashinfer_mxfp8_token_capacity_forwarded(self):
+        """Without this key MCore runs FlashInfer MXFP8 MoE over the full dispatcher buffer."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["inference_flashinfer_mxfp8_token_capacity"] = 512
+        config = {"megatron_cfg": megatron_cfg}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.inference_flashinfer_mxfp8_token_capacity == 512
 
     def test_hybridep_input_prepadding_wins_after_bridge_validation(self):
         from nemo_rl.models.megatron import setup

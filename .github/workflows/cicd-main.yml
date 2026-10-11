@@ -17,6 +17,7 @@ on:
   push:
     branches:
       - main
+      - "r[0-9]+.[0-9]+.[0-9]+"
       - "pull-request/[0-9]+"
   schedule:
     - cron: "0 9 * * *"
@@ -32,7 +33,7 @@ on:
           - L0
           - L1
           - L2
-        description: Test level to run. docs = doc tests only (reuses main container), Lfast = fast subset (reuses main container), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
+        description: Test level to run. docs = doc tests only (reuses main container), Lfast = fast subset (reuses main container, or the release branch's container for PRs to a release branch), L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
       test_script_pattern:
         description: "Case-insensitive substring used to select unit and functional test script names (for example, Megatron_1 or Vllm)."
         required: false
@@ -80,6 +81,7 @@ jobs:
       gb200_functional_test_count: ${{ steps.evaluate.outputs.gb200_functional_test_count }}
       megatron_lm_commit: ${{ steps.evaluate.outputs.megatron_lm_commit }}
       base_ref: ${{ steps.base-head-ref.outputs.base_ref }}
+      cache_scope: ${{ steps.base-head-ref.outputs.cache_scope }}
       base_sha: ${{ steps.base-head-ref.outputs.base_sha }}
       head_ref: ${{ steps.base-head-ref.outputs.head_ref }}
       head_sha: ${{ steps.base-head-ref.outputs.head_sha }}
@@ -103,6 +105,7 @@ jobs:
           IS_PULL_REQUEST_REF: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
           PR_INFO_JSON: ${{ steps.get-pr-info.outputs.pr-info }}
         run: |
+          cache_scope=""
           if [[ "$IS_PULL_REQUEST_REF" == "true" && -n "$PR_INFO_JSON" ]]; then
             base_ref=$(echo "$PR_INFO_JSON" | jq -r '.base.ref')
             base_sha=$(echo "$PR_INFO_JSON" | jq -r '.base.sha')
@@ -112,7 +115,16 @@ jobs:
             head_label=$(echo "$PR_INFO_JSON" | jq -r '.head.label // empty')
             ci_label=$(echo "$PR_INFO_JSON" | jq -r '[.labels[]? | (if type == "string" then . else .name end) | select(startswith("CI:"))] | first // empty')
             has_skip_cicd=$(echo "$PR_INFO_JSON" | jq -r '[.labels[]? | (if type == "string" then . else .name end) | select(. == "Skip CICD")] | length > 0')
+            # PRs targeting a release branch (e.g. r0.8.0) pin different submodule/TRT-LLM refs than main,
+            # so they must not share main's TRT-LLM caches or its prebuilt container.
+            if [[ "$base_ref" =~ ^r[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              cache_scope="$base_ref"
+            fi
           else
+            # Runs on the release branch itself (push after a merge) own that branch's caches and image tag.
+            if [[ "${{ github.ref_name }}" =~ ^r[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              cache_scope="${{ github.ref_name }}"
+            fi
             base_ref="HEAD~1"
             base_sha=$(git rev-parse HEAD~1)
             head_ref="HEAD"
@@ -124,6 +136,7 @@ jobs:
           fi
           [[ "$has_skip_cicd" != "true" ]] && has_skip_cicd="false"
           echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          echo "cache_scope=$cache_scope" >> "$GITHUB_OUTPUT"
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
           echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
@@ -154,6 +167,7 @@ jobs:
           CHANGED_SRC: ${{ steps.changed-files.outputs.src_all_changed_files }}
           IS_PULLREQUEST: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
           LABEL: ${{ steps.base-head-ref.outputs.ci_label }}
+          CACHE_SCOPE: ${{ steps.base-head-ref.outputs.cache_scope }}
           MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           DISPATCH_TEST_LEVEL: ${{ inputs.test_to_run }}
           DISPATCH_IMAGE_TAG: ${{ inputs.image_tag }}
@@ -274,9 +288,14 @@ jobs:
             echo "megatron_lm_commit=${MEGATRON_LM_COMMIT,,}"
           } | tee -a "$GITHUB_OUTPUT"
 
-          # Determine image tag: Lfast and docs reuse the main container, workflow_dispatch can override
+          # Determine image tag: Lfast and docs reuse a prebuilt container, workflow_dispatch can override.
+          # Lfast on a release-branch PR reuses that branch's container (published only by builds of the
+          # release branch itself after merges) because the main container carries main's TRT-LLM wheel,
+          # not the release branch's. PR builds never overwrite it.
           IMAGE_TAG=""
-          if [[ "$TEST_LEVEL" == "Lfast" || "$TEST_LEVEL" == "docs" ]]; then
+          if [[ "$TEST_LEVEL" == "Lfast" && "$IS_PULLREQUEST" == "true" && -n "$CACHE_SCOPE" ]]; then
+            IMAGE_TAG="$CACHE_SCOPE"
+          elif [[ "$TEST_LEVEL" == "Lfast" || "$TEST_LEVEL" == "docs" ]]; then
             IMAGE_TAG="main"
           fi
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "$DISPATCH_IMAGE_TAG" ]]; then
@@ -562,6 +581,7 @@ jobs:
         ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
       trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
+      trtllm-cache-scope: ${{ needs.pre-flight.outputs.cache_scope }}
       megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
       megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
       build-args: |
@@ -610,6 +630,7 @@ jobs:
         ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.gb200-config.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
       trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
+      trtllm-cache-scope: ${{ needs.pre-flight.outputs.cache_scope }}
       megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
       megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
       build-args: |
@@ -1112,7 +1133,7 @@ jobs:
             echo "| Label | What it runs |" >> $GITHUB_STEP_SUMMARY
             echo "|-------|-------------|" >> $GITHUB_STEP_SUMMARY
             echo "| \`CI:docs\` | Doc tests only |" >> $GITHUB_STEP_SUMMARY
-            echo "| \`CI:Lfast\` | Fast subset (reuses main container) |" >> $GITHUB_STEP_SUMMARY
+            echo "| \`CI:Lfast\` | Fast subset (reuses main container; release-branch PRs reuse that branch's container) |" >> $GITHUB_STEP_SUMMARY
             echo "| \`CI:L0\` | Unit tests + docs + lint |" >> $GITHUB_STEP_SUMMARY
             echo "| \`CI:L1\` | L0 + functional tests |" >> $GITHUB_STEP_SUMMARY
             echo "| \`CI:L2\` | L1 + convergence tests |" >> $GITHUB_STEP_SUMMARY
