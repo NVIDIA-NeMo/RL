@@ -488,8 +488,8 @@ def _assert_route_rows(rows, fragments):
     for row in rows:
         for key, got in row.items():
             assert got.routes.dtype == fragments[key].routes.dtype
-            # The leader keeps its broadcast copy on the transport device.
-            assert torch.equal(got.routes.cpu(), fragments[key].routes)
+            assert got.routes.device.type == "cpu"
+            assert torch.equal(got.routes, fragments[key].routes)
             assert got.encoding == fragments[key].encoding
             assert got.extras_metadata_json == fragments[key].extras_metadata_json
 
