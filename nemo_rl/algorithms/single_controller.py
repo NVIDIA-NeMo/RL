@@ -108,6 +108,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     evaluation_only_checkpoints,
     is_ppo_run,
+    step_checkpoint_due,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
@@ -3272,28 +3273,13 @@ class SingleControllerActor:
                 is_last_step = self._train_steps >= self._algo_cfg.max_num_steps or (
                     self._rollout_exhausted.is_set() and len(self._buffer) == 0
                 )
-                ft_save_period = self._master_config.checkpointing.get("ft_save_period")
                 # _train_steps was already incremented above, so it equals
                 # the legacy loop's 1-indexed `step + 1`.
-                should_save_by_step = (
-                    is_last_step
-                    or self._train_steps
-                    % self._master_config.checkpointing["save_period"]
-                    == 0
-                    or (
-                        ft_save_period is not None
-                        and self._train_steps % ft_save_period == 0
-                    )
+                should_save_by_step = step_checkpoint_due(
+                    self._master_config,
+                    train_steps=self._train_steps,
+                    is_last_step=is_last_step,
                 )
-                # Deferred evaluation retains exactly the requested first and
-                # final endpoints. Never silently alter max_num_steps, and avoid
-                # intervening periodic saves pruning the first endpoint.
-                deferred_eval = getattr(self._algo_cfg, "deferred_evaluation", None)
-                if deferred_eval and deferred_eval.get("enabled", False):
-                    should_save_by_step = (
-                        self._train_steps == int(deferred_eval["first_step"])
-                        or is_last_step
-                    )
                 # Call once per step and reuse the bool.
                 should_save_by_timeout = self._timeout.check_save()
                 will_save_checkpoint = self._master_config.checkpointing[
@@ -4757,8 +4743,9 @@ class SingleControllerActor:
         async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
             save_state.current_step = self._train_steps
             save_state.total_steps = self._train_steps
-            if evaluation_only_checkpoints(self._master_config):
-                save_state.evaluation_only = True
+            save_state.evaluation_only = evaluation_only_checkpoints(
+                self._master_config
+            )
             save_state.trainer_version = self._trainer_version
             save_state.current_epoch = self._current_epoch
             save_state.consumed_samples = self._consumed_samples

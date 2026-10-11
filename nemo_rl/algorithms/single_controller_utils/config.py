@@ -1265,10 +1265,90 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
 
+def deferred_evaluation_config(master_config: MasterConfig) -> Optional[dict[str, Any]]:
+    """The ``deferred_evaluation`` block when it is enabled, else None."""
+    deferred = getattr(algo_config(master_config), "deferred_evaluation", None)
+    if deferred and deferred.get("enabled", False):
+        return deferred
+    return None
+
+
 def evaluation_only_checkpoints(master_config: MasterConfig) -> bool:
     """Opt-in weights-only endpoints are for evaluation, never SC recovery."""
-    deferred = getattr(algo_config(master_config), "deferred_evaluation", None)
-    return bool(deferred and deferred.get("enabled") and deferred.get("weights_only"))
+    deferred = deferred_evaluation_config(master_config)
+    return bool(deferred and deferred.get("weights_only"))
+
+
+def step_checkpoint_due(
+    master_config: MasterConfig, *, train_steps: int, is_last_step: bool
+) -> bool:
+    """Whether the step-based checkpoint schedule fires after ``train_steps``.
+
+    Deferred evaluation retains exactly its first and final endpoints, so it
+    replaces the periodic and fault-tolerance schedule. ``max_num_steps`` is
+    never altered. Timeout saves are decided by the caller.
+    """
+    deferred = deferred_evaluation_config(master_config)
+    if deferred is not None:
+        return train_steps == deferred["first_step"] or is_last_step
+    checkpointing = master_config.checkpointing
+    ft_save_period = checkpointing.get("ft_save_period")
+    return (
+        is_last_step
+        or train_steps % checkpointing["save_period"] == 0
+        or (ft_save_period is not None and train_steps % ft_save_period == 0)
+    )
+
+
+def _validate_deferred_evaluation(master_config: MasterConfig) -> None:
+    """Validate an enabled ``grpo.deferred_evaluation`` block before setup.
+
+    The block is an undeclared extra key on the algorithm config, so every
+    misconfiguration would otherwise surface mid-run (a missing ``first_step``
+    as a KeyError after step 1) or silently (an endpoint that is never saved).
+    """
+    deferred = deferred_evaluation_config(master_config)
+    if deferred is None:
+        return
+    if is_ppo_run(master_config):
+        raise ValueError("SingleController deferred evaluation requires GRPO")
+    checkpointing = master_config.checkpointing
+    if not checkpointing["enabled"] or any(
+        checkpointing.get(key, False) for key in ("save_optimizer", "save_data_plane")
+    ):
+        raise ValueError(
+            "Deferred evaluation requires enabled weights-only checkpoints"
+        )
+    first_step = deferred.get("first_step")
+    max_num_steps = algo_config(master_config).max_num_steps
+    if (
+        type(first_step) is not int
+        or isinstance(first_step, bool)
+        or not 1 <= first_step <= max_num_steps
+    ):
+        raise ValueError(
+            "grpo.deferred_evaluation.first_step must be an integer in "
+            f"[1, grpo.max_num_steps={max_num_steps}]; got {first_step!r}"
+        )
+    if first_step == max_num_steps:
+        # A single endpoint is always the latest checkpoint, which retention keeps.
+        return
+    # Retention keeps only the latest checkpoint, save_period-aligned ones within
+    # keep_top_k, and ft_keep_latest_k. Without both guarantees below the first
+    # endpoint is pruned when the final one is saved, leaving a single endpoint.
+    save_period = checkpointing["save_period"]
+    if first_step % save_period != 0:
+        raise ValueError(
+            "grpo.deferred_evaluation.first_step "
+            f"({first_step}) must be a multiple of checkpointing.save_period "
+            f"({save_period}), or retention prunes the first endpoint"
+        )
+    keep_top_k = checkpointing.get("keep_top_k")
+    if keep_top_k is not None and keep_top_k < 2:
+        raise ValueError(
+            f"checkpointing.keep_top_k ({keep_top_k}) must be unset or >= 2 so "
+            "that both deferred-evaluation endpoints are retained"
+        )
 
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
@@ -1291,16 +1371,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             )
         _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
-    if evaluation_only_checkpoints(master_config):
-        if is_ppo_run(master_config):
-            raise ValueError("SingleController deferred evaluation requires GRPO")
-        if not master_config.checkpointing["enabled"] or any(
-            master_config.checkpointing.get(key, False)
-            for key in ("save_optimizer", "save_data_plane")
-        ):
-            raise ValueError(
-                "Deferred evaluation requires enabled weights-only checkpoints"
-            )
+    _validate_deferred_evaluation(master_config)
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)

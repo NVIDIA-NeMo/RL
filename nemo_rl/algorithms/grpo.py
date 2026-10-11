@@ -417,6 +417,13 @@ class GRPOSaveState:
     # SingleController only: exact last admitted dispatch batch. None preserves
     # compatibility with checkpoints that only recorded the trainer version.
     sampler_dispatch_index: Optional[int] = None
+    # SingleController only: True on weights-only deferred-evaluation endpoints,
+    # which cannot resume training. False on every other checkpoint.
+    evaluation_only: bool = False
+    # SingleController only: wall-clock end of the last completed optimizer
+    # update, in epoch milliseconds. Offline evaluation attributes accuracy to
+    # it. None until the first policy update and on older checkpoints.
+    training_step_end_time_ms: Optional[int] = None
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:

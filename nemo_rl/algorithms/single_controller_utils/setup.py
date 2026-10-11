@@ -1312,13 +1312,19 @@ def setup_single_controller(
         Optional[dict[str, Any]],
         checkpointer.load_training_info(trainer_checkpoint_path),
     )
-    if (loaded_state and loaded_state.get("evaluation_only")) or (
-        trainer_checkpoint_path is not None
-        and evaluation_only_checkpoints(master_config)
+    if loaded_state and loaded_state.get("evaluation_only"):
+        raise ValueError(
+            "The checkpoint is an evaluation-only deferred-evaluation endpoint "
+            "(weights only, no recovery state) and cannot resume SingleController "
+            "training; use a fresh checkpoint_dir."
+        )
+    if trainer_checkpoint_path is not None and evaluation_only_checkpoints(
+        master_config
     ):
         raise ValueError(
-            "Evaluation-only checkpoints cannot resume SingleController training; "
-            "use a fresh checkpoint_dir or a full recovery checkpoint."
+            "grpo.deferred_evaluation.weights_only does not support resuming, "
+            "including a requeue after a timeout; use a fresh checkpoint_dir, or "
+            "disable weights_only for a resumable run."
         )
     save_state = _get_grpo_save_state(loaded_state)
     weights_path, optimizer_path = checkpointer.get_resume_paths(
