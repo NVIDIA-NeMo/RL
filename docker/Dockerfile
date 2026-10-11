@@ -668,6 +668,10 @@ EOF
 # out to `uv pip install --no-cache`, which uv refuses to combine with symlink installs.
 # Gym pins vllm==0.25.1; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
 # RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
+# These two settings are meant for the Gym server venvs only, so the outer `uv run` uses
+# --no-sync: without it, uv re-syncs ${UV_PROJECT_ENVIRONMENT} under them first, which on
+# arm64 swaps a package in the main venv, and the runtime-UID `uv sync --frozen` check at the
+# end of this stage then fails on the root-owned files it would have to rewrite.
 ARG NEMO_GYM_CUDA=cu130
 ARG NEMO_GYM_VLLM_VERSION=0.25.1
 RUN <<"EOF" bash -exu
@@ -678,7 +682,7 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
         "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
     UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
     UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
-    UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
+    UV_LINK_MODE=symlink uv run --no-sync python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
     rm -f "${GYM_VLLM_OVERRIDE}"
 fi
 EOF
