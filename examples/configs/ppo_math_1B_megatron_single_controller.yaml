@@ -300,6 +300,11 @@ rollout_recovery:
   # provides compatibility for legacy datasets without task_source.
   #   agent_target_level_overrides: {genrm_agent: prompt_group}
   agent_target_level_overrides: {}
+  # Seconds every Gym deployment gets to park its in-flight steps before a
+  # "turn" checkpoint gives up on this attempt. Raise it for long agent or
+  # environment steps; token_capture.control_timeout_s still bounds each
+  # other Gym control call.
+  gym_prepare_timeout_s: 300.0
 
 # Leaving either map above non-empty requires the top-level token_capture section
 # to set enabled: true.

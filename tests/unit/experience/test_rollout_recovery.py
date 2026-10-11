@@ -866,6 +866,14 @@ def test_recovery_config_rejects_removed_task_name_override() -> None:
         )
 
 
+@pytest.mark.parametrize("timeout_s", [0.0, -1.0])
+def test_recovery_config_rejects_a_non_positive_gym_prepare_timeout(
+    timeout_s: float,
+) -> None:
+    with pytest.raises(ValueError, match="gym_prepare_timeout_s"):
+        RolloutRecoveryConfig(gym_prepare_timeout_s=timeout_s)
+
+
 def test_target_step_none_does_not_mean_unadmitted() -> None:
     ledger = RolloutRecoveryLedger()
     record = _reserve(
