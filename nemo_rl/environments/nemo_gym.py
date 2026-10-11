@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import copy
 import errno
 import json
 import math
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -426,9 +428,11 @@ def _gym_failure_row_error(
     ``run_examples(route_failures_to_sidecar=True)`` resolves a failed ``/run`` to its
     row plus ``_ng_failure_*`` fields instead of an exception that carries no row. That
     is what lets an ``admission_closed`` refusal name the row it refused while the rest
-    of the batch keeps streaming. Every other failure maps to what
-    :func:`_typed_gym_failure` returns for the same status, and a failure with no HTTP
-    reply is transport-shaped unless the reply arrived but was not JSON.
+    of the batch keeps streaming. An environment server's failed episode is data when
+    Gym marks it terminal and is re-sent otherwise. Every other failure maps to what
+    :func:`_typed_gym_failure` returns for the same error status, and one without an
+    error status, including a reply whose body broke off, is transport-shaped unless
+    the reply arrived but was not JSON.
 
     Only Gym's no-rollout classes are failures. A row that ran can carry a class
     too, such as the ``judge_failed`` row Gym's judge failsafe scores zero and masks;
@@ -446,6 +450,7 @@ def _gym_failure_row_error(
         AGENT_RUN_ERROR_FAILURE_CLASS,
         ENVIRONMENT_SERVER_FAILURE_CLASS,
         NG_FAILURE_CLASS_KEY,
+        NG_TERMINAL_KEY,
     )
 
     if result[NG_FAILURE_CLASS_KEY] not in {
@@ -462,7 +467,14 @@ def _gym_failure_row_error(
             f"NeMo-Gym refused /run while a checkpoint has admission closed: {body}",
             row["_rowidx"],
         )
-    if isinstance(status, int):
+    if result[NG_FAILURE_CLASS_KEY] == ENVIRONMENT_SERVER_FAILURE_CLASS:
+        detail = f"NeMo-Gym environment server failed the episode: {message}"
+        if result.get(NG_TERMINAL_KEY):
+            return RolloutDataFailure(detail)
+        return GymTransportError(detail)
+    # Gym stamps the reply's own status when only its body failed, so a 200
+    # here is a transport failure, not a data one.
+    if isinstance(status, int) and status >= 400:
         detail = f"NeMo-Gym /run failed with HTTP {status}: {message}"
         if http_status_is_infra(status):
             return GymTransportError(detail)
@@ -559,6 +571,30 @@ _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 # the token-capture secret: as an environment interpolation each server
 # resolves in its own process, never as a value in the serialized config.
 _POLICY_API_KEY_ENV = "NEMO_RL_POLICY_API_KEY"
+
+
+def _reject_typed_environment_servers(global_config: Mapping[str, Any]) -> None:
+    """Refuse turn recovery behind an environment server with a typed episode protocol.
+
+    A restored attempt reaches Gym as the attempt-qualified rollout id
+    ``<id>-a<N>``. An agent decodes it, including behind the ``legacy_agent``
+    relay, but a typed environment server builds ``EpisodeId`` from it
+    directly, which Gym rejects, so every restored turn would be re-run from
+    scratch until its row budget is spent.
+    """
+    typed = sorted(
+        f"{instance}={server_type}"
+        for instance, entry in global_config.items()
+        if isinstance(entry, Mapping)
+        for server_type in entry.get("environment_servers") or {}
+        if server_type != "legacy_agent"
+    )
+    if typed:
+        raise ValueError(
+            "rollout_recovery.target_level='turn' does not support environment "
+            f"servers with a typed episode protocol yet: {typed}; route these "
+            "rows through a legacy_agent environment server or use 'sibling'"
+        )
 
 
 def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
@@ -1163,15 +1199,13 @@ Depending on your data shape, you may want to change these values."""
         if not self.cfg["turn_checkpointing_enabled"]:
             raise RuntimeError("Gym checkpoint coordination is not enabled")
         if self._checkpoint_adapter is None:
-            token_capture = self.cfg.get("token_capture")
-            if token_capture is None:
-                raise RuntimeError(
-                    "Gym checkpoint coordination has no token-capture credentials"
-                )
+            _reject_typed_environment_servers(self._control_client().global_config_dict)
             self._checkpoint_adapter = GymCheckpointAdapter(
                 instance=self.cfg["checkpoint_instance"],
                 client=self._control_client(),
-                auth_token=token_capture["control_auth_token"],
+                auth_token=self.cfg["initial_global_config_dict"]["checkpoint"][
+                    "control_auth_token"
+                ],
             )
         return await self._checkpoint_adapter.discover()
 
@@ -1454,6 +1488,38 @@ Depending on your data shape, you may want to change these values."""
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         num_results = 0
+
+        def finish_row(agent_name: str) -> Optional[dict[str, Any]]:
+            """Count one resolved row; return the ``/run`` timing on its last."""
+            nonlocal num_results
+            num_results += 1
+            counts_left[agent_name] -= 1
+            if counts_left[agent_name] <= 0:
+                counts_left.pop(agent_name)
+            if num_results % 10 == 0 and counts_left:
+                top_left = counts_left.most_common(5)
+                top_left_str = "\n".join(
+                    f"{index + 1}. {name}: {count}"
+                    for index, (name, count) in enumerate(top_left)
+                )
+                print(
+                    "Top 5 NeMo Gym agent refs left in this rollout batch: "
+                    f"{top_left_str}",
+                    file=sys.stderr,
+                )
+            if num_results != len(nemo_gym_examples):
+                return None
+            timer.stop("_run_rollouts_total")
+            timing_metrics = timer.get_timing_metrics("sum")
+            total_time = timing_metrics.pop("_run_rollouts_total")
+            # A run whose every row was refused post-processed nothing.
+            postprocess_time = timing_metrics.get(f"{timer_prefix}/postprocess_results")
+            if postprocess_time is not None:
+                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+                    100 * postprocess_time / total_time
+                )
+            return timing_metrics
+
         for task in nemo_gym_result_iterator:
             with timer.time(label=f"{timer_prefix}/await_results"):
                 try:
@@ -1487,8 +1553,11 @@ Depending on your data shape, you may want to change these values."""
                 # Yielded, not raised: rows Gym admitted before the checkpoint
                 # closed admission keep streaming, and the caller unwinds this one
                 # row before the checkpoint drains.
-                num_results += 1
-                yield failure
+                yield GymAdmissionClosed(
+                    failure.detail,
+                    failure.rowidx,
+                    finish_row(nemo_gym_row["agent_ref"]["name"]),
+                )
                 continue
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
@@ -1509,33 +1578,7 @@ Depending on your data shape, you may want to change these values."""
                     )
                     if _has_nan_generation_logprobs(nemo_rl_result):
                         raise RuntimeError("Generation logprobs contain NaN")
-            num_results += 1
-            timing_metrics = None
-            if num_results == len(nemo_gym_examples):
-                timer.stop("_run_rollouts_total")
-                timing_metrics = timer.get_timing_metrics("sum")
-                total_time = timing_metrics.pop("_run_rollouts_total")
-                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-                    100
-                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
-                    / total_time
-                )
-
-            agent_name = nemo_gym_row["agent_ref"]["name"]
-            counts_left[agent_name] -= 1
-            if counts_left[agent_name] <= 0:
-                counts_left.pop(agent_name)
-            if num_results % 10 == 0 and counts_left:
-                top_left = counts_left.most_common(5)
-                top_left_str = "\n".join(
-                    f"{index + 1}. {name}: {count}"
-                    for index, (name, count) in enumerate(top_left)
-                )
-                print(
-                    "Top 5 NeMo Gym agent refs left in this rollout batch: "
-                    f"{top_left_str}",
-                    file=sys.stderr,
-                )
+            timing_metrics = finish_row(nemo_gym_row["agent_ref"]["name"])
 
             # task_source is resolved to agent_ref inside this Ray actor, after
             # the caller's row was serialized. Return the resolved ref explicitly
@@ -2431,15 +2474,16 @@ def _build_gym_actor_config(
             raise ValueError(
                 "Gym checkpoint coordination requires token capture to be enabled"
             )
-        control_auth_token = instance_token_capture.get("control_auth_token")
-        if not isinstance(control_auth_token, str) or not control_auth_token:
-            raise ValueError(
-                "Gym checkpoint coordination requires a token-capture control token"
-            )
+        # Gym serves its global config unauthenticated, so checkpoint control
+        # gets a credential of its own rather than the token-capture one.
         nemo_gym_dict["checkpoint"] = {
             "enabled": True,
-            "control_auth_token": control_auth_token,
+            "control_auth_token": secrets.token_hex(32),
         }
+        # The copy above is shallow; keep the caller's policy_model untouched.
+        nemo_gym_dict["policy_model"] = copy.deepcopy(
+            nemo_gym_dict.get("policy_model", {})
+        )
         policy_overrides = (
             nemo_gym_dict.setdefault("policy_model", {})
             .setdefault("responses_api_models", {})
