@@ -108,7 +108,7 @@ class TrtllmConfig(GenerationConfig):
     # Escape hatch for arbitrary TRT-LLM LLM/AsyncLLM constructor kwargs not
     # covered by TrtllmSpecificArgs (e.g. sampler_type, enable_attention_dp).
     # Spread into the engine constructor as `**trtllm_kwargs`, and shared by
-    # every engine -- a single engine's are trtllm_cfg.{ctx,gen}.trtllm_kwargs,
+    # every engine -- a single engine's are trtllm_cfg.{prefill,decode}_engine.trtllm_kwargs,
     # which are merged over these.
     trtllm_kwargs: NotRequired[dict[str, Any]]
 

@@ -123,7 +123,6 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import (
-    DisaggConfig,
     GenerationConfig,
     GenerationInterface,
     GenerationSamplingParams,
@@ -133,6 +132,7 @@ from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
+from nemo_rl.models.generation.trtllm.config import resolve_disagg_layout
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
@@ -582,6 +582,61 @@ def _shutdown_completed_nemo_gym_startup(
     shard_set.shutdown()
 
 
+def _check_disaggregation_backend(generation_config: GenerationConfig) -> None:
+    """Refuse ``generation.disaggregation.enabled`` on a backend without it.
+
+    The block is written in backend-agnostic terms, but only the TRT-LLM
+    backend implements it today: it is the one with a frontend
+    (OpenAIDisaggServer) to place in front of the two engine pools and a KV
+    transceiver to carry the handoff. Every other backend would silently ignore
+    the whole block and serve aggregated, which looks like a working run at half
+    the configured engine count -- so refuse to start instead.
+    """
+    if (
+        resolve_disagg_layout(generation_config).enabled
+        and generation_config["backend"] != "trtllm"
+    ):
+        raise ValueError(
+            "policy.generation.disaggregation.enabled is only supported for "
+            f"backend='trtllm', got '{generation_config['backend']}'. Set it to "
+            "false, or switch the backend."
+        )
+
+
+def _trtllm_nvlink_domain_span(generation_config: GenerationConfig) -> int:
+    """GPUs a TRT-LLM generation instance needs inside one NVLink domain.
+
+    TP is the whole engine width: TrtllmGeneration asserts
+    pipeline_parallel_size == 1, so there is no PP factor to fold in.
+
+    Under PD disaggregation the unit to keep inside one NVLink domain is the
+    *replica*, not the engine: an engine's TP group all-reduces internally, but
+    the KV cache handed from the replica's prefill engines to its decode engines
+    crosses the transceiver on every turn. Sizing by the engine would yield
+    nodes_per_instance=1 whenever an engine fits in a node, which skips domain
+    pinning entirely and lets a replica straddle racks -- correct, but with the
+    KV transfer demoted from NVLink to InfiniBand.
+    """
+    trtllm_cfg = generation_config.get("trtllm_cfg", {})
+    # MasterConfig validates disaggregation into a DisaggConfig, while direct
+    # callers may still pass a dict; the resolver accepts either shape.
+    disagg_cfg = resolve_disagg_layout(generation_config)
+    if not disagg_cfg.enabled:
+        return trtllm_cfg["tensor_parallel_size"]
+
+    def _role_tp(role: str) -> int:
+        # Per-role engine overrides live beside the engine config they
+        # override, not under disaggregation.
+        overrides = trtllm_cfg.get(f"{role}_engine") or {}
+        return int(
+            overrides.get("tensor_parallel_size", trtllm_cfg["tensor_parallel_size"])
+        )
+
+    return disagg_cfg.num_prefill_engines * _role_tp(
+        "prefill"
+    ) + disagg_cfg.num_decode_engines * _role_tp("decode")
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -652,24 +707,7 @@ def setup(
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
 
-    # generation.disaggregation is written in backend-agnostic terms, but only
-    # the TRT-LLM backend implements it today: it is the one with a frontend
-    # (OpenAIDisaggServer) to place in front of the two engine pools and a KV
-    # transceiver to carry the handoff. Every other backend would silently
-    # ignore the whole block and serve aggregated, which looks like a working
-    # run at half the configured engine count -- so refuse to start instead.
-    disagg = generation_config.get("disaggregation")
-    disagg_enabled = (
-        disagg.enabled
-        if isinstance(disagg, DisaggConfig)
-        else bool((disagg or {}).get("enabled"))
-    )
-    if disagg_enabled and generation_config["backend"] != "trtllm":
-        raise ValueError(
-            "policy.generation.disaggregation.enabled is only supported for "
-            f"backend='trtllm', got '{generation_config['backend']}'. Set it to "
-            "false, or switch the backend."
-        )
+    _check_disaggregation_backend(generation_config)
 
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
@@ -1184,44 +1222,7 @@ def setup(
                         "pipeline_parallel_size", 1
                     )
                 elif generation_config["backend"] == "trtllm":
-                    # TP is the whole engine width here: TrtllmGeneration
-                    # asserts pipeline_parallel_size == 1, so there is no PP
-                    # factor to fold in.
-                    trtllm_cfg = generation_config.get("trtllm_cfg", {})
-                    disagg_cfg = generation_config.get("disaggregation") or {}
-                    if disagg_cfg.get("enabled"):
-                        # Under PD disaggregation the unit to keep inside one
-                        # NVLink domain is the *replica*, not the engine: an
-                        # engine's TP group all-reduces internally, but the KV
-                        # cache handed from the replica's prefill engines to its
-                        # decode engines crosses the transceiver on every
-                        # turn. Sizing this by the engine (below) yields
-                        # nodes_per_instance=1 whenever an engine fits in a node,
-                        # which skips domain pinning entirely and lets a replica
-                        # straddle racks -- correct, but with the KV transfer
-                        # demoted from NVLink to InfiniBand.
-                        def _role_tp(role: str) -> int:
-                            # Per-role engine overrides live beside the engine
-                            # config they override, not under disaggregation.
-                            overrides = trtllm_cfg.get(f"{role}_engine") or {}
-                            return int(
-                                overrides.get(
-                                    "tensor_parallel_size",
-                                    trtllm_cfg["tensor_parallel_size"],
-                                )
-                            )
-
-                        # Both default to 1, matching DisaggConfig, so enabling
-                        # disaggregation without naming the counts sizes a
-                        # one-of-each replica here as it does in the backend.
-                        gpus_per_instance = int(
-                            disagg_cfg.get("num_prefill_engines", 1)
-                            * _role_tp("prefill")
-                            + disagg_cfg.get("num_decode_engines", 1)
-                            * _role_tp("decode")
-                        )
-                    else:
-                        gpus_per_instance = trtllm_cfg["tensor_parallel_size"]
+                    gpus_per_instance = _trtllm_nvlink_domain_span(generation_config)
                 elif generation_config["backend"] == "dynamo":
                     gpus_per_instance = DynamoConfig.model_validate(
                         generation_config

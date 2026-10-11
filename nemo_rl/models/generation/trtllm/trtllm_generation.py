@@ -448,7 +448,10 @@ class TrtllmGeneration(GenerationInterface):
             overrides[self._engine_key(pg_idx, bundles)] = {
                 "_disagg_role": role,
                 "_disagg_role_ordinal": ordinal,
-                **self._role_overrides(self.cfg["trtllm_cfg"], role),
+                # Under disaggregation _plan_engines only emits these two.
+                **self._role_overrides(
+                    self.cfg["trtllm_cfg"], cast(Literal["prefill", "decode"], role)
+                ),
             }
 
         cfg = dict(self.cfg)
@@ -682,25 +685,24 @@ class TrtllmGeneration(GenerationInterface):
         futures = []
         for replica_idx in range(self.num_replicas):
             base = replica_idx * per_replica
-            serve_args = dict(
-                ctx_addrs=[
-                    (a["host"], a["port"])
-                    for a in addrs[base : base + num_prefill]
+            serve_args: dict[str, Any] = {
+                "ctx_addrs": [
+                    (a["host"], a["port"]) for a in addrs[base : base + num_prefill]
                 ],
-                gen_addrs=[
+                "gen_addrs": [
                     (a["host"], a["port"])
                     for a in addrs[base + num_prefill : base + per_replica]
                 ],
-                ctx_router=server.ctx_router,
-                gen_router=server.gen_router,
-                gen_tokids_ctxbytes=server.gen_tokids_ctxbytes,
-                gen_strip_message_history=server.gen_strip_message_history,
-                frontend_tokenize=disagg.frontend_tokenize,
-                model_name=self.cfg["model_name"],
-                default_chat_template_kwargs=self.cfg["trtllm_cfg"].get(
+                "ctx_router": server.ctx_router,
+                "gen_router": server.gen_router,
+                "gen_tokids_ctxbytes": server.gen_tokids_ctxbytes,
+                "gen_strip_message_history": server.gen_strip_message_history,
+                "frontend_tokenize": disagg.frontend_tokenize,
+                "model_name": self.cfg["model_name"],
+                "default_chat_template_kwargs": self.cfg["trtllm_cfg"].get(
                     "default_chat_template_kwargs"
                 ),
-            )
+            }
             for fe_idx in range(n_fe):
                 # Its own CPU-only actor rather than an engine worker's
                 # process: this is the request hot path for the whole replica,
@@ -788,13 +790,16 @@ class TrtllmGeneration(GenerationInterface):
         return ray.get(futures)
 
     def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
-        """One or more OpenAI-compatible base URLs per DP shard, in shard order.
+        """OpenAI-compatible base URLs, grouped by DP shard in shard order.
 
         A shard's entry point is not always an engine: under disaggregation the
         caller must talk to the replica's disagg server, which routes prefill and
-        decode itself. Branching here rather than at the call site keeps the
-        contract "one URL per DP shard" true on both paths -- an engine-per-URL
-        list would have ``num_engines`` entries, which is no longer ``dp_size``.
+        decode itself. Without disaggregation this is one URL per DP shard.
+        With it, each replica (shard) contributes its ``num_frontend_workers``
+        (F) disagg servers, so the list has ``num_replicas * F`` entries,
+        replica-major -- callers must not index it by shard when F > 1. An
+        engine-per-URL list would instead have ``num_engines`` entries, which is
+        no longer ``dp_size``.
         """
         if self._disagg_cfg.enabled:
             return self._start_disagg_servers()

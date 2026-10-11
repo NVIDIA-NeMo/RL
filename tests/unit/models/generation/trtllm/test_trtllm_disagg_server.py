@@ -22,6 +22,8 @@ to the strip list; the TRT-LLM engine adapter ignores that field anyway.
 
 import asyncio
 import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -317,3 +319,35 @@ def test_decoded_tokens_are_not_mistaken_for_ids():
 
 def test_a_response_without_choices_is_returned_unchanged():
     assert attach_rollout_fields({"choices": []}) == {"choices": []}
+
+
+def _engine_rejection(status: int, body: dict):
+    import aiohttp
+
+    # aiohttp's message is the engine's raw response body.
+    return aiohttp.ClientResponseError(
+        request_info=MagicMock(), history=(), status=status, message=json.dumps(body)
+    )
+
+
+def _adaptor_handling(exception) -> Exception:
+    pytest.importorskip("tensorrt_llm.serve.openai_disagg_server")
+    from nemo_rl.models.generation.trtllm.trtllm_disagg_server import (
+        _build_adaptor_class,
+    )
+
+    server = SimpleNamespace(_perf_metrics_collector=MagicMock())
+    with pytest.raises(Exception) as raised:
+        _build_adaptor_class()._handle_exception(server, exception)
+    return raised.value
+
+
+def test_an_engine_context_length_rejection_keeps_its_text():
+    # Gym classifies overflow by this text. The base handler would replace it,
+    # because it only unwraps {"error": {"message": ...}} / {"message": ...}.
+    body = {"error": "context length exceeded: prompt (9000 tokens) exhausted"}
+
+    raised = _adaptor_handling(_engine_rejection(400, body))
+
+    assert raised.status_code == 400
+    assert "context length exceeded" in raised.detail

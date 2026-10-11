@@ -34,10 +34,10 @@ import random
 import threading
 import time
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
 
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
@@ -133,11 +133,38 @@ _TOKENIZE_SHADOW_RATE = float(
 )
 
 
+def _parse_disaggregated_params(raw: Optional[dict[str, Any]]) -> tuple[Any, bool]:
+    """The engine's ``DisaggregatedParams`` plus the orchestrator's b64 request.
+
+    The body carries TRT-LLM's *wire* ``DisaggregatedParams``; the engine takes
+    the LLM-level one (opaque_state is bytes there, base64 on the wire), so it
+    is converted with TRT-LLM's own helper. The conversion copies only what the
+    engine consumes, which drops ``return_prompt_token_ids_b64`` -- an
+    orchestrator-to-context-worker instruction (``gen_tokids_ctxbytes``) that
+    must therefore be read off the wire model before converting.
+
+    Returns:
+        ``(None, False)`` without disaggregated params, else the LLM-level
+        params and whether the context leg should return
+        ``prompt_token_ids_b64`` instead of the int list.
+    """
+    if raw is None:
+        return None, False
+    from tensorrt_llm.serve.openai_protocol import (
+        DisaggregatedParams as WireDisaggregatedParams,
+    )
+    from tensorrt_llm.serve.openai_protocol import to_llm_disaggregated_params
+
+    wire = WireDisaggregatedParams(**raw)
+    return_b64 = bool(getattr(wire, "return_prompt_token_ids_b64", False))
+    return to_llm_disaggregated_params(wire), return_b64
+
+
 def _context_leg_response(
     model_name: str,
     prompt_token_ids: list[int],
     gen: Any,
-    disagg_params: Any,
+    return_prompt_token_ids_b64: bool,
 ) -> Any:
     """Reply to a ``context_only`` request.
 
@@ -145,6 +172,8 @@ def _context_leg_response(
     the handshake back off this response (plus the prompt token ids, so the
     generation server need not re-tokenize). Nothing here is user-visible, so
     the reasoning/tool/stop-token post-processing is skipped entirely.
+
+    ``return_prompt_token_ids_b64`` comes from :func:`_parse_disaggregated_params`.
     """
     from fastapi.responses import JSONResponse
     from tensorrt_llm.serve.openai_protocol import to_disaggregated_params
@@ -178,7 +207,7 @@ def _context_leg_response(
 
     # The orchestrator asks for the base64 int32 buffer when it wants to relay a
     # string instead of materialising the int list on its event loop.
-    if getattr(disagg_params, "return_prompt_token_ids_b64", False):
+    if return_prompt_token_ids_b64:
         import base64
 
         import numpy as np
@@ -314,34 +343,17 @@ def create_app(
         tools: list[dict] | None = body.get("tools")
         logprobs_requested = body.get("logprobs", False)
 
-        # Conversation identity for rank-affine ADP routing: body
-        # conversation_params, else the id the disagg service stamps onto
-        # disaggregated_params. None = no affinity.
-        #
-        # Nothing sends it yet: Gym owns the rollout identity and starts
-        # forwarding it with NVIDIA-NeMo/Gym#3582, which also needs a Gym
-        # submodule pin bump here. Without an id a turn lands on a random
-        # attention-DP rank and re-prefills most of its history (prefix on the
-        # serving rank for 17-26% of turns vs 96-97% with it, at 2P-DEP8 /
-        # conc 512) -- nothing fails, so treat such a run as unmeasured.
-        _conv_id = (body.get("conversation_params") or {}).get("conversation_id") or (
-            body.get("disaggregated_params") or {}
-        ).get("conversation_id")
+        # Conversation affinity for attention-DP routing; affects perf only.
+        # Needs NVIDIA-NeMo/Gym#3582 to send conversation_params.
+        _conv_id = (body.get("conversation_params") or {}).get("conversation_id")
 
         # The disagg server drives this endpoint twice per request -- once
         # context_only, once generation_only -- carrying the handshake between
         # them. opaque_state is bytes in the engine but base64 on the wire, so
         # convert with TRT-LLM's own helper rather than reproducing it.
-        disagg_params = None
-        if body.get("disaggregated_params") is not None:
-            from tensorrt_llm.serve.openai_protocol import (
-                DisaggregatedParams as WireDisaggregatedParams,
-            )
-            from tensorrt_llm.serve.openai_protocol import to_llm_disaggregated_params
-
-            disagg_params = to_llm_disaggregated_params(
-                WireDisaggregatedParams(**body["disaggregated_params"])
-            )
+        disagg_params, return_prompt_token_ids_b64 = _parse_disaggregated_params(
+            body.get("disaggregated_params")
+        )
         is_context_leg = getattr(disagg_params, "request_type", None) == "context_only"
 
         # The NeMo-RL generation config, not the request, is the source of truth
@@ -488,7 +500,9 @@ def create_app(
             # -- reasoning parsing, tool parsing, stop-token trimming -- is for
             # the completed generation, so skip it and hand the disagg server
             # just what it needs to build the generation leg.
-            return _context_leg_response(model_name, adj_prompt, gen, disagg_params)
+            return _context_leg_response(
+                model_name, adj_prompt, gen, return_prompt_token_ids_b64
+            )
 
         gen_token_ids = list(gen.token_ids)
 
@@ -598,10 +612,10 @@ def create_app(
 
         if logprobs_requested and gen_logprobs:
             # `token` carries the id rather than the decoded text when asked.
-            # ChatCompletionResponseChoice has no token-id field upstream yet, so
-            # this declared string field is how the ids survive the disagg
-            # server's strict re-validation. Same encoding vLLM uses, which is
-            # what NeMo-Gym already parses.
+            # On TRT-LLM builds whose ChatCompletionResponseChoice lacks
+            # token_ids (declared since f94eeb37), this declared string field is
+            # how the ids survive the disagg server's strict re-validation. Same
+            # encoding vLLM uses, which is what NeMo-Gym already parses.
             # Under disaggregation the flag never survives the frontend's
             # gym-field strip, yet ids are exactly what rides this channel
             # (the disagg adaptor parses token_id:N back out) -- and decoding

@@ -59,6 +59,24 @@ def _log_gpu_state_on_bundle(label: str, local_rank: int) -> None:
     )
 
 
+def _check_dp_leader_worker_indices(
+    requested: list[int], tied_group_leaders: list[int]
+) -> None:
+    """Reject DP leaders that are not an ascending subset of the group leaders.
+
+    A DP leader has to be a model owner -- it is the worker every shard-level
+    call is routed to. Checking against the tied group leaders turns a wrong
+    layout into a startup error instead of requests landing on a worker that
+    never built a model.
+    """
+    unknown = set(requested) - set(tied_group_leaders)
+    if unknown or requested != sorted(requested):
+        raise ValueError(
+            f"dp_leader_worker_indices {requested} must be an ascending subset "
+            f"of the tied group leaders {tied_group_leaders}."
+        )
+
+
 def _get_initializer_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
     """Build the environment needed to unpickle worker constructor arguments."""
     initializer_env_vars = {
@@ -473,17 +491,9 @@ class RayWorkerGroup:
         )
 
         if dp_leader_worker_indices is not None:
-            # A DP leader has to be a model owner -- it is the worker every
-            # shard-level call is routed to. Checking against the tied group
-            # leaders derived above turns a wrong layout into a startup error
-            # instead of requests landing on a worker that never built a model.
-            unknown = set(dp_leader_worker_indices) - set(self.dp_leader_worker_indices)
-            if unknown or dp_leader_worker_indices != sorted(dp_leader_worker_indices):
-                raise ValueError(
-                    f"dp_leader_worker_indices {dp_leader_worker_indices} must be an "
-                    f"ascending subset of the tied group leaders "
-                    f"{self.dp_leader_worker_indices}."
-                )
+            _check_dp_leader_worker_indices(
+                dp_leader_worker_indices, self.dp_leader_worker_indices
+            )
             self.dp_leader_worker_indices = dp_leader_worker_indices
 
     def get_dp_leader_worker_idx(self, dp_shard_idx: int) -> int:

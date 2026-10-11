@@ -266,18 +266,21 @@ class TrtllmAsyncGenerationWorkerImpl:
         # prefill/decode role is per *request* in TRT-LLM
         # (DisaggregatedParams.request_type), not per engine, so engines are
         # symmetric here; which pool an engine lands in is decided by the
-        # replica's disagg server from its address alone.
-        disagg_cfg = engine_cfg.get("disaggregation") or {}
-        if disagg_cfg.get("enabled"):
+        # replica's disagg server from its address alone. The layout lives at
+        # generation.disaggregation, not in trtllm_cfg, so it is never in
+        # engine_cfg; the driver stamps _disagg_role on every engine exactly
+        # when disaggregation is enabled (_config_with_engine_overrides).
+        if engine_cfg.get("_disagg_role") is not None:
             from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
             # Tuning the transceiver (runtime, bounce size, timeouts) is an
             # AsyncLLM argument like any other, so it is set through
             # trtllm_kwargs.cache_transceiver_config rather than duplicated on
             # the disaggregation schema. Only the default is supplied here:
-            # without a transceiver config carrying a backend, LlmArgs does not
-            # consider the engine disaggregated at all (llm_args.py: is_disagg),
-            # so the engine would come up and fail on the first KV transfer.
+            # without a transceiver config carrying a backend, TRT-LLM builds no
+            # transceiver at all (create_kv_cache_transceiver returns None), so
+            # the engine would come up and every context leg would come back
+            # without disaggregated_params.
             if "cache_transceiver_config" not in extra_trtllm_kwargs:
                 llm_kwargs["cache_transceiver_config"] = CacheTransceiverConfig(
                     backend="DEFAULT"

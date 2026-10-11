@@ -250,3 +250,104 @@ async def test_async_ipc_refit_returns_false_on_worker_exception():
     worker.llm.collective_rpc.side_effect = RuntimeError("refit failed")
 
     assert await worker.update_weights_via_ipc_zmq_async() is False
+
+
+class _RecordedConfig:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+@pytest.fixture
+def recorded_async_llm(monkeypatch):
+    """Stub tensorrt_llm so the worker's constructor can run without a GPU.
+
+    Returns the ``AsyncLLM`` mock; its call kwargs are what the engine would
+    have been built with. The llm_args config classes just record their kwargs.
+    """
+    import importlib
+    import sys
+    import types
+
+    # ray.util re-exports the placement_group *function* under the module's
+    # name, so attribute access would patch the wrong object.
+    placement_group_module = importlib.import_module("ray.util.placement_group")
+
+    from nemo_rl.models.generation.trtllm import trtllm_worker_async
+
+    async_llm = MagicMock(name="AsyncLLM")
+    trt = types.ModuleType("tensorrt_llm")
+    trt.AsyncLLM = async_llm
+    trt.SamplingParams = object
+    llm_args = types.ModuleType("tensorrt_llm.llmapi.llm_args")
+    for name in (
+        "CacheTransceiverConfig",
+        "CudaGraphConfig",
+        "KvCacheConfig",
+        "SchedulerConfig",
+        "SleepConfig",
+    ):
+        setattr(llm_args, name, type(name, (_RecordedConfig,), {}))
+    llm_args.CapacitySchedulerPolicy = SimpleNamespace(MAX_UTILIZATION="max")
+    llm_args.ExecutorMemoryType = SimpleNamespace(KV_CACHE="kv")
+    for mod in (trt, types.ModuleType("tensorrt_llm.llmapi"), llm_args):
+        monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    monkeypatch.setattr(
+        placement_group_module,
+        "get_current_placement_group",
+        lambda: MagicMock(bundle_specs=[]),
+    )
+    monkeypatch.setattr(
+        trtllm_worker_async, "get_nsight_config_if_pattern_matches", lambda _: {}
+    )
+    return async_llm
+
+
+def _engine_kwargs(async_llm, cfg) -> dict:
+    TrtllmAsyncGenerationWorkerImpl(cfg, bundle_indices=[0], bundle_pg_idx=0)
+    return async_llm.call_args.kwargs
+
+
+def _disagg_worker_config(**trtllm_kwargs):
+    # The shape the driver ships: the layout under generation.disaggregation,
+    # and this engine's role stamped into trtllm_cfg._engine_overrides.
+    cfg = _config()
+    cfg["colocated"] = {"enabled": False}
+    cfg["disaggregation"] = {"enabled": True}
+    cfg["trtllm_cfg"]["_engine_overrides"] = {
+        "0:0": {"_disagg_role": "prefill", "_disagg_role_ordinal": 0}
+    }
+    if trtllm_kwargs:
+        cfg["trtllm_cfg"]["trtllm_kwargs"] = trtllm_kwargs
+    return cfg
+
+
+def test_a_disaggregated_engine_gets_the_default_cache_transceiver(
+    recorded_async_llm,
+):
+    # Without a transceiver config TRT-LLM builds no transceiver at all, and
+    # every context leg comes back without disaggregated_params.
+    kwargs = _engine_kwargs(recorded_async_llm, _disagg_worker_config())
+
+    assert kwargs["cache_transceiver_config"].kwargs == {"backend": "DEFAULT"}
+
+
+def test_an_explicit_cache_transceiver_config_is_not_overridden(recorded_async_llm):
+    cfg = _disagg_worker_config(cache_transceiver_config={"backend": "NIXL"})
+
+    kwargs = _engine_kwargs(recorded_async_llm, cfg)
+
+    assert kwargs["cache_transceiver_config"] == {"backend": "NIXL"}
+
+
+@pytest.mark.parametrize("disaggregation", [None, {"enabled": False}])
+def test_an_aggregated_engine_gets_no_cache_transceiver(
+    recorded_async_llm, disaggregation
+):
+    cfg = _config()
+    cfg["colocated"] = {"enabled": False}
+    if disaggregation is not None:
+        cfg["disaggregation"] = disaggregation
+
+    kwargs = _engine_kwargs(recorded_async_llm, cfg)
+
+    assert "cache_transceiver_config" not in kwargs

@@ -13,18 +13,24 @@
 # limitations under the License.
 
 import asyncio
+import base64
 import json
+import sys
+import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _build_prompt_token_ids,
     _build_sampling_params,
     _compute_splice_inputs,
+    _context_leg_response,
     _decode_request_body,
     _make_parse_tool_calls,
+    _parse_disaggregated_params,
     _resolve_tool_parser_name,
 )
 
@@ -282,3 +288,56 @@ def test_a_msgpack_body_is_decoded_when_the_orchestrator_flags_it():
     assert asyncio.run(_decode_request_body(request)) == payload
     with pytest.raises(UnicodeDecodeError):
         json.loads(raw)
+
+
+def test_no_disaggregated_params_means_an_aggregated_request():
+    assert _parse_disaggregated_params(None) == (None, False)
+
+
+@pytest.mark.parametrize("requested", [True, False])
+def test_the_b64_request_survives_the_wire_to_engine_conversion(requested):
+    # The orchestrator sets return_prompt_token_ids_b64 on the *wire* params
+    # (gen_tokids_ctxbytes). The LLM-level params the engine takes have no
+    # such field, so it must be read before converting, not after.
+    pytest.importorskip("tensorrt_llm.serve.openai_protocol")
+
+    disagg_params, return_b64 = _parse_disaggregated_params(
+        {"request_type": "context_only", "return_prompt_token_ids_b64": requested}
+    )
+
+    assert disagg_params.request_type == "context_only"
+    assert return_b64 is requested
+
+
+@pytest.fixture
+def stub_to_disaggregated_params(monkeypatch):
+    protocol = types.ModuleType("tensorrt_llm.serve.openai_protocol")
+    protocol.to_disaggregated_params = lambda params: SimpleNamespace(
+        model_dump=lambda: {"request_type": "context_only"}
+    )
+    monkeypatch.setitem(sys.modules, protocol.__name__, protocol)
+
+
+def _context_leg_body(return_prompt_token_ids_b64: bool) -> dict:
+    gen = SimpleNamespace(disaggregated_params=object(), finish_reason="length")
+    response = _context_leg_response("m", [1, 2, 3], gen, return_prompt_token_ids_b64)
+    return json.loads(response.body)
+
+
+def test_the_context_leg_returns_b64_prompt_ids_when_asked(
+    stub_to_disaggregated_params,
+):
+    body = _context_leg_body(return_prompt_token_ids_b64=True)
+
+    assert "prompt_token_ids" not in body
+    decoded = np.frombuffer(base64.b64decode(body["prompt_token_ids_b64"]), np.int32)
+    assert decoded.tolist() == [1, 2, 3]
+
+
+def test_the_context_leg_returns_the_int_list_by_default(
+    stub_to_disaggregated_params,
+):
+    body = _context_leg_body(return_prompt_token_ids_b64=False)
+
+    assert body["prompt_token_ids"] == [1, 2, 3]
+    assert "prompt_token_ids_b64" not in body

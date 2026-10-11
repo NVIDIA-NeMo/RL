@@ -23,8 +23,6 @@ grpo:
     # The sibling runs synchronously; async is what exercises refit against
     # live disagg engines.
     enabled: true
-    max_trajectory_age_steps: 1
-    in_flight_weight_updates: true
     recompute_kv_cache_after_weight_updates: true
 
 policy:
@@ -74,10 +72,10 @@ policy:
       disagg_server:
         ctx_router: conversation
         gen_router: load_balancing
-        # On by default here: these three are the disaggregation-specific
-        # paths most likely to perturb token-level agreement between the
-        # sampler and the trainer, which is exactly what the
-        # token_mult_prob_error gate in the driver measures.
+        # On by default here: these two (plus disaggregation.frontend_tokenize)
+        # are the disaggregation-specific paths most likely to perturb
+        # token-level agreement between the sampler and the trainer, which is
+        # exactly what the token_mult_prob_error gate in the driver measures.
         gen_tokids_ctxbytes: true
         gen_strip_message_history: true
     disaggregation:
@@ -121,7 +119,6 @@ policy:
 logger:
   log_dir: logs/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1
   wandb:
-    project: nemo-rl
     name: grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1
 
 cluster:

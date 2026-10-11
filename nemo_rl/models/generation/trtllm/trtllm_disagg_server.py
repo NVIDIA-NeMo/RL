@@ -122,8 +122,8 @@ _ADAPTED_PATHS = frozenset({"/v1/chat/completions", "/v1/completions"})
 def generation_token_ids(choice: dict[str, Any]) -> Optional[list[int]]:
     """Generated token ids, from whichever declared field carries them.
 
-    ``ChatCompletionResponseChoice.token_ids`` is the clean home, but it does
-    not exist upstream yet. Until it does they ride in
+    ``ChatCompletionResponseChoice.token_ids`` is declared since TRT-LLM
+    ``f94eeb37`` and is the live path. On builds without it they ride in
     ``logprobs.content[].token`` using vLLM's ``token_id:N`` encoding, which is
     a declared string field and therefore survives the hop.
     """
@@ -341,17 +341,16 @@ def _build_adaptor_class() -> type:
         # -------------------------------------------------------------- #
 
         def _handle_exception(self, exception: BaseException) -> None:
-            """Pass a downstream 4xx through instead of masking it as a 500.
+            """Pass a downstream 4xx through with the engine's error text intact.
 
-            The base implementation only re-raises ``HTTPException``; a 4xx
-            from a prefill/decode engine arrives as an
-            ``aiohttp.ClientResponseError`` and falls into the catch-all that
-            turns it into ``500 Internal server error``. The aggregated server
-            returns that same rejection to the caller as a 4xx, so without this
-            a deterministic client error -- most commonly the
-            ``context length exceeded`` guard in ``trtllm_http_server`` -- looks
-            like a server fault under disaggregation only, and Gym's masking
-            statistics stop being comparable between the two paths.
+            The base already re-raises an engine 4xx with its status, but it
+            replaces the text: ``_upstream_error_message`` only unwraps
+            ``{"error": {"message": ...}}`` or ``{"message": ...}``, and
+            ``trtllm_http_server`` rejects with ``{"error": "<text>"}``. That
+            text is how Gym recognizes the ``context length exceeded`` guard,
+            so without this override the same rejection is classified as
+            overflow on the aggregated path but not under disaggregation, and
+            Gym's masking statistics stop being comparable between the two.
             """
             if (
                 isinstance(exception, aiohttp.ClientResponseError)
@@ -381,7 +380,7 @@ def _build_adaptor_class() -> type:
                 # trtllm_http_server emits; only the JSONResponse re-wrap
                 # belongs to this subclass.
                 return JSONResponse(
-                    content=attach_rollout_fields(json.loads(response.body)),
+                    content=attach_rollout_fields(json.loads(bytes(response.body))),
                     status_code=response.status_code,
                 )
 
@@ -537,7 +536,7 @@ class DisaggServerActorImpl:
         self._frontend_idx = frontend_idx
         self._num_frontends = num_frontends
         self._port = port
-        self._thread = None
+        self._thread: Optional[threading.Thread] = None
         self._server = None
         self._base_url: Optional[str] = None
         # Serving from the constructor is what makes crash recovery work: Ray

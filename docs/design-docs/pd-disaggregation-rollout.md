@@ -220,6 +220,8 @@ policy:
         enable_block_reuse: true      # see below
 ```
 
+Colocated generation is not supported yet; set `colocated.enabled: false`.
+
 GPU budget:
 
 ```
@@ -252,10 +254,3 @@ snowflake request-id mint (`process_id` is hardwired to 0 without a coordinator,
 let two frontends mint the same `ctx_request_id`. We use
 `replica_idx * num_frontend_workers + frontend_idx`; the field is 8 bits, hence the
 asserted `num_replicas * num_frontend_workers <= 256`.
-
-## **Prerequisites**
-
-- **`ChatCompletionResponseChoice` needs a `token_ids` field.** Prompt token ids and
-per-token logprobs already come back on the standard response, but generated token ids do
-not — the chat choice carries only each token's decoded text. `CompletionResponseChoice`
-already has the field; the chat one needs the same.

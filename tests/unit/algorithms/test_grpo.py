@@ -44,6 +44,7 @@ from nemo_rl.algorithms.grpo import (
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
+    _check_disaggregation_backend,
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
@@ -56,6 +57,7 @@ from nemo_rl.algorithms.grpo import (
     _save_async_replay_buffer_checkpoint,
     _shutdown_completed_nemo_gym_startup,
     _startup_pipeline_ready,
+    _trtllm_nvlink_domain_span,
     _validate_multimodal_dedup_capability,
     _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
@@ -6945,3 +6947,78 @@ def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
         if f"data_plane/{scope}/breakdown" in c.args
     ], "the per-op breakdown table was not logged"
     client.close()
+
+
+def _trtllm_generation_config(disaggregation) -> dict:
+    cfg = {
+        "backend": "trtllm",
+        "trtllm_cfg": {
+            "tensor_parallel_size": 1,
+            "prefill_engine": {"tensor_parallel_size": 2},
+        },
+    }
+    if disaggregation is not None:
+        cfg["disaggregation"] = disaggregation
+    return cfg
+
+
+@pytest.mark.parametrize("as_model", [False, True], ids=["dict", "DisaggConfig"])
+def test_trtllm_nvlink_span_is_the_whole_disaggregated_replica(as_model):
+    # MasterConfig(**cfg) validates disaggregation into a DisaggConfig before
+    # setup() reads it, so both shapes must be accepted.
+    from nemo_rl.models.generation.interfaces import DisaggConfig
+
+    layout = {"enabled": True, "num_prefill_engines": 1, "num_decode_engines": 2}
+    if as_model:
+        layout = DisaggConfig.model_validate(layout)
+
+    # One TP2 prefill engine plus two TP1 decode engines.
+    span = _trtllm_nvlink_domain_span(_trtllm_generation_config(layout))
+
+    assert span == 4
+
+
+@pytest.mark.parametrize("disaggregation", [None, {"enabled": False}])
+def test_trtllm_nvlink_span_is_the_engine_without_disaggregation(disaggregation):
+    span = _trtllm_nvlink_domain_span(_trtllm_generation_config(disaggregation))
+
+    assert span == 1
+
+
+def test_a_master_config_validated_disagg_recipe_sizes_its_replica():
+    # The shape setup() actually receives: the YAML through MasterConfig.
+    register_omegaconf_resolvers()
+    recipe = Path(__file__).parents[3] / "examples/configs/grpo_math_1B_trtllm.yaml"
+    cfg = OmegaConf.to_container(load_config(str(recipe)), resolve=True)
+    generation = cfg["policy"]["generation"]
+    generation["disaggregation"]["enabled"] = True
+    generation["trtllm_cfg"]["tensor_parallel_size"] = 1
+
+    master_config = MasterConfig(**cfg)
+
+    assert _trtllm_nvlink_domain_span(master_config.policy["generation"]) == 2
+
+
+@pytest.mark.parametrize("as_model", [False, True], ids=["dict", "DisaggConfig"])
+def test_disaggregation_on_a_non_trtllm_backend_refuses_to_start(as_model):
+    from nemo_rl.models.generation.interfaces import DisaggConfig
+
+    layout = {"enabled": True}
+    if as_model:
+        layout = DisaggConfig.model_validate(layout)
+
+    with pytest.raises(ValueError, match="only supported for backend='trtllm'"):
+        _check_disaggregation_backend({"backend": "vllm", "disaggregation": layout})
+
+
+@pytest.mark.parametrize(
+    "generation_config",
+    [
+        {"backend": "trtllm", "disaggregation": {"enabled": True}},
+        {"backend": "vllm", "disaggregation": {"enabled": False}},
+        {"backend": "vllm"},
+    ],
+    ids=["trtllm-enabled", "vllm-disabled", "vllm-absent"],
+)
+def test_disaggregation_backend_check_allows_supported_configs(generation_config):
+    _check_disaggregation_backend(generation_config)
