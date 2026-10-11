@@ -34,7 +34,6 @@ from nemo_rl.experience.rollout_recovery import (
     PromptGroupRecoveryRecord,
     PromptGroupStatus,
     PromptRef,
-    RecoveryGranularity,
     RecoveryTargetLevel,
     RolloutAttemptRecord,
     RolloutAttemptStatus,
@@ -55,7 +54,6 @@ def test_rollout_capture_key_matches_gym_episode_identity(gym_attempt: int) -> N
         prompt_id="7",
         prompt_ref=PromptRef(sample_id="7", task_name=None),
         task_source=None,
-        recovery_granularity=RecoveryGranularity.SIBLING,
         restore_level=RecoveryTargetLevel.TURN,
         runtime_prompt_payload=None,
         expected_generations=1,
@@ -78,7 +76,8 @@ def test_rollout_capture_key_matches_gym_episode_identity(gym_attempt: int) -> N
         status=PromptGroupStatus.GENERATING,
     )
 
-    rollout_id, attempt = group.gym_episode(0)
+    episode = group.gym_episode(0)
+    rollout_id, attempt = episode.rollout_id, episode.attempt
     gym_episode = EpisodeId(rollout_id=rollout_id, attempt=attempt)
     capture_key = group.gate_rollout_id(0)
 
