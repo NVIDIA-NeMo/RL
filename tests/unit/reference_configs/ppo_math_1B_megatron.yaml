@@ -460,6 +460,7 @@ env:
 
 logger:
   log_dir: "logs"
+  trace_format: "jsonl" # Per-step train/val trace dump format: "jsonl" or "parquet" (zstd, written on a background thread)
   num_val_samples_to_print: 0
   wandb_enabled: false
   tensorboard_enabled: false

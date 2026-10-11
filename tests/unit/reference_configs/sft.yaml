@@ -277,6 +277,7 @@ data:
 
 logger:
   log_dir: "logs"  # Base directory for all logs
+  trace_format: "jsonl" # Per-step train/val trace dump format: "jsonl" or "parquet" (zstd, written on a background thread)
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
   mlflow_enabled: false

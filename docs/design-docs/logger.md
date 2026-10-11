@@ -177,6 +177,36 @@ When enabled, the pretty logging will generate formatted text similar to:
 
 ![Validation Pretty Logging Example](../assets/val-log.png)
 
+## Trace Dumps
+
+GRPO writes every step's training batch (`train_data_step<N>`) and each validation run (`val_data_step<N>`) to the log directory. Each dump holds one record per sample: the conversation, rewards, token IDs, loss masks, advantages, and logprobs. `logger.trace_format` picks the format:
+
+- `jsonl` (default): one JSON line per sample, with a batch dimension of 1 on every field. Written synchronously on the training thread.
+- `parquet`: the same values, one row per sample, one column per field, zstd-compressed. Written on a background thread. Read it with `pandas.read_parquet` or `pyarrow.parquet.read_table`.
+
+```yaml
+logger:
+  trace_format: parquet  # or jsonl (default)
+```
+
+### Parquet Format
+
+Each Parquet row holds the same values as the matching JSONL line. Tensors become typed list columns, with bf16/fp16 widened to fp32.
+Fields Arrow cannot type are stored as JSON strings, and if the table still cannot be built, the dump falls back to `<name>.jsonl`.
+
+### Background Writes
+
+The trainer copies the batch to CPU, hands the copy to a single writer thread, and keeps training.
+
+- **One dump in flight.** If the previous dump is still writing, the next step waits for it.
+- **Failures don't stop training.** A failed write, such as a full disk, prints a warning.
+- **No partial files.** Each dump is written to a temporary path and renamed into place.
+- **Flushed at exit.** A pending dump finishes before the process ends.
+
+### Why JSONL Stays Synchronous
+
+JSON encoding holds the GIL for the whole write, so a background thread would still stall the training loop. Arrow writes Parquet in C++ with the GIL released, so only Parquet dumps are offloaded.
+
 ## GPU Metric Logging
 
 NeMo RL monitors GPU memory and utilization through [system metrics](https://docs.ray.io/en/latest/ray-observability/reference/system-metrics.html#system-metrics) exposed by Ray nodes. While Ray makes these metrics available for tools like Prometheus, NeMo RL directly polls GPU memory and utilization data and logs them to TensorBoard, WandB, MLflow and/or SwanLab.

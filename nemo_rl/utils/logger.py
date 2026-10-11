@@ -23,10 +23,13 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, Optional, TypedDict
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, Callable, Literal, Mapping, Optional, TypedDict
 
 import mlflow
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import ray
 import requests
 import swanlab
@@ -106,6 +109,7 @@ class LoggerConfig(BaseModel, extra="allow"):
     monitor_gpus: bool = True
     gpu_monitoring: GPUMonitoringConfig = Field(default_factory=GPUMonitoringConfig)
     num_val_samples_to_print: int = 0
+    trace_format: Literal["jsonl", "parquet"] = "jsonl"
 
     @model_validator(mode="after")
     def _require_block_for_enabled_backends(self) -> "LoggerConfig":
@@ -1228,6 +1232,17 @@ class Logger(LoggerInterface):
 
         self.base_log_dir = cfg.log_dir
         os.makedirs(self.base_log_dir, exist_ok=True)
+        self.trace_format = cfg.trace_format
+        self._trace_executor: Optional[ThreadPoolExecutor] = None
+        self._trace_future: Optional[Future] = None
+        # Traces may be logged from more than one thread.
+        self._trace_lock = threading.RLock()
+        if self.trace_format == "parquet":
+            # JSON encoding holds the GIL, so only Parquet dumps run in the background.
+            self._trace_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="trace-writer"
+            )
+            atexit.register(self.flush_traces)
 
         if cfg.wandb_enabled:
             wandb_log_dir = os.path.join(self.base_log_dir, "wandb")
@@ -1388,6 +1403,86 @@ class Logger(LoggerInterface):
                 # default=str is a fallback for non-JSON-serializable types (e.g., datetime, custom objects)
                 f.write(json.dumps({**sample, "idx": i}, default=str) + "\n")
 
+        print(f"Logged data to {filepath}")
+
+    def log_batched_dict_as_trace(
+        self, to_log: BatchedDataDict[Any] | dict[str, Any], name: str
+    ) -> None:
+        """Log a per-sample trace as ``<name>.jsonl`` or ``<name>.parquet``.
+
+        The format comes from ``logger.trace_format`` (default ``"jsonl"``).
+        JSONL is written before returning. Parquet is written on a background
+        thread from a private copy of ``to_log``, with at most one dump in
+        flight; call flush_traces() to wait for it.
+
+        Args:
+            to_log: Batched fields to log, one row per sample.
+            name: File name without extension (within the log directory).
+        """
+        if self._trace_executor is None:
+            self.log_batched_dict_as_jsonl(to_log, f"{name}.jsonl")
+        else:
+            # Private copy, so later in-place edits by the caller cannot reach
+            # the file; then keep at most one dump in flight.
+            snapshot = {key: _snapshot_trace_value(v) for key, v in to_log.items()}
+            with self._trace_lock:
+                self.flush_traces()
+                self._trace_future = self._trace_executor.submit(
+                    self.log_batched_dict_as_parquet, snapshot, f"{name}.parquet"
+                )
+
+    def flush_traces(self) -> None:
+        """Wait for the in-flight background trace dump, if any.
+
+        A failed dump (e.g. disk full) is reported, not raised, so training
+        continues; that step's trace is lost.
+        """
+        with self._trace_lock:
+            if self._trace_future is None:
+                return
+            error = self._trace_future.exception()
+            self._trace_future = None
+        if error is not None:
+            print(f"Background trace dump failed: {error!r}")
+
+    def log_batched_dict_as_parquet(
+        self, to_log: BatchedDataDict[Any] | dict[str, Any], filename: str
+    ) -> None:
+        """Log a batched dict as a Parquet file with the same values as the JSONL dump.
+
+        One row per sample, one column per field, plus ``idx``. Tensors keep their
+        dtype and shape (a padded ``[batch, seq]`` tensor becomes one list per
+        row); bf16/fp16 are widened to fp32, as ``.tolist()`` would. A field Arrow
+        cannot type (e.g. dicts holding tensors) is stored as one JSON string per
+        row, encoded exactly like the JSONL dump. If the table still cannot be
+        built, the batch is written as JSONL instead, so the dump is never lost.
+
+        Args:
+            to_log: Batched fields to log, one row per sample.
+            filename: Filename to log to (within the log directory).
+        """
+        filepath = os.path.join(self.base_log_dir, filename)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        tmp_path = f"{filepath}.tmp"
+        try:
+            columns = {key: _trace_column(value) for key, value in to_log.items()}
+            num_rows = len(next(iter(columns.values()))) if columns else 0
+            columns["idx"] = pa.array(np.arange(num_rows, dtype=np.int64))
+            pq.write_table(pa.table(columns), tmp_path, compression="zstd")
+        except (pa.ArrowException, TypeError, ValueError) as e:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            fallback = f"{os.path.splitext(filename)[0]}.jsonl"
+            print(f"Parquet trace dump failed ({e}); writing {fallback} instead")
+            self.log_batched_dict_as_jsonl(to_log, fallback)
+            return
+        except BaseException:
+            # Never leave a partial file behind (e.g. disk full mid-write).
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+        # Readers never see a half-written file.
+        os.replace(tmp_path, filepath)
         print(f"Logged data to {filepath}")
 
     def log_string_list_as_jsonl(self, to_log: list[str], filename: str) -> None:
@@ -1626,6 +1721,56 @@ class Logger(LoggerInterface):
         """Clean up resources when the logger is destroyed."""
         if self.gpu_monitor:
             self.gpu_monitor.stop()
+        if self._trace_executor is not None:
+            self.flush_traces()
+            self._trace_executor.shutdown(wait=True)
+
+
+def _snapshot_trace_value(value: Any) -> Any:
+    """Copy a trace field for the background writer.
+
+    Tensors are copied to CPU, arrays copied, and lists/tuples/dicts rebuilt
+    recursively; immutable leaves (str, numbers, None) and other objects are
+    shared.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.detach().to("cpu", copy=True)
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, (list, tuple)):
+        return type(value)(_snapshot_trace_value(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _snapshot_trace_value(v) for k, v in value.items()}
+    return value
+
+
+def _trace_column(value: Any) -> pa.Array:
+    """Convert one batched trace field to an Arrow column with one row per sample.
+
+    Falls back to one JSON string per row (``json.dumps(..., default=str)``, as
+    in the JSONL dump) when Arrow cannot infer a type for the values.
+    """
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu()
+        if value.dtype in (torch.bfloat16, torch.float16):
+            value = value.float()
+        value = value.numpy()
+    try:
+        if isinstance(value, np.ndarray) and value.ndim == 1:
+            return pa.array(value)
+        if isinstance(value, np.ndarray) and value.ndim == 2:
+            # Padded [batch, seq]: one list per row, same values as .tolist().
+            offsets = np.arange(value.shape[0] + 1, dtype=np.int64) * value.shape[1]
+            return pa.LargeListArray.from_arrays(
+                pa.array(offsets), pa.array(np.ascontiguousarray(value).reshape(-1))
+            )
+        rows = value.tolist() if isinstance(value, np.ndarray) else list(value)
+        return pa.array(rows)
+    except pa.ArrowException:
+        rows = value.tolist() if isinstance(value, np.ndarray) else list(value)
+        return pa.array(
+            [json.dumps(row, default=str) for row in rows], type=pa.large_string()
+        )
 
 
 def flatten_dict(
