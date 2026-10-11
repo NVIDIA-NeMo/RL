@@ -28,8 +28,8 @@ from nemo_rl.algorithms.sft_v2 import (
     SFTV2SaveState,
     _max_train_steps,
 )
-from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data.energon.config import EnergonLoaderConfig
+from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.instrumentation import TRACE_CARRIER_KWARG
@@ -475,7 +475,6 @@ def test_setup_validates_nested_packing_options(
 def test_setup_loaders_uses_nested_packing_without_obsolete_kwargs(
     restored: bool,
 ) -> None:
-
     loader_config = EnergonLoaderConfig(
         model_family="qwen",
         task_encoder={

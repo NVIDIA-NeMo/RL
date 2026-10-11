@@ -18,6 +18,7 @@ import hashlib
 import importlib
 import importlib.util
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -280,7 +281,7 @@ TASK_ENCODER_REGISTRY.register(
 
 
 def selected_registry_identity(
-    *, task_encoder: ComponentConfig, cookers: list[ComponentConfig]
+    *, task_encoder: ComponentConfig, cookers: Sequence[ComponentConfig]
 ) -> dict[str, Any]:
     """Return stable identity data for all configured multimodal components."""
     return {
