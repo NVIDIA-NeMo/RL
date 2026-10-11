@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Any, TYPE_CHECKING
 
 import torch
+from omegaconf import OmegaConf
 from nemo_automodel.components.utils.parameter_config import ParameterConfig
 from torch.distributed.tensor import DTensor
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -59,7 +60,6 @@ class SpeechLMPolicy(SALMAutomodel):
         cfg["packed_encoder_cp"] = False
         cfg["cross_entropy_backend"] = "eager"
         super().__init__(cfg, parameter_config=parameter_config)
-        self.config = NeMoSpeechLMConfig(**cfg)
 
     @classmethod
     def from_pretrained(
@@ -111,6 +111,11 @@ class SpeechLMPolicy(SALMAutomodel):
             ),
             **kwargs,
         )
+        # Distributed loading defers backbone construction until this method.
+        # Reuse its parsed config rather than serialized JSON float markers.
+        config = OmegaConf.to_container(self.cfg, resolve=True)
+        config["llm_config"] = self.llm.config.to_dict()
+        self.config = NeMoSpeechLMConfig(**config)
 
     def refit_parameter_names(self) -> tuple[str, ...]:
         """Serving loads frozen native weights from the seed; refit the update surface."""
