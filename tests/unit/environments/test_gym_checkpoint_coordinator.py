@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
@@ -120,6 +121,7 @@ def _coordinator(*actors: _FakeGymActor) -> GymCheckpointCoordinator:
     return GymCheckpointCoordinator(
         NemoGymShardSet(handles={"tools": list(actors)}),
         control_timeout_s=30.0,
+        prepare_timeout_s=30.0,
     )
 
 
@@ -220,6 +222,7 @@ def test_coordinator_renews_lease_while_outer_checkpoint_is_slow() -> None:
     coordinator = GymCheckpointCoordinator(
         NemoGymShardSet(handles={"tools": [actor]}),
         control_timeout_s=0.03,
+        prepare_timeout_s=0.03,
     )
 
     async def exercise() -> None:
@@ -376,6 +379,7 @@ def _fast_coordinator(*actors: _FakeGymActor) -> GymCheckpointCoordinator:
     return GymCheckpointCoordinator(
         NemoGymShardSet(handles={"tools": list(actors)}),
         control_timeout_s=0.05,
+        prepare_timeout_s=0.05,
     )
 
 
@@ -500,3 +504,29 @@ def test_failures_that_leave_nothing_behind_are_transient(error) -> None:
 )
 def test_broken_invariants_are_not_transient(error) -> None:
     assert not is_transient_gym_checkpoint_failure(error)
+
+
+def test_prepare_gets_its_own_deadline_and_other_calls_keep_the_control_one() -> None:
+    """Parking waits for agent steps; renew, commit and resume are plain RPCs."""
+    actor = _FakeGymActor()
+    coordinator = GymCheckpointCoordinator(
+        NemoGymShardSet(handles={"tools": [actor]}),
+        control_timeout_s=30.0,
+        prepare_timeout_s=600.0,
+    )
+
+    async def exercise() -> float:
+        started = time.time()
+        async with coordinator.prepared("save-1"):
+            pass
+        return started
+
+    started = asyncio.run(exercise())
+
+    deadlines = {
+        operation: kwargs["deadline_ts"] for operation, _, kwargs in actor.calls
+    }
+    assert set(deadlines) == {"prepare", "renew", "resume"}
+    assert 590.0 < deadlines["prepare"] - started < 610.0
+    assert 20.0 < deadlines["renew"] - started < 40.0
+    assert 20.0 < deadlines["resume"] - started < 40.0
