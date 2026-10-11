@@ -121,7 +121,9 @@ def calculate_baseline_and_std_per_prompt(
     The same baseline is calculated for each prompt. Samples set to 0 in 'valid_mask'
     are not included in the baseline calculation.
 
-    prompts:    tensor (b, s)     Tensor of prompts the model used. May be on any device
+    prompts:    tensor (b, k)     Row equality keys defining prompt groups. GRPO uses
+                                  explicit rollout-group ids with shape (b, 1), not
+                                  prompt tokens. May be on any device.
     rewards:    tensor (b,)       Float-valued rewards. May be on any device
     valid_mask: tensor (b,)       Vector of 0/1, where 0 is to ignore and 1 is to keep
     leave_one_out_baseline: bool  Compute an unbiased baseline by leaving out the sample that

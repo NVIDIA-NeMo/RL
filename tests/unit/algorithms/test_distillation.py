@@ -883,12 +883,12 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
                         },
                     },
                 },
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },
             "teacher": {
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },
@@ -1026,7 +1026,7 @@ def test_distillation_setup_non_colocated_smoke(
                         },
                     },
                 },
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
                 "megatron_cfg": {
@@ -1038,7 +1038,7 @@ def test_distillation_setup_non_colocated_smoke(
             },
             "teacher": {
                 "model_name": "test-teacher",
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },
@@ -1189,13 +1189,13 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
                         "enabled": True,
                     },
                 },
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },
             "teacher": {
                 "model_name": "test-teacher",
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },
@@ -1428,12 +1428,12 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
                         },
                     },
                 },
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },
             "teacher": {
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": False,
                 },
             },

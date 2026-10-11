@@ -1516,7 +1516,7 @@ def _make_noncolocated_setup_config(
             "train_micro_batch_size": 1,
             "offload_policy_before_refit": False,
             "offload_optimizer_for_refit": True,
-            "dtensor_cfg": {"enabled": True},
+            "automodel_cfg": {"enabled": True},
             "megatron_cfg": {"enabled": False},
             "generation": {
                 "backend": backend,
@@ -2163,7 +2163,7 @@ def test_noncolocated_vllm_offload_before_refit_uses_weight_synchronizer(monkeyp
         total_gpus_per_node=8,
         inference_gpus_per_node=2,
     )
-    config.policy["dtensor_cfg"]["enabled"] = False
+    config.policy["automodel_cfg"]["enabled"] = False
     config.policy["megatron_cfg"]["enabled"] = True
     config.policy["offload_policy_before_refit"] = True
 
@@ -2215,7 +2215,7 @@ def test_megatron_train_iters_matches_ppo_training_limit(
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
 
     config = _make_noncolocated_setup_config()
-    config.policy["dtensor_cfg"]["enabled"] = False
+    config.policy["automodel_cfg"]["enabled"] = False
     config.policy["megatron_cfg"]["enabled"] = True
     config.ppo.max_num_steps = 10
     config.ppo.max_num_epochs = -1 if async_enabled else 1

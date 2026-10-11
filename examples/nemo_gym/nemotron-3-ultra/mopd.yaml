@@ -168,7 +168,7 @@ policy:
   offload_policy_before_refit: false
   offload_optimizer_for_refit: true
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
     cpu_offload: false
     sequence_parallel: false

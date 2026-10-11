@@ -65,10 +65,10 @@ def create_mock_tokenizer():
     return tokenizer
 
 
-def create_dtensor_config(
+def create_automodel_config(
     model_name: str, tp: int, pp: int = 1, cp: int = 1
 ) -> PolicyConfig:
-    """Create a DTensor configuration for testing."""
+    """Create an Automodel configuration for testing."""
     return {
         "model_name": model_name,
         "tokenizer": {"name": model_name},
@@ -95,7 +95,7 @@ def create_dtensor_config(
                 },
             },
         },
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "enabled": True,
             "cpu_offload": False,
             "sequence_parallel": False,
@@ -306,7 +306,7 @@ def test_policy_rejects_mismatched_vllm_and_megatron_fp32_lm_head(
 
 
 def test_policy_rejects_vllm_fp32_lm_head_with_dtensor_trainer():
-    config = create_dtensor_config("test-model", tp=1)
+    config = create_automodel_config("test-model", tp=1)
     set_vllm_generation(config, {"fp32_lm_head": True})
 
     with (
@@ -323,7 +323,7 @@ def test_policy_rejects_vllm_fp32_lm_head_with_dtensor_trainer():
 
 
 def test_policy_accepts_vllm_fp32_lm_head_disabled_with_dtensor_trainer():
-    config = create_dtensor_config("test-model", tp=1)
+    config = create_automodel_config("test-model", tp=1)
     set_vllm_generation(config, {})
 
     policy = construct_policy_with_mocks(config)
@@ -332,7 +332,7 @@ def test_policy_accepts_vllm_fp32_lm_head_disabled_with_dtensor_trainer():
 
 
 def test_policy_rejects_fp32_lm_head_env_var_toggle():
-    config = create_dtensor_config("test-model", tp=1)
+    config = create_automodel_config("test-model", tp=1)
     set_vllm_generation(
         config, {"env_vars": {VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "1"}}
     )
@@ -379,7 +379,7 @@ def test_validate_fp32_lm_head_rejects_fused_logprobs_without_generation():
 
     with pytest.raises(ValueError, match="use_fused_linear_logprobs"):
         validate_fp32_lm_head_config(
-            config, megatron_enabled=True, dtensor_enabled=False
+            config, megatron_enabled=True, automodel_enabled=False
         )
 
 
@@ -414,7 +414,7 @@ def test_policy_accepts_megatron_fp32_lm_head_with_megatron_generation():
 def test_policy_flops_tracker_uses_hf_config_overrides() -> None:
     cluster = create_mock_cluster(world_size=1)
     tokenizer = create_mock_tokenizer()
-    config = create_dtensor_config("test/model", tp=1)
+    config = create_automodel_config("test/model", tp=1)
     overrides = {"qk_rope_head_dim": 64}
     config["hf_config_overrides"] = overrides
     model_config = MagicMock()
@@ -440,7 +440,7 @@ def test_nvfp4_pertoken_rejects_dtensor_training_backend(
     mock_ray_worker_group,
     tiny_llama_model_path,
 ):
-    config = create_dtensor_config(tiny_llama_model_path, tp=1)
+    config = create_automodel_config(tiny_llama_model_path, tp=1)
     config["generation"]["backend"] = "vllm"
     config["generation"]["nvfp4_pertoken_rollout"] = {"enabled": True}
 
@@ -469,7 +469,7 @@ def test_policy_selects_worker_extension_from_config_or_constructor(
     configured_extension_fqn: str | None,
     explicit_extension_fqn: str | None,
 ) -> None:
-    config = create_dtensor_config("test-model", tp=1)
+    config = create_automodel_config("test-model", tp=1)
     if configured_extension_fqn is not None:
         config["worker_extension_cls_fqn"] = configured_extension_fqn
     with (
@@ -495,7 +495,7 @@ def test_policy_selects_worker_extension_from_config_or_constructor(
 
 def test_policy_constructor_worker_extension_allows_quantization() -> None:
     """The constructor argument may extend the quant-resolved worker; the config field may not."""
-    config = create_dtensor_config("test-model", tp=1)
+    config = create_automodel_config("test-model", tp=1)
     config["quant_cfg"] = "NVFP4"
 
     with (
@@ -542,7 +542,7 @@ def test_policy_rejects_invalid_worker_extension_config(
     explicit_extension_fqn,
     error_match,
 ) -> None:
-    config = create_dtensor_config("test-model", tp=1)
+    config = create_automodel_config("test-model", tp=1)
     config.update(config_updates)
 
     with pytest.raises(ValueError, match=error_match):
@@ -557,7 +557,7 @@ def test_policy_rejects_invalid_worker_extension_config(
 @pytest.mark.parametrize("from_config", [False, True])
 def test_policy_rejects_unregistered_worker_extension(from_config: bool) -> None:
     extension_fqn = "tests.extensions.UnregisteredPolicyWorker"
-    config = create_dtensor_config("test-model", tp=1)
+    config = create_automodel_config("test-model", tp=1)
     if from_config:
         config["worker_extension_cls_fqn"] = extension_fqn
     cluster = create_mock_cluster(world_size=1)
@@ -614,7 +614,7 @@ def test_world_size_validation_dtensor(
     """
     cluster = create_mock_cluster(world_size)
     tokenizer = create_mock_tokenizer()
-    config = create_dtensor_config(
+    config = create_automodel_config(
         tiny_llama_model_path, tp, pp=1, cp=cp
     )  # DTensor always has PP=1
 
@@ -665,8 +665,8 @@ def test_dtensor_dp_replicate_size_sets_batching_dp(
     """Test that dp_replicate_size is separated from the batching DP axis."""
     cluster = create_mock_cluster(world_size=8)
     tokenizer = create_mock_tokenizer()
-    config = create_dtensor_config(tiny_llama_model_path, tp=1)
-    config["dtensor_cfg"]["dp_replicate_size"] = 2
+    config = create_automodel_config(tiny_llama_model_path, tp=1)
+    config["automodel_cfg"]["dp_replicate_size"] = 2
 
     policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
 
@@ -689,8 +689,8 @@ def test_dtensor_hsdp_dispatches_distinct_batches(
     """
     cluster = create_mock_cluster(world_size=8)
     tokenizer = create_mock_tokenizer()
-    config = create_dtensor_config(tiny_llama_model_path, tp=1)
-    config["dtensor_cfg"]["dp_replicate_size"] = 2  # HSDP enabled
+    config = create_automodel_config(tiny_llama_model_path, tp=1)
+    config["automodel_cfg"]["dp_replicate_size"] = 2  # HSDP enabled
 
     policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
 

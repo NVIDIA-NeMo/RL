@@ -391,7 +391,7 @@ def prepare_loss_input(
                     "context parallel size, but got "
                     f"sequence_length={full_seq_len}, cp_size={cp_size}. "
                     "Set policy.make_sequence_length_divisible_by to a multiple of "
-                    "policy.dtensor_cfg.context_parallel_size."
+                    "policy.automodel_cfg.context_parallel_size."
                 )
             cp_rank = (
                 torch.distributed.get_rank(context_parallel_group)

@@ -87,7 +87,7 @@ policy:
   offload_optimizer_for_logprob: true
   offload_policy_before_refit: false
   offload_optimizer_for_refit: true
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
@@ -164,7 +164,7 @@ teachers:
     offload_optimizer_for_logprob: false
     offload_policy_before_refit: false
     offload_optimizer_for_refit: true
-    dtensor_cfg:
+    automodel_cfg:
       enabled: true
       checkpoint:
         model_save_format: "safetensors"
@@ -220,7 +220,7 @@ teachers:
     offload_optimizer_for_logprob: false
     offload_policy_before_refit: false
     offload_optimizer_for_refit: true
-    dtensor_cfg:
+    automodel_cfg:
       enabled: true
       checkpoint:
         model_save_format: "safetensors"

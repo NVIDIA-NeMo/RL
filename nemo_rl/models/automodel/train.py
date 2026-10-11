@@ -59,6 +59,7 @@ from nemo_rl.distributed.model_utils import (
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
     ProcessedMicrobatch,
+    drop_explicit_only_kwargs_not_in_forward,
     filter_multimodal_kwargs_for_model,
 )
 from nemo_rl.models.policy import PolicyConfig
@@ -124,6 +125,8 @@ def _build_model_batch(
 
     if is_reward_model or not allow_flash_attn_args:
         model_batch.pop("flash_attn_kwargs", None)
+
+    drop_explicit_only_kwargs_not_in_forward(model, model_batch)
 
     if clone_model_tensors:
         # Automodel may pad or shard these tensors in place. Keep the loss-side
@@ -1086,7 +1089,7 @@ class FullLogitsPostProcessor:
                     "teacher context parallel size, but got "
                     f"sequence_length={full_seq_len}, cp_size={self.cp_size}. "
                     "Set the teacher's make_sequence_length_divisible_by to a "
-                    "multiple of its dtensor_cfg.context_parallel_size."
+                    "multiple of its automodel_cfg.context_parallel_size."
                 )
             local_len = full_seq_len // self.cp_size
             cp_rank = torch.distributed.get_rank(self.cp_mesh.get_group())
