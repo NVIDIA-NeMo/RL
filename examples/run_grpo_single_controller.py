@@ -128,10 +128,8 @@ def main() -> None:
 
     config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
     print(f"📊 Using log directory: {config.logger.log_dir}")
-    if config.checkpointing["enabled"]:
-        print(
-            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
-        )
+    if config.checkpointing.enabled:
+        print(f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}")
 
     # Must precede init_ray() so the resolved NEMO_RL_OTEL_* env is snapshotted
     # into the Ray runtime_env and inherited by every worker -- including the

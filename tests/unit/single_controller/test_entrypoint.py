@@ -24,11 +24,11 @@ from examples import run_grpo_single_controller
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
-    AsyncRLConfig,
     MasterConfig,
 )
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 @pytest.fixture
@@ -44,8 +44,14 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         env={},
         data_plane={"enabled": True, "impl": "transfer_queue", "backend": "simple"},
         logger=LoggerConfig(log_dir="/tmp/logs"),
-        checkpointing={"enabled": False},
-        async_rl=AsyncRLConfig(),
+        checkpointing=CheckpointingConfig.model_construct(**{"enabled": False}),
+        async_rl=SimpleNamespace(
+            stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0),
+            # model_construct skips validation, so nothing fills the real
+            # AsyncRLConfig defaults in here. main() reads this before init_ray() to
+            # decide on EngineCore reaping; off keeps that a no-op.
+            generation_fleet_health=SimpleNamespace(enabled=False),
+        ),
         grpo=GRPOConfig(async_grpo=None),
     )
     configured_generation = {"backend": "vllm", "_mtp_weights_from_refit": True}
