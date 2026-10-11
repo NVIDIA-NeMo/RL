@@ -43,3 +43,25 @@ def test_setup_retains_generation_only_audit_and_policy_precedence(policy_overri
 def test_setup_without_generation_overrides_keeps_legacy_policy_config():
     policy = {"hf_config_overrides": {"rope_theta": 10000}, "generation": {}}
     assert _setup_handoff(policy) == {"hf_overrides": {"rope_theta": 10000}}
+
+
+@pytest.mark.parametrize(
+    "policy_overrides,generation_overrides,expected",
+    [
+        (
+            None,
+            {"audit": {"output_dir": "/job/refit"}},
+            {"audit": {"output_dir": "/job/refit"}},
+        ),
+        ({"rope_theta": 10000}, None, {"rope_theta": 10000}),
+        (None, None, {}),
+    ],
+)
+def test_setup_none_overrides_are_empty_without_losing_other_side(
+    policy_overrides, generation_overrides, expected
+):
+    policy = {
+        "hf_config_overrides": policy_overrides,
+        "generation": {"vllm_kwargs": {"hf_overrides": generation_overrides}},
+    }
+    assert _setup_handoff(policy)["hf_overrides"] == expected

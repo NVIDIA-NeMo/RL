@@ -1024,8 +1024,8 @@ def setup(
 
         # Keep generation-only configuration; shared model fields follow policy.
         vllm_kwargs["hf_overrides"] = {
-            **vllm_kwargs.get("hf_overrides", {}),
-            **policy_config.get("hf_config_overrides", {}),
+            **(vllm_kwargs.get("hf_overrides") or {}),
+            **(policy_config.get("hf_config_overrides") or {}),
         }
 
         if enable_nemo_gym:
