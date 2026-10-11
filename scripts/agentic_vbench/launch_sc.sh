@@ -252,6 +252,17 @@ mkdir -p "\${AGENTIC_VBENCH_RUNTIME_ROOT}"
 for prewarm_pass in populate verify; do
   /opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python -c "from transformers import AutoConfig, AutoProcessor, AutoTokenizer; p='${model_path}'; c=AutoConfig.from_pretrained(p, trust_remote_code=True); AutoProcessor.from_pretrained(p, trust_remote_code=True, use_fast=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print('vLLM prewarm: \${prewarm_pass}', type(c).__module__, type(c).__name__)"
 done
+# SKIP_REPLAY_RESTORE=1 (default): resume weights + dataloader cursor only. The
+# native TQ snapshot restore logs "dtype mismatch: existing=int64, incoming=
+# float32" for both partitions and the first step trained on restored rows had a
+# token_mult_prob_error of 1140 (run 2209083/2210161 step 2). Without
+# replay_buffer_metadata.pt the controller takes its documented empty-buffer
+# path and regenerates the buffered groups (costs about one step per restart).
+if [[ "${SKIP_REPLAY_RESTORE:-1}" == "1" ]]; then
+  for meta in "${checkpoint_dir}"/step_*/replay_buffer_metadata.pt; do
+    [[ -f "\$meta" ]] && mv "\$meta" "\$meta.disabled" && echo "[launch_sc] disabled replay restore: \$meta"
+  done
+fi
 "\${uv_bin}" run --no-sync python examples/run_grpo_single_controller.py \
   --config "${config_in_container}" \
   checkpointing.checkpoint_dir="${checkpoint_dir}" \
@@ -293,7 +304,7 @@ last_array_task=$((job_cycles - 1))
 # The cluster's OccupiedIdleGPUsJobReaper cancels jobs whose GPUs look idle;
 # model loading, Harbor container setup and the first long-episode wave keep the
 # generation GPUs idle for well over an hour. Declare the exemption up front.
-sbatch_comment="${SBATCH_COMMENT:-{\"OccupiedIdleGPUsJobReaper\":{\"exemptIdleTimeMins\":\"120\",\"reason\":\"data_loading\",\"description\":\"Model load, task-container setup and agentic rollouts keep GPUs idle for up to 120 minutes\"}}}"
+sbatch_comment="${SBATCH_COMMENT:-{\"OccupiedIdleGPUsJobReaper\":{\"exemptIdleTimeMins\":\"240\",\"reason\":\"data_loading\",\"description\":\"Model load, task-container setup and agentic rollouts keep GPUs idle for up to 240 minutes (training GPUs wait a whole generation phase)\"}}}"
 submit_args=(
   --parsable
   --comment="${sbatch_comment}"
