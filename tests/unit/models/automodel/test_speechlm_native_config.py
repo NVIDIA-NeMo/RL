@@ -4,6 +4,7 @@ import math
 from types import SimpleNamespace
 
 import pytest
+import torch
 from omegaconf import DictConfig
 from transformers import AutoConfig, NemotronHConfig
 
@@ -63,3 +64,22 @@ def test_native_facade_uses_loaded_config_and_preserves_overrides(tmp_path, monk
     assert model.config.mtp is None
     assert cfg["encoder_chunk_size_seconds"] == 10.0
     assert cfg["llm_config"]["time_step_limit"][1] == {"__float__": "Infinity"}
+
+
+@pytest.mark.parametrize("dtype", ["torch.float32", "float32", torch.float32])
+def test_native_loader_preserves_dtype_at_speech_boundary(monkeypatch, dtype):
+    observed = {}
+    model = SimpleNamespace(training=True, validate_update_surface=lambda: None, train=lambda mode: None)
+    def load(cls, model_name, **kwargs):
+        observed.update(kwargs)
+        return model
+    monkeypatch.setattr(SALMAutomodel, "from_pretrained", classmethod(load))
+    result = SpeechLMPolicy.from_pretrained(
+        "fixture", native_model={"trainable_names": ["llm.proj.weight"]}, torch_dtype=dtype,
+    )
+    assert result is model
+    assert observed["torch_dtype"] == ("float32" if isinstance(dtype, str) else dtype)
+    resolved = getattr(torch, observed["torch_dtype"]) if isinstance(observed["torch_dtype"], str) else observed["torch_dtype"]
+    assert resolved == torch.float32
+    assert observed["parameter_config"].trainable_dtype == torch.float32
+    assert observed["parameter_config"].frozen_dtype == torch.bfloat16

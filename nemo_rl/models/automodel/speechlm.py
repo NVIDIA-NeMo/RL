@@ -81,6 +81,9 @@ class SpeechLMPolicy(SALMAutomodel):
         for name in ("use_liger_kernel", "force_hf"):
             if kwargs.pop(name, False):
                 raise ValueError(f"{name} is not supported for native SpeechLM")
+        # RL's generic loader passes str(torch.dtype); Speech expects its name.
+        if isinstance(kwargs.get("torch_dtype"), str):
+            kwargs["torch_dtype"] = kwargs["torch_dtype"].removeprefix("torch.")
         activation_checkpointing = kwargs.pop("activation_checkpointing", False)
         kwargs["activation_checkpointing_llm"] = activation_checkpointing
         parameter_config = ParameterConfig(
