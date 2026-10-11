@@ -550,7 +550,9 @@ def _nested_round_trip_body(rank: int):
     )
     for key, value in expected.items():
         got = out[key]
-        assert got.device == out["input_lengths"].device, key
+        assert got.device == value.device, key
+        if rank == 0:
+            assert got is value, key
         if value.is_nested:
             assert got.is_nested and got.layout == value.layout, key
             for got_row, row in zip(got.unbind(), value.unbind()):

@@ -273,11 +273,13 @@ def _broadcast_batched_data_dict(
                     values.view(torch.uint8) if values.dtype == torch.int16 else values
                 )
                 torch.distributed.broadcast(wire, src=src, group=group)
+                del wire
             if not is_leader:
                 values = values.to(src_device)
-            out[key] = torch.nested.nested_tensor_from_jagged(
-                values, offsets.to(values.device)
-            )
+                out[key] = torch.nested.nested_tensor_from_jagged(
+                    values, offsets.to(values.device)
+                )
+            del values
         elif kind == "packed_tensor":
             header, shapes, dtype_str, source_device = entry[2:]
             if is_leader:
