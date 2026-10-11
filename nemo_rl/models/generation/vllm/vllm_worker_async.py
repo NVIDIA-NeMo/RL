@@ -1728,17 +1728,24 @@ class VllmAsyncGenerationWorkerImpl(
 
         return server, base_url, reserved_sock
 
-    def _engine_generate(self, *args: Any, **kwargs: Any) -> AsyncGenerator[Any, None]:
-        """Start an engine request from the Ray actor loop.
+    @on_engine_loop
+    async def _engine_generate_final(
+        self, prompt: Any, sampling_params: Any, request_id: str
+    ) -> Any:
+        """Run one engine request to completion and return its final output.
 
-        With an owner loop, each output step runs on that loop and an
-        unfinished request is aborted there.
+        With an owner loop, the whole request runs there and crosses threads
+        once, not once per output step. Cancelling the caller cancels the
+        request, which ``AsyncLLM.generate`` aborts.
         """
-        if getattr(self, "_engine_owner_loop", None) is None:
-            return self.llm.generate(*args, **kwargs)
-        return _AsyncLLMHTTPClient(self.llm, self._engine_owner_loop.loop).generate(
-            *args, **kwargs
-        )
+        final_request_output = None
+        async for request_output in self.llm.generate(
+            prompt=prompt, sampling_params=sampling_params, request_id=request_id
+        ):
+            final_request_output = request_output
+        if final_request_output is None:
+            raise RuntimeError(f"No output received for request {request_id}")
+        return final_request_output
 
     @on_engine_loop
     async def init_collective_async(
@@ -1882,20 +1889,11 @@ class VllmAsyncGenerationWorkerImpl(
 
             request_id = str(uuid.uuid4())
 
-            # Generate using vLLM async engine
-            vllm_request_generator = self._engine_generate(
+            final_request_output = await self._engine_generate_final(
                 prompt=prompt,
                 sampling_params=sampling_params_for_request,
                 request_id=request_id,
             )
-
-            # Get the final result from the generator
-            final_request_output = None
-            async for req_output in vllm_request_generator:
-                final_request_output = req_output
-
-            if final_request_output is None:
-                raise RuntimeError(f"No output received for request {request_id}")
 
             validate_rollout_prompt(
                 input_ids_batch[sample_idx, :current_input_actual_length].tolist(),
@@ -2112,20 +2110,11 @@ class VllmAsyncGenerationWorkerImpl(
 
             request_id = str(uuid.uuid4())
 
-            # Generate using vLLM async engine
-            vllm_request_generator = self._engine_generate(
+            final_request_output = await self._engine_generate_final(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
             )
-
-            # Get the final result from the generator
-            final_request_output = None
-            async for req_output in vllm_request_generator:
-                final_request_output = req_output
-
-            if final_request_output is None:
-                raise RuntimeError(f"No output received for request {request_id}")
 
             # Extract the generated text
             generated_text = final_request_output.outputs[0].text

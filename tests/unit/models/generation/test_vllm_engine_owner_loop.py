@@ -4,6 +4,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+import uvloop
 
 from nemo_rl.models.generation.vllm.engine_loop import EngineOwnerLoop, on_engine_loop
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -79,6 +80,7 @@ def test_owner_loop_runs_coroutines_on_its_thread() -> None:
         thread_id, loop = owner_loop.run(identity())
         assert thread_id == owner_loop.thread.ident
         assert loop is owner_loop.loop
+        assert isinstance(loop, uvloop.Loop)
         with pytest.raises(RuntimeError, match="outside its owner loop"):
             owner_loop.assert_owner()
     finally:
@@ -158,25 +160,49 @@ async def test_engine_entry_points_run_on_the_owner_loop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_engine_generate_steps_and_aborts_on_the_owner_loop() -> None:
+async def test_engine_generate_final_runs_whole_request_on_the_owner_loop() -> None:
     owner_loop = EngineOwnerLoop()
     engine = _OwnerCheckedEngine(owner_loop)
     worker = _worker(owner_loop, engine)
     try:
-        outputs = [
-            step
-            async for step in worker._engine_generate(
-                prompt="p", sampling_params=None, request_id="complete"
-            )
-        ]
-        assert outputs == [0, 1, 2]
-
-        stream = worker._engine_generate(
-            prompt="p", sampling_params=None, request_id="early-close"
+        final = await worker._engine_generate_final(
+            prompt="p", sampling_params=None, request_id="complete"
         )
-        assert await anext(stream) == 0
-        await stream.aclose()
-        assert engine.aborted == ["early-close"]
+        assert final == 2
+        assert engine.calls == ["generate:0", "generate:1", "generate:2"]
+    finally:
+        owner_loop.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_engine_generate_final_cancellation_reaches_the_engine() -> None:
+    owner_loop = EngineOwnerLoop()
+    started = threading.Event()
+    closed = threading.Event()
+
+    class BlockingEngine:
+        async def generate(self, prompt: Any, sampling_params: Any, request_id: str):
+            owner_loop.assert_owner()
+            started.set()
+            try:
+                await asyncio.Event().wait()
+                yield None
+            finally:
+                # AsyncLLM.generate aborts the request on this path.
+                closed.set()
+
+    worker = _worker(owner_loop, BlockingEngine())
+    task = asyncio.create_task(
+        worker._engine_generate_final(
+            prompt="p", sampling_params=None, request_id="cancelled"
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.to_thread(closed.wait, 5)
     finally:
         owner_loop.shutdown()
 

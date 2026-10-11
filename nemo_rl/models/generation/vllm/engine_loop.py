@@ -52,7 +52,12 @@ class EngineOwnerLoop:
         return self._loop
 
     def _run(self) -> None:
-        loop = asyncio.new_event_loop()
+        # vLLM installs uvloop (fastapi[standard] -> uvicorn[standard]), and
+        # uvicorn's default server thread already runs on it. Import it here so
+        # processes without vLLM can still import this module.
+        import uvloop
+
+        loop = uvloop.new_event_loop()
         asyncio.set_event_loop(loop)
         self._loop = loop
         self._thread_id = threading.get_ident()
