@@ -1022,8 +1022,11 @@ def setup(
         configure_vllm_for_router_replay(policy_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
 
-        ## make vllm hf overrides match the training policy
-        vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
+        # Keep generation-only configuration; shared model fields follow policy.
+        vllm_kwargs["hf_overrides"] = {
+            **vllm_kwargs.get("hf_overrides", {}),
+            **policy_config.get("hf_config_overrides", {}),
+        }
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
