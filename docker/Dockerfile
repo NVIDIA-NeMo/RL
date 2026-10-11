@@ -678,10 +678,17 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
     printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s-cp38-abi3-manylinux_2_28_%s.whl\n' \
         "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
+    # --no-sync: this outer run only drives prefetch_venvs.py. A plain `uv run` would re-sync the MAIN venv
+    # with UV_TORCH_BACKEND / UV_OVERRIDE set (a different torch/nvidia index than the lock) and leave root-owned
+    # files that the runtime-UID `uv sync --frozen` check at the end of this stage cannot replace. The two
+    # variables still reach the Gym server venvs through the environment.
     UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
     UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
-    UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
+    UV_LINK_MODE=symlink PYTHONPATH=/opt/nemo-rl uv run --no-sync python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
     rm -f "${GYM_VLLM_OVERRIDE}"
+    # Hand what this layer created in the shared cache and venvs to the runtime UID, as the layers above do.
+    find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
+        -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
 fi
 EOF
 # Prebuild Gym's h2-ping-sidecar: a local HTTP/2 PING proxy that keeps long requests to NVCF endpoints
