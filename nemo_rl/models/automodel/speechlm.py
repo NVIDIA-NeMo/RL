@@ -207,11 +207,14 @@ class SpeechLMPolicy(SALMAutomodel):
             if isinstance(head.weight, DTensor)
             else head.weight
         )
-        bias = (
-            head.bias.full_tensor()
-            if isinstance(getattr(head, "bias", None), DTensor)
-            else getattr(head, "bias", None)
-        )
+        # TE bias=False uses an empty ordinary tensor, which is not a bias
+        # parameter/buffer and can remain on CPU after model onload. DTensor
+        # numel() is global, so a real bias with an empty local shard is kept.
+        bias = getattr(head, "bias", None)
+        if bias is not None and bias.numel() == 0:
+            bias = None
+        elif isinstance(bias, DTensor):
+            bias = bias.full_tensor()
         result = response_logprobs(
             hidden,
             inputs["target_ids"],
