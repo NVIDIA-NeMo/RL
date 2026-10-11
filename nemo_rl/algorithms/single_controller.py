@@ -574,6 +574,9 @@ class SingleControllerActor:
             self._gym_checkpoint_coordinator = GymCheckpointCoordinator(
                 as_nemo_gym_shard_set(self._env_handles["nemo_gym"]),
                 control_timeout_s=(self._master_config.token_capture.control_timeout_s),
+                prepare_timeout_s=(
+                    self._master_config.rollout_recovery.gym_prepare_timeout_s
+                ),
             )
             self._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
             self._rollout_manager.set_rollout_dispatch_admission_gate(
