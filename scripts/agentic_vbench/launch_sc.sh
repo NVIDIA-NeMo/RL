@@ -259,7 +259,9 @@ done
 # replay_buffer_metadata.pt the controller takes its documented empty-buffer
 # path and regenerates the buffered groups (costs about one step per restart).
 if [[ "${SKIP_REPLAY_RESTORE:-1}" == "1" ]]; then
-  for meta in "${checkpoint_dir}"/step_*/replay_buffer_metadata.pt; do
+  # rollout_recovery.pt must go with it: the controller refuses a recovery file
+  # whose TQ snapshot is not being restored.
+  for meta in "${checkpoint_dir}"/step_*/replay_buffer_metadata.pt "${checkpoint_dir}"/step_*/rollout_recovery.pt; do
     [[ -f "\$meta" ]] && mv "\$meta" "\$meta.disabled" && echo "[launch_sc] disabled replay restore: \$meta"
   done
 fi
