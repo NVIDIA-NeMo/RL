@@ -47,6 +47,22 @@ vllm_load_format="${VLLM_LOAD_FORMAT:-auto}"
 persistent_cache="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/nemotron/users/arushig/nemo_rl_cache}"
 gym_venv_dir="${GYM_VENV_DIR:-${persistent_cache}/gym_venvs_cc_pr4200}"
 slurm_time_limit="${SLURM_TIME_LIMIT:-04:00:00}"
+# The controller stops a cycle early once elapsed + mean step time would pass
+# checkpointing.checkpoint_must_save_by; NeMo-RL's default is 3h45 regardless of
+# the job's limit, which made a 12 h cycle quit after one 2 h step. Derive it from
+# the Slurm limit minus a shutdown margin (DD:HH:MM:SS); CHECKPOINT_MUST_SAVE_BY overrides.
+_limit_to_seconds() {  # accepts HH:MM:SS, D-HH:MM:SS, D-HH, MM:SS, MM
+  local t=$1 d=0 hms
+  if [[ $t == *-* ]]; then d=${t%%-*}; hms=${t#*-}; else hms=$t; fi
+  IFS=: read -r a b c <<<"$hms"
+  if [[ -z $b ]]; then hms="00:$a:00"; elif [[ -z $c ]]; then [[ $t == *-* ]] && hms="$a:$b:00" || hms="00:$a:$b"; fi
+  IFS=: read -r h m s <<<"$hms"
+  echo $(( d*86400 + 10#$h*3600 + 10#$m*60 + 10#$s ))
+}
+_seconds_to_ddhhmmss() { printf '%02d:%02d:%02d:%02d' $(($1/86400)) $(($1%86400/3600)) $(($1%3600/60)) $(($1%60)); }
+_budget_s=$(( $(_limit_to_seconds "$slurm_time_limit") - ${CHECKPOINT_MARGIN_SECONDS:-1200} ))
+(( _budget_s < 600 )) && _budget_s=600
+checkpoint_must_save_by="${CHECKPOINT_MUST_SAVE_BY:-$(_seconds_to_ddhhmmss "$_budget_s")}"
 
 # Context compaction: "true" enables NeMo-RL's framework-owned context
 # reconstruction (token_capture.context_compaction). OpenCode's own compaction is
@@ -257,6 +273,7 @@ done
   grpo.num_prompts_per_step="${num_prompts}" \
   grpo.num_generations_per_prompt="${num_generations}" \
   grpo.max_num_steps="${max_steps}" \
+  checkpointing.checkpoint_must_save_by="${checkpoint_must_save_by}" \
   policy.train_global_batch_size="${train_global_batch_size}" \
   checkpointing.save_period="${save_period}" \
   checkpointing.keep_top_k="${checkpoint_keep_top_k}" \
@@ -296,6 +313,7 @@ submit_args=(
 
 echo "candidate=${candidate_name}"
 echo "sbatch_comment=${sbatch_comment}"
+echo "time_limit=${slurm_time_limit} checkpoint_must_save_by=${checkpoint_must_save_by}"
 echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template} vllm_load_format=${vllm_load_format}"
 echo "context_compaction=${context_compaction} opencode_compaction_auto=${AGENTIC_VBENCH_COMPACTION_AUTO} opencode_prune=${AGENTIC_VBENCH_COMPACTION_PRUNE} max_turns=${AGENTIC_VBENCH_MAX_TURNS:-32} context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS:-49152} output_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS:-8192} tasks=${AGENTIC_VBENCH_TASKS:-all}"
 echo "episodes=${AGENTIC_VBENCH_OUTPUT_ROOT}"
