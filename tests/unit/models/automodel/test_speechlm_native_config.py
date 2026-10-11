@@ -83,3 +83,56 @@ def test_native_loader_preserves_dtype_at_speech_boundary(monkeypatch, dtype):
     assert resolved == torch.float32
     assert observed["parameter_config"].trainable_dtype == torch.float32
     assert observed["parameter_config"].frozen_dtype == torch.bfloat16
+
+
+def test_native_perception_selection_precedes_activation_checkpoint_wrapping(monkeypatch):
+    from torch import nn
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+    from nemo_automodel.components.utils.parameter_config import ParameterConfig
+    from nemo.collections.speechlm2.models import salm_automodel
+
+    class Perception(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = nn.Module()
+            self.encoder.asr_encoder = nn.Module()
+            self.encoder.asr_encoder.layers = nn.ModuleList([nn.Linear(2, 2) for _ in range(32)])
+            self.proj = nn.Linear(2, 2)
+            self.checkpointing_enabled = False
+
+        def set_activation_checkpointing(self, enabled):
+            self.checkpointing_enabled = enabled
+            if enabled:
+                layers = self.encoder.asr_encoder.layers
+                for index, layer in enumerate(layers):
+                    layers[index] = checkpoint_wrapper(layer)
+
+    perception = Perception()
+    selected = tuple(
+        f"perception.encoder.asr_encoder.layers.{index}.{role}"
+        for index in (30, 31) for role in ("weight", "bias")
+    ) + ("perception.proj.weight", "perception.proj.bias")
+    model = SimpleNamespace(
+        _trainer=None,
+        cfg=DictConfig({"pretrained_llm": "fixture", "torch_dtype": "float32", "pretrained_weights": False}),
+        parameter_config=ParameterConfig(selected, torch.float32, torch.bfloat16),
+        _mtp_enabled=False,
+        setup_moe_options=lambda: None,
+        _apply_mtp_training_mode=lambda mode: None,
+    )
+    monkeypatch.setattr(salm_automodel, "load_pretrained_automodel_llm", lambda *args, **kwargs: SimpleNamespace(config=SimpleNamespace(num_nextn_predict_layers=0)))
+    monkeypatch.setattr(salm_automodel, "setup_speech_encoder", lambda model, **kwargs: setattr(model, "perception", perception))
+    monkeypatch.setattr(salm_automodel, "update_perception_output_dim", lambda model: None)
+    monkeypatch.setattr(salm_automodel, "maybe_load_pretrained_models", lambda model: None)
+    # Run the production configure path and real selection/casting/wrappers;
+    # only full backbone/ASR weight construction is replaced by tiny modules.
+    SALMAutomodel.configure_model(model, activation_checkpointing_perception=True)
+    assert perception.checkpointing_enabled
+    parameters = {name.replace("._checkpoint_wrapped_module", ""): value for name, value in perception.named_parameters()}
+    assert {"perception." + name for name, value in parameters.items() if value.requires_grad} == set(selected)
+    assert all(value.dtype == (torch.float32 if "perception." + name in selected else torch.bfloat16) for name, value in parameters.items())
+    assert all(hasattr(layer, "_checkpoint_wrapped_module") for layer in perception.encoder.asr_encoder.layers)
+    loss = sum(layer(torch.ones(1, 2)).sum() for layer in perception.encoder.asr_encoder.layers[30:])
+    loss.backward()
+    assert all(perception.encoder.asr_encoder.layers[index].weight.grad is not None for index in (30, 31))
+    assert perception.encoder.asr_encoder.layers[0].weight.grad is None
