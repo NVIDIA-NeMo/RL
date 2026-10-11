@@ -42,8 +42,10 @@ from nemo_rl.models.generation.trtllm.config import (
     TrtllmConfig,
     TrtllmDisaggServerConfig,
     TrtllmEngineArgs,
+    replica_width,
     resolve_disagg_layout,
     resolve_disagg_server_config,
+    role_tensor_parallel_size,
 )
 
 
@@ -387,8 +389,8 @@ class TrtllmGeneration(GenerationInterface):
             # keeps "replica" meaning the same thing on both paths.
             return ["aggregated"] * n, [self.tp_size] * n, n
 
-        prefill_tp = int(self._role_kwargs("prefill")["tensor_parallel_size"])
-        decode_tp = int(self._role_kwargs("decode")["tensor_parallel_size"])
+        prefill_tp = role_tensor_parallel_size(self.cfg, "prefill")
+        decode_tp = role_tensor_parallel_size(self.cfg, "decode")
         for role, value in (("prefill", prefill_tp), ("decode", decode_tp)):
             assert value >= 1, (
                 f"trtllm_cfg.{role}_engine.tensor_parallel_size must be >= 1"
@@ -401,13 +403,13 @@ class TrtllmGeneration(GenerationInterface):
             f"num_prefill_engines={num_prefill}, num_decode_engines={num_decode}"
         )
 
-        replica_width = num_prefill * prefill_tp + num_decode * decode_tp
-        assert world_size % replica_width == 0, (
-            f"replica width {replica_width} GPUs ({num_prefill} prefill x "
+        width = replica_width(self.cfg)
+        assert world_size % width == 0, (
+            f"replica width {width} GPUs ({num_prefill} prefill x "
             f"TP{prefill_tp} + {num_decode} decode x TP{decode_tp}) does not "
             f"divide the {world_size} inference GPUs."
         )
-        num_replicas = world_size // replica_width
+        num_replicas = world_size // width
 
         roles = (["prefill"] * num_prefill + ["decode"] * num_decode) * num_replicas
         tps = ([prefill_tp] * num_prefill + [decode_tp] * num_decode) * num_replicas
@@ -573,7 +575,7 @@ class TrtllmGeneration(GenerationInterface):
                     # be. Stopping early instead would leave these GPUs idle and
                     # silently run fewer engines than the config asks for.
                     free = pg.bundle_count - cursor
-                    replica_width = sum(engine_tps) // max(self.num_replicas, 1)
+                    width = replica_width(self.cfg)
                     if engine_idx < len(engine_tps):
                         why = (
                             f"engine {engine_idx} needs TP{engine_tps[engine_idx]} "
@@ -587,7 +589,7 @@ class TrtllmGeneration(GenerationInterface):
                         f"nodes. Engine widths in order: {engine_tps}. Two layouts "
                         f"always tile: give every role tensor_parallel_size == "
                         f"GPUs per node (one engine per node), or make the replica "
-                        f"width ({replica_width}) divide GPUs per node (whole "
+                        f"width ({width}) divide GPUs per node (whole "
                         f"replicas per node)."
                     )
 

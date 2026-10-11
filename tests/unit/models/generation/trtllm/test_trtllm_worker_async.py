@@ -78,6 +78,7 @@ def test_configure_worker_reserves_gpus_for_internal_trtllm_actors(monkeypatch):
     assert env_vars["PATH"].endswith(":/usr/bin")
     assert init_kwargs == {
         "bundle_indices": [2, 3],
+        "bundle_pg_idx": 0,
         "fraction_of_gpus": 2,
     }
     assert actor_options == {}

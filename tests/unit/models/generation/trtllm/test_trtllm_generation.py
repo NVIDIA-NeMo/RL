@@ -21,10 +21,11 @@ import torch
 from pydantic import ValidationError
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.trtllm import trtllm_generation
 from nemo_rl.models.generation.interfaces import DisaggConfig
+from nemo_rl.models.generation.trtllm import trtllm_generation
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmDisaggServerConfig,
+    replica_width,
     resolve_disagg_layout,
     resolve_disagg_server_config,
 )
@@ -409,9 +410,7 @@ def test_the_layout_and_the_server_block_carry_disjoint_keys():
 def test_a_layout_key_under_disagg_server_is_rejected():
     # extra="allow" would otherwise swallow it silently.
     with pytest.raises(ValueError, match="generation.disaggregation"):
-        resolve_disagg_server_config(
-            _config(disagg_server={"num_prefill_engines": 2})
-        )
+        resolve_disagg_server_config(_config(disagg_server={"num_prefill_engines": 2}))
 
 
 def test_a_plausible_but_wrong_router_is_rejected():
@@ -478,6 +477,25 @@ def test_plan_engines_lays_replicas_out_contiguously(
     assert roles == expected_roles
     assert tps == expected_tps
     assert num_replicas == expected_replicas
+
+
+@pytest.mark.parametrize("as_model", [False, True], ids=["dict", "DisaggConfig"])
+def test_a_disaggregated_replica_spans_all_of_its_engines(as_model):
+    # MasterConfig(**cfg) validates the layout into a DisaggConfig before
+    # grpo.setup() sizes NVLink-domain placement with this, so both shapes
+    # must work.
+    layout = {"enabled": True, "num_prefill_engines": 1, "num_decode_engines": 2}
+    cfg = _config(
+        disaggregation=DisaggConfig.model_validate(layout) if as_model else layout,
+        prefill_engine={"tensor_parallel_size": 2},
+    )
+
+    # One TP2 prefill engine plus two TP1 decode engines.
+    assert replica_width(cfg) == 4
+
+
+def test_an_aggregated_replica_is_one_engine():
+    assert replica_width(_config(tensor_parallel_size=2)) == 2
 
 
 def test_plan_engines_rejects_a_replica_width_that_does_not_tile_the_cluster():

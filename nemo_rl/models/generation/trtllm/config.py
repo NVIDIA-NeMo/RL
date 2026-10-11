@@ -131,6 +131,33 @@ def resolve_disagg_layout(config: TrtllmConfig) -> DisaggConfig:
     return DisaggConfig.model_validate(_as_dict(config.get("disaggregation")))
 
 
+def role_tensor_parallel_size(
+    config: TrtllmConfig, role: Literal["prefill", "decode"]
+) -> int:
+    """TP of one engine of ``role``: ``trtllm_cfg.{role}_engine`` over the shared TP."""
+    trtllm_cfg = config["trtllm_cfg"]
+    overrides = trtllm_cfg.get(f"{role}_engine") or {}
+    return int(
+        overrides.get("tensor_parallel_size", trtllm_cfg["tensor_parallel_size"])
+    )
+
+
+def replica_width(config: TrtllmConfig) -> int:
+    """GPUs one rollout replica spans.
+
+    Without disaggregation a replica is one engine, ``tensor_parallel_size``
+    wide (PP is always 1). Under it, a replica is its prefill engines plus its
+    decode engines -- the unit that must stay inside one NVLink domain, since
+    the KV cache crosses from prefill to decode on every turn.
+    """
+    layout = resolve_disagg_layout(config)
+    if not layout.enabled:
+        return int(config["trtllm_cfg"]["tensor_parallel_size"])
+    return layout.num_prefill_engines * role_tensor_parallel_size(
+        config, "prefill"
+    ) + layout.num_decode_engines * role_tensor_parallel_size(config, "decode")
+
+
 def resolve_disagg_server_config(config: TrtllmConfig) -> TrtllmDisaggServerConfig:
     """``trtllm_cfg.disagg_server`` as its schema.
 
