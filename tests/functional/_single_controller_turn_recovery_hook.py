@@ -24,7 +24,6 @@ therefore prove that a restored episode returns to the same Gym instance under
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
@@ -34,6 +33,7 @@ from typing import Any
 from examples import run_grpo_single_controller
 from nemo_rl.experience.rollout_manager import RolloutCompletionCallback
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from tests.functional._single_controller_hook_utils import append_event, find_group
 
 
 class _InstrumentedNemoGymRolloutImpl:
@@ -46,43 +46,17 @@ class _InstrumentedNemoGymRolloutImpl:
         recovery_ledger: Any,
         events_path: Path,
     ) -> None:
-        self._delegate = delegate
         # Captured before the hook patches ``delegate.run_rollout`` to point here.
         self._delegate_run_rollout = delegate.run_rollout
         self._recovery_ledger = recovery_ledger
         self._events_path = events_path
 
-    def __getattr__(self, name: str) -> Any:
-        delegate = self.__dict__.get("_delegate")
-        if delegate is None:
-            raise AttributeError(name)
-        return getattr(delegate, name)
-
-    def _append_event(self, event: str, **fields: Any) -> None:
-        self._events_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._events_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"event": event, **fields}, sort_keys=True) + "\n")
-
-    def _find_group(self, rollout_ids: list[str]) -> Any:
-        rollout_id_set = set(rollout_ids)
-        matches = [
-            group
-            for group in self._recovery_ledger.groups()
-            if rollout_id_set.intersection(group.gate_rollout_ids)
-        ]
-        if len(matches) != 1:
-            raise RuntimeError(
-                "turn recovery hook could not uniquely resolve rollout IDs "
-                f"to one ledger group: ids={rollout_ids!r}, matches="
-                f"{[group.group_id for group in matches]!r}"
-            )
-        return matches[0]
-
     @staticmethod
     def _sibling_fields(group: Any, generation_index: int) -> dict[str, Any]:
         sibling = group.siblings[generation_index]
         attempt = sibling.current_attempt
-        gym_rollout_id, gym_attempt = group.gym_episode(generation_index)
+        episode = group.gym_episode(generation_index)
+        gym_rollout_id, gym_attempt = episode.rollout_id, episode.attempt
         return {
             "generation_index": generation_index,
             "logical_rollout_id": group.logical_rollout_id(generation_index),
@@ -112,7 +86,7 @@ class _InstrumentedNemoGymRolloutImpl:
         if dispatch_recorder is None:
             raise RuntimeError("turn recovery hook requires a dispatch recorder")
 
-        group = self._find_group(rollout_ids)
+        group = find_group(self._recovery_ledger, rollout_ids, hook="turn")
         indices = list(generation_indices)
         common = {
             "group_id": group.group_id,
@@ -123,8 +97,9 @@ class _InstrumentedNemoGymRolloutImpl:
         }
 
         def _record_submission(event: str, submitted: list[int]) -> None:
-            refreshed = self._find_group(rollout_ids)
-            self._append_event(
+            refreshed = find_group(self._recovery_ledger, rollout_ids, hook="turn")
+            append_event(
+                self._events_path,
                 event,
                 **common,
                 siblings=[
@@ -134,8 +109,9 @@ class _InstrumentedNemoGymRolloutImpl:
 
         async def _record_completion(generation_index: int, completion: Any) -> None:
             await on_completion(generation_index, completion)
-            refreshed = self._find_group(rollout_ids)
-            self._append_event(
+            refreshed = find_group(self._recovery_ledger, rollout_ids, hook="turn")
+            append_event(
+                self._events_path,
                 "completion",
                 **common,
                 sibling=self._sibling_fields(refreshed, generation_index),
@@ -152,7 +128,7 @@ class _InstrumentedNemoGymRolloutImpl:
                 dispatch_recorder, record=_record_submission
             ),
         )
-        self._append_event("rollout_returned", **common)
+        append_event(self._events_path, "rollout_returned", **common)
         return result
 
 
