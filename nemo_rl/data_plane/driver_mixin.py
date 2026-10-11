@@ -95,10 +95,9 @@ class TQDriverMixin:
         next caller to remember. The union is a no-op for text-only runs, since
         ``present_multimodal_fields`` intersects with ``meta.fields``.
 
-        ``include_multimodal=False`` opts a dispatch out. A value model is the
-        case that exists: its inputs are a fixed list and it never consumes
-        pixels, so unioning them in would fetch and broadcast a column the
-        forward discards.
+        ``include_multimodal=False`` opts a dispatch out when it is known to be
+        text-only. Multimodal value models must keep the default so critic
+        forwards see the same media payload as policy forwards.
         """
         extra_info = dict(meta.extra_info)
         extra_info.pop(GLOBAL_FORWARD_PAD_SEQLEN, None)

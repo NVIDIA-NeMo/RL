@@ -1,0 +1,83 @@
+defaults: ../../ppo_math_1B_megatron_single_controller.yaml
+ppo:
+  num_prompts_per_step: 6
+  num_generations_per_prompt: 4
+  max_num_epochs: 1000
+  max_num_steps: 50
+  ppo_epochs: 1
+  critic_ppo_epochs: 1
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/vlm_ppo-qwen2.5-vl-3b-geometry3k-megatron-single-controller
+  save_period: 10
+policy:
+  model_name: Qwen/Qwen2.5-VL-3B-Instruct
+  is_vlm: true
+  train_global_batch_size: 24
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 3072
+  sequence_packing:
+    enabled: false
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    activation_checkpointing: true
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    optimizer:
+      lr: 5.0e-07
+      min_lr: 5.0e-08
+    scheduler:
+      lr_warmup_iters: 5
+      lr_warmup_init: 5.0e-08
+  generation:
+    max_new_tokens: 2048
+    colocated:
+      resources:
+        gpus_per_node: 2
+    vllm_cfg:
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.8
+      max_model_len: 3072
+    vllm_kwargs:
+      mm_processor_cache_gb: 0
+value:
+  train_micro_batch_size: 1
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    activation_checkpointing: true
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    scheduler:
+      lr_warmup_iters: 5
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: geometry3k
+    split: train
+  validation:
+    dataset_name: geometry3k
+    split: validation
+  default:
+    prompt_file: examples/prompts/geo3k.txt
+    processor: vlm_hf_data_processor
+    env_name: geometry3k
+env:
+  geometry3k:
+    num_workers: 8
+    reward_functions:
+    - name: format
+      weight: 0.1
+    - name: math_expr
+      weight: 0.9
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: nemo-rl
+    name: vlm-ppo-qwen2.5-vl-3b-geometry3k-megatron-single-controller
+cluster:
+  gpus_per_node: 8

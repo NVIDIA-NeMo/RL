@@ -143,6 +143,45 @@ class TestTQValueFanout:
         # logprob_mb_tokens rather than the (larger) train budget.
         assert mock_packing.call_args.args[0] == "logprob_mb_tokens"
 
+    @pytest.mark.parametrize("dispatch", ["get_values", "train"])
+    def test_multimodal_fields_follow_value_dispatch(self, dispatch):
+        v, wg = _make_tq_value()
+        meta = _meta()
+        meta.fields = [
+            *VALUE_SEED_FIELDS,
+            *DP_VALUE_TRAIN_FIELDS,
+            "pixel_values",
+            "image_grid_thw",
+            "content",
+        ]
+        wg.get_all_worker_results.return_value = [
+            {
+                "global_loss": 1.0,
+                "grad_norm": 0.5,
+                "all_mb_metrics": {},
+            }
+        ]
+
+        with (
+            patch.object(TQValue, "_stamp_pad_seqlen"),
+            patch.object(TQValue, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            if dispatch == "get_values":
+                v.get_values_from_meta(meta)
+                static_fields = set(VALUE_SEED_FIELDS)
+            else:
+                v.train_from_meta(meta, loss_fn="LF")
+                static_fields = set(DP_VALUE_TRAIN_FIELDS)
+
+        dispatched_fields = set(mock_shard.call_args.args[0].fields)
+        assert {"pixel_values", "image_grid_thw"} <= dispatched_fields
+        assert static_fields <= dispatched_fields
+        assert "content" not in dispatched_fields
+
     def test_train_from_meta_requests_the_value_train_columns(self):
         v, wg = _make_tq_value()
         meta = _meta()
