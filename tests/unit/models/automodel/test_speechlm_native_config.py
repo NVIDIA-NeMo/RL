@@ -67,7 +67,7 @@ def test_native_facade_uses_loaded_config_and_preserves_overrides(tmp_path, monk
 
 
 @pytest.mark.parametrize("dtype", ["torch.float32", "float32", torch.float32])
-def test_native_loader_preserves_dtype_at_speech_boundary(monkeypatch, dtype):
+def test_native_loader_uses_frozen_baseline_at_speech_boundary(monkeypatch, dtype):
     observed = {}
     model = SimpleNamespace(training=True, validate_update_surface=lambda: None, train=lambda mode: None)
     def load(cls, model_name, **kwargs):
@@ -78,9 +78,9 @@ def test_native_loader_preserves_dtype_at_speech_boundary(monkeypatch, dtype):
         "fixture", native_model={"trainable_names": ["llm.proj.weight"]}, torch_dtype=dtype,
     )
     assert result is model
-    assert observed["torch_dtype"] == ("float32" if isinstance(dtype, str) else dtype)
+    assert observed["torch_dtype"] == torch.bfloat16
     resolved = getattr(torch, observed["torch_dtype"]) if isinstance(observed["torch_dtype"], str) else observed["torch_dtype"]
-    assert resolved == torch.float32
+    assert resolved == torch.bfloat16
     assert observed["parameter_config"].trainable_dtype == torch.float32
     assert observed["parameter_config"].frozen_dtype == torch.bfloat16
 
@@ -179,3 +179,73 @@ def test_moe_options_preserve_explicit_parameter_selection(explicit_selection):
         assert not backbone.mtp.gate.bias.requires_grad
     else:
         assert all(gate.weight.requires_grad and gate.bias.requires_grad for gate in gates)
+
+
+def test_native_loader_preserves_frozen_frontend_and_fp32_selected_weights(monkeypatch):
+    from torch import nn
+    from nemo.collections.asr.modules.audio_preprocessing import AudioToMelSpectrogramPreprocessor
+    from nemo.collections.speechlm2.models import salm_automodel
+
+    class Perception(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(2, 2)
+            self.preprocessor = AudioToMelSpectrogramPreprocessor(
+                features=4, n_fft=16, window_size=None, window_stride=None,
+                n_window_size=16, n_window_stride=8,
+                dither=0.0, pad_to=0, normalize=None,
+            )
+            self.encoder = nn.Module()
+            self.encoder.diarization_model = nn.Module()
+            self.encoder.diarization_model.preprocessor = AudioToMelSpectrogramPreprocessor(
+                features=4, n_fft=16, window_size=None, window_stride=None,
+                n_window_size=16, n_window_stride=8,
+                dither=0.0, pad_to=0, normalize=None,
+            )
+
+        def set_activation_checkpointing(self, enabled):
+            pass
+
+    perception = Perception()
+    # Exact seed storage, including a selected FP32 value that BF16 cannot retain.
+    seed = {name: value.to(torch.bfloat16).clone() for name, value in perception.state_dict().items()}
+    seed["proj.weight"] = torch.full_like(perception.proj.weight, 1.000123)
+    observed = {}
+
+    def load(cls, model_name, **kwargs):
+        observed.update(kwargs)
+        dtype = kwargs["torch_dtype"]
+        dtype_name = str(dtype).removeprefix("torch.")
+        model = SimpleNamespace(
+            _trainer=None,
+            cfg=DictConfig({"pretrained_llm": "fixture", "torch_dtype": dtype_name, "pretrained_weights": False}),
+            parameter_config=kwargs["parameter_config"], _mtp_enabled=False,
+            setup_moe_options=lambda: None, _apply_mtp_training_mode=lambda mode: None,
+            training=True, validate_update_surface=lambda: None, train=lambda mode: None,
+        )
+        SALMAutomodel.configure_model(model)
+        model.perception.load_state_dict(seed, strict=True)
+        return model
+
+    monkeypatch.setattr(SALMAutomodel, "from_pretrained", classmethod(load))
+    monkeypatch.setattr(salm_automodel, "load_pretrained_automodel_llm", lambda *args, **kwargs: SimpleNamespace(config=SimpleNamespace(num_nextn_predict_layers=0)))
+    monkeypatch.setattr(salm_automodel, "setup_speech_encoder", lambda model, **kwargs: setattr(model, "perception", perception))
+    monkeypatch.setattr(salm_automodel, "update_perception_output_dim", lambda model: None)
+    monkeypatch.setattr(salm_automodel, "maybe_load_pretrained_models", lambda model: None)
+    SpeechLMPolicy.from_pretrained(
+        "fixture", native_model={"trainable_names": ["perception.proj.weight"]}, torch_dtype="torch.float32",
+    )
+    assert perception.proj.weight.dtype == torch.float32
+    assert perception.proj.weight.requires_grad
+    assert torch.equal(perception.proj.weight, seed["proj.weight"])
+    assert perception.proj.bias.dtype == torch.bfloat16
+    assert not perception.proj.bias.requires_grad
+    for name, value in perception.state_dict().items():
+        if name != "proj.weight":
+            assert value.dtype == seed[name].dtype, name
+            assert torch.equal(value, seed[name]), name
+    for frontend in (perception.preprocessor, perception.encoder.diarization_model.preprocessor):
+        assert frontend.dtype_sentinel_tensor.dtype == torch.bfloat16
+        assert "dtype_sentinel_tensor" not in frontend.state_dict()
+        features, _ = frontend(input_signal=torch.ones(1, 64, dtype=torch.float32), length=torch.tensor([64]))
+        assert features.dtype == torch.bfloat16
