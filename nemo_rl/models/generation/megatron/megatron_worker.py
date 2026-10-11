@@ -1046,7 +1046,13 @@ class MegatronGenerationMixin:
         supports_stop_tokens = any(
             field.name == "stop_token_ids" for field in fields(SamplingParams)
         )
-        if stop_token_ids and not supports_stop_tokens:
+        # configure_generation_config fills the default with tokenizer EOS.
+        # Legacy engines already stop on termination_id, so only additional
+        # token IDs require the newer SamplingParams API.
+        if not supports_stop_tokens and any(
+            token_id != self.megatron_tokenizer.eod
+            for token_id in (stop_token_ids or [])
+        ):
             raise NotImplementedError(
                 "Megatron stop_token_ids requires a Megatron-Core version with "
                 "SamplingParams.stop_token_ids support. Upgrade Megatron-Core "

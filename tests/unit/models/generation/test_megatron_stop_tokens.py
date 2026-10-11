@@ -52,12 +52,13 @@ def test_configured_stop_ids_reach_sampling_params(stop_ids, greedy):
     assert restored.stop_token_ids == params.stop_token_ids
 
 
-@pytest.mark.parametrize("stop_ids", [None, [], [7]])
+@pytest.mark.parametrize("stop_ids", [None, [], [11], [11, 11], [7], [11, 7]])
 def test_old_engine_does_not_silently_ignore_config(stop_ids):
     @dataclass(init=False)
     class LegacyParams:
         def __init__(self, **kwargs):
             assert "stop_token_ids" not in kwargs
+            assert kwargs["termination_id"] == 11
 
     worker = SimpleNamespace(
         cfg={
@@ -75,7 +76,7 @@ def test_old_engine_does_not_silently_ignore_config(stop_ids):
         "nemo_rl.models.generation.megatron.megatron_worker.SamplingParams",
         LegacyParams,
     ):
-        if stop_ids:
+        if any(token_id != 11 for token_id in (stop_ids or [])):
             with pytest.raises(NotImplementedError, match="Upgrade Megatron-Core"):
                 MegatronGenerationMixin._build_sampling_params(worker, False, None)
         else:
