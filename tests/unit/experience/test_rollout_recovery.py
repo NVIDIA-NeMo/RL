@@ -1115,6 +1115,44 @@ def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
         )
 
 
+def test_turn_restart_without_gym_state_starts_a_restored_attempt_over() -> None:
+    """A restored attempt continues Gym state; a restart without it cannot."""
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g7", gym_instance_id="tools/replica-0"
+        )
+    )
+    rollout_id, attempt = ledger.get_group("g7").gym_episode(0)
+    _mutate(
+        lambda cut: ledger.prepare_for_restart(
+            cut,
+            restored_gym_episodes={("tools/replica-0", rollout_id, attempt)},
+        )
+    )
+    assert ledger.get_group("g7").siblings[0].current_attempt.gym_attempt == 1
+
+    # Crash again; this restart has no Gym state to continue from.
+    restarted = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    _mutate(lambda cut: restarted.prepare_for_restart(cut))
+
+    current = restarted.get_group("g7").siblings[0].current_attempt
+    assert current.status is RolloutAttemptStatus.ABANDONED
+
+
 def test_turn_restart_falls_back_to_sibling_when_gym_episode_is_absent() -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(
