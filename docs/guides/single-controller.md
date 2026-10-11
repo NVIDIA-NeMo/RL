@@ -186,6 +186,11 @@ The TQ snapshot and replay index are captured under the same checkpoint barrier.
 
 On resume, Single-Controller validates the TQ snapshot against the trainer checkpoint, restores the replay index, and makes completed, committed, unconsumed groups available to the sampler before training resumes.
 
+Only the current `rollout_recovery.pt` schema is accepted, for every recovery
+level. Data-plane checkpoints written with an earlier schema, such as those from
+releases before turn-level recovery, cannot be resumed; start those runs in a
+new `checkpoint_dir`.
+
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
 
 [Forest-training runs](./context-compaction.md) recover the same way and need no extra settings.
@@ -373,8 +378,10 @@ group. When a row already carries an `agent_ref`, a matching
 mirroring Gym's concrete-route precedence. Otherwise the task-source override,
 then the global default, applies. The agent map also keeps datasets collated
 before Gym recorded `task_source` working, although re-collating them is
-recommended. Overrides may only select a coarser level than the global target.
-Until Gym advertises group-scoring capabilities, configure group-scored routes
+recommended. Overrides may only select a coarser level than the global target,
+and are not supported with `turn` yet: a checkpointing Gym deployment exports
+every live episode, so a coarser route on it would fall outside the commit
+scope. Until Gym advertises group-scoring capabilities, configure group-scored routes
 such as GenRM explicitly as `prompt_group`. Non-default policies require
 `token_capture.enabled: true`. The task source and resolved policy are persisted
 in `rollout_recovery.pt`, so
