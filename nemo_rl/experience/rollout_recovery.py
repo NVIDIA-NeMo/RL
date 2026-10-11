@@ -542,7 +542,12 @@ class RolloutRecoveryLedger:
                             attempt.status = RolloutAttemptStatus.RESERVED
                             consumed_restores.add(restore_key)
                             continue
-                        if attempt.status is RolloutAttemptStatus.RESERVED:
+                        # A reserved restored attempt continues Gym state; one
+                        # this restart did not restore again starts over.
+                        if (
+                            attempt.status is RolloutAttemptStatus.RESERVED
+                            and attempt.gym_attempt == 0
+                        ):
                             continue
                         attempt.status = RolloutAttemptStatus.ABANDONED
         unused_restores = restored - consumed_restores
