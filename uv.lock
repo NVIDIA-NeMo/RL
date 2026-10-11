@@ -100,7 +100,7 @@ overrides = [
     { name = "numpy", specifier = ">=2.1.0,<2.5" },
     { name = "nvidia-cublas", marker = "sys_platform != 'darwin'", specifier = "==13.5.1.27" },
     { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'", specifier = "==9.20.0.48" },
-    { name = "nvidia-cudnn-frontend", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==1.25.0" },
+    { name = "nvidia-cudnn-frontend", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = ">=1.26.0,<1.29.0" },
     { name = "nvidia-modelopt", extras = ["torch"], git = "https://github.com/NVIDIA/Model-Optimizer?rev=43fd41a58d52c4e6e5dec1d1ff5989ecc737ae1a" },
     { name = "nvidia-nccl-cu13", specifier = "==2.30.7" },
     { name = "nvidia-nvshmem-cu13", marker = "sys_platform != 'darwin'", specifier = ">=3.6.5" },
@@ -4512,7 +4512,7 @@ requires-dist = [
     { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "3rdparty/Gym-workspace/Gym" },
     { name = "nemo-lens", extras = ["aiohttp", "sdk"], git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b0f977d414b2f89938604a0b7eaa78ee08bc8700" },
     { name = "ninja" },
-    { name = "nixl", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==1.3.0" },
+    { name = "nixl", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==1.4.1" },
     { name = "num2words", specifier = ">=0.5.14" },
     { name = "num2words", marker = "extra == 'vllm'", specifier = ">=0.5.14" },
     { name = "numpy" },
@@ -4658,19 +4658,19 @@ wheels = [
 
 [[package]]
 name = "nixl"
-version = "1.3.0"
+version = "1.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "nixl-cu12" },
     { name = "nixl-cu13" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fa/a8/1e956af6efd181f44d0a94bfc9d883f1b19788467357018fbffe1fbe7a2d/nixl-1.3.0-py3-none-any.whl", hash = "sha256:000e2852040bce7863420c98f2c8ca675dc24066099c746fdbfe2bed3593ec9e", size = 10297, upload-time = "2026-06-15T23:22:51.093Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/5a/57be266e12d796fc18b44f87a31ebe164b471d3b4fe3b349d3996e4f05cf/nixl-1.4.1-py3-none-any.whl", hash = "sha256:40168c1fd9e6b77761d9e0f9225bd616cc3e48c75a9592fff488745ca33244df", size = 11744, upload-time = "2026-09-01T23:45:05.881Z" },
 ]
 
 [[package]]
 name = "nixl-cu12"
-version = "1.3.0"
+version = "1.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -4678,13 +4678,13 @@ dependencies = [
     { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or (extra == 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nvrx' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-trtllm')" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/36/f8/9ac816a23a35da5c79ce1e1da80933a013112073a00f4da52eb576a3ee68/nixl_cu12-1.3.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:9a275d532ddb45ecdc5af00f7f47f8945a027d9a1c7a3184d688e151764da2dc", size = 49104015, upload-time = "2026-06-15T23:17:23.474Z" },
-    { url = "https://files.pythonhosted.org/packages/cf/1a/2c11c42f71c0acf164c953291ec28297caeab02f571d9a97e7eca2034b3b/nixl_cu12-1.3.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:60eef38ee2b62957de8ba7d3178618b8bb099663bfd111cb19174b5010c7bd77", size = 50558141, upload-time = "2026-06-15T23:15:00.616Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/8f/6e115224d24d0683370f52a1ac2def237a056a5f57b791b89067b3a31246/nixl_cu12-1.4.1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:207e6f7f28c5e4f0419f1cfd5e66708fde8d9e070670d724941489baeb197d42", size = 77569495, upload-time = "2026-09-01T23:44:10.725Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/a7/af49301412e85694172b53b499cce4ba0024f11dd57a973678850310ca3e/nixl_cu12-1.4.1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:3aad860bed5686052c54f83bbcdd46de43cf5fcf87110aaf1fbbe09a4d6badce", size = 79317285, upload-time = "2026-09-01T23:42:07.901Z" },
 ]
 
 [[package]]
 name = "nixl-cu13"
-version = "1.3.0"
+version = "1.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -4692,8 +4692,8 @@ dependencies = [
     { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or (extra == 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nvrx' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-trtllm')" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ea/ff/9f462e977a40128c088bdc698ab855635caa5d7511fca245365ebf5d5e45/nixl_cu13-1.3.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:7c42f8546cfbe4595669212d4bbf596590f61494f0ae1a3bfbd3fb4fe4abf84f", size = 43678469, upload-time = "2026-06-15T23:21:58.728Z" },
-    { url = "https://files.pythonhosted.org/packages/67/96/d01c466193e88fcc4afeb2dc29ff35512b4af497db7a2e76e95f3f75b821/nixl_cu13-1.3.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:2363d3922402f7f3b7302254c3b44cc71520e5ad6a9dc43898fa59a6ee0620a3", size = 45134021, upload-time = "2026-06-15T23:19:50.763Z" },
+    { url = "https://files.pythonhosted.org/packages/21/df/676e75407416efa2849a41858b8d7d1d83f2079384e0fcb47f2119a02561/nixl_cu13-1.4.1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:23f229d3f73f810c59011231692e9497c78ec8942b083e9038f2e7707d984814", size = 55140149, upload-time = "2026-09-01T23:44:12.257Z" },
+    { url = "https://files.pythonhosted.org/packages/67/76/2893c9c588b633cad9ce30d4b48bde4f79d1b253d90481d89de830d38db9/nixl_cu13-1.4.1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:39b5e5e60843c50e5e3f6f538fb8b8f66755eb8532b4f071a29aa01f91cc99d9", size = 56911761, upload-time = "2026-09-01T23:42:08.913Z" },
 ]
 
 [[package]]
@@ -4910,11 +4910,11 @@ wheels = [
 
 [[package]]
 name = "nvidia-cudnn-frontend"
-version = "1.25.0"
+version = "1.28.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0e/37/ea07ff3578cb3cc847fbed4e7eb84bf02afa81bed437dc0a5e8b7f040c9f/nvidia_cudnn_frontend-1.25.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e8a223ef2e821bbe89fdc6a461cbce36b509e2daaa0a4425eb387060e0cc6ec7", size = 3263340, upload-time = "2026-06-10T21:08:53.528Z" },
-    { url = "https://files.pythonhosted.org/packages/ff/ff/072bc1ed5e6d7efaf785498e6610a0b2152603c1e020faa6e6b8761d4505/nvidia_cudnn_frontend-1.25.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:95ab349dfc871a4e7e5b7ceaed649a22b968ce02bca9be1d0a0a577e80fa6832", size = 3414303, upload-time = "2026-06-10T21:09:15.951Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/37/ce841fc013bc01de87d33eba58ba386477e411f31e3e41337d3f745ea1f3/nvidia_cudnn_frontend-1.28.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:30e20178e46a5a5049c2358f4147d1c5414b45b2753a455da05bab914807a44d", size = 5512441, upload-time = "2026-09-02T06:08:14.921Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/1a/51fa7f3d4fd8377d7acdf99e92d33a38be83979897360ca36b6f3521e92d/nvidia_cudnn_frontend-1.28.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:26cd299d202e832a1d562510d6844dc7c6f256cb1b4f0f29d5b2fa0b34f05e98", size = 5677523, upload-time = "2026-09-02T06:08:37.287Z" },
 ]
 
 [[package]]
