@@ -278,7 +278,7 @@ def flow_grpo_train(
     K = algo_cfg.num_generations_per_prompt
     max_steps = algo_cfg.max_num_steps
     seed_base = algo_cfg.seed
-    checkpointing_enabled = master_config.checkpointing["enabled"]
+    checkpointing_enabled = master_config.checkpointing.enabled
     save_period = checkpointer.save_period
     # The loss config crosses the Ray boundary into train_step as a dict.
     loss_cfg_dict = master_config.loss_fn.model_dump()
