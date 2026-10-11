@@ -200,6 +200,11 @@ ARG TRTLLM_CCACHE_MAXSIZE=20G
 ARG TRTLLM_BUILD_JOBS=24
 ARG RUNTIME_UID
 ARG RUNTIME_GID
+# Optional uv network tuning for slow or flaky links. The dependency install below is one long layer, so a
+# single timed-out download restarts it. Empty (the default) keeps uv's own defaults; for example
+# --build-arg UV_HTTP_TIMEOUT=300 --build-arg UV_HTTP_RETRIES=10
+ARG UV_HTTP_TIMEOUT
+ARG UV_HTTP_RETRIES
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
