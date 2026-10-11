@@ -691,6 +691,12 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
     UV_LINK_MODE=symlink PYTHONPATH=/opt/nemo-rl uv run --no-sync python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
     rm -f "${GYM_VLLM_OVERRIDE}"
+    # Belt and braces: bring the MAIN venv back to exactly the lock, offline and as root, so the runtime-UID
+    # `uv sync --frozen` check at the end of this stage has nothing left to replace. A no-op when it already matches.
+    SP="$("${UV_PROJECT_ENVIRONMENT}/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+    echo "== main venv before re-sync: $(ls -ld "${SP}/nvidia/cusparselt" 2>&1)"
+    UV_OFFLINE=1 uv sync --frozen --inexact --no-install-project --no-install-workspace --dry-run 2>&1 | head -40 || true
+    UV_OFFLINE=1 UV_LINK_MODE=hardlink uv sync --frozen --inexact --no-install-project --no-install-workspace
     # Hand what this layer created in the shared cache and venvs to the runtime UID, as the layers above do.
     find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
         -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
@@ -745,6 +751,11 @@ chown "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "
 # Local build contexts can come from a checkout with umask 0007. COPY preserves those
 # root-owned modes; the runtime UID needs to read source files and traverse directories.
 chmod -R a+rX /opt/nemo-rl
+# Diagnostics for the runtime-UID check below (never fatal): who owns the venv's nvidia packages, and what uv would change.
+SP="$("${UV_PROJECT_ENVIRONMENT}/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+echo "== pre-check: owner of site-packages/nvidia and nvidia/cusparselt"; ls -ld "${SP}/nvidia" "${SP}/nvidia/cusparselt" || true
+echo "== pre-check: root-owned entries directly under site-packages/nvidia"; find "${SP}/nvidia" -maxdepth 1 -uid 0 | head -20 || true
+echo "== pre-check: what uv sync would change"; UV_OFFLINE=1 uv sync --frozen --inexact --no-install-project --no-install-workspace --dry-run 2>&1 | head -40 || true
 EOF
 USER ${RUNTIME_UID}:${RUNTIME_GID}
 RUN <<"EOF" bash -exu
