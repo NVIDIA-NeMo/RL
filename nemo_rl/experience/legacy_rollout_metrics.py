@@ -72,6 +72,25 @@ _NAMED_AGENT_ERROR_KINDS = frozenset(
     {"max_iteration", "context_window", "stuck_in_loop"}
 )
 
+# Per-rollout behaviour flags the Gym opencode_sandboxed_agent reports as
+# ``opencode_behavior`` (responses_api_agents/opencode_sandboxed_agent/behavior.py):
+# reward-hacking signals (fetching the task's upstream fix, copying gold-patch lines
+# from an external copy, test tampering) and work lost to blocked egress. Fixed order so
+# every group emits the same key set; flags the agent does not report count as off.
+BEHAVIOR_FLAGS: tuple[str, ...] = (
+    "upstream_fetch_attempt",
+    "upstream_fetch_ok",
+    "gold_seen_external",
+    "gold_copied_external",
+    "solution_commit_seen",
+    "net_blocked",
+    "net_blocked_legit",
+    "official_test_edited",
+    "test_skip_added",
+    "test_infra_tamper",
+    "test_deleted",
+)
+
 # Trace kinds whose per-trace turn count is comparable to `agent_max_turns`
 # (the compaction summary is a single forced call; the empty dummy has none).
 TURN_COUNT_TRACE_KINDS: tuple[str, ...] = (
@@ -194,7 +213,15 @@ def _sandboxed_agent_debug_info(
         "num_subagent_compactions": 0,
         "num_subagent_sessions": int(full_result.get("opencode_num_task_calls") or 0),
         "segments": [],
+        "behavior": _behavior_flags(full_result.get("opencode_behavior")),
     }
+
+
+def _behavior_flags(reported: Any) -> dict[str, bool] | None:
+    """The known behaviour flags as bools; None when the agent reported none."""
+    if not isinstance(reported, Mapping):
+        return None
+    return {flag: bool(reported.get(flag)) for flag in BEHAVIOR_FLAGS}
 
 
 def termination_kind(info: Mapping[str, Any]) -> str:
@@ -347,6 +374,36 @@ def compaction_rollout_metrics(
     metrics["reward/unmasked/sum"] = sum(unmasked_rewards)
     metrics["reward/unmasked/count"] = len(unmasked_rewards)
     metrics["reward/masked_resolved/count"] = masked_resolved
+    return metrics
+
+
+def behavior_rollout_metrics(
+    rollout_infos: Sequence[Mapping[str, Any]], rewards: Sequence[float]
+) -> dict[str, float]:
+    """Per-prompt-group behaviour-flag rates as exact ``/sum`` + ``/count`` pairs.
+
+    Over rollouts that report flags (``rollout_debug_info(...)["behavior"]``):
+    ``behavior/{flag}/sum`` = rollouts with the flag, ``/count`` = rollouts reporting
+    (finalized ``/mean`` = rate). ``behavior_rewarded_trained/{flag}/{sum,count}`` is the
+    same over rollouts with reward > 0 that are not env-masked, i.e. the flag's share of
+    the reward signal that trains. Empty when no rollout in the group reports flags.
+    """
+    reported = [
+        (info["behavior"], float(reward) > 0 and not info.get("mask_sample"))
+        for info, reward in zip(rollout_infos, rewards)
+        if info.get("behavior") is not None
+    ]
+    if not reported:
+        return {}
+    rewarded_trained = [flags for flags, trained in reported if trained]
+    metrics: dict[str, float] = {}
+    for flag in BEHAVIOR_FLAGS:
+        metrics[f"behavior/{flag}/sum"] = sum(1 for flags, _ in reported if flags[flag])
+        metrics[f"behavior/{flag}/count"] = len(reported)
+        metrics[f"behavior_rewarded_trained/{flag}/sum"] = sum(
+            1 for flags in rewarded_trained if flags[flag]
+        )
+        metrics[f"behavior_rewarded_trained/{flag}/count"] = len(rewarded_trained)
     return metrics
 
 
@@ -703,6 +760,7 @@ def _aggregate_group(
         "mask_sample_rate": sum(1 for info in rollout_infos if info["mask_sample"])
         / batch_size,
         **compaction_rollout_metrics(rollout_infos, prepared["total_rewards"]),
+        **behavior_rollout_metrics(rollout_infos, prepared["total_rewards"]),
         **trace_kind_metrics(
             trace_kinds,
             turns_per_trace,

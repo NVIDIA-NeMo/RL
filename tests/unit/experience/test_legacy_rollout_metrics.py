@@ -29,8 +29,10 @@ import torch
 from nemo_rl.algorithms.multi_trace_metrics import finalize_sum_count_metrics
 from nemo_rl.experience.interfaces import TRACE_METADATA_KEY, Completion
 from nemo_rl.experience.legacy_rollout_metrics import (
+    BEHAVIOR_FLAGS,
     ROLLOUT_DEBUG_TAG,
     aggregate_rollout_metrics_with_sum_counts,
+    behavior_rollout_metrics,
     capture_generation_size_metrics,
     capture_rollout_debug_tag,
     compaction_rollout_metrics,
@@ -991,6 +993,63 @@ class TestSandboxedAgentDebugInfo:
         assert info["patch_exists"] is True
         assert info["openhands_run_time"] == 300.0
         assert info["final_eval_time"] == 40.0
+
+    def test_behavior_flags_are_the_known_set_as_bools(self):
+        assert rollout_debug_info(self._result())["behavior"] is None
+        info = rollout_debug_info(
+            self._result(
+                opencode_behavior={"upstream_fetch_ok": True, "not_a_flag": True}
+            )
+        )
+        assert set(info["behavior"]) == set(BEHAVIOR_FLAGS)
+        assert info["behavior"]["upstream_fetch_ok"] is True
+        assert not any(
+            v for k, v in info["behavior"].items() if k != "upstream_fetch_ok"
+        )
+
+
+class TestBehaviorRolloutMetrics:
+    @staticmethod
+    def _info(masked=False, **flags):
+        behavior = {flag: flags.get(flag, False) for flag in BEHAVIOR_FLAGS}
+        return {"behavior": behavior, "mask_sample": masked}
+
+    def test_rates_over_reporting_rollouts_and_rewarded_trained_share(self):
+        infos = [
+            # rewarded, trained
+            self._info(upstream_fetch_ok=True, gold_copied_external=True),
+            self._info(masked=True, upstream_fetch_ok=True),  # rewarded but masked
+            self._info(net_blocked_legit=True),  # unrewarded
+            {"behavior": None, "mask_sample": False},  # agent reported nothing
+        ]
+        metrics = behavior_rollout_metrics(infos, [1.0, 1.0, 0.0, 1.0])
+        assert metrics["behavior/upstream_fetch_ok/sum"] == 2
+        assert metrics["behavior/upstream_fetch_ok/count"] == 3
+        assert metrics["behavior/net_blocked_legit/sum"] == 1
+        assert metrics["behavior_rewarded_trained/upstream_fetch_ok/sum"] == 1
+        assert metrics["behavior_rewarded_trained/gold_copied_external/count"] == 1
+        assert metrics["behavior_rewarded_trained/net_blocked_legit/sum"] == 0
+
+    def test_groups_without_flags_emit_nothing(self):
+        assert behavior_rollout_metrics([{"behavior": None}], [1.0]) == {}
+
+    def test_cross_group_aggregation_gives_exact_rates(self):
+        group_a = behavior_rollout_metrics(
+            [self._info(upstream_fetch_attempt=True)], [0.0]
+        )
+        group_b = behavior_rollout_metrics(
+            [self._info(), self._info(), self._info(upstream_fetch_attempt=True)],
+            [1.0, 0.0, 1.0],
+        )
+        per_group = {}
+        for group in (group_a, group_b):
+            for key, value in group.items():
+                per_group.setdefault(key, []).append(value)
+        out = aggregate_rollout_metrics_with_sum_counts(per_group, lambda rest: {})
+        assert out["behavior/upstream_fetch_attempt/mean"] == pytest.approx(2 / 4)
+        rewarded_trained = out["behavior_rewarded_trained/upstream_fetch_attempt/mean"]
+        assert rewarded_trained == pytest.approx(1 / 2)
+        assert "behavior/upstream_fetch_attempt/rate" not in out
 
 
 class TestCaptureRolloutDebugTag:
