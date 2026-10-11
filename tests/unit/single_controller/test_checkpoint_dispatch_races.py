@@ -53,6 +53,10 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.grpo import _initial_grpo_save_state
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+    has_gym_restart_fallback,
+    write_gym_restart_fallback,
+)
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
@@ -813,6 +817,66 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
         ) == {"next_batch": 8}
 
     asyncio.run(exercise())
+
+
+class _UntouchableGymCoordinator:
+    """A Gym deployment the trainer checkpoint must leave running."""
+
+    instance_ids = frozenset({"tools/replica-0"})
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(f"trainer checkpoint called Gym {name!r}")
+
+
+def test_turn_trainer_checkpoint_leaves_gym_state_to_the_rollout_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Gym never holds up a trainer save; the next rollout snapshot captures it.
+
+    The trainer checkpoint says it holds no Gym state, does not count as a
+    rollout snapshot, and wakes the snapshot pump so the gap stays short.
+    """
+
+    async def exercise() -> Any:
+        save_state = _initial_grpo_save_state()
+        save_state.current_step = 7
+        save_state.total_steps = 7
+        save_state.trainer_version = 7
+        save_state.sampler_dispatch_index = 7
+        config = _actor_master_config(
+            tmp_path,
+            max_num_steps=8,
+            num_prompts_per_step=1,
+            max_num_epochs=1,
+            data_plane_checkpoint=True,
+        )
+        actor_args = _make_actor_args(
+            save_state=save_state,
+            dataloader=_FakeDataloader([], state={"next_batch": 8}),
+        )
+        actor_args.rollout_manager = _BlockingRolloutManager(  # type: ignore[assignment]
+            _PendingLedger()
+        )
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = controller_cls(config, actor_args, SetupTimingMetrics())
+        controller._gym_checkpoint_coordinator = _UntouchableGymCoordinator()
+        try:
+            await controller._save_checkpoint(
+                {"loss": 1.0},
+                is_policy_training_step=True,
+                is_final_checkpoint=False,
+            )
+            await asyncio.to_thread(controller._checkpointer.finalize_pending)
+        finally:
+            controller._checkpointer.shutdown()
+        return controller
+
+    controller = asyncio.run(exercise())
+
+    checkpoint = tmp_path / "checkpoints" / "step_7"
+    assert has_gym_restart_fallback(checkpoint, train_step=7, trainer_version=7)
+    assert controller._rollout_checkpoint_wakeup.is_set()
+    assert controller._last_rollout_snapshot_mutation_version is None
 
 
 def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> None:
@@ -1687,48 +1751,99 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
     asyncio.run(exercise())
 
 
+async def _turn_recovery_restart(
+    tmp_path: Path,
+) -> tuple[Any, _RecoveryRolloutManager, _RestoringGymCoordinator, tuple[str, int]]:
+    """A restarted controller whose checkpoint holds one dispatched turn rollout.
+
+    The caller adds the Gym manifest or the restart fallback it is testing.
+    """
+    dataset_prompt: DatumSpec = {
+        "idx": 70,
+        "message_log": [],
+        "length": 1,
+        "extra_env_info": None,
+        "loss_multiplier": 1.0,
+    }
+    prompt_batch = rl_collate_fn([dataset_prompt])
+    dispatched_prompt = cast(
+        DatumSpec,
+        {key: value[0] for key, value in prompt_batch.items()},
+    )
+    saved_ledger = RolloutRecoveryLedger()
+    async with DataPlaneCheckpointBarrier().mutation() as cut:
+        saved_group = saved_ledger.reserve_group(
+            cut,
+            group_id="batch-7-prompt-0",
+            admission_id="batch-7",
+            prompt_id="70",
+            prompt_payload=dispatched_prompt,
+            expected_generations=1,
+            target_step=7,
+            start_weight_version=7,
+            restore_level=RecoveryTargetLevel.TURN,
+            admitted=True,
+        )
+        saved_ledger.mark_group_dispatched(
+            cut,
+            saved_group.group_id,
+            gym_instance_id="tools/replica-0",
+        )
+    saved_state = build_rollout_recovery_state(
+        saved_ledger,
+        batch_shortfall={},
+        sampler_stamps_target_steps=True,
+    )
+    recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
+    torch.save(saved_state, recovery_path)
+    payload_sha256 = hashlib.sha256(recovery_path.read_bytes()).hexdigest()
+
+    rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
+    gym_coordinator = _RestoringGymCoordinator()
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    controller = object.__new__(controller_cls)
+    _init_recovery_telemetry(controller, train_steps=7)
+    controller._sampler = _CountingInOrderSampler()
+    controller._rollout_manager = rollout_manager
+    controller._gym_checkpoint_coordinator = gym_coordinator
+    controller._master_config = SimpleNamespace(
+        token_capture=SimpleNamespace(enabled=False)
+    )
+    controller._last_checkpoint_path = str(tmp_path)
+    controller._data_plane_checkpoint_metadata = {
+        "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+        "rollout_recovery_payload_sha256": payload_sha256,
+        "rollout_recovery_group_count": 1,
+    }
+    controller._async_cfg = SimpleNamespace(
+        max_buffered_rollouts=4,
+        max_inflight_prompts=2,
+    )
+    controller._buffer_capacity = asyncio.Semaphore(4)
+    controller._trainer_version = 7
+    controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    controller._dataloader = SimpleNamespace(
+        dataset={70: dataset_prompt},
+        collate_fn=rl_collate_fn,
+    )
+    controller._buffer = SimpleNamespace(
+        count_for_target_step=lambda _target_step: 0,
+        metadata_state_dict=lambda *, saved_capacity: {
+            "groups": [],
+            "saved_capacity": saved_capacity,
+        },
+    )
+    return controller, rollout_manager, gym_coordinator, saved_group.gym_episode(0)
+
+
 def test_turn_recovery_restores_gym_before_redispatch(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        dataset_prompt: DatumSpec = {
-            "idx": 70,
-            "message_log": [],
-            "length": 1,
-            "extra_env_info": None,
-            "loss_multiplier": 1.0,
-        }
-        prompt_batch = rl_collate_fn([dataset_prompt])
-        dispatched_prompt = cast(
-            DatumSpec,
-            {key: value[0] for key, value in prompt_batch.items()},
-        )
-        saved_ledger = RolloutRecoveryLedger()
-        async with DataPlaneCheckpointBarrier().mutation() as cut:
-            saved_group = saved_ledger.reserve_group(
-                cut,
-                group_id="batch-7-prompt-0",
-                admission_id="batch-7",
-                prompt_id="70",
-                prompt_payload=dispatched_prompt,
-                expected_generations=1,
-                target_step=7,
-                start_weight_version=7,
-                restore_level=RecoveryTargetLevel.TURN,
-                admitted=True,
-            )
-            saved_ledger.mark_group_dispatched(
-                cut,
-                saved_group.group_id,
-                gym_instance_id="tools/replica-0",
-            )
-        rollout_id, attempt = saved_group.gym_episode(0)
-        saved_state = build_rollout_recovery_state(
-            saved_ledger,
-            batch_shortfall={},
-            sampler_stamps_target_steps=True,
-        )
-        recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
-        torch.save(saved_state, recovery_path)
-        payload_sha256 = hashlib.sha256(recovery_path.read_bytes()).hexdigest()
+    async def exercise() -> tuple[Any, Any, GymCheckpointManifest]:
+        (
+            controller,
+            rollout_manager,
+            gym_coordinator,
+            (rollout_id, attempt),
+        ) = await _turn_recovery_restart(tmp_path)
         manifest = GymCheckpointManifest(
             schema_version=GYM_CHECKPOINT_SCHEMA_VERSION,
             checkpoint_id="save-1",
@@ -1738,58 +1853,60 @@ def test_turn_recovery_restores_gym_before_redispatch(tmp_path: Path) -> None:
             staging_keys={"tools/replica-0": ()},
         )
         write_gym_checkpoint_manifest(tmp_path, manifest)
-
-        rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
-        gym_coordinator = _RestoringGymCoordinator()
-        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
-        controller = object.__new__(controller_cls)
-        _init_recovery_telemetry(controller, train_steps=7)
-        controller._sampler = _CountingInOrderSampler()
-        controller._rollout_manager = rollout_manager
-        controller._gym_checkpoint_coordinator = gym_coordinator
-        controller._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(enabled=False)
-        )
-        controller._last_checkpoint_path = str(tmp_path)
-        controller._data_plane_checkpoint_metadata = {
-            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-            "rollout_recovery_payload_sha256": payload_sha256,
-            "rollout_recovery_group_count": 1,
-        }
-        controller._async_cfg = SimpleNamespace(
-            max_buffered_rollouts=4,
-            max_inflight_prompts=2,
-        )
-        controller._buffer_capacity = asyncio.Semaphore(4)
-        controller._trainer_version = 7
-        controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
-        controller._dataloader = SimpleNamespace(
-            dataset={70: dataset_prompt},
-            collate_fn=rl_collate_fn,
-        )
-        controller._buffer = SimpleNamespace(
-            count_for_target_step=lambda _target_step: 0,
-            metadata_state_dict=lambda *, saved_capacity: {
-                "groups": [],
-                "saved_capacity": saved_capacity,
-            },
-        )
-
         await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        return rollout_manager, gym_coordinator, manifest
 
-        restored_group = rollout_manager.recovery_ledger.get_group("batch-7-prompt-0")
-        restored_attempt = restored_group.siblings[0].current_attempt
-        assert restored_attempt.status is RolloutAttemptStatus.RESERVED
-        assert restored_attempt.gym_instance_id == "tools/replica-0"
-        assert restored_attempt.gym_attempt == 1
-        assert len(gym_coordinator.restores) == 1
-        restore_id, checkpoint_root, restored_manifest = gym_coordinator.restores[0]
-        assert restore_id.startswith("restore-")
-        assert checkpoint_root == tmp_path
-        assert restored_manifest == manifest
-        assert gym_coordinator.resumes == [restore_id]
+    rollout_manager, gym_coordinator, manifest = asyncio.run(exercise())
 
-    asyncio.run(exercise())
+    restored_group = rollout_manager.recovery_ledger.get_group("batch-7-prompt-0")
+    restored_attempt = restored_group.siblings[0].current_attempt
+    assert restored_attempt.status is RolloutAttemptStatus.RESERVED
+    assert restored_attempt.gym_instance_id == "tools/replica-0"
+    assert restored_attempt.gym_attempt == 1
+    assert len(gym_coordinator.restores) == 1
+    restore_id, checkpoint_root, restored_manifest = gym_coordinator.restores[0]
+    assert restore_id.startswith("restore-")
+    assert checkpoint_root == tmp_path
+    assert restored_manifest == manifest
+    assert gym_coordinator.resumes == [restore_id]
+
+
+def test_turn_recovery_from_a_trainer_checkpoint_restarts_unfinished_turns(
+    tmp_path: Path,
+) -> None:
+    """A trainer checkpoint holds no Gym state, so turns restart from their tasks."""
+
+    async def exercise() -> tuple[Any, Any]:
+        controller, rollout_manager, gym_coordinator, _ = await _turn_recovery_restart(
+            tmp_path
+        )
+        write_gym_restart_fallback(tmp_path, train_step=7, trainer_version=7)
+        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        return rollout_manager, gym_coordinator
+
+    rollout_manager, gym_coordinator = asyncio.run(exercise())
+
+    restored_group = rollout_manager.recovery_ledger.get_group("batch-7-prompt-0")
+    assert (
+        restored_group.siblings[0].current_attempt.status
+        is RolloutAttemptStatus.ABANDONED
+    )
+    assert gym_coordinator.restores == []
+    assert gym_coordinator.resumes == []
+
+
+def test_turn_recovery_refuses_a_checkpoint_with_neither_gym_state_nor_fallback(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        controller, _, gym_coordinator, _ = await _turn_recovery_restart(tmp_path)
+        try:
+            await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        finally:
+            assert gym_coordinator.restores == []
+
+    with pytest.raises(FileNotFoundError, match="gym_restart_fallback"):
+        asyncio.run(exercise())
 
 
 def test_turn_checkpoint_commits_owned_gym_episode_before_tq_cut(

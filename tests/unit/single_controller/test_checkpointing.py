@@ -2476,6 +2476,39 @@ class TestPeriodicRolloutCheckpoint:
         assert result.reason == "no_data_plane_mutations"
         assert actor._dp_client.save_calls == []
 
+    def test_periodic_pump_wakes_early_for_a_new_trainer_checkpoint(
+        self, tmp_path: Path
+    ):
+        """A turn trainer checkpoint needs a Gym snapshot soon, not an interval later."""
+        actor = self._actor(tmp_path)
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 3600.0
+        actor._train_steps = 1
+
+        async def _main() -> None:
+            attempted = asyncio.Event()
+
+            async def _save(*, force: bool = False) -> Any:
+                del force
+                attempted.set()
+                return SimpleNamespace(saved=False, reason="no_data_plane_mutations")
+
+            actor._save_rollout_checkpoint = _save
+            pump = asyncio.create_task(actor._rollout_checkpoint_pump())
+            await asyncio.sleep(0)
+            actor._rollout_checkpoint_wakeup.set()
+            try:
+                await asyncio.wait_for(attempted.wait(), timeout=1.0)
+            finally:
+                pump.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pump
+            assert not actor._rollout_checkpoint_wakeup.is_set()
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
     def test_periodic_pump_reports_each_consecutive_failure(
         self,
         tmp_path: Path,
