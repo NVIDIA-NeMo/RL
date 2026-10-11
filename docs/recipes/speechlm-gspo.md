@@ -9,9 +9,19 @@ reward metadata and never enters the prompt. Declared `input_order` must be
 `text_before_audio`. Existing Parquet consumers should retain their `messages`
 column so ResponseDataset preserves the metadata columns.
 
+The recipe consumes a prepared dataset; it does not mine or rebalance audio.
+For a faithful reproduction, keep the original seed-conditioned consumer and
+record its source seed/checkpoint, mining selection criteria, component/task/
+language balances and exact prompt frequencies. Record the resulting consumer
+hash and row/audio counts. Audio-level benchmark exclusion needs a separate
+versioned overlap audit against the evaluation manifests; distinct row IDs or
+paths alone do not establish exclusion. Keep any unverified exclusion claim
+explicitly pending rather than changing the consumer during training.
+
 Use `env_name: asr` even with the multimodal launcher: it keeps audio transport
 and routes rewards through the ASR environment. Policy training receives
-`audio_samples` and `audio_lengths`; rollout receives vLLM audio data.
+`audio_samples` and `audio_lengths`; the existing `vllm_audios` batch field
+passes the same waveform and sample rate to rollout generation.
 
 WER lowercases with Unicode casefold and separates punctuation, retaining
 alphanumeric characters, apostrophes, underscores, and combining marks. It
