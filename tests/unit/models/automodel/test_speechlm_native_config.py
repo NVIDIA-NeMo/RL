@@ -136,3 +136,46 @@ def test_native_perception_selection_precedes_activation_checkpoint_wrapping(mon
     loss.backward()
     assert all(perception.encoder.asr_encoder.layers[index].weight.grad is not None for index in (30, 31))
     assert perception.encoder.asr_encoder.layers[0].weight.grad is None
+
+
+@pytest.mark.parametrize("explicit_selection", [False, True])
+def test_moe_options_preserve_explicit_parameter_selection(explicit_selection):
+    from torch import nn
+    from nemo_automodel.components.moe.config import MoEConfig
+    from nemo_automodel.components.moe.layers import Gate
+    from nemo_automodel.components.utils.parameter_config import ParameterConfig, apply_parameter_config
+
+    config = MoEConfig(
+        n_routed_experts=2, n_shared_experts=0, n_activated_experts=1,
+        n_expert_groups=1, n_limited_groups=1, train_gate=False,
+        gate_bias_update_factor=0.0, aux_loss_coeff=0.0, score_func="softmax",
+        route_scale=1.0, dim=2, inter_dim=2, moe_inter_dim=2,
+        norm_topk_prob=True, router_bias=True, dtype=torch.float32,
+    )
+    backbone = nn.Module()
+    backbone.proj = nn.Linear(2, 2)
+    backbone.frozen_gate = Gate(config)
+    backbone.selected_gate = Gate(config)
+    backbone.mtp = nn.Module()
+    backbone.mtp.gate = Gate(config)
+    selected = ("proj.weight", "selected_gate.weight", "selected_gate.bias")
+    parameter_config = ParameterConfig(selected) if explicit_selection else None
+    if parameter_config is not None:
+        apply_parameter_config(backbone, parameter_config)
+    model = SimpleNamespace(
+        llm=backbone, parameter_config=parameter_config,
+        cfg=DictConfig({"train_gate": True, "aux_loss_coeff": 0.2}),
+    )
+    # Real Gate modules and real selection followed by the production MoE
+    # override, in the same order as native model construction.
+    SALMAutomodel.setup_moe_options(model)
+    gates = (backbone.frozen_gate, backbone.selected_gate, backbone.mtp.gate)
+    assert all(gate.train_gate and gate.aux_loss_coeff == 0.2 for gate in gates)
+    if explicit_selection:
+        assert {name for name, value in backbone.named_parameters() if value.requires_grad} == set(selected)
+        assert not backbone.frozen_gate.weight.requires_grad
+        assert not backbone.frozen_gate.bias.requires_grad
+        assert not backbone.mtp.gate.weight.requires_grad
+        assert not backbone.mtp.gate.bias.requires_grad
+    else:
+        assert all(gate.weight.requires_grad and gate.bias.requires_grad for gate in gates)
