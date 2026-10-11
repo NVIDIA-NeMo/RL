@@ -751,6 +751,8 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     agent_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
         default_factory=dict
     )
+    # Seconds Gym gets to park its in-flight steps; see the exemplar YAML.
+    gym_prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
 
     @model_validator(mode="after")
     def _validate_target_overrides(self) -> "RolloutRecoveryConfig":

@@ -286,6 +286,7 @@ class GymCheckpointCoordinator:
         shard_set: NemoGymShardSet,
         *,
         control_timeout_s: float,
+        prepare_timeout_s: float,
     ) -> None:
         if control_timeout_s <= 0:
             raise ValueError("Gym checkpoint control_timeout_s must be positive")
@@ -293,6 +294,7 @@ class GymCheckpointCoordinator:
         if not self._handles:
             raise ValueError("Gym checkpoint coordinator requires at least one actor")
         self._control_timeout_s = control_timeout_s
+        self._prepare_timeout_s = prepare_timeout_s
 
     @property
     def instance_ids(self) -> frozenset[str]:
@@ -300,7 +302,7 @@ class GymCheckpointCoordinator:
 
     @property
     def control_timeout_s(self) -> float:
-        """Maximum wall-clock budget for one coordinated control phase."""
+        """Maximum wall-clock budget for one coordinated control call but prepare."""
         return self._control_timeout_s
 
     def _deadline(self) -> float:
@@ -355,7 +357,9 @@ class GymCheckpointCoordinator:
         self,
         checkpoint_id: str,
     ) -> dict[str, GymCheckpointPrepareSummary]:
-        deadline_ts = self._deadline()
+        # Parking waits for in-flight agent and environment steps to reach a
+        # boundary, which can take far longer than one control call.
+        deadline_ts = time.time() + self._prepare_timeout_s
         results = await self._collect(
             "prepare",
             {
