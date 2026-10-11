@@ -23,13 +23,13 @@ production request path has no environment-variable or timing hook.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from pathlib import Path
 from typing import Any, cast
 
 from examples import run_grpo_single_controller
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
+from tests.functional._single_controller_hook_utils import append_event
 
 
 class _InstrumentedRolloutManager:
@@ -61,12 +61,6 @@ class _InstrumentedRolloutManager:
     def _tq_buffer(self, value: Any) -> None:
         self._delegate._tq_buffer = value
 
-    def _append_event(self, event: str, **fields: Any) -> None:
-        self._events_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"event": event, **fields}
-        with self._events_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(payload, sort_keys=True) + "\n")
-
     async def generate_and_push(
         self,
         input_sample: Any,
@@ -80,7 +74,7 @@ class _InstrumentedRolloutManager:
             "prompt_idx": int(input_sample["idx"]),
             "target_step": target_step,
         }
-        self._append_event("dispatch", **fields)
+        append_event(self._events_path, "dispatch", **fields)
 
         if (
             not self._blocked
@@ -90,7 +84,7 @@ class _InstrumentedRolloutManager:
             if lineage_group_id is None:
                 raise RuntimeError("recovery test expected a lineage-tracked group")
             self._blocked = True
-            self._append_event("blocked_before_tq_commit", **fields)
+            append_event(self._events_path, "blocked_before_tq_commit", **fields)
             print(
                 "recovery functional hook: blocked admitted "
                 f"group_id={lineage_group_id} target_step={target_step}",
@@ -107,7 +101,7 @@ class _InstrumentedRolloutManager:
             lineage_group_id=lineage_group_id,
         )
         if outcome is RolloutOutcome.COMMITTED:
-            self._append_event("canonical_tq_commit", **fields)
+            append_event(self._events_path, "canonical_tq_commit", **fields)
         return outcome
 
 
