@@ -108,9 +108,7 @@ def asr_data_processor(
         "idx": idx,
         "task_name": task_data_spec.task_name,
         "vllm_content": rendered,
-        "vllm_multi_modal_data": {
-            "audio": (np.array(waveform, copy=True), sampling_rate)
-        },
+        "vllm_audios": [(np.array(waveform, copy=True), sampling_rate)],
     }
 
 
