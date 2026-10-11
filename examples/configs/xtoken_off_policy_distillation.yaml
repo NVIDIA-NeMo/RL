@@ -253,14 +253,16 @@ data:
   train:
     dataset_name: "arrow_text"
     processor: "kd_data_processor"
-    # Default: an ungated, CC-BY-4.0 NVIDIA raw-text corpus, pointed straight at
-    # its parquet shards over hf:// so the recipe runs with no auth and no extra
-    # setup. `data_files` accepts a path/glob/URL to .arrow/.parquet/.json/.txt
-    # files (format inferred from the extension) OR a bare HuggingFace dataset id
-    # (loaded by name; in that case set `subset` to pick a config). To train on
-    # your own .arrow corpus, override only:
-    #   data.train.data_files=/path/glob/*.arrow
-    data_files: "hf://datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Formal-Logic/*.parquet"
+    # Default: an ungated, CC-BY-4.0 NVIDIA raw-text corpus, loaded by HuggingFace
+    # dataset id + `subset` so it resolves from the HF cache (works with
+    # HF_HUB_OFFLINE=1, unlike an hf:// URL which always contacts the Hub) and
+    # needs no auth. `data_files` accepts a bare HuggingFace dataset id (loaded by
+    # name; `subset` picks a config) OR a path/glob/URL to .arrow/.parquet/.json/.txt
+    # files (format inferred from the extension; `subset` must then be null). To
+    # train on your own .arrow corpus, override both:
+    #   data.train.data_files=/path/glob/*.arrow data.train.subset=null
+    data_files: "nvidia/Nemotron-Pretraining-Specialized-v1.1"
+    subset: "Nemotron-Pretraining-Formal-Logic"
     split: "train"
     text_key: "text"
     characters_per_sample: 16384
