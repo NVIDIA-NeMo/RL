@@ -722,7 +722,9 @@ def vlm_hf_data_processor(
             vllm_modality_items.setdefault(content_type, []).append(vllm_value)
     else:
         # conversation consists of a text-only message
-        user_message["content"] = task_data_spec.prompt.format(problem)
+        user_message["content"] = (
+            task_data_spec.prompt.format(problem) if task_data_spec.prompt else problem
+        )
 
     images = vllm_modality_items.get("image", [])
     # Detect processors that use <image> placeholder style (e.g., NemotronOmni/InternVL)

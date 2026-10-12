@@ -295,13 +295,22 @@ class TestVLMProcessorMMPRTiny:
         )
         assert torch.equal(batch["input_ids"][0], learner_ids)
 
-    def test_text_only_row_preserves_formatted_vllm_content(self):
+    # prompt_file ships as null in five VLM recipes, and the list branch of the
+    # same dispatch already guards for it; the text-only branch did not.
+    @pytest.mark.parametrize(
+        ("prompt", "expected"),
+        [
+            pytest.param("Answer: {}", "Answer: What is 2 + 2?", id="with-template"),
+            pytest.param(None, "What is 2 + 2?", id="null-prompt-file"),
+        ],
+    )
+    def test_text_only_row_preserves_formatted_vllm_content(self, prompt, expected):
         from nemo_rl.data.interfaces import TaskDataSpec
         from nemo_rl.data.processors import vlm_hf_data_processor
 
         processor = _make_stub_nemotron_processor()
         task_data_spec = TaskDataSpec(task_name="text-only")
-        task_data_spec.prompt = "Answer: {}"
+        task_data_spec.prompt = prompt
 
         result = vlm_hf_data_processor(
             datum_dict={
@@ -317,7 +326,7 @@ class TestVLMProcessorMMPRTiny:
             idx=0,
         )
 
-        assert result["vllm_content"] == "Answer: What is 2 + 2?"
+        assert result["vllm_content"] == expected
         assert result["vllm_multi_modal_data"] == {}
 
     def test_vllm_multi_modal_data_collapses_single_item_and_keeps_lists(
