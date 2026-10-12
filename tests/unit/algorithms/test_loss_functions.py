@@ -25,6 +25,8 @@ from nemo_rl.algorithms.loss import (
     DistillationLossFn,
     DPOLossConfig,
     DPOLossFn,
+    MseValueLossConfig,
+    MseValueLossFn,
     NLLLossFn,
     prepare_loss_input,
 )
@@ -3331,3 +3333,58 @@ def test_vocab_parallel_gather_columns_tp_sharded(monkeypatch):
     ref[..., idx].float().backward(grad_out)
     torch.testing.assert_close(shards[0].grad, ref.grad[..., :v_local])
     torch.testing.assert_close(shards[1].grad, ref.grad[..., v_local:])
+
+
+def test_distillation_loss_num_valid_samples_respects_sample_mask():
+    """The metric counts participating rows, not padded microbatch capacity."""
+    torch.manual_seed(0)
+    student_log_probs = torch.log_softmax(torch.randn(2, 3, 4), dim=-1)
+    teacher_log_probs = torch.log_softmax(torch.randn(2, 3, 4), dim=-1)
+    sample_mask = torch.tensor([1.0, 0.0])
+    data = {
+        "input_ids": torch.zeros(2, 4, dtype=torch.long),
+        "input_lengths": torch.full((2,), 4, dtype=torch.long),
+        "token_mask": torch.ones(2, 4),
+        "sample_mask": sample_mask,
+        "teacher_topk_logits": torch.empty(0),
+        "teacher_topk_indices": torch.empty(0, dtype=torch.long),
+    }
+    loss_fn = DistillationLossFn(
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
+    )
+
+    _, metrics = loss_fn(
+        student_log_probs,
+        teacher_log_probs,
+        None,
+        data,
+        global_valid_seqs=sample_mask.sum(),
+        global_valid_toks=torch.tensor(3.0),
+    )
+
+    assert metrics["num_valid_samples"] == 1
+
+
+def test_mse_value_loss_num_valid_samples_respects_sample_mask():
+    loss_fn = MseValueLossFn(MseValueLossConfig())
+    sample_mask = torch.tensor([1.0, 0.0])
+    data = BatchedDataDict(
+        {
+            "token_mask": torch.ones(2, 3),
+            "sample_mask": sample_mask,
+            "returns": torch.zeros(2, 3),
+        }
+    )
+
+    _, metrics = loss_fn(
+        torch.zeros(2, 3),
+        data,
+        global_valid_seqs=sample_mask.sum(),
+        global_valid_toks=torch.tensor(3.0),
+    )
+
+    assert metrics["num_valid_samples"] == 1

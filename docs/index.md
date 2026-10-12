@@ -171,10 +171,10 @@ Extend a model's context window with YaRN RoPE scaling on the Megatron backend f
 :::
 
 :::{grid-item-card} {octicon}`git-compare` Cross-Tokenizer Distillation
-:link: guides/xtoken-off-policy-distillation
+:link: guides/cross-tokenizer-distillation
 :link-type: doc
 
-Off-policy distillation across mismatched tokenizers — build a (student, teacher) projection matrix and run x-token KD via CUDA-IPC teacher logits.
+Choose X-Token projection matrices or CSD sub-token tables, prepare the tokenizer artifacts, and launch cross-tokenizer training.
 :::
 
 :::{grid-item-card} {octicon}`arrow-both` Weight Refit
@@ -336,6 +336,7 @@ guides/single-controller.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
+guides/cross-tokenizer-distillation.md
 guides/xtoken-off-policy-distillation.md
 guides/refit.md
 guides/checkpoint-engine-refit.md
@@ -390,6 +391,7 @@ design-docs/loss-functions.md
 design-docs/fsdp2-parallel-plan.md
 design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
+design-docs/csd-lockstep-sequence-packing.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md

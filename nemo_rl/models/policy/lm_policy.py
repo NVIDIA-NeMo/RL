@@ -28,6 +28,7 @@ from nemo_rl.data.megatron_sft_packed import (
     MEGATRON_SFT_PACKED_BATCH_FIELDS,
     is_direct_packed_row,
 )
+from nemo_rl.data.packing import LockstepPackingPlan
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -621,12 +622,33 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             unsorted_data_indices = None
         return sharded_data, unsorted_data_indices
 
+    def _validate_lockstep_plan_dp(
+        self, packing_plan: LockstepPackingPlan, packing_side_id: str
+    ) -> None:
+        """Fail before dispatch when a plan targets a different DP grid."""
+        if packing_side_id not in packing_plan.sides:
+            raise ValueError(
+                f"Lockstep plan batch_uid={packing_plan.batch_uid} has no side "
+                f"{packing_side_id!r}; available sides are "
+                f"{tuple(packing_plan.sides)!r}."
+            )
+        plan_dp_size = len(packing_plan.sides[packing_side_id].rank_bin_indices)
+        policy_dp_size = self.data_parallel_size
+        if plan_dp_size != policy_dp_size:
+            raise ValueError(
+                f"Lockstep plan batch_uid={packing_plan.batch_uid} side "
+                f"{packing_side_id!r} targets DP={plan_dp_size}, but this policy "
+                f"uses DP={policy_dp_size}."
+            )
+
     def _shard_for_train(
         self,
         data: BatchedDataDict[Any],
         batch_size: int,
         *,
         micro_batch_size: Optional[int] = None,
+        packing_plan: Optional[LockstepPackingPlan] = None,
+        packing_side_id: Optional[str] = None,
     ) -> list["SlicedDataDict"]:
         """Shard inputs for ``train``.
 
@@ -637,7 +659,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         scalar metrics (no per-row outputs to reorder).
         """
         dp_size = self.data_parallel_size
+        if (packing_plan is None) != (packing_side_id is None):
+            raise ValueError(
+                "packing_plan and packing_side_id must be provided together."
+            )
         if is_direct_packed_row(data):
+            if packing_plan is not None:
+                raise ValueError(
+                    "Direct packed rows cannot accept a lockstep packing plan."
+                )
             missing = _DIRECT_PACKED_SFT_REQUIRED_KEYS.difference(data)
             if missing:
                 raise ValueError(
@@ -680,6 +710,26 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
                 for dp_rank in range(dp_size)
             ]
+        elif packing_plan is not None:
+            if not self.use_sequence_packing:
+                raise ValueError(
+                    "A lockstep packing plan was supplied to a policy with "
+                    "sequence packing disabled."
+                )
+            if self.use_dynamic_batches:
+                raise ValueError(
+                    "Lockstep sequence packing cannot be combined with dynamic batching."
+                )
+            if batch_size != len(packing_plan.canonical_batch_item_ids):
+                raise ValueError(
+                    f"train batch_size={batch_size} does not match lockstep plan "
+                    f"logical size={len(packing_plan.canonical_batch_item_ids)}."
+                )
+            assert packing_side_id is not None
+            self._validate_lockstep_plan_dp(packing_plan, packing_side_id)
+            sharded_data = data.shard_by_packing_plan(
+                packing_plan, side_id=packing_side_id
+            )
         elif self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
@@ -874,6 +924,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         data: BatchedDataDict[GenerationDatumSpec],
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
+        *,
+        packing_plan: Optional[LockstepPackingPlan] = None,
+        packing_side_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Ship the teacher's full-vocab logits to the student via CUDA IPC.
 
@@ -892,19 +945,42 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         :meth:`release_ipc_buffer` at the end of training / validation (and on
         error), not per call.
 
-        v0 limitation: no dynamic batching, no sequence packing.
+        Packed CSD callers must supply the controller-owned plan and side ID;
+        this method never recomputes membership locally.
         """
-        if self.use_dynamic_batches or self.use_sequence_packing:
+        if self.use_dynamic_batches:
             raise NotImplementedError(
-                "get_full_logits_ipc does not support dynamic batching "
-                "or sequence packing in v0."
+                "get_full_logits_ipc does not support dynamic batching."
             )
+        if (packing_plan is None) != (packing_side_id is None):
+            raise ValueError(
+                "packing_plan and packing_side_id must be provided together."
+            )
+        if self.use_sequence_packing and packing_plan is None:
+            raise ValueError(
+                "Packed full-logits export requires the controller-owned "
+                "packing_plan and packing_side_id."
+            )
+        if packing_plan is not None and not self.use_sequence_packing:
+            raise ValueError(
+                "A lockstep packing plan was supplied to a policy with sequence "
+                "packing disabled."
+            )
+        if packing_plan is not None:
+            assert packing_side_id is not None
+            self._validate_lockstep_plan_dp(packing_plan, packing_side_id)
         dp_size = self.data_parallel_size
         with timer.time("get_full_logits_ipc/shard_data") if timer else nullcontext():
-            sharded_data = data.shard_by_batch_size(  # type: ignore
-                dp_size,
-                batch_size=None,
-            )
+            if packing_plan is not None:
+                assert packing_side_id is not None
+                sharded_data = data.shard_by_packing_plan(
+                    packing_plan, side_id=packing_side_id
+                )
+            else:
+                sharded_data = data.shard_by_batch_size(  # type: ignore
+                    dp_size,
+                    batch_size=None,
+                )
         with timer.time("get_full_logits_ipc/submit") if timer else nullcontext():
             futures = self.worker_group.run_all_workers_sharded_data(
                 "get_full_logits_ipc",
@@ -915,9 +991,74 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                # Keep every TP × CP output; consumer routes via overlap.
-                output_is_replicated=["pipeline_parallel"],
+                # Keep every TP × CP × PP output; the consumer routes shards by
+                # their vocab/seq metadata. PP is deliberately NOT declared
+                # replicated: only the LAST pipeline stage holds logits, and
+                # "replicated" would return stage 0's result — which is empty.
+                # Non-last stages return no handles and drop out in
+                # aggregate_per_sample_handles.
                 common_kwargs={"micro_batch_size": micro_batch_size},
+            )
+        worker_results = self.worker_group.get_all_worker_results(futures)
+        if packing_plan is not None:
+            return aggregate_per_sample_handles(
+                worker_results,
+                canonical_batch_item_ids=packing_plan.canonical_batch_item_ids,
+            )
+        return aggregate_per_sample_handles(worker_results)
+
+    def get_topk_logits_ipc(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        *,
+        k: int,
+        temperature: float,
+        vocab_size: Optional[int] = None,
+        micro_batch_size: Optional[int] = None,
+        support_mode: str,
+        gt_filter_topk: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> list[dict[str, Any]]:
+        """Ship sparse teacher logits, ids, and full-vocab logZ via CUDA IPC.
+
+        Tensor-parallel workers reduce to the same global top-k support; context
+        parallel workers retain distinct contiguous sequence shards, which are
+        grouped per sample for reconstruction by the student loss worker.
+        """
+        automodel_cfg = self.cfg["automodel_cfg"]
+        if not automodel_cfg["enabled"]:
+            raise NotImplementedError(
+                "get_topk_logits_ipc currently supports only Automodel workers."
+            )
+        if self.use_dynamic_batches or self.use_sequence_packing:
+            raise NotImplementedError(
+                "get_topk_logits_ipc does not support dynamic batching or "
+                "sequence packing."
+            )
+        with timer.time("get_topk_logits_ipc/shard_data") if timer else nullcontext():
+            sharded_data = data.shard_by_batch_size(
+                self.data_parallel_size,
+                batch_size=None,
+            )
+        with timer.time("get_topk_logits_ipc/submit") if timer else nullcontext():
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_topk_logits_ipc",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=["tensor_parallel", "pipeline_parallel"],
+                common_kwargs={
+                    "k": k,
+                    "temperature": temperature,
+                    "vocab_size": vocab_size,
+                    "micro_batch_size": micro_batch_size,
+                    "support_mode": support_mode,
+                    "gt_filter_topk": gt_filter_topk,
+                },
             )
         worker_results = self.worker_group.get_all_worker_results(futures)
         return aggregate_per_sample_handles(worker_results)
@@ -936,6 +1077,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
+        packing_plan: Optional[LockstepPackingPlan] = None,
+        packing_side_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
@@ -945,19 +1088,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 pre-flight check. Used by cross-tokenizer distillation to
                 pass through teacher / alignment auxiliaries that ride on
                 the same data dict.
+            packing_plan: Controller-owned shared membership and side geometry.
+            packing_side_id: Side key within ``packing_plan``; supplied together
+                with ``packing_plan`` for CSD lockstep packing.
         """
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
         with timer.time("policy_training/sharding_data") if timer else nullcontext():
-            if is_direct_packed_row(data):
-                sharded_data = self._shard_for_train(
-                    data,
-                    batch_size,
-                    micro_batch_size=micro_batch_size,
-                )
-            else:
-                sharded_data = self._shard_for_train(data, batch_size)
+            sharded_data = self._shard_for_train(
+                data,
+                batch_size,
+                micro_batch_size=micro_batch_size,
+                packing_plan=packing_plan,
+                packing_side_id=packing_side_id,
+            )
         self._report_sharded_payload(sharded_data, "policy_train")
 
         if self.flops_tracker is not None:

@@ -21,6 +21,9 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.datasets import load_response_dataset
 from nemo_rl.data.datasets.response_datasets import OpenAIFormatDataset
+from nemo_rl.data.datasets.response_datasets.response_dataset import (
+    resolve_source_sample_id,
+)
 
 
 @pytest.fixture
@@ -115,3 +118,48 @@ def test_message_formatting(sample_data, tokenizer):
     assert combined_message == "".join(
         message["content"] for message in first_example["messages"]
     )
+
+
+@pytest.mark.parametrize("use_preserving_dataset", [False, True])
+def test_identity_is_attached_before_both_openai_formatting_paths(
+    tmp_path, use_preserving_dataset
+):
+    data_path = tmp_path / "chat.jsonl"
+    records = [
+        {
+            "messages": [{"role": "assistant", "content": "sample-id"}],
+            "sample_id": "native-sample-id",
+        },
+        {
+            "messages": [{"role": "assistant", "content": "id"}],
+            "id": "native-id",
+        },
+        {
+            "messages": [{"role": "assistant", "content": "uuid"}],
+            "uuid": "550e8400-e29b-41d4-a716-446655440000",
+        },
+        {"messages": [{"role": "assistant", "content": "synthesized"}]},
+    ]
+    data_path.write_text(
+        "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+    )
+
+    dataset = OpenAIFormatDataset(
+        str(data_path),
+        use_preserving_dataset=use_preserving_dataset,
+        subset="conversation-v2",
+        split="validation",
+    )
+
+    assert [row["sample_id"] for row in dataset.dataset] == [
+        "native-sample-id",
+        "native-id",
+        "550e8400-e29b-41d4-a716-446655440000",
+        resolve_source_sample_id(
+            records[3],
+            3,
+            data_path=str(data_path),
+            subset="conversation-v2",
+            split="validation",
+        ),
+    ]
