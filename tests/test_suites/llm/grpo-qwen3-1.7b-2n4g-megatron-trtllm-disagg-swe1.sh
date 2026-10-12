@@ -16,9 +16,6 @@ USE_GYM_CONTAINER=true
 exit_if_max_steps_reached
 
 # Run the experiment
-VLLM_CACHE_DIR=${HF_HOME}/vllm_compile_cache \
-FLASHINFER_CUBIN_CACHE=${HF_HOME}/flashinfer_cubins \
-FLASHINFER_WS_BASE=${HF_HOME}/flashinfer_workspace \
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
