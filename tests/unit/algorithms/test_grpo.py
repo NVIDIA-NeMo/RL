@@ -1955,6 +1955,7 @@ def test_async_resume_plumbs_frontier_metadata_into_collector(
     ("generation_config", "expected"),
     [
         ({"backend": "dynamo"}, True),
+        ({"backend": "remote_vllm"}, True),
         ({"backend": "vllm", "vllm_cfg": {"async_engine": False}}, False),
         ({"backend": "vllm", "vllm_cfg": {"async_engine": True}}, True),
         (
@@ -1993,6 +1994,14 @@ def test_should_use_nemo_gym_accepts_megatron_always_async():
             "mcore_generation_config": {"expose_http_server": True},
         }
     }
+
+    assert should_use_nemo_gym(master_config)
+
+
+def test_should_use_nemo_gym_accepts_remote_vllm_http_service():
+    master_config = MagicMock()
+    master_config.env = {"should_use_nemo_gym": True}
+    master_config.policy = {"generation": {"backend": "remote_vllm"}}
 
     assert should_use_nemo_gym(master_config)
 

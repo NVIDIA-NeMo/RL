@@ -29,6 +29,7 @@ from typing import Any, Optional
 from nemo_rl.models.generation.constants import (
     DYNAMO_BACKEND,
     MEGATRON_BACKEND,
+    REMOTE_VLLM_BACKEND,
     SGLANG_BACKEND,
     VLLM_BACKEND,
 )
@@ -77,6 +78,7 @@ def create_weight_synchronizer(
         SGLANG_BACKEND,
         MEGATRON_BACKEND,
         DYNAMO_BACKEND,
+        REMOTE_VLLM_BACKEND,
     }
     if generation_backend not in _SUPPORTED_BACKENDS:
         raise ValueError(
@@ -87,13 +89,16 @@ def create_weight_synchronizer(
     if generation.cfg.get("refit_transport") == "hf_checkpoint":
         from nemo_rl.models.policy.draft_config import draft_refit_enabled
 
-        if generation_backend != VLLM_BACKEND:
+        if generation_backend not in {VLLM_BACKEND, REMOTE_VLLM_BACKEND}:
             raise ValueError("hf_checkpoint refit requires the vLLM backend")
         if colocated:
             raise ValueError("hf_checkpoint refit requires non-colocated generation")
         if not policy.cfg.get("megatron_cfg", {}).get("enabled"):
             raise NotImplementedError("hf_checkpoint export requires a Megatron policy")
-        if not generation.cfg["vllm_cfg"]["async_engine"]:
+        if (
+            generation_backend == VLLM_BACKEND
+            and not generation.cfg["vllm_cfg"]["async_engine"]
+        ):
             raise ValueError("hf_checkpoint refit currently requires async_engine=true")
         if generation.cfg.get("quant_cfg") or draft_refit_enabled(
             policy.cfg.get("draft")
@@ -110,6 +115,9 @@ def create_weight_synchronizer(
         config = normalize_vllm_refit_config(generation.cfg)
         assert config is not None and config.hf_checkpoint is not None
         return HfCheckpointWeightSynchronizer(policy, generation, config.hf_checkpoint)
+
+    if generation_backend == REMOTE_VLLM_BACKEND:
+        raise ValueError("remote_vllm requires refit_transport=hf_checkpoint")
 
     # Megatron owns its refit selectors (including "mcore"); the vLLM-oriented
     # checkpoint-engine normalization rejects that valid Megatron value.
