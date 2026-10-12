@@ -74,7 +74,12 @@ def test_uniform_allocation_yields_the_gres_flag(tmp_path):
 def test_only_the_gpu_entry_is_read(tmp_path):
     """Socket suffixes, other GRES types, and typed GPU entries do not change
     the count that is compared."""
-    for lines in (["gpu:8(S:0-3),shard:64"], ["gpu:h100:8"], ["shard:64,gpu:8"]):
+    for lines in (
+        ["gpu:8(S:0-3),shard:64"],
+        ["gpu:8,shard:64"],
+        ["gpu:h100:8"],
+        ["shard:64,gpu:8"],
+    ):
         result = _run(tmp_path, lines)
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "--gres=gpu:8"

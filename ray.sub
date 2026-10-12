@@ -49,7 +49,9 @@ maybe_gres_arg() {
   # GRES string may list several types and carry a socket suffix
   # ("gpu:8(S:0-3),shard:64"); only the gpu entry's count is read.
   local gres_lines gres_counts
-  gres_lines=$(sinfo -N -n "$SLURM_JOB_NODELIST" -h -o "%G" | grep "gpu:" || true)
+  # -a: without it sinfo leaves out Hidden=YES partitions, so nodes that are
+  # only in one print nothing and the steps would run without GPUs.
+  gres_lines=$(sinfo -N -n "$SLURM_JOB_NODELIST" -a -h -o "%G" | grep "gpu:" || true)
   if [[ -z "$gres_lines" ]]; then
     # No GRES support detected
     echo ""
