@@ -314,6 +314,8 @@ project-includes = [
   "nemo_rl/weight_sync/checkpoint_engine_weight_synchronizer.py",
   "nemo_rl/weight_sync/collective_weight_synchronizer.py",
   "nemo_rl/weight_sync/factory.py",
+  "nemo_rl/models/generation/remote_vllm/token_capture_bridge.py",
+  "nemo_rl/data_plane/token_staging_wire.py",
   "nemo_rl/weight_sync/hf_checkpoint_weight_synchronizer.py",
   "nemo_rl/weight_sync/hf_checkpoint_config.py",
   "nemo_rl/weight_sync/interfaces.py",

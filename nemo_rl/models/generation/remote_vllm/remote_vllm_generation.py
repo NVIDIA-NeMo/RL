@@ -14,6 +14,7 @@
 
 """GenerationInterface facade for a vLLM server outside NeMo-RL's Ray cluster."""
 
+import secrets
 from typing import TYPE_CHECKING, Any
 
 import ray
@@ -28,6 +29,10 @@ from nemo_rl.models.generation.remote_vllm.client import RemoteVllmClient
 from nemo_rl.models.generation.remote_vllm.config import RemoteVllmServiceConfig
 from nemo_rl.models.generation.remote_vllm.preflight import (
     preflight_remote_vllm_service,
+)
+from nemo_rl.models.generation.remote_vllm.token_capture_bridge import (
+    RemoteVllmTokenCaptureBridge,
+    set_remote_token_capture_weight_version,
 )
 
 if TYPE_CHECKING:
@@ -58,10 +63,6 @@ class RemoteVllmGeneration(GenerationInterface):
             raise ValueError(
                 "remote_vllm checkpoint export currently requires a Megatron policy"
             )
-        if master_config.token_capture.enabled:
-            raise NotImplementedError(
-                "remote_vllm does not yet support Single Controller token capture"
-            )
         RemoteVllmServiceConfig.model_validate(generation["remote_vllm_cfg"])
 
     def __init__(self, config: dict[str, Any]) -> None:
@@ -73,6 +74,18 @@ class RemoteVllmGeneration(GenerationInterface):
         self.dp_openai_server_base_urls: list[str] = [self.remote_config.base_url]
         self.weight_synchronizer = None
         self._paused_for_refit = False
+        self._token_capture_bridge: RemoteVllmTokenCaptureBridge | None = None
+        self._token_capture_bridge_url: str | None = None
+        self._token_capture_auth_token: str | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize only the bridge control coordinates into SingleController."""
+        state = self.__dict__.copy()
+        # The driver owns the live uvicorn thread, socket, and locks. The
+        # SingleController copy only needs the authenticated HTTP coordinates
+        # used to rotate the version stamped on subsequently staged calls.
+        state["_token_capture_bridge"] = None
+        return state
 
     def load_and_start(self) -> None:
         """Match the deferred local-vLLM setup hook; the service is already live."""
@@ -103,7 +116,62 @@ class RemoteVllmGeneration(GenerationInterface):
 
     def shutdown(self) -> bool:
         # The heterogeneous-job launcher, not NeMo-RL, owns the server process.
+        if self._token_capture_bridge is not None:
+            self._token_capture_bridge.stop()
+            self._token_capture_bridge = None
+        self._token_capture_bridge_url = None
+        self._token_capture_auth_token = None
         return True
+
+    def setup_token_capture(
+        self,
+        dp_cfg: dict[str, Any],
+        staging_partition: str,
+        *,
+        dp_client: Any,
+    ) -> None:
+        """Bridge external serving processes to controller-owned token staging."""
+        del dp_cfg
+        if (
+            self._token_capture_bridge is not None
+            or self._token_capture_bridge_url is not None
+        ):
+            raise RuntimeError("remote vLLM token capture is already configured")
+        auth_token = secrets.token_hex(32)
+        bridge = RemoteVllmTokenCaptureBridge(
+            dp_client=dp_client,
+            staging_partition=staging_partition,
+            auth_token=auth_token,
+        )
+        bridge.start()
+        assert bridge.base_url is not None
+        try:
+            self.client.configure_token_capture(
+                bridge_url=bridge.base_url,
+                auth_token=auth_token,
+            )
+        except RuntimeError:
+            bridge.stop()
+            raise
+        self._token_capture_bridge = bridge
+        self._token_capture_bridge_url = bridge.base_url
+        self._token_capture_auth_token = auth_token
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the version stamped by the controller-side capture bridge."""
+        if self._token_capture_bridge is not None:
+            self._token_capture_bridge.set_weight_version(version)
+            return
+        if (
+            self._token_capture_bridge_url is None
+            or self._token_capture_auth_token is None
+        ):
+            raise RuntimeError("remote vLLM token capture is not configured")
+        set_remote_token_capture_weight_version(
+            bridge_url=self._token_capture_bridge_url,
+            auth_token=self._token_capture_auth_token,
+            version=version,
+        )
 
     def pause_generation(self, mode: str) -> None:
         self.client.pause(mode=mode, clear_cache=True)
