@@ -15,8 +15,8 @@
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
-	url = ssh://git@gitlab-master.nvidia.com:12051/dmosallanezh/nemo-gym.git
-	branch = ultra-v3-posttraining
+	url = git@github.com:haifengqian/NeMo-Gym-fork.git
+	branch = double-rollout-paper
 	shallow = true
 [submodule "3rdparty/reasoning_limit_logit_processors"]
 	path = 3rdparty/reasoning_limit_logit_processors
