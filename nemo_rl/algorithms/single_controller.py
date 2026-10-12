@@ -2967,6 +2967,22 @@ class SingleControllerActor:
                         target_groups = self._target_groups_for_step(
                             version_during_step
                         )
+                        if (
+                            shared_prefix_dp_world is not None
+                            and target_groups % shared_prefix_dp_world
+                        ):
+                            # Setup rejects the configurable drops, but a structural
+                            # finalizer drop or a restored shortfall can still shrink
+                            # the step. Fail before another chunk trains.
+                            raise ValueError(
+                                f"Shared-prefix training step {version_during_step} "
+                                "lost "
+                                f"{self._algo_cfg.num_prompts_per_step - target_groups} "
+                                f"prompt group(s), leaving {target_groups}, which is not "
+                                "a multiple of the data-parallel size "
+                                f"{shared_prefix_dp_world}; shared-prefix training "
+                                "cannot close a step short"
+                            )
                         max_prompt_groups = target_groups - groups_dispatched
                         if max_prompt_groups <= 0:
                             break
@@ -2981,8 +2997,8 @@ class SingleControllerActor:
                             dispatch_groups = (
                                 (min_prompt_groups + dp_world - 1) // dp_world
                             ) * dp_world
-                            # Invariant only: the entry DP check plus setup's
-                            # zero drop budget keep every remainder aligned.
+                            # Invariant only: the entry DP check and the step-target
+                            # check above keep every remainder aligned.
                             if dispatch_groups > max_prompt_groups:
                                 raise ValueError(
                                     "Shared-prefix step remainder must contain complete DP groups: "

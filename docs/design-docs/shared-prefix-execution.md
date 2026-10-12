@@ -111,13 +111,13 @@ The `logprobs` and `train` modes also require the following. Policy and single-c
 - An explicit `policy.make_sequence_length_divisible_by` that is a multiple of M. Both `train_mb_tokens` and `logprob_mb_tokens` must be multiples of it.
 - `policy.generation.top_p: 1.0` and `top_k` disabled (`null`, `0` or `-1`). Shared logprob extraction does not support top-k/top-p filtering. Temperature scaling is supported.
 - `token_capture.enabled: true`.
-- `async_rl.rollout_failure.max_skipped_prompts: 0` and `max_consecutive_dropped_prompts: 0`. A dropped prompt can leave a step that no longer splits into complete data-parallel groups.
+- `async_rl.rollout_failure.max_skipped_prompts: 0` and `max_consecutive_dropped_prompts: 0`, and `token_capture.min_valid_fraction_per_group` unset. A dropped prompt can leave a step that no longer splits into complete data-parallel groups. A drop that no setting controls (a structural finalizer drop, or a shortfall restored from a checkpoint) stops the run at the next chunk selection, before another chunk trains.
 - `grpo.num_prompts_per_step` a multiple of the policy data-parallel size, because complete groups are assigned to data-parallel ranks. The controller checks this before the first training chunk.
 - A `TQPolicy`. Other policies raise `NotImplementedError` at construction.
 
 Samplers align their selection to the data-parallel size only when their own class body declares `supports_prompt_group_multiple = True`. The flag is not inherited. A subclass of a built-in sampler must redeclare it and accept the `prompt_group_multiple` keyword. Other samplers fall back to exact-minimum chunks, which are correct but smaller.
 
-On-policy distillation teachers always run with `mode: disabled`, because teacher dispatches are not group-sharded.
+On-policy distillation teachers always run with `mode: disabled`, because teacher dispatches are not group-sharded. So does the inference-only policy of non-colocated Megatron generation, which never trains.
 
 ### Rejected configurations
 
@@ -155,6 +155,8 @@ NeMo RL tests in this repository:
 - `tests/unit/data_plane/test_shared_prefix_preshard.py`, `tests/unit/single_controller/test_shared_prefix_controller.py`, `tests/unit/models/policy/test_shared_prefix_config.py`, `test_shared_prefix_stage_weights.py`, `test_megatron_worker_shared_prefix.py` and `tests/unit/models/megatron/test_shared_prefix_setup_capability.py` cover sharding, the train pump, configuration rules, dispatch plumbing, worker gating and setup checks.
 
 Megatron-LM tests compare the shared HybridModel forward and backward with the dense rows it replaces, at TP1/CP1, TP2/SP/CP2 and TP1/CP4. They use an FP32 dense reference with MoE top-k choices replayed from a fixed table. The shared BF16 error must stay within 1.25× of the dense BF16 error. At TP/CP, the shared-versus-dense gap must stay within 1.5× of the TP1/CP1 gap.
+
+Most of these tests need the `megatron.rl` packing library, so they skip when the installed Megatron-LM does not contain the shared-prefix stack. Until the Megatron Bridge pin includes it, CI therefore does not exercise the shared path. After the pin bump, run the Megatron lane with `NRL_REQUIRE_MEGATRON_RL_SHARED_PREFIX=1`, which makes `--mcore-only` fail instead of skip when the library is missing.
 
 No functional single-controller GRPO test for this feature exists yet. Training quality has not been qualified on this revision.
 

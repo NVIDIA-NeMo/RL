@@ -1298,6 +1298,15 @@ def setup_single_controller(
                 "max_consecutive_dropped_prompts=0: a dropped prompt can leave a "
                 "step that no longer splits into complete data-parallel groups"
             )
+        # A group below the valid-row threshold with no replacement shrinks its step
+        # the same way.
+        if token_capture_cfg.min_valid_fraction_per_group is not None:
+            raise ValueError(
+                "policy.shared_prefix_training does not support "
+                "token_capture.min_valid_fraction_per_group: a group dropped below "
+                "the threshold can leave a step that no longer splits into complete "
+                "data-parallel groups"
+            )
     if token_capture_cfg.enabled:
         if not should_use_nemo_gym(master_config):
             raise ValueError(

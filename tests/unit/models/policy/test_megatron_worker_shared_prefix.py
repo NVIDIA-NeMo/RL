@@ -102,6 +102,12 @@ def cpu_tensors(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(torch, "tensor", cpu_tensor)
 
 
+@pytest.fixture
+def megatron_rl_planner():
+    """Skip when the installed Megatron-LM lacks the megatron.rl shared-prefix planners."""
+    pytest.importorskip("megatron.rl.shared_prefix_alignment")
+
+
 def test_worker_without_init_keeps_shared_prefix_disabled() -> None:
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
 
@@ -114,7 +120,7 @@ def test_worker_without_init_keeps_shared_prefix_disabled() -> None:
     worker._validate_shared_prefix_loss(MagicMock(input_type=LossInputType.LOGIT))
 
 
-@pytest.mark.usefixtures("cpu_tensors")
+@pytest.mark.usefixtures("cpu_tensors", "megatron_rl_planner")
 def test_local_planning_failure_joins_the_agreement_before_raising(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -133,7 +139,7 @@ def test_local_planning_failure_joins_the_agreement_before_raising(
     assert all_reduce.calls == 1
 
 
-@pytest.mark.usefixtures("cpu_tensors")
+@pytest.mark.usefixtures("cpu_tensors", "megatron_rl_planner")
 def test_peer_planning_failure_raises_on_a_healthy_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -149,7 +155,7 @@ def test_peer_planning_failure_raises_on_a_healthy_rank(
         worker._plan_shared_prefix_execution_units(_batch(), bin_capacity=16)
 
 
-@pytest.mark.usefixtures("cpu_tensors")
+@pytest.mark.usefixtures("cpu_tensors", "megatron_rl_planner")
 def test_unaligned_forward_count_mismatch_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

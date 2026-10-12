@@ -61,6 +61,7 @@ modules concurrently; update this file if one of them changes:
 
 import functools
 import hashlib
+import importlib.util
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -72,7 +73,21 @@ import torch
 import torch.distributed as dist
 
 pytest.importorskip("megatron.core")
-pytest.importorskip("megatron.rl.shared_prefix_tensors")
+
+
+def _has_megatron_rl_packing() -> bool:
+    try:
+        return importlib.util.find_spec("megatron.rl.shared_prefix_tensors") is not None
+    except ImportError:
+        return False
+
+
+# Only the planning oracle needs the megatron.rl packing library (Megatron-LM #7914); the
+# restore and inactive-mode tests run against any Megatron-LM.
+requires_megatron_rl = pytest.mark.skipif(
+    not _has_megatron_rl_packing(),
+    reason="needs the megatron.rl shared-prefix packing modules (Megatron-LM #7914)",
+)
 
 from megatron.core import parallel_state  # noqa: E402
 
@@ -776,6 +791,7 @@ def single_rank_model_parallel(tmp_path_factory):
             dist.destroy_process_group()
 
 
+@requires_megatron_rl
 @pytest.mark.parametrize("chunk_size", [None, 7], ids=["unchunked", "chunk7"])
 @pytest.mark.parametrize("case_name", list(_CASES))
 def test_shared_prefix_consumer_matches_dense_oracle(
@@ -784,6 +800,7 @@ def test_shared_prefix_consumer_matches_dense_oracle(
     _check_case(_CASES[case_name], chunk_size=chunk_size)
 
 
+@requires_megatron_rl
 def test_shared_prefix_consumer_matches_dense_oracle_with_temperature(
     single_rank_model_parallel,
 ):
@@ -866,6 +883,7 @@ def _distributed_oracle(rank: int, world_size: int, *, tp_size: int, cp_size: in
         parallel_state.destroy_model_parallel()
 
 
+@requires_megatron_rl
 @pytest.mark.parametrize(
     "tp_size, cp_size", [(1, 2), (2, 1), (2, 2)], ids=["tp1cp2", "tp2cp1", "tp2cp2"]
 )

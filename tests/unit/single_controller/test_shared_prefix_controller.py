@@ -146,6 +146,32 @@ def test_unaligned_step_fails_before_any_chunk_trains(monkeypatch):
     assert ctrl._trainer.train_calls == 0
 
 
+def test_step_shortfall_fails_before_the_next_chunk_trains(monkeypatch):
+    # A structural finalizer drop (or a restored shortfall) leaves 7 of 8 groups at DP 4.
+    # The pump must raise at its next selection instead of training on and failing at the
+    # unaligned remainder.
+    sampler = _MinSampler()
+    ctrl = _shared_prefix_controller(
+        monkeypatch,
+        sampler,
+        num_prompts_per_step=8,
+        dp=4,
+        min_groups_for_streaming_train=4,
+    )
+    # The group is lost after the first chunk has trained.
+    monkeypatch.setattr(
+        ctrl,
+        "_target_groups_for_step",
+        lambda step: 8 if ctrl._trainer.train_calls == 0 else 7,
+    )
+
+    with pytest.raises(ValueError, match="cannot close a step short"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+
+    assert ctrl._trainer.train_calls == 1
+    assert len(sampler.calls) == 1
+
+
 def test_aligned_step_without_sampler_alignment_takes_exact_dp_chunks(monkeypatch):
     sampler = _MinSampler()
     ctrl = _shared_prefix_controller(monkeypatch, sampler, num_prompts_per_step=8, dp=4)
@@ -294,6 +320,20 @@ def test_shared_prefix_requires_token_capture_before_allocating_workers(
     mc.policy["shared_prefix_training"] = {"mode": "logprobs"}
 
     with pytest.raises(ValueError, match="requires token_capture.enabled=true"):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    patched_factories["_build_clusters"].assert_not_called()
+
+
+def test_shared_prefix_rejects_min_valid_fraction_before_allocating_workers(
+    patched_factories,  # noqa: F811
+):
+    mc = _make_master_config(sampler_cfg=InOrderSamplerConfig())
+    mc.policy["shared_prefix_training"] = {"mode": "train"}
+    mc.token_capture.enabled = True
+    mc.token_capture.min_valid_fraction_per_group = 0.5
+
+    with pytest.raises(ValueError, match="min_valid_fraction_per_group"):
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     patched_factories["_build_clusters"].assert_not_called()
