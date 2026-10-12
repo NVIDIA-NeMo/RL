@@ -83,6 +83,10 @@ def resolve_generation_class(
         from nemo_rl.models.generation.vllm import VllmGeneration
 
         return VllmGeneration
+    if backend == "remote_vllm":
+        from nemo_rl.models.generation.remote_vllm import RemoteVllmGeneration
+
+        return RemoteVllmGeneration
     if backend == "sglang":
         from nemo_rl.models.generation.sglang.sglang_generation import (
             SGLangGeneration,

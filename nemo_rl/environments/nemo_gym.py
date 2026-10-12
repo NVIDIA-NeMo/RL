@@ -175,6 +175,8 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         should_expose_http_server = generation_config.get("vllm_cfg", {}).get(
             "expose_http_server"
         )
+    elif generation_config["backend"] == "remote_vllm":
+        should_expose_http_server = True
     else:
         should_expose_http_server = False
     assert should_expose_http_server, (
@@ -1362,6 +1364,9 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     elif backend == "megatron":
         # Enable the http server for Gym dispatch over the Megatron generation backend.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
+    elif backend == "remote_vllm":
+        # The externally managed server is already OpenAI-compatible.
+        pass
     else:
         raise ValueError(f"NeMo Gym does not support generation backend {backend!r}.")
 
