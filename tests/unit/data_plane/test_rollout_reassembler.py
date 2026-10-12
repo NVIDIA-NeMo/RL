@@ -421,21 +421,19 @@ def r3_partitions(tq_client):
     tq_client.clear_samples(sample_ids=None, partition_id=_R3_PARTITION)
 
 
-def _routes_for_delta(call_idx: int, n_tokens: int) -> list:
-    """[n][L=2][K=2] rows, value = call*1000 + pos (recognizable per token)."""
-    return [
-        [[call_idx * 1000 + pos, call_idx * 1000 + pos + 500] for _ in range(2)]
-        for pos in range(n_tokens)
-    ]
-
-
 def _staged_routes_for(call_idx: int, record: StagedCallRecord) -> list:
-    """Routes as the vLLM worker stages them for one call.
+    """Fake routes for one call, saved the same way as the vLLM worker saves them.
 
-    A child call leads with one extra row: the real route of its parent's last
-    sampled token (value ``call*1000 + 900``, distinct from every delta row).
+    Shape: [rows][2 layers][top-2]. Each new token gets an easy-to-spot route
+    (``call*1000 + pos``). The last token gets ``-1``, because vLLM has no route
+    for it. A call with a parent starts with one extra row (``call*1000 + 900``):
+    the real route of the parent's last token.
     """
-    routes = _routes_for_delta(call_idx, len(record.token_ids_delta))
+    routes = [
+        [[call_idx * 1000 + pos, call_idx * 1000 + pos + 500] for _ in range(2)]
+        for pos in range(len(record.token_ids_delta))
+    ]
+    routes[-1] = [[-1, -1]] * 2
     if record.prev_len > 0:
         boundary_row = [[call_idx * 1000 + 900, call_idx * 1000 + 900]] * 2
         routes = [boundary_row] + routes
@@ -722,9 +720,13 @@ def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
     assert bool(materialized["routed_experts"][1].eq(-1).all())
 
 
-@pytest.mark.parametrize("bad_routed_len", [-1, 999])
+@pytest.mark.parametrize(
+    ("call_index", "bad_routed_len"),
+    [(0, -1), (0, 999), (1, 3)],
+    ids=["negative", "oversized", "child_without_boundary_row"],
+)
 def test_deferred_finalizer_rejects_invalid_routed_len(
-    tq_client, r3_deferred_partitions, bad_routed_len
+    tq_client, r3_deferred_partitions, call_index, bad_routed_len
 ):
     from dataclasses import replace as dataclass_replace
 
@@ -742,7 +744,10 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
     fetched = finalizer._source.fetch_for_finalization(
         [record["staging_key"] for record in receipt["manifest"]]
     )
-    fetched[0] = dataclass_replace(fetched[0], routed_len=bad_routed_len)
+    # Call 1 is a child with 3 new tokens, so it must stage 4 rows.
+    fetched[call_index] = dataclass_replace(
+        fetched[call_index], routed_len=bad_routed_len
+    )
 
     class _InjectedSource:
         def fetch_for_finalization(

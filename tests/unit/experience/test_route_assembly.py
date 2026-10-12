@@ -13,7 +13,7 @@
 # limitations under the License.
 """Token-capture router replay across calls: worker staging + route executor.
 
-vLLM never routes a call's last sampled token; that row is a placeholder.
+vLLM never routes a call's last sampled token; that row is the -1 sentinel.
 The next call routes it during prefill. For a linear chain of calls, the
 training routes must therefore equal the last call's full route tensor.
 """

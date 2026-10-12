@@ -875,7 +875,8 @@ class RolloutReassembler:
             valid_rows += 1
             covered_tokens += len(row.token_ids)
             if row.routed_experts is None:
-                sentinel_tokens += len(row.token_ids)
+                # The final token never has a recorded route; don't count it.
+                sentinel_tokens += max(len(row.token_ids) - 1, 0)
                 continue
             rows_with_routes += 1
             row_routes = row.routed_experts
