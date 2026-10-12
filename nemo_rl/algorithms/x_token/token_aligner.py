@@ -298,7 +298,7 @@ class TokenAligner:
         self,
         student_tokenizer,
         teacher_tokenizer,
-        projection_matrix_path: str,
+        projection_matrix_path: str | None,
     ):
         self.student_tokenizer = student_tokenizer
         self.teacher_tokenizer = teacher_tokenizer

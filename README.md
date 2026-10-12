@@ -112,6 +112,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - 🔜 **On-Policy Cross-Tokenizer Distillation** - cross-tokenizer support for the on-policy (MOPD) recipe (today MOPD is same-tokenizer; cross-tokenizer xToken is off-policy)
 - 🔜 **New Models** - Qwen3-Next, Minimax 
 
+- ✅ **CSD** - Cross-tokenizer distillation using bidirectional sub-token tables; see the [preparation and training guide](docs/guides/cross-tokenizer-distillation.md).
 - ✅ **X-Token Off-Policy Distillation** - Distillation across mismatched (student, teacher) tokenizers via a precomputed projection matrix.
 - ✅ **Muon Optimizer** - Emerging Optimizer support for SFT/RL
 - ✅ **Megatron Inference** - Improved performance for Megatron Inference (avoid weight conversion).
@@ -474,6 +475,8 @@ sbatch \
 > For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
 
 ## X-Token Off-Policy Distillation
+
+For an overview of X-Token and CSD, including CSD sub-token table preparation and training, see the [cross-tokenizer distillation guide](docs/guides/cross-tokenizer-distillation.md).
 
 We support off-policy distillation between a student and a teacher that **do not share a tokenizer** (cross-tokenizer, or "x-token", distillation) — for example, distilling a `Qwen/Qwen3-4B` teacher into a `meta-llama/Llama-3.2-1B` student. The reference recipe trains on the ungated, CC-BY-4.0 [Nemotron-Pretraining-Specialized-v1.1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1) corpus (`Nemotron-Pretraining-Formal-Logic` subset).
 

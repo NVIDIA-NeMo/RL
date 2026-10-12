@@ -22,6 +22,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
 )
+from nemo_rl.algorithms.loss.csd import CSDLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.loss.utils import (
     _pack_input_ids,
@@ -30,6 +31,7 @@ from nemo_rl.algorithms.loss.utils import (
 )
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.algorithms.x_token.loss_utils import (
+    prepare_csd_cross_tokenizer_loss_input,
     prepare_xtoken_cross_tokenizer_loss_input,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -335,34 +337,68 @@ def prepare_loss_input(
         }
 
     elif loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
-        # Rebuild each teacher's full-vocab logits from its per-rank CUDA IPC
-        # handles and do the shared CP-resolution the loss needs; the loss fn
-        # does the per-teacher projection / chunk-average / KL reductions and
-        # aggregates them by ``kd_loss_mode``. ``projection_matrix_paths`` drives
-        # the teacher count and which teachers are same-tokenizer (``None``). The
-        # TP group is derived from the student logits' own device mesh.
-        (
-            student_logits_contig,
-            teacher_full_logits_by_idx,
-            aligns_by_idx,
-            tp_group,
-            cp_group,
-        ) = prepare_xtoken_cross_tokenizer_loss_input(
-            logits,
-            data,
-            projection_matrix_paths=loss_fn.projection_matrix_paths,
-            vocab_parallel_group=vocab_parallel_group,
-            context_parallel_group=context_parallel_group,
-            cp_sharder=cp_sharder,
-        )
-        loss_input = {
-            "logits": logits,
-            "student_logits_contig": student_logits_contig,
-            "teacher_full_logits_by_idx": teacher_full_logits_by_idx,
-            "aligns_by_idx": aligns_by_idx,
-            "tp_group": tp_group,
-            "cp_group": cp_group,
-        }
+        if isinstance(loss_fn, CSDLossFn):
+            (
+                student_logits_contig,
+                teacher_full_logits_by_idx,
+                teacher_sparse_logits_by_idx,
+                aligns_by_idx,
+                dense_reconstruction_fallbacks_by_idx,
+                tp_group,
+                cp_group,
+                dp_cp_group,
+            ) = prepare_csd_cross_tokenizer_loss_input(
+                logits,
+                data,
+                projection_matrix_paths=loss_fn.projection_matrix_paths,
+                cross_tokenizer_teacher_mask=[
+                    not loss_fn._teacher_is_same_vocab(i)
+                    for i in range(loss_fn.num_teachers)
+                ],
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                cp_sharder=cp_sharder,
+            )
+            loss_input = {
+                "logits": logits,
+                "student_logits_contig": student_logits_contig,
+                "teacher_full_logits_by_idx": teacher_full_logits_by_idx,
+                "teacher_sparse_logits_by_idx": teacher_sparse_logits_by_idx,
+                "aligns_by_idx": aligns_by_idx,
+                "dense_reconstruction_fallbacks_by_idx": dense_reconstruction_fallbacks_by_idx,
+                "tp_group": tp_group,
+                "cp_group": cp_group,
+                "dp_cp_group": dp_cp_group,
+            }
+        else:
+            # Rebuild each teacher's full-vocab logits from its per-rank CUDA IPC
+            # handles and do the shared CP-resolution the loss needs; the loss fn
+            # does the per-teacher projection / chunk-average / KL reductions and
+            # aggregates them by ``kd_loss_mode``. ``projection_matrix_paths`` drives
+            # the teacher count and which teachers are same-tokenizer (``None``). The
+            # TP group is derived from the student logits' own device mesh.
+            (
+                student_logits_contig,
+                teacher_full_logits_by_idx,
+                aligns_by_idx,
+                tp_group,
+                cp_group,
+            ) = prepare_xtoken_cross_tokenizer_loss_input(
+                logits,
+                data,
+                projection_matrix_paths=loss_fn.projection_matrix_paths,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                cp_sharder=cp_sharder,
+            )
+            loss_input = {
+                "logits": logits,
+                "student_logits_contig": student_logits_contig,
+                "teacher_full_logits_by_idx": teacher_full_logits_by_idx,
+                "aligns_by_idx": aligns_by_idx,
+                "tp_group": tp_group,
+                "cp_group": cp_group,
+            }
         if cp_sharder is not None:
             next_token_logprobs = get_cp_sharded_next_token_logprobs(
                 logits,
