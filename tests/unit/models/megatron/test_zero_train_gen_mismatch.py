@@ -39,6 +39,8 @@ CONFIGS_DIR = Path(__file__).resolve().parents[4] / "examples" / "configs"
 
 ZERO_KL_EXEMPLARS = [
     "recipes/llm/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl.yaml",
+    "recipes/llm/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl-mlp-mxfp8.yaml",
+    "recipes/llm/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl-all-mxfp8.yaml",
 ]
 
 # Installed-package versions that satisfy every gate in `_validate_packages`.
@@ -362,14 +364,43 @@ def test_validate_rejects_non_bf16_precision():
     assert any("precision='bfloat16'" in v for v in _validate(config).violations)
 
 
+_MXFP8 = {"enabled": True, "fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True}
+
+
+def test_validate_accepts_mxfp8_on_both_sides():
+    # The generation side inherits policy.megatron_cfg.fp8_cfg.
+    config = _policy_config()
+    config["megatron_cfg"]["fp8_cfg"] = dict(_MXFP8)
+    config["generation"]["mcore_generation_config"][
+        "inference_grouped_gemm_backend"
+    ] = "torch"
+    assert _validate(config).violations == []
+
+
 @pytest.mark.parametrize("side", ["train", "generation"])
-def test_validate_rejects_fp8_on_either_side(side):
+def test_validate_rejects_mxfp8_on_one_side_only(side):
     config = _policy_config()
     if side == "train":
-        config["megatron_cfg"]["fp8_cfg"] = {"enabled": True}
+        config["megatron_cfg"]["fp8_cfg"] = dict(_MXFP8)
+        config["generation"]["mcore_generation_config"]["fp8_cfg"] = {"enabled": False}
     else:
-        config["generation"]["mcore_generation_config"]["fp8_cfg"] = {"enabled": True}
-    assert any("FP8" in v for v in _validate(config).violations)
+        config["generation"]["mcore_generation_config"]["fp8_cfg"] = dict(_MXFP8)
+    assert any("same precision" in v for v in _validate(config).violations)
+
+
+def test_validate_rejects_a_non_mxfp8_fp8_recipe():
+    config = _policy_config()
+    config["megatron_cfg"]["fp8_cfg"] = {**_MXFP8, "fp8_recipe": "blockwise"}
+    assert any("fp8_recipe='mxfp8'" in v for v in _validate(config).violations)
+
+
+def test_validate_rejects_flashinfer_grouped_gemm_with_mxfp8():
+    config = _policy_config()
+    config["megatron_cfg"]["fp8_cfg"] = dict(_MXFP8)
+    config["generation"]["mcore_generation_config"][
+        "inference_grouped_gemm_backend"
+    ] = "flashinfer"
+    assert any("flashinfer" in v for v in _validate(config).violations)
 
 
 # --------------------------------------------------------------------------- #

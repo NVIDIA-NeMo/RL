@@ -14,8 +14,8 @@
 
 """Zero train/generation KL (batch-invariant Megatron): validate the recipe, then enable.
 
-The recipe sets every required value; this module only checks them. Only BF16
-(no FP8) is supported.
+The recipe sets every required value; this module only checks them. Supported
+precisions are BF16 and MXFP8 (the same on train and generation).
 """
 
 from __future__ import annotations
@@ -410,6 +410,22 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
             f"generation transformer_impl must be 'inference_optimized' (got {impl!r})."
         )
 
+    fp8_cfg = inference_cfg.get("fp8_cfg") or {}
+    backend = inference_cfg.get("inference_grouped_gemm_backend")
+    backend = getattr(backend, "value", backend)
+    if (
+        impl == "inference_optimized"
+        and backend == "flashinfer"
+        and fp8_cfg.get("enabled")
+        and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    ):
+        out.violations.append(
+            "zero_train_gen_mismatch does not support "
+            "inference_grouped_gemm_backend='flashinfer' with MXFP8: the FlashInfer "
+            "kernel is batch-invariant but not bitwise identical to TE training. "
+            "Use 'torch' or 'vllm'."
+        )
+
 
 def _validate_platform(out: ZeroTrainGenValidation, *, check_device: bool) -> None:
     """Blackwell + FA4 only (mcore extra: flash-attn-4, CuteDSL). Hopper/FA3 not supported."""
@@ -518,7 +534,7 @@ def validate_zero_train_gen_model_provider(
 
 
 def _validate_precision(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
-    """Only BF16 without FP8 is supported, on both the train and generation side."""
+    """BF16, or FP8 with the MXFP8 recipe; train and generation must agree."""
     if config.get("precision") != "bfloat16":
         out.violations.append(
             "zero_train_gen_mismatch requires policy.precision='bfloat16' "
@@ -529,8 +545,20 @@ def _validate_precision(config: PolicyConfig, out: ZeroTrainGenValidation) -> No
     generation = config.get("generation")
     if generation is not None and generation.get("backend") == "megatron":
         sides.append(("generation", merged_inference_megatron_cfg(config)))
+    kinds: dict[str, str] = {}
     for label, cfg in sides:
-        if cfg.get("fp8_cfg") and cfg["fp8_cfg"].get("enabled"):
+        fp8_cfg = cfg.get("fp8_cfg") or {}
+        if not fp8_cfg.get("enabled"):
+            kinds[label] = "bf16"
+            continue
+        kinds[label] = f"fp8:{fp8_cfg.get('fp8_recipe')}"
+        if fp8_cfg.get("fp8_recipe") != "mxfp8":
             out.violations.append(
-                f"zero_train_gen_mismatch does not support FP8 ({label}.fp8_cfg.enabled=true)."
+                "zero_train_gen_mismatch supports FP8 only with fp8_recipe='mxfp8' "
+                f"(got {label}.fp8_cfg.fp8_recipe={fp8_cfg.get('fp8_recipe')!r})."
             )
+    if len(set(kinds.values())) > 1:
+        out.violations.append(
+            "zero_train_gen_mismatch requires the same precision on the train and "
+            f"generation side (got {kinds})."
+        )
