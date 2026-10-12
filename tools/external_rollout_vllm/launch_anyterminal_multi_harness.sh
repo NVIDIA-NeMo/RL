@@ -91,9 +91,9 @@ export MOUNTS
 
 ROLLOUT_BASE_URL=__ROLLOUT_BASE_URL__
 ROLLOUT_CONTROL_BASE_URL=__ROLLOUT_CONTROL_BASE_URL__
-COMMAND="cd ${PROJECT_ROOT} && OMP_NUM_THREADS=16 NEMO_GYM_VENV_DIR=${GYM_VENV_DIR} HF_HOME=${HF_HOME} RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 UV_HTTP_TIMEOUT=300 NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 NRL_WG_USE_RAY_REF=1 uv run examples/run_grpo_external_vllm_single_controller.py --config ${CONFIG} policy.model_name=${MODEL_PATH} cluster.num_nodes=${TRAIN_NODES} cluster.gpus_per_node=${GPUS_PER_NODE} cluster.segment_size=${SEGMENT_SIZE} data.train.data_path=${TRAIN_PATH} policy.generation.remote_vllm_cfg.base_url=${ROLLOUT_BASE_URL} ++policy.generation.remote_vllm_cfg.control_base_url=${ROLLOUT_CONTROL_BASE_URL} env.nemo_gym.nemo_gym_log_dir=${BASE_LOG_DIR}/nemo_gym checkpointing.checkpoint_dir=${BASE_LOG_DIR}/checkpoints logger.log_dir=${BASE_LOG_DIR} logger.wandb_enabled=true logger.wandb.entity=${WANDB_ENTITY} logger.wandb.project=${WANDB_PROJECT} logger.wandb.name=${WANDB_NAME}"
-
 source "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/pool_config.sh"
+COMMAND="cd ${PROJECT_ROOT} && OMP_NUM_THREADS=16 NEMO_GYM_VENV_DIR=${GYM_VENV_DIR} HF_HOME=${HF_HOME} RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 UV_HTTP_TIMEOUT=300 NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 NRL_WG_USE_RAY_REF=1 uv run examples/run_grpo_external_vllm_single_controller.py --config ${CONFIG} policy.model_name=${MODEL_PATH} cluster.num_nodes=${TRAIN_NODES} cluster.gpus_per_node=${GPUS_PER_NODE} cluster.segment_size=${SEGMENT_SIZE} data.train.data_path=${TRAIN_PATH} policy.generation.remote_vllm_cfg.base_url=${ROLLOUT_BASE_URL} ++policy.generation.remote_vllm_cfg.control_base_url=${ROLLOUT_CONTROL_BASE_URL} ${EXTERNAL_SERVICE_READINESS_PLACEHOLDER} env.nemo_gym.nemo_gym_log_dir=${BASE_LOG_DIR}/nemo_gym checkpointing.checkpoint_dir=${BASE_LOG_DIR}/checkpoints logger.log_dir=${BASE_LOG_DIR} logger.wandb_enabled=true logger.wandb.entity=${WANDB_ENTITY} logger.wandb.project=${WANDB_PROJECT} logger.wandb.name=${WANDB_NAME}"
+
 EXTERNAL_VLLM_POOLS=""
 register_external_vllm_pool ROLLOUT \
   --display-name "AnyTerminal mutable policy rollout" \

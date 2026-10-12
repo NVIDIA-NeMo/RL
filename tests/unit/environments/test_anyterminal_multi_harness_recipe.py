@@ -346,4 +346,5 @@ def test_external_vllm_launcher_keeps_scale_and_cache_routing_contract():
     assert "--max-num-batched-tokens 32768" in source
     assert "--async-scheduling" in source
     assert "--enable-prefix-caching" in source
+    assert "${EXTERNAL_SERVICE_READINESS_PLACEHOLDER}" in source
     assert "grpo.max_num_steps" not in source
