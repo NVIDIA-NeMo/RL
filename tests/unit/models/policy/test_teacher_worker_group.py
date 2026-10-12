@@ -122,6 +122,36 @@ def test_create_teacher_configs_heterogeneous_override():
     assert code_cfg.tensor_model_parallel_size == 8
 
 
+def test_create_teacher_configs_rejects_misspelled_override_alias() -> None:
+    # Keep the worker group's heavy Ray/Transformers imports out of test collection.
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    with pytest.raises(
+        ValueError, match="Unknown teacher override aliases"
+    ) as exc_info:
+        create_teacher_configs_from_opd_config(
+            {
+                "teacher_model_by_agent_name": {
+                    "math_teacher": "/ckpt/math",
+                    "code_teacher": "/ckpt/code",
+                },
+                "non_colocated_teachers": {
+                    "teacher_overrides": {
+                        "math_teacher": {"tensor_model_parallel_size": 4},
+                        "code-teacher": {
+                            "cross_tokenizer": {"tokenizer": {"name": "code-tokenizer"}}
+                        },
+                    }
+                },
+            }
+        )
+
+    assert "['code-teacher']" in str(exc_info.value)
+    assert "teacher_model_by_agent_name" in str(exc_info.value)
+
+
 def test_create_teacher_configs_sparse_override_keeps_cross_tokenizer_defaults():
     from nemo_rl.models.policy.teacher_worker_group import (
         create_teacher_configs_from_opd_config,

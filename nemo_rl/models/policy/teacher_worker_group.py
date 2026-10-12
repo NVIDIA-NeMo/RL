@@ -95,6 +95,14 @@ def create_teacher_configs_from_opd_config(
     non_coloc_cfg = dict(opd_cfg.get("non_colocated_teachers", {}))
     default_cfg = dict(non_coloc_cfg.get("default_teacher_cfg", {}))
     overrides = dict(non_coloc_cfg.get("teacher_overrides", {}))
+    unknown_aliases = sorted(set(overrides).difference(teacher_model_by_agent_name))
+    if unknown_aliases:
+        raise ValueError(
+            "Unknown teacher override aliases in "
+            f"non_colocated_teachers.teacher_overrides: {unknown_aliases}. "
+            "Each override must match a key in teacher_model_by_agent_name; "
+            "otherwise settings such as cross_tokenizer would be silently ignored."
+        )
     deduplicate = bool(opd_cfg.get("deduplicate_shared_teacher_checkpoints", True))
 
     configs: list[TeacherConfig] = []
