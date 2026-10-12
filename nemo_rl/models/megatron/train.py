@@ -29,7 +29,11 @@ from megatron.core.parallel_state import (
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.utils import StragglerDetector
 
-from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
+from nemo_rl.algorithms.loss_functions import (
+    LossFunction,
+    SequencePackingLossWrapper,
+    SequencePackingFusionLossWrapper,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -57,6 +61,7 @@ def model_forward(
     attention_mask: torch.Tensor,
     packed_seq_params: Optional[PackedSeqParams] = None,
     defer_fp32_logits: Optional[bool] = False,
+    mtp_loss_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
@@ -70,6 +75,7 @@ def model_forward(
         attention_mask: Attention mask for the sequence
         packed_seq_params: Parameters for packed sequences (optional)
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
+        mtp_loss_mask: MTP loss mask to exclude prompt tokens from MTP loss (optional)
         straggler_timer: Straggler detector for profiling the forward pass
 
     Returns:
@@ -85,6 +91,11 @@ def model_forward(
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
+
+    # Pass MTP loss mask to exclude prompt tokens from MTP loss
+    if mtp_loss_mask is not None:
+        additional_kwargs["loss_mask"] = mtp_loss_mask
+
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
 
@@ -160,6 +171,7 @@ def forward_with_post_processing_fn(
     position_ids = processed_mb.position_ids
     packed_seq_params = processed_mb.packed_seq_params
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
+    mtp_loss_mask = processed_mb.mtp_loss_mask
 
     output_tensor = model_forward(
         model=model,
@@ -170,6 +182,7 @@ def forward_with_post_processing_fn(
         attention_mask=attention_mask,
         packed_seq_params=packed_seq_params,
         defer_fp32_logits=defer_fp32_logits,
+        mtp_loss_mask=mtp_loss_mask,
         straggler_timer=straggler_timer,
     )
 
@@ -305,8 +318,9 @@ class LossPostProcessor:
         loss_fn = self.loss_fn
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
-            # remove padding
-            loss_fn = SequencePackingLossWrapper(
+            fuse_loss = self.cfg["sequence_packing"].get("fuse_loss", False)
+            wrapper_cls = SequencePackingFusionLossWrapper if fuse_loss else SequencePackingLossWrapper
+            loss_fn = wrapper_cls(
                 loss_fn=loss_fn,
                 cu_seqlens_q=packed_seq_params.cu_seqlens_q,
                 cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,

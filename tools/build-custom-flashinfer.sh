@@ -20,8 +20,8 @@ REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 
 
 # Parse command line arguments
-GIT_URL=${1:-https://github.com/flashinfer-ai/flashinfer}
-GIT_REF=${2:-main}
+GIT_URL=${1:-https://github.com/TomerBN-Nvidia/flashinfer.git}
+GIT_REF=${2:-ultra-rl}
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty/flashinfer")
 if [[ -e "$BUILD_DIR" ]]; then
@@ -72,7 +72,31 @@ desired = inline_table()
 desired.update({"path": "3rdparty/flashinfer", "editable": True})
 sources["flashinfer-python"] = desired
 
-# 2) Add flashinfer-python to [project.optional-dependencies].vllm
+# 2) Replace any flashinfer-python==X.Y.Z pin in [tool.uv].override-dependencies
+#    with an unpinned "flashinfer-python" so the local source version is accepted.
+#    We keep an unpinned entry rather than removing it entirely because sglang pins
+#    flashinfer-python==0.5.3 — the override forces the resolver to ignore that
+#    constraint and accept whatever version the local source provides.
+override_deps = uv.get("override-dependencies")
+if override_deps is not None:
+    replaced = False
+    new_list = []
+    for d in override_deps:
+        s = str(d).strip()
+        if s.startswith("flashinfer-python"):
+            if not replaced:
+                new_list.append("flashinfer-python")
+                replaced = True
+        else:
+            new_list.append(d)
+    if not replaced:
+        new_list.append("flashinfer-python")
+    override_deps.clear()
+    for d in new_list:
+        override_deps.append(d)
+    print("[INFO] Replaced flashinfer-python pin with unpinned override.")
+
+# 3) Add flashinfer-python to [project.optional-dependencies].vllm
 project = doc.get("project")
 if project is None:
     raise SystemExit("[ERROR] Missing [project] in pyproject.toml")

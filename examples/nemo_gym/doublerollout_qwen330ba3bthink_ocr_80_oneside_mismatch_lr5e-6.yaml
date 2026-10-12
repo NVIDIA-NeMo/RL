@@ -1,0 +1,63 @@
+
+defaults: "grpo_nanov3_recoverability_probe_pass_rate_all_10pct.yaml"
+
+recoverability_reward:
+  replace_suffix_by_advantage: true
+  suffix_swap_replacement_policy: oneside_mismatch
+  suffix_swap_advantage_source: probe_pass_rate
+  suffix_swap_reward_source: probe_pass_rate
+  suffix_swap_normalize_advantage: false
+  suffix_swap_require_think_close: true
+  suffix_swap_candidate_selection: random
+  max_output_token_buffer: 4000
+
+policy:
+  model_name: "/path/to/your/checkpoint"
+  train_global_batch_size: 2048
+  megatron_cfg:
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 4
+    mtp_num_layers: null
+    optimizer:
+      lr: 5e-06
+      min_lr: 5e-06
+
+data:
+  train:
+    data_path: "/path/to/your/train/data.jsonl"
+  validation:
+    data_path: "/path/to/your/eval/data.jsonl"
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+
+env:
+  nemo_gym:
+    global_aiohttp_connector_limit: 262144
+    global_aiohttp_connector_limit_per_host: 262144
+    max_concurrent_rollout_requests: 512
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/code_gen/configs/code_gen.yaml
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: 64
+          unit_test_timeout_secs: 10
+          debug: false
+    library_judge_math_simple_agent: null
+    math_with_judge: null
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 16
+
+token_ids:
+  eos: 151643
+  think_open:  151667
+  think_close: 151668
+penalize_duplicated_reasoning: true
+penalize_empty_final_answer: true
+penalize_eos_token: true
+penalize_malformed_think_tag: true

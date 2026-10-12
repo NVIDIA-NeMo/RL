@@ -1,0 +1,12 @@
+defaults: ./grpo-nemotron-super-8n8g.yaml
+
+policy:
+  generation:
+    colocated:
+      resources:
+        num_nodes: 8
+        gpus_per_node: 4
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 16

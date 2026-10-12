@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 import ray
+import torch
 from yaml import safe_load
 
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -200,3 +201,38 @@ def test_nemo_gym_sanity(
         return list(map(_standardize_single_result, l))
 
     assert _standardize(expected_result) == _standardize(actual_result)
+
+
+def test_postprocess_nemo_gym_result_normalizes_tensor_dtypes():
+    class DummyTokenizer:
+        def batch_decode(self, batch):
+            return ["decoded"] * len(batch)
+
+        def apply_chat_template(self, input_messages, tokenize=True):
+            assert tokenize
+            return [1, 2, 3]
+
+    env = NemoGym.__new__(NemoGym)
+    env.cfg = {}
+
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"text": "hello"}],
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3, 4],
+                    "generation_log_probs": [],
+                }
+            ]
+        },
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+    result = env._postprocess_nemo_gym_to_nemo_rl_result(nemo_gym_result, DummyTokenizer())
+
+    user_message, assistant_message = result["message_log"]
+    assert user_message["token_ids"].dtype == torch.int64
+    assert assistant_message["token_ids"].dtype == torch.int64
+    assert assistant_message["generation_logprobs"].dtype == torch.float32

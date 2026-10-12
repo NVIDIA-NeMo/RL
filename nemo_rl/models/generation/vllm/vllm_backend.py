@@ -38,6 +38,12 @@ except ImportError:
 
 
 class VllmInternalWorkerExtension:
+    def bind_numa(self) -> bool:
+        """Pin this TP worker to the NUMA-local CPUs of its GPU."""
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        return bind_to_gpu_numa()
+
     def init_collective(
         self,
         rank_prefix: int,
@@ -123,7 +129,7 @@ class VllmInternalWorkerExtension:
         )
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
+    def update_weights_via_ipc_zmq(self) -> tuple[bool, Exception | None]:
         """Receive and update model weights via ZMQ IPC socket.
 
         Returns:
@@ -147,6 +153,10 @@ class VllmInternalWorkerExtension:
                     process_weights_after_loading(
                         self.model_runner.model, self.model_config, self.device
                     )
+
+                    # Also process weights after loading for drafter model (MTP) if present
+                    self._maybe_process_drafter_weights_after_loading()
+
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
@@ -182,6 +192,12 @@ class VllmInternalWorkerExtension:
                 else:
                     self.model_runner.model.load_weights(weights=weights)
 
+                # Also load weights into the drafter model (MTP) if present
+                # The drafter has its own MTP-specific layers that need to be updated
+                # Note: embed_tokens and lm_head are shared with target model,
+                # so they're already updated above
+                self._maybe_load_drafter_weights(weights)
+
                 torch.cuda.current_stream().synchronize()
 
                 # CRITICAL: Delete views before ACK to prevent corruption.
@@ -199,18 +215,18 @@ class VllmInternalWorkerExtension:
 
             gc.collect()
             torch.cuda.empty_cache()
-            return True
+            return True, None
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n"
                 f"{traceback.format_exc()}"
             )
-            return False
+            return False, e
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(self) -> tuple[bool, Exception | None]:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
@@ -235,6 +251,9 @@ class VllmInternalWorkerExtension:
             else:
                 model_runner.model.load_weights(weights=weights)
 
+            # Also load weights into the drafter model (MTP) if present
+            self._maybe_load_drafter_weights(weights)
+
         load_model_weight_func = lambda x: _load_model_weights(x, self.model_runner)
 
         try:
@@ -245,16 +264,73 @@ class VllmInternalWorkerExtension:
                 post_unpack_func=load_model_weight_func,
             )
 
+            # Also process weights after loading for drafter model (MTP) if present
+            self._maybe_process_drafter_weights_after_loading()
+
             # Process weights after loading for FP8 KV cache
+            from vllm.model_executor.model_loader.utils import (
+                process_weights_after_loading,
+            )
+
+            process_weights_after_loading(
+                self.model_runner.model, self.model_config, self.device
+            )
             self._maybe_process_fp8_kv_cache()
 
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"
             )
-            return False
+            return False, e
 
-        return True
+        gc.collect()
+        torch.cuda.empty_cache()
+        return True, None
+
+    def _maybe_load_drafter_weights(self, weights) -> None:
+        """Load weights into the drafter model (MTP) if present.
+
+        The drafter model (e.g., NemotronHMTP) has its own MTP-specific layers
+        that need to be updated during refit. The embed_tokens and lm_head are
+        typically shared with the target model, so they're already updated when
+        the target model weights are loaded. This method handles the MTP-specific
+        weights like mtp.layers.*.mixer.*, mtp.layers.*.eh_proj.*, etc.
+
+        Args:
+            weights: List of (name, tensor) tuples containing model weights
+        """
+        if not hasattr(self.model_runner, "drafter"):
+            return
+
+        drafter = self.model_runner.drafter
+        if not hasattr(drafter, "model"):
+            return
+
+        drafter_model = drafter.model
+        if drafter_model is None:
+            return
+
+        # Check if drafter model has load_weights method
+        if not hasattr(drafter_model, "load_weights"):
+            return
+
+        # Load MTP-related weights into the drafter model
+        # The drafter's load_weights method will filter based on its
+        # expected weight patterns (e.g., mtp.*, embeddings, lm_head)
+        drafter_model.load_weights(weights=weights)
+
+    def _maybe_process_drafter_weights_after_loading(self) -> None:
+        """Process drafter model weights after loading."""
+        drafter_model = getattr(getattr(self.model_runner, "drafter", None), "model", None)
+        if drafter_model is None:
+            return
+
+        from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+        spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
+        drafter_model_config = getattr(spec_config, "draft_model_config", None) or self.model_config
+
+        process_weights_after_loading(drafter_model, drafter_model_config, self.device)
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""

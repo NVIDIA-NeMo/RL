@@ -1,0 +1,54 @@
+
+defaults: "grpo_nanov3_recoverability_probe_pass_rate_all_10pct.yaml"
+
+recoverability_reward:
+  replace_suffix_by_advantage: true
+  suffix_swap_replacement_policy: oneside_mismatch
+  suffix_swap_advantage_source: probe_pass_rate
+  suffix_swap_reward_source: probe_pass_rate
+  suffix_swap_normalize_advantage: false
+  suffix_swap_require_think_close: true
+  suffix_swap_candidate_selection: random
+  length_coefficient: 2.0
+  length_reward_only: true
+
+policy:
+  model_name: "/path/to/your/checkpoint"
+  train_global_batch_size: 2048
+  megatron_cfg:
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 4
+    optimizer:
+      lr: 2e-06
+      min_lr: 2e-06
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 2
+
+data:
+  train:
+    data_path: "/path/to/your/train/data.jsonl"
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  overlong_filtering: false
+
+env:
+  nemo_gym:
+    global_aiohttp_connector_limit: 262144
+    global_aiohttp_connector_limit_per_host: 262144
+    max_concurrent_rollout_requests: 512
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 8
+
+token_ids:
+  eos: 2
+  think_open: 12
+  think_close: 13
+penalize_duplicated_reasoning: true
+penalize_empty_final_answer: true
+penalize_eos_token: true
+penalize_malformed_think_tag: true

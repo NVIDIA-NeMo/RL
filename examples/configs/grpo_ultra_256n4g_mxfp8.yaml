@@ -1,0 +1,43 @@
+# =============================================================================
+# GRPO Ultra V3 — 256-node GB200 NVL72 Config (mxfp8)
+# =============================================================================
+# Config for GRPO training on 256 nodes × 4 GPUs/node (1024 GPUs).
+# Full batch sizes and sequence lengths for convergence runs.
+#
+# Node allocation (256 total, set via launch script env vars):
+#   - Training:   64 nodes  (256 GPUs) — 4 segments of 16
+#   - vLLM:      176 nodes  (704 GPUs) — 88 instances at TP=8 EP=8 (2 nodes each)
+#   - Gym/Judge:  16 nodes  ( 64 GPUs) — judges scaled for production throughput
+#
+# Generation-heavy split follows the SuperV3 production ratio (~25/69/6).
+#
+# Training parallelism (256 GPUs = 64 nodes):
+#   - TP: 8
+#   - EP: 64
+#   - CP: 8
+#   - PP: 1
+#   - SP: true
+#
+# vLLM parallelism (mxfp8, TP=8, EP=8):
+#   NeMo Gym requires async_engine=true, but vLLM DP+EP (EP > TP) requires
+#   async_engine=false (see https://github.com/NVIDIA-NeMo/RL/issues/1101).
+#   This forces EP <= TP. With EP=8 (=TP), vllm_dp_size = 8/8 = 1 so
+#   async_engine=true works.
+# =============================================================================
+defaults: "grpo_ultra_256n4g_bf16.yaml"
+
+policy:
+  megatron_cfg:
+    fp8_cfg:
+      enabled: true
+      fp8: "e4m3"
+      fp8_recipe: "mxfp8"
+      fp8_param: false
+
+  generation:
+    vllm_cfg:
+      precision: fp8
+      fp8_cfg:
+        is_mx: true
+      quantization_ignored_layer_kws: ["conv1d", "mtp"]
+      gpu_memory_utilization: 0.8

@@ -156,6 +156,16 @@ class MegatronConfigDisabled(TypedDict):
     enabled: Literal[False]
 
 
+class MegatronCheckpointConfig(TypedDict, total=False):
+    """Checkpoint knobs passed through to Megatron Bridge CheckpointConfig"""
+
+    async_save: bool
+    ckpt_assume_constant_structure: bool
+    fully_parallel_save_process_group: str  # "dp" | "ep_dp"
+    fully_parallel_load_process_group: str  # "dp" | "ep_dp"
+    fully_parallel_load_exchange_algo: str  # "broadcast" | "gather_rounds"
+
+
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
@@ -193,9 +203,12 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    use_gloo_process_groups: NotRequired[bool]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
+
+    checkpoint: NotRequired[MegatronCheckpointConfig]
 
 
 class TokenizerConfig(TypedDict):

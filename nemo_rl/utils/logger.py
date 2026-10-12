@@ -50,6 +50,7 @@ _rich_logging_configured = False
 class WandbConfig(TypedDict):
     project: NotRequired[str]
     name: NotRequired[str]
+    entity: NotRequired[str]
 
 
 class SwanlabConfig(TypedDict):
@@ -205,7 +206,12 @@ class WandbLogger(LoggerInterface):
     """Weights & Biases logger backend."""
 
     def __init__(self, cfg: WandbConfig, log_dir: Optional[str] = None):
-        self.run = wandb.init(**cfg, dir=log_dir)
+        # init_timeout default is 90s which is too tight on flaky cluster <-> api.wandb.ai
+        # paths; bump to 600s. Override per-run via WANDB_INIT_TIMEOUT env var if needed.
+        init_timeout = int(os.environ.get("WANDB_INIT_TIMEOUT", "600"))
+        self.run = wandb.init(
+            **cfg, dir=log_dir, settings=wandb.Settings(init_timeout=init_timeout)
+        )
 
         if os.environ.get("RAY_BACKEND_LOG_LEVEL", "").lower() == "debug":
             print(
@@ -381,7 +387,7 @@ class WandbLogger(LoggerInterface):
         Args:
             params: Dict of hyperparameters to log
         """
-        self.run.config.update(params)
+        self.run.config.update(params, allow_val_change=True)
 
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a plot to wandb.
@@ -448,7 +454,7 @@ class SwanlabLogger(LoggerInterface):
         Parameters:
             params (Mapping[str, Any]): Mapping of hyperparameter names to values to store in the run configuration.
         """
-        self.run.config.update(params)
+        self.run.config.update(params, allow_val_change=True)
 
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a plot to swanlab.
@@ -1551,3 +1557,43 @@ def get_next_experiment_dir(base_log_dir: str) -> str:
     os.makedirs(new_log_dir, exist_ok=True)
 
     return new_log_dir
+
+
+def log_container_init_timing() -> None:
+    """Log pre-Python container timing from environment variables.
+
+    Reads epoch timestamps set by the launch script (ray.sub) and prints
+    the Container Init breakdown.  Missing variables are silently skipped
+    so this is safe to call in any environment.
+    """
+    now = time.time()
+    slurm_start = os.environ.get("SLURM_JOB_START_TIME")
+    job_start = os.environ.get("NRL_JOB_START_EPOCH")
+    ray_ready = os.environ.get("NRL_RAY_READY_EPOCH")
+
+    if not job_start:
+        logging.warning(
+            "Cannot detect container startup time: NRL_JOB_START_EPOCH not set. "
+            "Ensure the launch script exports this variable for init timing."
+        )
+        return
+
+    job_start_f = float(job_start)
+    total = now - job_start_f
+
+    print("\n" + "=" * 60)
+    print(" " * 14 + "CONTAINER INIT TIMING")
+
+    if slurm_start:
+        prologue = job_start_f - float(slurm_start)
+        print(f"  slurm_prologue: {prologue:.1f}s")
+        total = now - float(slurm_start)
+
+    if ray_ready:
+        ray_ready_f = float(ray_ready)
+        cluster = ray_ready_f - job_start_f
+        driver_startup = now - ray_ready_f
+        print(f"  cluster_startup (orchestrator+container+ray): {cluster:.1f}s")
+        print(f"  driver_startup (launch+python+imports): {driver_startup:.1f}s")
+    print(f"  total: {total:.1f}s")
+    print("=" * 60 + "\n", flush=True)

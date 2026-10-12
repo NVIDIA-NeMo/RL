@@ -39,6 +39,19 @@ class VllmSpecificArgs(TypedDict):
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
+    # List of logit processor class specs in "module.path:ClassName" format.
+    # These are loaded and passed to vLLM's LLM engine for custom logit manipulation during generation.
+    logits_processors: NotRequired[list[str]]
+    # Environment variables to set on vLLM worker processes before engine init.
+    # Used to pass configuration (e.g. THINKING_BUDGET_LOGITS_PROCESSOR_ARGS) to logit processors.
+    logits_processor_env_vars: NotRequired[dict[str, str]]
+    # Max concurrent load_model calls during init to avoid overwhelming Ray GCS.
+    # When set, workers defer model loading during __init__ and load_and_start()
+    # performs staggered loading with this concurrency limit.
+    # When not set, all workers initialize in parallel (the default).
+    max_concurrent_model_loads: NotRequired[int]
+    # Timeout in seconds for each load_model call. Default 1800 (30 min).
+    model_load_timeout: NotRequired[int]
 
 
 class VllmConfig(GenerationConfig):

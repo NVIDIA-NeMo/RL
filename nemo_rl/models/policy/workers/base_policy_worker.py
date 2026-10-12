@@ -148,6 +148,10 @@ class AbstractPolicyWorker:
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
 
+    def finalize_async_save(self) -> None:
+        """Block until any in-flight async checkpoint write completes. No-op by default."""
+        pass
+
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation
         pass

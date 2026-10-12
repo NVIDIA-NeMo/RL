@@ -21,11 +21,11 @@ ckpts/
 # Test
 coverage.json
 .coverage*
-unit_results.json
-unit_results/
 test_assets/
 .nrl_remote_map.json
 .nrl_remote_state.json
+# Test biproducts
+tests/functional/*/
 
 # Cache
 uv_cache/
@@ -36,6 +36,7 @@ hf_datasets_cache/
 docker/*
 !docker/Dockerfile
 !docker/Dockerfile.ngc_pytorch
+!docker/build-vllm-sqsh.sh
 !docker/README.md
 wandb/
 checkpoints/

@@ -20,10 +20,14 @@ import pytest
 import ray
 
 from nemo_rl.distributed.virtual_cluster import (
+    NVLINK_DOMAIN_UNKNOWN,
     PY_EXECUTABLES,
+    TOPO_RANK_UNKNOWN,
     RayVirtualCluster,
     ResourceInsufficientError,
     _get_node_ip_and_free_port,
+    _sort_bundle_indices_by_topology,
+    select_segment_nodes,
 )
 from nemo_rl.utils.venvs import create_local_venv
 from tests.unit.conftest import TEST_ASSETS_DIR
@@ -246,3 +250,308 @@ def test_not_create_sorted_bundle_indices_for_per_node_pg():
     cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
     cluster._init_placement_groups(strategy=None, use_unified_pg=False)
     assert cluster._sorted_bundle_indices is None
+
+
+def test_sort_bundle_indices_fallback_by_node_id_gpu_id():
+    """Fallback: no topology -> sort by (node_id, gpu_id)."""
+    # bundle_data: (gpu_id, nvlink_domain, topo_rank, node_id)
+    bundle_data = [
+        (2, NVLINK_DOMAIN_UNKNOWN, TOPO_RANK_UNKNOWN, "node-b"),
+        (0, NVLINK_DOMAIN_UNKNOWN, TOPO_RANK_UNKNOWN, "node-a"),
+        (1, NVLINK_DOMAIN_UNKNOWN, TOPO_RANK_UNKNOWN, "node-a"),
+    ]
+    result = _sort_bundle_indices_by_topology(bundle_data)
+    # node-a (0,1) before node-b (2); within node-a, gpu 0 before gpu 1
+    assert result == [1, 2, 0]  # bundle 1: node-a gpu0, bundle 2: node-a gpu1, bundle 0: node-b gpu2
+
+
+def test_sort_bundle_indices_topology_single_domain():
+    """Topology: single domain -> sort by (topo_rank, gpu_id)."""
+    bundle_data = [
+        (1, "nvlink_domain_uuid-x", 100, "node-a"),
+        (0, "nvlink_domain_uuid-x", 100, "node-a"),
+        (2, "nvlink_domain_uuid-x", 101, "node-b"),
+    ]
+    result = _sort_bundle_indices_by_topology(bundle_data)
+    # topo 100 first (bundles 0,1), then topo 101 (bundle 2). Within 100: gpu 0 < gpu 1
+    assert result == [1, 0, 2]
+
+
+def test_sort_bundle_indices_topology_two_domains():
+    """Topology: two domains -> domains ordered by min(topo_rank), within domain by (topo_rank, gpu_id)."""
+    # Domain A: topo 100, 101. Domain B: topo 50, 51 (lower min -> first)
+    # (gpu_id, nvlink_domain, topo_rank, node_id)
+    bundle_data = [
+        (0, "nvlink_domain_B", 51, "node-b2"),
+        (1, "nvlink_domain_B", 50, "node-b1"),
+        (0, "nvlink_domain_A", 101, "node-a2"),
+        (1, "nvlink_domain_A", 100, "node-a1"),
+    ]
+    result = _sort_bundle_indices_by_topology(bundle_data)
+    # Domain B (min 50) before Domain A (min 100)
+    # Within B: (50,gpu1)=bundle 1, (51,gpu0)=bundle 0
+    # Within A: (100,gpu1)=bundle 3, (101,gpu0)=bundle 2
+    assert result == [1, 0, 3, 2]
+
+
+def test_sort_bundle_indices_topology_topo_rank_only():
+    """Topology: topo_rank present but nvlink_domain unknown -> still use topology sort."""
+    bundle_data = [
+        (1, NVLINK_DOMAIN_UNKNOWN, 10, "node-x"),
+        (0, NVLINK_DOMAIN_UNKNOWN, 5, "node-x"),
+    ]
+    result = _sort_bundle_indices_by_topology(bundle_data)
+    # topo 5 < topo 10; when topo equal, gpu_id breaks tie
+    assert result == [1, 0]
+
+
+def test_sort_bundle_indices_empty():
+    """Empty input returns empty list."""
+    assert _sort_bundle_indices_by_topology([]) == []
+
+
+# ===== segment_size tests for _sort_bundle_indices_by_topology =====
+
+def test_sort_bundle_indices_segment_requires_gpus_per_node():
+    """segment_size without gpus_per_node raises ValueError."""
+    bundle_data = [(0, "nvlink_domain_A", 100, "node-a")]
+    with pytest.raises(ValueError, match="gpus_per_node is required"):
+        _sort_bundle_indices_by_topology(bundle_data, segment_size=2, gpus_per_node=None)
+
+
+def test_sort_bundle_indices_segment_complete_domain():
+    """Two nodes (4 GPUs each) in one domain, segment_size=2: all kept."""
+    # 2 nodes × 4 GPUs = 8 bundles in one domain, segment_size=2 nodes -> all usable
+    bundle_data = [
+        (0, "nvlink_domain_A", 10, "node-a"),
+        (1, "nvlink_domain_A", 10, "node-a"),
+        (2, "nvlink_domain_A", 10, "node-a"),
+        (3, "nvlink_domain_A", 10, "node-a"),
+        (0, "nvlink_domain_A", 11, "node-b"),
+        (1, "nvlink_domain_A", 11, "node-b"),
+        (2, "nvlink_domain_A", 11, "node-b"),
+        (3, "nvlink_domain_A", 11, "node-b"),
+    ]
+    result = _sort_bundle_indices_by_topology(bundle_data, segment_size=2, gpus_per_node=4)
+    assert len(result) == 8
+    # topo_rank 10 bundles first (sorted by gpu_id), then topo_rank 11
+    assert result == [0, 1, 2, 3, 4, 5, 6, 7]
+
+
+def test_sort_bundle_indices_segment_incomplete_domain_trimmed():
+    """3 nodes in one domain, segment_size=2: only first 2 nodes (8 GPUs) kept."""
+    bundle_data = [
+        (0, "nvlink_domain_A", 10, "node-a"),
+        (1, "nvlink_domain_A", 10, "node-a"),
+        (2, "nvlink_domain_A", 10, "node-a"),
+        (3, "nvlink_domain_A", 10, "node-a"),
+        (0, "nvlink_domain_A", 11, "node-b"),
+        (1, "nvlink_domain_A", 11, "node-b"),
+        (2, "nvlink_domain_A", 11, "node-b"),
+        (3, "nvlink_domain_A", 11, "node-b"),
+        (0, "nvlink_domain_A", 12, "node-c"),
+        (1, "nvlink_domain_A", 12, "node-c"),
+        (2, "nvlink_domain_A", 12, "node-c"),
+        (3, "nvlink_domain_A", 12, "node-c"),
+    ]
+    result = _sort_bundle_indices_by_topology(bundle_data, segment_size=2, gpus_per_node=4)
+    # 3 nodes / segment_size=2 -> usable=2 nodes (8 GPUs); node-c (topo_rank=12) gets discarded
+    assert len(result) == 8
+    assert result == [0, 1, 2, 3, 4, 5, 6, 7]
+
+
+def test_sort_bundle_indices_segment_multi_domain():
+    """Two domains with different sizes: segment filtering per domain."""
+    bundle_data = [
+        # Domain A: 2 nodes (complete segment)
+        (0, "nvlink_domain_A", 100, "node-a1"),
+        (1, "nvlink_domain_A", 100, "node-a1"),
+        (0, "nvlink_domain_A", 101, "node-a2"),
+        (1, "nvlink_domain_A", 101, "node-a2"),
+        # Domain B: 3 nodes, only 2 kept with segment_size=2
+        (0, "nvlink_domain_B", 50, "node-b1"),
+        (1, "nvlink_domain_B", 50, "node-b1"),
+        (0, "nvlink_domain_B", 51, "node-b2"),
+        (1, "nvlink_domain_B", 51, "node-b2"),
+        (0, "nvlink_domain_B", 52, "node-b3"),
+        (1, "nvlink_domain_B", 52, "node-b3"),
+    ]
+    result = _sort_bundle_indices_by_topology(bundle_data, segment_size=2, gpus_per_node=2)
+    # Domain B (min topo_rank 50) first, Domain A (min 100) second
+    # Domain B: 3 nodes, usable=2 (topo 50, 51), node-b3 discarded
+    # Result: [b1-gpu0, b1-gpu1, b2-gpu0, b2-gpu1, a1-gpu0, a1-gpu1, a2-gpu0, a2-gpu1]
+    assert len(result) == 8
+    assert result == [4, 5, 6, 7, 0, 1, 2, 3]
+
+
+# ===== select_segment_nodes tests =====
+
+def test_select_segment_nodes_basic():
+    """Selects 2 segments of 2 nodes each from 2 domains."""
+    topology = {
+        "n1": ("domain_A", 100),
+        "n2": ("domain_A", 101),
+        "n3": ("domain_B", 50),
+        "n4": ("domain_B", 51),
+    }
+    training, remaining = select_segment_nodes(topology, segment_size=2, num_training_nodes=4)
+    assert len(training) == 4
+    assert len(remaining) == 0
+    # Domain B (min topo 50) first, then Domain A (min topo 100)
+    assert training == ["n3", "n4", "n1", "n2"]
+
+
+def test_select_segment_nodes_partial_selection():
+    """Selects only 1 segment from a domain with 2 segments available."""
+    topology = {
+        "n1": ("domain_A", 100),
+        "n2": ("domain_A", 101),
+        "n3": ("domain_A", 102),
+        "n4": ("domain_A", 103),
+    }
+    training, remaining = select_segment_nodes(topology, segment_size=2, num_training_nodes=2)
+    assert len(training) == 2
+    assert len(remaining) == 2
+    assert training == ["n1", "n2"]
+    assert set(remaining) == {"n3", "n4"}
+
+
+def test_select_segment_nodes_not_divisible():
+    """num_training_nodes not divisible by segment_size raises ValueError."""
+    topology = {"n1": ("domain_A", 100), "n2": ("domain_A", 101)}
+    with pytest.raises(ValueError, match="must be divisible"):
+        select_segment_nodes(topology, segment_size=3, num_training_nodes=4)
+
+
+def test_select_segment_nodes_insufficient():
+    """Not enough complete segments raises ResourceInsufficientError."""
+    topology = {
+        "n1": ("domain_A", 100),
+        "n2": ("domain_B", 200),
+    }
+    with pytest.raises(ResourceInsufficientError, match="Cannot form"):
+        select_segment_nodes(topology, segment_size=2, num_training_nodes=2)
+
+
+def test_select_segment_nodes_incomplete_domain_skipped():
+    """Domain with fewer nodes than segment_size is skipped."""
+    topology = {
+        "n1": ("domain_A", 100),  # only 1 node, can't form segment of 2
+        "n2": ("domain_B", 50),
+        "n3": ("domain_B", 51),
+    }
+    training, remaining = select_segment_nodes(topology, segment_size=2, num_training_nodes=2)
+    assert training == ["n2", "n3"]
+    assert remaining == ["n1"]
+
+
+def test_node_resource_constraints_init_validation():
+    """node_resource_constraints must match bundle_ct_per_node_list in length."""
+    with pytest.raises(AssertionError, match="node_resource_constraints length"):
+        RayVirtualCluster(
+            bundle_ct_per_node_list=[4, 4],
+            node_resource_constraints=[{"nvlink_domain_abc": 0.001}],
+        )
+
+
+def test_node_resource_constraints_none_accepted():
+    """None constraints are accepted and equivalent to no constraints."""
+    vc = RayVirtualCluster(
+        bundle_ct_per_node_list=[4, 4],
+        node_resource_constraints=None,
+    )
+    assert vc.node_resource_constraints is None
+
+
+@patch("nemo_rl.distributed.virtual_cluster.ray")
+@patch("nemo_rl.distributed.virtual_cluster.placement_group")
+def test_node_resource_constraints_applied_to_per_node_pg(mock_pg, mock_ray):
+    """Constraints are merged into bundle specs for per-node placement groups."""
+    mock_ray.cluster_resources.return_value = {"GPU": 8, "CPU": 8}
+
+    mock_pg_obj = MagicMock()
+    mock_pg_obj.ready.return_value = MagicMock()
+    mock_pg.return_value = mock_pg_obj
+    mock_ray.get.return_value = None
+
+    constraints = [
+        {"nvlink_domain_aaa": 0.001},
+        {"nvlink_domain_bbb": 0.001},
+    ]
+    vc = RayVirtualCluster(
+        bundle_ct_per_node_list=[4, 4],
+        node_resource_constraints=constraints,
+    )
+    vc._create_placement_groups_internal(strategy="PACK", use_unified_pg=False)
+
+    assert mock_pg.call_count == 2
+    # First node's bundles should include domain_aaa constraint
+    call_0_bundles = mock_pg.call_args_list[0][1]["bundles"]
+    assert len(call_0_bundles) == 4
+    for bundle in call_0_bundles:
+        assert bundle["CPU"] == 1
+        assert bundle["GPU"] == 1
+        assert bundle["nvlink_domain_aaa"] == 0.001
+        assert "nvlink_domain_bbb" not in bundle
+
+    # Second node's bundles should include domain_bbb constraint
+    call_1_bundles = mock_pg.call_args_list[1][1]["bundles"]
+    for bundle in call_1_bundles:
+        assert bundle["nvlink_domain_bbb"] == 0.001
+        assert "nvlink_domain_aaa" not in bundle
+
+
+@patch("nemo_rl.distributed.virtual_cluster.ray")
+@patch("nemo_rl.distributed.virtual_cluster.placement_group")
+def test_node_resource_constraints_applied_to_unified_pg(mock_pg, mock_ray):
+    """Constraints are merged into bundle specs for unified placement groups."""
+    mock_ray.cluster_resources.return_value = {"GPU": 8, "CPU": 8}
+
+    mock_pg_obj = MagicMock()
+    mock_pg_obj.ready.return_value = MagicMock()
+    mock_pg.return_value = mock_pg_obj
+    mock_ray.get.return_value = None
+
+    constraints = [
+        {"nvlink_domain_aaa": 0.001},
+        {"nvlink_domain_bbb": 0.001},
+    ]
+    vc = RayVirtualCluster(
+        bundle_ct_per_node_list=[4, 4],
+        node_resource_constraints=constraints,
+    )
+    vc._create_placement_groups_internal(strategy="PACK", use_unified_pg=True)
+
+    assert mock_pg.call_count == 1
+    all_bundles = mock_pg.call_args_list[0][1]["bundles"]
+    assert len(all_bundles) == 8
+    # First 4 bundles from node 0 -> domain_aaa
+    for bundle in all_bundles[:4]:
+        assert bundle["nvlink_domain_aaa"] == 0.001
+        assert "nvlink_domain_bbb" not in bundle
+    # Last 4 bundles from node 1 -> domain_bbb
+    for bundle in all_bundles[4:]:
+        assert bundle["nvlink_domain_bbb"] == 0.001
+        assert "nvlink_domain_aaa" not in bundle
+
+
+@patch("nemo_rl.distributed.virtual_cluster.ray")
+@patch("nemo_rl.distributed.virtual_cluster.placement_group")
+def test_no_constraints_bundles_unchanged(mock_pg, mock_ray):
+    """Without constraints, bundles only have CPU and GPU."""
+    mock_ray.cluster_resources.return_value = {"GPU": 4, "CPU": 4}
+
+    mock_pg_obj = MagicMock()
+    mock_pg_obj.ready.return_value = MagicMock()
+    mock_pg.return_value = mock_pg_obj
+    mock_ray.get.return_value = None
+
+    vc = RayVirtualCluster(
+        bundle_ct_per_node_list=[4],
+        node_resource_constraints=None,
+    )
+    vc._create_placement_groups_internal(strategy="PACK", use_unified_pg=False)
+
+    call_bundles = mock_pg.call_args_list[0][1]["bundles"]
+    for bundle in call_bundles:
+        assert set(bundle.keys()) == {"CPU", "GPU"}

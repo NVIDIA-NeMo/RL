@@ -41,6 +41,7 @@ class ProcessedInputs:
     position_ids: Optional[torch.Tensor]
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
+    mtp_loss_mask: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -67,6 +68,7 @@ class ProcessedMicrobatch:
     position_ids: Optional[torch.Tensor]
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
+    mtp_loss_mask: Optional[torch.Tensor] = None
 
 
 def make_processed_microbatch_iterator(
@@ -120,6 +122,7 @@ def make_processed_microbatch_iterator(
             position_ids=processed_inputs.position_ids,
             packed_seq_params=processed_inputs.packed_seq_params,
             cu_seqlens_padded=processed_inputs.cu_seqlens_padded,
+            mtp_loss_mask=processed_inputs.mtp_loss_mask,
         )
 
 
@@ -234,6 +237,7 @@ def process_microbatch(
         seq_lengths = None  # Will be set if using packed sequences
         cu_seqlens = None
         cu_seqlens_padded = None
+        mtp_loss_mask = None
 
         if pack_sequences:
             # For packed sequences with padded input, we need sequence lengths
@@ -264,6 +268,24 @@ def process_microbatch(
                 cp_size=get_context_parallel_world_size(),
             )
 
+            # Pack pre-computed mtp_loss_mask the same way as input_ids
+            if "mtp_loss_mask" in data_dict:
+                (
+                    _,
+                    mtp_loss_mask,
+                    _,
+                    _,
+                    _,
+                ) = _pack_sequences_for_megatron(
+                    data_dict["mtp_loss_mask"],
+                    seq_lengths,
+                    pad_individual_seqs_to_multiple_of,
+                    pad_packed_seq_to_multiple_of,
+                    pad_full_seq_to,
+                    cp_rank=get_context_parallel_rank(),
+                    cp_size=get_context_parallel_world_size(),
+                )
+
             # For packed sequences, position_ids and attention_mask are typically None
             # The PackedSeqParams handles all necessary sequence information
             position_ids = None
@@ -279,6 +301,8 @@ def process_microbatch(
                 eod_mask_loss=False,
                 pad_mask_loss=False,
             )
+            if "mtp_loss_mask" in data_dict:
+                mtp_loss_mask = data_dict["mtp_loss_mask"]
     return ProcessedInputs(
         input_ids=input_ids,
         input_ids_cp_sharded=input_ids_cp_sharded,
@@ -286,6 +310,7 @@ def process_microbatch(
         position_ids=position_ids,
         packed_seq_params=packed_seq_params,
         cu_seqlens_padded=cu_seqlens_padded,
+        mtp_loss_mask=mtp_loss_mask,
     )
 
 
@@ -557,13 +582,29 @@ def _get_pack_sequence_parameters_for_megatron(
     if tp_size > 1 and sp:
         pad_individual_seqs_to_multiple_of *= tp_size
 
-    # packed sequence length, after splitted to TP and CP domains, needs to be divisible by 128 if using blockwise FP8, and divisible by 16 if using other FP8 recipes.
+    # packed sequence length, after sharding to TP and CP domains, needs to be divisible
+    # by a recipe-dependent divisor:
+    #   blockwise FP8 : 128  (cublas block size)
+    #   MXFP8         :  32  (MXFP8 block size)
+    #   other FP8     :  16
+    #   HybridEP+flex : 128  (MAX_NUM_OF_TOKENS_PER_RANK must be divisible by
+    #                         NUM_OF_TOKENS_PER_CHUNK=128)
+    # When multiple constraints apply, take the max (128 is a multiple of 32/16).
+    divisor = 1
     if use_fp8:
-        divisor = 16
         if fp8_cfg["fp8_recipe"] == "blockwise":
-            divisor = 128
+            divisor = max(divisor, 128)
         elif fp8_cfg["fp8_recipe"] == "mxfp8":
-            divisor = 32
+            divisor = max(divisor, 32)
+        else:
+            divisor = max(divisor, 16)
+    if (
+        megatron_cfg.get("moe_token_dispatcher_type") == "flex"
+        and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
+    ):
+        divisor = max(divisor, 128)
+
+    if divisor > 1:
         pad_packed_seq_to_multiple_of = divisor
         if cp_size > 1:
             pad_packed_seq_to_multiple_of *= cp_size * 2
