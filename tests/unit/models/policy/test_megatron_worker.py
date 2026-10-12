@@ -1437,8 +1437,9 @@ class _ModelWithNonSerializableExtraState(torch.nn.Module):
 
 
 @pytest.mark.parametrize("hooks_enabled", [True, False])
+@pytest.mark.parametrize("parked", [True, False])
 def test_sync_params_before_refit_gathers_pending_bf16_params(
-    monkeypatch, hooks_enabled
+    monkeypatch, hooks_enabled, parked
 ):
     """Refit must see updated optimizer shards before it reads model parameters.
 
@@ -1446,15 +1447,32 @@ def test_sync_params_before_refit_gathers_pending_bf16_params(
     the updated shards into the DDP param buffer, and the MXFP8-only staging
     helper must not be involved.
     """
+    from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer
+
     from nemo_rl.models.policy.workers import megatron_policy_worker
 
     events = []
+    # Exercise MCore's real storage lifecycle without constructing a CUDA model.
+    buffer = object.__new__(_ParamAndGradBuffer)
+    buffer.param_data = torch.tensor([3.0, 4.0, 0.0, 0.0], dtype=torch.bfloat16)
+    buffer.param_data_cpu = torch.empty_like(buffer.param_data)
+    buffer.grad_data = torch.tensor([5.0, 6.0, 7.0, 8.0])
+    buffer.grad_data_size = 0
+    if parked:
+        buffer.offload_to_cpu(move_params=True, move_grads=False)
+    gradient_pointer = buffer.grad_data.data_ptr()
 
     class FakeDDP:
         ddp_config = SimpleNamespace(overlap_param_gather=True)
+        buffers = [buffer]
+        expert_parallel_buffers = []
 
         def start_param_sync(self, *, force_sync):
             events.append(("start_param_sync", force_sync))
+            # All-gather obtains views into param_data before writing peer shards.
+            # This raises if refit has not restored the released storage first.
+            local, peer = buffer.param_data.chunk(2)
+            peer.copy_(local)
 
     monkeypatch.setattr(megatron_policy_worker, "DistributedDataParallel", FakeDDP)
     monkeypatch.setattr(
@@ -1467,12 +1485,18 @@ def test_sync_params_before_refit_gathers_pending_bf16_params(
     worker._forward_pre_hook_enabled = lambda: hooks_enabled
     worker.finalize_async_save = lambda: events.append(("finalize_async_save", None))
     worker._copy_main_params_to_param_buffer = MagicMock()
+    move_model = worker.move_model
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append(("move_model", (device, kwargs)))
+        or move_model(model, device, **kwargs)
+    )
 
     worker.sync_params_before_refit()
 
     expected = (
         [
             ("finalize_async_save", None),
+            ("move_model", ("cuda", {"move_params": True, "move_grads": False})),
             ("start_param_sync", True),
             ("cuda_synchronize", None),
         ]
@@ -1481,6 +1505,14 @@ def test_sync_params_before_refit_gathers_pending_bf16_params(
     )
     assert events == expected
     worker._copy_main_params_to_param_buffer.assert_not_called()
+    assert buffer.grad_data.data_ptr() == gradient_pointer
+    torch.testing.assert_close(buffer.grad_data, torch.tensor([5.0, 6.0, 7.0, 8.0]))
+    if hooks_enabled:
+        torch.testing.assert_close(
+            buffer.param_data, torch.tensor([3.0, 4.0, 3.0, 4.0], dtype=torch.bfloat16)
+        )
+    elif parked:
+        assert buffer.param_data.untyped_storage().nbytes() == 0
 
 
 def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
@@ -1546,6 +1578,9 @@ def test_megatron_sync_params_before_refit_materializes_latest_mxfp8_weights(
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model = FakeDDP()
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append(("move_model", device, kwargs)) or model
+    )
     worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
     worker._forward_pre_hook_enabled = lambda: hooks_enabled
     worker._disable_forward_pre_hook_until_next_train_step = (
@@ -1553,7 +1588,15 @@ def test_megatron_sync_params_before_refit_materializes_latest_mxfp8_weights(
     )
     MegatronPolicyWorkerImpl.sync_params_before_refit(worker)
 
-    expected = ["finalize_async_save", ("disable_hook", True)] if hooks_enabled else []
+    expected = (
+        [
+            "finalize_async_save",
+            ("move_model", "cuda", {"move_params": True, "move_grads": False}),
+            ("disable_hook", True),
+        ]
+        if hooks_enabled
+        else []
+    )
     assert events == expected
 
 
@@ -1573,11 +1616,13 @@ def test_megatron_sync_params_before_refit_is_noop_without_overlap(monkeypatch, 
     worker.model = FakeDDP() if ddp else object()
     worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
     worker.finalize_async_save = MagicMock()
+    worker.move_model = MagicMock()
     worker._disable_forward_pre_hook_until_next_train_step = MagicMock()
 
     MegatronPolicyWorkerImpl.sync_params_before_refit(worker)
 
     worker.finalize_async_save.assert_not_called()
+    worker.move_model.assert_not_called()
     worker._disable_forward_pre_hook_until_next_train_step.assert_not_called()
 
 

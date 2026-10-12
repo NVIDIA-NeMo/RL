@@ -54,7 +54,8 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
-from nemo_rl.data_plane.schema import GROUP_ID_TAG, INPUT_IDS, INPUT_LENGTHS
+from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
+from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.train_data_dump import TrainDataDump
 
@@ -200,44 +201,6 @@ class AdvantageRequest:
     # names its file after it and the pool has no view of the controller's
     # counter. Unset when the dump is off, which is the default.
     train_step: Optional[int] = None
-
-
-def row_group_ids(meta: KVBatchMeta) -> list[str]:
-    """Return the prompt-group id of every row, in row order.
-
-    This is the key the group-relative estimators reduce over, so a missing
-    tag has to raise rather than fall back to prompt tokens: the token key is
-    what merged two same-text groups into one baseline in the first place, and
-    a silent fallback would reintroduce exactly that.
-    """
-    if meta.tags is None:
-        raise ValueError(
-            f"advantage stage: {len(meta.sample_ids)} row(s) of partition "
-            f"{meta.partition_id!r} carry no tags, so the {GROUP_ID_TAG!r} "
-            "baseline key is unavailable"
-        )
-    untagged = [
-        meta.sample_ids[i] for i, tag in enumerate(meta.tags) if GROUP_ID_TAG not in tag
-    ]
-    if untagged:
-        raise ValueError(
-            f"advantage stage: {len(untagged)} row(s) carry no {GROUP_ID_TAG!r} "
-            f"tag (first: {untagged[0]!r}); pack_payload stamps it on every row, "
-            "so this batch was written by a producer that predates it"
-        )
-    return [tag[GROUP_ID_TAG] for tag in meta.tags]
-
-
-def group_index_column(group_ids: list[str]) -> torch.Tensor:
-    """Turn per-row group ids into the ``[N, 1]`` column the baseline compares.
-
-    ``calculate_baseline_and_std_per_prompt`` only calls ``torch.unique(...,
-    dim=0)`` and compares rows for equality, so one integer per distinct group
-    carries everything it needs. The trailing dimension is load-bearing: the
-    helper does ``.all(1)``, so a flat ``[N]`` tensor would not work.
-    """
-    index = {group_id: i for i, group_id in enumerate(dict.fromkeys(group_ids))}
-    return torch.tensor([[index[group_id]] for group_id in group_ids])
 
 
 def split_meta_by_prompt_group(
