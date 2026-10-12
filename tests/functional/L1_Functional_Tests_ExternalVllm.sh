@@ -25,3 +25,4 @@ if [[ -z "${EXTERNAL_VLLM_TEST_PYTHON:-}" ]]; then
     export EXTERNAL_VLLM_TEST_PYTHON
 fi
 time uv run --no-sync bash "$SCRIPT_DIR/grpo_external_vllm_gym_single_controller.sh"
+time uv run --no-sync bash "$SCRIPT_DIR/grpo_external_vllm_prefix_gym.sh"
