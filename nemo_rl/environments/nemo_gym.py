@@ -1557,7 +1557,8 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         pass
     else:
         raise ValueError(
-            "NeMo-Gym setup supports vllm, dynamo, or megatron generation; got "
+            "NeMo-Gym setup supports vllm, dynamo, megatron, or remote_vllm "
+            "generation; got "
             f"{generation_config['backend']!r}"
         )
 

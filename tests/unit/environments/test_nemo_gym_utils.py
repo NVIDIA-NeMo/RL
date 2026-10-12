@@ -43,7 +43,7 @@ from nemo_rl.environments.nemo_gym import (
 )
 
 
-@pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron"])
+@pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron", "remote_vllm"])
 def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
     generation = {
         "backend": backend,
@@ -57,8 +57,8 @@ def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
     setup_nemo_gym_config(config, tokenizer=None)
 
     assert generation["vllm_cfg"] == {
-        "async_engine": backend != "megatron",
-        "expose_http_server": backend != "megatron",
+        "async_engine": backend in ("vllm", "dynamo"),
+        "expose_http_server": backend in ("vllm", "dynamo"),
     }
     assert generation["mcore_generation_config"] == {
         "expose_http_server": backend == "megatron"
