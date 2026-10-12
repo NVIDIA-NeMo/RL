@@ -270,6 +270,8 @@ guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
 guides/grpo-audio.md
+guides/gspo-speechlm.md
+recipes/speechlm-environment.md
 guides/rm.md
 guides/environments.md
 guides/eval.md
