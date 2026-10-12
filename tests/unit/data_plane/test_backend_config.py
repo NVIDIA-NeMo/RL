@@ -261,12 +261,11 @@ def test_schema_validates_without_any_backend_block() -> None:
 def simple_units(monkeypatch) -> list[tuple[dict, tuple, dict]]:
     """Fake SimpleStorageUnit: records (options, args, kwargs) per unit built.
 
-    Also restores TQ's provider registry after the test, since
-    _pin_simple_storage_units replaces the SimpleStorage provider in it.
+    Also gives TQ's provider a Ray-free default placement and restores it after
+    the test, since _pin_simple_storage_units swaps that hook in place.
     """
     from transfer_queue.storage import simple_storage
     from transfer_queue.storage.bootstrap import simple_storage_bootstrap
-    from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
     from transfer_queue.utils import zmq_utils
 
     built: list[tuple[dict, tuple, dict]] = []
@@ -280,15 +279,14 @@ def simple_units(monkeypatch) -> list[tuple[dict, tuple, dict]]:
 
     monkeypatch.setattr(simple_storage.SimpleStorageUnit, "options", options)
     monkeypatch.setattr(
-        simple_storage_bootstrap, "get_placement_group", lambda *a, **k: object()
+        simple_storage_bootstrap,
+        "get_node_round_robin_scheduling_strategies",
+        lambda num_actors, required_node_resource=None: [
+            SimpleNamespace(node_id="unpinned") for _ in range(num_actors)
+        ],
     )
     for module in (simple_storage_bootstrap, zmq_utils):
         monkeypatch.setattr(module, "process_zmq_server_info", lambda h: dict(h))
-    monkeypatch.setitem(
-        StorageBootstrapProvider._providers,
-        "simplestorage",
-        StorageBootstrapProvider.get_provider("SimpleStorage"),
-    )
     return built
 
 
@@ -325,16 +323,22 @@ def test_simple_storage_units_are_pinned_to_the_resolved_nodes(
     strategies = [opts["scheduling_strategy"] for opts, _, _ in simple_units]
     assert [s.node_id for s in strategies] == [n0, n1, n0]
     assert all(s.soft is False for s in strategies)
-    assert all(kw == {"storage_unit_size": 3} for _, _, kw in simple_units)
+    configs = [kw["config"] for _, _, kw in simple_units]
+    assert all(set(kw) == {"config"} for _, _, kw in simple_units)
+    assert all(
+        c["num_data_storage_units"] == 3 and c["total_storage_size"] == 9
+        for c in configs
+    )
+    assert len({c["_run_id"] for c in configs}) == 1  # one run ID shared by all units
     assert conf.backend.SimpleStorage.zmq_info == handles
 
 
 def test_pinned_simple_provider_matches_tq_except_placement(simple_units) -> None:
-    """_pin_simple_storage_units copies TQ's initialize_simple_storage.
+    """_pin_simple_storage_units swaps only the placement of TQ's own provider.
 
     Run both against the same conf and compare everything but the scheduling
-    options, so a TQ bump that changes how units are built fails here. Total
-    10 over 3 units also tells ceiling from floor division.
+    options and the per-run ID, so a TQ bump that changes how units are built
+    or placed fails here.
     """
     from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
 
@@ -348,7 +352,16 @@ def test_pinned_simple_provider_matches_tq_except_placement(simple_units) -> Non
 
     def without_placement(calls):
         return [
-            ({k: v for k, v in o.items() if k not in placement_keys}, a, kw)
+            (
+                {k: v for k, v in o.items() if k not in placement_keys},
+                a,
+                {
+                    k: {ck: cv for ck, cv in v.items() if ck != "_run_id"}
+                    if k == "config"
+                    else v
+                    for k, v in kw.items()
+                },
+            )
             for o, a, kw in calls
         ]
 
@@ -364,6 +377,40 @@ def test_pinned_simple_provider_matches_tq_except_placement(simple_units) -> Non
     assert ours_handles == tq_handles
     assert without_placement(simple_units) == tq_calls
     assert ours_conf == tq_conf
+
+
+def test_pinned_simple_units_keep_ssd_offload(monkeypatch, simple_units) -> None:
+    """TQ's provider still builds pinned units, so ssd_offload reaches each one."""
+    from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    captured = {}
+    monkeypatch.setattr(
+        adapter.tq, "init", lambda *, conf: captured.setdefault("conf", conf)
+    )
+    cfg = _cfg(
+        "simple",
+        simple={
+            "storage_capacity": 9,
+            "num_storage_units": 2,
+            "ssd_offload": {
+                "enabled": True,
+                "path": "/local/ssd",
+                "threshold_bytes": 4096,
+            },
+        },
+    )
+    adapter._init_tq(cfg, storage_unit_node_ids=["a" * 56, "b" * 56])
+    StorageBootstrapProvider.get_provider("SimpleStorage")(captured["conf"])
+
+    assert len(simple_units) == 2
+    for opts, _, kw in simple_units:
+        ssd = kw["config"]["ssd_offload"]
+        assert ssd["enabled"] is True
+        assert ssd["path"] == "/local/ssd"
+        assert ssd["threshold_bytes"] == 4096
+        assert opts["runtime_env"]["env_vars"]["MALLOC_MMAP_THRESHOLD_"]
 
 
 @pytest.mark.parametrize(
