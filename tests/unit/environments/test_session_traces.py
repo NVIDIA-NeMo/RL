@@ -130,6 +130,7 @@ def test_mode_and_limits_are_explicit_and_operational_paths_are_excluded() -> No
         {"opencode_subagent_max_active": 2},
         {"opencode_subagent_max_active": True},
         {"opencode_compaction_auto": True},
+        {"opencode_compaction_prune": True},
         {"opencode_pruning_enabled": True},
     ],
 )

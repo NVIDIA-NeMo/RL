@@ -33,7 +33,10 @@ dependencies = [
   "torch>=2.11,<2.14",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
-  "ray[default]>=2.55.1",
+  # Gym's video/compaction stack requires Ray >=2.58.0. Keep the driver floor
+  # aligned with every worker venv so a relock cannot reintroduce GCS-breaking
+  # cross-version actors.
+  "ray[default]>=2.58.0",
   "wandb>=0.30.0",                                                                                       # Address dependency vulnerabilities in bundled wandb-core
   "numpy",
   "datasets>=4.0.0",
@@ -503,6 +506,11 @@ override-dependencies = [
 
 # CVE fixes
 constraint-dependencies = [
+  # Megatron-LM's dev extra pulls nvidia-resiliency-ext transitively. The PyPI
+  # 0.6.0 release has no cp313 wheel, while the project-supported Git tag is
+  # source-buildable on Python 3.13 and is already the root nvrx source. Make
+  # that source authoritative in the mcore resolution fork as well.
+  "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@v0.6.0",
   # emerging-optimizers / fast-hadamard-transform flow transitively from megatron-core[dev],
   # whose [tool.uv.sources] pins them to git. uv requires such URL deps to also appear as a
   # direct requirement or constraint of the root project. Keep these URLs/revs in sync with

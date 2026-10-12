@@ -94,7 +94,11 @@ def validate_session_training_config(env: Mapping[str, Any]) -> TrainingMode | N
                     "(null) or the historical single-child limit (1)"
                 )
             for key, value in agent.items():
-                if key in ("opencode_compaction_auto", "opencode_pruning_enabled"):
+                if key in (
+                    "opencode_compaction_auto",
+                    "opencode_compaction_prune",
+                    "opencode_pruning_enabled",
+                ):
                     if value is not False:
                         raise ValueError("Subagent training forbids compaction/pruning")
         elif enabled:

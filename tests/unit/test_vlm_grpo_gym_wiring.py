@@ -45,7 +45,10 @@ def test_setup_gym_reaches_async_training(
         data_plane=None,
         policy={
             "tokenizer": {},
-            "generation": {"vllm_cfg": {"skip_tokenizer_init": False}},
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {"skip_tokenizer_init": False},
+            },
         },
         data={"use_multiple_dataloader": False},
         env={},

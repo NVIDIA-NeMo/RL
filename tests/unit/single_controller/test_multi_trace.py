@@ -418,6 +418,7 @@ def test_multitrace_resume_preserves_saved_progress_and_operational_changes():
         ("opencode_subagent_max_depth", 2),
         ("opencode_subagent_max_active", 2),
         ("opencode_compaction_auto", True),
+        ("opencode_compaction_prune", True),
         ("opencode_pruning_enabled", True),
     ],
 )
