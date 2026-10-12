@@ -1308,16 +1308,11 @@ def test_setup_nemo_gym_config_keeps_explicit_prefix_settings(
     assert _prefix_derivation(config.env["nemo_gym"]) is expected
 
 
-@pytest.mark.parametrize("backend", ["dynamo", "megatron"])
-def test_setup_nemo_gym_config_derives_prefix_only_for_native_vllm(backend) -> None:
+def test_setup_nemo_gym_config_leaves_gym_overlay_alone_for_megatron() -> None:
+    # Dynamo is left out: its own setup owns the Gym policy model overlay and
+    # may set this prefix flag too.
     config = SimpleNamespace(
-        policy={
-            "generation": {
-                "backend": backend,
-                "vllm_cfg": {},
-                "mcore_generation_config": {},
-            }
-        },
+        policy={"generation": {"backend": "megatron", "mcore_generation_config": {}}},
         env={"nemo_gym": {"port_range_low": 5000}},
     )
 
