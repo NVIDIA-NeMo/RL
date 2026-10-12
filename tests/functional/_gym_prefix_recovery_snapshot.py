@@ -17,13 +17,16 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
 import shutil
 import time
 import uuid
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 
@@ -152,7 +155,7 @@ def _require_cut_coverage(
 
 def inspect_snapshot(
     snapshot: Path,
-    sentinel_event: str,
+    sentinel_event: str | None,
     *,
     min_cuts: int = 1,
     min_cut_groups: int = 1,
@@ -161,7 +164,9 @@ def inspect_snapshot(
 
     The top-level fields describe the longest cut; ``cuts`` lists every one,
     and the snapshot qualifies only if it holds at least ``min_cuts`` of them
-    spread across at least ``min_cut_groups`` prompt groups.
+    spread across at least ``min_cut_groups`` prompt groups. A ``None``
+    ``sentinel_event`` selects a stateless resources server (e.g. CLEVR's
+    string_match), whose episodes export no resources state to check.
     """
 
     required = [
@@ -196,14 +201,23 @@ def inspect_snapshot(
         key = _episode_key(record)
         recovery = ledger.get(key)
         cut = _recoverable_cut(record)
-        resource_entry = resource_index.get(key)
-        if recovery is None or cut is None or resource_entry is None:
+        if recovery is None or cut is None:
             continue
-        resources_manifest, resources_state = resource_entry
-        try:
-            sentinel_count = _calendar_sentinel_count(resources_state, sentinel_event)
-        except (KeyError, StopIteration, TypeError):
-            continue
+        resources_manifest = None
+        if sentinel_event is not None:
+            resource_entry = resource_index.get(key)
+            if resource_entry is None:
+                continue
+            manifest_path, resources_state = resource_entry
+            try:
+                sentinel_count = _calendar_sentinel_count(
+                    resources_state, sentinel_event
+                )
+            except (KeyError, StopIteration, TypeError):
+                continue
+            if sentinel_count != 1:
+                continue
+            resources_manifest = str(manifest_path.relative_to(snapshot))
         instance_id = recovery["gym_instance_id"]
         checkpointed_episodes = {
             (episode["rollout_id"], episode["attempt"])
@@ -213,7 +227,6 @@ def inspect_snapshot(
         if (
             key not in checkpointed_episodes
             or key not in agent_keys
-            or sentinel_count != 1
             or recovery["restore_level"] != "prefix"
             or recovery["status"] != "dispatched"
             or not set(cut["staging_keys"]).issubset(retained_keys)
@@ -230,7 +243,7 @@ def inspect_snapshot(
                 "generation_index": recovery["generation_index"],
                 "target_step": recovery["target_step"],
                 "model_manifest": str(model_manifest.relative_to(snapshot)),
-                "resources_manifest": str(resources_manifest.relative_to(snapshot)),
+                "resources_manifest": resources_manifest,
                 "sentinel_event": sentinel_event,
                 **cut,
             }
@@ -260,7 +273,7 @@ def select_snapshot(args: argparse.Namespace) -> None:
             try:
                 selection = inspect_snapshot(
                     snapshot,
-                    args.sentinel_event,
+                    None if args.stateless_resources else args.sentinel_event,
                     min_cuts=args.min_cuts,
                     min_cut_groups=args.min_cut_groups,
                 )
@@ -410,6 +423,103 @@ def verify_restore(args: argparse.Namespace) -> None:
             raise AssertionError(f"train step {step} appeared {len(matches)} times")
 
 
+def _parity_helpers() -> ModuleType:
+    """Load the sibling parity module by path.
+
+    Unit tests load this module by path, without its directory on sys.path, so
+    a plain import would only work from the CLI.
+    """
+    path = Path(__file__).with_name("_gym_prefix_recovery_parity.py")
+    spec = importlib.util.spec_from_file_location("_gym_prefix_recovery_parity", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def assert_restored_prefixes_completed(
+    selection: Mapping[str, Any],
+    recovery_log: str,
+    recovery_records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Require each restored call to finish once and train on its restored prefix.
+
+    Needs no uninterrupted reference run. The cut call is its row's closing
+    call, so its tokens end the row: counting back ``total_generation_tokens``
+    from the end finds where the call starts. Unlike the last unmasked segment,
+    that is not fooled by positions the trainer masked inside the call (e.g.
+    top-p mismatches). The restored prefix must sit there, hash-identical to
+    what the worker logged when it restored the call.
+    """
+    parity = _parity_helpers()
+    parity._assert_selected_prefix_was_trained(selection, recovery_records)
+    rows = {
+        (row["group_id"], int(row["generation_index"])): row
+        for batch in recovery_records
+        for row in batch["rows"]
+    }
+    restored = parity._restored_prefix_hashes(recovery_log)
+    completed = re.findall(
+        r"generation prefix completed: rollout_id=\S+ model_call_id=\S+ "
+        r"source_model_call_id=(\S+) prefix_tokens=(\d+) tail_tokens=(\d+) "
+        r"total_generation_tokens=(\d+)",
+        recovery_log,
+    )
+    report = []
+    for cut in parity._selection_cuts(selection):
+        source = cut["model_call_id"]
+        prefix_tokens = int(cut["prefix_token_count"])
+        matches = [m for m in completed if m[0] == source]
+        if len(matches) != 1:
+            raise AssertionError(
+                f"restored call {source!r} did not complete exactly once: {matches!r}"
+            )
+        logged_prefix, tail, total = (int(value) for value in matches[0][1:])
+        if logged_prefix != prefix_tokens or tail <= 0 or logged_prefix + tail != total:
+            raise AssertionError(
+                f"restored call {source!r} token accounting is wrong: selected "
+                f"prefix={prefix_tokens}, logged prefix={logged_prefix}, "
+                f"tail={tail}, total={total}"
+            )
+        if source not in restored:
+            raise AssertionError(f"restored call {source!r} logged no prefix hash")
+        row = rows[(cut["group_id"], int(cut["generation_index"]))]
+        token_ids = row["token_ids"]
+        mask = row["token_loss_mask"]
+        first_generated = next((i for i, keep in enumerate(mask) if keep), None)
+        start = len(token_ids) - total
+        if first_generated is None or start < first_generated:
+            raise AssertionError(
+                f"trained row for {source!r} is shorter than its generation: "
+                f"row={len(token_ids)}, generated={total}, "
+                f"first_generated={first_generated}"
+            )
+        prefix_hash = parity._token_ids_sha256(token_ids[start : start + prefix_tokens])
+        if prefix_hash != restored[source]:
+            raise AssertionError(
+                f"trained row for {source!r} does not begin its call with the "
+                "restored prefix"
+            )
+        report.append(
+            {"model_call_id": source, "prefix_tokens": prefix_tokens, "total": total}
+        )
+    return report
+
+
+def verify_completion(args: argparse.Namespace) -> None:
+    """Without a reference run, require every restored prefix to finish and train."""
+    parity = _parity_helpers()
+    selection = _read_json(Path(args.selection_file))
+    records = parity._read_jsonl(Path(args.recovery_training))
+    report = assert_restored_prefixes_completed(
+        selection, Path(args.phase2_log).read_text(), records
+    )
+    parity._assert_retired_prefix_keys(
+        selection, records, Path(args.successor_checkpoint)
+    )
+    print(f"restored prefixes completed and trained: {report}", flush=True)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -421,7 +531,10 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("phase_log")
     select.add_argument("timeout_s", type=float)
     select.add_argument("backup_path")
-    select.add_argument("sentinel_event")
+    select.add_argument("sentinel_event", nargs="?")
+    # Explicit opt-out, so a Workplace caller that drops the sentinel fails
+    # instead of silently skipping the post-mutation resources check.
+    select.add_argument("--stateless-resources", action="store_true")
     select.add_argument("--min-cuts", type=int, default=1)
     select.add_argument("--min-cut-groups", type=int, default=1)
     select.set_defaults(func=select_snapshot)
@@ -434,9 +547,23 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("training_info")
     verify.add_argument("max_steps", type=int)
     verify.set_defaults(func=verify_restore)
+
+    completion = commands.add_parser("verify-completion")
+    completion.add_argument("selection_file")
+    completion.add_argument("recovery_training")
+    completion.add_argument("phase2_log")
+    completion.add_argument("successor_checkpoint")
+    completion.set_defaults(func=verify_completion)
     return parser
 
 
 if __name__ == "__main__":
-    arguments = _parser().parse_args()
+    parser = _parser()
+    arguments = parser.parse_args()
+    if arguments.command == "select" and (
+        (arguments.sentinel_event is None) != arguments.stateless_resources
+    ):
+        parser.error(
+            "select needs exactly one of sentinel_event or --stateless-resources"
+        )
     arguments.func(arguments)
