@@ -770,6 +770,17 @@ class MegatronConfig(TypedDict):
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.
     freeze_config: NotRequired[dict[str, Any]]
+    # Megatron-Core batch-invariant kernels (bitwise train/generation parity).
+    batch_invariant_mode: NotRequired[bool]
+    batch_invariant_backend: NotRequired[Literal["deepgemm", "te_native", "triton"]]
+    # Cross-rank EP combine: "ordered" is portable, "multimem" uses NVLS.
+    batch_invariant_collective: NotRequired[Literal["multimem", "ordered"]]
+    # FlashAttention generation. Defaults to 2 when unset (flash-attn-4 is installed,
+    # so TE's auto choice would be FA4); batch-invariant / zero-KL recipes set 4
+    # (3 or 4 are accepted under batch_invariant_mode).
+    flash_attention_version: NotRequired[Literal[2, 3, 4] | None]
+    # flag to enable zero train/gen KL with generation.backend='megatron'.
+    zero_train_gen_mismatch: NotRequired[bool]
 
 
 class TokenizerConfig(TypedDict):
@@ -947,6 +958,16 @@ def validate_shared_prefix_training_config(
         megatron_config = config.get("megatron_cfg")
         if megatron_config is None or not megatron_config["enabled"]:
             raise ValueError("dense comparison control requires the Megatron backend")
+    if shared_prefix_config.mode != "disabled":
+        # Generation runs dense, so train/gen parity cannot hold; dense mode's
+        # router-gating blocks only apply to the trainer. The refit-destination
+        # and teacher copies are forced to disabled and keep these flags.
+        for key in ("zero_train_gen_mismatch", "batch_invariant_mode"):
+            if (config.get("megatron_cfg") or {}).get(key):
+                raise ValueError(
+                    f"policy.shared_prefix_training.mode={shared_prefix_config.mode} "
+                    f"does not support policy.megatron_cfg.{key}=true"
+                )
     if not shared_prefix_config.enabled_for(stage="logprobs"):
         return shared_prefix_config
 

@@ -114,8 +114,10 @@ The `logprobs` and `train` modes also require the following. Policy and single-c
 - `async_rl.rollout_failure.max_skipped_prompts: 0` and `max_consecutive_dropped_prompts: 0`, and `token_capture.min_valid_fraction_per_group` unset. A dropped prompt can leave a step that no longer splits into complete data-parallel groups. A drop that no setting controls (a structural finalizer drop, or a shortfall restored from a checkpoint) and that leaves a step target that is not a multiple of the data-parallel size stops the run at the next chunk selection, before another chunk trains. A shortfall that keeps the target aligned closes the step short, as in dense mode.
 - `grpo.num_prompts_per_step` a multiple of the policy data-parallel size, because complete groups are assigned to data-parallel ranks. The controller checks this before the first training chunk.
 - A `TQPolicy`. Other policies raise `NotImplementedError` at construction.
+- No streaming PPO (`async_rl.min_groups_for_streaming_train` below `ppo.num_prompts_per_step`). Streaming PPO aligns chunks to both models' layouts through the same sampler keyword, and the two alignments are not combined.
+- No `weight_fifo` sampler with streaming training (`async_rl.min_groups_for_streaming_train` below `num_prompts_per_step`). That sampler selects from one weight version at a time. A version can be left with fewer ready groups than the data-parallel size, and the step would never fill.
 
-Samplers align their selection to the data-parallel size only when their own class body declares `supports_prompt_group_multiple = True`. The flag is not inherited. A subclass of a built-in sampler must redeclare it and accept the `prompt_group_multiple` keyword. Other samplers fall back to exact-minimum chunks, which are correct but smaller.
+The controller passes the data-parallel size to the sampler's `select` as `group_multiple`, the keyword streaming PPO also uses. Custom samplers must accept it and return a multiple of it. A selection that is not a multiple stops the run before the chunk trains.
 
 On-policy distillation teachers always run with `mode: disabled`, because teacher dispatches are not group-sharded. So does the inference-only policy of non-colocated Megatron generation, which never trains.
 
@@ -124,6 +126,7 @@ On-policy distillation teachers always run with `mode: disabled`, because teache
 The policy configuration rejects these settings in shared modes:
 
 - PEFT/LoRA, `policy.router_replay`, pipeline parallelism, training CUDA graphs, FP8, and `quant_cfg` (FP4 and other ModelOpt training quantization).
+- `policy.megatron_cfg.zero_train_gen_mismatch` and `batch_invariant_mode`, in every mode except `disabled`. In `logprobs` and `train` modes the trainer shares prefixes while generation runs dense, so train/generation parity cannot hold. In `dense` mode, `uniform_router_gating` changes only the trainer's router arithmetic, so these flags are rejected there too.
 - `moe_hybridep_prepad_packed_inputs` with the HybridEP flex dispatcher.
 
 Worker setup resolves the model provider and rejects these model settings:

@@ -75,10 +75,7 @@ class PromptGroupSampler(Protocol):
     ``supports_buffer_checkpoint = True``. It must additionally declare
     ``supports_training_claims = True`` before periodic rollout snapshots may
     be enabled; omitting that optional capability preserves the legacy
-    remove-on-selection behavior. A sampler whose ``select`` accepts
-    ``prompt_group_multiple`` declares ``supports_prompt_group_multiple = True``
-    in its own class body (the controller does not honor an inherited flag);
-    the controller otherwise pins shared-prefix chunks to ``min_prompt_groups``.
+    remove-on-selection behavior.
     """
 
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
@@ -100,14 +97,31 @@ class PromptGroupSampler(Protocol):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
     ) -> tuple[Optional[KVBatchMeta], int]:
         """Pick up to ``max_prompt_groups`` eligible groups for training.
 
         Claim-aware samplers transfer the groups from ordinary replay-buffer
         selection into training ownership until the controller releases them.
         Legacy custom samplers may still remove selected groups immediately.
-        Samplers declaring ``supports_prompt_group_multiple`` also accept a
-        ``prompt_group_multiple`` keyword and return a multiple of it.
+
+        Args:
+            current_train_weight: Trainer version used by the staleness policy.
+            min_prompt_groups: Minimum groups needed to return a selection.
+            max_prompt_groups: Maximum selection size. For chunked training,
+                this is the number of groups remaining in the current batch.
+            group_multiple: Align the capped selection to this many complete
+                groups, leaving any unaligned ready groups unclaimed.
+            min_remaining_groups: Defer a nonfinal selection if it would leave
+                fewer than this many groups in the current batch. A complete
+                aligned remainder may be selected even when below this floor,
+                provided it meets ``min_prompt_groups``. Zero preserves greedy
+                selection. Custom streaming PPO samplers must honor this bound.
+
+        Returns:
+            Selected metadata and group count, or ``(None, 0)`` when the
+            eligible groups do not satisfy the selection bounds.
         """
         ...
 
@@ -178,10 +192,6 @@ class BaseSampler(abc.ABC):
 
     supports_buffer_checkpoint: ClassVar[bool] = False
     supports_training_claims: ClassVar[bool] = True
-    # Opt-in per concrete class: the controller reads it from the sampler
-    # class's own ``__dict__``, so a subclass (of this or of a built-in) that
-    # overrides ``select`` without the keyword never inherits it.
-    supports_prompt_group_multiple: ClassVar[bool] = False
 
     def __init__(self, buffer: TQReplayBuffer) -> None:
         self._buffer = buffer
@@ -235,7 +245,8 @@ class BaseSampler(abc.ABC):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-        prompt_group_multiple: int = 1,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
     ) -> tuple[Optional[KVBatchMeta], int]: ...
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -278,7 +289,16 @@ class BaseSampler(abc.ABC):
         return 0
 
     @staticmethod
-    def _validate_group_bounds(min_prompt_groups: int, max_prompt_groups: int) -> None:
+    def _validate_group_bounds(
+        min_prompt_groups: int,
+        max_prompt_groups: int,
+        *,
+        min_remaining_groups: int = 0,
+    ) -> None:
+        if min_remaining_groups < 0:
+            raise ValueError(
+                f"min_remaining_groups must be >= 0, got {min_remaining_groups}"
+            )
         if min_prompt_groups < 1:
             raise ValueError(f"min_prompt_groups must be >= 1, got {min_prompt_groups}")
         if max_prompt_groups < min_prompt_groups:
@@ -292,20 +312,38 @@ class BaseSampler(abc.ABC):
         valid_idxs: list[int],
         min_prompt_groups: int,
         max_prompt_groups: int,
-        prompt_group_multiple: int = 1,
+        *,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
     ) -> tuple[Optional[KVBatchMeta], int]:
-        """Cap, claim from the buffer, and concat the chosen groups.
+        """Cap, align, and claim the selected groups for training.
 
-        Greedy without waiting: returns the largest currently-eligible prefix
-        up to ``max_prompt_groups`` that contains a whole number of
-        ``prompt_group_multiple`` groups, or ``(None, 0)`` when that prefix
-        is below ``min_prompt_groups``. The default preserves dense selection.
+        Returns the largest aligned selection up to ``max_prompt_groups``,
+        or ``(None, 0)`` below ``min_prompt_groups``. Unaligned tail groups
+        stay unclaimed, preserving their rows and readiness for a later chunk.
+        A selection leaving a nonzero tail below ``min_remaining_groups`` is
+        also deferred before any groups are claimed.
         """
-        if prompt_group_multiple < 1:
-            raise ValueError("prompt_group_multiple must be >= 1")
+        if group_multiple < 1:
+            raise ValueError(f"group_multiple must be >= 1, got {group_multiple}")
+        if min_remaining_groups and max_prompt_groups % group_multiple:
+            # A dropped rollout can shrink the current target after setup.
+            # Waiting cannot produce an aligned flush of this remainder.
+            raise ValueError(
+                "Tail-aware selection requires max_prompt_groups "
+                f"({max_prompt_groups}) to be a multiple of {group_multiple}"
+            )
+        if max_prompt_groups // group_multiple * group_multiple < min_prompt_groups:
+            raise ValueError(
+                f"No multiple of {group_multiple} fits selection bounds "
+                f"[{min_prompt_groups}, {max_prompt_groups}]"
+            )
         requested_groups = min(len(valid_idxs), max_prompt_groups)
-        requested_groups -= requested_groups % prompt_group_multiple
+        requested_groups -= requested_groups % group_multiple
         if requested_groups < min_prompt_groups:
+            return None, 0
+        remaining_groups = max_prompt_groups - requested_groups
+        if 0 < remaining_groups < min_remaining_groups:
             return None, 0
         selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
@@ -331,7 +369,6 @@ class WindowedSampler(BaseSampler):
 
     # Ungated restored groups are ordinary in-window candidates.
     supports_buffer_checkpoint: ClassVar[bool] = True
-    supports_prompt_group_multiple: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -391,9 +428,14 @@ class WindowedSampler(BaseSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-        prompt_group_multiple: int = 1,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
     ) -> tuple[Optional[KVBatchMeta], int]:
-        self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
+        self._validate_group_bounds(
+            min_prompt_groups,
+            max_prompt_groups,
+            min_remaining_groups=min_remaining_groups,
+        )
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         valid_idxs = [
             i
@@ -409,7 +451,11 @@ class WindowedSampler(BaseSampler):
                 )
             )
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups, prompt_group_multiple
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            group_multiple=group_multiple,
+            min_remaining_groups=min_remaining_groups,
         )
 
 
@@ -487,7 +533,6 @@ class ReadyFirstSampler(_GatedSampler):
 
     # Committed groups retain start_weight, which is sufficient for selection.
     supports_buffer_checkpoint: ClassVar[bool] = True
-    supports_prompt_group_multiple: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -504,16 +549,25 @@ class ReadyFirstSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-        prompt_group_multiple: int = 1,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
     ) -> tuple[Optional[KVBatchMeta], int]:
-        self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
+        self._validate_group_bounds(
+            min_prompt_groups,
+            max_prompt_groups,
+            min_remaining_groups=min_remaining_groups,
+        )
         valid_idxs = [
             i
             for i, weight in enumerate(self._buffer.start_weight_list)
             if weight <= current_train_weight and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups, prompt_group_multiple
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            group_multiple=group_multiple,
+            min_remaining_groups=min_remaining_groups,
         )
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -530,7 +584,6 @@ class WeightFifoSampler(_GatedSampler):
 
     # Committed groups retain start_weight, which is sufficient for selection.
     supports_buffer_checkpoint: ClassVar[bool] = True
-    supports_prompt_group_multiple: ClassVar[bool] = True
 
     def __init__(self, buffer: TQReplayBuffer, *, max_staleness_versions: int) -> None:
         super().__init__(buffer, gate_window=max_staleness_versions)
@@ -542,9 +595,14 @@ class WeightFifoSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-        prompt_group_multiple: int = 1,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
     ) -> tuple[Optional[KVBatchMeta], int]:
-        self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
+        self._validate_group_bounds(
+            min_prompt_groups,
+            max_prompt_groups,
+            min_remaining_groups=min_remaining_groups,
+        )
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         in_window = [
             weight
@@ -560,7 +618,11 @@ class WeightFifoSampler(_GatedSampler):
             if weight == target_version and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups, prompt_group_multiple
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            group_multiple=group_multiple,
+            min_remaining_groups=min_remaining_groups,
         )
 
 
@@ -583,7 +645,6 @@ class InOrderSampler(_GatedSampler):
     # Committed groups retain target_step, which is sufficient for selection.
     # The controller checkpoints the exact dispatch cursor separately.
     supports_buffer_checkpoint: ClassVar[bool] = True
-    supports_prompt_group_multiple: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -614,16 +675,25 @@ class InOrderSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-        prompt_group_multiple: int = 1,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
     ) -> tuple[Optional[KVBatchMeta], int]:
-        self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
+        self._validate_group_bounds(
+            min_prompt_groups,
+            max_prompt_groups,
+            min_remaining_groups=min_remaining_groups,
+        )
         valid_idxs = [
             i
             for i, target in enumerate(self._buffer.target_step_list)
             if target == current_train_weight and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups, prompt_group_multiple
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            group_multiple=group_multiple,
+            min_remaining_groups=min_remaining_groups,
         )
 
     async def evict(self, *, current_train_weight: int) -> int:

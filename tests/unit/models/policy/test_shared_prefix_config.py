@@ -491,6 +491,23 @@ def test_dense_control_requires_megatron(policy_config, enabled):
         validate_shared_prefix_training_config(policy_config)
 
 
+@pytest.mark.parametrize("key", ["zero_train_gen_mismatch", "batch_invariant_mode"])
+@pytest.mark.parametrize("mode", ["dense", "logprobs", "train"])
+def test_active_modes_reject_zero_train_gen_mismatch(policy_config, mode, key):
+    policy_config["shared_prefix_training"]["mode"] = mode
+    policy_config["megatron_cfg"][key] = True
+    with pytest.raises(ValueError, match=f"does not support policy.megatron_cfg.{key}"):
+        validate_shared_prefix_training_config(policy_config)
+
+
+@pytest.mark.parametrize("key", ["zero_train_gen_mismatch", "batch_invariant_mode"])
+def test_disabled_mode_keeps_zero_train_gen_mismatch(policy_config, key):
+    # The refit-destination and teacher policy copies are forced to disabled.
+    policy_config["shared_prefix_training"]["mode"] = "disabled"
+    policy_config["megatron_cfg"][key] = True
+    assert validate_shared_prefix_training_config(policy_config).mode == "disabled"
+
+
 @pytest.mark.mcore
 def test_hybridep_without_prepadding_accepted(policy_config, megatron_rl):
     policy_config["megatron_cfg"].update(

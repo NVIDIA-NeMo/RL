@@ -1307,6 +1307,35 @@ def setup_single_controller(
                 "the threshold can leave a step that no longer splits into complete "
                 "data-parallel groups"
             )
+        # Streaming PPO aligns chunks to both models' layouts through the same
+        # sampler group_multiple; the two alignments are not combined.
+        if (
+            is_ppo_run(master_config)
+            and master_config.async_rl.min_groups_for_streaming_train
+            < master_config.ppo.num_prompts_per_step
+        ):
+            raise ValueError(
+                "policy.shared_prefix_training does not support streaming PPO "
+                "(async_rl.min_groups_for_streaming_train < "
+                "ppo.num_prompts_per_step): its chunk alignment does not "
+                "guarantee complete policy data-parallel groups"
+            )
+        # Weight FIFO selects from one weight version at a time. A streaming chunk
+        # rounded to whole DP groups can leave that version with fewer ready
+        # groups than the DP size, and the step then never fills.
+        if (
+            master_config.async_rl.sampler.name == "weight_fifo"
+            and master_config.async_rl.min_groups_for_streaming_train
+            < algo_config(master_config).num_prompts_per_step
+        ):
+            raise ValueError(
+                "policy.shared_prefix_training does not support the weight_fifo "
+                "sampler with streaming training (async_rl.min_groups_for_streaming_train "
+                "< num_prompts_per_step): a weight version can be left with fewer "
+                "ready groups than the data-parallel size, and the step stalls. Use "
+                "in_order, ready_first or windowed, or set "
+                "min_groups_for_streaming_train to num_prompts_per_step"
+            )
     if token_capture_cfg.enabled:
         if not should_use_nemo_gym(master_config):
             raise ValueError(

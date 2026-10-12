@@ -64,6 +64,7 @@ class FakeBuffer:
         self.target_step_list: list[int | None] = []
         self.ready_list: list[bool] = []
         self.remove_calls: list[tuple[list[int], bool]] = []
+        self.claim_calls: list[list[int]] = []
 
     def add(
         self,
@@ -98,6 +99,7 @@ class FakeBuffer:
         return len(idxs)
 
     async def claim_for_training(self, idxs: list[int]) -> int:
+        self.claim_calls.append(list(idxs))
         return await self.remove(idxs, remove_in_dp=False)
 
 
@@ -661,6 +663,315 @@ class TestInOrderSelect:
         ) == (None, 0)
 
 
+@pytest.fixture(
+    params=[
+        WindowedSamplerConfig(),
+        ReadyFirstSamplerConfig(),
+        WeightFifoSamplerConfig(),
+        InOrderSamplerConfig(),
+    ],
+    ids=lambda config: config.name,
+)
+def aligned_sampler(request: pytest.FixtureRequest):
+    buffer = FakeBuffer()
+    return create_sampler(buffer, request.param), buffer
+
+
+class TestGroupAlignedSelection:
+    def test_keeps_unaligned_remainder_until_more_groups_arrive(self, aligned_sampler):
+        sampler, buffer = aligned_sampler
+        for index in range(53):
+            buffer.add(str(index), weight=0, target_step=0)
+
+        meta, count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=32,
+                max_prompt_groups=256,
+                group_multiple=8,
+            )
+        )
+
+        assert count == 48
+        assert meta.sample_ids == [f"{index}_g0" for index in range(48)]
+        assert buffer.remove_calls == [(list(range(48)), False)]
+        assert [meta.sample_ids for meta in buffer.meta_list] == [
+            [f"{index}_g0"] for index in range(48, 53)
+        ]
+        for index in range(53, 56):
+            buffer.add(str(index), weight=0, target_step=0)
+
+        remaining, count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=8,
+                max_prompt_groups=8,
+                group_multiple=8,
+            )
+        )
+
+        assert count == 8
+        assert remaining.sample_ids == [f"{index}_g0" for index in range(48, 56)]
+        assert buffer.meta_list == []
+
+    def test_rounds_before_checking_readiness_threshold(self, aligned_sampler):
+        sampler, buffer = aligned_sampler
+        for index in range(35):
+            buffer.add(str(index), weight=0, target_step=0)
+
+        async def select():
+            return await sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=33,
+                max_prompt_groups=64,
+                group_multiple=8,
+            )
+
+        assert _run(select()) == (None, 0)
+        assert buffer.remove_calls == []
+        assert len(buffer.meta_list) == 35
+        for index in range(35, 40):
+            buffer.add(str(index), weight=0, target_step=0)
+
+        meta, count = _run(select())
+        assert count == 40
+        assert meta.size == 40
+
+    def test_caps_selection_before_rounding(self, aligned_sampler):
+        sampler, buffer = aligned_sampler
+        for index in range(53):
+            buffer.add(str(index), weight=0, target_step=0)
+
+        meta, count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=1,
+                max_prompt_groups=50,
+                group_multiple=8,
+            )
+        )
+
+        assert count == meta.size == 48
+        assert len(buffer.meta_list) == 5
+
+    def test_does_not_claim_a_chunk_smaller_than_one_aligned_group_set(
+        self, aligned_sampler
+    ):
+        sampler, buffer = aligned_sampler
+        buffer.add("partial", weight=0, target_step=0)
+
+        assert _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=1,
+                max_prompt_groups=8,
+                group_multiple=8,
+            )
+        ) == (None, 0)
+        assert buffer.remove_calls == []
+
+    @pytest.mark.parametrize("group_multiple", [0, -1])
+    def test_rejects_nonpositive_multiple(self, aligned_sampler, group_multiple):
+        sampler, buffer = aligned_sampler
+        buffer.add("group", weight=0, target_step=0)
+
+        with pytest.raises(ValueError, match="group_multiple"):
+            _run(
+                sampler.select(
+                    current_train_weight=0,
+                    min_prompt_groups=1,
+                    max_prompt_groups=8,
+                    group_multiple=group_multiple,
+                )
+            )
+        assert buffer.remove_calls == []
+
+
+class TestTailAwareSelection:
+    def test_tail_aware_merges_88_32_8_into_88_40(self, aligned_sampler):
+        sampler, buffer = aligned_sampler
+        for index in range(88):
+            buffer.add(str(index), weight=0, target_step=0)
+
+        first, count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=32,
+                max_prompt_groups=128,
+                min_remaining_groups=16,
+            )
+        )
+        assert count == first.size == 88
+        for index in range(88, 120):
+            buffer.add(str(index), weight=0, target_step=0)
+
+        async def select_remaining():
+            return await sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=32,
+                max_prompt_groups=40,
+                min_remaining_groups=16,
+            )
+
+        # Repeated waiting polls neither claim nor remove the ready 32 groups.
+        for _ in range(2):
+            assert _run(select_remaining()) == (None, 0)
+            assert buffer.claim_calls == [list(range(88))]
+            assert buffer.remove_calls == [(list(range(88)), False)]
+            assert len(buffer.meta_list) == 32
+        for index in range(120, 128):
+            buffer.add(str(index), weight=0, target_step=0)
+
+        final, count = _run(select_remaining())
+        assert count == final.size == 40
+        assert first.sample_ids + final.sample_ids == [
+            f"{index}_g0" for index in range(128)
+        ]
+        assert buffer.claim_calls == [list(range(88)), list(range(40))]
+        assert buffer.meta_list == []
+
+    def test_full_flush_caps_selection_before_claiming(
+        self, aligned_sampler: tuple[PromptGroupSampler, FakeBuffer]
+    ) -> None:
+        sampler, buffer = aligned_sampler
+        for index in range(136):
+            buffer.add(
+                str(index),
+                weight=0,
+                target_step=0,
+                rollout_metrics={"metric": float(index)},
+            )
+
+        meta, count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=32,
+                max_prompt_groups=128,
+                group_multiple=8,
+                min_remaining_groups=16,
+            )
+        )
+
+        assert count == 128
+        assert meta is not None
+        assert meta.sample_ids == [f"{index}_g0" for index in range(128)]
+        assert meta.extra_info[ROLLOUT_METRICS] == [
+            {"metric": float(index)} for index in range(128)
+        ]
+        assert buffer.claim_calls == [list(range(128))]
+        assert buffer.remove_calls == [(list(range(128)), False)]
+        assert [item.sample_ids for item in buffer.meta_list] == [
+            [f"{index}_g0"] for index in range(128, 136)
+        ]
+
+    @pytest.mark.parametrize(
+        ("ready", "remaining", "minimum", "multiple", "expected"),
+        [
+            (8, 8, 8, 1, 8),  # The full final remainder may be below the floor.
+            (31, 64, 32, 1, 0),
+            (32, 64, 32, 1, 32),  # Equality at the chunk threshold is sufficient.
+            (32, 48, 32, 1, 32),  # A tail exactly equal to the floor is sufficient.
+            (114, 128, 32, 1, 0),
+            (115, 128, 32, 8, 112),  # Apply the floor to the aligned candidate.
+            (123, 128, 32, 8, 0),
+        ],
+    )
+    def test_tail_aware_thresholds_and_full_flush(
+        self, aligned_sampler, ready, remaining, minimum, multiple, expected
+    ):
+        sampler, buffer = aligned_sampler
+        for index in range(ready):
+            buffer.add(str(index), weight=0, target_step=0)
+
+        meta, count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=minimum,
+                max_prompt_groups=remaining,
+                group_multiple=multiple,
+                min_remaining_groups=16,
+            )
+        )
+        assert count == expected
+        assert len(buffer.meta_list) == ready - expected
+        if expected:
+            assert meta.size == expected
+        else:
+            assert meta is None
+            assert buffer.claim_calls == buffer.remove_calls == []
+
+    def test_defaults_preserve_unaligned_greedy_selection_and_small_tail(
+        self, aligned_sampler
+    ):
+        sampler, buffer = aligned_sampler
+        for index in range(119):
+            buffer.add(str(index), weight=0, target_step=0)
+        meta, count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=32,
+                max_prompt_groups=128,
+            )
+        )
+        assert count == meta.size == 119
+        assert buffer.meta_list == []
+
+    def test_tail_aware_rejects_negative_floor_without_claiming(self, aligned_sampler):
+        sampler, buffer = aligned_sampler
+        with pytest.raises(ValueError, match="min_remaining_groups"):
+            _run(
+                sampler.select(
+                    current_train_weight=0,
+                    min_prompt_groups=32,
+                    max_prompt_groups=128,
+                    min_remaining_groups=-1,
+                )
+            )
+        assert buffer.remove_calls == []
+
+    def test_tail_aware_rejects_unaligned_shrunken_target(self, aligned_sampler):
+        sampler, buffer = aligned_sampler
+        for index in range(125):
+            buffer.add(str(index), weight=0, target_step=0)
+        with pytest.raises(ValueError, match="max_prompt_groups.*multiple of 4"):
+            _run(
+                sampler.select(
+                    current_train_weight=0,
+                    min_prompt_groups=32,
+                    max_prompt_groups=125,
+                    group_multiple=4,
+                    min_remaining_groups=16,
+                )
+            )
+        assert buffer.remove_calls == []
+        assert len(buffer.meta_list) == 125
+
+    def test_tail_aware_does_not_fill_current_tail_with_future_batch(self):
+        buffer = FakeBuffer()
+        sampler = InOrderSampler(buffer, max_lookahead_versions=1)
+        for index in range(32):
+            buffer.add(f"current-{index}", weight=0, target_step=0)
+        for index in range(8):
+            buffer.add(f"future-{index}", weight=0, target_step=1)
+
+        async def select():
+            return await sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=32,
+                max_prompt_groups=40,
+                min_remaining_groups=16,
+            )
+
+        assert _run(select()) == (None, 0)
+        assert buffer.remove_calls == []
+        for index in range(32, 40):
+            buffer.add(f"current-{index}", weight=0, target_step=0)
+        meta, count = _run(select())
+        assert count == 40
+        assert meta.sample_ids == [f"current-{index}_g0" for index in range(40)]
+        assert buffer.target_step_list == [1] * 8
+
+
 class TestDefaultEvictSkipsUnready:
     def test_windowed_evict_drops_ready_below_window(self):
         buf = FakeBuffer()
@@ -784,152 +1095,3 @@ class PropertyCapabilitySampler:
 
 
 NOT_A_SAMPLER_CLASS = object()
-
-
-# Shared-prefix packing requires whole DP group counts, while ready-first
-# sampling should still greedily consume the available prefix of the queue.
-def _aligned_ready_buffer(count):
-    buffer = FakeBuffer()
-    for index in range(count):
-        buffer.add(str(index), weight=0)
-    return buffer, ReadyFirstSampler(buffer, max_staleness_versions=16)
-
-
-def test_shared_aligned_ready_first_uses_full_ready_update():
-    buffer, sampler = _aligned_ready_buffer(512)
-    meta, count = _run(
-        sampler.select(
-            current_train_weight=0,
-            min_prompt_groups=32,
-            max_prompt_groups=512,
-            prompt_group_multiple=16,
-        )
-    )
-    assert count == 512
-    assert meta.sample_ids == [f"{i}_g0" for i in range(512)]
-    assert buffer.meta_list == []
-    assert buffer.remove_calls == [(list(range(512)), False)]
-
-
-def test_shared_aligned_ready_first_keeps_unaligned_tail():
-    buffer, sampler = _aligned_ready_buffer(49)
-    meta, count = _run(
-        sampler.select(
-            current_train_weight=0,
-            min_prompt_groups=32,
-            max_prompt_groups=512,
-            prompt_group_multiple=16,
-        )
-    )
-    assert count == 48
-    assert meta.sample_ids == [f"{i}_g0" for i in range(48)]
-    assert buffer.meta_list[0].sample_ids == ["48_g0"]
-
-
-def test_shared_aligned_ready_first_does_not_wait_for_maximum():
-    _, sampler = _aligned_ready_buffer(32)
-    _, count = _run(
-        sampler.select(
-            current_train_weight=0,
-            min_prompt_groups=32,
-            max_prompt_groups=512,
-            prompt_group_multiple=16,
-        )
-    )
-    assert count == 32
-
-
-def test_shared_aligned_ready_first_waits_for_minimum_without_claiming():
-    buffer, sampler = _aligned_ready_buffer(31)
-    result = _run(
-        sampler.select(
-            current_train_weight=0,
-            min_prompt_groups=32,
-            max_prompt_groups=512,
-            prompt_group_multiple=16,
-        )
-    )
-    assert result == (None, 0)
-    assert len(buffer.meta_list) == 31
-    assert buffer.remove_calls == []
-
-
-def test_shared_aligned_ready_first_ignores_pending_and_future_weights():
-    buffer, sampler = _aligned_ready_buffer(48)
-    buffer.add("pending", weight=0, ready=False)
-    buffer.add("future", weight=1)
-    meta, count = _run(
-        sampler.select(
-            current_train_weight=0,
-            min_prompt_groups=32,
-            max_prompt_groups=512,
-            prompt_group_multiple=16,
-        )
-    )
-    assert count == 48
-    assert meta.sample_ids == [f"{i}_g0" for i in range(48)]
-    assert len(buffer.meta_list) == 2
-    assert buffer.ready_list == [False, True]
-
-
-def test_shared_aligned_ready_first_bounds_and_repeated_claims():
-    buffer, sampler = _aligned_ready_buffer(530)
-    meta, count = _run(
-        sampler.select(
-            current_train_weight=0,
-            min_prompt_groups=32,
-            max_prompt_groups=511,
-            prompt_group_multiple=16,
-        )
-    )
-    assert count == 496
-    tail, tail_count = _run(
-        sampler.select(
-            current_train_weight=0,
-            min_prompt_groups=16,
-            max_prompt_groups=32,
-            prompt_group_multiple=16,
-        )
-    )
-    assert tail_count == 32
-    assert meta.sample_ids + tail.sample_ids == [f"{i}_g0" for i in range(528)]
-    assert [m.sample_ids[0] for m in buffer.meta_list] == ["528_g0", "529_g0"]
-
-
-def test_shared_aligned_ready_first_default_keeps_dense_behavior():
-    buffer, sampler = _aligned_ready_buffer(49)
-    _, count = _run(
-        sampler.select(
-            current_train_weight=0, min_prompt_groups=32, max_prompt_groups=512
-        )
-    )
-    assert count == 49
-    assert buffer.meta_list == []
-
-
-def test_shared_aligned_ready_first_rejects_nonpositive_alignment():
-    _, sampler = _aligned_ready_buffer(32)
-    for multiple in (0, -1):
-        with pytest.raises(ValueError, match="prompt_group_multiple"):
-            _run(
-                sampler.select(
-                    current_train_weight=0,
-                    min_prompt_groups=32,
-                    max_prompt_groups=512,
-                    prompt_group_multiple=multiple,
-                )
-            )
-
-
-def test_shared_aligned_ready_first_rounding_cannot_violate_minimum():
-    buffer, sampler = _aligned_ready_buffer(33)
-    result = _run(
-        sampler.select(
-            current_train_weight=0,
-            min_prompt_groups=33,
-            max_prompt_groups=512,
-            prompt_group_multiple=16,
-        )
-    )
-    assert result == (None, 0)
-    assert buffer.remove_calls == []

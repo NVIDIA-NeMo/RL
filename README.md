@@ -11,6 +11,7 @@
 
 ## 📣 News
 
+* [10/07/2026] We shared the [NeMo-DCR preprint](https://huggingface.co/papers/2610.08430), which presents the delta-compressed refit method used in NeMo RL for fast, bitwise-exact sparse weight synchronization between training and rollout clusters.
 * [09/21/2026] DeepSeek V4.1 Flash RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/deepseek-v4.1-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/deepseek-v4.1-support/docs/guides/models/deepseek/deepseek-v4.1-flash.md).
 * [08/26/2026] Qwen3.8-Flash-Next RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/qwen3-8-flash-next-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/qwen3-8-flash-next-support/docs/guides/models/qwen/qwen3-8-flash-next.md).
 * [08/12/2026] MuseGlimmer RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/muse-glimmer-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/muse-glimmer-support/docs/guides/models/muse-glimmer.md).
@@ -139,8 +140,9 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **GB200** - container support for GB200.
 
 ## Table of Contents
-  - [Prerequisites](#prerequisites)
   - [Quick Start](#quick-start)
+    - [Bare-Metal Quick Start](#bare-metal-quick-start)
+  - [Prerequisites](#prerequisites)
   - Support Matrix
 
     <p></p>
@@ -162,7 +164,7 @@ For detailed information on backend selection, configuration, and examples, see 
   - [Set Up Clusters](#set-up-clusters)
   - [Tips and Tricks](#tips-and-tricks)
   - [Citation](#citation)
-  - [Contributing](#contributing)
+  - [Acknowledgement and Contribution Guide](#acknowledgement-and-contribution-guide)
   - [Licenses](#licenses)
 
 ## Quick Start

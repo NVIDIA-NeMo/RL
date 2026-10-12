@@ -30,16 +30,16 @@ import pytest
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     BaseSampler,
-    InOrderSampler,
     InOrderSamplerConfig,
-    ReadyFirstSampler,
-    WeightFifoSampler,
-    WindowedSampler,
+    WeightFifoSamplerConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import setup_single_controller
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
-from tests.unit.single_controller.test_sampler_interface import FakeBuffer, _run
+from tests.unit.single_controller.test_ppo_setup import (  # noqa: F401
+    _ppo_master_config,
+    patched_ppo_factories,
+)
 from tests.unit.single_controller.test_setup import (  # noqa: F401
     _make_master_config,
     patched_factories,
@@ -91,21 +91,12 @@ class _MinSampler(_EmptySampler):
         return meta, count
 
 
-class _AligningMinSampler(_MinSampler):
-    supports_prompt_group_multiple = True
+class _UnalignedSampler(_MinSampler):
+    """Ignores ``group_multiple`` and returns one group more than the minimum."""
 
-
-class _LegacyWindowedSubclass(_MinSampler, WindowedSampler):
-    """A custom subclass of a built-in that predates ``prompt_group_multiple``."""
-
-    async def select(
-        self, *, current_train_weight, min_prompt_groups, max_prompt_groups
-    ):
-        return await super().select(
-            current_train_weight=current_train_weight,
-            min_prompt_groups=min_prompt_groups,
-            max_prompt_groups=max_prompt_groups,
-        )
+    async def select(self, **kwargs):
+        kwargs["min_prompt_groups"] += 1
+        return await super().select(**kwargs)
 
 
 def _shared_prefix_controller(
@@ -190,7 +181,7 @@ def test_restored_shortfall_fails_before_any_chunk_trains(monkeypatch):
     assert sampler.calls == []
 
 
-def test_aligned_step_without_sampler_alignment_takes_exact_dp_chunks(monkeypatch):
+def test_aligned_step_selects_whole_dp_groups(monkeypatch):
     sampler = _MinSampler()
     ctrl = _shared_prefix_controller(monkeypatch, sampler, num_prompts_per_step=8, dp=4)
 
@@ -198,12 +189,22 @@ def test_aligned_step_without_sampler_alignment_takes_exact_dp_chunks(monkeypatc
 
     assert ctrl._train_steps == 1
     assert [
-        (c["min_prompt_groups"], c["max_prompt_groups"]) for c in sampler.calls
+        (c["min_prompt_groups"], c["max_prompt_groups"], c["group_multiple"])
+        for c in sampler.calls
     ] == [
-        (4, 4),
-        (4, 4),
+        (4, 8, 4),
+        (4, 4, 4),
     ]
-    assert all("prompt_group_multiple" not in c for c in sampler.calls)
+
+
+def test_unaligned_sampler_selection_fails_before_training(monkeypatch):
+    sampler = _UnalignedSampler()
+    ctrl = _shared_prefix_controller(monkeypatch, sampler, num_prompts_per_step=8, dp=4)
+
+    with pytest.raises(RuntimeError, match="not a multiple of group_multiple=4"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+
+    assert ctrl._trainer.train_calls == 0
 
 
 def test_streaming_chunks_round_up_to_whole_dp_groups(monkeypatch):
@@ -224,7 +225,7 @@ def test_streaming_chunks_round_up_to_whole_dp_groups(monkeypatch):
     assert [
         (c["min_prompt_groups"], c["max_prompt_groups"]) for c in sampler.calls
     ] == [
-        (8, 8),
+        (8, 12),
         (4, 4),
     ]
     assert ctrl._trainer.train_calls == 2
@@ -252,83 +253,7 @@ def test_dense_pump_never_aligns_to_dp(monkeypatch):
         (5, 6),
         (1, 1),
     ]
-    assert all("prompt_group_multiple" not in c for c in sampler.calls)
-
-
-def test_aligning_sampler_gets_prompt_group_multiple(monkeypatch):
-    sampler = _AligningMinSampler()
-    ctrl = _shared_prefix_controller(monkeypatch, sampler, num_prompts_per_step=8, dp=4)
-
-    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
-
-    assert ctrl._train_steps == 1
-    assert sampler.calls[0]["min_prompt_groups"] == 4
-    assert sampler.calls[0]["max_prompt_groups"] == 8
-    assert all(c["prompt_group_multiple"] == 4 for c in sampler.calls)
-
-
-def test_builtin_subclass_does_not_inherit_prompt_group_multiple(monkeypatch):
-    sampler = _LegacyWindowedSubclass()
-    ctrl = _shared_prefix_controller(monkeypatch, sampler, num_prompts_per_step=8, dp=4)
-
-    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
-
-    assert ctrl._train_steps == 1
-    assert [
-        (c["min_prompt_groups"], c["max_prompt_groups"]) for c in sampler.calls
-    ] == [
-        (4, 4),
-        (4, 4),
-    ]
-
-
-def test_builtin_samplers_declare_prompt_group_multiple():
-    for sampler_cls in (
-        WindowedSampler,
-        ReadyFirstSampler,
-        WeightFifoSampler,
-        InOrderSampler,
-    ):
-        # Declared in each class body: the controller ignores inherited flags.
-        assert sampler_cls.__dict__["supports_prompt_group_multiple"] is True
-
-    class _CustomSampler(BaseSampler):
-        async def admit(self, *, trainer_version_fn):
-            return None
-
-        async def select(self, **kwargs):
-            return None, 0
-
-    assert _CustomSampler.supports_prompt_group_multiple is False
-
-
-@pytest.mark.parametrize(
-    "make_sampler",
-    [
-        lambda buffer: WindowedSampler(buffer, max_staleness_versions=16),
-        lambda buffer: WeightFifoSampler(buffer, max_staleness_versions=16),
-        lambda buffer: InOrderSampler(buffer, max_lookahead_versions=16),
-    ],
-    ids=["windowed", "weight_fifo", "in_order"],
-)
-def test_builtin_samplers_select_greedy_aligned_prefix(make_sampler):
-    buffer = FakeBuffer()
-    for index in range(49):
-        buffer.add(str(index), weight=0, target_step=0)
-    sampler = make_sampler(buffer)
-
-    meta, count = _run(
-        sampler.select(
-            current_train_weight=0,
-            min_prompt_groups=16,
-            max_prompt_groups=512,
-            prompt_group_multiple=16,
-        )
-    )
-
-    assert count == 48
-    assert meta.sample_ids == [f"{i}_g0" for i in range(48)]
-    assert [m.sample_ids for m in buffer.meta_list] == [["48_g0"]]
+    assert all("group_multiple" not in c for c in sampler.calls)
 
 
 def test_shared_prefix_requires_token_capture_before_allocating_workers(
@@ -338,6 +263,39 @@ def test_shared_prefix_requires_token_capture_before_allocating_workers(
     mc.policy["shared_prefix_training"] = {"mode": "logprobs"}
 
     with pytest.raises(ValueError, match="requires token_capture.enabled=true"):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    patched_factories["_build_clusters"].assert_not_called()
+
+
+def test_shared_prefix_rejects_streaming_ppo_before_allocating_workers(
+    patched_ppo_factories,  # noqa: F811
+):
+    # Streaming PPO aligns chunks through the same sampler group_multiple.
+    mc = _ppo_master_config(min_groups_for_streaming_train=2, megatron_enabled=True)
+    mc.ppo.ppo_epochs = 1
+    mc.ppo.adv_estimator.normalize_advantages = False
+    mc.policy["shared_prefix_training"] = {"mode": "train"}
+    mc.token_capture.enabled = True
+
+    with pytest.raises(ValueError, match="does not support streaming PPO"):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    patched_ppo_factories["_build_clusters"].assert_not_called()
+
+
+def test_shared_prefix_rejects_streaming_weight_fifo_before_allocating_workers(
+    patched_factories,  # noqa: F811
+):
+    # Streaming chunks can leave a weight version with fewer ready groups than DP.
+    mc = _make_master_config(
+        sampler_cfg=WeightFifoSamplerConfig(), num_prompts_per_step=4
+    )
+    mc.async_rl.min_groups_for_streaming_train = 2
+    mc.policy["shared_prefix_training"] = {"mode": "train"}
+    mc.token_capture.enabled = True
+
+    with pytest.raises(ValueError, match="does not support the weight_fifo sampler"):
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     patched_factories["_build_clusters"].assert_not_called()
