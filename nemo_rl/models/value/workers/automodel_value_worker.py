@@ -246,6 +246,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
             self.is_generation_colocated,
             _runtime_sampling_params,
             _runtime_is_reward_model,
+            _runtime_model_load_dtype,
         ) = runtime_config
 
     def _autocast_context(self) -> AbstractContextManager[Any]:

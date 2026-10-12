@@ -94,3 +94,8 @@ research/template_project/tests/test_suites/llm/single_update_1n8g.sh
 
 # Full Flow-GRPO recipe requires an externally served GenRM OCR judge.
 research/flow_grpo/tests/test_suites/flow_grpo_qwen_image_ocr.sh
+
+# CSD qualification requires prepared tokenizer tables; router replay also requires recorded routes.
+tests/test_suites/llm/csd-qwen3-4b-to-llama3.2-1b-1n8g-dtensor-tp4cp2.sh
+tests/test_suites/llm/csd-multiteacher-qwen3-4b-llama3.2-3b-to-llama3.2-1b-1n8g-dtensor-tp4cp2.sh
+tests/test_suites/llm/csd-qwen3-4b-to-moonlight-16ba3b-1n8g-megatron-router-replay.sh

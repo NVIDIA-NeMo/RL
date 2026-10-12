@@ -66,6 +66,14 @@ class DatumSpec(TypedDict):
     extra_env_info: Optional[dict[str, Any]]
     loss_multiplier: float  # multiplier for the loss for this datum. 0 to mask out (say the sample is invalid)
     idx: int
+    # Durable identity of the source row.  Unlike ``idx`` this is assigned
+    # before filtering/splitting and survives validation padding.
+    sample_id: NotRequired[str | int]
+    # Unique identity of one occurrence in a controller-owned global batch.
+    # CSD assigns this after validation padding and before lockstep packing.
+    batch_item_id: NotRequired[int]
+    # Canonical row-level tool schema used by tool-aware chat templates.
+    tools: NotRequired[list[dict[str, Any]]]
     task_name: NotRequired[str]
     # One binary value per message; assistant turns only.
     message_loss_mask: NotRequired[list[int]]
