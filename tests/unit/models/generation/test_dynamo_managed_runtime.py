@@ -203,6 +203,14 @@ def test_runtime_builds_stable_disaggregated_roles_and_rejects_wrong_gpu_count()
         ManagedDynamoRuntime(cluster=_Cluster(), config=config)
 
 
+def test_runtime_sizes_aggregated_fleet_from_cluster_world_size() -> None:
+    # Four cluster GPUs at TP=2 yield two aggregated engines, and the frontend
+    # must see both register under the "backend" component.
+    runtime = ManagedDynamoRuntime(cluster=_Cluster(), config=_config(tp=2))
+    assert runtime._worker_roles == ["aggregated", "aggregated"]
+    assert runtime._expected_components == {"backend": 2}
+
+
 def test_managed_service_and_frontend_environments_are_runtime_owned(
     monkeypatch,
 ) -> None:
