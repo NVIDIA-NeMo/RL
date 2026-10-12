@@ -14,10 +14,10 @@
 
 import pytest
 
-from nemo_rl.models.generation.vllm.vllm_worker import (
-    BaseVllmGenerationWorker,
-    _draft_module_sharing_disable_required,
+from nemo_rl.models.generation.vllm.draft_utils import (
+    draft_module_sharing_disable_required,
 )
+from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 
 @pytest.mark.parametrize(
@@ -101,9 +101,9 @@ def test_draft_module_sharing_disable_required(
     config = _draft_config(
         method, load_format=load_format, draft_full_refit=draft_full_refit
     )
-    assert _draft_module_sharing_disable_required(config) == expected
+    assert draft_module_sharing_disable_required(config) == expected
 
 
 def test_draft_module_sharing_disable_required_no_speculative_config():
     config = {"vllm_cfg": {"load_format": "dummy"}, "vllm_kwargs": {}}
-    assert _draft_module_sharing_disable_required(config) is False
+    assert draft_module_sharing_disable_required(config) is False
