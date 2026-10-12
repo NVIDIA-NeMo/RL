@@ -14,6 +14,7 @@
 
 """vLLM endpoint plugin for NeMo RL multi-turn prefix-token preservation."""
 
+import asyncio
 from argparse import Namespace
 from http import HTTPStatus
 from importlib.metadata import version
@@ -36,6 +37,7 @@ from vllm.entrypoints.serve.utils.api_utils import (
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.exceptions import VLLMValidationError
 
+from .capture_runtime import CaptureRuntime
 from .renderer_patch import install_renderer_patch
 from .route_override import (
     CHAT_COMPLETIONS_PATH,
@@ -43,7 +45,7 @@ from .route_override import (
 )
 
 PLUGIN_NAME = "nemo_rl_prefix_api"
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.2.0"
 SUPPORTED_VLLM_VERSION = "0.29.0"
 CAPABILITY_PATH = "/v1/nemo-rl/prefix-token-capability"
 
@@ -52,6 +54,7 @@ class NeMoRLChatCompletionRequest(ChatCompletionRequest):
     """Stock vLLM request plus the exact token prefix required by NeMo Gym."""
 
     required_prefix_token_ids: list[int] | None = None
+    ng_capture: dict[str, Any] | None = None
 
 
 class NeMoRLPrefixEndpointPlugin:
@@ -59,6 +62,9 @@ class NeMoRLPrefixEndpointPlugin:
 
     name = PLUGIN_NAME
     required_tasks = ("generate",)
+
+    def __init__(self) -> None:
+        self._capture_runtime = CaptureRuntime()
 
     def attach_router(self, app: FastAPI) -> None:
         replaced_route_count = remove_existing_chat_completion_routes(app)
@@ -68,7 +74,25 @@ class NeMoRLPrefixEndpointPlugin:
         async def prefix_token_capability(raw_request: Request) -> dict[str, Any]:
             return {
                 **raw_request.app.state.nemo_rl_prefix_token_capability,
+                **self._capture_runtime.capability(),
             }
+
+        @router.post("/v1/nemo-rl/token-capture/configure")
+        async def configure_token_capture(
+            body: dict[str, Any],
+        ) -> dict[str, Any]:
+            bridge_url = body.get("bridge_url")
+            auth_token = body.get("auth_token")
+            if not isinstance(bridge_url, str) or not isinstance(auth_token, str):
+                return JSONResponse(
+                    content={"error": "bridge_url and auth_token must be strings"},
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            self._capture_runtime.configure(
+                bridge_url=bridge_url,
+                auth_token=auth_token,
+            )
+            return {"status": "ok", "token_capture_configured": True}
 
         @router.post(
             CHAT_COMPLETIONS_PATH,
@@ -93,14 +117,24 @@ class NeMoRLPrefixEndpointPlugin:
                     "The model does not support Chat Completions API"
                 )
 
-            generator = await handler.create_chat_completion(request, raw_request)
+            try:
+                generator = await handler.create_chat_completion(request, raw_request)
+            except BaseException:
+                self._capture_runtime.discard(request)
+                raise
             if isinstance(generator, ErrorResponse):
+                self._capture_runtime.discard(request)
                 return JSONResponse(
                     content=generator.model_dump(),
                     status_code=generator.error.code,
                 )
             if isinstance(generator, ChatCompletionResponse):
                 content = generator.model_dump()
+                content = await asyncio.to_thread(
+                    self._capture_runtime.finish,
+                    request,
+                    content,
+                )
                 metrics_header_format = raw_request.headers.get(
                     "endpoint-load-metrics-format", ""
                 )
@@ -109,6 +143,7 @@ class NeMoRLPrefixEndpointPlugin:
                     headers=metrics_header(metrics_header_format),
                 )
 
+            self._capture_runtime.discard(request)
             args = getattr(raw_request.app.state, "args", None)
             keep_alive_interval = getattr(args, "sse_keep_alive_interval", 0)
             return StreamingResponse(
@@ -144,6 +179,7 @@ class NeMoRLPrefixEndpointPlugin:
         install_renderer_patch(
             serving_chat.online_renderer,
             VLLMValidationError,
+            self._capture_runtime,
         )
         state.nemo_rl_prefix_token_capability = {
             "active": True,
@@ -151,6 +187,8 @@ class NeMoRLPrefixEndpointPlugin:
             "plugin_version": PLUGIN_VERSION,
             "vllm_version": installed_vllm_version,
             "required_prefix_token_ids": True,
+            "ng_capture": True,
+            "external_staging": True,
             "return_token_ids": True,
             "stock_chat_routes_replaced": getattr(
                 state, "nemo_rl_prefix_stock_chat_routes_replaced", 0

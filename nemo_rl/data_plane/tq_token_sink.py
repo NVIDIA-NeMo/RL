@@ -62,6 +62,10 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXTRAS_METADATA_FIELD,
     ROUTED_LEN_FIELD,
 )
+from nemo_rl.data_plane.token_staging_wire import (
+    StagedTokenRecord,
+    StagingWriteResult,
+)
 from nemo_rl.experience.route_assembly import RouteFragment
 
 # These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
@@ -158,9 +162,24 @@ class TQTokenSink:
         self._staging_partition = staging_partition
 
     def stage(self, record: StagedCallRecord) -> StageResult:
+        """Stage a Gym record and return Gym's protocol result type."""
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
 
+        result = self._stage_record(record)
+        return StageResult(
+            ok=result.ok,
+            staging_key=result.staging_key,
+            error=result.error,
+        )
+
+    def stage_wire(self, record: StagedTokenRecord) -> StagingWriteResult:
+        """Stage a dependency-neutral record from an external serving bridge."""
+        return self._stage_record(record)
+
+    def _stage_record(
+        self, record: StagedCallRecord | StagedTokenRecord
+    ) -> StagingWriteResult:
         key = record.staging_key
         try:
             field_dict = {
@@ -299,10 +318,10 @@ class TQTokenSink:
                 type(error).__name__,
                 error,
             )
-            return StageResult(
+            return StagingWriteResult(
                 ok=False, staging_key=key, error=f"{type(error).__name__}: {error}"
             )
-        return StageResult(ok=True, staging_key=key)
+        return StagingWriteResult(ok=True, staging_key=key)
 
     def clear(self, staging_keys: list[str]) -> None:
         """Drop staged rows (finalizer / eviction cleanup)."""
