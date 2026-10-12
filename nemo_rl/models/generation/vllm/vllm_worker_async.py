@@ -205,8 +205,9 @@ def _parse_orjson_request(request_body: bytes, request_type):
 
 
 def _orjson_response(content, status_code: int = 200) -> Response:
+    # Like json.dumps, accept int dict keys such as vLLM's prompt_logprobs.
     return Response(
-        content=orjson.dumps(content),
+        content=orjson.dumps(content, option=orjson.OPT_NON_STR_KEYS),
         status_code=status_code,
         media_type="application/json",
     )

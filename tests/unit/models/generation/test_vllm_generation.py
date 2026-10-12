@@ -973,6 +973,15 @@ def test_vllm_orjson_request_and_response_preserve_fields():
     assert orjson.loads(response.body) == orjson.loads(body)
 
 
+def test_vllm_orjson_response_matches_json_for_int_keys():
+    # ChatCompletionResponse.prompt_logprobs is list[dict[int, Logprob] | None].
+    content = {"prompt_logprobs": [None, {7: {"logprob": -0.5, "rank": 1}}]}
+
+    response = _orjson_response(content)
+
+    assert json.loads(response.body) == json.loads(json.dumps(content))
+
+
 def test_vllm_orjson_request_rejects_invalid_json_and_schema():
     with pytest.raises(orjson.JSONDecodeError):
         _parse_orjson_request(b"{", _OrjsonRequest)
