@@ -90,6 +90,19 @@ results_dir="${RESULTS_DIR:-${code_dir}/results/${base_name}}"
 checkpoint_root="${CHECKPOINT_ROOT:-${results_dir}}"
 checkpoint_dir="${CHECKPOINT_DIR:-${checkpoint_root}/checkpoints}"
 token_capture_dir="${TOKEN_CAPTURE_DIR:-${results_dir}/token_capture}"
+# TorchInductor's generated Python records absolute cubin paths. A submit-shell
+# TMPDIR on shared Lustre therefore lets ranks on different nodes race through
+# one cache and can leave a graph pointing at a missing cubin. Keep compiler
+# caches run-scoped and node-local. The uv standalone-Python bin directory also
+# supplies python3-config, which the static Triton launcher invokes via make.
+job_local_cache_id=$(printf '%s' "${base_name}" | sha256sum | cut -c1-16)
+job_local_cache_root="${JOB_LOCAL_CACHE_ROOT:-/tmp/nemo_rl_${cache_user}_${job_local_cache_id}}"
+export TMPDIR="${JOB_TMPDIR:-/tmp}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR_OVERRIDE:-${job_local_cache_root}/torchinductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR_OVERRIDE:-${job_local_cache_root}/triton}"
+export CUDA_CACHE_PATH="${CUDA_CACHE_PATH_OVERRIDE:-${job_local_cache_root}/cuda}"
+python_toolchain_bin="${PYTHON_TOOLCHAIN_BIN:-/opt/uv/python/cpython-3.13.14-linux-x86_64-gnu/bin}"
+export PATH="${python_toolchain_bin}:${PATH}"
 # Harbor episodes (trial artifacts, runner logs, recorded model calls) per run.
 export AGENTIC_VBENCH_OUTPUT_ROOT="${AGENTIC_VBENCH_OUTPUT_ROOT:-${results_dir}/episodes}"
 slurm_log_dir="${results_dir}/slurm"
@@ -214,12 +227,15 @@ export HF_MODULES_CACHE="${persistent_cache}/huggingface/modules/${base_name}"
 read -r -d '' SETUP_COMMAND <<'SETUP_EOF' || true
 set -euo pipefail
 cd /opt/nemo-rl
+export PATH=/opt/uv/python/cpython-3.13.14-linux-x86_64-gnu/bin:${PATH}
 export UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 export UV_LINK_MODE=copy
 export NRL_CONTAINER=1
 export RAY_USAGE_STATS_ENABLED=0
 # The driver venv has no nemo_gym extra; the driver imports Gym's config helpers from the source tree.
 export PYTHONPATH=/opt/nemo-rl:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:${PYTHONPATH:-}
+mkdir -p "${TMPDIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${CUDA_CACHE_PATH}"
+command -v python3-config >/dev/null
 uv_bin=$(command -v uv || echo /usr/local/bin/uv)
 test -x "${uv_bin}"
 bash "${TRAINING_DEPS_SETUP_SCRIPT:-/opt/nemo-rl/tools/ensure_agentic_vbench_deps.sh}"
@@ -347,8 +363,9 @@ echo "validation=${VAL_PATH}"
 echo "results=${results_dir}"
 echo "checkpoints=${checkpoint_dir}"
 echo "token_capture=${token_capture_dir}"
+echo "job_local_cache_root=${job_local_cache_root}"
 # Record the AgenticVBench environment the Gym agent will read, for reproducibility.
-env | grep -E '^(AGENTIC_VBENCH_|AVB_DATA_ROOT|TRAIN_PATH|VAL_PATH|MODEL_PATH|CONTEXT_COMPACTION|NRL_MEGATRON_|WANDB_MODE)' | grep -v -i 'key\|token\|secret' | sort > "${results_dir}/avb_environment.env"
+env | grep -E '^(AGENTIC_VBENCH_|AVB_DATA_ROOT|TRAIN_PATH|VAL_PATH|MODEL_PATH|CONTEXT_COMPACTION|NRL_MEGATRON_|WANDB_MODE|TMPDIR|TORCHINDUCTOR_CACHE_DIR|TRITON_CACHE_DIR|CUDA_CACHE_PATH)' | grep -v -i 'key\|token\|secret' | sort > "${results_dir}/avb_environment.env"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   printf '%s\n' "${COMMAND}" > "${results_dir}/training_command.sh"
