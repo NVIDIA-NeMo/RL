@@ -225,8 +225,14 @@ unset PYTHONPATH
 cd "$RL_REPO"
 uv run --no-project --python "$GENERATION_PYTHON" \
   examples/run_vlm_grpo.py \
-  --config examples/configs/recipes/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml
+  --config examples/configs/recipes/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml \
+  ++policy.dtensor_cfg.moe_parallelizer.ignore_router_for_ac=true
 ```
+
+The explicit override caches the MoE router projection during activation
+checkpointing. Recomputing the projection can change expert routing and cause a
+tensor-shape mismatch during backward. Automodel defaults vary by revision;
+retain this override when resuming.
 
 The image actor environments are reused intentionally; the environment setup
 pins their packages independently of the source-checkout fingerprint. A generic
