@@ -51,7 +51,9 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 if [[ $(jq 'to_entries | .[] | select(.key == "train/token_mult_prob_error") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'median(data["train/token_mult_prob_error"]) < 1.1'
+        'median(data["train/token_mult_prob_error"]) < 1.1' \
+        'min(data["train/mopd/valid_tokens"]) > 0' \
+        'mean(data["train/mopd/samples_with_valid_alignment"]) / mean(data["train/mopd/samples"]) > 0.5'
 
     rm -rf "$CKPT_DIR"
 fi
