@@ -316,28 +316,31 @@ def _typed_gym_failure(failure_row: dict) -> GymTransportError | RolloutDataFail
     happens here, on the actor side, with the same ``http_status_is_infra``
     rule the driver applies.
 
-    A 5xx or a retriable 4xx (408, 429) means the endpoint is unwell and becomes
-    ``GymTransportError``, as does a row without a status (a connection failure or a
-    timeout before any reply). Only a non-retriable 4xx describes the request itself
-    and becomes ``RolloutDataFailure``: a failure row carrying a status below 400
-    means the reply broke after its status line (the body read or parse failed, as
-    when a relayed multi-megabyte response is cut mid-body), which is the transport's
-    trouble, so that row is re-dispatched instead of ending the step. Both take a
-    single str, so they pickle cleanly across the actor boundary and
-    ``classify_rollout_failure``'s explicit-class fast path wins on the far side. The
-    recorded response body (already capped by Gym) rides in the detail, so a 4xx
+    A status that rule blames on the endpoint (5xx, a retriable 4xx, or a status
+    below 400 on a request that still failed, which means the reply broke after its
+    status line) becomes ``GymTransportError``, as does a row without a status (a
+    connection failure or a timeout before any reply); such a row is re-dispatched
+    instead of ending the step. Only a non-retriable 4xx describes the request itself
+    and becomes ``RolloutDataFailure``. Both take a single str, so they pickle cleanly
+    across the actor boundary and ``classify_rollout_failure``'s explicit-class fast
+    path wins on the far side. The detail names the failure type, because the type
+    (a payload or JSON decode error) is the diagnosis when the status says success,
+    and carries the recorded response body (already capped by Gym), so a 4xx
     explains what the server rejected.
     """
     status = failure_row.get(GYM_FAILURE_STATUS_KEY)
+    failure_type = failure_row.get(GYM_FAILURE_TYPE_KEY)
     message = failure_row.get(GYM_FAILURE_MESSAGE_KEY)
     body = failure_row.get(GYM_FAILURE_BODY_KEY)
     body_suffix = f" (response body: {body})" if body else ""
     if isinstance(status, int):
-        detail = f"NeMo-Gym /run failed with HTTP {status}: {message}{body_suffix}"
-        if 400 <= status < 500 and not http_status_is_infra(status):
+        detail = (
+            f"NeMo-Gym /run failed with HTTP {status} ({failure_type}): "
+            f"{message}{body_suffix}"
+        )
+        if not http_status_is_infra(status):
             return RolloutDataFailure(detail)
         return GymTransportError(detail)
-    failure_type = failure_row.get(GYM_FAILURE_TYPE_KEY)
     return GymTransportError(
         f"NeMo-Gym /run failed without an HTTP status ({failure_type}): "
         f"{message}{body_suffix}"

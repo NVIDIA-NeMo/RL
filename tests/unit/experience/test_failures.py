@@ -271,6 +271,7 @@ class TestTheRayActorBoundary:
             (429, FailureClass.INFRA),
             (400, FailureClass.DATA),  # context-length overflow and friends
             (404, FailureClass.DATA),
+            (200, FailureClass.INFRA),  # the reply broke after its status line
         ],
     )
     def test_what_nemo_gym_reports_survives_the_boundary_and_still_classifies(
@@ -293,18 +294,22 @@ class TestTheRayActorBoundary:
     def test_a_failure_row_with_a_success_status_is_a_transport_failure(self):
         """A failure row carrying a status below 400 means the reply broke after
         its status line: the body was cut mid-transfer and the read or parse
-        failed, so the row re-dispatches instead of ending the step."""
+        failed, so the row re-dispatches instead of ending the step. Gym's
+        collector records the body error's type beside the reply's status."""
         typed = _typed_gym_failure(
-            self._failure_row(200, self._realistic_response_error(200))
+            self._failure_row(
+                200, aiohttp.ClientPayloadError("Response payload is not completed")
+            )
         )
         assert isinstance(typed, GymTransportError)
         restored = ray_cloudpickle.loads(ray_cloudpickle.dumps(typed))
         assert classify_rollout_failure(restored) is FailureClass.INFRA
-        assert "200" in str(restored)
+        assert "HTTP 200 (ClientPayloadError)" in str(restored)
 
     def test_both_sides_of_the_boundary_share_one_status_policy(self):
-        """nemo_gym classifies at source, failures.py on the driver -- one rule, not two."""
-        for status in (400, 404, 408, 429, 500, 503):
+        """nemo_gym classifies at source, failures.py on the driver -- one rule, not two,
+        below 400 included."""
+        for status in (0, 200, 302, 400, 404, 408, 429, 500, 503):
             at_source = isinstance(
                 _typed_gym_failure(
                     self._failure_row(status, self._realistic_response_error(status))
