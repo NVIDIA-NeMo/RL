@@ -16,6 +16,7 @@ import asyncio
 import json
 
 import pytest
+from fastapi.testclient import TestClient
 from transformers import AutoTokenizer
 
 from nemo_rl.models.generation.dynamo.token_wrapper import (
@@ -650,3 +651,110 @@ def test_forward_chat_completion_reuses_loop_bound_session() -> None:
     assert "X-Dynamo-Session-ID" not in session.calls[0][2]
     assert session.calls[1][2]["Authorization"] == "Bearer token"
     assert session.calls[1][2]["X-Dynamo-Session-ID"] == "trajectory-session"
+
+
+class _FakeDynamoResponse:
+    status = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def text(self):
+        return json.dumps(
+            {
+                "choices": [{"message": {"role": "assistant", "content": "answer"}}],
+                "nvext": {
+                    "engine_data": {
+                        "prompt_token_ids": [10, 99],
+                        "completion_token_ids": [5],
+                        "completion_logprobs": [-0.5],
+                    }
+                },
+            }
+        )
+
+
+class _FakeDynamoSession:
+    def __init__(self):
+        self.calls = []
+
+    def post(self, url, *, json, headers):
+        self.calls.append((url, json, headers))
+        return _FakeDynamoResponse()
+
+
+def _wrapper_client() -> tuple[TestClient, _FakeDynamoSession]:
+    server = DynamoTokenWrapperServer(
+        dynamo_frontend_base_url="http://dynamo/v1",
+        tokenizer=_Tokenizer(),
+        tokenizer_chat_template_kwargs=None,
+        exclude_tools_when_tool_choice_none=True,
+        request_timeout_s=30,
+    )
+    session = _FakeDynamoSession()
+    server._client_session = session
+    # Not used as a context manager, so the lifespan does not replace the fake
+    # session with a real aiohttp session.
+    return TestClient(server._build_app()), session
+
+
+@pytest.mark.parametrize(
+    ("conversation_params", "expected_session_id"),
+    [
+        ({"conversation_id": "gym-session"}, "gym-session"),
+        ({}, None),
+        (None, None),
+    ],
+)
+def test_chat_completion_forwards_gym_conversation_id_as_session_header(
+    conversation_params, expected_session_id
+) -> None:
+    client, session = _wrapper_client()
+    body = {
+        "model": "dummy-model",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    if conversation_params is not None:
+        body["conversation_params"] = conversation_params
+
+    response = client.post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["generation_token_ids"] == [5]
+    assert len(session.calls) == 1
+    url, forwarded_body, headers = session.calls[0]
+    assert url == "http://dynamo/v1/chat/completions"
+    assert "conversation_params" not in forwarded_body
+    assert forwarded_body["nvext"]["token_data"] == [10, 99]
+    assert headers.get("X-Dynamo-Session-ID") == expected_session_id
+
+
+@pytest.mark.parametrize(
+    ("conversation_params", "expected_message"),
+    [
+        ("gym-session", "conversation_params must be a JSON object"),
+        ({"conversation_id": 7}, "conversation_id must be a non-empty string"),
+        ({"conversation_id": ""}, "conversation_id must be a non-empty string"),
+        ({"conversation_id": "  "}, "conversation_id must be a non-empty string"),
+    ],
+)
+def test_chat_completion_rejects_malformed_conversation_params(
+    conversation_params, expected_message
+) -> None:
+    client, session = _wrapper_client()
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "dummy-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "conversation_params": conversation_params,
+        },
+    )
+
+    assert response.status_code == 400
+    assert expected_message in response.json()["detail"]
+    assert session.calls == []

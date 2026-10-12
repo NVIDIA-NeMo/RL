@@ -66,7 +66,6 @@ from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
     attach_static_multimodal_payload,
 )
-from nemo_rl.models.generation.dynamo.token_wrapper import DYNAMO_SESSION_ID_HEADER
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.telemetry.instrumentation import TRACE_CARRIER_KWARG
 
@@ -1130,7 +1129,7 @@ def test_validate_reward_components_match_scalar():
         )
 
 
-def test_setup_nemo_gym_config_merges_session_header_for_dynamo() -> None:
+def test_setup_nemo_gym_config_forwards_session_id_for_dynamo() -> None:
     config = SimpleNamespace(
         policy={"generation": {"backend": "dynamo", "vllm_cfg": {}}},
         env={
@@ -1152,13 +1151,13 @@ def test_setup_nemo_gym_config_merges_session_header_for_dynamo() -> None:
     responses_api_models = nemo_gym["policy_model"]["responses_api_models"]
     assert responses_api_models["vllm_model"] == {
         "model_name": "keep-me",
-        "session_id_header": DYNAMO_SESSION_ID_HEADER,
+        "forward_session_id_as_conversation_id": True,
     }
     assert responses_api_models["other_model"] == {"model_name": "untouched"}
     assert nemo_gym["num_gpu_nodes"] == 2
 
 
-def test_setup_nemo_gym_config_does_not_set_session_header_for_vllm() -> None:
+def test_setup_nemo_gym_config_does_not_forward_session_id_for_vllm() -> None:
     config = SimpleNamespace(
         policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
         env={},
