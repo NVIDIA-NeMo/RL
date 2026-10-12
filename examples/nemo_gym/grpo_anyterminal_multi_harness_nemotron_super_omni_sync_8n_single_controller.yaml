@@ -1,0 +1,33 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Synchronous 8-node companion to the 16-node async AnyTerminal Super Omni
+# recipe. Four nodes host Megatron training and four host vLLM generation.
+# SingleController admits exactly one prompt batch at a time and refits before
+# admitting the next batch, so every rollout is generated from current weights.
+defaults: ./grpo_anyterminal_multi_harness_nemotron_super_omni_single_controller.yaml
+
+cluster:
+  num_nodes: 8
+
+policy:
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 4
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0
+  recompute_kv_cache_after_weight_updates: true
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+
+logger:
+  log_dir: logs/grpo-anyterminal-multi-harness-super-omni-sync-8n
+  wandb:
+    name: anyterminal-multi-harness-super-omni-sync-8n

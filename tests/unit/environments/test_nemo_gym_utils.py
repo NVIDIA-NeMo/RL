@@ -74,6 +74,31 @@ def test_setup_nemo_gym_config_rejects_unsupported_backend() -> None:
         setup_nemo_gym_config(config, tokenizer=None)
 
 
+def test_setup_nemo_gym_config_injects_fan_out_into_gym_datasets() -> None:
+    fan_out = {"shared": ["opencode", "hermes"]}
+    config = SimpleNamespace(
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {},
+                "stop_strings": None,
+                "stop_token_ids": None,
+            }
+        },
+        env={"nemo_gym": {"fan_out": fan_out}},
+        data={
+            "train": {"dataset_name": "NemoGymDataset", "data_path": "train.jsonl"},
+            "validation": {"dataset_name": "NemoGymDataset", "data_path": "val.jsonl"},
+            "default": {},
+        },
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert config.data["train"]["fan_out"] == fan_out
+    assert config.data["validation"]["fan_out"] == fan_out
+
+
 @pytest.mark.parametrize(
     ("output_item_dict", "expected_invalid_tool_call", "expected_malformed_thinking"),
     [
@@ -752,6 +777,85 @@ def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(detected_uv_dir
     )
 
 
+def test_unsharded_actor_forwards_agent_pool_to_gym(detected_uv_dirs):
+    cluster = _FakeGymCluster()
+    agent_pool = {"reasoning": ["opencode", "codex"]}
+
+    with _patched_cluster(cluster):
+        shard_set = nemo_gym_mod.build_nemo_gym_actors(
+            _env_configs(agent_pool=agent_pool),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
+
+    assert shard_set.agent_pool == {}
+    assert (
+        cluster.actor_configs[0]["initial_global_config_dict"]["agent_pool"]
+        == agent_pool
+    )
+
+
+def test_unsharded_actor_consumes_fan_out_before_gym_dispatch(detected_uv_dirs):
+    cluster = _FakeGymCluster(
+        entries_by_index={
+            0: {
+                "opencode": ["responses_api_agents"],
+                "codex": ["responses_api_agents"],
+            }
+        }
+    )
+    fan_out = {"reasoning": ["opencode", "codex"]}
+
+    with _patched_cluster(cluster):
+        shard_set = nemo_gym_mod.build_nemo_gym_actors(
+            _env_configs(fan_out=fan_out),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
+
+    assert shard_set.fan_out == fan_out
+    assert "fan_out" not in cluster.actor_configs[0]["initial_global_config_dict"]
+
+
+def test_sharded_actors_consume_agent_pool_before_gym_dispatch(detected_uv_dirs):
+    agent_pool = {"reasoning": ["opencode", "codex"]}
+    cluster = _FakeGymCluster(
+        entries_by_index={
+            0: {
+                "reasoning": ["resources_servers"],
+                "opencode": ["responses_api_agents"],
+            },
+            1: {
+                "reasoning": ["resources_servers"],
+                "codex": ["responses_api_agents"],
+            },
+        }
+    )
+
+    with _patched_cluster(cluster):
+        shard_set = nemo_gym_mod.build_nemo_gym_actors(
+            _shard_env_configs(agent_pool=agent_pool),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
+
+    assert shard_set.agent_pool == agent_pool
+    assert shard_set.route_to_shard == {"opencode": "judged", "codex": "tools"}
+    assert all(
+        "agent_pool" not in config["initial_global_config_dict"]
+        for config in cluster.actor_configs
+    )
+
+
 def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(
     detected_uv_dirs,
 ):
@@ -1168,6 +1272,23 @@ def test_task_source_is_validated_before_gym_resolves_agent_ref():
             "extra_env_info": json.dumps(
                 {
                     "task_source": "workplace_assistant",
+                    "responses_create_params": {"input": []},
+                }
+            )
+        }
+    ]
+
+    nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
+
+
+def test_agent_pool_source_is_covered_by_its_validated_targets():
+    shard_set = _sharded_set({"opencode": "left", "codex": "right"})
+    shard_set.agent_pool = {"reasoning": ["opencode", "codex"]}
+    dataset = [
+        {
+            "extra_env_info": json.dumps(
+                {
+                    "task_source": "reasoning",
                     "responses_create_params": {"input": []},
                 }
             )

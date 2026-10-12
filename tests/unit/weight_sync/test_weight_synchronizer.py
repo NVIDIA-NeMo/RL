@@ -14,6 +14,7 @@
 
 """Unit tests for the WeightSynchronizer abstraction and its implementations."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -21,6 +22,7 @@ import pytest
 from nemo_rl.models.generation.constants import (
     DYNAMO_BACKEND,
     MEGATRON_BACKEND,
+    REMOTE_VLLM_BACKEND,
     SGLANG_BACKEND,
     VLLM_BACKEND,
 )
@@ -39,6 +41,9 @@ from nemo_rl.weight_sync.megatron_weight_synchronizer import (
 from nemo_rl.weight_sync.nccl_reshard_utils import build_nccl_reshard_refit_info
 from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
     NcclReshardWeightSynchronizer,
+)
+from nemo_rl.weight_sync.remote_vllm_checkpoint_weight_synchronizer import (
+    RemoteVllmCheckpointWeightSynchronizer,
 )
 from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
@@ -1125,6 +1130,23 @@ class TestFactory:
             inference_cluster=_mock_cluster(),
         )
         assert isinstance(sync, CollectiveWeightSynchronizer)
+
+    def test_non_colocated_remote_vllm_returns_checkpoint_synchronizer(self):
+        policy = _mock_policy()
+        policy.cfg = {"megatron_cfg": {"enabled": True}}
+        generation = _mock_generation()
+        generation.remote_config = SimpleNamespace(
+            refit=SimpleNamespace(checkpoint_dir="/shared/hf-exports")
+        )
+
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=generation,
+            generation_backend=REMOTE_VLLM_BACKEND,
+            colocated=False,
+        )
+
+        assert isinstance(sync, RemoteVllmCheckpointWeightSynchronizer)
 
     def test_colocated_megatron_returns_megatron_synchronizer(self):
         sync = create_weight_synchronizer(

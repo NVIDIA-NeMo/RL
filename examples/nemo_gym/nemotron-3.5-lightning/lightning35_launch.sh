@@ -76,7 +76,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/../../..")"
 
-CONFIG_PATH="examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml"
+CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml}"
+TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py}"
 NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-32}"
 NUM_GEN_NODES="${NUM_GEN_NODES:-32}"
 NUM_GYM_NODES="${NUM_GYM_NODES:-2}"
@@ -118,6 +119,9 @@ GENRM_STARTUP_TIMEOUT="${GENRM_STARTUP_TIMEOUT:-3600}"
 GENRM_CONTAINER="${GENRM_CONTAINER:-${CONTAINER:-}}"
 GENRM_VLLM_PYTHON="${GENRM_VLLM_PYTHON:-/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python}"
 GENRM_REASONING_PARSER_NAME="${GENRM_REASONING_PARSER_NAME:-nemotron_v3}"
+GENRM_REASONING_PARSER="${GENRM_REASONING_PARSER:-}"
+GENRM_FLASHINFER_ALLREDUCE_BACKEND="${GENRM_FLASHINFER_ALLREDUCE_BACKEND:-trtllm}"
+GENRM_NCCL_MNNVL_ENABLE="${GENRM_NCCL_MNNVL_ENABLE:-}"
 GENRM_TOOL_CALL_PARSER="${GENRM_TOOL_CALL_PARSER:-qwen3_coder}"
 GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-1}"
 GENRM_COMPILATION_CONFIG="${GENRM_COMPILATION_CONFIG:-{\"pass_config\":{\"fuse_allreduce_rms\":false}}}"
@@ -143,6 +147,8 @@ source "${PROJECT_ROOT}/tools/external_gym_vllm/pool_config.sh"
 EXTERNAL_VLLM_POOLS=""
 EXTERNAL_VLLM_TOOLS_DIR_HOST="${EXTERNAL_VLLM_TOOLS_DIR_HOST:-${PROJECT_ROOT}/tools/external_gym_vllm}"
 EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
+genrm_pool_extra_args=()
+[[ -n "${GENRM_REASONING_PARSER}" ]] && genrm_pool_extra_args+=(--shared-path "${GENRM_REASONING_PARSER}")
 register_external_vllm_pool GENRM \
   --display-name GenRM \
   --model "${GENRM_MODEL}" \
@@ -154,11 +160,15 @@ register_external_vllm_pool GENRM \
   --vllm-port "${GENRM_VLLM_PORT}" \
   --lb-port "${GENRM_LB_PORT}" \
   --startup-timeout "${GENRM_STARTUP_TIMEOUT}" \
-  --url-placeholder "${GENRM_BASE_URL}"
-external_vllm_pool_env GENRM \
+  --url-placeholder "${GENRM_BASE_URL}" \
+  "${genrm_pool_extra_args[@]}"
+genrm_pool_env=(
   "FLASHINFER_WORKSPACE_BASE=/tmp" \
-  "VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm" \
+  "VLLM_FLASHINFER_ALLREDUCE_BACKEND=${GENRM_FLASHINFER_ALLREDUCE_BACKEND}" \
   "VLLM_ALLREDUCE_USE_SYMM_MEM=0"
+)
+[[ -n "${GENRM_NCCL_MNNVL_ENABLE}" ]] && genrm_pool_env+=("NCCL_MNNVL_ENABLE=${GENRM_NCCL_MNNVL_ENABLE}")
+external_vllm_pool_env GENRM "${genrm_pool_env[@]}"
 genrm_vllm_args=(
   --trust-remote-code
   --dtype bfloat16
@@ -172,6 +182,7 @@ genrm_vllm_args=(
   --compilation-config "${GENRM_COMPILATION_CONFIG}"
   --model-loader-extra-config "${GENRM_MODEL_LOADER_EXTRA_CONFIG}"
 )
+[[ -n "${GENRM_REASONING_PARSER}" ]] && genrm_vllm_args+=(--reasoning-parser-plugin "${GENRM_REASONING_PARSER}")
 [[ "${GENRM_ENABLE_EXPERT_PARALLEL}" == "1" ]] && genrm_vllm_args+=(--enable-expert-parallel)
 external_vllm_pool_args GENRM "${genrm_vllm_args[@]}"
 
@@ -788,7 +799,8 @@ NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=\${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
+${NEMO_GYM_VENV_DIR:+NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR} }\
+uv run ${TRAIN_ENTRYPOINT} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
@@ -870,7 +882,10 @@ echo ""
   echo "timestamp: $(date -Iseconds)"
   echo "branch: $(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
   echo "commit: $(git -C "${PROJECT_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
-  echo "dirty: $(git -C "${PROJECT_ROOT}" status --porcelain 2>/dev/null | head -20)"
+  # `head` can close the pipe early in a dirty development checkout.  Under
+  # `set -o pipefail` that SIGPIPE aborts the launcher before `sbatch`; `sed`
+  # keeps consuming the status stream while emitting the same bounded excerpt.
+  echo "dirty: $(git -C "${PROJECT_ROOT}" status --porcelain 2>/dev/null | sed -n '1,20p')"
   echo "snapshot: ${USE_SNAPSHOT}"
   if [[ "${USE_SNAPSHOT}" == "1" ]]; then
     echo "snapshot_dir: ${SNAPSHOT_DIR}"
@@ -942,6 +957,7 @@ SBATCH_OUTPUT=$(sbatch \
     ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
     ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+    "${SLURM_COMMENT_ARGS[@]}" \
     "${BATCH_SCRIPT}")
 
 echo "${SBATCH_OUTPUT}"

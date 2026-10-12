@@ -22,6 +22,7 @@ LB_SCRIPT="$(dirname "$0")/vllm_pool_lb.py"
 PORT="${1:?port required}"
 REGISTRY_DIR="${2:?registry directory required}"
 GROUP_ID="${3:?group ID required}"
+MODE="${4:-load-balance}"
 
 lb_pid=""
 shutdown() {
@@ -41,7 +42,8 @@ while true; do
   "${PYTHON}" "${LB_SCRIPT}" \
     --port "${PORT}" \
     --registry-dir "${REGISTRY_DIR}" \
-    --group-id "${GROUP_ID}" &
+    --group-id "${GROUP_ID}" \
+    --mode "${MODE}" &
   lb_pid=$!
   wait "${lb_pid}"
   status=$?

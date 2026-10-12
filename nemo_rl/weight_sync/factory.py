@@ -20,6 +20,7 @@ topology (colocated vs. non-colocated) and the generation backend:
 - Megatron -> Megatron reshard synchronizer
 - vLLM colocated -> IPC (ZMQ + CUDA IPC handles)
 - vLLM non-colocated -> NCCL collective
+- external vLLM -> Megatron-Bridge HF export + vLLM collective RPC reload
 - SGLang colocated -> Ray CUDA-IPC bucket transfer
 - SGLang non-colocated -> NCCL broadcast over SGLang's own weight-update group
 """
@@ -29,6 +30,7 @@ from typing import Any, Optional
 from nemo_rl.models.generation.constants import (
     DYNAMO_BACKEND,
     MEGATRON_BACKEND,
+    REMOTE_VLLM_BACKEND,
     SGLANG_BACKEND,
     VLLM_BACKEND,
 )
@@ -53,8 +55,8 @@ def create_weight_synchronizer(
     Args:
         policy: Policy object (ColocatablePolicyInterface).
         generation: Generation object (GenerationInterface).
-        generation_backend: Name of the generation backend ("vllm", "sglang",
-            "megatron", or "dynamo").
+        generation_backend: Name of the generation backend ("vllm",
+            "remote_vllm", "sglang", "megatron", or "dynamo").
         colocated: Whether policy and generation share the same GPUs.
         train_cluster: RayVirtualCluster for training workers. Required for
             non-colocated deployments except SGLang, which owns its own group.
@@ -77,6 +79,7 @@ def create_weight_synchronizer(
         SGLANG_BACKEND,
         MEGATRON_BACKEND,
         DYNAMO_BACKEND,
+        REMOTE_VLLM_BACKEND,
     }
     if generation_backend not in _SUPPORTED_BACKENDS:
         raise ValueError(
@@ -88,7 +91,7 @@ def create_weight_synchronizer(
     # checkpoint-engine normalization rejects that valid Megatron value.
     checkpoint_engine_config = (
         None
-        if generation_backend == MEGATRON_BACKEND
+        if generation_backend in (MEGATRON_BACKEND, REMOTE_VLLM_BACKEND)
         else checkpoint_engine_refit_config(generation.cfg)
     )
     if checkpoint_engine_config is not None:
@@ -116,6 +119,19 @@ def create_weight_synchronizer(
 
     if refit_buffer_size_gb is not None and refit_buffer_size_gb <= 0:
         raise ValueError("refit_buffer_size_gb must be > 0")
+
+    if generation_backend == REMOTE_VLLM_BACKEND:
+        if colocated:
+            raise ValueError("remote_vllm weight synchronization cannot be colocated")
+        if not policy.cfg.get("megatron_cfg", {}).get("enabled"):
+            raise NotImplementedError(
+                "remote_vllm checkpoint export currently requires a Megatron policy"
+            )
+        from nemo_rl.weight_sync.remote_vllm_checkpoint_weight_synchronizer import (
+            RemoteVllmCheckpointWeightSynchronizer,
+        )
+
+        return RemoteVllmCheckpointWeightSynchronizer(policy, generation)
 
     if generation_backend == MEGATRON_BACKEND:
         from nemo_rl.weight_sync.megatron_weight_synchronizer import (

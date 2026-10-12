@@ -22,6 +22,7 @@ import uuid
 import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -76,6 +77,25 @@ LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from nemo_gym.token_id_capture.staging.capture import ActiveCall
+
+
+def _resolve_vllm_plugin_path(plugin_path: str) -> str:
+    """Resolve repository-relative vLLM plugins independently of worker cwd."""
+    path = Path(plugin_path)
+    if path.is_absolute() or path.exists():
+        return str(path)
+
+    # ``vllm_worker_async.py`` is installed as
+    # ``<package-root>/nemo_rl/models/generation/vllm/vllm_worker_async.py``.
+    # Ray workers can inherit the cluster launcher's cwd rather than the driver
+    # cwd, so resolve NeMo RL's repository-relative config paths from the package
+    # root before handing them to vLLM.
+    package_relative = Path(__file__).resolve().parents[4] / path
+    if package_relative.exists():
+        return str(package_relative)
+
+    # Preserve vLLM's native error and diagnostics for a genuinely missing path.
+    return plugin_path
 
 
 @dataclass
@@ -930,14 +950,16 @@ class VllmAsyncGenerationWorkerImpl(
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
         if maybe_tool_parser_plugin:
-            ToolParserManager.import_tool_parser(maybe_tool_parser_plugin)
+            ToolParserManager.import_tool_parser(
+                _resolve_vllm_plugin_path(maybe_tool_parser_plugin)
+            )
 
         maybe_reasoning_parser_plugin = self.cfg["vllm_cfg"].get(
             "reasoning_parser_plugin"
         )
         if maybe_reasoning_parser_plugin:
             ReasoningParserManager.import_reasoning_parser(
-                maybe_reasoning_parser_plugin
+                _resolve_vllm_plugin_path(maybe_reasoning_parser_plugin)
             )
 
         engine_client = self._http_engine_client

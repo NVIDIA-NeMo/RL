@@ -1,0 +1,165 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Minimum synchronous Nano 3 Omni AnyTerminal topology: one node trains with
+# Megatron and one TP=8 vLLM node serves the four external harnesses. Each of
+# the four Terminal-Bench tasks is fanned out to OpenCode, OpenClaw, Pi, and
+# Hermes, with two GRPO siblings per task/harness prompt group.
+defaults: ../configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-circle-click-2n8g-megatron-tp2ep8.v1.yaml
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 2
+  # Treat the scheduler allocation as the run boundary; do not stop after the
+  # four-task validation dataset has been consumed once.
+  max_num_epochs: 1000000
+  max_num_steps: 1000000
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  async_grpo: null
+
+policy:
+  train_global_batch_size: 8
+  # Terminal agents carry much larger tool schemas than the one-turn VLM task
+  # in the base recipe. 8K leaves OpenCode no generation token after rendering
+  # its tools, so keep enough room for both the harness prompt and reasoning.
+  max_total_sequence_length: 16384
+  generation:
+    max_new_tokens: 8192
+    # Interactive validation should reach rollouts quickly. Production recipes
+    # can retain vLLM's one-time FlashInfer autotuning for peak throughput.
+    vllm_kwargs:
+      kernel_config:
+        enable_flashinfer_autotune: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  _override_: true
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    dataset_name: NemoGymDataset
+    data_path: /path/to/anyterminal_multi_harness/train.jsonl
+  validation: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    is_trajectory_collection: false
+    skip_venv_if_present: true
+    # First-run portable harness setup can exceed 30 minutes on shared NFS.
+    # Let the scheduler allocation, rather than an internal startup timer,
+    # define the boundary for this interactive debugging recipe.
+    server_spinup_timeout_seconds: 0
+    model_endpoint_readiness_timeout_seconds: 0
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/anyterminal_agent/configs/anyterminal_multi_harness_enroot.yaml
+    fan_out:
+      anyterminal_multi_harness:
+        - anyterminal_opencode
+        - anyterminal_openclaw
+        - anyterminal_pi
+        - anyterminal_hermes
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          sampling_overrides:
+            temperature: ${policy.generation.temperature}
+            top_p: ${policy.generation.top_p}
+            top_k: -1
+          extra_body:
+            bad_words: ${policy.generation.bad_words}
+            chat_template_kwargs:
+              enable_thinking: true
+              truncate_history_thinking: false
+    anyterminal_opencode:
+      responses_api_agents:
+        anyterminal_agent:
+          global_agent_timeout: 900
+          agent_kwargs:
+            # OpenCode can compact with a prompt at its advertised context
+            # boundary. Keep that boundary below vLLM's hard model limit so
+            # the compaction call always has room for at least one token.
+            context_window: ${add:${policy.max_total_sequence_length},-512}
+            max_input_tokens: ${add:${policy.max_total_sequence_length},-8704}
+            max_output_tokens: 8192
+    anyterminal_openclaw:
+      responses_api_agents:
+        anyterminal_agent:
+          global_agent_timeout: 900
+          agent_kwargs:
+            # The Nano recipe keeps an 8K generation budget for other
+            # harnesses, but OpenClaw's fixed system prompt needs more input
+            # room. Use the same 4K OpenClaw output budget as Super.
+            context_window: ${add:${policy.max_total_sequence_length},-512}
+            max_output_tokens: 4096
+    anyterminal_pi:
+      responses_api_agents:
+        anyterminal_agent:
+          global_agent_timeout: 900
+    anyterminal_hermes:
+      responses_api_agents:
+        anyterminal_agent:
+          global_agent_timeout: 900
+          agent_kwargs:
+            context_window: ${add:${policy.max_total_sequence_length},-512}
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+
+token_capture:
+  enabled: true
+  staging_partition: rollout_staging
+  min_valid_fraction_per_group: 1.0
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0
+  # A slow or failed harness should not discard an otherwise trainable
+  # three-harness batch during multi-harness debugging.
+  rollout_failure:
+    min_step_batch_fraction: 0.75
+  recompute_kv_cache_after_weight_updates: true
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+
+checkpointing:
+  enabled: false
+
+logger:
+  log_dir: logs/grpo-anyterminal-multi-harness-nano-omni-sync-2n-debug
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    entity: adlr
+    project: multi-harness-RL
+    name: anyterminal-multi-harness-nano-omni-sync-2n-debug
+    log_nemo_gym_full_result_tables: true
