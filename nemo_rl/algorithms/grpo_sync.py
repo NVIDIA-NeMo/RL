@@ -269,8 +269,8 @@ def validate_sync(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """TQ-mediated counterpart to :func:`nemo_rl.algorithms.grpo.validate`.
 
-    Per-batch: register the val partition → ``rollout_to_tq`` →
-    ``policy.read_from_dataplane`` for message logs → ``policy.finish_step``.
+    Per-batch: register the val partition → ``rollout_to_tq`` (turn_roles /
+    turn_contents returned in ``driver_carry``) → ``policy.finish_step``.
     Caller owns ``policy_generation.prepare_for_generation`` /
     ``finish_generation`` around the call; the actor's per-rollout
     ``finish_generation`` is suppressed so inference state stays warm
@@ -422,9 +422,9 @@ def _log_data_plane_metrics_impl(
 
     The prefix names the scope because the two differ by a lot: the driver
     issues about one op of each kind per step while the bulk traffic is the
-    workers' per-DP-rank ``get_samples``. Note that even the cluster view
-    omits the rollout actor, which builds its own client and is not on the
-    worker group -- so ``kv_first_write`` is not in these totals.
+    workers' per-DP-rank ``get_samples``. The cluster view also includes the
+    rollout actor (registered via ``add_data_plane_snapshot_source``), so
+    ``kv_first_write`` is in these totals.
     """
     get_metrics = getattr(policy, "get_data_plane_step_metrics", None)
     if not callable(get_metrics):
@@ -573,6 +573,7 @@ def grpo_train_sync(
         master_config=master_config,
         dp_cfg=dp_cfg,
     )
+    policy.add_data_plane_snapshot_source(rollout_actor)
 
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
@@ -757,6 +758,7 @@ def grpo_train_sync(
                             partition_id=policy.tq_partition_id,
                             group_size=master_config.grpo.num_generations_per_prompt,
                             first_iter=(dynamic_sampling_num_gen_batches == 1),
+                            apply_length_penalty=True,
                         )
                     )
 
@@ -802,6 +804,17 @@ def grpo_train_sync(
                     )
                     driver_carry["baseline"] = baseline
                     driver_carry["std"] = std
+                    if "env_reward" in driver_carry:
+                        # grpo.length_penalty rewrote total_reward; keep a
+                        # baseline of the env reward for the pct_* diagnostics.
+                        driver_carry["env_baseline"], _, _ = (
+                            calculate_baseline_and_std_per_prompt(
+                                prompt_group_ids,
+                                driver_carry["env_reward"],
+                                torch.ones_like(driver_carry["env_reward"]),
+                                leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                            )
+                        )
                     tags = {
                         "std": driver_carry["std"].tolist(),
                         "baseline": driver_carry["baseline"].tolist(),
@@ -902,6 +915,11 @@ def grpo_train_sync(
                 if hasattr(policy_generation, "get_step_metrics"):
                     gen_step_metrics = policy_generation.get_step_metrics()
                 baseline_for_log = baseline.clone()
+                env_baseline_for_log = (
+                    driver_carry["env_baseline"].clone()
+                    if "env_baseline" in driver_carry
+                    else None
+                )
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 skip_prev_logprobs, skip_reference_logprobs = (
@@ -1028,8 +1046,9 @@ def grpo_train_sync(
                         metrics=metrics,
                         baseline=baseline_for_log,
                         advantages=advantages,
+                        env_baseline=env_baseline_for_log,
                     )
-                    del baseline_for_log
+                    del baseline_for_log, env_baseline_for_log
 
                 # ── Driver delta-write: advantages + (post-masking)
                 # sample_mask under the same meta.sample_ids so workers fetch

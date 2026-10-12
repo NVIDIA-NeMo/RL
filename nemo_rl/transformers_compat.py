@@ -14,8 +14,9 @@
 # limitations under the License.
 """Temporary compatibility patches for supported Transformers releases.
 
-Remove this module and its package bootstrap when NeMo RL requires Transformers
-5.13.0 or newer.
+The dynamic-module hashing patch can be removed when NeMo RL requires
+Transformers 5.13.0 or newer. Keep the torch-FX helper until the converted
+DeepSeek-V3 checkpoint no longer imports the Transformers 4.x API.
 """
 
 import hashlib
@@ -36,6 +37,41 @@ _EXPECTED_HASH_FUNCTION_PARAMETERS = (
     "pretrained_model_name_or_path",
     "resolved_module_file",
 )
+
+
+def _is_torch_fx_available_compat() -> bool:
+    """Compatibility replacement for the helper removed in Transformers 5."""
+    try:
+        importlib.import_module("torch.fx")
+    except ImportError:
+        return False
+    return True
+
+
+def _patch_transformers_torch_fx_compat() -> bool:
+    """Restore the legacy helper imported by DeepSeek-V3 remote model code.
+
+    The converted DeepSeek-V3 checkpoint used by the performance suite embeds
+    model code written for Transformers 4.33.1. That code imports
+    ``is_torch_fx_available`` from ``transformers.utils.import_utils``, but the
+    helper was removed in Transformers 5. Install an equivalent only when the
+    installed Transformers does not provide it already.
+    """
+    try:
+        distribution_version("transformers")
+    except PackageNotFoundError:
+        return False
+
+    import_utils = importlib.import_module("transformers.utils.import_utils")
+    if hasattr(import_utils, "is_torch_fx_available"):
+        return False
+
+    setattr(import_utils, "is_torch_fx_available", _is_torch_fx_available_compat)
+    logger.info(
+        "Installed the Transformers compatibility helper "
+        "is_torch_fx_available for legacy remote model code"
+    )
+    return True
 
 
 def _compute_local_source_files_hash_with_symlink_fix(

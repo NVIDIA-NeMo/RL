@@ -81,6 +81,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -113,6 +114,7 @@ from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
     backfill_missing_routed_experts,
+    get_effort_config,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -160,6 +162,7 @@ from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
 )
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
@@ -394,6 +397,10 @@ class GRPOConfig(BaseModel, extra="allow"):
     deduplicate_multimodal_data: bool = False
     # Emit exact-boundary and logical-vs-physical payload metrics.
     debug_payload_metrics: bool = False
+    # Optional per-prompt-group length penalties/bonuses applied to NeMo-Gym
+    # training rollout rewards (binary single-reward envs only); see
+    # docs/guides/length-penalty.md. None/absent disables the feature.
+    length_penalty: Optional[LengthPenaltyConfig] = None
 
 
 @dataclass
@@ -875,6 +882,9 @@ def setup(
     # spinup can overlap with vLLM model loading via deferred model load.
     enable_nemo_gym = should_use_nemo_gym(master_config)
     _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=enable_nemo_gym
+    )
+    _raise_if_length_penalty_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
     nemo_gym_actor = None
@@ -2219,6 +2229,11 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
     generated assistant messages have generation_logprobs, so use that field as the
     trainable-token marker. This function mutates each message in-place by adding a
     token_loss_mask and, when missing, a zero-valued generation_logprobs tensor.
+    Batches with at least one non-empty media segment also receive a per-token
+    media-validity field. Exact masks minted by the multimodal processor are
+    preserved; legacy messages fall back to PackedTensor ownership. Every other
+    message, including generated assistant text, is invalid. Batches without
+    media segments carry no media-validity field.
     Router-replay routes get the same treatment via
     :func:`backfill_missing_routed_experts`, so every per-token field is defined
     for every tokenized message before the batch is flattened.
@@ -2229,6 +2244,21 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
             ``generation_logprobs`` are treated as rollout-generated messages.
     """
     backfill_missing_routed_experts(message_logs)
+
+    def _owns_media(message: dict[str, Any]) -> bool:
+        return any(
+            key in PACKED_MULTIMODAL_FIELDS
+            and isinstance(value, PackedTensor)
+            and any(value.logical_segment_counts_by_row())
+            for key, value in message.items()
+        )
+
+    # Only add masks if some message has non-empty media. Overlength messages keep
+    # empty media, which is not stored; storing their mask anyway would make
+    # reading them together with text-only messages fail on the missing mask.
+    has_media = any(
+        _owns_media(message) for message_log in message_logs for message in message_log
+    )
     for message_log in message_logs:
         for message in message_log:
             role = cast(str, message["role"])
@@ -2242,6 +2272,19 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
             if "generation_logprobs" not in message:
                 message["generation_logprobs"] = torch.zeros_like(
                     token_ids, dtype=torch.float32
+                )
+
+            if not has_media:
+                message.pop("media_token_validity_mask", None)
+                continue
+            existing_media_mask = message.get("media_token_validity_mask")
+            if isinstance(existing_media_mask, torch.Tensor):
+                message["media_token_validity_mask"] = existing_media_mask.bool()
+            else:
+                message["media_token_validity_mask"] = torch.full_like(
+                    token_ids,
+                    fill_value=_owns_media(message),
+                    dtype=torch.bool,
                 )
 
 
@@ -2283,6 +2326,26 @@ def _raise_if_reward_penalties_enabled_without_nemo_gym(
     raise ValueError(
         "reward_penalties require the NeMo-Gym path "
         "(env.should_use_nemo_gym=true); they are not supported with the native "
+        "generation path."
+    )
+
+
+def _raise_if_length_penalty_enabled_without_nemo_gym(
+    master_config: MasterConfig,
+    *,
+    enable_nemo_gym: bool,
+) -> None:
+    """Validate grpo.length_penalty is only used with NeMo-Gym.
+
+    The hook lives in the NeMo-Gym rollout postprocessor, so a native-path run
+    with the block set would train on unadjusted rewards without any error.
+    """
+    if enable_nemo_gym or master_config.grpo.length_penalty is None:
+        return
+
+    raise ValueError(
+        "grpo.length_penalty requires the NeMo-Gym path "
+        "(env.should_use_nemo_gym=true); it is not supported with the native "
         "generation path."
     )
 
@@ -2556,12 +2619,7 @@ def _write_latest_checkpoint_status(
 
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
     """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
-    if "nemo_gym" not in master_config.env:
-        return None
-    effort_dict = master_config.env["nemo_gym"].get("effort_levels")
-    if effort_dict is None:
-        return None
-    return EffortLevelsConfig.model_validate(effort_dict)
+    return get_effort_config(master_config.env)
 
 
 def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch.Tensor:
@@ -2777,13 +2835,17 @@ def _log_mixed_rewards_and_advantages_information(
     metrics: dict[str, Any],
     baseline: torch.Tensor,
     advantages: torch.Tensor,
+    env_baseline: Optional[torch.Tensor] = None,
 ) -> None:
     # The histograms that are logged are logged with a prefix "train/" to the name, since that is what the remaining metrics will be logged with.
     logger.log_histogram(
         baseline.numpy(), total_steps + 1, "train/baseline_reward/histogram"
     )
-    metrics["baseline_reward/pct_0"] = 100 * (baseline == 0).float().mean().item()
-    metrics["baseline_reward/pct_1"] = 100 * (baseline == 1).float().mean().item()
+    # The pct_* diagnostics assume binary rewards. When grpo.length_penalty
+    # rewrote total_reward, read them off the env-reward baseline instead.
+    pct_baseline = env_baseline if env_baseline is not None else baseline
+    metrics["baseline_reward/pct_0"] = 100 * (pct_baseline == 0).float().mean().item()
+    metrics["baseline_reward/pct_1"] = 100 * (pct_baseline == 1).float().mean().item()
     metrics["baseline_reward/pct_mixed"] = (
         100 - metrics["baseline_reward/pct_0"] - metrics["baseline_reward/pct_1"]
     )
@@ -3323,6 +3385,7 @@ def _grpo_train_impl(
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
                             reward_penalty_config=master_config.reward_penalties,
+                            length_penalty_config=master_config.grpo.length_penalty,
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                             mask_env_flagged_samples=should_mask_flagged_samples(
                                 master_config.env
@@ -3467,6 +3530,18 @@ def _grpo_train_impl(
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                             std_rewards=std_rewards,
                         )
+                    if "env_reward" in repeated_batch:
+                        # grpo.length_penalty rewrote total_reward; keep a
+                        # baseline of the env reward for the pct_* diagnostics.
+                        # Stored on the batch so dynamic sampling filters it.
+                        repeated_batch["env_baseline"], _, _ = (
+                            calculate_baseline_and_std_per_prompt(
+                                repeated_batch[PROMPT_GROUP_IDS_KEY],
+                                repeated_batch["env_reward"],
+                                torch.ones_like(rewards),
+                                leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                            )
+                        )
 
                     # Apply dynamic sampling to filter prompts with non-zero std (DAPO algorithm)
                     repeated_batch, is_batch_complete, batch_cache, ds_metrics = (
@@ -3506,6 +3581,11 @@ def _grpo_train_impl(
 
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
+                    env_baseline_for_log = (
+                        repeated_batch["env_baseline"].clone()
+                        if "env_baseline" in repeated_batch
+                        else None
+                    )
 
                     # Backfill before the training flatten reuses these messages.
                     backfill_missing_routed_experts(repeated_batch["message_log"])
@@ -3722,8 +3802,9 @@ def _grpo_train_impl(
                         metrics=metrics,
                         baseline=baseline_for_log,
                         advantages=train_data["advantages"],
+                        env_baseline=env_baseline_for_log,
                     )
-                    del baseline_for_log
+                    del baseline_for_log, env_baseline_for_log
 
                     penalty_metrics = (
                         _apply_configured_message_level_advantage_penalties(
@@ -4352,6 +4433,11 @@ def validate(
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
                     reward_penalty_config=master_config.reward_penalties,
+                    # No length_penalty_config here: validation metrics
+                    # (accuracy/pass_k) must reflect the raw env reward, and the
+                    # adjustment code groups by the TRAINING stride
+                    # (num_generations_per_prompt), which does not match
+                    # val_num_generations_per_prompt.
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                     mask_env_flagged_samples=should_mask_flagged_samples(
                         master_config.env

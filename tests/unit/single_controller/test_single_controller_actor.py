@@ -182,6 +182,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
         finalizer_actors=[],
+        storage_units=(),
         advantage_actors=[],
         data_plane_checkpoint_metadata=None,
         partition_includes_multimodal_fields=False,
@@ -384,7 +385,7 @@ def test_mooncake_checkpoint_workers_configured_before_restore(
     master_config.data_plane = _data_plane_config("mooncake_cpu")
     master_config.token_capture.enabled = token_capture
     master_config.checkpointing.update(enabled=True, save_data_plane=True)
-    workers = [object() for _ in range(9)]
+    workers = [object() for _ in range(10)]
 
     def group(members: list[object], leaders: tuple[int, ...] = ()) -> SimpleNamespace:
         return SimpleNamespace(
@@ -399,7 +400,10 @@ def test_mooncake_checkpoint_workers_configured_before_restore(
         value_handle=group(workers[2:3]),
         teacher_worker_groups={"teacher": group(workers[3:4])},
         gen_handle=group(workers[4:8], leaders=(0, 2)),
-        finalizer_actors=workers[8:],
+        finalizer_actors=workers[8:9],
+        # With storage units on they are the only memory owners, so a save
+        # that dropped them would write no data-plane payload.
+        storage_units=(workers[9],),
     )
 
     def stop_after_restore(**kwargs):
@@ -1662,6 +1666,10 @@ class _EmptyBuffer:
     def __len__(self) -> int:
         return 0
 
+    @property
+    def group_ids(self) -> tuple[str, ...]:
+        return ()
+
     def training_owned_group_ids(self) -> set[str]:
         return set()
 
@@ -1902,6 +1910,8 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
     ctrl._finalizer_metrics_by_group = {}
+    ctrl._finalizer_rewards_by_group = {}
+    ctrl._log_full_result_tables = False
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -2917,3 +2927,98 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
         assert logged_timings[0]["train_data_dump"] > 2.0
         assert not final.with_suffix(".jsonl.partial").exists()
     assert "train_data_dump" not in ctrl._timer.get_timing_metrics()
+
+
+@pytest.mark.parametrize("log_full_result_tables", [False, True])
+def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
+    monkeypatch, log_full_result_tables
+):
+    from nemo_rl.experience.reward_penalties import FinalizedReward, RewardLogContext
+    from nemo_rl.experience.rollout_recovery import (
+        RolloutRecoveryLedger,
+        build_rollout_recovery_state,
+        parse_rollout_recovery_state,
+    )
+
+    metas = [
+        KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"group-{i}_g0"],
+            fields=[],
+            sequence_lengths=[1],
+            tags=[{"weight_version": 0, GROUP_ID_TAG: f"group-{i}"}],
+        )
+        for i in range(2)
+    ]
+    ctrl = _train_pump_controller(sampler=_SequenceSampler(metas))
+    ctrl._log_full_result_tables = log_full_result_tables
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    pending = {
+        "group-0": {
+            "finalize/penalty_count/empty_final_answer": 1.0,
+            "finalize/effort/low/100": 1.0,
+            "finalize/effort/length_reward_sum": 0.9,
+            "finalize/effort/reward_sum": 1.9,
+        },
+        "group-1": {
+            "finalize/penalty_count/empty_final_answer": 0.0,
+            "finalize/effort/low/900": 1.0,
+            "finalize/effort/low/1000": 1.0,
+            "finalize/effort/low/1200": 1.0,
+            "finalize/effort/length_reward_sum": -0.1,
+            "finalize/effort/reward_sum": 2.9,
+        },
+    }
+    state = build_rollout_recovery_state(
+        RolloutRecoveryLedger(),
+        batch_shortfall={},
+        sampler_stamps_target_steps=True,
+        finalizer_metrics_by_group=pending,
+        finalizer_rewards_by_group={
+            "group-0": [
+                FinalizedReward(
+                    "group-0_g0",
+                    "attempt-0",
+                    0.0,
+                    RewardLogContext("agent", '{"answer":"empty","reward":99}'),
+                )
+            ],
+            "group-1": [
+                FinalizedReward(
+                    f"group-1_g{i}",
+                    f"attempt-1-{i}",
+                    2.0,
+                    RewardLogContext("agent", None),
+                )
+                for i in range(3)
+            ],
+        },
+    )
+    ctrl._finalizer_metrics_by_group = parse_rollout_recovery_state(
+        state
+    ).finalizer_metrics_by_group
+    ctrl._finalizer_rewards_by_group = parse_rollout_recovery_state(
+        state
+    ).finalizer_rewards_by_group
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+    metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert metrics["empty_final_answer_rate"] == 0.25
+    assert metrics["finalize/reward_count"] == 4.0
+    assert metrics["finalize/penalty_count/empty_final_answer"] == 1.0
+    assert metrics["total_reward/mean"] == 1.5
+    assert metrics["total_reward/median"] == 2.0
+    assert metrics["total_reward/histogram"] == [0.0, 2.0, 2.0, 2.0]
+    assert metrics["agent/reward/histogram"] == [0.0, 2.0, 2.0, 2.0]
+    assert ("agent/full_result" in metrics) is log_full_result_tables
+    if log_full_result_tables:
+        assert '"reward":0.0' in metrics["agent/full_result"].data[0][0]
+    assert metrics["mean_reward_low"] == pytest.approx(1.2)
+    assert metrics["mean_length_low"] == 800
+    assert metrics["median_length_low"] == 950
+    assert metrics["mean_length_reward_low"] == pytest.approx(0.2)
+    assert not any(name.startswith("finalize/effort/") for name in metrics)
+    assert ctrl._finalizer_metrics_by_group == {}
+    assert ctrl._finalizer_rewards_by_group == {}

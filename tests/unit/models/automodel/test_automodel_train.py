@@ -355,6 +355,74 @@ class TestModelForward:
 
         assert "num_frames" in model.forward_kwargs
 
+    @pytest.mark.parametrize(
+        "forward_kind, expects_mask",
+        [
+            ("var_kwargs", False),
+            ("explicit_without_mask", False),
+            ("explicit_with_mask", True),
+        ],
+    )
+    def test_explicit_only_kwargs_require_named_forward_arg(
+        self, processed_inputs_multimodal, forward_kind, expects_mask
+    ):
+        class RecordingModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.forward_kwargs = {}
+
+            def _record(self, **kwargs):
+                self.forward_kwargs = kwargs
+                return MagicMock(logits=torch.randn(2, 64, 1000))
+
+        class VarKwargsModel(RecordingModel):
+            def forward(self, **kwargs):
+                return self._record(**kwargs)
+
+        class ExplicitWithoutMaskModel(RecordingModel):
+            def forward(
+                self,
+                input_ids,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+                pixel_values=None,
+            ):
+                return self._record(pixel_values=pixel_values)
+
+        class ExplicitWithMaskModel(RecordingModel):
+            def forward(
+                self,
+                input_ids,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+                pixel_values=None,
+                media_token_validity_mask=None,
+            ):
+                return self._record(
+                    pixel_values=pixel_values,
+                    media_token_validity_mask=media_token_validity_mask,
+                )
+
+        model = {
+            "var_kwargs": VarKwargsModel,
+            "explicit_without_mask": ExplicitWithoutMaskModel,
+            "explicit_with_mask": ExplicitWithMaskModel,
+        }[forward_kind]()
+        media_mask = torch.zeros(2, 64, dtype=torch.bool)
+        processed_inputs_multimodal.vlm_kwargs["media_token_validity_mask"] = media_mask
+
+        prepared = _prepare_cp1(model, processed_inputs_multimodal)
+        model_forward(model, prepared.model_batch)
+
+        assert "pixel_values" in model.forward_kwargs
+        if expects_mask:
+            assert model.forward_kwargs["media_token_validity_mask"] is media_mask
+        else:
+            assert "media_token_validity_mask" not in model.forward_kwargs
+        assert "media_token_validity_mask" in processed_inputs_multimodal.vlm_kwargs
+
     def test_forward_reward_model_removes_flash_attn(
         self, mock_model, processed_inputs_with_flash
     ):
