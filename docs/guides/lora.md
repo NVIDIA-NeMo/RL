@@ -18,8 +18,8 @@ LoRA is implemented on two training backends, each with its own config schema:
 
 | Backend | Config path | Notes |
 | --- | --- | --- |
-| **DTensor (Automodel)** | `policy.dtensor_cfg.lora_cfg` | This is the default backend. |
-| **Megatron Core** | `policy.megatron_cfg.peft` | Requires `policy.megatron_cfg.enabled=true` (and `policy.dtensor_cfg.enabled=false`). |
+| **Automodel** | `policy.automodel_cfg.lora_cfg` | This is the default backend. |
+| **Megatron Core** | `policy.megatron_cfg.peft` | Requires `policy.megatron_cfg.enabled=true` (and `policy.automodel_cfg.enabled=false`). |
 
 LoRA is supported across the SFT, GRPO, and DPO algorithms on both backends.
 
@@ -55,11 +55,11 @@ The effective learning-rate multiplier for the adapter is `alpha / dim` on both 
 
 ## DTensor Configuration
 
-LoRA settings live under `policy.dtensor_cfg.lora_cfg`:
+LoRA settings live under `policy.automodel_cfg.lora_cfg`:
 
 ```yaml
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     lora_cfg:
       enabled: False            # Set to True to enable LoRA fine-tuning
       target_modules: []        # List of module names to apply LoRA
@@ -138,7 +138,7 @@ policy:
 `restore_from` initializes this run's adapters from a donor PEFT checkpoint, e.g. to carry an
 SFT LoRA into GRPO. The accepted path format differs by backend:
 
-- **DTensor (Automodel)**: `policy.dtensor_cfg.lora_cfg.restore_from` — a directory containing
+- **Automodel**: `policy.automodel_cfg.lora_cfg.restore_from` — a directory containing
   `adapter_model.safetensors` + `adapter_config.json` (a previous run's `step_*/policy/weights`
   or its `model/` subdirectory).
 - **Megatron Core**: `policy.megatron_cfg.peft.restore_from` — a native Megatron `iter_XXXXXXX`
@@ -159,7 +159,7 @@ policy still anchors to the warm-started (donor) adapters, not to the bare base 
 The config uses the DTensor backend by default, so DTensor LoRA only requires enabling the flag:
 
 ```bash
-uv run examples/run_sft.py policy.dtensor_cfg.lora_cfg.enabled=true
+uv run examples/run_sft.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
 To use the Megatron backend, switch backends and enable the PEFT block:
@@ -167,7 +167,7 @@ To use the Megatron backend, switch backends and enable the PEFT block:
 ```sh
 uv run examples/run_sft.py \
   --config examples/configs/sft.yaml \
-  policy.dtensor_cfg.enabled=false \
+  policy.automodel_cfg.enabled=false \
   policy.megatron_cfg.enabled=true \
   policy.megatron_cfg.peft.enabled=true
 ```
@@ -179,7 +179,7 @@ See the [SFT guide](sft.md) for the full SFT workflow.
 GRPO supports LoRA on both backends. Enable the DTensor adapter with:
 
 ```bash
-uv run examples/run_grpo.py policy.dtensor_cfg.lora_cfg.enabled=true
+uv run examples/run_grpo.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
 The DTensor GRPO LoRA path uses a **merge-weight** approach: during generation, LoRA adapter
@@ -199,7 +199,7 @@ DPO fully supports LoRA on **both** the DTensor and Megatron backends, using the
 enable it on an existing DPO config via an override. For the DTensor backend:
 
 ```bash
-uv run examples/run_dpo.py policy.dtensor_cfg.lora_cfg.enabled=true
+uv run examples/run_dpo.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
 For the Megatron backend:
@@ -207,7 +207,7 @@ For the Megatron backend:
 ```bash
 uv run examples/run_dpo.py \
   --config examples/configs/dpo.yaml \
-  policy.dtensor_cfg.enabled=false \
+  policy.automodel_cfg.enabled=false \
   policy.megatron_cfg.enabled=true \
   policy.megatron_cfg.peft.enabled=true
 ```

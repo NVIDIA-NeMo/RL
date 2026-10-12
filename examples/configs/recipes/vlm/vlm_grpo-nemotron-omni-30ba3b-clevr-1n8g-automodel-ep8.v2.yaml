@@ -15,7 +15,7 @@ policy:
       foreach: false
   dynamic_batching:
     enabled: false
-  dtensor_cfg:
+  automodel_cfg:
     expert_parallel_size: 8
     activation_checkpointing: true
     moe_parallelizer:

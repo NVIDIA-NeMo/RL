@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
+import sys
 from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -21,7 +23,10 @@ import pytest
 from examples import run_grpo_single_controller
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
-from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AsyncRLConfig,
+    MasterConfig,
+)
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.logger import LoggerConfig
 
@@ -40,13 +45,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         data_plane={"enabled": True, "impl": "transfer_queue", "backend": "simple"},
         logger=LoggerConfig(log_dir="/tmp/logs"),
         checkpointing={"enabled": False},
-        async_rl=SimpleNamespace(
-            stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0),
-            # model_construct skips validation, so nothing fills the real
-            # AsyncRLConfig defaults in here. main() reads this before init_ray() to
-            # decide on EngineCore reaping; off keeps that a no-op.
-            generation_fleet_health=SimpleNamespace(enabled=False),
-        ),
+        async_rl=AsyncRLConfig(),
         grpo=GRPOConfig(async_grpo=None),
     )
     configured_generation = {"backend": "vllm", "_mtp_weights_from_refit": True}
@@ -232,3 +231,16 @@ def test_main_passes_processor_for_vlm(
     setup_single_controller.assert_called_once_with(
         main_context.config, "vlm-tokenizer", processor=processor
     )
+
+
+def test_main_line_buffers_driver_stdout(
+    main_context: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forwarded actor prints must not sit in a block buffer when stdout is a file."""
+    stdout = io.TextIOWrapper(io.BytesIO())
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    run_grpo_single_controller.main()
+
+    assert stdout.line_buffering

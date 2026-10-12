@@ -6,11 +6,25 @@ set -eou pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")
 BASE_TEST=$SCRIPT_DIR/grpo_dp_single_controller.sh
-BACKEND=${1:-simple}
-case "$BACKEND" in
-    simple) TEST_NAME=grpo_dp_single_controller_tq_recovery ;;
-    mooncake_cpu) TEST_NAME=grpo_dp_mooncake_tq_recovery ;;
-    *) echo "Unsupported recovery backend: $BACKEND" >&2; exit 1 ;;
+# simple / mooncake_cpu, or a storage-unit variant of either:
+#   simple_placed   simple with SimpleStorageUnits pinned (storage_unit_placement=all)
+#   mooncake_units  mooncake_cpu with CPU storage units as the only memory owners
+VARIANT=${1:-simple}
+VARIANT_OVERRIDES=()
+case "$VARIANT" in
+    simple) BACKEND=simple; TEST_NAME=grpo_dp_single_controller_tq_recovery ;;
+    mooncake_cpu) BACKEND=mooncake_cpu; TEST_NAME=grpo_dp_mooncake_tq_recovery ;;
+    simple_placed)
+        BACKEND=simple
+        TEST_NAME=grpo_dp_simple_placed_tq_recovery
+        VARIANT_OVERRIDES=(data_plane.simple.storage_unit_placement=all)
+        ;;
+    mooncake_units)
+        BACKEND=mooncake_cpu
+        TEST_NAME=grpo_dp_mooncake_units_tq_recovery
+        VARIANT_OVERRIDES=(data_plane.mooncake_cpu.storage_unit_segment_size=4294967296)
+        ;;
+    *) echo "Unsupported recovery variant: $VARIANT" >&2; exit 1 ;;
 esac
 TEST_DIR=$SCRIPT_DIR/$TEST_NAME
 CHECKPOINT_DIR=$TEST_DIR/checkpoints
@@ -32,11 +46,14 @@ COMMON_OVERRIDES=(
     '+async_rl.sampler.max_staleness_versions=1'
     async_rl.max_inflight_prompts=8
     async_rl.max_buffered_rollouts=8
+    # Bridge rewrites the scheduler position on resume only when this is on.
+    '+policy.megatron_cfg.scheduler.override_opt_param_scheduler=true'
+    "${VARIANT_OVERRIDES[@]}"
 )
 if [[ "$BACKEND" == "mooncake_cpu" ]]; then
     COMMON_OVERRIDES+=(
         data_plane.mooncake_cpu.global_segment_size=4294967296
-        data_plane.mooncake_cpu.local_buffer_size=1073741824
+        data_plane.mooncake_cpu.local_buffer_size=2147483648
     )
 fi
 
@@ -49,6 +66,8 @@ EXP_NAME="$TEST_NAME/run" RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" \
     grpo.max_num_steps=2 \
     checkpointing.checkpoint_must_save_by=0:0:0:1
 cp "$BASE_RUN_LOG" "$PHASE1_LOG"
+# Phase 2 re-runs the base test, which deletes its log dir; keep phase 1's.
+cp -r "$TEST_DIR/run/logs" "$TEST_DIR/phase1_logs"
 
 test -d "$CHECKPOINT_DIR/step_1/data_plane"
 test -f "$CHECKPOINT_DIR/step_1/replay_buffer_metadata.pt"
@@ -64,6 +83,23 @@ echo "=== Phase 2: start a fresh process, restore TQ, and train one more step ==
 EXP_NAME="$TEST_NAME/run" RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" \
     "${COMMON_OVERRIDES[@]}" grpo.max_num_steps=2
 cp "$BASE_RUN_LOG" "$PHASE2_LOG"
+
+# Both phases are still in LR warmup, so the resumed LR must be higher than
+# phase 1's. A scheduler reset on resume makes them equal.
+uv run --directory "$PROJECT_ROOT" tests/json_dump_tb_logs.py "$TEST_DIR/phase1_logs" \
+    --output_path "$TEST_DIR/phase1_metrics.json"
+uv run --directory "$PROJECT_ROOT" tests/json_dump_tb_logs.py "$TEST_DIR/run/logs" \
+    --output_path "$TEST_DIR/phase2_metrics.json"
+uv run --directory "$PROJECT_ROOT" python - "$TEST_DIR/phase1_metrics.json" "$TEST_DIR/phase2_metrics.json" <<'EOF'
+import json
+import sys
+
+before, after = (json.load(open(path))["train/lr"] for path in sys.argv[1:3])
+assert min(after.values()) > max(before.values()), (
+    f"train/lr did not advance across the resume: {before} -> {after}"
+)
+print(f"✓ train/lr advanced across the resume: {before} -> {after}")
+EOF
 
 grep -q "Native TQ checkpoint restored and validated: groups=${REPLAY_GROUP_COUNT}" "$PHASE2_LOG"
 grep -q "Native TQ replay inventory validated" "$PHASE2_LOG"
@@ -81,4 +117,4 @@ if [[ "$BACKEND" == "simple" ]]; then
         --checkpoint-dir "$TEST_DIR/verifier_bundle"
 fi
 
-echo "Native TQ recovery functional test passed ($BACKEND)."
+echo "Native TQ recovery functional test passed ($VARIANT)."

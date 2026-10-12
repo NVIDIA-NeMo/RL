@@ -168,7 +168,7 @@ def test_policy_forwards_final_checkpoint_marker_to_dtensor_v2(monkeypatch):
         "nemo_rl.models.policy.lm_policy.ray.get", lambda futures: futures
     )
     policy = Policy.__new__(Policy)
-    policy.cfg = {"dtensor_cfg": {"enabled": True}}
+    policy.cfg = {"automodel_cfg": {"enabled": True}}
     policy.worker_group = WorkerGroup()
 
     policy.save_checkpoint(
@@ -203,7 +203,7 @@ def test_policy_uses_megatron_save_path_when_dtensor_is_disabled(monkeypatch):
     policy = Policy.__new__(Policy)
     policy.cfg = {
         # Disabled DTensor settings must not select the Automodel save path.
-        "dtensor_cfg": {"enabled": False},
+        "automodel_cfg": {"enabled": False},
         "megatron_cfg": {"enabled": True},
     }
     policy.worker_group = WorkerGroup()
