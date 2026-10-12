@@ -1513,9 +1513,24 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 
 
 def setup_nemo_gym_config(config, tokenizer) -> None:
-    """Configure NeMo-Gym for the selected generation backend.
+    """Configure NeMo-Gym for the selected generation backend, in place.
 
-    Dynamo idempotently requests engine data so Gym can derive exact prefixes.
+    For the Dynamo backend, this also configures the Gym policy model at
+    ``env.nemo_gym.policy_model.responses_api_models.vllm_model``. It appends
+    ``"engine_data"`` to ``extra_body.nvext.extra_fields`` and sets
+    ``derive_prefix_token_ids_from_messages: true``. Gym then reads Dynamo's
+    native token data and sends the exact multi-turn prefix that the Dynamo
+    token wrapper requires. Repeated calls do not change the result.
+
+    Args:
+        config: The master config. ``config.policy`` and ``config.env`` are
+            updated in place.
+        tokenizer: The policy tokenizer.
+
+    Raises:
+        ValueError: The generation backend is unsupported, or the Dynamo Gym
+            policy model config has a non-mapping ``extra_body`` or ``nvext``,
+            or a non-list ``nvext.extra_fields``.
     """
     generation_config = config.policy["generation"]
 
@@ -1570,6 +1585,9 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
             )
         if "engine_data" not in extra_fields:
             extra_fields.append("engine_data")
+        # The Dynamo token wrapper needs the newest assistant turn's exact
+        # tokens. Gym sends them only when this opt-in flag is set.
+        model_cfg["derive_prefix_token_ids_from_messages"] = True
 
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for

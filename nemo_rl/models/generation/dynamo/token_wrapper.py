@@ -178,16 +178,22 @@ def _render_prompt_token_ids_with_optional_prefix(
     return full_prompt_token_ids, template_prefix_token_ids
 
 
-def _latest_tokenized_assistant_index(messages: list[Any]) -> Optional[int]:
+def _newest_assistant_index_if_tokenized(messages: list[Any]) -> Optional[int]:
+    """Return the newest assistant message's index if it carries token IDs.
+
+    This matches NeMo-Gym's prefix derivation, which reads only the newest
+    assistant message. Older turns stop being a prefix of the prompt once a
+    later assistant turn is injected, edited, or regenerated.
+    """
     for index in reversed(range(len(messages))):
         message = messages[index]
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        if (
+        has_token_ids = (
             message.get("prompt_token_ids") is not None
             and message.get("generation_token_ids") is not None
-        ):
-            return index
+        )
+        return index if has_token_ids else None
     return None
 
 
@@ -234,8 +240,9 @@ def prepare_dynamo_chat_completion_request(
 ) -> dict[str, Any]:
     """Prepare a NeMo-Gym chat-completion request for Dynamo token input.
 
-    Gym owns prefix derivation. A tokenized assistant message and its Gym prefix
-    must be present together.
+    Gym owns prefix derivation. When the newest assistant message carries token
+    IDs, the request must also carry Gym's ``required_prefix_token_ids``, and a
+    prefix requires such a message. Either mismatch raises ``ValueError``.
     """
     if request_body.get("stream"):
         raise ValueError("Dynamo native token wrapper does not support stream=True.")
@@ -263,16 +270,18 @@ def prepare_dynamo_chat_completion_request(
 
     add_generation_prompt = _request_add_generation_prompt(prepared_body)
     template_messages = deepcopy(stripped_messages)
-    assistant_index = _latest_tokenized_assistant_index(messages)
+    assistant_index = _newest_assistant_index_if_tokenized(messages)
     if assistant_index is not None and not required_prefix_token_ids:
+        # Keep this short: Gym logs only the first 200 characters of an error body.
         raise ValueError(
             "A tokenized assistant message requires required_prefix_token_ids. "
-            "Set return_token_id_information: true and request "
-            'nvext.extra_fields=["engine_data"].'
+            "Set derive_prefix_token_ids_from_messages: true on the NeMo-Gym "
+            "policy model."
         )
     if assistant_index is None and required_prefix_token_ids is not None:
         raise ValueError(
-            "required_prefix_token_ids requires a tokenized assistant message."
+            "required_prefix_token_ids requires the newest assistant message "
+            "to carry token IDs."
         )
 
     try:

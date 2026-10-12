@@ -1164,15 +1164,19 @@ def test_setup_nemo_gym_config_requests_dynamo_engine_data() -> None:
     setup_nemo_gym_config(config, tokenizer=None)
     setup_nemo_gym_config(config, tokenizer=None)
 
-    extra_body = config.env["nemo_gym"]["policy_model"]["responses_api_models"][
+    vllm_model = config.env["nemo_gym"]["policy_model"]["responses_api_models"][
         "vllm_model"
-    ]["extra_body"]
-    assert extra_body == {
-        "chat_template_kwargs": {"enable_thinking": False},
-        "nvext": {
-            "extra_fields": ["timing", "engine_data"],
-            "trace": "keep-me",
+    ]
+    assert vllm_model == {
+        "extra_body": {
+            "chat_template_kwargs": {"enable_thinking": False},
+            "nvext": {
+                "extra_fields": ["timing", "engine_data"],
+                "trace": "keep-me",
+            },
         },
+        # The Dynamo token wrapper requires Gym's message-derived prefix.
+        "derive_prefix_token_ids_from_messages": True,
     }
 
 
@@ -1189,7 +1193,8 @@ def test_setup_nemo_gym_config_builds_dynamo_engine_data_config() -> None:
             "policy_model": {
                 "responses_api_models": {
                     "vllm_model": {
-                        "extra_body": {"nvext": {"extra_fields": ["engine_data"]}}
+                        "extra_body": {"nvext": {"extra_fields": ["engine_data"]}},
+                        "derive_prefix_token_ids_from_messages": True,
                     }
                 }
             }
@@ -1216,7 +1221,10 @@ def test_setup_nemo_gym_config_normalizes_null_mappings(model_config) -> None:
 
     setup_nemo_gym_config(config, tokenizer=None)
 
-    assert model_config["extra_body"] == {"nvext": {"extra_fields": ["engine_data"]}}
+    assert model_config == {
+        "extra_body": {"nvext": {"extra_fields": ["engine_data"]}},
+        "derive_prefix_token_ids_from_messages": True,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1250,14 +1258,24 @@ def test_setup_nemo_gym_config_rejects_invalid_dynamo_containers(
 
 
 def test_setup_nemo_gym_config_does_not_add_dynamo_fields_for_vllm() -> None:
+    nemo_gym_config = {
+        "port_range_low": 5000,
+        "policy_model": {
+            "responses_api_models": {
+                "vllm_model": {"return_token_id_information": True}
+            }
+        },
+    }
     config = SimpleNamespace(
         policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
-        env={"nemo_gym": {"port_range_low": 5000}},
+        env={"nemo_gym": deepcopy(nemo_gym_config)},
     )
 
     setup_nemo_gym_config(config, tokenizer=None)
 
-    assert config.env["nemo_gym"] == {"port_range_low": 5000}
+    # NeMo-RL's vLLM HTTP server derives its own prefix, so Gym's opt-in
+    # derivation and the Dynamo engine_data request stay off.
+    assert config.env["nemo_gym"] == nemo_gym_config
 
 
 @pytest.fixture(scope="function")

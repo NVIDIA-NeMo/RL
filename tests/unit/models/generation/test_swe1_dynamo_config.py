@@ -72,12 +72,14 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry(
     assert config["env"]["nemo_gym"]["config_paths"][-1].endswith(
         "swe_pivot_single_step_tool_use_with_argument_comparison.yaml"
     )
-    assert (
-        config["env"]["nemo_gym"]["policy_model"]["responses_api_models"]["vllm_model"][
-            "chat_template_kwargs"
-        ]["force_nonempty_content"]
-        is True
-    )
+    gym_policy_model = config["env"]["nemo_gym"]["policy_model"][
+        "responses_api_models"
+    ]["vllm_model"]
+    assert gym_policy_model["chat_template_kwargs"]["force_nonempty_content"] is True
+    assert gym_policy_model["extra_body"] == {
+        "nvext": {"extra_fields": ["engine_data"]}
+    }
+    assert gym_policy_model["derive_prefix_token_ids_from_messages"] is True
     assert (
         config["env"]["nemo_gym"]["single_step_tool_use_with_argument_comparison_swe"][
             "responses_api_agents"

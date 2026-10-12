@@ -394,7 +394,7 @@ def test_prepare_dynamo_chat_completion_request_requires_gym_prefix(
         ValueError,
         match=(
             "requires required_prefix_token_ids.*"
-            "return_token_id_information.*engine_data"
+            "derive_prefix_token_ids_from_messages: true"
         ),
     ):
         prepare_dynamo_chat_completion_request(
@@ -404,20 +404,81 @@ def test_prepare_dynamo_chat_completion_request_requires_gym_prefix(
         )
 
 
-def test_prepare_dynamo_chat_completion_request_rejects_prefix_without_metadata() -> (
-    None
-):
+_TOKENIZED_FIRST_TURN = {
+    "role": "assistant",
+    "content": "first",
+    "prompt_token_ids": [10],
+    "generation_token_ids": [31, 32, 2],
+    "generation_log_probs": [-0.1, -0.2, -0.3],
+}
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        pytest.param([{"role": "user", "content": "hello"}], id="no-assistant"),
+        pytest.param(
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "first"},
+                {"role": "user", "content": "next"},
+            ],
+            id="untokenized-assistant",
+        ),
+        pytest.param(
+            [
+                {"role": "user", "content": "hello"},
+                _TOKENIZED_FIRST_TURN,
+                {"role": "user", "content": "next"},
+                {"role": "assistant", "content": "second"},
+                {"role": "user", "content": "next"},
+            ],
+            id="only-older-assistant-tokenized",
+        ),
+    ],
+)
+def test_prepare_dynamo_chat_completion_request_rejects_prefix_without_metadata(
+    messages,
+) -> None:
     body = {
-        "messages": [{"role": "user", "content": "hello"}],
+        "messages": messages,
         "required_prefix_token_ids": [10, 31, 32, 2],
     }
 
-    with pytest.raises(ValueError, match="requires a tokenized assistant message"):
+    with pytest.raises(
+        ValueError,
+        match="requires the newest assistant message to carry token IDs",
+    ):
         prepare_dynamo_chat_completion_request(
             body,
             tokenizer=_Tokenizer(),
             exclude_tools_when_tool_choice_none=True,
         )
+
+
+def test_prepare_dynamo_chat_completion_request_ignores_older_tokenized_turns() -> None:
+    """Match Gym: only the newest assistant message can supply a prefix."""
+    tokenizer = _Tokenizer()
+    body = {
+        "messages": [
+            {"role": "user", "content": "hello"},
+            _TOKENIZED_FIRST_TURN,
+            {"role": "user", "content": "next"},
+            {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "next"},
+        ],
+    }
+
+    prepared = prepare_dynamo_chat_completion_request(
+        body,
+        tokenizer=tokenizer,
+        exclude_tools_when_tool_choice_none=True,
+    )
+
+    # The older turn's token IDs are not spliced, so the prompt is re-rendered.
+    assert prepared["nvext"]["token_data"] == [10, 3, 2, 40, 777, 2, 40, 99]
+    assert "prompt_token_ids" not in prepared["messages"][1]
+    assert len(tokenizer.calls) == 1
 
 
 def test_prepare_dynamo_chat_completion_request_validates_extra_fields() -> None:
