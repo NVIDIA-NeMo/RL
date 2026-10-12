@@ -1433,9 +1433,16 @@ def test_configure_and_command_reuse_the_existing_process_local_manager(
         pytest.fail("checkpoint RPC created another TQ client")
 
     monkeypatch.setattr(tq, "init", unexpected_init)
-    workers = [object(), object()]
-    checkpoint_plugin.configure_checkpoint_workers(workers)
-    assert list(manager._checkpoint_workers) == workers
+    # One candidate owns a segment; the other (e.g. a generation worker whose
+    # token-capture client disowned storage) describes as nothing to save.
+    other = _manager(_FakeStore(_FakeCluster({}, {}), "10.0.0.2:12302"), "manager-b")
+    _participant(other)
+    owner = SimpleNamespace(
+        mooncake_checkpoint=_RemoteMethod(other._checkpoint_participant._dispatch)
+    )
+    non_owner = SimpleNamespace(mooncake_checkpoint=_RemoteMethod(lambda _body: None))
+    checkpoint_plugin.configure_checkpoint_workers([owner, non_owner])
+    assert list(manager._checkpoint_workers) == [owner]
     response = checkpoint_plugin.run_checkpoint_command(
         checkpoint_plugin._request_body(manager, "DESCRIBE")
     )
@@ -1494,7 +1501,7 @@ def test_installed_manager_keeps_non_actor_clients_out_of_the_storage_topology(
     endpoint = "10.3.0.7:14321"
     cluster = _FakeCluster({}, {})
     store = _FakeStore(cluster, endpoint)
-    manager_closes: list[str] = []
+    manager_closes: list[Any] = []
     config = _manager(store).config
     config["global_segment_size"] = 1024
     config["checkpoint"]["enabled"] = enabled
@@ -1513,7 +1520,9 @@ def test_installed_manager_keeps_non_actor_clients_out_of_the_storage_topology(
     monkeypatch.setattr(
         mooncake_manager.MooncakeStorageManager,
         "close",
-        lambda _self: manager_closes.append("manager"),
+        # Record which manager closed: a manager left in a reference cycle by
+        # an earlier case can be garbage-collected (and closed) during this one.
+        lambda self: manager_closes.append(self),
     )
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
     monkeypatch.setattr(
@@ -1545,7 +1554,7 @@ def test_installed_manager_keeps_non_actor_clients_out_of_the_storage_topology(
         }
 
     manager.close()
-    assert manager_closes == ["manager"]
+    assert [m for m in manager_closes if m is manager] == [manager]
 
 
 @pytest.mark.parametrize("enabled", [False, True])

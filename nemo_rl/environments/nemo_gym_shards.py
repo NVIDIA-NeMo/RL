@@ -40,7 +40,13 @@ from omegaconf import OmegaConf
 AGENT_POOL_CONFIG_KEY = "agent_pool"
 FAN_OUT_CONFIG_KEY = "fan_out"
 NEMO_RL_DICT_CONFIG_KEYS = frozenset(
-    {AGENT_POOL_CONFIG_KEY, FAN_OUT_CONFIG_KEY, "effort_levels", "tokenizer_config"}
+    {
+        AGENT_POOL_CONFIG_KEY,
+        FAN_OUT_CONFIG_KEY,
+        "effort_levels",
+        "external_service_readiness",
+        "tokenizer_config",
+    }
 )
 
 # Ray placement-group strategies a shard plan may ask for. STRICT_SPREAD is the
