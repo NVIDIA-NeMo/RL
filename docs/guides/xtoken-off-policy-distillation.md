@@ -1,5 +1,7 @@
 # Cross-Tokenizer (X-Token) Off-Policy Distillation
 
+For algorithm selection and the CSD sub-token table workflow, see the [cross-tokenizer distillation guide](cross-tokenizer-distillation.md). This guide describes X-Token and its projection-matrix workflow.
+
 NeMo RL supports off-policy distillation between a student and a teacher that **do not share a tokenizer** — for example, distilling a Qwen3-4B teacher into a Llama-3.2-1B student. Cross-tokenizer ("x-token") distillation handles the vocabulary mismatch by routing student logits through a precomputed **projection matrix** that maps each student token to the teacher tokens it most plausibly corresponds to, projecting the student into the teacher's vocab space so the two distributions can be compared.
 
 Tokenizer vocabularies overlap only partially, which is what makes the projection necessary. The table below reports the pairwise overlap (intersection divided by the smaller vocabulary, on canonical token forms) across several model tokenizers; the off-diagonal entries sit well below `1.0` — that shared-vocabulary gap is exactly what the projection matrix bridges.
