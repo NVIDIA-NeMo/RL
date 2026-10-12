@@ -1729,7 +1729,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         # Megatron Inference is always async; should_use_async_rollouts rejects
         # an explicit mcore_generation_config.async_engine key.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
-    elif backend == "remote_vllm":
+    elif generation_config["backend"] == "remote_vllm":
         # The externally managed server is already OpenAI-compatible.
         pass
     else:
