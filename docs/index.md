@@ -331,6 +331,7 @@ guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
 guides/refit.md
+guides/external-vllm.md
 guides/checkpoint-engine-refit.md
 guides/dynamo-generation.md
 guides/router-replay.md
