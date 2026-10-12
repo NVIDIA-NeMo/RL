@@ -30,7 +30,6 @@ from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
-    need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
@@ -604,7 +603,6 @@ class AutomodelPolicyWorkerImpl(
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
-          "token_mask": only for top-k/top-p filtering; masked out -inf positions.
         """
         self.timer.start("get_logprobs")
         logprob_batch_size = (
@@ -617,7 +615,6 @@ class AutomodelPolicyWorkerImpl(
         sequence_dim, seq_dim_size = check_sequence_dim(data)
 
         all_log_probs = []
-        all_token_masks: list[torch.Tensor] = []
         self.model.eval()
 
         # Create logprobs post-processor
@@ -666,8 +663,6 @@ class AutomodelPolicyWorkerImpl(
                     continue
 
                 all_log_probs.append(token_logprobs)
-                if "token_mask" in _metrics:
-                    all_token_masks.append(_metrics["token_mask"])
 
         # Concatenate all batches
         return_data = BatchedDataDict[LogprobOutputSpec]()
@@ -675,12 +670,6 @@ class AutomodelPolicyWorkerImpl(
         return_data["logprobs"] = pad_and_concat(
             all_log_probs, target_len=seq_dim_size
         ).cpu()
-        # Taken from config so every DP rank emits the same keys.
-        if need_top_k_or_top_p_filtering(self.sampling_params):
-            # Pad token_mask with 0 so padded positions are excluded from the loss.
-            return_data["token_mask"] = pad_and_concat(
-                all_token_masks, target_len=seq_dim_size
-            ).cpu()
 
         self.timer.stop("get_logprobs")
         return return_data

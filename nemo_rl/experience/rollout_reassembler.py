@@ -208,13 +208,15 @@ def _empty_trainer_media(
     keeps the column present, in the pinned dtype, and rebuilds on the
     trainer as a ``[0, 3*P*P]`` tensor the Omni model treats as "no images".
     """
-    pixels = torch.empty(0, spec.pixel_feature_dim, dtype=spec.pixel_dtype)
-    sizes = torch.empty(0, 2, dtype=torch.int32)
-    frames = torch.empty(0, dtype=torch.int32)
+    pixels: list[torch.Tensor | None] = [
+        torch.empty(0, spec.pixel_feature_dim, dtype=spec.pixel_dtype)
+    ] * num_rows
+    sizes: list[torch.Tensor | None] = [torch.empty(0, 2, dtype=torch.int32)] * num_rows
+    frames: list[torch.Tensor | None] = [torch.empty(0, dtype=torch.int32)] * num_rows
     return {
-        "pixel_values": PackedTensor([pixels] * num_rows, dim_to_pack=0),
-        "imgs_sizes": PackedTensor([sizes] * num_rows, dim_to_pack=0),
-        "num_frames": PackedTensor([frames] * num_rows, dim_to_pack=0),
+        "pixel_values": PackedTensor(pixels, dim_to_pack=0),
+        "imgs_sizes": PackedTensor(sizes, dim_to_pack=0),
+        "num_frames": PackedTensor(frames, dim_to_pack=0),
     }
 
 
