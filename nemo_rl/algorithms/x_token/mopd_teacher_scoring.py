@@ -31,7 +31,6 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.x_token.mopd import (
     ThinkingState,
-    _normalize_leading_instruction_messages,
     align_token_ids,
     apply_teacher_chat_template,
     build_char_mapping,
@@ -46,7 +45,6 @@ from nemo_rl.algorithms.x_token.mopd import (
     proven_template_only_teacher_token_indices,
     qwen3_assistant_content_transform,
     qwen3_leading_think_prefix_len,
-    qwen_chat_boundaries_present,
     render_teacher_open_thinking_prefix,
     sampled_im_end_token_id,
     split_sampled_assistant_eot,
@@ -320,6 +318,48 @@ def load_mopd_student_alignment_tokenizer(
     return tokenizer
 
 
+def validate_mopd_student_thinking_preflight(
+    tokenizer: PreTrainedTokenizerBase,
+) -> bool:
+    """Validate a thinking student's prompt and report whether it samples reasoning.
+
+    The tokenizer must already include the configured template and template
+    kwargs. A false result does not establish conversation-format compatibility;
+    that requires the independent student alignment preflight.
+    """
+    student_template = getattr(tokenizer, "chat_template", None)
+    if not (
+        isinstance(student_template, str)
+        and "<think>" in student_template
+        and "</think>" in student_template
+    ):
+        return False
+
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "MOPD thinking boundary preflight"}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    if not isinstance(rendered, str):
+        raise TypeError("student thinking preflight must render text")
+    token_ids = _to_int_list(
+        tokenizer(rendered, return_tensors=None, add_special_tokens=False)["input_ids"]
+    )
+    state = classify_thinking_state_before_generated_span(
+        tokenizer,
+        token_ids,
+        generated_start=len(token_ids),
+        expects_thinking=True,
+    )
+    if state == "unknown":
+        raise ValueError(
+            "cross-tokenizer MOPD student thinking generation boundary is "
+            "unsupported; expected a ChatML assistant header, an open "
+            "<think> block, or a supported closed thinking prefix"
+        )
+    return state != "closed"
+
+
 def _validate_tokenizer_offsets(
     tokenizer: PreTrainedTokenizerBase,
     rendered: str,
@@ -347,22 +387,86 @@ def _validate_tokenizer_offsets(
         raise TypeError(f"{label} tokenizer decode must return nonempty text")
 
 
-def validate_mopd_student_alignment_preflight(
-    student_tokenizer_config: Any,
+def _validate_student_chat_format(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: list[dict[str, str]],
+    *,
+    add_generation_prompt: bool,
 ) -> None:
-    """Prove that the plain-HF student alignment tokenizer exposes offsets."""
-    tokenizer = load_mopd_student_alignment_tokenizer(student_tokenizer_config)
     rendered = tokenizer.apply_chat_template(
-        [
-            {"role": "user", "content": "MOPD tokenizer preflight input"},
-            {"role": "assistant", "content": "MOPD tokenizer preflight output"},
-        ],
+        messages,
         tokenize=False,
-        add_generation_prompt=False,
+        add_generation_prompt=add_generation_prompt,
     )
     if not isinstance(rendered, str):
         raise TypeError("student chat template preflight must render text")
     _validate_tokenizer_offsets(tokenizer, rendered, label="student alignment")
+    token_ids = _to_int_list(
+        tokenizer(rendered, return_tensors=None, add_special_tokens=False)["input_ids"]
+    )
+    parsed = parse_qwen_chat_token_stream(tokenizer, token_ids)
+    if parsed is None:
+        raise ValueError(
+            "Cross-tokenizer MOPD requires a student chat template with parseable "
+            "ChatML message boundaries: <|im_start|>role\\n...<|im_end|>. "
+            "The configured student template and chat_template_kwargs produced "
+            "an unsupported conversation format."
+        )
+    parsed_messages, bounds = parsed
+    # Compare ordered content probes, not message dictionaries: Qwen may rewrite
+    # tool roles as user, merge adjacent tool results, or add thinking prefixes.
+    parsed_content = "\n".join(message["content"] for message in parsed_messages)
+    search_start = 0
+    for message in messages:
+        probe = message["content"]
+        probe_start = parsed_content.find(probe, search_start)
+        if probe_start < 0:
+            raise ValueError(
+                "Student chat template must preserve MOPD conversation probes "
+                "in order in the parsed content."
+            )
+        search_start = probe_start + len(probe)
+
+    if add_generation_prompt:
+        final_bound = bounds[-1]
+        if (
+            final_bound["role"] != "assistant"
+            or final_bound["content_end"] != len(token_ids)
+            or classify_thinking_state_before_generated_span(
+                tokenizer,
+                token_ids,
+                generated_start=len(token_ids),
+                expects_thinking=True,
+            )
+            == "unknown"
+        ):
+            raise ValueError(
+                "Student chat template generation prompt must end at a supported "
+                "open assistant message boundary."
+            )
+
+
+def validate_mopd_student_alignment_preflight(
+    student_tokenizer_config: Any,
+) -> bool:
+    """Check student offsets and conversation format, then classify reasoning.
+
+    These probes check compatibility with the strict ChatML stream parser, not
+    every possible rollout. Runtime reconstruction and span mapping must still
+    prove each sampled transcript independently.
+    """
+    tokenizer = load_mopd_student_alignment_tokenizer(student_tokenizer_config)
+    messages = [
+        {"role": "user", "content": "MOPD input alpha"},
+        {"role": "assistant", "content": "MOPD answer beta"},
+        {"role": "tool", "content": "MOPD tool gamma"},
+        {"role": "tool", "content": "MOPD tool delta"},
+        {"role": "user", "content": "MOPD followup epsilon"},
+        {"role": "assistant", "content": "MOPD answer zeta"},
+    ]
+    _validate_student_chat_format(tokenizer, messages, add_generation_prompt=False)
+    _validate_student_chat_format(tokenizer, messages[:-1], add_generation_prompt=True)
+    return validate_mopd_student_thinking_preflight(tokenizer)
 
 
 def validate_cross_tokenizer_preflight(cross_tokenizer_config: Any) -> None:
@@ -551,7 +655,6 @@ class MOPDTeacherScorer:
     ) -> None:
         self.teacher_group = teacher_group
         self.context = context
-        self._role_markers: dict[str, tuple[str, str]] = {}
 
     @classmethod
     def from_config(
@@ -625,52 +728,6 @@ class MOPDTeacherScorer:
         )
         return cls(teacher_group=teacher_group, context=context)
 
-    def _get_role_markers(self, role: str) -> tuple[str, str]:
-        if role in self._role_markers:
-            return self._role_markers[role]
-        sentinel = "NRL_SENT_X9Z_2026"
-        try:
-            rendered = self.context.student_tokenizer.apply_chat_template(
-                [{"role": role, "content": sentinel}],
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            token_ids = _tokenize_text(self.context.student_tokenizer, rendered)
-            decoded = self.context.student_tokenizer.decode(
-                token_ids,
-                skip_special_tokens=True,
-            )
-        except (KeyError, TypeError, ValueError, RuntimeError):
-            markers = ("", "")
-        else:
-            if sentinel not in decoded:
-                markers = ("", "")
-            else:
-                markers = decoded.split(sentinel, 1)
-        self._role_markers[role] = markers
-        return markers
-
-    def _message_content(self, message: Mapping[str, Any]) -> str:
-        content = message.get("content")
-        if content:
-            return str(content)
-        raw_token_ids = message.get("token_ids")
-        if raw_token_ids is None:
-            return ""
-        role = str(message.get("role", ""))
-        decoded = self.context.student_tokenizer.decode(
-            _to_int_list(raw_token_ids),
-            skip_special_tokens=True,
-        )
-        if role == "assistant":
-            return decoded
-        prefix, suffix = self._get_role_markers(role)
-        if prefix and decoded.startswith(prefix):
-            decoded = decoded[len(prefix) :]
-        if suffix and decoded.endswith(suffix):
-            decoded = decoded[: -len(suffix)]
-        return decoded
-
     def _teacher_tokenize_with_offsets(
         self,
         text: str,
@@ -737,31 +794,6 @@ class MOPDTeacherScorer:
             skip_special_tokens=skip_special_tokens,
         )
 
-    def _fallback_messages_and_mapping(
-        self,
-        message_log: Sequence[dict[str, Any]],
-    ) -> tuple[list[dict[str, str]], dict[int, int]]:
-        messages = [
-            {
-                "role": str(message["role"]),
-                "content": self._message_content(message),
-            }
-            for message in message_log
-        ]
-        normalized, instruction_prefix_length = _normalize_leading_instruction_messages(
-            messages
-        )
-        if instruction_prefix_length == 0:
-            return normalized, {
-                message_index: message_index
-                for message_index in range(len(message_log))
-            }
-        shift = instruction_prefix_length - 1
-        return normalized, {
-            message_index: message_index - shift
-            for message_index in range(instruction_prefix_length, len(message_log))
-        }
-
     def _recover_transcript(
         self,
         *,
@@ -769,18 +801,14 @@ class MOPDTeacherScorer:
         student_length: int,
         message_log: Sequence[dict[str, Any]],
         metrics: Counter[str],
-    ) -> tuple[list[dict[str, str]], dict[int, int]]:
-        messages, mapping = self._fallback_messages_and_mapping(message_log)
+    ) -> tuple[list[dict[str, str]], dict[int, int]] | None:
+        """Recover only transcripts proven by the exact student token stream."""
         message_stream: list[int] = []
         for message in message_log:
             raw_token_ids = message.get("token_ids")
             if raw_token_ids is not None:
                 message_stream.extend(_to_int_list(raw_token_ids))
 
-        structured = qwen_chat_boundaries_present(
-            self.context.student_tokenizer,
-            student_row_ids,
-        )
         exact_stream = (
             len(message_stream) >= student_length
             and message_stream[:student_length] == student_row_ids
@@ -804,11 +832,8 @@ class MOPDTeacherScorer:
                 metrics["transcripts_recovered"] += 1
                 return parsed_messages, parsed_mapping
 
-        metrics["transcript_recovery_fallbacks"] += 1
-        if structured:
-            metrics["structured_transcripts_failed_closed"] += 1
-            return messages, {}
-        return messages, mapping
+        metrics["transcript_reconstruction_failures"] += 1
+        return None
 
     def _render_teacher_transcript(
         self,
@@ -918,12 +943,15 @@ class MOPDTeacherScorer:
     ) -> _PreparedSample:
         student_tokenizer = self.context.student_tokenizer
         teacher_tokenizer = self.context.teacher_tokenizer
-        messages, teacher_message_index_by_log_index = self._recover_transcript(
+        recovered = self._recover_transcript(
             student_row_ids=student_row_ids,
             student_length=student_length,
             message_log=message_log,
             metrics=metrics,
         )
+        if recovered is None:
+            return _PreparedSample(teacher_ids=(0,), turns=())
+        messages, teacher_message_index_by_log_index = recovered
 
         student_template = getattr(student_tokenizer, "chat_template", None)
         expects_thinking_state = bool(
@@ -1461,8 +1489,7 @@ class MOPDTeacherScorer:
             "missing_think_close_detected",
             "open_state_preserved",
             "transcripts_recovered",
-            "transcript_recovery_fallbacks",
-            "structured_transcripts_failed_closed",
+            "transcript_reconstruction_failures",
             "think_char_mapping_failures",
             "teacher_offset_fallbacks",
             "teacher_open_render_failures",
@@ -1664,4 +1691,5 @@ __all__ = [
     "score_mopd_teacher_group",
     "validate_cross_tokenizer_preflight",
     "validate_mopd_student_alignment_preflight",
+    "validate_mopd_student_thinking_preflight",
 ]

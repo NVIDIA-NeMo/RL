@@ -172,12 +172,40 @@ set it in the teacher resource rather than relying on the student policy value.
 
 ### Cross-token transcript semantics
 
+Student serialization currently requires ChatML messages of the form
+`<|im_start|>role\ncontent<|im_end|>`, with each boundary marker encoded as one
+token and the generation prompt ending inside an open assistant message.
+Supported roles are `system`, `developer`, `user`, `assistant`, and `tool`.
+Qwen-style tool results wrapped in `<tool_response>` and consecutive tool
+results merged into one rendered user message are supported. Custom formats
+such as `<S role>...<E>` are rejected. This restriction applies to the student
+parser; it does not require a ChatML teacher template.
+
+Setup checks the student's configured template and `chat_template_kwargs`,
+including preservation of ordered content probes, an open assistant generation
+boundary, and tokenizer offsets. A template containing both `<think>` and
+`</think>` also requires a recognized thinking boundary: a plain assistant
+header waiting for generated thinking (Qwen3), a prefilled `<think>\n` prefix
+(Nano-style), or a supported closed thinking prefix inside the open assistant
+message. Closed prefixes are `<think></think>` and
+`<think>\n\n</think>\n\n`; they report that the student does not sample reasoning.
+Templates without both thinking markers also report no student reasoning, but
+must still pass conversation-format validation. Other thinking boundaries,
+including R1-Distill-style boundaries, are rejected. An assistant message
+already terminated by `<|im_end|>` is not an open generation prompt.
+
 Cross-token scoring reconstructs the exact sampled student token stream from
 `message_log`, then renders the full multi-turn transcript with the teacher's
-native chat template. This includes developer/system normalization and tool
-loops. Only generated assistant messages that carry generation log-probabilities
-are aligned and trained; user, tool, environment, and template-only regions do
-not become distillation targets. With `only_unmask_final: true`, the complete
+native chat template, including developer/system normalization and tool loops.
+Setup is a compatibility check, not proof for future rollouts: every rollout
+still requires exact-stream validation, strict parsing, and a successful mapping
+from generated spans to recovered assistant messages.
+Failure invalidates every teacher-score position in that rollout, increments
+`mopd/transcript_reconstruction_failures`, and stops preparation before teacher
+template rendering. Only generated assistant messages that carry generation
+log-probabilities are aligned and trained; user, tool, environment, and
+template-only regions do not become distillation targets. With
+`only_unmask_final: true`, the complete
 transcript is still teacher and student context, but only the last generated
 assistant message is included in the common training loss mask. A trailing tool
 or environment message does not change which assistant turn is selected.

@@ -366,18 +366,6 @@ def render_teacher_open_thinking_prefix(
     return rendered
 
 
-def qwen_chat_boundaries_present(
-    tokenizer: Any,
-    token_ids: Sequence[int],
-) -> bool:
-    """Return whether a stream contains a provable Qwen message boundary."""
-    try:
-        im_start_ids = _tokenizer_ids(tokenizer, "<|im_start|>")
-    except (KeyError, TypeError, ValueError, RuntimeError):
-        return False
-    return len(im_start_ids) == 1 and im_start_ids[0] in token_ids
-
-
 def parse_qwen_chat_token_stream(
     tokenizer: Any,
     token_ids: Sequence[int],

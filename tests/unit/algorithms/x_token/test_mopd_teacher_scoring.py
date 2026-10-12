@@ -103,6 +103,46 @@ class _PieceTokenizer(_CharTokenizer):
         return [self.pieces[int(token_id)] for token_id in ids]
 
 
+class _ChatMLTokenizer(_PieceTokenizer):
+    """Student fixture with single-token ChatML message boundaries."""
+
+    def __init__(self, pieces: list[str] | None = None) -> None:
+        super().__init__(
+            [
+                *(pieces if pieces is not None else [chr(i) for i in range(32, 127)]),
+                "<|im_start|>",
+                "<|im_end|>",
+                "user\n",
+                "assistant\n",
+                "tool\n",
+                "\n",
+            ]
+        )
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+    ) -> str | list[int]:
+        rendered = "".join(
+            f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n"
+            for message in messages
+        )
+        if add_generation_prompt:
+            rendered += "<|im_start|>assistant\n"
+        return self(rendered)["input_ids"] if tokenize else rendered
+
+
+def _student_prompt_ids(tokenizer: _ChatMLTokenizer) -> list[int]:
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": "q"}],
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+
+
 class _Sharding:
     def get_axis_size(self, axis):
         assert axis == "data_parallel"
@@ -148,7 +188,7 @@ def _cross_tokenizer_config():
 def test_cross_token_scorer_projects_nonconstant_scores_with_real_aligner() -> None:
     from nemo_rl.algorithms.x_token import mopd_teacher_scoring as scoring
 
-    student_tokenizer = _PieceTokenizer(["q", "a", "b", "c", "d"])
+    student_tokenizer = _ChatMLTokenizer(["q", "a", "b", "c", "d"])
     teacher_tokenizer = _PieceTokenizer(["q", "ab", "cd"])
     # The prompt score must be excluded; the two answer scores differ.
     teacher_group = _TeacherGroup(logprobs=torch.tensor([[-7.0, -2.0, -3.0]]))
@@ -159,12 +199,13 @@ def test_cross_token_scorer_projects_nonconstant_scores_with_real_aligner() -> N
         teacher_tokenizer=teacher_tokenizer,
     )
 
+    prompt_ids = _student_prompt_ids(student_tokenizer)
     result = scorer.score(
-        input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
-        input_lengths=torch.tensor([5]),
+        input_ids=torch.tensor([prompt_ids + [2, 3, 4, 5]]),
+        input_lengths=torch.tensor([len(prompt_ids) + 4]),
         message_logs=[
             [
-                {"role": "user", "content": "q", "token_ids": [1]},
+                {"role": "user", "content": "", "token_ids": prompt_ids},
                 {
                     "role": "assistant",
                     "content": "abcd",
@@ -177,10 +218,12 @@ def test_cross_token_scorer_projects_nonconstant_scores_with_real_aligner() -> N
 
     # The real aligner maps [a, b] to [ab] and [c, d] to [cd].
     torch.testing.assert_close(
-        result.logprobs, torch.tensor([[0.0, -1.0, -1.0, -1.5, -1.5]])
+        result.logprobs,
+        torch.tensor([[0.0] * len(prompt_ids) + [-1.0, -1.0, -1.5, -1.5]]),
     )
     assert torch.equal(
-        result.valid_mask, torch.tensor([[False, True, True, True, True]])
+        result.valid_mask,
+        torch.tensor([[False] * len(prompt_ids) + [True] * 4]),
     )
     assert teacher_group.calls == 1
     torch.testing.assert_close(
@@ -244,7 +287,7 @@ def test_cross_token_scorer_applies_generated_turn_mask_in_tool_loop(
         ]
 
     monkeypatch.setattr(scoring, "align_token_ids", exact_alignment)
-    student_tokenizer = _CharTokenizer()
+    student_tokenizer = _ChatMLTokenizer()
     teacher_tokenizer = _CharTokenizer()
     teacher_group = _TeacherGroup()
     scorer = scoring.build_mopd_teacher_scorer(
@@ -263,11 +306,17 @@ def test_cross_token_scorer_applies_generated_turn_mask_in_tool_loop(
     )
     tool_result = "sunny"
     trailing_tool_result = "logged"
-    prompt_ids = student_tokenizer("q")["input_ids"]
+    prompt_ids = _student_prompt_ids(student_tokenizer)
     tool_call_ids = student_tokenizer(tool_call)["input_ids"]
-    tool_result_ids = student_tokenizer(tool_result)["input_ids"]
+    tool_result_ids = student_tokenizer(
+        "<|im_end|>\n<|im_start|>tool\n"
+        + tool_result
+        + "<|im_end|>\n<|im_start|>assistant\n"
+    )["input_ids"]
     final_answer_ids = student_tokenizer(final_answer)["input_ids"]
-    trailing_tool_result_ids = student_tokenizer(trailing_tool_result)["input_ids"]
+    trailing_tool_result_ids = student_tokenizer(
+        "<|im_end|>\n<|im_start|>tool\n" + trailing_tool_result + "<|im_end|>\n"
+    )["input_ids"]
     input_ids = torch.tensor(
         [
             prompt_ids
@@ -342,6 +391,67 @@ def test_cross_token_scorer_applies_generated_turn_mask_in_tool_loop(
     assert teacher_tokenizer.decode(
         teacher_group.last_batch["input_ids"][0, :teacher_length]
     ) == ("q" + tool_call + tool_result + final_answer + trailing_tool_result)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["custom_format", "malformed_chatml", "stream_mismatch", "generated_user_span"],
+)
+def test_unproven_transcript_is_masked_before_teacher_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    student_tokenizer = _ChatMLTokenizer()
+    teacher_tokenizer = _CharTokenizer()
+    render_teacher = MagicMock(side_effect=AssertionError("must not render"))
+    monkeypatch.setattr(teacher_tokenizer, "apply_chat_template", render_teacher)
+    prompt = "<|im_start|>user\nQuestion<|im_end|>\n<|im_start|>assistant\n"
+    response = "answer"
+    if failure == "custom_format":
+        prompt = "<S user>\nQuestion<E>\n<S assistant>\n"
+    elif failure == "malformed_chatml":
+        prompt = "<|im_start|>user\nQuestion<|im_start|>assistant\n"
+    elif failure == "generated_user_span":
+        prompt = "<|im_start|>user\nQuestion<|im_end|>\n<|im_start|>user\n"
+        response += "<|im_end|>"
+    prompt_ids = student_tokenizer(prompt)["input_ids"]
+    response_ids = student_tokenizer(response)["input_ids"]
+    message_prompt_ids = (
+        student_tokenizer(prompt.replace("Question", "Changed"))["input_ids"]
+        if failure == "stream_mismatch"
+        else prompt_ids
+    )
+    message_log = [
+        {"role": "user", "content": "", "token_ids": message_prompt_ids},
+        {
+            "role": "assistant",
+            "content": response,
+            "token_ids": response_ids,
+            "generation_logprobs": [0.0] * len(response_ids),
+        },
+    ]
+    teacher = _TeacherGroup()
+    scorer = scoring.build_mopd_teacher_scorer(
+        student_tokenizer=student_tokenizer,
+        teacher_tokenizer=teacher_tokenizer,
+        teacher_group=teacher,
+        cross_tokenizer_config=_cross_tokenizer_config(),
+    )
+
+    result = scorer.score(
+        input_ids=torch.tensor([prompt_ids + response_ids]),
+        message_logs=[message_log],
+    )
+
+    assert not result.valid_mask.any()
+    assert not result.logprobs.any()
+    assert result.metrics["mopd/transcript_reconstruction_failures"] == 1.0
+    assert result.metrics["mopd/transcripts_recovered"] == 0.0
+    assert result.metrics["mopd/sample_prepare_failures"] == 0.0
+    assert result.metrics["mopd/samples_fully_masked"] == 1.0
+    render_teacher.assert_not_called()
+    assert teacher.last_batch["input_ids"].tolist() == [[0]]
+    assert teacher.last_batch["input_lengths"].tolist() == [1]
 
 
 def test_alignment_tokenizer_uses_plain_transformers_construction(monkeypatch):
@@ -740,7 +850,9 @@ def test_native_qwen3_unproven_preservation_masks_turn(
         def unproven_recovery(
             **kwargs: Any,
         ) -> tuple[list[dict[str, str]], dict[int, int]]:
-            recovered_messages, mapping = recover(**kwargs)
+            recovered = recover(**kwargs)
+            assert recovered is not None
+            recovered_messages, mapping = recovered
             recovered_messages[-1]["content"] = "reasoning"
             return recovered_messages, mapping
 
@@ -817,6 +929,53 @@ def test_native_qwen3_closed_prompt_keeps_plain_answer_scores(
         ),
         dropped_prefix_tokens=0,
     )
+
+
+def test_native_qwen3_merged_tool_results_reconstruct_and_score(
+    native_qwen3_tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    tokenizer = native_qwen3_tokenizer
+    scorer, teacher, _, response_ids, message_log = _native_scoring_case(
+        tokenizer, "answer<|im_end|>", enable_thinking=False
+    )
+    prompt = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": "q"},
+            {"role": "tool", "content": "first tool result"},
+            {"role": "tool", "content": "second tool result"},
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    message_log[0] = {"role": "user", "content": "", "token_ids": prompt_ids}
+    student_ids = prompt_ids + response_ids
+    recovered = scorer._recover_transcript(
+        student_row_ids=student_ids,
+        student_length=len(student_ids),
+        message_log=message_log,
+        metrics=Counter(),
+    )
+    assert recovered is not None
+    messages, mapping = recovered
+    assert [message["role"] for message in messages] == ["user", "user", "assistant"]
+    assert messages[1]["content"] == (
+        "<tool_response>\nfirst tool result\n</tool_response>\n"
+        "<tool_response>\nsecond tool result\n</tool_response>"
+    )
+    assert mapping == {1: 2}
+
+    result = scorer.score(
+        input_ids=torch.tensor([student_ids]), message_logs=[message_log]
+    )
+
+    assert not result.valid_mask[0, : len(prompt_ids)].any()
+    assert result.valid_mask[0, len(prompt_ids) :].all()
+    assert (result.logprobs[0, len(prompt_ids) :] < 0).all()
+    assert result.metrics["mopd/transcripts_recovered"] == 1.0
+    assert result.metrics["mopd/transcript_reconstruction_failures"] == 0.0
+    assert teacher.calls == 1
 
 
 @pytest.mark.parametrize("policy", ["mask", "preserve_open_if_proven"])
@@ -915,17 +1074,19 @@ def test_scorer_emits_every_counter_on_clean_batch() -> None:
     import ast
     import inspect
 
+    student_tokenizer = _ChatMLTokenizer(["q", "a", "b", "c", "d"])
+    prompt_ids = _student_prompt_ids(student_tokenizer)
     scorer = scoring.build_mopd_teacher_scorer(
-        student_tokenizer=_PieceTokenizer(["q", "a", "b", "c", "d"]),
+        student_tokenizer=student_tokenizer,
         teacher_group=_TeacherGroup(logprobs=torch.tensor([[-7.0, -2.0, -3.0]])),
         cross_tokenizer_config=_cross_tokenizer_config(),
         teacher_tokenizer=_PieceTokenizer(["q", "ab", "cd"]),
     )
     result = scorer.score(
-        input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
+        input_ids=torch.tensor([prompt_ids + [2, 3, 4, 5]]),
         message_logs=[
             [
-                {"role": "user", "content": "q", "token_ids": [1]},
+                {"role": "user", "content": "", "token_ids": prompt_ids},
                 {
                     "role": "assistant",
                     "content": "abcd",
@@ -962,8 +1123,10 @@ def test_sample_coverage_counts_every_fully_masked_row(monkeypatch) -> None:
     monkeypatch.setattr(scoring, "align_token_ids", reject_cd_only_turn)
     teacher_group = _TeacherGroup()
     teacher_group.cfg = {"max_total_sequence_length": 3}
+    student_tokenizer = _ChatMLTokenizer(["q", "a", "b", "c", "d"])
+    prompt_ids = _student_prompt_ids(student_tokenizer)
     scorer = scoring.build_mopd_teacher_scorer(
-        student_tokenizer=_PieceTokenizer(["q", "a", "b", "c", "d"]),
+        student_tokenizer=student_tokenizer,
         teacher_group=teacher_group,
         cross_tokenizer_config=_cross_tokenizer_config(),
         teacher_tokenizer=_PieceTokenizer(["q", "ab", "cd"]),
@@ -971,7 +1134,7 @@ def test_sample_coverage_counts_every_fully_masked_row(monkeypatch) -> None:
 
     def message_log(answer_ids):
         return [
-            {"role": "user", "content": "q", "token_ids": [1]},
+            {"role": "user", "content": "", "token_ids": prompt_ids},
             {
                 "role": "assistant",
                 "content": "",
@@ -983,17 +1146,17 @@ def test_sample_coverage_counts_every_fully_masked_row(monkeypatch) -> None:
     result = scorer.score(
         input_ids=torch.tensor(
             [
-                [1, 2, 3, 4, 5, 0, 0],  # aligned
-                [1, 2, 3, 4, 5, 2, 3],  # teacher transcript over the length cap
-                [1, 0, 0, 0, 0, 0, 0],  # preparation raises
-                [1, 4, 5, 0, 0, 0, 0],  # every alignment pair is rejected
+                prompt_ids + [2, 3, 4, 5, 0, 0],  # aligned
+                prompt_ids + [2, 3, 4, 5, 2, 3],  # teacher over the length cap
+                prompt_ids + [0, 0, 0, 0, 0, 0],  # preparation raises
+                prompt_ids + [4, 5, 0, 0, 0, 0],  # all alignment pairs rejected
             ]
         ),
-        input_lengths=torch.tensor([5, 7, 1, 3]),
+        input_lengths=torch.tensor([len(prompt_ids) + n for n in [4, 6, 0, 2]]),
         message_logs=[
             message_log([2, 3, 4, 5]),
             message_log([2, 3, 4, 5, 2, 3]),
-            [{"content": "q", "token_ids": [1]}],  # missing role
+            [{"role": "user", "content": "", "token_ids": ["invalid"]}],
             message_log([4, 5]),
         ],
     )
