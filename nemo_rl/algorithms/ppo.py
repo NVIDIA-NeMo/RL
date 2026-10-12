@@ -1524,6 +1524,9 @@ def ppo_train(
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
+                            retry_config=master_config.policy["generation"].get(
+                                "native_retry"
+                            ),
                             max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
@@ -3227,6 +3230,15 @@ def validate(
                 max_seq_len=master_config.policy["max_total_sequence_length"],
                 max_rollout_turns=master_config.ppo.max_rollout_turns,
                 greedy=False,
+                **(
+                    {
+                        "retry_config": master_config.policy["generation"].get(
+                            "native_retry"
+                        )
+                    }
+                    if rollout_fn is run_async_multi_turn_rollout
+                    else {}
+                ),
             )
 
             total_rewards.extend(val_batch["total_reward"].tolist())

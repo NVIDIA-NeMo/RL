@@ -14,10 +14,20 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cache
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, Optional, TypedDict, Union
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    NotRequired,
+    Optional,
+    TypedDict,
+    Union,
+)
 
 import ray
 import torch
+from pydantic import BaseModel, Field
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -214,6 +224,14 @@ class CheckpointEngineConfig(TypedDict):
     engine_kwargs: dict[str, dict[str, Any]]
 
 
+class NativeGenerationRetryConfig(BaseModel, extra="allow"):
+    """Bounded recovery of a native generation turn; never retries environment steps."""
+
+    max_retries: Annotated[int, Field(ge=0)] = 2
+    backoff_seconds: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 1.0
+    deadline_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1800.0
+
+
 class GenerationConfig(TypedDict):
     """Configuration for generation."""
 
@@ -238,6 +256,7 @@ class GenerationConfig(TypedDict):
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
     use_async_rollouts: NotRequired[bool]
+    native_retry: NotRequired[NativeGenerationRetryConfig]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
     # Eagle draft weights arrive via refit when policy.draft.enabled=true.
@@ -436,6 +455,14 @@ def reject_unenforceable_refit_deadline(
 
 class GenerationInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
+
+    def supports_native_generation_retries(self) -> bool:
+        """Whether cancelled generation acknowledges request cleanup before returning.
+
+        Backends must opt in only once retrying cannot leave a previous request
+        running. Native rollout failures still propagate for other backends.
+        """
+        return False
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:

@@ -3154,7 +3154,8 @@ class TestAsyncTrajectoryCollector:
         assert collector.get_rollouts_state() == {"next_ng_task_index": 0}
         assert target_weight not in collector._generating_targets
 
-    def test_native_batch_worker_enqueues_each_group(self, monkeypatch):
+    @pytest.mark.parametrize("failed_group", [False, True])
+    def test_native_batch_worker_enqueues_each_group(self, monkeypatch, failed_group):
         """The common worker enqueues every native group without Gym metadata."""
 
         class _ReadyResult:
@@ -3180,7 +3181,9 @@ class TestAsyncTrajectoryCollector:
                 self.add = RemoteMethod()
 
         replay_buffer = FakeReplayBuffer()
-        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector = self.create_local_collector(
+            replay_buffer=replay_buffer, max_generation_failures=1
+        )
         collector.running = True
         target_weight = 13
         collector._generating_targets.add(target_weight)
@@ -3194,6 +3197,8 @@ class TestAsyncTrajectoryCollector:
             assert kwargs["input_batch"].size == 6
             assert kwargs["num_generations"] == 3
             for group_index in range(2):
+                if failed_group and group_index == 1:
+                    raise TimeoutError("group 1 exhausted generation retries")
                 yield trajectory_collector_mod.RolloutGroupResult(
                     group_index=group_index,
                     final_batch=batches[group_index],
@@ -3216,7 +3221,7 @@ class TestAsyncTrajectoryCollector:
             )
         )
 
-        assert len(replay_buffer.add.calls) == 2
+        assert len(replay_buffer.add.calls) == (1 if failed_group else 2)
         for group_index, call in enumerate(replay_buffer.add.calls):
             trajectory_group, generation_weight, target = call
             assert trajectory_group["batch"] is batches[group_index]
@@ -3229,6 +3234,86 @@ class TestAsyncTrajectoryCollector:
             assert generation_weight == 2
             assert target == target_weight
         assert target_weight not in collector._generating_targets
+        assert collector._failure_count == int(failed_group)
+        collector.check_health()
+
+    def test_native_stream_failure_cannot_hide_buffer_bug(self, monkeypatch):
+        collector = self.create_local_collector(max_generation_failures=3)
+        collector.running = True
+        collector._generating_targets.add(13)
+
+        async def stream(**kwargs):
+            yield trajectory_collector_mod.RolloutGroupResult(
+                group_index=0,
+                final_batch=BatchedDataDict({"value": torch.tensor([1, 2])}),
+                rollout_metrics={},
+            )
+            raise TimeoutError("second group failed")
+
+        async def push(**kwargs):
+            raise ValueError("invalid buffer payload")
+
+        monkeypatch.setattr(collector, "_iter_rollout_groups", stream)
+        monkeypatch.setattr(collector, "_enqueue_rollout_group", push)
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=self.create_mock_batch(size=2).repeat_interleave(2),
+                generation_weight_version=2,
+                target_weight_version=13,
+                num_generations=2,
+                use_nemo_gym=False,
+            )
+        )
+        with pytest.raises(RuntimeError, match="invalid buffer payload"):
+            collector.check_health()
+        assert 13 not in collector._generating_targets
+
+    def test_cancelled_native_stream_drains_pending_buffer_push(self, monkeypatch):
+        collector = self.create_local_collector()
+        collector.running = True
+        target_weight = 13
+        collector._generating_targets.add(target_weight)
+
+        async def run():
+            push_started = asyncio.Event()
+            push_drained = asyncio.Event()
+
+            async def stream(**kwargs):
+                yield trajectory_collector_mod.RolloutGroupResult(
+                    group_index=0,
+                    final_batch=BatchedDataDict({"value": torch.tensor([1, 2])}),
+                    rollout_metrics={},
+                )
+                await asyncio.Event().wait()
+
+            async def push(**kwargs):
+                try:
+                    push_started.set()
+                    await asyncio.Event().wait()
+                finally:
+                    push_drained.set()
+
+            monkeypatch.setattr(collector, "_iter_rollout_groups", stream)
+            monkeypatch.setattr(collector, "_enqueue_rollout_group", push)
+            task = asyncio.create_task(
+                collector._run_rollout_batch_worker(
+                    repeated_batch=self.create_mock_batch(size=2).repeat_interleave(2),
+                    generation_weight_version=2,
+                    target_weight_version=target_weight,
+                    num_generations=2,
+                    use_nemo_gym=False,
+                )
+            )
+            await push_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert push_drained.is_set()
+            assert len(asyncio.all_tasks()) == 1
+
+        asyncio.run(run())
+        assert target_weight not in collector._generating_targets
+        assert collector._failure_count == 0
 
     def test_unexpected_replay_buffer_status_fails_batch(self, monkeypatch):
         """Unknown replay-buffer statuses fail instead of polling forever."""
@@ -3515,10 +3600,10 @@ class TestAsyncTrajectoryCollector:
 
         outcomes = []
         if max_generation_failures > 0:
-            outcomes.append(ValueError("pre-reset failure"))
+            outcomes.append(TimeoutError("pre-reset failure"))
         outcomes.append(None)
         outcomes.extend(
-            ValueError(f"backend failed {failure_index}")
+            TimeoutError(f"backend failed {failure_index}")
             for failure_index in range(max_generation_failures + 2)
         )
 
@@ -3573,7 +3658,7 @@ class TestAsyncTrajectoryCollector:
         assert "generation_weight=4" in error_message
         assert "target_weight=7" in error_message
         assert (
-            f"ValueError('backend failed {max_generation_failures}')" in error_message
+            f"TimeoutError('backend failed {max_generation_failures}')" in error_message
         )
         assert "Worker traceback:" in error_message
         assert "Traceback (most recent call last):" in error_message
@@ -3622,7 +3707,7 @@ class TestAsyncTrajectoryCollector:
         monkeypatch.setattr(collector, "_process_batch", process_gap_fill)
 
         async def fail_rollout_batch(**kwargs):
-            raise ValueError("worker exhausted retries")
+            raise TimeoutError("worker exhausted retries")
 
         monkeypatch.setattr(collector, "_collect_rollout_batch", fail_rollout_batch)
 
@@ -3649,6 +3734,29 @@ class TestAsyncTrajectoryCollector:
         assert not collection_thread.is_alive()
         assert collector._failure_count == 1
         collector.check_health()
+
+    def test_native_unknown_failure_ignores_tolerance(self, monkeypatch):
+        collector = self.create_local_collector(max_generation_failures=3)
+        collector.running = True
+        collector._generating_targets.add(7)
+
+        async def fail(**kwargs):
+            raise ValueError("invalid rollout shape")
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", fail)
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=None,
+                generation_weight_version=4,
+                target_weight_version=7,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+        with pytest.raises(RuntimeError, match="invalid rollout shape"):
+            collector.check_health()
+        assert 7 not in collector._generating_targets
+        assert collector._failure_count == 1
 
     def test_worker_shutdown_error_is_not_counted(self, monkeypatch):
         """An in-flight worker stopping after exhaustion is not a generation failure."""

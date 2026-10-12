@@ -31,7 +31,13 @@ import ray.exceptions
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.failures import GenerationUnavailable, NoHealthyShards
+from nemo_rl.experience.failures import (
+    FailureClass,
+    GenerationUnavailable,
+    NoHealthyShards,
+    RolloutDataFailure,
+    classify_rollout_failure,
+)
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetHealth,
@@ -49,13 +55,24 @@ class _WorkerGroup:
         self.fail_on_workers = set(fail_on_workers)
         self.dispatched: list[int] = []
 
+    def shutdown(self, **kwargs):
+        return True
+
     def get_dp_leader_worker_idx(self, dp_shard_idx: int) -> int:
         # One leader per shard keeps shard index and worker index aligned, so the
         # assertions below can talk about either.
         return dp_shard_idx
 
-    def run_single_worker_single_data(self, *, method_name, worker_idx, data, greedy):
-        del method_name, data, greedy
+    def run_single_worker_single_data(
+        self, *, method_name, worker_idx, request_id, data=None, greedy=False
+    ):
+        if method_name == "abort_generation":
+
+            async def abort():
+                return None
+
+            return abort()
+        del method_name, data, greedy, request_id
         self.dispatched.append(worker_idx)
         if worker_idx in self.fail_on_workers:
             raise ray.exceptions.ActorDiedError()
@@ -73,6 +90,7 @@ def _make_generation(dp_size: int, fail_on_workers=()) -> VllmGeneration:
     """Build a VllmGeneration without firing its real __init__."""
     gen = object.__new__(VllmGeneration)
     gen.worker_group = _WorkerGroup(dp_size, fail_on_workers)
+    gen.weight_synchronizer = None
     gen.current_generate_dp_shard_idx = 0
     gen.fleet_monitor = None
     gen.fleet_selector = None
@@ -121,12 +139,13 @@ class TestWithoutFleetHealth:
         picked = [gen._next_dp_shard_idx() for _ in range(7)]
         assert picked == [0, 1, 2, 0, 1, 2, 0]
 
-    def test_no_monitor_means_no_reporting(self):
+    def test_actor_death_enables_reactive_health(self):
         gen = _make_generation(dp_size=2, fail_on_workers={0})
         with pytest.raises(GenerationUnavailable):
             _generate(gen)
-        # Nothing to report to; the failure still surfaces typed.
-        assert gen.fleet_monitor is None
+        assert gen.fleet_monitor.serving_shards() == [1]
+        _generate(gen)
+        assert gen.worker_group.dispatched == [0, 1]
 
 
 class TestWithFleetHealth:
@@ -204,10 +223,33 @@ class _HangingWorkerGroup(_WorkerGroup):
     the failure the fleet-health docstrings cite to justify reactive reporting.
     """
 
-    def run_single_worker_single_data(self, *, method_name, worker_idx, data, greedy):
-        del method_name, data, greedy
+    def run_single_worker_single_data(
+        self, *, method_name, worker_idx, request_id, data=None, greedy=False
+    ):
+        if method_name == "abort_generation":
+
+            async def abort():
+                return None
+
+            return abort()
+        del method_name, data, greedy, request_id
         self.dispatched.append(worker_idx)
-        return _never_returns()
+        return _CancellableGenerator(_never_returns())
+
+
+class _CancellableGenerator:
+    def __init__(self, outputs):
+        self.outputs = outputs
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await anext(self.outputs)
+
+    async def completed(self):
+        await self.outputs.aclose()
+        raise ray.exceptions.TaskCancelledError()
 
 
 async def _never_returns():
@@ -278,3 +320,95 @@ class TestGenerationTimeoutIsReported:
 
         _generate(gen)
         assert monitor.snapshot()[0].consecutive_reported_failures == 0
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_waiting_for_first_yield_is_cancelled_and_drained(monkeypatch, cancel):
+    events = []
+
+    class Pending:
+        async def __anext__(self):
+            events.append("started")
+            await asyncio.Event().wait()
+
+        async def completed(self):
+            events.append("drained")
+            raise ray.exceptions.TaskCancelledError()
+
+    class Workers(_WorkerGroup):
+        def run_single_worker_single_data(self, *, method_name, request_id, **kwargs):
+            if method_name == "abort_generation":
+
+                async def abort():
+                    events.append(("aborted", request_id))
+
+                return abort()
+            events.append(("request", request_id))
+            return Pending()
+
+    gen = _make_generation(1)
+    gen.worker_group = Workers(1)
+    _attach(gen)
+    monkeypatch.setenv("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "0.01")
+    monkeypatch.setattr(ray, "cancel", lambda _proxy: events.append("cancelled"))
+
+    async def run():
+        async def consume():
+            async for _ in gen.generate_async(_one_sample()):
+                pytest.fail("hung request produced output")
+
+        task = asyncio.create_task(consume())
+        if cancel:
+            while "started" not in events:
+                await asyncio.sleep(0)
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError if cancel else GenerationUnavailable):
+            await task
+        assert len(asyncio.all_tasks()) == 1
+
+    asyncio.run(run())
+    request_id = events[0][1]
+    assert events == [
+        ("request", request_id),
+        "started",
+        "cancelled",
+        "drained",
+        ("aborted", request_id),
+    ]
+    assert gen.fleet_selector.inflight(0) == 0
+
+
+def test_failed_cleanup_is_not_retryable_even_when_wrapped(monkeypatch):
+    class Workers(_HangingWorkerGroup):
+        def run_single_worker_single_data(self, **kwargs):
+            if kwargs["method_name"] == "abort_generation":
+
+                async def abort():
+                    raise TimeoutError("abort acknowledgment lost")
+
+                return abort()
+            return super().run_single_worker_single_data(**kwargs)
+
+    gen = _make_generation(1)
+    gen.worker_group = Workers(1)
+    monkeypatch.setenv("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "0.01")
+    monkeypatch.setattr(ray, "cancel", lambda _proxy: None)
+    with pytest.raises(RolloutDataFailure, match="confirm cleanup") as error:
+        _generate(gen)
+    wrapped = RuntimeError("sample failed")
+    wrapped.__cause__ = error.value
+    assert classify_rollout_failure(wrapped) is FailureClass.DATA
+
+
+def test_ray_programming_error_does_not_become_infrastructure():
+    class Workers(_WorkerGroup):
+        def run_single_worker_single_data(self, **kwargs):
+            raise ray.exceptions.RayTaskError(
+                "generate", "trace", ValueError("bad shape")
+            )
+
+    gen = _make_generation(1)
+    gen.worker_group = Workers(1)
+    with pytest.raises(ray.exceptions.RayTaskError) as error:
+        _generate(gen)
+    assert classify_rollout_failure(error.value) is FailureClass.DATA

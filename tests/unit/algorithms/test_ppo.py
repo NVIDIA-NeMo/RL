@@ -2819,7 +2819,12 @@ def test_async_ppo_initial_refit_failure_cleans_up_actors(monkeypatch):
 
 
 @pytest.mark.parametrize("async_engine", [False, True])
-def test_validate_dispatches_rollout_by_engine_mode(monkeypatch, async_engine):
+@pytest.mark.parametrize(
+    "retry_config", [None, {"max_retries": 0, "deadline_seconds": 7}]
+)
+def test_validate_dispatches_rollout_by_engine_mode(
+    monkeypatch, async_engine, retry_config
+):
     from nemo_rl.algorithms import ppo
 
     rollout_result = (
@@ -2836,6 +2841,8 @@ def test_validate_dispatches_rollout_by_engine_mode(monkeypatch, async_engine):
 
     config = _make_async_ppo_config()
     config.policy["generation"]["vllm_cfg"]["async_engine"] = async_engine
+    if retry_config is not None:
+        config.policy["generation"]["native_retry"] = retry_config
     config.policy["max_total_sequence_length"] = 16
     config.ppo.max_val_samples = 1
     config.ppo.val_batch_size = 1
@@ -2856,3 +2863,7 @@ def test_validate_dispatches_rollout_by_engine_mode(monkeypatch, async_engine):
     unselected_rollout = sync_rollout if async_engine else async_rollout
     selected_rollout.assert_called_once()
     unselected_rollout.assert_not_called()
+    if async_engine:
+        assert selected_rollout.call_args.kwargs["retry_config"] is retry_config
+    else:
+        assert "retry_config" not in selected_rollout.call_args.kwargs
