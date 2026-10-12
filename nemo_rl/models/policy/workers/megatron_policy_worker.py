@@ -27,6 +27,9 @@ log = logging.getLogger(__name__)
 
 import ray
 import torch
+from megatron.bridge.models.glm_moe_dsa.glm_dsa_native_fp8 import (
+    maybe_enable_glm52_dsa_native_fp8,
+)
 from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
@@ -740,6 +743,12 @@ class MegatronPolicyWorkerImpl(
 
         self.mcore_state = model_and_optimizer_state.state
         self.model = model_and_optimizer_state.model
+        self._maybe_enable_glm52_dsa_native_fp8(
+            self.model,
+            hf_model_id=hf_model_name,
+            model_config=runtime_config.model_cfg,
+            model_role="training",
+        )
         self.optimizer = model_and_optimizer_state.optimizer
         self.scheduler = model_and_optimizer_state.scheduler
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
@@ -882,6 +891,34 @@ class MegatronPolicyWorkerImpl(
         log_gpu_memory_diagnostics(
             label="init_complete", worker_type="MegatronPolicyWorker"
         )
+
+    def _maybe_enable_glm52_dsa_native_fp8(
+        self,
+        model: Any,
+        *,
+        hf_model_id: str,
+        model_config: Any,
+        model_role: str,
+    ) -> None:
+        """Enable the automatic GLM-5.2 native SM90 FP8 DSA Indexer patch.
+
+        Runs after the model container is built (fresh conversion or checkpoint
+        load), so activation does not depend on which provider class the
+        checkpoint's run_config deserialized to. A no-op for non-GLM-5.2 models,
+        non-SM90 devices, and incompatible DSA configurations.
+        """
+        patched_indexers = maybe_enable_glm52_dsa_native_fp8(
+            model,
+            hf_model_id=hf_model_id,
+            model_config=model_config,
+        )
+        if patched_indexers:
+            log.info(
+                "Automatically enabled GLM-5.2 native SM90 FP8 cuDNN DSA on %d "
+                "local %s Indexer modules",
+                patched_indexers,
+                model_role,
+            )
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -4312,6 +4349,12 @@ class MegatronPolicyWorkerImpl(
         # reshard needs it resident; finish_generation offloads it afterwards.
         self.inference_model = build_inference_model(
             inference_config, self.megatron_cfg, plan.initial_model_provider
+        )
+        self._maybe_enable_glm52_dsa_native_fp8(
+            self.inference_model,
+            hf_model_id=config["model_name"],
+            model_config=plan.initial_model_provider,
+            model_role="colocated inference",
         )
         # The plan is consumed (provider mutated to the inference layout); release it.
         self._colocated_reshard_plan = None
