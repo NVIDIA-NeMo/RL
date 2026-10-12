@@ -1357,6 +1357,48 @@ def test_setup_nemo_gym_config_derives_prefix_in_every_shard(
         assert _prefix_derivation(merged) is True
 
 
+@pytest.mark.parametrize(
+    "policy_model",
+    [
+        None,
+        {"responses_api_models": None},
+        {"responses_api_models": {"vllm_model": None}},
+    ],
+)
+def test_setup_nemo_gym_config_derives_prefix_into_null_overlay(policy_model) -> None:
+    """A null level of an unsharded policy_model overlay is treated as empty."""
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
+        env={"nemo_gym": {"policy_model": policy_model}},
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert _prefix_derivation(config.env["nemo_gym"]) is True
+
+
+@pytest.mark.parametrize(
+    ("policy_model", "bad_key"),
+    [
+        ("vllm_model", "policy_model"),
+        ({"responses_api_models": ["vllm_model"]}, "responses_api_models"),
+        ({"responses_api_models": {"vllm_model": True}}, "vllm_model"),
+    ],
+)
+def test_setup_nemo_gym_config_rejects_non_mapping_policy_overlay(
+    policy_model, bad_key
+) -> None:
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
+        env={"nemo_gym": {"policy_model": policy_model}},
+    )
+
+    with pytest.raises(
+        ValueError, match=f"env.nemo_gym {bad_key} overlay must be a mapping or null"
+    ):
+        setup_nemo_gym_config(config, tokenizer=None)
+
+
 @pytest.fixture(scope="function")
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)

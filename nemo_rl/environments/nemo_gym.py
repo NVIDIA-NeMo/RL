@@ -21,7 +21,7 @@ import threading
 import urllib.parse
 import urllib.request
 from collections import Counter
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Mapping, MutableMapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -1692,6 +1692,33 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 ########################################
 
 
+def _gym_policy_model_overlay(
+    nemo_gym_cfg: MutableMapping[str, Any],
+) -> MutableMapping[str, Any]:
+    """Return the Gym policy model's ``vllm_model`` overlay, creating it if needed.
+
+    A sharded job must claim every top-level Gym overlay, so when it has no
+    top-level ``policy_model`` the overlay goes in ``common_overrides``, which
+    reaches every shard. A null level is treated as empty.
+
+    Raises:
+        ValueError: A level of the overlay is neither a mapping nor null.
+    """
+    overlay_root = nemo_gym_cfg
+    if "shards" in nemo_gym_cfg and nemo_gym_cfg.get(_POLICY_SERVER_NAME) is None:
+        if nemo_gym_cfg.get("common_overrides") is None:
+            nemo_gym_cfg["common_overrides"] = {}
+        overlay_root = nemo_gym_cfg["common_overrides"]
+    node = overlay_root
+    for key in (_POLICY_SERVER_NAME, "responses_api_models", "vllm_model"):
+        if node.get(key) is None:
+            node[key] = {}
+        node = node[key]
+        if not isinstance(node, MutableMapping):
+            raise ValueError(f"env.nemo_gym {key} overlay must be a mapping or null.")
+    return node
+
+
 def _enable_gym_prefix_derivation(nemo_gym_cfg: dict[str, Any]) -> None:
     """Have Gym send the native vLLM server each request's exact token prefix.
 
@@ -1701,19 +1728,12 @@ def _enable_gym_prefix_derivation(nemo_gym_cfg: dict[str, Any]) -> None:
     set. An explicit value in the policy model overlay wins. The flag stays off
     when the overlay enables ``supply_prefix_token_ids``, which owns the same
     request field and which Gym rejects alongside it.
+
+    Raises:
+        ValueError: A level of the policy model overlay is neither a mapping
+            nor null.
     """
-    overlay_root = nemo_gym_cfg
-    if "shards" in nemo_gym_cfg and nemo_gym_cfg.get(_POLICY_SERVER_NAME) is None:
-        # A sharded job must claim every top-level Gym overlay, and
-        # common_overrides reaches all shards without one.
-        if nemo_gym_cfg.get("common_overrides") is None:
-            nemo_gym_cfg["common_overrides"] = {}
-        overlay_root = nemo_gym_cfg["common_overrides"]
-    model_cfg = (
-        overlay_root.setdefault(_POLICY_SERVER_NAME, {})
-        .setdefault("responses_api_models", {})
-        .setdefault("vllm_model", {})
-    )
+    model_cfg = _gym_policy_model_overlay(nemo_gym_cfg)
     if model_cfg.get("supply_prefix_token_ids"):
         return
     model_cfg.setdefault("derive_prefix_token_ids_from_messages", True)
