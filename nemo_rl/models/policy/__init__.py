@@ -574,6 +574,17 @@ class MegatronConfig(TypedDict):
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.
     freeze_config: NotRequired[dict[str, Any]]
+    # Megatron-Core batch-invariant kernels (bitwise train/generation parity).
+    batch_invariant_mode: NotRequired[bool]
+    batch_invariant_backend: NotRequired[Literal["deepgemm", "te_native", "triton"]]
+    # Cross-rank EP combine: "ordered" is portable, "multimem" uses NVLS.
+    batch_invariant_collective: NotRequired[Literal["multimem", "ordered"]]
+    # FlashAttention generation. Defaults to 2 when unset (flash-attn-4 is installed,
+    # so TE's auto choice would be FA4); batch-invariant / zero-KL recipes set 4
+    # (3 or 4 are accepted under batch_invariant_mode).
+    flash_attention_version: NotRequired[Literal[2, 3, 4] | None]
+    # flag to enable zero train/gen KL with generation.backend='megatron'.
+    zero_train_gen_mismatch: NotRequired[bool]
 
 
 class TokenizerConfig(TypedDict):
