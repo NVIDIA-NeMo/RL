@@ -98,6 +98,14 @@ env:
             context_window: ${add:${policy.max_total_sequence_length},-512}
             max_input_tokens: ${add:${policy.max_total_sequence_length},-33280}
             max_output_tokens: 32768
+            # Keep the long-context production rollout bounded independently
+            # of the 9,000-second outer timeout. The extra turn carries
+            # OpenCode's final text-only response after 64 working turns.
+            max_model_turns: 65
+            opencode_config:
+              agent:
+                build:
+                  steps: 64
     anyterminal_openclaw:
       responses_api_agents:
         anyterminal_agent:

@@ -83,7 +83,7 @@ env:
     anyterminal_opencode:
       responses_api_agents:
         anyterminal_agent:
-          global_agent_timeout: 900
+          global_agent_timeout: 1800
           # OpenCode must see the same context boundary as vLLM or it will
           # continue a tool loop past the server limit instead of compacting.
           # OpenCode can compact with a prompt at its advertised context
@@ -93,10 +93,20 @@ env:
             context_window: ${add:${policy.max_total_sequence_length},-512}
             max_input_tokens: ${add:${policy.max_total_sequence_length},-4608}
             max_output_tokens: 4096
+            # Preserve the 32 working turns plus OpenCode's final text-only
+            # response, then enforce a committed-turn boundary in Gym.
+            max_model_turns: 33
+            # Keep pathological build/compaction cycles finite without
+            # limiting GRPO training. Production rollouts retain twice the
+            # debug recipe's agentic tool budget.
+            opencode_config:
+              agent:
+                build:
+                  steps: 32
     anyterminal_openclaw:
       responses_api_agents:
         anyterminal_agent:
-          global_agent_timeout: 900
+          global_agent_timeout: 1800
           agent_kwargs:
             # Reserve enough input space for OpenClaw's fixed system prompt in
             # addition to keeping its boundary below vLLM's hard model limit.
@@ -105,11 +115,11 @@ env:
     anyterminal_pi:
       responses_api_agents:
         anyterminal_agent:
-          global_agent_timeout: 900
+          global_agent_timeout: 1800
     anyterminal_hermes:
       responses_api_agents:
         anyterminal_agent:
-          global_agent_timeout: 900
+          global_agent_timeout: 1800
           agent_kwargs:
             context_window: ${add:${policy.max_total_sequence_length},-512}
 

@@ -155,6 +155,8 @@ def test_super_omni_anyterminal_recipe_resolves_training_topology():
         "context_window": 15872,
         "max_input_tokens": 11776,
         "max_output_tokens": 4096,
+        "max_model_turns": 33,
+        "opencode_config": {"agent": {"build": {"steps": 32}}},
     }
     assert config["env"]["nemo_gym"]["anyterminal_openclaw"]["responses_api_agents"][
         "anyterminal_agent"
@@ -269,8 +271,10 @@ def test_nano_omni_sync_2n_debug_recipe_resolves_multi_harness_topology():
         "anyterminal_agent"
     ]["agent_kwargs"] == {
         "context_window": 15872,
-        "max_input_tokens": 7680,
-        "max_output_tokens": 8192,
+        "max_input_tokens": 11776,
+        "max_output_tokens": 4096,
+        "max_model_turns": 17,
+        "opencode_config": {"agent": {"build": {"steps": 16}}},
     }
     assert config["env"]["nemo_gym"]["anyterminal_openclaw"]["responses_api_agents"][
         "anyterminal_agent"
@@ -319,6 +323,15 @@ def test_external_vllm_recipe_resolves_production_multi_harness_contract(
     assert config["token_capture"]["enabled"] is True
     assert config["logger"]["wandb"]["entity"] == "adlr"
     assert config["logger"]["wandb"]["project"] == "multi-harness-RL"
+    assert config["env"]["nemo_gym"]["anyterminal_opencode"]["responses_api_agents"][
+        "anyterminal_agent"
+    ]["agent_kwargs"] == {
+        "context_window": 196096,
+        "max_input_tokens": 163328,
+        "max_output_tokens": 32768,
+        "max_model_turns": 65,
+        "opencode_config": {"agent": {"build": {"steps": 64}}},
+    }
 
 
 def test_external_vllm_launcher_keeps_scale_and_cache_routing_contract():

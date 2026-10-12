@@ -95,32 +95,44 @@ env:
     anyterminal_opencode:
       responses_api_agents:
         anyterminal_agent:
-          global_agent_timeout: 900
+          global_agent_timeout: 1800
           agent_kwargs:
-            # OpenCode can compact with a prompt at its advertised context
-            # boundary. Keep that boundary below vLLM's hard model limit so
-            # the compaction call always has room for at least one token.
+            # OpenCode's fixed prompt and tool schema need more than the 7.5K
+            # input budget left by an 8K output reservation. Match the proven
+            # Super split so normal calls do not immediately compact in a
+            # loop, while retaining a serving guard below vLLM's hard limit.
             context_window: ${add:${policy.max_total_sequence_length},-512}
-            max_input_tokens: ${add:${policy.max_total_sequence_length},-8704}
-            max_output_tokens: 8192
+            max_input_tokens: ${add:${policy.max_total_sequence_length},-4608}
+            max_output_tokens: 4096
+            # OpenCode's native step setting is advisory: after emitting its
+            # final text-only turn it can compact and regenerate indefinitely.
+            # The Gym adapter stops at the committed final-turn boundary.
+            max_model_turns: 17
+            # Stop a weak debug model from alternating build and compaction
+            # until the outer agent timeout. OpenCode forces a final text-only
+            # answer at this boundary; GRPO epochs and optimizer steps remain
+            # controlled independently by grpo.max_num_{epochs,steps}.
+            opencode_config:
+              agent:
+                build:
+                  steps: 16
     anyterminal_openclaw:
       responses_api_agents:
         anyterminal_agent:
-          global_agent_timeout: 900
+          global_agent_timeout: 1800
           agent_kwargs:
-            # The Nano recipe keeps an 8K generation budget for other
-            # harnesses, but OpenClaw's fixed system prompt needs more input
-            # room. Use the same 4K OpenClaw output budget as Super.
+            # OpenClaw's fixed system prompt needs more input room. Use the
+            # same 4K OpenClaw output budget as Super.
             context_window: ${add:${policy.max_total_sequence_length},-512}
             max_output_tokens: 4096
     anyterminal_pi:
       responses_api_agents:
         anyterminal_agent:
-          global_agent_timeout: 900
+          global_agent_timeout: 1800
     anyterminal_hermes:
       responses_api_agents:
         anyterminal_agent:
-          global_agent_timeout: 900
+          global_agent_timeout: 1800
           agent_kwargs:
             context_window: ${add:${policy.max_total_sequence_length},-512}
 
