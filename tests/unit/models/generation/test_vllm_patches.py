@@ -46,8 +46,10 @@ import torch
 
 from nemo_rl.models.generation.vllm import patches
 from nemo_rl.models.generation.vllm.config import (
-    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
     vllm_nemotron_h_fp32_lm_head_enabled,
+)
+from nemo_rl.models.generation.vllm.patches import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
 )
 from tests.unit.models.generation.vllm_patch_source_utils import (
     patch_snippets,

@@ -281,6 +281,26 @@ def assert_prev_logprobs_available(master_config: Any) -> None:
         )
 
 
+def assert_trust_region_supported(master_config: Any) -> None:
+    """Raise if TROPD knobs are set on a path that never reads the advantage.
+
+    Full-vocabulary MOPD replaces the policy-gradient objective with an exact
+    reverse KL and ignores ``advantages``, so a proximal teacher or a global
+    baseline would be silently dropped there.
+    """
+    adv_cfg = master_config.grpo.adv_estimator
+    if adv_cfg.proximal_teacher_alpha == 1.0 and not adv_cfg.subtract_global_baseline:
+        return
+    if get_opd_full_config(master_config) is not None:
+        raise ValueError(
+            "grpo.adv_estimator.proximal_teacher_alpha < 1 and "
+            "grpo.adv_estimator.subtract_global_baseline have no effect with "
+            "on_policy_distillation.full.enabled=true: the full-vocabulary loss "
+            "ignores advantages. Set proximal_teacher_alpha=1.0 and "
+            "subtract_global_baseline=false."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Teacher routing
 # ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ checkpointing:
 policy:
   train_global_batch_size: 32
   generation_batch_size: 32
-  dtensor_cfg:
+  automodel_cfg:
     tensor_parallel_size: 1
     context_parallel_size: 1
   dynamic_batching:
@@ -34,7 +34,7 @@ teacher:
   model_name: Qwen/Qwen3-32B
   train_global_batch_size: 32
   generation_batch_size: 32
-  dtensor_cfg:
+  automodel_cfg:
     context_parallel_size: 1
   dynamic_batching:
     enabled: false

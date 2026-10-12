@@ -9,7 +9,7 @@ policy:
     name: nvidia/NVIDIA-Nemotron-Nano-12B-v2
   # TODO(automodel-issue): NemotronH needs force_hf=true with transformers v5
   # to bypass custom backbone→model.model attribute mismatch in parallelizer.
-  dtensor_cfg:
+  automodel_cfg:
     automodel_kwargs:
       force_hf: true
     cpu_offload: true

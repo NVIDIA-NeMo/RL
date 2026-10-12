@@ -55,9 +55,52 @@ from nemo_rl.models.megatron.alignment import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.instrumentation import (
+    accepts_trace_context,
+    managed_span,
+    trace_context_kwargs,
+    umbrella_span,
+    umbrella_trace_fn,
+)
+from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
+from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker
+
+LOADER_LATENCY_MAX_KEY = "loader_latency_max"
+POLICY_TIME_KEY = "policy_time"
+TOTAL_STEP_TIME_KEY = "total_step_time"
+VALID_TOKENS_PER_SECOND_KEY = "valid_tokens_per_second"
+
+SFT_V2_TEED_METRICS = (
+    TeedMetric(
+        LOADER_LATENCY_MAX_KEY,
+        "rl.sft_v2.loader.latency.max",
+        unit="s",
+        description="Slowest data-loader rank per SFT v2 step.",
+    ),
+    TeedMetric(
+        POLICY_TIME_KEY,
+        "rl.sft_v2.policy.duration",
+        unit="s",
+        description="Controller policy update duration per SFT v2 step.",
+    ),
+    TeedMetric(
+        TOTAL_STEP_TIME_KEY,
+        "rl.sft_v2.step.duration",
+        unit="s",
+        description="Wall-clock duration of an SFT v2 step.",
+    ),
+    TeedMetric(
+        VALID_TOKENS_PER_SECOND_KEY,
+        "rl.sft_v2.valid_tokens_per_second",
+        unit="{token}/s",
+        description="Supervised token throughput per SFT v2 step.",
+    ),
+)
+register_teed_metrics(SFT_V2_TEED_METRICS)
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -143,6 +186,10 @@ class SFTSingleControllerActor:
     """Drive colocated loaders and the existing TQPolicy from one actor."""
 
     def __init__(self, master_config: MasterConfig, actor_args: SFTV2ActorArgs) -> None:
+        telemetry = init_telemetry_worker(
+            rank=0, world_size=1, worker_group="sft_v2_controller"
+        )
+        self._tracer = telemetry.tracer if telemetry is not None else None
         self._master_config = master_config
         self._trainer = actor_args.trainer
         self._loss_fn = actor_args.loss_fn
@@ -164,29 +211,36 @@ class SFTSingleControllerActor:
         self._timeout.start_iterations()
         self._setup_loaders()
 
+    @accepts_trace_context
+    def run_with_trace_context(self) -> dict[str, Any]:
+        """Run under the driver's trace context when called through Ray."""
+        return self.run()
+
     def run(self) -> dict[str, Any]:
         """Run SFT training."""
         try:
-            self._trainer.prepare_for_training()
-            while self._save_state.total_steps < self._max_steps:
-                metrics = self._run_train_step()
-                self._logger.log_metrics(metrics, self._save_state.total_steps)
-                metric = self._checkpoint_metric(metrics)
-                self._timeout.mark_iteration()
-                save_by_timeout = self._timeout.check_save()
-                if self._should_save(save_by_timeout=save_by_timeout):
-                    self._save_checkpoint(metric)
-                if save_by_timeout:
-                    # check_save fires once and then latches, so continuing
-                    # would train unsaved until the walltime kill.
-                    print("Timeout has been reached, stopping training early")
-                    break
-            return vars(self._save_state).copy()
+            with umbrella_span(RLSpanGroup.U_JOB, "rl.sft_v2.job", tracer=self._tracer):
+                self._trainer.prepare_for_training()
+                while self._save_state.total_steps < self._max_steps:
+                    metrics = self._run_train_step()
+                    self._logger.log_metrics(metrics, self._save_state.total_steps)
+                    metric = self._checkpoint_metric(metrics)
+                    self._timeout.mark_iteration()
+                    save_by_timeout = self._timeout.check_save()
+                    if self._should_save(save_by_timeout=save_by_timeout):
+                        self._save_checkpoint(metric)
+                    if save_by_timeout:
+                        # check_save fires once and then latches, so continuing
+                        # would train unsaved until the walltime kill.
+                        print("Timeout has been reached, stopping training early")
+                        break
+                return vars(self._save_state).copy()
         finally:
             for cleanup, name in (
                 (self._close_loaders, "loader close"),
                 (self._logger.finish, "logger close"),
                 (self._checkpointer.shutdown, "checkpoint close"),
+                (shutdown_telemetry, "telemetry flush"),
             ):
                 try:
                     cleanup()
@@ -243,6 +297,7 @@ class SFTSingleControllerActor:
             make_sequence_length_divisible_by=self._master_config.policy[
                 "make_sequence_length_divisible_by"
             ],
+            **trace_context_kwargs(),
         )
         envelopes = ray.get(futures)
         logical_ranks = [envelope.logical_rank for envelope in envelopes]
@@ -253,19 +308,26 @@ class SFTSingleControllerActor:
             )
         return envelopes
 
+    @umbrella_trace_fn(RLSpanGroup.U_STEP, "rl.sft_v2.step")
     def _run_train_step(self) -> dict[str, Any]:
         started = time.monotonic()
         envelopes = self._load_envelopes()
         train_started = time.monotonic()
         step_open = False
         try:
-            self._trainer.begin_train_step(self._loss_fn)
-            step_open = True
-            self._trainer.train_placed_microbatches(
-                [envelope.meta for envelope in envelopes]
-            )
-            train_results = self._trainer.finish_train_step()
-            step_open = False
+            with managed_span(
+                RLSpanGroup.POLICY_UPDATE,
+                "rl.sft_v2.policy_training",
+                tracer=self._tracer,
+            ):
+                self._trainer.begin_train_step(self._loss_fn)
+                step_open = True
+                self._trainer.train_placed_microbatches(
+                    [envelope.meta for envelope in envelopes]
+                )
+                train_results = self._trainer.finish_train_step()
+                step_open = False
+            policy_seconds = time.monotonic() - train_started
             self._owner_call("commit_sft_batch")
         except Exception:
             if step_open:
@@ -279,7 +341,6 @@ class SFTSingleControllerActor:
                 warnings.warn(f"SFTv2 loader abort failed: {error}", stacklevel=2)
             raise
 
-        policy_seconds = time.monotonic() - train_started
         valid_tokens = sum(envelope.valid_tokens for envelope in envelopes)
         self._save_state.total_steps += 1
         self._save_state.consumed_samples += sum(
@@ -289,17 +350,17 @@ class SFTSingleControllerActor:
         loader_seconds = [envelope.load_seconds for envelope in envelopes]
         loader_latency_max = max(loader_seconds)
         metrics: dict[str, Any] = {
-            "loader_latency_max": loader_latency_max,
+            LOADER_LATENCY_MAX_KEY: loader_latency_max,
             "loader_latency_mean": statistics.fmean(loader_seconds),
             "loader_copy_imbalance": loader_latency_max - min(loader_seconds),
-            "policy_time": policy_seconds,
-            "total_step_time": time.monotonic() - started,
+            POLICY_TIME_KEY: policy_seconds,
+            TOTAL_STEP_TIME_KEY: time.monotonic() - started,
             "valid_tokens": valid_tokens,
             "source_samples": sum(len(envelope.source_ids) for envelope in envelopes),
             "physical_packs": sum(
                 len(envelope.meta.sample_ids) for envelope in envelopes
             ),
-            "valid_tokens_per_second": valid_tokens
+            VALID_TOKENS_PER_SECOND_KEY: valid_tokens
             / max(time.monotonic() - started, 1e-12),
         }
         metrics.update(self._policy_metrics(train_results))
@@ -498,17 +559,17 @@ def setup_sft_v2(
     checkpoint_probe.shutdown()
 
     cluster_config = master_config.cluster
-    num_nodes = cluster_config["num_nodes"]
-    segment_size = cluster_config.get("segment_size")
+    num_nodes = cluster_config.num_nodes
+    segment_size = cluster_config.segment_size
     node_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="sft_v2_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         max_colocated_worker_groups=1,
-        port_range_low=cluster_config.get("master_port_range_low"),
-        port_range_high=cluster_config.get("master_port_range_high"),
+        port_range_low=cluster_config.master_port_range_low,
+        port_range_high=cluster_config.master_port_range_high,
         segment_size=segment_size,
         node_resource_constraints=node_constraints,
     )
