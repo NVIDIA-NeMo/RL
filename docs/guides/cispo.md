@@ -58,6 +58,18 @@ loss_fn:
 > [!NOTE]
 > When `use_importance_sampling_correction: true`, the shared GRPO loss path additionally multiplies the CISPO token loss by the actor-vs-generation correction `exp(prev_logprobs - generation_logprobs)`. This correction is separate from CISPO's clipped `pi_theta / pi_old` weight.
 
+For single-update training, override these fields in the `loss_fn` example above to reuse the training forward's logprobs. TIS clips the detached current/rollout ratio; its bounds must match the CISPO bounds above (`[0, 6]`).
+
+```yaml
+  force_on_policy_ratio: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio_min: 0.0
+  truncated_importance_sampling_ratio: 6.0
+```
+
+SingleController skips the previous-policy forward unless `grpo.seq_logprob_error_threshold` is set. A reference-policy forward is still required when reference KL is enabled.
+
 ## References
 
 - **CISPO / MiniMax-M1 Paper**: [MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention](https://arxiv.org/abs/2506.13585)

@@ -720,8 +720,7 @@ def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_config):
 
     - disable_ppo_ratio removes the pi_theta / pi_theta_old ratio that CISPO
       uses as the importance weight, so they are mutually exclusive.
-    - force_on_policy_ratio makes every ratio 1.0, removing CISPO's clipped
-      importance-weight behavior.
+    - force_on_policy_ratio requires TIS correction, which this config omits.
     - sequence_level_importance_ratios changes the token-level IS weights that
       CISPO is defined over.
     - ratio_clip_c (dual clipping) runs after the CISPO loss assembly inside
@@ -734,6 +733,39 @@ def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_config):
     )
     with pytest.raises(AssertionError):
         ClippedPGLossFn(cfg)
+
+
+def test_clipped_pg_loss_single_forward_cispo() -> None:
+    data, _, _, _ = _setup_clipped_pg_test_data(device="cpu")
+    del data["prev_logprobs"]
+    curr = torch.tensor([[-3.0, -2.0, -1.0]], requires_grad=True)
+    data["advantages"][0, 1:] = torch.tensor([1.0, -2.0, 3.0])
+    data["generation_logprobs"][:, 1:] = curr.detach() - torch.log(
+        torch.tensor([[0.1, 1.0, 10.0]])
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            use_cispo=True,
+            force_on_policy_ratio=True,
+            use_importance_sampling_correction=True,
+            truncated_importance_sampling_type="tis",
+            truncated_importance_sampling_ratio_min=0.5,
+            truncated_importance_sampling_ratio=2.0,
+            ratio_clip_min=0.5,
+            ratio_clip_max=1.0,
+            reference_policy_kl_penalty=0.0,
+        )
+    )
+    loss, _ = loss_fn(
+        next_token_logprobs=curr,
+        data=data,
+        global_valid_seqs=torch.tensor(1),
+        global_valid_toks=torch.tensor(3),
+    )
+    # Weights [0.5, 1, 2] give losses [1.5, -4, 6] and gradients [-0.5, 2, -6].
+    torch.testing.assert_close(loss, torch.tensor(7.0 / 6.0))
+    loss.backward()
+    torch.testing.assert_close(curr.grad, torch.tensor([[-1.0 / 6.0, 2.0 / 3.0, -2.0]]))
 
 
 def test_clipped_pg_loss_cispo():

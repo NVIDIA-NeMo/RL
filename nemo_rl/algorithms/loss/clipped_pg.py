@@ -134,7 +134,9 @@ def clipped_pg_actor_objective(
     token_level_loss: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute and reduce the actor objective in one compilable region."""
-    if force_on_policy_ratio:
+    if force_on_policy_ratio and use_cispo:
+        ratios = ratios_clamped = torch.ones_like(curr_logprobs)
+    elif force_on_policy_ratio:
         # Ratio is one in the forward pass, but gradients still flow.
         ratios = (curr_logprobs - curr_logprobs.detach()).exp()
         ratios_clamped = ratios
@@ -150,7 +152,10 @@ def clipped_pg_actor_objective(
         ratios = curr_logprobs
         ratios_clamped = curr_logprobs
 
-    if use_cispo:
+    if use_cispo and force_on_policy_ratio:
+        # The detached TIS current/rollout weight is applied below.
+        clip_loss = -advantages * curr_logprobs
+    elif use_cispo:
         clip_loss = -advantages * ratios_clamped.detach() * curr_logprobs
     else:
         clip_loss = torch.maximum(-advantages * ratios, -advantages * ratios_clamped)
