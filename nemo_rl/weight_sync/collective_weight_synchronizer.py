@@ -327,7 +327,13 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # state_dict_info at all -- update_weights_from_collective asserts on it -- and
         # this is metadata rather than weights, so redistributing it to shards that
         # already have it is cheap and removes the need to track who is new.
-        state_dict_info = self._policy.prepare_refit_info()
+        #
+        # Same payload mode as init_communicator: the policy has required it since #3739,
+        # and this call shipped without it, so every collective-transport recovery died
+        # here with a TypeError before touching NCCL (PR #3929 validation, job 18689836).
+        state_dict_info = self._policy.prepare_refit_info(
+            refit_payload_mode=self._generation.get_refit_payload_mode()
+        )
         self._generation.prepare_refit_info(state_dict_info)
 
         # nccl_peer, exactly as init_communicator passes it. The receiver's bootstrap is

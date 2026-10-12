@@ -23,6 +23,8 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.single_controller_utils.utils import (
+    AdvantagePartial,
+    RewardPartial,
     aggregate_step_metrics,
     apply_message_level_advantage_penalties,
     fields_for_put,
@@ -97,6 +99,16 @@ class TestAggregateStepMetrics:
         assert out["num_ranks"] == 4
         assert "grad_norm" not in out
 
+    def test_draft_grad_norm_tensor_is_preserved(self) -> None:
+        out = aggregate_step_metrics({"draft_grad_norm": torch.tensor([1.0, 3.0])})
+
+        assert out["draft_grad_norm"] == pytest.approx(2.0)
+
+    def test_draft_grad_norm_scalar_is_preserved(self) -> None:
+        out = aggregate_step_metrics({"draft_grad_norm": 0.25})
+
+        assert out["draft_grad_norm"] == pytest.approx(0.25)
+
     def test_mb_metric_reduction_rules(self) -> None:
         result = {
             "all_mb_metrics": {
@@ -136,8 +148,10 @@ class TestAggregateStepMetrics:
 class TestReduceAdvantagePumpMetrics:
     def test_reward_and_advantages_and_tokens(self) -> None:
         out = reduce_advantage_pump_metrics(
-            rewards=[torch.tensor([1.0, 3.0])],
-            masked_advantages=[torch.tensor([-1.0, 0.0, 2.0])],
+            reward_partials=[RewardPartial.from_rows(torch.tensor([1.0, 3.0]))],
+            advantage_partials=[
+                AdvantagePartial.from_values(torch.tensor([-1.0, 0.0, 2.0]))
+            ],
             sequence_lengths=[4, 6],
             num_mask_sample_filtered=[1, 2],
         )
@@ -148,10 +162,48 @@ class TestReduceAdvantagePumpMetrics:
         assert out["total_num_tokens"] == pytest.approx(10.0)
         assert out["num_mask_sample_filtered"] == pytest.approx(3.0)
 
+    def test_partials_merge_to_the_same_values_as_one_call(self) -> None:
+        rewards = torch.tensor([1.0, 3.0, 5.0, 7.0])
+        masks = torch.tensor([1.0, 0.0, 1.0, 1.0])
+        advantages = torch.tensor([-1.0, 0.0, 2.0, 4.0])
+
+        whole = reduce_advantage_pump_metrics(
+            reward_partials=[RewardPartial.from_rows(rewards, masks)],
+            advantage_partials=[AdvantagePartial.from_values(advantages)],
+            sequence_lengths=[],
+        )
+        split = reduce_advantage_pump_metrics(
+            reward_partials=[
+                RewardPartial.from_rows(rewards[:2], masks[:2]),
+                RewardPartial.from_rows(rewards[2:], masks[2:]),
+            ],
+            advantage_partials=[
+                AdvantagePartial.from_values(advantages[:2]),
+                AdvantagePartial.from_values(advantages[2:]),
+            ],
+            sequence_lengths=[],
+        )
+
+        assert split == pytest.approx(whole)
+        assert whole["reward"] == pytest.approx(13.0 / 3.0)
+
+    def test_empty_partial_does_not_skew_merged_advantages(self) -> None:
+        out = reduce_advantage_pump_metrics(
+            reward_partials=[],
+            advantage_partials=[
+                AdvantagePartial.from_values(torch.empty(0)),
+                AdvantagePartial.from_values(torch.tensor([2.0, 4.0])),
+            ],
+            sequence_lengths=[],
+        )
+        assert out["advantages/mean"] == pytest.approx(3.0)
+        assert out["advantages/min"] == pytest.approx(2.0)
+        assert out["advantages/max"] == pytest.approx(4.0)
+
     def test_empty_advantages_tensor_yields_zeros(self) -> None:
         out = reduce_advantage_pump_metrics(
-            rewards=[],
-            masked_advantages=[torch.empty(0)],
+            reward_partials=[],
+            advantage_partials=[AdvantagePartial.from_values(torch.empty(0))],
             sequence_lengths=[],
         )
         assert out["advantages/mean"] == 0.0
@@ -167,8 +219,8 @@ class TestReduceAdvantagePumpMetrics:
         self,
     ) -> None:
         out = reduce_advantage_pump_metrics(
-            rewards=[],
-            masked_advantages=[],
+            reward_partials=[],
+            advantage_partials=[],
             sequence_lengths=[],
             seq_logprob_error_metrics=[
                 {
@@ -209,8 +261,8 @@ class TestReduceAdvantagePumpMetrics:
 
     def test_violation_rates_from_per_sample_counts(self) -> None:
         out = reduce_advantage_pump_metrics(
-            rewards=[],
-            masked_advantages=[],
+            reward_partials=[],
+            advantage_partials=[],
             sequence_lengths=[],
             num_invalid_tool_calls=[1, 0, 1],
             num_malformed_thinking=[0, 1, 0],

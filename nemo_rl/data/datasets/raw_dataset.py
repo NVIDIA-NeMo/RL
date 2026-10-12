@@ -16,6 +16,7 @@ from datasets import Dataset
 
 from nemo_rl.data import PreferenceDatasetConfig, ResponseDatasetConfig
 from nemo_rl.data.interfaces import (
+    NemoGymSourceIdentity,
     TaskDataPreProcessFnCallable,
     TaskDataProcessFnCallable,
     TaskDataSpec,
@@ -27,6 +28,7 @@ class RawDataset:
     # change to ResponseDatasetConfig | PreferenceDatasetConfig once preference dataset is refactored
     data_config: ResponseDatasetConfig | PreferenceDatasetConfig
     dataset: Dataset
+    agent_name_sources: frozenset[NemoGymSourceIdentity] | None = None
     # `val_dataset` is used only when current dataset is used for both training and validation
     val_dataset: Dataset | None
     processor: TaskDataProcessFnCallable
@@ -77,5 +79,6 @@ class RawDataset:
             video_maintain_aspect_ratio=self.data_config.get(
                 "video_maintain_aspect_ratio"
             ),
+            pad_audio_to_hop_length=self.data_config.get("pad_audio_to_hop_length"),
             min_generation_tokens=self.data_config.get("min_generation_tokens"),
         )

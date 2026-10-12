@@ -31,7 +31,9 @@ from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    compute_engine_step_metrics,
     compute_spec_decode_metrics,
+    encode_counter_key,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
@@ -75,7 +77,10 @@ def test_vllm_utils_vlm_with_images_and_text():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["<s>user: hi</s>", "<s>user: hello</s>"],
-            "vllm_images": [["img1"], ["img2a", "img2b"]],
+            "vllm_multi_modal_data": [
+                {"image": "img1"},
+                {"image": ["img2a", "img2b"]},
+            ],
         }
     )
 
@@ -87,14 +92,57 @@ def test_vllm_utils_vlm_with_images_and_text():
     assert prompts[1]["multi_modal_data"]["image"] == ["img2a", "img2b"]
 
 
+def test_vllm_utils_forwards_unknown_modality_keys():
+    """NeMo-RL forwards keys; the served vLLM model validates supported modalities."""
+    embedding = torch.ones(1, 2, 3)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "input_lengths": torch.tensor([2]),
+            "vllm_multi_modal_data": [{"image": "img", "conditioning": embedding}],
+        }
+    )
+
+    prompts = format_prompt_for_vllm_generation(data)
+
+    multi_modal_data = prompts[0]["multi_modal_data"]
+    assert prompts[0]["prompt_token_ids"] == [1, 2]
+    assert multi_modal_data["image"] == "img"
+    assert multi_modal_data["conditioning"] is embedding
+
+
+@pytest.mark.parametrize("empty_value", [None, [], ()])
+@pytest.mark.parametrize("content", [None, "formatted prompt"])
+def test_vllm_utils_omits_empty_modality_values(
+    empty_value: None | list | tuple, content: str | None
+) -> None:
+    audio = (torch.ones(4), 16000)
+    rows = [{"image": empty_value}, {"image": empty_value, "audio": audio}]
+    input_ids, input_lengths = _mk_inputs()
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "vllm_content": [content, content],
+            "vllm_multi_modal_data": rows,
+        }
+    )
+
+    prompts = format_prompt_for_vllm_generation(data)
+
+    assert prompts[0] == {"prompt_token_ids": input_ids[0].tolist()}
+    assert set(prompts[1]["multi_modal_data"]) == {"audio"}
+    assert prompts[1]["multi_modal_data"]["audio"] is audio
+    assert rows[1]["image"] is empty_value
+
+
 def test_vllm_utils_vlm_with_audio_and_video_intent_path():
     """IntentTrain/IntentBench rollouts must surface both modalities to vLLM.
 
-    Asserts ``multi_modal_data`` contains a ``video`` key built from
-    ``vllm_videos`` AND an ``audio`` key built from ``vllm_audios`` for the
-    same prompt. This is the regression bar for AC-3 of the audio+video
-    intent recipe; if either key is dropped at this site, vLLM rolls out a
-    text-only / single-modality prompt and the smoke run silently degrades.
+    Asserts ``multi_modal_data`` contains both ``video`` and ``audio`` for the
+    same prompt. This is the regression bar for AC-3 of the audio+video intent
+    recipe; if either key is dropped at this site, vLLM rolls out a text-only /
+    single-modality prompt and the smoke run silently degrades.
     """
     input_ids, input_lengths = _mk_inputs()
     data = BatchedDataDict(
@@ -102,8 +150,10 @@ def test_vllm_utils_vlm_with_audio_and_video_intent_path():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["<s>user: q1</s>", "<s>user: q2</s>"],
-            "vllm_videos": [["frames-1"], ["frames-2"]],
-            "vllm_audios": [[("audio-1", 16000)], [("audio-2", 16000)]],
+            "vllm_multi_modal_data": [
+                {"video": "frames-1", "audio": ("audio-1", 16000)},
+                {"video": "frames-2", "audio": ("audio-2", 16000)},
+            ],
             "task_name": ["intent-train", "intent-bench"],
         }
     )
@@ -115,14 +165,8 @@ def test_vllm_utils_vlm_with_audio_and_video_intent_path():
             f"prompt {i} missing multi_modal_data: keys={list(prompt)}"
         )
         mm = prompt["multi_modal_data"]
-        assert "video" in mm, (
-            f"prompt {i} dropped vllm_videos -> multi_modal_data['video']: "
-            f"keys={list(mm)}"
-        )
-        assert "audio" in mm, (
-            f"prompt {i} dropped vllm_audios -> multi_modal_data['audio']: "
-            f"keys={list(mm)}"
-        )
+        assert "video" in mm, f"prompt {i} dropped video: keys={list(mm)}"
+        assert "audio" in mm, f"prompt {i} dropped audio: keys={list(mm)}"
     # The independent-streams path explicitly does not set
     # mm_processor_kwargs={"use_audio_in_video": True} (Round 1 BitLesson
     # BL-20260428-omni-use-audio-in-video). If a future change re-introduces
@@ -140,7 +184,10 @@ def test_vllm_utils_vlm_with_video_only():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["<s>user: q1</s>", "<s>user: q2</s>"],
-            "vllm_videos": [["frames-1"], ["frames-2"]],
+            "vllm_multi_modal_data": [
+                {"video": "frames-1"},
+                {"video": "frames-2"},
+            ],
         }
     )
 
@@ -154,15 +201,15 @@ def test_vllm_utils_vlm_with_video_only():
         assert "image" not in mm, f"prompt {i} should not have image key"
 
 
-def test_vllm_utils_vlm_with_empty_videos_fallback_to_tokens():
-    """Empty vllm_videos (per-sample) should fall back to prompt_token_ids."""
+def test_vllm_utils_vlm_with_empty_media_fallback_to_tokens():
+    """Empty per-sample media should fall back to prompt_token_ids."""
     input_ids, input_lengths = _mk_inputs()
     data = BatchedDataDict(
         {
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["a", "b"],
-            "vllm_videos": [[], []],
+            "vllm_multi_modal_data": [{}, {}],
         }
     )
     prompts = format_prompt_for_vllm_generation(data)
@@ -177,7 +224,7 @@ def test_vllm_utils_vlm_with_missing_images_fallback_to_tokens():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["a", "b"],
-            "vllm_images": None,
+            "vllm_multi_modal_data": None,
         }
     )
     prompts = format_prompt_for_vllm_generation(data_none)
@@ -189,7 +236,7 @@ def test_vllm_utils_vlm_with_missing_images_fallback_to_tokens():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["a", "b"],
-            "vllm_images": [[], []],
+            "vllm_multi_modal_data": [{}, {}],
         }
     )
     prompts = format_prompt_for_vllm_generation(data_empty)
@@ -203,7 +250,7 @@ def test_vllm_utils_vlm_with_none_content_uses_updated_tokens_and_media():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": [None, None],
-            "vllm_images": [["img"], ["img"]],
+            "vllm_multi_modal_data": [{"image": "img"}, {"image": "img"}],
         }
     )
     prompts_all = format_prompt_for_vllm_generation(data)
@@ -833,6 +880,214 @@ def test_compute_spec_decode_metrics():
     assert math.isclose(metrics["vllm/spec_acceptance_rate"], 0.8, rel_tol=1e-6)
 
 
+def _engine_snapshot(
+    prompt_tokens: float,
+    generation_tokens: float,
+    prompt_sum: float,
+    prompt_count: float,
+    gen_sum: float,
+    gen_count: float,
+    finished: dict[str, float],
+) -> dict[str, float]:
+    """Build a counter snapshot in the shape the worker reports."""
+    snapshot: dict[str, float] = {
+        "vllm:prompt_tokens": prompt_tokens,
+        "vllm:generation_tokens": generation_tokens,
+        encode_counter_key("vllm:request_prompt_tokens", "sum"): prompt_sum,
+        encode_counter_key("vllm:request_prompt_tokens", "count"): prompt_count,
+        encode_counter_key("vllm:request_generation_tokens", "sum"): gen_sum,
+        encode_counter_key("vllm:request_generation_tokens", "count"): gen_count,
+    }
+    for reason, value in finished.items():
+        snapshot[
+            encode_counter_key("vllm:request_success", f"finished_reason={reason}")
+        ] = value
+    return snapshot
+
+
+def test_engine_step_metrics_reports_token_length_and_outcome_deltas():
+    start = _engine_snapshot(
+        1000.0, 500.0, 1000.0, 10.0, 500.0, 10.0, {"stop": 8.0, "abort": 2.0}
+    )
+    # Over the step: 400 prompt tokens across 4 requests (mean 100), 600
+    # generated across 4 (mean 150), 3 finished normally and 1 was aborted.
+    end = _engine_snapshot(
+        1400.0, 1100.0, 1400.0, 14.0, 1100.0, 14.0, {"stop": 11.0, "abort": 3.0}
+    )
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert metrics["vllm/prompt_tokens"] == 400.0
+    assert metrics["vllm/generation_tokens"] == 600.0
+    assert math.isclose(metrics["vllm/prompt_length_mean"], 100.0)
+    assert math.isclose(metrics["vllm/generation_length_mean"], 150.0)
+    assert metrics["vllm/generations_ok"] == 3.0
+    assert metrics["vllm/generations_failed"] == 1.0
+
+
+def test_length_is_truncation_aware_not_a_failure():
+    """``length`` means max_tokens was reached, which is routine in RL.
+
+    Counting it as a failure would report most of a well-behaved run as failed.
+    """
+    start = _engine_snapshot(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {"length": 0.0})
+    end = _engine_snapshot(10.0, 10.0, 10.0, 1.0, 10.0, 1.0, {"length": 5.0})
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert metrics["vllm/generations_ok"] == 5.0
+    assert metrics["vllm/generations_failed"] == 0.0
+
+
+def test_an_unknown_finish_reason_counts_as_failed_not_dropped():
+    """``ok + failed`` must stay equal to the engine's own total.
+
+    vLLM has grown finish reasons before, so a reason this code has never heard
+    of has to land somewhere rather than vanish from both counters.
+    """
+    start = _engine_snapshot(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {})
+    end = _engine_snapshot(
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {"stop": 4.0, "some_future_reason": 6.0}
+    )
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert metrics["vllm/generations_ok"] == 4.0
+    assert metrics["vllm/generations_failed"] == 6.0
+    assert metrics["vllm/generations_ok"] + metrics["vllm/generations_failed"] == 10.0
+
+
+def test_a_step_that_served_no_request_omits_the_means():
+    """A zero-count histogram is "no data", not a zero-length sequence."""
+    snapshot = _engine_snapshot(5.0, 5.0, 100.0, 2.0, 100.0, 2.0, {"stop": 1.0})
+
+    metrics = compute_engine_step_metrics(snapshot, snapshot)
+
+    assert "vllm/prompt_length_mean" not in metrics
+    assert "vllm/generation_length_mean" not in metrics
+
+
+def test_a_renamed_series_is_omitted_rather_than_reported_as_zero():
+    """vLLM renames these across releases; a gap beats a plausible-looking 0."""
+    metrics = compute_engine_step_metrics({}, {})
+
+    assert metrics == {}
+
+
+@pytest.mark.vllm
+def test_engine_metric_names_match_vllm():
+    """The series names are copies of vLLM's, so they can go stale silently.
+
+    A renamed series is omitted rather than reported as zero, which is the
+    right runtime behaviour but leaves no error to notice -- the dashboard just
+    loses a line. Checking the copies against vLLM's own declarations turns
+    that into a test failure at the version bump that causes it.
+    """
+    pytest.importorskip("vllm")
+
+    import inspect
+
+    from vllm.v1.engine import FINISH_REASON_STRINGS
+    from vllm.v1.metrics.loggers import PrometheusStatLogger
+
+    from nemo_rl.models.generation.vllm.metric_names import (
+        FINISHED_REASON_LABEL,
+        GENERATION_LENGTH_HISTOGRAMS,
+        GENERATION_TOKEN_COUNTERS,
+        OK_FINISH_REASONS,
+        PROMPT_LENGTH_HISTOGRAMS,
+        PROMPT_TOKEN_COUNTERS,
+        REQUEST_SUCCESS_COUNTERS,
+    )
+
+    # vLLM declares each of these as a literal ``name=`` on the collector, so
+    # the names it registers are readable straight off the source. Reading the
+    # registry instead would mean standing up an engine.
+    declared = inspect.getsource(PrometheusStatLogger)
+    expected = (
+        *PROMPT_TOKEN_COUNTERS,
+        *GENERATION_TOKEN_COUNTERS,
+        *PROMPT_LENGTH_HISTOGRAMS,
+        *GENERATION_LENGTH_HISTOGRAMS,
+        *REQUEST_SUCCESS_COUNTERS,
+    )
+    missing = [name for name in expected if f'name="{name}"' not in declared]
+
+    assert not missing, (
+        f"vLLM no longer declares {missing}; these step metrics will silently "
+        "stop being reported. Update nemo_rl/models/generation/vllm/metric_names.py."
+    )
+    assert f'"{FINISHED_REASON_LABEL}"' in declared
+    # Copied from vLLM too. A reason that stops existing would be counted as
+    # failed forever, which is the same silent-drift failure as a renamed series.
+    assert OK_FINISH_REASONS <= set(FINISH_REASON_STRINGS)
+
+
+def test_a_counter_that_went_backwards_is_omitted_rather_than_negative():
+    """These totals are summed over workers, so a drop means an engine restarted.
+
+    restart_shard replaces a worker's engine and its counters start from zero,
+    so the step's true count is unknown -- reporting end minus start would put
+    a negative token count on the dashboard.
+    """
+    start = _engine_snapshot(
+        1000.0, 500.0, 1000.0, 10.0, 500.0, 10.0, {"stop": 8.0, "abort": 2.0}
+    )
+    # One of two workers restarted, so the fleet totals are below where they
+    # were, except generation_tokens which still grew overall.
+    end = _engine_snapshot(
+        400.0, 900.0, 400.0, 4.0, 900.0, 12.0, {"stop": 3.0, "abort": 1.0}
+    )
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert "vllm/prompt_tokens" not in metrics
+    assert "vllm/generations_ok" not in metrics
+    assert "vllm/generations_failed" not in metrics
+    # The series that did grow is still reported.
+    assert metrics["vllm/generation_tokens"] == 400.0
+
+
+def test_engine_counters_survive_worker_aggregation():
+    """The engine series must not be dropped by the spec-decode filter.
+
+    They were: one substring check discarded every non-spec-decode series, so
+    the tokens and outcomes crossed the wire on every step and were thrown away.
+    """
+    counters = aggregate_spec_decode_counters(
+        [
+            {"vllm:prompt_tokens": 100.0, "vllm:num_requests_running": 3.0},
+            {"vllm:prompt_tokens": 50.0},
+        ]
+    )
+
+    assert counters["vllm:prompt_tokens"] == 150.0
+    # Still filtered: forwarding the whole ~40-series snapshot would put
+    # unbounded, version-dependent cardinality on the step metrics.
+    assert "vllm:num_requests_running" not in counters
+
+
+def test_near_miss_sibling_series_are_not_swept_in():
+    """The kept names are matched exactly, not as prefixes.
+
+    vLLM really ships ``vllm:prompt_tokens_by_source`` and
+    ``vllm:prompt_tokens_cached`` alongside ``vllm:prompt_tokens``. A prefix
+    test would forward both on every step for nothing, and the ``_by_source``
+    one is labelled, so it would arrive collapsed and meaningless.
+    """
+    counters = aggregate_spec_decode_counters(
+        [
+            {
+                "vllm:prompt_tokens": 100.0,
+                "vllm:prompt_tokens_by_source": 60.0,
+                "vllm:prompt_tokens_cached": 40.0,
+            }
+        ]
+    )
+
+    assert set(counters) == {"vllm:prompt_tokens"}
+
+
 def test_resolve_routed_experts_dtype_boundaries():
     assert resolve_routed_experts_dtype(None) == ROUTED_EXPERTS_FALLBACK_DTYPE
     assert resolve_routed_experts_dtype(8) == torch.int8
@@ -899,3 +1154,42 @@ def test_pad_and_align_rejects_expert_ids_overflowing_dtype(monkeypatch):
             device=torch.device("cpu"),
             routed_experts_dtype=torch.int8,
         )
+
+
+def _generation_stub(counters):
+    """Enough of a ``VllmGeneration`` to call ``get_step_metrics`` unbound.
+
+    Constructing the real class needs a Ray cluster and a loaded engine, and
+    none of that is what this exercises.
+    """
+    return SimpleNamespace(
+        _step_metrics_snapshot=counters,
+        _get_raw_spec_counters=lambda: counters,
+    )
+
+
+def test_step_metrics_survive_an_unreadable_engine_snapshot():
+    """A metrics failure must cost the metrics, not the run.
+
+    All four callers do ``metrics.update(policy_generation.get_step_metrics())``
+    with no guard, so anything raising in here ends training. The inputs are
+    vLLM's Prometheus series, whose names and shapes move between releases.
+    """
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    stub = _generation_stub({"vllm:num_preemptions_total": 1.0})
+    stub._get_raw_spec_counters = MagicMock(side_effect=RuntimeError("reader gone"))
+
+    assert VllmGeneration.get_step_metrics(stub) == {}
+    # Reset even on failure, so the next step's snapshot is not seen as a double.
+    assert stub._step_metrics_snapshot is None
+
+
+def test_step_metrics_are_returned_when_the_snapshot_reads_cleanly():
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    stub = _generation_stub({})
+    metrics = VllmGeneration.get_step_metrics(stub)
+
+    assert isinstance(metrics, dict)
+    assert stub._step_metrics_snapshot is None

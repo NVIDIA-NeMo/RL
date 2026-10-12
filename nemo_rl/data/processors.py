@@ -19,6 +19,7 @@ import logging
 from copy import deepcopy
 from typing import Any, Dict, cast
 
+import numpy as np
 import torch
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
@@ -377,7 +378,11 @@ def vlm_preference_preprocessor(
     THD input; the canonical ``NemotronOmniModel`` inserts media embeddings
     before selecting this rank's context-parallel tokens.
     """
-    from nemo_rl.data.multimodal_utils import PackedTensor
+    from nemo_rl.data.multimodal_utils import (
+        PackedTensor,
+        get_preprocess,
+        uses_image_placeholder,
+    )
 
     completions = datum_dict["completions"]
     if len(completions) != 2:
@@ -386,13 +391,9 @@ def vlm_preference_preprocessor(
     if ordered[0]["rank"] == ordered[1]["rank"]:
         raise ValueError("Tied preference ranks are not supported")
 
-    placeholder_style_processors = {
-        "NemotronNanoVLV2Processor",
-        "NemotronH_Nano_Omni_Reasoning_V3Processor",
-    }
     message_processor = (
         _NemotronOmniPreferenceProcessorProxy(processor)
-        if type(processor).__name__ in placeholder_style_processors
+        if uses_image_placeholder(processor)
         else processor
     )
 
@@ -404,25 +405,36 @@ def vlm_preference_preprocessor(
             task_data_spec,
         )
 
-        # Mirror the canonical Nemotron Omni metadata contract. Dynamic-resolution
-        # image batches may differ spatially across rows, while imgs_sizes
-        # preserves the true crop consumed by model-owned patchification.
-        for raw_message in message_log:
+        # Mirror the canonical Nemotron Omni metadata. Record native image sizes
+        # before patchification removes the spatial dimensions.
+        for raw_message in message_log if uses_image_placeholder(processor) else []:
             message = cast(Any, raw_message)
             pixel_values = message.get("pixel_values")
             if not isinstance(pixel_values, PackedTensor):
                 continue
-            pixel_values.pad_to_max_shape = True
-            pixels = pixel_values.as_tensor()
-            if pixels is not None and pixels.ndim == 4 and "imgs_sizes" not in message:
-                num_images, _, height, width = pixels.shape
+            if "imgs_sizes" not in message:
+                image_sizes: list[list[int]] = []
+                for pixels in pixel_values.iter_logical_segments():
+                    if pixels is None:
+                        continue
+                    if pixels.ndim != 4:
+                        raise ValueError(
+                            "Nemotron Omni pixel values must be [N, C, H, W] "
+                            f"before patchification, got {tuple(pixels.shape)}"
+                        )
+                    image_sizes.extend(
+                        [[int(pixels.shape[-2]), int(pixels.shape[-1])]]
+                        * int(pixels.shape[0])
+                    )
                 message["imgs_sizes"] = PackedTensor(
-                    torch.tensor(
-                        [[height, width]] * num_images,
-                        dtype=torch.long,
-                    ),
+                    torch.tensor(image_sizes, dtype=torch.long),
                     dim_to_pack=0,
                 )
+            message["pixel_values"] = PackedTensor(
+                pixel_values.tensors,
+                pixel_values.dim_to_pack,
+                **get_preprocess(processor, "pixel_values"),
+            )
             imgs_sizes = message.get("imgs_sizes")
             if isinstance(imgs_sizes, PackedTensor) and "num_frames" not in message:
                 sizes = imgs_sizes.as_tensor()
@@ -489,40 +501,28 @@ def math_data_processor(
     solution = str(datum_dict["expected_answer"])
     extra_env_info = {"ground_truth": solution}
 
-    message_log: LLMMessageLogType = []
-
-    # system prompt
+    # Render the full conversation together, as in math_hf_data_processor.
+    message_list = []
     if task_data_spec.system_prompt:
-        sys_prompt: dict[str, str | torch.Tensor] = {
-            "role": "system",
-            "content": task_data_spec.system_prompt,
-        }
-        sys = tokenizer.apply_chat_template(
-            [cast(dict[str, str], sys_prompt)],
-            tokenize=False,
-            add_generation_prompt=False,
-            add_special_tokens=False,
-        )
-        sys_prompt["token_ids"] = tokenizer(
-            sys, return_tensors="pt", add_special_tokens=False
-        )["input_ids"][0]
-        message_log.append(sys_prompt)
+        message_list.append({"role": "system", "content": task_data_spec.system_prompt})
 
     # user prompt
     if task_data_spec.prompt:
         problem = task_data_spec.prompt.format(problem)
     user_message = {"role": "user", "content": problem}
+    message_list.append(user_message)
     message = tokenizer.apply_chat_template(
-        [user_message],
+        message_list,
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    user_message["token_ids"] = tokenizer(
-        message, return_tensors="pt", add_special_tokens=False
-    )["input_ids"][0]
-    user_message["content"] = message
-    message_log.append(user_message)
+    token_ids = tokenizer(message, return_tensors="pt", add_special_tokens=False)[
+        "input_ids"
+    ][0]
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
 
     length = sum(len(m["token_ids"]) for m in message_log)
 
@@ -672,15 +672,12 @@ def vlm_hf_data_processor(
     ### only one round of interaction is assumed, this can easily be extended to a conversational setting
     user_message: dict[str, Any] = {"role": "user", "content": []}
     #
-    images = []
-    audios = []
-    videos = []
+    vllm_modality_items: dict[str, list[Any]] = {}
     load_video_kwargs: dict[str, Any] = {}
     if isinstance(problem, list):
         for content in problem:
-            # for image, video, audio, just append it
-            # for text, format the prompt to the problem
-            if content["type"] == "text":
+            content_type = content["type"]
+            if content_type == "text":
                 user_message["content"].append(
                     {
                         "type": "text",
@@ -689,16 +686,23 @@ def vlm_hf_data_processor(
                         else content["text"],
                     }
                 )
-            elif content["type"] == "image":
+                continue
+            if content_type == "image":
                 user_message["content"].append(content)
-                images.append(content["image"])
-            elif content["type"] == "audio":
-                user_message["content"].append(content)
+                vllm_value = resolve_to_image(content["image"])
+            elif content_type == "audio":
+                audio = content["audio"]
+                if task_data_spec.pad_audio_to_hop_length:
+                    # Match vLLM models (e.g. Qwen3-Omni) that pre-pad audio before
+                    # feature extraction, so learner and vLLM count the same frames.
+                    hop_length = processor.feature_extractor.hop_length
+                    audio = np.pad(audio, (0, -len(audio) % hop_length))
+                    user_message["content"].append({**content, "audio": audio})
+                else:
+                    user_message["content"].append(content)
                 # Store as (audio_array, sample_rate) tuple for vLLM
-                audios.append(
-                    (content["audio"], processor.feature_extractor.sampling_rate)
-                )
-            elif content["type"] == "video":
+                vllm_value = (audio, processor.feature_extractor.sampling_rate)
+            elif content_type == "video":
                 from transformers.video_utils import load_video
 
                 if not load_video_kwargs:
@@ -712,14 +716,15 @@ def vlm_hf_data_processor(
                     )[0]
                 # Replace path with loaded frames so apply_chat_template can consume it
                 user_message["content"].append({"type": "video", "video": video_value})
-                videos.append(video_value)
+                vllm_value = video_value
             else:
-                raise ValueError(f"Unsupported content type: {content['type']}")
+                raise ValueError(f"Unsupported content type: {content_type}")
+            vllm_modality_items.setdefault(content_type, []).append(vllm_value)
     else:
         # conversation consists of a text-only message
         user_message["content"] = task_data_spec.prompt.format(problem)
 
-    images = [resolve_to_image(image) for image in images]
+    images = vllm_modality_items.get("image", [])
     # Detect processors that use <image> placeholder style (e.g., NemotronOmni/InternVL)
     # vs OpenAI content list style (e.g., Qwen-VL, Gemma).
     # These processors expand <image> tokens in __call__ but NOT in apply_chat_template,
@@ -786,15 +791,18 @@ def vlm_hf_data_processor(
     ### append to user message
     message_log.append(user_message)
 
+    vllm_multi_modal_data = {
+        modality: items[0] if len(items) == 1 else items
+        for modality, items in vllm_modality_items.items()
+    }
+
     length = sum(len(m["token_ids"]) for m in message_log)
     loss_multiplier = 1.0
     if length >= max_seq_length:
         # Treat truncated messages as text only
         vllm_kwargs = {
             "vllm_content": None,
-            "vllm_images": [],
-            "vllm_audios": [],
-            "vllm_videos": [],
+            "vllm_multi_modal_data": {},
         }
 
         # make smaller and mask out
@@ -808,14 +816,9 @@ def vlm_hf_data_processor(
         loss_multiplier = 0.0
     else:
         # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images/audios) for the entire conversation
-        # Placeholder-style processors set vllm_content to None so vLLM uses expanded input_ids.
         vllm_kwargs = {
-            "vllm_content": (
-                None if uses_placeholder and images else string_formatted_dialog
-            ),
-            "vllm_images": images,
-            "vllm_audios": audios,
-            "vllm_videos": videos,
+            "vllm_content": string_formatted_dialog,
+            "vllm_multi_modal_data": vllm_multi_modal_data,
         }
 
     output: DatumSpec = {
@@ -861,24 +864,10 @@ def multichoice_qa_processor(
     if "subject" in datum_dict:
         extra_env_info.update({"subject": datum_dict["subject"]})
 
-    message_log: LLMMessageLogType = []
-
-    # system prompt
+    # Render the full conversation together, as in math_hf_data_processor.
+    message_list = []
     if task_data_spec.system_prompt:
-        sys_prompt: dict[str, str | torch.Tensor] = {
-            "role": "system",
-            "content": task_data_spec.system_prompt,
-        }
-        sys = tokenizer.apply_chat_template(
-            [cast(dict[str, str], sys_prompt)],
-            tokenize=False,
-            add_generation_prompt=False,
-            add_special_tokens=False,
-        )
-        sys_prompt["token_ids"] = tokenizer(
-            sys, return_tensors="pt", add_special_tokens=False
-        )["input_ids"][0]
-        message_log.append(sys_prompt)
+        message_list.append({"role": "system", "content": task_data_spec.system_prompt})
 
     # user prompt
     if task_data_spec.prompt:
@@ -886,17 +875,19 @@ def multichoice_qa_processor(
             task_data_spec.prompt, question, options
         )
     user_message = {"role": "user", "content": question}
+    message_list.append(user_message)
     message = tokenizer.apply_chat_template(
-        [user_message],
+        message_list,
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    user_message["token_ids"] = tokenizer(
-        message, return_tensors="pt", add_special_tokens=False
-    )["input_ids"][0]
-    user_message["content"] = message
-    message_log.append(user_message)
+    token_ids = tokenizer(message, return_tensors="pt", add_special_tokens=False)[
+        "input_ids"
+    ][0]
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
 
     length = sum(len(m["token_ids"]) for m in message_log)
     output: DatumSpec = {
@@ -922,7 +913,9 @@ def nemo_gym_data_processor(
 
     NeMo-Gym builds the real cumulative prompt server-side. Both LLM and VLM
     rows therefore use a placeholder here; VLM inputs are processed once after
-    the complete rollout has been collected.
+    the complete rollout has been collected. A configured video sampling style
+    enables specialized handling for rows that contain one recognized static
+    video; heterogeneous non-video rows retain the generic Gym representation.
     """
     extra_env_info = json.loads(datum_dict["extra_env_info"])
     if task_data_spec is not None and task_data_spec.video_sampling_style is not None:
@@ -946,11 +939,8 @@ def nemo_gym_data_processor(
             task_name=datum_dict["task_name"],
             data_config=task_data_spec,
         )
-        if video_output is None:
-            raise ValueError(
-                "Gym video data configuration requires a static video in every row"
-            )
-        return cast(DatumSpec, video_output)
+        if video_output is not None:
+            return cast(DatumSpec, video_output)
 
     output: DatumSpec = {
         # load to dict format here since `Dataset` cannot handle nested structure well in `NemoGymDataset`

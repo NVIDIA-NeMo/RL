@@ -23,7 +23,7 @@ from PIL import Image
 
 from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
-    NATIVE_MULTIMODAL_KEYS,
+    VLLM_MULTI_MODAL_DATA_KEY,
     PackedTensor,
 )
 
@@ -165,8 +165,8 @@ def collect_multimodal_payload_metrics(
         "logical_segments": 0,
     }
     per_key: dict[str, int] = {}
-    seen_native_leaves: set[int] = set()
-    seen_native_segments: set[int] = set()
+    seen_vllm_leaves: set[int] = set()
+    seen_vllm_segments: set[int] = set()
     seen_packed_leaves: set[int] = set()
     seen_packed_leaves_by_key: dict[str, set[int]] = {}
 
@@ -200,29 +200,29 @@ def collect_multimodal_payload_metrics(
             per_key[logical_key] = per_key.get(logical_key, 0) + len(logical_items)
         elif key == "vllm_content":
             totals["physical_media_bytes"] += _typed_content_media_nbytes(
-                value, seen_native_leaves
+                value, seen_vllm_leaves
             )
             totals["logical_media_bytes"] += _typed_content_media_nbytes(value)
             totals["physical_segments"] += _typed_content_media_segment_count(
-                value, seen_native_segments
+                value, seen_vllm_segments
             )
             totals["logical_segments"] += _typed_content_media_segment_count(value)
-        elif key in NATIVE_MULTIMODAL_KEYS:
-            totals["physical_media_bytes"] += _value_nbytes(value, seen_native_leaves)
+        elif key == VLLM_MULTI_MODAL_DATA_KEY:
+            totals["physical_media_bytes"] += _value_nbytes(value, seen_vllm_leaves)
             totals["logical_media_bytes"] += _value_nbytes(value)
             totals["physical_segments"] += _value_segment_count(
-                value, seen_native_segments
+                value, seen_vllm_segments
             )
             totals["logical_segments"] += _value_segment_count(value)
         elif (
             isinstance(value, Mapping) and value.get("type") in MULTIMODAL_CONTENT_TYPES
         ):
             totals["physical_media_bytes"] += _typed_content_media_nbytes(
-                value, seen_native_leaves
+                value, seen_vllm_leaves
             )
             totals["logical_media_bytes"] += _typed_content_media_nbytes(value)
             totals["physical_segments"] += _typed_content_media_segment_count(
-                value, seen_native_segments
+                value, seen_vllm_segments
             )
             totals["logical_segments"] += _typed_content_media_segment_count(value)
         elif isinstance(value, Mapping):

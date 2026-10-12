@@ -28,11 +28,17 @@ from pathlib import Path
 from nemo_rl.models.generation.vllm import patches
 
 
-def patch_snippets(patch_fn_name: str) -> tuple[str, str]:
-    """Return ``(old_snippet, new_snippet)`` for a patch function in patches.py.
+def patch_snippets(
+    patch_fn_name: str,
+    old_name: str = "old_snippet",
+    new_name: str = "new_snippet",
+) -> tuple[str, str]:
+    """Return a named ``(old_snippet, new_snippet)`` pair from a patch function.
 
     Read out of the source with ``ast`` rather than duplicated here, so the
-    snippets cannot drift from the patch they are meant to reverse.
+    snippets cannot drift from the patch they are meant to reverse. The names
+    default to the convention used by single-file patches; callers can select
+    another pair when one function patches multiple files.
     """
     tree = ast.parse(Path(patches.__file__).read_text())
     try:
@@ -52,17 +58,17 @@ def patch_snippets(patch_fn_name: str) -> tuple[str, str]:
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id in ("old_snippet", "new_snippet")
+            and node.targets[0].id in (old_name, new_name)
         ):
             snippets[node.targets[0].id] = ast.literal_eval(node.value)
 
-    missing = {"old_snippet", "new_snippet"} - snippets.keys()
+    missing = {old_name, new_name} - snippets.keys()
     if missing:
         raise AssertionError(
             f"{patch_fn_name} no longer defines {sorted(missing)}; the test "
             "helper can no longer reverse its patch"
         )
-    return snippets["old_snippet"], snippets["new_snippet"]
+    return snippets[old_name], snippets[new_name]
 
 
 def write_unpatched_copy(

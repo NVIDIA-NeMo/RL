@@ -27,6 +27,10 @@ skill keyword — infer it from the artifact you read.
 
 ## Code Review
 
+For formal GitHub reviews, comment `/review` or `/review mode=strict` on the PR.
+See CONTRIBUTING.md for service integration prerequisites. The existing
+repository review guidance and local interactive commands below are unchanged.
+
 Use `/review-pr <pr-number>` for interactive local PR review.
 
 Use `/review-pr-team <pr-number>` for a deeper review by a coordinated team of

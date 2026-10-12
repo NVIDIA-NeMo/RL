@@ -31,7 +31,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     PreferenceLossDataDict,
     PreferenceLossFn,
 )
-from nemo_rl.algorithms.loss.utils import (
+from nemo_rl.algorithms.loss.loss_input import (
     prepare_loss_input,
     prepare_packed_loss_input,
 )

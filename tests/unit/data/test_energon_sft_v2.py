@@ -71,6 +71,10 @@ def _v2_fingerprint(
                 logical_rank=logical_rank,
                 logical_world_size=logical_world_size,
             ),
+            packing_algorithm=None,
+            max_sequences_per_bin=None,
+            sequence_length_pad_multiple=1,
+            only_unmask_final=False,
         )
     )
 

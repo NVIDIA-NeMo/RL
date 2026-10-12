@@ -199,7 +199,7 @@ class GenerationRouterImpl:
         return backend.removesuffix("/v1") + path_qs
 
     async def _handle(self, request: Any) -> Any:
-        from aiohttp import ClientError, web
+        from aiohttp import ClientConnectionResetError, ClientError, web
 
         self._requests_total += 1
         backend = self._pick_backend()
@@ -220,6 +220,25 @@ class GenerationRouterImpl:
         try:
             return await self._forward(request, backend)
         except (TimeoutError, ClientError) as error:
+            print(
+                "policy router: backend request failed "
+                f"method={request.method} path={request.rel_url.path_qs} "
+                f"backend={backend}: {type(error).__name__}: {error}",
+                flush=True,
+            )
+            if request.rel_url.path == "/v1/models" and isinstance(
+                error, ClientConnectionResetError
+            ):
+                # Gym uses this only as a startup probe and treats every HTTP status,
+                # including vLLM's expected 404, as "answering". In particular, its
+                # short client timeout can close the downstream connection while this
+                # streaming proxy is finishing that 404; aiohttp then raises a
+                # ClientConnectionResetError here even though vLLM answered. Do not let
+                # that transport race poison fleet health and evict a working shard.
+                return web.json_response(
+                    {"error": f"backend probe failed: {type(error).__name__}: {error}"},
+                    status=404,
+                )
             return self._on_backend_error(backend, error)
         finally:
             self._inflight[backend] = max(0, self._inflight.get(backend, 0) - 1)

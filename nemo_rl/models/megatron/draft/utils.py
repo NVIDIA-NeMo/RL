@@ -19,7 +19,7 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Callable, Iterator, Mapping, cast
 
 import torch
 import torch.distributed as dist
@@ -28,6 +28,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.utils import unwrap_model
 from torch import Tensor
+
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
 StateDict = dict[str, Tensor]
 CheckpointLoader = Callable[[Path], StateDict]
@@ -47,6 +49,19 @@ _HF_SNAPSHOT_ALLOW_PATTERNS = [
     "pytorch_model.bin.index.json",
 ]
 _HF_SNAPSHOT_IGNORE_PATTERNS = ["*.pt", "*.pth", "*.ckpt"]
+# Both the HF-mapped name ("lm_head") and the native Megatron/EAGLE names
+# ("output_layer", "eagle_output_layer") must be rejected: the validator runs on
+# raw state dicts too, where the copied target head is
+# `eagle_module.eagle_output_layer.weight`.
+_DFLASH_FORBIDDEN_EXPORT_COMPONENTS = frozenset(
+    {
+        "lm_head",
+        "output_layer",
+        "eagle_output_layer",
+        "mask_embedding",
+        "mask_token",
+    }
+)
 _MODEL_LAYER_QKV_KEY_PATTERN = re.compile(
     r"^eagle_module\.decoder\.layers\.(\d+)\.self_attention\.linear_qkv\.weight$"
 )
@@ -417,7 +432,7 @@ def _gather_tp_weight_if_needed(
     split_axis: int | None = None,
 ) -> Tensor:
     if split_axis is None:
-        tp_group = expected_shape_or_tp_group
+        tp_group = cast(dist.ProcessGroup | None, expected_shape_or_tp_group)
         if tp_group is None or not dist.is_available() or not dist.is_initialized():
             return local_weight
 
@@ -952,7 +967,10 @@ def load_hf_weights_to_eagle(
         config=unwrap_model(model).config,
     )
 
-    return model.load_state_dict(new_state, strict=False)
+    return cast(
+        tuple[list[str], list[str]],
+        model.load_state_dict(new_state, strict=False),
+    )
 
 
 def _require_state_tensor(
@@ -1140,6 +1158,27 @@ def export_eagle_weights_to_hf(
     return hf_state
 
 
+def validate_dflash_export_state_dict(
+    state_dict: Mapping[str, Tensor],
+) -> None:
+    """Reject target-owned parameters from a standalone DFlash artifact.
+
+    Called from the DFlash export path added in PR #3757.
+    """
+    forbidden_keys = sorted(
+        key
+        for key in state_dict
+        if _DFLASH_FORBIDDEN_EXPORT_COMPONENTS.intersection(
+            component.casefold() for component in key.split(".")
+        )
+    )
+    if forbidden_keys:
+        raise ValueError(
+            "[draft] DFlash export contains target-owned parameter keys: "
+            + ", ".join(forbidden_keys)
+        )
+
+
 def get_policy_lm_head_weight(policy_model_chunk: MegatronModule) -> torch.Tensor:
     """Return the local policy LM-head shard for draft initialization."""
     unwrapped_policy_model = unwrap_model(policy_model_chunk)
@@ -1254,12 +1293,12 @@ def register_draft_grad_norm_group() -> None:
 
 def build_draft_model(
     model_provider,
-    draft_config: dict[str, Any],
+    draft_config: Eagle3DraftConfig,
     pg_collection: ProcessGroupCollection,
     policy_model_chunk: MegatronModule,
 ) -> MegatronModule | None:
     """Build an Eagle draft model before parent mixed-precision/DDP wrapping."""
-    if not draft_config["enabled"]:
+    if not draft_config.enabled:
         return None
 
     from transformers import AutoConfig
@@ -1269,9 +1308,9 @@ def build_draft_model(
         get_eagle3_aux_hidden_state_layers,
     )
 
-    model_name = draft_config.get("model_name")
+    model_name = draft_config.model_name
     hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
-    draft_num_layers = draft_config.get("num_layers")
+    draft_num_layers = draft_config.num_layers
     config = TransformerConfig(
         normalization="RMSNorm",
         activation_func=torch.nn.functional.silu,
@@ -1342,9 +1381,7 @@ def build_draft_model(
             "eagle_aux_hidden_state_layer_ids", []
         )
     else:
-        config.eagle_aux_hidden_state_layer_ids = (
-            draft_config.get("aux_layer_indices") or []
-        )
+        config.eagle_aux_hidden_state_layer_ids = draft_config.aux_layer_indices or []
     if (
         config.use_aux_hidden_state
         and len(config.eagle_aux_hidden_state_layer_ids) == 0

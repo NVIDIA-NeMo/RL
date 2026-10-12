@@ -34,6 +34,7 @@ from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     attach_image_model_inputs_to_message,
+    attach_processor_media_token_validity_mask,
     image_to_data_url,
 )
 from nemo_rl.data.processors import nemo_gym_data_processor
@@ -46,6 +47,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.environments.interfaces import EnvironmentReturn
+from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -177,6 +179,10 @@ def test_attach_image_model_inputs_keeps_rollout_tokens_and_packs_media():
     class _TextTokenizer:
         model_input_names = ["input_ids"]
 
+        def convert_tokens_to_ids(self, token):
+            assert token == "<image>"
+            return 8
+
     class _Processor:
         image_token = "<image>"
         image_processor = _ImageProcessor()
@@ -207,6 +213,9 @@ def test_attach_image_model_inputs_keeps_rollout_tokens_and_packs_media():
     # token_ids remain authoritative.
     assert message["token_ids"] is rollout_tokens
     assert "input_ids" not in message
+    torch.testing.assert_close(
+        message["media_token_validity_mask"], torch.tensor([False, True, False])
+    )
 
 
 def test_attach_image_model_inputs_is_a_noop_without_images_or_processor():
@@ -220,15 +229,35 @@ def test_attach_image_model_inputs_is_a_noop_without_images_or_processor():
     assert set(message) == {"role", "content", "token_ids"}
 
 
+def test_processor_media_mask_rejects_unknown_token_fallback():
+    tokenizer = SimpleNamespace(
+        unk_token_id=0,
+        convert_tokens_to_ids=lambda _token: 0,
+    )
+    processor = SimpleNamespace(image_token="<image>", tokenizer=tokenizer)
+    message = {
+        "role": "user",
+        "content": "",
+        "token_ids": torch.tensor([0, 7]),
+    }
+
+    attach_processor_media_token_validity_mask(message, processor)
+
+    assert "media_token_validity_mask" not in message
+
+
 def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():
     first_image = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
     second_image = PackedTensor(torch.tensor([[2.0]]), dim_to_pack=0)
+    first_media_mask = torch.tensor([False, True])
     original_logs = [
         [
             {
                 "role": "user",
                 "content": "first",
+                "token_ids": torch.tensor([1, 7]),
                 "pixel_values": first_image,
+                "media_token_validity_mask": first_media_mask,
                 "request_metadata": {"must_not": "reattach"},
             },
             {"role": "assistant", "content": "answer"},
@@ -236,7 +265,7 @@ def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():
                 "role": "user",
                 "content": "second",
                 "pixel_values": second_image,
-                "vllm_videos": ["video.mp4"],
+                "vllm_multi_modal_data": {"video": "video.mp4"},
             },
         ]
     ]
@@ -244,18 +273,28 @@ def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():
         {
             "_initial_multimodal_data_omitted": True,
             "input_message_log": [
-                {"role": "user", "content": "first"},
-                {"role": "user", "content": "second"},
+                {
+                    "role": "user",
+                    "content": "first",
+                    "token_ids": torch.tensor([7, 2, 7]),
+                },
+                {"role": "user", "content": "second", "token_ids": torch.tensor([3])},
             ],
             "message_log": [
                 {"role": "system", "content": "system"},
                 {
                     "role": "user",
                     "content": "first",
+                    "token_ids": torch.tensor([7, 2, 7]),
                     "pixel_values": "remote placeholder",
                 },
-                {"role": "assistant", "content": "answer"},
-                {"role": "user", "content": "second"},
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "token_ids": torch.tensor([7]),
+                    "generation_logprobs": torch.tensor([0.1]),
+                },
+                {"role": "user", "content": "second", "token_ids": torch.tensor([3])},
             ],
         }
     ]
@@ -267,9 +306,44 @@ def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():
             message for message in results[0][log_key] if message["role"] == "user"
         ]
         assert user_messages[0]["pixel_values"] is first_image
+        torch.testing.assert_close(
+            user_messages[0]["media_token_validity_mask"],
+            torch.tensor([True, False, True]),
+        )
+        assert user_messages[0]["media_token_validity_mask"] is not first_media_mask
         assert user_messages[1]["pixel_values"] is second_image
-        assert user_messages[1]["vllm_videos"] == ["video.mp4"]
+        assert user_messages[1]["vllm_multi_modal_data"] == {"video": "video.mp4"}
         assert "request_metadata" not in user_messages[0]
+    generated_assistant = results[0]["message_log"][2]
+    assert generated_assistant["role"] == "assistant"
+    assert "media_token_validity_mask" not in generated_assistant
+
+
+@pytest.mark.parametrize("has_target_mask", [True, False])
+def test_reattach_keeps_target_mask_when_source_is_untokenized(has_target_mask):
+    """Deduplicated generic Gym prompts carry an empty mask on empty token_ids."""
+    image = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    target_mask = torch.tensor([False, True, False])
+    target = {"role": "user", "content": "", "token_ids": torch.tensor([7, 8, 9])}
+    if has_target_mask:
+        target["media_token_validity_mask"] = target_mask
+    source = {
+        "role": "user",
+        "content": "",
+        "token_ids": torch.tensor([], dtype=torch.long),
+        "media_token_validity_mask": torch.tensor([], dtype=torch.bool),
+        "pixel_values": image,
+    }
+    results = [{"_initial_multimodal_data_omitted": True, "message_log": [target]}]
+
+    _reattach_original_multimodal_payloads(results, [[source]])
+
+    assert target["pixel_values"] is image
+    if has_target_mask:
+        assert target["media_token_validity_mask"] is target_mask
+    else:
+        # Left to the GRPO fallback, which derives the mask from attached media.
+        assert "media_token_validity_mask" not in target
 
 
 @pytest.mark.parametrize("omission_marker", [False, None])
@@ -362,7 +436,7 @@ def test_nemo_gym_initial_media_stays_compact_through_replay_and_policy_flatten(
     assert media.as_tensor().shape == (generations, 3, 2, 2)
 
 
-def test_dedup_generation_sends_only_native_vllm_media():
+def test_dedup_generation_sends_only_vllm_ready_media():
     class _Generation:
         cfg = {"backend": "vllm"}
 
@@ -376,7 +450,7 @@ def test_dedup_generation_sends_only_native_vllm_media():
     active_batch = BatchedDataDict(
         {
             "vllm_content": ["<image> describe"],
-            "vllm_images": [[torch.ones(1, 2)]],
+            "vllm_multi_modal_data": [{"image": torch.ones(1, 2)}],
         }
     )
     compact_generation_input = BatchedDataDict()
@@ -391,12 +465,15 @@ def test_dedup_generation_sends_only_native_vllm_media():
 
     assert "pixel_values" not in compact_generation_input
     assert compact_generation_input["vllm_content"] == ["<image> describe"]
-    assert compact_generation_input["vllm_images"] is active_batch["vllm_images"]
+    assert (
+        compact_generation_input["vllm_multi_modal_data"]
+        is active_batch["vllm_multi_modal_data"]
+    )
 
     later_turn_batch = BatchedDataDict(
         {
             "vllm_content": [None],
-            "vllm_images": active_batch["vllm_images"],
+            "vllm_multi_modal_data": active_batch["vllm_multi_modal_data"],
         }
     )
     later_turn_generation_input = BatchedDataDict()
@@ -409,7 +486,10 @@ def test_dedup_generation_sends_only_native_vllm_media():
     )
     assert "pixel_values" not in later_turn_generation_input
     assert later_turn_generation_input["vllm_content"] == [None]
-    assert later_turn_generation_input["vllm_images"] is active_batch["vllm_images"]
+    assert (
+        later_turn_generation_input["vllm_multi_modal_data"]
+        is active_batch["vllm_multi_modal_data"]
+    )
 
     legacy_generation_input = BatchedDataDict()
     _add_multimodal_generation_payload(
@@ -422,7 +502,7 @@ def test_dedup_generation_sends_only_native_vllm_media():
     assert legacy_generation_input["pixel_values"] is pixel_values
 
 
-def test_dedup_generation_keeps_policy_media_for_unconsumed_native_metadata():
+def test_dedup_generation_keeps_policy_media_for_unconsumed_metadata():
     class _Generation:
         cfg = {"backend": "vllm"}
 
@@ -602,7 +682,7 @@ class _CapturingSyncVllmGeneration:
                 "input_ids": data["input_ids"].clone(),
                 "input_lengths": data["input_lengths"].clone(),
                 "vllm_content": list(data["vllm_content"]),
-                "vllm_images": data["vllm_images"],
+                "vllm_multi_modal_data": data["vllm_multi_modal_data"],
                 "has_policy_media": "pixel_values" in data,
             }
         )
@@ -626,7 +706,7 @@ class _CapturingSyncVllmGeneration:
 
 
 @pytest.mark.parametrize("deduplicate_multimodal_data", [False, True])
-def test_sync_vlm_multiturn_drops_stale_native_content(
+def test_sync_vlm_multiturn_drops_stale_vllm_content(
     monkeypatch, deduplicate_multimodal_data
 ):
     generation = _CapturingSyncVllmGeneration()
@@ -669,7 +749,7 @@ def test_sync_vlm_multiturn_drops_stale_native_content(
                 "stop_strings": [None],
                 "idx": [0],
                 "vllm_content": ["<image> initial prompt"],
-                "vllm_images": [[image]],
+                "vllm_multi_modal_data": [{"image": image}],
             }
         ),
         tokenizer=_DummyTokenizer(),
@@ -682,18 +762,18 @@ def test_sync_vlm_multiturn_drops_stale_native_content(
     assert len(generation.calls) == 2
     assert generation.calls[0]["vllm_content"] == ["<image> initial prompt"]
     assert generation.calls[1]["vllm_content"] == [None]
-    assert generation.calls[0]["vllm_images"][0][0] is image
-    assert generation.calls[1]["vllm_images"][0][0] is image
+    assert generation.calls[0]["vllm_multi_modal_data"][0]["image"] is image
+    assert generation.calls[1]["vllm_multi_modal_data"][0]["image"] is image
     assert generation.calls[0]["input_ids"][0, :1].tolist() == [1]
     assert generation.calls[1]["input_ids"][0, :3].tolist() == [1, 9, 7]
-    # Deduplication sends only the native vLLM media; flag-off also sends the
+    # Deduplication sends only the vLLM-ready media; flag-off also sends the
     # policy-ready representation. Without this the two legs are identical.
     assert [call["has_policy_media"] for call in generation.calls] == [
         not deduplicate_multimodal_data
     ] * 2
 
 
-def test_async_vlm_generation_receives_exact_compact_native_media_payload():
+def test_async_vlm_generation_receives_exact_compact_vllm_media_payload():
     generation = _CapturingAsyncVllmGeneration()
     policy_media = PackedTensor(torch.ones(1, 3, 2, 2), dim_to_pack=0)
     image = torch.ones(3, 2, 2)
@@ -717,9 +797,11 @@ def test_async_vlm_generation_receives_exact_compact_native_media_payload():
             max_seq_len=32,
             sample_multimodal_data={
                 "vllm_content": "<image><audio><video>",
-                "vllm_images": [image],
-                "vllm_audios": [(audio, 16_000)],
-                "vllm_videos": [video],
+                "vllm_multi_modal_data": {
+                    "image": image,
+                    "audio": (audio, 16_000),
+                    "video": video,
+                },
             },
             deduplicate_multimodal_data=True,
         )
@@ -729,12 +811,12 @@ def test_async_vlm_generation_receives_exact_compact_native_media_payload():
     assert generation_input is not None
     assert "pixel_values" not in generation_input
     assert generation_input["vllm_content"] == ["<image><audio><video>"]
-    assert generation_input["vllm_images"][0][0] is image
-    assert generation_input["vllm_audios"][0][0][0] is audio
-    assert generation_input["vllm_videos"][0][0] is video
+    assert generation_input["vllm_multi_modal_data"][0]["image"] is image
+    assert generation_input["vllm_multi_modal_data"][0]["audio"][0] is audio
+    assert generation_input["vllm_multi_modal_data"][0]["video"] is video
 
 
-def test_async_vlm_generation_uses_policy_media_without_native_payload():
+def test_async_vlm_generation_uses_policy_media_without_vllm_payload():
     generation = _CapturingAsyncVllmGeneration()
     policy_media = PackedTensor(torch.ones(1, 3, 2, 2), dim_to_pack=0)
     message_log = [
@@ -765,7 +847,7 @@ def test_async_vlm_generation_uses_policy_media_without_native_payload():
 
 
 @pytest.mark.parametrize("deduplicate_multimodal_data", [False, True])
-def test_async_vlm_multiturn_drops_stale_native_content(
+def test_async_vlm_multiturn_drops_stale_vllm_content(
     monkeypatch, deduplicate_multimodal_data
 ):
     calls = []
@@ -837,7 +919,7 @@ def test_async_vlm_multiturn_drops_stale_native_content(
                 "extra_env_info": None,
                 "task_name": "vlm",
                 "vllm_content": "<image> initial prompt",
-                "vllm_images": [image],
+                "vllm_multi_modal_data": {"image": image},
             },
             policy_generation=object(),
             tokenizer=_DummyTokenizer(),
@@ -851,8 +933,8 @@ def test_async_vlm_multiturn_drops_stale_native_content(
     assert len(calls) == 2
     assert calls[0]["multimodal"]["vllm_content"] == "<image> initial prompt"
     assert calls[1]["multimodal"]["vllm_content"] is None
-    assert calls[0]["multimodal"]["vllm_images"][0] is image
-    assert calls[1]["multimodal"]["vllm_images"][0] is image
+    assert calls[0]["multimodal"]["vllm_multi_modal_data"]["image"] is image
+    assert calls[1]["multimodal"]["vllm_multi_modal_data"]["image"] is image
     assert [message["token_ids"].tolist() for message in calls[1]["message_log"]] == [
         [1],
         [9],
@@ -1682,7 +1764,7 @@ def test_native_rollout_groups_match_whole_batch(monkeypatch):
             "idx": [100, 101, 102, 103],
             "loss_multiplier": torch.arange(4),
             "vllm_content": [f"native-{i}" for i in range(4)],
-            "vllm_images": [[torch.tensor([i])] for i in range(4)],
+            "vllm_multi_modal_data": [{"custom": torch.tensor([i])} for i in range(4)],
         }
     )
     rollout_kwargs = {
@@ -1711,7 +1793,7 @@ def test_native_rollout_groups_match_whole_batch(monkeypatch):
     for sample_idx, sample_state, kwargs in captured_calls:
         assert kwargs["deduplicate_multimodal_data"] is True
         assert sample_state["vllm_content"] == f"native-{sample_idx}"
-        assert sample_state["vllm_images"][0].item() == sample_idx
+        assert sample_state["vllm_multi_modal_data"]["custom"].item() == sample_idx
 
     assert [group.group_index for group in groups] == [0, 1]
     assert [group.final_batch.size for group in groups] == [2, 2]
@@ -1891,6 +1973,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
                 "task_source": "workplace_assistant",
                 "responses_create_params": {},
                 "_ng_task_index": task_index,
+                "agent_ref": {"name": "agent"},
             }
         )
     original_media = [
@@ -2129,10 +2212,73 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
+    assert rollout_result.rollout_metrics["agent/truncation_rate"] == 0.0
 
 
-def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
-    input_batch = BatchedDataDict({"loss_multiplier": torch.ones(3)})
+def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
+    agent_names = ["agent-a", "agent-a", "agent-b", "agent-b"]
+    is_truncated = [True, False, True, True]
+    rows = [{"agent_ref": {"name": name}} for name in agent_names]
+    results = []
+    for index, truncated in enumerate(is_truncated):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1]),
+        }
+        assistant_token_count = 2 if truncated else 1
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2] * assistant_token_count),
+                        "generation_logprobs": torch.tensor(
+                            [-0.1] * assistant_token_count
+                        ),
+                    },
+                ],
+                "full_result": {"reward": float(index)},
+            }
+        )
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 3}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(4)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+    )
+
+    metrics = rollout_result.rollout_metrics
+    assert metrics["truncation_rate"] == pytest.approx(0.75)
+    assert metrics["agent-a/truncation_rate"] == pytest.approx(0.5)
+    assert metrics["agent-b/truncation_rate"] == pytest.approx(1.0)
+    assert metrics["agent-a/total_tokens_per_sample/mean"] == pytest.approx(2.5)
+    assert metrics["agent-a/total_tokens_per_sample/histogram"] == [3, 2]
+    assert metrics["agent-a/gen_tokens_per_sample/mean"] == pytest.approx(1.5)
+    assert metrics["agent-a/gen_tokens_per_sample/histogram"] == [2, 1]
+    assert metrics["agent-b/total_tokens_per_sample/mean"] == pytest.approx(3.0)
+    assert metrics["agent-b/total_tokens_per_sample/histogram"] == [3, 3]
+    assert metrics["agent-b/gen_tokens_per_sample/mean"] == pytest.approx(2.0)
+    assert metrics["agent-b/gen_tokens_per_sample/histogram"] == [2, 2]
+    assert rollout_result.final_batch["truncated"].tolist() == is_truncated
+
+
+def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(
+    monkeypatch,
+):
+    input_batch = BatchedDataDict({"loss_multiplier": torch.ones(4)})
     expected = rollouts_mod.NemoGymRolloutResult(
         input_ids=torch.empty(0),
         final_batch=input_batch,
@@ -2142,6 +2288,8 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
 
     async def fake_stream(**kwargs):
         assert kwargs["num_generations"] == input_batch.size
+        assert kwargs["identity_num_generations"] == 2
+        assert kwargs["routing_group_size"] == 2
         assert kwargs["returns_entire_batch"] is True
         assert kwargs["log_full_result_tables"] is False
         assert kwargs["deduplicate_multimodal_data"] is True
@@ -2157,11 +2305,70 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
         task_to_env={},
         generation_config={},
         log_full_result_tables=False,
+        num_generations_per_prompt=2,
         deduplicate_multimodal_data=True,
         debug_payload_metrics=True,
     )
 
     assert actual is expected
+
+
+@pytest.mark.parametrize(
+    ("row_count", "identity_num_generations", "error"),
+    [
+        (2, 0, "identity_num_generations must be greater than zero"),
+        (
+            3,
+            2,
+            "NeMo-Gym rollout batch size must be divisible by identity_num_generations",
+        ),
+    ],
+)
+def test_run_async_nemo_gym_rollout_validates_identity_group_size(
+    row_count,
+    identity_num_generations,
+    error,
+):
+    input_batch = BatchedDataDict(
+        {"extra_env_info": [{"responses_create_params": {}} for _ in range(row_count)]}
+    )
+
+    async def collect():
+        return [
+            result
+            async for result in run_async_nemo_gym_rollout(
+                policy_generation=SimpleNamespace(
+                    cfg={"max_total_sequence_length": 128}
+                ),
+                input_batch=input_batch,
+                tokenizer=None,
+                task_to_env={},
+                generation_config={
+                    "max_new_tokens": 16,
+                    "stop_strings": [],
+                    "stop_token_ids": [],
+                },
+                num_generations=row_count,
+                identity_num_generations=identity_num_generations,
+                log_full_result_tables=False,
+                sampling_params=SimpleNamespace(top_k=0),
+            )
+        ]
+
+    with pytest.raises(ValueError, match=error):
+        asyncio.run(collect())
+
+
+def test_run_nemo_gym_rollout_sync_requires_explicit_prompt_group_size():
+    with pytest.raises(TypeError, match="num_generations_per_prompt"):
+        run_nemo_gym_rollout_sync(
+            policy_generation=None,
+            input_batch=BatchedDataDict({"loss_multiplier": torch.ones(1)}),
+            tokenizer=None,
+            task_to_env={},
+            generation_config={},
+            log_full_result_tables=False,
+        )
 
 
 def test_rollout_manager_consumes_stream_and_restores_input_order():
@@ -2222,8 +2429,8 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, inputs, timer_prefix):
-            del inputs, timer_prefix
+        def remote(self, inputs, timer_prefix, per_prompt=False):
+            del inputs, timer_prefix, per_prompt
             return _Stream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
@@ -2250,8 +2457,16 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     completions, prompt_message_log, metrics = asyncio.run(
         manager._run_rollouts(
             inputs=[
-                {"_rowidx": 0, "task_source": "workplace_assistant"},
-                {"_rowidx": 1, "task_source": "workplace_assistant"},
+                {
+                    "_rowidx": 0,
+                    "task_source": "workplace_assistant",
+                    "agent_ref": {"name": "agent"},
+                },
+                {
+                    "_rowidx": 1,
+                    "task_source": "workplace_assistant",
+                    "agent_ref": {"name": "agent"},
+                },
             ],
             timer=rollouts_mod.Timer(),
             timer_prefix="timing/test",
@@ -2265,6 +2480,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         "completion_count": 2,
         "agent": "agent",
         "remote_time": 2.0,
+        "timing/test/routing/group_share/nemo_gym": 1,
     }
 
 
@@ -2347,8 +2563,8 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, inputs, timer_prefix):
-            del inputs, timer_prefix
+        def remote(self, inputs, timer_prefix, per_prompt=False):
+            del inputs, timer_prefix, per_prompt
             return _DuplicateStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
@@ -2394,6 +2610,122 @@ def test_prepare_nemo_gym_rows_stamps_distinct_legacy_prompt_groups():
     assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
 
 
+def test_rollout_manager_rotates_replicas_and_reports_group_share():
+    first, second = object(), object()
+    selected = []
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._timeouts = RolloutTimeouts()
+    manager._max_gym_row_attempts = 1
+    manager._deadline_registry = None
+    manager._num_generations_per_prompt = 1
+    manager._task_to_env = {
+        "nemo_gym": NemoGymShardSet(
+            handles={"tools": [first, second]},
+            route_to_shard={"agent": "tools"},
+        )
+    }
+    manager._tokenizer = None
+    manager._effort_config = None
+    manager._stats = None
+
+    async def fake_stream_rows(
+        environment,
+        pending,
+        results,
+        shaping_by_rowidx,
+        total_rows,
+        timer_prefix,
+        *,
+        on_completion,
+    ):
+        del total_rows, timer_prefix, on_completion
+        selected.append(environment)
+        for row in pending:
+            rowidx = row["_rowidx"]
+            results[rowidx] = {"input_message_log": [{"token_ids": [1]}]}
+            shaping_by_rowidx[rowidx] = SimpleNamespace(
+                length_rewards_low=[],
+                rewards_low=[],
+                low_lengths=[],
+                high_lengths=[],
+            )
+
+    manager._stream_rows = fake_stream_rows
+    manager._results_to_completions = lambda _results: ([object()], {})
+    manager._compute_rollout_metrics = lambda *_args: {}
+    manager._compute_reward_penalty_metrics = lambda *_args: {}
+
+    async def run_group():
+        return await manager._run_rollouts(
+            inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
+            timer=rollouts_mod.Timer(),
+            timer_prefix="timing/test",
+        )
+
+    metrics = [asyncio.run(run_group())[2] for _ in range(3)]
+
+    assert selected == [first, second, first]
+    per_group_metrics = {key: [group[key] for group in metrics] for key in metrics[0]}
+    from nemo_rl.algorithms.grpo import aggregate_rollout_metrics
+
+    aggregated = aggregate_rollout_metrics(per_group_metrics)
+    assert aggregated["timing/test/routing/group_share/tools/0"] == pytest.approx(2 / 3)
+    assert aggregated["timing/test/routing/group_share/tools/1"] == pytest.approx(1 / 3)
+
+
+def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
+    class _FailedRef:
+        def __await__(self):
+            async def _resolve():
+                raise RuntimeError("actor died")
+
+            return _resolve().__await__()
+
+    class _FailedStream:
+        def __init__(self):
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._sent:
+                raise StopAsyncIteration
+            self._sent = True
+            return _FailedRef()
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, inputs, timer_prefix, per_prompt=False):
+            del inputs, timer_prefix, per_prompt
+            return _FailedStream()
+
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._timeouts = RolloutTimeouts()
+    manager._max_gym_row_attempts = 1
+    manager._deadline_registry = None
+    manager._num_generations_per_prompt = 1
+    manager._task_to_env = {
+        "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    }
+    manager._tokenizer = None
+
+    with pytest.raises(RuntimeError, match="actor died") as exc_info:
+        asyncio.run(
+            manager._run_rollouts(
+                inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
+                timer=rollouts_mod.Timer(),
+                timer_prefix="timing/test",
+            )
+        )
+    assert exc_info.value.__notes__ == [
+        "NeMo-Gym instance 'nemo_gym' failed during rollout collection"
+    ]
+
+
 @pytest.mark.nemo_gym
 def test_run_async_nemo_gym_rollout(
     nemo_gym,  # noqa: F811
@@ -2434,6 +2766,7 @@ def test_run_async_nemo_gym_rollout(
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         generation_config=nemo_gym_vllm_generation.cfg,
         log_full_result_tables=True,
+        num_generations_per_prompt=1,
         max_rollout_turns=None,
         debug_payload_metrics=True,
     )
@@ -2514,6 +2847,14 @@ def test_run_async_nemo_gym_rollout(
             "example_multi_step_simple_agent/accuracy/median": 0.0,
             "example_multi_step_simple_agent/accuracy/min": 0.0,
             "example_multi_step_simple_agent/accuracy/stddev": 0.0,
+            # Gym declares mask_sample on every verify response (Gym #2611), so it
+            # surfaces through the per-agent metric pass like any other scalar field.
+            "example_multi_step_simple_agent/mask_sample/histogram": None,
+            "example_multi_step_simple_agent/mask_sample/max": 0.0,
+            "example_multi_step_simple_agent/mask_sample/mean": 0.0,
+            "example_multi_step_simple_agent/mask_sample/median": 0.0,
+            "example_multi_step_simple_agent/mask_sample/min": 0.0,
+            "example_multi_step_simple_agent/mask_sample/stddev": 0.0,
             "example_multi_step_simple_agent/order_instruction_following_failure/histogram": None,
             "example_multi_step_simple_agent/order_instruction_following_failure/max": 0.0,
             "example_multi_step_simple_agent/order_instruction_following_failure/mean": 0.0,
@@ -2532,6 +2873,19 @@ def test_run_async_nemo_gym_rollout(
             "example_multi_step_simple_agent/reward/median": 0.0,
             "example_multi_step_simple_agent/reward/min": 0.0,
             "example_multi_step_simple_agent/reward/stddev": 0.0,
+            "example_multi_step_simple_agent/truncation_rate": 0.0,
+            "example_multi_step_simple_agent/total_tokens_per_sample/mean": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/max": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/min": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/median": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/stddev": None,
+            "example_multi_step_simple_agent/total_tokens_per_sample/histogram": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/mean": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/max": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/min": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/median": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/stddev": None,
+            "example_multi_step_simple_agent/gen_tokens_per_sample/histogram": None,
             "example_multi_step_simple_agent/set_overlap/histogram": None,
             "example_multi_step_simple_agent/set_overlap/max": 0.0,
             "example_multi_step_simple_agent/set_overlap/mean": 0.0,

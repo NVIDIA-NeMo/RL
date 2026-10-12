@@ -5,7 +5,6 @@ grpo:
   max_num_steps: 20
 checkpointing:
   checkpoint_dir: results/grpo-gemma3-27b-it-8n8g-fsdp2tp8sp-actckpt-long
-  model_save_format: null
 policy:
   model_name: google/gemma-3-27b-it
   tokenizer:
@@ -13,10 +12,9 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 4
   max_total_sequence_length: 16384
-  dtensor_cfg:
+  automodel_cfg:
     activation_checkpointing: true
     tensor_parallel_size: 8
-    _v2: false
   sequence_packing:
     enabled: false
   make_sequence_length_divisible_by: 8

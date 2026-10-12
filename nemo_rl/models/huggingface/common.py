@@ -14,20 +14,18 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, Tuple, TypeVar
+from typing import Optional, Tuple
 
 import torch
 from transformers import AutoConfig
-
-Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
 @dataclass
 class FlashAttentionKwargs:
     """Dataclass to hold FlashAttention v2 kwargs."""
 
-    cu_seqlens_q: Tensor
-    cu_seqlens_k: Tensor
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
     max_seqlen_q: int
     max_seqlen_k: int
 

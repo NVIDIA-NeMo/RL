@@ -237,8 +237,14 @@ Optimize large language models with FP8 quantization for faster training and inf
 :link: guides/quantization-aware-rl
 :link-type: doc
 
-Run quantization-aware GRPO and distillation using NVIDIA ModelOpt.
-Includes NVFP4 W4A4 and W4A16 real rollout.
+Run quantized GRPO and distillation with NVIDIA ModelOpt.
+:::
+
+:::{grid-item-card} {octicon}`meter` End-to-End NVFP4 Training
+:link: design-docs/te-nvfp4-per-token-rollout
+:link-type: doc
+
+Run W4A4 policy training and per-token vLLM rollout on NVIDIA Blackwell GPUs.
 :::
 
 :::{grid-item-card} {octicon}`container` Docker Containers
@@ -313,6 +319,7 @@ guides/cispo.md
 guides/prorlv2.md
 guides/swe-rl-qwen3.md
 guides/grpo.md
+guides/length-penalty.md
 guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
@@ -373,6 +380,7 @@ design-docs/uv.md
 design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
+design-docs/ppo-colocated-streaming.md
 design-docs/dynamo-integration.md
 design-docs/sparse-delta-refit.md
 design-docs/checkpoint-engines.md
@@ -384,9 +392,11 @@ design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
+design-docs/te-nvfp4-per-token-rollout.md
 design-docs/nccl-reshard-refit.md
 design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
+design-docs/token-capture-ledger.md
 ```
 
 ```{toctree}

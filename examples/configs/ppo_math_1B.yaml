@@ -85,9 +85,12 @@ loss_fn:
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false
+  seq_logprob_error_in_loss: false  # Only supported by non-streaming Megatron GRPO.
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
+  metrics_level: "full"
+  enable_torch_compile: false
 
 value_loss_fn:
   scale: 0.4
@@ -101,8 +104,6 @@ checkpointing:
   keep_top_k: 5
   save_period: 10
   checkpoint_must_save_by: null
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 policy:
@@ -120,9 +121,14 @@ policy:
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
@@ -175,10 +181,12 @@ policy:
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
+    fp32_lm_head: false # Emit fp32 logits from Megatron's LM head; must match policy.generation.vllm_cfg.fp32_lm_head.
     moe_per_layer_logging: False
 
     optimizer:
@@ -237,7 +245,7 @@ policy:
     microbatch_order: "packer"
     sequence_length_round: 64
 
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.automodel_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
 
   optimizer:
@@ -296,6 +304,7 @@ policy:
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute Nemotron-H logits with an fp32 LM head.
       # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
       refit_with_reload_api: false
       tensor_parallel_size: 1
@@ -327,16 +336,21 @@ value:
   train_global_batch_size: ${policy.train_global_batch_size}
   train_micro_batch_size: ${policy.train_micro_batch_size}
   max_total_sequence_length: ${policy.max_total_sequence_length}
-  make_sequence_length_divisible_by: ${value.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${value.automodel_cfg.tensor_parallel_size}
   precision: "bfloat16"
 
   reward_model_cfg:
     enabled: true  # DTensor V2 value worker requires reward_model_cfg.enabled=true
     reward_model_type: "regression"
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: false
@@ -388,10 +402,12 @@ value:
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
+    fp32_lm_head: false # Emit fp32 logits from Megatron's LM head.
     moe_per_layer_logging: False
 
     optimizer:

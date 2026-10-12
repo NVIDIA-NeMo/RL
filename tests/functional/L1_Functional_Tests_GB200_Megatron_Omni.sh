@@ -43,7 +43,8 @@ fi
 # Both tests colocate TP2/EP2 training and generation on two GB200 GPUs.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
-run_test fast uv run --no-sync bash ./tests/functional/nemotron_omni_clevr_megatron_1n2g.sh
+run_test fast uv run --no-sync bash \
+    ./tests/functional/nemotron_omni_clevr_flash_megatron_1n2g.sh
 run_test fast uv run --no-sync bash ./tests/functional/nemotron_omni_gym_video_megatron_1n2g.sh
 
 cd "${PROJECT_ROOT}/tests"

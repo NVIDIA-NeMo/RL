@@ -340,13 +340,15 @@ def patch_transformers_module_dir(
 patch_transformers_module_dir(os.environ, apply_to_current_interpreter=True)
 
 
-# Transformers 5.11 and 5.12 follow cached snapshot symlinks into blobs/ while
-# hashing trust_remote_code modules. Install the version-gated upstream fix
-# before model configurations are loaded in this interpreter. Remove this
-# bootstrap after the minimum Transformers version is upgraded to 5.13.0.
+# Install compatibility fixes before trust_remote_code model configurations are
+# loaded in this interpreter. The dynamic-module hashing patch is version-gated;
+# the torch-FX helper is installed only when Transformers no longer exposes it.
 from nemo_rl.transformers_compat import (  # noqa: E402
     _patch_transformers_dynamic_module_symlink_cache,
+    _patch_transformers_torch_fx_compat,
 )
 
 _patch_transformers_dynamic_module_symlink_cache()
+_patch_transformers_torch_fx_compat()
 del _patch_transformers_dynamic_module_symlink_cache
+del _patch_transformers_torch_fx_compat

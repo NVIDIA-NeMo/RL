@@ -21,7 +21,7 @@ import time
 import warnings
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
-from typing import Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import requests
 import torch
@@ -85,6 +85,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.megatron.config import (
+    MultimodalPromptConfigOverrides,
     resolve_refit_execution_batch_bytes,
 )
 from nemo_rl.models.generation.megatron.utils import (
@@ -99,6 +100,9 @@ from nemo_rl.models.megatron.memory_saver import (
     HAVE_TORCH_MEMORY_SAVER,
     pause_inference_weights,
     resume_inference_weights,
+)
+from nemo_rl.models.megatron.zero_train_gen_mismatch import (
+    allow_installed_flash_attn_4,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
@@ -261,6 +265,10 @@ def _apply_inference_cuda_graph_scope(
         ]
 
 
+if TYPE_CHECKING:
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
+
+
 class MegatronGenerationMixin:
     """Engine lifecycle, coordinator, HTTP server, and finish-generation machinery.
 
@@ -303,6 +311,9 @@ class MegatronGenerationMixin:
         )
         self._inference_loop = None
         self._inference_thread = None
+        self._token_capture_enabled = False
+        self._request_payload_stager = None
+        self._request_prompt_preparer = None
 
     def _get_megatron_inference_wrapper_cls(self) -> Optional[type]:
         """Resolve the configured Megatron inference wrapper, if any.
@@ -381,6 +392,18 @@ class MegatronGenerationMixin:
         if "vision_model_type" in generation_config:
             image_kwargs["vision_model_type"] = str(
                 generation_config["vision_model_type"]
+            )
+        if "image_dynamic_resolution_model_length" in generation_config:
+            image_kwargs["dynamic_resolution_model_length"] = int(
+                generation_config["image_dynamic_resolution_model_length"]
+            )
+        if "image_dynamic_resolution_rounding_mode" in generation_config:
+            image_kwargs["dynamic_resolution_rounding_mode"] = str(
+                generation_config["image_dynamic_resolution_rounding_mode"]
+            )
+        if "image_dynamic_resolution_resize_mode" in generation_config:
+            image_kwargs["dynamic_resolution_resize_mode"] = str(
+                generation_config["image_dynamic_resolution_resize_mode"]
             )
         return build_image_preprocessing_config(
             processor.image_processor,
@@ -484,6 +507,7 @@ class MegatronGenerationMixin:
         if self._inference_engine_initialized:
             return
 
+        from megatron.core.inference.config import MultimodalPromptConfig
         from megatron.core.inference.contexts.dynamic_context import (
             DynamicInferenceContext,
         )
@@ -550,6 +574,11 @@ class MegatronGenerationMixin:
             torch.float16,
             torch.bfloat16,
         )
+        # Batch-invariant mode needs the policy's RoPE bits, and MCore rejects
+        # an explicit True there.
+        if getattr(model_config, "batch_invariant_mode", False):
+            use_flashinfer_fused_rope = False
+            allow_installed_flash_attn_4()
 
         image_preprocessing_config = self._build_image_preprocessing_config(
             mcore_generation_config
@@ -559,6 +588,30 @@ class MegatronGenerationMixin:
             mcore_generation_config,
             frame_manifest_magic=CACHED_VIDEO_FRAME_MANIFEST_MAGIC,
         )
+        multimodal_prompt_config = None
+        prompt_config_overrides = mcore_generation_config.get(
+            "multimodal_prompt_config"
+        )
+        if prompt_config_overrides is not None:
+            if inference_wrapper_cls is None:
+                raise ValueError(
+                    "multimodal_prompt_config requires megatron_inference_wrapper."
+                )
+            wrapper_prompt_defaults = getattr(
+                inference_wrapper_cls, "multimodal_prompt_config", None
+            )
+            if wrapper_prompt_defaults is None:
+                raise ValueError(
+                    f"{inference_wrapper_cls.__name__} does not define a multimodal "
+                    "prompt contract to override."
+                )
+            prompt_config_overrides = MultimodalPromptConfigOverrides.model_validate(
+                prompt_config_overrides
+            )
+            multimodal_prompt_config = MultimodalPromptConfig.from_dict(
+                prompt_config_overrides.model_dump(exclude_unset=True),
+                defaults=wrapper_prompt_defaults,
+            )
 
         inference_config_kwargs: dict[str, Any] = {
             "block_size_tokens": block_size_tokens,
@@ -589,6 +642,7 @@ class MegatronGenerationMixin:
             "max_requests": max_requests,
             "image_preprocessing_config": image_preprocessing_config,
             "video_preprocessing_config": video_preprocessing_config,
+            "multimodal_prompt_config": multimodal_prompt_config,
         }
         _apply_optional_inference_config_kwargs(
             inference_config_kwargs, mcore_generation_config
@@ -956,6 +1010,72 @@ class MegatronGenerationMixin:
         """Return this worker's OpenAI server base URL (None if not the leader)."""
         return self.base_url
 
+    def setup_token_capture(
+        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+    ) -> bool:
+        """Install canonical TQ capture on each MInf model-parallel leader."""
+        engine = self.dynamic_inference_engine
+        if engine is None:
+            raise RuntimeError(
+                "Megatron token capture requires an initialized inference engine"
+            )
+        missing = [
+            name
+            for name in ("payload_stager", "prompt_preparer")
+            if not hasattr(engine, name)
+        ]
+        if missing:
+            raise RuntimeError(
+                "Megatron token capture requires MInf RequestPayloadStager, request "
+                f"metadata, and prompt preparation support; missing {', '.join(missing)}"
+            )
+        self._token_capture_enabled = True
+        if not engine.is_mp_coordinator:
+            return False
+
+        from nemo_rl.data_plane import build_data_plane_client
+        from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+        from nemo_rl.models.generation.megatron.token_capture import (
+            TQMegatronPromptPreparer,
+            TQMegatronTokenStager,
+        )
+
+        # Own no segment, as vLLM capture does, so a save never waits on a
+        # generation-only worker. A trainer in this process attached first and
+        # keeps its segment: TQ reuses a process's existing client.
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
+        prompt_preparer = TQMegatronPromptPreparer(
+            TQTokenSource(dp_client, staging_partition=staging_partition)
+        )
+        engine.prompt_preparer = prompt_preparer
+        self._request_prompt_preparer = prompt_preparer
+        stager = TQMegatronTokenStager(
+            TQTokenSink(dp_client, staging_partition=staging_partition)
+        )
+        engine.payload_stager = stager
+        self._request_payload_stager = stager
+        return True
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Stamp subsequent MInf requests with the trainer weight version."""
+        if type(version) is not int or version < 0:
+            raise ValueError(
+                f"rollout weight version must be a non-negative int, got {version!r}"
+            )
+        if not self._token_capture_enabled:
+            raise RuntimeError("Megatron token capture is not initialized")
+        if torch.distributed.get_rank() != 0:
+            return
+        if self.inference_client is None:
+            raise RuntimeError("Megatron token capture is not initialized")
+
+        # The client's socket is also read by its listener task on the inference
+        # loop thread, and ZMQ sockets are not thread safe: send from that loop.
+        async def _send_epoch() -> None:
+            self.inference_client.set_generation_epoch(version)
+
+        asyncio.run_coroutine_threadsafe(_send_epoch(), self._inference_loop).result()
+
     def _build_sampling_params(
         self,
         greedy: bool,
@@ -979,7 +1099,11 @@ class MegatronGenerationMixin:
             skip_prompt_log_probs=True,
             return_log_probs=True,
             num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"],
-            termination_id=self.megatron_tokenizer.eod,
+            termination_id=(
+                -1
+                if self.cfg["generation"].get("ignore_eos", False)
+                else self.megatron_tokenizer.eod
+            ),
             stop_words=stop_words,
             return_prompt_tokens=return_prompt_tokens,
             detokenize_stop_sequence=True,

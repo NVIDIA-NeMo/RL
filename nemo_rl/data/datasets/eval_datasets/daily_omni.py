@@ -47,9 +47,14 @@ class DailyOmniEvalDataset:
         split: str = "train",
         prompt_file: Optional[str] = None,
         system_prompt_file: Optional[str] = None,
+        max_samples: Optional[int] = None,
     ):
         self._base = DailyOmniDataset(split=split)
         self.rekeyed_ds = self._base.dataset
+        if max_samples is not None:
+            self.rekeyed_ds = self.rekeyed_ds.select(
+                range(min(max_samples, len(self.rekeyed_ds)))
+            )
         self.task_spec = TaskDataSpec(
             task_name=self._base.task_name,
             prompt_file=prompt_file,

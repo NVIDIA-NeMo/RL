@@ -45,6 +45,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.failures import GenerationUnavailable
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -101,7 +102,7 @@ def _with_cut(buffer, callback):
     return _run(apply())
 
 
-def test_generate_response_forwards_message_log_media_to_generation() -> None:
+def test_generate_response_forwards_all_vllm_media_to_generation() -> None:
     captured: dict[str, BatchedDataDict] = {}
 
     class _Generation:
@@ -131,6 +132,7 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
     manager._deadline_registry = None
     pixel_values = PackedTensor(torch.ones(2, 3, 4, 4), dim_to_pack=0)
     imgs_sizes = PackedTensor(torch.tensor([[4, 4], [4, 4]]), dim_to_pack=0)
+    native_image = object()
     message_log = [
         {
             "role": "user",
@@ -147,13 +149,22 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
     ]
 
     assistant_message, input_lengths, _ = _run(
-        manager._generate_response(message_log, ["<stop>"])
+        manager._generate_response(
+            message_log,
+            ["<stop>"],
+            native_generation_data={
+                "vllm_content": "rendered prompt",
+                "vllm_multi_modal_data": {"image": native_image},
+            },
+        )
     )
 
     generation_data = captured["data"]
     assert generation_data["input_ids"].tolist() == [[1, 2, 3, 4, 5]]
     assert generation_data["input_lengths"].tolist() == [5]
     assert generation_data["stop_strings"] == [["<stop>"]]
+    assert generation_data["vllm_content"] == ["rendered prompt"]
+    assert generation_data["vllm_multi_modal_data"] == [{"image": native_image}]
     assert isinstance(generation_data["pixel_values"], PackedTensor)
     assert isinstance(generation_data["imgs_sizes"], PackedTensor)
     assert torch.equal(
@@ -165,6 +176,93 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
     assert input_lengths.tolist() == [5]
     assert assistant_message["content"] == "answer"
     assert assistant_message["token_ids"].tolist() == [42]
+
+
+def test_run_single_rollout_preserves_native_media_across_turns(monkeypatch) -> None:
+    calls: list[dict] = []
+    image = object()
+    audio = object()
+    video = object()
+
+    async def generate_response(
+        _message_log,
+        _stop_strings,
+        *,
+        native_generation_data=None,
+    ):
+        calls.append(dict(native_generation_data or {}))
+        return (
+            {
+                "role": "assistant",
+                "content": "answer",
+                "token_ids": torch.tensor([42]),
+                "generation_logprobs": torch.tensor([0.0]),
+            },
+            torch.tensor(1),
+            {},
+        )
+
+    def calculate_rewards(_batch, _task_to_env):
+        return EnvironmentReturn(
+            observations=[{"role": "user", "content": "next"}],
+            metadata=[None],
+            next_stop_strings=[None],
+            rewards=torch.tensor([0.0]),
+            terminateds=torch.tensor([len(calls) == 2]),
+            answers=[None],
+        )
+
+    class _Tokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return SimpleNamespace(input_ids=torch.tensor([[7]]))
+
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollout_manager.calculate_rewards", calculate_rewards
+    )
+    manager = object.__new__(AsyncRolloutImpl)
+    manager._generate_response = generate_response
+    manager._tokenizer = _Tokenizer()
+    manager._task_to_env = {}
+    manager._max_seq_len = 32
+    manager._max_rollout_turns = 2
+    manager._timeouts = SimpleNamespace(env_s=10.0)
+
+    _run(
+        manager._run_single_rollout(
+            {
+                "idx": 0,
+                "message_log": [
+                    {
+                        "role": "user",
+                        "content": "",
+                        "token_ids": torch.tensor([1]),
+                    }
+                ],
+                "extra_env_info": None,
+                "task_name": "vlm",
+                "vllm_content": "<image><audio><video>",
+                "vllm_multi_modal_data": {
+                    "image": image,
+                    "audio": audio,
+                    "video": video,
+                },
+                # Dropped by #3803's key consolidation: must not be forwarded.
+                "vllm_images": [image],
+            },
+            traj_idx=0,
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["vllm_content"] == "<image><audio><video>"
+    assert calls[1]["vllm_content"] is None
+    for call in calls:
+        assert call["vllm_multi_modal_data"] == {
+            "image": image,
+            "audio": audio,
+            "video": video,
+        }
+        assert "vllm_images" not in call
 
 
 class _FakeBuffer:
@@ -961,14 +1059,17 @@ def test_receipt_completion_drops_mask_flag_when_gate_off():
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
-def test_streamed_receipt_callback_uses_current_completion_conversion():
+@pytest.mark.parametrize("log_full_result_tables", [False, True])
+def test_streamed_receipt_callback_uses_current_completion_conversion(
+    log_full_result_tables,
+):
     class _RunRolloutsRemote:
         def options(self, *, num_returns):
             assert num_returns == "streaming"
             return self
 
-        def remote(self, pending, timer_prefix):
-            del pending, timer_prefix
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            del pending, timer_prefix, per_prompt
 
             async def result_ref():
                 return (
@@ -983,7 +1084,7 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
 
             return stream()
 
-    impl = _nemo_gym_impl(False)
+    impl = _nemo_gym_impl(False, log_full_result_tables=log_full_result_tables)
     env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     results = [None]
     shaping = [None]
@@ -1009,6 +1110,11 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
     assert generation_index == 0
     assert completion.env_extras["ng_rollout_id"] == "r0"
     assert "mask_sample" not in completion.env_extras["instance_config"]
+    context = completion.env_extras["ng_reward_log_context"]
+    assert context.agent_name == "resolved-agent"
+    assert (context.full_result_json is not None) is log_full_result_tables
+    if log_full_result_tables:
+        assert "reward" not in json.loads(context.full_result_json)
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
@@ -1027,6 +1133,78 @@ def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     metrics = impl._compute_rollout_metrics([completion], "agent")
 
     assert ("agent/full_result" in metrics) is log_full_result_tables
+
+
+def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
+    completions = [
+        Completion(
+            message_log=[
+                {"role": "user", "token_ids": [1, 2]},
+                {"role": "assistant", "token_ids": [3]},
+            ],
+            env_extras={
+                "reward": 0.0,
+                "total_tokens_per_sample": 1000,
+                "gen_tokens_per_sample": 1000,
+            },
+            truncated=False,
+            reward=0.0,
+        ),
+        Completion(
+            message_log=[
+                {"role": "user", "token_ids": [1]},
+                {"role": "assistant", "token_ids": [2, 3, 4]},
+            ],
+            env_extras={
+                "reward": 1.0,
+                "total_tokens_per_sample": 1000,
+                "gen_tokens_per_sample": 1000,
+            },
+            truncated=True,
+            reward=1.0,
+        ),
+    ]
+
+    metrics = _nemo_gym_impl(True)._compute_rollout_metrics(completions, "agent")
+
+    assert metrics["truncation_rate"] == pytest.approx(0.5)
+    assert metrics["agent/truncation_rate"] == pytest.approx(0.5)
+    # Live token counts win over similarly named env_extras (1000).
+    assert metrics["agent/total_tokens_per_sample/mean"] == pytest.approx(3.5)
+    assert metrics["agent/total_tokens_per_sample/max"] == 4
+    assert metrics["agent/total_tokens_per_sample/histogram"] == [3, 4]
+    assert metrics["agent/gen_tokens_per_sample/mean"] == pytest.approx(2.0)
+    assert metrics["agent/gen_tokens_per_sample/max"] == 3
+    assert metrics["agent/gen_tokens_per_sample/histogram"] == [1, 3]
+
+
+def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics():
+    def _receipt_completion(manifest, truncated):
+        return Completion(
+            message_log=[],
+            env_extras={
+                "reward": 0.5,
+                "ng_receipt": {"rollout_id": "r", "manifest": manifest},
+            },
+            truncated=truncated,
+            reward=0.5,
+        )
+
+    completions = [
+        _receipt_completion(
+            [{"cum_len": 5, "delta_len": 2}, {"cum_len": 9, "delta_len": 3}],
+            truncated=False,
+        ),
+        _receipt_completion([{"cum_len": 4, "delta_len": 4}], truncated=True),
+    ]
+
+    metrics = _nemo_gym_impl(True)._compute_rollout_metrics(completions, "agent")
+
+    assert metrics["agent/truncation_rate"] == pytest.approx(0.5)
+    assert metrics["agent/total_tokens_per_sample/histogram"] == [9, 4]
+    assert metrics["agent/total_tokens_per_sample/mean"] == pytest.approx(6.5)
+    assert metrics["agent/gen_tokens_per_sample/histogram"] == [5, 4]
+    assert metrics["agent/gen_tokens_per_sample/mean"] == pytest.approx(4.5)
 
 
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
@@ -2128,3 +2306,64 @@ class TestGenerateForFinalizationFlow:
         assert (
             restored._impl.seen_recovery_granularity is RecoveryGranularity.PROMPT_GROUP
         )
+
+
+def test_capture_completion_preserves_checks_and_raw_reward_until_finalization():
+    from nemo_rl.experience.reward_penalties import RewardChecks
+
+    impl = _nemo_gym_impl(
+        True, {"penalize_empty_final_answer": True}, log_full_result_tables=True
+    )
+    checks = RewardChecks(False, True, True)
+    result = {
+        "rollout_id": "r",
+        "receipt": {"rollout_id": "r", "manifest": []},
+        "reward_checks": checks,
+        "message_log": [],
+        "input_message_log": [],
+        "full_result": {"reward": -2.0, "response": {"output": []}},
+    }
+    completions, counts = impl._results_to_completions([result])
+    assert completions[0].reward == -2.0
+    assert completions[0].env_extras["ng_reward_checks"] == checks
+    assert sum(counts.values()) == 0
+    assert impl._compute_reward_penalty_metrics(counts, 0) == {}
+    metrics = impl._compute_rollout_metrics(completions, "agent")
+    assert not any(k.startswith(("total_reward/", "agent/reward/")) for k in metrics)
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_capture_manager_seals_checks_and_forwards_them_to_reassembly(
+    monkeypatch, granularity
+):
+    from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
+
+    checks = RewardChecks(True, True, True)
+    log_context = RewardLogContext("agent", '{"answer":"ok"}')
+    original = _receipt_record
+
+    def with_checks(*args, **kwargs):
+        record = original(*args, **kwargs)
+        for completion in record.completions:
+            completion.env_extras["ng_reward_checks"] = checks
+            completion.env_extras["ng_reward_log_context"] = log_context
+        return record
+
+    monkeypatch.setattr(f"{__name__}._receipt_record", with_checks)
+    mgr = _make_capture_manager(
+        _FakeCaptureBuffer(),
+        recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+    )
+    request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+    assert request.rewards == (0.5, 0.5)
+    assert request.reward_checks == (checks, checks)
+    assert request.reward_log_contexts == (log_context, log_context)
+    restored = RolloutRecoveryLedger.from_state_dict(mgr.recovery_ledger.state_dict())
+    assert (
+        tuple(restored.finalization_inputs(request.group_id)[5])
+        == request.reward_checks
+    )
+    assert (
+        tuple(restored.finalization_inputs(request.group_id)[6])
+        == request.reward_log_contexts
+    )

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Guards on pins we declare directly even though a submodule already declares them.
+"""Guards on dependency pins and exclusions declared in the root project.
 
 `megatron-energon` reaches us transitively as
 nemo-rl[mcore] -> megatron-bridge[te,ssm] -> megatron-core[dev,mlm] -> megatron-energon,
@@ -100,4 +100,47 @@ def test_mcore_energon_floor_is_within_megatron_lm_range(
         f"of Megatron-LM's '{megatron_lm_energon.specifier}'. Our pin only exists to raise "
         f"the floor; widening it past upstream either makes `uv lock` unsatisfiable or "
         f"silently has no effect."
+    )
+
+
+@pytest.mark.parametrize("package", ["av", "opencv-python-headless"])
+def test_royalty_sensitive_codecs_are_excluded(package: str) -> None:
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text())
+    canonical_name = canonicalize_name(package)
+    overrides = [
+        override
+        for override in lock["manifest"]["overrides"]
+        if canonicalize_name(override["name"]) == canonical_name
+    ]
+
+    assert len(overrides) == 1, (
+        f"expected exactly one uv.lock override for {package}, got {overrides}"
+    )
+    assert overrides[0].get("marker") == "sys_platform == 'never'"
+    assert all(
+        canonicalize_name(locked_package["name"]) != canonical_name
+        for locked_package in lock["package"]
+    ), f"{package} must not be resolved in uv.lock"
+
+
+def test_torch_split_shims_are_still_needed() -> None:
+    """Trip-wire: both shims exist only while an inference extra pins torch below 2.13."""
+    pinned = [
+        Version(
+            next(
+                iter(
+                    _requirement(REPO_ROOT / "pyproject.toml", extra, "torch").specifier
+                )
+            ).version
+        )
+        for extra in ("sglang", "trtllm")
+    ]
+    assert any(version < Version("2.13") for version in pinned), (
+        "no extra pins torch below 2.13 any more; remove both torch-split shims:\n"
+        "1. nemo_rl/utils/cuda_ipc.py, plus its call sites in "
+        "nemo_rl/models/policy/utils.py and "
+        "nemo_rl/models/generation/sglang/utils/train_utils.py\n"
+        "2. _has_no_named_dims and its conjunct in _physical_keys "
+        "(nemo_rl/data_plane/adapters/tq_mooncake_checkpoint.py) - drop the "
+        "check outright; the pre-2.13 `names` comparison cannot be restored"
     )
