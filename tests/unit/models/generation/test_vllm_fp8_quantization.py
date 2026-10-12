@@ -2768,11 +2768,13 @@ def test_get_module_still_uses_unambiguous_packed_mapping(fp8_module):
     assert module is model.model.layers[0].self_attn.qkv_proj
 
 
-def test_deepseek_parameter_names_do_not_import_legacy_remote_code(fp8_module):
+def test_deepseek_parameter_names_fall_back_on_legacy_rope_type(
+    fp8_module, monkeypatch
+):
     from transformers import PretrainedConfig
 
-    # A remote config with stale auto_map entries must not import its modeling
-    # module just to enumerate the MLA projections excluded from FP8.
+    # Moonlight's remote model expects rope_scaling["type"], while Transformers
+    # 5 normalizes it to "rope_type". Only the failed construction falls back.
     class RemoteDeepseekV3Config(PretrainedConfig):
         model_type = "deepseek_v3"
 
@@ -2795,7 +2797,72 @@ def test_deepseek_parameter_names_do_not_import_legacy_remote_code(fp8_module):
         first_k_dense_replace=1,
         auto_map={"AutoModel": "missing_legacy_module.DeepseekV3Model"},
     )
+    from_config = fp8_module.AutoModel.from_config
+    calls = []
+
+    def build_model(model_config, *, trust_remote_code):
+        calls.append((model_config, trust_remote_code))
+        if trust_remote_code:
+            raise KeyError("type")
+        return from_config(model_config, trust_remote_code=False)
+
+    monkeypatch.setattr(fp8_module.AutoModel, "from_config", build_model)
     names = fp8_module._get_fp8_parameter_names(config)
+    assert calls[0] == (config, True)
+    assert len(calls) == 2
+    assert type(calls[1][0]) is fp8_module.DeepseekV3Config
+    assert calls[1][1] is False
     for layer in range(2):
         for projection in ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]:
             assert f"layers.{layer}.self_attn.{projection}.weight" in names
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v3", "llama"])
+def test_fp8_parameter_names_preserve_working_remote_model(
+    fp8_module, monkeypatch, model_type
+):
+    config = types.SimpleNamespace(model_type=model_type)
+    # Native DeepSeek V3 fuses these weights; keep the working remote model's
+    # names so expert exclusions and first/last BF16 layers still match vLLM.
+    expected = [
+        "layers.0.self_attn.q_a_proj.weight",
+        "layers.1.mlp.experts.0.gate_proj.weight",
+        "layers.1.mlp.experts.0.up_proj.weight",
+        "layers.1.mlp.experts.0.down_proj.weight",
+    ]
+
+    def build_model(model_config, *, trust_remote_code):
+        assert model_config is config
+        assert trust_remote_code is True
+        return types.SimpleNamespace(
+            named_parameters=lambda: [(name, None) for name in expected]
+        )
+
+    monkeypatch.setattr(fp8_module.AutoModel, "from_config", build_model)
+    assert fp8_module._get_fp8_parameter_names(config) == expected
+
+
+@pytest.mark.parametrize(
+    "model_type, error",
+    [
+        ("llama", KeyError("type")),
+        ("deepseek_v3", KeyError("unrelated_key")),
+        ("deepseek_v3", ValueError("invalid configuration")),
+        ("deepseek_v3", ImportError("missing dependency")),
+        ("deepseek_v3", RuntimeError("construction failed")),
+    ],
+)
+def test_fp8_parameter_names_propagate_unrelated_errors(
+    fp8_module, monkeypatch, model_type, error
+):
+    config = types.SimpleNamespace(model_type=model_type)
+
+    def build_model(model_config, *, trust_remote_code):
+        assert model_config is config
+        assert trust_remote_code is True
+        raise error
+
+    monkeypatch.setattr(fp8_module.AutoModel, "from_config", build_model)
+    with pytest.raises(type(error)) as exc_info:
+        fp8_module._get_fp8_parameter_names(config)
+    assert exc_info.value is error

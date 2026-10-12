@@ -241,15 +241,23 @@ def apply_fp8_patches(self, fp8_config):
 
 def _get_fp8_parameter_names(config: PretrainedConfig) -> list[str]:
     """Enumerate model parameters without loading pretrained weights."""
-    trust_remote_code = True
-    if getattr(config, "model_type", None) == "deepseek_v3":
-        # Moonlight's remote modeling code imports removed Transformers APIs.
-        # Native DeepSeek V3 preserves its MLA projection names, which are
-        # needed here only to select layers excluded from FP8 quantization.
-        config = DeepseekV3Config.from_dict(config.to_dict())
-        trust_remote_code = False
-    with init_empty_weights():
-        model = AutoModel.from_config(config, trust_remote_code=trust_remote_code)
+    try:
+        with init_empty_weights():
+            model = AutoModel.from_config(config, trust_remote_code=True)
+    except KeyError as exc:
+        if config.model_type != "deepseek_v3" or exc.args != ("type",):
+            raise
+        # Moonlight's remote _init_rope still expects rope_scaling["type"].
+        # Fall back only for that incompatibility; working remote models keep
+        # their original parameter names, including unfused expert weights.
+        logger.warning(
+            "Remote DeepSeek V3 model construction failed with %r; using the "
+            "native model to enumerate FP8 parameter names.",
+            exc,
+        )
+        native_config = DeepseekV3Config.from_dict(config.to_dict())
+        with init_empty_weights():
+            model = AutoModel.from_config(native_config, trust_remote_code=False)
     return [name for name, _ in model.named_parameters()]
 
 
