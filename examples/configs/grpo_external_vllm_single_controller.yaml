@@ -1,0 +1,95 @@
+# Public small-model SingleController/Gym example using external vLLM.
+defaults:
+  - grpo_math_1B_megatron_single_controller.yaml
+  - ../nemo_gym/grpo_qwen3_30ba3b_instruct.yaml
+
+grpo:
+  async_grpo: null
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 2
+  max_num_steps: 2
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  max_total_sequence_length: 512
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+  generation:
+    backend: remote_vllm
+    vllm_cfg: null
+    vllm_kwargs: null
+    mcore_generation_config: null
+    refit_transport: hf_checkpoint
+    refit_cfg:
+      hf_checkpoint:
+        # Same absolute path in training and serving processes/containers.
+        checkpoint_dir: ${oc.env:EXTERNAL_ROLLOUT_HF_EXPORT_DIR}
+    remote_vllm_cfg:
+      base_url: ${oc.env:EXTERNAL_ROLLOUT_VLLM_URL}
+      served_model_name: policy
+      max_model_len: ${policy.max_total_sequence_length}
+      refit:
+        inflight_policy: keep
+        timeout_s: 1800.0
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: null
+        gpus_per_node: null
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 1
+
+data:
+  train:
+    data_path: ${oc.env:GYM_TRAIN_PATH}
+  validation:
+    data_path: ${oc.env:GYM_VALIDATION_PATH}
+
+token_capture:
+  enabled: false
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          return_token_id_information: true
+          request_prompt_and_generation_token_ids: true
+          supply_prefix_token_ids: false
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0
+  min_groups_for_streaming_train: 4
+  max_inflight_prompts: 4
+  max_buffered_rollouts: 4
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: 2
+
+checkpointing:
+  enabled: false
+
+logger:
+  wandb_enabled: false
