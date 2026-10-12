@@ -33,9 +33,14 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
+from tensordict import TensorDict
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
-from nemo_rl.data.multimodal_utils import PER_TOKEN_MULTIMODAL_FIELDS
+from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    PER_TOKEN_MULTIMODAL_FIELDS,
+    row_shapes_key,
+)
 from nemo_rl.data_plane.codec import materialize, pack_jagged_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import (
@@ -83,6 +88,60 @@ def round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
+def fetch_columns(
+    dp_client: DataPlaneClient,
+    meta: KVBatchMeta,
+    select_fields: Sequence[str] | None,
+) -> TensorDict:
+    """Fetch sparse media separately: TQ intersects fields across requested rows.
+
+    Geometry tags identify which rows carry each packed field. Fetch equal
+    row sets together, then insert empty wire rows for samples without media.
+    Homogeneous batches still need only one fetch.
+    """
+    if select_fields is None:
+        raise ValueError("fetch_columns requires explicit select_fields")
+    all_rows = tuple(range(len(meta.sample_ids)))
+    groups: dict[tuple[int, ...], list[str]] = {}
+    for key in select_fields:
+        indices = all_rows
+        if key in PACKED_MULTIMODAL_FIELDS and meta.tags is not None:
+            indices = tuple(
+                i
+                for i, tag in enumerate(meta.tags)
+                if tag.get(row_shapes_key(key), {}).get("shapes")
+            )
+        if indices:
+            groups.setdefault(indices, []).append(key)
+
+    result = TensorDict({}, batch_size=[len(all_rows)])
+    for indices, fields in groups.items():
+        fetched = dp_client.get_samples(
+            sample_ids=[meta.sample_ids[i] for i in indices],
+            partition_id=meta.partition_id,
+            select_fields=fields,
+        )
+        missing = set(fields) - set(fetched.keys())
+        if missing:
+            raise ValueError(
+                f"Data-plane fetch dropped requested fields {sorted(missing)} "
+                f"in partition {meta.partition_id!r}"
+            )
+        for key in fields:
+            value = fetched[key]
+            if indices != all_rows:
+                # Only packed media is sparse here; its wire rows are flat.
+                if not isinstance(value, torch.Tensor) or not value.is_nested:
+                    raise ValueError(f"Sparse media field {key!r} must be nested")
+                parts = list(value.unbind())
+                rows = [parts[0].new_empty(0) for _ in all_rows]
+                for i, part in zip(indices, parts, strict=True):
+                    rows[i] = part
+                value = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+            result[key] = value
+    return result
+
+
 def read_columns(
     dp_client: DataPlaneClient,
     meta: KVBatchMeta,
@@ -109,11 +168,7 @@ def read_columns(
     Returns:
         ``BatchedDataDict`` with the requested fields, materialized.
     """
-    td = dp_client.get_samples(
-        sample_ids=meta.sample_ids,
-        partition_id=meta.partition_id,
-        select_fields=list(select_fields),
-    )
+    td = fetch_columns(dp_client, meta, select_fields)
     pad_to_seqlen = int((meta.extra_info or {}).get(GLOBAL_FORWARD_PAD_SEQLEN, 0))
     data = materialize(
         td,
