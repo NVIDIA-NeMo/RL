@@ -47,10 +47,14 @@ policy:
       tensor_parallel_size: 8
       gpu_memory_utilization: 0.7
       async_engine: true
-    # vllm_kwargs:
-    #   # vLLM 0.20's default FlashInfer TRTLLM MoE backend isn't refit-compatible,
-    #   # change to triton to keep same behavior as vLLM 0.17.
-    #   moe_backend: triton
+    vllm_kwargs:
+      # The utilization-derived 24.91 GiB KV cache leaves too little headroom
+      # to wake the colocated Megatron policy. Explicit bytes take precedence
+      # over gpu_memory_utilization for KV-cache sizing.
+      kv_cache_memory_bytes: 21474836480  # 20 GiB
+      # vLLM 0.20's default FlashInfer TRTLLM MoE backend isn't refit-compatible;
+      # uncomment to keep the vLLM 0.17 Triton behavior.
+      # moe_backend: triton
 logger:
   wandb_enabled: true
   tensorboard_enabled: true

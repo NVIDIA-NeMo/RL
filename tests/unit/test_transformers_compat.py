@@ -18,11 +18,13 @@ from pathlib import Path
 
 import pytest
 import transformers.dynamic_module_utils as dynamic_module_utils
+import transformers.utils.import_utils as transformers_import_utils
 
 import nemo_rl.transformers_compat as transformers_compat
 from nemo_rl.transformers_compat import (
     _compute_local_source_files_hash_with_symlink_fix,
     _patch_transformers_dynamic_module_symlink_cache,
+    _patch_transformers_torch_fx_compat,
 )
 
 _SOURCE_FILES = {
@@ -58,9 +60,9 @@ def test_get_cached_module_file_handles_symlinked_hub_cache(monkeypatch, tmp_pat
         _compute_local_source_files_hash_with_symlink_fix
     ), (
         "The symlink-cache patch is not installed. If Transformers is now "
-        "5.13.0 or newer the upstream fix is already in place: delete "
-        "nemo_rl/transformers_compat.py, its bootstrap at the bottom of "
-        "nemo_rl/__init__.py, and this test file. Do not widen the version gate."
+        "5.13.0 or newer the upstream fix is already in place: delete the "
+        "dynamic-module hashing patch, its call in nemo_rl/__init__.py and "
+        "its tests. Keep the torch-FX helper. Do not widen the version gate."
     )
     for filename, content in _SOURCE_FILES.items():
         assert (cached_source_dir / filename).read_text(encoding="utf-8") == content
@@ -162,3 +164,33 @@ def test_patch_fails_loudly_if_transformers_target_signature_changed(monkeypatch
 
     with pytest.raises(RuntimeError, match="unexpected.*signature"):
         _patch_transformers_dynamic_module_symlink_cache()
+
+
+def test_torch_fx_compat_patch_restores_removed_helper(monkeypatch):
+    monkeypatch.setattr(transformers_compat, "distribution_version", lambda _: "5.12.1")
+    monkeypatch.delattr(
+        transformers_import_utils,
+        "is_torch_fx_available",
+        raising=False,
+    )
+
+    assert _patch_transformers_torch_fx_compat() is True
+    assert (
+        transformers_import_utils.is_torch_fx_available
+        is transformers_compat._is_torch_fx_available_compat
+    )
+    assert _patch_transformers_torch_fx_compat() is False
+
+
+def test_torch_fx_compat_patch_preserves_existing_helper(monkeypatch):
+    existing_helper = object()
+    monkeypatch.setattr(transformers_compat, "distribution_version", lambda _: "4.57.1")
+    monkeypatch.setattr(
+        transformers_import_utils,
+        "is_torch_fx_available",
+        existing_helper,
+        raising=False,
+    )
+
+    assert _patch_transformers_torch_fx_compat() is False
+    assert transformers_import_utils.is_torch_fx_available is existing_helper

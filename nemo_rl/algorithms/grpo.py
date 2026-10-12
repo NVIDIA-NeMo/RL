@@ -82,6 +82,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -114,6 +115,7 @@ from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
     backfill_missing_routed_experts,
+    get_effort_config,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -142,6 +144,7 @@ from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
+from nemo_rl.models.megatron.zero_train_gen_mismatch import validate_zero_train_gen_kl
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -867,6 +870,9 @@ def setup(
         )
 
     _validate_use_kl_in_reward_compat(master_config)
+
+    # Fail on an invalid zero-KL config before Ray allocates GPUs.
+    validate_zero_train_gen_kl(policy_config, check_environment=False)
 
     # ==========================
     #          Cluster
@@ -2228,6 +2234,11 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
     generated assistant messages have generation_logprobs, so use that field as the
     trainable-token marker. This function mutates each message in-place by adding a
     token_loss_mask and, when missing, a zero-valued generation_logprobs tensor.
+    Batches with at least one non-empty media segment also receive a per-token
+    media-validity field. Exact masks minted by the multimodal processor are
+    preserved; legacy messages fall back to PackedTensor ownership. Every other
+    message, including generated assistant text, is invalid. Batches without
+    media segments carry no media-validity field.
     Router-replay routes get the same treatment via
     :func:`backfill_missing_routed_experts`, so every per-token field is defined
     for every tokenized message before the batch is flattened.
@@ -2238,6 +2249,21 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
             ``generation_logprobs`` are treated as rollout-generated messages.
     """
     backfill_missing_routed_experts(message_logs)
+
+    def _owns_media(message: dict[str, Any]) -> bool:
+        return any(
+            key in PACKED_MULTIMODAL_FIELDS
+            and isinstance(value, PackedTensor)
+            and any(value.logical_segment_counts_by_row())
+            for key, value in message.items()
+        )
+
+    # Only add masks if some message has non-empty media. Overlength messages keep
+    # empty media, which is not stored; storing their mask anyway would make
+    # reading them together with text-only messages fail on the missing mask.
+    has_media = any(
+        _owns_media(message) for message_log in message_logs for message in message_log
+    )
     for message_log in message_logs:
         for message in message_log:
             role = cast(str, message["role"])
@@ -2251,6 +2277,19 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
             if "generation_logprobs" not in message:
                 message["generation_logprobs"] = torch.zeros_like(
                     token_ids, dtype=torch.float32
+                )
+
+            if not has_media:
+                message.pop("media_token_validity_mask", None)
+                continue
+            existing_media_mask = message.get("media_token_validity_mask")
+            if isinstance(existing_media_mask, torch.Tensor):
+                message["media_token_validity_mask"] = existing_media_mask.bool()
+            else:
+                message["media_token_validity_mask"] = torch.full_like(
+                    token_ids,
+                    fill_value=_owns_media(message),
+                    dtype=torch.bool,
                 )
 
 
@@ -2585,12 +2624,7 @@ def _write_latest_checkpoint_status(
 
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
     """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
-    if "nemo_gym" not in master_config.env:
-        return None
-    effort_dict = master_config.env["nemo_gym"].get("effort_levels")
-    if effort_dict is None:
-        return None
-    return EffortLevelsConfig.model_validate(effort_dict)
+    return get_effort_config(master_config.env)
 
 
 def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch.Tensor:
