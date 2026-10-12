@@ -33,6 +33,10 @@ env:
     config_paths:
       - resources_servers/math/configs/math.yaml
       - responses_api_agents/simple_agent/configs/simple_agent.yaml
+    # Driver-side reliability knob, read by the rollout loop in
+    # nemo_rl/experience/rollouts.py and never forwarded to Gym. Off by
+    # default: one dispatch per row.
+    max_infra_attempts_per_rollout: 1    # dispatches one row may use after a /run infrastructure failure
 
 logger:
   wandb:

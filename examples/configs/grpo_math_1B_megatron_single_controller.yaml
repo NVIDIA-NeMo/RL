@@ -96,9 +96,9 @@ async_rl:
       env_timeout_s: null             # one environment step
     nemo_gym:                         # AsyncNemoGymRolloutImpl only
       rollout_timeout_s: null         # the whole prompt-group rollout, retries included
-      # Re-send just the rows that never arrived before retrying the whole group.
-      # Gym's stream dies on its first failing row, so one bad row loses every later
-      # one; recovering those individually beats redoing all N.
+      # Re-send just the rows that never arrived before retrying the whole group: a
+      # row whose /run failed at the infrastructure level comes back as a marker and
+      # is re-sent by itself; recovering rows individually beats redoing all N.
       max_row_attempts: 3
 
   # Last-resort stall detection. stall_timeout_s must exceed interval_s and every
