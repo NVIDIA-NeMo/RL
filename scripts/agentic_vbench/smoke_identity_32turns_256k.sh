@@ -24,7 +24,8 @@ export TRAIN_REPEATS=${TRAIN_REPEATS:-$((MAX_STEPS + 2))}
 export ENV_FILE=${ENV_FILE:-/dev/null}
 # Gym server venvs are built from this branch's Gym tree; keep them apart from the cc-pr4200 ones.
 export GYM_VENV_DIR=${GYM_VENV_DIR:-$AVB_DATA_ROOT/gym_venvs_unified_teacher}
-export MODEL_PATH=${MODEL_PATH:-/lustre/fsw/portfolios/nemotron/users/arushig/workspace/output/stage2_text_rl_with_r3_step120}
+: "${MODEL_PATH:?MODEL_PATH must point to a complete Hugging Face checkpoint visible on every node}"
+export MODEL_PATH
 export NUM_NODES=${NUM_NODES:-8}
 export GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 export NUM_GEN_NODES=${NUM_GEN_NODES:-4}

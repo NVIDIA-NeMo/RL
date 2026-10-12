@@ -25,7 +25,8 @@ export AGENTIC_VBENCH_CONCURRENCY=${AGENTIC_VBENCH_CONCURRENCY:-$((NUM_PROMPTS *
 export TRAIN_LIMIT=${TRAIN_LIMIT:-$NUM_PROMPTS}
 export TRAIN_REPEATS=${TRAIN_REPEATS:-$((MAX_STEPS + 2))}
 export ENV_FILE=${ENV_FILE:-/dev/null}
-export MODEL_PATH=${MODEL_PATH:-/lustre/fsw/portfolios/nemotron/users/arushig/workspace/output/stage2_text_rl_with_r3_step120}
+: "${MODEL_PATH:?MODEL_PATH must point to a complete Hugging Face checkpoint visible on every node}"
+export MODEL_PATH
 # 8 nodes (4 training / 4 generation) matched the 2026-10-01 GRPO smoke layout.
 export NUM_NODES=${NUM_NODES:-8}
 export GPUS_PER_NODE=${GPUS_PER_NODE:-8}

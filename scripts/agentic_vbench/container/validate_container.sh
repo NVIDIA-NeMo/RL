@@ -12,7 +12,8 @@ code_dir=$(cd "$script_dir/../../.." && pwd)
 container=${1:-${CONTAINER:-/lustre/fsw/portfolios/nemotron/users/arushig/images/nemo-rl-cc-pr4200.sqsh}}
 [[ -f $container ]] || { echo "container not found: $container" >&2; exit 1; }
 recipe=${CONFIG_IN_CONTAINER:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc.v1.yaml}
-model_path=${MODEL_PATH:-/lustre/fsw/portfolios/nemotron/users/arushig/workspace/output/stage2_text_rl_with_r3_step120}
+: "${MODEL_PATH:?MODEL_PATH must point to a complete Hugging Face checkpoint visible in the container}"
+model_path=${MODEL_PATH}
 mounts="/lustre:/lustre,/scratch:/scratch"
 for sub in nemo_rl examples tools scripts 3rdparty/Gym-workspace/Gym 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge; do
   mounts+=",$code_dir/$sub:/opt/nemo-rl/$sub"

@@ -31,7 +31,8 @@ fi
 # this Gym accepts >=2.56.1), so the x86 cc-pr4200 image is the equivalent.
 container="${CONTAINER:-/lustre/fsw/portfolios/nemotron/users/arushig/images/nemo-rl-cc-pr4200.sqsh}"
 config_in_container="${CONFIG_IN_CONTAINER:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-8n8g-megatron-agentic-vbench-sc.v2.yaml}"
-model_path="${MODEL_PATH:-/lustre/fsw/portfolios/nemotron/users/arushig/workspace/output/stage2_text_rl_with_r3_step120}"
+: "${MODEL_PATH:?MODEL_PATH must point to a complete Hugging Face checkpoint visible on every node}"
+model_path="${MODEL_PATH}"
 export MODEL_PATH="${model_path}"
 export RAY_TMPDIR="${RAY_TMPDIR:-/tmp}"
 : "${TRAIN_PATH:?TRAIN_PATH is required}"
