@@ -694,8 +694,9 @@ def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
         route for call_id in expected.call_ids for route in routes_by_call[call_id]
     ]
     valid_len = len(expected.token_ids)
-    assert materialized["routed_experts"][0, :valid_len].tolist() == expected_routes
-    assert bool(materialized["routed_experts"][1].eq(-1).all())
+    routed_rows = materialized["routed_experts"].unbind()
+    assert routed_rows[0][:valid_len].tolist() == expected_routes
+    assert bool(routed_rows[1].eq(-1).all())
 
 
 @pytest.mark.parametrize("bad_routed_len", [-1, 999])

@@ -81,6 +81,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -142,6 +143,7 @@ from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
+from nemo_rl.models.megatron.zero_train_gen_mismatch import validate_zero_train_gen_kl
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -874,6 +876,9 @@ def setup(
         )
 
     _validate_use_kl_in_reward_compat(master_config)
+
+    # Fail on an invalid zero-KL config before Ray allocates GPUs.
+    validate_zero_train_gen_kl(policy_config, check_environment=False)
 
     # ==========================
     #          Cluster
@@ -2255,6 +2260,11 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
     generated assistant messages have generation_logprobs, so use that field as the
     trainable-token marker. This function mutates each message in-place by adding a
     token_loss_mask and, when missing, a zero-valued generation_logprobs tensor.
+    Batches with at least one non-empty media segment also receive a per-token
+    media-validity field. Exact masks minted by the multimodal processor are
+    preserved; legacy messages fall back to PackedTensor ownership. Every other
+    message, including generated assistant text, is invalid. Batches without
+    media segments carry no media-validity field.
     Router-replay routes get the same treatment via
     :func:`backfill_missing_routed_experts`, so every per-token field is defined
     for every tokenized message before the batch is flattened.
@@ -2265,6 +2275,21 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
             ``generation_logprobs`` are treated as rollout-generated messages.
     """
     backfill_missing_routed_experts(message_logs)
+
+    def _owns_media(message: dict[str, Any]) -> bool:
+        return any(
+            key in PACKED_MULTIMODAL_FIELDS
+            and isinstance(value, PackedTensor)
+            and any(value.logical_segment_counts_by_row())
+            for key, value in message.items()
+        )
+
+    # Only add masks if some message has non-empty media. Overlength messages keep
+    # empty media, which is not stored; storing their mask anyway would make
+    # reading them together with text-only messages fail on the missing mask.
+    has_media = any(
+        _owns_media(message) for message_log in message_logs for message in message_log
+    )
     for message_log in message_logs:
         for message in message_log:
             role = cast(str, message["role"])
@@ -2278,6 +2303,19 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
             if "generation_logprobs" not in message:
                 message["generation_logprobs"] = torch.zeros_like(
                     token_ids, dtype=torch.float32
+                )
+
+            if not has_media:
+                message.pop("media_token_validity_mask", None)
+                continue
+            existing_media_mask = message.get("media_token_validity_mask")
+            if isinstance(existing_media_mask, torch.Tensor):
+                message["media_token_validity_mask"] = existing_media_mask.bool()
+            else:
+                message["media_token_validity_mask"] = torch.full_like(
+                    token_ids,
+                    fill_value=_owns_media(message),
+                    dtype=torch.bool,
                 )
 
 
@@ -2914,6 +2952,8 @@ def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: Optional[float],
+    *,
+    filtering_on: bool = False,
 ) -> dict:
     """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
 
@@ -2928,6 +2968,7 @@ def compute_and_apply_seq_logprob_error_masking(
         rewards: Reward tensor for computing statistics on masked sequences.
         seq_logprob_error_threshold: If set, mask sequences with mult_prob_error
                                     exceeding this threshold. If None, only compute metrics.
+        filtering_on: Whether policy top-k/top-p can produce unsupported -inf tokens.
 
     Returns:
         Dict with keys: max_seq_mult_prob_error, mean_seq_mult_prob_error,
@@ -2939,6 +2980,11 @@ def compute_and_apply_seq_logprob_error_masking(
     sample_mask = train_data["sample_mask"]
     prev_logprobs = train_data["prev_logprobs"][:, 1:]
     generation_logprobs = train_data["generation_logprobs"][:, 1:]
+    if filtering_on:
+        # Narrow only the diagnostic mask; the shared mask still owns KL terms.
+        token_mask = token_mask * (
+            ~torch.isneginf(prev_logprobs) & ~torch.isneginf(generation_logprobs)
+        ).to(token_mask.dtype)
     seq_mult_prob_error, valid_seq_mask = compute_seq_logprob_errors(
         policy_logprobs=prev_logprobs,
         generation_logprobs=generation_logprobs,
@@ -3707,10 +3753,6 @@ def _grpo_train_impl(
                     if not skip_prev_logprobs:
                         prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
                         train_data["prev_logprobs"] = prev_lp_result["logprobs"]
-                        # When top-k/top-p filtering is enabled, the worker returns a mask that has
-                        # -inf positions zeroed. Propagate it so the loss reduction skips them.
-                        if "token_mask" in prev_lp_result:
-                            train_data["token_mask"] = prev_lp_result["token_mask"]
                     else:
                         print(
                             "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
@@ -3756,6 +3798,12 @@ def _grpo_train_impl(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
+                        filtering_on=need_top_k_or_top_p_filtering(
+                            TrainingSamplingParams(
+                                top_k=master_config.policy["generation"]["top_k"],
+                                top_p=master_config.policy["generation"]["top_p"],
+                            )
+                        ),
                     )
                     seq_logprob_error_metrics = seq_error_result
                     if "num_masked_seqs" in seq_logprob_error_metrics:
@@ -4167,6 +4215,12 @@ def _grpo_train_impl(
                     },
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
+                    filtering_on=need_top_k_or_top_p_filtering(
+                        TrainingSamplingParams(
+                            top_k=master_config.policy["generation"]["top_k"],
+                            top_p=master_config.policy["generation"]["top_p"],
+                        )
+                    ),
                 )
             del train_data
             if (
@@ -5511,9 +5565,6 @@ def async_grpo_train(
                     if not skip_prev_logprobs:
                         prev_lp_result = policy.get_logprobs(train_data, timer=timer)
                         train_data["prev_logprobs"] = prev_lp_result["logprobs"]
-                        # Propagate the top-k/top-p neginf token mask.
-                        if "token_mask" in prev_lp_result:
-                            train_data["token_mask"] = prev_lp_result["token_mask"]
                     else:
                         train_data["prev_logprobs"] = torch.zeros_like(
                             train_data["generation_logprobs"]
@@ -5552,6 +5603,12 @@ def async_grpo_train(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
+                        filtering_on=need_top_k_or_top_p_filtering(
+                            TrainingSamplingParams(
+                                top_k=master_config.policy["generation"]["top_k"],
+                                top_p=master_config.policy["generation"]["top_p"],
+                            )
+                        ),
                     )
                     seq_logprob_error_metrics = seq_error_result
                     if "num_masked_seqs" in seq_logprob_error_metrics:
