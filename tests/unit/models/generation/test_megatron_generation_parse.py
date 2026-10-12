@@ -376,39 +376,22 @@ def test_http_server_port_reservation(monkeypatch):
 
 @pytest.mark.mcore
 @pytest.mark.parametrize(
-    ("gen_cfg_extra", "sampling_cfg", "expected", "absent"),
+    ("gen_cfg_extra", "expected", "absent"),
     [
         # Replica count reaches MCore, and stays absent when unconfigured.
-        pytest.param({}, None, {}, ["num_replicas"], id="num-replicas-unset"),
+        pytest.param({}, {}, ["num_replicas"], id="num-replicas-unset"),
         pytest.param(
             {"http_server_num_replicas": 8},
-            None,
             {"num_replicas": 8},
             [],
             id="num-replicas-forwarded",
         ),
-        pytest.param(
-            {},
-            {"temperature": 0.7, "top_p": None, "top_k": None},
-            {"default_temperature": 0.7, "default_top_p": 1.0, "default_top_k": 0},
-            [],
-            id="sampling-defaults-unset",
-        ),
-        pytest.param(
-            {},
-            {"temperature": 1.0, "top_p": 0.9, "top_k": 50},
-            {"default_temperature": 1.0, "default_top_p": 0.9, "default_top_k": 50},
-            [],
-            id="sampling-defaults-forwarded",
-        ),
     ],
 )
 def test_http_server_kwargs_follow_policy_config(
-    monkeypatch, gen_cfg_extra, sampling_cfg, expected, absent
+    monkeypatch, gen_cfg_extra, expected, absent
 ):
-    started = _start_stubbed_http_server(
-        monkeypatch, gen_cfg_extra=gen_cfg_extra, sampling_cfg=sampling_cfg
-    )
+    started = _start_stubbed_http_server(monkeypatch, gen_cfg_extra=gen_cfg_extra)
 
     assert {key: started[key] for key in expected} == expected
     assert not set(absent) & set(started)
@@ -492,3 +475,35 @@ def test_mp_coordinator_starts_exposed_http_server(monkeypatch):
     future.result.assert_called_once_with()
     setup_server.assert_called_once_with()
     assert worker.base_url == "http://10.0.0.5:5555/v1"
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("sampling", "expected"),
+    [
+        (
+            {"temperature": 1.0, "top_p": 1.0, "top_k": None},
+            {"default_temperature": 1.0, "default_top_p": 1.0, "default_top_k": 0},
+        ),
+        (
+            {"temperature": 0.7, "top_p": None, "top_k": -1},
+            {"default_temperature": 0.7, "default_top_p": 1.0, "default_top_k": 0},
+        ),
+        (
+            {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+            {"default_temperature": 0.6, "default_top_p": 0.95, "default_top_k": 20},
+        ),
+    ],
+)
+def test_http_server_defaults_follow_generation_sampling(
+    monkeypatch, sampling, expected
+):
+    """Requests that omit sampling fields use the training sampling profile.
+
+    Without explicit server defaults, MCore falls back to hardcoded values or to
+    the model's generation_config.json, which can differ from the parameters the
+    policy recomputes log probabilities with.
+    """
+    started = _start_stubbed_http_server(monkeypatch, sampling_cfg=sampling)
+
+    assert {key: started[key] for key in expected} == expected
