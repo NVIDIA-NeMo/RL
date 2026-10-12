@@ -90,7 +90,7 @@ Each process sets stable-for-the-run values on its OTel `Resource` — `init_tel
 | `rl.algorithm` | the `algorithm="<algo>"` passed to `init_telemetry_driver` |
 | `rl.model` | `policy.model_name` |
 | `nemo.precision` | `policy.precision` |
-| `dl.tensor_parallel.size` | `policy.megatron_cfg` / `dtensor_cfg` TP size |
+| `dl.tensor_parallel.size` | `policy.megatron_cfg` / `automodel_cfg` TP size |
 | `dl.pipeline_parallel.size` | `policy.megatron_cfg` PP size |
 | `nv.dl.rank`, `nv.dl.world_size` | this process's rank and group size (`RANK` / `WORLD_SIZE`, or `0` / `1` for the driver and singleton actors) |
 | `rl.worker_group` | worker processes only: the worker group's `name_prefix` (`lm_policy`, `vllm_policy`, ...), from `NRL_WORKER_GROUP`. The `NemoGym` actor reports the literal `nemo_gym` — it is built from the environment registry rather than by `RayWorkerGroup`, so nothing sets the env var for it |

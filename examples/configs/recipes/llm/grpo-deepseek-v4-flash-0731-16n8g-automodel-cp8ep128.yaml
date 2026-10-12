@@ -64,7 +64,7 @@ policy:
       total_iters: 10000000000
   - milestones:
     - 5
-  dtensor_cfg:
+  automodel_cfg:
     context_parallel_size: 8
     expert_parallel_size: 128
     activation_checkpointing: true
@@ -78,7 +78,7 @@ policy:
         linear: torch
         rms_norm: torch_fp32
         experts: torch_mm
-        dispatcher: deepep
+        dispatcher: hybridep
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
