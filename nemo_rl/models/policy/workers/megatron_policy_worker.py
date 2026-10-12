@@ -45,7 +45,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.experimental_attention_variant.glm_dsa_native_fp8 import (
+from megatron.core.transformer.experimental_attention_variant.dsa_native_fp8_glm52 import (
     maybe_enable_glm52_dsa_native_fp8,
 )
 from megatron.core.utils import get_model_config, unwrap_model
