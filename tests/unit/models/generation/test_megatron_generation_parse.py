@@ -457,3 +457,22 @@ def test_mp_coordinator_starts_exposed_http_server(monkeypatch):
     future.result.assert_called_once_with()
     setup_server.assert_called_once_with()
     assert worker.base_url == "http://10.0.0.5:5555/v1"
+
+
+@pytest.mark.parametrize("backend", ["torch", "flashinfer"])
+def test_sampling_backend_override(backend):
+    kwargs = {"sampling_backend": "flashinfer"}
+    _apply_optional_inference_config_kwargs(kwargs, {"sampling_backend": backend})
+    assert kwargs["sampling_backend"] == backend
+
+
+def test_sampling_backend_default_stays_flashinfer():
+    kwargs = {"sampling_backend": "flashinfer"}
+    _apply_optional_inference_config_kwargs(kwargs, {})
+    assert kwargs["sampling_backend"] == "flashinfer"
+
+
+@pytest.mark.parametrize("backend", [None, "typo", True])
+def test_sampling_backend_rejects_invalid_override(backend):
+    with pytest.raises(ValueError, match="sampling_backend"):
+        _apply_optional_inference_config_kwargs({}, {"sampling_backend": backend})

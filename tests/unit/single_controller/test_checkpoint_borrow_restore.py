@@ -209,6 +209,7 @@ def _controller(
     elif checkpoint_path is not None:
         controller._sampler.set_dispatch_index(0)
     controller._async_cfg = SimpleNamespace(
+        seeded_rollouts=False,
         max_inflight_prompts=16,
         max_buffered_rollouts=_CAPACITY,
         diagnostics=False,

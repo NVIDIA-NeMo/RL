@@ -550,3 +550,49 @@ partial file is not proof of a completed training step.
 The per-step `timing/train/train_data_dump` metric reports wall-clock seconds
 summed across chunk preparation/writes and final-file publication. Chunk dump
 time is also included in `advantage_calculation`; these timings overlap.
+
+
+## Request seeds for SWE rollouts
+
+Set `async_rl.seeded_rollouts=true` for a NeMo Gym SWE run to send an episode
+seed in `responses_create_params.metadata.sampling_seed`. This is opt-in and
+requires the seed-aware [Gym SWE wrapper (PR #3927)](https://github.com/NVIDIA-NeMo/Gym/pull/3927)
+and OpenHands client, plus a generation
+server that honors request seeds (Megatron-LM PR
+[#7828](https://github.com/NVIDIA/Megatron-LM/pull/7828)). OpenHands support is in
+[nv-OpenHands PR #24](https://github.com/sdevare-nv/nv-OpenHands/pull/24).
+If overriding the Gym SWE configuration, use
+`agent_framework_repo: https://github.com/sdevare-nv/nv-OpenHands.git` and
+`agent_framework_commit: 57792518a83ef7f3956f924602fce9bd12998726`
+(or a descendant containing that change). Older clients may ignore this
+metadata, so update the complete integration before enabling it.
+
+The controller derives each prompt seed from the algorithm seed (`grpo.seed` or
+`ppo.seed`), dataset index, and epoch. The Gym rollout builder derives separate
+seeds for sibling generations. Dispatch order, random group IDs, policy version,
+and retries do not enter these identities. Partial retries preserve the original
+sibling index. Replacement prompts keep the identity assigned when read from the
+data loader. A stable dataset with unique indices per epoch is required.
+
+Unfinished prompt recovery persists the prompt seed alongside its dataset
+reference; completed replay data is unchanged. Restoring unfinished unseeded
+rollouts while turning this option on is rejected because their original sampling
+identity is unavailable. Checkpoints containing seeded unfinished groups require
+a reader supporting this field. Start a fresh run when enabling the option on an
+older unseeded checkpoint.
+
+This setting does not change admission, batching, or weight-update scheduling and
+introduces no additional synchronization. It makes random draws follow logical
+requests, not completion timing. It does not guarantee identical token sequences
+when model numerics, policy versions, prompts, or live tool observations differ;
+it does not provide exact live sandbox continuation. Generation-side seed handling
+may have its own overhead. Native non-Gym rollouts are rejected when it is enabled.
+
+For Megatron, also set
+`policy.generation.mcore_generation_config.sampling_backend=torch`.
+The worker otherwise retains its existing FlashInfer backend. Seeded FlashInfer,
+static inference, and speculative decoding are not supported by Megatron PR #7828;
+use dynamic inference without speculative decoding. Selecting Torch can change
+sampling performance independently of the small rollout-seed bookkeeping cost.
+Leave Gym `sampling_overrides.seed` unset so a fixed override does not replace the
+per-call seeds supplied by OpenHands.

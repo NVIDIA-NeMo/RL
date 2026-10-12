@@ -2308,6 +2308,46 @@ class TestGenerateForFinalizationFlow:
         )
 
 
+@pytest.mark.parametrize("metadata", [None, {"trace": "keep"}])
+def test_gym_sampling_seed_stays_with_logical_sibling(metadata):
+    from nemo_rl.utils.sampling_seed import derive_sampling_seed
+
+    impl = _nemo_gym_impl(False)
+    impl._num_generations_per_prompt = 4
+    sample = {
+        "sampling_seed": derive_sampling_seed(42, 3, 17),
+        "extra_env_info": {"responses_create_params": {"metadata": metadata}},
+    }
+    original = deepcopy(sample)
+    rows = impl._build_inputs(sample)
+    seeds = [
+        row["responses_create_params"]["metadata"]["sampling_seed"] for row in rows
+    ]
+    assert len(set(seeds)) == 4
+    assert all(0 <= int(seed) < 2**63 for seed in seeds)
+    # Partial retry uses original sibling indices, even in a different order and
+    # with freshly generated physical group IDs.
+    retry = impl._build_inputs(sample, generation_indices=[3, 1])
+    assert [
+        row["responses_create_params"]["metadata"]["sampling_seed"] for row in retry
+    ] == [seeds[3], seeds[1]]
+    assert sample == original
+    if metadata:
+        assert all(
+            row["responses_create_params"]["metadata"]["trace"] == "keep"
+            for row in rows
+        )
+
+
+def test_gym_unseeded_requests_keep_existing_metadata():
+    impl = _nemo_gym_impl(False)
+    sample = {
+        "extra_env_info": {"responses_create_params": {"metadata": {"trace": "keep"}}}
+    }
+    row = impl._build_inputs(sample)[0]
+    assert row["responses_create_params"]["metadata"] == {"trace": "keep"}
+
+
 def test_capture_completion_preserves_checks_and_raw_reward_until_finalization():
     from nemo_rl.experience.reward_penalties import RewardChecks
 

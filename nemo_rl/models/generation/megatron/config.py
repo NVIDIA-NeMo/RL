@@ -184,6 +184,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # processors. Policy recomputation uses raw model logits, so numerical
     # parity checks should select raw_logprobs explicitly.
     logprobs_mode: Literal["processed_logprobs", "raw_logprobs"]
+    # Override the existing FlashInfer default; request seeds require Torch.
+    sampling_backend: NotRequired[Literal["torch", "flashinfer"]]
 
     # FP8/MXFP8 for the dedicated (non-colocated) inference model;
     # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.

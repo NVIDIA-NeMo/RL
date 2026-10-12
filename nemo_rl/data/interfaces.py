@@ -66,6 +66,7 @@ class DatumSpec(TypedDict):
     extra_env_info: Optional[dict[str, Any]]
     loss_multiplier: float  # multiplier for the loss for this datum. 0 to mask out (say the sample is invalid)
     idx: int
+    sampling_seed: NotRequired[int]  # Stable logical prompt occurrence seed.
     task_name: NotRequired[str]
     stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
     __extra__: NotRequired[Any]  # This allows additional fields of any type
