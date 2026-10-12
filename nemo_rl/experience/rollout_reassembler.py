@@ -394,6 +394,11 @@ class RolloutReassembler:
                         staged_route_len=item.routed_len,
                         extras_digest_version=commitment.extras_digest_version,
                         extras_digest=commitment.extras_digest,
+                        boundary_rows=(
+                            boundary_route_rows(record.prev_len)
+                            if item.routed_len
+                            else 0
+                        ),
                     )
                 )
             if sum(span.carry_len + span.generation_len for span in route_spans) != len(

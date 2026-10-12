@@ -33,6 +33,7 @@ from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
 from nemo_rl.data_plane.schema import ROUTE_ENCODING_ENVELOPE  # noqa: E402
 from nemo_rl.experience.route_assembly import (  # noqa: E402
     RouteFragment,
+    boundary_route_rows,
     execute_route_plan,
 )
 from nemo_rl.experience.route_plan import (  # noqa: E402
@@ -90,6 +91,7 @@ def _assemble(calls: list[tuple[torch.Tensor, int, int]]) -> torch.Tensor:
                 extras_digest=compute_extras_digest(
                     {"routed_experts": encode_routed_experts(staged)}
                 ),
+                boundary_rows=boundary_route_rows(prev_len),
             )
         )
         fragments[key] = RouteFragment(staged, ROUTE_ENCODING_ENVELOPE, b"null")

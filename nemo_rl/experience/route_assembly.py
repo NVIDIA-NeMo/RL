@@ -155,11 +155,10 @@ def execute_route_plan(
     position = 0
     for span in plan.spans:
         contribution = span.carry_len + span.generation_len
-        boundary_rows = boundary_route_rows(position) if span.staged_route_len else 0
         mode = classify_route_span(
             carry_len=span.carry_len,
             generation_len=span.generation_len,
-            staged_route_len=span.staged_route_len - boundary_rows,
+            staged_route_len=span.staged_route_len - span.boundary_rows,
         )
         if mode != "sentinel":
             fragment = fragments.get(span.staging_key)
@@ -178,7 +177,7 @@ def execute_route_plan(
                 return None, ROUTE_FAILURE_LENGTH
             if tuple(routes.shape[1:]) != (num_moe_layers, top_k):
                 return None, ROUTE_FAILURE_MODEL_SHAPE
-            if boundary_rows:
+            if span.boundary_rows:
                 routed[position - 1] = routes[0].to(torch.int16)
                 routes = routes[1:]
             if mode == "full":
