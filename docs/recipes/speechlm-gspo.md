@@ -71,11 +71,13 @@ saves native weights/optimizer/dataloader state and verifies the restored cursor
 optimizer/scheduler state and exactly two resumed updates.
 
 For canonical HF export, use `examples/speechlm2/to_hf.py` from the public
-Speech checkout. Supply its matching experiment config (including `model` and
+Speech checkout in an eight-GPU allocation. Set `SPEECHLM_GSPO_POLICY_PYTHON`
+to the prepared policy interpreter; the training driver variable above points
+to the generation interpreter. Supply the matching experiment config (including `model` and
 `trainer.strategy` fields), not the seed HF `config.json`:
 
 ```bash
-python -m torch.distributed.run --standalone --nproc-per-node=8 \
+"$SPEECHLM_GSPO_POLICY_PYTHON" -m torch.distributed.run --standalone --nproc-per-node=8 \
   "$SPEECH_REPO/examples/speechlm2/to_hf.py" \
   class_path=nemo.collections.speechlm2.models.SALMAutomodel \
   checkpoint_format=nemo_rl \
