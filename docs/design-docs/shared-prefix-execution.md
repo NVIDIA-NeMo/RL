@@ -38,7 +38,7 @@ Prompt boundaries come from the rollout, not from padded tokens. The rollout rea
 - MoE expert-bias counts follow the dense convention. With the HybridEP flex dispatcher, per-branch padding is excluded. Otherwise it counts, as in a dense packed forward.
 - MTP runs on the dense expanded rows with its existing heads. MTP prefix sharing is out of scope. Each loss group is normalized as a packed dense forward of that group would be, using CP-local token counts at CP>1.
 - `bypass_evaluation_mtp` passes `compute_mtp_loss=False` to every logprob forward.
-- `uniform_router_gating` runs the MoE router GEMM in MCore's fixed row blocks in every policy forward and backward. Router arithmetic then does not depend on how rows are packed.
+- `uniform_router_gating` runs the MoE router's forward GEMM in MCore's fixed row blocks in every policy forward, including Megatron's checkpoint recomputation. Routing scores then do not depend on how rows are packed. The router's backward GEMMs are unchanged, so router gradients can still depend on packing. MCore restores the scope only in `tensor_parallel.checkpoint` and `CheckpointWithoutOutput`, not in `te_checkpoint`, which it uses with FP8/FP4 recompute (shared modes reject FP8/FP4; the `dense` control does not).
 - `match_logprob_training_layout` makes logprob forwards use training's sharding weights, token budget and execution plan. A different layout in one phase can change numerical results even at identical weights.
 - Matched layouts alone do not make logprob and training forwards bit-identical. Exact equality also needs deterministic algorithms and the same MoE top-k ordering. MCore sorts top-k results only when gradients are enabled, so a no-grad logprob forward can combine experts in a different order than the training forward.
 
@@ -111,7 +111,7 @@ The `logprobs` and `train` modes also require the following. Policy and single-c
 - An explicit `policy.make_sequence_length_divisible_by` that is a multiple of M. Both `train_mb_tokens` and `logprob_mb_tokens` must be multiples of it.
 - `policy.generation.top_p: 1.0` and `top_k` disabled (`null`, `0` or `-1`). Shared logprob extraction does not support top-k/top-p filtering. Temperature scaling is supported.
 - `token_capture.enabled: true`.
-- `async_rl.rollout_failure.max_skipped_prompts: 0` and `max_consecutive_dropped_prompts: 0`, and `token_capture.min_valid_fraction_per_group` unset. A dropped prompt can leave a step that no longer splits into complete data-parallel groups. A drop that no setting controls (a structural finalizer drop, or a shortfall restored from a checkpoint) stops the run at the next chunk selection, before another chunk trains.
+- `async_rl.rollout_failure.max_skipped_prompts: 0` and `max_consecutive_dropped_prompts: 0`, and `token_capture.min_valid_fraction_per_group` unset. A dropped prompt can leave a step that no longer splits into complete data-parallel groups. A drop that no setting controls (a structural finalizer drop, or a shortfall restored from a checkpoint) and that leaves a step target that is not a multiple of the data-parallel size stops the run at the next chunk selection, before another chunk trains. A shortfall that keeps the target aligned closes the step short, as in dense mode.
 - `grpo.num_prompts_per_step` a multiple of the policy data-parallel size, because complete groups are assigned to data-parallel ranks. The controller checks this before the first training chunk.
 - A `TQPolicy`. Other policies raise `NotImplementedError` at construction.
 
@@ -156,7 +156,7 @@ NeMo RL tests in this repository:
 
 Megatron-LM tests compare the shared HybridModel forward and backward with the dense rows it replaces, at TP1/CP1, TP2/SP/CP2 and TP1/CP4. They use an FP32 dense reference with MoE top-k choices replayed from a fixed table. The shared BF16 error must stay within 1.25× of the dense BF16 error. At TP/CP, the shared-versus-dense gap must stay within 1.5× of the TP1/CP1 gap.
 
-Most of these tests need the `megatron.rl` packing library, so they skip when the installed Megatron-LM does not contain the shared-prefix stack. Until the Megatron Bridge pin includes it, CI therefore does not exercise the shared path. After the pin bump, run the Megatron lane with `NRL_REQUIRE_MEGATRON_RL_SHARED_PREFIX=1`, which makes `--mcore-only` fail instead of skip when the library is missing.
+Most of these tests need the `megatron.rl` packing library, and the logprob oracle also needs MCore's `megatron.core.models.hybrid.shared_prefix`, so they skip when the installed Megatron-LM does not contain the shared-prefix stack. Until the Megatron Bridge pin includes it, CI therefore does not exercise the shared path. After the pin bump, run the Megatron lane with `NRL_REQUIRE_MEGATRON_RL_SHARED_PREFIX=1`, which makes `--mcore-only` fail instead of skip when either module is missing.
 
 No functional single-controller GRPO test for this feature exists yet. Training quality has not been qualified on this revision.
 

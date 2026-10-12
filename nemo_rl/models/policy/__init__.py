@@ -281,8 +281,9 @@ class SharedPrefixTrainingConfig(BaseModel, extra="forbid"):
     bypass_evaluation_mtp: StrictBool = False
     """Skip HybridModel MTP in logprobs; requires shared execution or dense control."""
     uniform_router_gating: StrictBool = False
-    """Use MCore's fixed router row blocks in all policy forwards and backwards.
+    """Use MCore's fixed router row blocks for the router forward GEMM in all policy forwards.
 
+    Megatron's checkpoint recomputation keeps the scope; the backward GEMMs are unchanged.
     Opt-in numerical reference for shared execution, dense fallbacks and MTP.
     Requires an execution or dense-control mode; disabled must not change
     arithmetic.

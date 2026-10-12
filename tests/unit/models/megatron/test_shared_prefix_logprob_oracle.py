@@ -75,18 +75,25 @@ import torch.distributed as dist
 pytest.importorskip("megatron.core")
 
 
-def _has_megatron_rl_packing() -> bool:
+def _has_shared_prefix_stack() -> bool:
     try:
-        return importlib.util.find_spec("megatron.rl.shared_prefix_tensors") is not None
+        return all(
+            importlib.util.find_spec(name) is not None
+            for name in (
+                "megatron.rl.shared_prefix_tensors",
+                "megatron.core.models.hybrid.shared_prefix",
+            )
+        )
     except ImportError:
         return False
 
 
-# Only the planning oracle needs the megatron.rl packing library (Megatron-LM #7914); the
-# restore and inactive-mode tests run against any Megatron-LM.
+# Only the planning oracle needs the Megatron-LM shared-prefix stack (the megatron.rl packing
+# library and MCore's HybridModel shared-prefix forward); the restore and inactive-mode tests
+# run against any Megatron-LM.
 requires_megatron_rl = pytest.mark.skipif(
-    not _has_megatron_rl_packing(),
-    reason="needs the megatron.rl shared-prefix packing modules (Megatron-LM #7914)",
+    not _has_shared_prefix_stack(),
+    reason="needs the Megatron-LM shared-prefix stack (megatron.rl and MCore shared_prefix)",
 )
 
 from megatron.core import parallel_state  # noqa: E402

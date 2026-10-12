@@ -146,10 +146,33 @@ def test_unaligned_step_fails_before_any_chunk_trains(monkeypatch):
     assert ctrl._trainer.train_calls == 0
 
 
-def test_step_shortfall_fails_before_the_next_chunk_trains(monkeypatch):
-    # A structural finalizer drop (or a restored shortfall) leaves 7 of 8 groups at DP 4.
-    # The pump must raise at its next selection instead of training on and failing at the
-    # unaligned remainder.
+def test_mid_step_shortfall_fails_before_the_next_chunk_trains(monkeypatch):
+    # A structural finalizer drop leaves 11 of 12 groups at DP 4 after the first chunk.
+    # The pump must raise at the next selection; it used to train one more chunk and then
+    # fail at the 3-group remainder.
+    sampler = _MinSampler()
+    ctrl = _shared_prefix_controller(
+        monkeypatch,
+        sampler,
+        num_prompts_per_step=12,
+        dp=4,
+        min_groups_for_streaming_train=4,
+    )
+    monkeypatch.setattr(
+        ctrl,
+        "_target_groups_for_step",
+        lambda step: 12 if ctrl._trainer.train_calls == 0 else 11,
+    )
+
+    with pytest.raises(ValueError, match="cannot close a step short"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+
+    assert ctrl._trainer.train_calls == 1
+    assert len(sampler.calls) == 1
+
+
+def test_restored_shortfall_fails_before_any_chunk_trains(monkeypatch):
+    # A shortfall restored from a checkpoint is already in the step target.
     sampler = _MinSampler()
     ctrl = _shared_prefix_controller(
         monkeypatch,
@@ -158,18 +181,13 @@ def test_step_shortfall_fails_before_the_next_chunk_trains(monkeypatch):
         dp=4,
         min_groups_for_streaming_train=4,
     )
-    # The group is lost after the first chunk has trained.
-    monkeypatch.setattr(
-        ctrl,
-        "_target_groups_for_step",
-        lambda step: 8 if ctrl._trainer.train_calls == 0 else 7,
-    )
+    monkeypatch.setattr(ctrl, "_target_groups_for_step", lambda step: 7)
 
     with pytest.raises(ValueError, match="cannot close a step short"):
         asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
 
-    assert ctrl._trainer.train_calls == 1
-    assert len(sampler.calls) == 1
+    assert ctrl._trainer.train_calls == 0
+    assert sampler.calls == []
 
 
 def test_aligned_step_without_sampler_alignment_takes_exact_dp_chunks(monkeypatch):
