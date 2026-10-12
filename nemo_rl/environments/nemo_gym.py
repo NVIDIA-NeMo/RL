@@ -1512,12 +1512,41 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 ########################################
 
 
+def _gym_policy_model_overlay(
+    nemo_gym_cfg: MutableMapping[str, Any],
+) -> MutableMapping[str, Any]:
+    """Return the Gym policy model's ``vllm_model`` overlay, creating it if needed.
+
+    A sharded job must claim every top-level Gym overlay, so when it has no
+    top-level ``policy_model`` the overlay goes in ``common_overrides``, which
+    reaches every shard. A null level is treated as empty.
+
+    Raises:
+        ValueError: A level of the overlay is neither a mapping nor null.
+    """
+    overlay_root = nemo_gym_cfg
+    if "shards" in nemo_gym_cfg and nemo_gym_cfg.get(_POLICY_SERVER_NAME) is None:
+        if nemo_gym_cfg.get("common_overrides") is None:
+            nemo_gym_cfg["common_overrides"] = {}
+        overlay_root = nemo_gym_cfg["common_overrides"]
+    node = overlay_root
+    for key in (_POLICY_SERVER_NAME, "responses_api_models", "vllm_model"):
+        if node.get(key) is None:
+            node[key] = {}
+        node = node[key]
+        if not isinstance(node, MutableMapping):
+            raise ValueError(f"env.nemo_gym {key} overlay must be a mapping or null.")
+    return node
+
+
 def setup_nemo_gym_config(config, tokenizer) -> None:
     """Configure NeMo-Gym for the selected generation backend, in place.
 
-    For the Dynamo backend, this also configures the Gym policy model at
-    ``env.nemo_gym.policy_model.responses_api_models.vllm_model``. It appends
-    ``"engine_data"`` to ``extra_body.nvext.extra_fields`` and sets
+    For the Dynamo backend, this also configures the Gym policy model's
+    ``policy_model.responses_api_models.vllm_model`` overlay in
+    ``env.nemo_gym``, or in ``env.nemo_gym.common_overrides`` for a sharded job
+    without a top-level ``policy_model``. It appends ``"engine_data"`` to
+    ``extra_body.nvext.extra_fields`` and sets
     ``derive_prefix_token_ids_from_messages: true``. Gym then reads Dynamo's
     native token data and sends the exact multi-turn prefix that the Dynamo
     token wrapper requires. Repeated calls do not change the result.
@@ -1528,9 +1557,10 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         tokenizer: The policy tokenizer.
 
     Raises:
-        ValueError: The generation backend is unsupported, or the Dynamo Gym
-            policy model config has a non-mapping ``extra_body`` or ``nvext``,
-            or a non-list ``nvext.extra_fields``.
+        ValueError: The generation backend is unsupported, or a level of the
+            Dynamo Gym policy model overlay is neither a mapping nor null, or
+            the overlay has a non-mapping ``extra_body`` or ``nvext``, or a
+            non-list ``nvext.extra_fields``.
     """
     generation_config = config.policy["generation"]
 
@@ -1554,12 +1584,9 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config["stop_token_ids"] = None
 
     if generation_config["backend"] == "dynamo":
-        env_cfg = config.env.setdefault("nemo_gym", {})
-        model_cfg = (
-            env_cfg.setdefault("policy_model", {})
-            .setdefault("responses_api_models", {})
-            .setdefault("vllm_model", {})
-        )
+        if config.env.get("nemo_gym") is None:
+            config.env["nemo_gym"] = {}
+        model_cfg = _gym_policy_model_overlay(config.env["nemo_gym"])
         extra_body = model_cfg.get("extra_body")
         if extra_body is None:
             model_cfg["extra_body"] = {}

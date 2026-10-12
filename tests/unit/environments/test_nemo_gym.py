@@ -58,6 +58,10 @@ from nemo_rl.environments.nemo_gym_request import (
     _deep_merge_dict,
     _metadata_extra_body,
 )
+from nemo_rl.environments.nemo_gym_shards import (
+    apply_shard_overlay,
+    parse_shard_plan,
+)
 from nemo_rl.environments.nemotron_utils import (
     _expand_nemotron_video_placeholders,
     _flatten_nemotron_video_frame_messages,
@@ -1255,6 +1259,103 @@ def test_setup_nemo_gym_config_rejects_invalid_dynamo_containers(
 
     with pytest.raises(ValueError, match=error):
         setup_nemo_gym_config(config, tokenizer=None)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        pytest.param({"nemo_gym": None}, id="null_nemo_gym"),
+        pytest.param({"nemo_gym": {"policy_model": None}}, id="null_policy_model"),
+        pytest.param(
+            {"nemo_gym": {"policy_model": {"responses_api_models": None}}},
+            id="null_responses_api_models",
+        ),
+    ],
+)
+def test_setup_nemo_gym_config_treats_null_dynamo_overlays_as_empty(env) -> None:
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "dynamo", "vllm_cfg": {}}},
+        env=env,
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    vllm_model = config.env["nemo_gym"]["policy_model"]["responses_api_models"][
+        "vllm_model"
+    ]
+    assert vllm_model["derive_prefix_token_ids_from_messages"] is True
+    assert vllm_model["extra_body"]["nvext"]["extra_fields"] == ["engine_data"]
+
+
+@pytest.mark.parametrize(
+    ("nemo_gym_config", "error"),
+    [
+        ({"policy_model": []}, "policy_model overlay must be a mapping or null"),
+        (
+            {"policy_model": {"responses_api_models": "openai_model"}},
+            "responses_api_models overlay must be a mapping or null",
+        ),
+        (
+            {"policy_model": {"responses_api_models": {"vllm_model": []}}},
+            "vllm_model overlay must be a mapping or null",
+        ),
+    ],
+)
+def test_setup_nemo_gym_config_rejects_non_mapping_dynamo_overlay(
+    nemo_gym_config, error
+) -> None:
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "dynamo", "vllm_cfg": {}}},
+        env={"nemo_gym": nemo_gym_config},
+    )
+
+    with pytest.raises(ValueError, match=error):
+        setup_nemo_gym_config(config, tokenizer=None)
+
+
+@pytest.mark.parametrize(
+    "policy_model_config",
+    [
+        pytest.param({}, id="absent"),
+        pytest.param({"policy_model": None}, id="null"),
+        pytest.param(
+            {
+                "policy_model": {
+                    "responses_api_models": {"vllm_model": {"model": "m"}}
+                },
+                "common_inherited_overlays": ["policy_model"],
+            },
+            id="claimed",
+        ),
+    ],
+)
+def test_setup_nemo_gym_config_requests_dynamo_engine_data_in_every_shard(
+    policy_model_config,
+) -> None:
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "dynamo", "vllm_cfg": {}}},
+        env={
+            "nemo_gym": {
+                "config_paths": None,
+                "shards": [
+                    {"name": "a", "config_paths": ["a.yaml"]},
+                    {"name": "b", "config_paths": ["b.yaml"]},
+                ],
+                **deepcopy(policy_model_config),
+            }
+        },
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    # An unclaimed top-level policy_model overlay would fail the shard plan.
+    plan = parse_shard_plan(config.env["nemo_gym"])
+    assert plan is not None
+    for shard in plan.shards:
+        merged = apply_shard_overlay(config.env["nemo_gym"], plan, shard)
+        vllm_model = merged["policy_model"]["responses_api_models"]["vllm_model"]
+        assert vllm_model["derive_prefix_token_ids_from_messages"] is True
+        assert "engine_data" in vllm_model["extra_body"]["nvext"]["extra_fields"]
 
 
 def test_setup_nemo_gym_config_does_not_add_dynamo_fields_for_vllm() -> None:
