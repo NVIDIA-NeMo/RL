@@ -139,7 +139,11 @@ def _as_routed_experts_tensor(
     global G_ROUTED_EXPERTS_RANGE_CHECKED
     tensor = torch.as_tensor(value, device=device)
     if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
-        max_id = int(tensor.max())
+        # PyTorch does not implement max for vLLM's uint16 route IDs.
+        range_tensor = (
+            tensor.to(torch.int32) if tensor.dtype == torch.uint16 else tensor
+        )
+        max_id = int(range_tensor.max())
         limit = torch.iinfo(dtype).max
         if max_id > limit:
             raise ValueError(
