@@ -857,6 +857,41 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
         return self
 
 
+class RolloutCollectionConfig(BaseModel, extra="forbid"):
+    """Generation-only rollout collection for offline critic pretraining (PPO only).
+
+    ``enabled=True`` turns a PPO config into a collection job (stage A of the
+    legacy decoupled pipeline): every node serves vLLM, which loads the policy
+    from ``policy.model_name``; there is no trainer, critic, logprob forward or
+    refit. Rollouts are generated and finalized exactly as in training (token
+    capture, segment rows), and each step's groups are written to ``bank_dir``
+    (see ``rollout_bank.py``) for
+    ``examples/run_critic_pretrain_single_controller.py``. Run one small job per
+    data shard; checkpoints carry only the dataloader position.
+    """
+
+    enabled: bool = False
+    # Directory the per-step bank shards are written to. Required when enabled.
+    bank_dir: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_bank_dir(self) -> "RolloutCollectionConfig":
+        """Require a bank directory when collection is on."""
+        if self.enabled and not self.bank_dir:
+            raise ValueError("rollout_collection.enabled requires bank_dir")
+        return self
+
+
+def rollout_collection_enabled(master_config: MasterConfig) -> bool:
+    """Whether this run collects rollouts into a bank instead of training.
+
+    ``model_construct`` skips defaults, so the block can be missing on a
+    hand-built config.
+    """
+    collection = getattr(master_config, "rollout_collection", None)
+    return bool(collection is not None and collection.enabled)
+
+
 class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
@@ -883,6 +918,9 @@ class MasterConfig(BaseModel, extra="allow"):
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
     telemetry: Optional[TelemetryConfig] = None
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
+    rollout_collection: RolloutCollectionConfig = Field(
+        default_factory=RolloutCollectionConfig
+    )
 
     @model_validator(mode="after")
     def validate_algorithm_block(self) -> "MasterConfig":
@@ -1205,6 +1243,55 @@ def _validate_swe_privileged_critic(master_config: MasterConfig) -> None:
         )
 
 
+def _validate_rollout_collection(master_config: MasterConfig) -> None:
+    """Check a collection run's settings (see RolloutCollectionConfig)."""
+    if not rollout_collection_enabled(master_config):
+        return
+    if not is_ppo_run(master_config):
+        raise ValueError(
+            "rollout_collection banks rollouts for PPO critic pretraining and "
+            "needs the `ppo` block: its row padding, masks and advantage stage "
+            "are what the bank and the pretraining driver reproduce."
+        )
+    generation = master_config.policy["generation"]
+    if generation["backend"] != "vllm" or generation["colocated"]["enabled"]:
+        raise ValueError(
+            "rollout_collection needs a non-colocated vLLM engine: with no "
+            "trainer, the engine must load the policy from disk."
+        )
+    if master_config.checkpointing.get("save_data_plane") or (
+        master_config.async_rl.checkpoint_replay_buffer
+    ):
+        raise ValueError(
+            "rollout_collection checkpoints only the dataloader position: set "
+            "checkpointing.save_data_plane=false and "
+            "async_rl.checkpoint_replay_buffer=false."
+        )
+    if master_config.data_plane["backend"] == "mooncake_cpu":
+        raise ValueError(
+            "rollout_collection supports data_plane.backend='simple' only: Mooncake "
+            "checkpointing runs through the trainer, which a collection job lacks."
+        )
+    if master_config.async_rl.generation_fleet_health.restart_dead_shards:
+        raise ValueError(
+            "rollout_collection cannot restart dead engines: a restart is followed "
+            "by a refit from the trainer. Set "
+            "async_rl.generation_fleet_health.restart_dead_shards=false."
+        )
+    if master_config.ppo.policy_training_start_step > 0:  # type: ignore[union-attr]
+        raise ValueError(
+            "rollout_collection never trains the policy, so "
+            "ppo.policy_training_start_step must stay 0."
+        )
+    if master_config.ppo.warm_start_value_checkpoint is not None:  # type: ignore[union-attr]
+        warnings.warn(
+            "ppo.warm_start_value_checkpoint is ignored by rollout_collection: "
+            "the critic is not built.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+
 def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
@@ -1445,7 +1532,9 @@ def _validate_segment_rows_config(master_config: MasterConfig) -> None:
         )
     policy_config = master_config.policy
     sequence_packing_config = (
-        policy_config.get("sequence_packing", {}) if isinstance(policy_config, Mapping) else {}
+        policy_config.get("sequence_packing", {})
+        if isinstance(policy_config, Mapping)
+        else {}
     ) or {}
     if not sequence_packing_config.get("enabled", False):
         raise ValueError(
@@ -1462,14 +1551,21 @@ def _validate_segment_rows_config(master_config: MasterConfig) -> None:
         double_counting = [
             name
             for name, enabled in (
-                ("grpo.use_dynamic_sampling", getattr(algo_cfg, "use_dynamic_sampling", False)),
+                (
+                    "grpo.use_dynamic_sampling",
+                    getattr(algo_cfg, "use_dynamic_sampling", False),
+                ),
                 (
                     "grpo.reward_shaping.enabled",
-                    getattr(getattr(algo_cfg, "reward_shaping", None), "enabled", False),
+                    getattr(
+                        getattr(algo_cfg, "reward_shaping", None), "enabled", False
+                    ),
                 ),
                 (
                     "grpo.reward_scaling.enabled",
-                    getattr(getattr(algo_cfg, "reward_scaling", None), "enabled", False),
+                    getattr(
+                        getattr(algo_cfg, "reward_scaling", None), "enabled", False
+                    ),
                 ),
             )
             if enabled
@@ -1504,6 +1600,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "Use the non-streaming GRPO trainer."
         )
     _validate_algo_settings(master_config)
+    _validate_rollout_collection(master_config)
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)

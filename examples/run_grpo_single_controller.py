@@ -37,6 +37,9 @@ from nemo_rl.algorithms.single_controller_utils import (
     is_ppo_run,
     setup_single_controller,
 )
+from nemo_rl.algorithms.single_controller_utils.config import (
+    rollout_collection_enabled,
+)
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -167,6 +170,9 @@ def main() -> None:
                 config.policy["generation"] = configure_generation_config(
                     config.policy["generation"],
                     tokenizer,
+                    # A collection job has no trainer to refit from, so its engines
+                    # load the real weights.
+                    is_eval=rollout_collection_enabled(config),
                     has_refit_draft_weights=has_refit_draft_weights,
                     trains_mtp=trains_mtp,
                 )

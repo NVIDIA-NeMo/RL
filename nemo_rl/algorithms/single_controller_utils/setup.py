@@ -67,6 +67,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     is_ppo_run,
     replay_checkpoint_enabled,
+    rollout_collection_enabled,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -432,6 +433,19 @@ def _build_clusters(
             f"reserving {teacher_nodes} non-colocated teacher node(s); got "
             f"cluster.num_nodes={num_nodes}."
         )
+
+    if rollout_collection_enabled(master_config):
+        # Generation only: every node serves rollouts; there is no trainer.
+        inference_cluster = RayVirtualCluster(
+            name="sc_inference_cluster",
+            bundle_ct_per_node_list=[gpus_per_node] * policy_nodes,
+            use_gpus=True,
+            num_gpus_per_node=gpus_per_node,
+            max_colocated_worker_groups=1,
+            port_range_low=port_range_low,
+            port_range_high=port_range_high,
+        )
+        return None, inference_cluster, None
 
     # Worker groups sharing the training GPUs: the policy, plus the critic on
     # the PPO path.
@@ -1354,7 +1368,9 @@ def setup_single_controller(
     weights_path, optimizer_path = checkpointer.get_resume_paths(
         trainer_checkpoint_path
     )
-    if is_ppo_run(master_config):
+    # A collection run builds no trainer or critic: no weights to resolve.
+    collecting = rollout_collection_enabled(master_config)
+    if is_ppo_run(master_config) and not collecting:
         # Only a fresh run reads this; a resume ignores it and restores the critic
         # from its own checkpoint, so the key can stay in the config.
         warm_start = (
@@ -1536,7 +1552,7 @@ def setup_single_controller(
     # Claim constrained training nodes before unconstrained inference or Gym
     # tasks can consume them. This matters when inference topology alignment
     # falls back while the training cluster remains topology-constrained.
-    if not colocated and segment_size is not None:
+    if not colocated and segment_size is not None and train_cluster is not None:
         train_cluster.get_placement_groups()
 
     # Claim teacher placement groups before deferred generation starts NeMo-Gym,
@@ -1778,7 +1794,8 @@ def setup_single_controller(
                 tokenizer=tokenizer,
                 processor=processor,
             )
-        build_tasks["trainer"] = _build_trainer_and_value
+        if not collecting:
+            build_tasks["trainer"] = _build_trainer_and_value
 
     # Submit build tasks and get results
     submitted: dict[str, Any] = {}
@@ -1793,7 +1810,10 @@ def setup_single_controller(
                 gen_load_time = time_metrics["gen_time"]
             else:
                 generation, gen_load_time = submitted["generation"].result()
-                trainer, value, time_metrics = submitted["trainer"].result()
+                if collecting:
+                    trainer, value, time_metrics = None, None, {"trainer_time": 0.0}
+                else:
+                    trainer, value, time_metrics = submitted["trainer"].result()
             if megatron_reserved_urls:
                 # Gym initialization needs a live URL that will respond to health checks.
                 # Megatron generation can only respond to health checks once initialized.
@@ -1853,7 +1873,8 @@ def setup_single_controller(
     # final process-local client.
     restore_data_plane_in_actor = dp_config["backend"] == "mooncake_cpu"
     data_plane_checkpoint_metadata = None
-    if not restore_data_plane_in_actor:
+    # A collection run saves no data plane (see _validate_rollout_collection).
+    if not restore_data_plane_in_actor and not collecting:
         data_plane_load_started = time.monotonic()
         data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
             load_checkpoint=trainer.load_data_plane_checkpoint,
@@ -1919,8 +1940,9 @@ def setup_single_controller(
     # ==========================
     # Setup Data Plane Client & Weight Sync
     # ==========================
-    # Connect-only DP client; TQPolicy already bootstrapped the controller.
-    dp_client = build_data_plane_client(dp_config, bootstrap=False)
+    # Connect-only DP client; TQPolicy already bootstrapped the controller. A
+    # collection run has no TQPolicy, so this client bootstraps it.
+    dp_client = build_data_plane_client(dp_config, bootstrap=collecting)
 
     # Token-capture mode: pre-register both rollout partitions from this
     # single driver thread before any producer is live. TQ's controller
@@ -1955,7 +1977,8 @@ def setup_single_controller(
         )
         generation.set_rollout_weight_version(0)
 
-    if weight_synchronizer is None:
+    # A collection run's engines loaded the policy from disk and are never refit.
+    if weight_synchronizer is None and not collecting:
         t0 = time.perf_counter()
         weight_synchronizer = create_weight_synchronizer(
             policy=trainer,
@@ -1981,7 +2004,7 @@ def setup_single_controller(
     )
     value_loss_fn: Optional[LossFunction] = (
         MseValueLossFn(master_config.value_loss_fn)  # type: ignore
-        if is_ppo_run(master_config)
+        if is_ppo_run(master_config) and not collecting
         else None
     )
 
@@ -2079,7 +2102,7 @@ def setup_single_controller(
     privilege_cfg = resolve_swe_privileged_critic_config(master_config.value)
     privilege_store = (
         SwePrivilegePrefixStore(tokenizer, privilege_cfg)
-        if privilege_cfg is not None
+        if privilege_cfg is not None and not collecting
         else None
     )
 

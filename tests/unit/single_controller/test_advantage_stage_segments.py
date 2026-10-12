@@ -661,3 +661,30 @@ def test_ppo_reward_metric_stays_per_row_with_a_per_rollout_companion():
     # Legacy echo semantics: every trained row counts.
     assert out["reward"] == pytest.approx(2 / 3)
     assert out["reward_per_rollout"] == pytest.approx(0.5)
+
+
+# ── rollout_collection: no critic ──────────────────────────────────────────
+
+
+def test_collection_runs_the_ppo_stage_on_zero_values_without_fetching_them():
+    rows = _three_rollouts_with_extras()
+    data, meta = _batch(rows)  # no "values" column: no critic ran
+    plane = _DataPlane(data)
+    ctrl = _controller(
+        plane, estimator=_gae_estimator(), is_ppo=True, num_generations_per_prompt=3
+    )
+    ctrl._collect = True
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    assert "values" not in (plane.selected_fields or [])
+    _, returns = _gae_estimator().compute_advantage(
+        prompt_ids=data["prompt_ids_for_adv"],
+        rewards=data["total_reward"],
+        mask=data["token_mask"],
+        values=torch.zeros_like(data["token_mask"]),
+        valid_mask=data["sample_mask"],
+        logprobs_policy=data["prev_logprobs"],
+    )
+    torch.testing.assert_close(_written(plane, "returns"), returns)
+    # The step's reward metrics still come out of the stage.
+    assert ctrl._step_log_dict["rewards"][0].tolist() == [r.reward for r in rows]
