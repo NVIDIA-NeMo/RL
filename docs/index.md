@@ -332,6 +332,7 @@ guides/models/index.md
 model-quirks.md
 guides/async-grpo.md
 guides/single-controller.md
+guides/context-compaction.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
