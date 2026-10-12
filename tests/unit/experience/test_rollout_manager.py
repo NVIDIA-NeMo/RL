@@ -1311,6 +1311,89 @@ def test_nemo_gym_run_rollouts_names_the_infra_failure_when_attempts_run_out():
     assert env.dispatched == [[0, 1]]
 
 
+def test_nemo_gym_run_rollouts_names_marked_and_unmarked_missing_rows():
+    """A group can end one attempt with a marked row and a row that simply never
+    arrived. The final error names the marker's detail for the first and says
+    the second never arrived, so neither is misreported."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+    from nemo_rl.experience.failures import GymTransportError
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (
+                    0,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                )
+            ]
+        ]
+    )
+    impl = _run_rollouts_impl(env, max_attempts=1)
+
+    with pytest.raises(
+        GymTransportError,
+        match=(
+            r"rows \[0\] of 2 failed at the infrastructure level on every "
+            r"attempt \(1\): row 0: NeMo-Gym /run failed with HTTP 503: down; "
+            r"rows \[1\] never arrived"
+        ),
+    ):
+        _run(
+            impl._run_rollouts(
+                inputs=[
+                    {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                    {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+                ],
+                timer=Timer(),
+                timer_prefix="timing/test",
+            )
+        )
+    assert env.dispatched == [[0, 1]]
+
+
+def test_nemo_gym_run_rollouts_keeps_the_group_timing_across_a_redispatch():
+    """The actor attaches its timing to the last tuple of each attempt's stream.
+    A one-row re-dispatch reports under its own ``retry<n>`` label, so the
+    first attempt's timing, the group's, is what the instance label reports."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+    from nemo_rl.experience.rollouts import Timer
+
+    key = "timing/test/shard/nemo_gym/await_results"
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _streamed_gym_result(), None),
+                (
+                    1,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    {key: 100.0},
+                ),
+            ],
+            [(1, {"name": "agent"}, _streamed_gym_result(), {key: 1.0})],
+        ]
+    )
+    impl = _run_rollouts_impl(env, max_attempts=2)
+
+    _completions, _message_log, metrics = _run(
+        impl._run_rollouts(
+            inputs=[
+                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+            ],
+            timer=Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert env.dispatched == [[0, 1], [1]]
+    assert metrics[key] == 100.0
+    assert metrics["timing/test/shard/nemo_gym/retry1/await_results"] == 1.0
+
+
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
 def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     impl = _nemo_gym_impl(True, log_full_result_tables=log_full_result_tables)

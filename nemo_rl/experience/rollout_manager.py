@@ -1246,7 +1246,10 @@ class AsyncNemoGymRolloutImpl:
 
         Sibling recovery re-dispatches only rows that never arrive. Prompt-group
         recovery performs one physical Gym dispatch here and delegates a complete
-        cohort replacement to the outer recovery loop.
+        cohort replacement to the outer recovery loop. The first attempt's actor
+        timing is reported under the instance label and every later attempt's
+        under ``<instance label>/retry<n>``, the rule the driver path's stream
+        merge applies, so a one-row re-dispatch never replaces the group's totals.
         """
         if not inputs:
             raise ValueError("NeMo-Gym rollout dispatch requires at least one row")
@@ -1278,6 +1281,7 @@ class AsyncNemoGymRolloutImpl:
                 None for _ in range(total_rows)
             ]
             env_timing_metrics: dict[str, Any] = {}
+            timing_payloads = 0
             # One deadline for the whole prompt group, re-dispatches included -- it is
             # the group that has a budget, not each attempt. It also spans the stream
             # rather than each await: NeMo-Gym yields rows as they finish, so a
@@ -1347,7 +1351,22 @@ class AsyncNemoGymRolloutImpl:
                             raise
                     else:
                         if timing_metrics is not None:
-                            env_timing_metrics = timing_metrics
+                            timing_payloads += 1
+                            if timing_payloads == 1:
+                                env_timing_metrics = dict(timing_metrics)
+                            else:
+                                # A later attempt re-dispatches a subset of the group,
+                                # so its payload goes under its own label instead of
+                                # replacing the group's totals.
+                                retry_prefix = f"{instance_timer_prefix}/retry{timing_payloads - 1}"
+                                suffix_start = len(instance_timer_prefix)
+                                for key, value in timing_metrics.items():
+                                    relabeled = (
+                                        retry_prefix + key[suffix_start:]
+                                        if key.startswith(instance_timer_prefix)
+                                        else key
+                                    )
+                                    env_timing_metrics[relabeled] = value
 
             missing = [index for index in expected_indices if results[index] is None]
             if missing:
