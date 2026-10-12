@@ -328,6 +328,11 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
     validate_router_replay_config,
 )
+from nemo_rl.models.megatron.zero_train_gen_mismatch import (
+    enable_batch_invariant_kernels,
+    validate_zero_train_gen_kl,
+    validate_zero_train_gen_model_provider,
+)
 from nemo_rl.models.policy import (
     Fp4Config,
     MegatronConfig,
@@ -431,6 +436,13 @@ def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, 
                     f"{', '.join(dtype_aliases)}"
                 ) from e
     return resolved
+
+
+def enable_batch_invariant_mode(config: PolicyConfig) -> None:
+    """Validate, then enable Megatron-Core batch-invariant kernels before CUDA init."""
+    validate_zero_train_gen_kl(config, check_environment=True)
+    if config["megatron_cfg"].get("batch_invariant_mode"):
+        enable_batch_invariant_kernels(config)
 
 
 def destroy_parallel_state():
@@ -1132,6 +1144,8 @@ def setup_model_config(
     # Validate training configuration
     _validate_training_config(config, model_cfg)
 
+    validate_zero_train_gen_model_provider(config, model_cfg)
+
     # Create final megatron config
     megatron_cfg = _create_megatron_config(
         model_cfg, checkpoint_config, config, hf_model_name, dtype, fp8_param_enabled
@@ -1818,6 +1832,24 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Invalid attention backend: {attention_backend}. "
                 f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
+
+    # Default to FA2 for every Megatron run: flash-attn-4 is installed, so TE
+    # would otherwise pick FA4. Batch-invariant / zero-KL recipes set 4.
+    flash_attention_version = config["megatron_cfg"].get("flash_attention_version")
+    model_cfg.flash_attention_version = (
+        2 if flash_attention_version is None else flash_attention_version
+    )
+
+    if "batch_invariant_mode" in config["megatron_cfg"]:
+        model_cfg.batch_invariant_mode = config["megatron_cfg"]["batch_invariant_mode"]
+    if "batch_invariant_backend" in config["megatron_cfg"]:
+        model_cfg.batch_invariant_backend = config["megatron_cfg"][
+            "batch_invariant_backend"
+        ]
+    if "batch_invariant_collective" in config["megatron_cfg"]:
+        model_cfg.batch_invariant_collective = config["megatron_cfg"][
+            "batch_invariant_collective"
+        ]
 
     # These overrides need to be applied before the workers spawn.
     if "transformer_impl" in config["megatron_cfg"]:

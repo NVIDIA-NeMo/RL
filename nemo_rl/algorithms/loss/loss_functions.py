@@ -475,6 +475,7 @@ class ClippedPGLossFn(LossFunction):
                 else MetricNormalizer.TOKENS
             ),
             # Raw count — the downstream per-microbatch sum IS the value.
+            "policy_support_excluded_tokens": MetricNormalizer.NONE,
             "num_valid_samples": MetricNormalizer.NONE,
             "seq_logprob_error_valid_tokens": MetricNormalizer.NONE,
             "seq_logprob_error_valid_seqs": MetricNormalizer.NONE,
@@ -493,6 +494,7 @@ class ClippedPGLossFn(LossFunction):
                 "loss",
                 "kl_penalty",
                 "num_valid_samples",
+                "policy_support_excluded_tokens",
                 "positive_nll_loss",
                 "token_mult_prob_error",
             }
@@ -556,6 +558,7 @@ class ClippedPGLossFn(LossFunction):
         opd_full_divergence: Optional[Tensor] = None,
         opd_full_entropy: Optional[Tensor] = None,
         opd_full_cross_entropy: Optional[Tensor] = None,
+        policy_support_mask: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
 
@@ -568,6 +571,8 @@ class ClippedPGLossFn(LossFunction):
             data: Microbatch with masks, advantages, and prior log-probabilities.
             global_valid_seqs: Global valid-sequence count for normalization.
             global_valid_toks: Global valid-token count for normalization.
+            policy_support_mask: Current top-k/top-p support, supplied only with filtering.
+                Negative infinity in other policy logprobs is also excluded.
             opd_full_divergence: Per-token reverse KL ``[B, S - 1]``, required on
                 the ``opd_full`` branch.
             opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
@@ -622,12 +627,23 @@ class ClippedPGLossFn(LossFunction):
         if self.force_on_policy_ratio:
             prev_logprobs = curr_logprobs.detach()
 
+        # Only top-k/top-p can mark -inf as an expected support mismatch.
+        # Keep NaN/+inf observable, and preserve strict checks without filtering.
+        if policy_support_mask is not None:
+            policy_support_mask = (
+                policy_support_mask
+                & ~torch.isneginf(prev_logprobs)
+                & ~torch.isneginf(generation_logprobs)
+            )
+        seq_error_token_mask = token_mask
+        if policy_support_mask is not None:
+            seq_error_token_mask = token_mask * policy_support_mask.to(token_mask.dtype)
         seq_error_metrics = {}
         if self.seq_logprob_error_in_loss:
             errors, _ = compute_seq_logprob_errors(
                 policy_logprobs=curr_logprobs.detach(),
                 generation_logprobs=generation_logprobs,
-                token_mask=token_mask,
+                token_mask=seq_error_token_mask,
                 sample_mask=sample_mask,
             )
             filtered_sample_mask = sample_mask * (
@@ -654,6 +670,28 @@ class ClippedPGLossFn(LossFunction):
                     mask.bool(), data["reference_policy_logprobs"][:, 1:], 0.0
                 )
 
+        # Reference KL uses the unfiltered policy and retains its own token set.
+        # Actor support mismatches must not discard otherwise valid KL terms.
+        kl_token_mask = token_mask
+        kl_sample_mask = sample_mask
+        kl_mask = mask
+        kl_generation_logprobs = torch.where(kl_mask.bool(), generation_logprobs, 0.0)
+
+        # Keep support information until all three policy distributions are
+        # available. Replacing -inf with zero earlier turns an impossible token
+        # into log-probability one in token/sequence importance ratios.
+        if policy_support_mask is not None:
+            token_mask = token_mask * policy_support_mask.to(token_mask.dtype)
+            sample_mask = sample_mask * token_mask.bool().any(dim=-1).to(
+                sample_mask.dtype
+            )
+        mask = token_mask * sample_mask.unsqueeze(-1)
+        curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
+        prev_logprobs = torch.where(mask.bool(), prev_logprobs, 0.0)
+        generation_logprobs = torch.where(mask.bool(), generation_logprobs, 0.0)
+        if self.seq_logprob_error_in_loss:
+            seq_error_metrics["seq_logprob_error_valid_tokens"] = mask.sum().item()
+            seq_error_metrics["seq_logprob_error_valid_seqs"] = sample_mask.sum().item()
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
             # When top-k/top-p filtering is enabled, we need special handling for KL:
@@ -671,7 +709,7 @@ class ClippedPGLossFn(LossFunction):
             if self.use_on_policy_kl_approximation:
                 # See: docs/guides/grpo.md#on-policy-kl-approximation
                 kl_importance_weights = torch.exp(
-                    curr_logprobs_unfiltered - generation_logprobs
+                    curr_logprobs_unfiltered - kl_generation_logprobs
                 )
             else:
                 kl_importance_weights = torch.exp(
@@ -694,12 +732,12 @@ class ClippedPGLossFn(LossFunction):
             # Reduce KL loss
             if self.loss_type == LossType.TOKEN_LEVEL:
                 kl = masked_mean(
-                    kl, mask, global_normalization_factor=global_valid_toks
+                    kl, kl_mask, global_normalization_factor=global_valid_toks
                 )
             else:
                 kl = masked_mean(
-                    masked_mean(kl, token_mask, dim=-1),
-                    sample_mask,
+                    masked_mean(kl, kl_token_mask, dim=-1),
+                    kl_sample_mask,
                     global_normalization_factor=global_valid_seqs,
                 )
         else:
@@ -931,6 +969,7 @@ class ClippedPGLossFn(LossFunction):
                 **_is_filter_metrics,
             }
         )
+        metric_tensors["policy_support_excluded_tokens"] = (kl_mask - mask).sum()
         return loss, {
             **materialize_scalar_metrics(metric_tensors, loss.dtype),
             **seq_error_metrics,

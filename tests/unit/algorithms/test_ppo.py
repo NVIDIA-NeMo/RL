@@ -988,6 +988,8 @@ def _run_mock_ppo_train(
         policy={
             "generation": {
                 "backend": "vllm",
+                "top_k": None,
+                "top_p": 1.0,
                 "colocated": {"enabled": False},
                 "vllm_cfg": {"async_engine": False},
             },

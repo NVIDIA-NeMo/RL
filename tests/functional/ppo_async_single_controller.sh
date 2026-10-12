@@ -16,7 +16,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(realpath "${SCRIPT_DIR}/../..")
-EXP_NAME=$(basename "$0" .sh)
+EXP_NAME=${EXP_NAME:-$(basename "$0" .sh)}
 EXP_DIR="${SCRIPT_DIR}/${EXP_NAME}"
 CKPT_DIR="${EXP_DIR}/checkpoints"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
