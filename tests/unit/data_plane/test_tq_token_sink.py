@@ -53,6 +53,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     ChainPrefixCache,
     TQTokenSink,
     TQTokenSource,
+    generation_cut_staging_key,
     resolve_admission_prefix,
 )
 from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
@@ -469,6 +470,38 @@ def test_sink_clear_drops_rows(tq_client, staging_partition):
     sink.clear(keys)
     with pytest.raises(KeyError):
         source.fetch(keys)
+
+
+def test_generation_prefix_round_trips_under_checkpoint_scoped_keys(
+    tq_client, staging_partition
+):
+    sink = TQTokenSink(tq_client, staging_partition=staging_partition)
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    records, _, _ = build_fixture_artifacts("single_call")
+    record = records[0]
+
+    first = sink.stage_generation_prefix(
+        record, checkpoint_id="checkpoint-1", chunk_sequence=0
+    )
+    second = sink.stage_generation_prefix(
+        record, checkpoint_id="checkpoint-1", chunk_sequence=1
+    )
+    keys = [
+        generation_cut_staging_key(
+            "checkpoint-1",
+            record.rollout_id,
+            record.model_call_id,
+            chunk_sequence=sequence,
+        )
+        for sequence in (0, 1)
+    ]
+
+    assert first.ok and second.ok
+    assert [first.staging_key, second.staging_key] == keys
+    assert [snapshot.model_dump() for snapshot in source.fetch(keys)] == [
+        record.model_dump(exclude={"extras"}),
+        record.model_dump(exclude={"extras"}),
+    ]
 
 
 def test_fetch_prefix_token_ids_empty(tq_client, staging_partition):
