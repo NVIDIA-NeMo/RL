@@ -1,0 +1,65 @@
+# Keep attention, dense MLPs, and shared experts in BF16. Apply MXFP8 only to
+# routed-expert linears. Initialization-time settings such as fp8_param belong
+# in fp8_cfg; a matched module's own fp8_param must equal fp8_cfg.fp8_param.
+#
+# Use the same file on train and generation (generation inherits megatron_cfg): a module
+# that is MXFP8 on one side and BF16 on the other breaks bitwise equality.
+configs:
+  bf16:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe:
+      override_quantized_autocast: true
+    evaluation_recipe: {}
+  mxfp8:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe:
+      fp8_quantization_recipe: "mxfp8"
+      fp8_format: "hybrid"
+      fp8_param: true
+      # Both flags are required under zero_train_gen_mismatch, and they apply to
+      # different surrounding forwards. Repeat them on evaluation_recipe: model
+      # construction uses that block whenever grad is disabled.
+      # - override_quantized_autocast: the training step is already inside an FP8
+      #   autocast; this replaces that outer recipe with this block's MXFP8.
+      # - override_nonquantized_autocast: logprob and other grad-disabled forwards
+      #   are not. Without it the module dequantizes these weights and runs BF16
+      #   while generation stays MXFP8.
+      override_quantized_autocast: true
+      override_nonquantized_autocast: true
+    # Model construction picks evaluation_recipe whenever grad is disabled (the
+    # generation model), so it has to repeat the training precision; an empty block
+    # would mean BF16. Both autocast overrides are repeated for the same reason.
+    evaluation_recipe:
+      fp8_quantization_recipe: "mxfp8"
+      fp8_format: "hybrid"
+      fp8_param: true
+      override_quantized_autocast: true
+      override_nonquantized_autocast: true
+
+matchers:
+  attn_qkv_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*.linear_qkv"
+    enabled: true
+  attn_proj_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*.linear_proj"
+    enabled: true
+  mlp_fc1_mxfp8:
+    config: "mxfp8"
+    type: "glob"
+    pattern: "*.experts.linear_fc1"
+    enabled: true
+  mlp_fc2_mxfp8:
+    config: "mxfp8"
+    type: "glob"
+    pattern: "*.experts.linear_fc2"
+    enabled: true
+  # First match wins: keep this last so routed experts retain MXFP8.
+  fallthrough_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*"
+    enabled: true
