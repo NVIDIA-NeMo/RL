@@ -797,6 +797,111 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
     ]
 
 
+def test_fixed_pool_scopes_ports_per_node_while_roles_stay_fleet_global(
+    monkeypatch,
+) -> None:
+    reservations = iter(
+        _FakeReservation(metadata={"node_ip": node_ip, "gpu_id": gpu_id})
+        for node_ip in ("10.0.0.1", "10.0.0.2")
+        for gpu_id in (0, 1)
+    )
+    launch_kwargs = []
+    actor_names = []
+
+    class RemoteFactory:
+        def __init__(self, actor):
+            self.actor = actor
+
+        def remote(self, *args, **kwargs):
+            return self.actor
+
+    class ReservationFactory:
+        @staticmethod
+        def options(**kwargs):
+            return RemoteFactory(next(reservations))
+
+    class WorkerFactory:
+        @staticmethod
+        def options(**kwargs):
+            actor_names.append(kwargs["name"])
+
+            class CapturingRemoteFactory(RemoteFactory):
+                def remote(self, *args, **kwargs):
+                    launch_kwargs.append(kwargs)
+                    return super().remote(*args, **kwargs)
+
+            return CapturingRemoteFactory(_FakeWorker())
+
+    class Cluster:
+        @staticmethod
+        def get_placement_groups():
+            return [SimpleNamespace(bundle_count=2), SimpleNamespace(bundle_count=2)]
+
+    pool = FixedDynamoWorkerPool(
+        cluster=Cluster(),
+        config=_config(),
+        namespace="nemo-rl-test",
+        engine_world_size=1,
+        worker_roles=["decode", "decode", "prefill", "prefill"],
+        manager_env={},
+        startup_timeout_s=5,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.DynamoGpuReservation",
+        ReservationFactory,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.DynamoVllmWorker",
+        WorkerFactory,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.get_actor_python_env",
+        lambda _fqn: "python",
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.PlacementGroupSchedulingStrategy",
+        lambda **kwargs: kwargs,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.worker_pool.ray.get",
+        lambda refs, **kwargs: refs,
+    )
+
+    pool.start()
+
+    # Role order and actor names span the fleet; port slots restart per node.
+    assert [kwargs["worker_role"] for kwargs in launch_kwargs] == [
+        "decode",
+        "decode",
+        "prefill",
+        "prefill",
+    ]
+    assert actor_names == [
+        "nemo-rl-test-dynamo-vllm-decode-0",
+        "nemo-rl-test-dynamo-vllm-decode-1",
+        "nemo-rl-test-dynamo-vllm-prefill-0",
+        "nemo-rl-test-dynamo-vllm-prefill-1",
+    ]
+    assert [kwargs["vllm_port"] for kwargs in launch_kwargs] == [
+        7000,
+        7100,
+        7000,
+        7100,
+    ]
+    assert [kwargs["nixl_port"] for kwargs in launch_kwargs] == [
+        4100,
+        4101,
+        4100,
+        4101,
+    ]
+    assert [kwargs["kv_event_port"] for kwargs in launch_kwargs] == [
+        None,
+        None,
+        4200,
+        4201,
+    ]
+
+
 def test_fixed_pool_shutdown_releases_workers_and_reservations(monkeypatch) -> None:
     pool = object.__new__(FixedDynamoWorkerPool)
     worker = _FakeWorker()
