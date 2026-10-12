@@ -284,11 +284,11 @@ def test_vllm_generation_selects_worker_extension(
         ),
     ):
         worker_group.return_value.dp_size = 1
-        VllmGeneration(cluster, config, defer_model_load=True)
+        VllmGeneration(cluster, config, defer_model_load=True, use_fastokens=True)
 
     assert worker_builder.call_args.args[:2] == (extension_fqn, config)
     assert worker_builder.call_args.kwargs == (
-        {"defer_model_load": True} if async_engine else {}
+        {"defer_model_load": True, "use_fastokens": True} if async_engine else {}
     )
 
 
