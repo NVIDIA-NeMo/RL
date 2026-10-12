@@ -45,7 +45,12 @@ fi
 tokenizer_chat_template="${TOKENIZER_CHAT_TEMPLATE:-default}"
 vllm_chat_template="${VLLM_CHAT_TEMPLATE:-null}"
 vllm_load_format="${VLLM_LOAD_FORMAT:-auto}"
-persistent_cache="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/nemotron/users/arushig/nemo_rl_cache}"
+# Compile/JIT caches contain user-owned logs and lock files. Sharing another
+# user's cache can read successfully during preflight and then fail only on a
+# worker's first FlashInfer or vLLM write. Default to the submitter's shared
+# Lustre namespace; PERSISTENT_CACHE remains available for an explicit cache.
+cache_user=${USER:-$(id -un)}
+persistent_cache="${PERSISTENT_CACHE:-/lustre/fsw/portfolios/nemotron/users/${cache_user}/nemo_rl_cache}"
 gym_venv_dir="${GYM_VENV_DIR:-${persistent_cache}/gym_venvs_cc_pr4200}"
 slurm_time_limit="${SLURM_TIME_LIMIT:-04:00:00}"
 # The controller stops a cycle early once elapsed + mean step time would pass

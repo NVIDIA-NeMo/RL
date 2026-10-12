@@ -25,7 +25,14 @@ export AGENTIC_VBENCH_BACKEND_DIR=${AGENTIC_VBENCH_BACKEND_DIR:-$AVB_DATA_ROOT/b
 [[ -s $AGENTIC_VBENCH_BACKEND_DIR/client.env ]] || { echo "No task backend: $AGENTIC_VBENCH_BACKEND_DIR/client.env (submit_backend.sh)" >&2; exit 1; }
 export TRAIN_PATH=${TRAIN_PATH:-/dev/null}
 export GYM_VENV_DIR_IN_JOB=$gym_venv_dir
-srun --account="${SLURM_ACCOUNT:-nemotron_n4_omni}" --partition="${PREFETCH_PARTITION:-cpu}" --nodes=1 --ntasks=1 \
+srun_args=(
+  --account="${SLURM_ACCOUNT:-nemotron_n4_omni}"
+  --partition="${PREFETCH_PARTITION:-cpu}"
+)
+if [[ -n ${PREFETCH_QOS:-} ]]; then
+  srun_args+=(--qos="${PREFETCH_QOS}")
+fi
+srun "${srun_args[@]}" --nodes=1 --ntasks=1 \
   --cpus-per-task=16 --mem=64G --time=01:00:00 --job-name=nrlcc-gym-venvs \
   --container-image="$container" --container-mounts="$mounts" --container-workdir=/opt/nemo-rl \
   --export=ALL,NRL_CONTAINER=1,NRL_IGNORE_VERSION_MISMATCH=1,UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv,RAY_USAGE_STATS_ENABLED=0,RAY_ENABLE_UV_RUN_RUNTIME_ENV=0,NEMO_RL_VENV_DIR=/opt/ray_venvs,NEMO_GYM_VENV_DIR="$gym_venv_dir" \
