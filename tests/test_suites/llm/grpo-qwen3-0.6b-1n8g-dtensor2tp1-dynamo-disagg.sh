@@ -52,6 +52,11 @@ component_ready_line=$(grep -F \
     "frontend ready with managed components" "${RUN_LOG}")
 grep -Fq "'backend': 1" <<< "${component_ready_line}"
 grep -Fq "'prefill': 1" <<< "${component_ready_line}"
+# Prove decode pulled KV from prefill rather than prefilling locally. vLLM
+# 0.23.0 logs this only in the decode-side NIXL handshake, which runs only for
+# requests with remote-prefill kv_transfer_params
+# (vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py).
+grep -F "NIXL compatibility check passed" "${RUN_LOG}"
 
 grep -F "Performing policy generation refit" "${RUN_LOG}"
 grep -F "Invalidated generation backend KV caches after weight update" "${RUN_LOG}"
