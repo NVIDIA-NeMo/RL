@@ -54,10 +54,31 @@ groups. `policy.native_model.trainable_names` explicitly selects the original
 all other seed tensors remain frozen, including native MTP weights and metadata.
 MTP auxiliary loss and matched-evaluation speculation remain disabled.
 
-The CER400 recipe is in `examples/configs/recipes/vlm/`. Its 20-update plus
-two-update resume driver is in `tests/test_suites/vlm/`. Set
+Use the [CER400 recipe](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml) and its
+[20-update plus two-update resume driver](../../tests/test_suites/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.sh). Set
 `SPEECHLM_GSPO_MODEL`, `SPEECHLM_GSPO_DATA`, `SPEECHLM_GSPO_OUTPUT_DIR` and
 `SPEECHLM_GSPO_PYTHON` to the seed, consumer Parquet, output root and prepared
-generation actor interpreter. The driver uses the existing multimodal entrypoint,
+generation actor interpreter. The initial model is the full Speech seed HF
+directory containing config, tokenizer and safetensors; it is distinct from the
+native DCP checkpoints saved for resume. From the RL checkout, run:
+
+```bash
+bash tests/test_suites/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.sh
+```
+
+The driver uses the existing multimodal entrypoint,
 saves native weights/optimizer/dataloader state and verifies the restored cursor,
 optimizer/scheduler state and exactly two resumed updates.
+
+For canonical HF export, use `examples/speechlm2/to_hf.py` from the public
+Speech checkout. Supply its matching experiment config (including `model` and
+`trainer.strategy` fields), not the seed HF `config.json`:
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=8 \
+  "$SPEECH_REPO/examples/speechlm2/to_hf.py" \
+  class_path=nemo.collections.speechlm2.models.SALMAutomodel \
+  checkpoint_format=nemo_rl \
+  ckpt_path="$SPEECHLM_GSPO_OUTPUT_DIR/checkpoints/step_22/policy/weights/model" \
+  ckpt_config="$SPEECH_EXPORT_CONFIG" output_dir="$SPEECH_HF_OUTPUT"
+```
