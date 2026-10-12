@@ -200,6 +200,24 @@ def _copy_vllm_chat_messages(messages):
     return copied_messages
 
 
+def _message_prefix_token_ids(messages: list[Any]) -> list[int] | None:
+    """Return the newest assistant turn's exact prompt + generation tokens.
+
+    Compatibility fallback for Gym requests without ``required_prefix_token_ids``.
+    It follows Gym's own derivation rule: only the newest assistant message
+    counts, and if it has no token information there is no prefix. An older
+    turn's tokens stop being a prefix of the prompt once a later turn is
+    injected, edited, or regenerated.
+    """
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        if "prompt_token_ids" not in message:
+            return None
+        return message["prompt_token_ids"] + message["generation_token_ids"]
+    return None
+
+
 def _parse_orjson_request(request_body: bytes, request_type):
     return request_type.model_validate(orjson.loads(request_body))
 
@@ -998,17 +1016,13 @@ class VllmAsyncGenerationWorkerImpl(
             def model_post_init(self, context):
                 # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
                 if self.required_prefix_token_ids is None:
-                    for message in reversed(self.messages):
-                        if "prompt_token_ids" in message:
-                            LOGGER.warning(
-                                "Native vLLM used the compatibility prefix fallback; "
-                                "the Gym request did not provide required_prefix_token_ids."
-                            )
-                            self.required_prefix_token_ids = (
-                                message["prompt_token_ids"]
-                                + message["generation_token_ids"]
-                            )
-                            break
+                    prefix_token_ids = _message_prefix_token_ids(self.messages)
+                    if prefix_token_ids is not None:
+                        LOGGER.warning(
+                            "Native vLLM used the compatibility prefix fallback; "
+                            "the Gym request did not provide required_prefix_token_ids."
+                        )
+                        self.required_prefix_token_ids = prefix_token_ids
 
                 return super().model_post_init(context)
 

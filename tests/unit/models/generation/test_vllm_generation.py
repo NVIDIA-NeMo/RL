@@ -60,6 +60,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
     _AsyncLLMHTTPClient,
     _copy_vllm_chat_messages,
+    _message_prefix_token_ids,
     _orjson_response,
     _parse_orjson_request,
 )
@@ -939,6 +940,52 @@ def test_vllm_chat_message_copy_is_shallow_and_does_not_mutate_input():
     assert copied[1]["tool_calls"] is not messages[1]["tool_calls"]
     assert copied[1]["tool_calls"][0] is nested_tool_call
     assert isinstance(messages[1]["tool_calls"], tuple)
+
+
+def test_message_prefix_uses_newest_assistant_tokens():
+    messages = [
+        {"role": "user", "content": "first"},
+        {
+            "role": "assistant",
+            "content": "old",
+            "prompt_token_ids": [1],
+            "generation_token_ids": [2],
+        },
+        {"role": "user", "content": "second"},
+        {
+            "role": "assistant",
+            "content": "new",
+            "prompt_token_ids": [1, 2, 3],
+            "generation_token_ids": [4, 5],
+        },
+        {"role": "tool", "content": "result", "tool_call_id": "call-1"},
+    ]
+
+    assert _message_prefix_token_ids(messages) == [1, 2, 3, 4, 5]
+
+
+def test_message_prefix_does_not_fall_back_to_an_older_assistant_turn():
+    # The newest assistant turn was injected or edited and carries no tokens.
+    # The older turn's tokens are no longer a prefix of the rendered prompt.
+    messages = [
+        {"role": "user", "content": "first"},
+        {
+            "role": "assistant",
+            "content": "old",
+            "prompt_token_ids": [1],
+            "generation_token_ids": [2],
+        },
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "injected"},
+        {"role": "user", "content": "third"},
+    ]
+
+    assert _message_prefix_token_ids(messages) is None
+
+
+def test_message_prefix_is_none_without_an_assistant_turn():
+    assert _message_prefix_token_ids([{"role": "user", "content": "hi"}]) is None
+    assert _message_prefix_token_ids([]) is None
 
 
 class _OrjsonRequest(BaseModel):
