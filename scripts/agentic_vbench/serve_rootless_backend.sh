@@ -47,6 +47,12 @@ if [[ -d /raid/scratch && -w /raid/scratch ]]; then
   mkdir -p "$runtime_parent"
 fi
 runtime=$(mktemp -d "$runtime_parent/avb-backend.XXXXXXXX")
+# sbatch --export=ALL preserves the submitter's TMPDIR. Interactive tooling can
+# point it at Lustre, where rootless Buildah cannot create the mount namespace
+# directories used by `RUN` layers. Keep all Podman/Buildah temporary state on
+# the backend node beside its storage and run roots.
+mkdir -p "$runtime/tmp"
+export TMPDIR="$runtime/tmp"
 port=${AVB_BACKEND_PORT:-18443}
 # Certificates must outlive the job: the walltime in days, plus one.
 walltime_seconds=$(squeue -h -j "${SLURM_JOB_ID:-0}" -o %l 2>/dev/null | awk -F'[-:]' '
