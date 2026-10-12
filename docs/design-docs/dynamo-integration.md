@@ -25,7 +25,12 @@ Both GRPO trainers use `DynamoGeneration.generate_async()` against the managed
 frontend. NeMo-Gym traffic passes through a process-local token wrapper. It
 uses the policy tokenizer, preserves caller `nvext.extra_fields`, adds Dynamo
 engine metadata, and translates rendered multi-turn prefixes back to the exact
-caller token IDs.
+caller token IDs. For Gym rollouts, the wrapper removes Gym's
+`conversation_params.conversation_id` from the request body and sends it as the
+`X-Dynamo-Session-ID` header. Direct rollouts send one UUID per trajectory
+attempt. Session affinity is opt-in: add
+`--router-session-affinity-ttl-secs <seconds>` to
+`policy.generation.dynamo_cfg.frontend_args.extra_cli_args`.
 
 Serialized rollout copies contain only frontend URLs and immutable worker
 admin endpoints. They cannot own or stop services. Those endpoints are enough
