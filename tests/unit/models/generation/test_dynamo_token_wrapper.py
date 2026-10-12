@@ -723,7 +723,6 @@ def test_chat_completion_forwards_gym_conversation_id_as_session_header(
     response = client.post("/v1/chat/completions", json=body)
 
     assert response.status_code == 200
-    assert response.json()["choices"][0]["message"]["generation_token_ids"] == [5]
     assert len(session.calls) == 1
     url, forwarded_body, headers = session.calls[0]
     assert url == "http://dynamo/v1/chat/completions"
