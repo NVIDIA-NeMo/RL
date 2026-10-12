@@ -774,6 +774,9 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.renderer = kwargs["renderer"]
 
+    class HfRenderer:
+        pass
+
     class OpenAIServingChat:
         instances = []
 
@@ -853,6 +856,10 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     make_module(
         "vllm.renderers.online_renderer",
         OnlineRenderer=OnlineRenderer,
+    )
+    make_module(
+        "vllm.renderers.hf",
+        HfRenderer=HfRenderer,
     )
     make_module(
         "vllm.entrypoints.serve.tokenize.serving",

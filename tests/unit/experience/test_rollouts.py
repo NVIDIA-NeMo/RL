@@ -2347,6 +2347,8 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     manager._timeouts = RolloutTimeouts()
     manager._deadline_registry = None
     manager._max_gym_row_attempts = 1
+    manager._context_compaction = False
+    manager._mask_sample_rules = ()
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
@@ -2354,6 +2356,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     manager._effort_config = None
     manager._results_to_completions = lambda results: (
         [result["value"] for result in results],
+        {},
         {},
     )
     manager._compute_reward_penalty_metrics = lambda counts, num_results: {}
@@ -2481,6 +2484,8 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
     manager._timeouts = RolloutTimeouts()
     manager._deadline_registry = None
     manager._max_gym_row_attempts = 1
+    manager._context_compaction = False
+    manager._mask_sample_rules = ()
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
@@ -2526,6 +2531,8 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
     manager._max_gym_row_attempts = 1
     manager._deadline_registry = None
     manager._num_generations_per_prompt = 1
+    manager._context_compaction = False
+    manager._mask_sample_rules = ()
     manager._task_to_env = {
         "nemo_gym": NemoGymShardSet(
             handles={"tools": [first, second]},
@@ -2559,7 +2566,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
             )
 
     manager._stream_rows = fake_stream_rows
-    manager._results_to_completions = lambda _results: ([object()], {})
+    manager._results_to_completions = lambda _results: ([object()], {}, {})
     manager._compute_rollout_metrics = lambda *_args: {}
     manager._compute_reward_penalty_metrics = lambda *_args: {}
 
@@ -2616,6 +2623,8 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
     manager._max_gym_row_attempts = 1
     manager._deadline_registry = None
     manager._num_generations_per_prompt = 1
+    manager._context_compaction = False
+    manager._mask_sample_rules = ()
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
