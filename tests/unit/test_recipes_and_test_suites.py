@@ -43,6 +43,7 @@ disabled_test_suite_path = os.path.join(test_suites_dir, "disabled.txt")
 
 # Relative to project root
 ALGO_MAPPING_TO_BASE_YAML = {
+    "csd": "examples/configs/csd.yaml",
     "sft": "examples/configs/sft.yaml",
     "dpo": "examples/configs/dpo.yaml",
     "grpo": "examples/configs/grpo_math_1B.yaml",

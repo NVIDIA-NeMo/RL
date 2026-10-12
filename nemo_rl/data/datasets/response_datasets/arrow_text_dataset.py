@@ -27,6 +27,9 @@ from typing import Any, Iterable
 from datasets import Dataset
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
+from nemo_rl.data.datasets.response_datasets.response_dataset import (
+    attach_source_sample_id,
+)
 from nemo_rl.data.datasets.utils import load_dataset_from_path
 
 
@@ -70,8 +73,22 @@ class ArrowTextDataset(RawDataset):
     ):
         self.text_key = text_key
         self.task_name = "x_token"
+        self.source_namespace = (data_files, subset, split)
 
         raw = load_dataset_from_path(data_files, subset, split)
+        # Identity must be attached before filtering, mapping, or splitting so
+        # the surviving row keeps its source provenance.  Respect an upstream
+        # ID when present; otherwise namespace the stable raw-row ordinal.
+        raw = raw.map(
+            attach_source_sample_id,
+            with_indices=True,
+            remove_columns=["sample_id"] if "sample_id" in raw.column_names else None,
+            fn_kwargs={
+                "data_path": data_files,
+                "subset": subset,
+                "split": split,
+            },
+        )
         # Filter at the source so the packed and non-packed branches see the
         # same corpus (the packed path also drops empty/non-string rows).
         raw = raw.filter(lambda d: isinstance(d[text_key], str) and bool(d[text_key]))
@@ -91,7 +108,7 @@ class ArrowTextDataset(RawDataset):
                     "task_name": self.task_name,
                     # Part of the HF datasets cache fingerprint; bump it
                     # whenever the emitted row schema changes.
-                    "schema_version": "messages-v1",
+                    "schema_version": "messages-v2-sample-id",
                 },
             )
 
@@ -105,6 +122,7 @@ class ArrowTextDataset(RawDataset):
         return {
             "messages": [{"role": "assistant", "content": text}],
             "task_name": self.task_name,
+            "sample_id": data["sample_id"],
         }
 
 
@@ -123,22 +141,27 @@ def _pack_generator(
     """
     del schema_version
     buf: list[str] = []
+    sample_ids: list[str] = []
     n = 0
-    for row in raw:
+    for source_ordinal, row in enumerate(raw):
         text = row[text_key]
         buf.append(text)
+        sample_ids.append(str(row.get("sample_id", source_ordinal)))
         n += len(text)
         if n >= characters_per_sample:
             packed = "\n".join(buf)
             yield {
                 "messages": [{"role": "assistant", "content": packed}],
                 "task_name": task_name,
+                "sample_id": "legacy-pack:" + "|".join(sample_ids),
             }
             buf = []
+            sample_ids = []
             n = 0
     if buf:
         packed = "\n".join(buf)
         yield {
             "messages": [{"role": "assistant", "content": packed}],
             "task_name": task_name,
+            "sample_id": "legacy-pack:" + "|".join(sample_ids),
         }

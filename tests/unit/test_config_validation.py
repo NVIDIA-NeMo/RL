@@ -36,6 +36,9 @@ from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
+    CSDMasterConfig,
+)
+from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig as XTokenOffPolicyDistillationMasterConfig,
 )
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
@@ -135,6 +138,9 @@ def test_all_config_files_have_required_keys(config_file):
     if "/evals/" in config_file:
         master_config_class = EvalMasterConfig
         config_type = "eval"
+    elif config_dict.get("algorithm") == "csd":
+        master_config_class = CSDMasterConfig
+        config_type = "csd"
     elif "teachers" in config_dict or (
         "loss_fn" in config_dict and "projection_matrix_path" in config_dict["loss_fn"]
     ):
