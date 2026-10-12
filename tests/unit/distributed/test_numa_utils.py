@@ -29,7 +29,7 @@ from nemo_rl.distributed.numa_utils import (
     _get_numa_node,
     _load_libnuma,
     _parse_cpulist,
-    _set_numa_membind,
+    _set_numa_preferred,
     bind_to_gpu_numa,
     resolve_visible_gpu_id,
 )
@@ -254,7 +254,7 @@ class TestBindToGpuNuma:
 
     def test_gpu_not_in_file(self, monkeypatch):
         monkeypatch.delenv("NRL_DISABLE_NUMA_BINDING", raising=False)
-        monkeypatch.setenv("NRL_DISABLE_NUMA_MEMBIND", "1")
+        monkeypatch.setenv("NRL_DISABLE_NUMA_PREFERRED", "1")
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write("0:0-71\n1:0-71\n2:72-143\n3:72-143\n")
@@ -270,7 +270,7 @@ class TestBindToGpuNuma:
     def test_successful_cpu_binding(self, monkeypatch):
         """Verify sched_setaffinity is called with the correct CPU set."""
         monkeypatch.delenv("NRL_DISABLE_NUMA_BINDING", raising=False)
-        monkeypatch.setenv("NRL_DISABLE_NUMA_MEMBIND", "1")
+        monkeypatch.setenv("NRL_DISABLE_NUMA_PREFERRED", "1")
 
         # Derive the cpulist from the CPUs actually available to this process so
         # the test is host-portable. GPUs 0/1 map to the first CPU group, GPUs
@@ -307,7 +307,7 @@ class TestBindToGpuNuma:
         # Full-node CVD as seen under NOSET mode.
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
         monkeypatch.delenv("NRL_DISABLE_NUMA_BINDING", raising=False)
-        monkeypatch.setenv("NRL_DISABLE_NUMA_MEMBIND", "1")
+        monkeypatch.setenv("NRL_DISABLE_NUMA_PREFERRED", "1")
 
         group0, group1 = _split_available_cpus()
         if group1 is None:
@@ -331,22 +331,57 @@ class TestBindToGpuNuma:
                 _reset_all_bindings()
 
 
-class TestSetNumaMembind:
-    """Test membind with libnuma (skipped if libnuma unavailable)."""
+class TestSetNumaPreferred:
+    """Test the preferred-node memory policy with libnuma (skipped if libnuma unavailable)."""
 
     @pytest.fixture(autouse=True)
     def _check_libnuma(self):
         if _load_libnuma() is None:
             pytest.skip("libnuma.so.1 not available")
 
-    def test_membind_disabled(self, monkeypatch):
-        monkeypatch.setenv("NRL_DISABLE_NUMA_MEMBIND", "1")
-        assert _set_numa_membind({0, 1, 2}) is False
+    def test_preferred_disabled(self, monkeypatch):
+        monkeypatch.setenv("NRL_DISABLE_NUMA_PREFERRED", "1")
+        assert _set_numa_preferred({0, 1, 2}) is False
 
-    def test_membind_succeeds(self, monkeypatch):
+    def test_deprecated_membind_env_still_disables(self, monkeypatch, caplog):
+        monkeypatch.delenv("NRL_DISABLE_NUMA_PREFERRED", raising=False)
+        monkeypatch.setenv("NRL_DISABLE_NUMA_MEMBIND", "1")
+        with caplog.at_level("WARNING", logger="nemo_rl.distributed.numa_utils"):
+            assert _set_numa_preferred({0, 1, 2}) is False
+        assert "NRL_DISABLE_NUMA_MEMBIND is deprecated" in caplog.text
+
+    def test_preferred_succeeds(self, monkeypatch):
+        monkeypatch.delenv("NRL_DISABLE_NUMA_PREFERRED", raising=False)
         monkeypatch.delenv("NRL_DISABLE_NUMA_MEMBIND", raising=False)
         cpus = os.sched_getaffinity(0)
-        assert _set_numa_membind(cpus) is True
+        assert _set_numa_preferred(cpus) is True
+
+    def test_prefers_local_node_instead_of_binding(self, monkeypatch):
+        # A hard bind (MPOL_BIND) OOM-kills a worker once its node is full even
+        # when other nodes have free memory; MPOL_PREFERRED spills over instead.
+        import ctypes
+
+        monkeypatch.delenv("NRL_DISABLE_NUMA_PREFERRED", raising=False)
+        monkeypatch.delenv("NRL_DISABLE_NUMA_MEMBIND", raising=False)
+        libnuma = _load_libnuma()
+        libnuma.get_mempolicy.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        libnuma.get_mempolicy.restype = ctypes.c_int
+        libnuma.numa_preferred.restype = ctypes.c_int
+        cpus = os.sched_getaffinity(0)
+        try:
+            assert _set_numa_preferred(cpus) is True
+            mode = ctypes.c_int(-1)
+            assert libnuma.get_mempolicy(ctypes.byref(mode), None, 0, None, 0) == 0
+            assert mode.value == 1  # MPOL_PREFERRED; MPOL_BIND would be 2
+            assert libnuma.numa_preferred() == _get_numa_node(libnuma, cpus)
+        finally:
+            libnuma.numa_set_localalloc()
 
     def test_get_numa_node_valid(self):
         libnuma = _load_libnuma()
@@ -430,7 +465,7 @@ class TestNUMABindingBenchmark:
         if affinity_file is None:
             pytest.skip("Could not parse nvidia-smi topo output")
 
-        # Apply NUMA binding (CPU affinity + membind)
+        # Apply NUMA binding (CPU affinity + preferred memory node)
         old_path = _patch_affinity_path(affinity_file)
         gpu_str = cvd.split(",")[0]
         try:

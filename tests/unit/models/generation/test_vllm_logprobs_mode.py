@@ -27,6 +27,9 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 def test_worker_generate_records_sampled_token_logprob(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_worker
 
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+
     sampled_token_id = 880
     generation = SimpleNamespace(
         token_ids=[sampled_token_id],
@@ -38,7 +41,7 @@ def test_worker_generate_records_sampled_token_logprob(monkeypatch):
         ],
         finish_reason="stop",
     )
-    raw_output = SimpleNamespace(outputs=[generation])
+    raw_output = SimpleNamespace(prompt_token_ids=[101, 102], outputs=[generation])
 
     worker = vllm_worker.VllmGenerationWorkerImpl.__new__(
         vllm_worker.VllmGenerationWorkerImpl
@@ -51,6 +54,7 @@ def test_worker_generate_records_sampled_token_logprob(monkeypatch):
     worker.routed_experts_dtype = torch.int32
     worker.llm = SimpleNamespace(
         generate=MagicMock(return_value=[raw_output]),
+        renderer=SimpleNamespace(get_tokenizer=lambda: SimpleNamespace(bos_token=None)),
         llm_engine=SimpleNamespace(
             model_config=SimpleNamespace(max_model_len=16, model="test-model")
         ),

@@ -9,7 +9,7 @@ policy:
   tokenizer:
     name: Qwen/Qwen2.5-32B
   max_total_sequence_length: 16000
-  dtensor_cfg:
+  automodel_cfg:
     sequence_parallel: true
     activation_checkpointing: true
     tensor_parallel_size: 8

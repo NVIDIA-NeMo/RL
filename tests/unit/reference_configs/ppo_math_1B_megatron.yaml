@@ -86,6 +86,8 @@ loss_fn:
   use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
+  metrics_level: "full"
+  enable_torch_compile: false
 
 value_loss_fn:
   scale: 0.4
@@ -116,8 +118,7 @@ policy:
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
     checkpoint:
       model_save_format: "safetensors"
@@ -172,6 +173,7 @@ policy:
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
@@ -317,8 +319,7 @@ value:
     enabled: false
     reward_model_type: "regression"
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
     checkpoint:
       model_save_format: "safetensors"
@@ -372,6 +373,7 @@ value:
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
@@ -470,13 +472,20 @@ logger:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"
     log_nemo_gym_full_result_tables: false
+    entity: null
+    id: null
+    resume: null
   swanlab:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"
-  tensorboard: {}
+  tensorboard:
+    log_dir: null
   mlflow:
     experiment_name: "ppo-dapo-megatron-dev"
     run_name: "ppo_dapo_megatron_1B"
+    run_id: null
+    tracking_uri: null
+    artifact_location: null
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10

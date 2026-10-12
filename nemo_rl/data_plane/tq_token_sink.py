@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     )
 
 from nemo_rl.data_plane.schema import (
+    PER_TOKEN_STAGING_FIELDS,
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
     ROUTE_ENCODING_NONE,
@@ -107,9 +108,7 @@ _MEDIA_INDEX_DTYPES = (torch.int32, torch.int64)
 
 
 STAGING_FIELDS = [
-    "token_ids_delta",
-    "token_mask_delta",
-    "generation_logprobs_delta",
+    *PER_TOKEN_STAGING_FIELDS,
     "schema_version",
     "digest_version",
     "extras_digest_version",
