@@ -217,17 +217,41 @@ def test_unrecoverable_pause_stops_before_weight_transfer(failure, with_monitor)
     assert not ctrl._rollout_permitted.is_set()
 
 
-def test_retry_pause_failure_preserves_partial_weights() -> None:
-    ctrl, monitor, sync = _make_controller(ABORTED)
-    ctrl._gen.pause_generation_for_refit.side_effect = [True, ABORTED]
+def test_pause_timeout_with_no_absent_shard_stops_without_withholding_survivors() -> (
+    None
+):
+    # A frozen-but-alive leader times out before any transfer. Without an absent
+    # or suspect shard, recovery must stop without marking healthy weights partial.
+    ctrl, monitor, sync = _make_controller(ABORTED, dead_shards=())
+    ctrl._gen.pause_generation_for_refit.side_effect = ABORTED
 
-    with pytest.raises(RefitAborted):
+    with pytest.raises(RuntimeError, match="could be identified as absent"):
         asyncio.run(ctrl._sync_weights())
 
+    ctrl._gen.pause_generation_for_refit.assert_called_once()
+    assert sync.sync_calls == 0
+    assert monitor.serving_shards() == [0, 1]
+    assert [shard.state for shard in monitor.snapshot()] == [ShardState.HEALTHY] * 2
+    ctrl._gen.resume_generation_after_refit.assert_not_called()
+    assert not ctrl._rollout_permitted.is_set()
+
+
+@pytest.mark.parametrize("retry_failure", [ABORTED, ray.exceptions.ActorDiedError()])
+def test_retry_pause_failure_preserves_partial_weights(
+    retry_failure: BaseException,
+) -> None:
+    ctrl, monitor, sync = _make_controller(ABORTED)
+    ctrl._gen.pause_generation_for_refit.side_effect = [True, retry_failure]
+
+    with pytest.raises(type(retry_failure)):
+        asyncio.run(ctrl._sync_weights())
+
+    assert ctrl._gen.pause_generation_for_refit.call_count == 2  # no second recovery
     assert sync.sync_calls == 1
     assert monitor.state_of(1) is ShardState.STALE
     assert monitor.serving_shards() == []
     assert monitor.snapshot()[1].weight_version == 0
+    ctrl._gen.resume_generation_after_refit.assert_not_called()
     assert not ctrl._rollout_permitted.is_set()
 
 
