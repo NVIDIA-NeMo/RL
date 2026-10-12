@@ -181,6 +181,7 @@ policy:
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
@@ -401,6 +402,7 @@ value:
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false

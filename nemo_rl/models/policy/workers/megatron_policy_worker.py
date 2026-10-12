@@ -106,6 +106,7 @@ from nemo_rl.models.megatron.router_replay import (
 )
 from nemo_rl.models.megatron.setup import (
     build_inference_model,
+    enable_batch_invariant_mode,
     finalize_megatron_setup,
     handle_model_import,
     load_teacher_output_layer_weight,
@@ -606,6 +607,8 @@ class MegatronPolicyWorkerImpl(
         gpu_ids = ray.get_gpu_ids()
         local_rank = int(gpu_ids[0])
         os.environ["LOCAL_RANK"] = str(local_rank)
+        # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
+        enable_batch_invariant_mode(config)
         torch.cuda.set_device(local_rank)
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
@@ -1599,6 +1602,9 @@ class MegatronPolicyWorkerImpl(
             # streaming chunks the controller has fed into this optimizer step
             # so far.
             "num_chunks": 0,
+            # Policy parameters/optimizer may be offloaded between PPO chunks;
+            # accumulated gradients remain resident until the step closes.
+            "offloaded": False,
             "draft_step_state": DraftStepState(),
             # Saved across the step so we can restore at finish/abort.
             "saved_grad_sync_func": None,
@@ -1766,6 +1772,8 @@ class MegatronPolicyWorkerImpl(
         regular ``train`` path.
         """
         state = self._assert_step_open()
+        if state.get("offloaded", False):
+            raise RuntimeError("prepare_for_training must restore the offloaded step")
         try:
             self._train_microbatch_body(state, data)
         except Exception:
@@ -1964,6 +1972,8 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/finish_train_step")
     def finish_train_step(self) -> dict[str, Any]:
         state = self._assert_step_open()
+        if state.get("offloaded", False):
+            raise RuntimeError("prepare_for_training must restore the offloaded step")
         try:
             return self._finish_train_step_body(state)
         except Exception:
@@ -4335,6 +4345,43 @@ class MegatronPolicyWorkerImpl(
         # The plan is consumed (provider mutated to the inference layout); release it.
         self._colocated_reshard_plan = None
 
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/pause_train_step_with_offloading")
+    def pause_train_step_with_offloading(self) -> None:
+        """Pause the step, offloading parameters and optimizer state to CPU.
+
+        Pending dense/expert gradients stay on GPU. Counts, metrics and disabled
+        reduction hooks are preserved until ``prepare_for_training`` resumes it.
+        """
+        state = self._assert_step_open()
+        if state.get("offloaded", False):
+            raise RuntimeError("the open train step is already offloaded")
+        if not isinstance(self.model, DistributedDataParallel):
+            raise ValueError("PPO streaming offload requires Megatron DDP")
+        if (
+            self.megatron_cfg.ddp.use_distributed_optimizer
+            and self.megatron_cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag
+        ):
+            raise ValueError(
+                "PPO streaming offload with the distributed optimizer requires "
+                "reuse_grad_buf_for_mxfp8_param_ag=False"
+            )
+
+        self.finalize_async_save()
+        # eval may materialize model-specific caches; do it before CPU offload.
+        self.model.eval()
+        state["offloaded"] = True
+        self.model = self.move_model(
+            self.model, "cpu", move_params=True, move_grads=False
+        )
+        # optimizer_cpu_offload offloads optimizer computation to CPU. Here we
+        # only park GPU optimizer state on CPU while another RL model runs.
+        if self.optimizer is not None and not self.optimizer_cpu_offload:
+            self.move_optimizer("cpu")
+        self._release_opd_full_teacher_lm_head()
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
         self.model = self.move_model(
@@ -4354,6 +4401,9 @@ class MegatronPolicyWorkerImpl(
             and not self.optimizer_cpu_offload
         ):
             self.move_optimizer("cuda")
+
+        if self._train_step_state is not None:
+            self._train_step_state["offloaded"] = False
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
@@ -4416,16 +4466,21 @@ class MegatronPolicyWorkerImpl(
             # Disabled hooks mean no optimizer update is waiting to be gathered.
             return
 
+        # Settle checkpoint reads before rewriting it.
+        self.finalize_async_save()
+        # PPO can park the policy before critic training. Param gathering writes
+        # into its buffers, so restore their storage first (a no-op if resident).
+        self.model = self.move_model(
+            self.model, "cuda", move_params=True, move_grads=False
+        )
         if self._uses_mxfp8_overlap_shared_param_buffer():
             # This path requantizes updated master shards into the shared buffer.
             # Hold that buffer materialized until the next training step.
-            self.finalize_async_save()
             self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
             return
 
         # BF16 master shards are already in the DDP parameter buffer; only the
-        # all-gather remains. Settle checkpoint reads before rewriting it.
-        self.finalize_async_save()
+        # all-gather remains.
         self.model.start_param_sync(force_sync=True)
         # Ensure exporters cannot observe a partially gathered buffer.
         torch.cuda.synchronize()

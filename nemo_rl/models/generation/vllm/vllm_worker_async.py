@@ -547,7 +547,9 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 
-        dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        # Own no segment: a save would otherwise wait on this actor, whose event
+        # loop is busy serving rollouts. Capture writes land in other segments.
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
         # The Omni processor emits pixels in the engine's model dtype; the
         # sink pins its media column to it so text-call sentinels never
         # introduce a second dtype (TQ keeps one dtype per field).
