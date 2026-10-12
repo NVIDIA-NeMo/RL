@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import tempfile
 import uuid
 from copy import deepcopy
@@ -34,6 +35,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import nemo_rl.experience.rollouts as rollouts_mod
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
     PostWriteEnrichmentError,
@@ -1475,6 +1477,157 @@ def test_nemo_gym_sc_per_agent_metrics_cover_the_union_of_result_fields():
 
     assert metrics["agent/speedup/mean"] == pytest.approx(6.0 / 3)
     assert metrics["agent/speedup/max"] == 4.0
+
+
+def _masked_flag(flag_form, value):
+    if flag_form == "first_class":
+        return {"mask_sample": value}
+    return {"instance_config": {"mask_sample": value}}
+
+
+@pytest.mark.parametrize("flag_form", ["first_class", "instance_config"])
+def test_nemo_gym_sc_per_agent_value_metrics_exclude_environment_masked_rollouts(
+    flag_form,
+):
+    """An environment-masked completion votes in no per-agent value metric on
+    the single-controller path either, whichever form the flag takes; the
+    masked share is reported for both forms; with the gate off every completion
+    votes, so the two paths agree in both settings."""
+
+    def completion(reward, **extras):
+        return Completion(
+            message_log=[
+                {"role": "user", "token_ids": [1]},
+                {"role": "assistant", "token_ids": [2]},
+            ],
+            env_extras={"reward": reward, **extras},
+            truncated=False,
+            reward=reward,
+        )
+
+    completions = [
+        completion(1.0, correctness=1.0, speedup=4.0, **_masked_flag(flag_form, False)),
+        completion(0.0, correctness=0.0, speedup=2.0, **_masked_flag(flag_form, False)),
+        # The masked rollout's values are placeholders, not measurements.
+        completion(0.0, correctness=0.0, speedup=0.0, **_masked_flag(flag_form, True)),
+    ]
+
+    metrics = _nemo_gym_impl(True)._compute_rollout_metrics(completions, "agent")
+
+    assert metrics["agent/correctness/mean"] == pytest.approx(0.5)
+    assert metrics["agent/speedup/mean"] == pytest.approx(3.0)
+    assert metrics["agent/speedup/histogram"] == [4.0, 2.0]
+    assert metrics["agent/reward/mean"] == pytest.approx(0.5)
+    assert metrics["agent/mask_sample/mean"] == pytest.approx(1 / 3)
+    # The sample-level reward statistic is not a per-agent metric and still
+    # covers every completion.
+    assert metrics["total_reward/mean"] == pytest.approx(1 / 3)
+
+    voting = _nemo_gym_impl(False)._compute_rollout_metrics(completions, "agent")
+    assert voting["agent/correctness/mean"] == pytest.approx(1 / 3)
+    assert voting["agent/mask_sample/mean"] == pytest.approx(1 / 3)
+
+    all_masked = _nemo_gym_impl(True)._compute_rollout_metrics(
+        [completion(0.0, correctness=0.0, mask_sample=True)] * 2, "agent"
+    )
+    assert all_masked["agent/mask_sample/mean"] == 1.0
+    assert "agent/correctness/mean" not in all_masked
+
+
+def _token_result(rowidx, reward):
+    """One token-mode Gym row as the single-controller stream yields it."""
+    return {
+        "input_message_log": [{"role": "user", "token_ids": [rowidx + 1]}],
+        "message_log": [
+            {"role": "user", "token_ids": [rowidx + 1]},
+            {
+                "role": "assistant",
+                "token_ids": [2, 3],
+                "generation_logprobs": [0.0, 0.0],
+            },
+        ],
+        "full_result": {"reward": reward},
+    }
+
+
+def test_nemo_gym_sc_rollout_metrics_hook_runs_after_the_built_in_metrics(
+    caplog, monkeypatch
+):
+    """On the single-controller path the hook sees rows and full results
+    aligned in row order whatever order the inputs arrive in, and a key it
+    returns survives the built-in writers with a collision warning."""
+    from nemo_rl.experience.rollouts import Timer
+
+    monkeypatch.setattr(rollouts_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
+    seen = []
+
+    def hook(rows, full_results):
+        seen.append(
+            list(
+                zip(
+                    [row["_rowidx"] for row in rows],
+                    [full_result["reward"] for full_result in full_results],
+                )
+            )
+        )
+        return {"agent/reward/mean": 99.0, "mean_gen_tokens_per_sample": 77.0}
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _token_result(0, 0.0), None),
+                (1, {"name": "agent"}, _token_result(1, 1.0), None),
+            ]
+        ]
+    )
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+    impl._task_to_env = {"nemo_gym": env}
+    # Resolution from rollout_config is pinned by
+    # test_nemo_gym_sc_path_applies_the_rollout_metrics_hook.
+    impl._rollout_metrics_hook = hook
+
+    with caplog.at_level(logging.WARNING):
+        _completions, _prompt, metrics = _run(
+            impl._run_rollouts(
+                inputs=[
+                    {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+                    {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                ],
+                timer=Timer(),
+                timer_prefix="timing/test",
+            )
+        )
+
+    assert seen == [[(0, 0.0), (1, 1.0)]]
+    assert metrics["agent/reward/mean"] == 99.0
+    assert metrics["mean_gen_tokens_per_sample"] == 77.0
+    assert any("overrides built-in metric key" in r.message for r in caplog.records)
+
+
+def test_nemo_gym_sc_path_rejects_a_bad_metrics_hook_path_before_dispatch():
+    """An unresolvable hook path fails the single-controller rollout before any
+    row is dispatched, as on the driver path, instead of after a generated
+    prompt group."""
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[[(0, {"name": "agent"}, _streamed_gym_result(), None)]],
+        rollout_settings={"rollout_metrics_hook": "no.such.module.function"},
+    )
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 1
+    impl._task_to_env = {"nemo_gym": env}
+
+    with pytest.raises(ModuleNotFoundError):
+        _run(
+            impl._run_rollouts(
+                inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
+                timer=Timer(),
+                timer_prefix="timing/test",
+            )
+        )
+    assert env.dispatched == []
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])

@@ -2788,6 +2788,7 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
     manager._tokenizer = None
+    manager._rollout_metrics_hook = None
 
     with pytest.raises(RuntimeError, match="actor died") as exc_info:
         asyncio.run(
@@ -3620,7 +3621,7 @@ def test_nemo_gym_rollout_metrics_hook_runs_after_the_per_agent_means(
     """The hook runs after every built-in metric writer, so a key it returns
     survives instead of being reabsorbed by the per-agent means, and the
     collision is warned once."""
-    monkeypatch.setattr(rollouts_mod, "_ROLLOUT_METRICS_HOOK_COLLISION_WARNED", set())
+    monkeypatch.setattr(rollouts_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
 
     def hook(rows, full_results):
         return {"agent/reward/mean": 99.0}
@@ -3631,6 +3632,121 @@ def test_nemo_gym_rollout_metrics_hook_runs_after_the_per_agent_means(
         ).rollout_metrics
     assert metrics["agent/reward/mean"] == 99.0
     assert any("overrides built-in metric key" in r.message for r in caplog.records)
+
+
+def test_nemo_gym_rollout_metrics_hook_output_is_validated(caplog, monkeypatch):
+    """A hook that returns no mapping is reported once like a raising hook and
+    cannot fail the rollout; a value the step aggregation cannot average is
+    dropped and reported once while the hook's other metrics survive."""
+    monkeypatch.setattr(rollouts_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
+
+    def forgot_the_return(rows, full_results):
+        sum(r["reward"] for r in full_results)
+
+    with caplog.at_level(logging.WARNING):
+        metrics = _postprocess_hook_group(
+            [_hook_group_result(1.0)], forgot_the_return
+        ).rollout_metrics
+    assert metrics["agent/reward/mean"] == pytest.approx(1.0)
+    assert any(
+        "rollout metrics hook" in r.message
+        and r.exc_info
+        and "expected a mapping" in str(r.exc_info[1])
+        for r in caplog.records
+    )
+
+    def mixed_values(rows, full_results):
+        return {
+            "score_over_correct": None,
+            "pass_rate/histogram": 0.5,
+            "pass_rate": 0.5,
+            "scores/histogram": [0.5, 1.0],
+        }
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        metrics = _postprocess_hook_group(
+            [_hook_group_result(1.0)], mixed_values
+        ).rollout_metrics
+    assert metrics["pass_rate"] == 0.5
+    assert metrics["scores/histogram"] == [0.5, 1.0]
+    assert "score_over_correct" not in metrics
+    assert "pass_rate/histogram" not in metrics
+    dropped = [r for r in caplog.records if "cannot average" in r.message]
+    assert len(dropped) == 1
+    assert "['pass_rate/histogram', 'score_over_correct']" in dropped[0].getMessage()
+
+
+def test_nemo_gym_rollout_metrics_hook_conditions_are_reported_once(
+    caplog, monkeypatch
+):
+    """Each condition (a failure, a collision) is reported the first time only
+    for a given hook, since it would otherwise repeat for every prompt group."""
+    monkeypatch.setattr(rollouts_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
+
+    def broken(rows, full_results):
+        raise KeyError("score")
+
+    def colliding(rows, full_results):
+        return {"agent/reward/mean": 99.0}
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(2):
+            _postprocess_hook_group([_hook_group_result(1.0)], broken)
+            _postprocess_hook_group([_hook_group_result(1.0)], colliding)
+
+    failed = [r for r in caplog.records if "hook" in r.message and r.exc_info]
+    collided = [
+        r for r in caplog.records if "overrides built-in metric key" in r.message
+    ]
+    assert len(failed) == 1
+    assert len(collided) == 1
+
+
+@pytest.mark.parametrize("flag_form", ["first_class", "instance_config"])
+def test_per_agent_result_metrics_exclude_environment_masked_rollouts(flag_form):
+    """Whichever form the flag takes, a masked rollout's placeholder values
+    vote in no value metric while the gate honors the flag, the masked share is
+    reported by the same predicate, and with the gate off every rollout votes."""
+
+    def flagged(value):
+        if flag_form == "first_class":
+            return {"mask_sample": value}
+        return {"instance_config": {"mask_sample": value}}
+
+    results = [
+        {"reward": 1.0, "correctness": 1.0, "speedup": 4.0, **flagged(False)},
+        {"reward": 0.0, "correctness": 0.0, "speedup": 2.0, **flagged(False)},
+        {"reward": 0.0, "correctness": 0.0, "speedup": 0.0, **flagged(True)},
+    ]
+
+    metrics = rollouts_mod.per_agent_result_metrics(
+        "agent", results, exclude_masked=True
+    )
+    assert metrics["agent/correctness/mean"] == pytest.approx(0.5)
+    assert metrics["agent/speedup/mean"] == pytest.approx(3.0)
+    assert metrics["agent/speedup/histogram"] == [4.0, 2.0]
+    assert metrics["agent/mask_sample/mean"] == pytest.approx(1 / 3)
+
+    voting = rollouts_mod.per_agent_result_metrics(
+        "agent", results, exclude_masked=False
+    )
+    assert voting["agent/correctness/mean"] == pytest.approx(1 / 3)
+    assert voting["agent/mask_sample/mean"] == pytest.approx(1 / 3)
+
+
+def test_per_agent_result_metrics_report_only_the_share_when_every_rollout_is_masked():
+    """An agent whose rollouts are all masked has no measurement to report: the
+    value keys are absent for the group and the share says why."""
+    results = [{"reward": 0.0, "correctness": 0.0, "mask_sample": True}] * 2
+
+    metrics = rollouts_mod.per_agent_result_metrics(
+        "agent", results, exclude_masked=True
+    )
+
+    assert metrics["agent/mask_sample/mean"] == 1.0
+    assert "agent/correctness/mean" not in metrics
+    assert "agent/reward/mean" not in metrics
 
 
 def test_nemo_gym_per_agent_metrics_cover_fields_present_on_some_rollouts_only():

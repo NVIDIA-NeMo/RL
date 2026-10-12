@@ -77,6 +77,7 @@ from nemo_rl.experience.rollout_recovery import (
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
+    RolloutMetricsHook,
     _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
     _dummy_routed_experts_for_tokens,
@@ -91,6 +92,7 @@ from nemo_rl.experience.rollouts import (
     calculate_rewards,
     compute_reward_penalty_metrics,
     get_nemo_gym_rollout_metrics_hook,
+    per_agent_result_metrics,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -1284,6 +1286,10 @@ class AsyncNemoGymRolloutImpl:
         expected_indices = [row["_rowidx"] for row in inputs]
         if len(expected_indices) != len(set(expected_indices)):
             raise ValueError("NeMo-Gym input rows contain duplicate _rowidx values")
+        # Resolved before any dispatch, as the driver path resolves it before
+        # preparing its rows, so a bad hook path fails at configuration time
+        # instead of after a generated prompt group.
+        hook = await self._resolve_rollout_metrics_hook()
 
         # Run generation and restore input order as results stream back.
         with timer.time(f"{timer_prefix}/run_rollouts"):
@@ -1457,23 +1463,25 @@ class AsyncNemoGymRolloutImpl:
                 )
             )
             # The configured rollout-metrics hook runs after every built-in
-            # writer, with the same (rows, full_results) contract as the
-            # driver path (see get_nemo_gym_rollout_metrics_hook).
-            hook = await self._resolve_rollout_metrics_hook()
-            if hook is not None:
-                apply_nemo_gym_rollout_metrics_hook(
-                    hook,
-                    sorted(inputs, key=lambda row: row["_rowidx"]),
-                    [
-                        {
-                            k: v
-                            for k, v in (c.env_extras or {}).items()
-                            if k != "ng_receipt"
-                        }
-                        for c in completions
-                    ],
-                    rollout_metrics,
-                )
+            # writer of the group (the timing and routing keys are added
+            # below), with the same (rows, full_results) contract as the
+            # driver path (see get_nemo_gym_rollout_metrics_hook): each
+            # rollout's own full_result, which under token capture (receipt
+            # mode) carries the verifier's reward before shaping and
+            # penalties, applied at capture finalization. completed_results
+            # is in _rowidx order, like completions.
+            hook_rows: list[dict[str, Any]] = []
+            hook_full_results: list[dict[str, Any]] = []
+            for row, result in zip(
+                sorted(inputs, key=lambda row: row["_rowidx"]), completed_results
+            ):
+                full_result = result.get("full_result")
+                if isinstance(full_result, dict):
+                    hook_rows.append(row)
+                    hook_full_results.append(full_result)
+            apply_nemo_gym_rollout_metrics_hook(
+                hook, hook_rows, hook_full_results, rollout_metrics
+            )
 
         rollout_metrics.update(env_timing_metrics)
         for handle in shard_set.all_handles:
@@ -1483,7 +1491,7 @@ class AsyncNemoGymRolloutImpl:
 
         return completions, prompt_message_log, rollout_metrics
 
-    async def _resolve_rollout_metrics_hook(self):
+    async def _resolve_rollout_metrics_hook(self) -> Optional[RolloutMetricsHook]:
         """The configured ``env.nemo_gym.rollout_metrics_hook``, resolved once.
 
         Read from the Gym actor's ``rollout_config`` exactly like the driver
@@ -1675,31 +1683,16 @@ class AsyncNemoGymRolloutImpl:
             }
             for c in completions
         ]
-        # Union of keys in first-seen order: a field present only on some
-        # rollouts (a masked sample's flag, for example) is still aggregated,
-        # exactly as _postprocess_single_nemo_gym_group aggregates it. An
-        # environment-masked rollout carries placeholder values, so it votes in
-        # no value metric; the mask flag itself averages over every rollout as
-        # the masked share.
-        unmasked = [
-            r
-            for r in agent_extras
-            if not (
-                r.get("mask_sample")
-                or (r.get("instance_config") or {}).get("mask_sample")
+        # Every numeric result field over the completions, by the helper the
+        # driver path uses so the two cannot drift; an environment-masked
+        # completion votes only while the mask gate honors its flag.
+        rollout_metrics.update(
+            per_agent_result_metrics(
+                agent_name,
+                agent_extras,
+                exclude_masked=self._mask_env_flagged_samples,
             )
-        ]
-        for key in dict.fromkeys(key for r in agent_extras for key in r):
-            source = agent_extras if key == "mask_sample" else unmasked
-            values = [
-                float(r[key])  # type: ignore
-                for r in source
-                if isinstance(r.get(key), (bool, int, float))
-            ]
-            if values:
-                rollout_metrics.update(
-                    calculate_single_metric(values, len(source), f"{agent_name}/{key}")
-                )
+        )
 
         # Emit authoritative live token metrics after full-result metrics so
         # similarly named environment metadata cannot overwrite them. In receipt
