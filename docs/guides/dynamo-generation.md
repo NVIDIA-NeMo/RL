@@ -134,11 +134,16 @@ NeMo RL manages `--disaggregation-mode`, the NIXL connector, NIXL side-channel
 ports, and prefill KV-event ports. Do not set these values in
 `worker_args.extra_cli_args`, `vllm_kwargs`, or `vllm_cfg.env_vars`.
 When vLLM prefix caching is disabled, Dynamo does not publish KV events because
-there are no cached prefixes to reuse.
+there are no cached prefixes to reuse. Decode workers never publish KV events,
+so `router_mode: kv` applies KV-aware routing only when selecting a prefill
+worker.
 
 NIXL moves KV-cache data from prefill to decode. NCCL moves model weights from
 training to every prefill and decode engine. Both roles receive each refit and
-both roles have their KV caches cleared after the refit.
+both roles have their KV caches cleared after the refit. `NCCL_*` variables
+tune only the refit transport. NIXL uses UCX by default, so set UCX variables
+such as `UCX_TLS` and `UCX_NET_DEVICES` in `vllm_cfg.env_vars` to tune
+cross-node KV transfer.
 
 `vllm_cfg` settings are handled in five explicit classes:
 
