@@ -22,7 +22,7 @@ import uuid
 import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, TypeVar, cast
 
 import orjson
 import ray
@@ -30,6 +30,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import Response
+from pydantic import BaseModel
 
 from nemo_rl.data.captured_media import (
     CapturedMedia,
@@ -189,8 +190,23 @@ class _AsyncLLMHTTPClient:
         return await self._engine_client.is_tracing_enabled()
 
 
-def _copy_vllm_chat_messages(messages):
-    """Copy only the request containers that vLLM normalizes in place."""
+def _copy_vllm_chat_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    """Copy each chat message and its ``tool_calls`` list for vLLM rendering.
+
+    The tool-call dicts inside stay shared with ``messages``. vLLM 0.29 renders
+    from conversation dicts it builds itself, and the one in-place write that
+    reaches these messages is ``_postprocess_messages``
+    (``vllm/entrypoints/chat_utils.py``) parsing each
+    ``tool_calls[].function.arguments`` into a dict. That rewrite is
+    idempotent, so the full render and the prefix render of one request see
+    the same arguments.
+
+    Args:
+        messages: The request's ``ChatCompletionMessageParam`` dicts.
+
+    Returns:
+        New message dicts, with a new ``tool_calls`` list where one is set.
+    """
     copied_messages = []
     for message in messages:
         copied_message = dict(message)
@@ -218,11 +234,16 @@ def _message_prefix_token_ids(messages: list[Any]) -> list[int] | None:
     return None
 
 
-def _parse_orjson_request(request_body: bytes, request_type):
+_RequestT = TypeVar("_RequestT", bound=BaseModel)
+
+
+def _parse_orjson_request(
+    request_body: bytes, request_type: type[_RequestT]
+) -> _RequestT:
     return request_type.model_validate(orjson.loads(request_body))
 
 
-def _orjson_response(content, status_code: int = 200) -> Response:
+def _orjson_response(content: Any, status_code: int = 200) -> Response:
     # Like json.dumps, accept int dict keys such as vLLM's prompt_logprobs.
     return Response(
         content=orjson.dumps(content, option=orjson.OPT_NON_STR_KEYS),
