@@ -262,6 +262,9 @@ class GenerationConfig(TypedDict):
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
     use_async_rollouts: NotRequired[bool]
+    # Controller-only connection and checkpoint-refit settings for an external
+    # stock vLLM deployment.
+    remote_vllm_cfg: NotRequired["RemoteVllmServiceConfig"]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
     # Eagle draft weights arrive via refit when policy.draft.enabled=true.
@@ -290,6 +293,10 @@ def should_use_async_rollouts(
     backend = generation_config.get("backend", "")
 
     if backend == "dynamo":
+        return True
+
+    if backend == "remote_vllm":
+        # Rollouts run through the external server's asynchronous HTTP API.
         return True
 
     if backend == "sglang":
@@ -840,3 +847,7 @@ class GenerationInterface(ABC):
         per-worker deltas before summing them, so counter resets are detectable.
         """
         return self.get_logger_metrics()
+
+
+if TYPE_CHECKING:
+    from nemo_rl.models.generation.remote_vllm.config import RemoteVllmServiceConfig

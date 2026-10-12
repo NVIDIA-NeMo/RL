@@ -292,6 +292,8 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         should_expose_http_server = generation_config.get("vllm_cfg", {}).get(
             "expose_http_server"
         )
+    elif generation_config["backend"] == "remote_vllm":
+        should_expose_http_server = True
     else:
         should_expose_http_server = False
     assert should_expose_http_server, (
@@ -1767,9 +1769,12 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         # each engine on, so there is no non-HTTP Gym path for this backend.
         generation_config["trtllm_cfg"]["async_engine"] = True
         generation_config["trtllm_cfg"]["expose_http_server"] = True
+    elif generation_config["backend"] == "remote_vllm":
+        # The externally managed server is already OpenAI-compatible.
+        pass
     else:
         raise ValueError(
-            "NeMo-Gym setup supports vllm, dynamo, megatron, or trtllm "
+            "NeMo-Gym setup supports vllm, remote_vllm, dynamo, megatron, or trtllm "
             f"generation; got {generation_config['backend']!r}"
         )
 

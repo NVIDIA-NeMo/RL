@@ -29,6 +29,7 @@ from typing import Any, Optional
 from nemo_rl.models.generation.constants import (
     DYNAMO_BACKEND,
     MEGATRON_BACKEND,
+    REMOTE_VLLM_BACKEND,
     SGLANG_BACKEND,
     TRTLLM_BACKEND,
     VLLM_BACKEND,
@@ -116,6 +117,7 @@ def create_weight_synchronizer(
         MEGATRON_BACKEND,
         DYNAMO_BACKEND,
         TRTLLM_BACKEND,
+        REMOTE_VLLM_BACKEND,
     }
     if generation_backend not in _SUPPORTED_BACKENDS:
         raise ValueError(
@@ -134,6 +136,38 @@ def create_weight_synchronizer(
         colocated=colocated,
         refit_transport=generation.cfg.get("refit_transport"),
     )
+    if generation.cfg.get("refit_transport") == "hf_checkpoint":
+        from nemo_rl.models.policy.draft_config import draft_refit_enabled
+
+        if generation_backend not in {VLLM_BACKEND, REMOTE_VLLM_BACKEND}:
+            raise ValueError("hf_checkpoint refit requires the vLLM backend")
+        if colocated:
+            raise ValueError("hf_checkpoint refit requires non-colocated generation")
+        if not policy.cfg.get("megatron_cfg", {}).get("enabled"):
+            raise NotImplementedError("hf_checkpoint export requires a Megatron policy")
+        if (
+            generation_backend == VLLM_BACKEND
+            and not generation.cfg["vllm_cfg"]["async_engine"]
+        ):
+            raise ValueError("hf_checkpoint refit currently requires async_engine=true")
+        if generation.cfg.get("quant_cfg") or draft_refit_enabled(
+            policy.cfg.get("draft")
+        ):
+            raise NotImplementedError(
+                "hf_checkpoint refit does not support quant_cfg or draft policies"
+            )
+        # Optional vLLM configuration is imported only for this transport.
+        from nemo_rl.models.generation.vllm.config import normalize_vllm_refit_config
+        from nemo_rl.weight_sync.hf_checkpoint_weight_synchronizer import (
+            HfCheckpointWeightSynchronizer,
+        )
+
+        config = normalize_vllm_refit_config(generation.cfg)
+        assert config is not None and config.hf_checkpoint is not None
+        return HfCheckpointWeightSynchronizer(policy, generation, config.hf_checkpoint)
+
+    if generation_backend == REMOTE_VLLM_BACKEND:
+        raise ValueError("remote_vllm requires refit_transport=hf_checkpoint")
 
     # Megatron owns its refit selectors (including "mcore"); the vLLM-oriented
     # checkpoint-engine normalization rejects that valid Megatron value.

@@ -1,0 +1,62 @@
+#!/bin/bash
+# Two-GPU external vLLM + Megatron SingleController/Gym smoke.
+# Run inside an isolated allocation; service GPU and training GPU are disjoint.
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")
+MODEL=${EXTERNAL_VLLM_TEST_MODEL:-Qwen/Qwen3-0.6B}
+RUN_DIR=${EXTERNAL_VLLM_TEST_RUN_DIR:-$SCRIPT_DIR/grpo_external_vllm_gym_single_controller}
+SERVER_PORT=${EXTERNAL_VLLM_TEST_PORT:-19210}
+VLLM_PYTHON=${EXTERNAL_VLLM_TEST_PYTHON:?Set EXTERNAL_VLLM_TEST_PYTHON to the vLLM environment python}
+mkdir -p "$RUN_DIR"
+EXPORT_DIR="$RUN_DIR/hf_exports"
+SERVER_PID=""
+cleanup() {
+    if [[ -n "$SERVER_PID" ]]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+CUDA_VISIBLE_DEVICES=${EXTERNAL_VLLM_TEST_SERVICE_GPU:-1} VLLM_SERVER_DEV_MODE=1 \
+    "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server \
+    --model "$MODEL" --served-model-name policy --port "$SERVER_PORT" \
+    --max-model-len 512 --gpu-memory-utilization 0.7 \
+    --enable-auto-tool-choice --tool-call-parser hermes \
+    > "$RUN_DIR/server.log" 2>&1 &
+SERVER_PID=$!
+ready=0
+for ((attempt=0; attempt<300; attempt++)); do
+    if curl --fail --silent "http://127.0.0.1:$SERVER_PORT/health" >/dev/null; then
+        ready=1
+        break
+    fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        cat "$RUN_DIR/server.log"
+        exit 1
+    fi
+    sleep 2
+done
+[[ "$ready" == 1 ]] || { cat "$RUN_DIR/server.log"; exit 1; }
+if [[ "${EXTERNAL_VLLM_TEST_REQUIRE_PREFIX:-0}" == 1 ]]; then
+    curl --fail --silent "http://127.0.0.1:$SERVER_PORT/v1/nemo-rl/prefix-token-capability" \
+        | jq -e '.active == true and .required_prefix_token_ids == true' >/dev/null
+fi
+CUDA_VISIBLE_DEVICES=${EXTERNAL_VLLM_TEST_TRAIN_GPU:-0} \
+SC_TEST_RUN_DIR="$RUN_DIR/train" \
+    bash "$SCRIPT_DIR/grpo_async_gym_single_controller.sh" \
+    policy.model_name="$MODEL" \
+    policy.generation.backend=remote_vllm \
+    policy.generation.refit_transport=hf_checkpoint \
+    ++policy.generation.refit_cfg.hf_checkpoint.checkpoint_dir="$EXPORT_DIR" \
+    ++policy.generation.remote_vllm_cfg.base_url="http://127.0.0.1:$SERVER_PORT/v1" \
+    ++policy.generation.remote_vllm_cfg.served_model_name=policy \
+    ++policy.generation.remote_vllm_cfg.max_model_len=512 \
+    ++policy.generation.remote_vllm_cfg.refit={} \
+    cluster.gpus_per_node=1 \
+    token_capture.enabled=false \
+    ++env.nemo_gym.policy_model.responses_api_models.vllm_model.return_token_id_information=true \
+    ++env.nemo_gym.policy_model.responses_api_models.vllm_model.request_prompt_and_generation_token_ids=true \
+    ++env.nemo_gym.policy_model.responses_api_models.vllm_model.supply_prefix_token_ids=false \
+    "$@"
