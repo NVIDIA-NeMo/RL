@@ -1345,6 +1345,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         ray.get(futures)
 
+    def export_hf_checkpoint(self, output_path: str) -> None:
+        """Collectively export the live Megatron model as an HF checkpoint."""
+        if not self.cfg.get("megatron_cfg", {}).get("enabled"):
+            raise NotImplementedError(
+                "Live HF checkpoint export currently requires a Megatron policy"
+            )
+        futures = self.worker_group.run_all_workers_single_data(
+            "export_hf_checkpoint", output_path=output_path
+        )
+        ray.get(futures)
+
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""
         futures = self.worker_group.run_all_workers_single_data("offload_before_refit")

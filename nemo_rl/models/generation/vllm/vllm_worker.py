@@ -1406,6 +1406,13 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             traceback.print_exc()
             return False
 
+    def reload_weights(self, weights_path: str) -> bool:
+        """Reload a published HF checkpoint on every TP/PP engine worker."""
+        if self.llm is None:
+            raise RuntimeError("vLLM engine is not initialized")
+        self.llm.collective_rpc("reload_weights", kwargs={"weights_path": weights_path})
+        return True
+
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""
         assert self.llm is not None, (

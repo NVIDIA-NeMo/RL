@@ -4362,6 +4362,27 @@ class MegatronPolicyWorkerImpl(
                             f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
                         )
 
+    def export_hf_checkpoint(self, output_path: str) -> str:
+        """Collectively export the live model through Megatron-Bridge.
+
+        Every model-parallel rank must enter this method because Bridge gathers
+        tensor-, pipeline-, and expert-parallel shards during conversion. Bridge
+        limits filesystem writes to the appropriate rank.
+        """
+        if self.model is None or self.megatron_bridge is None:
+            raise RuntimeError("Megatron model and bridge must be initialized")
+        self.model = self.move_model(
+            self.model, "cuda", move_params=True, move_grads=False
+        )
+        torch.cuda.synchronize()
+        self.megatron_bridge.save_hf_pretrained(
+            [self.model],
+            output_path,
+            show_progress=torch.distributed.get_rank() == 0,
+            strict=True,
+        )
+        return output_path
+
     def save_checkpoint(
         self,
         weights_path: str,

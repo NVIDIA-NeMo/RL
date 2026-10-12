@@ -24,9 +24,12 @@ from pydantic import (
 )
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.weight_sync.hf_checkpoint_config import HfCheckpointRefitConfig
 
 VllmRefitTransportName = Literal["s3", "zmq"]
-VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
+VllmRefitSelector = Literal[
+    "vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard", "hf_checkpoint"
+]
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
 REFITTABLE_FP8_KV_CACHE_DTYPES = frozenset({"fp8", "fp8_e4m3"})
 
@@ -176,6 +179,7 @@ class VllmCheckpointEnginePluginConfig(BaseModel, extra="allow"):
 
 
 class VllmRefitConfig(BaseModel, extra="allow"):
+    hf_checkpoint: HfCheckpointRefitConfig | None = None
     sparse: VllmSparseRefitConfig = Field(default_factory=VllmSparseRefitConfig)
     nixl: VllmNixlRefitConfig = Field(default_factory=VllmNixlRefitConfig)
 
@@ -292,7 +296,7 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     if transport not in get_args(VllmRefitSelector) and ":" not in transport:
         raise ValueError(
             f"Unknown vLLM refit transport {transport!r}: expected null, "
-            "'nccl_reshard', 'vllm_s3_sparse', 'vllm_zmq_sparse', 'nixl', or a "
+            "'hf_checkpoint', 'nccl_reshard', 'vllm_s3_sparse', 'vllm_zmq_sparse', 'nixl', or a "
             "'module:ClassName' checkpoint-engine path."
         )
     # The encoder-cache reset is implemented only on the collective/IPC and
@@ -318,5 +322,9 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
                 f"policy.generation.refit_cfg[{transport!r}]."
             )
         VllmCheckpointEnginePluginConfig.model_validate(plugin_config)
+    if transport == "hf_checkpoint" and refit_config.hf_checkpoint is None:
+        raise ValueError(
+            "hf_checkpoint requires refit_cfg.hf_checkpoint.checkpoint_dir"
+        )
     config["refit_cfg"] = refit_config
     return refit_config

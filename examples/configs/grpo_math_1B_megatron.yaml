@@ -190,6 +190,10 @@ policy:
       data_parallel_sharding_strategy: "optim_grads_params"
 
   generation:
+    # hf_checkpoint publishes live Megatron weights on shared storage for async,
+    # non-colocated vLLM. Null retains the topology's default transport.
+    refit_transport: null
+    refit_cfg: null # hf_checkpoint: {checkpoint_dir: /shared/hf_exports}
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
