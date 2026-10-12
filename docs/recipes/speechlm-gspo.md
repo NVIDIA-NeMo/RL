@@ -1,5 +1,8 @@
 # SpeechLM GSPO
 
+For checkout, environment, data, training, and export instructions, see the
+[SpeechLM GSPO guide](../guides/gspo-speechlm.md).
+
 The registered `asr` processor reads a consumer Parquet row with an
 `audio_filepath` (or `audio_path`), an `instruction` (or `prompt`), and a separate
 `reference` (or `expected_answer`). Audio stays at its consumer path and must be
