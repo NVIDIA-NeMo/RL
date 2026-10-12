@@ -15,6 +15,7 @@ import asyncio
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -101,6 +102,11 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
+# How long Gym servers that outlive RunHelper.shutdown() get to exit after
+# SIGINT before they are killed. It has to fit, with RunHelper.shutdown()'s own
+# waits, in NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S, the caller's budget for the
+# whole actor shutdown.
+NEMO_GYM_LEFTOVER_SERVER_TIMEOUT_S = 10
 
 # The three server-type keys Gym nests under a top-level config entry. Gym's
 # constant is private (nemo_gym.discovery._SERVER_GROUP_KEYS), and the literal
@@ -475,6 +481,63 @@ def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
     if not nemo_gym_config:
         return False
     return bool(nemo_gym_config.get("pad_dynamic_image_shapes"))
+
+
+def _shut_down_gym_servers(run_helper: Any) -> None:
+    """Run Gym's ``RunHelper.shutdown()``, then stop the servers it left running.
+
+    With ``nemo_gym_log_dir`` set, Gym launches each server as
+    ``set -o pipefail; (<server command>) 2>&1 | tee -a <log>`` under bash, and
+    ``RunHelper.shutdown()`` signals only that bash process. The server never
+    sees the signal and outlives it, reparented away from this process, along
+    with any placement group it created as a Ray driver, such as a local vLLM
+    judge's GPUs. Ray kills only an actor's direct children when the actor
+    exits, so nothing else stops them on a cluster without process-group
+    cleanup.
+
+    So each server's process tree is recorded first, and whatever is left after
+    Gym's shutdown is interrupted, as Gym itself would, and killed if it ignores
+    that. ``tee`` is left to exit at EOF so the log keeps the servers' shutdown
+    output. Without ``nemo_gym_log_dir`` Gym's shutdown leaves nothing behind
+    and this adds nothing.
+
+    Args:
+        run_helper: The Gym ``RunHelper`` that started the servers.
+    """
+    # Deferred: psutil comes with nemo_gym, which only the Gym actor's venv is
+    # guaranteed to have.
+    import psutil
+
+    # Recorded before RunHelper.shutdown(), which clears _processes. Gym has no
+    # public accessor for the processes it launched.
+    # TODO: switch to a public RunHelper accessor once Gym provides one.
+    gym_processes: list[psutil.Process] = []
+    for popen in run_helper._processes.values():
+        try:
+            root = psutil.Process(popen.pid)
+            gym_processes += [root, *root.children(recursive=True)]
+        except psutil.NoSuchProcess:
+            continue
+
+    try:
+        run_helper.shutdown()
+    finally:
+        leftover = []
+        for process in gym_processes:
+            try:
+                if process.name() != "tee":
+                    process.send_signal(signal.SIGINT)
+            except psutil.NoSuchProcess:
+                continue
+            leftover.append(process)
+        _, still_alive = psutil.wait_procs(
+            leftover, timeout=NEMO_GYM_LEFTOVER_SERVER_TIMEOUT_S
+        )
+        for process in still_alive:
+            try:
+                process.kill()
+            except psutil.NoSuchProcess:
+                pass
 
 
 # Fail fast rather than restart. The servers this actor owns are started in
@@ -1446,11 +1509,14 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         RunHelper.shutdown() is not idempotent, so the handle is cleared before
         it is used. A failure therefore cannot leave a live handle that a later
         cleanup attempt invokes again.
+
+        Servers that RunHelper.shutdown() leaves running are stopped as well;
+        see _shut_down_gym_servers.
         """
         try:
             rh, self.rh = self.rh, None
             if rh is not None:
-                rh.shutdown()
+                _shut_down_gym_servers(rh)
         finally:
             # Ray reaps this actor, so no atexit handler runs: whatever the span
             # processor is still holding is dropped unless it is flushed here.
