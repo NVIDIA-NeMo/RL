@@ -53,8 +53,11 @@ must update and reverify these coupled locations:
   and resolved dependency set
 - root `pyproject.toml` and `uv.lock`, plus the isolated Dynamo project and
   lockfile: the `nvidia-nccl-cu13` pins must remain identical
-- `docker/dynamo/install.sh` and `tests/functional/grpo_dynamo.sh`: the vLLM
-  version, backport marker, and runtime assertions
+- `docker/dynamo/install.sh`, `tests/functional/grpo_dynamo.sh`, and
+  `tests/test_suites/llm/grpo-qwen3-0.6b-1n8g-dtensor2tp1-dynamo-disagg.sh`:
+  the vLLM version, backport marker, and runtime assertions. The P/D nightly
+  also greps for vLLM 0.23.0's decode-side `NIXL compatibility check passed`
+  log line; reverify that string against the new vLLM release
 - `docker/dynamo/patches/vllm-0.23.0-layerwise-reload-composed-loader.patch`:
   the version-specific #44814 backport
 - `tests/unit/distributed/test_stateless_process_group.py`: vLLM's
