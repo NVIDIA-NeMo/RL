@@ -1010,46 +1010,59 @@ class TestSandboxedAgentDebugInfo:
 
 class TestBehaviorRolloutMetrics:
     @staticmethod
-    def _info(masked=False, **flags):
-        behavior = {flag: flags.get(flag, False) for flag in BEHAVIOR_FLAGS}
-        return {"behavior": behavior, "mask_sample": masked}
+    def _info(**flags):
+        return {"behavior": {flag: flags.get(flag, False) for flag in BEHAVIOR_FLAGS}}
 
-    def test_rates_over_reporting_rollouts_and_rewarded_trained_share(self):
+    def test_counts_flagged_rollouts(self):
         infos = [
-            # rewarded, trained
             self._info(upstream_fetch_ok=True, gold_copied_external=True),
-            self._info(masked=True, upstream_fetch_ok=True),  # rewarded but masked
-            self._info(net_blocked_legit=True),  # unrewarded
-            {"behavior": None, "mask_sample": False},  # agent reported nothing
+            self._info(upstream_fetch_ok=True),
+            self._info(net_blocked_legit=True),
+            {"behavior": None},  # agent reported nothing
         ]
-        metrics = behavior_rollout_metrics(infos, [1.0, 1.0, 0.0, 1.0])
-        assert metrics["behavior/upstream_fetch_ok/sum"] == 2
-        assert metrics["behavior/upstream_fetch_ok/count"] == 3
-        assert metrics["behavior/net_blocked_legit/sum"] == 1
-        assert metrics["behavior_rewarded_trained/upstream_fetch_ok/sum"] == 1
-        assert metrics["behavior_rewarded_trained/gold_copied_external/count"] == 1
-        assert metrics["behavior_rewarded_trained/net_blocked_legit/sum"] == 0
+        metrics = behavior_rollout_metrics(infos)
+        assert set(metrics) == {
+            f"behavior_flagged/{flag}/count" for flag in BEHAVIOR_FLAGS
+        }
+        assert metrics["behavior_flagged/upstream_fetch_ok/count"] == 2
+        assert metrics["behavior_flagged/gold_copied_external/count"] == 1
+        assert metrics["behavior_flagged/net_blocked_legit/count"] == 1
+        assert metrics["behavior_flagged/test_deleted/count"] == 0
 
     def test_groups_without_flags_emit_nothing(self):
-        assert behavior_rollout_metrics([{"behavior": None}], [1.0]) == {}
+        assert behavior_rollout_metrics([{"behavior": None}]) == {}
 
-    def test_cross_group_aggregation_gives_exact_rates(self):
-        group_a = behavior_rollout_metrics(
-            [self._info(upstream_fetch_attempt=True)], [0.0]
-        )
-        group_b = behavior_rollout_metrics(
-            [self._info(), self._info(), self._info(upstream_fetch_attempt=True)],
-            [1.0, 0.0, 1.0],
-        )
+    def test_cross_group_totals_and_pct_of_batch(self):
+        group_a = {
+            "rollouts/count": 1,
+            **behavior_rollout_metrics([self._info(upstream_fetch_attempt=True)]),
+        }
+        group_b = {
+            "rollouts/count": 4,
+            **behavior_rollout_metrics(
+                [
+                    self._info(),
+                    self._info(),
+                    self._info(upstream_fetch_attempt=True),
+                    {"behavior": None},
+                ]
+            ),
+        }
         per_group = {}
         for group in (group_a, group_b):
             for key, value in group.items():
                 per_group.setdefault(key, []).append(value)
         out = aggregate_rollout_metrics_with_sum_counts(per_group, lambda rest: {})
-        assert out["behavior/upstream_fetch_attempt/mean"] == pytest.approx(2 / 4)
-        rewarded_trained = out["behavior_rewarded_trained/upstream_fetch_attempt/mean"]
-        assert rewarded_trained == pytest.approx(1 / 2)
-        assert "behavior/upstream_fetch_attempt/rate" not in out
+        assert out["behavior_flagged/upstream_fetch_attempt/count"] == 2
+        # Share of the whole batch (5 rollouts), including the one that reported no flags.
+        assert out[
+            "behavior_flagged/upstream_fetch_attempt/pct_of_batch"
+        ] == pytest.approx(40.0)
+        assert out["behavior_flagged/test_deleted/pct_of_batch"] == 0
+        assert not any(
+            k.startswith("behavior/") or "rewarded_trained" in k for k in out
+        )
+        assert "behavior_flagged/upstream_fetch_attempt/mean" not in out
 
 
 class TestCaptureRolloutDebugTag:

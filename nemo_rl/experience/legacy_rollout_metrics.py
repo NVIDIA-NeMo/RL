@@ -378,33 +378,25 @@ def compaction_rollout_metrics(
 
 
 def behavior_rollout_metrics(
-    rollout_infos: Sequence[Mapping[str, Any]], rewards: Sequence[float]
+    rollout_infos: Sequence[Mapping[str, Any]],
 ) -> dict[str, float]:
-    """Per-prompt-group behaviour-flag rates as exact ``/sum`` + ``/count`` pairs.
+    """Per-prompt-group behaviour-flag counts.
 
-    Over rollouts that report flags (``rollout_debug_info(...)["behavior"]``):
-    ``behavior/{flag}/sum`` = rollouts with the flag, ``/count`` = rollouts reporting
-    (finalized ``/mean`` = rate). ``behavior_rewarded_trained/{flag}/{sum,count}`` is the
-    same over rollouts with reward > 0 that are not env-masked, i.e. the flag's share of
-    the reward signal that trains. Empty when no rollout in the group reports flags.
+    ``behavior_flagged/{flag}/count`` = rollouts in the group with the flag set
+    (``rollout_debug_info(...)["behavior"]``). Summed over groups it is the number of
+    flagged samples in the step; :func:`finalize_sum_count_metrics` adds
+    ``behavior_flagged/{flag}/pct_of_batch`` = 100 * flagged / ``rollouts/count``.
+    Empty when no rollout in the group reports flags.
     """
     reported = [
-        (info["behavior"], float(reward) > 0 and not info.get("mask_sample"))
-        for info, reward in zip(rollout_infos, rewards)
-        if info.get("behavior") is not None
+        info["behavior"] for info in rollout_infos if info.get("behavior") is not None
     ]
     if not reported:
         return {}
-    rewarded_trained = [flags for flags, trained in reported if trained]
-    metrics: dict[str, float] = {}
-    for flag in BEHAVIOR_FLAGS:
-        metrics[f"behavior/{flag}/sum"] = sum(1 for flags, _ in reported if flags[flag])
-        metrics[f"behavior/{flag}/count"] = len(reported)
-        metrics[f"behavior_rewarded_trained/{flag}/sum"] = sum(
-            1 for flags in rewarded_trained if flags[flag]
-        )
-        metrics[f"behavior_rewarded_trained/{flag}/count"] = len(rewarded_trained)
-    return metrics
+    return {
+        f"behavior_flagged/{flag}/count": sum(1 for flags in reported if flags[flag])
+        for flag in BEHAVIOR_FLAGS
+    }
 
 
 def trace_kind_metrics(
@@ -760,7 +752,7 @@ def _aggregate_group(
         "mask_sample_rate": sum(1 for info in rollout_infos if info["mask_sample"])
         / batch_size,
         **compaction_rollout_metrics(rollout_infos, prepared["total_rewards"]),
-        **behavior_rollout_metrics(rollout_infos, prepared["total_rewards"]),
+        **behavior_rollout_metrics(rollout_infos),
         **trace_kind_metrics(
             trace_kinds,
             turns_per_trace,

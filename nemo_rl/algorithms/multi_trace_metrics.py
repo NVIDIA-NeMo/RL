@@ -44,6 +44,8 @@ _RATE_COUNT_KEYS: frozenset[str] = frozenset(
     {"format/think_tag_violation/count", "reward/masked_resolved/count"}
 )
 ROLLOUT_COUNT_KEY = "rollouts/count"
+# Flag counters that also get `/pct_of_batch` (= 100 * count / rollouts/count).
+_PCT_OF_BATCH_PREFIXES: tuple[str, ...] = ("behavior_flagged/",)
 
 # Segment kinds (``legacy_rollout_metrics.trace_kind``) that only occur in a
 # rollout that compacted at least once. The compacted/uncompacted
@@ -322,7 +324,8 @@ def finalize_sum_count_metrics(aggregated: dict) -> dict:
     (the ``/count`` key is kept). For rollout-level event counters
     (``termination/*/count``, ``mask_sample/by_kind/*/count``,
     ``format/think_tag_violation/count``, ``reward/masked_resolved/count``) also
-    emit ``X/rate = count / rollouts/count`` when ``rollouts/count > 0``.
+    emit ``X/rate = count / rollouts/count`` when ``rollouts/count > 0``; for
+    ``behavior_flagged/*/count`` emit ``X/pct_of_batch = 100 * count / rollouts/count``.
 
     Keys not matching those patterns pass through untouched. Never emits NaN.
     """
@@ -347,4 +350,8 @@ def finalize_sum_count_metrics(aggregated: dict) -> dict:
                 continue
             if key in _RATE_COUNT_KEYS or key.startswith(_RATE_COUNT_PREFIXES):
                 out[key[: -len("/count")] + "/rate"] = value / num_rollouts
+            if key.startswith(_PCT_OF_BATCH_PREFIXES):
+                out[key[: -len("/count")] + "/pct_of_batch"] = (
+                    100.0 * value / num_rollouts
+                )
     return out
