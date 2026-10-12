@@ -332,6 +332,8 @@ policy:
     _v2: true
     activation_checkpointing: true
     expert_parallel_size: 8
+    moe_parallelizer:
+      ignore_router_for_ac: true
   optimizer:
     kwargs:
       lr: 1.0e-06
