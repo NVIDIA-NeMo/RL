@@ -19,7 +19,7 @@ import subprocess
 import sys
 import threading
 from collections import Counter
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Mapping, MutableMapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -1512,6 +1512,33 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 ########################################
 
 
+def _gym_policy_model_overlay(
+    nemo_gym_cfg: MutableMapping[str, Any],
+) -> MutableMapping[str, Any]:
+    """Return the Gym policy model's ``vllm_model`` overlay, creating it if needed.
+
+    A sharded job must claim every top-level Gym overlay, so when it has no
+    top-level ``policy_model`` the overlay goes in ``common_overrides``, which
+    reaches every shard. A null level is treated as empty.
+
+    Raises:
+        ValueError: A level of the overlay is neither a mapping nor null.
+    """
+    overlay_root = nemo_gym_cfg
+    if "shards" in nemo_gym_cfg and nemo_gym_cfg.get(_POLICY_SERVER_NAME) is None:
+        if nemo_gym_cfg.get("common_overrides") is None:
+            nemo_gym_cfg["common_overrides"] = {}
+        overlay_root = nemo_gym_cfg["common_overrides"]
+    node = overlay_root
+    for key in (_POLICY_SERVER_NAME, "responses_api_models", "vllm_model"):
+        if node.get(key) is None:
+            node[key] = {}
+        node = node[key]
+        if not isinstance(node, MutableMapping):
+            raise ValueError(f"env.nemo_gym {key} overlay must be a mapping or null.")
+    return node
+
+
 def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
@@ -1538,12 +1565,9 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         # Gym's vllm_model then sends its session ID as
         # conversation_params.conversation_id. The Dynamo token wrapper strips
         # that field and forwards the ID as Dynamo's session header.
-        model_config = (
-            config.env.setdefault("nemo_gym", {})
-            .setdefault("policy_model", {})
-            .setdefault("responses_api_models", {})
-            .setdefault("vllm_model", {})
-        )
+        if config.env.get("nemo_gym") is None:
+            config.env["nemo_gym"] = {}
+        model_config = _gym_policy_model_overlay(config.env["nemo_gym"])
         model_config["forward_session_id_as_conversation_id"] = True
 
     # For VLM runs, plumb the tokenizer config into the gym env config so the
