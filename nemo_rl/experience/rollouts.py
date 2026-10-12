@@ -2000,11 +2000,14 @@ def get_nemo_gym_max_infra_attempts(env_config: dict[str, Any]) -> int:
     Reads ``env.nemo_gym.max_infra_attempts_per_rollout``; an absent or null key
     means ``DEFAULT_MAX_INFRA_ATTEMPTS_PER_ROLLOUT``. The value must be at least 1.
 
-    This budget governs the driver path (``run_async_nemo_gym_rollout``) only.
-    The asynchronous collector re-dispatches a failure-marker row through its
-    own attempt loop, budgeted by ``rollout_manager.RolloutRetryPolicy``'s
-    ``max_gym_row_attempts``, and whole-attempt failures there are budgeted by
-    its ``max_attempts_per_prompt``; the three are deliberately separate knobs.
+    This budget governs every caller of ``run_async_nemo_gym_rollout``
+    (synchronous GRPO, the asynchronous trajectory collector, PPO,
+    distillation). The single-controller path
+    (``rollout_manager.AsyncNemoGymRolloutImpl``) re-dispatches a
+    failure-marker row through its own attempt loop, budgeted by
+    ``RolloutRetryPolicy.max_gym_row_attempts``, and whole-attempt failures
+    there are budgeted by its ``max_attempts_per_prompt``; the three are
+    deliberately separate knobs.
     """
     nemo_gym_config = env_config.get("nemo_gym")
     value = (
@@ -2544,9 +2547,9 @@ async def _merge_nemo_gym_instance_streams(
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
     *,
-    record_infra_failure: Optional[Callable[[int, str], dict]] = None,
-    record_timing: Optional[Callable[[str, dict], None]] = None,
-) -> AsyncGenerator[tuple[int, dict, dict, dict | None, str], None]:
+    record_infra_failure: Callable[[int, str], dict],
+    record_timing: Callable[[str, dict], None],
+) -> AsyncGenerator[tuple[int, dict, dict, str], None]:
     """Interleave K actor streams into one, yielding rows as they complete.
 
     ``run_rollouts`` is a streaming generator, so there is nothing to gather:
@@ -2554,27 +2557,26 @@ async def _merge_nemo_gym_instance_streams(
     accumulator that already exists. With a single bucket it degenerates to
     that one stream, which is what keeps the unsharded path unchanged.
 
-    With ``record_infra_failure`` set, a failure-marker row
-    (``GYM_INFRA_FAILURE_KEY``) is not yielded: the accounted row is dispatched
-    again as a fresh single-row stream on the instance that produced the
-    failure, and ``record_infra_failure`` raises once the row's attempts are
-    used up. The retry stays on its own instance because bucketing is by
-    prompt group (see ``_bucket_nemo_gym_rows_by_instance``): a group split
-    across instances deadlocks any verifier that buffers whole groups. The
-    instance is also not the failed component in the dead-engine case -- every
-    instance holds the same engine ``base_urls`` and Gym picks the engine per
-    request.
+    A failure-marker row (``GYM_INFRA_FAILURE_KEY``) is not yielded: the
+    accounted row is dispatched again as a fresh single-row stream on the
+    instance that produced the failure, and ``record_infra_failure`` raises
+    once the row's attempts are used up. The retry stays on its own instance
+    because bucketing is by prompt group (see
+    ``_bucket_nemo_gym_rows_by_instance``): a group split across instances
+    deadlocks any verifier that buffers whole groups. The instance is also not
+    the failed component in the dead-engine case -- every instance holds the
+    same engine ``base_urls`` and Gym picks the engine per request.
 
-    With ``record_timing`` set, every timing payload a stream delivers is
-    handed to it under that stream's label as it arrives, failure markers
-    included; a marker is never yielded, so the callback is the only channel
-    that delivers a timing payload attached to one. A retry stream reports
-    under ``<instance_label>/retry<n>``, so a one-row retry never replaces its
-    bucket's totals.
+    Every timing payload a stream delivers is handed to ``record_timing``
+    under that stream's label as it arrives, failure markers included. A
+    marker is never yielded, so the callback is the only timing channel; a
+    retry stream reports under ``<instance_label>/retry<n>``, so a one-row
+    retry never replaces its bucket's totals. Both callbacks are required:
+    the actor always returns a failed ``/run`` as a marker, so a merge that
+    yielded one would hand the consumer a row with no message log.
 
     Yields:
-        ``(row_index, resolved_agent_ref, result, timing_metrics, instance_label)``.
-        ``timing_metrics`` is non-None only on the last row of each stream.
+        ``(row_index, resolved_agent_ref, result, instance_label)``.
     """
     iterators: dict[Any, str] = {}
     streams_by_iterator: dict[Any, Any] = {}
@@ -2644,9 +2646,9 @@ async def _merge_nemo_gym_instance_streams(
                         enabled=debug_payload_metrics,
                     )
                 )
-                if record_timing is not None and timing_metrics is not None:
+                if timing_metrics is not None:
                     record_timing(timing_labels_by_iterator[iterator], timing_metrics)
-                if record_infra_failure is not None and GYM_INFRA_FAILURE_KEY in result:
+                if GYM_INFRA_FAILURE_KEY in result:
                     # Raises GymTransportError once the row's attempts are used up.
                     row = record_infra_failure(row_index, result[GYM_INFRA_FAILURE_KEY])
                     print(
@@ -2665,13 +2667,7 @@ async def _merge_nemo_gym_instance_streams(
                     )
                     pending[asyncio.ensure_future(anext(iterator))] = iterator
                     continue
-                yield (
-                    row_index,
-                    resolved_agent_ref,
-                    result,
-                    timing_metrics,
-                    instance_label,
-                )
+                yield (row_index, resolved_agent_ref, result, instance_label)
                 pending[asyncio.ensure_future(anext(iterator))] = iterator
         if first_failure is not None:
             instance_label, error = first_failure
@@ -2708,8 +2704,11 @@ def _merge_nemo_gym_timing_metrics(
     batch-wide average, which is the honest reading -- averaging percentages
     over instances with different row counts would not mean anything.
 
-    With one instance this returns exactly what it reported, so the unsharded
-    path is unchanged.
+    With one label this returns exactly what it reported, so an unsharded step
+    without a re-dispatch is unchanged. A re-dispatched row adds a
+    ``<instance_label>/retry<n>`` label (see
+    ``_merge_nemo_gym_instance_streams``), so such a step reports per-label
+    keys and the roll-up is the maximum over the bucket and its retries.
     """
     if len(timing_by_instance) <= 1:
         return dict(next(iter(timing_by_instance.values()), {}))
@@ -2971,7 +2970,6 @@ async def run_async_nemo_gym_rollout(
                         rowidx,
                         resolved_agent_ref,
                         result,
-                        _timing_metrics,
                         _instance_label,
                     ) = await anext(rollout_iterator)
                 except StopAsyncIteration:

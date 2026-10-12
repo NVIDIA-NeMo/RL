@@ -3236,6 +3236,42 @@ def test_redispatched_row_stays_on_its_own_replica(monkeypatch):
     assert replica_b.dispatched_rows == []
 
 
+def test_run_async_nemo_gym_rollout_retries_a_failed_retry_under_its_own_label(
+    monkeypatch,
+):
+    """A retry stream can itself report a marker. The row is dispatched again on
+    the same instance while the budget lasts, each retry stream reports its
+    timing under its own ``retry<n>`` label, and the bucket's totals survive."""
+    rows = [_gym_row(), _gym_row()]
+    marker = {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"}
+    actor = _FakeGymActor(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _gym_result(0), None),
+                (1, {"name": "agent"}, marker, {"timing/remote": 100.0}),
+            ],
+            [(1, {"name": "agent"}, marker, {"timing/remote": 5.0})],
+            [(1, {"name": "agent"}, _gym_result(1), {"timing/remote": 1.0})],
+        ]
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+
+    results = asyncio.run(
+        _collect_gym_rollout(actor, rows, max_infra_attempts_per_rollout=3)
+    )
+
+    assert actor.dispatched_rows == [rows, [rows[1]], [rows[1]]]
+    assert len(results) == 1
+    metrics = results[0].rollout_metrics
+    assert metrics["nemo_gym_infra_redispatches"] == 2
+    assert metrics["timing/remote"] == 100.0
+    assert metrics["timing/rollout/shard/nemo_gym/timing/remote"] == 100.0
+    assert metrics["timing/rollout/shard/nemo_gym/retry1/timing/remote"] == 5.0
+    assert metrics["timing/rollout/shard/nemo_gym/retry2/timing/remote"] == 1.0
+
+
 def test_run_async_nemo_gym_rollout_raises_when_infra_attempts_are_exhausted(
     monkeypatch,
 ):
