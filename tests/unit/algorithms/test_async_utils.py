@@ -169,6 +169,16 @@ class TestReplayBufferImplCheckpointing:
         )
         assert buffer.get_trajectories_needed(1, 2, max_age_steps) == 1
 
+        # Older trajectories count toward a future target only within its age window.
+        buffer.add(
+            {"batch": {"data": 3}, "rollout_metrics": {}},
+            weight_version=0,
+            target_weight_version=2,
+        )
+        assert buffer.get_trajectories_needed(2, 2, max_age_steps) == (
+            2 if max_age_steps == 1 else 1
+        )
+
     def _state(
         self,
         trajectory_versions: list[int],
