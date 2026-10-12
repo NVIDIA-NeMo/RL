@@ -14,6 +14,7 @@
 
 """Install required-prefix-token processing on a vLLM OnlineRenderer."""
 
+import asyncio
 from copy import deepcopy
 from types import MethodType
 from typing import Any
@@ -45,6 +46,7 @@ def _message_role(message: Any) -> str | None:
 def install_renderer_patch(
     online_renderer: Any,
     validation_error_type: type[Exception],
+    capture_runtime: Any | None = None,
 ) -> bool:
     """Wrap ``preprocess_chat`` once and return whether a patch was installed."""
     if getattr(online_renderer, _PATCH_MARKER, False):
@@ -68,6 +70,25 @@ def install_renderer_patch(
         reuses_prefill_prompt = isinstance(kv_transfer_params, dict) and bool(
             kv_transfer_params.get("prompt_token_ids")
         )
+        admission = getattr(request, "ng_capture", None)
+        capture_prefix_token_ids: list[int] = []
+        if admission is not None:
+            if capture_runtime is None:
+                raise RuntimeError("ng_capture is unavailable on this vLLM endpoint")
+            if not isinstance(admission, dict):
+                admission = admission.model_dump(mode="json")
+            prefill_prompt_token_ids = (
+                list(kv_transfer_params["prompt_token_ids"])
+                if reuses_prefill_prompt
+                else None
+            )
+            capture_prefix_token_ids = await asyncio.to_thread(
+                capture_runtime.resolve_prefix,
+                admission,
+                prefill_prompt_token_ids=prefill_prompt_token_ids,
+            )
+            if admission.get("mode") == "token_in":
+                request.required_prefix_token_ids = capture_prefix_token_ids
         required_prefix_token_ids = getattr(request, "required_prefix_token_ids", None)
         messages_for_prefix_render = deepcopy(messages)
         actual_max_tokens = _get_request_max_tokens(request)
@@ -147,6 +168,19 @@ def install_renderer_patch(
                     )
                 _set_request_max_tokens(
                     request, min(actual_max_tokens, remaining_tokens)
+                )
+
+            is_pd_prefill = (
+                isinstance(kv_transfer_params, dict)
+                and bool(kv_transfer_params.get("do_remote_decode"))
+                and not reuses_prefill_prompt
+            )
+            if admission is not None and not is_pd_prefill:
+                capture_runtime.record_prompt(
+                    request,
+                    admission=admission,
+                    prefix_token_ids=capture_prefix_token_ids,
+                    prompt_token_ids=final_prompt_token_ids,
                 )
 
             return result

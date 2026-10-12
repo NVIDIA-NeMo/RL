@@ -68,6 +68,10 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXTRAS_METADATA_FIELD,
     ROUTED_LEN_FIELD,
 )
+from nemo_rl.data_plane.token_staging_wire import (
+    StagedTokenRecord,
+    StagingWriteResult,
+)
 from nemo_rl.experience.route_assembly import RouteFragment, boundary_route_rows
 
 # These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
@@ -460,6 +464,23 @@ class TQTokenSink:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
 
+        result = self._stage_record(record, attachments=attachments)
+        return StageResult(
+            ok=result.ok,
+            staging_key=result.staging_key,
+            error=result.error,
+        )
+
+    def stage_wire(self, record: StagedTokenRecord) -> StagingWriteResult:
+        """Stage a dependency-neutral record from an external serving bridge."""
+        return self._stage_record(record)
+
+    def _stage_record(
+        self,
+        record: StagedCallRecord | StagedTokenRecord,
+        *,
+        attachments: Mapping[str, Any] | None = None,
+    ) -> StagingWriteResult:
         key = record.staging_key
         write_started = False
         try:
@@ -621,10 +642,10 @@ class TQTokenSink:
             )
             if write_started:
                 self._discard_failed_write(key)
-            return StageResult(
+            return StagingWriteResult(
                 ok=False, staging_key=key, error=f"{type(error).__name__}: {error}"
             )
-        return StageResult(ok=True, staging_key=key)
+        return StagingWriteResult(ok=True, staging_key=key)
 
     def _discard_failed_write(self, key: str) -> None:
         """Reclaim whatever a failed combined write may have left behind.

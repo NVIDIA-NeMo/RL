@@ -13,12 +13,15 @@
 # limitations under the License.
 
 import json
+import threading
 import urllib.request
 from types import SimpleNamespace
+
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from ray import cloudpickle
 from pydantic import TypeAdapter, ValidationError
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
@@ -291,3 +294,66 @@ def test_generation_refit_lifecycle_forwards_controller_deadlines() -> None:
     )
     assert generation.resume_generation_after_refit(timeout_s=4.0)
     generation.client.resume.assert_called_once_with(timeout_s=4.0)
+
+
+def test_token_capture_configuration_uses_service_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[urllib.request.Request] = []
+
+    def urlopen(request: urllib.request.Request, timeout: float) -> _Response:
+        requests.append(request)
+        return _Response({"status": "ok", "fanout_backends": 8})
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    config = _config()
+
+    RemoteVllmClient(config).configure_token_capture(
+        bridge_url="http://10.0.0.1:12345",
+        auth_token="secret",
+    )
+
+    assert requests[0].full_url == (
+        "http://rollout.test:9210/v1/nemo-rl/token-capture/configure"
+    )
+    assert json.loads(requests[0].data or b"") == {
+        "bridge_url": "http://10.0.0.1:12345",
+        "auth_token": "secret",
+    }
+
+
+def test_generation_serializes_bridge_coordinates_not_live_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnpicklableBridge:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+
+    generation = RemoteVllmGeneration({"remote_vllm_cfg": _config().model_dump()})
+    live_bridge = UnpicklableBridge()
+    generation._token_capture_bridge = live_bridge  # type: ignore[assignment]
+    generation._token_capture_bridge_url = "http://10.0.0.1:12345"
+    generation._token_capture_auth_token = "secret"
+
+    restored = cloudpickle.loads(cloudpickle.dumps(generation))
+
+    assert generation._token_capture_bridge is live_bridge
+    assert restored._token_capture_bridge is None
+    assert restored._token_capture_bridge_url == "http://10.0.0.1:12345"
+    assert restored._token_capture_auth_token == "secret"
+
+    requests: list[urllib.request.Request] = []
+
+    def urlopen(request: urllib.request.Request, timeout: float) -> _Response:
+        assert timeout == 30.0
+        requests.append(request)
+        return _Response({"weight_version": 7})
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    restored.set_rollout_weight_version(7)
+
+    assert requests[0].full_url == (
+        "http://10.0.0.1:12345/v1/nemo-rl/token-capture/weight-version"
+    )
+    assert requests[0].headers["Authorization"] == "Bearer secret"
+    assert json.loads(requests[0].data or b"") == {"weight_version": 7}

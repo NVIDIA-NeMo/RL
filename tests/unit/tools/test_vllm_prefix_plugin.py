@@ -28,6 +28,7 @@ core_utils = importlib.util.module_from_spec(core_utils_spec)
 core_utils_spec.loader.exec_module(core_utils)
 core_replace_prefix_tokens = core_utils.replace_prefix_tokens
 
+from nemo_rl_vllm_prefix_plugin.capture_runtime import CaptureRuntime  # noqa: E402
 from nemo_rl_vllm_prefix_plugin.prefix import (  # noqa: E402
     replace_prefix_tokens as plugin_replace_prefix_tokens,
 )
@@ -217,11 +218,45 @@ async def test_renderer_patch_restores_requested_length_after_render_failure():
     assert request.max_completion_tokens == 42
 
 
+@pytest.mark.asyncio
+async def test_renderer_patch_resolves_ng_capture_and_records_engine_prompt():
+    renderer = _OnlineRenderer(max_model_len=8)
+    capture_runtime = _CaptureRuntimeForRenderer()
+    install_renderer_patch(renderer, _ValidationError, capture_runtime)
+    request = _Request(None)
+    request.ng_capture = {"mode": "token_in", "prev_len": 4}
+
+    _, engine_inputs = await renderer.preprocess_chat(
+        request,
+        [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "second"},
+        ],
+        default_template=None,
+        default_template_content_format="auto",
+        default_template_kwargs=None,
+    )
+
+    assert engine_inputs[0]["prompt_token_ids"] == [10, 200, 201, 2, 20, 21]
+    assert request.required_prefix_token_ids == [10, 200, 201, 2]
+    assert capture_runtime.recorded == [
+        (
+            request,
+            {
+                "admission": request.ng_capture,
+                "prefix_token_ids": [10, 200, 201, 2],
+                "prompt_token_ids": [10, 200, 201, 2, 20, 21],
+            },
+        )
+    ]
+
+
 def test_plugin_metadata_registers_vllm_endpoint_plugin():
     metadata = tomllib.loads((PLUGIN_ROOT / "pyproject.toml").read_text())
 
     assert metadata["project"]["dependencies"] == ["vllm==0.29.0"]
-    assert metadata["project"]["version"] == "0.1.0"
+    assert metadata["project"]["version"] == "0.2.0"
     assert metadata["project"]["entry-points"]["vllm.endpoint_plugins"] == {
         "nemo_rl_prefix_api": (
             "nemo_rl_vllm_prefix_plugin.plugin:NeMoRLPrefixEndpointPlugin"
@@ -264,3 +299,70 @@ class _CaptureBridge:
     def commit(self, body):
         self.commits.append(body)
         return {"disposition": "staged", "staging_key": "call-2"}
+
+
+def test_capture_runtime_fetches_staged_prefix_and_commits_exact_tokens():
+    runtime = CaptureRuntime()
+    bridge = _CaptureBridge()
+    runtime._bridge = bridge
+    admission = {
+        "mode": "token_in",
+        "prev_len": 3,
+        "required_prefix_token_ids": [],
+        "staging_chain": ["call-0", "call-1"],
+    }
+    request = object()
+
+    prefix = runtime.resolve_prefix(admission, prefill_prompt_token_ids=None)
+    runtime.record_prompt(
+        request,
+        admission=admission,
+        prefix_token_ids=prefix,
+        prompt_token_ids=[10, 11, 12, 20],
+    )
+    content = {
+        "choices": [
+            {
+                "message": {"content": "done"},
+                "logprobs": {
+                    "content": [
+                        {"token": "token_id:30", "logprob": -0.1},
+                        {"token": "31", "logprob": -0.2},
+                    ]
+                },
+            }
+        ]
+    }
+
+    result = runtime.finish(request, content)
+
+    assert result["ng_commit_coords"] == {
+        "disposition": "staged",
+        "staging_key": "call-2",
+    }
+    assert "logprobs" not in result["choices"][0]
+    assert bridge.commits == [
+        {
+            "admission": admission,
+            "prefix_token_ids": [10, 11, 12],
+            "prompt_token_ids": [10, 11, 12, 20],
+            "generated_token_ids": [30, 31],
+            "generated_logprobs": [-0.1, -0.2],
+            "extras": None,
+        }
+    ]
+
+
+def test_capture_runtime_reuses_pd_prefill_prompt_as_prefix():
+    runtime = CaptureRuntime()
+    admission = {
+        "mode": "token_in",
+        "prev_len": 3,
+        "required_prefix_token_ids": [],
+        "staging_chain": ["not-fetched"],
+    }
+
+    assert runtime.resolve_prefix(
+        admission,
+        prefill_prompt_token_ids=[10, 11, 12, 20, 21],
+    ) == [10, 11, 12]

@@ -1378,9 +1378,9 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] not in ("vllm", "megatron"):
+        if generation_config["backend"] not in ("vllm", "remote_vllm", "megatron"):
             raise NotImplementedError(
-                "token_capture.enabled supports vllm or megatron; got "
+                "token_capture.enabled supports vllm, remote_vllm, or megatron; got "
                 f"{generation_config['backend']!r}"
             )
         if (
@@ -2165,11 +2165,19 @@ def setup_single_controller(
     # Mooncake memory owners when storage_unit_segment_size > 0.
     storage_units = start_storage_units(dp_config, storage_unit_node_ids)
     if token_capture_cfg.enabled:
-        media_columns = generation.setup_token_capture(
-            dp_config,
-            token_capture_cfg.staging_partition,
-            capture_media=capture_media,
-        )
+        if generation_config["backend"] == "remote_vllm":
+            media_columns = generation.setup_token_capture(
+                dp_config,
+                token_capture_cfg.staging_partition,
+                dp_client=dp_client,
+                capture_media=capture_media,
+            )
+        else:
+            media_columns = generation.setup_token_capture(
+                dp_config,
+                token_capture_cfg.staging_partition,
+                capture_media=capture_media,
+            )
         if capture_media and media_columns is None:
             raise RuntimeError(
                 "media capture is enabled but no serving worker reported the "

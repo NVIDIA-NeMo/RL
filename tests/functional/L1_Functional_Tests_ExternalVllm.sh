@@ -26,3 +26,4 @@ if [[ -z "${EXTERNAL_VLLM_TEST_PYTHON:-}" ]]; then
 fi
 time uv run --no-sync bash "$SCRIPT_DIR/grpo_external_vllm_gym_single_controller.sh"
 time uv run --no-sync bash "$SCRIPT_DIR/grpo_external_vllm_prefix_gym.sh"
+time uv run --no-sync bash "$SCRIPT_DIR/grpo_external_vllm_capture_gym.sh"
