@@ -96,6 +96,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
     build_nemo_gym_actors,
+    set_nemo_gym_log_dir,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
 )
@@ -163,7 +164,6 @@ from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
 )
-from nemo_rl.utils.config import warn_if_config_path_overridden
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import (
     Logger,
@@ -694,18 +694,9 @@ def setup(
     # ==========================
     logger = Logger(logger_config)
     if enable_nemo_gym:
-        # NeMo Gym writes server log files only when nemo_gym_log_dir is set.
-        # Always point it at this run's log directory, replacing any configured
-        # value, so the Gym logs stay with the rest of this run's logs.
-        nemo_gym_config = env_configs.setdefault("nemo_gym", {})
-        nemo_gym_log_dir = os.path.join(logger.base_log_dir, "nemo_gym")
-        warn_if_config_path_overridden(
-            "env.nemo_gym.nemo_gym_log_dir",
-            configured=nemo_gym_config.get("nemo_gym_log_dir"),
-            effective=nemo_gym_log_dir,
-            reason="NeMo Gym server logs always go under this run's log directory",
-        )
-        nemo_gym_config["nemo_gym_log_dir"] = nemo_gym_log_dir
+        # Before log_hyperparams, so the logged config shows where the Gym
+        # server logs actually go.
+        set_nemo_gym_log_dir(env_configs, logger.base_log_dir)
     logger.log_hyperparams(master_config.model_dump())
 
     # ==========================

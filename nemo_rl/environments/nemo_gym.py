@@ -61,6 +61,7 @@ from nemo_rl.environments.nemo_gym_multimodal import (
 )
 from nemo_rl.environments.nemo_gym_shards import (
     DEFAULT_PLACEMENT_STRATEGY,
+    GYM_LOG_DIR_KEY,
     SHARDING_CONFIG_KEYS,
     ShardConfigError,
     ShardPlan,
@@ -93,6 +94,7 @@ from nemo_rl.telemetry.setup import (
     shutdown_telemetry,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils.config import warn_if_config_path_overridden
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
@@ -237,6 +239,32 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
     )
 
     return True
+
+
+def set_nemo_gym_log_dir(env_config: dict[str, Any], log_dir: str) -> None:
+    """Point NeMo Gym's server logs at ``<log_dir>/nemo_gym``.
+
+    Gym writes server log files only when ``nemo_gym_log_dir`` is set, so call
+    this before building the Gym actors. Any configured value is replaced, with
+    a warning, so the Gym logs stay with the rest of this run's logs.
+
+    The path is made absolute here, on the driver. Gym resolves a relative path
+    against the Gym actor's working directory, which is the raylet's and differs
+    from the driver's when the driver attaches to a cluster started elsewhere.
+
+    Args:
+        env_config: The ``env`` section of the master config; updated in place.
+        log_dir: This run's log directory.
+    """
+    nemo_gym_config = env_config.setdefault("nemo_gym", {})
+    nemo_gym_log_dir = os.path.abspath(os.path.join(log_dir, "nemo_gym"))
+    warn_if_config_path_overridden(
+        f"env.nemo_gym.{GYM_LOG_DIR_KEY}",
+        configured=nemo_gym_config.get(GYM_LOG_DIR_KEY),
+        effective=nemo_gym_log_dir,
+        reason="NeMo Gym server logs always go under this run's log directory",
+    )
+    nemo_gym_config[GYM_LOG_DIR_KEY] = nemo_gym_log_dir
 
 
 def _has_nan_generation_logprobs(result: dict) -> bool:
