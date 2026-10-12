@@ -81,14 +81,14 @@ class SpeechLMPolicy(SALMAutomodel):
         for name in ("use_liger_kernel", "force_hf"):
             if kwargs.pop(name, False):
                 raise ValueError(f"{name} is not supported for native SpeechLM")
-        # RL's generic loader passes str(torch.dtype); Speech expects its name.
-        if isinstance(kwargs.get("torch_dtype"), str):
-            kwargs["torch_dtype"] = kwargs["torch_dtype"].removeprefix("torch.")
         activation_checkpointing = kwargs.pop("activation_checkpointing", False)
         kwargs["activation_checkpointing_llm"] = activation_checkpointing
         parameter_config = ParameterConfig(
             tuple(native_model["trainable_names"]), torch.float32, torch.bfloat16
         )
+        # Construct the frozen baseline, including frontend buffers/output dtype,
+        # in BF16. ParameterConfig promotes selected masters before strict load.
+        kwargs["torch_dtype"] = parameter_config.frozen_dtype
         model = super().from_pretrained(
             model_name,
             parameter_config=parameter_config,
