@@ -1185,18 +1185,20 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] != "vllm":
+        if generation_config["backend"] not in {"vllm", "remote_vllm"}:
             raise NotImplementedError(
-                "token_capture.enabled supports the vllm backend only; got "
+                "token_capture.enabled supports the vllm and remote_vllm "
+                "backends only; got "
                 f"{generation_config['backend']!r}"
             )
-        vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
-        if not vllm_cfg["async_engine"]:
-            raise ValueError(
-                "token_capture.enabled requires "
-                "policy.generation.vllm_cfg.async_engine=true (the capture "
-                "host is the worker's in-process HTTP server)"
-            )
+        if generation_config["backend"] == "vllm":
+            vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
+            if not vllm_cfg["async_engine"]:
+                raise ValueError(
+                    "token_capture.enabled requires "
+                    "policy.generation.vllm_cfg.async_engine=true (the capture "
+                    "host is the worker's in-process HTTP server)"
+                )
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
         # per-run control-plane bearer token and the process-shared capture
@@ -1854,7 +1856,17 @@ def setup_single_controller(
         # Host Gym's capture core in every vLLM DP leader (in-worker DP
         # client + TQTokenSink + the single install_capture call), and give
         # workers the initial weight version to stamp on captured calls.
-        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
+        if generation_config["backend"] == "remote_vllm":
+            generation.setup_token_capture(
+                dp_config,
+                token_capture_cfg.staging_partition,
+                dp_client=dp_client,
+            )
+        else:
+            generation.setup_token_capture(
+                dp_config,
+                token_capture_cfg.staging_partition,
+            )
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
