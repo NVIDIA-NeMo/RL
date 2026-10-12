@@ -1204,6 +1204,36 @@ def test_an_unsharded_job_is_checked_against_the_actors_entries():
     assert "math_agent" in str(excinfo.value)
 
 
+def test_an_unsharded_job_counts_only_routable_entries_as_hosted():
+    """A model-only entry is not a route on one actor any more than on many.
+
+    ``build_route_shard_map`` maps agents and resources servers only, so on a
+    sharded job a row naming a ``responses_api_models`` entry is rejected at
+    setup. The unsharded check must agree, and must not list the model among
+    the hosted routes in its error message.
+    """
+    handle = MagicMock()
+    shard_set = nemo_gym_mod.as_nemo_gym_shard_set(handle)
+    tool_row = {"extra_env_info": json.dumps({"task_source": "math_tools"})}
+
+    with patch.object(nemo_gym_mod.ray, "get") as ray_get:
+        ray_get.return_value = {
+            "math_agent": ["responses_api_agents"],
+            "math_tools": ["resources_servers"],
+            "policy_model": ["responses_api_models"],
+        }
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            shard_set, {"train": [*_gym_dataset("math_agent"), tool_row]}
+        )
+        with pytest.raises(nemo_gym_mod.ShardSetupError) as excinfo:
+            nemo_gym_mod.validate_dataset_agent_coverage(
+                shard_set, {"train": _gym_dataset("policy_model")}
+            )
+
+    assert "['policy_model']" in str(excinfo.value)
+    assert "Hosted routes: ['math_agent', 'math_tools']." in str(excinfo.value)
+
+
 def test_the_wrapped_dataset_is_unwrapped_before_scanning():
     """Rows live on AllTaskProcessedDataset.dataset, not on the wrapper."""
     wrapper = SimpleNamespace(dataset=_gym_dataset("ghost"))

@@ -741,8 +741,10 @@ Depending on your data shape, you may want to change these values."""
         Gym does not start a process for them.
 
         Callers compare these names across actors to build the agent->shard map
-        and to catch an entry duplicated across shards. Names are all that is
-        interpreted; what an entry *means* is Gym's business.
+        and to catch an entry duplicated across shards; an unsharded job's
+        coverage check (``validate_dataset_agent_coverage``) reads them as the
+        entries a dataset row may name. Names are all that is interpreted; what
+        an entry *means* is Gym's business.
         """
         if self.rh is None:
             raise RuntimeError(
@@ -2226,10 +2228,9 @@ def validate_dataset_agent_coverage(
 
     A sharded job checks against the route map built at setup. An unsharded
     job has one actor and no route map, so it asks that actor which entries
-    its resolved Gym config spawned and checks against those names. That list
-    holds every entry with an entrypoint, not only the agents a row can route
-    to, so the unsharded check is more permissive than the sharded one, never
-    stricter.
+    its resolved Gym config spawned and keeps the routable ones, agents and
+    resources servers, exactly as the sharded route map does. A model or
+    environment server is never a route, on one actor or on many.
 
     Args:
         shard_set: The running actors. A sharded set carries the route map
@@ -2243,7 +2244,10 @@ def validate_dataset_agent_coverage(
     if shard_set.is_sharded:
         hosted = shard_set.hosted_routes
     else:
-        hosted = frozenset(ray.get(shard_set.all_handles[0].list_entries.remote()))
+        # The same filter the sharded route map applies; with one shard its
+        # duplicate checks are vacuous, so only the routable-type rule remains.
+        entries = ray.get(shard_set.all_handles[0].list_entries.remote())
+        hosted = frozenset(build_route_shard_map({DEFAULT_SHARD_NAME: entries}))
     for split, dataset in datasets.items():
         unhosted = sorted(_iter_dataset_agent_names(dataset) - hosted)
         if unhosted:

@@ -3743,9 +3743,9 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     monkeypatch.setattr(grpo_mod, "build_nemo_gym_actors", build_nemo_gym_actors)
     # The agent-coverage check asks an unsharded job's actor for its entries
     # over Ray, which a mock actor cannot answer; the check has its own tests.
-    monkeypatch.setattr(
-        grpo_mod, "validate_dataset_agent_coverage", lambda *_args, **_kwargs: None
-    )
+    # The mock records the call so the wiring of the splits is asserted below.
+    validate_coverage = MagicMock()
+    monkeypatch.setattr(grpo_mod, "validate_dataset_agent_coverage", validate_coverage)
 
     master_config = mock_grpo_components["master_config"]
     master_config.policy["model_name"] = "test-model"
@@ -3794,6 +3794,9 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         tokenizer=tokenizer,
         enable_router_replay=False,
         use_fastokens=False,
+    )
+    validate_coverage.assert_called_once_with(
+        nemo_gym_shard_set, {"train": dataset, "validation": None}
     )
 
 
