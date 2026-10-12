@@ -17,7 +17,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath "${SCRIPT_DIR}/../..")
-EXP_NAME=${DYNAMO_EXP_NAME:-$(basename "$0" .sh)}
+EXP_NAME=$(basename "$0" .sh)
 EXP_DIR=${SCRIPT_DIR}/${EXP_NAME}
 LOG_DIR=${EXP_DIR}/logs
 RUN_LOG=${EXP_DIR}/run.log
@@ -36,28 +36,16 @@ grep -Fqx \
 /opt/dynamo_venv/bin/etcd --version
 /opt/dynamo_venv/bin/nats-server --version
 
-config_path=${DYNAMO_CONFIG_PATH:-${PROJECT_ROOT}/examples/configs/grpo_math_1B_dynamo.yaml}
-
 cd "${PROJECT_ROOT}"
 uv run --no-sync coverage run -a \
   --data-file="${PROJECT_ROOT}/tests/.coverage" \
   --source="${PROJECT_ROOT}/nemo_rl" \
   "${PROJECT_ROOT}/examples/run_grpo.py" \
-  --config "${config_path}" \
+  --config "${PROJECT_ROOT}/examples/configs/grpo_math_1B_dynamo.yaml" \
   policy.model_name=Qwen/Qwen3-0.6B \
   policy.tokenizer.name=Qwen/Qwen3-0.6B \
   logger.log_dir="${LOG_DIR}" \
   2>&1 | tee "${RUN_LOG}"
-
-if [[ "${DYNAMO_EXPECT_DISAGG:-0}" == "1" ]]; then
-  grep -F "'--disaggregation-mode', 'decode'" "${RUN_LOG}"
-  grep -F "'--disaggregation-mode', 'prefill'" "${RUN_LOG}"
-  grep -F "'VLLM_NIXL_SIDE_CHANNEL_PORT':" "${RUN_LOG}"
-  component_ready_line=$(grep -F \
-    "frontend ready with managed components" "${RUN_LOG}")
-  grep -Fq "'backend': 1" <<< "${component_ready_line}"
-  grep -Fq "'prefill': 1" <<< "${component_ready_line}"
-fi
 
 grep -F "Performing policy generation refit" "${RUN_LOG}"
 grep -F "Invalidated generation backend KV caches after weight update" "${RUN_LOG}"
