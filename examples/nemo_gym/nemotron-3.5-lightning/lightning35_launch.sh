@@ -802,7 +802,6 @@ data.validation.data_path=${VAL_PATH} \
 ${GENRM_OVERRIDE:+${GENRM_OVERRIDE}} \
 ${NL2BASH_OVERRIDE:+${NL2BASH_OVERRIDE}} \
 ${SAFETY_JUDGE_MODEL:+env.nemo_gym.safety_judge_model.responses_api_models.local_vllm_model.model=${SAFETY_JUDGE_MODEL}} \
-env.nemo_gym.nemo_gym_log_dir=${LOG_DIR}/nemo_gym \
 logger.log_dir=${LOG_DIR} \
 logger.wandb_enabled=${WANDB_ENABLED} \
 logger.wandb.name=${WANDB_NAME} \
