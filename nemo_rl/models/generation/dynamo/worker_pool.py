@@ -49,7 +49,13 @@ def _vllm_port_for_node_slot(node_slot: int) -> int:
 
 
 def _nixl_port_for_node_slot(node_slot: int) -> int:
-    """Return the managed node-local NIXL side-channel port."""
+    """Return the managed node-local NIXL side-channel port.
+
+    One port per engine group is enough for vLLM 0.23.0: its NIXL scheduler
+    serves every TP rank's handshake from one listener on
+    ``VLLM_NIXL_SIDE_CHANNEL_PORT + data_parallel_index``, and managed engines
+    run with DP=1.
+    """
     port = DEFAULT_DYNAMO_NIXL_PORT_RANGE_LOW + node_slot
     if port >= DEFAULT_DYNAMO_NIXL_PORT_RANGE_HIGH:
         raise ValueError(
@@ -71,7 +77,14 @@ def _kv_event_port_for_node_slot(node_slot: int) -> int:
 
 
 class FixedDynamoWorkerPool:
-    """Reserve inference GPUs and launch one worker per model-parallel group."""
+    """Reserve inference GPUs and launch one worker per model-parallel group.
+
+    ``worker_roles`` is positional: element ``i`` is assigned to the ``i``-th
+    engine group in placement-group iteration order. The same index sets that
+    engine's NCCL refit rank offset (see ``DynamoRefitChannel``), so callers
+    pass decode roles before prefill roles and keep the order stable. Port
+    slots are node-local, while role indices are fleet-global.
+    """
 
     def __init__(
         self,

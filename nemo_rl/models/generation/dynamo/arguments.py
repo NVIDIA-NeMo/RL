@@ -124,7 +124,11 @@ def build_dynamo_vllm_argv(
     worker_role: DynamoWorkerRole,
     kv_event_port: int | None,
 ) -> list[str]:
-    """Build a conflict-free ``python -m dynamo.vllm`` argument list."""
+    """Build a conflict-free ``python -m dynamo.vllm`` argument list.
+
+    ``kv_event_port`` must be set for ``prefill`` workers and must be ``None``
+    for ``decode`` and ``aggregated`` workers.
+    """
     builder = _ArgvBuilder()
     builder.add("--model", model_name, source="managed runtime")
     builder.add("--served-model-name", model_name, source="managed runtime")
@@ -142,6 +146,8 @@ def build_dynamo_vllm_argv(
             worker_role,
             source="managed disaggregation",
         )
+        # vLLM 0.23.0 logs a deprecation warning for kv_role="kv_both" with
+        # NixlConnector. Dynamo 1.3.0 documents this exact P/D config.
         builder.add(
             "--kv-transfer-config",
             {"kv_connector": "NixlConnector", "kv_role": "kv_both"},

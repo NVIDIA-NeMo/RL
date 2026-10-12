@@ -157,7 +157,8 @@ def uv_py_executable(extras: Sequence[str]) -> str:
 #     [4000, 4100) Dynamo worker system endpoints (node-local free-port selection)
 #     [4100, 4200) Dynamo NIXL side channels (node-local engine index)
 #     [4200, 4300) Dynamo prefill KV event streams (node-local engine index)
-#     [4300, 4999) Other generation HTTP servers + SGLang engine NCCL/dist_init
+#     Non-Dynamo backends pick HTTP and SGLang NCCL/dist_init ports from all of
+#     [3000, 4999); this is safe because only one rollout backend runs per job.
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
 #   6000         NeMo-Skills sandbox Nginx       (NEMO_SKILLS_SANDBOX_PORT; ray.sub starts one
 #                                                 sidecar per allocated node, driver included)

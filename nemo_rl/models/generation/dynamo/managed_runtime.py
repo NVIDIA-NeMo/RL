@@ -95,9 +95,7 @@ class ManagedDynamoRuntime:
                 self._worker_roles.append("aggregated")
             self._expected_components = {"backend": len(self._worker_roles)}
         else:
-            expected_world_size = (
-                disaggregation.prefill_workers + disaggregation.decode_workers
-            ) * self._engine_world_size
+            expected_world_size = validated_config.managed_inference_world_size
             if cluster_world_size != expected_world_size:
                 raise ValueError(
                     "Managed Dynamo disaggregation received the wrong inference "
@@ -111,6 +109,8 @@ class ManagedDynamoRuntime:
                 self._worker_roles.append("decode")
             for _ in range(disaggregation.prefill_workers):
                 self._worker_roles.append("prefill")
+            # Keys are Dynamo component names, not worker roles: decode and
+            # aggregated workers register as "backend"; prefill as "prefill".
             self._expected_components = {
                 "backend": disaggregation.decode_workers,
                 "prefill": disaggregation.prefill_workers,
