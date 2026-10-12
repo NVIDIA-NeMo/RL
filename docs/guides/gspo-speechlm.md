@@ -223,7 +223,7 @@ export PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 NO_VCS_VERSION=1
 unset PYTHONPATH
 
 cd "$RL_REPO"
-uv run --no-project --no-sync --python "$GENERATION_PYTHON" \
+uv run --no-project --python "$GENERATION_PYTHON" \
   examples/run_vlm_grpo.py \
   --config examples/configs/recipes/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml
 ```
@@ -286,8 +286,8 @@ export SPEECH_EXPORT_CONFIG=/shared/configs/speechlm-export.yaml
 export SPEECH_HF_OUTPUT=/shared/results/speechlm-gspo-hf-step400
 
 cd "$AUTOMODEL_REPO"
-uv run --no-project --no-sync --python "$POLICY_PYTHON" \
-  -m torch.distributed.run --standalone --nproc-per-node=8 \
+uv run --no-project --python "$POLICY_PYTHON" \
+  python -m torch.distributed.run --standalone --nproc-per-node=8 \
   "$SPEECH_REPO/examples/speechlm2/to_hf.py" \
   class_path=nemo.collections.speechlm2.models.SALMAutomodel \
   checkpoint_format=nemo_rl \

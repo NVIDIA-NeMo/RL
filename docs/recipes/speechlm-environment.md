@@ -49,7 +49,7 @@ for profile in policy generation; do
   else
     actor_python="$GENERATION_PYTHON"
   fi
-  uv run --no-project --no-sync --python "$actor_python" - \
+  uv run --no-project --python "$actor_python" python - \
     "$profile" "$SPEECHLM_SETUP_DIR" "$RL_REPO" <<'PY'
 import importlib.metadata as metadata
 from pathlib import Path
