@@ -50,6 +50,7 @@ extensions = [
     "sphinx_design",  # For grid layout
     "sphinx.ext.ifconfig",  # For conditional content
     "sphinxcontrib.mermaid",  # For Mermaid diagrams
+    "sphinx_reredirects",  # For preserving URLs when pages move
 ]
 
 templates_path = ["_templates"]
@@ -111,6 +112,10 @@ html_theme_options = {
     },
 }
 html_extra_path = ["project.json", "versions1.json"]
+
+redirects = {
+    "guides/eval": "../about/evaluation.html",
+}
 
 
 # Github links are now getting rate limited from the Github Actions
