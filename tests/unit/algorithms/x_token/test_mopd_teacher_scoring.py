@@ -729,6 +729,53 @@ def test_native_qwen3_generated_thinking_scores_original_positions(
         assert result.metrics["mopd/template_only_teacher_tokens_excluded"] > 0
 
 
+def test_trimming_teacher_excludes_template_newline_after_reasoning_whitespace(
+    native_qwen3_tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    tokenizer = native_qwen3_tokenizer
+    teacher_tokenizer = deepcopy(tokenizer)
+    # Reuse the native token vocabulary with Qwen3.5/3.6-style content and
+    # reasoning trimming, without downloading another teacher's tokenizer.
+    teacher_tokenizer.chat_template = (
+        "{%- macro render_content(content, is_assistant) -%}"
+        "{{- content -}}{%- endmacro -%}"
+        + tokenizer.chat_template.replace(
+            "set content = message.content",
+            "set content = render_content(message.content, true)|trim",
+        ).replace("reasoning_content.strip('\\n')", "reasoning_content.strip()")
+    )
+    scorer, teacher, prompt_ids, response_ids, messages = _native_scoring_case(
+        tokenizer,
+        "<think>\nreasoning \n</think>\n\nanswer<|im_end|>",
+        teacher_tokenizer=teacher_tokenizer,
+    )
+    student_ids = prompt_ids + response_ids
+    result = scorer.score(
+        input_ids=torch.tensor([student_ids]),
+        input_lengths=torch.tensor([len(student_ids)]),
+        message_logs=[messages],
+    )
+
+    teacher_ids = teacher.last_batch["input_ids"][0].tolist()
+    assert teacher_tokenizer.decode(teacher_ids, skip_special_tokens=False) == (
+        "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n"
+        "<think>\nreasoning\n</think>\n\nanswer<|im_end|>\n"
+    )
+    # The last reasoning token must get only its own teacher score. The inserted
+    # newline after it would otherwise be included in the same alignment chunk.
+    last_reasoning_id = tokenizer("reasoning", add_special_tokens=False)["input_ids"][
+        -1
+    ]
+    student_position = len(prompt_ids) + response_ids.index(last_reasoning_id)
+    teacher_position = teacher_ids.index(last_reasoning_id)
+    assert teacher_tokenizer.decode([teacher_ids[teacher_position + 1]]) == "\n"
+    assert result.valid_mask[0, student_position]
+    assert result.logprobs[0, student_position].item() == -(teacher_position + 1)
+    assert result.metrics["mopd/template_provenance_turns_proven"] == 1
+    assert result.metrics["mopd/template_provenance_turns_unproven"] == 0
+    assert result.metrics["mopd/template_only_teacher_tokens_excluded"] == 1
+
+
 @pytest.mark.parametrize("split_opening", [False, True])
 @pytest.mark.parametrize("sample_eot", [False, True])
 @pytest.mark.parametrize("missing_close_policy", ["mask", "preserve_open_if_proven"])

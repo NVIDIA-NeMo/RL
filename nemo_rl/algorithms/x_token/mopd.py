@@ -886,12 +886,17 @@ def proven_template_only_teacher_token_indices(
     original: str,
     transformed: str,
     teacher_offsets: Sequence[tuple[int, int]],
+    *,
+    trim_outer_whitespace: bool = False,
 ) -> tuple[set[int], set[int]] | None:
     r"""Prove teacher tokens containing only template-inserted whitespace."""
     if original.count("</think>") != 1:
         return None
 
-    expected, had_think = qwen3_assistant_content_transform(original)
+    expected, had_think = qwen3_assistant_content_transform(
+        original,
+        trim_outer_whitespace=trim_outer_whitespace,
+    )
     if not had_think or expected != transformed:
         return None
 

@@ -96,6 +96,18 @@ def test_template_provenance_distinguishes_template_only_and_mixed_tokens():
     ) == ({1, 3}, {2})
 
 
+@pytest.mark.parametrize("reasoning", ["r ", "r\t", " r ", "\tr\t"])
+def test_template_provenance_excludes_newline_after_trimmed_reasoning(
+    reasoning: str,
+) -> None:
+    assert proven_template_only_teacher_token_indices(
+        f"{reasoning}\n</think>\n\nx",
+        "r\n</think>\n\nx",
+        [(0, 1), (1, 2), (2, 10), (10, 12), (12, 13)],
+        trim_outer_whitespace=True,
+    ) == ({1}, set())
+
+
 def test_manual_offsets_support_tokens_that_decode_only_as_a_group():
     assert compute_offsets_manual(_GroupedDecodeTokenizer(), [10, 11], "x") == [
         (0, 1),

@@ -1263,6 +1263,7 @@ class MOPDTeacherScorer:
                     student_alignment_text,
                     transformed_text,
                     teacher_local_offsets,
+                    trim_outer_whitespace=trim_this_turn,
                 )
                 if provenance is None:
                     metrics["template_provenance_turns_unproven"] += 1
