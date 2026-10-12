@@ -80,10 +80,13 @@ def test_value_head_hook_replaces_nested_vlm_language_head() -> None:
                 f"{prefix}language_model.decoder.weight": torch.ones(1),
             }
 
+    non_post_process_chunk = SimpleNamespace(post_process=False)
     chunk = _VLMChunk()
-    result = make_value_head_hook(hidden_size=4, sequence_parallel=False)(chunk)
+    result = make_value_head_hook(hidden_size=4, sequence_parallel=False)(
+        [non_post_process_chunk, chunk]
+    )
 
-    assert result == [chunk]
+    assert result == [non_post_process_chunk, chunk]
     assert isinstance(chunk.language_model.output_layer, LinearForLastLayer)
     assert chunk.language_model.output_layer.out_features == 1
     assert not hasattr(chunk, "output_layer")
@@ -93,6 +96,23 @@ def test_value_head_hook_replaces_nested_vlm_language_head() -> None:
         state = chunk.sharded_state_dict()
     assert "language_model.output_layer.weight" not in state
     assert "language_model.decoder.weight" in state
+
+
+def test_value_head_parent_supports_gpt_and_rejects_unknown_layouts() -> None:
+    """The scalar head helper must handle GPT chunks and fail closed otherwise."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _value_head_parent,
+    )
+
+    output_layer = torch.nn.Linear(4, 8, bias=False)
+    gpt_chunk = SimpleNamespace(output_layer=output_layer)
+
+    parent, path = _value_head_parent(gpt_chunk)
+
+    assert parent is gpt_chunk
+    assert path == "output_layer"
+    with pytest.raises(AttributeError, match="no supported output layer"):
+        _value_head_parent(SimpleNamespace())
 
 
 def test_get_values_suspends_activation_offload() -> None:
