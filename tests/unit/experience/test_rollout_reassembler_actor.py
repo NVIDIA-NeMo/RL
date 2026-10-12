@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import builtins
+import typing
 from dataclasses import fields, replace
 from typing import Any
 from unittest.mock import MagicMock, call, patch
@@ -29,13 +30,13 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import (
-    _FORBIDDEN_RPC_KEYS,
     ReassemblyRequest,
     RolloutReassemblerActor,
     RolloutReassemblerActorConfig,
     assert_metadata_only,
     create_rollout_reassembler_actors,
 )
+from nemo_rl.utils.rpc_guard import FORBIDDEN_RPC_KEYS
 
 
 def _request() -> ReassemblyRequest:
@@ -107,6 +108,8 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         prompt_idx=17,
         loss_multiplier=0.25,
         canonical_sample_ids=["group_g0"],
+        reward_checks=None,
+        reward_log_contexts=None,
     )
 
 
@@ -168,9 +171,9 @@ def test_rpc_dataclass_fields_are_classified() -> None:
     """A new field on either RPC dataclass must be a deliberate choice.
 
     assert_metadata_only cannot tell a heavy list[int] of token ids from a short
-    list of metadata, so _FORBIDDEN_RPC_KEYS is maintained by hand. Pinning the
-    inventory makes a new field fail here until someone decides whether it is
-    light enough to cross the wire.
+    list of metadata, so FORBIDDEN_RPC_KEYS only covers names it knows. Pinning
+    the inventory makes a new field fail here until someone decides whether it
+    is light enough to cross the wire.
     """
     assert {f.name for f in fields(ReassemblyRequest)} == {
         "group_id",
@@ -182,6 +185,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "prompt_idx",
         "mask_sample",
         "loss_multiplier",
+        "reward_checks",
+        "reward_log_contexts",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",
@@ -190,6 +195,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "staging_keys",
         "canonical_output_tokens",
         "metrics",
+        "reward_observations",
         "dropped",
         "drop_reason",
         "valid_row_count",
@@ -197,11 +203,32 @@ def test_rpc_dataclass_fields_are_classified() -> None:
     }
 
 
-@pytest.mark.parametrize("key", sorted(_FORBIDDEN_RPC_KEYS))
+@pytest.mark.parametrize("key", sorted(FORBIDDEN_RPC_KEYS))
 def test_every_forbidden_key_is_rejected(key) -> None:
     """Removing an entry from the denylist should fail loudly."""
     with pytest.raises(TypeError, match="forbidden heavy field"):
         assert_metadata_only({key: [1, 2, 3]})
+
+
+@pytest.mark.nemo_gym
+def test_forbidden_keys_cover_gym_staging_fields() -> None:
+    """Gym owns these names, so the guard has to track them from outside.
+
+    ``generation_log_probs_delta`` is Gym's spelling and is the one staging
+    name the guard still has to write out by hand, because the driver does not
+    install ``nemo_gym``. Imported in the body rather than at module scope so
+    the default lane can collect this file without the extra; the
+    ``--nemo-gym-only`` conftest raises when Gym is missing, so here it fails
+    rather than skipping.
+    """
+    from nemo_gym.token_id_capture.staging.records import StagedCallBaseSnapshot
+
+    per_token = {
+        name
+        for name, info in StagedCallBaseSnapshot.model_fields.items()
+        if typing.get_origin(info.annotation) is list
+    }
+    assert per_token and per_token <= FORBIDDEN_RPC_KEYS
 
 
 @pytest.mark.parametrize(
@@ -286,3 +313,18 @@ def test_dependency_check_propagates_import_error(
     with pytest.raises(ModuleNotFoundError) as exc_info:
         actor.check_dependencies()
     assert exc_info.value is import_error
+
+
+def test_reward_checks_remain_metadata_only_and_reach_finalizer():
+    from nemo_rl.experience.reward_penalties import RewardChecks
+
+    checks = RewardChecks(True, True, True)
+    request = replace(_request(), reward_checks=(checks,))
+    assert_metadata_only(request)
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    actor._finalizer = MagicMock()
+    actor._finalizer.finalize_group.return_value = FinalizedGroup(
+        None, 4, 4, [], dropped=True
+    )
+    actor.finalize(request)
+    assert actor._finalizer.finalize_group.call_args.kwargs["reward_checks"] == [checks]

@@ -23,7 +23,7 @@ policy:
   logprob_batch_size: 1
   max_total_sequence_length: 4096
   make_sequence_length_divisible_by: 1
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
     tensor_parallel_size: 1
     context_parallel_size: 1
@@ -58,7 +58,7 @@ teacher:
   logprob_batch_size: 1
   max_total_sequence_length: 4096
   make_sequence_length_divisible_by: 1
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
     tensor_parallel_size: 1
     context_parallel_size: 1

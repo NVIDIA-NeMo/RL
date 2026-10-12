@@ -15,8 +15,8 @@
 from typing import Any, NotRequired, TypedDict
 
 from nemo_rl.models.policy import (
-    DTensorConfig,
-    DTensorConfigDisabled,
+    AutomodelConfig,
+    AutomodelConfigDisabled,
     DynamicBatchingConfig,
     DynamicBatchingConfigDisabled,
     MegatronConfig,
@@ -54,7 +54,7 @@ class ValueConfig(TypedDict):
     reward_model_cfg: RewardModelConfig
 
     # Backend configuration - DTensor or Megatron
-    dtensor_cfg: DTensorConfig | DTensorConfigDisabled
+    automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
 
     # HuggingFace config overrides

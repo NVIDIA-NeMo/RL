@@ -123,6 +123,63 @@ def test_resolve_optimizer_fp8_moment_dtypes():
 
 
 @pytest.mark.mcore
+def test_sync_consumed_samples_on_scheduler_load_survives_bridge_override():
+    """Bridge overwrites num_steps with consumed_train_samples after loading the scheduler."""
+    from nemo_rl.models.megatron.setup import _sync_consumed_samples_on_scheduler_load
+
+    class _Scheduler:
+        num_steps = 0
+
+        def load_state_dict(self, state_dict):
+            self.num_steps = state_dict["num_steps"]
+
+    scheduler = _Scheduler()
+    state = SimpleNamespace(train_state=None)
+
+    with _sync_consumed_samples_on_scheduler_load(state, scheduler):
+        # Bridge's load order: train_state from the checkpoint (0 in checkpoints
+        # saved before the save-side fix), then the scheduler, then the
+        # override_opt_param_scheduler copy.
+        state.train_state = SimpleNamespace(consumed_train_samples=0)
+        scheduler.load_state_dict({"num_steps": 96})
+        scheduler.num_steps = state.train_state.consumed_train_samples
+
+    assert scheduler.num_steps == 96
+    assert state.train_state.consumed_train_samples == 96
+    assert "load_state_dict" not in vars(scheduler)
+
+
+@pytest.mark.mcore
+def test_load_checkpoint_checkpoint_state_migration_hook_dne():
+    """
+    When this test fails, add a checkpoint hook to load_checkpoint()
+    to set state.train_state.consumed_train_samples = scheduler.num_steps
+    from the scheduler checkpoint and remove this context manager:
+    _sync_consumed_samples_on_scheduler_load
+
+    Draft PR: https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/6321
+
+    False positives can happen, in which case just add the new arg to
+    the list if it's not the hook this test is referring to.
+    """
+    import inspect
+
+    from megatron.bridge.training.checkpointing import load_checkpoint
+
+    assert list(inspect.signature(load_checkpoint).parameters) == [
+        "state",
+        "model",
+        "optimizer",
+        "opt_param_scheduler",
+        "strict",
+        "checkpointing_context",
+        "skip_load_to_model_and_opt",
+        "pg_collection",
+        "module_name",
+    ]
+
+
+@pytest.mark.mcore
 class TestValidateModelPaths:
     """Tests for validate_model_paths function."""
 
@@ -886,6 +943,20 @@ class TestApplyMoeConfig:
         _apply_moe_config(model_cfg, config)
 
         assert not hasattr(model_cfg, "moe_grouped_gemm")
+        assert not hasattr(model_cfg, "inference_flashinfer_mxfp8_token_capacity")
+
+    def test_flashinfer_mxfp8_token_capacity_forwarded(self):
+        """Without this key MCore runs FlashInfer MXFP8 MoE over the full dispatcher buffer."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["inference_flashinfer_mxfp8_token_capacity"] = 512
+        config = {"megatron_cfg": megatron_cfg}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.inference_flashinfer_mxfp8_token_capacity == 512
 
     def test_hybridep_input_prepadding_wins_after_bridge_validation(self):
         from nemo_rl.models.megatron import setup
@@ -2157,6 +2228,28 @@ class TestApplyPerformanceConfig:
 
         assert model_cfg.cuda_graph_modules == ["attn"]
         assert model_cfg.cuda_graph_warmup_steps == 1
+
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            ({}, 2),
+            ({"flash_attention_version": None}, 2),
+            ({"flash_attention_version": 2}, 2),
+            ({"flash_attention_version": 3}, 3),
+            ({"flash_attention_version": 4}, 4),
+        ],
+    )
+    def test_flash_attention_version_defaults_to_fa2(self, configured, expected):
+        """Unset means FA2 (not TE's auto choice, which would be FA4); explicit wins."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(gated_linear_unit=True)
+        config = self._config()
+        config["megatron_cfg"].update(configured)
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.flash_attention_version == expected
 
     def test_basic_performance_config(self):
         """Test applying basic performance configuration."""
@@ -3736,6 +3829,77 @@ class TestSetupModelConfig:
             trust_remote_code=True,
             rope_scaling={"rope_type": "yarn", "factor": 4.0},
         )
+
+    @pytest.mark.parametrize(
+        ("field_name", "field_value"),
+        [
+            ("multi_latent_attention", True),
+            ("hybrid_layer_pattern", "M*-"),
+            ("experimental_attention_variant", "gated_delta_net"),
+        ],
+    )
+    def test_zero_kl_rejects_unsupported_architecture_from_provider(
+        self, request, field_name, field_value
+    ):
+        """The architecture lives on the HF-derived provider, not in megatron_cfg."""
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        model_cfg = self._make_model_cfg_mock()
+        model_cfg.multi_latent_attention = False
+        model_cfg.hybrid_layer_pattern = None
+        model_cfg.experimental_attention_variant = None
+        setattr(model_cfg, field_name, field_value)
+        bridge = MagicMock()
+        bridge.to_megatron_provider.return_value = model_cfg
+        config = {
+            "pretrained_checkpoint": {"format": "megatron_lm", "path": "/ckpt"},
+            "megatron_cfg": {"zero_train_gen_mismatch": True},
+        }
+
+        with (
+            patch("transformers.AutoConfig.from_pretrained"),
+            patch("nemo_rl.models.megatron.setup.AutoBridge") as mock_auto_bridge,
+            pytest.raises(ValueError, match=field_name),
+        ):
+            mock_auto_bridge.from_hf_config.return_value = bridge
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path="/ckpt/iter_0005000",
+            )
+
+    def test_zero_kl_accepts_supported_provider(self, request):
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        model_cfg = self._make_model_cfg_mock()
+        model_cfg.multi_latent_attention = False
+        model_cfg.hybrid_layer_pattern = None
+        model_cfg.experimental_attention_variant = None
+        bridge = MagicMock()
+        bridge.to_megatron_provider.return_value = model_cfg
+        config = {
+            "pretrained_checkpoint": {"format": "megatron_lm", "path": "/ckpt"},
+            "megatron_cfg": {"zero_train_gen_mismatch": True},
+        }
+
+        with (
+            patch("transformers.AutoConfig.from_pretrained"),
+            patch("nemo_rl.models.megatron.setup.AutoBridge") as mock_auto_bridge,
+        ):
+            mock_auto_bridge.from_hf_config.return_value = bridge
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path="/ckpt/iter_0005000",
+            )
 
     @pytest.mark.parametrize("fmt", [None, "megatron_bridge"])
     def test_skip_weight_load_has_no_pretrained_checkpoint_dependency(
@@ -5462,7 +5626,11 @@ class TestPeftWarmStart:
             ),
             optimizer=SimpleNamespace(use_distributed_optimizer=False),
             rng=SimpleNamespace(data_parallel_random_init=False),
-            ddp=SimpleNamespace(use_megatron_fsdp=False),
+            ddp=SimpleNamespace(
+                use_megatron_fsdp=False,
+                fp8_param_gather=False,
+                fp4_param_gather=False,
+            ),
         )
         state = SimpleNamespace(
             cfg=cfg,

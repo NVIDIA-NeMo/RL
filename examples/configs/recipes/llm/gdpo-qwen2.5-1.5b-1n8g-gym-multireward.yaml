@@ -5,7 +5,7 @@ grpo:
 policy:
   model_name: Qwen/Qwen2.5-1.5B-Instruct
   max_total_sequence_length: 2048
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
     tensor_parallel_size: 1
   megatron_cfg:

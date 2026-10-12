@@ -95,7 +95,7 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null  # Disabled to allow defer_fp32_logits: false
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
     checkpoint:
       model_save_format: "safetensors"

@@ -43,7 +43,7 @@ from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
 # register the worker extension class to the actor environment registry
 ACTOR_ENVIRONMENT_REGISTRY[
-    "template_project.worker_extension.DTensorPolicyWorkerV2Extension"
+    "template_project.worker_extension.AutomodelPolicyWorkerExtension"
 ] = PY_EXECUTABLES.AUTOMODEL
 ```
 
