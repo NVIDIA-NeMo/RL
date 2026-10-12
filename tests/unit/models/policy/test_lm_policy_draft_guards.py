@@ -32,7 +32,7 @@ def _draft_config(
             "pipeline_model_parallel_size": pipeline_model_parallel_size,
             "use_fused_linear_logprobs": use_fused_linear_logprobs,
         },
-        "dtensor_cfg": {"enabled": False},
+        "automodel_cfg": {"enabled": False},
         "draft": {"enabled": True},
         "sequence_packing": {"enabled": sequence_packing_enabled},
     }

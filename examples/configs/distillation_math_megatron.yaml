@@ -15,7 +15,7 @@ policy: &POLICY_BASE
     precision: "bfloat16"
     logprob_chunk_size: null
 
-    dtensor_cfg:
+    automodel_cfg:
         enabled: false
 
     dynamic_batching:

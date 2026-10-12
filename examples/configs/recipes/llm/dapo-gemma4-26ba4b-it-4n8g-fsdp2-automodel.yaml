@@ -50,7 +50,7 @@ policy:
       total_iters: 10000000000
   - milestones:
     - 10
-  dtensor_cfg:
+  automodel_cfg:
     expert_parallel_size: 32
     activation_checkpointing: true
     automodel_kwargs:
