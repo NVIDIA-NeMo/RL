@@ -322,13 +322,16 @@ submit_args=(
   --job-name="${candidate_name}"
   --output="${slurm_log_dir}/%A_%a-${SLURM_ACCOUNT}.out"
   --error="${slurm_log_dir}/%A_%a-${SLURM_ACCOUNT}.out"
-  "${code_dir}/ray.sub"
 )
+if [[ -n ${SLURM_QOS:-} ]]; then
+  submit_args+=(--qos="${SLURM_QOS}")
+fi
+submit_args+=("${code_dir}/ray.sub")
 
 echo "candidate=${candidate_name}"
 echo "sbatch_comment=${sbatch_comment}"
 echo "time_limit=${slurm_time_limit} checkpoint_must_save_by=${checkpoint_must_save_by}"
-echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template} vllm_load_format=${vllm_load_format}"
+echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} qos=${SLURM_QOS:-default} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template} vllm_load_format=${vllm_load_format}"
 echo "context_compaction=${context_compaction} opencode_compaction_auto=${AGENTIC_VBENCH_COMPACTION_AUTO} opencode_prune=${AGENTIC_VBENCH_COMPACTION_PRUNE} max_turns=${AGENTIC_VBENCH_MAX_TURNS:-32} context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS:-49152} output_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS:-8192} tasks=${AGENTIC_VBENCH_TASKS:-all}"
 echo "episodes=${AGENTIC_VBENCH_OUTPUT_ROOT}"
 echo "container=${container}"
