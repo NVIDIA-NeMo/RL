@@ -50,7 +50,7 @@ from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
 
 pytestmark = pytest.mark.nemo_gym
 
-PLACEHOLDER = [0, 1]  # vLLM's padding for the last sampled token (top_k=2)
+NO_ROUTE = [-1, -1]  # vLLM never routes a call's last sampled token (top_k=2)
 
 
 def _routes(*rows: list[int]) -> torch.Tensor:
@@ -111,18 +111,18 @@ def _assemble(calls: list[tuple[torch.Tensor, int, int]]) -> torch.Tensor:
 
 def test_single_call_keeps_vllm_routes() -> None:
     # Prompt: 2 tokens. Generation: 2 tokens.
-    call = _routes([10, 11], [12, 13], [14, 15], PLACEHOLDER)
+    call = _routes([10, 11], [12, 13], [14, 15], NO_ROUTE)
     assert torch.equal(_assemble([(call, 0, 2)]), call)
 
 
 def test_turn_boundary_gets_the_next_calls_route() -> None:
     # Call 1: prompt 2 tokens, generates 2 (positions 2-3).
-    call1 = _routes([10, 11], [12, 13], [14, 15], PLACEHOLDER)
+    call1 = _routes([10, 11], [12, 13], [14, 15], NO_ROUTE)
     # Call 2: prompt = call 1's 4 tokens + 1 tool token, generates 1.
     # Its prefill computed the real route of position 3 (call 1's last token).
-    call2 = _routes([10, 11], [12, 13], [14, 15], [16, 17], [18, 19], PLACEHOLDER)
+    call2 = _routes([10, 11], [12, 13], [14, 15], [16, 17], [18, 19], NO_ROUTE)
 
     routed = _assemble([(call1, 0, 2), (call2, 4, 5)])
 
-    assert routed[3].tolist() == [[16, 17]], "boundary token kept the placeholder"
+    assert routed[3].tolist() == [[16, 17]], "boundary token has no route"
     assert torch.equal(routed, call2)
