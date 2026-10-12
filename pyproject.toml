@@ -101,10 +101,11 @@ dependencies = [
   # automatically include them. Removes the need for a `[data-plane]`
   # extra and the corresponding plumbing in the per-worker venv builder.
   "tensordict",
-  # TransferQueue v0.1.9 adds full-system checkpoint save/load APIs and
-  # retains the exact-key MooncakeStore clear behavior required by DAPO.
+  # TransferQueue v0.1.11 adds SimpleStorage SSD offload on top of v0.1.9's
+  # full-system checkpoint save/load APIs and exact-key MooncakeStore clear
+  # behavior required by DAPO.
   # Pin the immutable release commit rather than the mutable version tag.
-  "TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@c51614308b68c8d7a87c9b3ef62d59e14c69bde2",
+  "TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@05d4cc3377bee9b0f2897bbb90914ee20c0aea39",
   # Backs data_plane.backend="mooncake_cpu". Default backend is "simple"
   # (in-process), but the mooncake_cpu path needs the `mooncake_master`
   # binary that ships in this wheel at <site-packages>/mooncake/. Bundled

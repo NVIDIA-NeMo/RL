@@ -592,6 +592,10 @@ data_plane:
     storage_capacity: 1000000        # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
     storage_unit_placement: null     # all, or cluster names like [inference]; null = TQ SPREAD
+    ssd_offload:
+      enabled: false
+      path: null
+      threshold_bytes: 1048576
   mooncake_cpu:
     global_segment_size: 68719476736 # 64 GiB/process
     local_buffer_size:    2147483648 # 2 GiB/process = 4 TQ transfer threads x 512 MiB slot

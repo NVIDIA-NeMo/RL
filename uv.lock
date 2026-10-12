@@ -4460,7 +4460,7 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform != 'darwin' and extra == 'sglang'", specifier = "==0.26.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchvision", marker = "sys_platform != 'darwin' and extra == 'trtllm'", specifier = "==0.28.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchvision", marker = "sys_platform != 'darwin' and extra == 'vllm'", specifier = "==0.28.0", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "transferqueue", git = "https://github.com/Ascend/TransferQueue.git?rev=c51614308b68c8d7a87c9b3ef62d59e14c69bde2" },
+    { name = "transferqueue", git = "https://github.com/Ascend/TransferQueue.git?rev=05d4cc3377bee9b0f2897bbb90914ee20c0aea39" },
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'automodel'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.14.1" },
     { name = "transformers", specifier = ">=5.5.0,<=5.12.1" },
     { name = "transformers", marker = "extra == 'automodel'", specifier = "==5.12.1" },
@@ -8546,8 +8546,8 @@ wheels = [
 
 [[package]]
 name = "transferqueue"
-version = "0.1.9"
-source = { git = "https://github.com/Ascend/TransferQueue.git?rev=c51614308b68c8d7a87c9b3ef62d59e14c69bde2#c51614308b68c8d7a87c9b3ef62d59e14c69bde2" }
+version = "0.1.11"
+source = { git = "https://github.com/Ascend/TransferQueue.git?rev=05d4cc3377bee9b0f2897bbb90914ee20c0aea39#05d4cc3377bee9b0f2897bbb90914ee20c0aea39" }
 dependencies = [
     { name = "hydra-core" },
     { name = "msgspec" },

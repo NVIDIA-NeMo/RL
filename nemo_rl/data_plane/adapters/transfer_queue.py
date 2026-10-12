@@ -855,6 +855,9 @@ def _init_tq(
         }
         if storage_unit_node_ids is not None:
             _pin_simple_storage_units(storage_unit_node_ids)
+        ssd = simple_cfg.ssd_offload
+        if ssd.enabled:
+            overlay["backend"]["SimpleStorage"]["ssd_offload"] = ssd.model_dump()
     elif backend == "mooncake_cpu":
         # The mooncake-transfer-engine wheel ships `mooncake_master` at
         # <site-packages>/mooncake/, NOT on $PATH. TQ's

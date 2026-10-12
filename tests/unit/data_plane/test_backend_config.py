@@ -32,6 +32,7 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneConfig,
     MooncakeCpuConfig,
     SimpleStorageConfig,
+    SsdOffloadConfig,
     backend_config,
     data_plane_supports_checkpointing,
 )
@@ -163,6 +164,66 @@ def test_simple_backend_nested_block_is_used() -> None:
     assert isinstance(resolved, SimpleStorageConfig)
     assert resolved.storage_capacity == 7
     assert resolved.num_storage_units == 3
+
+
+def _simple_overlay(monkeypatch, **simple) -> dict:
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    captured = {}
+    monkeypatch.setattr(
+        adapter.tq, "init", lambda *, conf: captured.setdefault("conf", conf)
+    )
+    cfg = _cfg("simple", simple={"num_storage_units": 2, **simple})
+    adapter._init_tq(cfg)
+    conf = OmegaConf.to_container(captured["conf"], resolve=True)
+    return conf["backend"]["SimpleStorage"]
+
+
+def test_simple_ssd_offload_is_off_by_default(monkeypatch) -> None:
+    # Whatever TQ's own base config carries, we must not turn it on.
+    storage = _simple_overlay(monkeypatch)
+    assert storage.get("ssd_offload", {}).get("enabled") is not True
+
+
+def test_simple_ssd_offload_reaches_tq_config(monkeypatch) -> None:
+    storage = _simple_overlay(
+        monkeypatch,
+        ssd_offload={"enabled": True, "path": "/local/ssd", "threshold_bytes": 4096},
+    )
+    assert storage["ssd_offload"]["enabled"] is True
+    assert storage["ssd_offload"]["path"] == "/local/ssd"
+    assert storage["ssd_offload"]["threshold_bytes"] == 4096
+
+
+@pytest.mark.parametrize("path", [None, "", "relative/ssd"])
+def test_ssd_offload_requires_absolute_path_when_enabled(path) -> None:
+    """Fails at config load, not later inside driver bootstrap."""
+    with pytest.raises(pydantic.ValidationError, match="ssd_offload.path"):
+        TypeAdapter(DataPlaneConfig).validate_python(
+            _cfg(
+                "simple",
+                simple={
+                    "num_storage_units": 2,
+                    "ssd_offload": {"enabled": True, "path": path},
+                },
+            )
+        )
+
+
+def test_ssd_offload_defaults_are_off_and_path_optional_when_disabled() -> None:
+    absent = backend_config(_cfg("simple", simple={"num_storage_units": 2}))
+    assert absent.ssd_offload == SsdOffloadConfig(
+        enabled=False, path=None, threshold_bytes=1048576
+    )
+    partial = backend_config(
+        _cfg(
+            "simple",
+            simple={"num_storage_units": 2, "ssd_offload": {"path": "/local/ssd"}},
+        )
+    )
+    assert partial.ssd_offload.path == "/local/ssd"
+    assert partial.ssd_offload.enabled is False
+    assert partial.ssd_offload.threshold_bytes == 1048576
 
 
 def test_simple_backend_num_storage_units_has_no_default() -> None:
