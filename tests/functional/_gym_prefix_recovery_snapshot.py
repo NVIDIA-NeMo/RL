@@ -84,6 +84,16 @@ def _episode_key(record: dict[str, Any]) -> tuple[str, int]:
     return episode["rollout_id"], episode["attempt"]
 
 
+def _calendar_sentinel_count(state: dict[str, Any], event_name: str) -> int:
+    """Count the selected calendar event in a checkpointed Workplace state."""
+
+    columns = state["calendar"]["_calendar_events"]["columns"]
+    names = next(
+        column["values"] for column in columns if column["name"] == "event_name"
+    )
+    return sum(str(name).lower() == event_name.lower() for name in names)
+
+
 def _process_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -123,8 +133,36 @@ def _recoverable_cut(record: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
-    """Return one fully cross-checked nonterminal prefix in ``snapshot``."""
+def _require_cut_coverage(
+    candidates: list[dict[str, Any]], *, min_cuts: int, min_cut_groups: int
+) -> None:
+    """Reject a snapshot whose recoverable prefixes cover too little work.
+
+    Gym refuses a dispatch that lands while a checkpoint holds admission, and
+    the refused rollout starts later, so requiring every sibling to be mid-decode
+    at once is a race. Coverage per prompt group still restores every group.
+    """
+    groups = {candidate["group_id"] for candidate in candidates}
+    if len(candidates) < min_cuts or len(groups) < min_cut_groups:
+        raise AssertionError(
+            f"snapshot has {len(candidates)} recoverable prefixes in "
+            f"{len(groups)} prompt groups, need {min_cuts} in {min_cut_groups}"
+        )
+
+
+def inspect_snapshot(
+    snapshot: Path,
+    sentinel_event: str,
+    *,
+    min_cuts: int = 1,
+    min_cut_groups: int = 1,
+) -> dict[str, Any]:
+    """Return the post-mutation nonterminal prefixes in ``snapshot``.
+
+    The top-level fields describe the longest cut; ``cuts`` lists every one,
+    and the snapshot qualifies only if it holds at least ``min_cuts`` of them
+    spread across at least ``min_cut_groups`` prompt groups.
+    """
 
     required = [
         snapshot / "manifest.json",
@@ -146,9 +184,10 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
     agent_keys = {
         _episode_key(record) for _, record in _participant_records(snapshot, "agent")
     }
-    resources_keys = {
-        _episode_key(record)
-        for _, record in _participant_records(snapshot, "resources")
+    resource_index = {
+        _episode_key(record): (manifest_path, record["state"])
+        for manifest_path, record in _participant_records(snapshot, "resources")
+        if record.get("state")
     }
     model_records = _participant_records(snapshot, "model")
 
@@ -157,7 +196,13 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
         key = _episode_key(record)
         recovery = ledger.get(key)
         cut = _recoverable_cut(record)
-        if recovery is None or cut is None:
+        resource_entry = resource_index.get(key)
+        if recovery is None or cut is None or resource_entry is None:
+            continue
+        resources_manifest, resources_state = resource_entry
+        try:
+            sentinel_count = _calendar_sentinel_count(resources_state, sentinel_event)
+        except (KeyError, StopIteration, TypeError):
             continue
         instance_id = recovery["gym_instance_id"]
         checkpointed_episodes = {
@@ -168,7 +213,7 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
         if (
             key not in checkpointed_episodes
             or key not in agent_keys
-            or key not in resources_keys
+            or sentinel_count != 1
             or recovery["restore_level"] != "prefix"
             or recovery["status"] != "dispatched"
             or not set(cut["staging_keys"]).issubset(retained_keys)
@@ -185,6 +230,8 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
                 "generation_index": recovery["generation_index"],
                 "target_step": recovery["target_step"],
                 "model_manifest": str(model_manifest.relative_to(snapshot)),
+                "resources_manifest": str(resources_manifest.relative_to(snapshot)),
+                "sentinel_event": sentinel_event,
                 **cut,
             }
         )
@@ -192,7 +239,12 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
         raise AssertionError(
             "snapshot has no recoverable nonterminal active generation prefix"
         )
-    return max(candidates, key=lambda item: item["prefix_token_count"])
+    _require_cut_coverage(candidates, min_cuts=min_cuts, min_cut_groups=min_cut_groups)
+    cuts = sorted(
+        candidates, key=lambda item: (item["group_id"], item["generation_index"])
+    )
+    longest = max(candidates, key=lambda item: item["prefix_token_count"])
+    return {**longest, "cuts": cuts}
 
 
 def select_snapshot(args: argparse.Namespace) -> None:
@@ -206,7 +258,12 @@ def select_snapshot(args: argparse.Namespace) -> None:
     while time.monotonic() < deadline:
         for snapshot in sorted(root.glob("snapshot_*"), reverse=True):
             try:
-                selection = inspect_snapshot(snapshot)
+                selection = inspect_snapshot(
+                    snapshot,
+                    args.sentinel_event,
+                    min_cuts=args.min_cuts,
+                    min_cut_groups=args.min_cut_groups,
+                )
             except (AssertionError, FileNotFoundError, json.JSONDecodeError) as error:
                 last_error = f"{snapshot}: {error}"
                 continue
@@ -224,8 +281,8 @@ def select_snapshot(args: argparse.Namespace) -> None:
             return
         if not _process_alive(args.phase_pid):
             raise RuntimeError(
-                "phase one exited before publishing a recoverable generation prefix:\n"
-                + _log_tail(phase_log)
+                "phase one exited before publishing a recoverable generation prefix "
+                f"(last rejection: {last_error}):\n" + _log_tail(phase_log)
             )
         time.sleep(0.2)
     raise TimeoutError(f"no recoverable prefix snapshot found ({last_error})")
@@ -252,38 +309,41 @@ def _matching_siblings(
     return found
 
 
-def verify_restore(args: argparse.Namespace) -> None:
-    selection = _read_json(Path(args.selection_file))
-    phase1 = _events(Path(args.phase1_events))
-    phase2 = _events(Path(args.phase2_events))
-    log = Path(args.phase2_log).read_text()
-    training_info = _read_json(Path(args.training_info))
+def _verify_restored_cut(
+    cut: dict[str, Any],
+    *,
+    phase1: list[dict[str, Any]],
+    phase2: list[dict[str, Any]],
+    restored_prefixes: list[tuple[str, ...]],
+) -> None:
+    """Require one cut to return to its Gym owner and resume its exact prefix."""
 
-    phase1_dispatch = _matching_siblings(phase1, selection, "dispatch")
+    phase1_dispatch = _matching_siblings(phase1, cut, "dispatch")
     if not phase1_dispatch:
         raise AssertionError(
-            "selected Gym episode was not observed in phase-one dispatches"
+            f"cut Gym episode {cut['gym_rollout_id']!r} was not observed in "
+            "phase-one dispatches"
         )
     if not all(
-        sibling["gym_instance_id"] == selection["gym_instance_id"]
-        and sibling["gym_attempt"] == selection["gym_attempt"]
+        sibling["gym_instance_id"] == cut["gym_instance_id"]
+        and sibling["gym_attempt"] == cut["gym_attempt"]
         for sibling in phase1_dispatch
     ):
         raise AssertionError(
             f"phase-one dispatch identity mismatch: {phase1_dispatch!r}"
         )
 
-    phase2_dispatch = _matching_siblings(phase2, selection, "dispatch")
-    phase2_refused = _matching_siblings(phase2, selection, "refused")
+    phase2_dispatch = _matching_siblings(phase2, cut, "dispatch")
+    phase2_refused = _matching_siblings(phase2, cut, "refused")
     if len(phase2_dispatch) - len(phase2_refused) != 1:
         raise AssertionError(
             f"expected one accepted restored dispatch: {phase2_dispatch!r}, {phase2_refused!r}"
         )
     restored = phase2_dispatch[-1]
     expected_identity = (
-        selection["gym_instance_id"],
-        selection["gym_attempt"] + 1,
-        selection["generation_index"],
+        cut["gym_instance_id"],
+        cut["gym_attempt"] + 1,
+        cut["generation_index"],
     )
     actual_identity = (
         restored["gym_instance_id"],
@@ -293,25 +353,19 @@ def verify_restore(args: argparse.Namespace) -> None:
     if actual_identity != expected_identity:
         raise AssertionError((actual_identity, expected_identity))
 
-    completions = _matching_siblings(phase2, selection, "completion")
+    completions = _matching_siblings(phase2, cut, "completion")
     if not any(
-        sibling["gym_instance_id"] == selection["gym_instance_id"]
-        and sibling["gym_attempt"] == selection["gym_attempt"] + 1
+        sibling["gym_instance_id"] == cut["gym_instance_id"]
+        and sibling["gym_attempt"] == cut["gym_attempt"] + 1
         and sibling["status"] == "sealed"
         for sibling in completions
     ):
         raise AssertionError(f"restored Gym episode did not seal: {completions!r}")
 
-    restored_prefixes = re.findall(
-        r"generation prefix restored: rollout_id=(\S+) model_call_id=(\S+) "
-        r"source_model_call_id=(\S+) prefix_tokens=(\d+) "
-        r"prefix_digest=([0-9a-f]{64})",
-        log,
-    )
     expected_prefix = (
-        selection["model_call_id"],
-        selection["prefix_token_count"],
-        selection["prefix_digest"],
+        cut["model_call_id"],
+        cut["prefix_token_count"],
+        cut["prefix_digest"],
     )
     if not any(
         source_model_call_id == expected_prefix[0]
@@ -320,8 +374,30 @@ def verify_restore(args: argparse.Namespace) -> None:
         for _, _, source_model_call_id, prefix_tokens, prefix_digest in restored_prefixes
     ):
         raise AssertionError(
-            f"selected prefix was not restored: expected={expected_prefix!r}, "
+            f"cut prefix was not restored: expected={expected_prefix!r}, "
             f"observed={restored_prefixes!r}"
+        )
+
+
+def verify_restore(args: argparse.Namespace) -> None:
+    selection = _read_json(Path(args.selection_file))
+    phase1 = _events(Path(args.phase1_events))
+    phase2 = _events(Path(args.phase2_events))
+    log = Path(args.phase2_log).read_text()
+    training_info = _read_json(Path(args.training_info))
+
+    restored_prefixes = re.findall(
+        r"generation prefix restored: rollout_id=(\S+) model_call_id=(\S+) "
+        r"source_model_call_id=(\S+) prefix_tokens=(\d+) "
+        r"prefix_digest=([0-9a-f]{64})",
+        log,
+    )
+    for cut in selection.get("cuts", [selection]):
+        _verify_restored_cut(
+            cut,
+            phase1=phase1,
+            phase2=phase2,
+            restored_prefixes=restored_prefixes,
         )
 
     if training_info["current_step"] != args.max_steps:
@@ -345,6 +421,9 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("phase_log")
     select.add_argument("timeout_s", type=float)
     select.add_argument("backup_path")
+    select.add_argument("sentinel_event")
+    select.add_argument("--min-cuts", type=int, default=1)
+    select.add_argument("--min-cut-groups", type=int, default=1)
     select.set_defaults(func=select_snapshot)
 
     verify = commands.add_parser("verify-restore")
