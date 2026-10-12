@@ -424,7 +424,10 @@ def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
     assert teacher_topology is None
 
 
-def test_single_controller_mopd_recipe_resolves_to_runtime_contract(monkeypatch):
+@pytest.mark.parametrize("proximal_reward_alpha", [None, 0.2])
+def test_single_controller_mopd_recipe_resolves_to_runtime_contract(
+    monkeypatch, proximal_reward_alpha: Optional[float]
+):
     """The inherited recipe resolves exactly as the SC entrypoint consumes it."""
     # The parent recipe locates its fixture data below HF_HOME. This test only
     # validates config resolution, so it needs a stable path, not real data.
@@ -439,6 +442,7 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract(monkeypatch)
 
     assert isinstance(resolved, dict)
     config = MasterConfig.model_validate(resolved)
+    config.grpo.adv_estimator.proximal_reward_alpha = proximal_reward_alpha
     validate_single_controller_config(config)
     assert config.grpo.async_grpo is None
     assert config.grpo.adv_estimator.name == "opd"
@@ -2301,12 +2305,29 @@ def test_fullvocab_mopd_recipes_resolve_to_runtime_contract(recipe_name: str):
     # opd_full still runs the OPD advantage estimator: `advantages` is a
     # required training column and its stage gates the training step.
     assert config.grpo.adv_estimator.name == "opd"
+    assert config.grpo.adv_estimator.proximal_reward_alpha is None
     # Self-distillation: student and teacher are the same checkpoint, which is
     # what makes "the divergence must stay ~0" a meaningful assertion.
     assert (
         config.on_policy_distillation.teacher_model_by_agent_name["default_teacher"]
         == config.policy["model_name"]
     )
+
+
+@pytest.mark.parametrize("recipe_name", _FULLVOCAB_RECIPES)
+@pytest.mark.parametrize("proximal_reward_alpha", [0.2, 1.0])
+def test_fullvocab_mopd_rejects_proximal_reward_shaping(
+    recipe_name: str, proximal_reward_alpha: float
+):
+    """Reject TOP-D at setup because the full-vocabulary loss ignores advantages."""
+    config = _load_fullvocab_master_config(recipe_name)
+    config.grpo.adv_estimator.proximal_reward_alpha = proximal_reward_alpha
+
+    with pytest.raises(
+        ValueError,
+        match=r"proximal_reward_alpha.*silently ignored.*Set it to null",
+    ):
+        validate_single_controller_config(config)
 
 
 def test_fullvocab_recipe_builds_an_opd_full_loss_function():

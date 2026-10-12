@@ -1506,6 +1506,16 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "on_policy_distillation.enabled=true requires "
                 "grpo.adv_estimator.name='opd'."
             )
+        if (
+            opd_module.get_opd_full_config(master_config) is not None
+            and algo_cfg.adv_estimator.proximal_reward_alpha is not None
+        ):
+            raise ValueError(
+                "grpo.adv_estimator.proximal_reward_alpha (TOP-D shaping) only "
+                "reshapes OPD advantages, which on_policy_distillation.full never "
+                "reads, so it would be silently ignored. Set it to null or "
+                "disable on_policy_distillation.full."
+            )
         if not opd_module.is_non_colocated_teachers_enabled(master_config):
             raise ValueError(
                 "SingleController MOPD currently requires "

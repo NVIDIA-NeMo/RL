@@ -399,6 +399,9 @@ Rejected at construction rather than silently ignored:
   `positive_example_nll_weight`, `use_kl_in_reward`, and
   `use_on_policy_kl_approximation` (the base MOPD recipe sets this one to
   `true`, so a derived full-vocabulary recipe must override it to `false`).
+- `grpo.adv_estimator.proximal_reward_alpha` must be `null`: TOP-D shaping
+  changes OPD advantages, which the full-vocabulary loss ignores. Use sampled
+  MOPD to enable TOP-D.
 
 ## Running MOPD
 
