@@ -224,6 +224,7 @@ class MegatronGeneration(GenerationInterface):
         mcore_cfg = cast(MCoreGenerationConfig, policy_config["generation"])[
             "mcore_generation_config"
         ]
+
         # Recompute-after-refit is implemented engine-side (kv_cache_management_mode="recompute");
         # the loop-level flag must agree with that mode, and setup errors on a mismatch.
         kv_cache_mode = mcore_cfg["kv_cache_management_mode"]
@@ -593,8 +594,13 @@ class MegatronGeneration(GenerationInterface):
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate asynchronously, yielding `(index, batch)` tuples as they complete."""
         worker = self._policy.worker_group.workers[0]
-        futures = worker.generate_async.options(num_returns="streaming").remote(
-            data=data, greedy=greedy
+        # Not .options(num_returns="streaming"): this process cannot unpickle the
+        # Megatron worker class (no Megatron here), so Ray gives the handle a
+        # placeholder class whose methods are not generators. Ray >= 2.58 checks
+        # that in .options() and raises; _remote() skips the check.
+        # NOTE(@cspades): https://github.com/ray-project/ray/pull/64749
+        futures = worker.generate_async._remote(
+            kwargs={"data": data, "greedy": greedy}, num_returns="streaming"
         )
         async for result_ref in futures:
             index, result_batch = await result_ref

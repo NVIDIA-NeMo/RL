@@ -227,7 +227,7 @@ The RayJob object itself sticks around for `--ttl` seconds (default 3600s) so yo
 
 - **OmegaConf interpolation** eats `${VAR}` in recipe/infra YAML. Escape shell variables with `\${VAR}` so OmegaConf passes them through to the pod shell verbatim.
 - **Megatron optimizer configs** don't carry `foreach` / `fused`. Overrides like `~policy.optimizer.kwargs.foreach ~policy.optimizer.kwargs.fused` (valid for DTensor configs) break on Megatron recipes. Omit them for Megatron.
-- **DTensor vs Megatron** — MoE recipes typically use `megatron_cfg.enabled=true`; ensure `dtensor_cfg.enabled=false` in inherited defaults.
+- **Automodel vs Megatron** — MoE recipes typically use `megatron_cfg.enabled=true`; ensure `automodel_cfg.enabled=false` in inherited defaults.
 - **Shared filesystem vs git divergence** — `codeSource: image|lustre` reads from the pod filesystem. If your local edits aren't on the shared filesystem the pods mount, the run is testing the on-disk version, not yours. Either sync via a helper pod (head pod exec is often blocked) or override via Hydra flags.
 - **Ephemeral-storage + readinessProbe** are injected by kuberay/CDI webhooks at pod-apply time. Do NOT add them to the inline RayCluster spec.
 - **Node taints** vary per cluster. `tolerations: [{operator: Exists}]` on workers is defensive and worth keeping.

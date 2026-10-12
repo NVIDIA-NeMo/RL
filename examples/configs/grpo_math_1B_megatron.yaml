@@ -54,7 +54,7 @@ policy:
   max_total_sequence_length: 512
   precision: "bfloat16"
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 

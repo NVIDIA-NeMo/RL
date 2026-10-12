@@ -438,7 +438,7 @@ class BaseVllmGenerationWorker:
         # Only bind single-GPU workers to their GPU's NUMA node.
         # For TP>1 workers, the parent process spans multiple NUMA nodes;
         # binding it would incorrectly constrain the EngineCore subprocess
-        # (which inherits sched_setaffinity + numa_set_membind via fork).
+        # (which inherits sched_setaffinity + numa_set_preferred via fork).
         # Individual TP workers get their own NUMA binding via collective_rpc
         # in post_init / post_init_async.
         # ray.get_gpu_ids()[0] is this worker's physical GPU index, which keys

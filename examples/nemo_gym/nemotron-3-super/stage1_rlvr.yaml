@@ -97,7 +97,7 @@ policy:
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
     cpu_offload: False
     sequence_parallel: false

@@ -19,11 +19,19 @@ policy:
       NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
       NVLINK_DOMAIN_SIZE: "8"
       USE_MNNVL: "0"
+      # Limit collective-refit staging memory so Megatron-to-HF conversion has
+      # enough H100 headroom for the largest DeepSeek tensors.
+      NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
+      NRL_REFIT_NUM_BUFFERS: "1"
   generation:
     vllm_cfg:
       tensor_parallel_size: 16
       precision: "fp8"
       use_deep_gemm: true
+      # Keep the generation side consistent with the policy refit buffers.
+      env_vars:
+        NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
+        NRL_REFIT_NUM_BUFFERS: "1"
       quantization_ignored_layer_kws: [
         a_proj,
         b_proj

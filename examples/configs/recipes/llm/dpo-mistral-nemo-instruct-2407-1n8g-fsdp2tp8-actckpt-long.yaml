@@ -15,7 +15,7 @@ policy:
   train_global_batch_size: 8
   train_micro_batch_size: 1
   max_total_sequence_length: 12288
-  dtensor_cfg:
+  automodel_cfg:
     activation_checkpointing: true
     tensor_parallel_size: 8
     clear_cache_every_n_steps: 1
