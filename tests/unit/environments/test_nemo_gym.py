@@ -62,6 +62,10 @@ from nemo_rl.environments.nemo_gym_request import (
     _deep_merge_dict,
     _metadata_extra_body,
 )
+from nemo_rl.environments.nemo_gym_shards import (
+    apply_shard_overlay,
+    parse_shard_plan,
+)
 from nemo_rl.environments.nemotron_utils import (
     _expand_nemotron_video_placeholders,
     _flatten_nemotron_video_frame_messages,
@@ -1251,11 +1255,113 @@ def test_nemo_gym_stub_module():
     )
 
 
+def _prefix_derivation(model_overlay: dict) -> object:
+    return model_overlay["policy_model"]["responses_api_models"]["vllm_model"].get(
+        "derive_prefix_token_ids_from_messages"
+    )
+
+
+def test_setup_nemo_gym_config_derives_prefix_for_native_vllm() -> None:
+    config_paths = [
+        "responses_api_models/vllm_model/configs/vllm_model_for_training.yaml"
+    ]
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
+        env={"nemo_gym": {"config_paths": config_paths}},
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert config.env["nemo_gym"] == {
+        "config_paths": config_paths,
+        "policy_model": {
+            "responses_api_models": {
+                "vllm_model": {"derive_prefix_token_ids_from_messages": True}
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("model_config", "expected"),
+    [
+        # An explicit choice in the recipe wins.
+        ({"derive_prefix_token_ids_from_messages": False}, False),
+        # Gym rejects derivation together with prefix supply, which owns the field.
+        ({"supply_prefix_token_ids": True}, None),
+    ],
+)
+def test_setup_nemo_gym_config_keeps_explicit_prefix_settings(
+    model_config, expected
+) -> None:
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
+        env={
+            "nemo_gym": {
+                "policy_model": {"responses_api_models": {"vllm_model": model_config}}
+            }
+        },
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert _prefix_derivation(config.env["nemo_gym"]) is expected
+
+
+@pytest.mark.parametrize("backend", ["dynamo", "megatron"])
+def test_setup_nemo_gym_config_derives_prefix_only_for_native_vllm(backend) -> None:
+    config = SimpleNamespace(
+        policy={
+            "generation": {
+                "backend": backend,
+                "vllm_cfg": {},
+                "mcore_generation_config": {},
+            }
+        },
+        env={"nemo_gym": {"port_range_low": 5000}},
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert config.env["nemo_gym"] == {"port_range_low": 5000}
+
+
+@pytest.mark.parametrize("claimed_policy_overlay", [False, True])
+def test_setup_nemo_gym_config_derives_prefix_in_every_shard(
+    claimed_policy_overlay,
+) -> None:
+    nemo_gym_cfg = {
+        "config_paths": None,
+        "shards": [
+            {"name": "a", "config_paths": ["a.yaml"]},
+            {"name": "b", "config_paths": ["b.yaml"]},
+        ],
+    }
+    if claimed_policy_overlay:
+        nemo_gym_cfg["policy_model"] = {
+            "responses_api_models": {"vllm_model": {"model": "m"}}
+        }
+        nemo_gym_cfg["common_inherited_overlays"] = ["policy_model"]
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
+        env={"nemo_gym": nemo_gym_cfg},
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    # An unclaimed top-level policy_model overlay would fail the shard plan.
+    plan = parse_shard_plan(config.env["nemo_gym"])
+    assert plan is not None
+    for shard in plan.shards:
+        merged = apply_shard_overlay(config.env["nemo_gym"], plan, shard)
+        assert _prefix_derivation(merged) is True
+
+
 @pytest.fixture(scope="function")
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
     master_config = MasterConfig.model_construct(
-        policy={"generation": generation_config}
+        policy={"generation": generation_config}, env={}
     )
     setup_nemo_gym_config(master_config, nemo_gym_tokenizer)
 

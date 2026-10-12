@@ -542,3 +542,59 @@ def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None
     assert vllm_cfg["async_engine"] is True
     assert vllm_cfg["expose_http_server"] is True
     assert should_use_nemo_gym(config) is True
+
+
+def test_token_capture_spinup_turns_off_message_derived_prefixes(
+    monkeypatch, tmp_path
+) -> None:
+    """Token capture drops Gym's token echo, which message-derived prefixes need.
+
+    setup_nemo_gym_config opts native vLLM into derive_prefix_token_ids_from_messages,
+    and Gym rejects that flag without return_token_id_information.
+    """
+    import nemo_gym.cli
+    import nemo_gym.rollout_collection
+
+    from nemo_rl.environments import nemo_gym as nemo_gym_env
+
+    started: dict = {}
+
+    class FakeRunHelper:
+        def start(self, *, global_config_dict_parser_config) -> None:
+            started["config"] = global_config_dict_parser_config
+
+    monkeypatch.setattr(nemo_gym.cli, "RunHelper", FakeRunHelper)
+    monkeypatch.setattr(
+        nemo_gym.rollout_collection, "RolloutCollectionHelper", lambda: None
+    )
+    monkeypatch.setattr(nemo_gym_env, "_get_node_ip_local", lambda: "127.0.0.1")
+    monkeypatch.setattr(nemo_gym_env, "_get_free_port_local", lambda low, high: low)
+    # _spinup exports the control token; setenv restores the original on teardown.
+    monkeypatch.setenv(nemo_gym_env._TOKEN_CAPTURE_CONTROL_ENV, "unset")
+
+    env = NemoGym.__ray_metadata__.modified_class(
+        {
+            "model_name": "m",
+            "base_urls": ["http://127.0.0.1:1/v1"],
+            "initial_global_config_dict": {
+                "policy_model": {
+                    "responses_api_models": {
+                        "vllm_model": {"derive_prefix_token_ids_from_messages": True}
+                    }
+                }
+            },
+            "token_capture": {
+                "enabled": True,
+                "capture_dir": str(tmp_path),
+                "generation_backend": "vllm",
+                "control_auth_token": "secret",
+            },
+        }
+    )
+    env._spinup()
+
+    vllm_model = started["config"].initial_global_config_dict["policy_model"][
+        "responses_api_models"
+    ]["vllm_model"]
+    assert vllm_model["return_token_id_information"] is False
+    assert vllm_model["derive_prefix_token_ids_from_messages"] is False
