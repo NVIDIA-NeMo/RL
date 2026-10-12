@@ -345,7 +345,9 @@ def test_init_fp8_keeps_mixed_recipe_boundary_targets_in_bf16(
     quant_config = vllm_kwargs["hf_overrides"]["quantization_config"]
     modelopt_config = ModelOptMxFp8Config.from_config(quant_config)
     mapper = WeightsMapper(orig_to_new_prefix=recipe_case.mapper_prefixes)
-    modelopt_config.apply_vllm_mapper(mapper.get_unstacked_mapper())
+    # vLLM 0.29 renamed WeightsMapper.get_unstacked_mapper -> get_rename_mapper;
+    # this mirrors what vLLM's model loader passes to apply_vllm_mapper.
+    modelopt_config.apply_vllm_mapper(mapper.get_rename_mapper())
     modelopt_config.packed_modules_mapping.update(
         {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
     )
@@ -1215,7 +1217,6 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
         "fp8_backend": Fp8MoeBackend.FLASHINFER_TRTLLM,
         "experts_cls": experts_cls,
         "routing_tables": (None, None, None),
-        "layer": layer,
     }
 
 
@@ -2412,7 +2413,12 @@ def test_deepseek_v4_two_refits_preserve_kernel_fp32_scale_references(
     layer.w13_input_scale = None
     layer.w2_input_scale = None
     layer._expert_routing_tables = lambda: None
-    layer.moe_config = types.SimpleNamespace(has_bias=False)
+    # vLLM 0.29's Fp8MoEMethod.__init__ refines the block shape from the MoE
+    # config (intermediate_size_per_partition / tp_size / hidden_dim); sizes
+    # divisible by the [2, 2] block keep the checkpoint block shape.
+    layer.moe_config = types.SimpleNamespace(
+        has_bias=False, intermediate_size_per_partition=4, tp_size=1, hidden_dim=4
+    )
     layer.quant_method = method = vllm_fp8.Fp8MoEMethod(
         vllm_fp8.Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[2, 2]),
         layer,
@@ -2658,3 +2664,217 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(
             assert weight.shape == shape
             assert scale.shape == (shape[0] // 128, shape[1] // 128)
             _assert_dequant_close(weight, scale, source[eid])
+
+
+@GROUPED_EXPERT_KEY_SHAPES
+@pytest.mark.parametrize(
+    "refit_with_reload_api,scale_suffix",
+    [(False, "_scale_from_checkpoint"), (True, "_scale")],
+    ids=["legacy", "reload-api"],
+)
+def test_load_weights_expands_grouped_experts_for_mxfp8(
+    fp8_module,
+    monkeypatch,
+    layers_prefix,
+    wrap_language_model,
+    refit_with_reload_api,
+    scale_suffix,
+):
+    """MXFP8 grouped slabs emit per-expert values and E8M0 scales."""
+    import torch
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = types.SimpleNamespace(
+        use_weight_pow2_scale=False, is_mx=True
+    )
+    model = _grouped_expert_model(
+        fp8, monkeypatch, torch.float8_e4m3fn, wrap_language_model
+    )
+
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    quantized_inputs = []
+
+    def fake_mxfp8_quantize(weight):
+        quantized_inputs.append(weight.clone())
+        rows, cols = weight.shape
+        value = weight.to(torch.float8_e4m3fn)
+        scale = torch.full(
+            (rows, cols // 32, 1),
+            0,
+            dtype=torch.uint8,
+        )
+        return value, scale
+
+    monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", fake_mxfp8_quantize)
+
+    intermediate, hidden = 32, 64
+    gate_up = (
+        torch.arange(2 * 2 * intermediate * hidden, dtype=torch.float32)
+        .remainder(128)
+        .reshape(2, 2 * intermediate, hidden)
+    )
+    down = (
+        torch.arange(2 * hidden * intermediate, dtype=torch.float32)
+        .remainder(128)
+        .reshape(2, hidden, intermediate)
+    )
+    loaded = list(
+        fp8.get_quantized_weight_iterator(
+            [
+                (
+                    f"{layers_prefix}.0.mlp.experts.gate_up_proj",
+                    gate_up.to(torch.bfloat16),
+                ),
+                (
+                    f"{layers_prefix}.0.mlp.experts.down_proj",
+                    down.to(torch.bfloat16),
+                ),
+            ],
+            types.SimpleNamespace(model=model),
+            refit_with_reload_api=refit_with_reload_api,
+        )
+    )
+
+    base = f"{layers_prefix}.0.mlp.experts"
+    expected_names = [
+        f"{base}.{eid}.{proj}.weight{suffix}"
+        for proj in ("gate_proj", "up_proj")
+        for eid in (0, 1)
+        for suffix in ("", scale_suffix)
+    ] + [
+        f"{base}.{eid}.down_proj.weight{suffix}"
+        for eid in (0, 1)
+        for suffix in ("", scale_suffix)
+    ]
+    assert [name for name, _ in loaded] == expected_names
+
+    entries = dict(loaded)
+    source_shards = {
+        "gate_proj": gate_up[:, :intermediate, :],
+        "up_proj": gate_up[:, intermediate:, :],
+        "down_proj": down,
+    }
+    quantize_call = 0
+    for proj, source in source_shards.items():
+        for expert_id in (0, 1):
+            quantize_call += 1
+            name = f"{base}.{expert_id}.{proj}.weight"
+            value = entries[name]
+            scale = entries[name + scale_suffix]
+            assert value.dtype == torch.float8_e4m3fn
+            # The refit path receives bf16 slabs, so expectations must follow
+            # the same fp32 -> bf16 -> e4m3 rounding chain as production.
+            expected = source[expert_id].to(torch.bfloat16).to(torch.float8_e4m3fn)
+            assert torch.equal(value.float(), expected.float())
+            assert scale.dtype == torch.uint8
+            assert scale.shape == (*value.shape[:-1], value.shape[-1] // 32)
+            assert torch.all(scale == 1)
+            assert torch.equal(
+                quantized_inputs[quantize_call - 1],
+                source[expert_id].to(torch.bfloat16),
+            )
+
+    assert len(quantized_inputs) == 6
+
+
+def _deepseek_v4_lookup_model():
+    """A DeepSeek V4-shaped model with vLLM 0.29's ambiguous packed mapping."""
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    class Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fused_wqa_wkv = torch.nn.Linear(4, 4, bias=False)
+
+    class Compressor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fused_wkv_wgate = torch.nn.Linear(4, 4, bias=False)
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = Attn()
+            self.compressor = Compressor()
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Layer()])
+
+    class Model(torch.nn.Module):
+        # vLLM 0.29 DeepseekV4ForCausalLM: ``wkv`` is a shard of two fused modules.
+        packed_modules_mapping = {
+            "fused_wqa_wkv": ["wq_a", "wkv"],
+            "fused_wkv_wgate": ["wkv", "wgate"],
+        }
+
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(model_type="deepseek_v4")
+            self.hf_to_vllm_mapper = WeightsMapper()
+            self.model = Decoder()
+
+    return Model()
+
+
+@pytest.mark.parametrize(
+    ("param_name", "expected_attr"),
+    [
+        ("model.layers.0.attn.wkv.weight", "attn.fused_wqa_wkv"),
+        ("model.layers.0.attn.wq_a.weight", "attn.fused_wqa_wkv"),
+        ("model.layers.0.compressor.wkv.weight", "compressor.fused_wkv_wgate"),
+        ("model.layers.0.compressor.wgate.weight", "compressor.fused_wkv_wgate"),
+    ],
+)
+def test_get_module_resolves_shards_shared_by_two_fused_modules(
+    fp8_module, param_name, expected_attr
+):
+    """A leaf shard listed under two fused modules is resolved by its parent.
+
+    vLLM 0.29 added ``packed_modules_mapping`` to DeepseekV4ForCausalLM with
+    ``wkv`` under both ``fused_wqa_wkv`` and ``fused_wkv_wgate``; resolving the
+    leaf alone sent ``attn.wkv`` to ``attn.fused_wkv_wgate`` (which does not
+    exist), so the weight was treated as non-fp8 and refit unquantized.
+    """
+    model = _deepseek_v4_lookup_model()
+    layer = model.model.layers[0]
+    expected = layer
+    for part in expected_attr.split("."):
+        expected = getattr(expected, part)
+
+    module = fp8_module.get_module_from_param_name(model, param_name)
+
+    assert module is expected
+
+
+def test_get_module_still_uses_unambiguous_packed_mapping(fp8_module):
+    class Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv_proj = torch.nn.Linear(4, 4, bias=False)
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = Attn()
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Layer()])
+
+    class Model(torch.nn.Module):
+        packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(model_type="llama")
+            self.model = Decoder()
+
+    model = Model()
+    module = fp8_module.get_module_from_param_name(
+        model, "model.layers.0.self_attn.k_proj.weight"
+    )
+    assert module is model.model.layers[0].self_attn.qkv_proj

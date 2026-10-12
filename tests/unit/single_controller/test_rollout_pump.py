@@ -56,6 +56,7 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
     RolloutRecoveryState,
 )
+from nemo_rl.utils.logger import LoggerConfig
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
 from tests.unit.experience.test_rollout_manager import (
@@ -1386,14 +1387,7 @@ def test_rollout_pump_writes_expected_tq_data(
             max_inflight_prompts=num_prompts,
             max_buffered_rollouts=num_prompts,
         ),
-        logger={
-            "log_dir": str(tmp_path / "logs"),
-            "wandb_enabled": False,
-            "swanlab_enabled": False,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": False,
-            "monitor_gpus": False,
-        },
+        logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
         # Actor __init__ builds a CheckpointManager + TimeoutChecker from
         # this block; enabled=False keeps the run write-free.
         checkpointing={
@@ -1445,6 +1439,7 @@ def test_rollout_pump_writes_expected_tq_data(
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
         finalizer_actors=[],
+        advantage_actors=[],
     )
     ctrl = SingleControllerActor.remote(
         master_config=master_config,
@@ -1517,10 +1512,12 @@ def test_rollout_pump_writes_expected_tq_data(
     for tag in tags:
         assert tag["weight_version"] == 0
         assert tag["prompt_idx"] == input_sample["idx"]
-        # Tag schema: recovery identity plus per-row violation counts.
+        # Tag schema: recovery identity, the prompt-group key the advantage
+        # stage reduces over, and per-row violation counts.
         assert set(tag) == {
             "weight_version",
             "prompt_idx",
+            "group_id",
             "num_invalid_tool_calls",
             "num_malformed_thinking",
             "num_assistant_messages",

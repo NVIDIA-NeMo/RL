@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import os
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, fields
+from functools import partial
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import numpy as np
@@ -29,6 +31,7 @@ from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
@@ -120,6 +123,131 @@ class MasterConfig(BaseModel, extra="allow"):
     telemetry: Optional[TelemetryConfig] = None
 
 
+def _uses_direct_megatron_sft_packing(
+    dataset: Optional[AllTaskProcessedDataset],
+) -> bool:
+    if dataset is None:
+        return False
+    task_data_processors = dataset.task_data_processors
+    return (
+        isinstance(task_data_processors, dict)
+        and "megatron_sft_packed" in task_data_processors
+    )
+
+
+def _validate_direct_megatron_sft_setup(
+    master_config: MasterConfig,
+    train_dataset: Optional[AllTaskProcessedDataset],
+    val_dataset: Optional[AllTaskProcessedDataset],
+    loss_fn: NLLLossFn,
+) -> None:
+    direct_train = _uses_direct_megatron_sft_packing(train_dataset)
+    direct_validation = _uses_direct_megatron_sft_packing(val_dataset)
+    uses_direct_packing = direct_train or direct_validation
+    if not uses_direct_packing:
+        return
+
+    for dataset in (train_dataset, val_dataset):
+        if dataset is None or not isinstance(dataset.task_data_processors, dict):
+            continue
+        if (
+            "megatron_sft_packed" in dataset.task_data_processors
+            and len(dataset.task_data_processors) != 1
+        ):
+            raise ValueError(
+                "SFT cannot mix direct Megatron-LM prepacked and regular datasets"
+            )
+
+    # Every MegatronSFTPackedDataset registers under task_name
+    # "megatron_sft_packed", so a second one overwrites the first in
+    # task_data_processors and the guard above still sees a single entry. The
+    # config is the only place the duplicate is still visible.
+    for split_name in ("train", "validation"):
+        split_config = master_config.data.get(split_name)
+        if split_config is None:
+            continue
+        entries = (
+            list(split_config)
+            if isinstance(split_config, (list, tuple))
+            else [split_config]
+        )
+        packed_entries = sum(
+            1
+            for entry in entries
+            if hasattr(entry, "get")
+            and entry.get("dataset_name") == "megatron_sft_packed"
+        )
+        if packed_entries > 1:
+            raise ValueError(
+                f"data.{split_name} configures {packed_entries} "
+                "megatron_sft_packed datasets, but they all register under the "
+                "same task name so only the last one would be used. Merge them "
+                "into one packed dataset."
+            )
+
+    policy_config = master_config.policy
+    megatron_cfg = policy_config.get("megatron_cfg")
+    if megatron_cfg is None or not megatron_cfg["enabled"]:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires the Megatron backend"
+        )
+    if "draft" in policy_config and policy_config["draft"]["enabled"]:
+        raise NotImplementedError(
+            "Direct Megatron-LM prepacked SFT does not support draft training"
+        )
+    if policy_config["dynamic_batching"]["enabled"]:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires dynamic batching to be disabled"
+        )
+    if direct_train and policy_config["train_micro_batch_size"] != 1:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires policy.train_micro_batch_size=1"
+        )
+    if direct_validation and master_config.sft.val_micro_batch_size != 1:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires sft.val_micro_batch_size=1"
+        )
+    if "router_replay" in policy_config and policy_config["router_replay"]["enabled"]:
+        raise NotImplementedError(
+            "Direct Megatron-LM prepacked SFT does not support router replay"
+        )
+    if master_config.sft.only_unmask_final:
+        raise ValueError(
+            "sft.only_unmask_final=true is not supported with direct "
+            "Megatron-LM prepacked SFT because its assistant-token loss masks "
+            "were materialized during offline packing. Set "
+            "sft.only_unmask_final=false or use the online SFT data path."
+        )
+
+    if "sequence_packing" in policy_config and policy_config["sequence_packing"].get(
+        "fuse_loss", False
+    ):
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT does not support "
+            "policy.sequence_packing.fuse_loss=true"
+        )
+
+    if type(loss_fn) is not NLLLossFn or loss_fn.use_fused_linear_logprobs:
+        raise TypeError(
+            "Direct Megatron-LM prepacked SFT requires the standard NLLLossFn "
+            "with use_fused_linear_logprobs=false."
+        )
+
+
+def _build_sft_collate_fn(
+    policy_config: PolicyConfig,
+) -> Callable[[list[DatumSpec]], BatchedDataDict[Any]]:
+    megatron_cfg = policy_config.get("megatron_cfg")
+    context_parallel_size = None
+    if megatron_cfg is not None and megatron_cfg["enabled"]:
+        context_parallel_size = int(megatron_cfg["context_parallel_size"])
+
+    return partial(
+        rl_collate_fn,
+        megatron_sft_context_parallel_size=context_parallel_size,
+    )
+
+
 # =======================================================
 # Setup & Initialization
 # =======================================================
@@ -160,6 +288,20 @@ def setup(
         processor = tokenizer
         tokenizer = processor.tokenizer
 
+    megatron_cfg = policy_config.get("megatron_cfg")
+    use_fused_linear_logprobs = bool(
+        megatron_cfg is not None
+        and megatron_cfg["enabled"]
+        and megatron_cfg.get("use_fused_linear_logprobs")
+    )
+    loss_fn = NLLLossFn(use_fused_linear_logprobs=use_fused_linear_logprobs)
+    _validate_direct_megatron_sft_setup(
+        master_config,
+        train_dataset,
+        val_dataset,
+        loss_fn,
+    )
+
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
@@ -186,11 +328,12 @@ def setup(
     else:
         if train_dataset is None:
             raise ValueError("The Hugging Face SFT backend requires a train dataset.")
+        sft_collate_fn = _build_sft_collate_fn(policy_config)
         train_dataloader = StatefulDataLoader(
             train_dataset,
             batch_size=policy_config["train_global_batch_size"],
             shuffle=data_config["shuffle"],
-            collate_fn=rl_collate_fn,
+            collate_fn=sft_collate_fn,
             drop_last=True,
             num_workers=data_config["num_workers"],
         )
@@ -200,7 +343,7 @@ def setup(
                 val_dataset,
                 batch_size=sft_config.val_global_batch_size,
                 shuffle=False,
-                collate_fn=rl_collate_fn,
+                collate_fn=sft_collate_fn,
                 drop_last=False,
                 num_workers=data_config["num_workers"],
             )
@@ -214,17 +357,17 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...")
-    num_nodes = cluster_config["num_nodes"]
-    segment_size = cluster_config.get("segment_size")
+    num_nodes = cluster_config.num_nodes
+    segment_size = cluster_config.segment_size
     node_resource_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="sft_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         max_colocated_worker_groups=1,
-        port_range_low=cluster_config.get("master_port_range_low"),
-        port_range_high=cluster_config.get("master_port_range_high"),
+        port_range_low=cluster_config.master_port_range_low,
+        port_range_high=cluster_config.master_port_range_high,
         segment_size=segment_size,
         node_resource_constraints=node_resource_constraints,
     )
@@ -255,10 +398,6 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = NLLLossFn(
-        use_fused_linear_logprobs=policy_config["megatron_cfg"]["enabled"]
-        and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]
-    )
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
@@ -600,7 +739,6 @@ def sft_train(
                             "make_sequence_length_divisible_by"
                         ],
                     )
-
                 print("▶ Taking a training step...")
                 with (
                     timer.time("policy_training"),
@@ -687,14 +825,6 @@ def sft_train(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_loss --> 'val:val_loss'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -785,8 +915,7 @@ def sft_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             if total_time > 0:
                 timing_metrics["valid_tokens_per_sec_per_gpu"] = (

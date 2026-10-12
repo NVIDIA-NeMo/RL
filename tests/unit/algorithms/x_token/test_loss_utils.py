@@ -541,8 +541,8 @@ class TestLocalizeAlignment:
 
     def test_no_cp_keeps_full_teacher_chunk_id(self):
         data = self._data()
-        align = localize_alignment(data, teacher_seq_len=6, cp_group=None)
-        # cp_group=None → start offset 0, full teacher_chunk_id passed through.
+        align = localize_alignment(data, teacher_seq_len=6)
+        # teacher_seq_len covers the whole tensor, so it passes through.
         assert torch.equal(align.teacher_chunk_id, data["alignment_teacher_chunk_id"])
         assert torch.equal(align.student_chunk_id, data["alignment_student_chunk_id"])
         assert torch.equal(align.pair_valid, data["alignment_pair_valid"])

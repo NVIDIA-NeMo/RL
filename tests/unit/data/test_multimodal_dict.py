@@ -470,6 +470,29 @@ def test_dynamic_resolution_padding_is_cropped_before_radio_patchification():
     torch.testing.assert_close(packed_patches, expected_patches)
 
 
+@pytest.mark.mcore
+def test_captured_media_pack_images_matches_bridge_patchify():
+    """The vLLM-side copy of Bridge's patchify must stay bit-exact with Bridge."""
+    from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import (
+        NemotronOmniModel,
+    )
+
+    from nemo_rl.data.captured_media import pack_images
+
+    class _Patchifier:
+        patch_dim = 16
+
+    pixels = torch.randn(2, 3, 64, 48, generator=torch.Generator().manual_seed(0))
+    # Crops smaller than the padded frame exercise the crop-then-patchify path.
+    sizes = torch.tensor([[32, 48], [64, 16]], dtype=torch.int32)
+    torch.testing.assert_close(
+        pack_images(pixels, sizes, patch_size=16),
+        NemotronOmniModel._patchify_dynamic_images(_Patchifier(), pixels, sizes),
+        rtol=0,
+        atol=0,
+    )
+
+
 @pytest.mark.parametrize(
     ("first_shape", "second_shape", "expected_shape"),
     [

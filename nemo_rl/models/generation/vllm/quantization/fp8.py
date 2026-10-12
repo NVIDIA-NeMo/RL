@@ -570,9 +570,8 @@ def get_quantized_weight_iterator(
     for k, v in weights:
         # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix
         # (so `_is_fp8_weight` would skip them) and vLLM's grouped loader cannot
-        # load their per-block scales. Expand them into the per-expert FP8 (w13, w2 -> w1, w2, and w3)
-        # layout, then reshape to 2D [num_experts, out_features, in_features] -> [num_experts*out_features, in_features]
-        # so the block scales can be quantized and routed correctly.
+        # load their scales. Expand them into the per-expert projection layout so
+        # both values and scales route through the standard expert mapping.
         if is_grouped_moe_expert_weight_name(k):
             # Quantize only if vLLM built this layer's experts as FP8. Experts
             # covered by ``ignored_layers`` (num_{first,last}_layers_in_bf16 /
@@ -582,7 +581,12 @@ def get_quantized_weight_iterator(
             # bf16 slab through instead; vLLM's fused expert mapping loads it
             # directly, same as a bf16 refit.
             if _is_fp8_grouped_moe_expert(k, model):
-                yield from _expand_grouped_moe_expert_to_fp8(k, v)
+                if global_fp8_config.is_mx:
+                    yield from _expand_grouped_moe_expert_to_mxfp8(
+                        k, v, refit_with_reload_api=refit_with_reload_api
+                    )
+                else:
+                    yield from _expand_grouped_moe_expert_to_fp8(k, v)
             else:
                 yield k, v
             continue
@@ -763,6 +767,24 @@ def _quantize_grouped_experts_blockwise(grouped_moe_expert):
     return weight_fp8, scale_inv
 
 
+def _split_grouped_moe_shards(
+    key: str, weight: torch.Tensor
+) -> tuple[str, tuple[tuple[str, torch.Tensor], ...]]:
+    """Split one grouped expert slab into vLLM projection shards."""
+    base, proj = key.rsplit(".", 1)
+    if proj == "gate_up_proj":
+        intermediate = weight.shape[1] // 2
+        shards = (
+            ("gate_proj", weight[:, :intermediate, :]),
+            ("up_proj", weight[:, intermediate:, :]),
+        )
+    elif proj == "down_proj":
+        shards = (("down_proj", weight),)
+    else:
+        raise ValueError(f"Unsupported grouped MoE projection {proj!r} in {key!r}")
+    return base, shards
+
+
 def _expand_grouped_moe_expert_to_fp8(key, weight):
     """Expand a grouped Qwen3.5 MoE expert slab into per-expert FP8 weights.
 
@@ -788,15 +810,7 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
         A list of ``(name, tensor)`` pairs: for every expert, the FP8 weight and
         its ``_scale_inv`` for each unfused projection.
     """
-    base, proj = key.rsplit(".", 1)
-    if proj == "gate_up_proj":
-        intermediate = weight.shape[1] // 2
-        shards = (
-            ("gate_proj", weight[:, :intermediate, :]),
-            ("up_proj", weight[:, intermediate:, :]),
-        )
-    else:
-        shards = (("down_proj", weight),)
+    base, shards = _split_grouped_moe_shards(key, weight)
 
     entries = []
     # gate/up are dim-1 slices; feed the views directly — per-expert rows stay
@@ -808,6 +822,23 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
             name = f"{base}.{expert_id}.{shard_name}.weight"
             entries.append((name, weight_fp8[expert_id]))
             entries.append((name + "_scale_inv", scale_inv[expert_id]))
+    return entries
+
+
+def _expand_grouped_moe_expert_to_mxfp8(
+    key: str, weight: torch.Tensor, *, refit_with_reload_api: bool
+) -> list[tuple[str, torch.Tensor]]:
+    """Expand a grouped Qwen3.5 MoE slab into per-expert MXFP8 entries."""
+    base, shards = _split_grouped_moe_shards(key, weight)
+
+    entries = []
+    scale_suffix = "_scale" if refit_with_reload_api else "_scale_from_checkpoint"
+    for shard_name, grouped_moe_expert in shards:
+        for expert_id, expert_weight in enumerate(grouped_moe_expert):
+            value, scale = quantize_mxfp8_weight(expert_weight.contiguous())
+            name = f"{base}.{expert_id}.{shard_name}.weight"
+            entries.append((name, value))
+            entries.append((name + scale_suffix, scale))
     return entries
 
 
@@ -1114,8 +1145,9 @@ def process_weights_after_loading_moe(self, layer) -> None:
     replace_parameter() to avoid creating new torch.nn.Parameter objects, because that removes
     the weight_loader attribute which we need for refit.
 
-    Updated for vLLM 0.25 which passes a RoutedExperts module as `layer` and
-    sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=..., layer=...).
+    Updated for vLLM >= 0.25, which passes a RoutedExperts module as `layer` and
+    sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=...); 0.29
+    dropped the kernel factory's `layer=` kwarg.
     """
     from vllm.model_executor.layers.quantization.fp8 import (
         convert_to_fp8_moe_kernel_format,
@@ -1174,7 +1206,6 @@ def process_weights_after_loading_moe(self, layer) -> None:
             fp8_backend=self.fp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 
@@ -1503,7 +1534,6 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
             fp8_backend=self.mxfp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 
@@ -1558,14 +1588,31 @@ def process_weights_after_loading_kv(self, layer) -> None:
 
     Doesn't delete k_scale, v_scale, q_scale, and prob_scale parameters to allow
     for dynamic updates during refit.
-    """
-    # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
-    # regardless whether the kv-scale is available in the checkpoint.
-    # No need to process kv scales after loading if we are going to
-    # calculate them on the fly.
-    from vllm.platforms import current_platform
 
-    if layer.kv_cache_dtype != "auto" and not layer.calculate_kv_scales:
+    Ported to vLLM 0.28: the attention layer no longer carries
+    ``calculate_kv_scales`` (dynamic per-token-head scales are a KV-cache dtype
+    now, see ``kv_cache_uses_per_token_head_scales``), and the fp8 branch keys off
+    ``is_quantized_kv_cache`` instead of ``!= "auto"``. Mirrors
+    ``BaseKVCacheMethod.process_weights_after_loading`` in
+    ``vllm/model_executor/layers/quantization/kv_cache.py`` minus the parameter
+    deletion.
+    """
+    from vllm.platforms import current_platform
+    from vllm.utils.torch_utils import is_quantized_kv_cache
+    from vllm.v1.kv_cache_interface import kv_cache_uses_per_token_head_scales
+
+    # Per-token-head quantized KV cache: scales are computed dynamically per
+    # (token, head) in the kernel at cache-write time. Nothing to refit here.
+    if kv_cache_uses_per_token_head_scales(layer.kv_cache_dtype):
+        layer._k_scale.copy_(1.0)
+        layer._v_scale.copy_(1.0)
+        layer._k_scale_float = 1.0
+        layer._v_scale_float = 1.0
+        return
+
+    # If the kv-cache is not quantized, we enforce the k/v_scale to be 1.0
+    # regardless whether the kv-scale is available in the checkpoint.
+    if is_quantized_kv_cache(layer.kv_cache_dtype):
         if layer.k_scale > 0.0 and layer.v_scale > 0.0:
             # We prefer to use separate k_scale and v_scale if present
             k_scale = layer.k_scale.to("cpu").tolist()
@@ -1602,12 +1649,16 @@ def process_weights_after_loading_kv(self, layer) -> None:
         layer._v_scale.copy_(v_scale)
         layer._k_scale_float = k_scale
         layer._v_scale_float = v_scale
+        # vLLM 0.28 also keeps host copies for the AITER fused kernels; the
+        # buffers exist on every platform, so keep them in sync on refit too.
+        if hasattr(layer, "_k_scale_cpu"):
+            layer._k_scale_cpu.fill_(k_scale)
+            layer._v_scale_cpu.fill_(v_scale)
 
     if layer.q_scale > 0.0:
         q_scale = layer.q_scale
         if current_platform.is_fp8_fnuz():
             q_scale *= 2
-        layer.calculate_kv_scales = False
     else:
         q_scale = 1.0
     if layer.prob_scale > 0.0:

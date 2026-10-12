@@ -377,6 +377,7 @@ class TestAudioMCQFormatData:
 
 class _FakeFeatureExtractor:
     sampling_rate = 16000
+    hop_length = 160
     model_input_names: list[str] = []
 
 
@@ -449,3 +450,64 @@ class TestAudioMCQProcessor:
         assert result["task_name"] == "custom-vlm-task"
         assert result["extra_env_info"]["ground_truth"] == "hello"
         assert result["vllm_content"] == "<chat>fake</chat>"
+
+    @pytest.mark.parametrize(
+        "pad_audio_to_hop_length, num_samples, expected_num_samples",
+        [(True, 16_001, 16_160), (True, 16_000, 16_000), (None, 16_001, 16_001)],
+    )
+    def test_pad_audio_to_hop_length_reaches_learner_and_vllm(
+        self, pad_audio_to_hop_length, num_samples, expected_num_samples
+    ):
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        class _RecordingProcessor(_FakeProcessor):
+            def apply_chat_template(self, messages, tokenize=False, **kwargs):
+                self.messages = messages
+                return super().apply_chat_template(messages, tokenize, **kwargs)
+
+        audio = np.ones(num_samples, dtype=np.float32)
+        processor = _RecordingProcessor()
+        result = vlm_hf_data_processor(
+            datum_dict={
+                "task_name": "custom-audio-task",
+                "messages": [
+                    {"role": "user", "content": [{"type": "audio", "audio": audio}]},
+                    {"role": "assistant", "content": "hello"},
+                ],
+            },
+            task_data_spec=TaskDataSpec(
+                task_name="custom-audio-task",
+                pad_audio_to_hop_length=pad_audio_to_hop_length,
+            ),
+            processor=processor,
+            max_seq_length=4096,
+            idx=0,
+        )
+
+        learner_audio = processor.messages[0]["content"][0]["audio"]
+        vllm_audio, sampling_rate = result["vllm_multi_modal_data"]["audio"]
+        assert learner_audio is vllm_audio
+        assert sampling_rate == 16000
+        assert vllm_audio.shape == (expected_num_samples,)
+        assert np.array_equal(vllm_audio[:num_samples], audio)
+        assert not vllm_audio[num_samples:].any()
+
+    def test_load_response_dataset_passes_pad_audio_to_hop_length_to_task_spec(
+        self, monkeypatch, tmp_path
+    ):
+        from nemo_rl.data.datasets.response_datasets import load_response_dataset
+
+        snapshot_root = _build_fixture_snapshot(tmp_path, [_row(0)])
+        _patch_snapshot(monkeypatch, snapshot_root)
+
+        dataset = load_response_dataset(
+            {
+                "dataset_name": "audiomcq",
+                "max_samples": 1,
+                "processor": "vlm_hf_data_processor",
+                "pad_audio_to_hop_length": True,
+            }
+        )
+
+        assert dataset.task_spec.pad_audio_to_hop_length is True

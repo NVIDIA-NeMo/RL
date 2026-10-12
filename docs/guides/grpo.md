@@ -651,6 +651,7 @@ When top-p or top-k filtering is enabled, the following conventions apply:
 - **`curr_logprobs` and `prev_logprobs`** are computed *with* filtering applied, for compatibility with the actor loss.
 - **`reference_policy_logprobs`** is computed *without* filtering (see the `use_reference_model` in the policy worker).
 - **KL divergence** uses `curr_logprobs_unfiltered`(`curr_logprobs` *without* filtering) so that it is consistent with the reference policy logprobs.
+- **`-inf` positions** caused by the training-side and inference-side disagreeing on the top-k/top-p filtered set are dropped from `token_mask`. They contribute to neither the actor loss nor the KL penalty, as the `token_mask` is applied to `curr_logprobs_unfiltered`.
 
 Under tensor parallelism (TP), enabling top-p or top-k adds communication overhead. The vocabulary is sharded across GPUs (vocab-parallel), while top-p and top-k require full-vocabulary probabilities. A naive all-gather of logits would require large additional memory. The implementation therefore switches to a batch–sequence-parallel layout via all-to-all communication, applies filtering over the full vocabulary, then switches back, avoiding materialization of the full vocabulary on any single rank.
 
@@ -702,6 +703,14 @@ semantics.
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
+`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described
+below. Set it to `minimal` to skip optional diagnostic kernels; the loss
+and objective bookkeeping remain unchanged. Both modes report
+`token_mult_prob_error` to monitor training–generation logprob mismatch.
+`loss_fn.enable_torch_compile` can
+be enabled separately to compile the tensor-only actor objective (it is opt-in
+because backend and distributed-layout support should be validated first).
+
 ### Multiplicative Token Probability Error
 This feature is controlled by the parameter `token_mult_prob_error`. It measures the error introduced when token probabilities are scaled multiplicatively, which can affect model calibration and output consistency. This is equal to the 'Logprob consistency metric' defined in [Adding New Models](../adding-new-models.md#importance-of-log-probability-consistency-in-training-and-inference):
 
@@ -747,7 +756,7 @@ This is simply $\frac{1}{|T|}\sum_{t \in \text{tokens}}\text{exp}(\text{log}(\pi
 
 Similar to [Multiplicative Token Probability Error](#multiplicative-token-probability-error), this is a measure of how far off your inference backend is from your training framework. However, this metric is meant to find the bias in that error, rather than the variance, as it does not take the absolute value of the error. With some noise, this should hover around 1.
 
-This metric is always calculated and the per-token version (without the mean) is used in the loss function when [Importance Sampling Correction](#importance-sampling-correction) is enabled.
+This metric is always reported when `loss_fn.metrics_level` is `full`. In `minimal` mode, it is only reported when `use_importance_sampling_correction` is enabled. The per-token version (without the mean) is used in the loss function when [Importance Sampling Correction](#importance-sampling-correction) is enabled.
 
 ### Entropy
 This feature is controlled by the parameter `approx_entropy`. It estimates the entropy of the policy distribution, which can be used to encourage exploration and prevent premature convergence during training. We roughly approximate the entropy of the LLM's distribution throughout training by calculating:
@@ -844,7 +853,7 @@ The headline metric is per-reward convergence, not just aggregate reward. NeMo-R
 GRPO supports LoRA on both the DTensor and Megatron backends. To enable LoRA on the default DTensor backend:
 
 ```bash
-uv run examples/run_grpo.py policy.dtensor_cfg.lora_cfg.enabled=true
+uv run examples/run_grpo.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
 The DTensor GRPO LoRA path uses a merge-weight approach: during generation, LoRA adapter weights are merged into the base linear weights. This improves performance, with a small training-inference mismatch that we consider acceptable. If you require strict training-inference parity, use the [split-weight variant branch](https://github.com/NVIDIA-NeMo/RL/tree/ruit/lora_grpo_async), which may trade off some performance. For a comparison between merge-weight and split-weight, see [PR 1797: Support lora in dtensor grpo workflow by merging weight](https://github.com/NVIDIA-NeMo/RL/pull/1797).

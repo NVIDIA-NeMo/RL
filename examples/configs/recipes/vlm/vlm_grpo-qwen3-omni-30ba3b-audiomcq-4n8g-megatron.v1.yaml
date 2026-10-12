@@ -62,6 +62,7 @@ data:
   default:
     prompt_file: null
     processor: vlm_hf_data_processor
+    pad_audio_to_hop_length: true
     env_name: vlm
 env:
   vlm:

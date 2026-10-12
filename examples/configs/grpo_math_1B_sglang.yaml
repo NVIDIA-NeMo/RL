@@ -37,6 +37,24 @@ policy:
         num_gpus_per_engine: ${policy.generation.sglang_cfg.tp_size}
       sglang_router_config:
         use_external_router: false
+        # Managed-router total attempts per request and worker circuit threshold.
+        # These retain the sglang-router 0.3.2 defaults; external routers own theirs.
+        retry_max_retries: 5
+        cb_failure_threshold: 10
+      sglang_http_client_config:
+        # Total client POST attempts, including the first; also applies with an
+        # external router. Distributed dispatch and local fallback each use it.
+        max_retries: 3
+      # Fault tolerance: probe serving health during generation and check engine
+      # liveness before refit, restarting hung/dead engines at that refit.
+      sglang_fault_tolerance_config:
+        use_fault_tolerance: false
+        rollout_health_check_interval: 60
+        rollout_health_check_timeout: 60
+        rollout_health_check_first_wait: 60
+        # Nonnegative restart limit per logical engine over the run's lifetime.
+        # Abort when exhausted; 0 disables restarts.
+        rollout_max_restart_attempts: 3
     colocated:
       enabled: true
 

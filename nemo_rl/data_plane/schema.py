@@ -30,6 +30,21 @@ GLOBAL_FORWARD_PAD_SEQLEN = "global_forward_pad_seqlen"
 # same string with a flat-dict shape, so this constant is not a drop-in there.
 ROLLOUT_METRICS = "rollout_metrics"
 
+# Per-row key in `KVBatchMeta.tags` naming the prompt group a row was generated
+# in. The group-relative estimators key their baseline on this rather than on
+# prompt tokens, which two distinct groups can share.
+GROUP_ID_TAG = "group_id"
+
+# The per-token members of `tq_token_sink.STAGING_FIELDS` (Gym's
+# `StagedCallRecord` deltas, under the names `stage()` renames them to). Named
+# here rather than inside the sink so `nemo_rl.utils.rpc_guard` can build its
+# forbidden-key set from the list that owns these names instead of a copy.
+PER_TOKEN_STAGING_FIELDS = (
+    "token_ids_delta",
+    "token_mask_delta",
+    "generation_logprobs_delta",
+)
+
 # Skeleton field names from `shard_meta_for_dp`.
 INPUT_IDS = "input_ids"
 INPUT_LENGTHS = "input_lengths"
@@ -44,7 +59,8 @@ MALFORMED_THINKING_MASK = "malformed_thinking_mask"
 
 # Tensor fields in the train partition. Rollout writes the input
 # subset on first put; later stages add prev_logprobs /
-# reference_policy_logprobs (workers) and advantages (driver).
+# reference_policy_logprobs (workers) and advantages (driver);
+# under top-k/top-p the prev-logprob stage also rewrites token_mask.
 DP_TRAIN_FIELDS = (
     "input_ids",
     "input_lengths",

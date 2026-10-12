@@ -4,8 +4,10 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
+STEPS_PER_RUN=100
 MAX_STEPS=100
-NUM_MINUTES=20
+NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
+NUM_MINUTES=30
 STUDENT_MODEL=meta-llama/Llama-3.2-1B
 TEACHER_MODEL=Qwen/Qwen3-4B
 # ===== END CONFIG =====
@@ -71,5 +73,6 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'mean(data["train/accuracy"], -5, -1) > 0.80' \
         'data["validation/kl_loss"]["100"] < 0.04' \
         'data["validation/kl_loss"]["100"] < 0.65 * data["validation/kl_loss"]["0"]' \
+        'mean(data["timing/train/total_step_time"], -5, -1) < 8' \
         'max(data["ray/node.0.gpu.0.mem_gb"]) < 30'
 fi

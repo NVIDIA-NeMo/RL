@@ -80,8 +80,8 @@ dimensions and the separate generation allocation.
 
 ## Important Recipe Settings
 
-- `policy.dtensor_cfg.context_parallel_size: 8` and
-  `policy.dtensor_cfg.expert_parallel_size: 128` select the training layout.
+- `policy.automodel_cfg.context_parallel_size: 8` and
+  `policy.automodel_cfg.expert_parallel_size: 128` select the training layout.
 - The AutoModel backend uses `attn: sdpa`, `linear: te`, and
   `dispatcher: hybridep`.
 - The optimizer is Transformer Engine `FusedAdam`, with `master_weights: true`,

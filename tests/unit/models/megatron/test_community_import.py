@@ -101,6 +101,30 @@ def _install_runtime_stubs_for_hf_import(monkeypatch):
     core_module.tensor_parallel = tensor_parallel
 
 
+def test_iter_vlm_config_overrides_yields_super35_runtime_values(monkeypatch):
+    module = _load_community_import_module(monkeypatch)
+
+    overrides = dict(
+        module.iter_vlm_config_overrides(
+            {
+                "radio_force_eval_mode": False,
+                "recompute_vision": True,
+                "vision_recompute_granularity": "full",
+                "vision_recompute_method": "block",
+                "vision_recompute_num_layers": 30,
+            }
+        )
+    )
+
+    assert overrides == {
+        "radio_force_eval_mode": False,
+        "recompute_vision": True,
+        "vision_recompute_granularity": "full",
+        "vision_recompute_method": "block",
+        "vision_recompute_num_layers": 30,
+    }
+
+
 def _stage_conversion(path) -> None:
     """Materialize a complete conversion layout (iter_0000000/run_config.yaml)."""
     os.makedirs(os.path.join(str(path), "iter_0000000"), exist_ok=True)
