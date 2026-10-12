@@ -847,7 +847,11 @@ def setup(
     def init_vllm():
         """Initialize vLLM generation workers."""
         t0 = time.perf_counter()
-        pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
+        pg = VllmGeneration(
+            cluster=inference_cluster,
+            config=generation_config,
+            use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+        )
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 

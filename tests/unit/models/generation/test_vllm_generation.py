@@ -305,7 +305,7 @@ def test_vllm_generation_rejects_worker_extension_with_quantization() -> None:
         ValueError,
         match="worker_extension_cls_fqn and quant_cfg are mutually exclusive",
     ):
-        VllmGeneration(cluster, config, defer_model_load=True)
+        VllmGeneration(cluster, config, defer_model_load=True, use_fastokens=False)
 
     cluster._init_placement_groups.assert_not_called()
 
@@ -327,7 +327,7 @@ def test_vllm_generation_rejects_unregistered_worker_extension(
         ) as worker_group,
         pytest.raises(ValueError, match="No actor environment registered"),
     ):
-        VllmGeneration(cluster, config, defer_model_load=True)
+        VllmGeneration(cluster, config, defer_model_load=True, use_fastokens=False)
 
     worker_group.assert_not_called()
     cluster._init_placement_groups.assert_not_called()
@@ -1989,7 +1989,7 @@ def policy(cluster, tokenizer):
     # Ensure async_engine is False for the standard policy fixture
     vllm_config["vllm_cfg"]["async_engine"] = False
     vllm_config = configure_generation_config(vllm_config, tokenizer)
-    p = VllmGeneration(cluster, vllm_config)
+    p = VllmGeneration(cluster, vllm_config, use_fastokens=False)
     yield p
     try:
         p.shutdown()
@@ -2077,7 +2077,7 @@ def test_vllm_missing_required_config_key(cluster):
 
     # Attempt to initialize VllmGeneration with incomplete config - should raise AssertionError
     with pytest.raises(AssertionError) as excinfo:
-        VllmGeneration(cluster, incomplete_config)
+        VllmGeneration(cluster, incomplete_config, use_fastokens=False)
 
     # Verify the error message contains information about the missing key
     error_message = str(excinfo.value)
@@ -2140,7 +2140,7 @@ def test_vllm_generation_rejects_unsupported_reload_refit_config(
         target[parts[-1]] = value
 
     with pytest.raises(AssertionError, match=error_match):
-        VllmGeneration(DummyCluster(), vllm_config)
+        VllmGeneration(DummyCluster(), vllm_config, use_fastokens=False)
 
 
 def test_vllm_validate_settings_rejects_unsupported_reload_refit_config():
@@ -2222,7 +2222,7 @@ def test_vllm_policy_generation_with_fastokens_enabled(
 
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer)
-    vllm_policy = VllmGeneration(cluster, vllm_config)
+    vllm_policy = VllmGeneration(cluster, vllm_config, use_fastokens=False)
 
     try:
         outputs = vllm_policy.generate(test_input_data)
@@ -2288,7 +2288,7 @@ async def test_vllm_policy_generation_async(
         from nemo_rl.models.policy.lm_policy import Policy
 
         print("creating vllm policy...")
-        async_policy = VllmGeneration(cluster, vllm_config)
+        async_policy = VllmGeneration(cluster, vllm_config, use_fastokens=False)
         async_policy.finish_generation()
 
         print("creating lm policy...")
@@ -2388,7 +2388,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
     print("Creating vLLM policy with default seed behavior...")
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer)
-    policy = VllmGeneration(cluster, vllm_config)
+    policy = VllmGeneration(cluster, vllm_config, use_fastokens=False)
     policy.finish_generation()
 
     from nemo_rl.models.policy.lm_policy import Policy
@@ -2450,7 +2450,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
         VllmGenerationWorker.configure_worker = configure_worker_fixed_seed
 
         # Create a new policy with fixed seed
-        fixed_seed_policy = VllmGeneration(cluster, vllm_config)
+        fixed_seed_policy = VllmGeneration(cluster, vllm_config, use_fastokens=False)
 
         # Generate with the same duplicated prompts
         print("Running generation with fixed seed...")
@@ -2707,7 +2707,7 @@ async def test_vllm_generation_with_hf_training_colocated(
     vllm_config["vllm_cfg"]["lora_cfg"]["enabled"] = enable_lora
 
     vllm_config = configure_generation_config(vllm_config, tokenizer)
-    vllm_policy = VllmGeneration(cluster, vllm_config)
+    vllm_policy = VllmGeneration(cluster, vllm_config, use_fastokens=False)
     vllm_policy.finish_generation()
 
     # Create Policy
@@ -2779,7 +2779,9 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     if vllm_precision == "fp8":
         vllm_config["vllm_cfg"]["kv_cache_dtype"] = "fp8"
     vllm_config = configure_generation_config(vllm_config, tokenizer)
-    vllm_policy = VllmGeneration(generation_cluster_separate, vllm_config)
+    vllm_policy = VllmGeneration(
+        generation_cluster_separate, vllm_config, use_fastokens=False
+    )
     vllm_policy.finish_generation()
 
     assert not (enable_lora and vllm_precision == "fp8"), (
@@ -2837,7 +2839,7 @@ def test_vllm_policy_tensor_parallel(cluster, tokenizer):
 
     vllm_policy = None
     try:
-        vllm_policy = VllmGeneration(cluster, tp_config)
+        vllm_policy = VllmGeneration(cluster, tp_config, use_fastokens=False)
 
         # Create simple test input
         test_prompts = ["Hello, my name is", "The capital of France is"]
@@ -2904,7 +2906,7 @@ def test_vllm_generate_text(cluster, tokenizer):
     )
 
     # Create vLLM generation
-    vllm_generation = VllmGeneration(cluster, vllm_config)
+    vllm_generation = VllmGeneration(cluster, vllm_config, use_fastokens=False)
 
     # Generate and check result
     output = vllm_generation.generate_text(test_prompts, greedy=True)
@@ -2962,7 +2964,7 @@ def test_vllm_http_server(cluster, tokenizer):
     generation_config["temperature"] = 0.0
 
     # Create vLLM generation
-    vllm_generation = VllmGeneration(cluster, generation_config)
+    vllm_generation = VllmGeneration(cluster, generation_config, use_fastokens=False)
 
     # We expect one server per vLLM DP rank.
     base_urls = vllm_generation.dp_openai_server_base_urls
@@ -3135,7 +3137,9 @@ def test_vllm_deferred_model_load(cluster, tokenizer):
     generation_config["temperature"] = 0.0
 
     # Phase 1: Deferred init — only reserve ports, no model loading
-    vllm_generation = VllmGeneration(cluster, generation_config, defer_model_load=True)
+    vllm_generation = VllmGeneration(
+        cluster, generation_config, defer_model_load=True, use_fastokens=False
+    )
 
     # URLs should be available immediately from reserved ports
     reserved_urls = vllm_generation.dp_openai_server_base_urls
@@ -3327,7 +3331,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
     generation_config["temperature"] = 0.0
 
     # Create vLLM generation
-    vllm_generation = VllmGeneration(cluster, generation_config)
+    vllm_generation = VllmGeneration(cluster, generation_config, use_fastokens=False)
 
     # We expect one server per vLLM DP rank.
     base_urls = vllm_generation.dp_openai_server_base_urls
@@ -3466,7 +3470,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print(f"Creating vLLM policy for TP={tensor_parallel_size}...")
-        vllm_policy = VllmGeneration(cluster, vllm_config)
+        vllm_policy = VllmGeneration(cluster, vllm_config, use_fastokens=False)
 
         print("preparing refit info...")
         state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
@@ -3569,7 +3573,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
 
     # Create policies
     print("Creating vLLM policy...")
-    vllm_policy = VllmGeneration(cluster, vllm_config)
+    vllm_policy = VllmGeneration(cluster, vllm_config, use_fastokens=False)
     vllm_policy.finish_generation()
 
     print("Creating Training Policy...")
@@ -3644,7 +3648,7 @@ def test_vllm_generation_with_stop(cluster, test_input_data, tokenizer, is_eval)
 
     # Create policies
     print("Creating vLLM policy...")
-    vllm_generation = VllmGeneration(cluster, vllm_config)
+    vllm_generation = VllmGeneration(cluster, vllm_config, use_fastokens=False)
 
     # Get weights from HF policy if not in eval mode
     if not is_eval:
@@ -3779,7 +3783,9 @@ async def test_vllm_refit_non_colocated_update_weights(
 
     # Create Policy and VllmGeneration
     lm_policy = Policy(policy_cluster_separate, lm_config, tokenizer)
-    vllm_generation = VllmGeneration(generation_cluster_separate, vllm_config)
+    vllm_generation = VllmGeneration(
+        generation_cluster_separate, vllm_config, use_fastokens=False
+    )
 
     # initialize collective communication for update weights
     ip, port = policy_cluster_separate.get_master_address_and_port()
@@ -3911,7 +3917,7 @@ def test_vllm_generation_with_megatron_training(
 
         # Create both policies
         print("Creating vLLM policy...")
-        vllm_policy = VllmGeneration(cluster, vllm_config)
+        vllm_policy = VllmGeneration(cluster, vllm_config, use_fastokens=False)
         vllm_policy.finish_generation()
 
         print("Creating Megatron policy...")
@@ -4075,7 +4081,7 @@ def test_vllm_generation_with_megatron_training_moe_model(
 
         # Create both policies
         print("Creating vLLM policy...")
-        vllm_policy = VllmGeneration(moe_cluster, vllm_config)
+        vllm_policy = VllmGeneration(moe_cluster, vllm_config, use_fastokens=False)
         vllm_policy.finish_generation()
 
         print("Creating Megatron policy...")
@@ -4203,7 +4209,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
 
     # Create policies
     print("Creating vLLM policy...")
-    vllm_policy = VllmGeneration(cluster, vllm_config)
+    vllm_policy = VllmGeneration(cluster, vllm_config, use_fastokens=False)
     vllm_policy.finish_generation()
 
     print("Creating Megatron policy...")
@@ -4319,7 +4325,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
         )
 
         print("Creating vLLM policy...")
-        vllm_policy = VllmGeneration(cluster, vllm_config)
+        vllm_policy = VllmGeneration(cluster, vllm_config, use_fastokens=False)
         vllm_policy.finish_generation()
 
         print("Creating Megatron policy with PP=2...")
@@ -4391,7 +4397,7 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
         vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
         vllm_config["model_name"] = model_name
         vllm_config["tokenizer"]["name"] = model_name
-        vllm_generation = VllmGeneration(cluster, vllm_config)
+        vllm_generation = VllmGeneration(cluster, vllm_config, use_fastokens=False)
 
         # prepare refit info
         state_dict_info = megatron_policy.prepare_refit_info(

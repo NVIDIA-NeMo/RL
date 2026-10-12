@@ -90,7 +90,9 @@ def main(config: MasterConfig) -> None:
     # Initialize vLLM directly from config
     policy_config["generation"]["model_name"] = policy_config["model_name"]
     policy_generation = VllmGeneration(
-        cluster=cluster, config=policy_config["generation"]
+        cluster=cluster,
+        config=policy_config["generation"],
+        use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
     )
     # Pre-initialize workers to avoid contention later
     policy_generation.finish_generation()

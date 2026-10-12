@@ -162,7 +162,8 @@ class VllmGeneration(GenerationInterface):
         name_prefix: str = "vllm_policy",
         workers_per_node: Optional[Union[int, list[int]]] = None,
         defer_model_load: bool = False,
-        use_fastokens: bool = False,
+        *,
+        use_fastokens: bool,
     ):
         """Initialize a vLLM policy with distributed workers.
 
@@ -177,8 +178,9 @@ class VllmGeneration(GenerationInterface):
             name_prefix: Prefix for Ray actor names
             workers_per_node: Workers per node override
             defer_model_load: If True, defer model loading for overlapped init
-            use_fastokens: Apply the configured Fastokens patch in async vLLM
-                actors before they create their tokenizer and HTTP renderer.
+            use_fastokens: The resolved ``policy.tokenizer.use_fastokens``. Async
+                vLLM actors apply the Fastokens patch before they create their
+                tokenizer and HTTP renderer; the sync engine does not use it.
         """
         # Store config
         self.cfg = config

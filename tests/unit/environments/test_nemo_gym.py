@@ -1372,7 +1372,7 @@ def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
         "tool_parser": "hermes",
     }
 
-    vllm_generation = VllmGeneration(cluster, generation_config)
+    vllm_generation = VllmGeneration(cluster, generation_config, use_fastokens=False)
 
     yield vllm_generation
 

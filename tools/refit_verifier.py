@@ -361,7 +361,11 @@ def setup_clusters_and_policies(args, megatron_config, vllm_config, tokenizer):
 
     # Create vLLM policy for inference-only logprobs
     vllm_inference_policy = VllmGeneration(
-        cluster=megatron_cluster, config=vllm_inference_config
+        cluster=megatron_cluster,
+        config=vllm_inference_config,
+        # The verifier's inline tokenizer config has no use_fastokens, and its
+        # sync vLLM engine would ignore it anyway.
+        use_fastokens=False,
     )
 
     return megatron_cluster, policy, vllm_inference_policy

@@ -154,7 +154,11 @@ def setup(
     assert backend == "vllm", "Only vLLM backend is supported for evaluation"
 
     # initialize vllm generation
-    vllm_generation = VllmGeneration(cluster=cluster, config=generation_config)
+    vllm_generation = VllmGeneration(
+        cluster=cluster,
+        config=generation_config,
+        use_fastokens=bool(master_config.tokenizer.get("use_fastokens")),
+    )
     print(
         f"  ✓ Using vLLM backend for generation with {generation_config['model_name']}"
     )
