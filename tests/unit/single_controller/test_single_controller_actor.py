@@ -4373,6 +4373,76 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
 
 
 @pytest.mark.parametrize("policy", ["exclude", "include"])
+def test_advantage_stage_statistics_participation_is_binary(policy: str) -> None:
+    """A fractional data-plane sample weight votes fully; a placeholder never votes."""
+    batch_size, sequence_length = 3, 4
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(batch_size, 1, dtype=torch.long),
+            "total_reward": torch.tensor([1.0, 0.0, 5.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            # Row 0 trains at half weight; row 2 is a token-capture placeholder.
+            "sample_mask": torch.tensor([0.5, 1.0, 0.0]),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
+    ctrl._is_ppo = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig(seq_logprob_error_threshold=None, masked_reward_policy=policy)
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
+    ctrl._step_log_dict = {
+        key: []
+        for key in (
+            "reward_partials",
+            "advantage_partials",
+            "sequence_lengths",
+            "num_mask_sample_filtered",
+            "seq_logprob_error_metrics",
+        )
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
+    )
+
+    _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert has_valid_training_tokens
+    # Statistics: binary, the same under both policies for this batch.
+    assert torch.equal(estimator.valid_mask, torch.tensor([1.0, 1.0, 0.0]))
+    torch.testing.assert_close(
+        estimator.normalization_mask,
+        data["token_mask"] * torch.tensor([1.0, 1.0, 0.0]).unsqueeze(-1),
+    )
+    # Loss: the fractional weight is preserved (no filter changed the mask, so
+    # the stage does not rewrite the sample_mask column).
+    torch.testing.assert_close(
+        estimator.mask, data["token_mask"] * torch.tensor([0.5, 1.0, 0.0]).unsqueeze(-1)
+    )
+    assert data_plane.written_fields is not None
+    assert "sample_mask" not in data_plane.written_fields.keys()
+
+
+@pytest.mark.parametrize("policy", ["exclude", "include"])
 @pytest.mark.parametrize("estimator_name", ["grpo", "gdpo", "reinforce_plus_plus"])
 def test_advantage_stage_placeholders_never_vote(
     policy: str, estimator_name: str

@@ -211,7 +211,7 @@ class SyncRolloutActor:
         """
         # Lazy imports keep rollout-specific dependencies off the actor startup path.
         # ``_policy_dtype`` sizes the VLM pixel tensors below.
-        from nemo_rl.algorithms.grpo import _mask_sample_valid_mask, _policy_dtype
+        from nemo_rl.algorithms.grpo import _dynamic_sampling_valid_mask, _policy_dtype
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import decompose_message_log
         from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -315,7 +315,13 @@ class SyncRolloutActor:
                 "input_lengths": input_lengths,
                 "generation_logprobs": flat["generation_logprobs"],
                 "token_mask": flat["token_loss_mask"],
-                "sample_mask": fb["loss_multiplier"] * _mask_sample_valid_mask(fb),
+                # Read only by the worker logprob passes, which zero logprobs
+                # outside token_mask * sample_mask under top-k/top-p filtering:
+                # the rows that vote in the advantage statistics under
+                # grpo.masked_reward_policy keep real logprobs. The loss weights
+                # travel in driver_carry; the driver writes the final training
+                # sample_mask back after computing advantages.
+                "sample_mask": _dynamic_sampling_valid_mask(fb, cfg.grpo),
             }
         )
         if ROUTED_EXPERTS_FIELD in flat:

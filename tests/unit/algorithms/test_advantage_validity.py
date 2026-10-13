@@ -24,6 +24,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 
 
 def _estimator(**overrides) -> GRPOAdvantageEstimator:
@@ -362,3 +363,82 @@ def test_reinforce_pp_empty_legacy_normalization_mask_is_finite():
     )
     assert torch.isfinite(actual).all()
     assert actual.count_nonzero() == 0
+
+
+def test_reinforce_pp_include_policy_needs_real_logprobs_through_worker_filtering():
+    """Worker top-k/top-p filtering, then Reinforce++ KL-in-reward under ``include``.
+
+    The workers zero every logprob outside ``token_mask * sample_mask`` for the
+    policy and the reference model alike. When that mask is the loss mask, a
+    loss-masked row that still votes in the statistics reaches the estimator
+    with a zero KL term and moves its siblings' normalized advantages. The
+    trainers therefore hand the worker the statistics mask; this pins the
+    estimator-side consequence with an independently computed reference.
+    """
+    prompt_ids = torch.zeros(3, 1, dtype=torch.long)
+    rewards = torch.tensor([1.0, 0.0, 1.0])
+    token_mask = torch.tensor(
+        [[0.0, 1.0, 1.0, 1.0], [0.0, 1.0, 1.0, 0.0], [0.0, 1.0, 1.0, 1.0]]
+    )
+    loss_weights = torch.tensor([1.0, 1.0, 0.0])  # row 2 carries no loss
+    statistics_mask = torch.ones(3)  # include: every row votes
+    real_policy = torch.tensor(
+        [
+            [0.0, -0.5, -1.0, -0.2],
+            [0.0, -0.3, -2.0, 0.0],
+            [0.0, -1.5, -0.7, -0.1],
+        ]
+    )
+    # A support mismatch on a trainable token stays -inf and is excluded from
+    # the KL term, as on main.
+    real_policy[0, 2] = -torch.inf
+    reference = torch.tensor(
+        [
+            [0.0, -0.4, -0.9, -0.3],
+            [0.0, -0.1, -1.5, 0.0],
+            [0.0, -1.0, -0.6, -0.4],
+        ]
+    )
+    estimator = ReinforcePlusPlusAdvantageEstimator(
+        AdvEstimatorConfig(minus_baseline=True),
+        ClippedPGLossConfig(
+            use_kl_in_reward=True,
+            reference_policy_kl_penalty=0.2,
+            reference_policy_kl_type="k1",
+        ),
+    )
+
+    def worker_filter(logprobs, sample_mask):
+        # nemo_rl/models/{automodel,megatron}/train.py under top-k/top-p filtering.
+        return mask_filtered_logprobs_outside_tokens(
+            logprobs, token_mask * sample_mask[:, None]
+        )
+
+    def advantages(worker_sample_mask):
+        return estimator.compute_advantage(
+            prompt_ids,
+            rewards,
+            token_mask * loss_weights[:, None],
+            valid_mask=statistics_mask,
+            normalization_mask=token_mask,
+            logprobs_policy=worker_filter(real_policy, worker_sample_mask),
+            logprobs_reference=worker_filter(reference, worker_sample_mask),
+        )
+
+    # Independent reference on the real logprobs: group mean over all rows,
+    # k1 KL (policy - reference) with the -inf token excluded, token-level
+    # normalization over every response token.
+    kl = torch.where(torch.isneginf(real_policy), 0.0, real_policy - reference)
+    token_adv = (rewards - rewards.mean())[:, None] - 0.2 * kl
+    stats = token_adv[token_mask.bool()]
+    expected = (token_adv - stats.mean()) / stats.var(correction=0).sqrt()
+
+    kept = advantages(statistics_mask)
+    torch.testing.assert_close(kept[token_mask.bool()], expected[token_mask.bool()])
+    assert torch.isfinite(kept).all()
+
+    # Filtering with the loss mask zeroes row 2's logprobs (policy and
+    # reference) so its KL collapses to zero and the trainable rows move.
+    dropped = advantages(loss_weights)
+    trainable = (token_mask * loss_weights[:, None]).bool()
+    assert not torch.allclose(dropped[trainable], expected[trainable])

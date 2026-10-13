@@ -40,6 +40,7 @@ import torch
 
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
+    _binary_participation,
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
 )
@@ -412,13 +413,18 @@ class AdvantageComputer:
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
-        advantage_valid_mask = final_sample_mask
+        # Statistics participation is binary and independent of the loss
+        # weights (grpo._binary_participation). ``include`` lets every row the
+        # data plane marks usable vote, so token-capture placeholders
+        # (sample_mask 0) never do; ``exclude`` lets the rows with a nonzero
+        # final loss weight vote. PPO's GAE ignores valid_mask.
+        participation = final_sample_mask
         if (
             not cfg.is_ppo
             and cast(GRPOConfig, cfg.algo).masked_reward_policy == "include"
         ):
-            # Preserve data-plane validity: token-capture placeholders never vote.
-            advantage_valid_mask = sample_mask
+            participation = sample_mask
+        advantage_valid_mask = _binary_participation(participation)
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,

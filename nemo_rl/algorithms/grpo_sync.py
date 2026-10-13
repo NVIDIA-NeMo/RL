@@ -812,6 +812,12 @@ def grpo_train_sync(
                         else None
                     )
                     prompt_group_ids = group_index_column(row_group_ids(meta))
+                    # One policy-selected participation mask for every statistic
+                    # computed before the logprob pass (baseline/std, env baseline,
+                    # dynamic-sampling admission); see _dynamic_sampling_valid_mask.
+                    statistics_valid_mask = _dynamic_sampling_valid_mask(
+                        driver_carry, master_config.grpo
+                    )
                     (
                         baseline,
                         std,
@@ -819,7 +825,7 @@ def grpo_train_sync(
                     ) = calculate_baseline_and_std_per_prompt(
                         prompt_group_ids,
                         driver_carry["total_reward"],
-                        _dynamic_sampling_valid_mask(driver_carry, master_config.grpo),
+                        statistics_valid_mask,
                         leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                         std_rewards=std_rewards,
                     )
@@ -827,12 +833,13 @@ def grpo_train_sync(
                     driver_carry["std"] = std
                     if "env_reward" in driver_carry:
                         # grpo.length_penalty rewrote total_reward; keep a
-                        # baseline of the env reward for the pct_* diagnostics.
+                        # baseline of the env reward for the pct_* diagnostics,
+                        # over the same population as the training baseline.
                         driver_carry["env_baseline"], _, _ = (
                             calculate_baseline_and_std_per_prompt(
                                 prompt_group_ids,
                                 driver_carry["env_reward"],
-                                torch.ones_like(driver_carry["env_reward"]),
+                                statistics_valid_mask,
                                 leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                             )
                         )
@@ -850,9 +857,7 @@ def grpo_train_sync(
                             calculate_trivial_reward_distributions(
                                 prompt_group_ids,
                                 dynamic_sampling_rewards,
-                                _dynamic_sampling_valid_mask(
-                                    driver_carry, master_config.grpo
-                                ),
+                                statistics_valid_mask,
                             )
                         )
                         tags["is_trivial_prompt_distribution"] = (
