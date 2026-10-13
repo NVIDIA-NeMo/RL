@@ -1186,8 +1186,8 @@ def test_pad_and_align_accepts_unsigned_backend_ids(
 ):
     """Ids in vLLM's native unsigned dtype are narrowed to the resolved carry dtype.
 
-    Covers both the prompt and the completion route tensors, and the default
-    route written into the padding rows, which is built in the carry dtype.
+    Covers both the prompt and the completion route tensors, and the
+    missing-route sentinel written into the padding rows.
     """
     monkeypatch.setattr(vllm_utils, "G_ROUTED_EXPERTS_RANGE_CHECKED", False)
     carry_dtype = resolve_routed_experts_dtype(num_experts)
@@ -1213,10 +1213,7 @@ def test_pad_and_align_accepts_unsigned_backend_ids(
     assert routed_experts.dtype == carry_dtype
     assert routed_experts.shape == (8, 3, top_k)
     assert torch.equal(routed_experts[:5], ids.to(carry_dtype))
-    default_route = torch.arange(top_k, dtype=carry_dtype)
-    assert torch.equal(
-        routed_experts[5:], default_route.view(1, 1, -1).expand(3, 3, top_k)
-    )
+    assert routed_experts[5:].eq(R3_MISSING_ROUTE_SENTINEL).all()
 
 
 def test_pad_and_align_overflow_guard_sees_unwrapped_unsigned_ids(monkeypatch):
