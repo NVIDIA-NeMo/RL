@@ -56,6 +56,8 @@ teachers:
   precision: bfloat16
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
   automodel_cfg:
     enabled: true
     cpu_offload: false
