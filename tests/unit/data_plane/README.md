@@ -126,7 +126,7 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_bootstrap_that_skips_the_wrapped_popen_is_a_drift_error` — A bootstrap that launches the master by another route fails loudly instead of silently keeping 9003.
 - `test_init_tq_reserves_every_master_port_from_the_band` — Metadata, master RPC and metrics ports all come from the data-plane band, and no `metrics_port` config key is sent.
 
-## `test_message_log_decompose.py` (11 tests)
+## `test_message_log_decompose.py` (13 tests)
 
 - `test_decompose_message_log_basic_shapes` — Basic shapes of decompose output.
 - `test_decompose_message_log_no_assistant_turn` — No-assistant case handled.
@@ -139,6 +139,8 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_attach_message_log_view_populates_batch` — `attach_message_log_view` populates batch view.
 - `test_attach_message_log_view_noop_when_fields_absent` — Without decomposed fields, attach is a no-op.
 - `test_attach_message_log_view_idempotent` — Calling twice produces same shape.
+- `test_decompose_realistic_multi_turn_jagged_count` — Jagged turn counts (1, 4, 2) with alternating roles: `turn_lengths` padded with zeros, non-padding lengths and roles match the source.
+- `test_decompose_reconstruct_roundtrip_realistic_multi_turn` — decompose → flat `input_ids` → reconstruct on jagged turn counts (1, 3, 4) preserves roles, contents, and token ids per turn.
 
 ## `test_observability.py` (8 tests)
 
