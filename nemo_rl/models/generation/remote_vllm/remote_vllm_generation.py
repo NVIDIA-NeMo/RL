@@ -25,10 +25,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.models.generation.remote_vllm.client import RemoteVllmClient
-from nemo_rl.models.generation.remote_vllm.config import RemoteVllmServiceConfig
 from nemo_rl.models.generation.remote_vllm.preflight import (
     preflight_remote_vllm_service,
 )
+from nemo_rl.models.generation.remote_vllm_config import RemoteVllmServiceConfig
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig

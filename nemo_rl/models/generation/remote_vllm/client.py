@@ -22,7 +22,7 @@ import urllib.request
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from nemo_rl.models.generation.remote_vllm.config import RemoteVllmServiceConfig
+from nemo_rl.models.generation.remote_vllm_config import RemoteVllmServiceConfig
 
 
 def service_url(base_url: str, absolute_path: str) -> str:
