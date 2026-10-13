@@ -153,7 +153,7 @@ def test_policy_worker_offsets_its_rank_in_the_collective(monkeypatch):
     )
 
 
-def test_policy_forwards_final_checkpoint_marker_to_dtensor_v2(monkeypatch):
+def test_policy_forwards_final_checkpoint_marker_to_automodel(monkeypatch):
     calls = []
 
     class WorkerGroup:
@@ -189,7 +189,7 @@ def test_policy_forwards_final_checkpoint_marker_to_dtensor_v2(monkeypatch):
     ]
 
 
-def test_policy_uses_megatron_save_path_when_dtensor_is_disabled(monkeypatch):
+def test_policy_uses_megatron_save_path_when_automodel_is_disabled(monkeypatch):
     calls = []
 
     class WorkerGroup:

@@ -537,7 +537,7 @@ def test_get_resume_paths_warns_when_megatron_optimizer_missing(
     assert optimizer_path is None
 
 
-def test_get_resume_paths_prefers_dtensor_optimizer(checkpoint_dir, monkeypatch):
+def test_get_resume_paths_prefers_automodel_optimizer(checkpoint_dir, monkeypatch):
     checkpoint_path = checkpoint_dir / "step_1"
     optimizer_path = checkpoint_path / "policy" / "optimizer"
     optimizer_path.mkdir(parents=True)

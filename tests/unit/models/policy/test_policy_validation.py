@@ -305,7 +305,7 @@ def test_policy_rejects_mismatched_vllm_and_megatron_fp32_lm_head(
     worker_group.assert_not_called()
 
 
-def test_policy_rejects_vllm_fp32_lm_head_with_dtensor_trainer():
+def test_policy_rejects_vllm_fp32_lm_head_with_automodel_trainer():
     config = create_automodel_config("test-model", tp=1)
     set_vllm_generation(config, {"fp32_lm_head": True})
 
@@ -322,7 +322,7 @@ def test_policy_rejects_vllm_fp32_lm_head_with_dtensor_trainer():
     worker_group.assert_not_called()
 
 
-def test_policy_accepts_vllm_fp32_lm_head_disabled_with_dtensor_trainer():
+def test_policy_accepts_vllm_fp32_lm_head_disabled_with_automodel_trainer():
     config = create_automodel_config("test-model", tp=1)
     set_vllm_generation(config, {})
 
@@ -436,7 +436,7 @@ def test_policy_flops_tracker_uses_hf_config_overrides() -> None:
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_nvfp4_pertoken_rejects_dtensor_training_backend(
+def test_nvfp4_pertoken_rejects_automodel_training_backend(
     mock_ray_worker_group,
     tiny_llama_model_path,
 ):
@@ -597,7 +597,7 @@ def test_policy_rejects_unregistered_worker_extension(from_config: bool) -> None
     ],
 )
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_world_size_validation_dtensor(
+def test_world_size_validation_automodel(
     mock_ray_worker_group,
     tiny_llama_model_path,
     world_size,
@@ -658,7 +658,7 @@ def test_world_size_validation_dtensor(
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_dtensor_dp_replicate_size_sets_batching_dp(
+def test_automodel_dp_replicate_size_sets_batching_dp(
     mock_ray_worker_group,
     tiny_llama_model_path,
 ):
@@ -676,7 +676,7 @@ def test_dtensor_dp_replicate_size_sets_batching_dp(
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_dtensor_hsdp_dispatches_distinct_batches(
+def test_automodel_hsdp_dispatches_distinct_batches(
     mock_ray_worker_group,
     tiny_llama_model_path,
 ):

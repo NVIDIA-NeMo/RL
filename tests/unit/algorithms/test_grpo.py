@@ -2983,7 +2983,7 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
         ("auto", "bfloat16", None),
     ],
 )
-def test_setup_dtensor_fp8_kv_cache_guard(
+def test_setup_automodel_fp8_kv_cache_guard(
     mock_grpo_components, monkeypatch, kv_cache_dtype, precision, error
 ):
     import nemo_rl.algorithms.grpo as grpo_mod

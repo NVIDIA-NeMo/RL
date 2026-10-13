@@ -61,7 +61,7 @@ class _FakeTrainableModel:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_prepare_for_training_restores_optimizer(monkeypatch):
+def test_prepare_for_training_restores_optimizer(monkeypatch):
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     model = _FakeTrainableModel()
     restored_devices = []
@@ -85,9 +85,7 @@ def test_dtensor_v2_prepare_for_training_restores_optimizer(monkeypatch):
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 @pytest.mark.parametrize("keep_train_buffers", [False, True])
-def test_dtensor_v2_prepare_for_lp_inference_keep_train_buffers(
-    monkeypatch, keep_train_buffers
-):
+def test_prepare_for_lp_inference_keep_train_buffers(monkeypatch, keep_train_buffers):
     """``keep_train_buffers`` suppresses the optimizer offload and nothing else.
 
     ``True`` is not reachable from a dtensor run today -- the split train API
@@ -123,7 +121,7 @@ def test_dtensor_v2_prepare_for_lp_inference_keep_train_buffers(
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_update_moe_gate_bias_called_when_supported():
+def test_update_moe_gate_bias_called_when_supported():
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = MagicMock()
     worker.model.update_moe_gate_bias = MagicMock()
@@ -135,7 +133,7 @@ def test_dtensor_v2_update_moe_gate_bias_called_when_supported():
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_update_moe_gate_bias_noop_when_unsupported():
+def test_update_moe_gate_bias_noop_when_unsupported():
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     # A real module without the hook: getattr(..., None) must short-circuit so
     # models that do not expose update_moe_gate_bias are unaffected.
@@ -284,7 +282,7 @@ def two_gpu_virtual_cluster():
 @pytest.mark.automodel
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("save_optimizer", [True, False])
-def test_dtensor_v2_checkpoint_save_and_load(
+def test_checkpoint_save_and_load(
     two_gpu_virtual_cluster,
     tiny_llama_model_path,
     save_optimizer,
@@ -379,7 +377,7 @@ def test_dtensor_v2_checkpoint_save_and_load(
 @pytest.mark.automodel
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("precision", ["bfloat16", "float16"])
-def test_dtensor_v2_mixed_precision_training_and_logprobs(
+def test_mixed_precision_training_and_logprobs(
     two_gpu_virtual_cluster,
     tiny_llama_model_path,
     precision,
@@ -873,7 +871,7 @@ def _init_v2_worker_mocked(
     ("model_type", "expected_async"),
     [("deepseek_v4", False), ("deepseek_v3", True)],
 )
-def test_dtensor_v2_scopes_synchronous_checkpointing_to_dsv4(
+def test_scopes_synchronous_checkpointing_to_dsv4(
     monkeypatch, model_type, expected_async
 ):
     worker, *_ = _init_v2_worker_mocked(
@@ -889,7 +887,7 @@ def test_dtensor_v2_scopes_synchronous_checkpointing_to_dsv4(
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_resume_with_reference_model_defers_checkpoint_load(monkeypatch):
+def test_resume_with_reference_model_defers_checkpoint_load(monkeypatch):
     """On resume with a KL reference, the reference must be captured from base
     weights (checkpoint load deferred until after the capture)."""
     worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
@@ -917,7 +915,7 @@ def test_dtensor_v2_resume_with_reference_model_defers_checkpoint_load(monkeypat
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_resume_without_reference_model_passes_paths_through(monkeypatch):
+def test_resume_without_reference_model_passes_paths_through(monkeypatch):
     worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
         monkeypatch,
         init_reference_model=False,
@@ -932,7 +930,7 @@ def test_dtensor_v2_resume_without_reference_model_passes_paths_through(monkeypa
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_fresh_run_with_reference_model_does_not_defer(monkeypatch):
+def test_fresh_run_with_reference_model_does_not_defer(monkeypatch):
     worker, call_log, setup_mock, load_mock = _init_v2_worker_mocked(
         monkeypatch,
         init_reference_model=True,
