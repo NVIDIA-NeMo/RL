@@ -29,8 +29,11 @@ export AGENTIC_VBENCH_MAX_TURNS=${AGENTIC_VBENCH_MAX_TURNS:-32}
 # This wrapper is specifically the mechanism gate, so require one bounded child
 # call.  The production recipe remains opt-in ("may delegate") after the parent
 # and child training rows have been proven healthy here.
-debug_delegation_prompt="During this task, you must call the task tool exactly once to delegate one suitable bounded subtask to the general subagent. "
-debug_delegation_prompt+="Do not delegate the full task. Review and integrate the child's result before producing the final answer."
+# Keep this Hydra override free of commas and apostrophes.  The launcher passes
+# the value as one argv entry, but Hydra still parses punctuation in the value;
+# an apostrophe in the v9 prompt made the live driver fail before setup.
+debug_delegation_prompt="During this task you must call the task tool exactly once to delegate one suitable bounded subtask to the general subagent. "
+debug_delegation_prompt+="Do not delegate the full task. Review and integrate the child result before producing the final answer."
 export AGENTIC_VBENCH_DELEGATION_PROMPT=${AGENTIC_VBENCH_DELEGATION_PROMPT:-"${debug_delegation_prompt}"}
 export BASE_NAME=${BASE_NAME:-agentic_vbench_v2_subagents_sync_8n_$(date -u +%Y%m%d-%H%M%S)-$$}
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$BASE_NAME}
