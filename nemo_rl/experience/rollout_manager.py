@@ -170,7 +170,11 @@ def _failure_class(r: Mapping[str, Any]) -> Optional[str]:
         or r.get("error_kind") == "eval_timeout"
     ):
         return "timeout"
-    if r.get("agent_error_kind") == "context_window" or overflow_text:
+    if (
+        r.get("agent_error_kind") == "context_window"
+        or r.get("context_overflow")
+        or overflow_text
+    ):
         return "overflow"
     if incomplete_text:
         return "agent_incomplete"

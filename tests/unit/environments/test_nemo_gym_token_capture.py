@@ -243,6 +243,42 @@ def test_receipt_assembly_ignores_uncommitted_call_failures_off_the_terminal_cha
     assert receipt["terminal_model_call_id"] == "c2"
 
 
+@pytest.mark.parametrize("train_overflow_as_zero", [False, True])
+def test_receipt_postprocess_trains_overflow_prefix_at_zero(
+    train_overflow_as_zero: bool,
+) -> None:
+    env = _capture_env()
+    env.cfg = {"train_overflow_as_zero": train_overflow_as_zero}
+    env._control = AsyncMock(
+        return_value={
+            "rollout_id": "r0",
+            "records": [_manifest_record("c1"), _manifest_record("c2", parent="c1")],
+            "failures": [{"model_call_id": "c3", "reason": "context_overflow"}],
+        }
+    )
+    result = asyncio.run(
+        env._postprocess_receipt_mode(
+            {"_ng_rollout_id": "r0"},
+            # The harness names the synthetic overflow reply as its terminal.
+            {
+                "reward": 1.0,
+                "reward_components": {"a": 1.0},
+                "terminal_response_id": "resp-c3",
+            },
+        )
+    )
+    full_result, receipt = result["full_result"], result["receipt"]
+    assert full_result["context_overflow"] is True
+    if train_overflow_as_zero:
+        assert full_result["reward"] == receipt["reward"] == 0.0
+        assert full_result["reward_components"] == {"a": 0.0}
+        assert receipt["terminal_model_call_id"] == "c2"
+        assert receipt["capture_poisoned"] is False
+    else:
+        assert receipt["reward"] == 1.0
+        assert receipt["failure_reason"] == "missing_terminal_row"
+
+
 def test_receipt_assembly_still_poisons_when_the_terminal_call_died_uncommitted() -> (
     None
 ):

@@ -371,6 +371,9 @@ class NemoGymConfig(TypedDict):
     # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
     # tokenizer consistently with the driver. Defaults to off when absent.
     use_fastokens: NotRequired[bool]
+    # Train rollouts with a context-overflow call at reward 0, ending at the
+    # last committed call, instead of their verify reward.
+    train_overflow_as_zero: NotRequired[bool]
     # Optional startup gate for externally served Gym dependencies. The actor
     # starts local Gym services first, then waits for every target before it
     # exposes its rollout collection helper to the training driver.
@@ -397,6 +400,8 @@ _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
+# Gym's CONTEXT_OVERFLOW_CALL_REASON, inlined so an older Gym still imports.
+CONTEXT_OVERFLOW_CALL_REASON = "context_overflow"
 
 
 def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
@@ -1162,6 +1167,20 @@ Depending on your data shape, you may want to change these values."""
                 "GET",
                 f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/manifest",
             )
+            if any(
+                failure.get("reason") == CONTEXT_OVERFLOW_CALL_REASON
+                for failure in manifest.get("failures") or []
+            ):
+                nemo_gym_result["context_overflow"] = True
+                if self.cfg.get("train_overflow_as_zero"):
+                    nemo_gym_result["reward"] = 0.0
+                    if nemo_gym_result.get("reward_components"):
+                        nemo_gym_result["reward_components"] = dict.fromkeys(
+                            nemo_gym_result["reward_components"], 0.0
+                        )
+                    # The harness may name the synthetic overflow reply as its
+                    # terminal; end at the last committed call instead.
+                    terminal_response_id = scored_response = None
             receipt = self._assemble_receipt(
                 rollout_id,
                 manifest,
@@ -1289,7 +1308,8 @@ Depending on your data shape, you may want to change these values."""
         poisoning_failures = [
             failure
             for failure in failures
-            if str(failure.get("reason") or "") != UNCOMMITTED_CALL_REASON
+            if str(failure.get("reason") or "")
+            not in (UNCOMMITTED_CALL_REASON, CONTEXT_OVERFLOW_CALL_REASON)
         ]
         failure_reason = None
         if poisoning_failures:
@@ -1803,6 +1823,7 @@ def _build_gym_actor_config(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    train_overflow_as_zero = bool(nemo_gym_dict.pop("train_overflow_as_zero", False))
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
         key: value
@@ -1842,6 +1863,7 @@ def _build_gym_actor_config(
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        train_overflow_as_zero=train_overflow_as_zero,
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,

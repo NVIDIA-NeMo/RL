@@ -1070,6 +1070,7 @@ _HOST_TIMEOUT = _RUN_ERROR | {"failure_reason": "invoke failed (host_timeout)"}
             "overflow",
         ),
         ({"agent_error_kind": "context_window", "resolved": True}, "overflow"),
+        ({"context_overflow": True}, "overflow"),
         (
             _RUN_ERROR | {"failure_reason": "mini_swe_agent_incomplete, input length"},
             "overflow",
