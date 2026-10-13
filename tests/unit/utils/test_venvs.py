@@ -106,20 +106,32 @@ def test_make_actor_runtime_env_builds_local_venv_for_uv_python_executable():
     assert runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] == "/fake/venv"
 
 
-def _fake_run(
-    fail_times: int, calls: list[list[str]]
+def _fake_run_failing(
+    failing_calls: set[int], calls: list[list[str]]
 ) -> Callable[..., subprocess.CompletedProcess[bytes]]:
-    """Return a ``subprocess.run`` stand-in that fails the first ``fail_times`` calls."""
+    """Return a ``subprocess.run`` stand-in whose n-th call fails iff ``n`` is in ``failing_calls``.
+
+    Calls are numbered from 1; a failing call raises ``CalledProcessError`` with ``n``
+    as its exit code so tests can tell failures apart.
+    """
 
     def fake_run(
         cmd: list[str], env: dict[str, str] | None = None, check: bool = True
     ) -> subprocess.CompletedProcess[bytes]:
         calls.append(list(cmd))
-        if len(calls) <= fail_times:
-            raise subprocess.CalledProcessError(1, cmd)
+        n = len(calls)
+        if n in failing_calls:
+            raise subprocess.CalledProcessError(n, cmd)
         return subprocess.CompletedProcess(cmd, 0)
 
     return fake_run
+
+
+def _fake_run(
+    fail_times: int, calls: list[list[str]]
+) -> Callable[..., subprocess.CompletedProcess[bytes]]:
+    """Return a ``subprocess.run`` stand-in that fails the first ``fail_times`` calls."""
+    return _fake_run_failing(set(range(1, fail_times + 1)), calls)
 
 
 def test_run_with_retries_reruns_all_commands_after_failure():
@@ -139,6 +151,28 @@ def test_run_with_retries_reruns_all_commands_after_failure():
         ["uv", "run", "echo"],
     ]
     assert mock_sleep.call_count == 2
+
+
+def test_run_with_retries_second_command_failure_reruns_first_command():
+    calls: list[list[str]] = []
+    with (
+        patch.dict(os.environ, {"NEMO_RL_UV_SYNC_ATTEMPTS": "3"}),
+        patch.object(
+            venvs.subprocess, "run", side_effect=_fake_run_failing({2}, calls)
+        ),
+        patch.object(venvs.time, "sleep") as mock_sleep,
+    ):
+        venvs._run_with_retries([["uv", "sync"], ["uv", "run", "echo"]], env={})
+
+    # `uv run echo` failed once: the retry re-runs `uv sync` before it, in order,
+    # rather than retrying only the command that failed.
+    assert calls == [
+        ["uv", "sync"],
+        ["uv", "run", "echo"],
+        ["uv", "sync"],
+        ["uv", "run", "echo"],
+    ]
+    assert mock_sleep.call_count == 1
 
 
 def test_run_with_retries_reraises_after_last_attempt():
