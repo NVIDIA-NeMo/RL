@@ -64,3 +64,7 @@ code_snapshots*/
 
 # Agentic-VBench shared inputs, backends and prepared datasets (linked or prepared per checkout).
 data/agentic_vbench
+
+# ClawEval prompt data is tracked, but live rootless-backend directories contain
+# generated TLS private keys and must never be committed.
+/data/claweval/backend*/
