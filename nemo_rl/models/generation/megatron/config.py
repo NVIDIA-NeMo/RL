@@ -181,8 +181,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
 
     logging_step_interval: NotRequired[int]
     # Whether MCore returns selected-token log-probs before or after sampling
-    # processors. Policy recomputation uses raw model logits, so numerical
-    # parity checks should select raw_logprobs explicitly.
+    # processors. GRPO policy recomputation applies temperature/top-k/top-p;
+    # use processed_logprobs unless all processors are identity operations.
     logprobs_mode: Literal["processed_logprobs", "raw_logprobs"]
 
     # FP8/MXFP8 for the dedicated (non-colocated) inference model;
