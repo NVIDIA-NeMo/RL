@@ -404,6 +404,15 @@ trainers carry no placeholder rows and let dataset-zero-weight rows vote under
 `include`; a dataset-level weight is shared by the whole prompt group, so this
 does not move any trainable sibling's group baseline.
 
+The `train/baseline_reward/histogram` and `baseline_reward/pct_{0,1,mixed}`
+diagnostics of the legacy and TransferQueue trainers count the rows that vote
+under the configured policy, the same mask the estimator receives: every row
+under `include`, the rows with a nonzero final loss weight under `exclude`. A
+non-voting row still receives a baseline entry (under the leave-one-out baseline
+it is the mean of its voting siblings' rewards, which is neither 0 nor 1), so
+counting it would report an all-correct group as mixed. When no row votes, the
+three percentages are reported as 0.
+
 Independently of the policy, the TransferQueue trainer now zeroes the loss
 weight of rows the environment flags with `mask_sample` after dynamic sampling
 and reports `num_mask_sample_filtered`, as the legacy loop does. Earlier
