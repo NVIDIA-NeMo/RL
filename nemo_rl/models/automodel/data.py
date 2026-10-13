@@ -279,8 +279,10 @@ def process_microbatch(
         min_seq_len = cfg["sequence_packing"]["train_mb_tokens"]
         packed_len = int(mb["input_lengths"].sum())
         if packed_len > min_seq_len:
-            # A sequence longer than the bin capacity is packed alone; keep its
-            # row aligned to make_sequence_length_divisible_by.
+            # Rows are padded to at least train_mb_tokens (TP backward WAR above). A
+            # row longer than that -- an oversized singleton bin, or a logprob bin
+            # packed with logprob_mb_tokens > train_mb_tokens -- is rounded up to a
+            # multiple of make_sequence_length_divisible_by instead.
             multiple = cfg["make_sequence_length_divisible_by"]
             min_seq_len = (packed_len + multiple - 1) // multiple * multiple
         input_ids, position_ids, _ = pack_sequences(

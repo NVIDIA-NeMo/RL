@@ -374,7 +374,7 @@ class TestProcessMicrobatch:
         "train_mb_tokens,expected_min_seq_len",
         [
             (256, 256),  # packed length 204 fits: pad up to train_mb_tokens
-            (128, 208),  # oversized bin: round 204 up to a multiple of 16
+            (128, 208),  # longer than train_mb_tokens: round 204 up to a multiple of 16
         ],
     )
     @patch("nemo_rl.models.automodel.data.pack_sequences")
@@ -421,13 +421,13 @@ class TestProcessMicrobatch:
         "train_mb_tokens,expected_packed_len",
         [
             (256, 256),  # packed length 204 fits: row padded to train_mb_tokens
-            (128, 208),  # oversized bin: row padded to a multiple of 16
+            (128, 208),  # row longer than train_mb_tokens: pad to a multiple of 16
         ],
     )
     def test_sequence_packing_oversized_row_keeps_tokens_and_alignment(
         self, mock_tokenizer, train_mb_tokens, expected_packed_len
     ):
-        """Unmocked packing: an oversized row keeps every token and stays aligned."""
+        """Unmocked: a row longer than train_mb_tokens keeps all tokens and stays aligned."""
         input_lengths = torch.tensor([32, 48, 60, 64])
         input_ids = torch.arange(4 * 64).reshape(4, 64)
         mb = BatchedDataDict(
