@@ -28,6 +28,11 @@ export CLAW_EVAL_SUBAGENTS_ENABLED=true
 export CLAW_EVAL_CONTEXT_TOKENS=${CLAW_EVAL_CONTEXT_TOKENS:-262144}
 export CLAW_EVAL_OUTPUT_TOKENS=${CLAW_EVAL_OUTPUT_TOKENS:-8192}
 export CLAW_EVAL_MAX_TURNS=${CLAW_EVAL_MAX_TURNS:-40}
+# The uncapped first debug step admitted a 92,902-token row and OOM'd the
+# 8-node TP8/EP16/CP1 learner after its first successful optimizer update.
+# Match the production-tested Agentic VBench envelope; overlong rows become
+# placeholders, and an all-placeholder GRPO batch is skipped by the controller.
+export CLAW_EVAL_MAX_ROW_TOKENS=${CLAW_EVAL_MAX_ROW_TOKENS:-65536}
 export CLAW_EVAL_CONCURRENCY=${CLAW_EVAL_CONCURRENCY:-$((NUM_PROMPTS * NUM_GENERATIONS))}
 export CLAW_EVAL_DELEGATION_PROMPT=${CLAW_EVAL_DELEGATION_PROMPT:-You may delegate suitable subtasks to subagents when useful. Review and integrate their results before producing the final answer.}
 export BASE_NAME=${BASE_NAME:-claweval_subagents_sync_8n_$(date -u +%Y%m%d-%H%M%S)}
@@ -44,6 +49,7 @@ exec bash "$script_dir/run_sc.sh" \
   async_rl.rollout_failure.on_dropped_prompt=replace \
   async_rl.rollout_failure.max_replacement_attempts=4 \
   async_rl.rollout_failure.replacement_reserve_prompts=1 \
+  "+token_capture.max_train_row_tokens=${CLAW_EVAL_MAX_ROW_TOKENS}" \
   +env.nemo_gym.training_mode=subagent \
   "+${agent}.opencode_training_mode=subagent" \
   "+${agent}.opencode_subagents_enabled=true" \

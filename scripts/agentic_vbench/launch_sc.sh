@@ -282,7 +282,9 @@ done
 # float32" for both partitions and the first step trained on restored rows had a
 # token_mult_prob_error of 1140 (run 2209083/2210161 step 2). Without
 # replay_buffer_metadata.pt the controller takes its documented empty-buffer
-# path and regenerates the buffered groups (costs about one step per restart).
+# path. The controller rewinds an ahead-of-trainer in-order dispatch cursor when
+# both ownership sidecars are absent, so fresh prompts can refill that step
+# instead of waiting forever at the admission gate.
 if [[ "${SKIP_REPLAY_RESTORE:-1}" == "1" ]]; then
   # rollout_recovery.pt must go with it: the controller refuses a recovery file
   # whose TQ snapshot is not being restored.

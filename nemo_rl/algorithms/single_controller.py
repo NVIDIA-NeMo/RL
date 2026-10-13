@@ -987,6 +987,32 @@ class SingleControllerActor:
                     "with the older implementation or explicitly start without "
                     "restoring buffered rollouts."
                 )
+            # A weights+dataloader-only resume deliberately omits both replay
+            # sidecars.  Its durable sampler cursor can nevertheless be ahead
+            # of the trainer because checkpointing raced one or more admitted
+            # batches.  With no replay or recovery owner left for those target
+            # steps, preserving that cursor deadlocks a zero-lookahead in-order
+            # sampler: admission waits for a trainer advance that an empty
+            # buffer can never produce.  Re-seed only when *both* ownership
+            # sidecars are absent.  If rollout recovery still exists, its
+            # target-step stamps remain authoritative and the exact cursor must
+            # be retained for redispatch.
+            recovery_path = os.path.join(
+                self._last_checkpoint_path, ROLLOUT_RECOVERY_STATE_FILENAME
+            )
+            if (
+                not os.path.exists(recovery_path)
+                and self._sampler.dispatch_index >= self._trainer_version
+            ):
+                restored_dispatch_index = self._sampler.dispatch_index
+                self._sampler.set_dispatch_index(self._trainer_version)
+                print(
+                    "⚠️ Empty replay resume rewound the sampler cursor: "
+                    f"dispatch_index={restored_dispatch_index} -> "
+                    f"{self._sampler.dispatch_index}, "
+                    f"trainer_version={self._trainer_version}",
+                    flush=True,
+                )
             print(
                 f"⚠️ No native replay metadata found at {metadata_path}. "
                 "Starting with an empty replay buffer.",
@@ -2738,6 +2764,7 @@ class SingleControllerActor:
             evicted_stale_prompt_groups = 0
             min_sample_version = None
             step_open = False
+            skipped_empty_optimizer_step = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
             selected_rollout_metrics: list[dict[str, Any]] = []
@@ -3249,28 +3276,32 @@ class SingleControllerActor:
                             "CC optimizer step requires the full logical sample count"
                         )
                     if not step_open:
-                        raise RuntimeError(
+                        skipped_empty_optimizer_step = True
+                        log.warning(
                             "SingleController has no valid response tokens after "
-                            "filtering. Check seq_logprob_error_threshold, "
-                            "overlong_filtering, and environment mask_sample flags "
-                            "to avoid an optimizer step with an empty batch."
+                            "filtering; skipping this GRPO optimizer update and "
+                            "continuing with the next rollout batch. Check "
+                            "seq_logprob_error_threshold, overlong_filtering, and "
+                            "environment mask_sample rates."
                         )
-
-                    with (
-                        self._timer.time("policy_training"),
-                        managed_span(
-                            RLSpanGroup.POLICY_UPDATE,
-                            "rl.sc.policy_optimizer_step",
-                            tracer=self._tracer,
-                        ),
-                    ):
-                        policy_result = await asyncio.to_thread(
-                            self._trainer.finish_train_step
-                        )
-                    self._optimizer_commit_in_progress = True
+                    else:
+                        with (
+                            self._timer.time("policy_training"),
+                            managed_span(
+                                RLSpanGroup.POLICY_UPDATE,
+                                "rl.sc.policy_optimizer_step",
+                                tracer=self._tracer,
+                            ),
+                        ):
+                            policy_result = await asyncio.to_thread(
+                                self._trainer.finish_train_step
+                            )
+                        self._optimizer_commit_in_progress = True
 
                 # Aggregate step metrics
                 step_metrics = {}
+                if skipped_empty_optimizer_step:
+                    step_metrics["skipped_empty_optimizer_step"] = 1.0
                 if policy_result is not None:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:

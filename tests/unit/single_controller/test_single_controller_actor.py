@@ -1600,6 +1600,7 @@ def _train_pump_controller(*, sampler) -> object:
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
         checkpointing={"enabled": False, "save_period": 10},
+        token_capture=SimpleNamespace(context_compaction=False),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -1879,7 +1880,9 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
     ) is reference_logprobs_required
 
 
-def test_train_pump_rejects_step_with_no_valid_training_chunks() -> None:
+def test_train_pump_skips_step_with_no_valid_training_chunks(
+    monkeypatch,
+) -> None:
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
@@ -1893,17 +1896,18 @@ def test_train_pump_rejects_step_with_no_valid_training_chunks() -> None:
     ctrl._advantage_stage = AsyncMock(return_value=(meta, False))
     trainer = MagicMock(spec=_NoOpTrainer)
     ctrl._trainer = trainer
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
 
-    with pytest.raises(
-        RuntimeError,
-        match="no valid response tokens after filtering",
-    ):
-        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     trainer.prepare_for_training.assert_called_once_with()
     trainer.begin_train_step.assert_not_called()
     trainer.train_microbatches_from_meta.assert_not_called()
     trainer.finish_train_step.assert_not_called()
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert train_metrics["skipped_empty_optimizer_step"] == 1.0
 
 
 def test_train_pump_skips_empty_chunk_and_trains_later_valid_chunk(

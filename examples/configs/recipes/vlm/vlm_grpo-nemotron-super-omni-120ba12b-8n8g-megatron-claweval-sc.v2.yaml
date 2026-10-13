@@ -9,6 +9,12 @@ grpo:
   max_num_epochs: null
   max_num_steps: 1000000
 
+token_capture:
+  # A 92,902-token row OOM'd the 8-node learner after its first successful
+  # update. Keep individual training rows inside the validated 64k envelope;
+  # generation still retains the full 256k context window.
+  max_train_row_tokens: 65536
+
 env:
   nemo_gym:
     config_paths:

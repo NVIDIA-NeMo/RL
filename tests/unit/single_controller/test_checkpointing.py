@@ -982,6 +982,36 @@ def _training_info(ckpt_dir: Path, step: int) -> dict[str, Any]:
 
 
 class TestCounterRestore:
+    @pytest.mark.parametrize("has_rollout_recovery", [False, True])
+    def test_empty_replay_resume_rewinds_only_without_recovery_ownership(
+        self, tmp_path: Path, has_rollout_recovery: bool
+    ) -> None:
+        """A skipped replay restore cannot leave in-order admission gated forever."""
+        if has_rollout_recovery:
+            (tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME).touch()
+
+        actor = object.__new__(_ACTOR_CLS)
+        actor._last_checkpoint_path = str(tmp_path)
+        actor._trainer_version = 4
+        actor._sampler = MagicMock()
+        actor._sampler.supports_buffer_checkpoint = True
+        actor._sampler.dispatch_index = 4
+
+        def _seed_dispatch_index(trainer_version: int) -> None:
+            actor._sampler.dispatch_index = trainer_version - 1
+
+        actor._sampler.set_dispatch_index.side_effect = _seed_dispatch_index
+
+        restored = asyncio.run(actor._maybe_restore_replay_buffer())
+
+        assert restored == 0
+        if has_rollout_recovery:
+            actor._sampler.set_dispatch_index.assert_not_called()
+            assert actor._sampler.dispatch_index == 4
+        else:
+            actor._sampler.set_dispatch_index.assert_called_once_with(4)
+            assert actor._sampler.dispatch_index == 3
+
     @pytest.mark.parametrize(
         ("buffer_target_steps", "recovery_target_steps"),
         [([8], []), ([], [8])],

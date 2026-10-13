@@ -25,6 +25,7 @@ export CLAW_EVAL_SUBAGENTS_ENABLED=true
 export CLAW_EVAL_CONTEXT_TOKENS=${CLAW_EVAL_CONTEXT_TOKENS:-262144}
 export CLAW_EVAL_OUTPUT_TOKENS=${CLAW_EVAL_OUTPUT_TOKENS:-8192}
 export CLAW_EVAL_MAX_TURNS=${CLAW_EVAL_MAX_TURNS:-40}
+export CLAW_EVAL_MAX_ROW_TOKENS=${CLAW_EVAL_MAX_ROW_TOKENS:-65536}
 export CLAW_EVAL_CONCURRENCY=${CLAW_EVAL_CONCURRENCY:-$((NUM_PROMPTS * NUM_GENERATIONS))}
 export CLAW_EVAL_DELEGATION_PROMPT=${CLAW_EVAL_DELEGATION_PROMPT:-You may delegate suitable subtasks to subagents when useful. Review and integrate their results before producing the final answer.}
 export BASE_NAME=${BASE_NAME:-claweval_subagents_async_16n_$(date -u +%Y%m%d-%H%M%S)}
@@ -40,6 +41,7 @@ exec bash "$script_dir/run_sc.sh" \
   "async_rl.min_groups_for_streaming_train=${NUM_PROMPTS}" \
   "async_rl.max_inflight_prompts=${inflight_groups}" \
   "async_rl.max_buffered_rollouts=${inflight_groups}" \
+  "+token_capture.max_train_row_tokens=${CLAW_EVAL_MAX_ROW_TOKENS}" \
   +env.nemo_gym.training_mode=subagent \
   "+${agent}.opencode_training_mode=subagent" \
   "+${agent}.opencode_subagents_enabled=true" \
