@@ -6,6 +6,11 @@
 #   AGENTIC_VBENCH_CONTEXT_TOKENS=262144 AGENTIC_VBENCH_MAX_TURNS=32 AGENTIC_VBENCH_OUTPUT_TOKENS=8192 ...
 defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc.v1.yaml
 
+grpo:
+  # Emit per-sequence generation/trainer parity diagnostics. This is
+  # observational only: it neither filters samples nor changes the loss.
+  debug_payload_metrics: true
+
 policy:
   # Training rows, vLLM max_model_len and data.max_input_seq_length all follow this.
   # Rows are fixed-batch (no packing) at micro batch 1 with TP8 sequence
@@ -27,6 +32,11 @@ policy:
     # full recomputation and chunked fp32 logprobs.
     pipeline_model_parallel_size: 1
     empty_unused_memory_level: 2
+    # Keep the learner aligned with the validated SuperVL3.5/video recipes.
+    # The V1 base leaves these trainable, which can make multimodal learner
+    # logprobs diverge from the generation engine even when text rows agree.
+    freeze_vision_model: true
+    freeze_vision_projection: true
   generation:
     vllm_cfg:
       # Keep generation logits on the same fp32 LM-head path as Megatron so

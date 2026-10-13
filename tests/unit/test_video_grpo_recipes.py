@@ -110,6 +110,17 @@ def test_agentic_vbench_recipes_allow_long_inline_image_histories(name: str):
     assert image_limit >= 128
 
 
+def test_agentic_vbench_256k_debug_recipe_preserves_multimodal_parity_contract():
+    recipe = _load_recipe(
+        "vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml"
+    )
+
+    assert recipe["grpo"]["debug_payload_metrics"] is True
+    assert recipe["grpo"]["seq_logprob_error_threshold"] is None
+    assert recipe["policy"]["megatron_cfg"]["freeze_vision_model"] is True
+    assert recipe["policy"]["megatron_cfg"]["freeze_vision_projection"] is True
+
+
 def test_agentic_vbench_in_order_recipe_replaces_dropped_prompt_groups():
     recipe = _load_recipe(
         "vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc.v1.yaml"
