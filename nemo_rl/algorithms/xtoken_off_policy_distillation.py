@@ -40,7 +40,7 @@ from typing import Any, NotRequired, Optional, TypedDict, cast
 
 import numpy as np
 import torch
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -204,17 +204,6 @@ class TeacherConfig(BaseModel, extra="allow"):
     weight: float = 1.0
     gold_loss: Optional[bool] = None
     xtoken_loss: Optional[bool] = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _reject_legacy_projection_matrix_path(cls, value: Any) -> Any:
-        """Reject the legacy root projection path with the supported location."""
-        if isinstance(value, dict) and "projection_matrix_path" in value:
-            raise ValueError(
-                "teachers[i].projection_matrix_path is no longer supported; "
-                "move it to teachers[i].aligner.projection_matrix_path."
-            )
-        return value
 
     def policy_config(self) -> PolicyConfig:
         """Recover the plain ``PolicyConfig`` dict (cross-tokenizer knobs stripped)."""
