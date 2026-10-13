@@ -62,6 +62,7 @@ from nemo_rl.experience.reward_penalties import (
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
+    boundary_route_rows,
     execute_route_plan,
 )
 from nemo_rl.experience.route_plan import (
@@ -437,7 +438,10 @@ class RolloutReassembler:
                 commitment = commitments_by_call.get(call_id)
                 if record is None or item is None or commitment is None:
                     return rejected(f"route_span_identity:{call_id}", staging_keys)
-                if item.routed_len not in (0, record.delta_len):
+                expected_routed_len = record.delta_len + boundary_route_rows(
+                    record.prev_len
+                )
+                if item.routed_len not in (0, expected_routed_len):
                     return rejected(f"routed_len_mismatch:{call_id}", staging_keys)
                 if generation_len < 0 or generation_len > record.delta_len:
                     return rejected(
@@ -455,6 +459,11 @@ class RolloutReassembler:
                         staged_route_len=item.routed_len,
                         extras_digest_version=commitment.extras_digest_version,
                         extras_digest=commitment.extras_digest,
+                        boundary_rows=(
+                            boundary_route_rows(record.prev_len)
+                            if item.routed_len
+                            else 0
+                        ),
                     )
                 )
             if sum(span.carry_len + span.generation_len for span in route_spans) != len(
@@ -975,7 +984,8 @@ class RolloutReassembler:
             valid_rows += 1
             covered_tokens += len(row.token_ids)
             if row.routed_experts is None:
-                sentinel_tokens += len(row.token_ids)
+                # The final token never has a recorded route; don't count it.
+                sentinel_tokens += max(len(row.token_ids) - 1, 0)
                 continue
             rows_with_routes += 1
             row_routes = row.routed_experts
@@ -987,8 +997,9 @@ class RolloutReassembler:
                     f"rollout {row.rollout_id}"
                 )
             routed[i, : row_routes.shape[0]] = row_routes
+            # The final token never has a recorded route; don't count it.
             sentinel_tokens += int(
-                row_routes.eq(ROUTE_MISSING_SENTINEL).all(-1).all(-1).sum().item()
+                row_routes[:-1].eq(ROUTE_MISSING_SENTINEL).all(-1).all(-1).sum().item()
             )
         if valid_rows:
             metrics["finalize/routed_experts_row_coverage"] = (

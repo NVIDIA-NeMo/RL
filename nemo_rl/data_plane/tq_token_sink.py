@@ -43,6 +43,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import ray
 import torch
 from tensordict import TensorDict
@@ -67,7 +68,7 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXTRAS_METADATA_FIELD,
     ROUTED_LEN_FIELD,
 )
-from nemo_rl.experience.route_assembly import RouteFragment
+from nemo_rl.experience.route_assembly import RouteFragment, boundary_route_rows
 
 # These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
 # transformed by stage() below. Adding a field means editing both this list and
@@ -143,7 +144,10 @@ def _bytes_tensor(value: bytes) -> torch.Tensor:
     """Encode non-empty bytes as one jagged TQ row."""
     if not value:
         raise ValueError("staging byte fields must be non-empty")
-    return torch.tensor([list(value)], dtype=torch.uint8)
+    # Own writable storage without expanding bytes into a Python list.
+    return torch.from_numpy(np.frombuffer(bytearray(value), dtype=np.uint8)).unsqueeze(
+        0
+    )
 
 
 def _optional_digest_fields(value: str | None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -477,14 +481,14 @@ class TQTokenSink:
                     media, _media_sentinels(self._media_pixel_dtype)
                 )
             field_dict = {
-                "token_ids_delta": torch.tensor(
-                    [record.token_ids_delta], dtype=torch.int64
+                "token_ids_delta": torch.from_numpy(
+                    np.array([record.token_ids_delta], dtype=np.int64)
                 ),
-                "token_mask_delta": torch.tensor(
-                    [record.token_mask_delta], dtype=torch.float32
+                "token_mask_delta": torch.from_numpy(
+                    np.array([record.token_mask_delta], dtype=np.float32)
                 ),
-                "generation_logprobs_delta": torch.tensor(
-                    [record.generation_log_probs_delta], dtype=torch.float32
+                "generation_logprobs_delta": torch.from_numpy(
+                    np.array([record.generation_log_probs_delta], dtype=np.float32)
                 ),
                 "schema_version": torch.tensor(
                     [record.schema_version], dtype=torch.int64
@@ -574,10 +578,13 @@ class TQTokenSink:
                 else:
                     experts = torch.tensor(routed, dtype=torch.int16)
                     routed_encoding = ROUTE_ENCODING_LIST
-                if experts.dim() != 3 or experts.shape[0] != delta_len:
+                expected_len = delta_len + boundary_route_rows(record.prev_len)
+                if experts.dim() != 3 or experts.shape[0] != expected_len:
                     raise ValueError(
                         "routed_experts must already be delta-aligned: "
-                        f"got shape {tuple(experts.shape)} for delta_len={delta_len}"
+                        f"got shape {tuple(experts.shape)} for "
+                        f"prev_len={record.prev_len}, delta_len={delta_len} "
+                        f"(expected {expected_len} rows)"
                     )
                 field_dict[ROUTED_EXPERTS_FIELD] = experts.unsqueeze(0)
                 routed_len = int(experts.shape[0])
