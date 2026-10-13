@@ -1,4 +1,4 @@
-defaults: ../../examples/configs/xtoken_off_policy_distillation.yaml
+defaults: xtoken_off_policy_distillation.yaml
 cluster:
   gpus_per_node: 2
 distillation:
