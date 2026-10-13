@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from nemo_rl.models.generation.hf_checkpoint_config import HfCheckpointRefitConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
 from nemo_rl.weight_sync.hf_checkpoint_weight_synchronizer import (
     HfCheckpointWeightSynchronizer,
@@ -157,10 +158,12 @@ def test_export_failure_never_reloads_or_resumes(tmp_path: Path) -> None:
     assert sync.is_stale
 
 
+@pytest.mark.parametrize("draft", [None, {"enabled": False}, Eagle3DraftConfig()])
 def test_factory_selects_hf_transport_without_collective_clusters(
     tmp_path: Path,
+    draft,
 ) -> None:
-    policy = SimpleNamespace(cfg={"megatron_cfg": {"enabled": True}})
+    policy = SimpleNamespace(cfg={"megatron_cfg": {"enabled": True}, "draft": draft})
     generation = SimpleNamespace(
         cfg={
             "refit_transport": "hf_checkpoint",
@@ -170,6 +173,20 @@ def test_factory_selects_hf_transport_without_collective_clusters(
     )
     sync = create_weight_synchronizer(policy, generation, "vllm", False)
     assert isinstance(sync, HfCheckpointWeightSynchronizer)
+
+
+@pytest.mark.parametrize("draft", [{"enabled": True}, Eagle3DraftConfig(enabled=True)])
+def test_factory_rejects_hf_draft_refit(tmp_path: Path, draft) -> None:
+    policy = SimpleNamespace(cfg={"megatron_cfg": {"enabled": True}, "draft": draft})
+    generation = SimpleNamespace(
+        cfg={
+            "refit_transport": "hf_checkpoint",
+            "refit_cfg": {"hf_checkpoint": {"checkpoint_dir": str(tmp_path)}},
+            "vllm_cfg": {"async_engine": True},
+        }
+    )
+    with pytest.raises(NotImplementedError, match="draft policies"):
+        create_weight_synchronizer(policy, generation, "vllm", False)
 
 
 @pytest.mark.parametrize(

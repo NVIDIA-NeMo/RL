@@ -85,6 +85,8 @@ def create_weight_synchronizer(
         )
 
     if generation.cfg.get("refit_transport") == "hf_checkpoint":
+        from nemo_rl.models.policy.draft_config import draft_refit_enabled
+
         if generation_backend != VLLM_BACKEND:
             raise ValueError("hf_checkpoint refit requires the vLLM backend")
         if colocated:
@@ -93,8 +95,8 @@ def create_weight_synchronizer(
             raise NotImplementedError("hf_checkpoint export requires a Megatron policy")
         if not generation.cfg["vllm_cfg"]["async_engine"]:
             raise ValueError("hf_checkpoint refit currently requires async_engine=true")
-        if generation.cfg.get("quant_cfg") or policy.cfg.get("draft", {}).get(
-            "enabled"
+        if generation.cfg.get("quant_cfg") or draft_refit_enabled(
+            policy.cfg.get("draft")
         ):
             raise NotImplementedError(
                 "hf_checkpoint refit does not support quant_cfg or draft policies"
