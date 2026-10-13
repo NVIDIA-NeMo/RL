@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel, Field, PositiveInt
+from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt
 from tensordict import TensorDict
 
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
@@ -59,6 +59,10 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
 
     storage_capacity: int = 1000000  # max samples retained per partition
     num_storage_units: int
+    # Clusters whose nodes host the units, round-robin: "all" or a list of
+    # names (train, inference, teacher:<name>). None keeps TQ's own SPREAD
+    # placement over every Ray node.
+    storage_unit_placement: list[str] | Literal["all"] | None = None
 
 
 class MooncakeCpuConfig(BaseModel, extra="allow"):
@@ -74,11 +78,11 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     instead of registering a fresh one per transfer; set false to fall back to
     upstream's per-call registration.
 
-    ``staging_buffer_size`` is that pool's per-slot ceiling. It is a pooling
-    threshold, not a size limit: a bigger payload still transfers, just with a
-    transient registration. Slots ratchet — they grow to the largest payload
-    admitted and never shrink — so raise it only when a per-key payload (one
-    sample of one field) genuinely exceeds it, not for headroom.
+    ``staging_buffer_size`` is that pool's per-slot ceiling (mooncake's native
+    ``BufferPool``, carved out of ``local_buffer_size``, which must be at
+    least 4 x this). A bigger payload still transfers, with a transient
+    registration. Raise it only when a per-key payload (one sample of one
+    field) genuinely exceeds it.
 
     ``use_gdr`` lets CUDA-initialized clients transfer through TransferQueue's
     persistent GPU staging buffer. ``gdr_staging_buffer_mb`` is the positive
@@ -93,11 +97,24 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     """
 
     global_segment_size: int = 68719476736  # 64 GiB per client process
-    local_buffer_size: int = 4294967296  # 4 GiB per client process
+    # The staging pool is carved out of this buffer, one staging_buffer_size
+    # slot per TQ transfer thread (MAX_BATCH_WORKER_THREADS = 4; per process,
+    # not per GPU): must be >= 4 x staging_buffer_size while
+    # reuse_registered_buffers is on.
+    local_buffer_size: int = 2147483648  # 2 GiB = 4 TQ threads x 512 MiB
     reuse_registered_buffers: bool = True
-    staging_buffer_size: int = 268435456  # 256 MiB per pool slot
+    # A payload above this is registered per transfer instead of pooled.
+    staging_buffer_size: int = 536870912  # 512 MiB per pool slot
     use_gdr: bool = False
     gdr_staging_buffer_mb: PositiveInt = 1024
+    # >0: only CPU MooncakeStorageUnit actors own Mooncake memory (this many
+    # bytes each); every other process is a client and off the save path.
+    storage_unit_segment_size: NonNegativeInt = 0
+    # Total units, like simple.num_storage_units; None: 2 per selected node.
+    num_storage_units: PositiveInt | None = None
+    # Clusters whose nodes host units: "all" or a list of names (train,
+    # inference, teacher:<name>).
+    storage_unit_placement: list[str] | Literal["all"] = "all"
 
 
 class DataPlaneConfig(TypedDict):
@@ -174,6 +191,22 @@ def backend_config(cfg: DataPlaneConfig) -> Any:
     if isinstance(nested, BaseModel):
         nested = nested.model_dump(exclude_unset=True)
     return _BACKEND_MODELS[backend].model_validate(nested)
+
+
+def storage_unit_placement(cfg: DataPlaneConfig) -> list[str] | Literal["all"] | None:
+    """Where this config's storage units go, or None when they are off.
+
+    ``mooncake_cpu``: on when ``storage_unit_segment_size > 0``. ``simple``: on
+    when ``simple.storage_unit_placement`` is set.
+    """
+    backend = cfg["backend"]
+    if backend == "mooncake_cpu":
+        block = backend_config(cfg)
+        return block.storage_unit_placement if block.storage_unit_segment_size else None
+    # An absent simple block cannot validate: num_storage_units has no default.
+    if backend == "simple" and "simple" in cfg:
+        return backend_config(cfg).storage_unit_placement
+    return None
 
 
 class ObservabilityConfig(TypedDict):

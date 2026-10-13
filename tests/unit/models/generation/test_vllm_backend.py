@@ -1631,7 +1631,7 @@ def test_worker_prepare_refit_info_forwards_state_dict_info():
 
 @pytest.mark.vllm
 @pytest.mark.parametrize("refit_with_reload_api", [False, True])
-def test_generation_prepare_refit_info_rejects_mxfp8_grouped_moe(
+def test_generation_prepare_refit_info_allows_mxfp8_grouped_moe(
     monkeypatch,
     refit_with_reload_api,
 ):
@@ -1652,14 +1652,14 @@ def test_generation_prepare_refit_info_rejects_mxfp8_grouped_moe(
     generation.worker_group = SimpleNamespace(workers=[leader])
     generation.dp_size = 1
     generation._refit_membership = None
-    monkeypatch.setattr(vllm_generation.ray, "get", MagicMock())
+    monkeypatch.setattr(vllm_generation.ray, "get", MagicMock(return_value=[None]))
 
-    with pytest.raises(AssertionError, match="MXFP8 refit does not support"):
-        generation.prepare_refit_info(
-            {"model.layers.0.mlp.experts.gate_up_proj": object()}
-        )
+    state_dict_info = {"model.layers.0.mlp.experts.gate_up_proj": object()}
+    assert generation.prepare_refit_info(state_dict_info) is None
 
-    leader.prepare_refit_info.remote.assert_not_called()
+    leader.prepare_refit_info.remote.assert_called_once_with(
+        state_dict_info=state_dict_info
+    )
     leader.prepare_refit_info_async.remote.assert_not_called()
 
 

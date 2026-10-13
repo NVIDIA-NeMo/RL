@@ -47,7 +47,7 @@ class RewardModelEnvironmentConfig(TypedDict):
         logprob_batch_size: Batch size for log probability computation
         resources: Resource allocation configuration
         reward_model_cfg: Reward model specific configuration
-        dtensor_cfg: DTensor configuration for distributed training
+        automodel_cfg: Automodel configuration for distributed training
         dynamic_batching: Dynamic batching configuration
         sequence_packing: Sequence packing configuration
         max_grad_norm: Maximum gradient norm for training
@@ -61,7 +61,7 @@ class RewardModelEnvironmentConfig(TypedDict):
     checkpoint_path: str
     logprob_batch_size: int
     resources: Dict[str, Any]
-    dtensor_cfg: Optional[Dict[str, Any]]
+    automodel_cfg: Optional[Dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig = {"enabled": False}
     sequence_packing: NotRequired[SequencePackingConfig] = {"enabled": False}
     max_grad_norm: Optional[float] = None
@@ -113,16 +113,16 @@ class RewardModelEnvironment(EnvironmentInterface):
         assert not self.config["sequence_packing"]["enabled"], (
             "Sequence packing is currently not supported with reward model environment."
         )
-        assert self.config["dtensor_cfg"]["enabled"], (
+        assert (self.config.get("automodel_cfg") or {}).get("enabled"), (
             "Reward model environment currently only support with DTensor. You can show your interest in mcore path by upvoting on https://github.com/NVIDIA-NeMo/RL/issues/1154"
         )
         assert self.config["max_grad_norm"] == None, (
             "Max grad norm must be None in reward model environment."
         )
-        assert not self.config["dtensor_cfg"]["cpu_offload"], (
+        assert not self.config["automodel_cfg"]["cpu_offload"], (
             "CPU offload is currently not supported with reward model environment."
         )
-        assert not self.config["dtensor_cfg"]["activation_checkpointing"], (
+        assert not self.config["automodel_cfg"]["activation_checkpointing"], (
             "Activation checkpointing is currently not supported with reward model environment."
         )
         # Add values for reward model cfg. reward_model_cfg must be enabled in reward model environment config.
@@ -136,9 +136,9 @@ class RewardModelEnvironment(EnvironmentInterface):
         self.config["sequence_packing"]["enabled"] = False
         self.config["max_grad_norm"] = None
         # Reward model environment is always using DTensor
-        self.config["dtensor_cfg"]["enabled"] = True
-        self.config["dtensor_cfg"]["cpu_offload"] = False
-        self.config["dtensor_cfg"]["activation_checkpointing"] = False
+        self.config["automodel_cfg"]["enabled"] = True
+        self.config["automodel_cfg"]["cpu_offload"] = False
+        self.config["automodel_cfg"]["activation_checkpointing"] = False
 
         self.task_data_spec = TaskDataSpec(
             task_name="reward_model_env",
@@ -218,7 +218,7 @@ class RewardModelEnvironment(EnvironmentInterface):
             pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
         )
 
-        # Create data in the format expected by DTensorRewardModelWorker
+        # Create data in the format expected by AutomodelPolicyWorker with is_reward_model=True
         reward_data = BatchedDataDict[GenerationDatumSpec](
             {
                 "input_ids": cat_and_padded["token_ids"],
