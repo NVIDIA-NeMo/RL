@@ -8,7 +8,11 @@ PLUGIN_WHEEL=$(bash "$PROJECT_ROOT/tools/external_rollout_vllm/build_prefix_plug
 export PYTHONPATH="$PLUGIN_WHEEL:${PYTHONPATH:-}"
 export VLLM_PLUGINS=nemo_rl_prefix_api
 export EXTERNAL_VLLM_TEST_REQUIRE_PREFIX=1
+export EXTERNAL_VLLM_TEST_MAX_AGENT_STEPS=${EXTERNAL_VLLM_TEST_MAX_AGENT_STEPS:-6}
 export EXTERNAL_VLLM_TEST_RUN_DIR=${EXTERNAL_VLLM_TEST_RUN_DIR:-$SCRIPT_DIR/grpo_external_vllm_prefix_gym/run}
 bash "$SCRIPT_DIR/grpo_external_vllm_gym_single_controller.sh" \
     ++env.nemo_gym.policy_model.responses_api_models.vllm_model.supply_prefix_token_ids=true \
     "$@"
+
+uv run "$PROJECT_ROOT/tests/check_metrics.py" "$EXTERNAL_VLLM_TEST_RUN_DIR/train/metrics.json" \
+    'max(data["train/turns_per_sample/max"]) >= 2'
