@@ -75,6 +75,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEMO_GYM_UNUSABLE_ROLLOUT_KEY,
+    is_synthetic_unusable_rollout,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.reward_penalties import (
@@ -279,7 +280,18 @@ def _reattach_static_multimodal_payloads_to_result(
     source_message_log: list[dict[str, Any]],
     tokenizer: Any = None,
 ) -> None:
-    """Restore static media to each Gym-authored message-log representation."""
+    """Restore static media to each Gym-authored message-log representation.
+
+    The no-generation placeholder emitted under
+    ``env.nemo_gym.mask_unusable_rollouts`` is skipped: its message log is
+    synthetic text with no media placeholder tokens, and a native VLM forward
+    (Nemotron Omni pairs one text placeholder with each projected media feature)
+    rejects original image tensors attached to it before the row's zero loss
+    weight can exclude it. A non-contiguous rollout reduced to its contiguous
+    prefix keeps real tokens and still gets its media back.
+    """
+    if is_synthetic_unusable_rollout(result.get("full_result")):
+        return
     # input_message_log is commonly a slice of message_log, so the two views
     # can alias the same message dictionaries. Process each target once.
     processed_target_ids: set[int] = set()

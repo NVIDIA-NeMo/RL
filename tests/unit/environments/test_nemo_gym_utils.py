@@ -413,6 +413,44 @@ def test_build_nemo_gym_config_moves_mask_unusable_rollouts_to_actor_field(
     assert "mask_unusable_rollouts" not in cfg["initial_global_config_dict"]
 
 
+def test_build_nemo_gym_config_rejects_mask_unusable_rollouts_in_receipt_mode(
+    detected_uv_dirs,
+):
+    """Receipt mode bypasses the converter that emits the placeholder: fail at setup."""
+    token_capture = {"enabled": True, "capture_dir": "/tmp/cap"}
+
+    with pytest.raises(ValueError, match="mask_unusable_rollouts is not supported"):
+        build_nemo_gym_config(
+            _env_configs(mask_unusable_rollouts=True),
+            base_urls=[],
+            model_name="test-model",
+            enable_router_replay=False,
+            use_fastokens=False,
+            token_capture=token_capture,
+        )
+
+    # A disabled capture config and the knob off are both fine.
+    cfg = build_nemo_gym_config(
+        _env_configs(mask_unusable_rollouts=True),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        token_capture={"enabled": False},
+    )
+    assert cfg["mask_unusable_rollouts"] is True
+    cfg = build_nemo_gym_config(
+        _env_configs(mask_unusable_rollouts=False),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        token_capture=token_capture,
+    )
+    assert cfg["mask_unusable_rollouts"] is False
+    assert cfg["token_capture"] == token_capture
+
+
 def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(detected_uv_dirs):
     cfg = build_nemo_gym_config(
         _env_configs(),

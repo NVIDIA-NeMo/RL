@@ -92,7 +92,11 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
-from nemo_rl.experience.interfaces import NEMO_GYM_UNUSABLE_ROLLOUT_KEY
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_UNUSABLE_NO_GENERATION_DATA,
+    NEMO_GYM_UNUSABLE_NON_CONTIGUOUS_TOKEN_CHAIN,
+    NEMO_GYM_UNUSABLE_ROLLOUT_KEY,
+)
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -347,6 +351,14 @@ def _unusable_rollout_message_log(
     It only keeps the batch shape: a fixed-length prompt (the start of the
     input text, padded with EOS) and a single EOS "generation" with logprob 0.
     The caller marks the sample so that it carries no loss and no reward signal.
+
+    The placeholder is text-only on purpose and must stay that way: it holds no
+    media placeholder tokens, so attaching the prompt's original image tensors
+    to it would hand a native VLM forward (Nemotron Omni requires one text
+    placeholder per projected media feature) zero placeholders beside non-empty
+    features, which fails before loss masking can exclude the row. The
+    restoration helpers recognize it through
+    ``nemo_rl.experience.interfaces.is_synthetic_unusable_rollout``.
     """
     filler_token_id = tokenizer.eos_token_id
     if filler_token_id is None:
@@ -1603,7 +1615,10 @@ Depending on your data shape, you may want to change these values."""
             )
             if not is_contiguous and self.cfg.get("mask_unusable_rollouts", False):
                 # E.g. agent harnesses that rewrite or compact their history.
-                # Keep the contiguous prefix as a masked placeholder sample.
+                # Keep the contiguous prefix as a masked placeholder sample. The
+                # prefix is real Gym-authored tokens, so it keeps the per-turn
+                # images attached above and the prompt's static media is still
+                # restored to it downstream.
                 print(
                     "[nemo_gym] masking a rollout with a non-contiguous token "
                     f"chain at trainable item {turn_idx} "
@@ -1611,7 +1626,9 @@ Depending on your data shape, you may want to change these values."""
                     f"{len(output_item_dict['prompt_token_ids'])} tokens)",
                     flush=True,
                 )
-                _mark_unusable_rollout(nemo_gym_result, "non_contiguous_token_chain")
+                _mark_unusable_rollout(
+                    nemo_gym_result, NEMO_GYM_UNUSABLE_NON_CONTIGUOUS_TOKEN_CHAIN
+                )
                 break
             assert is_contiguous, f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
@@ -1811,7 +1828,14 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 f"types: {output_item_types})",
                 flush=True,
             )
-            _mark_unusable_rollout(nemo_gym_result, "no_generation_data")
+            # The synthetic placeholder replaces the Gym-authored tokens
+            # entirely. It is text-only and is identified by this reason, so the
+            # static-media restoration in rollouts.py and the RolloutManager
+            # skips it instead of pairing the prompt's image tensors with a
+            # prompt that holds no media placeholder tokens.
+            _mark_unusable_rollout(
+                nemo_gym_result, NEMO_GYM_UNUSABLE_NO_GENERATION_DATA
+            )
             nemo_rl_message_log = _unusable_rollout_message_log(
                 tokenizer, input_messages
             )
@@ -2086,6 +2110,17 @@ def _build_gym_actor_config(
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     mask_unusable_rollouts = bool(nemo_gym_dict.pop("mask_unusable_rollouts", False))
+    if mask_unusable_rollouts and token_capture and token_capture.get("enabled"):
+        # Receipt mode never runs the legacy converter that emits the
+        # placeholder, so the knob would be silently ignored. Gym's token
+        # capture already flags an unusable capture with mask_sample on the
+        # receipt; fail at setup rather than let the operator rely on a no-op.
+        raise ValueError(
+            "env.nemo_gym.mask_unusable_rollouts is not supported together with "
+            "env.nemo_gym.token_capture.enabled (receipt mode): receipt rollouts "
+            "bypass the token-echo converter that emits the placeholder sample. "
+            "Disable one of the two."
+        )
     port_range = {
         key: value
         for key in ("port_range_low", "port_range_high")

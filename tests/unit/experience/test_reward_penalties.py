@@ -108,6 +108,22 @@ class TestMaskSampleFlags:
             mask_sample, torch.tensor([True, False, False, False, False])
         )
 
+    def test_reads_top_level_mask_sample_beside_instance_config(self):
+        # NeMo-Gym's BaseVerifyResponse (and token-id capture) put mask_sample
+        # at the top level of the /run result. These rows pair a top-level
+        # value with an empty or absent instance_config mapping, so neither
+        # read can shadow the other.
+        results = [
+            {"full_result": {"mask_sample": True, "instance_config": {}}},
+            {"full_result": {"mask_sample": False, "instance_config": None}},
+            {"full_result": {"mask_sample": True}},
+            {"full_result": {"mask_sample": False}},
+        ]
+
+        mask_sample = _mask_sample_flags(r["full_result"] for r in results)
+
+        assert torch.equal(mask_sample, torch.tensor([True, False, True, False]))
+
 
 class TestShouldMaskFlaggedSamples:
     def test_reads_env_should_mask_flagged_samples(self):

@@ -384,7 +384,8 @@ env:
     # thinking_tags: ["<think>", "</think>"]
     # Replace rollouts that yield no trainable tokens (no generation data, or a
     # non-contiguous token chain) with a masked placeholder sample instead of
-    # failing the rollout batch.
+    # failing the rollout batch. Token-echo path only: not allowed together
+    # with token_capture.enabled (receipt mode).
     # mask_unusable_rollouts: false
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
