@@ -13,13 +13,13 @@ from nemo_rl.data.multimodal_utils import (
     encode_multimodal_for_wire,
     multimodal_row_tags,
 )
-from nemo_rl.data_plane.column_io import kv_first_write, read_columns
+from nemo_rl.data_plane.column_io import kv_first_write, read_columns, write_columns
 from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
-def _write_rows(client):
+def _write_rows(client, token_field="media_token_validity_mask"):
     partition = f"sparse-media-{uuid4().hex}"
     metas, originals = [], []
     for i in range(4):
@@ -31,6 +31,12 @@ def _write_rows(client):
         )
         media = {}
         if i in (1, 2):
+            fields[token_field] = torch.ones(
+                (1, length),
+                dtype=torch.bool
+                if token_field == "media_token_validity_mask"
+                else torch.long,
+            )
             media["pixel_values"] = PackedTensor(
                 [torch.full((i, 3, 2, 2), float(i))], dim_to_pack=0
             )
@@ -62,22 +68,35 @@ def _read(client, meta, reader):
     worker = SimpleNamespace(
         _require_dp_client=lambda: client,
         _pad_value_dict=lambda: {},
-        _forward_pad_seqlen=lambda meta: 8,
+        _forward_pad_seqlen=lambda meta: int(
+            meta.extra_info.get(GLOBAL_FORWARD_PAD_SEQLEN, 0)
+        ),
         _maybe_assemble_routed_experts=lambda meta, data: data,
     )
     return TQWorkerMixin._fetch(worker, meta, fetch_policy="independent")
 
 
 @pytest.mark.parametrize("reader", ["driver", "worker"])
-@pytest.mark.parametrize("indices", [[0, 2, 1, 3], [2, 1], [3, 0], [2, 0, 2]])
-def test_sparse_media_survives_tq_fetch(tq_client, reader, indices):
-    meta, originals = _write_rows(tq_client)
+@pytest.mark.parametrize("indices", [[0, 1], [0, 2, 1, 3], [2, 1], [3, 0], [2, 0, 2]])
+@pytest.mark.parametrize("pad", [False, True])
+@pytest.mark.parametrize(
+    "token_field", ["media_token_validity_mask", "mm_token_type_ids"]
+)
+def test_sparse_media_survives_tq_fetch(tq_client, reader, indices, pad, token_field):
+    meta, originals = _write_rows(tq_client, token_field)
     meta = meta.subset(indices)
+    if not pad:
+        meta.extra_info.pop(GLOBAL_FORWARD_PAD_SEQLEN)
     try:
         result = _read(tq_client, meta, reader)
-        assert result["input_ids"].shape == (len(indices), 8)
+        width = 8 if pad else max(meta.sequence_lengths)
+        assert result["input_ids"].shape == (len(indices), width)
+        assert result[token_field].shape == result["input_ids"].shape
         for j, i in enumerate(indices):
             assert result["input_ids"][j, : i + 2].tolist() == [i] * (i + 2)
+            mask = result[token_field][j]
+            assert mask[: i + 2].tolist() == [i in (1, 2)] * (i + 2)
+            assert not mask[i + 2 :].any()
             for key in ("pixel_values", "imgs_sizes", "input_features"):
                 expected = originals[i].get(key)
                 if expected is not None:
@@ -98,5 +117,25 @@ def test_missing_expected_pixels_fail(tq_client, reader):
     try:
         with pytest.raises(ValueError, match="dropped requested fields.*pixel_values"):
             _read(tq_client, meta, reader)
+    finally:
+        tq_client.clear_samples(None, meta.partition_id)
+
+
+@pytest.mark.parametrize("reader", ["driver", "worker"])
+def test_dense_media_masks_preserve_text_row_values(tq_client, reader):
+    meta, _ = _write_rows(tq_client)
+    expected = torch.tensor(
+        [
+            [True, False, False, False, False],
+            [False, True, False, False, False],
+            [False, False, True, False, False],
+            [True, False, True, False, True],
+        ],
+        dtype=torch.bool,
+    )
+    try:
+        write_columns(tq_client, meta, {"media_token_validity_mask": expected})
+        result = _read(tq_client, meta, reader)
+        assert torch.equal(result["media_token_validity_mask"][:, :5], expected)
     finally:
         tq_client.clear_samples(None, meta.partition_id)
