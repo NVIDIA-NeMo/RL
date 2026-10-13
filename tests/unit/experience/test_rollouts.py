@@ -2287,18 +2287,30 @@ def _incomplete_response(reason):
 
 
 def test_nemo_gym_rollout_hit_max_tokens_token_budget():
-    assert nemo_gym_rollout_hit_max_tokens({}, 128, 128)
-    assert nemo_gym_rollout_hit_max_tokens({}, 130, 128)
-    assert not nemo_gym_rollout_hit_max_tokens({}, 127, 128)
-    assert nemo_gym_rollout_hit_max_tokens(None, 128, 128)
-    assert not nemo_gym_rollout_hit_max_tokens(None, 10, 128)
+    assert nemo_gym_rollout_hit_max_tokens(
+        {}, total_tokens=128, max_total_tokens_per_sample=128
+    )
+    assert nemo_gym_rollout_hit_max_tokens(
+        {}, total_tokens=130, max_total_tokens_per_sample=128
+    )
+    assert not nemo_gym_rollout_hit_max_tokens(
+        {}, total_tokens=127, max_total_tokens_per_sample=128
+    )
+    assert nemo_gym_rollout_hit_max_tokens(
+        None, total_tokens=128, max_total_tokens_per_sample=128
+    )
+    assert not nemo_gym_rollout_hit_max_tokens(
+        None, total_tokens=10, max_total_tokens_per_sample=128
+    )
 
 
 @pytest.mark.parametrize("reason", ["max_output_tokens", "length", "max_tokens"])
 def test_nemo_gym_rollout_hit_max_tokens_length_incomplete_response(reason):
     # A context overflow comes back as an empty length-cut completion, so the
     # chain stops well short of the token limit.
-    assert nemo_gym_rollout_hit_max_tokens(_incomplete_response(reason), 10, 128)
+    assert nemo_gym_rollout_hit_max_tokens(
+        _incomplete_response(reason), total_tokens=10, max_total_tokens_per_sample=128
+    )
 
 
 def test_nemo_gym_rollout_hit_max_tokens_per_turn_cap_counts_as_truncated():
@@ -2310,7 +2322,9 @@ def test_nemo_gym_rollout_hit_max_tokens_per_turn_cap_counts_as_truncated():
     full_result["response"]["output"] = [
         {"type": "message", "role": "assistant", "content": "partial answer"}
     ]
-    assert nemo_gym_rollout_hit_max_tokens(full_result, 10, 128)
+    assert nemo_gym_rollout_hit_max_tokens(
+        full_result, total_tokens=10, max_total_tokens_per_sample=128
+    )
 
 
 @pytest.mark.parametrize(
@@ -2332,7 +2346,9 @@ def test_nemo_gym_rollout_hit_max_tokens_per_turn_cap_counts_as_truncated():
     ],
 )
 def test_nemo_gym_rollout_hit_max_tokens_other_endings(full_result):
-    assert not nemo_gym_rollout_hit_max_tokens(full_result, 10, 128)
+    assert not nemo_gym_rollout_hit_max_tokens(
+        full_result, total_tokens=10, max_total_tokens_per_sample=128
+    )
 
 
 def test_postprocess_nemo_gym_group_marks_context_overflow_truncated():

@@ -1455,8 +1455,8 @@ class AsyncNemoGymRolloutImpl:
                 continue
             truncated = nemo_gym_rollout_hit_max_tokens(
                 result["full_result"],
-                sum(len(m["token_ids"]) for m in result["message_log"]),
-                self._max_seq_len,
+                total_tokens=sum(len(m["token_ids"]) for m in result["message_log"]),
+                max_total_tokens_per_sample=self._max_seq_len,
             )
             completions.append(
                 Completion(

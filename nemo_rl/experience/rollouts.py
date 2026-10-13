@@ -2973,6 +2973,7 @@ _LENGTH_LIMIT_INCOMPLETE_REASONS = frozenset(
 
 def nemo_gym_rollout_hit_max_tokens(
     full_result: dict[str, Any] | None,
+    *,
     total_tokens: int,
     max_total_tokens_per_sample: int,
 ) -> bool:
@@ -3097,8 +3098,8 @@ def _postprocess_single_nemo_gym_group(
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
                 "hit_max_tokens": nemo_gym_rollout_hit_max_tokens(
                     r["full_result"],
-                    sum(len(m["token_ids"]) for m in r["message_log"]),
-                    max_total_tokens_per_sample,
+                    total_tokens=sum(len(m["token_ids"]) for m in r["message_log"]),
+                    max_total_tokens_per_sample=max_total_tokens_per_sample,
                 ),
                 # max_gen_tokens_per_turn: Diagnostic for long single generations
                 "max_gen_tokens_per_turn": max(
