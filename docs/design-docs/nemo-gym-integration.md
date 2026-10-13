@@ -83,9 +83,9 @@ restored onto it (a native VLM forward such as Nemotron Omni pairs each text
 placeholder with exactly one projected media feature and rejects the mismatch
 before loss masking). Each replacement is logged with a
 `[nemo_gym] masking a rollout` line. The knob applies to the token-echo path
-only; combining it with `env.nemo_gym.token_capture.enabled` (receipt mode) is
-rejected at setup, because receipt rollouts bypass the converter that emits the
-placeholder.
+only; combining it with the top-level single-controller `token_capture.enabled`
+(receipt mode) is rejected at setup, because receipt rollouts bypass the
+converter that emits the placeholder.
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
