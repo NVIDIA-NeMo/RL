@@ -114,7 +114,9 @@ num_gen_nodes="${NUM_GEN_NODES:-8}"
 segment_size="${SEGMENT_SIZE:-8}"
 num_prompts="${NUM_PROMPTS:-8}"
 num_generations="${NUM_GENERATIONS:-4}"
-max_steps="${MAX_STEPS:-20}"
+# Keep the production GRPO horizon. The controller still stops at the data-epoch
+# or Slurm/checkpoint boundary; this must not become a one-step smoke cap.
+max_steps="${MAX_STEPS:-1000000}"
 save_period="${SAVE_PERIOD:-10}"
 checkpoint_keep_top_k="${CHECKPOINT_KEEP_TOP_K:-2}"
 train_global_batch_size=$((num_prompts * num_generations))
@@ -354,7 +356,12 @@ echo "candidate=${candidate_name}"
 echo "sbatch_comment=${sbatch_comment}"
 echo "time_limit=${slurm_time_limit} checkpoint_must_save_by=${checkpoint_must_save_by}"
 echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} qos=${SLURM_QOS:-default} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template} vllm_load_format=${vllm_load_format}"
-echo "context_compaction=${context_compaction} opencode_compaction_auto=${AGENTIC_VBENCH_COMPACTION_AUTO} opencode_prune=${AGENTIC_VBENCH_COMPACTION_PRUNE} max_turns=${AGENTIC_VBENCH_MAX_TURNS:-32} context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS:-49152} output_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS:-8192} tasks=${AGENTIC_VBENCH_TASKS:-all}"
+echo "context_compaction=${context_compaction}"
+if [[ -n ${CLAW_EVAL_SOURCE:-} ]]; then
+  echo "claweval_compaction_auto=${CLAW_EVAL_COMPACTION_AUTO:-null} claweval_prune=${CLAW_EVAL_COMPACTION_PRUNE:-null} training_mode=${CLAW_EVAL_TRAINING_MODE:-null} subagents=${CLAW_EVAL_SUBAGENTS_ENABLED:-false} max_turns=${CLAW_EVAL_MAX_TURNS:-40} context_tokens=${CLAW_EVAL_CONTEXT_TOKENS:-49152} output_tokens=${CLAW_EVAL_OUTPUT_TOKENS:-8192}"
+else
+  echo "agentic_vbench_compaction_auto=${AGENTIC_VBENCH_COMPACTION_AUTO} agentic_vbench_prune=${AGENTIC_VBENCH_COMPACTION_PRUNE} max_turns=${AGENTIC_VBENCH_MAX_TURNS:-32} context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS:-49152} output_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS:-8192} tasks=${AGENTIC_VBENCH_TASKS:-all}"
+fi
 echo "episodes=${AGENTIC_VBENCH_OUTPUT_ROOT}"
 echo "container=${container}"
 echo "config=${config_in_container}"
@@ -366,7 +373,7 @@ echo "checkpoints=${checkpoint_dir}"
 echo "token_capture=${token_capture_dir}"
 echo "job_local_cache_root=${job_local_cache_root}"
 # Record the AgenticVBench environment the Gym agent will read, for reproducibility.
-env | grep -E '^(AGENTIC_VBENCH_|AVB_DATA_ROOT|TRAIN_PATH|VAL_PATH|MODEL_PATH|CONTEXT_COMPACTION|NRL_MEGATRON_|WANDB_MODE|TMPDIR|TORCHINDUCTOR_CACHE_DIR|TRITON_CACHE_DIR|CUDA_CACHE_PATH)' | grep -v -i 'key\|token\|secret' | sort > "${results_dir}/avb_environment.env"
+env | grep -E '^(AGENTIC_VBENCH_|AVB_DATA_ROOT|CLAW_EVAL_|TRAIN_PATH|VAL_PATH|MODEL_PATH|CONTEXT_COMPACTION|NRL_MEGATRON_|WANDB_MODE|WANDB_PROJECT|WANDB_ENTITY|TMPDIR|TORCHINDUCTOR_CACHE_DIR|TRITON_CACHE_DIR|CUDA_CACHE_PATH)' | grep -v -i 'key\|token\|secret' | sort > "${results_dir}/gym_environment.env"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   printf '%s\n' "${COMMAND}" > "${results_dir}/training_command.sh"

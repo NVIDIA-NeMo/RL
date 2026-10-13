@@ -16,7 +16,7 @@ grpo:
   num_prompts_per_step: 8
   num_generations_per_prompt: 4
   max_num_epochs: 1000
-  max_num_steps: 20
+  max_num_steps: 1000000
   # SC has no validation loop.
   val_period: 0
   val_at_start: false

@@ -1,0 +1,21 @@
+# ClawEval GRPO on Nemotron Super Omni through the NeMo-RL v2 SingleController.
+# The launcher overrides paths/topology and keeps max_num_steps at the production
+# horizon rather than introducing a debug-step cap.
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml
+
+grpo:
+  max_num_epochs: 1000
+  max_num_steps: 1000000
+
+env:
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/claweval_agent/configs/claweval_train.yaml
+
+checkpointing:
+  checkpoint_dir: results/claweval-sc
+
+logger:
+  wandb:
+    project: nemorl-v2-subagent-comapction-debug

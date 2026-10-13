@@ -54,6 +54,36 @@ if [[ ! -s $TRAIN_PATH ]]; then
   python3 "$script_dir/build_train_dataset.py" --benchmark-root "$AGENTIC_VBENCH_ROOT" --tasks "$tasks" \
     ${train_limit:+--limit "$train_limit"} --repeats "$train_repeats" --output "$TRAIN_PATH"
 fi
+# A non-empty cache is not sufficient: older datasets on this branch used the
+# deprecated agent_ref schema and can silently route the wrong Gym source.  Rebuild
+# the expected rows in memory and compare the complete public row payload before
+# allocating GPUs.
+python3 - "$gym_dir" "$AGENTIC_VBENCH_ROOT" "$TRAIN_PATH" "$tasks" "$train_limit" "$train_repeats" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+gym_root, benchmark_root, train_path, selection, raw_limit, raw_repeats = sys.argv[1:]
+sys.path.insert(0, gym_root)
+from responses_api_agents.agentic_vbench_agent.core import dataset_rows, inventory
+
+expected = dataset_rows(inventory(Path(benchmark_root)), selection)
+if raw_limit:
+    expected = expected[: int(raw_limit)]
+expected = [
+    {**row, "task_source": "agentic_vbench_agent"}
+    for _ in range(int(raw_repeats))
+    for row in expected
+]
+with Path(train_path).open() as handle:
+    actual = [json.loads(line) for line in handle if line.strip()]
+if actual != expected:
+    raise SystemExit(
+        f"Stale/mismatched Agentic VBench dataset: {train_path}; "
+        "remove it or select a new TRAIN_PATH so it can be regenerated"
+    )
+print(f"Validated {len(actual)} Agentic VBench rows against the pinned benchmark")
+PY
 export TRAINING_DEPS_SETUP_SCRIPT=/opt/nemo-rl/tools/ensure_agentic_vbench_deps.sh
 # Leave GYM_VENV_DIR unset unless the caller chose one. launch_sc.sh then uses
 # the submitter-owned, prewarmed cc-pr4200 cache under PERSISTENT_CACHE instead
