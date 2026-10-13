@@ -395,6 +395,11 @@ class ClippedPGLossFn(LossFunction):
 
         self.use_cispo = cfg.use_cispo
         if self.use_cispo:
+            if self.truncated_importance_sampling_type == "ipo":
+                raise ValueError(
+                    "use_cispo is incompatible with truncated_importance_sampling_type='ipo'. "
+                    "Set loss_fn.use_cispo=false to use IPO."
+                )
             assert not self.disable_ppo_ratio, (
                 "use_cispo is incompatible with disable_ppo_ratio; "
                 "CISPO needs the pi_theta/pi_theta_old ratio but disable_ppo_ratio removes it"

@@ -736,6 +736,17 @@ def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_config):
         ClippedPGLossFn(cfg)
 
 
+def test_clipped_pg_loss_rejects_ipo_with_cispo():
+    cfg = ClippedPGLossConfig(
+        use_cispo=True,
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type="ipo",
+        truncated_importance_sampling_ratio=0.3,
+    )
+    with pytest.raises(ValueError, match="use_cispo is incompatible with"):
+        ClippedPGLossFn(cfg)
+
+
 def test_clipped_pg_loss_cispo():
     """Tests CISPO (Clipped IS-weight Policy Optimization) path in ClippedPGLossFn.
 
