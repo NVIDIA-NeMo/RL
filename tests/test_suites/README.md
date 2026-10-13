@@ -30,7 +30,7 @@ vlm_<algo>-<model>-<nodes>n<gpus>g-<strategy>[-modifiers][.vN].sh
 - **algo**: task or algorithm, e.g., `sft`, `dpo`, `grpo`.
 - **model**: model identifier, e.g., `llama3.1-8b-instruct`, `qwen2.5-7b-instruct`.
 - **nodes/gpus**: cluster allocation, e.g., `1n8g`, `4n8g`, `8n8g`.
-- **strategy-and-params**: parallelism or framework detail, e.g., `fsdp2tp1`, `tp4pp2`, `megatron`, `dtensor2tp1`.
+- **strategy-and-params**: parallelism or framework detail, e.g., `automodel`, `automodel-ep8`, `megatron`, `megatron-ep16tp2cp2`.
 - **modifiers** (optional): short flags like `sp` (sequence packing), `actckpt` (activation checkpointing), `fp8`, `noncolocated`, `quick`.
 - **-long** (optional): indicates long-running recipe.
 - **.vN** (optional): version suffix (e.g., `.v2`, `.v3`) reserved for convergence-impacting changes. Use when the recipe's convergence behavior changes (dataset, loss, convergence bug fix). Pure performance changes do not require a version bump.
