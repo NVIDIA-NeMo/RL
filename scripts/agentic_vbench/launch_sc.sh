@@ -252,6 +252,7 @@ export SETUP_COMMAND
 read -r -d '' COMMAND <<COMMAND_EOF || true
 set -euo pipefail
 cd /opt/nemo-rl
+export PATH=${python_toolchain_bin}:\${PATH}
 export UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 export UV_LINK_MODE=copy
 export NRL_CONTAINER=1
