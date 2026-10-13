@@ -2706,7 +2706,7 @@ def test_startup_pipeline_ready(
 
 
 @contextmanager
-def _patched_logprob_phase(policy):
+def _patched_logprob_phase(policy, num_rows: int = 1):
     """Provide real tensors for the logprob phase of ``grpo_train``.
 
     Both PRs #2174 / #2178 (``skip_reference_policy_logprobs_calculation=True``)
@@ -2715,23 +2715,24 @@ def _patched_logprob_phase(policy):
     ``TypeError: zeros_like(): argument 'input' must be Tensor, not MagicMock``
     when the surrounding inputs come straight from the bare ``mock_grpo_components``
     fixture. This helper swaps in real tensors for the duration of the test and
-    restores the original mock return values afterwards.
+    restores the original mock return values afterwards. ``num_rows`` is the
+    row count of the rollout batch the fake flat batch must stay aligned with.
     """
     fake_flat = BatchedDataDict(
         {
-            "token_ids": torch.tensor([[1, 2]]),
-            "advantages": torch.tensor([[0.5, 0.5]]),
-            "generation_logprobs": torch.tensor([[0.0, 0.0]]),
-            "token_loss_mask": torch.tensor([[1, 1]]),
-            "content": ["ok"],
+            "token_ids": torch.tensor([[1, 2]] * num_rows),
+            "advantages": torch.tensor([[0.5, 0.5]] * num_rows),
+            "generation_logprobs": torch.tensor([[0.0, 0.0]] * num_rows),
+            "token_loss_mask": torch.tensor([[1, 1]] * num_rows),
+            "content": ["ok"] * num_rows,
         }
     )
-    fake_lengths = torch.tensor([2])
+    fake_lengths = torch.tensor([2] * num_rows)
     saved_lp = policy.get_logprobs.return_value
     saved_rlp = policy.get_reference_policy_logprobs.return_value
-    policy.get_logprobs.return_value = {"logprobs": torch.zeros(1, 2)}
+    policy.get_logprobs.return_value = {"logprobs": torch.zeros(num_rows, 2)}
     policy.get_reference_policy_logprobs.return_value = {
-        "reference_logprobs": torch.zeros(1, 2)
+        "reference_logprobs": torch.zeros(num_rows, 2)
     }
     with patch(
         "nemo_rl.algorithms.grpo.batched_message_log_to_flat_message",
@@ -4862,7 +4863,11 @@ def test_grpo_train_skips_reference_policy_logprobs(mock_grpo_components, train_
 
 
 def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
-    """Run one GRPO training step with rollout/logprob infrastructure mocked."""
+    """Run one GRPO training step with rollout/logprob infrastructure mocked.
+
+    The fake flat batch of the logprob phase is sized to the rollout batch so a
+    multi-row ``train_dataloader`` batch stays row-aligned through the step.
+    """
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
     mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
     policy = mock_grpo_components["policy"]
@@ -4877,7 +4882,7 @@ def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
         master_config.policy["generation"]["colocated"]["enabled"] = False
         with (
             mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
-            _patched_logprob_phase(policy),
+            _patched_logprob_phase(policy, num_rows=mock_batch.size),
         ):
             train_func(
                 policy,
@@ -4895,7 +4900,7 @@ def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
             )
     else:
         with (
-            _patched_logprob_phase(policy),
+            _patched_logprob_phase(policy, num_rows=mock_batch.size),
             patch(
                 "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
                 return_value=(mock_batch, mock_rollout_metrics),
@@ -4955,11 +4960,50 @@ def test_grpo_train_clips_advantages_when_configured(
 def test_grpo_train_applies_agent_loss_weights(
     mock_grpo_components, train_func, monkeypatch
 ):
-    """Both loops weight the batch after advantages with the trainer's global batch size."""
-    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
-    mock_batch["agent_ref"] = [{"name": "short_agent"}]
+    """Both loops hand policy.train the normalized two-agent mask after advantages.
+
+    One row of one agent cannot tell the weighted path from an untouched mask
+    (the per-step rescale makes both [1.0]); two equal rows of two agents with
+    weights {1, 4} must come out as [0.4, 1.6] (c = 2 / 5), which the unweighted
+    loop cannot produce.
+    """
+    batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "test",
+                        "token_ids": torch.tensor([1, 2, 3]),
+                    }
+                ]
+                for _ in range(2)
+            ],
+            "task_name": ["math", "math"],
+            "extra_env_info": [{}, {}],
+            "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "idx": torch.tensor([0, 1]),
+            "length": torch.tensor([3, 3]),
+            "total_reward": torch.tensor([1.0, 0.0]),
+            "agent_ref": [{"name": "long_agent"}, {"name": "short_agent"}],
+        }
+    )
+    mock_grpo_components["train_dataloader"].__iter__ = lambda self: iter([batch] * 10)
+    for env in (
+        mock_grpo_components["task_to_env"]["math"],
+        mock_grpo_components["val_task_to_env"]["math"],
+    ):
+        env.global_post_process_and_metrics.return_value = (batch, {})
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.agent_loss_weights = {"short_agent": 4.0}
+    master_config.policy["train_global_batch_size"] = 2
+    master_config.grpo.num_prompts_per_step = 1
+    # The sync loop repeats the dataloader batch num_generations_per_prompt
+    # times before the mocked rollout returns it unchanged; the async loop's
+    # fixed-batch check needs size == num_prompts_per_step * num_generations.
+    master_config.grpo.num_generations_per_prompt = (
+        2 if train_func is async_grpo_train else 1
+    )
     calls = []
 
     def recording_apply(
@@ -4984,23 +5028,32 @@ def test_grpo_train_applies_agent_loss_weights(
 
     assert calls == [
         (
-            [{"name": "short_agent"}],
+            [{"name": "long_agent"}, {"name": "short_agent"}],
             {"short_agent": 4.0},
-            master_config.policy["train_global_batch_size"],
+            2,
         )
     ]
     policy = mock_grpo_components["policy"]
     policy.train.assert_called_once()
-    # One agent is uniformly weighted, so the per-step rescaling makes it a no-op.
-    assert policy.train.call_args[0][0]["sample_mask"].tolist() == [1.0]
+    # Two equal 1-token rows, weights {1, 4}: c = 2 / 5 and the mask is c * w.
+    torch.testing.assert_close(
+        policy.train.call_args[0][0]["sample_mask"], torch.tensor([0.4, 1.6])
+    )
     logged = {}
     for call in mock_grpo_components["logger"].log_metrics.call_args_list:
         logged.update(call.args[0])
     assert logged["agent_loss_weights/short_agent/weight"] == 4.0
+    assert logged["agent_loss_weights/long_agent/weight"] == 1.0
     assert logged["agent_loss_weights/short_agent/effective_weight"] == pytest.approx(
-        1.0
+        1.6
+    )
+    assert logged["agent_loss_weights/long_agent/effective_weight"] == pytest.approx(
+        0.4
     )
     assert logged["agent_loss_weights/short_agent/num_samples"] == 1.0
+    assert logged[
+        "agent_loss_weights/short_agent/token_share_weighted"
+    ] == pytest.approx(0.8)
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
