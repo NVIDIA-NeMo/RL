@@ -412,6 +412,46 @@ class TestBaselineValidMask:
 
         assert torch.equal(valid_mask, torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0]))
 
+    def test_fractional_loss_multiplier_votes_only_zero_is_excluded(self):
+        # Participation is binary: a fractional weight still counts as one
+        # vote, and the training loss weights themselves are left untouched.
+        loss_multiplier = torch.tensor([1.0, 0.5, 0.25, 0.0, 1e-6])
+        repeated_batch = BatchedDataDict({"loss_multiplier": loss_multiplier.clone()})
+
+        valid_mask = _baseline_valid_mask(repeated_batch, torch.zeros(5))
+
+        assert torch.equal(valid_mask, torch.tensor([1.0, 1.0, 1.0, 0.0, 1.0]))
+        assert set(valid_mask.unique().tolist()) <= {0.0, 1.0}
+        assert torch.equal(repeated_batch["loss_multiplier"], loss_multiplier)
+
+    def test_truncated_rows_vote_until_overlong_filtering_rewrites_loss_multiplier(
+        self,
+    ):
+        # The truncated-row rule is enforced by call order: taken before the
+        # overlong rewrite, truncated rollouts vote (docs/guides/grpo.md).
+        truncated = torch.tensor([True, False, True])
+        repeated_batch = BatchedDataDict(
+            {
+                "truncated": truncated,
+                "mask_sample": torch.tensor([False, False, False]),
+                "loss_multiplier": torch.ones(3),
+            }
+        )
+
+        assert torch.equal(
+            _baseline_valid_mask(repeated_batch, torch.zeros(3)), torch.ones(3)
+        )
+
+        # Once overlong filtering zeroes their loss weight they would stop
+        # voting, which is why both loops take the mask first.
+        loss_multiplier = repeated_batch["loss_multiplier"].clone()
+        loss_multiplier[truncated] = 0
+        repeated_batch["loss_multiplier"] = loss_multiplier
+        assert torch.equal(
+            _baseline_valid_mask(repeated_batch, torch.zeros(3)),
+            torch.tensor([0.0, 1.0, 0.0]),
+        )
+
     def test_list_valued_flags(self):
         repeated_batch = BatchedDataDict(
             {"mask_sample": [True, False, False], "loss_multiplier": [1.0, 0.0, 1.0]}
@@ -2902,6 +2942,111 @@ def test_grpo_train_dynamic_sampling_std_excludes_masked_rows(
     assert captured["is_trivial"].all()
 
 
+def test_grpo_train_every_baseline_site_excludes_masked_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_grpo_components: dict[str, Any],
+) -> None:
+    """The trivial check, the baseline/std, and the env baseline share one mask."""
+    rollout_metrics = {"mean_gen_tokens_per_sample": 1.0}
+    rewards = torch.tensor([0.0, 0.0, 0.0, 1.0])
+    mask_sample = torch.tensor([False, False, False, True])
+
+    def fake_rollout(*_args: Any, **kwargs: Any) -> tuple[BatchedDataDict, dict]:
+        rollout_batch = kwargs["input_batch"]
+        for message_log in rollout_batch["message_log"]:
+            message_log.append(
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "token_ids": torch.tensor([4]),
+                }
+            )
+        rollout_batch["total_reward"] = rewards.clone()
+        # grpo.length_penalty keeps the pre-penalty reward under env_reward.
+        rollout_batch["env_reward"] = rewards.clone()
+        rollout_batch["mask_sample"] = mask_sample.clone()
+        return rollout_batch, rollout_metrics
+
+    real_trivial = grpo_mod.calculate_trivial_reward_distributions
+    real_baseline = grpo_mod.calculate_baseline_and_std_per_prompt
+    seen_valid_masks: dict[str, list[torch.Tensor]] = {"trivial": [], "baseline": []}
+    captured: dict[str, torch.Tensor] = {}
+
+    def recording_trivial(prompts, group_rewards, valid_mask):
+        seen_valid_masks["trivial"].append(valid_mask.clone())
+        return real_trivial(prompts, group_rewards, valid_mask)
+
+    def recording_baseline(prompts, group_rewards, valid_mask, **kwargs):
+        seen_valid_masks["baseline"].append(valid_mask.clone())
+        return real_baseline(prompts, group_rewards, valid_mask, **kwargs)
+
+    def capture_dynamic_sampling(repeated_batch, *_args, **_kwargs):
+        captured["env_baseline"] = repeated_batch["env_baseline"].clone()
+        raise RuntimeError("captured env baseline")
+
+    monkeypatch.setattr(
+        grpo_mod, "should_use_async_rollouts", lambda *_args, **_kwargs: False
+    )
+    monkeypatch.setattr(grpo_mod, "run_multi_turn_rollout", fake_rollout)
+    monkeypatch.setattr(
+        grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        grpo_mod, "calculate_trivial_reward_distributions", recording_trivial
+    )
+    monkeypatch.setattr(
+        grpo_mod, "calculate_baseline_and_std_per_prompt", recording_baseline
+    )
+    monkeypatch.setattr(grpo_mod, "dynamic_sampling", capture_dynamic_sampling)
+    monkeypatch.setattr(grpo_mod, "MemoryTracker", MagicMock)
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.num_prompts_per_step = 1
+    master_config.grpo.num_generations_per_prompt = 4
+    master_config.grpo.dynamic_sampling_max_gen_batches = 2
+    master_config.grpo.use_dynamic_sampling = True
+
+    with pytest.raises(RuntimeError, match="captured env baseline"):
+        grpo_mod.grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    expected_valid_mask = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    # One trivial-group check, then the training baseline/std and the env
+    # baseline (the GPU baseline/std branch passes the same tensor).
+    assert len(seen_valid_masks["trivial"]) == 1
+    assert len(seen_valid_masks["baseline"]) == 2
+    for valid_mask in seen_valid_masks["trivial"] + seen_valid_masks["baseline"]:
+        assert torch.equal(valid_mask, expected_valid_mask)
+
+    # The env baseline of the real rows ignores the masked row's reward ...
+    assert torch.equal(captured["env_baseline"][:3], torch.zeros(3))
+    # ... whereas the all-ones mask would have shifted it.
+    unmasked_env_baseline, _, _ = real_baseline(
+        torch.zeros(4, 1, dtype=torch.long),
+        rewards,
+        torch.ones_like(rewards),
+        leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+    )
+    assert torch.all(unmasked_env_baseline[:3] > 0)
+
+
 def test_dapo_dynamic_sampling_preserves_mask_sample_alignment(mock_grpo_components):
     """mask_sample should follow rows through dynamic-sampling filter and slice."""
     batch_size = 9
@@ -4965,6 +5110,7 @@ def test_grpo_train_preserves_advantages_when_clipping_disabled(
     ("mask_sample", "loss_multiplier", "expected_valid"),
     [
         pytest.param(False, 1.0, 1.0, id="valid"),
+        pytest.param(False, 0.5, 1.0, id="fractional_loss_multiplier"),
         pytest.param(True, 1.0, 0.0, id="mask_sample"),
         pytest.param(False, 0.0, 0.0, id="zero_loss_multiplier"),
     ],
@@ -4993,6 +5139,35 @@ def test_grpo_train_passes_baseline_valid_mask_to_advantage_estimator(
     mock_adv_estimator.compute_advantage.assert_called_once()
     valid_mask = mock_adv_estimator.compute_advantage.call_args.kwargs["valid_mask"]
     assert torch.equal(valid_mask, torch.tensor([expected_valid]))
+    # Statistical participation is binary; the training loss weight is not.
+    train_data = mock_grpo_components["policy"].train.call_args.args[0]
+    expected_sample_mask = torch.tensor([0.0 if mask_sample else loss_multiplier])
+    assert torch.equal(train_data["sample_mask"], expected_sample_mask)
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_train_truncated_rows_vote_in_baseline_but_not_in_loss(
+    mock_grpo_components, train_func, monkeypatch
+):
+    """Under overlong_filtering a truncated rollout keeps voting in the baseline."""
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["truncated"] = torch.tensor([True])
+    mock_grpo_components["master_config"].grpo.overlong_filtering = True
+    mock_adv_estimator = MagicMock()
+    mock_adv_estimator.compute_advantage.return_value = torch.zeros(1, 2)
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.grpo._create_advantage_estimator",
+        lambda _cfg: mock_adv_estimator,
+    )
+
+    _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch)
+
+    mock_adv_estimator.compute_advantage.assert_called_once()
+    valid_mask = mock_adv_estimator.compute_advantage.call_args.kwargs["valid_mask"]
+    assert torch.equal(valid_mask, torch.ones(1))
+    # ... while overlong filtering removed it from the loss, as documented.
+    train_data = mock_grpo_components["policy"].train.call_args.args[0]
+    assert torch.equal(train_data["sample_mask"], torch.zeros(1))
 
 
 def test_clip_grpo_advantages_respects_config_bounds():

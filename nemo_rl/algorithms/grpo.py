@@ -2694,16 +2694,27 @@ def _trajectory_group_ids(trajectories: list[dict[str, Any]]) -> torch.Tensor:
 def _baseline_valid_mask(
     repeated_batch: BatchedDataDict[DatumSpec], rewards: torch.Tensor
 ) -> torch.Tensor:
-    """Return a ``[B]`` mask of the rows whose reward may vote in the group baseline/std.
+    """Return the binary ``[B]`` mask of rows whose reward votes in the group baseline/std.
 
-    Rows the environment flags with ``mask_sample`` and rows that already carry
-    ``loss_multiplier == 0`` contribute no loss, and their reward is not a valid
-    measurement of the policy. Counting them would bias their siblings' baseline
-    and make a group whose only reward variance comes from such a row look
-    non-uniform to dynamic sampling.
+    A row is excluded (0) when the environment flagged it with ``mask_sample``
+    or when it already carries ``loss_multiplier == 0``: it contributes no loss
+    and its reward, often a synthetic placeholder, is not a measurement of the
+    policy. Counting it would bias its siblings' baseline and could make a
+    group whose only reward variance comes from that row look non-uniform to
+    dynamic sampling. Every other row votes (1).
 
-    Call this before overlong filtering rewrites ``loss_multiplier`` so that
-    truncated (but otherwise valid) rollouts keep voting, as before.
+    Two rules follow from how ``calculate_baseline_and_std_per_prompt`` consumes
+    the mask (``rewards * valid_mask`` divided by ``valid_mask.sum()``):
+
+    * Participation is binary. A nonzero fractional ``loss_multiplier`` keeps
+      the row voting with full weight; the fraction remains a training loss
+      weight only. ``repeated_batch`` is not modified.
+    * Truncated rollouts keep voting. Call this before ``overlong_filtering``
+      rewrites ``loss_multiplier``, so a truncated but otherwise real rollout
+      still counts toward the baseline, as ``docs/guides/grpo.md`` documents
+      for these loops. The SingleController ``advantage_stage`` folds
+      ``truncated`` into its ``valid_mask`` instead; reconciling the two is a
+      separate policy decision, not made here.
     """
     valid_mask = torch.ones_like(rewards)
     if "mask_sample" in repeated_batch:
@@ -3660,7 +3671,10 @@ def _grpo_train_impl(
                 ):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
-                    # Masked rows must not vote in the group baseline/std.
+                    # Binary participation mask for the group statistics (see
+                    # _baseline_valid_mask). Taken before overlong filtering, so
+                    # truncated rollouts keep voting; masked and zero-loss rows
+                    # do not.
                     valid_mask = _baseline_valid_mask(repeated_batch, rewards)
 
                     print("▶ Computing advantages...", flush=True)
@@ -3721,11 +3735,13 @@ def _grpo_train_impl(
                         # grpo.length_penalty rewrote total_reward; keep a
                         # baseline of the env reward for the pct_* diagnostics.
                         # Stored on the batch so dynamic sampling filters it.
+                        # Same population as the training baseline: a masked
+                        # row's env reward must not vote in those diagnostics.
                         repeated_batch["env_baseline"], _, _ = (
                             calculate_baseline_and_std_per_prompt(
                                 repeated_batch[PROMPT_GROUP_IDS_KEY],
                                 repeated_batch["env_reward"],
-                                torch.ones_like(rewards),
+                                valid_mask,
                                 leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                             )
                         )
@@ -5629,8 +5645,10 @@ def async_grpo_train(
                         )
 
                     rewards = repeated_batch["total_reward"]
-                    # Masked rows must not vote in the group baseline. Taken
-                    # before overlong filtering rewrites loss_multiplier.
+                    # Binary participation mask for the group baseline (see
+                    # _baseline_valid_mask). Taken before overlong filtering, so
+                    # truncated rollouts keep voting; masked and zero-loss rows
+                    # do not.
                     baseline_valid_mask = _baseline_valid_mask(repeated_batch, rewards)
 
                     print(
