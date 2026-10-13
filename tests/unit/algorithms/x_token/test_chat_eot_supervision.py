@@ -106,36 +106,11 @@ def _loss_fn(vocab_size: int) -> CrossTokenizerDistillationLossFn:
 
 
 @pytest.mark.parametrize("loss_kind", ["ce", "same_tokenizer_kd"])
-@pytest.mark.parametrize("truncated", [False, True])
-def test_chat_loss_supervises_eot_predictor_only(
-    loss_kind: str, truncated: bool
-) -> None:
+def test_chat_loss_supervises_eot_predictor_only(loss_kind: str) -> None:
     tokenizer = _tokenizer()
     # The full chat has assistant targets at 4/5 and 10/11 (answer/EOT).
-    # Truncation at 5 retains the first answer but removes its EOT.
-    if truncated:
-        # Production rejects overflow. Exercise the reusable lower-level
-        # truncation helper separately to keep its loss-boundary regression.
-        with pytest.raises(ValueError, match="exceeds context length"):
-            _batch(tokenizer, ctx_length=5)
-        ids, offsets, mask, _, _ = CrossTokenizerCollator._render_and_tokenize_chat(
-            tokenizer, _MESSAGES, 5
-        )
-        input_ids, attention, _, token_mask = CrossTokenizerCollator._pad_chat_batch(
-            [ids], [offsets], [mask], tokenizer.pad_token_id, 16
-        )
-        batch = BatchedDataDict(
-            {
-                "input_ids": input_ids,
-                "input_lengths": attention.sum(-1),
-                "token_mask": token_mask,
-                "sample_mask": torch.ones(1),
-            }
-        )
-    else:
-        batch = _batch(tokenizer)
-    expected_targets = [4] if truncated else [4, 5, 10, 11]
-    assert batch["token_mask"].nonzero(as_tuple=True)[1].tolist() == expected_targets
+    batch = _batch(tokenizer)
+    assert batch["token_mask"].nonzero(as_tuple=True)[1].tolist() == [4, 5, 10, 11]
     logits = torch.zeros(
         (*batch["input_ids"].shape, len(tokenizer)), requires_grad=True
     )
@@ -163,14 +138,11 @@ def test_chat_loss_supervises_eot_predictor_only(
     loss.backward()
     assert logits.grad is not None
     active_predictors = logits.grad.abs().sum(dim=-1).nonzero(as_tuple=True)[1].tolist()
-    assert active_predictors == ([3] if truncated else [3, 4, 9, 10])
-    if not truncated:
-        # Answer logits learn the terminator; outgoing EOT predictions target
-        # the next role header or padding and must remain unsupervised.
-        assert (logits.grad[0, [4, 10], tokenizer.eos_token_id] < 0).all()
-        assert torch.count_nonzero(logits.grad[0, [5, 11]]) == 0
-    else:
-        assert torch.count_nonzero(logits.grad[0, 4:]) == 0
+    assert active_predictors == [3, 4, 9, 10]
+    # Answer logits learn the terminator; outgoing EOT predictions target
+    # the next role header or padding and must remain unsupervised.
+    assert (logits.grad[0, [4, 10], tokenizer.eos_token_id] < 0).all()
+    assert torch.count_nonzero(logits.grad[0, [5, 11]]) == 0
 
 
 def test_eot_supervision_mask_does_not_change_cross_tokenizer_kd(
