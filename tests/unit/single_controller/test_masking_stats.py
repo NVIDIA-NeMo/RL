@@ -59,6 +59,7 @@ def test_breakdown_counts_every_mask_source_once():
     assert (
         out["masking/truncated_rows"] == 1 and out["masking/truncated_masked_rows"] == 1
     )
+    assert math.isclose(out["truncation_rate"], 1 / 7, rel_tol=1e-6)
     assert out["masking/seq_logprob_error_rows"] == 1
     assert out["masking/masked_rows"] == 3 and math.isclose(
         out["masking/masked_frac"], 3 / 7, rel_tol=1e-6
@@ -76,7 +77,7 @@ def test_breakdown_counts_every_mask_source_once():
     assert out["masking/groups"] == 2 and out["masking/groups_lt2_trained_frac"] == 0.0
 
 
-def test_truncation_only_counts_as_masked_when_filtering_is_on():
+def test_truncation_rate_counts_unmasked_truncation_when_filtering_is_off():
     acc = new_masking_stats_accumulator()
     common = dict(
         prompt_ids=torch.tensor([1, 1]),
@@ -93,11 +94,37 @@ def test_truncation_only_counts_as_masked_when_filtering_is_on():
         **common,
     )
     out = reduce_masking_stats(acc)
-    assert (
-        out["masking/truncated_rows"] == 1 and out["masking/truncated_masked_rows"] == 0
-    )
+    # truncation_rate counts every row that hit the length limit; masking/truncated_*
+    # only the rows the overlong filter masked, so none here.
+    assert out["truncation_rate"] == 0.5
+    assert out["masking/truncated_rows"] == 0 and out["masking/truncated_frac"] == 0.0
+    assert out["masking/truncated_masked_rows"] == 0
+    assert "masking/reward_mean_truncated" not in out
     assert out["masking/masked_rows"] == 0 and out["masking/reinstated_rows"] == 0
     assert "masking/reward_mean_masked" not in out
+
+
+def test_truncated_rows_include_env_flagged_ones_but_truncated_masked_does_not():
+    acc = new_masking_stats_accumulator()
+    # Row 0 truncated and env-flagged, row 1 truncated only, row 2 clean; overlong on.
+    accumulate_masking_stats(
+        acc,
+        prompt_ids=torch.tensor([1, 1, 1]),
+        rewards=torch.tensor([0.0, 1.0, 1.0]),
+        sample_mask=torch.ones(3),
+        mask_sample=torch.tensor([True, False, False]),
+        truncated=torch.tensor([True, True, False]),
+        overlong_filtering=True,
+        final_sample_mask=torch.tensor([0.0, 0.0, 1.0]),
+        baseline_mask=torch.tensor([0.0, 0.0, 1.0]),
+    )
+    out = reduce_masking_stats(acc)
+    assert math.isclose(out["truncation_rate"], 2 / 3, rel_tol=1e-6)
+    assert out["masking/truncated_rows"] == 2
+    assert math.isclose(out["masking/truncated_frac"], 2 / 3, rel_tol=1e-6)
+    assert out["masking/truncated_masked_rows"] == 1
+    assert out["masking/reward_mean_truncated"] == 0.5
+    assert out["masking/seq_logprob_error_rows"] == 0
 
 
 def test_groups_with_fewer_than_two_trained_rows_and_multi_chunk_ids():

@@ -1825,10 +1825,13 @@ class AsyncNemoGymRolloutImpl:
                 max_gen_tokens_per_turn, n, "max_gen_tokens_per_turn"
             ),
             "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
-            # truncated metrics
-            "natural_termination_rate": sum(not t for t in truncated) / n,
-            "truncation_rate": sum(truncated) / n,
         }
+        if not receipt_mode:
+            # Receipt completions carry truncated=False as a placeholder (no tokens at
+            # dispatch); their truncation is measured per row after reassembly and
+            # logged as truncation_rate by masking_stats, which this would overwrite.
+            rollout_metrics["natural_termination_rate"] = sum(not t for t in truncated) / n
+            rollout_metrics["truncation_rate"] = sum(truncated) / n
 
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
