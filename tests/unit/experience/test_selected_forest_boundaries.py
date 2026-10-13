@@ -288,9 +288,6 @@ def test_excluded_leaf_preserves_selected_ancestor(forest: ForestCapture) -> Non
     assert not any(partition == "staged" for partition, _ in forest.plane.rows)
 
 
-@pytest.mark.xfail(
-    strict=True, raises=ValueError, reason="Selector requires global capture order"
-)
 def test_per_chain_envelopes_preserve_membership(forest: ForestCapture) -> None:
     records, replies = forest.capture([None, None, 0, 1])
     result = {
@@ -303,11 +300,6 @@ def test_per_chain_envelopes_preserve_membership(forest: ForestCapture) -> None:
     assert {r.model_call_id for r in selected} == {r.model_call_id for r in records}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason="Scored terminal must be the last selected call",
-)
 def test_explicit_scored_parent_can_precede_worker(forest: ForestCapture) -> None:
     records, replies = forest.capture([None, None, 0, 1])
     result = ordinary(replies)
@@ -387,8 +379,13 @@ def test_invalid_selected_edges_fail_before_publication(
         "future": records[2].model_call_id,
     }[bad_parent]
     records[1] = records[1].model_copy(update={"parent_call_id": parent})
-    with pytest.raises(ValueError, match="selected predecessor"):
-        publish(forest, records, records)
+    if bad_parent == "future":
+        # Completion order is no longer proof against this edge. The capture
+        # digests still reject the forged parent and mask the owner.
+        assert publish(forest, records, records).valid_row_count == 0
+    else:
+        with pytest.raises(ValueError, match="selected predecessor|cycle"):
+            publish(forest, records, records)
     assert not any(partition == "canonical" for partition, _ in forest.plane.rows)
 
 
@@ -445,3 +442,42 @@ def test_shared_plan_and_masks_survive_selection_serialization(
     ]
     assert prepared[0] == prepared[1]
     assert prepared[0].valid_owner_count == 1
+
+
+@pytest.mark.parametrize("parents", [[None, 0, 0], [None, 0, None], [None, None, 0, 1]])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_completion_order_does_not_change_selected_forest(
+    forest: ForestCapture, parents: list[int | None], reverse: bool
+) -> None:
+    records, replies = forest.capture(parents)
+    manifest = list(reversed(records)) if reverse else records
+    # Deliberately exercise a stronger permutation than real completion order:
+    # storage order is not an ancestry or accepted-history contract.
+    selected = select_captured_calls(manifest, ordinary(replies))
+    result = publish(forest, manifest, selected)
+    assert result.valid_row_count == 2
+    assert_loss_once(forest, selected, records)
+    first = forest.plane.rows["canonical", result.meta.sample_ids[0]]
+    assert first["input_ids"].tolist()[0][:2] == [10, 11]
+
+
+def test_all_captured_membership_uses_existing_planner_boundary(
+    forest: ForestCapture,
+) -> None:
+    records, _ = forest.capture([None, 0, 0, None, 3])
+    # A provider supplies membership directly; ordinary-history matching is
+    # not required by the shared planner. Terminal and membership are separate.
+    selected = [records[i] for i in (1, 2, 0, 4, 3)]
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [receipt(list(reversed(records)), terminal=records[1])],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[selection(selected)],
+    )
+    assert result.valid_row_count == 3
+    assert_loss_once(forest, selected, records)

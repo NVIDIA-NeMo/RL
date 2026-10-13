@@ -28,8 +28,8 @@ from nemo_gym.token_id_capture.staging.records import CallRecord
 
 def _output_items(
     result: dict[str, Any], *, captured_response_ids: set[str]
-) -> tuple[list[dict[str, Any]], dict[int, str]]:
-    """Normalize ordinary output, retaining envelope terminals by item offset."""
+) -> tuple[list[dict[str, Any]], dict[int, str | None]]:
+    """Normalize ordinary output, retaining envelope boundaries and identities."""
     responses = result.get("responses") or [result.get("response") or {}]
     sessions = {(r.get("metadata") or {}).get("session_id") for r in responses}
     if len(sessions) > 1:
@@ -83,8 +83,10 @@ def _output_items(
         if native_id in captured_response_ids and not authored:
             raise ValueError("No accepted captured generations in response output")
         items.extend(authored)
-        if native_id in captured_response_ids:
-            terminals[len(items)] = native_id
+        if authored:
+            terminals[len(items)] = (
+                native_id if native_id in captured_response_ids else None
+            )
     return items, terminals
 
 
@@ -142,7 +144,9 @@ def select_captured_calls(
             result, captured_response_ids=set(by_response)
         )
         terminals = {
-            end: by_response[identity] for end, identity in envelope_ids.items()
+            end: by_response[identity]
+            for end, identity in envelope_ids.items()
+            if identity is not None
         }
         fingerprints = [output_item_fingerprint(item) for item in items]
         by_item_id: dict[str, set[str]] = defaultdict(set)
@@ -173,6 +177,7 @@ def select_captured_calls(
                 required.add(ancestor)
                 ancestor = by_call.get(ancestor).parent_call_id
         position = 0
+        envelope_selected_start = 0
         while position < len(items):
             matches = []
             for candidate in by_first.get(fingerprints[position], []):
@@ -185,12 +190,15 @@ def select_captured_calls(
                     continue
                 evidence = candidate.output_items or []
                 end = position + len(evidence)
-                # A native envelope identifies its final whole call, including
-                # when its output contains a cumulative conversation. Synthetic
-                # exporter IDs are not capture identities and impose no bound.
-                if any(position < stop < end for stop in terminals):
+                # Whole calls cannot cross response envelopes. A native ID must
+                # occur inside its own envelope, but need not be its last call.
+                if any(position < stop < end for stop in envelope_ids):
                     continue
-                if end in terminals and terminals[end] != candidate:
+                if (
+                    end in terminals
+                    and terminals[end] != candidate
+                    and terminals[end] not in selected[envelope_selected_start:]
+                ):
                     continue
                 if [item.fingerprint for item in evidence] != fingerprints[
                     position:end
@@ -227,6 +235,8 @@ def select_captured_calls(
                 )
             selected.append(matches[0])
             position += len(matches[0].output_items or [])
+            if position in envelope_ids:
+                envelope_selected_start = len(selected)
         if referenced is not None and len(selected) != len(referenced):
             raise ValueError(
                 "Returned output is missing referenced generations: "
@@ -237,13 +247,14 @@ def select_captured_calls(
         selected = referenced
     if not selected:
         raise ValueError("No accepted captured generations")
-    positions = {r.model_call_id: i for i, r in enumerate(records)}
-    indexes = [positions[r.model_call_id] for r in selected]
-    if indexes != sorted(set(indexes)):
-        raise ValueError("Accepted generations are duplicated or out of capture order")
-    if terminal is not None and terminal != selected[-1]:
-        raise ValueError("Selected terminal differs from the scored response")
+    if len({record.model_call_id for record in selected}) != len(selected):
+        raise ValueError("Accepted generations are duplicated")
+    if terminal is not None and terminal not in selected:
+        raise ValueError("Scored response is absent from accepted history")
     declared = result.get("terminal_response_id")
-    if declared and declared != selected[-1].response_id:
-        raise ValueError("Declared terminal differs from accepted history")
+    if declared:
+        if declared not in {record.response_id for record in selected}:
+            raise ValueError("Declared terminal is absent from accepted history")
+        if terminal is not None and declared != terminal.response_id:
+            raise ValueError("Declared terminal differs from the scored response")
     return selected

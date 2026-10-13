@@ -292,14 +292,17 @@ def test_an_undrained_receipt_masks_instead_of_wedging() -> None:
     assert _receipt_staging_keys(receipt) == ["r0/c1"]
 
 
+@pytest.mark.parametrize("compaction", [False, True])
 def test_the_terminal_manifest_read_drains_an_in_flight_call(
     monkeypatch: pytest.MonkeyPatch,
+    compaction: bool,
 ) -> None:
     """A session ended at its budget can leave its last call executing in the
     engine; the terminal manifest read polls until the call resolves."""
     import nemo_rl.environments.nemo_gym as env_module
 
     env = _capture_env()
+    env._context_compaction = compaction
     pending = {
         "rollout_id": "r0",
         "records": [],
@@ -319,6 +322,14 @@ def test_the_terminal_manifest_read_drains_an_in_flight_call(
     manifest = asyncio.run(env._drained_manifest("r0"))
     assert manifest["pending_call_ids"] == []
     assert env._control.await_count == 2
+    assert env._control.await_args_list[0].args == (
+        "POST" if compaction else "GET",
+        f"/training-token-capture/control/rollouts/r0/{'close' if compaction else 'manifest'}",
+    )
+    assert env._control.await_args_list[1].args == (
+        "GET",
+        "/training-token-capture/control/rollouts/r0/manifest",
+    )
 
 
 def test_the_drain_budget_bounds_the_wait(monkeypatch: pytest.MonkeyPatch) -> None:

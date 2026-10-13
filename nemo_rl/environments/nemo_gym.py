@@ -1003,11 +1003,17 @@ Depending on your data shape, you may want to change these values."""
         may still stage data, so those IDs cannot transfer to cleanup.
         """
         deadline = monotonic() + _CAPTURE_DRAIN_TIMEOUT_S
+        # Close before the first snapshot: an empty pending set alone does not
+        # prevent a queued request from starting after finalization/cleanup.
+        method, operation = (
+            ("POST", "close") if self._context_compaction else ("GET", "manifest")
+        )
         while True:
             manifest = await self._control(
-                "GET",
-                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/manifest",
+                method,
+                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/{operation}",
             )
+            method, operation = "GET", "manifest"
             failed = {
                 failure.get("model_call_id")
                 for failure in manifest.get("failures") or []
@@ -1131,10 +1137,17 @@ Depending on your data shape, you may want to change these values."""
             r.finish_reason in ("length", "max_tokens", "max_output_tokens")
             for r in selected
         )
+        terminal_response_id = None
+        if selected:
+            terminal_response_id = result.get("terminal_response_id") or (
+                result.get("response") or {}
+            ).get("id")
+            if terminal_response_id not in {r.response_id for r in selected}:
+                terminal_response_id = selected[-1].response_id
         receipt = self._assemble_receipt(
             owner,
             manifest,
-            terminal_response_id=selected[-1].response_id if selected else None,
+            terminal_response_id=terminal_response_id,
             reward=float(reward),
         )
         if capture_failed:

@@ -34,8 +34,10 @@ def _env(harness):
     env.cfg = {}
 
     async def control(method, path):
-        assert method == "GET"
         capture_id = path.split("/")[-2]
+        if method == "POST" and path.endswith("/close"):
+            return await harness.ledger.close_admissions(capture_id)
+        assert method == "GET" and path.endswith("/manifest")
         return await harness.ledger.manifest(capture_id)
 
     env._control = AsyncMock(side_effect=control)

@@ -38,6 +38,7 @@ import math
 import time
 from collections import Counter
 from dataclasses import dataclass, field, replace
+from graphlib import CycleError, TopologicalSorter
 from typing import Any, Optional, cast
 
 import torch
@@ -110,7 +111,12 @@ class ActionOutputFlags:
 
 @dataclass(frozen=True)
 class RolloutSelection:
-    """Harness-independent ordered action selection within one capture attempt."""
+    """Eligible calls and flags within one attempt, independent of commit order.
+
+    Selection order determines root/path priority, including the grouping prompt;
+    parents determine reconstruction order. The receipt identifies the scored
+    terminal separately. Providers need not use Gym's accepted-history matcher.
+    """
 
     response_ids: tuple[str, ...]
     action_flags: tuple[ActionOutputFlags, ...]
@@ -1143,30 +1149,40 @@ class RolloutReassembler:
                 raise ValueError(
                     "Selected response is missing or ambiguous in the capture manifest"
                 )
+            # Selection supplies membership and semantic root order. Completion
+            # order in the manifest says nothing about independent branches.
             positions = {
-                record.response_id: index
-                for index, record in enumerate(parsed.manifest)
+                response_id: index for index, response_id in enumerate(selected)
             }
-            if [positions[item] for item in selected] != sorted(
-                positions[item] for item in selected
-            ):
-                raise ValueError("Selected responses must preserve capture order")
-            if by_response[selected[-1]].model_call_id != parsed.terminal_model_call_id:
-                raise ValueError("Selected terminal differs from the scored receipt")
-            selected_records = [by_response[response_id] for response_id in selected]
-            by_call = {record.model_call_id: record for record in selected_records}
+            by_call = {by_response[r].model_call_id: by_response[r] for r in selected}
+            if parsed.terminal_model_call_id not in by_call:
+                raise ValueError("Scored terminal is absent from selected calls")
             flags_by_call = dict(zip(by_call, selection.action_flags, strict=True))
+            graph = {
+                call_id: (record.parent_call_id,)
+                if record.parent_call_id is not None
+                else ()
+                for call_id, record in by_call.items()
+            }
+            if any(
+                parent not in by_call
+                for parents in graph.values()
+                for parent in parents
+            ):
+                raise ValueError(
+                    "Selected continuation is missing its selected predecessor"
+                )
+            try:
+                selected_records = [
+                    by_call[c] for c in TopologicalSorter(graph).static_order()
+                ]
+            except CycleError as error:
+                raise ValueError("Selected capture contains a cycle") from error
             root_positions: dict[str, int] = {}
             parents: set[str] = set()
             for record in selected_records:
                 if record.parent_call_id is None:
                     root_positions[record.model_call_id] = positions[record.response_id]
-                elif record.parent_call_id not in root_positions:
-                    # Require selected ancestry and parent-before-child order;
-                    # this also rejects cycles before walking any endpoint.
-                    raise ValueError(
-                        "Selected continuation must follow its selected predecessor"
-                    )
                 else:
                     root_positions[record.model_call_id] = root_positions[
                         record.parent_call_id

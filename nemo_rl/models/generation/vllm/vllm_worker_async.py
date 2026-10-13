@@ -1112,7 +1112,10 @@ class VllmAsyncGenerationWorkerImpl(
                 admission = worker_self._capture_admission(request)
                 serving_admission = admission
                 verify_retained_media = False
-                if admission is not None and admission.mode == "candidate":
+                if admission is not None and (
+                    admission.mode == "candidate"
+                    or admission.request_replay is not None
+                ):
                     # Inline assistant token fields cannot override RL's decision.
                     request.required_prefix_token_ids = None
                     decision = decide_capture_input(
@@ -1120,7 +1123,7 @@ class VllmAsyncGenerationWorkerImpl(
                         messages=messages_for_replace_prefix_tokens,
                         # HF/string parsing maps null and empty tool content to
                         # identical template inputs. Structured content and
-                        # other renderers retain the strict source comparison.
+                        # other renderers cannot authorize that equivalence.
                         allow_empty_tool_content=(
                             type(self.renderer) is HfRenderer
                             and bool(res[0])

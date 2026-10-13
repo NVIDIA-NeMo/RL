@@ -263,6 +263,36 @@ def test_response_collection_native_id_cannot_contradict_output() -> None:
         )
 
 
+@pytest.mark.parametrize("collection", [False, True])
+def test_native_envelope_accepts_scored_call_before_last_history_item(
+    collection: bool,
+) -> None:
+    first, scored, worker = [
+        message("same") | {"id": name} for name in ("first", "scored", "worker")
+    ]
+    records = [call(1, [first]), call(2, [worker]), call(3, [scored], parent=1)]
+    envelope = {"id": "response-3", "output": [first, scored, worker]}
+    result = {"responses": [envelope]} if collection else {"response": envelope}
+    assert select_captured_calls(records, result) == [
+        records[0],
+        records[2],
+        records[1],
+    ]
+
+
+def test_native_envelope_cannot_borrow_identity_from_previous_envelope() -> None:
+    first, second = message("first"), message("second")
+    records = [call(1, [first]), call(2, [second])]
+    result = {
+        "responses": [
+            {"id": "export", "output": [first]},
+            {"id": "response-1", "output": [second]},
+        ]
+    }
+    with pytest.raises(ValueError, match="Missing or ambiguous"):
+        select_captured_calls(records, result)
+
+
 def test_response_collection_native_id_identifies_cumulative_terminal() -> None:
     first, last = message("first"), message("last")
     records = [call(1, [first]), call(2, [last], parent=1)]

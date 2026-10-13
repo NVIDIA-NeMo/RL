@@ -285,10 +285,10 @@ def test_unknown_capture_ack_is_not_cleanup_permission():
 
 
 @pytest.mark.parametrize(
-    "invalid", [None, "duplicate", "reordered", "missing", "terminal", "foreign"]
+    "case", [None, "duplicate", "reordered", "missing", "terminal", "foreign"]
 )
 def test_selection_validates_before_publication_and_unselected_roots_are_cleaned(
-    monkeypatch, tmp_path, invalid
+    monkeypatch, tmp_path, case
 ):
     from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
     from nemo_rl.experience.rollout_reassembler import RolloutReassembler
@@ -307,15 +307,15 @@ def test_selection_validates_before_publication_and_unselected_roots_are_cleaned
     manifest = calls[-1]["manifest"]
     records = [record.model_dump() for record in manifest.records]
     ids = (calls[0]["ids"][0], calls[2]["ids"][0])
-    if invalid == "duplicate":
+    if case == "duplicate":
         ids = (ids[0], ids[0])
-    elif invalid == "reordered":
+    elif case == "reordered":
         ids = tuple(reversed(ids))
-    elif invalid == "missing":
+    elif case == "missing":
         ids = (ids[0], "absent")
-    elif invalid == "terminal":
+    elif case == "terminal":
         ids = (ids[0],)
-    elif invalid == "foreign":
+    elif case == "foreign":
         records[0]["staging_key"] = "another-attempt/call"
     receipt = dict(
         rollout_id="attempt",
@@ -348,7 +348,7 @@ def test_selection_validates_before_publication_and_unselected_roots_are_cleaned
             logical_selections=[selection],
         )
 
-    if invalid:
+    if case not in (None, "reordered"):
         with pytest.raises(ValueError):
             run()
         assert all(
@@ -380,7 +380,10 @@ def test_gym_adapter_returns_one_real_receipt_and_rl_selection(monkeypatch, tmp_
     env._context_compaction = True
     env.cfg = {}
 
-    async def control(*args):
+    async def control(method, path):
+        if method == "POST":
+            assert path.endswith("/close")
+            return await harness.ledger.close_admissions("attempt")
         return await harness.ledger.manifest("attempt")
 
     env._control = AsyncMock(side_effect=control)
@@ -649,7 +652,7 @@ def test_existing_detectors_mask_only_selected_generation_spans(monkeypatch, tmp
         asyncio.run(harness.ledger.close())
 
 
-def test_appended_assistant_uses_real_rl_root_decision(monkeypatch, tmp_path):
+def test_appended_assistant_uses_gym_root_and_real_rl_capture(monkeypatch, tmp_path):
     h = gym_harness.make_capture_harness(
         monkeypatch, tmp_path, decide_input=decide_capture_input
     )
@@ -665,6 +668,6 @@ def test_appended_assistant_uses_real_rl_root_decision(monkeypatch, tmp_path):
     gym_harness.assert_clean(h.post("attempt", rewritten))
     m = h.manifest("attempt")
     assert len(m.records) == 2 and not m.failures and not m.pending_call_ids
-    assert h.worker_calls[1][0].mode == "candidate"
-    assert h.worker_calls[1][0].parent_call_id == m.records[0].model_call_id
+    assert h.worker_calls[1][0].mode == "text"
+    assert h.worker_calls[1][0].parent_call_id is None
     assert m.records[1].parent_call_id is None
