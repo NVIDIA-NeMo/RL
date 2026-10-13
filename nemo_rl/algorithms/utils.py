@@ -40,6 +40,22 @@ if TYPE_CHECKING:
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
+def aggregate_policy_update_results(
+    update_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Keep final-update metrics but sum training work over a nonempty rollout.
+
+    FLOPs must cover the same updates as the outer policy_training timer. When
+    workers report synchronized elapsed times, sum those as well. Rank counts
+    and theoretical throughput describe the hardware and are not additive.
+    """
+    train_results = update_results[-1].copy()
+    for key in ("total_flops", "train_elapsed_seconds"):
+        if key in train_results:
+            train_results[key] = sum(result[key] for result in update_results)
+    return train_results
+
+
 def get_gdpo_reward_component_keys(batch) -> list[str]:
     """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
     return sorted(
