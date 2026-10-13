@@ -1225,7 +1225,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "but max_buffered_rollouts is still validated against the wider one. "
             "Remove it, or add a `ppo` block with policy_training_start_step > 0."
         )
-    
+
     # Filtering reports a zero-variance group as a dropped prompt, so the dropped-prompt
     # knobs decide what it costs. Neither default substitutes one, which would silently
     # shrink steps instead of resampling.
@@ -1238,6 +1238,14 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 f'"{rollout_failure.on_dropped_prompt}" a filtered group is never '
                 "substituted, so each zero-variance group silently shrinks its "
                 "training step instead of being resampled."
+            )
+        if async_config.sampler.name not in ("in_order", "custom"):
+            raise ValueError(
+                "grpo.use_dynamic_sampling requires a sampler that stamps a target "
+                f"step (async_rl.sampler.name='in_order'), but got "
+                f"'{async_config.sampler.name}': without a stamped step a filtered "
+                "group cannot be credited short or replaced, so every filtered group "
+                "silently shrinks the batch."
             )
         if rollout_failure.max_replacement_attempts < 1:
             raise ValueError(

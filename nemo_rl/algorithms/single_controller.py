@@ -2302,12 +2302,17 @@ class SingleControllerActor:
                                 / finalized.total_row_count
                                 < min_valid_fraction
                             )
-                            if not below_threshold:
+                            zero_variance = (
+                                self._rollout_manager.filter_zero_variance_groups
+                                and finalized.zero_variance
+                            )
+                            if not below_threshold and not zero_variance:
                                 self._rollout_manager.stats.committed += 1
                                 ownership_transferred = True
                                 break
                             # Enough rows verified to publish, but too few to
-                            # be worth training on. Unlike the finalizer's own
+                            # be worth training on, or (dynamic sampling) all
+                            # scored the same. Unlike the finalizer's own
                             # structural drops above, this is a policy call
                             # only the controller can act on: it is the one
                             # component that can source a replacement.
@@ -2315,24 +2320,36 @@ class SingleControllerActor:
                                 await self._discard_committed_group(request)
                             except BaseException as cleanup_error:
                                 raise RuntimeError(
-                                    "finalizer group fell below "
-                                    "min_valid_fraction_per_group and "
-                                    "known-key cleanup failed for group "
+                                    "finalizer group was discarded "
+                                    f"({'below min_valid_fraction_per_group' if below_threshold else 'zero reward variance'}) "
+                                    "and known-key cleanup failed for group "
                                     f"{request.group_id}"
                                 ) from cleanup_error
-                            print(
-                                f"  finalize: group {request.group_id} below "
-                                "min_valid_fraction_per_group "
-                                f"({finalized.valid_row_count}/"
-                                f"{finalized.total_row_count} < "
-                                f"{min_valid_fraction}); seeking a replacement",
-                                flush=True,
-                            )
+                            if below_threshold:
+                                print(
+                                    f"  finalize: group {request.group_id} below "
+                                    "min_valid_fraction_per_group "
+                                    f"({finalized.valid_row_count}/"
+                                    f"{finalized.total_row_count} < "
+                                    f"{min_valid_fraction}); seeking a replacement",
+                                    flush=True,
+                                )
+                            else:
+                                self._rollout_manager.stats.zero_variance_groups += 1
+                                print(
+                                    f"  dynamic sampling: dropped group "
+                                    f"{request.group_id} (target_step={target_step}), "
+                                    "all rewards equal; "
+                                    f"{self._rollout_manager.stats.zero_variance_groups} "
+                                    "dropped so far; seeking a replacement",
+                                    flush=True,
+                                )
                             replacement = self._take_replacement(
                                 target_step, replacements
                             )
                             if replacement is None:
-                                self._rollout_manager.record_finalizer_dropped_prompt()
+                                if below_threshold:
+                                    self._rollout_manager.record_finalizer_dropped_prompt()
                                 self._buffer_capacity.release()
                                 self._credit_shortfall(target_step)
                                 return

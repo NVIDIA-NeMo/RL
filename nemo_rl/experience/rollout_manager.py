@@ -287,6 +287,7 @@ class RolloutStats:
         metrics: dict[str, float] = {
             "rollout/committed_total": float(self.committed),
             "rollout/skipped_total": float(self.skipped),
+            "rollout/zero_variance_groups_total": float(self.zero_variance_groups),
             "rollout/redispatch_total": float(
                 sum(self.redispatches_by_reason.values())
             ),
@@ -1789,6 +1790,10 @@ class RolloutManager:
         """Return the prompt-group ownership ledger shared with the controller."""
         return self._recovery_ledger
 
+    @property
+    def filter_zero_variance_groups(self) -> bool:
+        return self._filter_zero_variance_groups
+
     def record_finalizer_dropped_prompt(self) -> None:
         """Count a controller-side drop after generation and finalization succeeded.
 
@@ -2083,6 +2088,13 @@ class RolloutManager:
                     await self._tq_buffer.remove_group(tq_group_id)
                     self._stats.zero_variance_groups += 1
                     rewards = [c.reward for c in record.completions]
+                    print(
+                        f"  dynamic sampling: dropped group {tq_group_id} "
+                        f"(target_step={target_step}), all {len(rewards)} "
+                        f"generations scored {rewards[0] if rewards else float('nan')}; "
+                        f"{self._stats.zero_variance_groups} dropped so far",
+                        flush=True,
+                    )
                     return RolloutOutcome.SKIPPED
                 end_version = self._weight_version
                 await self._tq_buffer.commit(
