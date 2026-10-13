@@ -411,7 +411,7 @@ def _apply_rope(
 
 
 class DFlashBody(_ShardedModule):
-    """DFlash decoder body that shares target embeddings and output head."""
+    """DFlash decoder body with caller-provided embeddings and no output head."""
 
     def __init__(
         self,
