@@ -64,6 +64,9 @@ teachers:
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
   max_grad_norm: 1.0
   dynamic_batching:
     enabled: false
