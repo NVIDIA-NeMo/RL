@@ -371,8 +371,9 @@ class GRPOConfig(BaseModel, extra="allow"):
     stop_at_validation_threshold: float | None = None
     # Early stop on entropy collapse: end training (after saving a checkpoint,
     # like the validation early stop) once the step's train approx_entropy has
-    # been below this value for stop_at_entropy_patience consecutive steps of
-    # the current run; null disables.
+    # been below this value for stop_at_entropy_patience consecutive measured
+    # steps of the current run. A step that trained on no valid tokens is not
+    # measured and resets the count; null disables.
     stop_at_entropy_below: float | None = None
     stop_at_entropy_patience: int = 1
     skip_reference_policy_logprobs_calculation: bool = False
@@ -3133,7 +3134,7 @@ def _validation_early_stop_message(
 
 
 def _step_approx_entropy(train_results: dict[str, Any]) -> Optional[float]:
-    """Batch-level ``approx_entropy`` of one training step, or None if absent.
+    """Batch-level ``approx_entropy`` measured in one training step, or None.
 
     The loss reports ``approx_entropy`` per microbatch, already divided by the
     *global* number of valid tokens, so the per-microbatch values are
@@ -3141,9 +3142,24 @@ def _step_approx_entropy(train_results: dict[str, Any]) -> Optional[float]:
     same reduction the train loops apply before logging. Averaging the
     fragments instead under-reads by the number of microbatches (e.g. 0.005
     instead of 0.31 with 64 microbatches) and would trip a floor at once.
+
+    None means the step measured nothing: the loss reports no
+    ``approx_entropy`` (e.g. ``metrics_level: minimal``), or the step trained
+    on no valid tokens. The workers stamp every microbatch's metrics with the
+    step's ``global_valid_toks``; when that is zero everywhere (dynamic
+    sampling off and every rollout filtered out, for instance) the Megatron
+    worker still reports ``approx_entropy == 0`` for finite, healthy logprobs,
+    because ``masked_mean`` divides an empty masked sum by ``0 + 1e-8``. That
+    zero is a diagnostic artefact, not measured entropy, so it must not count
+    as collapse. The AutoModel worker drops such microbatches, which leaves
+    no ``approx_entropy`` at all and is treated the same way.
     """
-    values = (train_results.get("all_mb_metrics") or {}).get(APPROX_ENTROPY_KEY)
+    mb_metrics = train_results.get("all_mb_metrics") or {}
+    values = mb_metrics.get(APPROX_ENTROPY_KEY)
     if values is None:
+        return None
+    valid_toks = np.asarray(mb_metrics.get("global_valid_toks", []), dtype=float)
+    if not (valid_toks > 0).any():
         return None
     arr = np.asarray(values, dtype=float).ravel()
     arr = arr[np.isfinite(arr)]
@@ -3154,17 +3170,20 @@ class EntropyFloorStop:
     """Early-stop rule ``grpo.stop_at_entropy_below`` / ``stop_at_entropy_patience``.
 
     ``update`` is called once per training step with that step's batch-level
-    ``approx_entropy`` and returns a stop message once the entropy has been
-    below the threshold for ``patience`` consecutive steps, else None. The
-    count lives in memory, so it restarts when a run resumes from a
-    checkpoint.
+    ``approx_entropy`` (see ``_step_approx_entropy``) and returns a stop
+    message once the entropy has been below the threshold for ``patience``
+    consecutive measured steps, else None. A step without an observation
+    (None) is not measured: it never counts toward ``patience`` and it resets
+    the streak, so only an unbroken run of measured low-entropy steps stops
+    training. The count lives in memory, so it also restarts when a run
+    resumes from a checkpoint.
     """
 
     def __init__(self, threshold: Optional[float], patience: int = 1):
         self.threshold = threshold
         self.patience = patience
         self.consecutive = 0
-        self._warned_missing = False
+        self._warned_unmeasured = False
 
     @classmethod
     def from_config(cls, grpo_config: Any) -> "EntropyFloorStop":
@@ -3176,12 +3195,17 @@ class EntropyFloorStop:
         if self.threshold is None:
             return None
         if approx_entropy is None:
-            if not self._warned_missing:
+            # Not a measurement: a step with no valid tokens reads a
+            # diagnostic approx_entropy of 0 (Megatron) or none (AutoModel).
+            self.consecutive = 0
+            if not self._warned_unmeasured:
                 warnings.warn(
-                    "grpo.stop_at_entropy_below is set but the loss reports no "
-                    f"'{APPROX_ENTROPY_KEY}' metric; the entropy early stop is inactive."
+                    "grpo.stop_at_entropy_below is set but this step has no "
+                    f"'{APPROX_ENTROPY_KEY}' observation (the loss does not report "
+                    "it, or the step trained on no valid tokens); the step is not "
+                    "counted and the consecutive-low streak is reset."
                 )
-                self._warned_missing = True
+                self._warned_unmeasured = True
             return None
         self.consecutive = (
             self.consecutive + 1 if approx_entropy < self.threshold else 0
