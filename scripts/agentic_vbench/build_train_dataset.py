@@ -4,9 +4,10 @@
 """Training rows for the gym-native Agentic-VBench agent.
 
 Rows carry the verbatim benchmark prompt and verifier metadata exactly as
-``benchmarks/agentic_vbench/prepare.py`` exports them, plus the Gym routing stamp
-NeMo-RL needs. Repeats provide enough rows for async prefetch; they are repeated
-tasks, not distinct examples, and training on benchmark tasks is for debugging.
+``benchmarks/agentic_vbench/prepare.py`` exports them, plus the current Gym
+``task_source`` routing stamp NeMo-RL needs. Repeats provide enough rows for
+async prefetch; they are repeated tasks, not distinct examples, and training on
+benchmark tasks is for debugging.
 """
 
 import argparse
@@ -19,7 +20,11 @@ sys.path.insert(0, str(GYM_ROOT))
 
 from responses_api_agents.agentic_vbench_agent.core import REVISION, dataset_rows, ensure_checkout, inventory  # noqa: E402
 
-AGENT_REF = {"type": "responses_api_agents", "name": "agentic_vbench_agent"}
+# This is the *config instance* that declares the dataset in
+# agentic_vbench_train.yaml, not the concrete agent implementation.  Current
+# Gym resolves task_source to the configured agent at run time; baking an
+# agent_ref into data is the deprecated, non-reroutable format.
+TASK_SOURCE = "agentic_vbench_agent"
 
 
 def main() -> None:
@@ -41,11 +46,12 @@ def main() -> None:
     with args.output.open("w") as handle:
         for _ in range(args.repeats):
             for row in rows:
-                handle.write(json.dumps({**row, "agent_ref": AGENT_REF}) + "\n")
+                handle.write(json.dumps({**row, "task_source": TASK_SOURCE}) + "\n")
     manifest = {
         "benchmark_root": str(root),
         "benchmark_revision": REVISION,
         "selection": args.tasks,
+        "task_source": TASK_SOURCE,
         "tasks": [row["verifier_metadata"]["task_id"] for row in rows],
         "repeats": args.repeats,
         "rows": len(rows) * args.repeats,
