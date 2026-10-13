@@ -1,6 +1,5 @@
 # Public small-model SingleController/Gym example using external vLLM.
 defaults:
-  - grpo_math_1B_megatron_single_controller.yaml
   - ../nemo_gym/grpo_qwen3_30ba3b_instruct.yaml
 
 grpo:
@@ -101,3 +100,4 @@ checkpointing:
 
 logger:
   wandb_enabled: false
+  tensorboard_enabled: true
