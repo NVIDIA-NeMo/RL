@@ -1143,6 +1143,10 @@ class AsyncNemoGymRolloutImpl:
                 # derives the id from the run body and stamps /ng-rollout/<id>
                 # on every model call, so the TQ sample id IS the capture key.
                 row["_ng_rollout_id"] = rollout_ids[i]
+            else:
+                # Inline prefix supply also needs a correlated Gym identity.
+                # Give every generation a fresh ID across repeated dispatches.
+                row["_ng_rollout_id"] = uuid.uuid4().hex
             rows.append(row)
         return rows
 
