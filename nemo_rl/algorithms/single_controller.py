@@ -3177,7 +3177,7 @@ class SingleControllerActor:
                             )
                         value_inference_prepared = False
                     else:
-                        await self._run_policy_logprobs(train_meta, step_open=False)
+                        await self._run_policy_logprobs(train_meta, step_open=step_open)
                     # Compute advantages
                     with (
                         self._timer.time("advantage_calculation"),
