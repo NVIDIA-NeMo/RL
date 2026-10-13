@@ -55,6 +55,7 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
+    get_automodel_policy_worker_cls,
     resolve_policy_worker_cls,
     validate_fp32_lm_head_config,
 )
@@ -273,10 +274,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "or set policy.automodel_cfg.enabled=true to use the Automodel training backend."
                 )
 
-            worker_builder_cls_fqn = resolve_policy_worker_cls(
-                "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker",
-                config,
-            )
+            worker_builder_cls_fqn = get_automodel_policy_worker_cls(config)
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 warnings.warn(
                     "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in AutomodelPolicyWorker. This variable is set in our container, but "

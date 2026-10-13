@@ -119,7 +119,9 @@ def automodel_params_generator(
         the refit dtype and made contiguous.
     """
     module_map = dict(model.named_modules())
-    for name, tensor in model.state_dict().items():
+    from nemo_rl.models.automodel.refit import refit_state_dict
+
+    for name, tensor in refit_state_dict(model).items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
@@ -1044,7 +1046,9 @@ class AutomodelPolicyWorkerImpl(
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         del refit_payload_mode
         state_dict_info = {}
-        for name, tensor in self.model.state_dict().items():
+        from nemo_rl.models.automodel.refit import refit_state_dict
+
+        for name, tensor in refit_state_dict(self.model).items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
                 continue
             full_tensor = (

@@ -50,6 +50,7 @@ from nemo_rl.models.generation.vllm.config import (
     validate_nvfp4_pertoken_model,
     vllm_nemotron_h_fp32_lm_head_enabled,
 )
+from nemo_rl.models.generation.vllm.output_limits import per_request_output_limits
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     FINISHED_REASON_LABEL,
@@ -498,16 +499,29 @@ class BaseVllmGenerationWorker:
         self.py_executable = sys.executable
 
         vllm_cfg = self.cfg["vllm_cfg"]
-        _apply_vllm_patches(
-            self.py_executable,
-            extra_env_vars=extra_env_vars,
-            nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
-            require_moe_routed_experts_capture=bool(
-                (self.cfg.get("vllm_kwargs") or {}).get(
-                    "enable_return_routed_experts", False
+        if vllm_cfg.get("native_speechlm"):
+            if vllm_cfg["async_engine"] or (self.cfg.get("vllm_kwargs") or {}).get(
+                "speculative_config"
+            ):
+                raise ValueError(
+                    "Native SpeechLM requires synchronous MTP-off generation"
                 )
-            ),
-        )
+            from nemo.collections.speechlm2.vllm.salm import (
+                register,
+            )  # Optional Speech plugin.
+
+            register()
+        else:
+            _apply_vllm_patches(
+                self.py_executable,
+                extra_env_vars=extra_env_vars,
+                nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
+                require_moe_routed_experts_capture=bool(
+                    (self.cfg.get("vllm_kwargs") or {}).get(
+                        "enable_return_routed_experts", False
+                    )
+                ),
+            )
 
         # Skip model loading if we're not the model owner
         if not self.is_model_owner:
@@ -1161,6 +1175,24 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 greedy=greedy,
                 stop_strings=stop_strings,
             )
+
+        if data.get("max_output_tokens") is not None:
+            if spec_lookahead:
+                raise ValueError(
+                    "Per-row output caps do not support speculative decoding"
+                )
+            limits = per_request_output_limits(
+                data["max_output_tokens"],
+                input_lengths.tolist(),
+                configured_max_new_tokens=int(self.cfg["max_new_tokens"]),
+                max_model_len=int(self.cfg["vllm_cfg"]["max_model_len"]),
+            )
+            sampling_params = [
+                self._build_sampling_params(
+                    greedy=greedy, stop_strings=stop_strings, max_new_tokens=limit
+                )
+                for limit in limits
+            ]
 
         # Convert inputs to vLLM format and generate outputs.
         prompts = format_prompt_for_vllm_generation(data)

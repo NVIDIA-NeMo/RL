@@ -41,6 +41,11 @@ import sys
 # ``None`` means the actor runs on the driver's interpreter and gets no venv.
 # Every extra must exist in ``[project.optional-dependencies]`` of pyproject.toml.
 ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
+    # Native SpeechLM uses the prepared driver/policy environment with its
+    # companion Speech and Automodel checkouts; generic Automodel pins stay fixed.
+    "nemo_rl.models.policy.workers.speechlm_policy_worker.SpeechLMPolicyWorker": None,
+    "nemo_rl.environments.asr_environment.ASREnvironment": None,
+    "nemo_rl.environments.asr_environment.ASRRewardWorker": None,
     # vLLM workers always get vllm + nemo_gym. Token capture (token_capture.enabled)
     # imports nemo_gym inside the worker, and worker venvs are cached by actor class
     # name -- a venv prebuilt with plain "vllm" is reused as-is, so the extras have to
