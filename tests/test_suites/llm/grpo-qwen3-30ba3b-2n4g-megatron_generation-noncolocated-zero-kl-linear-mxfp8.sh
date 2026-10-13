@@ -1,8 +1,8 @@
 #!/bin/bash
-# Five-step GB200 test for zero train/generation KL on Qwen3-30B-A3B with MXFP8 routed
-# experts: Megatron training (TP1, EP4, TE MXFP8 grouped GEMM) against non-colocated
-# Megatron inference (torch MXFP8 grouped GEMM) with the batch-invariant kernel stack
-# (te_native GEMMs, ordered collectives, FA4).
+# Five-step GB200 test for zero train/generation KL on Qwen3-30B-A3B with MXFP8 on every
+# TE linear (attention QKV/proj and routed experts): Megatron training (TP1, EP4) against
+# non-colocated Megatron inference (torch MXFP8 grouped GEMM, Triton quantize plus
+# scaled_mm for the dense linears) with the batch-invariant kernel stack.
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
@@ -38,7 +38,7 @@ uv run --no-sync tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # The recipe must have switched the batch-invariant kernels on.
 grep -F -q "[zero_train_gen_mismatch] batch-invariant kernels enabled: backend=te_native collective=ordered flash_attention_version=4" $RUN_LOG
 
-# The per-module MXFP8 recipe must have been loaded (experts MXFP8, the rest BF16).
+# The per-module MXFP8 recipe must have been loaded (every TE linear is MXFP8).
 grep -F -q "TE per-module precision recipe loaded from" $RUN_LOG
 
 MAX_RECORDED_STEP=$(jq -r 'if has("train/loss") then (."train/loss" | keys | map(tonumber) | max // 0) else 0 end' $JSON_METRICS)
