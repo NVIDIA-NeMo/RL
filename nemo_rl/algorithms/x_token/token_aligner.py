@@ -186,10 +186,9 @@ _SPECIAL_TOKEN_MAP = {
 class AlignmentPair:
     """One aligned span between student and teacher token sequences.
 
-    The alignment builds these as it walks the two token sequences;
-    the shared matcher fills in ``is_correct`` from strict decoded-text
-    comparison. Insertions/deletions (orphan groups) use ``-1`` for the empty
-    side's start/end indices.
+    The alignment sets ``is_correct`` using decoded-text equality,
+    NFC-validated native repair, or matching EOS roles. Insertions/deletions
+    (orphan groups) use ``-1`` for the empty side's start/end indices.
 
     Attributes:
         s_tokens: Student tokens covered by this pair.
@@ -202,10 +201,9 @@ class AlignmentPair:
             (``-1`` for student-only insertions).
         t_end: Exclusive end index into the teacher token sequence
             (``-1`` for student-only insertions).
-        is_correct: ``True`` when the decoded student span text
-            matches the decoded teacher span text. Defaults to
-            ``False`` so the aligner can build pairs before computing the
-            mask.
+        is_correct: ``True`` when the decoded student and teacher span texts
+            are equal, when an NFC-validated native repair matches them, or
+            when both spans are their tokenizer's EOS token.
     """
 
     s_tokens: List[str]
@@ -260,7 +258,9 @@ class AlignmentBatch:
     Attributes:
         pair_valid: ``[B, max_pairs]`` bool. False on padding entries.
         pair_is_correct: ``[B, max_pairs]`` bool. True when decoded student
-            and teacher text match, or native source validation succeeds.
+            and teacher span texts are equal, when an NFC-validated native
+            repair matches them, or when both spans are their tokenizer's
+            EOS token.
         student_chunk_id: ``[B, T_s]`` long. Chunk index (= pair index) the
             student token belongs to; ``-1`` if not in any chunk
             (insertion-only pair on student side).
