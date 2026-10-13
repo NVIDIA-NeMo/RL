@@ -1,3 +1,5 @@
+# Pair of the masked-reward-exclude config: differs only in grpo.masked_reward_policy.
+# include is the exemplar default; it is set explicitly so the pair is self-describing.
 defaults: ../grpo_math_1B.yaml
 
 grpo:
