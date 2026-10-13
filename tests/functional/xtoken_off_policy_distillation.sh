@@ -73,14 +73,13 @@ uv run tests/check_metrics.py $JSON_METRICS \
 # history override preserves reasoning and tools on both sides, while their
 # different token boundaries exercise many-to-one and one-to-many alignment.
 CHAT_DIR="$EXP_DIR/native_chat"
-CHAT_DATA_PATH="$CHAT_DIR/train.jsonl"
+CHAT_DATA_PATH="$PROJECT_ROOT/tests/functional/test_data/xtoken_native_chat.jsonl"
 CHAT_PROJ_DIR="$CHAT_DIR/projection"
 CHAT_PROJ_PATH="$CHAT_PROJ_DIR/smol_qwen_special.pt"
 CHAT_LOG_DIR="$CHAT_DIR/logs"
 CHAT_METRICS="$CHAT_DIR/metrics.json"
 mkdir -p "$CHAT_PROJ_DIR" "$CHAT_LOG_DIR"
 
-uv run tests/functional/xtoken_native_chat.py "$CHAT_DATA_PATH"
 # Qwen3-1.7B uses the same vocabulary as the pinned Qwen3-4B tokenizer in the
 # chat config. SmolLM2 has its own, substantially smaller vocabulary.
 uv run python -m tools.x_token.minimal_projection_via_multitoken \
