@@ -16,7 +16,7 @@ NeMo RL supports multiple training algorithms for post-training large language m
 | [PPO](ppo.md) | [PPO Single Node](ppo.md#ppo-single-node) | [PPO Multi-node](ppo.md#ppo-multi-node) |
 | [RM](rm.md) | [RM Single Node](rm.md#rm-single-node) | [RM Multi-node](rm.md#rm-multi-node) |
 
-On-policy distillation is also supported in the PyTorch DTensor path.
+On-policy distillation is also supported in the Automodel path.
 ```{toctree}
 :maxdepth: 2
 :hidden:

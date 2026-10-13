@@ -305,7 +305,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             assert config["train_micro_batch_size"] == config["logprob_batch_size"], (
                 f"{sep_line}\n"
                 "There is a known batch-variant accuracy issue with TP>=4 for both Automodel and Megatron backend.\n"
-                "See https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause for more details.\n"
+                "See https://docs.nvidia.com/nemo/rl/latest/guides/automodel-tp-accuracy.html#root-cause for more details.\n"
                 "\n"
                 "Please choose either of the following solutions to avoid this issue:\n"
                 "1. Set tp_size to 1 or 2. (tensor_parallel_size for Automodel, or tensor_model_parallel_size for Megatron)\n"
@@ -1212,7 +1212,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     ) -> None:
         """Set up the colocate Gloo gather topology for SGLang weight refit.
 
-        Called by the SGLang colocated refit drivers (Megatron and FSDP)
+        Called by the SGLang colocated refit drivers (Megatron and Automodel)
         whenever engines are added or recovered.
         """
         futures = self.worker_group.run_all_workers_single_data(

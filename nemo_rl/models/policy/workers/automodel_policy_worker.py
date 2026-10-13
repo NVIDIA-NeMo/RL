@@ -1125,7 +1125,7 @@ class AutomodelPolicyWorkerImpl(
         target_precision: str = "bf16",
         sglang_quantization_cfg: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Send FSDP weights to colocated SGLang engines via Ray CUDA IPC.
+        """Send Automodel weights to colocated SGLang engines via Ray CUDA IPC.
 
         Synchronous: each chunk is awaited via ``ray.get`` inside
         :func:`send_hf_buckets_via_ipc_actor_impl` before the next chunk is
