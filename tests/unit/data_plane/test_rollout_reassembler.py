@@ -421,12 +421,39 @@ def r3_partitions(tq_client):
     tq_client.clear_samples(sample_ids=None, partition_id=_R3_PARTITION)
 
 
-def _routes_for_delta(call_idx: int, n_tokens: int) -> list:
-    """[n][L=2][K=2] rows, value = call*1000 + pos (recognizable per token)."""
-    return [
+def _staged_routes_for(call_idx: int, record: StagedCallRecord) -> list:
+    """Fake routes for one call, saved the same way as the vLLM worker saves them.
+
+    Shape: [rows][2 layers][top-2]. Each new token gets an easy-to-spot route
+    (``call*1000 + pos``). The last token gets ``-1``, because vLLM has no route
+    for it. A call with a parent starts with one extra row (``call*1000 + 900``):
+    the real route of the parent's last token.
+    """
+    routes = [
         [[call_idx * 1000 + pos, call_idx * 1000 + pos + 500] for _ in range(2)]
-        for pos in range(n_tokens)
+        for pos in range(len(record.token_ids_delta))
     ]
+    routes[-1] = [[-1, -1]] * 2
+    if record.prev_len > 0:
+        boundary_row = [[call_idx * 1000 + 900, call_idx * 1000 + 900]] * 2
+        routes = [boundary_row] + routes
+    return routes
+
+
+def _assembled_routes(call_ids: list[str], routes_by_call: dict) -> list:
+    """Expected training routes for a linear chain of staged calls.
+
+    Each call contributes its delta rows; each child's leading boundary row
+    replaces the parent's last row (vLLM's placeholder for the last sampled token).
+    """
+    assembled: list = []
+    for index, call_id in enumerate(call_ids):
+        staged = routes_by_call[call_id]
+        if index > 0:
+            assembled[-1] = staged[0]
+            staged = staged[1:]
+        assembled.extend(staged)
+    return assembled
 
 
 def _record_with_routes(record: StagedCallRecord, routes: list) -> StagedCallRecord:
@@ -484,7 +511,7 @@ def _stage_fixture_with_routes(tq_client, name: str, *, rollout_id: str):
     routes_by_call = {}
     staged_records = []
     for idx, record in enumerate(records):
-        routes = _routes_for_delta(idx, len(record.token_ids_delta))
+        routes = _staged_routes_for(idx, record)
         routes_by_call[record.model_call_id] = routes
         staged = _record_with_routes(record, routes)
         staged_records.append(staged)
@@ -527,13 +554,10 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
         partition_id=_R3_PARTITION,
         select_fields=["routed_experts", "input_lengths"],
     )
-    # Valid row: the delivered chain's staged extras, concatenated in chain
-    # order (the golden fixture is a single linear chain).
-    expected_routes = [
-        row_routes
-        for call_id in expected.call_ids
-        for row_routes in routes_by_call[call_id]
-    ]
+    # Valid row: the delivered chain's staged extras in chain order, with each
+    # turn's last token carrying the next call's route (the golden fixture is
+    # a single linear chain).
+    expected_routes = _assembled_routes(expected.call_ids, routes_by_call)
     valid_len = len(expected.token_ids)
     assert len(expected_routes) == valid_len
     published = torch.as_tensor(rows["routed_experts"][0]).reshape(-1, 2, 2)
@@ -622,7 +646,7 @@ def _stage_deferred_fixture(tq_client, *, rollout_id: str):
     routes_by_call = {}
     staged_records = []
     for idx, record in enumerate(records):
-        routes = _routes_for_delta(idx, len(record.token_ids_delta))
+        routes = _staged_routes_for(idx, record)
         routes_by_call[record.model_call_id] = routes
         staged = _record_with_routes(record, routes)
         staged_records.append(staged)
@@ -690,18 +714,20 @@ def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
         worker_meta,
         dp_aligned_seq_len=False,
     )
-    expected_routes = [
-        route for call_id in expected.call_ids for route in routes_by_call[call_id]
-    ]
+    expected_routes = _assembled_routes(expected.call_ids, routes_by_call)
     valid_len = len(expected.token_ids)
     routed_rows = materialized["routed_experts"].unbind()
     assert routed_rows[0][:valid_len].tolist() == expected_routes
     assert bool(routed_rows[1].eq(-1).all())
 
 
-@pytest.mark.parametrize("bad_routed_len", [-1, 999])
+@pytest.mark.parametrize(
+    ("call_index", "bad_routed_len"),
+    [(0, -1), (0, 999), (1, 3)],
+    ids=["negative", "oversized", "child_without_boundary_row"],
+)
 def test_deferred_finalizer_rejects_invalid_routed_len(
-    tq_client, r3_deferred_partitions, bad_routed_len
+    tq_client, r3_deferred_partitions, call_index, bad_routed_len
 ):
     from dataclasses import replace as dataclass_replace
 
@@ -719,7 +745,10 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
     fetched = finalizer._source.fetch_for_finalization(
         [record["staging_key"] for record in receipt["manifest"]]
     )
-    fetched[0] = dataclass_replace(fetched[0], routed_len=bad_routed_len)
+    # Call 1 is a child with 3 new tokens, so it must stage 4 rows.
+    fetched[call_index] = dataclass_replace(
+        fetched[call_index], routed_len=bad_routed_len
+    )
 
     class _InjectedSource:
         def fetch_for_finalization(
