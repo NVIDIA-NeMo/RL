@@ -286,7 +286,7 @@ def test_prepare_for_training_restores_optimizer(monkeypatch):
 def test_prepare_for_lp_inference_keep_train_buffers(monkeypatch, keep_train_buffers):
     """``keep_train_buffers`` suppresses the optimizer offload and nothing else.
 
-    ``True`` is not reachable from a dtensor run today -- the split train API
+    ``True`` is not reachable from an Automodel run today -- the split train API
     that leaves a step open (begin_train_step / train_microbatch /
     finish_train_step) exists only on the Megatron worker -- but the branch is
     here, so pin it: inverted, it would strand the optimizer on CPU for the rest
@@ -1164,7 +1164,7 @@ class TestSingleGPUCluster:
     @pytest.mark.timeout(360)
     @pytest.mark.automodel
     def test_single_gpu_training(self, single_gpu_cluster, tiny_llama_model_path):
-        """Test DTensor training with a single GPU cluster (no parallelism)."""
+        """Test Automodel training with a single GPU cluster (no parallelism)."""
         config = create_test_config(
             tiny_llama_model_path,
             tp=1,
@@ -1238,7 +1238,7 @@ class TestSingleGPUCluster:
     @pytest.mark.timeout(360)
     @pytest.mark.automodel
     def test_single_gpu_logprob(self, single_gpu_cluster, tiny_llama_model_path):
-        """Test DTensor logprob computation with a single GPU cluster (no parallelism)."""
+        """Test Automodel logprob computation with a single GPU cluster (no parallelism)."""
         config = create_test_config(
             tiny_llama_model_path,
             tp=1,
@@ -1665,7 +1665,7 @@ class TestTwoGPUCluster:
     def test_tp_and_tied_model_with_custom_parallel_plan(
         self, two_gpu_cluster, tiny_llama_tied_model_path
     ):
-        """Test that DTensor with a tp > 1 and a tied model with a custom parallel plan works."""
+        """Test that Automodel with a tp > 1 and a tied model with a custom parallel plan works."""
         from torch.distributed.tensor.parallel import ColwiseParallel
         from torch.distributed.tensor.placement_types import Replicate
 
@@ -1710,7 +1710,7 @@ class TestTwoGPUCluster:
     def test_loss_independent_of_microbatch_size_two_gpus(
         self, two_gpu_cluster, tiny_llama_model_path
     ):
-        """Tests that changing microbatch size while keeping global batch size constant does not affect loss values in DTensor."""
+        """Tests that changing microbatch size while keeping global batch size constant does not affect loss values in Automodel."""
         # Create test batch with global batch size of 8
         global_batch_size = 8
         seq_len = 128
@@ -1801,7 +1801,7 @@ class TestTwoGPUCluster:
     @pytest.mark.timeout(300)
     @pytest.mark.automodel
     def test_policy_flops_range_check(self, tiny_llama_model_path, two_gpu_cluster):
-        """Test that the returned FLOPS is within a reasonable range using dtensor backend.
+        """Test that the returned FLOPS is within a reasonable range using the Automodel backend.
 
         Performs 2 warmup iterations and checks FLOPS for the next 3 iterations.
         """

@@ -480,7 +480,7 @@ def test_get_resume_paths_missing_optimizer(
 
 @pytest.mark.parametrize("model_component", ["policy", "value"])
 def test_get_resume_paths_separate_optimizer(checkpoint_dir, model_component):
-    """DTensor checkpoints use a physical optimizer directory."""
+    """Automodel checkpoints use a physical optimizer directory."""
     checkpoint_path = checkpoint_dir / "step_1"
     expected_weights_path = checkpoint_path / model_component / "weights"
     expected_optimizer_path = checkpoint_path / model_component / "optimizer"

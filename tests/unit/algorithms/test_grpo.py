@@ -2976,8 +2976,8 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
 @pytest.mark.parametrize(
     ("kv_cache_dtype", "precision", "error"),
     [
-        ("fp8", "fp8", "DTensor backend is not supported"),
-        ("fp8_e4m3", "fp8", "DTensor backend is not supported"),
+        ("fp8", "fp8", "Automodel backend is not supported"),
+        ("fp8_e4m3", "fp8", "Automodel backend is not supported"),
         ("fp8_ds_mla", "fp8", None),
         ("fp8_ds_mla", "bfloat16", "requires precision='fp8'"),
         ("auto", "bfloat16", None),

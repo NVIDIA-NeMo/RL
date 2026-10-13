@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Automodel DTensor checkpoint-engine weight transfer."""
+"""Tests for the Automodel checkpoint-engine weight transfer."""
 
 import pytest
 import torch

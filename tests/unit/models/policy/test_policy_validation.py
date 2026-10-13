@@ -311,7 +311,7 @@ def test_policy_rejects_vllm_fp32_lm_head_with_automodel_trainer():
 
     with (
         patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
-        pytest.raises(ValueError, match="DTensor has no matching"),
+        pytest.raises(ValueError, match="Automodel has no matching"),
     ):
         Policy(
             cluster=create_mock_cluster(world_size=1),
@@ -580,7 +580,7 @@ def test_policy_rejects_unregistered_worker_extension(from_config: bool) -> None
 @pytest.mark.parametrize(
     "world_size,tp,cp,should_pass,expected_error_type,description",
     [
-        # Valid cases - DTensor backend (PP is always 1 for DTensor)
+        # Valid cases - Automodel backend (PP is always 1 for Automodel)
         (8, 8, 1, True, None, "Valid: DP=1, TP=8, PP=1, CP=1"),
         (16, 8, 1, True, None, "Valid: DP=2, TP=8, PP=1, CP=1"),
         (8, 4, 2, True, None, "Valid: DP=1, TP=4, PP=1, CP=2"),
@@ -607,16 +607,16 @@ def test_world_size_validation_automodel(
     expected_error_type,
     description,
 ):
-    """Test world_size validation with DTensor backend.
+    """Test world_size validation with Automodel backend.
 
-    Note: DTensor backend always uses PP=1 (no pipeline parallelism support).
+    Note: Automodel backend always uses PP=1 (no pipeline parallelism support).
     Tests the constraint: world_size = DP * PP * CP * TP where DP >= 1 and DP must be integer.
     """
     cluster = create_mock_cluster(world_size)
     tokenizer = create_mock_tokenizer()
     config = create_automodel_config(
         tiny_llama_model_path, tp, pp=1, cp=cp
-    )  # DTensor always has PP=1
+    )  # Automodel always has PP=1
 
     # Mock RayWorkerGroup to prevent actual worker creation
     mock_worker_group_instance = MagicMock()
@@ -627,7 +627,7 @@ def test_world_size_validation_automodel(
         try:
             policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
             # Verify the calculated DP makes sense
-            expected_dp = world_size // (1 * cp * tp)  # PP=1 for DTensor
+            expected_dp = world_size // (1 * cp * tp)  # PP=1 for Automodel
             assert expected_dp >= 1, f"Expected DP should be >= 1, got {expected_dp}"
             # Verify that worker group was created (validation passed)
             mock_ray_worker_group.assert_called_once()
@@ -788,7 +788,7 @@ def test_world_size_validation_megatron(
 ):
     """Test world_size validation with Megatron backend.
 
-    Megatron backend supports pipeline parallelism (PP > 1) unlike DTensor.
+    Megatron backend supports pipeline parallelism (PP > 1) unlike Automodel.
     Tests the constraint: world_size = DP * PP * CP * TP where DP >= 1 and DP must be integer.
     Note: Expert Parallelism (EP) is handled internally by Megatron-Core, not at the worker level.
     """

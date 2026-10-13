@@ -202,7 +202,7 @@ def test_policy_uses_megatron_save_path_when_automodel_is_disabled(monkeypatch):
     )
     policy = Policy.__new__(Policy)
     policy.cfg = {
-        # Disabled DTensor settings must not select the Automodel save path.
+        # Disabled Automodel settings must not select the Automodel save path.
         "automodel_cfg": {"enabled": False},
         "megatron_cfg": {"enabled": True},
     }
