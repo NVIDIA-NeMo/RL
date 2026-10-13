@@ -3226,11 +3226,13 @@ class EntropyFloorStop:
     ``update`` is called once per training step with that step's batch-level
     ``approx_entropy`` (see ``_step_approx_entropy``) and returns a stop
     message once the entropy has been below the threshold for ``patience``
-    consecutive measured steps, else None. A step without an observation
-    (None) is not measured: it never counts toward ``patience`` and it resets
-    the streak, so only an unbroken run of measured low-entropy steps stops
-    training. The count lives in memory, so it also restarts when a run
-    resumes from a checkpoint.
+    consecutive measured steps, else None. Like
+    ``_validation_early_stop_message`` it only returns the message; the
+    trainer prints it once and exits after checkpointing. A step without an
+    observation (None) is not measured: it never counts toward ``patience``
+    and it resets the streak, so only an unbroken run of measured low-entropy
+    steps stops training. The count lives in memory, so it also restarts when
+    a run resumes from a checkpoint.
     """
 
     def __init__(self, threshold: Optional[float], patience: int = 1):
@@ -3266,13 +3268,11 @@ class EntropyFloorStop:
         )
         if self.consecutive < self.patience:
             return None
-        message = (
+        return (
             f"Train {APPROX_ENTROPY_KEY} {approx_entropy:.4f} has been below "
             f"grpo.stop_at_entropy_below={self.threshold} for {self.consecutive} "
             "consecutive step(s); stopping training"
         )
-        print(message, flush=True)
-        return message
 
 
 def _grpo_train_impl(
@@ -4129,9 +4129,9 @@ def _grpo_train_impl(
                             stop_at_validation_metric,
                         )
                     )
-                    if early_stop_message is not None:
-                        # Exit at the end of this step, after checkpointing.
-                        print(early_stop_message, flush=True)
+                if early_stop_message is not None:
+                    # Exit at the end of this step, after checkpointing.
+                    print(early_stop_message, flush=True)
 
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
@@ -6052,10 +6052,6 @@ def async_grpo_train(
                                     step + 1,
                                     prefix="validation",
                                 )
-                        if early_stop_message is not None:
-                            # Exit at the end of this step, after checkpointing.
-                            print(early_stop_message, flush=True)
-
                         # Explicit GPU memory cleanup after validation in async mode
                         gc.collect()
                         torch.cuda.empty_cache()
@@ -6063,6 +6059,9 @@ def async_grpo_train(
                         if early_stop_message is None:
                             # Resume trajectory collection after validation
                             trajectory_collector.resume.remote()
+                if early_stop_message is not None:
+                    # Exit at the end of this step, after checkpointing.
+                    print(early_stop_message, flush=True)
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]

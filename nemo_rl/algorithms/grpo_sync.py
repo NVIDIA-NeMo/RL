@@ -1202,9 +1202,9 @@ def grpo_train_sync(
                             stop_at_validation_metric,
                         )
                     )
-                    if early_stop_message is not None:
-                        # Exit at the end of this step, after checkpointing.
-                        print(early_stop_message, flush=True)
+                if early_stop_message is not None:
+                    # Exit at the end of this step, after checkpointing.
+                    print(early_stop_message, flush=True)
 
                 # advantages and token_mask are in scope from the
                 # advantage / masking blocks above. No need to re-fetch.
