@@ -4988,7 +4988,7 @@ def test_step_approx_entropy_requires_a_valid_token_population():
     ) == pytest.approx(0.05)
 
 
-def test_entropy_floor_stop_counts_consecutive_steps():
+def test_entropy_floor_stop_counts_consecutive_steps(capsys):
     guard = EntropyFloorStop(threshold=0.18, patience=3)
     assert guard.update(0.10) is None
     assert guard.update(0.10) is None
@@ -4997,6 +4997,8 @@ def test_entropy_floor_stop_counts_consecutive_steps():
     assert guard.update(0.10) is None
     message = guard.update(0.17)
     assert message is not None and "stop_at_entropy_below=0.18" in message
+    # Like _validation_early_stop_message, the rule leaves printing to the trainer.
+    assert capsys.readouterr().out == ""
 
 
 def test_entropy_floor_stop_disabled_and_unmeasured_step():
@@ -5182,16 +5184,18 @@ _ALL_FILTERED_STEP = {"approx_entropy": [0.0, 0.0], "global_valid_toks": [0, 0]}
 
 
 def _run_entropy_stop_trainer(
-    mock_grpo_components, train_func, tmp_path, step_mb_metrics
+    mock_grpo_components, train_func, tmp_path, step_mb_metrics, *, val_period=0
 ):
     """Run ``train_func`` for up to 5 steps with floor 0.18 and patience 2.
 
     ``step_mb_metrics`` lists per-step ``all_mb_metrics`` overrides returned by
     the mocked policy; the last entry repeats for any further steps.
+    ``val_period`` runs the (mocked, metric-less) validation every that many
+    steps; 0 disables it.
     """
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_steps = 5
-    master_config.grpo.val_period = 0
+    master_config.grpo.val_period = val_period
     master_config.grpo.val_at_end = False
     master_config.grpo.stop_at_entropy_below = 0.18
     master_config.grpo.stop_at_entropy_patience = 2
@@ -5239,7 +5243,10 @@ def _run_entropy_stop_trainer(
         )
         stack.enter_context(patch("nemo_rl.algorithms.grpo.torch.save"))
         stack.enter_context(patch("nemo_rl.algorithms.grpo_sync.torch.save"))
-        stack.enter_context(patch(validate_target, return_value=({}, {})))
+        # The save path reads val_metrics["accuracy"] whenever validation ran.
+        stack.enter_context(
+            patch(validate_target, return_value=({"accuracy": 0.0}, {}))
+        )
         train_func(
             policy,
             _mock_policy_generation(),
@@ -5275,6 +5282,21 @@ def test_training_stops_at_entropy_floor(mock_grpo_components, train_func, tmp_p
     policy.save_checkpoint.assert_called_once()
     assert policy.save_checkpoint.call_args.kwargs["is_final_checkpoint"] is True
     assert checkpointer.shutdown.called
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_entropy_stop_message_is_printed_once_on_a_validation_step(
+    mock_grpo_components, train_func, tmp_path, capsys
+):
+    """An entropy stop that coincides with validation logs its message once."""
+    train_calls, checkpointer, _ = _run_entropy_stop_trainer(
+        mock_grpo_components, train_func, tmp_path, [_LOW_ENTROPY_STEP], val_period=2
+    )
+
+    assert train_calls == 2
+    assert checkpointer.init_tmp_checkpoint.call_args.args[0] == 2
+    printed = capsys.readouterr().out
+    assert printed.count("grpo.stop_at_entropy_below=0.18") == 1
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
