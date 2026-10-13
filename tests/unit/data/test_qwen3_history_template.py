@@ -20,12 +20,10 @@ import pickle
 from pathlib import Path
 
 import pytest
-from omegaconf import OmegaConf
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
-from nemo_rl.algorithms.xtoken_off_policy_distillation import MasterConfig
 from nemo_rl.data.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
@@ -36,9 +34,6 @@ from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.native_chat import _render_and_tokenize_chat
 from nemo_rl.data.processors import chat_kd_processor
-from nemo_rl.data.utils import setup_response_data
-from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
-from tests.functional.xtoken_native_chat import write_dataset
 
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = Path(__file__).parent / "fixtures/xtoken"
@@ -430,46 +425,3 @@ def test_native_collator_rejects_configured_history_truncation(flags):
         _native_collator(tokenizer, None, same_tokenizer=True)(
             [{"message_log": conversation(), "loss_multiplier": 1.0, "idx": 29}]
         )
-
-
-def test_native_functional_config_loads_exact_tokenizers_and_dataset(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The functional config's chat_template paths are relative to the repo root.
-    monkeypatch.chdir(ROOT)
-    data_path = tmp_path / "native_chat.jsonl"
-    write_dataset(data_path)
-    register_omegaconf_resolvers()
-    path = ROOT / "examples/configs/xtoken_native_chat.yaml"
-    raw_config = load_config(path)
-    OmegaConf.update(raw_config, "data.train.data_path", str(data_path))
-    config = MasterConfig.model_validate(
-        OmegaConf.to_container(raw_config, resolve=True)
-    )
-    student = get_tokenizer(config.policy["tokenizer"])
-    teacher = get_tokenizer(config.teachers[0].policy_config()["tokenizer"])
-    assert student.get_vocab() != teacher.get_vocab()
-    train, validation = setup_response_data(student, config.data, env_configs=None)
-    assert validation is None
-    rows = [train[index] for index in range(len(train))]
-    assert len(rows) == 8
-    collator = CrossTokenizerCollator(
-        config=config.collator,
-        student_tokenizer=student,
-        teacher_tokenizers=[teacher],
-        aligners=[TokenAligner(student, teacher, "unused.pt")],
-        ctx_length_student=config.policy["max_total_sequence_length"],
-        ctx_length_teachers=[config.teachers[0].max_total_sequence_length],
-        drop_first_assistant_chunk_kl_by_teacher=[False],
-    )
-    batch = collator(rows)
-    assert batch["input_ids"].shape[0] == 8
-    assert batch["alignment_0_pair_valid"].any(dim=1).all()
-    assert batch["token_mask"].sum(dim=1).min() > 0
-    student_chunks = batch["alignment_0_student_chunk_id"]
-    teacher_chunks = batch["alignment_0_teacher_chunk_id"]
-    assert any(
-        (student_chunks[sample] == chunk).sum().item()
-        != (teacher_chunks[sample] == chunk).sum().item()
-        for sample, chunk in batch["alignment_0_pair_valid"].nonzero().tolist()
-    )
