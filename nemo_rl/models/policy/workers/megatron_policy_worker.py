@@ -919,7 +919,14 @@ class MegatronPolicyWorkerImpl(
                 patched_indexers,
                 model_role,
             )
-
+        elif patched_indexers is None and "glm-5.2" in hf_model_id.casefold():
+            log.warning(
+                "GLM-5.2 native SM90 FP8 cuDNN DSA was not enabled on the %s model "
+                "(non-SM90 device or incompatible DSA config); the stock BF16 "
+                "indexer is used and its top-k can diverge from vLLM, inflating "
+                "train/gen_kl_error.",
+                model_role,
+            )
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
         if not self._forward_pre_hook_enabled():
