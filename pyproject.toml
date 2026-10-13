@@ -217,6 +217,10 @@ mcore = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
+  # FlashAttention-4 (CuTe DSL). Required by megatron_cfg.flash_attention_version=4, which
+  # zero_train_gen_mismatch / batch_invariant_mode pins on both train and generation.
+  # Pinned to b19: b20+ need apache-tvm-ffi>=0.1.12, but the shared override keeps 0.1.11.
+  "flash-attn-4==4.0.0b19 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
   # remove them: [tool.uv.sources] git pins only attach to direct requirements, and the
   # conflicting extras resolve in separate forks — without these direct deps the mcore fork

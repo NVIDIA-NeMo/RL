@@ -71,7 +71,7 @@ def test_automodel_get_logprobs_uses_the_microbatch_hook(monkeypatch):
     worker.dp_mesh = MagicMock()
     worker.tokenizer = MagicMock()
     worker._make_logprobs_post_processor = MagicMock(return_value="postprocessor")
-    worker._logprobs_for_microbatch = MagicMock(return_value=(torch.zeros(2, 3), {}))
+    worker._logprobs_for_microbatch = MagicMock(return_value=torch.zeros(2, 3))
     microbatch = object()
     data = MagicMock()
 

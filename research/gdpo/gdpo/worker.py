@@ -174,14 +174,11 @@ class AutomodelGDPOPolicyWorker(AutomodelPolicyWorkerImpl):
         processed_mb: Any,
         post_processing_fn: Any,
         sequence_dim: int,
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        return (
-            self._gdpo_elbo_logprobs(
-                processed_mb=processed_mb,
-                post_processing_fn=post_processing_fn,
-                sequence_dim=sequence_dim,
-            ),
-            {},
+    ) -> torch.Tensor:
+        return self._gdpo_elbo_logprobs(
+            processed_mb=processed_mb,
+            post_processing_fn=post_processing_fn,
+            sequence_dim=sequence_dim,
         )
 
     @torch.no_grad()

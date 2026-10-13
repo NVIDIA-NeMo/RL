@@ -1372,7 +1372,11 @@ def test_rollout_pump_writes_expected_tq_data(
         },
         policy={
             "train_global_batch_size": expected_samples,
-            "generation": {"colocated": {"enabled": False}},
+            "generation": {
+                "top_k": None,
+                "top_p": 1.0,
+                "colocated": {"enabled": False},
+            },
         },
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=num_prompts,

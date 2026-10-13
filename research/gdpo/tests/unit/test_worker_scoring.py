@@ -19,12 +19,16 @@ the test can observe exactly what each quadrature point was handed.
 """
 
 import contextlib
+import math
 import types
 
 import pytest
 import torch
 from gdpo import SdmcElboEstimator, SdmcLikelihoodConfig
 from gdpo.worker import AutomodelGDPOPolicyWorker
+
+from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
+from nemo_rl.models.automodel.train import LogprobsPostProcessor
 
 # The worker is a Ray actor class; the plain class carrying the methods sits
 # behind __ray_metadata__ and is what we bind the method under test from.
@@ -185,3 +189,48 @@ class TestOutput:
             processed_mb=batch, post_processing_fn=None, sequence_dim=1
         )
         assert out.shape == batch.processed_inputs.input_ids.shape
+
+    def test_real_automodel_scoring_preserves_clean_targets_and_gradients(self, batch):
+        class UniformDiffusionModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.logits = torch.nn.Parameter(torch.zeros(100))
+
+            def forward(self, input_ids, attention_mask=None, use_cache=False):
+                return types.SimpleNamespace(
+                    logits=self.logits.expand(*input_ids.shape, -1)
+                )
+
+        input_ids = batch.processed_inputs.input_ids
+        microbatch = ProcessedMicrobatch(
+            processed_inputs=ProcessedInputs(
+                input_ids=input_ids,
+                seq_len=input_ids.shape[1],
+                position_ids=torch.arange(input_ids.shape[1]).expand_as(input_ids),
+            ),
+            data_dict={
+                **batch.data_dict,
+                "input_lengths": torch.full((input_ids.shape[0],), input_ids.shape[1]),
+            },
+            original_batch_size=input_ids.shape[0],
+            original_seq_len=input_ids.shape[1],
+        )
+        worker = make_worker("gauss-1")
+        worker.model = UniformDiffusionModel()
+
+        result = worker._gdpo_elbo_logprobs(
+            processed_mb=microbatch,
+            post_processing_fn=LogprobsPostProcessor(cfg={}, shift_targets=False),
+            sequence_dim=1,
+        )
+
+        # At t=1/2 exactly two of four completion tokens are scored, each
+        # weighted by 1/t. A uniform 100-token model gives -4*log(100).
+        torch.testing.assert_close(
+            result.sum(dim=1), torch.full((input_ids.shape[0],), -4 * math.log(100))
+        )
+        result.sum().backward()
+        assert torch.isfinite(worker.model.logits.grad).all()
+        assert worker.model.logits.grad[MASK_ID] < 0
+        assert worker.model.logits.grad[input_ids[:, 2:]].sum() > 0
+        assert microbatch.processed_inputs.input_ids is input_ids

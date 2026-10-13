@@ -279,9 +279,45 @@ def attach_static_multimodal_payload(
             "turns than the source prompt."
         )
     for source, target in zip(source_users, target_users):
+        # Check if the source is empty or not.
+        source_token_ids = source.get("token_ids")
+        source_is_tokenized = (
+            isinstance(source_token_ids, torch.Tensor) and source_token_ids.numel() > 0
+        )
         for key, value in source.items():
+            # Reattach multimodal media to Gym output.
             if isinstance(value, PackedTensor) or key in VLLM_PROMPT_KEYS:
                 target[key] = value
+            elif key == "media_token_validity_mask" and source_is_tokenized:
+                # Skipped for generic Gym prompts, which are not tokenized before
+                # the rollout and source an empty mask. The target then keeps
+                # its own mask, or GRPO builds one below from the attached media.
+                target[key] = value
+
+        # Create a target media validity mask based on the media tokens
+        # specified by the source mask to ensure parity.
+        source_mask = source.get("media_token_validity_mask")
+        target_token_ids = target.get("token_ids")
+        if (
+            source_is_tokenized
+            and isinstance(source_token_ids, torch.Tensor)
+            and isinstance(source_mask, torch.Tensor)
+            and isinstance(target_token_ids, torch.Tensor)
+        ):
+            if source_mask.shape != source_token_ids.shape:
+                raise ValueError(
+                    "Source media_token_validity_mask must align with source token_ids "
+                    f"during static media reattachment: mask={tuple(source_mask.shape)}, "
+                    f"token_ids={tuple(source_token_ids.shape)}."
+                )
+            media_token_ids = torch.unique(source_token_ids[source_mask.bool()]).to(
+                target_token_ids.device
+            )
+            target["media_token_validity_mask"] = (
+                torch.isin(target_token_ids, media_token_ids)
+                if media_token_ids.numel()
+                else torch.zeros_like(target_token_ids, dtype=torch.bool)
+            )
 
 
 def _add_r3_fallback_metrics(

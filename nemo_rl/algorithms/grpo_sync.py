@@ -46,7 +46,6 @@ import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-# Re-imports from grpo so this file is a thin trainer-only fork.
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     MasterConfig,
@@ -62,6 +61,12 @@ from nemo_rl.algorithms.grpo import (
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
     scale_rewards,
+)
+
+# Re-imports from grpo so this file is a thin trainer-only fork.
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
@@ -269,8 +274,8 @@ def validate_sync(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """TQ-mediated counterpart to :func:`nemo_rl.algorithms.grpo.validate`.
 
-    Per-batch: register the val partition → ``rollout_to_tq`` →
-    ``policy.read_from_dataplane`` for message logs → ``policy.finish_step``.
+    Per-batch: register the val partition → ``rollout_to_tq`` (turn_roles /
+    turn_contents returned in ``driver_carry``) → ``policy.finish_step``.
     Caller owns ``policy_generation.prepare_for_generation`` /
     ``finish_generation`` around the call; the actor's per-rollout
     ``finish_generation`` is suppressed so inference state stays warm
@@ -376,6 +381,7 @@ def _compute_seq_logprob_error_metrics(
     generation_logprobs: torch.Tensor,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: Optional[float],
+    filtering_on: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     # Thin BDD for the data-driven masking call: take
     # the slice you need, transform, write delta back.
@@ -391,6 +397,7 @@ def _compute_seq_logprob_error_metrics(
         train_data=masking_data,
         rewards=rewards,
         seq_logprob_error_threshold=seq_logprob_error_threshold,
+        filtering_on=filtering_on,
     )
     seq_logprob_error_metrics = seq_error_result
     if "num_masked_seqs" in seq_logprob_error_metrics:
@@ -422,9 +429,9 @@ def _log_data_plane_metrics_impl(
 
     The prefix names the scope because the two differ by a lot: the driver
     issues about one op of each kind per step while the bulk traffic is the
-    workers' per-DP-rank ``get_samples``. Note that even the cluster view
-    omits the rollout actor, which builds its own client and is not on the
-    worker group -- so ``kv_first_write`` is not in these totals.
+    workers' per-DP-rank ``get_samples``. The cluster view also includes the
+    rollout actor (registered via ``add_data_plane_snapshot_source``), so
+    ``kv_first_write`` is in these totals.
     """
     get_metrics = getattr(policy, "get_data_plane_step_metrics", None)
     if not callable(get_metrics):
@@ -573,6 +580,7 @@ def grpo_train_sync(
         master_config=master_config,
         dp_cfg=dp_cfg,
     )
+    policy.add_data_plane_snapshot_source(rollout_actor)
 
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
@@ -1007,6 +1015,12 @@ def grpo_train_sync(
                             generation_logprobs=generation_logprobs,
                             rewards=rewards,
                             seq_logprob_error_threshold=seq_logprob_error_threshold,
+                            filtering_on=need_top_k_or_top_p_filtering(
+                                TrainingSamplingParams(
+                                    top_k=master_config.policy["generation"]["top_k"],
+                                    top_p=master_config.policy["generation"]["top_p"],
+                                )
+                            ),
                         )
                     )
 
@@ -1419,6 +1433,12 @@ def grpo_train_sync(
                     },
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
+                    filtering_on=need_top_k_or_top_p_filtering(
+                        TrainingSamplingParams(
+                            top_k=master_config.policy["generation"]["top_k"],
+                            top_p=master_config.policy["generation"]["top_p"],
+                        )
+                    ),
                 )
             if (
                 master_config.policy["generation"]
