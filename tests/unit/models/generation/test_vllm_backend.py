@@ -2572,8 +2572,8 @@ def _make_dspark_refit_extension(
 
     The default fake drafter mimics the pinned vLLM Qwen3DSparkForCausalLM
     layout: fused qkv/gate_up parameters, a mask_embedding placeholder, and an
-    owned lm_head. Ownership is controlled via vllm_backend.get_pp_group in
-    tests.
+    owned lm_head. Ownership is controlled via
+    vllm.distributed.parallel_state.get_pp_group in tests.
     """
     if drafter_param_names is None:
         drafter_param_names = [
@@ -2954,7 +2954,7 @@ def test_eagle3_owner_rejects_dspark_only_extras(monkeypatch):
 def test_eagle3_megatron_partial_manifest_accepted(monkeypatch):
     """The megatron eagle3 exporter streams a PARTIAL drafter (midlayer.*
     alias, no embed_tokens) and relies on drafter module sharing; exact-key
-    validation must only apply to the DTensor-v2 full stream."""
+    validation must only apply to the Automodel full stream."""
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext, _ = _make_dspark_refit_extension(
@@ -2976,6 +2976,33 @@ def test_eagle3_megatron_partial_manifest_accepted(monkeypatch):
     }
     ext.prepare_refit_info(info)
     assert ext.state_dict_info is info
+
+
+@pytest.mark.vllm
+def test_eagle3_megatron_partial_manifest_without_drafter_hard_fails_at_prepare(
+    monkeypatch,
+):
+    """An owning rank with a non-empty (even partial) draft manifest but no
+    drafter model must hard-fail in prepare_refit_info, not defer to
+    _load_draft_weights's warn-and-skip path."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend,
+        has_speculator=False,
+        method="eagle3",
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+    info = {
+        "model.weight": ((4, 4), torch.bfloat16),
+        "draft.fc.weight": ((4, 4), torch.bfloat16),
+        "draft.midlayer.self_attn.q_proj.weight": ((4, 4), torch.bfloat16),
+    }
+    with pytest.raises(RuntimeError, match="Draft refit validation requires"):
+        ext.prepare_refit_info(info)
 
 
 @pytest.mark.vllm

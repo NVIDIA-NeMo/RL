@@ -593,7 +593,7 @@ class MegatronConfig(TypedDict):
 
 
 # Block drafters propose a whole anchored block per step and exist only on
-# the DTensor-v2 co-training path; eagle3 additionally runs on Megatron.
+# the Automodel co-training path; eagle3 additionally runs on Megatron.
 BLOCK_DRAFT_ALGOS = ("dspark", "dflash")
 DRAFT_ALGOS = ("eagle3", *BLOCK_DRAFT_ALGOS)
 

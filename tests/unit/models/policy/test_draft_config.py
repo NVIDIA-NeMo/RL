@@ -43,7 +43,7 @@ def test_eagle3_draft_config_preserves_legacy_defaults() -> None:
         "num_layers": None,
         "aux_layer_indices": None,
         "optimizer": None,
-        # DTensor-v2 TTT training options; the Megatron single-step path
+        # Automodel TTT training options; the Megatron single-step path
         # ignores these.
         "learning_rate": 1.0e-4,
         "ttt_steps": 3,

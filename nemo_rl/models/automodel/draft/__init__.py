@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DSpark/DFlash/EAGLE3 draft co-training on the DTensor-v2 backend.
+"""DSpark/DFlash/EAGLE3 draft co-training on the Automodel backend.
 
 Thin extension layer over ``nemo_automodel.components.speculative`` (3rdparty
 Automodel r0.6.0): byte-identical building blocks are imported from Automodel;

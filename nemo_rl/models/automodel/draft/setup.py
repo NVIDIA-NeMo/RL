@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Building the draft model and its optimizer for DTensor-v2 co-training.
+"""Building the draft model and its optimizer for Automodel co-training.
 
 Adapts a dspark/dflash/eagle3 checkpoint's config onto the vendored draft
 models, validates it against the training options, and FSDP2-shards it. Also
@@ -88,7 +88,7 @@ def load_draft_hf_config(
                 f"Draft checkpoint {model_name} is not speculators-format and "
                 f"does not declare one of {list(NATIVE_FLAT_EAGLE3_ARCHS)}; only "
                 "speculators-format and SGLang SpecForge-style eagle3 "
-                "checkpoints are supported on the DTensor-v2 path."
+                "checkpoints are supported on the Automodel backend."
             )
         return _adapt_native_flat_eagle3_config(
             config_dict, model_name, target_num_hidden_layers

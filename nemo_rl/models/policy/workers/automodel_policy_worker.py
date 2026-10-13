@@ -401,9 +401,6 @@ class AutomodelPolicyWorkerImpl(
         # setup_model_and_optimizer (mirrors Megatron, which attaches the
         # draft during its own setup and has the worker only read it back).
         self.draft_runtime = model_and_optimizer_state.draft_runtime
-        self.draft_algo = (
-            config["draft"].speculator_type if self.draft_model is not None else None
-        )
 
         # Initialize reference model if requested. With deferred loading the
         # model still holds the base (model_name) weights here, so the KL

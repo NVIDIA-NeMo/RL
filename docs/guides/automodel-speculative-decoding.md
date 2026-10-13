@@ -1,15 +1,15 @@
 # Speculative Decoding Draft Co-Training on Automodel Backend
 
-This guide covers draft-model co-training on the Automodel (DTensor v2)
+This guide covers draft-model co-training on the Automodel
 backend: training a speculative-decoding drafter alongside the policy so it
 tracks the policy's drift during RL, then refitting both into vLLM for
 faster rollout generation.
 
-This is the DTensor-v2 counterpart to the
+This is the Automodel counterpart to the
 [Eagle3 Speculative Decoding](eagle3-speculative-decoding.md) guide, which
 covers the Megatron backend. Concepts (teacher signal, refit, why co-train at
 all) are shared between the two guides; this one is specific to the
-DTensor-v2 drafters and their config surface. For GRPO fundamentals, see the
+Automodel drafters and their config surface. For GRPO fundamentals, see the
 [GRPO guide](grpo.md).
 
 ## Supported Drafters
@@ -18,7 +18,7 @@ DTensor-v2 drafters and their config surface. For GRPO fundamentals, see the
 | --- | --- | --- | --- |
 | `"dspark"` | DSpark block drafter (multi-token block proposal) | `deepseek-ai/dspark_qwen3_8b_block7` | `policy.automodel_cfg.enabled=true` |
 | `"dflash"` | DFlash block drafter (markov-free, confidence-free variant of DSpark) | `RedHatAI/*-speculator.dflash` | same as `dspark` |
-| `"eagle3"` | EAGLE3 TTT (test-time-training) drafter | `RedHatAI/*-speculator.eagle3`, SGLang SpecForge native-flat checkpoints (e.g. `lmsys/SGLang-EAGLE3-*`) | DTensor v2 (this guide) **or** Megatron (see the [Eagle3 guide](eagle3-speculative-decoding.md)) |
+| `"eagle3"` | EAGLE3 TTT (test-time-training) drafter | `RedHatAI/*-speculator.eagle3`, SGLang SpecForge native-flat checkpoints (e.g. `lmsys/SGLang-EAGLE3-*`) | Automodel (this guide) **or** Megatron (see the [Eagle3 guide](eagle3-speculative-decoding.md)) |
 
 All three algorithms train alongside the policy on the same rollout batch,
 using the policy's own in-flight logits/hidden states as the distillation
@@ -91,7 +91,7 @@ policy:
         draft_sample_method: "probabilistic"
 ```
 
-#### EAGLE3 (DTensor v2)
+#### EAGLE3
 
 ```yaml
 policy:
@@ -139,7 +139,7 @@ Shared across all three:
 | `l1_loss_alpha` | `0.9` | Total-variation distillation weight against the policy's raw logits. |
 | `confidence_loss_alpha` | `1.0` (dspark) / `0.0` (dflash) | Confidence-head BCE weight; `dflash` has no confidence head, so its default is `0.0`. |
 | `loss_decay_gamma` | `4.0` | Exponential per-block-position decay on the loss mask. |
-| `train_embed_and_head` | `true` | Train the draft's `embed_tokens`/`lm_head` instead of keeping the checkpoint copies frozen. |
+| `train_embed_and_head` | `true` | Train the draft's `embed_tokens`/`lm_head` instead of keeping the checkpoint copies frozen. Megatron backends handle embedding/lm_head ownership differently; see [NVIDIA-NeMo/RL#4691](https://github.com/NVIDIA-NeMo/RL/issues/4691). |
 
 `speculator_type: "eagle3"`:
 
@@ -214,7 +214,7 @@ What stays local to NeMo RL, and why:
   third-party checkpoint formats (speculators, SGLang SpecForge).
 - **Wiring the RL main loop** (`nemo_rl/models/automodel/{setup,train}.py`,
   `nemo_rl/algorithms/loss/wrapper.py`,
-  `nemo_rl/models/policy/{lm_policy,workers/dtensor_policy_worker_v2}.py`):
+  `nemo_rl/models/policy/{lm_policy,workers/automodel_policy_worker}.py`):
   building the draft optimizer param group, capturing teacher logits at the
   right point in the forward pass, combining the loss terms, config
   validation, and streaming `draft.*` weights through the same refit path

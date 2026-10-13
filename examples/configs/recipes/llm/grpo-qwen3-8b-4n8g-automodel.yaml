@@ -1,6 +1,6 @@
 defaults: ../../grpo_math_1B.yaml
 # GRPO Math baseline (NO speculative decoding): Qwen3-8B (thinking ON),
-# automodel (DTensor v2) backend, 4 nodes x 8 GPUs. Control arm for the
+# Automodel backend, 4 nodes x 8 GPUs. Control arm for the
 # draft co-training siblings (grpo-qwen3-8b-4n8g-automodel-{dspark,
 # dflash,eagle3}.yaml), which inherit from this recipe unchanged except
 # for their draft block.

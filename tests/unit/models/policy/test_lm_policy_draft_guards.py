@@ -102,7 +102,7 @@ def _automodel_dspark_config():
 
 
 def test_automodel_dspark_draft_config_passes_backend_guards():
-    """dspark on the Automodel (DTensor v2) backend must clear the
+    """dspark on the Automodel backend must clear the
     "requires the Automodel backend" guard in lm_policy.py -- every other test
     in this file only covers the Megatron backend, so a regression like
     automodel_enabled silently keying off a removed/renamed config field

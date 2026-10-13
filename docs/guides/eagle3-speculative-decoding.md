@@ -7,7 +7,7 @@ This guide covers the NeMo RL-specific runtime and training path. For a high-lev
 ## Offline vs Online
 
 - **Offline draft model**: vLLM uses a fixed Eagle3 checkpoint for speculative decoding, but the RL training loop does not update that draft model.
-- **Online draft training**: NeMo RL attaches an Eagle3 draft model to the policy worker, trains it alongside the policy, and refits both policy and draft weights into vLLM. This guide covers the Megatron path; for the Automodel (DTensor v2) path, see the [Automodel speculative decoding guide](automodel-speculative-decoding.md).
+- **Online draft training**: NeMo RL attaches an Eagle3 draft model to the policy worker, trains it alongside the policy, and refits both policy and draft weights into vLLM. This guide covers the Megatron path; for the Automodel path, see the [Automodel speculative decoding guide](automodel-speculative-decoding.md).
 
 Use the offline path when you already have a good drafter and only want faster rollouts. Use the online path when the policy is changing during RL and you want the drafter to track those updates.
 
@@ -29,7 +29,8 @@ NeMo RL initializes the draft LM head from the current policy output layer inste
 > `train_embed_and_head` in the
 > [Automodel speculative decoding guide](automodel-speculative-decoding.md#config-reference).
 > Whether to unify this
-> behavior across backends is an open question, not yet decided.
+> behavior across backends is an open question, not yet decided -- tracked in
+> [NVIDIA-NeMo/RL#4691](https://github.com/NVIDIA-NeMo/RL/issues/4691).
 
 ## Enablement
 
@@ -76,7 +77,7 @@ policy:
 ```
 
 > [!NOTE]
-> This config enables online draft training on the Megatron backend; it does not support context parallelism yet. Set `policy.megatron_cfg.enabled=true`, `policy.automodel_cfg.enabled=false`, and `policy.megatron_cfg.context_parallel_size=1`. Sequence packing (`policy.sequence_packing.enabled=true`) is supported. For the Automodel (DTensor v2) backend, see the [Automodel speculative decoding guide](automodel-speculative-decoding.md).
+> This config enables online draft training on the Megatron backend; it does not support context parallelism yet. Set `policy.megatron_cfg.enabled=true`, `policy.automodel_cfg.enabled=false`, and `policy.megatron_cfg.context_parallel_size=1`. Sequence packing (`policy.sequence_packing.enabled=true`) is supported. For the Automodel backend, see the [Automodel speculative decoding guide](automodel-speculative-decoding.md).
 
 ## How It Works
 

@@ -881,9 +881,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             return
 
         method = self._speculative_method()
-        # A megatron partial stream (no embed_tokens) predates (and must
-        # keep) the lenient path: no alias guard, warn-and-skip on a missing
-        # drafter.
+        # A megatron partial stream (no embed_tokens) skips the alias guard
+        # below. The warn-and-skip branch further down for a missing drafter
+        # is now effectively unreachable for a cotrained, owning rank:
+        # prepare_refit_info's _validate_draft_refit_info hard-fails earlier
+        # in that case. It still guards non-cotrained methods and a drafter
+        # that disappears between prepare and load.
         strict_cotraining = _is_full_draft_stream([name for name, _ in draft_weights])
         draft_model = self._get_drafter_model()
         if draft_model is None:

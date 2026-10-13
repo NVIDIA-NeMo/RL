@@ -15,13 +15,11 @@
 # Built on nemo_automodel.components.speculative.eagle.draft_llama
 # (LlamaEagle3DraftModel / Eagle3LlamaAttention / Eagle3LlamaDecoderLayer):
 # the actual drafter network (attention, decoder layer, embedding/fc/lm_head)
-# is imported unchanged, not vendored. That module's TTT attention is
-# meaningfully better than what used to be hand-rolled here: step 0's causal
-# block runs once (dense [T, T], optionally FlashAttention-2) and every later
-# TTT step attends only to its OWN previous-step K/V at the SAME position (an
-# O(T) einsum "diagonal" via a shared `cache_hidden` list) instead of
-# re-attending against the whole growing KV cache (an O(T^2 * step) matmul
-# per step) the way the previous from-scratch implementation did.
+# is imported unchanged, not vendored. Its TTT attention runs step 0's causal
+# block once (dense [T, T], optionally FlashAttention-2); every later TTT
+# step attends only to its own previous-step K/V at the same position (an
+# O(T) einsum "diagonal" via a shared `cache_hidden` list) rather than
+# re-attending the whole growing KV cache.
 #
 # What lives in THIS file are the RL-specific deltas that don't fit
 # automodel's `Eagle3TrainerModule` (core.py) API:

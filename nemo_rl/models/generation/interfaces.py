@@ -245,7 +245,7 @@ class GenerationConfig(TypedDict):
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
     # The trainer streams the drafter's full weight set (incl. embed/lm_head)
-    # on refit (DTensor-v2 draft co-training); drafter module sharing must be
+    # on refit (Automodel draft co-training); drafter module sharing must be
     # disabled and the draft manifest is validated exactly.
     _draft_full_refit: NotRequired[bool]
     # Internal debug-only measurement of exact Ray generation arguments.

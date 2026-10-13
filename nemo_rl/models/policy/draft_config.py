@@ -64,9 +64,9 @@ class _DraftConfigBase(BaseModel, extra="allow"):
 class Eagle3DraftConfig(_DraftConfigBase):
     """Configuration for EAGLE-3 draft-model co-training with the policy.
 
-    Runs on the Megatron backend (single-step distillation) or the DTensor v2
+    Runs on the Megatron backend (single-step distillation) or the Automodel
     backend (TTT training). num_layers/aux_layer_indices apply to the
-    Megatron path only; architecture fields for the DTensor v2 path (hidden
+    Megatron path only; architecture fields for the Automodel path (hidden
     sizes, draft vocab, d2t/t2d maps) are read from the draft checkpoint's
     config.json instead.
     """
@@ -78,7 +78,7 @@ class Eagle3DraftConfig(_DraftConfigBase):
     num_layers: int | None = None
     aux_layer_indices: list[int] | None = None
     # Megatron-path-only override of the draft optimizer's lr/min_lr/
-    # weight_decay schedule (NVIDIA-NeMo/RL#3707); unused by the DTensor v2
+    # weight_decay schedule (NVIDIA-NeMo/RL#3707); unused by the Automodel
     # TTT path below, which always uses learning_rate.
     optimizer: DraftOptimizerConfig | None = None
     # Learning rate for the draft's optimizer param group; the draft needs a
@@ -97,7 +97,7 @@ class Eagle3DraftConfig(_DraftConfigBase):
 
 
 class _BlockDraftConfig(_DraftConfigBase):
-    """Shared fields for the DTensor-v2-only block drafters (DSpark/DFlash).
+    """Shared fields for the Automodel-only block drafters (DSpark/DFlash).
 
     Architecture fields (block_size, target_layer_ids, mask_token_id, markov
     and confidence head layout) are read from the draft checkpoint's
@@ -134,13 +134,13 @@ class _BlockDraftConfig(_DraftConfigBase):
 
 
 class DSparkDraftConfig(_BlockDraftConfig):
-    """Training options for DSpark draft co-training (DTensor-v2 backend only)."""
+    """Training options for DSpark draft co-training (Automodel backend only)."""
 
     speculator_type: Literal["dspark"] = "dspark"
 
 
 class DFlashDraftConfig(_BlockDraftConfig):
-    """Training options for DFlash draft co-training (DTensor-v2 backend only).
+    """Training options for DFlash draft co-training (Automodel backend only).
 
     DFlash is the markov-free/confidence-free subset of DSpark, so its
     checkpoints carry no confidence head.

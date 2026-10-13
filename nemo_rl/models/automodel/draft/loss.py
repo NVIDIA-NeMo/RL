@@ -303,36 +303,6 @@ def _collect_local_terms(
     return loss_terms, has_confidence
 
 
-def _build_loss(
-    *,
-    loss_terms: dict[str, torch.Tensor],
-    global_denominators: dict[str, torch.Tensor],
-    ce_loss_alpha: float,
-    l1_loss_alpha: float,
-    confidence_head_alpha: float,
-    has_confidence: bool,
-) -> torch.Tensor:
-    # Globally normalized sum; the caller's forward/backward loop is responsible
-    # for undoing gradient averaging across data-parallel ranks (nemo-rl
-    # multiplies each microbatch loss by dp_size * cp_size before backward).
-    ce_loss = loss_terms["ce_loss_num"] / (global_denominators["ce_loss_den"] + 1e-6)
-    l1_loss = ce_loss.new_zeros(())
-    if global_denominators["l1_loss_den"].item() > 0:
-        l1_loss = loss_terms["l1_loss_num"] / (
-            global_denominators["l1_loss_den"] + 1e-6
-        )
-    confidence_loss = ce_loss.new_zeros(())
-    if has_confidence:
-        confidence_loss = loss_terms["confidence_loss_num"] / (
-            global_denominators["confidence_loss_den"] + 1e-6
-        )
-    return (
-        ce_loss_alpha * ce_loss
-        + l1_loss_alpha * l1_loss
-        + confidence_head_alpha * confidence_loss
-    )
-
-
 def compute_dspark_loss(
     *,
     outputs: DSparkForwardOutput,
@@ -347,9 +317,11 @@ def compute_dspark_loss(
 
     The returned ``backward_loss`` is built from ``global_denominators``
     (all-reduced across ``process_group``) so it is correct under FSDP's
-    gradient averaging; the per-rank scalars in ``terms`` (when
-    ``return_terms=True``) are local, detached diagnostics only and must not
-    be used for the backward pass.
+    gradient averaging. The per-term scalars in ``terms`` (when
+    ``return_terms=True``) are detached copies of the same global-denominator
+    values that make up ``backward_loss`` -- summing them across DP ranks (as
+    the training loop's metric reduction does) reproduces the backward-scale
+    global mean, unlike a per-rank local-denominator mean, which would not.
 
     Args:
         outputs: forward-pass outputs from the DSpark draft model.
@@ -380,28 +352,27 @@ def compute_dspark_loss(
     l1_loss_alpha = float(l1_loss_alpha)
     confidence_head_alpha = float(confidence_head_alpha)
 
-    local_ce_loss = loss_terms["ce_loss_num"] / (loss_terms["ce_loss_den"] + 1e-6)
-    local_l1_loss = local_ce_loss.new_zeros(())
+    # Globally normalized (local numerator over all-reduced denominator), the
+    # same scheme as the backward pass: the caller's forward/backward loop is
+    # responsible for undoing gradient averaging across data-parallel ranks
+    # (nemo-rl multiplies each microbatch loss by dp_size * cp_size before
+    # backward), and these same values (not a per-rank local-denominator
+    # mean) are also what gets logged below so the metric sums correctly.
+    ce_loss = loss_terms["ce_loss_num"] / (global_denominators["ce_loss_den"] + 1e-6)
+    l1_loss = ce_loss.new_zeros(())
     if global_denominators["l1_loss_den"].item() > 0:
-        local_l1_loss = loss_terms["l1_loss_num"] / (loss_terms["l1_loss_den"] + 1e-6)
-    local_confidence_loss = local_ce_loss.new_zeros(())
-    if has_confidence:
-        local_confidence_loss = loss_terms["confidence_loss_num"] / (
-            loss_terms["confidence_loss_den"] + 1e-6
+        l1_loss = loss_terms["l1_loss_num"] / (
+            global_denominators["l1_loss_den"] + 1e-6
         )
-    local_loss = (
-        ce_loss_alpha * local_ce_loss
-        + l1_loss_alpha * local_l1_loss
-        + confidence_head_alpha * local_confidence_loss
-    )
-
-    backward_loss = _build_loss(
-        loss_terms=loss_terms,
-        global_denominators=global_denominators,
-        ce_loss_alpha=ce_loss_alpha,
-        l1_loss_alpha=l1_loss_alpha,
-        confidence_head_alpha=confidence_head_alpha,
-        has_confidence=has_confidence,
+    confidence_loss = ce_loss.new_zeros(())
+    if has_confidence:
+        confidence_loss = loss_terms["confidence_loss_num"] / (
+            global_denominators["confidence_loss_den"] + 1e-6
+        )
+    backward_loss = (
+        ce_loss_alpha * ce_loss
+        + l1_loss_alpha * l1_loss
+        + confidence_head_alpha * confidence_loss
     )
     if return_terms:
         # The losses are already-normalized (DP-global-denominator) scalars;
@@ -412,10 +383,10 @@ def compute_dspark_loss(
         # the DP group and divides once, giving the exact global ratio (and a
         # tau that never dips below its definitional floor of 1).
         terms = {
-            "loss": local_loss.detach(),
-            "ce_loss": local_ce_loss.detach(),
-            "l1_loss": local_l1_loss.detach(),
-            "confidence_loss": local_confidence_loss.detach(),
+            "loss": backward_loss.detach(),
+            "ce_loss": ce_loss.detach(),
+            "l1_loss": l1_loss.detach(),
+            "confidence_loss": confidence_loss.detach(),
             "accept_rate_per_pos_num": loss_terms["accept_rate_pos_num"],
             "accept_rate_per_pos_den": loss_terms["accept_rate_pos_den"],
             "tau_num": loss_terms["tau_num"],

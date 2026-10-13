@@ -661,7 +661,7 @@ class BaseVllmGenerationWorker:
         # ever marks them as owned), and the draft refit would then overwrite
         # the policy's serving weights through the alias. Disable the sharing
         # before engine creation; the env flag re-applies it in any spawned
-        # vLLM executor worker. dspark/dflash exist only on the DTensor-v2
+        # vLLM executor worker. dspark/dflash exist only on the Automodel
         # full-stream path; eagle3 is gated on _draft_full_refit because the
         # megatron eagle3 trainer streams a PARTIAL set (no embed_tokens) and
         # relies on the drafter sharing the target's embedding.

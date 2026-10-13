@@ -112,14 +112,14 @@ def resolve_generation_class(
 def draft_full_refit_enabled(policy_cfg: dict) -> bool:
     """Whether the trainer streams the drafter's FULL weight set on refit.
 
-    True for DTensor-v2 draft co-training (dspark/dflash/eagle3), which
+    True for Automodel draft co-training (dspark/dflash/eagle3), which
     exports the drafter's entire state_dict under the ``draft.`` prefix; the
     megatron eagle3 path streams a partial set instead. Feeds the
     ``draft_full_refit`` argument of :func:`configure_generation_config`.
 
     DTensor is always the v2 (Automodel) backend now (DTensor v1 and its
     dtensor_cfg._v2 toggle have been removed upstream), so
-    automodel_cfg.enabled alone identifies the DTensor v2 path.
+    automodel_cfg.enabled alone identifies the Automodel path.
     """
     from nemo_rl.models.policy.draft_config import coerce_draft_config
 
@@ -211,7 +211,7 @@ def configure_generation_config(
         config["_mtp_weights_from_refit"] = trains_mtp
 
         # Whether the trainer streams the drafter's FULL weight set (incl.
-        # embed_tokens/lm_head) on every refit — true for DTensor-v2 draft
+        # embed_tokens/lm_head) on every refit — true for Automodel draft
         # co-training. The megatron eagle3 path streams a partial set and
         # relies on drafter module sharing instead.
         config["_draft_full_refit"] = draft_full_refit

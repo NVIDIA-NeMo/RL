@@ -266,6 +266,9 @@ def load_checkpoint_with_draft(
         ),
     )
     if optimizer_path and optimizer is not None:
+        checkpoint_manager.check_master_weight_dtypes(
+            composite_model, optimizer, optimizer_path
+        )
         checkpoint_manager.checkpointer.load_optimizer(
             optimizer=optimizer,
             model=composite_model,
@@ -314,6 +317,7 @@ def save_checkpoint_with_draft(
             weights_path=optimizer_path,
             scheduler=scheduler,
         )
+        checkpoint_manager.checkpointer.maybe_wait_for_staging()
     save_draft_checkpoint(
         draft_model,
         weights_path,

@@ -78,7 +78,7 @@ def _draft_config(
 @pytest.mark.parametrize(
     ("method", "load_format", "draft_full_refit", "expected"),
     [
-        # DTensor-v2 full-stream co-training (all 3 methods): disable
+        # Automodel full-stream co-training (all 3 methods): disable
         # required regardless of method name.
         ("dspark", "dummy", True, True),
         ("dflash", "dummy", True, True),

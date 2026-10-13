@@ -344,8 +344,8 @@ policy:
     enabled: false
     model_name: null
     loss_weight: 0.1
-    # Drafter family: "eagle3" (Megatron backend, or DTensor v2 with the
-    # speculators-style TTT trainer), "dspark" / "dflash" (DTensor v2 backend).
+    # Drafter family: "eagle3" (Megatron backend, or Automodel with the
+    # speculators-style TTT trainer), "dspark" / "dflash" (Automodel backend).
     speculator_type: "eagle3"
     num_layers: null
     aux_layer_indices: null

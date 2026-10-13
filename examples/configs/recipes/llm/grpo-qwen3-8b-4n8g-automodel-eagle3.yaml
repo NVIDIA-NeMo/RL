@@ -1,5 +1,5 @@
 defaults: grpo-qwen3-8b-4n8g-automodel.yaml
-# Qwen3-8B GRPO math baseline with EAGLE3 draft co-training (DTensor v2
+# Qwen3-8B GRPO math baseline with EAGLE3 draft co-training (Automodel
 # backend, speculators-style TTT unrolling), 4 nodes x 8 GPUs. Draft
 # architecture fields (aux layer ids, draft_vocab_size, d2t/t2d maps,
 # norm_before_residual, layer family) come from the draft checkpoint's

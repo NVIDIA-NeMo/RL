@@ -11,14 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""vLLM-side draft co-training helpers, kept vllm-import-free at module scope.
-
-Collects the draft-specific refit/module-sharing glue that ``vllm_backend.py``
-and ``vllm_worker.py`` previously spread across each other (``vllm_worker.py``
-re-declaring ``vllm_backend.py``'s method list because ``vllm_backend.py``
-imports vllm eagerly). Every vllm import here is function-local so the Ray
-driver process -- which never installs vllm -- can still import this module.
-"""
+"""vLLM-side draft co-training helpers; vllm imports stay function-local."""
 
 import os
 from typing import Any, Optional
@@ -46,7 +39,7 @@ def draft_module_sharing_disable_required(config: dict[str, Any]) -> bool:
     doesn't imply a full stream -- Megatron block-drafter paths can use the
     same dspark/dflash method names with a headless exporter that relies on
     module sharing, just like the megatron eagle3 path does -- so gate on
-    _draft_full_refit (true only for DTensor-v2 co-training, which always
+    _draft_full_refit (true only for Automodel co-training, which always
     streams the drafter's entire state_dict) for all three methods.
     """
     load_format = config["vllm_cfg"]["load_format"]
@@ -120,35 +113,24 @@ _DRAFT_SKIPPED_KEY_SUBSTRINGS = {
 
 
 def _is_full_draft_stream(draft_keys: "set[str] | list[str]") -> bool:
-    """Whether a ``draft.*`` stream is the DTensor-v2 FULL drafter.
+    """Whether a ``draft.*`` stream is the Automodel FULL drafter.
 
-    The DTensor-v2 co-training path streams the vendored model's entire
-    state_dict (always including per-layer keys like ``layers.0.*``, and
-    normally ``embed_tokens`` too), regardless of method (dspark/dflash/
-    eagle3). A megatron co-training exporter may instead stream a PARTIAL
-    drafter -- the megatron eagle3 exporter intentionally omits
-    ``embed_tokens`` and aliases its single collapsed layer as
-    ``midlayer.*`` instead of ``layers.0.*``, relying on drafter module
-    sharing at serve time -- and future megatron block drafters
-    (dspark/dflash) may do the same.
+    The Automodel co-training path streams the drafter's entire state_dict
+    (always including per-layer keys like ``layers.0.*``, and normally
+    ``embed_tokens`` too), regardless of method (dspark/dflash/eagle3). A
+    megatron co-training exporter may instead stream a PARTIAL drafter --
+    the megatron eagle3 exporter intentionally omits ``embed_tokens`` and
+    aliases its single collapsed layer as ``midlayer.*`` instead of
+    ``layers.0.*``, relying on drafter module sharing at serve time -- and
+    future megatron block drafters (dspark/dflash) may do the same.
 
-    Neither signal alone is reliable: a FULL stream can be missing
-    ``embed_tokens`` (e.g. a misconfigured trainer export, or
-    ``train_embed_and_head=False``), and some callers only ever see a
-    one-key slice of a FULL stream (e.g. a single IPC transport batch) with
-    no ``layers.*`` key in it either. Treat the stream as FULL unless it
-    carries neither signal, so a batch that happens to contain only
-    ``lm_head.weight`` -- as the genuine megatron partial path's minimal
-    payload does -- is still read as partial, while a FULL stream missing
-    just ``embed_tokens`` is still caught by its remaining ``layers.*``
-    keys.
+    Neither signal alone is reliable, so the stream is treated as FULL
+    unless it carries neither: a one-key batch slice carrying only
+    ``lm_head.weight`` -- the genuine megatron partial path's minimal
+    payload -- is read as partial, while a FULL stream missing just
+    ``embed_tokens`` is still caught by its remaining ``layers.*`` keys.
     """
     return any("embed_tokens" in key or "layers." in key for key in draft_keys)
-
-
-def _speculative_method_of(model_runner: Any) -> Optional[str]:
-    spec_config = getattr(model_runner.vllm_config, "speculative_config", None)
-    return getattr(spec_config, "method", None) if spec_config else None
 
 
 def _draft_owns_speculator(model_runner: Any, method: Optional[str]) -> bool:
@@ -253,7 +235,7 @@ def _validate_draft_refit_info(
         # midlayer.* alias for the single layer) and relies on the
         # drafter sharing the target's embedding; exact-key validation
         # against the vLLM parameter layout only applies to the
-        # DTensor-v2 full stream.
+        # Automodel full stream.
         return
     expected = _expected_draft_keys(draft_model, method)
     skipped = _DRAFT_SKIPPED_KEY_SUBSTRINGS[method]

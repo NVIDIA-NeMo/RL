@@ -132,7 +132,7 @@ Configure offline and online Eagle3 draft-model workflows to accelerate rollout 
 :link: guides/automodel-speculative-decoding
 :link-type: doc
 
-Co-train DSpark, DFlash, and EAGLE3 drafters alongside the policy on the DTensor v2 (Automodel) backend.
+Co-train DSpark, DFlash, and EAGLE3 drafters alongside the policy on the Automodel backend.
 :::
 
 :::{grid-item-card} {octicon}`unmute` Audio GRPO on AVQA

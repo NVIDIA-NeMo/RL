@@ -1,6 +1,6 @@
 defaults: grpo-qwen3-8b-4n8g-automodel.yaml
 # Qwen3-30B-A3B-Instruct-2507 GRPO math baseline with EAGLE3 draft
-# co-training (DTensor v2 backend), 4 nodes x 8 GPUs.
+# co-training (Automodel backend), 4 nodes x 8 GPUs.
 grpo:
   val_period: 10
 checkpointing:

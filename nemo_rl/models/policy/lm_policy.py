@@ -288,6 +288,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "sequence_packing.enabled": bool(
                         config.get("sequence_packing", {}).get("enabled", False)
                     ),
+                    # The draft shares the policy's optimizer, but
+                    # prepare_for_training skips the CUDA restore of optimizer
+                    # state under cpu_offload (correct for the policy's
+                    # CPUOffloadPolicy, not for the draft, whose fully_shard
+                    # params/grads stay on CUDA) -- the draft's Adam state is
+                    # left on CPU after offload_before_refit, causing a device
+                    # mismatch in optimizer.step() on the next training step.
+                    "cpu_offload": bool(automodel_cfg.get("cpu_offload", False)),
                 }
                 enabled_unsupported = [name for name, on in unsupported.items() if on]
                 if enabled_unsupported:

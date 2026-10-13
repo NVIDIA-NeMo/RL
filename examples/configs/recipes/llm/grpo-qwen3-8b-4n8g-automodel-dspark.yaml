@@ -1,5 +1,5 @@
 defaults: grpo-qwen3-8b-4n8g-automodel.yaml
-# Qwen3-8B GRPO math baseline with DSpark draft co-training (DTensor v2
+# Qwen3-8B GRPO math baseline with DSpark draft co-training (Automodel
 # backend), 4 nodes x 8 GPUs. Draft architecture fields (block_size,
 # target_layer_ids, mask_token_id, markov/confidence heads) come from the
 # draft checkpoint's config.json; only training options are set here.
