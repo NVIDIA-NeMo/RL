@@ -26,6 +26,8 @@ from transformers import PreTrainedTokenizerFast
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 from nemo_rl.algorithms.x_token.loss_utils import LocalizedAlignment
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
+from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.processors import kd_data_processor
 from nemo_rl.data.xtoken.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
@@ -92,7 +94,8 @@ def _batch(
         make_seq_div_by_student=16,
         make_seq_div_by_teachers=[16],
     )
-    return collator([{"message_log": _MESSAGES, "loss_multiplier": 1.0, "idx": 0}])
+    datum = kd_data_processor({"messages": _MESSAGES}, TaskDataSpec(), None, None, 0)
+    return collator([datum])
 
 
 def _loss_fn(vocab_size: int) -> CrossTokenizerDistillationLossFn:

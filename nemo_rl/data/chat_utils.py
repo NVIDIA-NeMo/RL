@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Validation shared by chat dataset adapters, processors, and collators."""
+"""Message selection validation for chat data processors."""
 
 from numbers import Integral
 from typing import Any, Sequence

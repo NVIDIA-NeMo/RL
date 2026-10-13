@@ -303,7 +303,7 @@ class CrossTokenizerCollator:
                 datum["message_log"],
                 ctx_length,
                 tools=datum.get("tools"),
-                message_loss_mask=datum.get("message_loss_mask"),
+                message_loss_mask=datum["message_loss_mask"],
                 include_thinking_in_loss=self.include_thinking_in_loss,
                 native_thinking_alignment=self.native_thinking_alignment,
             )

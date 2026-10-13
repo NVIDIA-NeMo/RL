@@ -963,10 +963,10 @@ def kd_data_processor(
     max_seq_length: int | None,
     idx: int,
 ) -> DatumSpec:
-    """Process a raw-text datum for cross-tokenizer distillation.
+    """Process raw messages for cross-tokenizer distillation.
 
-    Tokenization is deferred to the collator, so the text is carried forward
-    as a single assistant message in ``message_log``.
+    Tokenization is deferred to the collator. Every output carries a validated
+    message loss mask, defaulting to all assistant turns when none is supplied.
     """
     output: DatumSpec = {
         # Tool call arguments can contain nested dictionaries and lists. Isolate
@@ -980,10 +980,9 @@ def kd_data_processor(
     }
     if "task_name" in datum_dict:
         output["task_name"] = datum_dict["task_name"]
-    if datum_dict.get("message_loss_mask") is not None:
-        output["message_loss_mask"] = normalize_message_loss_mask(
-            datum_dict["messages"], datum_dict["message_loss_mask"]
-        )
+    output["message_loss_mask"] = normalize_message_loss_mask(
+        datum_dict["messages"], datum_dict.get("message_loss_mask")
+    )
     tools = datum_dict.get("tools")
     if tools is not None:
         if not isinstance(tools, list) or any(
