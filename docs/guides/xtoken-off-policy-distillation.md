@@ -322,13 +322,23 @@ Content tokens that also absorb surrounding whitespace retain CE supervision;
 their full decoded strings still determine exact-match correctness.
 
 The [`xtoken_off_policy_distillation.sh`](../../tests/functional/xtoken_off_policy_distillation.sh)
-functional test covers raw text and native chat. Its
+functional test covers raw text. The standalone
+[`xtoken_native_chat.sh`](../../tests/functional/xtoken_native_chat.sh) functional
+test covers native chat and is registered separately in the fast and full CI
+suites. Its
 [`chat configuration`](../../examples/configs/xtoken_native_chat.yaml)
 uses a SmolLM2-135M-Instruct student and Qwen3-1.7B teacher with distinct
 tokenizer vocabularies and token boundaries. Both use the history-preserving
 ChatML override so the test retains reasoning, tool calls, and end-of-turn
-supervision. The script generates its multi-turn arithmetic JSONL and projection
-matrix at runtime, then checks that three training steps produce finite losses.
+supervision. The script reads the checked-in multi-turn arithmetic
+[`JSONL fixture`](../../tests/functional/test_data/xtoken_native_chat.jsonl), builds
+its projection matrix, and checks that three training steps produce finite
+losses. It owns its experiment directory and logs, so it can run independently:
+
+```bash
+bash tests/functional/xtoken_native_chat.sh
+```
+
 The chat scenario is functional coverage, not a nightly convergence benchmark.
 DP alignment, native student-only SFT, sequence packing, and backend/loss changes
 are outside this port.
