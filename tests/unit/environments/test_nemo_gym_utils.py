@@ -244,6 +244,138 @@ def test_build_nemo_gym_config_uv_dirs(detected_uv_dirs, configured, expected):
     assert (global_config["uv_cache_dir"], global_config["uv_venv_dir"]) == expected
 
 
+def test_build_nemo_gym_config_moves_external_service_readiness_to_actor_field(
+    detected_uv_dirs,
+):
+    """Every entrypoint, SingleController included, builds its actor config here."""
+    cfg = build_nemo_gym_config(
+        _env_configs(
+            external_service_readiness={
+                "services": [
+                    {
+                        "name": "GENRM",
+                        "url": "http://10.0.0.1:9213/health",
+                        "expected_backends": 2,
+                    }
+                ],
+                "timeout_seconds": 10,
+                "poll_interval_seconds": 1,
+                "request_timeout_seconds": 2,
+            }
+        ),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )
+
+    readiness = cfg["external_service_readiness"]
+    assert isinstance(readiness, nemo_gym_mod.ExternalServiceReadinessConfig)
+    assert readiness.services[0].expected_backends == 2
+    assert "external_service_readiness" not in cfg["initial_global_config_dict"]
+
+
+def test_build_nemo_gym_config_rejects_invalid_external_service_readiness(
+    detected_uv_dirs,
+):
+    """A malformed gate fails on the driver, before any actor is created."""
+    service = {"name": "GENRM", "url": "http://10.0.0.1:9213/health"}
+    with pytest.raises(ValueError, match="must be unique"):
+        build_nemo_gym_config(
+            _env_configs(
+                external_service_readiness={
+                    "services": [
+                        {**service, "expected_backends": 1},
+                        {**service, "expected_backends": 2},
+                    ],
+                    "timeout_seconds": 10,
+                    "poll_interval_seconds": 1,
+                    "request_timeout_seconds": 2,
+                }
+            ),
+            base_urls=[],
+            model_name="test-model",
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
+
+
+@contextmanager
+def _stub_gym_spinup(run_helper):
+    """Stand in for the Gym modules and Ray context that _spinup reads."""
+    cli = types.ModuleType("nemo_gym.cli")
+    cli.GlobalConfigDictParserConfig = MagicMock
+    cli.RunHelper = lambda: run_helper
+    rollout_collection = types.ModuleType("nemo_gym.rollout_collection")
+    rollout_collection.RolloutCollectionHelper = MagicMock
+    server_utils = types.ModuleType("nemo_gym.server_utils")
+    server_utils.HEAD_SERVER_KEY_NAME = "head_server"
+    server_utils.BaseServerConfig = MagicMock
+    with (
+        patch.dict(
+            sys.modules,
+            {
+                "nemo_gym": types.ModuleType("nemo_gym"),
+                "nemo_gym.cli": cli,
+                "nemo_gym.rollout_collection": rollout_collection,
+                "nemo_gym.server_utils": server_utils,
+            },
+        ),
+        patch.object(nemo_gym_mod, "_get_node_ip_local", return_value="10.0.0.1"),
+        patch.object(nemo_gym_mod, "_get_free_port_local", return_value=5000),
+        patch.object(nemo_gym_mod, "ray") as mock_ray,
+    ):
+        mock_ray.get_runtime_context.return_value.gcs_address = "10.0.0.1:6379"
+        yield
+
+
+def test_spinup_stops_local_gym_servers_when_external_services_time_out():
+    """Local Gym servers start first; a missed external deadline must stop them."""
+    readiness = nemo_gym_mod.ExternalServiceReadinessConfig(
+        services=[
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            }
+        ],
+        timeout_seconds=1,
+        poll_interval_seconds=1,
+        request_timeout_seconds=1,
+    )
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__(
+        {
+            "model_name": "test-model",
+            "base_urls": [],
+            "initial_global_config_dict": {},
+            "external_service_readiness": readiness,
+        }
+    )
+    # One parent mock records the order of RunHelper and readiness calls.
+    calls = MagicMock()
+    calls.wait.side_effect = TimeoutError("GENRM: request failed")
+
+    with (
+        _stub_gym_spinup(calls.run_helper),
+        patch.object(nemo_gym_mod, "_wait_for_external_services", calls.wait),
+    ):
+        with pytest.raises(TimeoutError, match="GENRM"):
+            actor._spinup()
+
+    # _spinup stops the servers and drops the handle itself, so the caller's
+    # teardown cannot reach the non-idempotent RunHelper.shutdown() again.
+    assert actor.rh is None
+    actor.shutdown()
+    assert [name for name, _, _ in calls.mock_calls] == [
+        "run_helper.start",
+        "wait",
+        "run_helper.shutdown",
+    ]
+    calls.wait.assert_called_once_with(readiness)
+
+
 def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs):
     cfg = build_nemo_gym_config(
         _env_configs(port_range_low=6000, port_range_high=6999),
