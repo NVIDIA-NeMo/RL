@@ -22,4 +22,4 @@ bash "$SCRIPT_DIR/grpo_external_vllm_gym_single_controller.sh" \
     "$@"
 
 uv run "$PROJECT_ROOT/tests/check_metrics.py" "$EXTERNAL_VLLM_TEST_RUN_DIR/train/metrics.json" \
-    'max(data["train/turns_per_sample/max"]) >= 2'
+    'max(data["train/finalize/calls_per_rollout"]) > 1 if "train/finalize/calls_per_rollout" in data else max(data["train/turns_per_sample/max"]) >= 2'
