@@ -292,7 +292,12 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     # new weights (also clears the prefix cache). False keeps their pre-update KV
     # (Magistral-style) AND leaves the prefix cache stale across weight updates,
     # which grows train-vs-rollout mismatch when prompts share prefixes; the
-    # collector warns in that case. Drained refits always invalidate caches.
+    # collector warns in that case on vLLM. Drained refits ask the backend to
+    # invalidate its caches regardless of this flag. With the Megatron generation
+    # backend an unset flag is derived from mcore_generation_config.
+    # kv_cache_management_mode at setup (recompute -> true, else false); an
+    # explicit disagreement errors. Note: the shipped exemplar YAMLs pin false,
+    # so recipes inheriting them keep false unless they set the key themselves.
     recompute_kv_cache_after_weight_updates: bool = True
 
 
@@ -458,6 +463,56 @@ def _get_grpo_save_state(
         {key: value for key, value in loaded_state.items() if key in known_fields}
     )
     return GRPOSaveState(**state_values)
+
+
+def _reconcile_megatron_recompute_kv_cache_flag(
+    async_grpo_config: Optional[AsyncGRPOConfig],
+    generation_config: GenerationConfig,
+) -> None:
+    """Align ``recompute_kv_cache_after_weight_updates`` with Megatron generation.
+
+    Megatron generation expresses recompute-after-refit engine-side via
+    ``mcore_generation_config.kv_cache_management_mode="recompute"``; the
+    loop-level flag must agree. The flag's class default (true) is chosen for
+    vLLM, where it also governs prefix-cache invalidation, so when the user left
+    the flag unset it is derived from the engine mode instead of erroring. Note
+    that ``model_fields_set`` reflects the merged YAML, exemplar included: a
+    recipe that inherits ``grpo_math_1B.yaml`` carries that file's explicit
+    value and never reaches the derivation.
+
+    Args:
+        async_grpo_config: ``grpo.async_grpo``; mutated in place when the flag
+            is derived. ``None`` means the legacy sync path, which has no flag.
+        generation_config: ``policy.generation`` with ``backend == "megatron"``.
+
+    Raises:
+        ValueError: when an explicitly set flag disagrees with the engine mode.
+    """
+    if (
+        async_grpo_config is not None
+        and "recompute_kv_cache_after_weight_updates"
+        not in async_grpo_config.model_fields_set
+    ):
+        async_grpo_config.recompute_kv_cache_after_weight_updates = (
+            generation_config["mcore_generation_config"]["kv_cache_management_mode"]
+            == "recompute"
+        )
+    recompute_kv_cache = bool(
+        async_grpo_config is not None
+        and async_grpo_config.recompute_kv_cache_after_weight_updates
+    )
+    kv_cache_mode = generation_config["mcore_generation_config"][
+        "kv_cache_management_mode"
+    ]
+    if recompute_kv_cache != (kv_cache_mode == "recompute"):
+        raise ValueError(
+            "grpo.async_grpo.recompute_kv_cache_after_weight_updates="
+            f"{recompute_kv_cache} conflicts with policy.generation."
+            f"mcore_generation_config.kv_cache_management_mode={kv_cache_mode!r}: "
+            "with policy.generation.backend='megatron' the two must agree. "
+            "Either set the flag to true with kv_cache_management_mode="
+            "'recompute', or leave the flag false with 'persist'/'offload'."
+        )
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -702,6 +757,13 @@ def setup(
             "This entry point never reads it, so leaving it enabled here would "
             "silently train the sampled-token top-k objective instead of the "
             "full-vocabulary reverse KL."
+        )
+
+    # Reconcile the loop-level recompute flag with Megatron generation before the
+    # config is logged or checkpointed, so every consumer sees the derived value.
+    if generation_config["backend"] == "megatron":
+        _reconcile_megatron_recompute_kv_cache_flag(
+            grpo_config.async_grpo, generation_config
         )
 
     # Set seed for all random number generators
@@ -1318,40 +1380,6 @@ def setup(
             grpo_config.max_num_epochs * train_sample_count,
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
-
-    # Megatron generation expresses recompute-after-refit engine-side via
-    # `kv_cache_management_mode="recompute"`; the loop-level flag must agree.
-    if generation_config["backend"] == "megatron":
-        async_grpo_config = grpo_config.async_grpo
-        if (
-            async_grpo_config is not None
-            and "recompute_kv_cache_after_weight_updates"
-            not in async_grpo_config.model_fields_set
-        ):
-            # The flag's default (true) is chosen for vLLM, where it also governs
-            # prefix-cache invalidation. Megatron generation expresses the same
-            # choice engine-side via kv_cache_management_mode, so when the user
-            # left the flag unset, follow the engine mode instead of erroring.
-            async_grpo_config.recompute_kv_cache_after_weight_updates = (
-                generation_config["mcore_generation_config"]["kv_cache_management_mode"]
-                == "recompute"
-            )
-        recompute_kv_cache = bool(
-            async_grpo_config is not None
-            and async_grpo_config.recompute_kv_cache_after_weight_updates
-        )
-        kv_cache_mode = generation_config["mcore_generation_config"][
-            "kv_cache_management_mode"
-        ]
-        if recompute_kv_cache != (kv_cache_mode == "recompute"):
-            raise ValueError(
-                "grpo.async_grpo.recompute_kv_cache_after_weight_updates="
-                f"{recompute_kv_cache} conflicts with policy.generation."
-                f"mcore_generation_config.kv_cache_management_mode={kv_cache_mode!r}: "
-                "with policy.generation.backend='megatron' the two must agree. "
-                "Either set the flag to true with kv_cache_management_mode="
-                "'recompute', or leave the flag false with 'persist'/'offload'."
-            )
 
     # Define initialization functions that will be used in all paths
     init_reference_model = loss_config.reference_policy_kl_penalty > 0
