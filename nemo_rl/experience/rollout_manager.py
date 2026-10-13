@@ -151,14 +151,24 @@ class RolloutDispatchRecorder(Protocol):
 
     async def replace_dropped(
         self, generation_indices: Sequence[int]
-    ) -> Mapping[int, str]:
+    ) -> Optional[ReplacedRows]:
         """Give rows a broken stream left running in Gym fresh attempts for their re-send.
 
-        Returns the replacement Gate rollout ID of each row, or nothing once the
-        group was discarded. The abandoned attempts wait for the next checkpoint
-        to retire them.
+        Returns None once the group was discarded. The abandoned attempts wait
+        for the next checkpoint to retire them.
         """
         ...
+
+
+@dataclass(frozen=True)
+class ReplacedRows:
+    """Fresh identities for rows a broken Gym stream dropped."""
+
+    # Replacement Gate rollout ID by row index.
+    rollout_ids: Mapping[int, str]
+    # The group's attempt coordinate after the replacement, as a restart would
+    # rebuild it from the ledger.
+    group_attempt: int
 
 
 # First pause before re-sending rows Gym refused at checkpoint admission. Doubles
@@ -1257,6 +1267,9 @@ class AsyncNemoGymRolloutImpl:
     ) -> Optional[dict[str, Any]]:
         """Dispatch ``pending`` rows and fill their slots in ``results`` as they land.
 
+        A row Gym refuses at checkpoint admission is re-sent on its own once
+        dispatch admission reopens, while the other rows keep streaming.
+
         Args:
             nemo_gym_env: The NeMo-Gym environment actor handle.
             pending: Rows still awaiting a result; each carries its original ``_rowidx``.
@@ -1267,8 +1280,9 @@ class AsyncNemoGymRolloutImpl:
             timer_prefix: Timer namespace forwarded to the environment.
             dispatch_recorder: Marks the submission dispatched in the recovery
                 ledger and unwinds rows Gym refuses at checkpoint admission.
-            admission_closed_rows: Collects the indices of rows Gym refused because a
-                checkpoint had admission closed; required with ``dispatch_recorder``.
+            admission_closed_rows: Rows Gym refused because a checkpoint had
+                admission closed and that wait for their re-send; required with
+                ``dispatch_recorder``.
 
         Returns:
             The environment's timing metrics, or None if the stream ended without them.
@@ -1281,131 +1295,178 @@ class AsyncNemoGymRolloutImpl:
             raise ValueError(
                 "a dispatch recorder requires a admission_closed_rows collector"
             )
-        dispatched = {row["_rowidx"] for row in pending}
-        inputs_by_rowidx = {row["_rowidx"]: row for row in pending}
-        received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
         row_failure: Optional[Exception] = None
+        streams: set[asyncio.Task[None]] = set()
+        finished: asyncio.Queue[asyncio.Task[None]] = asyncio.Queue()
 
-        # Read here, not in the actor: the scope is a ContextVar in this
-        # process, and NemoGym is a separate Ray actor.
-        remote_method = nemo_gym_env.run_rollouts.options(num_returns="streaming")
-        gate = self._dispatch_admission_gate
-        # ``dispatch_with_trace_context`` calls ``.remote`` synchronously.
-        # Release admission immediately after Ray accepts the streaming RPC;
-        # consuming the returned stream must remain live during Gym prepare.
-        async with gate.mutation("gym_dispatch") if gate is not None else nullcontext():
-            if dispatch_recorder is None:
-                result_refs = dispatch_with_trace_context(
-                    remote_method,
-                    pending,
-                    timer_prefix,
-                    per_prompt=in_per_prompt_scope(),
+        async def consume(pending_rows: list[dict], refusal_streak: int = 0) -> None:
+            nonlocal env_timing_metrics, row_failure
+            if refusal_streak:
+                # The dispatch gate below waits out the checkpoint; the pause
+                # only stops a hot loop if Gym stays closed after it opens.
+                # Refusals spend no row attempt.
+                await asyncio.sleep(
+                    min(
+                        _PARKED_REDISPATCH_BACKOFF_S * 2 ** min(refusal_streak - 1, 16),
+                        _MAX_PARKED_REDISPATCH_BACKOFF_S,
+                    )
                 )
-            else:
-                # The ledger turns DISPATCHED only once Ray has accepted the
-                # RPC, and still inside the admission, so a checkpoint never
-                # counts an attempt that is waiting at the closed gate.
-                async with dispatch_recorder.submitting(
-                    sorted(dispatched)
-                ) as mark_dispatched:
+            dispatched = {row["_rowidx"] for row in pending_rows}
+            inputs_by_rowidx = {row["_rowidx"]: row for row in pending_rows}
+            received: set[int] = set()
+
+            # Read here, not in the actor: the scope is a ContextVar in this
+            # process, and NemoGym is a separate Ray actor.
+            remote_method = nemo_gym_env.run_rollouts.options(num_returns="streaming")
+            gate = self._dispatch_admission_gate
+            # ``dispatch_with_trace_context`` calls ``.remote`` synchronously.
+            # Release admission immediately after Ray accepts the streaming RPC;
+            # consuming the returned stream must remain live during Gym prepare.
+            async with (
+                gate.mutation("gym_dispatch") if gate is not None else nullcontext()
+            ):
+                if dispatch_recorder is None:
                     result_refs = dispatch_with_trace_context(
                         remote_method,
-                        pending,
+                        pending_rows,
                         timer_prefix,
                         per_prompt=in_per_prompt_scope(),
                     )
-                    mark_dispatched()
+                else:
+                    # The ledger turns DISPATCHED only once Ray has accepted the
+                    # RPC, and still inside the admission, so a checkpoint never
+                    # counts an attempt that is waiting at the closed gate.
+                    async with dispatch_recorder.submitting(
+                        sorted(dispatched)
+                    ) as mark_dispatched:
+                        result_refs = dispatch_with_trace_context(
+                            remote_method,
+                            pending_rows,
+                            timer_prefix,
+                            per_prompt=in_per_prompt_scope(),
+                        )
+                        mark_dispatched()
+                        assert admission_closed_rows is not None
+                        admission_closed_rows.difference_update(dispatched)
 
-        async for result_ref in result_refs:
-            item = await result_ref
-            if isinstance(item, GymAdmissionClosed):
-                rowidx = item.rowidx
-                if rowidx not in dispatched or rowidx in received:
+            async for result_ref in result_refs:
+                item = await result_ref
+                if isinstance(item, GymAdmissionClosed):
+                    rowidx = item.rowidx
+                    if rowidx not in dispatched or rowidx in received:
+                        raise ValueError(
+                            f"NeMo-Gym refused row index {rowidx}, which is not an "
+                            f"outstanding row of this attempt ({sorted(dispatched)})"
+                        )
+                    if dispatch_recorder is None:
+                        raise item
+                    received.add(rowidx)
+                    # Unwound before the next row is read, so a checkpoint draining
+                    # right now stops waiting on an episode Gym never admitted.
+                    await dispatch_recorder.refused(rowidx)
+                    assert admission_closed_rows is not None
+                    admission_closed_rows.add(rowidx)
+                    if item.timing_metrics is not None:
+                        env_timing_metrics = item.timing_metrics
+                    if self._stats is not None:
+                        self._stats.record_gym_admission_closed()
+                    # Re-sent on its own rather than after this stream ends: the
+                    # admitted rows may sit in a cohort verifier, such as GenRM,
+                    # that waits for this very row before any of them returns.
+                    submit([inputs_by_rowidx[rowidx]], refusal_streak + 1)
+                    continue
+                if isinstance(item, GymRowFailure):
+                    rowidx = item.rowidx
+                    if rowidx not in dispatched or rowidx in received:
+                        raise ValueError(
+                            f"NeMo-Gym failed row index {rowidx}, which is not an "
+                            f"outstanding row of this attempt ({sorted(dispatched)})"
+                        )
+                    received.add(rowidx)
+                    if classify_rollout_failure(item.error) is not FailureClass.INFRA:
+                        # The prompt fails as a whole; its other rows cannot save it.
+                        raise item.error
+                    # Raised once the stream ends. The other rows keep running in
+                    # Gym either way; ending the stream now would only re-send them
+                    # while they still run.
+                    if row_failure is None:
+                        row_failure = item.error
+                    continue
+                rowidx, resolved_agent_ref, result, timing_metrics = item
+                # Validated against the original group, not the pending subset: on a
+                # re-dispatch the row keeps its original index so results stay ordered.
+                if not isinstance(rowidx, int) or not 0 <= rowidx < total_rows:
                     raise ValueError(
-                        f"NeMo-Gym refused row index {rowidx}, which is not an "
-                        f"outstanding row of this attempt ({sorted(dispatched)})"
+                        f"NeMo-Gym returned invalid row index {rowidx!r} for "
+                        f"{total_rows} inputs"
                     )
-                if dispatch_recorder is None:
-                    raise item
-                received.add(rowidx)
-                # Unwound before the next row is read, so a checkpoint draining
-                # right now stops waiting on an episode Gym never admitted.
-                await dispatch_recorder.refused(rowidx)
-                assert admission_closed_rows is not None
-                admission_closed_rows.add(rowidx)
-                if item.timing_metrics is not None:
-                    env_timing_metrics = item.timing_metrics
-                continue
-            if isinstance(item, GymRowFailure):
-                rowidx = item.rowidx
-                if rowidx not in dispatched or rowidx in received:
+                if rowidx not in dispatched:
                     raise ValueError(
-                        f"NeMo-Gym failed row index {rowidx}, which is not an "
-                        f"outstanding row of this attempt ({sorted(dispatched)})"
+                        f"NeMo-Gym returned row index {rowidx}, which was not dispatched "
+                        f"in this attempt ({sorted(dispatched)})"
                     )
+                if rowidx in received:
+                    raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
                 received.add(rowidx)
-                if classify_rollout_failure(item.error) is not FailureClass.INFRA:
-                    # The prompt fails as a whole; its other rows cannot save it.
-                    raise item.error
-                # Raised once the stream ends. The other rows keep running in
-                # Gym either way; ending the stream now would only re-send them
-                # while they still run.
-                if row_failure is None:
-                    row_failure = item.error
-                continue
-            rowidx, resolved_agent_ref, result, timing_metrics = item
-            # Validated against the original group, not the pending subset: on a
-            # re-dispatch the row keeps its original index so results stay ordered.
-            if not isinstance(rowidx, int) or not 0 <= rowidx < total_rows:
-                raise ValueError(
-                    f"NeMo-Gym returned invalid row index {rowidx!r} for "
-                    f"{total_rows} inputs"
-                )
-            if rowidx not in dispatched:
-                raise ValueError(
-                    f"NeMo-Gym returned row index {rowidx}, which was not dispatched "
-                    f"in this attempt ({sorted(dispatched)})"
-                )
-            if rowidx in received:
-                raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
-            received.add(rowidx)
-            inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
-            if "receipt" in result:
-                result["reward_checks"] = compute_reward_checks(
-                    result["full_result"], inputs_by_rowidx[rowidx], self._effort_config
-                )
-                result["reward_log_context"] = RewardLogContext(
-                    agent_name=_nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
-                    full_result_json=json.dumps(
-                        {
-                            key: value
-                            for key, value in result["full_result"].items()
-                            if key != "reward"
-                        },
-                        separators=(",", ":"),
+                inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
+                if "receipt" in result:
+                    result["reward_checks"] = compute_reward_checks(
+                        result["full_result"],
+                        inputs_by_rowidx[rowidx],
+                        self._effort_config,
                     )
-                    if self._log_full_result_tables
-                    else None,
-                )
-            else:
-                shaping_by_rowidx[rowidx] = _apply_effort_shaping(
-                    [result], [inputs_by_rowidx[rowidx]], self._effort_config
-                )
-            results[rowidx] = result
-            if on_completion is not None:
-                # Use the same conversion path as completed groups so streamed
-                # recovery records inherit the current mask and reward semantics.
-                # Completion callbacks are token-capture receipt-only, making this
-                # conversion lightweight and safe to repeat during group metrics.
-                row_completions, _ = self._results_to_completions([result])
-                assert row_completions[0].env_extras is not None
-                row_completions[0].env_extras["agent_ref"] = copy.deepcopy(
-                    resolved_agent_ref
-                )
-                await on_completion(rowidx, row_completions[0])
-            if timing_metrics is not None:
-                env_timing_metrics = timing_metrics
+                    result["reward_log_context"] = RewardLogContext(
+                        agent_name=_nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
+                        full_result_json=json.dumps(
+                            {
+                                key: value
+                                for key, value in result["full_result"].items()
+                                if key != "reward"
+                            },
+                            separators=(",", ":"),
+                        )
+                        if self._log_full_result_tables
+                        else None,
+                    )
+                else:
+                    shaping_by_rowidx[rowidx] = _apply_effort_shaping(
+                        [result], [inputs_by_rowidx[rowidx]], self._effort_config
+                    )
+                results[rowidx] = result
+                if on_completion is not None:
+                    # Use the same conversion path as completed groups so streamed
+                    # recovery records inherit the current mask and reward semantics.
+                    # Completion callbacks are token-capture receipt-only, making this
+                    # conversion lightweight and safe to repeat during group metrics.
+                    row_completions, _ = self._results_to_completions([result])
+                    assert row_completions[0].env_extras is not None
+                    row_completions[0].env_extras["agent_ref"] = copy.deepcopy(
+                        resolved_agent_ref
+                    )
+                    await on_completion(rowidx, row_completions[0])
+                if timing_metrics is not None:
+                    env_timing_metrics = timing_metrics
+
+        def submit(pending_rows: list[dict], refusal_streak: int = 0) -> None:
+            task = asyncio.create_task(consume(pending_rows, refusal_streak))
+            streams.add(task)
+            # A re-send can fail while the original stream is still blocked;
+            # see its failure without waiting for that stream to end.
+            task.add_done_callback(finished.put_nowait)
+
+        submit(pending)
+        try:
+            while streams:
+                task = await finished.get()
+                task.result()
+                streams.remove(task)
+        finally:
+            # A failed stream or the group deadline must not leave a refused
+            # row's re-send dispatching after the caller has moved on.
+            for task in streams:
+                task.cancel()
+            await asyncio.gather(*streams, return_exceptions=True)
 
         if row_failure is not None:
             raise row_failure
@@ -1436,13 +1497,20 @@ class AsyncNemoGymRolloutImpl:
         ]
         if not unreturned:
             return
-        rollout_ids = await dispatch_recorder.replace_dropped(
+        replaced = await dispatch_recorder.replace_dropped(
             [row["_rowidx"] for row in unreturned]
         )
+        if replaced is None:
+            return
         for row in unreturned:
-            row["_ng_rollout_id"] = rollout_ids.get(
-                row["_rowidx"], row["_ng_rollout_id"]
-            )
+            row["_ng_rollout_id"] = replaced.rollout_ids[row["_rowidx"]]
+        if len(pending) == len(results) and all(result is None for result in results):
+            # No row of the cohort came back, so the whole cohort is replaced.
+            # GenRM keeps failed group attempts, so new rollout IDs alone would
+            # send every row straight back to the same failure. Refused rows,
+            # which keep their rollout IDs, move to the new attempt too.
+            for row in pending:
+                row[NEMO_GYM_GROUP_ATTEMPT_KEY] = replaced.group_attempt
 
     async def _run_rollouts(
         self,
@@ -1519,15 +1587,14 @@ class AsyncNemoGymRolloutImpl:
                 "NeMo-Gym prompt group",
                 registry=self._deadline_registry,
             ):
-                # Rows Gym refused at checkpoint admission never ran, so re-sending
-                # them spends no row attempt; admission_closed_streak only paces the re-sends.
+                # Rows Gym refuses at checkpoint admission are re-sent inside
+                # _stream_rows; only a lost or failed row spends an attempt.
                 attempt = 1
-                admission_closed_streak = 0
                 while attempt <= max_row_attempts:
                     pending = [row for row in inputs if results[row["_rowidx"]] is None]
                     if not pending:
                         break
-                    if attempt > 1 and admission_closed_streak == 0:
+                    if attempt > 1:
                         print(
                             f"NeMo-Gym: re-dispatching {len(pending)}/{total_rows} "
                             f"row(s) (attempt {attempt}/{max_row_attempts})",
@@ -1539,7 +1606,6 @@ class AsyncNemoGymRolloutImpl:
                         if self._stats is not None:
                             self._stats.record_gym_row_redispatch(len(pending))
                     admission_closed_rows: set[int] = set()
-                    stream_failed = False
                     try:
                         timing_metrics = await self._stream_rows(
                             nemo_gym_env,
@@ -1573,7 +1639,6 @@ class AsyncNemoGymRolloutImpl:
                             admission_closed_rows,
                             dispatch_recorder=dispatch_recorder,
                         )
-                        stream_failed = True
                     else:
                         if timing_metrics is not None:
                             env_timing_metrics = timing_metrics
@@ -1584,38 +1649,6 @@ class AsyncNemoGymRolloutImpl:
                                 admission_closed_rows,
                                 dispatch_recorder=dispatch_recorder,
                             )
-                        # A short clean end lost rows like a stream error does. Spend
-                        # the attempt, so the admission re-send below cannot reuse an
-                        # abandoned rollout ID.
-                        stream_failed = any(
-                            results[row["_rowidx"]] is None
-                            and row["_rowidx"] not in admission_closed_rows
-                            for row in pending
-                        )
-                    if admission_closed_rows:
-                        if self._stats is not None:
-                            self._stats.record_gym_admission_closed(
-                                len(admission_closed_rows)
-                            )
-                        if not stream_failed:
-                            admission_closed_streak += 1
-                            print(
-                                f"NeMo-Gym: {len(admission_closed_rows)} row(s) refused at "
-                                "checkpoint admission; re-sending once dispatch "
-                                "admission reopens",
-                                flush=True,
-                            )
-                            # The re-send also waits on the dispatch gate; the pause
-                            # only stops a hot loop if Gym stays closed after it opens.
-                            await asyncio.sleep(
-                                min(
-                                    _PARKED_REDISPATCH_BACKOFF_S
-                                    * 2 ** (admission_closed_streak - 1),
-                                    _MAX_PARKED_REDISPATCH_BACKOFF_S,
-                                )
-                            )
-                            continue
-                    admission_closed_streak = 0
                     attempt += 1
 
             missing = [index for index in expected_indices if results[index] is None]
@@ -1992,17 +2025,22 @@ class _LedgerDispatchRecorder:
 
     async def replace_dropped(
         self, generation_indices: Sequence[int]
-    ) -> Mapping[int, str]:
+    ) -> Optional[ReplacedRows]:
         ledger = self.manager._recovery_ledger
         async with self.manager._recovery_mutation() as cut:
             if self.group_id not in ledger:
                 # Discarding the group already queued its Gym episodes.
-                return {}
+                return None
             ledger.replace_dropped_dispatch(
                 cut, self.group_id, generation_indices=generation_indices
             )
             record = ledger.get_group(self.group_id)
-        return {index: record.gate_rollout_id(index) for index in generation_indices}
+        return ReplacedRows(
+            rollout_ids={
+                index: record.gate_rollout_id(index) for index in generation_indices
+            },
+            group_attempt=max(len(sibling.attempts) for sibling in record.siblings) - 1,
+        )
 
 
 class RolloutManager:
