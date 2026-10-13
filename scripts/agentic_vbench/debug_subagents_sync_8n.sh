@@ -22,9 +22,16 @@ export CHECKPOINT_KEEP_TOP_K=${CHECKPOINT_KEEP_TOP_K:-2}
 export JOB_CYCLES=${JOB_CYCLES:-6}
 export SLURM_QOS=${SLURM_QOS:-short}
 export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-02:00:00}
-# Twelve turns give the 8-node parity gate useful tool/subagent coverage while
-# keeping synchronous straggler time below the full 32-turn qualification run.
-export AGENTIC_VBENCH_MAX_TURNS=${AGENTIC_VBENCH_MAX_TURNS:-12}
+# Use the recipe's full turn budget.  A 12-turn shortcut caused every completed
+# v8 rollout to terminate before solving the task, with zero reward and no
+# delegation, so it cannot serve as the subagent qualification gate.
+export AGENTIC_VBENCH_MAX_TURNS=${AGENTIC_VBENCH_MAX_TURNS:-32}
+# This wrapper is specifically the mechanism gate, so require one bounded child
+# call.  The production recipe remains opt-in ("may delegate") after the parent
+# and child training rows have been proven healthy here.
+debug_delegation_prompt="During this task, you must call the task tool exactly once to delegate one suitable bounded subtask to the general subagent. "
+debug_delegation_prompt+="Do not delegate the full task. Review and integrate the child's result before producing the final answer."
+export AGENTIC_VBENCH_DELEGATION_PROMPT=${AGENTIC_VBENCH_DELEGATION_PROMPT:-"${debug_delegation_prompt}"}
 export BASE_NAME=${BASE_NAME:-agentic_vbench_v2_subagents_sync_8n_$(date -u +%Y%m%d-%H%M%S)-$$}
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$BASE_NAME}
 
