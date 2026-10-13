@@ -1693,7 +1693,7 @@ def get_basic_megatron_test_config(
             },
         },
         "draft": Eagle3DraftConfig(enabled=False),
-        "optimizer": None,  # Remove default FSDP optimizer
+        "optimizer": None,  # Remove default Automodel optimizer
         "scheduler": None,  # Remove default scheduler
         "max_grad_norm": 1.0,
         "generation": deepcopy(basic_vllm_test_config),

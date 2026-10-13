@@ -2301,7 +2301,7 @@ def create_megatron_test_config(
         },
         "draft": Eagle3DraftConfig(enabled=False),
         "make_sequence_length_divisible_by": tp,
-        "optimizer": None,  # Remove default FSDP optimizer
+        "optimizer": None,  # Remove default Automodel optimizer
         "scheduler": None,  # Remove default scheduler
         "max_grad_norm": 1.0,
     }
