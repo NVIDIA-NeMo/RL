@@ -55,12 +55,14 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.rollout_manager import (
+    _FAILURE_METRICS,
     AsyncNemoGymRolloutImpl,
     AsyncRolloutImpl,
     RolloutManager,
     RolloutOutcome,
     RolloutRetryPolicy,
     RolloutStats,
+    _failure_class,
     _nemo_gym_metric_namespace,
 )
 from nemo_rl.experience.rollout_recovery import (
@@ -1033,23 +1035,81 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
+_RUN_ERROR = {"failure_kind": "agent_run_error"}
+_HOST_TIMEOUT = _RUN_ERROR | {"failure_reason": "invoke failed (host_timeout)"}
+
+
 @pytest.mark.parametrize(
-    ("failure_kind", "masked", "infra", "timeout"),
-    [("agent_run_error", True, 1.0, 0.0), ("agent_timeout", False, 0.0, 1.0)],
+    ("full_result", "expected"),
+    [
+        ({"error_kind": "sandbox", "failure_kind": "agent_timeout"}, "infra"),
+        ({"sandbox_failed": True}, "infra"),
+        (
+            {
+                "_ng_failure_class": "judge_failed",
+                "failure_reason": "stopped before submitting",
+            },
+            "infra",
+        ),
+        ({"agent_error_kind": "model_connection", "resolved": False}, "infra"),
+        (_RUN_ERROR | {"failure_reason": "SandboxCreateError"}, "infra"),
+        (_HOST_TIMEOUT | {"_ng_token_capture": {"n_calls": 0}}, "infra"),
+        (_HOST_TIMEOUT | {"_ng_token_capture": {"n_calls": 461}}, "timeout"),
+        (_HOST_TIMEOUT, "timeout"),
+        (
+            {"failure_kind": "agent_timeout", "failure_reason": "context length"},
+            "timeout",
+        ),
+        ({"error_kind": "eval_timeout"}, "timeout"),
+        (
+            _RUN_ERROR | {"failure_reason": "This model's maximum context length is 8"},
+            "overflow",
+        ),
+        (
+            _RUN_ERROR | {"failure_reason": "empty block, stop-reason=max_tokens"},
+            "overflow",
+        ),
+        ({"agent_error_kind": "context_window", "resolved": True}, "overflow"),
+        (
+            _RUN_ERROR | {"failure_reason": "mini_swe_agent_incomplete, input length"},
+            "overflow",
+        ),
+        (
+            _RUN_ERROR | {"failure_reason": "mini_swe_agent_incomplete"},
+            "agent_incomplete",
+        ),
+        ({"agent_error_kind": "max_iteration", "resolved": True}, None),
+        ({}, None),
+    ],
 )
-def test_mask_infra_failures_keeps_only_infra_masked_when_gate_off(
-    failure_kind, masked, infra, timeout
-):
+def test_failure_class_precedence(full_result, expected):
+    assert _failure_class(full_result) == expected
+
+
+@pytest.mark.parametrize(
+    ("update", "failure"),
+    [
+        (_RUN_ERROR, "infra"),
+        ({"failure_kind": "agent_timeout"}, "timeout"),
+        ({"agent_error_kind": "context_window"}, "overflow"),
+        (
+            _RUN_ERROR | {"failure_reason": "stopped before submitting"},
+            "agent_incomplete",
+        ),
+    ],
+)
+def test_mask_infra_failures_masks_only_infra_when_gate_off(update, failure):
     result = _mask_gate_result()
-    result["full_result"]["failure_kind"] = failure_kind
+    result["full_result"].update(update)
     impl = _nemo_gym_impl(False, mask_infra_failures=True)
     completion = impl._results_to_completions([result])[0][0]
-    assert ("mask_sample" in completion.env_extras["instance_config"]) is masked
-    assert completion.env_extras["infra_failure"] == infra
-    assert completion.env_extras["timeout_failure"] == timeout
+    assert ("mask_sample" in completion.env_extras["instance_config"]) is (
+        failure == "infra"
+    )
+    assert completion.reward == 1.0
     metrics = impl._compute_rollout_metrics([completion], "agent")
-    assert metrics["infra_failure_rate"] == infra
-    assert metrics["timeout_rate"] == timeout
+    for name, (flag, metric) in _FAILURE_METRICS.items():
+        assert completion.env_extras[flag] == metrics[metric] == float(name == failure)
 
 
 def _mask_gate_receipt_result():

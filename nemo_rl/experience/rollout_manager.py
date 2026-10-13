@@ -119,25 +119,62 @@ def _contains_post_write_enrichment_error(error: BaseException) -> bool:
     return False
 
 
-def _is_infra_failure(full_result: Mapping[str, Any]) -> bool:
-    r = full_result
-    return bool(
+_OVERFLOW_TEXT = (
+    "max_model_len",
+    "maximum context length",
+    "input length",
+    "context_length_exceeded",
+    "context length",
+    "contextwindow",
+    "context window",
+    "stop-reason=max_tokens",
+)
+_AGENT_INCOMPLETE_TEXT = ("mini_swe_agent_incomplete", "stopped before submitting")
+# Failure class -> (env_extras flag, rollout metric).
+_FAILURE_METRICS = {
+    "infra": ("infra_failure", "infra_failure_rate"),
+    "timeout": ("timeout_failure", "timeout_rate"),
+    "overflow": ("overflow_failure", "overflow_rate"),
+    "agent_incomplete": ("agent_incomplete", "agent_incomplete_rate"),
+}
+
+
+def _failure_class(r: Mapping[str, Any]) -> Optional[str]:
+    """Return the first matching class: infra, timeout, overflow, agent_incomplete.
+
+    Only infra is masked; the other classes are model behavior and keep
+    their scored reward.
+    """
+    reason = str(r.get("failure_reason") or "").lower()
+    overflow_text = any(text in reason for text in _OVERFLOW_TEXT)
+    incomplete_text = any(text in reason for text in _AGENT_INCOMPLETE_TEXT)
+    # A host timeout after model calls means the agent ran out of time.
+    capture = r.get("_ng_token_capture")
+    host_timeout = "host_timeout" in reason and not (
+        isinstance(capture, Mapping) and capture.get("n_calls") == 0
+    )
+    run_error = r.get("failure_kind") == "agent_run_error"
+    if (
         r.get("error_kind") == "sandbox"
         or r.get("sandbox_failed")
-        or r.get("failure_kind") == "agent_run_error"
+        or (run_error and not (overflow_text or incomplete_text or host_timeout))
         or r.get("_ng_failure_class") == "judge_failed"
         or (r.get("agent_error_kind") == "model_connection" and not r.get("resolved"))
-    )
-
-
-def _is_timeout_failure(full_result: Mapping[str, Any]) -> bool:
-    r = full_result
-    return not _is_infra_failure(r) and bool(
+    ):
+        return "infra"
+    if (
         r.get("failure_kind") == "agent_timeout"
+        or (run_error and host_timeout)
         or r.get("agent_timed_out")
         or r.get("container_timed_out")
         or r.get("error_kind") == "eval_timeout"
-    )
+    ):
+        return "timeout"
+    if r.get("agent_error_kind") == "context_window" or overflow_text:
+        return "overflow"
+    if incomplete_text:
+        return "agent_incomplete"
+    return None
 
 
 def _nemo_gym_metric_namespace(row: Mapping[str, Any]) -> str:
@@ -1448,8 +1485,8 @@ class AsyncNemoGymRolloutImpl:
         # from the completion's env_extras.
         for result in results:
             full = result["full_result"]
-            infra = self._mask_infra_failures and _is_infra_failure(full)
-            if infra:
+            failure = _failure_class(full) if self._mask_infra_failures else None
+            if failure == "infra":
                 full["instance_config"] = {
                     **(full.get("instance_config") or {}),
                     "mask_sample": True,
@@ -1457,8 +1494,8 @@ class AsyncNemoGymRolloutImpl:
             elif not self._mask_env_flagged_samples:
                 (full.get("instance_config") or {}).pop("mask_sample", None)
             if self._mask_infra_failures:
-                full["infra_failure"] = float(infra)
-                full["timeout_failure"] = float(_is_timeout_failure(full))
+                for name, (flag, _) in _FAILURE_METRICS.items():
+                    full[flag] = float(failure == name)
 
         penalty_counts = apply_reward_penalties(
             token_results, self._reward_penalty_config
@@ -1601,12 +1638,8 @@ class AsyncNemoGymRolloutImpl:
         }
         if self._mask_infra_failures:
             extras = [c.env_extras or {} for c in completions]
-            rollout_metrics["infra_failure_rate"] = (
-                sum(e.get("infra_failure", 0.0) for e in extras) / n
-            )
-            rollout_metrics["timeout_rate"] = (
-                sum(e.get("timeout_failure", 0.0) for e in extras) / n
-            )
+            for flag, metric in _FAILURE_METRICS.values():
+                rollout_metrics[metric] = sum(e.get(flag, 0.0) for e in extras) / n
 
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
