@@ -1812,7 +1812,16 @@ def _build_gym_actor_config(
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
-    decode_prompt_strs = bool(nemo_gym_dict.pop("decode_prompt_strs", True))
+    # Like the other optional NeMo-RL-side knobs, null/absent means "use the
+    # default"; anything that is not a bool is a misconfiguration.
+    decode_prompt_strs = nemo_gym_dict.pop("decode_prompt_strs", None)
+    if decode_prompt_strs is None:
+        decode_prompt_strs = True
+    elif not isinstance(decode_prompt_strs, bool):
+        raise ValueError(
+            "env.nemo_gym.decode_prompt_strs must be a boolean, got "
+            f"{decode_prompt_strs!r}"
+        )
     port_range = {
         key: value
         for key in ("port_range_low", "port_range_high")
