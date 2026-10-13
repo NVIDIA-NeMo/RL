@@ -27,6 +27,11 @@ export AGENTIC_VBENCH_COMPACTION_AUTO=false
 export AGENTIC_VBENCH_COMPACTION_PRUNE=false
 export AGENTIC_VBENCH_TRAINING_MODE=subagent
 export AGENTIC_VBENCH_SUBAGENTS_ENABLED=true
+# Keep the pinned task row verbatim; OpenCode applies this only to the primary
+# build agent so the dedicated smoke reliably exercises child-trace training.
+delegation_prompt_default="You may delegate suitable subtasks to subagents when useful. "
+delegation_prompt_default+="Review and integrate their results before producing the final answer."
+export AGENTIC_VBENCH_DELEGATION_PROMPT=${AGENTIC_VBENCH_DELEGATION_PROMPT:-"${delegation_prompt_default}"}
 export NUM_NODES=${NUM_NODES:-16}
 export NUM_GEN_NODES=${NUM_GEN_NODES:-8}
 export SEGMENT_SIZE=${SEGMENT_SIZE:-8}
