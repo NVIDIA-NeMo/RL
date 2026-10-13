@@ -20,6 +20,7 @@ import ray
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
@@ -64,7 +65,7 @@ class RemoteVllmGeneration(GenerationInterface):
             )
         RemoteVllmServiceConfig.model_validate(generation["remote_vllm_cfg"])
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: GenerationConfig) -> None:
         self.cfg = config
         self.remote_config = RemoteVllmServiceConfig.model_validate(
             config["remote_vllm_cfg"]
