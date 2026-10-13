@@ -89,6 +89,7 @@ async_rl:
 
 data_plane:
   enabled: true
+  claim_meta_poll_interval_s: 0.5
   impl: transfer_queue
   backend: simple
   simple:
