@@ -1236,12 +1236,17 @@ class VllmAsyncGenerationWorkerImpl(
                     )
 
                 final_res = None
+                cancelled = False
 
                 async def capture_result_generator():
-                    nonlocal final_res
-                    async for res in result_generator:
-                        final_res = res
-                        yield res
+                    nonlocal final_res, cancelled
+                    try:
+                        async for res in result_generator:
+                            final_res = res
+                            yield res
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        raise
 
                 response = await super().chat_completion_full_generator(
                     request,
@@ -1249,6 +1254,16 @@ class VllmAsyncGenerationWorkerImpl(
                     *args,
                     **kwargs,
                 )
+                if cancelled:
+                    # vLLM's chat_completion_full_generator catches the
+                    # CancelledError that with_cancellation throws into the
+                    # handler task on a client disconnect and returns
+                    # ErrorResponse("Client disconnected") instead of
+                    # re-raising. Nobody reads that response (the wrapper has
+                    # already returned), and letting it through would make the
+                    # route label the capture "error_response". Re-raise so the
+                    # task finishes cancelled and the route sees the disconnect.
+                    raise asyncio.CancelledError()
                 if (
                     not isinstance(response, ChatCompletionResponse)
                     or final_res is None
@@ -1467,7 +1482,10 @@ class VllmAsyncGenerationWorkerImpl(
                     status_code=400,
                 )
             except asyncio.CancelledError:
-                # Client disconnected (see with_cancellation above).
+                # Client disconnected (see with_cancellation above). A cancel
+                # before generation starts propagates here directly; one that
+                # lands mid-generation is swallowed by vLLM and re-raised by
+                # NeMoRLOpenAIServingChatMixin.chat_completion_full_generator.
                 worker_self._abort_request_capture(request, reason="client_disconnect")
                 raise
             except BaseException:
