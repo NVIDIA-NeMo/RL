@@ -108,7 +108,7 @@ def _datum(*, multiple_turns: bool = False, trailing_content: str = "") -> dict:
 @pytest.mark.parametrize("separator", ["", " \n\n"])
 @pytest.mark.parametrize("trailing_content", ["", "  \n"])
 @pytest.mark.parametrize("pad_is_eot", [False, True])
-def test_masks_include_each_assistant_eot_only(
+def test_masks_include_only_final_assistant_content_and_eot(
     separator: str, trailing_content: str, pad_is_eot: bool
 ):
     student = _tokenizer(suffix=separator + "<eot>\n", pad_is_eot=pad_is_eot)
@@ -116,16 +116,16 @@ def test_masks_include_each_assistant_eot_only(
     batch = _collator(student, teacher)(
         [_datum(multiple_turns=True, trailing_content=trailing_content)]
     )
-    # Every turn has three tokens: role, content, EOT. Only the two assistant
-    # content/EOT pairs are scored. User terminators and padding share the EOT
+    # Every turn has three tokens: role, content, EOT. Only the final assistant
+    # content/EOT pair is scored. Earlier turns and padding share the EOT
     # id in some tokenizers, so enabling every occurrence of that id is wrong.
-    expected = torch.tensor([[0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0]])
+    expected = torch.tensor([[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0]])
     assert torch.equal(batch["token_mask"], expected)
     assert torch.equal(batch["teacher_0_token_mask"], expected)
-    assert batch["alignment_0_pair_valid"].sum().item() == 4
+    assert batch["alignment_0_pair_valid"].sum().item() == 2
     for side in ("student", "teacher"):
         chunks = batch[f"alignment_0_{side}_chunk_id"][0]
-        assert chunks[[4, 5, 10, 11]].tolist() == [0, 1, 2, 3]
+        assert chunks[[10, 11]].tolist() == [0, 1]
         assert chunks[expected[0] == 0].eq(-1).all()
 
 
@@ -147,10 +147,10 @@ def test_template_without_terminators_does_not_supervise_next_role_header():
     student = _tokenizer(suffix="")
     teacher = _tokenizer(suffix="", teacher=True)
     batch = _collator(student, teacher)([_datum(multiple_turns=True)])
-    expected = torch.tensor([[0, 0, 0, 1, 0, 0, 0, 1]])
+    expected = torch.tensor([[0, 0, 0, 0, 0, 0, 0, 1]])
     assert torch.equal(batch["token_mask"], expected)
     assert torch.equal(batch["teacher_0_token_mask"], expected)
-    assert batch["alignment_0_pair_valid"].sum().item() == 2
+    assert batch["alignment_0_pair_valid"].sum().item() == 1
     assert batch["alignment_0_student_chunk_id"][0, 4] == -1
 
 

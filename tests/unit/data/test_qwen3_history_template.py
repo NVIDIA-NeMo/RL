@@ -257,6 +257,96 @@ def test_training_history_matches_history_preserving_reference(
     assert ours == reference
 
 
+@pytest.mark.parametrize("teacher_kind", ["ce", "same_tokenizer", "cross_tokenizer"])
+def test_stock_qwen_ordinary_chat_trains_only_final_repeated_answer(
+    stock_qwen_tokenizer: PreTrainedTokenizerBase, teacher_kind: str
+) -> None:
+    student = copy.deepcopy(stock_qwen_tokenizer)
+    teacher = None if teacher_kind == "ce" else copy.deepcopy(stock_qwen_tokenizer)
+    messages = [
+        {"role": "user", "content": "Please repeat Same answer"},
+        {"role": "assistant", "content": "Same answer"},
+        {"role": "user", "content": "Repeat it again"},
+        {"role": "assistant", "content": "Same answer"},
+    ]
+    original = copy.deepcopy(messages)
+    rendered = student.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
+    )
+    earlier_render = student.apply_chat_template(
+        messages[:2], tokenize=False, add_generation_prompt=False
+    )
+    # Stock Qwen changes the earlier answer's scaffold once another user turn
+    # follows it. This is the multi-turn case that prefix comparisons rejected.
+    assert not rendered.startswith(earlier_render)
+    selected = [0, 1, 0, 1]
+    document = _render_and_tokenize_chat(
+        student,
+        messages,
+        1024,
+        message_loss_mask=selected,
+        include_thinking_in_loss=False,
+        native_thinking_alignment=False,
+    )
+    cross_tokenizer = teacher_kind == "cross_tokenizer"
+    collator = CrossTokenizerCollator(
+        config=CrossTokenizerCollatorConfig(mode="chat"),
+        student_tokenizer=student,
+        teacher_tokenizers=[teacher],
+        aligners=[
+            TokenAligner(student, teacher, "unused.pt") if cross_tokenizer else None
+        ],
+        ctx_length_student=1024,
+        ctx_length_teachers=[1024],
+        drop_first_assistant_chunk_kl_by_teacher=[False],
+        make_seq_div_by_student=64,
+        make_seq_div_by_teachers=[64],
+    )
+    batch = collator(
+        [
+            {
+                "message_log": messages,
+                "message_loss_mask": selected,
+                "loss_multiplier": 1.0,
+                "idx": 71,
+            }
+        ]
+    )
+    assert messages == original
+    assert document.rendered_text == rendered
+    assert document.source_turn_indices == [3]
+    answer_start = rendered.rindex("Same answer")
+    answer_end = answer_start + len("Same answer")
+    assert document.assistant_spans == [(answer_start, answer_end)]
+    eot_id = student.convert_tokens_to_ids("<|im_end|>")
+    final_eot = max(
+        i for i, token_id in enumerate(document.input_ids) if token_id == eot_id
+    )
+    assert document.eot_indices == [final_eot]
+    target_indices = [
+        i
+        for i, (start, end) in enumerate(document.offsets)
+        if answer_start <= start < end <= answer_end
+    ] + [final_eot]
+    assert target_indices
+    expected_ids = student(rendered, add_special_tokens=False)["input_ids"]
+    for prefix in ["", "teacher_0_"] if cross_tokenizer else [""]:
+        length = batch[f"{prefix}input_lengths"][0].item()
+        assert batch[f"{prefix}input_ids"][0, :length].tolist() == expected_ids
+        mask = batch[f"{prefix}token_mask"][0]
+        assert mask.nonzero(as_tuple=True)[0].tolist() == target_indices
+        if cross_tokenizer:
+            side = "teacher" if prefix else "student"
+            chunks = batch[f"alignment_0_{side}_chunk_id"][0]
+            assert chunks[mask == 0].eq(-1).all()
+            assert chunks[mask == 1].ge(0).all()
+            assert batch["alignment_0_pair_valid"][0, chunks[mask == 1]].all()
+            assert batch["alignment_0_pair_is_correct"][0, chunks[mask == 1]].all()
+    if not cross_tokenizer:
+        assert "teacher_0_input_ids" not in batch
+        assert "alignment_0_pair_valid" not in batch
+
+
 def _native_collator(student, teacher, *, same_tokenizer=False):
     return CrossTokenizerCollator(
         config=CrossTokenizerCollatorConfig(
@@ -307,11 +397,11 @@ def test_real_qwen_history_masks_and_kd(
             }
         ]
     )
-    assert document.source_turn_indices == ([1, 3] if select_all else [3])
+    assert document.source_turn_indices == [3]
     assert "Earlier unique reasoning" in document.rendered_text
     assert "Latest unique reasoning" in document.rendered_text
     for phrase, supervised in [
-        (conversation()[1]["reasoning_content"], select_all),
+        (conversation()[1]["reasoning_content"], False),
         (conversation()[3]["reasoning_content"], True),
     ]:
         start = document.rendered_text.index(phrase)
@@ -394,31 +484,40 @@ def test_real_qwen_dataset_tools_to_collator(qwen_tokenizer, tmp_path):
     decoded_targets = student.decode(
         batch["input_ids"][0, batch["token_mask"][0].bool()].tolist()
     )
-    assert '"enabled": true' in decoded_targets
-    assert '"optional": null' in decoded_targets
+    decoded_context = student.decode(batch["input_ids"][0].tolist())
+    assert '"enabled": true' in decoded_context
+    assert '"optional": null' in decoded_context
+    assert "Earlier answer" not in decoded_targets
+    assert "<tool_call>" not in decoded_targets
     assert "Latest unique reasoning" in decoded_targets
     assert "System insertion" not in decoded_targets
     assert "A tool result" not in decoded_targets
     assert batch["alignment_0_pair_valid"].any()
 
 
-def test_stock_qwen_dropped_history_fails_with_sample_context(
+def test_stock_qwen_native_mode_accepts_template_defined_history(
     stock_qwen_tokenizer: PreTrainedTokenizerBase,
 ):
     student = copy.deepcopy(stock_qwen_tokenizer)
-    with pytest.raises(
-        ValueError, match="student, sample idx=71.*(reasoning|historical)"
-    ):
-        _native_collator(student, None, same_tokenizer=True)(
-            [
-                {
-                    "message_log": conversation(),
-                    "message_loss_mask": [0, 0, 0, 1],
-                    "loss_multiplier": 1.0,
-                    "idx": 71,
-                }
-            ]
-        )
+    batch = _native_collator(student, None, same_tokenizer=True)(
+        [
+            {
+                "message_log": conversation(),
+                "message_loss_mask": [0, 1, 0, 1],
+                "loss_multiplier": 1.0,
+                "idx": 71,
+            }
+        ]
+    )
+    context = student.decode(batch["input_ids"][0].tolist())
+    targets = student.decode(
+        batch["input_ids"][0, batch["token_mask"][0].bool()].tolist()
+    )
+    assert "Earlier answer" in context
+    assert "Earlier unique reasoning" not in context
+    assert "Earlier answer" not in targets
+    assert "Latest unique reasoning" in targets
+    assert "Latest answer" in targets
 
 
 @pytest.mark.parametrize(
@@ -432,7 +531,7 @@ def test_stock_qwen_dropped_history_fails_with_sample_context(
         {"preserve_thinking": False},
     ],
 )
-def test_native_collator_rejects_configured_history_truncation(flags):
+def test_native_collator_respects_configured_history_rendering(flags):
     tokenizer = get_tokenizer(
         {
             "name": "Qwen/Qwen3-4B",
@@ -441,14 +540,22 @@ def test_native_collator_rejects_configured_history_truncation(flags):
             "chat_template_kwargs": flags,
         }
     )
-    with pytest.raises(ValueError, match="student, sample idx=29.*reasoning"):
-        _native_collator(tokenizer, None, same_tokenizer=True)(
-            [
-                {
-                    "message_loss_mask": [0, 1, 0, 1],
-                    "message_log": conversation(),
-                    "loss_multiplier": 1.0,
-                    "idx": 29,
-                }
-            ]
-        )
+    batch = _native_collator(tokenizer, None, same_tokenizer=True)(
+        [
+            {
+                "message_loss_mask": [0, 1, 0, 1],
+                "message_log": conversation(),
+                "loss_multiplier": 1.0,
+                "idx": 29,
+            }
+        ]
+    )
+    context = tokenizer.decode(batch["input_ids"][0].tolist())
+    targets = tokenizer.decode(
+        batch["input_ids"][0, batch["token_mask"][0].bool()].tolist()
+    )
+    assert "Earlier answer" in context
+    assert "Earlier unique reasoning" not in context
+    assert "Earlier answer" not in targets
+    assert "Latest unique reasoning" in targets
+    assert "Latest answer" in targets

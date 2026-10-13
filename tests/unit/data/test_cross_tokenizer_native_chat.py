@@ -331,7 +331,7 @@ def test_native_collator_wires_semantic_regions_and_tools() -> None:
     assert teacher_text == student_text
 
 
-def test_native_collator_supervises_corrected_canonical_tool_call_only() -> None:
+def test_native_collator_keeps_historical_tool_call_as_context_only() -> None:
     student, teacher, aligner = _native_pair()
     call = (
         "<tool_call>\n<function=lookup>\n<parameter=query>\nstatus\n"
@@ -377,10 +377,12 @@ def test_native_collator_supervises_corrected_canonical_tool_call_only() -> None
         )
         if include
     )
-    assert "need tool" in supervised
-    assert "<function=lookup>" in supervised
-    assert "status" in supervised
-    assert "final" in supervised
+    rendered = student.decode(result["input_ids"][0].tolist())
+    assert "need tool" in rendered
+    assert "<function=lookup>" in rendered
+    assert "status" in rendered
+    assert "secret tool result" in rendered
+    assert supervised == "done</think>final<|im_end|>"
     assert "secret tool result" not in supervised
     assert "<tools>schema</tools>" not in supervised
 
@@ -397,8 +399,7 @@ def test_native_collator_supervises_corrected_canonical_tool_call_only() -> None
         result["alignment_0_teacher_chunk_id"][0].tolist(),
         valid.tolist(),
     )
-    assert "<function=lookup>" in student_aligned
-    assert "status" in student_aligned
+    assert student_aligned == "done</think>final<|im_end|>"
     assert teacher_aligned == student_aligned
 
 
@@ -487,6 +488,8 @@ def test_structured_tool_call_with_empty_content_is_supervised(style: str) -> No
     )
     messages = [
         {"role": "user", "content": "check"},
+        {"role": "assistant", "content": "checking"},
+        {"role": "tool", "content": "secret tool result"},
         {
             "role": "assistant",
             "content": "",
@@ -501,14 +504,12 @@ def test_structured_tool_call_with_empty_content_is_supervised(style: str) -> No
                 }
             ],
         },
-        {"role": "tool", "content": "secret tool result"},
-        {"role": "assistant", "content": "done"},
     ]
     document = _render_and_tokenize_chat(
         tokenizer,
         messages,
         512,
-        message_loss_mask=[0, 1, 0, 0],
+        message_loss_mask=[0, 1, 0, 1],
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
     )
@@ -787,7 +788,9 @@ def test_native_parts_reject_unexpected_tool_serializer_difference() -> None:
 
 @pytest.mark.parametrize("select_history", [False, True])
 @pytest.mark.parametrize("inline", [False, True])
-def test_history_retention_and_supervision_are_independent(select_history, inline):
+def test_native_history_is_context_only_regardless_of_message_mask(
+    select_history: bool, inline: bool
+) -> None:
     student, teacher, aligner = _native_pair()
     messages = [
         {"role": "user", "content": "first question"},
@@ -844,13 +847,68 @@ def test_history_retention_and_supervision_are_independent(select_history, inlin
         result["alignment_0_pair_valid"][0].tolist(),
     )
     assert "earlier reasoning" in rendered and "latest reasoning" in rendered
-    assert ("earlier reasoning" in supervised) == select_history
-    assert ("earlier reasoning" in aligned) == select_history
+    assert "earlier reasoning" not in supervised and "earlier answer" not in supervised
+    assert "earlier reasoning" not in aligned and "earlier answer" not in aligned
     assert "latest reasoning" in supervised and "latest reasoning" in aligned
     assert "<think>" not in supervised
 
 
-def test_missing_unselected_historical_reasoning_is_rejected():
+def test_native_repeated_reasoning_and_answer_bind_only_final_turn() -> None:
+    student, teacher, _ = _native_pair()
+    messages = [
+        {"role": "user", "content": "first question"},
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "reason",
+        },
+        {"role": "user", "content": "repeat the answer"},
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "reason",
+        },
+    ]
+    for tokenizer in (student, teacher):
+        document = _render_and_tokenize_chat(
+            tokenizer,
+            messages,
+            512,
+            message_loss_mask=[0, 1, 0, 1],
+            include_thinking_in_loss=True,
+            native_thinking_alignment=True,
+        )
+        text = document.rendered_text
+        header = "<|im_start|>assistant\n"
+        final_content_start = text.rindex(header) + len(header)
+        assert document.source_turn_indices == [3]
+        assert document.assistant_spans == [
+            (final_content_start, text.rindex("<|im_end|>"))
+        ]
+        assert all(
+            not keep
+            for (_, end), keep in zip(document.offsets, document.assistant_mask)
+            if end <= final_content_start
+        )
+        regions = document.alignment_regions[0]
+        assert regions.reasoning == (text.rindex("reason"), text.rindex("reason") + 6)
+        assert regions.answer == (text.rindex("answer"), text.rindex("answer") + 6)
+        assert len(document.eot_indices) == 1
+        assert document.offsets[document.eot_indices[0]][0] == text.rindex("<|im_end|>")
+        supervised = tokenizer.decode(
+            [
+                token
+                for token, keep in zip(document.input_ids, document.assistant_mask)
+                if keep
+            ]
+        )
+        assert supervised == "reason</think>answer<|im_end|>"
+
+
+@pytest.mark.parametrize("select_history", [False, True])
+def test_native_template_can_drop_context_only_historical_reasoning(
+    select_history: bool,
+) -> None:
     class DroppingHistoryTokenizer(_NativeThinkingTokenizer):
         def apply_chat_template(self, messages, **kwargs):
             messages = deepcopy(messages)
@@ -858,7 +916,7 @@ def test_missing_unselected_historical_reasoning_is_rejected():
                 message.pop("reasoning_content", None)
             return super().apply_chat_template(messages, **kwargs)
 
-    tokenizer = DroppingHistoryTokenizer("qwen")
+    tokenizer = DroppingHistoryTokenizer("qwen", ("<|im_end|>",))
     messages = [
         {
             "role": "assistant",
@@ -868,15 +926,25 @@ def test_missing_unselected_historical_reasoning_is_rejected():
         {"role": "user", "content": "next"},
         {"role": "assistant", "content": "latest"},
     ]
-    with pytest.raises(ValueError, match="turn 0: missing requested reasoning"):
-        _render_and_tokenize_chat(
-            tokenizer,
-            messages,
-            512,
-            message_loss_mask=[0, 0, 1],
-            include_thinking_in_loss=True,
-            native_thinking_alignment=True,
-        )
+    document = _render_and_tokenize_chat(
+        tokenizer,
+        messages,
+        512,
+        message_loss_mask=[int(select_history), 0, 1],
+        include_thinking_in_loss=True,
+        native_thinking_alignment=True,
+    )
+    assert "old answer" in document.rendered_text
+    assert "required history" not in document.rendered_text
+    assert document.source_turn_indices == [2]
+    supervised = tokenizer.decode(
+        [
+            token
+            for token, keep in zip(document.input_ids, document.assistant_mask)
+            if keep
+        ]
+    )
+    assert supervised == "latest<|im_end|>"
 
 
 @pytest.mark.parametrize("content", ["", " \n\t"])
@@ -1028,9 +1096,9 @@ class _OrdinaryChatTokenizer(_NativeThinkingTokenizer):
         )
 
 
-def test_ordinary_canonical_spans_bind_repeated_logical_turns():
-    student = _OrdinaryChatTokenizer(trim=False)
-    teacher = _OrdinaryChatTokenizer(trim=True)
+def test_ordinary_canonical_span_binds_only_final_repeated_answer() -> None:
+    student = _OrdinaryChatTokenizer(trim=False, merged_pieces=("<|im_end|>",))
+    teacher = _OrdinaryChatTokenizer(trim=True, merged_pieces=("<|im_end|>",))
     messages = [
         {"role": "user", "content": "  Same  "},
         {"role": "assistant", "content": "  Same  "},
@@ -1051,9 +1119,9 @@ def test_ordinary_canonical_spans_bind_repeated_logical_turns():
     for document in docs:
         assert [
             document.rendered_text[start:end] for start, end in document.assistant_spans
-        ] == ["Same", "Same"]
-        assert document.source_turn_indices == [1, 3]
-        assert document.assistant_spans[0][0] > document.rendered_text.index("Same")
+        ] == ["Same"]
+        assert document.source_turn_indices == [3]
+        assert document.assistant_spans[0][0] == document.rendered_text.rindex("Same")
     aligner = TokenAligner(student, teacher, None)
     collator = CrossTokenizerCollator(
         config=CrossTokenizerCollatorConfig(mode="chat"),
@@ -1080,18 +1148,18 @@ def test_ordinary_canonical_spans_bind_repeated_logical_turns():
         result["alignment_0_student_chunk_id"][0].tolist(),
         result["alignment_0_pair_valid"][0].tolist(),
     )
-    assert aligned.count("Same") == 2
+    assert aligned == "Same<|im_end|>"
     assert result["alignment_0_pair_is_correct"][result["alignment_0_pair_valid"]].all()
 
 
-def test_ordinary_transformed_turn_cannot_match_later_repeated_content():
+def test_ordinary_transformed_final_answer_is_rejected() -> None:
     tokenizer = _OrdinaryChatTokenizer(trim=True, transform=True)
-    with pytest.raises(ValueError, match="turn 0: missing canonical content span"):
+    with pytest.raises(ValueError, match="turn 1: missing canonical content span"):
         _render_and_tokenize_chat(
             tokenizer,
             [
                 {"role": "user", "content": "same"},
-                {"role": "assistant", "content": "SAME"},
+                {"role": "assistant", "content": "same"},
             ],
             256,
             message_loss_mask=[0, 1],
@@ -1153,8 +1221,10 @@ def test_ordinary_content_matching_role_header_binds_body():
 
 
 @pytest.mark.parametrize("select_history", [False, True])
-def test_ordinary_separate_reasoning_loss_requires_native_alignment(select_history):
-    tokenizer = _NativeThinkingTokenizer("qwen")
+def test_ordinary_separate_historical_reasoning_remains_context_only(
+    select_history: bool,
+) -> None:
+    tokenizer = _NativeThinkingTokenizer("qwen", ("<|im_end|>",))
     collator = CrossTokenizerCollator(
         config=CrossTokenizerCollatorConfig(mode="chat", include_thinking_in_loss=True),
         student_tokenizer=tokenizer,
@@ -1164,28 +1234,50 @@ def test_ordinary_separate_reasoning_loss_requires_native_alignment(select_histo
         ctx_length_teachers=[512],
         drop_first_assistant_chunk_kl_by_teacher=[False],
     )
-    with pytest.raises(
-        ValueError,
-        match="student, sample idx=17: turn 1:.*native_thinking_alignment=true",
-    ):
-        collator(
+    result = collator(
+        [
+            {
+                "idx": 17,
+                "loss_multiplier": 1.0,
+                "message_loss_mask": [0, int(select_history), 0, 1],
+                "message_log": [
+                    {"role": "user", "content": "first"},
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "reasoning_content": "historical reasoning",
+                    },
+                    {"role": "user", "content": "second"},
+                    {"role": "assistant", "content": "final"},
+                ],
+            }
+        ]
+    )
+    rendered = tokenizer.decode(result["input_ids"][0].tolist())
+    supervised = tokenizer.decode(
+        result["input_ids"][0, result["token_mask"][0].bool()].tolist()
+    )
+    assert "historical reasoning" in rendered
+    assert supervised == "final<|im_end|>"
+
+
+def test_ordinary_separate_final_reasoning_loss_requires_native_alignment() -> None:
+    tokenizer = _NativeThinkingTokenizer("qwen")
+    with pytest.raises(ValueError, match="turn 1:.*native_thinking_alignment=true"):
+        _render_and_tokenize_chat(
+            tokenizer,
             [
+                {"role": "user", "content": "question"},
                 {
-                    "idx": 17,
-                    "loss_multiplier": 1.0,
-                    "message_loss_mask": [0, int(select_history), 0, 1],
-                    "message_log": [
-                        {"role": "user", "content": "first"},
-                        {
-                            "role": "assistant",
-                            "content": "answer",
-                            "reasoning_content": "required historical reasoning",
-                        },
-                        {"role": "user", "content": "second"},
-                        {"role": "assistant", "content": "final"},
-                    ],
-                }
-            ]
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": "supervised reasoning",
+                },
+            ],
+            512,
+            message_loss_mask=[0, 1],
+            include_thinking_in_loss=True,
+            native_thinking_alignment=False,
         )
 
 
@@ -1205,3 +1297,97 @@ def test_ordinary_inline_reasoning_can_receive_loss():
         [token for token, keep in zip(doc.input_ids, doc.assistant_mask) if keep]
     )
     assert supervised == "reason</think>answer<|im_end|>"
+
+
+@pytest.mark.parametrize("native_thinking_alignment", [False, True])
+@pytest.mark.parametrize(
+    "messages,message_loss_mask",
+    [
+        ([], []),
+        ([{"role": "user", "content": "question"}], [0]),
+        (
+            [
+                {"role": "assistant", "content": "earlier answer"},
+                {"role": "tool", "content": "result"},
+            ],
+            [1, 0],
+        ),
+        (
+            [
+                {"role": "assistant", "content": "earlier answer"},
+                {"role": "user", "content": "follow-up"},
+                {"role": "assistant", "content": "final answer"},
+            ],
+            [1, 0, 0],
+        ),
+    ],
+    ids=["empty", "user-final", "tool-final", "final-masked-out"],
+)
+def test_chat_requires_a_supervised_final_assistant(
+    native_thinking_alignment: bool,
+    messages: list[dict[str, str]],
+    message_loss_mask: list[int],
+) -> None:
+    tokenizer = _NativeThinkingTokenizer("qwen")
+    with pytest.raises(ValueError, match="final assistant"):
+        _render_and_tokenize_chat(
+            tokenizer,
+            messages,
+            512,
+            message_loss_mask=message_loss_mask,
+            include_thinking_in_loss=True,
+            native_thinking_alignment=native_thinking_alignment,
+        )
+
+
+def test_ordinary_final_span_uses_full_history_for_context_dependent_template() -> None:
+    class LatestThinkingTokenizer(_NativeThinkingTokenizer):
+        def __init__(self) -> None:
+            super().__init__("qwen", ("<think>", "</think>", "<|im_end|>"))
+            self.rendered_messages: list[list[dict[str, Any]]] = []
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: Any
+        ) -> str:
+            self.rendered_messages.append(deepcopy(messages))
+            prepared = deepcopy(messages)
+            # Model Qwen's different formatting of historical and final answers.
+            for index, message in enumerate(prepared):
+                if message["role"] == "assistant" and index == len(prepared) - 1:
+                    message["content"] = "<think></think>" + message["content"]
+            return super().apply_chat_template(prepared, **kwargs)
+
+    tokenizer = LatestThinkingTokenizer()
+    messages = [
+        {"role": "user", "content": "Same"},
+        {"role": "assistant", "content": "Same"},
+        {"role": "user", "content": "Same"},
+        {"role": "assistant", "content": "Same"},
+    ]
+    document = _render_and_tokenize_chat(
+        tokenizer,
+        messages,
+        512,
+        message_loss_mask=[0, 1, 0, 1],
+        include_thinking_in_loss=False,
+        native_thinking_alignment=False,
+    )
+    assert document.rendered_text.count("Same") == 4
+    assert document.rendered_text.count("<think>") == 1
+    assert document.source_turn_indices == [3]
+    start, end = document.assistant_spans[0]
+    assert start == document.rendered_text.rindex("Same")
+    assert document.rendered_text[start:end] == "Same"
+    supervised = tokenizer.decode(
+        [
+            token
+            for token, keep in zip(document.input_ids, document.assistant_mask)
+            if keep
+        ]
+    )
+    assert supervised == "Same<|im_end|>"
+    assert tokenizer.rendered_messages
+    assert all(
+        len(rendered) == len(messages) and rendered[:-1] == messages[:-1]
+        for rendered in tokenizer.rendered_messages
+    )
