@@ -3519,7 +3519,7 @@ def test_minf_image_preprocessing_emits_float32_pixels():
 
 def test_single_controller_rejects_entropy_floor_stop():
     """grpo.stop_at_entropy_below is not wired into SingleController; reject it."""
-    config = _load_fullvocab_master_config()
+    config = _make_master_config()
     validate_single_controller_config(config)
     config.grpo.stop_at_entropy_below = 0.18
     with pytest.raises(NotImplementedError, match="stop_at_entropy_below"):
