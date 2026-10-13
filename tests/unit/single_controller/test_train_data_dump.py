@@ -339,3 +339,25 @@ def test_empty_chunk_cannot_publish_completed_step(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="no training dump"):
         writer.finish_step(0)
     assert not list(tmp_path.glob("*.jsonl"))
+
+
+def test_nonfinite_logprobs_are_null_in_strict_json(tmp_path):
+    values = torch.tensor([[0.0, -torch.inf, torch.inf, torch.nan]])
+    writer = TrainDataDump(str(tmp_path))
+    writer.add_chunk(
+        step=0,
+        sample_ids=["sample"],
+        tags=None,
+        input_lengths=torch.tensor([4]),
+        sequences={"prev_logprobs": values},
+        scalars={},
+    )
+    writer.finish_step(0)
+    text = (tmp_path / "train_data_step1.jsonl").read_text()
+
+    def reject_nonfinite(value):
+        raise AssertionError(value)
+
+    row = json.loads(text, parse_constant=reject_nonfinite)
+    assert row["prev_logprobs"] == [[0.0, None, None, None]]
+    assert torch.isneginf(values[0, 1])

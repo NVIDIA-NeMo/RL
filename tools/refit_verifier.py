@@ -201,7 +201,7 @@ def setup_configs(args, tokenizer):
                 "eps": 1e-8,
             },
         },
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "enabled": False,
         },
         "dynamic_batching": {

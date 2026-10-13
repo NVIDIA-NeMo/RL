@@ -96,7 +96,7 @@ class RightShiftLossWrapper:
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
-class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
+class AutomodelValueWorkerImpl(AbstractPolicyWorker):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs."""
         if torch.distributed.is_initialized():
@@ -104,7 +104,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         else:
             return f"{self.__class__.__qualname__}"
 
-    @traced_worker_init("rl.value.load_model", **{"rl.backend": "dtensor_v2"})
+    @traced_worker_init("rl.value.load_model", **{"rl.backend": "automodel"})
     def __init__(
         self,
         config: ValueConfig,
@@ -114,16 +114,16 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         init_optimizer: bool = True,
         **kwargs: Any,
     ):
-        """Initialize the DTensorValueWorkerV2.
+        """Initialize the AutomodelValueWorker.
 
         Note: Value models don't need a reference model since they don't compute KL divergence.
         """
-        if config["dtensor_cfg"]["context_parallel_size"] > 1:
+        if config["automodel_cfg"]["context_parallel_size"] > 1:
             raise NotImplementedError(
-                "DTensorValueWorkerV2 cannot be initialized with "
+                "AutomodelValueWorker cannot be initialized with "
                 "context_parallel_size > 1 because its get_values() scoring path "
                 "does not support context parallelism. Set "
-                "value.dtensor_cfg.context_parallel_size=1."
+                "value.automodel_cfg.context_parallel_size=1."
             )
 
         # Apply patches
@@ -145,7 +145,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         self.cfg = config
         self.tokenizer = tokenizer
         self.lora_enabled = (
-            config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
+            config["automodel_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
 
         assert (
@@ -155,7 +155,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
             "DTensor value models require reward_model_cfg.enabled=true and reward_model_cfg.reward_model_type='regression'."
         )
 
-        print("Initializing DTensorValueWorkerV2")
+        print("Initializing AutomodelValueWorker")
 
         # Initialize checkpoint manager
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
@@ -189,9 +189,9 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         self.cp_size = distributed_manager.cp_size
 
         # Initialize checkpoint manager
-        dtensor_cfg = config["dtensor_cfg"]
+        automodel_cfg = config["automodel_cfg"]
         checkpoint_config = build_checkpoint_config(
-            dtensor_cfg,
+            automodel_cfg,
             model_repo_id=config["model_name"],
             dequantize_base_checkpoint=config.get("dequantize_base_checkpoint", False),
             is_peft=self.lora_enabled,
@@ -254,7 +254,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
             return nullcontext()
         return torch.autocast(device_type="cuda", dtype=self.dtype)
 
-    @wrap_with_nvtx_name("dtensor_value_worker_v2/train")
+    @wrap_with_nvtx_name("automodel_value_worker/train")
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -302,7 +302,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         )
 
         # Setup cache clearing callback if configured
-        empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
+        empty_cache_steps = self.cfg.get("automodel_cfg", {}).get(
             "clear_cache_every_n_steps"
         )
         if empty_cache_steps:
@@ -423,7 +423,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
 
             return metrics
 
-    @wrap_with_nvtx_name("dtensor_value_worker_v2/get_values")
+    @wrap_with_nvtx_name("automodel_value_worker/get_values")
     def get_values(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[ValueOutputSpec]:
@@ -496,7 +496,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
 
         return return_data
 
-    @wrap_with_nvtx_name("dtensor_value_worker_v2/prepare_for_training")
+    @wrap_with_nvtx_name("automodel_value_worker/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
         """Prepare for training by loading model and optimizer to GPU."""
         if not self.cpu_offload:
@@ -626,7 +626,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
 
 
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+    runtime_env=get_runtime_env_for_policy_worker("automodel_policy_worker")
 )  # pragma: no cover
-class DTensorValueWorkerV2(DTensorValueWorkerV2Impl):
+class AutomodelValueWorker(AutomodelValueWorkerImpl):
     pass

@@ -181,7 +181,7 @@ rollout_checkpointing:
   extra_fingerprint_excluded_paths: []
 
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true
