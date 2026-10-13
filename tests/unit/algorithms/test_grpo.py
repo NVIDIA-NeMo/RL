@@ -49,11 +49,11 @@ from nemo_rl.algorithms.grpo import (
     _baseline_valid_mask,
     _binary_participation,
     _dynamic_sampling_valid_mask,
-    _logprob_sample_mask,
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
     _log_mixed_rewards_and_advantages_information,
+    _logprob_sample_mask,
     _maybe_restore_async_replay_buffer_checkpoint,
     _needs_hf_refit_handshake,
     _raise_if_length_penalty_enabled_without_nemo_gym,
@@ -83,9 +83,9 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
-    mask_filtered_logprobs_outside_tokens,
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
+    mask_filtered_logprobs_outside_tokens,
 )
 from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
@@ -365,7 +365,7 @@ def test_refit_returns_empty_metrics_when_synchronizer_returns_none() -> None:
 
 
 def test_masked_reward_policy_default_and_validation() -> None:
-    assert GRPOConfig().masked_reward_policy == "exclude"
+    assert GRPOConfig().masked_reward_policy == "include"
     with pytest.raises(ValueError, match="masked_reward_policy"):
         GRPOConfig(masked_reward_policy="unknown")
 
@@ -391,7 +391,9 @@ class TestStatisticsParticipation:
 
         valid_mask = _advantage_valid_mask(sample_mask, config)
 
-        expected = torch.ones(3) if policy == "include" else torch.tensor([1.0, 1.0, 0.0])
+        expected = (
+            torch.ones(3) if policy == "include" else torch.tensor([1.0, 1.0, 0.0])
+        )
         assert torch.equal(valid_mask, expected)
         # The logprob pass uses the same statistics rows, not the loss weights.
         assert torch.equal(_logprob_sample_mask(sample_mask, config), expected)
@@ -441,7 +443,10 @@ class TestStatisticsParticipation:
             )
             assert torch.equal(valid_mask, torch.ones(2))
             baseline, _, _ = calculate_baseline_and_std_per_prompt(
-                prompt_ids, batch["total_reward"], valid_mask, leave_one_out_baseline=False
+                prompt_ids,
+                batch["total_reward"],
+                valid_mask,
+                leave_one_out_baseline=False,
             )
             assert torch.equal(baseline, torch.tensor([0.5, 0.5]))
             assert not calculate_trivial_reward_distributions(
@@ -3385,17 +3390,28 @@ def test_grpo_train_every_baseline_site_excludes_masked_rows(
     assert torch.all(unmasked_env_baseline[:3] > 0)
 
 
-def test_grpo_train_dynamic_sampling_recomputes_valid_mask_on_assembled_batch(
-    mock_grpo_components: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("policy", "expected_valid_mask"),
+    [
+        ("exclude", [1.0, 1.0, 0.0, 1.0, 1.0, 1.0]),
+        ("include", [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+    ],
+)
+def test_grpo_train_dynamic_sampling_estimator_mask_follows_assembled_batch(
+    mock_grpo_components: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+    expected_valid_mask: list[float],
 ) -> None:
-    """compute_advantage gets the mask of the cached+current training batch.
+    """compute_advantage gets the statistics mask of the cached+current batch.
 
     Two generation batches of 2 prompts x 3 generations. Batch 1: group 0 is
     trivial (dropped); group 1 has one masked row and is kept in the cache.
     Batch 2 has no masked rows and completes the step. The final 6-row batch is
-    [group 1 | group 2], so its mask ([1, 1, 0, 1, 1, 1]) differs from the mask
-    of the last generation batch (all ones): only a recompute on the assembled
-    batch can produce it.
+    [group 1 | group 2]. Under ``exclude`` its mask ([1, 1, 0, 1, 1, 1]) differs
+    from the mask of the last generation batch (all ones): only a mask taken on
+    the assembled batch, after ``_apply_mask_sample_filter`` zeroed the masked
+    row's loss weight, can produce it. Under ``include`` every row votes.
     """
     original_batch = next(iter(mock_grpo_components["train_dataloader"]))
     input_batch = original_batch.repeat_interleave(2)
@@ -3464,14 +3480,15 @@ def test_grpo_train_dynamic_sampling_recomputes_valid_mask_on_assembled_batch(
     cfg.grpo.num_generations_per_prompt = 3
     cfg.grpo.use_dynamic_sampling = True
     cfg.grpo.dynamic_sampling_max_gen_batches = 2
+    cfg.grpo.masked_reward_policy = policy
 
-    policy = mock_grpo_components["policy"]
+    policy_mock = mock_grpo_components["policy"]
     with (
-        _patched_logprob_phase(policy),
+        _patched_logprob_phase(policy_mock),
         pytest.raises(RuntimeError, match="captured compute_advantage inputs"),
     ):
         grpo_mod.grpo_train(
-            policy,
+            policy_mock,
             _mock_policy_generation(),
             mock_grpo_components["train_dataloader"],
             mock_grpo_components["val_dataloader"],
@@ -3490,11 +3507,9 @@ def test_grpo_train_dynamic_sampling_recomputes_valid_mask_on_assembled_batch(
     torch.testing.assert_close(
         captured["rewards"], torch.tensor([0.0, 1.0, 1.0, 0.0, 1.0, 1.0])
     )
-    # Recomputed on the assembled batch; the last generation batch's own mask
-    # would have been all ones.
-    assert torch.equal(
-        captured["valid_mask"], torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 1.0])
-    )
+    # Taken on the assembled batch under the configured policy; under exclude
+    # the last generation batch's own mask would have been all ones.
+    assert torch.equal(captured["valid_mask"], torch.tensor(expected_valid_mask))
 
 
 def test_log_mixed_rewards_pct_diagnostics_count_only_voting_rows() -> None:
@@ -3575,11 +3590,35 @@ def test_log_mixed_rewards_pct_diagnostics_without_voting_rows_are_zero() -> Non
     assert metrics["baseline_reward/pct_mixed"] == 0.0
 
 
-def test_grpo_train_pct_diagnostics_exclude_masked_rows(
+@pytest.mark.parametrize(
+    ("policy", "expected_valid_mask", "expected_pct", "expected_histogram"),
+    [
+        # Only the three real rows vote: an all-correct group.
+        ("exclude", [1.0, 1.0, 1.0, 0.0], (0.0, 100.0, 0.0), [1.0, 1.0, 1.0]),
+        # Every row votes, so the group [1, 1, 1, 0] is genuinely mixed: the
+        # real rows' leave-one-out baseline is 2/3 and the masked row's is 1.
+        (
+            "include",
+            [1.0, 1.0, 1.0, 1.0],
+            (0.0, 25.0, 75.0),
+            [2 / 3, 2 / 3, 2 / 3, 1.0],
+        ),
+    ],
+)
+def test_grpo_train_pct_diagnostics_use_the_statistics_population(
     monkeypatch: pytest.MonkeyPatch,
     mock_grpo_components: dict[str, Any],
+    policy: str,
+    expected_valid_mask: list[float],
+    expected_pct: tuple[float, float, float],
+    expected_histogram: list[float],
 ) -> None:
-    """The pct_* diagnostics count the rows that voted in the baseline."""
+    """The pct_* diagnostics count the rows that vote under the configured policy.
+
+    grpo_train hands _log_mixed_rewards_and_advantages_information the same
+    mask it hands compute_advantage: all ones under ``include``, the binary
+    final loss mask under ``exclude``.
+    """
     rewards = torch.tensor([1.0, 1.0, 1.0, 0.0])
     mask_sample = torch.tensor([False, False, False, True])
 
@@ -3642,16 +3681,18 @@ def test_grpo_train_pct_diagnostics_exclude_masked_rows(
     master_config.grpo.num_prompts_per_step = 1
     master_config.grpo.num_generations_per_prompt = 4
     master_config.grpo.use_dynamic_sampling = False
-    # Under the leave-one-out baseline the masked row's entry is 3 / 2.
+    master_config.grpo.masked_reward_policy = policy
+    # Under the leave-one-out baseline the masked row's entry is 3 / 2 when it
+    # does not vote (exclude) and 1 when it does (include).
     master_config.grpo.use_leave_one_out_baseline = True
 
-    policy = mock_grpo_components["policy"]
+    policy_mock = mock_grpo_components["policy"]
     with (
-        _patched_logprob_phase(policy),
+        _patched_logprob_phase(policy_mock),
         pytest.raises(RuntimeError, match="captured pct diagnostics"),
     ):
         grpo_mod.grpo_train(
-            policy,
+            policy_mock,
             _mock_policy_generation(),
             mock_grpo_components["train_dataloader"],
             mock_grpo_components["val_dataloader"],
@@ -3665,13 +3706,19 @@ def test_grpo_train_pct_diagnostics_exclude_masked_rows(
             master_config,
         )
 
-    assert torch.equal(captured["valid_mask"], torch.tensor([1.0, 1.0, 1.0, 0.0]))
-    # Three real rows all rewarded 1 are an all-correct group. Counting the
-    # masked row's entry (1.5) would have reported pct_1 75 / pct_mixed 25.
-    assert captured["metrics"]["baseline_reward/pct_1"] == 100.0
-    assert captured["metrics"]["baseline_reward/pct_0"] == 0.0
-    assert captured["metrics"]["baseline_reward/pct_mixed"] == 0.0
-    assert captured["histogram"].tolist() == [1.0, 1.0, 1.0]
+    assert torch.equal(captured["valid_mask"], torch.tensor(expected_valid_mask))
+    # Under exclude the three real rows all rewarded 1 are an all-correct
+    # group; counting the masked row's non-voting entry (1.5) would have
+    # reported pct_1 75 / pct_mixed 25. Under include that row votes and the
+    # group is mixed.
+    expected_pct_0, expected_pct_1, expected_pct_mixed = expected_pct
+    assert captured["metrics"]["baseline_reward/pct_0"] == expected_pct_0
+    assert captured["metrics"]["baseline_reward/pct_1"] == expected_pct_1
+    assert captured["metrics"]["baseline_reward/pct_mixed"] == expected_pct_mixed
+    torch.testing.assert_close(
+        torch.tensor(captured["histogram"].tolist()),
+        torch.tensor(expected_histogram),
+    )
 
 
 def test_dapo_dynamic_sampling_preserves_mask_sample_alignment(mock_grpo_components):
@@ -5899,9 +5946,7 @@ def _run_grpo_train_step_on_batch(mock_grpo_components, train_func, batch):
                 "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
                 return_value=(batch, rollout_metrics),
             ),
-            patch(
-                "nemo_rl.algorithms.grpo.refit_policy_generation", return_value={}
-            ),
+            patch("nemo_rl.algorithms.grpo.refit_policy_generation", return_value={}),
             patch(
                 "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
                 return_value=_mock_seq_logprob_error_result(),
@@ -6025,7 +6070,9 @@ def test_grpo_train_include_kl_in_reward_sees_real_logprobs_of_masked_rows(
         mock_grpo_components, total_reward=[1.0, 0.0], mask_sample=[False, True]
     )
     # Three prompt tokens, two response tokens per row.
-    real_policy = torch.tensor([[0.0, 0.0, 0.0, -0.5, -1.0], [0.0, 0.0, 0.0, -0.3, -2.0]])
+    real_policy = torch.tensor(
+        [[0.0, 0.0, 0.0, -0.5, -1.0], [0.0, 0.0, 0.0, -0.3, -2.0]]
+    )
     reference = torch.tensor([[0.0, 0.0, 0.0, -0.4, -0.9], [0.0, 0.0, 0.0, -0.1, -0.5]])
 
     def worker_filter(logprobs, data):
@@ -6059,7 +6106,8 @@ def test_grpo_train_include_kl_in_reward_sees_real_logprobs_of_masked_rows(
     # Zeroed logprobs for the masked row (the loss mask as the worker filter)
     # would have shifted the unmasked row.
     zeroed = (rewards - rewards.mean())[:, None] - 0.2 * (
-        real_policy * torch.tensor([[1.0], [0.0]]) - reference * torch.tensor([[1.0], [0.0]])
+        real_policy * torch.tensor([[1.0], [0.0]])
+        - reference * torch.tensor([[1.0], [0.0]])
     )
     zeroed_stats = zeroed[token_mask.bool()]
     assert not torch.allclose(

@@ -358,10 +358,12 @@ class GRPOConfig(BaseModel, extra="allow"):
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
     normalize_rewards: bool = True
-    # Participation of loss-masked rewards in group and batch advantage statistics.
-    # "exclude" omits them from statistics; "include" enables ablations.
-    # Neither value changes the loss mask.
-    masked_reward_policy: Literal["exclude", "include"] = "exclude"
+    # Which rows vote in the advantage statistics (group baseline/std, GDPO and
+    # Reinforce++ batch normalization, dynamic-sampling admission). "include"
+    # (default, requested by the post-training team): every row, masked rewards
+    # too. "exclude": only rows with a nonzero loss weight. Neither changes the
+    # loss masks; token-capture placeholders never vote under either policy.
+    masked_reward_policy: Literal["include", "exclude"] = "include"
     # Clipping bounds for normalized advantages to prevent extreme values
     # When set, advantages are clipped to [advantage_clip_low, advantage_clip_high] after normalization
     # Default: null (no clipping)
