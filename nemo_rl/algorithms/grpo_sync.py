@@ -489,7 +489,6 @@ def grpo_train_sync(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
     )
-    timeout.start_iterations()
     memory_tracker = MemoryTracker()
 
     kv_scales_cache = None  # Cache reused for computed kv scales
@@ -623,6 +622,11 @@ def grpo_train_sync(
         )
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
+
+    # Time iterations from the first training step so that the optional
+    # val_at_start pass above does not become the slowest "iteration" that the
+    # checkpoint_must_save_by look-ahead budgets for.
+    timeout.start_iterations()
 
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())

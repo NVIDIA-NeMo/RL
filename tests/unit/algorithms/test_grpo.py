@@ -5456,6 +5456,61 @@ def test_grpo_timeout_budgets_upcoming_validation(
     )
 
 
+@pytest.mark.parametrize("train_func", [grpo_train, grpo_train_sync])
+def test_grpo_timeout_iterations_start_after_initial_validation(
+    mock_grpo_components, train_func
+):
+    """The val_at_start pass is not measured as an iteration.
+
+    With the max-based look-ahead, an initial validation folded into the first
+    iteration time would otherwise set the estimate for the whole run.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 2
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = True
+    master_config.checkpointing["enabled"] = False
+
+    events: list[object] = []
+
+    def record_validate(*args, **kwargs):
+        events.append(("validate", kwargs["step"]))
+        return {}, {}
+
+    with ExitStack() as stack:
+        mock_validate, mock_timeout = _enter_timeout_test_mocks(
+            stack, train_func, mock_grpo_components
+        )
+        mock_validate.side_effect = record_validate
+        mock_timeout.start_iterations.side_effect = lambda: events.append(
+            "start_iterations"
+        )
+        mock_timeout.mark_iteration.side_effect = lambda: events.append(
+            "mark_iteration"
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert events == [
+        ("validate", 0),
+        "start_iterations",
+        "mark_iteration",
+        "mark_iteration",
+    ]
+
+
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     [
