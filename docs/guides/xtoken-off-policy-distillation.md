@@ -246,10 +246,9 @@ and each retained end-of-turn token; user turns, role headers, and padding are
 excluded. Cross-tokenizer KD aligns assistant content and uses a separate EOT
 pair when both tokenizations retain the terminator.
 
-The configuration class supplies defaults. The old `data.collator_mode` key
-becomes `collator.mode`; the other four settings also move from `data` into
-`collator`. Packing multiple examples per row remains unsupported; keep
-`num_packed_rows=1`. Text tokenization uses `add_special_tokens=False`. Chat
+The configuration class supplies defaults. Packing multiple examples per row
+remains unsupported; keep `num_packed_rows=1`. Text tokenization uses
+`add_special_tokens=False`. Chat
 rows exceeding either the student's or any teacher's context limit are rejected
 instead of independently truncating their conversations.
 
