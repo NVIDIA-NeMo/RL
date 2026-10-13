@@ -54,9 +54,12 @@ class TQValue(TQDriverMixin, Value):
     built alongside this critic already did that. Partition lifecycle stays
     with the caller.
 
-    The value workers have no split begin/microbatch/finish train API, so one
-    train_from_meta call is one optimizer step. Streaming PPO retains every
-    chunk's rows and trains the critic on the complete batch after policy refit.
+    The split API accumulates chunks into one optimizer step. Keep the model
+    resident between begin and finish/abort so gradient buffers survive.
+    Across calls the chunks must contain exactly ``gbs`` samples. Each chunk
+    must be shardable over critic DP ranks and contain complete microbatches
+    unless packing or dynamic batching is enabled. Failed steps require abort
+    before reuse.
     """
 
     def __init__(
