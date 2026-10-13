@@ -24,8 +24,8 @@ RECIPE_ROOT = Path(__file__).parents[2] / "examples/configs/recipes"
 @pytest.mark.parametrize(
     "recipe_name",
     [
-        "llm/sft-nanov3-30BA3B-2n8g-fsdp2.yaml",
-        "llm/sft-nanov3-30BA3B-2n4g-fsdp2.yaml",
+        "llm/sft-nanov3-30BA3B-2n8g-automodel.yaml",
+        "llm/sft-nanov3-30BA3B-2n4g-automodel.yaml",
         "llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.yaml",
         "llm/sft-gpt-oss-20b-1n4g-fsdp4ep4-automodel.yaml",
         "vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml",
@@ -45,7 +45,7 @@ def test_gemma4_cp_keeps_local_hybridep_inputs_aligned(
 ) -> None:
     register_omegaconf_resolvers()
     config = load_config(
-        RECIPE_ROOT / "llm/dapo-gemma4-26ba4b-it-4n8g-fsdp2ep16cp2-automodel.yaml"
+        RECIPE_ROOT / "llm/dapo-gemma4-26ba4b-it-4n8g-automodel-ep16cp2.yaml"
     )
     config.policy.automodel_cfg.context_parallel_size = context_parallel_size
     global_alignment = 64 * config.policy.automodel_cfg.context_parallel_size
@@ -65,7 +65,7 @@ def test_gemma4_cp_keeps_local_hybridep_inputs_aligned(
             "hybridep",
             "torch_mm",
         ),
-        ("llm/dapo-gemma4-26ba4b-it-4n8g-fsdp2-automodel.yaml", "hybridep", "gmm"),
+        ("llm/dapo-gemma4-26ba4b-it-4n8g-automodel.yaml", "hybridep", "gmm"),
         ("llm/dapo-nanov3.5-30BA3B-4n8g-automodel.yaml", "hybridep", "gmm"),
         ("llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml", "hybridep", "gmm"),
         ("llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml", "hybridep", "gmm"),

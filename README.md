@@ -40,8 +40,8 @@
     * LoRA GRPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1889) backends.
     * LoRA DPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1826) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/2125) backends.
     * Nano v3 LoRA recipes:
-        * [sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
-        * [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
+        * [sft-nanov3-30BA3B-2n8g-automodel-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-lora.yaml)
+        * [grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml)
         * [grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml)
    
 * [01/30/2026] [Release v0.5.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.5.0)

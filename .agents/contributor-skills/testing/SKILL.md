@@ -59,9 +59,9 @@ Append the driver script path (relative to `tests/test_suites/`) to @tests/test_
 
 Examples:
 ```
-sft-llama3.1-8b-1n8g-fsdp2tp1-long.yaml
+sft-llama3.1-8b-1n8g-automodel-long.yaml
 grpo-llama3.1-8b-instruct-1n8g-megatron-fp8.yaml
-grpo-qwen2.5-7b-instruct-4n8g-fsdp2tp4sp.v3.yaml
+grpo-qwen2.5-7b-instruct-4n8g-automodel-tp4sp.v3.yaml
 ```
 
 ### VLM Pattern
