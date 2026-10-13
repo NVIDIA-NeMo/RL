@@ -5355,7 +5355,7 @@ class SingleControllerActor:
             )
 
     async def _run_policy_logprobs(self, meta: KVBatchMeta, *, step_open: bool) -> None:
-        if step_open:
+        if step_open and self._is_ppo and not self._value_dedicated:
             with self._timer.time("training_prep"):
                 await asyncio.to_thread(self._trainer.prepare_for_training)
         if not (self._policy_logprobs_required or self._reference_logprobs_required):
