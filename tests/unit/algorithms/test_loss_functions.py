@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import math
 import pickle
 
 import pytest
@@ -2483,6 +2484,55 @@ def test_distillation_loss_jsd_symmetric_beta():
     )
 
     torch.testing.assert_close(loss, swapped_loss, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("jsd_beta", [0.1, 0.5, 0.9])
+def test_distillation_loss_jsd_zero_outside_topk_matches_full_vocab(jsd_beta):
+    """zero_outside_topk jsd must equal the full-vocab JSD with a top-k teacher."""
+    torch.manual_seed(0)
+    batch_size, seq_len, vocab_size, k = 2, 5, 32, 4
+    student_logprobs = torch.randn(
+        batch_size, seq_len, vocab_size, dtype=torch.float64
+    ).log_softmax(-1)
+    teacher_logits = 2 * torch.randn(
+        batch_size, seq_len, vocab_size, dtype=torch.float64
+    )
+    topk_indices = teacher_logits.topk(k, dim=-1).indices
+    student_topk_logprobs = student_logprobs.gather(-1, topk_indices)
+    teacher_topk_logprobs = teacher_logits.gather(-1, topk_indices).log_softmax(-1)
+    H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
+
+    loss_fn = DistillationLossFn(
+        DistillationLossConfig(kl_type="jsd", jsd_beta=jsd_beta, zero_outside_topk=True)
+    )
+    loss, _ = loss_fn(
+        student_topk_logprobs=student_topk_logprobs,
+        teacher_topk_logprobs=teacher_topk_logprobs,
+        H_all=H_all,
+        data={"input_ids": torch.zeros(batch_size, seq_len + 1, dtype=torch.long)},
+        global_valid_seqs=None,
+        global_valid_toks=None,
+    )
+
+    teacher_logprobs = torch.full_like(
+        student_logprobs, float(loss_fn.log_infinitesimal)
+    ).scatter(-1, topk_indices, teacher_topk_logprobs)
+    mixture_logprobs = torch.logaddexp(
+        teacher_logprobs + math.log(jsd_beta),
+        student_logprobs + math.log1p(-jsd_beta),
+    )
+    expected = (
+        (
+            jsd_beta * teacher_logprobs.exp() * (teacher_logprobs - mixture_logprobs)
+            + (1 - jsd_beta)
+            * student_logprobs.exp()
+            * (student_logprobs - mixture_logprobs)
+        )
+        .sum(-1)
+        .mean()
+    )
+
+    torch.testing.assert_close(loss, expected, atol=1e-6, rtol=1e-5)
 
 
 def test_distillation_loss_jsd_gradient_flow():

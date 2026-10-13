@@ -1865,14 +1865,22 @@ class DistillationLossFn(LossFunction):
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
-        # jsd is forward KL at beta=0 and reverse KL at beta=1, so the topk
-        # correction below is skipped/unscaled the same way forward/reverse are.
-        is_forward_like = self.kl_type == "forward" or (
-            self.kl_type == "jsd" and self.jsd_beta <= 0.0
-        )
-
         loss_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
-        if self.zero_outside_topk and not is_forward_like:
+        if self.zero_outside_topk and self.kl_type == "jsd":
+            if 0.0 < self.jsd_beta < 1.0:
+                # Outside the top-k the teacher is ~0, so M = (1 - beta) * student
+                # there and only KL(student || M) contributes, which reduces to
+                # -(1 - beta) * log(1 - beta) * P_rest. beta=0/1 fall back to the
+                # forward/reverse KL handling below.
+                P_rest = 1 - student_probs.sum(-1)  # [B, S-1]
+                loss_correction_term = (
+                    -(1.0 - self.jsd_beta) * math.log1p(-self.jsd_beta) * P_rest
+                )
+            elif self.jsd_beta >= 1.0:
+                H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
+                P_rest = 1 - (student_probs.sum(-1))
+                loss_correction_term = H_rest - self.log_infinitesimal * P_rest
+        elif self.zero_outside_topk and self.kl_type != "forward":
             H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
             P_rest = 1 - (student_probs.sum(-1))
             # The entropy and prob of the rest of the tokens [B, S-1]
@@ -1881,8 +1889,6 @@ class DistillationLossFn(LossFunction):
                 loss_correction_term = loss_correction_term * (
                     1.0 - self.mixed_kl_weight
                 )
-            elif self.kl_type == "jsd" and self.jsd_beta < 1.0:
-                loss_correction_term = loss_correction_term * (1.0 - self.jsd_beta)
 
         if self.kl_type == "forward":
             per_token_kl = teacher_probs * (
