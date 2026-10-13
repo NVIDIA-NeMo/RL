@@ -110,7 +110,10 @@ case "$NRL_MOUNT_HOST_ENROOT" in
 esac
 # Seconds the head srun may outlive the driver before the job is ended anyway (0 disables).
 DRIVER_EXIT_GRACE_S=${DRIVER_EXIT_GRACE_S:-180}
-if [[ ! "$DRIVER_EXIT_GRACE_S" =~ ^[0-9]+$ ]]; then
+if [[ "$DRIVER_EXIT_GRACE_S" =~ ^[0-9]+$ ]]; then
+  # Force base 10: (( )) would read a leading zero as octal ("08" errors, "010" means 8).
+  DRIVER_EXIT_GRACE_S=$((10#$DRIVER_EXIT_GRACE_S))
+else
   echo "Error: DRIVER_EXIT_GRACE_S must be a non-negative integer number of seconds (0 disables), got '$DRIVER_EXIT_GRACE_S'." >&2
   exit 1
 fi

@@ -177,6 +177,8 @@ def test_sidecar_failure_signals_ended_without_waiting_for_the_grace_period(
         (None, 0, "180"),  # unset: default
         ("0", 0, "0"),  # disabled
         ("600", 0, "600"),
+        ("08", 0, "8"),  # a leading zero must not be read as octal ((( 08 )) errors)
+        ("010", 0, "10"),  # ... nor silently mean 8
         ("abc", 1, None),
         ("1.5", 1, None),
         ("-1", 1, None),
