@@ -45,20 +45,14 @@ single `ValueError` listing every violation. The current requirements are:
   configured ETP. An explicitly requested generation-side ETP > 1 with
   `inference_optimized` is rejected by config key name rather than surfacing as
   a raw MCore assert at model build.
-* **Bulk precision is independent of source and destination storage.** Supported
-  Transformer Engine blockwise FP8 and MXFP8 training parameters are dequantized
-  using their own quantization metadata. BF16 logical weights are then sent to
-  BF16, blockwise FP8, or MXFP8 destination hooks. The destination derives its
-  own weight scales when requantizing; training-side scales are not a wire format.
-  vLLM blockwise destinations use FP32 inverse scales and the destination's effective
-  block grid, including refined MoE grids. Fused gate/up partitions must align with
-  that grid; incompatible runtime scale layouts are rejected. Megatron blockwise destinations
-  use Transformer Engine storage, while `inference_optimized` supports MXFP8.
-  The unchanged misc path still limits blockwise FP8 parameter storage on the
-  training side to blockwise FP8 vLLM destinations (`precision='fp8'`, `is_mx=false`):
-  misc weights retain their physical FP8 values and inverse scales. This restriction
-  comes from misc loading, not from the bulk BF16 transport.
-* Megatron generation accepts BF16 or supported Transformer Engine FP8 training
+* **Supported precisions:** BF16, FP16, FP32, Transformer Engine blockwise FP8,
+  and MXFP8 sources; unquantized, blockwise FP8, and MXFP8 destinations.
+  Megatron blockwise FP8 destinations require Transformer Engine layers;
+  `inference_optimized` supports MXFP8. Blockwise FP8 training storage with
+  vLLM still requires `precision='fp8'`, `is_mx=false` because of the misc path.
+  TE FP8 generation over unquantized parameters requires
+  `disable_parameter_transpose_cache=true` so refits refresh its compute weights.
+* Megatron generation accepts unquantized or supported Transformer Engine FP8 training
   parameter storage, including blockwise FP8 and MXFP8 with `fp8_param=true`.
   Quantized sources are materialized as logical BF16 for transport; the
   destination either stores the logical weight or quantizes each complete local
@@ -70,14 +64,11 @@ single `ValueError` listing every violation. The current requirements are:
   persistent DDP/autograd views remain valid; ordinary gradient buffers and
   optimizer state are offloaded only when
   `policy.generation.mcore_generation_config.offload_policy_before_refit` is true.
-* **Every bulk transfer uses canonical HF layout and `torch.bfloat16`.** This
-  contract applies to the source `ctx.buf`, advertised metadata, and receiver
-  buffer, including MXFP8 train → MXFP8 gen. It deliberately trades wire size
-  and repeated dequantization for a stable interface across storage formats.
-  For example, TE and MCore MXFP8 use different representations, and MCore's
-  padded, swizzled scale layout cannot be resharded as logical HF weights.
-  Precision-specific conversion belongs in the hooks. This BF16 requirement
-  does not change the misc path or other refit transports.
+* **Bulk transfers use canonical HF layout.** Quantized sources are dequantized
+  to `torch.bfloat16`; unquantized sources retain their original dtype.
+  Source `ctx.buf`, advertised metadata, and receiver buffers share that dtype.
+  Destination hooks own storage conversion and quantization. The misc path and
+  other refit transports retain their existing behavior.
 * BF16 FlashInfer TRTLLM MoE is supported through vLLM's native
   layerwise-reload path. Its grouped expert weights must use expert-parallel
   destination sharding with linear expert placement; tensor-sharded expert
@@ -159,8 +150,8 @@ the inference-engine lifecycle and delegates only the transfer to an
 `NcclReshardWeightSynchronizer.init_communicator()` runs three steps once, before
 training starts:
 
-Bulk preparation always describes logical BF16 weights, regardless of the generation
-backend. There is no payload-mode negotiation. Bulk conversion tasks are kept separate
+Bulk preparation describes logical weights in the source's transfer dtype, regardless
+of the generation backend. Bulk conversion tasks are kept separate
 from the existing misc export tasks so changing the bulk contract does not change
 attention, embedding, router, or other misc payloads. Megatron workers are assigned
 an explicit source or destination refit role and expose the same
@@ -192,8 +183,8 @@ The derived metadata (`nccl_reshard_refit_info`) contains, per parameter:
 * `name` — the HF parameter name (per-expert MoE weights are grouped into a single
   `...experts.{gate,up,down}_proj.weight` entry of shape `[num_experts, ...]`, tagged
   with `grouped_expert_proj`);
-* `global_shape` in canonical HF layout and `dtype=torch.bfloat16` for the full,
-  unsharded logical tensor;
+* `global_shape` in canonical HF layout and the transfer `dtype`: BF16 for
+  quantized sources, otherwise the original source dtype;
 * `src_mesh_info` / `src_placements` — the training-side rank mesh (`MeshInfo`) and
   DTensor-style `Shard`/`Replicate` placements, derived from the training parallelism
   (TP/EP/PP; experts live on an EP mesh, everything else on a TP mesh);
@@ -212,14 +203,14 @@ realized **locally**:
 
 * On the **training side**, each `pre(base)` independently reads current local
   parameter values, dequantizes quantized storage, selects the corresponding HF
-  slice, and produces a contiguous BF16 buffer. Selection follows dequantization
-  so fused gate/up slices use the complete source's quantization metadata.
+  slice, and produces a contiguous buffer in the advertised dtype. Selection follows
+  dequantization so fused gate/up slices use the complete source's quantization metadata.
   Grouped MoE hooks materialize their ordered expert members and stack them into
   `[num_local_experts, ...]`. There is no shared source cache or cache lifecycle
   in the transfer loop; repeated preparation observes parameter updates immediately.
-* On the **generation side**, canonical BF16 storage can receive in place. Other
-  storage uses `pre` to allocate BF16 staging and `post` to cast, assemble, or
-  quantize the received values. Fused gate/up and grouped expert layouts retain
+* On the **generation side**, canonical storage matching the transfer dtype can
+  receive in place. Other storage uses `pre` to allocate staging in the advertised
+  dtype and `post` to cast, assemble, or quantize the received values. Fused gate/up and grouped expert layouts retain
   the assembly needed to commit complete local weights. Quantized commits update
   weight values and their associated scales together. BF16
   FlashInfer TRTLLM grouped experts instead receive into canonical EP-local staging
@@ -232,7 +223,8 @@ Every training step (with in-flight weight updates, concurrently with generation
 `NcclReshardWeightSynchronizer.sync_weights()` triggers both sides:
 
 * `base` identifies local storage; it is not necessarily the transfer buffer.
-* `pre(base)` prepares a `RefitCtx` whose `buf` is a canonical HF BF16 shard.
+* `pre(base)` prepares a `RefitCtx` whose `buf` is a canonical HF shard matching
+  the advertised transfer dtype.
   Omitting `pre` is valid only when `base` already satisfies that contract.
 * `post(ctx)` commits received values to local storage, including quantization and
   scale updates. It runs after the transfer on the corresponding CUDA stream.
@@ -257,12 +249,12 @@ Every training step (with in-flight weight updates, concurrently with generation
 
 After the bulk reshard completes, the misc parameters are transferred.
 This part is reusing the same code implementation as the conventional packed_tensor refit.
-Its representation is unchanged. Only source scale entries belonging to BF16 bulk
+Its representation is unchanged. Only source scale entries belonging to quantized bulk
 weights are removed; the receiver must retain its newly generated scales for those
 weights. This also keeps unrelated weight scales and KV-cache scales on their existing
 load path.
 
-Quantized destination handling added for BF16 bulk weights stays in the bulk hooks.
+Quantized destination handling stays in the bulk hooks.
 Megatron's packed collective imports, including `refit_transport=null` and misc
 weights, retain their existing destination `copy_` behavior. Likewise, vLLM bulk
 hooks explicitly opt into rectangular FP8 blocks; the shared quantizer keeps its
@@ -296,7 +288,7 @@ generation side maps those HF names onto whatever its own storage layout is.
 * **Training side** (`megatron_policy_worker.py`): producing the HF-named state-dict
   metadata; building `hf_to_local_param_map` — resolving each HF name to the local
   Megatron tensor view and providing `pre` hooks for quantized-source
-  independent dequantization, BF16 conversion, and grouped-MoE stacking; the
+  independent dequantization to BF16, unquantized dtype preservation, and grouped-MoE stacking; the
   `init_collective` / `init_nccl_reshard_comm_group` bootstrap methods; the
   `nccl_reshard_refit()` send loop; the misc packed-broadcast producer.
 * **Generation side** (`vllm_backend.py`): building `hf_to_local_param_map` — mapping HF
@@ -307,8 +299,8 @@ generation side maps those HF names onto whatever its own storage layout is.
   `nccl_reshard_refit()` receive loop; the misc consumer feeding `load_weights`; and
   backend-specific finalization after all weights arrive.
 * **Megatron generation side** (`megatron_worker.py`): mapping the same canonical
-  HF FFN shards to local fused dense/expert views. BF16 destinations receive in
-  place; quantized destinations use short-lived BF16 staging buffers, assemble
+  HF FFN shards to local fused dense/expert views. Matching unquantized destinations
+  receive in place; other destinations stage in the advertised dtype, assemble
   fused components, and quantize into persistent storage with fresh scales.
   Misc weights continue through Megatron Bridge's
   packed-broadcast import path.
@@ -320,7 +312,7 @@ Everything else follows the fixed transport contract.
 
 **The one backend-specific implementation — `build_hf_to_local_param_map`:** resolve
 each bulk HF name to your local storage as a `LocalParamSpec` — `base` for tensors
-sent/received as-is only when already canonical BF16, and `pre`/`post` hooks wherever
+sent/received as-is only when already canonical with the advertised dtype, and `pre`/`post` hooks wherever
 the local representation requires staging (quantization, fused/merged tensors, layout
 conversions, grouped-expert stacking). Backends that
 rebuild runtime storage may also need one transport-level finalizer after all specs have
@@ -380,6 +372,10 @@ Both transports honor the `stream` argument so the transfer is ordered with the 
 
 
 ## Expected Performance
+
+These measurements predate the logical-weight hook refactor. In particular, the
+FP8 row used physical FP8 transfers; quantized sources now transfer BF16 and
+require source dequantization and destination quantization.
 
 | Platform | Model | Precision | Train → Gen mapping | XferDTensor fraction | Refit time |
 |--|---|---|---|---:|---:|

@@ -390,6 +390,36 @@ def test_check_nccl_reshard_rejects_unsupported_megatron_generation(
     assert expected_violation in str(exc_info.value)
 
 
+@pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
+@pytest.mark.parametrize("inherited", [False, True])
+def test_check_nccl_reshard_rejects_cached_te_fp8_compute(
+    recipe: str, inherited: bool
+) -> None:
+    fp8_cfg = {"enabled": True, "fp8_recipe": recipe, "fp8_param": False}
+    config = _megatron_gen_config(
+        policy_updates={"megatron_cfg": {"enabled": True, "fp8_cfg": fp8_cfg}}
+        if inherited
+        else None,
+        **({} if inherited else {"fp8_cfg": fp8_cfg}),
+    )
+
+    with pytest.raises(ValueError, match="reuse stale cached FP8 weights"):
+        check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
+@pytest.mark.parametrize("fp8_param", [False, True])
+def test_check_nccl_reshard_accepts_te_fp8_without_stale_cache(
+    recipe: str, fp8_param: bool
+) -> None:
+    config = _megatron_gen_config(
+        fp8_cfg={"enabled": True, "fp8_recipe": recipe, "fp8_param": fp8_param},
+        disable_parameter_transpose_cache=not fp8_param,
+    )
+
+    check_nccl_reshard_refit_support(config)
+
+
 # --------------------------------------------------------------------------
 # MeshInfo
 # --------------------------------------------------------------------------

@@ -154,6 +154,7 @@ from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     _INDIVIDUAL_EXPERT_RE,
+    _STR_TO_DTYPE,
     HFToLocalParamMap,
     LocalParamSpec,
     RefitBuilderInterface,
@@ -283,7 +284,7 @@ def _is_quantized_refit_source(tensor: torch.Tensor) -> bool:
 
 
 def _dequantize_refit_source(tensor: torch.Tensor) -> torch.Tensor:
-    """Materialize a logical BF16 weight from TE quantized parameter storage."""
+    """Decode quantized storage to BF16, preserving unquantized source dtype."""
     # Defer optional TE FP8 helpers until a quantized source is materialized.
     from megatron.core.fp8_utils import (
         dequantize_fp8_tensor,
@@ -3143,7 +3144,7 @@ class MegatronPolicyWorkerImpl(
         return (self.cfg.get("generation") or {}).get("backend") == "megatron"
 
     def _build_bulk_refit_conversion_tasks(self) -> list[Any]:
-        """Use standard Bridge mappings and live parameters for BF16 bulk refit."""
+        """Use standard Bridge mappings and live parameters for bulk refit."""
         # Defer the optional draft-model helper until building export tasks.
         from nemo_rl.models.megatron.draft import draft_model_detached
 
@@ -3331,7 +3332,7 @@ class MegatronPolicyWorkerImpl(
 
         def pre(base: torch.Tensor) -> RefitCtx:
             logical = _dequantize_refit_source(base)
-            return RefitCtx(buf=spec.select(logical).to(torch.bfloat16).contiguous())
+            return RefitCtx(buf=spec.select(logical).contiguous())
 
         return LocalParamSpec(base=tensor, pre=pre)
 
@@ -3346,7 +3347,8 @@ class MegatronPolicyWorkerImpl(
         Unlike ``_iter_params_with_optional_kv_scales`` (PP broadcast + TP gather
         via ``export_hf_weights``), this yields TP-local source specs directly
         from the Megatron params — no collectives. Every pre hook independently
-        materializes the current parameter as canonical HF BF16. EP:
+        materializes the current parameter in canonical HF layout, using BF16
+        for quantized storage and retaining unquantized dtypes. EP:
         ``_bulk_refit_conversion_tasks`` holds only this rank's local experts;
         PP non-local params have ``param_weight is None``.
         """
@@ -3754,9 +3756,9 @@ class MegatronPolicyWorkerImpl(
                 ):
                     state_dict_metadata[name] = {
                         "shape": list(tensor.shape),
-                        "dtype": str(torch.bfloat16),
+                        "dtype": str(tensor.dtype),
                     }
-                    _xfer_bytes += tensor.numel() * 2
+                    _xfer_bytes += tensor.numel() * tensor.element_size()
                     if layer_prefix is not None:
                         assert layer_prefix == _extract_layer_prefix(name), (
                             f"layer_prefix mismatch: {layer_prefix} != {_extract_layer_prefix(name)}"
@@ -3765,8 +3767,8 @@ class MegatronPolicyWorkerImpl(
                         layer_prefix = _extract_layer_prefix(name)
 
             # Preserve the existing export dtype/order of unrelated weights and
-            # KV scales. A bulk weight is BF16 on the wire; its training-format
-            # scale must not overwrite scales computed by a destination post hook.
+            # KV scales. Quantized bulk weights are decoded to BF16, so their
+            # training scales must not overwrite destination post-hook scales.
             for name, tensor in self._iter_params_with_optional_kv_scales():
                 if name in state_dict_metadata or any(
                     name.endswith(suffix)
@@ -3963,7 +3965,7 @@ class MegatronPolicyWorkerImpl(
 
         Wraps this rank's local Megatron shards into ``LocalParamSpec``s:
         - local weight: ``base`` is the live parameter; ``pre`` dequantizes if
-          necessary, selects the HF view, and converts it to BF16.
+          necessary and selects the HF view, preserving unquantized dtypes.
         - grouped MoE expert: ``pre`` materializes the ordered per-expert specs
           and stacks them into ``[E_local, ...]`` each refit.
         """
@@ -4117,8 +4119,9 @@ class MegatronPolicyWorkerImpl(
                 assert ctx.buf is not None, (
                     f"no local tensor for {param_info['name']!r}"
                 )
-                assert ctx.buf.dtype == torch.bfloat16, (
-                    f"bulk refit source {param_info['name']!r} must be BF16"
+                assert ctx.buf.dtype == _STR_TO_DTYPE[param_info["dtype"]], (
+                    f"bulk refit source {param_info['name']!r} has dtype "
+                    f"{ctx.buf.dtype}, expected {param_info['dtype']}"
                 )
                 src_tensor = DTensorRef(
                     local_tensor=ctx.buf, global_shape=param_info["global_shape"]

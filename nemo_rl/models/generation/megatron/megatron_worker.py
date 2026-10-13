@@ -212,7 +212,6 @@ class _MegatronBulkRefitPiece:
     task: _MegatronRefitTask
     spec: Any
     shape: torch.Size
-    dtype: torch.dtype
     device: torch.device
     destination: torch.Tensor | None
 
@@ -1607,7 +1606,7 @@ class MegatronGenerationRefitMixin:
                         f"expected {tuple(piece.task.expected_shape)}, "
                         f"got {tuple(logical_weight.shape)}."
                     )
-                # Only BF16 bulk hooks use MCore's TE/grouped quantized writer.
+                # Only bulk hooks use MCore's TE/grouped quantized writer.
                 # Keep this optional API out of the packed collective/misc path.
                 from megatron.core.fp8_utils import copy_tensor_to_quantized_param
 
@@ -1632,7 +1631,6 @@ class MegatronGenerationRefitMixin:
                 task=task,
                 spec=spec,
                 shape=spec.selected_shape(task.expected_shape),
-                dtype=torch.bfloat16,
                 device=task.destination.device,
                 destination=destination,
             )
@@ -1654,6 +1652,7 @@ class MegatronGenerationRefitMixin:
 
         def grouped_spec(
             grouped: tuple[_MegatronBulkRefitPiece, ...],
+            wire_dtype: torch.dtype,
         ) -> LocalParamSpec:
             first = grouped[0]
 
@@ -1661,7 +1660,7 @@ class MegatronGenerationRefitMixin:
                 return RefitCtx(
                     buf=torch.empty(
                         (len(grouped), *first.shape),
-                        dtype=first.dtype,
+                        dtype=wire_dtype,
                         device=first.device,
                     )
                 )
@@ -1672,10 +1671,12 @@ class MegatronGenerationRefitMixin:
 
             return LocalParamSpec(base=None, pre=pre, post=post)
 
-        def staged_spec(piece: _MegatronBulkRefitPiece) -> LocalParamSpec:
+        def staged_spec(
+            piece: _MegatronBulkRefitPiece, wire_dtype: torch.dtype
+        ) -> LocalParamSpec:
             def pre(_base: Any) -> RefitCtx:
                 return RefitCtx(
-                    buf=torch.empty(piece.shape, dtype=piece.dtype, device=piece.device)
+                    buf=torch.empty(piece.shape, dtype=wire_dtype, device=piece.device)
                 )
 
             def post(ctx: RefitCtx) -> None:
@@ -1695,11 +1696,12 @@ class MegatronGenerationRefitMixin:
         for layer_name in refit_info["layer_names"]:
             for param_info in refit_info["per_layer_params"][layer_name]:
                 name = param_info["name"]
-                wire_dtype = param_info.get("dtype")
-                if wire_dtype not in (torch.bfloat16, "torch.bfloat16"):
+                wire_dtype_value = param_info.get("dtype")
+                wire_dtype = _STR_TO_DTYPE.get(str(wire_dtype_value))
+                if wire_dtype not in (torch.bfloat16, torch.float16, torch.float32):
                     raise ValueError(
-                        f"Megatron bulk refit requires BF16 wire dtype for {name!r}, "
-                        f"got {wire_dtype!r}."
+                        f"Unsupported Megatron bulk refit wire dtype "
+                        f"{wire_dtype_value!r} for {name!r}."
                     )
                 grouped_proj = param_info.get("grouped_expert_proj")
                 if grouped_proj is not None:
@@ -1714,7 +1716,7 @@ class MegatronGenerationRefitMixin:
                         raise ValueError(
                             f"No local Megatron experts map to M-to-N weight {name!r}."
                         )
-                    specs[name] = grouped_spec(grouped)
+                    specs[name] = grouped_spec(grouped, wire_dtype)
                     continue
 
                 piece = pieces.get(name)
@@ -1723,9 +1725,8 @@ class MegatronGenerationRefitMixin:
                         f"No local Megatron destination maps to M-to-N weight {name!r}."
                     )
                 specs[name] = (
-                    staged_spec(piece)
-                    if piece.task.is_quantized
-                    or piece.destination.dtype != torch.bfloat16
+                    staged_spec(piece, wire_dtype)
+                    if piece.task.is_quantized or piece.destination.dtype != wire_dtype
                     else direct_spec(piece)
                 )
 

@@ -253,7 +253,8 @@ def test_build_mapping_unmapped_param_raises():
 # --------------------------------------------------------------------------
 # build_hf_to_local_param_map (the unified interface) + RefitCtx pre/post
 # --------------------------------------------------------------------------
-def test_build_hf_to_local_param_map_specs_and_roundtrip():
+@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_build_hf_to_local_param_map_specs_and_roundtrip(wire_dtype):
     # FFN-only: dense gate/up (merge) + down (direct), MoE experts (w13/w2).
     H, E, Pl = 32, 2, 64
     refit_info = {
@@ -264,34 +265,34 @@ def test_build_hf_to_local_param_map_specs_and_roundtrip():
                 {
                     "name": "model.layers.0.mlp.gate_proj.weight",
                     "global_shape": [256, H],
-                    "dtype": "torch.bfloat16",
+                    "dtype": str(wire_dtype),
                 },
                 {
                     "name": "model.layers.0.mlp.up_proj.weight",
                     "global_shape": [256, H],
-                    "dtype": "torch.bfloat16",
+                    "dtype": str(wire_dtype),
                 },
                 {
                     "name": "model.layers.0.mlp.down_proj.weight",
                     "global_shape": [H, 256],
-                    "dtype": "torch.bfloat16",
+                    "dtype": str(wire_dtype),
                 },
                 {
                     "name": "model.layers.0.mlp.experts.gate_proj.weight",
                     "global_shape": [E, 128, H],
-                    "dtype": "torch.bfloat16",
+                    "dtype": str(wire_dtype),
                     "grouped_expert_proj": "gate_proj",
                 },
                 {
                     "name": "model.layers.0.mlp.experts.up_proj.weight",
                     "global_shape": [E, 128, H],
-                    "dtype": "torch.bfloat16",
+                    "dtype": str(wire_dtype),
                     "grouped_expert_proj": "up_proj",
                 },
                 {
                     "name": "model.layers.0.mlp.experts.down_proj.weight",
                     "global_shape": [E, H, 128],
-                    "dtype": "torch.bfloat16",
+                    "dtype": str(wire_dtype),
                     "grouped_expert_proj": "down_proj",
                 },
             ]
@@ -314,17 +315,17 @@ def test_build_hf_to_local_param_map_specs_and_roundtrip():
     assert isinstance(pmap, HFToLocalParamMap)
     assert pmap.get("does.not.exist") is None
 
-    # Direct FP32 storage stages the BF16 wire weight and casts on commit.
+    # FP32 storage receives the advertised wire dtype and casts on commit.
     dn = pmap.get("model.layers.0.mlp.down_proj.weight")
     assert dn.base.data_ptr() == down.data_ptr()
     assert dn.pre is not None and dn.post is not None
-    assert dn.pre(dn.base).buf.dtype == torch.bfloat16
+    assert dn.pre(dn.base).buf.dtype == wire_dtype
 
     # Grouped expert down_proj -> w2 is also direct.
     edn = pmap.get("model.layers.0.mlp.experts.down_proj.weight")
     assert edn.base.data_ptr() == w2.data_ptr()
     assert edn.pre is not None and edn.post is not None
-    assert edn.pre(edn.base).buf.dtype == torch.bfloat16
+    assert edn.pre(edn.base).buf.dtype == wire_dtype
 
     # Merged dense gate_proj: pre allocates a recv buffer for gate's region of
     # gate_up_proj (rows [0:64] at TP=4); post scatters it back.
@@ -347,7 +348,8 @@ def test_build_hf_to_local_param_map_specs_and_roundtrip():
     assert torch.equal(w13[:, 0:Pl, :], torch.full_like(w13[:, 0:Pl, :], 5.0))
 
 
-def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
+@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_build_hf_to_local_param_map_stages_trtllm_local_experts(wire_dtype):
     """Packed TRTLLM storage receives canonical EP-local weights via load_weights."""
     H, E, P = 16, 4, 32
     expert_name = "model.layers.0.mlp.experts.gate_proj.weight"
@@ -359,7 +361,7 @@ def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
                 {
                     "name": expert_name,
                     "global_shape": [E, P, H],
-                    "dtype": "torch.bfloat16",
+                    "dtype": str(wire_dtype),
                     "grouped_expert_proj": "gate_proj",
                     "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
                     "dst_placements": [Shard(0)],
@@ -385,7 +387,7 @@ def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
 
     ctx = spec.pre(spec.base)
     assert ctx.buf.shape == (2, P, H)
-    assert ctx.buf.dtype == torch.bfloat16
+    assert ctx.buf.dtype == wire_dtype
     ctx.buf[0].fill_(2.0)
     ctx.buf[1].fill_(3.0)
     spec.post(ctx)
@@ -396,10 +398,10 @@ def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
         "model.layers.0.mlp.experts.3.gate_proj.weight",
     ]
     torch.testing.assert_close(
-        loaded_weights[0][1], torch.full((P, H), 2.0, dtype=torch.bfloat16)
+        loaded_weights[0][1], torch.full((P, H), 2.0, dtype=wire_dtype)
     )
     torch.testing.assert_close(
-        loaded_weights[1][1], torch.full((P, H), 3.0, dtype=torch.bfloat16)
+        loaded_weights[1][1], torch.full((P, H), 3.0, dtype=wire_dtype)
     )
     torch.testing.assert_close(packed_w13, torch.full_like(packed_w13, 7.0))
 
@@ -938,7 +940,10 @@ def test_nccl_reshard_refit_runs_transport_lifecycle(monkeypatch):
     finalize.assert_called_once_with()
 
 
-def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):
+@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_build_hf_to_local_param_map_quantizes_wire_weights_for_mxfp8(
+    wire_dtype, monkeypatch
+):
     H, E, Pl = 32, 2, 64
     refit_info = {
         "gen_tp_size": 1,
@@ -948,13 +953,13 @@ def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):
                 {
                     "name": "model.layers.0.mlp.experts.gate_proj.weight",
                     "global_shape": [E, Pl, H],
-                    "dtype": "torch.bfloat16",
+                    "dtype": str(wire_dtype),
                     "grouped_expert_proj": "gate_proj",
                 },
                 {
                     "name": "model.layers.0.mlp.experts.down_proj.weight",
                     "global_shape": [E, H, Pl],
-                    "dtype": "torch.bfloat16",
+                    "dtype": str(wire_dtype),
                     "grouped_expert_proj": "down_proj",
                 },
             ]
@@ -974,6 +979,8 @@ def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):
     )
 
     def fake_quantize(weight):
+        expected_dtype = torch.bfloat16 if wire_dtype == torch.float32 else wire_dtype
+        assert weight.dtype == expected_dtype
         return (
             torch.full_like(weight, 3, dtype=torch.float8_e4m3fn),
             torch.full(
@@ -991,7 +998,7 @@ def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):
     gate = pmap.get("model.layers.0.mlp.experts.gate_proj.weight")
     assert gate is not None and gate.pre is not None and gate.post is not None
     gate_ctx = gate.pre(gate.base)
-    assert gate_ctx.buf.dtype == torch.bfloat16
+    assert gate_ctx.buf.dtype == wire_dtype
     assert gate_ctx.buf.shape == w13[:, :Pl, :].shape
     gate.post(gate_ctx)
     assert torch.all(w13[:, :Pl, :].float() == 3)
@@ -1000,7 +1007,7 @@ def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):
     down = pmap.get("model.layers.0.mlp.experts.down_proj.weight")
     assert down is not None and down.pre is not None and down.post is not None
     down_ctx = down.pre(down.base)
-    assert down_ctx.buf.dtype == torch.bfloat16
+    assert down_ctx.buf.dtype == wire_dtype
     assert down_ctx.buf.shape == w2.shape
     down.post(down_ctx)
     assert torch.all(w2.float() == 3)
@@ -1084,7 +1091,9 @@ def test_build_hf_to_local_param_map_uses_routed_expert_runtime_mxfp8_scale(
     assert torch.all(runtime_scale[:, :intermediate_size, :] == 7)
 
 
+@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_build_hf_to_local_param_map_quantizes_dense_gate_and_up_for_mxfp8(
+    wire_dtype,
     monkeypatch,
 ):
     hidden_size, intermediate_size = 32, 64
@@ -1096,12 +1105,12 @@ def test_build_hf_to_local_param_map_quantizes_dense_gate_and_up_for_mxfp8(
                 {
                     "name": "model.layers.0.mlp.gate_proj.weight",
                     "global_shape": [intermediate_size, hidden_size],
-                    "dtype": "torch.bfloat16",
+                    "dtype": str(wire_dtype),
                 },
                 {
                     "name": "model.layers.0.mlp.up_proj.weight",
                     "global_shape": [intermediate_size, hidden_size],
-                    "dtype": "torch.bfloat16",
+                    "dtype": str(wire_dtype),
                 },
             ]
         },
@@ -1118,6 +1127,8 @@ def test_build_hf_to_local_param_map_quantizes_dense_gate_and_up_for_mxfp8(
     )
 
     def fake_quantize(weight):
+        expected_dtype = torch.bfloat16 if wire_dtype == torch.float32 else wire_dtype
+        assert weight.dtype == expected_dtype
         fill_value = int(weight[0, 0].item())
         return (
             torch.full_like(weight, fill_value, dtype=torch.float8_e4m3fn),
@@ -1138,6 +1149,7 @@ def test_build_hf_to_local_param_map_quantizes_dense_gate_and_up_for_mxfp8(
         spec = pmap.get(f"model.layers.0.mlp.{name}.weight")
         assert spec is not None and spec.pre is not None and spec.post is not None
         ctx = spec.pre(spec.base)
+        assert ctx.buf.dtype == wire_dtype
         ctx.buf.fill_(fill_value)
         spec.post(ctx)
 
@@ -1147,7 +1159,7 @@ def test_build_hf_to_local_param_map_quantizes_dense_gate_and_up_for_mxfp8(
     assert torch.all(gate_up_scale[intermediate_size:] == 6)
 
 
-def test_build_hf_to_local_param_map_rejects_non_bf16_wire_dtype():
+def test_build_hf_to_local_param_map_rejects_quantized_wire_dtype():
     hidden_size, intermediate_size = 32, 64
     refit_info = {
         "gen_tp_size": 1,
@@ -1157,14 +1169,14 @@ def test_build_hf_to_local_param_map_rejects_non_bf16_wire_dtype():
                 {
                     "name": "model.layers.0.mlp.down_proj.weight",
                     "global_shape": [hidden_size, intermediate_size],
-                    "dtype": "torch.float32",
+                    "dtype": "torch.float8_e4m3fn",
                 }
             ]
         },
     }
     down = torch.empty(hidden_size, intermediate_size, dtype=torch.bfloat16)
 
-    with pytest.raises(ValueError, match="bulk wire dtype must be torch.bfloat16"):
+    with pytest.raises(ValueError, match="unsupported wire dtype"):
         _make_ext(
             {"model.layers.0.mlp.down_proj.weight": down}
         ).build_hf_to_local_param_map(refit_info)
@@ -1241,14 +1253,15 @@ def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_metadata(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.bfloat16])
-def test_bf16_receiver_commits_to_live_nonquantized_storage(dtype):
+@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_receiver_commits_wire_dtype_to_live_nonquantized_storage(dtype, wire_dtype):
     name = "model.layers.0.mlp.down_proj.weight"
     param = torch.nn.Parameter(torch.full((4, 8), -1, dtype=dtype), requires_grad=False)
     info = {
         "layer_names": ["model.layers.0"],
         "per_layer_params": {
             "model.layers.0": [
-                {"name": name, "global_shape": [4, 8], "dtype": "torch.bfloat16"}
+                {"name": name, "global_shape": [4, 8], "dtype": str(wire_dtype)}
             ]
         },
     }
@@ -1256,18 +1269,23 @@ def test_bf16_receiver_commits_to_live_nonquantized_storage(dtype):
     old_storage = param.data
     param.data = torch.full_like(param, -2)
     ctx = spec.pre(spec.base)
-    assert ctx.buf.dtype == torch.bfloat16
-    ctx.buf.copy_(torch.arange(32, dtype=torch.bfloat16).reshape(4, 8) / 16)
+    assert ctx.buf.dtype == wire_dtype
+    # Preserve values that would be rounded by an intermediate BF16 conversion.
+    expected = (torch.arange(32, dtype=torch.float32).reshape(4, 8) / 1000 + 1).to(
+        wire_dtype
+    )
+    ctx.buf.copy_(expected)
     assert torch.all(param == -2)
     spec.post(ctx)
-    torch.testing.assert_close(param, ctx.buf.to(dtype))
+    torch.testing.assert_close(param, expected.to(dtype), rtol=0, atol=0)
     assert torch.all(old_storage == -1)
 
 
 @pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("pow2_scale", [False, True])
-def test_bf16_receiver_quantizes_blockwise_fused_weights(
-    grouped, pow2_scale, monkeypatch
+@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_receiver_quantizes_blockwise_fused_weights(
+    grouped, pow2_scale, wire_dtype, monkeypatch
 ):
     from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -1286,7 +1304,7 @@ def test_bf16_receiver_quantizes_blockwise_fused_weights(
         metadata = {
             "name": f"{prefix}.{projection}.weight",
             "global_shape": list(local_shape),
-            "dtype": "torch.bfloat16",
+            "dtype": str(wire_dtype),
         }
         if grouped:
             metadata["grouped_expert_proj"] = projection
@@ -1305,7 +1323,7 @@ def test_bf16_receiver_quantizes_blockwise_fused_weights(
         for projection, magnitude in (("gate_proj", 3), ("up_proj", 67)):
             spec = specs.get(f"{prefix}.{projection}.weight")
             ctx = spec.pre(spec.base)
-            assert ctx.buf.dtype == torch.bfloat16
+            assert ctx.buf.dtype == wire_dtype
             ctx.buf.fill_(cycle * magnitude)
             spec.post(ctx)
         expanded_scales = scales.repeat_interleave(128, dim=-2).repeat_interleave(
@@ -1321,6 +1339,85 @@ def test_bf16_receiver_quantizes_blockwise_fused_weights(
         )
         torch.testing.assert_close(restored, expected, rtol=0.07, atol=0)
         assert not torch.any(scales == 9)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="MXFP8 quantization requires CUDA"
+)
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_mxfp8_receiver_quantizes_wire_weights_on_gpu(grouped, wire_dtype):
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    prefix = "model.layers.0.mlp.experts" if grouped else "model.layers.0.mlp"
+    local_shape = (2, 128, 128) if grouped else (128, 128)
+    full_shape = (2, 256, 128) if grouped else (256, 128)
+    param_name = prefix + (".w13_weight" if grouped else ".gate_up_proj.weight")
+    weight = torch.zeros(full_shape, dtype=torch.float8_e4m3fn, device="cuda")
+    scales = torch.zeros((*full_shape[:-1], 4), dtype=torch.uint8, device="cuda")
+    pointers = (weight.data_ptr(), scales.data_ptr())
+    metadata = []
+    for projection in ("gate_proj", "up_proj"):
+        info = {
+            "name": f"{prefix}.{projection}.weight",
+            "global_shape": list(local_shape),
+            "dtype": str(wire_dtype),
+        }
+        if grouped:
+            info["grouped_expert_proj"] = projection
+        metadata.append(info)
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {"model.layers.0": metadata},
+    }
+    specs = _make_ext(
+        {param_name: weight, param_name + "_scale_from_checkpoint": scales}
+    ).build_hf_to_local_param_map(refit_info)
+    for cycle in (1, 2):
+        for part, info in enumerate(metadata):
+            spec = specs.get(info["name"])
+            ctx = spec.pre(spec.base)
+            assert ctx.buf.dtype == wire_dtype
+            expected = (
+                torch.arange(ctx.buf.numel(), device="cuda", dtype=torch.float32)
+                .reshape(local_shape)
+                .remainder(83)
+                .add_(0.003)
+                .mul_(cycle * (part + 1))
+                .to(wire_dtype)
+            )
+            ctx.buf.copy_(expected)
+            previous_weight, previous_scales = weight.clone(), scales.clone()
+            spec.post(ctx)
+            quantizer_input = (
+                expected.to(torch.bfloat16) if wire_dtype == torch.float32 else expected
+            )
+            expected_weight, expected_scales = fp8.quantize_mxfp8_weight(
+                quantizer_input
+            )
+            torch.testing.assert_close(
+                weight.chunk(2, dim=-2)[part].float(),
+                expected_weight.float(),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                scales.chunk(2, dim=-2)[part], expected_scales, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                weight.chunk(2, dim=-2)[1 - part].float(),
+                previous_weight.chunk(2, dim=-2)[1 - part].float(),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                scales.chunk(2, dim=-2)[1 - part],
+                previous_scales.chunk(2, dim=-2)[1 - part],
+                rtol=0,
+                atol=0,
+            )
+            assert (weight.data_ptr(), scales.data_ptr()) == pointers
 
 
 def test_fp8_receiver_does_not_commit_invalid_quantizer_output(monkeypatch):

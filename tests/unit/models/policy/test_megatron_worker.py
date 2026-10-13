@@ -262,7 +262,7 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     assert not isinstance(megatron_forwarded, list)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_local_hf_shards_follow_bridge_specs(dtype: torch.dtype) -> None:
     from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
 
@@ -272,8 +272,11 @@ def test_local_hf_shards_follow_bridge_specs(dtype: torch.dtype) -> None:
     )
 
     fused = torch.nn.Parameter(
-        torch.arange(8, dtype=dtype).reshape(4, 2), requires_grad=False
+        1 + torch.arange(8, dtype=dtype).reshape(4, 2) / 1024,
+        requires_grad=False,
     )
+    if dtype != torch.bfloat16:
+        assert not torch.equal(fused, fused.to(torch.bfloat16).to(dtype))
     task = SimpleNamespace(
         param_weight=fused,
         megatron_module=None,
@@ -293,20 +296,18 @@ def test_local_hf_shards_follow_bridge_specs(dtype: torch.dtype) -> None:
         spec = shards[f"model.layers.0.mlp.{name}_proj.weight"]
         assert spec.base is fused and spec.pre is not None and spec.post is None
         result = _materialize_refit_spec(spec).buf
-        assert result.dtype == torch.bfloat16 and result.is_contiguous()
-        assert torch.equal(
-            result, fused[index * 2 : (index + 1) * 2].to(torch.bfloat16)
-        )
+        assert result.dtype == dtype and result.is_contiguous()
+        assert torch.equal(result, fused[index * 2 : (index + 1) * 2])
     fused[0, 0] = 99
     assert (
         _materialize_refit_spec(shards["model.layers.0.mlp.gate_proj.weight"]).buf[0, 0]
         == 99
     )
-    fused.data = torch.full_like(fused, 23)
+    fused.data = torch.full_like(fused, 1.0009765625)
     for spec in shards.values():
         assert torch.equal(
             _materialize_refit_spec(spec).buf,
-            torch.full((2, 2), 23, dtype=torch.bfloat16),
+            torch.full((2, 2), 1.0009765625, dtype=dtype),
         )
 
 
@@ -437,8 +438,11 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
     worker._build_layer_to_pp_stage.assert_not_called()
 
 
+@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    wire_dtype: torch.dtype,
 ) -> None:
     """Only scales for selected bulk weights disappear from the misc stream."""
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
@@ -446,7 +450,10 @@ def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
     bulk_name = "model.layers.0.mlp.gate_proj.weight"
     misc_weight = "model.layers.0.self_attn.q_proj.weight"
     unsafe_weight = "model.layers.0.mlp.down_proj.weight"
-    logical_bulk = torch.empty(4, 2, dtype=torch.float32)
+    # A meta tensor makes byte-accounting differences visible in the GiB log
+    # without allocating a large parameter. Quantized export arrives as BF16;
+    # ordinary FP16/FP32 export retains its source dtype.
+    logical_bulk = torch.empty(32768, 8192, dtype=wire_dtype, device="meta")
     values = {
         bulk_name: torch.empty(4, 2, dtype=torch.float8_e4m3fn),
         bulk_name + "_scale_inv": torch.full((1,), 3.0),
@@ -503,8 +510,10 @@ def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
 
     bulk_meta = info["per_layer_params"]["model.layers.0"][0]
     assert bulk_meta["name"] == bulk_name
-    assert bulk_meta["dtype"] == "torch.bfloat16"
-    assert bulk_meta["global_shape"] == (4, 2)
+    assert bulk_meta["dtype"] == str(wire_dtype)
+    assert bulk_meta["global_shape"] == tuple(logical_bulk.shape)
+    expected_gib = logical_bulk.numel() * logical_bulk.element_size() / 1024**3
+    assert f"nccl_reshard={expected_gib:.2f}GiB" in capsys.readouterr().out
     expected_misc = {
         name: tensor
         for name, tensor in values.items()
@@ -1602,9 +1611,12 @@ def test_megatron_refit_quantized_hooks_read_current_fused_source(
     assert dequantize.call_args_list == [call(quantized_source)] * 6
 
 
-@pytest.mark.parametrize("failure_stage", [None, "pre", "transfer", "post"])
+@pytest.mark.parametrize("source_dtype", [torch.uint8, torch.float16, torch.float32])
+@pytest.mark.parametrize("failure_stage", [None, "pre", "dtype", "transfer", "post"])
 def test_megatron_refit_hooks_refresh_after_updates_and_failures(
-    monkeypatch: pytest.MonkeyPatch, failure_stage: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str | None,
+    source_dtype: torch.dtype,
 ) -> None:
     # Keep the optional Megatron/NCCL imports local to this mcore test.
     from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
@@ -1616,7 +1628,10 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
     worker.my_pp_stage = 0
     worker.pp_comm_group = object()
     worker._broadcast_misc_params_packed = MagicMock()
-    quantized_source = torch.arange(8, dtype=torch.uint8).reshape(4, 2)
+    source = torch.arange(8, dtype=source_dtype).reshape(4, 2)
+    wire_dtype = torch.bfloat16 if source_dtype == torch.uint8 else source_dtype
+    if source_dtype != torch.uint8:
+        source = 1 + source / 1024
     layer_names = ["model.layers.0", "model.layers.1"]
     worker.nccl_reshard_refit_info = {
         "layer_names": layer_names,
@@ -1625,6 +1640,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
                 {
                     "name": f"{layer}.mlp.{proj}_proj.weight",
                     "global_shape": [2, 2],
+                    "dtype": str(wire_dtype),
                     "src_mesh_info": object(),
                     "src_placements": (),
                     "dst_mesh_info": object(),
@@ -1645,7 +1661,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
     monkeypatch.setattr(
         worker_module,
         "_is_quantized_refit_source",
-        lambda tensor: tensor is quantized_source,
+        lambda tensor: tensor is source and source_dtype == torch.uint8,
     )
     materialized_sources = []
     transferred = []
@@ -1654,7 +1670,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
     def dequantize(tensor: torch.Tensor) -> torch.Tensor:
         # Each HF view reads the current full source independently.
         assert torch.cuda.current_stream() is current_stream
-        logical = tensor.to(torch.bfloat16)
+        logical = tensor.to(wire_dtype)
         materialized_sources.append(logical.clone())
         return logical
 
@@ -1667,7 +1683,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
                 yield (
                     name,
                     worker._local_refit_source_spec(
-                        quantized_source,
+                        source,
                         LocalHFParamSpec(name, -2, split_index, 2),
                     ),
                 )
@@ -1705,22 +1721,36 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
     monkeypatch.setattr(transfer_module, "xferdtensor", transfer)
 
     if failure_stage is not None:
-        with pytest.raises(RuntimeError, match=f"injected {failure_stage} failure"):
+        first_meta = worker.nccl_reshard_refit_info["per_layer_params"][layer_names[0]][
+            0
+        ]
+        if failure_stage == "dtype":
+            first_meta["dtype"] = str(
+                torch.float32 if wire_dtype != torch.float32 else torch.float16
+            )
+            expected_error = AssertionError
+            expected_message = "dtype .*expected"
+        else:
+            expected_error = RuntimeError
+            expected_message = f"injected {failure_stage} failure"
+        with pytest.raises(expected_error, match=expected_message):
             worker._nccl_reshard_refit()
         assert len(materialized_sources) == 1
         assert completed == []
         worker._broadcast_misc_params_packed.assert_not_called()
+        first_meta["dtype"] = str(wire_dtype)
         failure_stage = None
         materialized_sources.clear()
         transferred.clear()
-        quantized_source.add_(10)
+        source.add_(10)
 
     for _ in range(2):
-        expected = quantized_source.to(torch.bfloat16)
+        expected = source.to(wire_dtype)
         worker._nccl_reshard_refit()
         assert len(materialized_sources) == 4
         assert all(torch.equal(logical, expected) for logical in materialized_sources)
         assert len(transferred) == 4
+        assert all(tensor.dtype == wire_dtype for tensor in transferred)
         for offset in (0, 2):
             assert torch.equal(transferred[offset], expected[:2])
             assert torch.equal(transferred[offset + 1], expected[2:])
@@ -1728,7 +1758,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
         materialized_sources.clear()
         transferred.clear()
         completed.clear()
-        quantized_source.add_(10)
+        source.add_(10)
 
     assert worker._broadcast_misc_params_packed.call_count == 2
 

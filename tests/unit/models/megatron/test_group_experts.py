@@ -16,7 +16,7 @@
 
 ``_group_experts`` (``MegatronPolicyWorkerImpl``) creates a ``pre`` hook that
 materializes this rank's local per-expert sources for one projection and stacks
-them into ``[E_local, ...]``. Plain CPU tensors suffice for the BF16 path.
+them into ``[E_local, ...]``. Plain CPU tensors suffice for unquantized sources.
 
 Importing ``megatron_policy_worker`` pulls in megatron.core, so this is
 mcore-marked and skipped where mcore is unavailable.
@@ -47,11 +47,12 @@ def _group(proj, grouped_name, expert_groups):
     return _materialize_refit_spec(grouped).buf
 
 
-def test_group_experts_stacks_in_order():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_group_experts_stacks_in_order(dtype: torch.dtype):
     prefix = "model.layers.0.mlp.experts"
-    e0 = torch.randn(1536, 4096, dtype=torch.bfloat16)
-    e1 = torch.randn(1536, 4096, dtype=torch.bfloat16)
-    e2 = torch.randn(1536, 4096, dtype=torch.bfloat16)
+    e0 = 1 + torch.arange(64, dtype=dtype).reshape(8, 8) / 1024
+    e1 = e0 + 1
+    e2 = e0 + 2
     groups = {
         (prefix, "gate_proj"): [
             LocalParamSpec(base=e0),
@@ -60,8 +61,8 @@ def test_group_experts_stacks_in_order():
         ]
     }
     out = _group("gate_proj", f"{prefix}.gate_proj.weight", groups)
-    assert out.shape == (3, 1536, 4096)
-    assert out.dtype == torch.bfloat16
+    assert out.shape == (3, 8, 8)
+    assert out.dtype == dtype
     # Order preserved (expert 0 first).
     assert torch.equal(out[0], e0)
     assert torch.equal(out[1], e1)
@@ -85,7 +86,8 @@ def test_group_experts_empty_group_raises():
 # shards (_iter_local_hf_param_shards) into LocalParamSpecs.  Fake the shard
 # iterator; _build_expert_groups / _group_experts run for real.
 # --------------------------------------------------------------------------
-def test_build_hf_to_local_param_map_train_side():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_build_hf_to_local_param_map_train_side(dtype: torch.dtype):
     from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
 
     w = object.__new__(MegatronPolicyWorkerImpl)  # no __init__ / no megatron state
@@ -97,13 +99,9 @@ def test_build_hf_to_local_param_map_train_side():
     w._opd_full_teacher_checkpoint_paths = {}
     w._opd_full_lm_head_evicted = False
     prefix = "model.layers.0.mlp.experts"
-    direct = torch.randn(
-        8, 16, dtype=torch.bfloat16
-    )  # a dense FFN down_proj local shard view
-    e0 = torch.randn(
-        128, 16, dtype=torch.bfloat16
-    )  # this rank's local expert 0 gate_proj
-    e1 = torch.randn(128, 16, dtype=torch.bfloat16)  # local expert 1 gate_proj
+    direct = torch.randn(8, 16, dtype=dtype)  # dense FFN down_proj local shard view
+    e0 = torch.randn(128, 16, dtype=dtype)  # local expert 0 gate_proj
+    e1 = torch.randn(128, 16, dtype=dtype)  # local expert 1 gate_proj
     w._iter_local_hf_param_shards = lambda: [
         ("model.layers.0.mlp.down_proj.weight", LocalParamSpec(base=direct)),
         (f"{prefix}.1.gate_proj.weight", LocalParamSpec(base=e1)),
@@ -139,6 +137,7 @@ def test_build_hf_to_local_param_map_train_side():
     assert g.base is None and g.pre is not None and g.post is None
     ctx = _materialize_refit_spec(g)
     assert ctx.buf.shape == (2, 128, 16)
+    assert ctx.buf.dtype == dtype
     assert torch.equal(ctx.buf[0], e0) and torch.equal(ctx.buf[1], e1)
 
     direct.add_(1)
@@ -146,5 +145,6 @@ def test_build_hf_to_local_param_map_train_side():
     e1.add_(3)
     assert _materialize_refit_spec(d).buf is direct
     refreshed = _materialize_refit_spec(g).buf
+    assert refreshed.dtype == dtype
     assert torch.equal(refreshed[0], e0) and torch.equal(refreshed[1], e1)
     assert not torch.equal(refreshed, ctx.buf)

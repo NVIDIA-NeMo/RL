@@ -1711,17 +1711,18 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
         Wraps the ``(vllm_param, merged_slice)`` resolution from
         ``_build_hf_to_gen_backend_mapping`` into ``LocalParamSpec``s:
-        - ordinary storage: ``pre`` allocates a BF16 receive buffer for the live
-          component, and ``post`` casts it into the destination region.
-        - FP8 storage: ``post`` quantizes the BF16 component and commits its value
+        - ordinary storage: ``pre`` allocates a receive buffer in the wire dtype,
+          and ``post`` casts it into the live destination region.
+        - FP8 storage: ``post`` quantizes the received component and commits its value
           and scale together before the backend's final layout conversion.
-        - TRTLLM grouped experts: ``pre`` allocates canonical EP-local BF16 storage,
+        - TRTLLM grouped experts: ``pre`` allocates canonical EP-local wire storage,
           and ``post`` sends each expert through vLLM's native weight loader.
         """
 
         def _staged_param_spec(
             vllm_param: torch.Tensor,
             merged_slice: tuple[slice, ...] | None,
+            wire_dtype: torch.dtype,
         ) -> LocalParamSpec:
             def pre(_base: torch.Tensor) -> RefitCtx:
                 region = (
@@ -1730,7 +1731,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     else vllm_param.data[merged_slice]
                 )
                 return RefitCtx(
-                    buf=torch.empty_like(region, dtype=torch.bfloat16),
+                    buf=torch.empty_like(region, dtype=wire_dtype),
                     extra={"region": region},
                 )
 
@@ -1742,6 +1743,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         def _trtllm_grouped_expert_spec(
             param_info: dict[str, Any],
             vllm_param: torch.Tensor,
+            wire_dtype: torch.dtype,
         ) -> LocalParamSpec:
             from torch.distributed._tensor import Shard
 
@@ -1818,18 +1820,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 registered_vllm_name,
                 registered_vllm_name.replace(".routed_experts.", "."),
             }
-            dtype_value = param_info.get("dtype")
-            dtype = _STR_TO_DTYPE.get(str(dtype_value))
-            if dtype != torch.bfloat16:
-                raise ValueError(
-                    "BF16 FlashInfer TRTLLM nccl_reshard refit got an "
-                    f"unsupported wire dtype {dtype_value!r} for "
-                    f"{param_info['name']!r}"
-                )
 
             def pre(_base: None) -> RefitCtx:
                 return RefitCtx(
-                    buf=torch.empty(local_shape, dtype=dtype, device=self.device)
+                    buf=torch.empty(local_shape, dtype=wire_dtype, device=self.device)
                 )
 
             def post(ctx: RefitCtx) -> None:
@@ -1856,12 +1850,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
             return LocalParamSpec(base=None, pre=pre, post=post)
 
-        def _bf16_to_fp8_receiver_quant_spec(
+        def _fp8_receiver_quant_spec(
             value_param: torch.Tensor,
             scale_param: torch.Tensor,
             merged_slice: tuple[slice, ...] | None,
             scale_slice: tuple[slice, ...] | None,
             block_size: tuple[int, int] | None,
+            wire_dtype: torch.dtype,
         ) -> LocalParamSpec:
             def pre(_base: torch.Tensor) -> RefitCtx:
                 value_region = (
@@ -1875,7 +1870,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     else scale_param.data[scale_slice]
                 )
                 return RefitCtx(
-                    buf=torch.empty_like(value_region, dtype=torch.bfloat16),
+                    buf=torch.empty_like(value_region, dtype=wire_dtype),
                     extra={"value_region": value_region, "scale_region": scale_region},
                 )
 
@@ -1884,7 +1879,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 from nemo_rl.models.generation.vllm.quantization import fp8
 
                 if block_size is None:
-                    value, scale = fp8.quantize_mxfp8_weight(ctx.buf)
+                    # FlashInfer's MXFP8 quantizer accepts BF16/FP16 inputs.
+                    # Convert FP32 only here, after the full-precision transfer.
+                    weight = (
+                        ctx.buf.to(torch.bfloat16)
+                        if ctx.buf.dtype == torch.float32
+                        else ctx.buf
+                    )
+                    value, scale = fp8.quantize_mxfp8_weight(weight)
                 elif ctx.buf.ndim == 2:
                     value, scale = fp8.cast_tensor_to_fp8_blockwise(
                         ctx.buf, block_size, allow_rectangular=True
@@ -1930,28 +1932,20 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         specs = {}
         for hf_name, (vllm_param, merged_slice) in vllm_param_map_and_slices.items():
             param_info = param_info_by_name[hf_name]
-            if id(vllm_param) in unquantized_trtllm_param_ids and param_info.get(
-                "grouped_expert_proj"
-            ):
-                specs[hf_name] = _trtllm_grouped_expert_spec(param_info, vllm_param)
-                continue
-
             wire_dtype_value = param_info.get("dtype")
-            wire_dtype = (
-                wire_dtype_value
-                if isinstance(wire_dtype_value, torch.dtype)
-                else _STR_TO_DTYPE.get(wire_dtype_value)
-            )
-            if wire_dtype is None:
+            wire_dtype = _STR_TO_DTYPE.get(str(wire_dtype_value))
+            if wire_dtype not in (torch.bfloat16, torch.float16, torch.float32):
                 raise ValueError(
                     f"build_hf_to_local_param_map: unsupported wire dtype "
                     f"{wire_dtype_value!r} for {hf_name!r}"
                 )
-            if wire_dtype != torch.bfloat16:
-                raise ValueError(
-                    f"build_hf_to_local_param_map: bulk wire dtype must be torch.bfloat16, "
-                    f"got {wire_dtype} for {hf_name!r}"
+            if id(vllm_param) in unquantized_trtllm_param_ids and param_info.get(
+                "grouped_expert_proj"
+            ):
+                specs[hf_name] = _trtllm_grouped_expert_spec(
+                    param_info, vllm_param, wire_dtype
                 )
+                continue
             if vllm_param.dtype == torch.float8_e4m3fn:
                 vllm_name = vllm_names_by_id.get(id(vllm_param))
                 if vllm_name is None:
@@ -2057,8 +2051,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         f"build_hf_to_local_param_map: FP8 scale target "
                         f"{scale_name!r} has dtype {scale_param.dtype}, expected {expected_scale_dtype}"
                     )
-                specs[hf_name] = _bf16_to_fp8_receiver_quant_spec(
-                    vllm_param, scale_param, merged_slice, scale_slice, block_size
+                specs[hf_name] = _fp8_receiver_quant_spec(
+                    vllm_param,
+                    scale_param,
+                    merged_slice,
+                    scale_slice,
+                    block_size,
+                    wire_dtype,
                 )
             else:
                 if vllm_param.dtype not in (
@@ -2070,7 +2069,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         f"Unsupported refit destination dtype {vllm_param.dtype} "
                         f"for {hf_name!r}"
                     )
-                specs[hf_name] = _staged_param_spec(vllm_param, merged_slice)
+                specs[hf_name] = _staged_param_spec(
+                    vllm_param, merged_slice, wire_dtype
+                )
         return HFToLocalParamMap(specs=specs)
 
     def _build_hf_to_gen_backend_mapping(self, refit_info):
@@ -2230,11 +2231,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         sequence and a hang can be in either.
         Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``, built
         during prepare or after PP communicator setup for TRTLLM experts) provides
-        the dst buffer:
-        for a direct param xferdtensor receives straight into the live vLLM
-        param (no hooks); for a merged param (dense gate_up_proj, grouped w13)
-        ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
-        slice back into the live merged param.
+        a canonical receive buffer in the advertised wire dtype. Its ``post``
+        hook casts or quantizes the received shard into the live destination.
         """
         from nemo_rl.distributed.refit_watchdog import (
             RefitAborted,
@@ -2262,12 +2260,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """Receive weights from training workers via xferdtensor.
 
         Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``,
-        built once in ``prepare_nccl_reshard_refit_info``) provides the dst buffer:
-        for a direct param xferdtensor receives straight into the live vLLM
-        param (no hooks); for a merged param (dense gate_up_proj, grouped w13)
-        ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
-        slice back into the live merged param. TRTLLM grouped experts instead
-        receive into canonical local tensors and load through vLLM's native path.
+        built once in ``prepare_nccl_reshard_refit_info``) stages the canonical
+        shard in the advertised wire dtype and commits it in ``post``. TRTLLM
+        grouped experts load the received tensors through vLLM's native path.
         """
         import os
         from collections import OrderedDict

@@ -69,7 +69,8 @@ class RefitCtx:
     """Handoff between a param's ``pre`` and ``post`` refit hooks.
 
     The transfer API (xferdtensor) reads only ``buf``: bulk weights use
-    canonical HF layout and BF16 dtype, independently of either storage format.
+    canonical HF layout. Quantized sources use BF16; unquantized sources retain
+    their dtype. Metadata and receiver buffers use the same transfer dtype.
     ``extra`` is provided for flexible, backend-specific state.
 
     Use case:
@@ -681,8 +682,8 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                 "policy.megatron_cfg.account_for_loss_in_pipeline_split must be False."
             )
 
-        # Bulk values always travel as canonical HF BF16. Source storage and
-        # destination precision are independent; destination hooks own quantization.
+        # Bulk values use canonical HF layout and preserve unquantized source
+        # dtypes. Quantized sources use BF16; destination hooks own quantization.
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
         fp8_param = fp8_cfg.get("fp8_param", False)
         if fp8_param and not fp8_cfg.get("enabled", False):
@@ -781,6 +782,22 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                 violations.append(
                     "Blockwise FP8 Megatron destinations require Transformer Engine "
                     "storage, not transformer_impl='inference_optimized'."
+                )
+
+            # TE caches FP8 compute weights from ordinary parameters after the
+            # first inference forward. Refits do not reset is_first_microbatch.
+            if (
+                gen_fp8_cfg.get("enabled")
+                and not gen_fp8_cfg.get("fp8_param")
+                and mcore_generation_cfg.get("transformer_impl")
+                != "inference_optimized"
+                and not mcore_generation_cfg.get("disable_parameter_transpose_cache")
+            ):
+                violations.append(
+                    "FP8 Megatron generation with Transformer Engine layers requires "
+                    "fp8_cfg.fp8_param=True or disable_parameter_transpose_cache=True "
+                    "in policy.generation.mcore_generation_config for nccl_reshard "
+                    "refit, so inference does not reuse stale cached FP8 weights."
                 )
 
     # Gen-backend restrictions. The reshard supports gen-side TP, DP, EP, and
