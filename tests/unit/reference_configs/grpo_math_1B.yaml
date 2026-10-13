@@ -60,6 +60,9 @@ grpo:
   deduplicate_multimodal_data: false
   # Debug-only exact Ray payload telemetry; serialization adds runtime overhead.
   debug_payload_metrics: false
+  # Optional per-prompt-group length penalties/bonuses for NeMo-Gym rollouts
+  # (binary-reward envs only). See docs/guides/length-penalty.md. null disables.
+  length_penalty: null
 
   async_grpo:
     enabled: false # Set to true to enable async training mode
@@ -154,9 +157,13 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
+  # Run the policy offload lifecycle before non-colocated refit.
+  offload_policy_before_refit: false
+  # Move optimizer state to CPU when the refit offload lifecycle runs.
+  offload_optimizer_for_refit: true
   worker_extension_cls_fqn: null
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
@@ -234,6 +241,7 @@ policy:
     moe_permute_fusion: true
     # gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
+    flash_attention_version: 2
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
@@ -364,7 +372,7 @@ policy:
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.automodel_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
 
   optimizer:
@@ -445,7 +453,6 @@ policy:
       refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
       refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
       logprobs_mode: processed_logprobs  # Return log-probs after sampling processors. Use raw_logprobs for parity with policy recomputation.
-      offload_policy_before_refit: false  # Keep policy state on GPU by default. Enable when a non-colocated Megatron refit needs additional GPU headroom for transfer staging.
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
       http_server_num_replicas: 8  # HTTP frontend event loops per model-parallel coordinator.
@@ -586,11 +593,15 @@ data_plane:
   simple:
     storage_capacity: 1000000        # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
+    storage_unit_placement: null     # all, or cluster names like [inference]; null = TQ SPREAD
   mooncake_cpu:
     global_segment_size: 68719476736 # 64 GiB/process
-    local_buffer_size:    4294967296 # 4 GiB/process
+    local_buffer_size:    2147483648 # 2 GiB/process = 4 TQ transfer threads x 512 MiB slot
     reuse_registered_buffers: true   # reuse RDMA-registered buffers
-    staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
+    staging_buffer_size:   536870912 # 512 MiB/pool slot; bigger payloads register per transfer
+    storage_unit_segment_size: 0     # >0: CPU storage units own all memory (bytes each)
+    num_storage_units: null          # null = 2 per selected node
+    storage_unit_placement: all      # all, or cluster names: [inference], [train, teacher:<name>]
     use_gdr: false                   # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024      # HBM reserved per active GDR client;
                                      # 8 clients/node is ~8 GiB off the training

@@ -46,17 +46,17 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 cd $PROJECT_ROOT
 
 # Dtensor 2 step baseline
-train_cmd logger.log_dir=$LOG_DIR/baseline sft.max_num_steps=2 policy.dtensor_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[baseline 2step] " | tee ${RUN_LOG}.2step_baseline
+train_cmd logger.log_dir=$LOG_DIR/baseline sft.max_num_steps=2 policy.automodel_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[baseline 2step] " | tee ${RUN_LOG}.2step_baseline
 uv run tests/json_dump_tb_logs.py $LOG_DIR/baseline --output_path $EXP_DIR/baseline.json
 # Dtensor 1+1 step
-train_cmd logger.log_dir=$LOG_DIR/dtensor sft.max_num_steps=2 checkpointing.checkpoint_must_save_by=0:0:0:1 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/dtensor policy.dtensor_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[dtensor 1step] " | tee ${RUN_LOG}.dtensor_1step
+train_cmd logger.log_dir=$LOG_DIR/dtensor sft.max_num_steps=2 checkpointing.checkpoint_must_save_by=0:0:0:1 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/dtensor policy.automodel_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[dtensor 1step] " | tee ${RUN_LOG}.dtensor_1step
 uv run tests/json_dump_tb_logs.py $LOG_DIR/dtensor --output_path $EXP_DIR/dtensor_1step.json
-train_cmd logger.log_dir=$LOG_DIR/dtensor sft.max_num_steps=2 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/dtensor policy.dtensor_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[dtensor 2step] " | tee ${RUN_LOG}.dtensor_2step
+train_cmd logger.log_dir=$LOG_DIR/dtensor sft.max_num_steps=2 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/dtensor policy.automodel_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[dtensor 2step] " | tee ${RUN_LOG}.dtensor_2step
 uv run tests/json_dump_tb_logs.py $LOG_DIR/dtensor --output_path $EXP_DIR/dtensor_2step.json
 # Mcore 2+2 step
-train_cmd logger.log_dir=$LOG_DIR/mcore sft.max_num_steps=2 checkpointing.checkpoint_must_save_by=0:0:0:1 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/mcore policy.dtensor_cfg.enabled=false policy.megatron_cfg.enabled=true $@ 2>&1 | prefix_output "[mcore 1step] " | tee ${RUN_LOG}.mcore_1step
+train_cmd logger.log_dir=$LOG_DIR/mcore sft.max_num_steps=2 checkpointing.checkpoint_must_save_by=0:0:0:1 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/mcore policy.automodel_cfg.enabled=false policy.megatron_cfg.enabled=true $@ 2>&1 | prefix_output "[mcore 1step] " | tee ${RUN_LOG}.mcore_1step
 uv run tests/json_dump_tb_logs.py $LOG_DIR/mcore --output_path $EXP_DIR/mcore_1step.json
-train_cmd logger.log_dir=$LOG_DIR/mcore sft.max_num_steps=2 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/mcore policy.dtensor_cfg.enabled=false policy.megatron_cfg.enabled=true $@ 2>&1 | prefix_output "[mcore 2step] " | tee ${RUN_LOG}.mcore_2step
+train_cmd logger.log_dir=$LOG_DIR/mcore sft.max_num_steps=2 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/mcore policy.automodel_cfg.enabled=false policy.megatron_cfg.enabled=true $@ 2>&1 | prefix_output "[mcore 2step] " | tee ${RUN_LOG}.mcore_2step
 uv run tests/json_dump_tb_logs.py $LOG_DIR/mcore --output_path $EXP_DIR/mcore_2step.json
 
 uv run python - <<EOF $EXP_DIR/baseline.json $EXP_DIR/dtensor_1step.json $EXP_DIR/dtensor_2step.json $EXP_DIR/mcore_1step.json $EXP_DIR/mcore_2step.json
@@ -105,7 +105,7 @@ EOF
 
 # Mcore 1+1 resume with override_opt_param_scheduler: Bridge rewrites the
 # scheduler position on resume only when this flag is on.
-MCORE_OVERRIDE=(policy.dtensor_cfg.enabled=false policy.megatron_cfg.enabled=true
+MCORE_OVERRIDE=(policy.automodel_cfg.enabled=false policy.megatron_cfg.enabled=true
   +policy.megatron_cfg.scheduler.override_opt_param_scheduler=true
   policy.megatron_cfg.scheduler.lr_warmup_init=1.0e-7
   policy.megatron_cfg.scheduler.lr_warmup_iters=10

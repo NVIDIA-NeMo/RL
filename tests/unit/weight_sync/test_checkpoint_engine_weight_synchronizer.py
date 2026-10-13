@@ -375,7 +375,7 @@ class TestCheckpointEngineFactory:
         ],
     )
     def test_checkpoint_engine_factory_routing(self, backend, colocated, expected):
-        policy = _mock_policy(cfg={})
+        policy = _mock_policy(cfg={"offload_policy_before_refit": False})
         gen = _mock_generation(cfg=_nixl_refit_cfg())
         if isinstance(expected, type) and issubclass(expected, Exception):
             with pytest.raises(expected):
@@ -396,7 +396,16 @@ class TestCheckpointEngineFactory:
             expected,
         )
 
-    @pytest.mark.parametrize("cfg", [{"megatron_cfg": {"enabled": False}}, {}])
+    @pytest.mark.parametrize(
+        "cfg",
+        [
+            {
+                "megatron_cfg": {"enabled": False},
+                "offload_policy_before_refit": False,
+            },
+            {"offload_policy_before_refit": False},
+        ],
+    )
     def test_checkpoint_engine_accepts_non_megatron_policy(self, cfg):
         gen = _mock_generation(cfg=_nixl_refit_cfg())
         assert isinstance(

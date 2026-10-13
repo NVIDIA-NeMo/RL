@@ -52,7 +52,7 @@ def maybe_preinit_nixl_checkpoint_engine(config: dict[str, Any]) -> Any:
     )
 
 
-class DTensorCheckpointEngineSendMixin:
+class AutomodelCheckpointEngineSendMixin:
     """Onload DTensor/FSDP2 policy weights for checkpoint-engine transfer."""
 
     model: torch.nn.Module

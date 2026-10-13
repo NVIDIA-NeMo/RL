@@ -13,7 +13,7 @@ policy:
   train_global_batch_size: 64
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  dtensor_cfg:
+  automodel_cfg:
     activation_checkpointing: true
     context_parallel_size: 4
     cpu_offload: true
@@ -61,7 +61,7 @@ logger:
   wandb_enabled: true
   wandb:
     project: grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
-    name: grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5-tp${policy.dtensor_cfg.tensor_parallel_size}
+    name: grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5-tp${policy.automodel_cfg.tensor_parallel_size}
   tensorboard:
     log_dir: tb_logs-grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
   mlflow:

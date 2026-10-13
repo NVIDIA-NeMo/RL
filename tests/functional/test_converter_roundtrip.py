@@ -86,7 +86,7 @@ def create_test_config() -> Dict[str, Any]:
             "max_total_sequence_length": 128,
             "precision": "bfloat16",
             "offload_optimizer_for_logprob": False,
-            "dtensor_cfg": {
+            "automodel_cfg": {
                 "enabled": True,
                 "checkpoint": {
                     "model_save_format": "torch_save",
