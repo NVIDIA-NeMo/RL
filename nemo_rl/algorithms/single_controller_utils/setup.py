@@ -823,7 +823,7 @@ def _spinup_gym(
     model_name = generation_config["model_name"]
     if generation_config["backend"] == "remote_vllm":
         # Keep the optional remote backend out of managed-generation imports.
-        from nemo_rl.models.generation.remote_vllm.config import RemoteVllmServiceConfig
+        from nemo_rl.models.generation.remote_vllm_config import RemoteVllmServiceConfig
 
         model_name = RemoteVllmServiceConfig.model_validate(
             generation_config["remote_vllm_cfg"]
@@ -861,7 +861,7 @@ def _generation_max_seq_len(generation_config) -> int:
         return generation_config["mcore_generation_config"]["max_model_len"]
     if backend == "remote_vllm":
         # Keep the optional remote backend out of managed-generation imports.
-        from nemo_rl.models.generation.remote_vllm.config import RemoteVllmServiceConfig
+        from nemo_rl.models.generation.remote_vllm_config import RemoteVllmServiceConfig
 
         return RemoteVllmServiceConfig.model_validate(
             generation_config["remote_vllm_cfg"]

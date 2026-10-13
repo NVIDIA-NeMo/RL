@@ -13,14 +13,15 @@
 # limitations under the License.
 
 import json
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
-import urllib.request
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
+from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.remote_vllm import (
     RemoteVllmClient,
     RemoteVllmGeneration,
@@ -31,6 +32,11 @@ from nemo_rl.weight_sync.factory import create_weight_synchronizer
 from nemo_rl.weight_sync.hf_checkpoint_weight_synchronizer import (
     HfCheckpointWeightSynchronizer,
 )
+
+
+def test_generation_config_builds_runtime_remote_service_schema() -> None:
+    schema = TypeAdapter(GenerationConfig).json_schema()
+    assert "RemoteVllmServiceConfig" in schema["$defs"]
 
 
 class _Response:

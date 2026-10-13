@@ -17,7 +17,7 @@
 from typing import Any
 
 from nemo_rl.models.generation.remote_vllm.client import RemoteVllmClient
-from nemo_rl.models.generation.remote_vllm.config import (
+from nemo_rl.models.generation.remote_vllm_config import (
     RemoteVllmServiceConfig,
     RemoteVllmServiceInfo,
 )
