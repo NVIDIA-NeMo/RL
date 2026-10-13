@@ -323,7 +323,7 @@ their full decoded strings still determine exact-match correctness.
 
 The [`xtoken_off_policy_distillation.sh`](../../tests/functional/xtoken_off_policy_distillation.sh)
 functional test covers raw text and native chat. Its
-[`chat configuration`](../../tests/functional/xtoken_native_chat.yaml)
+[`chat configuration`](../../examples/configs/xtoken_native_chat.yaml)
 uses a SmolLM2-135M-Instruct student and Qwen3-1.7B teacher with distinct
 tokenizer vocabularies and token boundaries. Both use the history-preserving
 ChatML override so the test retains reasoning, tool calls, and end-of-turn

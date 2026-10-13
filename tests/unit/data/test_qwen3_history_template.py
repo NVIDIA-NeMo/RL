@@ -440,7 +440,7 @@ def test_native_functional_config_loads_exact_tokenizers_and_dataset(
     data_path = tmp_path / "native_chat.jsonl"
     write_dataset(data_path)
     register_omegaconf_resolvers()
-    path = ROOT / "tests/functional/xtoken_native_chat.yaml"
+    path = ROOT / "examples/configs/xtoken_native_chat.yaml"
     raw_config = load_config(path)
     OmegaConf.update(raw_config, "data.train.data_path", str(data_path))
     config = MasterConfig.model_validate(
