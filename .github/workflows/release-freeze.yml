@@ -34,7 +34,8 @@ on:
         default: true
 jobs:
   code-freeze:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@bfdb5e35067fd8cd91ce21fca4eb1072ffd7ab8c # v1.4.2
+    # TODO(kajalj): repin to a released tag once NVIDIA-NeMo/FW-CI-templates#586 merges.
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@72aa99de4599aed63abae8f5a03bf2e4b5a501dd
     with:
       library-name: NeMo-RL
       python-package: nemo_rl
@@ -44,6 +45,11 @@ jobs:
       next-pre-release: ""
       next-dev: ""
       use-pat: true
+      cherry-pick-psa: >-
+        PSA: For automated cherry picks back to `main`, assign the label `cherry-pick-to-main` to your PR
+        _before_ merging to `{RELEASE_BRANCH}`. A bot will attempt a cherry pick into `main`. If it fails
+        due to a merge-conflict, you'll get pinged in #swdl-nemo-rl-alerts and will need to take action —
+        no one will proactively reach out.
     secrets:
       SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
