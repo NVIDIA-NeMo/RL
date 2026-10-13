@@ -30,9 +30,11 @@ import tempfile
 import uuid
 from copy import deepcopy
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
+from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
@@ -1135,6 +1137,37 @@ def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     assert ("agent/full_result" in metrics) is log_full_result_tables
 
 
+def test_capture_metrics_are_mirrored_into_the_resolved_harness_namespace():
+    impl = _nemo_gym_impl(True)
+    completion = Completion(
+        message_log=[],
+        env_extras={
+            "reward": 1.0,
+            "instance_config": {"mask_sample": True},
+            "ng_receipt": {
+                "capture_poisoned": False,
+                "manifest": [
+                    {"cum_len": 8, "delta_len": 3},
+                    {"cum_len": 13, "delta_len": 5},
+                ],
+            },
+        },
+        truncated=False,
+        reward=1.0,
+    )
+
+    metrics = impl._compute_rollout_metrics([completion], "anyterminal_openclaw")
+
+    assert metrics["anyterminal_openclaw/total_reward/mean"] == 1.0
+    assert metrics["anyterminal_openclaw/turns_per_sample/mean"] == 2.0
+    assert metrics["anyterminal_openclaw/total_tokens_per_sample/mean"] == 13.0
+    assert metrics["anyterminal_openclaw/gen_tokens_per_sample/mean"] == 8.0
+    assert metrics["anyterminal_openclaw/success_rate"] == 1.0
+    assert metrics["anyterminal_openclaw/mask_sample_rate"] == 1.0
+    assert metrics["anyterminal_openclaw/capture_poisoned_rate"] == 0.0
+    assert metrics["anyterminal_openclaw/samples_per_group"] == 1.0
+
+
 def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
     completions = [
         Completion(
@@ -1953,6 +1986,7 @@ def _make_capture_manager(
     retry_policy: RolloutRetryPolicy | None = None,
     instance_configs=None,
     recovery_config: RolloutRecoveryConfig | None = None,
+    rollout_metrics: dict[str, Any] | None = None,
 ):
     mgr = object.__new__(RolloutManager)
     mgr._tokenizer = None
@@ -2015,6 +2049,7 @@ def _make_capture_manager(
                 instance_configs=selected_configs,
                 loss_multiplier=float(_sample.get("loss_multiplier", 1.0)),
             )
+            record.rollout_metrics = dict(rollout_metrics or {})
             if on_completion is not None:
                 for generation_index, completion in zip(indices, record.completions):
                     await on_completion(generation_index, completion)
@@ -2025,6 +2060,26 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    def test_request_preserves_per_harness_scalar_metrics(self):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(
+            buf,
+            rollout_metrics={
+                "anyterminal_openclaw/reward/mean": 0.5,
+                "anyterminal_openclaw/reward/histogram": [1.0, 0.0],
+                "anyterminal_openclaw/full_result": Table(
+                    columns=["Full result"], data=[["large payload"]]
+                ),
+            },
+        )
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+
+        assert request.rollout_metrics == {
+            "anyterminal_openclaw/reward/mean": 0.5,
+            "anyterminal_openclaw/reward/histogram": [1.0, 0.0],
+        }
+
     def test_request_carries_env_mask_flags(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(

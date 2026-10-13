@@ -32,6 +32,7 @@ import requests
 import torch
 from pydantic import ValidationError
 
+import nemo_rl.models.generation.vllm.vllm_worker_async as vllm_worker_async
 from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -886,7 +887,7 @@ class _FakeFastAPIApp:
         return decorator
 
 
-def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
+def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch, tmp_path):
     (
         tool_parser_manager,
         reasoning_parser_manager,
@@ -894,12 +895,16 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     ) = _install_fake_vllm_openai_modules(monkeypatch)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    plugin_path = (
+        "nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py"
+    )
+    monkeypatch.chdir(tmp_path)
     worker.cfg = {
         "temperature": 1.0,
         "top_p": 1.0,
         "vllm_cfg": {
             "tool_parser_plugin": "/plugins/tool_parser.py",
-            "reasoning_parser_plugin": "/plugins/reasoning_parser.py",
+            "reasoning_parser_plugin": plugin_path,
             "http_server_serving_chat_kwargs": {
                 "reasoning_parser": "nano_v3",
             },
@@ -917,8 +922,11 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     tool_parser_manager.import_tool_parser.assert_called_once_with(
         "/plugins/tool_parser.py"
     )
+    resolved_plugin_path = (
+        Path(vllm_worker_async.__file__).resolve().parents[4] / plugin_path
+    )
     reasoning_parser_manager.import_reasoning_parser.assert_called_once_with(
-        "/plugins/reasoning_parser.py"
+        str(resolved_plugin_path)
     )
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`

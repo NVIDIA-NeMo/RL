@@ -133,6 +133,26 @@ def _nemo_gym_metric_namespace(row: Mapping[str, Any]) -> str:
     return "nemo_gym"
 
 
+def _metadata_rollout_metrics(
+    metrics: Mapping[str, Any],
+) -> dict[str, float | int | list[float | int]]:
+    """Keep rollout metrics that can safely cross the finalizer actor RPC.
+
+    W&B Tables contain full result payloads and intentionally stay local to the
+    ordinary rollout path. Scalars and numeric histogram observations are the
+    per-agent training metrics needed after token-capture row reassembly.
+    """
+    retained: dict[str, float | int | list[float | int]] = {}
+    for name, value in metrics.items():
+        if isinstance(value, (int, float)):
+            retained[name] = value
+        elif isinstance(value, list) and all(
+            isinstance(observation, (int, float)) for observation in value
+        ):
+            retained[name] = list(value)
+    return retained
+
+
 class RolloutOutcome(str, enum.Enum):
     """How :meth:`RolloutManager.generate_and_push` finished for one prompt."""
 
@@ -1569,6 +1589,29 @@ class AsyncNemoGymRolloutImpl:
             f"{agent_name}/truncation_rate": truncation_rate,
         }
 
+        mask_sample = [
+            bool(((c.env_extras or {}).get("instance_config") or {}).get(MASK_SAMPLE))
+            for c in completions
+        ]
+        capture_poisoned = [
+            bool(((c.env_extras or {}).get("ng_receipt") or {}).get("capture_poisoned"))
+            for c in completions
+        ]
+        rollout_metrics.update(
+            {
+                "success_rate": sum(reward > 0 for reward in total_reward) / n,
+                "mask_sample_rate": sum(mask_sample) / n,
+                "capture_poisoned_rate": sum(capture_poisoned) / n,
+            }
+        )
+        # Every prompt group has exactly one resolved Gym agent. Mirror the
+        # group-level rollout metrics into that agent's namespace so W&B can
+        # compare harness quality and cost directly. The unprefixed metrics
+        # remain for backwards-compatible aggregate dashboards.
+        for metric_name, value in list(rollout_metrics.items()):
+            rollout_metrics[f"{agent_name}/{metric_name}"] = value
+        rollout_metrics[f"{agent_name}/samples_per_group"] = float(n)
+
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
         agent_extras = [
@@ -1613,6 +1656,9 @@ class AsyncNemoGymRolloutImpl:
         # Necessary for downstream nemo rl logging/printing.
         rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
             "gen_tokens_per_sample/mean"
+        ]
+        rollout_metrics[f"{agent_name}/mean_gen_tokens_per_sample"] = rollout_metrics[
+            "mean_gen_tokens_per_sample"
         ]
         return rollout_metrics
 
@@ -2282,6 +2328,7 @@ class RolloutManager:
             rollout_ids=list(rollout_ids),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
+        rollout_metrics: dict[str, float | int | list[float | int]] = {}
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -2383,13 +2430,14 @@ class RolloutManager:
                             group_id,
                             generation_indices=pending_indices,
                         )
-                    await self.run_rollout(
+                    record = await self.run_rollout(
                         attempt_input_sample,
                         rollout_ids=list(rollout_ids),
                         generation_indices=pending_indices,
                         on_completion=_record_streamed_completion,
                         recovery_granularity=recovery_group.recovery_granularity,
                     )
+                    rollout_metrics = _metadata_rollout_metrics(record.rollout_metrics)
             finally:
                 if inflight_registry is not None:
                     inflight_registry.pop(group_id, None)
@@ -2413,6 +2461,7 @@ class RolloutManager:
                 fallback_weight_version=start_version,
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
+                rollout_metrics=rollout_metrics,
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
             )
             assert_metadata_only(request)

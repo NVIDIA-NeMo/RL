@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nemo-rl-vllm-prefix-plugin"
+version = "0.2.0"
+description = "NeMo RL prefix-token and external-staging support for vLLM"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["vllm==0.29.0"]
+
+[project.entry-points."vllm.endpoint_plugins"]
+nemo_rl_prefix_api = "nemo_rl_vllm_prefix_plugin.plugin:NeMoRLPrefixEndpointPlugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nemo_rl_vllm_prefix_plugin"]

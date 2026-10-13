@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 import ray
@@ -49,6 +49,13 @@ class ReassemblyRequest:
     # train pump reads the same ``mask_sample`` field as the native path
     # (SingleController reads it unconditionally).
     mask_sample: tuple[bool, ...]
+    # Scalar and histogram rollout metrics remain metadata-only, so the
+    # token-capture finalizer can carry them across the canonical-row rewrite.
+    # Without this sidecar the rewrite discards per-agent metrics before the
+    # SingleController train step reaches W&B.
+    rollout_metrics: dict[str, float | int | list[float | int]] = field(
+        default_factory=dict
+    )
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
     reward_checks: tuple[RewardChecks | None, ...] | None = None
