@@ -18,7 +18,9 @@ export NUM_GENERATIONS=${NUM_GENERATIONS:-4}
 # by dataset epochs; the allocation lifetime remains the operational bound.
 export MAX_STEPS=${MAX_STEPS:-1000000}
 export SAVE_PERIOD=${SAVE_PERIOD:-1}
-export JOB_CYCLES=${JOB_CYCLES:-1}
+# Chain allocation-bounded cycles against the same checkpoint/W&B run.  This
+# preserves the effectively uncapped GRPO horizon across Slurm time limits.
+export JOB_CYCLES=${JOB_CYCLES:-6}
 export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-04:00:00}
 export CONTEXT_COMPACTION=true
 export CLAW_EVAL_COMPACTION_AUTO=false
@@ -34,7 +36,12 @@ export CLAW_EVAL_MAX_TURNS=${CLAW_EVAL_MAX_TURNS:-40}
 # placeholders, and an all-placeholder GRPO batch is skipped by the controller.
 export CLAW_EVAL_MAX_ROW_TOKENS=${CLAW_EVAL_MAX_ROW_TOKENS:-65536}
 export CLAW_EVAL_CONCURRENCY=${CLAW_EVAL_CONCURRENCY:-$((NUM_PROMPTS * NUM_GENERATIONS))}
-export CLAW_EVAL_DELEGATION_PROMPT=${CLAW_EVAL_DELEGATION_PROMPT:-You may delegate suitable subtasks to subagents when useful. Review and integrate their results before producing the final answer.}
+# This synchronous run is the mechanism gate: require one bounded child call so
+# parent/child capture and optimization are exercised deterministically.  The
+# later production/async recipe keeps natural, optional delegation.
+debug_delegation_prompt="During this task, you must call the task tool exactly once to delegate one suitable bounded subtask to the general subagent. "
+debug_delegation_prompt+="Do not delegate the full task. Review and integrate the child's result before producing the final answer."
+export CLAW_EVAL_DELEGATION_PROMPT=${CLAW_EVAL_DELEGATION_PROMPT:-"${debug_delegation_prompt}"}
 export BASE_NAME=${BASE_NAME:-claweval_subagents_sync_8n_$(date -u +%Y%m%d-%H%M%S)}
 export WANDB_PROJECT=nemorl-v2-subagent-comapction-debug
 export WANDB_ENTITY=${WANDB_ENTITY:-adlr}
