@@ -127,43 +127,20 @@ def _prepare_native_thinking_messages(
     return prepared
 
 
-def _turn_render(
+def _final_content_span(
     tokenizer: PreTrainedTokenizerBase,
     messages: list[dict[str, Any]],
-    turn: int,
     text: str,
     *,
     preserve_thinking: bool,
     tools: list[dict[str, Any]] | None,
-) -> str:
-    prefix = _render_chat_text(
-        tokenizer,
-        messages[: turn + 1],
-        preserve_thinking=preserve_thinking,
-        tools=tools,
-    )
-    if not text.startswith(prefix):
-        raise ValueError(
-            f"turn {turn}: template changed historical content or reasoning; "
-            "install a compatible history-preserving template"
-        )
-    return prefix
-
-
-def _ordinary_content_span(
-    tokenizer: PreTrainedTokenizerBase,
-    messages: list[dict[str, Any]],
-    turn: int,
-    prefix: str,
-    *,
-    preserve_thinking: bool,
-    tools: list[dict[str, Any]] | None,
 ) -> tuple[int, int, str] | None:
-    """Bind content inside its template envelope, never role headers/suffixes."""
+    """Locate the final answer while keeping the full history in both renders."""
+    turn = len(messages) - 1
     marker = "__nemo_rl_content_span_probe__"
-    while marker in prefix:
+    while marker in text:
         marker += "_"
-    probe_messages = deepcopy(messages[: turn + 1])
+    probe_messages = deepcopy(messages)
     probe_messages[-1]["content"] = marker
     probe = _render_chat_text(
         tokenizer, probe_messages, preserve_thinking=preserve_thinking, tools=tools
@@ -173,20 +150,18 @@ def _ordinary_content_span(
             f"turn {turn}: missing canonical content span; template transformed the content probe"
         )
     before, after = probe.split(marker)
-    if not prefix.startswith(before) or not prefix.endswith(after):
+    if not text.startswith(before) or not text.endswith(after):
         raise ValueError(
             f"turn {turn}: missing canonical content span; template changed the content envelope"
         )
     content_start = len(before)
-    content_end = len(prefix) - len(after)
+    content_end = len(text) - len(after)
     source = messages[turn].get("content") or ""
-    if prefix[content_start:content_end].strip() != source.strip():
+    if text[content_start:content_end].strip() != source.strip():
         raise ValueError(
             f"turn {turn}: missing canonical content span; rendered content differs from source"
         )
-    return find_rendered_message_content_span(
-        prefix[:content_end], source, content_start
-    )
+    return find_rendered_message_content_span(text[:content_end], source, content_start)
 
 
 def _eot_index(offsets: list[tuple[int, int]], text: str, position: int) -> int:
@@ -207,19 +182,21 @@ def _tokenize_chat_text(
     native_semantic_messages: list[dict[str, Any]] | None,
     tools: list[dict[str, Any]] | None = None,
 ) -> RenderedChatDocument:
-    """Tokenize one rendered document and bind supervision to logical turns.
+    """Tokenize the full conversation and supervise only its final assistant turn.
 
     Reject documents that exceed the context limit instead of truncating them.
     """
-    if include_thinking_in_loss and native_semantic_messages is None:
-        for turn, message in enumerate(messages):
-            if message.get("role") == "assistant" and message.get("reasoning_content"):
-                raise ValueError(
-                    f"turn {turn}: supervising separate reasoning_content requires "
-                    "collator.native_thinking_alignment=true with a supported "
-                    "Qwen/Nano ChatML template; ordinary chat supports inline "
-                    "<think> reasoning in message.content"
-                )
+    if (
+        include_thinking_in_loss
+        and native_semantic_messages is None
+        and messages[-1].get("reasoning_content")
+    ):
+        raise ValueError(
+            f"turn {len(messages) - 1}: supervising separate reasoning_content requires "
+            "collator.native_thinking_alignment=true with a supported "
+            "Qwen/Nano ChatML template; ordinary chat supports inline "
+            "<think> reasoning in message.content"
+        )
     encoded = tokenizer(
         text,
         return_offsets_mapping=True,
@@ -247,130 +224,111 @@ def _tokenize_chat_text(
         answer_parts=[],
     )
     preserve = include_thinking_in_loss or native_semantic_messages is not None
-    native_cursor: int = 0
-    for turn, message in enumerate(messages):
-        selected = bool(message_loss_mask[turn])
-        content = message.get("content") or ""
-        if not isinstance(content, str):
-            raise TypeError(f"turn {turn}: chat requires string content")
-        if native_semantic_messages is not None:
-            if message.get("role") != "assistant":
-                continue
-            marker_start = text.find(_IM_START_ASSISTANT, native_cursor)
-            eot_start = (
-                text.find(_IM_END, marker_start + len(_IM_START_ASSISTANT))
-                if marker_start >= 0
-                else -1
+    # Earlier messages remain context; only the final turn needs loss boundaries.
+    turn = len(messages) - 1
+    message = messages[turn]
+    content = message.get("content") or ""
+    if not isinstance(content, str):
+        raise TypeError(f"turn {turn}: chat requires string content")
+    if native_semantic_messages is not None:
+        marker_start = text.rfind(_IM_START_ASSISTANT)
+        eot_start = (
+            text.find(_IM_END, marker_start + len(_IM_START_ASSISTANT))
+            if marker_start >= 0
+            else -1
+        )
+        if marker_start < 0 or eot_start < marker_start:
+            raise ValueError(
+                f"turn {turn}: unsupported native layout; expected Qwen/Nano ChatML markers"
             )
-            if marker_start < 0 or eot_start < marker_start:
-                raise ValueError(
-                    f"turn {turn}: unsupported native layout; expected Qwen/Nano ChatML markers"
-                )
-            content_start = marker_start + len(_IM_START_ASSISTANT)
-            native_cursor = eot_start + len(_IM_END)
-            regions: dict[str, tuple[int, int]] = {}
-            reasoning = message.get("reasoning_content")
-            answer_cursor = content_start
-            if reasoning:
-                open_start = text.find("<think>", content_start, eot_start)
-                if open_start < 0:
-                    raise ValueError(
-                        f"turn {turn}: missing requested reasoning scaffold"
-                    )
-                reasoning_start = text.find(reasoning, open_start + 7, eot_start)
-                if reasoning_start < 0:
-                    raise ValueError(
-                        f"turn {turn}: missing requested reasoning content"
-                    )
-                reasoning_end = reasoning_start + len(reasoning)
-                close_start = text.find("</think>", reasoning_end, eot_start)
-                if close_start < 0:
-                    raise ValueError(f"turn {turn}: missing reasoning closing marker")
-                regions["reasoning"] = (reasoning_start, reasoning_end)
-                regions["close"] = (close_start, close_start + 8)
-                answer_cursor = close_start + 8
-            if content:
-                answer_start = text.find(content, answer_cursor, eot_start)
-                if answer_start < 0:
-                    raise ValueError(f"turn {turn}: missing native answer content")
-                regions["answer"] = (answer_start, answer_start + len(content))
-                answer_cursor = answer_start + len(content)
-            calls = message.get("tool_calls")
-            if calls:
-                first_call = _render_native_tool_call(tokenizer, calls[0])
-                tool_start = text.find(first_call, answer_cursor, eot_start)
-                if tool_start < 0:
-                    raise ValueError(f"turn {turn}: missing native tool payload")
-                last_call = _render_native_tool_call(tokenizer, calls[-1])
-                tool_end = text.rfind(last_call, tool_start, eot_start) + len(last_call)
-                regions["answer"] = (
-                    regions.get("answer", (tool_start, tool_end))[0],
-                    tool_end,
-                )
-            if not selected:
-                continue
-            if not regions:
-                raise ValueError(
-                    f"turn {turn}: selected assistant has empty supervision (whitespace-only content is unsupported)"
-                )
-            typed_regions = NativeAlignmentRegions(**regions)
-            doc.alignment_regions.append(typed_regions)
-            doc.assistant_spans.append((content_start, eot_start))
-            doc.eot_indices.append(_eot_index(offsets, text, eot_start))
-            doc.source_turn_indices.append(turn)
-            for token_i, (start, end) in enumerate(offsets):
-                if end > start and any(
-                    a <= start and end <= b for a, b in regions.values()
-                ):
-                    doc.assistant_mask[token_i] = 1
-        else:
-            # Prefix renders anchor the lookup to this logical turn, including
-            # user/context turns whose text may recur in an assistant answer.
-            prefix = _turn_render(
-                tokenizer, messages, turn, text, preserve_thinking=preserve, tools=tools
+        content_start = marker_start + len(_IM_START_ASSISTANT)
+        regions: dict[str, tuple[int, int]] = {}
+        reasoning = message.get("reasoning_content")
+        answer_cursor = content_start
+        if reasoning:
+            open_start = text.find("<think>", content_start, eot_start)
+            if open_start < 0:
+                raise ValueError(f"turn {turn}: missing requested reasoning scaffold")
+            reasoning_start = text.find(reasoning, open_start + 7, eot_start)
+            if reasoning_start < 0:
+                raise ValueError(f"turn {turn}: missing requested reasoning content")
+            reasoning_end = reasoning_start + len(reasoning)
+            close_start = text.find("</think>", reasoning_end, eot_start)
+            if close_start < 0:
+                raise ValueError(f"turn {turn}: missing reasoning closing marker")
+            regions["reasoning"] = (reasoning_start, reasoning_end)
+            regions["close"] = (close_start, close_start + 8)
+            answer_cursor = close_start + 8
+        if content:
+            answer_start = text.find(content, answer_cursor, eot_start)
+            if answer_start < 0:
+                raise ValueError(f"turn {turn}: missing native answer content")
+            regions["answer"] = (answer_start, answer_start + len(content))
+            answer_cursor = answer_start + len(content)
+        calls = message.get("tool_calls")
+        if calls:
+            first_call = _render_native_tool_call(tokenizer, calls[0])
+            tool_start = text.find(first_call, answer_cursor, eot_start)
+            if tool_start < 0:
+                raise ValueError(f"turn {turn}: missing native tool payload")
+            last_call = _render_native_tool_call(tokenizer, calls[-1])
+            tool_end = text.rfind(last_call, tool_start, eot_start) + len(last_call)
+            regions["answer"] = (
+                regions.get("answer", (tool_start, tool_end))[0],
+                tool_end,
             )
-            span = _ordinary_content_span(
-                tokenizer,
-                messages,
-                turn,
-                prefix,
-                preserve_thinking=preserve,
-                tools=tools,
+        if not regions:
+            raise ValueError(
+                f"turn {turn}: selected assistant has empty supervision (whitespace-only content is unsupported)"
             )
-            if span is None:
-                if content.strip() or selected:
-                    raise ValueError(
-                        f"turn {turn}: missing canonical content span or empty selected assistant"
-                    )
-                continue
-            start, end, canonical = span
-            if not selected:
-                continue
-            doc.assistant_spans.append((start, end))
-            doc.source_turn_indices.append(turn)
-            suffix = prefix[end:]
-            terminator = suffix.lstrip()
-            eot_position = end + len(suffix) - len(terminator)
-            doc.eot_indices.append(
-                _eot_index(offsets, text, eot_position) if terminator else -1
+        typed_regions = NativeAlignmentRegions(**regions)
+        doc.alignment_regions.append(typed_regions)
+        doc.assistant_spans.append((content_start, eot_start))
+        doc.eot_indices.append(_eot_index(offsets, text, eot_start))
+        doc.source_turn_indices.append(turn)
+        for token_i, (start, end) in enumerate(offsets):
+            if end > start and any(
+                a <= start and end <= b for a, b in regions.values()
+            ):
+                doc.assistant_mask[token_i] = 1
+    else:
+        span = _final_content_span(
+            tokenizer,
+            messages,
+            text,
+            preserve_thinking=preserve,
+            tools=tools,
+        )
+        if span is None:
+            raise ValueError(
+                f"turn {turn}: missing canonical content span or empty final assistant"
             )
-            thinking = [
-                (start + m.start(), start + m.end())
-                for m in _THINK_PATTERN.finditer(canonical)
-            ]
-            openings = [
-                (start + m.start(), start + m.start() + 7)
-                for m in _THINK_PATTERN.finditer(canonical)
-            ]
-            for token_i, (a, b) in enumerate(offsets):
-                if b <= a or b <= start or a >= end:
-                    continue
-                if text[a:start].strip() or text[end:b].strip():
-                    continue
-                in_think = any(x <= a and b <= y for x, y in thinking)
-                in_open = any(x < b and a < y for x, y in openings)
-                if (include_thinking_in_loss and not in_open) or not in_think:
-                    doc.assistant_mask[token_i] = 1
+        start, end, canonical = span
+        doc.assistant_spans.append((start, end))
+        doc.source_turn_indices.append(turn)
+        suffix = text[end:]
+        terminator = suffix.lstrip()
+        eot_position = end + len(suffix) - len(terminator)
+        doc.eot_indices.append(
+            _eot_index(offsets, text, eot_position) if terminator else -1
+        )
+        thinking = [
+            (start + m.start(), start + m.end())
+            for m in _THINK_PATTERN.finditer(canonical)
+        ]
+        openings = [
+            (start + m.start(), start + m.start() + 7)
+            for m in _THINK_PATTERN.finditer(canonical)
+        ]
+        for token_i, (a, b) in enumerate(offsets):
+            if b <= a or b <= start or a >= end:
+                continue
+            if text[a:start].strip() or text[end:b].strip():
+                continue
+            in_think = any(x <= a and b <= y for x, y in thinking)
+            in_open = any(x < b and a < y for x, y in openings)
+            if (include_thinking_in_loss and not in_open) or not in_think:
+                doc.assistant_mask[token_i] = 1
     for index in doc.eot_indices:
         if index >= 0:
             doc.assistant_mask[index] = 1
@@ -424,7 +382,16 @@ def _render_and_tokenize_chat(
     include_thinking_in_loss: bool,
     native_thinking_alignment: bool,
 ) -> RenderedChatDocument:
-    """Render and tokenize chat using a message mask validated by the processor."""
+    """Render the full chat and supervise its final assistant message only.
+
+    The processor validates the incoming message mask. Earlier selections are
+    context only here; the final message must be an assistant selected for loss.
+    """
+    if not messages or messages[-1].get("role") != "assistant":
+        raise ValueError("Chat training requires a final assistant message")
+    if not message_loss_mask[-1]:
+        raise ValueError("The final assistant message must be selected for supervision")
+    message_loss_mask = [0] * (len(messages) - 1) + [1]
     if tools is not None:
         if not isinstance(tools, list):
             raise ValueError("tools must be a list of function schemas")

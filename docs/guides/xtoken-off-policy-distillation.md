@@ -240,11 +240,22 @@ collator:
 ```
 
 For conversation data, set `collator.mode=chat` and use `chat_kd_processor` with
-raw `messages` or `conversation` data. Each model renders its own chat
-template. CE, same-tokenizer KD, and teacher scoring include assistant content
-and each retained end-of-turn token; user turns, role headers, and padding are
-excluded. Cross-tokenizer KD aligns assistant content and uses a separate EOT
-pair when both tokenizations retain the terminator.
+raw `messages` or `conversation` data. Each model applies its own chat template
+to the full conversation, but training supervises **only the final assistant
+turn**. Earlier messages remain context and do not contribute training targets.
+Every chat row must end with an assistant message. CE, same-tokenizer KD, and
+teacher scoring include the final assistant content and its retained end-of-turn
+token; earlier turns, role headers, and padding are excluded. Cross-tokenizer KD
+aligns the final assistant content and uses a separate EOT pair when both
+tokenizations retain the terminator. This applies to both ordinary and native
+chat alignment; raw-text training is unchanged.
+
+Each chat row can supply `message_loss_mask`, a list containing one binary
+integer per message. Only assistant turns may have a value of `1`, and the final
+assistant message must be selected (`1`). Earlier mask entries never enable
+training on history: earlier messages are context only, even when their mask
+entry is `1`. Omitting the mask selects the final assistant turn for training.
+The OpenAI adapter prepends a zero when it inserts a system message.
 
 The configuration class supplies defaults. Packing multiple examples per row
 remains unsupported; keep `num_packed_rows=1`. Text tokenization uses
@@ -269,28 +280,26 @@ collator:
   num_packed_rows: 1
 ```
 
-Each row can supply `tools` and `message_loss_mask`, a list containing one binary
-integer per message. Only assistant turns may have a value of `1`; the default
-selects every assistant turn. A zero masks loss while retaining the message and
-its reasoning in the model's context. The OpenAI adapter prepends a zero when it
-inserts a system message. Set `use_preserving_dataset: true` for JSONL tool data
-to retain heterogeneous argument objects without Arrow adding null fields.
+Each row can supply `tools`. Set `use_preserving_dataset: true` for JSONL tool
+data to retain heterogeneous argument objects without Arrow adding null fields.
 
-Selected turns supervise reasoning text (when `include_thinking_in_loss` is true),
-the closing `</think>`, answers, tool payloads, and EOT. Opening thinking scaffolds,
-formatting-only tokens, schemas, user/system/tool-result text, unselected turns, and padding
+The final assistant turn supervises reasoning text (when
+`include_thinking_in_loss` is true), the closing `</think>`, answers, tool payloads,
+and EOT. Opening thinking scaffolds, formatting-only tokens, schemas,
+user/system/tool-result text, earlier turns, and padding
 are excluded. `kd_alignment_regions` further restricts cross-tokenizer KD without
 changing CE or same-tokenizer KD masks. Prose and each tool call align separately;
 permitted Boolean/null spelling differences retain CE but omit the unequal piece
 from exact-text KD. Missing or transformed required content fails explicitly.
-Selected empty or whitespace-only assistant turns are rejected; tool-only turns
-are supported. Supervising a separate `reasoning_content` field requires native
+An empty or whitespace-only final assistant turn is rejected; tool-only final
+turns are supported. Supervising a separate `reasoning_content` field requires native
 alignment. Ordinary chat supports reasoning embedded in `content` and rejects
 requests to supervise a separate reasoning field without native alignment.
 
 Qwen3-4B's stock template drops historical reasoning when a later user turn
-follows it. Apply the maintained override to **each Qwen tokenizer** used by the
-collator (both `policy.tokenizer` and the appropriate `teachers[i].tokenizer`):
+follows it. To retain that reasoning as context, apply the maintained override to
+**each Qwen tokenizer** used by the collator (both `policy.tokenizer` and the
+appropriate `teachers[i].tokenizer`):
 
 ```yaml
 tokenizer:
@@ -310,14 +319,16 @@ The template accepts explicit `reasoning_content` and leading inline
 `preserve_thinking=true` enables retention; otherwise stock behavior applies.
 `enable_thinking` preserves Qwen3's generation-prompt behavior, including its
 empty thinking block when false; it does not delete supplied reasoning. Training
-renders with `add_generation_prompt=False`. Native training requires retained
-reasoning and rejects a template that silently drops it.
+renders with `add_generation_prompt=False`. Native training requires the final
+turn's supervised reasoning to be retained and rejects a template that silently
+drops it. Historical reasoning follows the template's context-retention policy
+and does not contribute loss.
 
 The override adds explicit history-retention controls to the pinned Qwen3-4B
 template while preserving its tool serialization and generation behavior. The shared offset matcher compares literal decoded strings; whitespace
 differences are unequal. Native Unicode repair is separate and requires both
 NFC-normalized decodings to equal the original source region. Ordinary chat uses
-one canonical nonempty content key on both sides and follows logical turn order.
+one canonical nonempty content key on both sides for the final assistant turn.
 Content tokens that also absorb surrounding whitespace retain CE supervision;
 their full decoded strings still determine exact-match correctness.
 

@@ -111,9 +111,9 @@ def _loss_fn(vocab_size: int) -> CrossTokenizerDistillationLossFn:
 @pytest.mark.parametrize("loss_kind", ["ce", "same_tokenizer_kd"])
 def test_chat_loss_supervises_eot_predictor_only(loss_kind: str) -> None:
     tokenizer = _tokenizer()
-    # The full chat has assistant targets at 4/5 and 10/11 (answer/EOT).
+    # Earlier answer/EOT tokens at 4/5 remain context; only 10/11 are targets.
     batch = _batch(tokenizer)
-    assert batch["token_mask"].nonzero(as_tuple=True)[1].tolist() == [4, 5, 10, 11]
+    assert batch["token_mask"].nonzero(as_tuple=True)[1].tolist() == [10, 11]
     logits = torch.zeros(
         (*batch["input_ids"].shape, len(tokenizer)), requires_grad=True
     )
@@ -141,11 +141,12 @@ def test_chat_loss_supervises_eot_predictor_only(loss_kind: str) -> None:
     loss.backward()
     assert logits.grad is not None
     active_predictors = logits.grad.abs().sum(dim=-1).nonzero(as_tuple=True)[1].tolist()
-    assert active_predictors == [3, 4, 9, 10]
+    assert active_predictors == [9, 10]
     # Answer logits learn the terminator; outgoing EOT predictions target
     # the next role header or padding and must remain unsupervised.
-    assert (logits.grad[0, [4, 10], tokenizer.eos_token_id] < 0).all()
-    assert torch.count_nonzero(logits.grad[0, [5, 11]]) == 0
+    assert logits.grad[0, 10, tokenizer.eos_token_id] < 0
+    assert torch.count_nonzero(logits.grad[0, :9]) == 0
+    assert torch.count_nonzero(logits.grad[0, 11:]) == 0
 
 
 def test_eot_supervision_mask_does_not_change_cross_tokenizer_kd(
@@ -166,7 +167,7 @@ def test_eot_supervision_mask_does_not_change_cross_tokenizer_kd(
     spans = [
         [
             (rendered.index(word), rendered.index(word) + len(word))
-            for word in ("answer", "final")
+            for word in ("final",)
         ]
     ]
     encoded = [
@@ -188,8 +189,8 @@ def test_eot_supervision_mask_does_not_change_cross_tokenizer_kd(
     for supervise_eot in (False, True):
         student_mask = batch["token_mask"].clone()
         teacher_mask = batch["teacher_0_token_mask"].clone()
-        student_mask[:, [5, 11]] = int(supervise_eot)
-        teacher_mask[:, [5, 11]] = int(supervise_eot)
+        student_mask[:, 11] = int(supervise_eot)
+        teacher_mask[:, 11] = int(supervise_eot)
         alignment = aligner.align_chat(
             batch["input_ids"],
             batch["teacher_0_input_ids"],
@@ -201,8 +202,8 @@ def test_eot_supervision_mask_does_not_change_cross_tokenizer_kd(
             teacher_attention_mask=encoded[1]["attention_mask"],
             student_asst_mask=student_mask,
             teacher_asst_mask=teacher_mask,
-            student_eot_indices=[[5, 11]],
-            teacher_eot_indices=[[5, 11]],
+            student_eot_indices=[[11]],
+            teacher_eot_indices=[[11]],
         )
         localized = LocalizedAlignment(
             sample_mask=batch["sample_mask"],
@@ -222,7 +223,7 @@ def test_eot_supervision_mask_does_not_change_cross_tokenizer_kd(
             tp_group=None,
             cp_group=None,
         )
-        assert valid_pairs.item() == 4  # Two content pairs and two EOT pairs.
+        assert valid_pairs.item() == 2  # Final content pair and final EOT pair.
         alignments.append(alignment)
         losses.append(loss.detach())
         gradients.append(torch.autograd.grad(loss, student_logits)[0])
@@ -235,5 +236,6 @@ def test_eot_supervision_mask_does_not_change_cross_tokenizer_kd(
         )
     torch.testing.assert_close(losses[0], losses[1])
     torch.testing.assert_close(gradients[0], gradients[1])
-    assert (gradients[1][0, [4, 10], student.eos_token_id] < 0).all()
-    assert torch.count_nonzero(gradients[1][0, [5, 11]]) == 0
+    assert gradients[1][0, 10, student.eos_token_id] < 0
+    assert torch.count_nonzero(gradients[1][0, :9]) == 0
+    assert torch.count_nonzero(gradients[1][0, 11:]) == 0
