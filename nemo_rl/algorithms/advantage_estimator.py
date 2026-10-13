@@ -100,7 +100,8 @@ class GRPOAdvantageEstimator:
         """Compute GRPO advantages.
 
         Args:
-            prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
+            prompt_ids: Row equality keys of shape [batch_size, k] identifying
+                rollout groups; GRPO callers supply explicit ids with k=1.
             rewards: Tensor of shape [batch_size] containing reward for each sample.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
                   Used only for expanding advantages to token-level shape.
@@ -313,6 +314,9 @@ class ReinforcePlusPlusAdvantageEstimator:
                 logprobs_reference,
                 kl_type=self.kl_type,
             )
+            # Tokens outside the filtered policy support are excluded from the
+            # actor loss; keep their -inf logprobs from poisoning the batch.
+            kl = torch.where(~torch.isneginf(logprobs_policy), kl, 0.0)
             adv = adv - self.kl_coef * kl
 
         # global normalization across the batch
@@ -448,6 +452,9 @@ class GeneralizedAdvantageEstimator:
             and logprobs_reference is not None
         ):
             kl = calculate_kl(logprobs_policy, logprobs_reference, self.kl_type)
+            # Tokens outside the filtered policy support are excluded from the
+            # actor loss; keep their -inf logprobs from poisoning the rewards.
+            kl = torch.where(~torch.isneginf(logprobs_policy), kl, 0.0)
             token_level_rewards = token_level_rewards - self.kl_coef * kl
 
         # Place terminal reward at the last response token (last mask=1
@@ -719,6 +726,13 @@ class OPDAdvantageEstimator:
                 prev_logprobs + math.log1p(-alpha),
             )
             distill_advantages = (proximal_teacher_logprobs - prev_logprobs).detach()
+
+        # Exclude unsupported student tokens from the baseline and metrics as
+        # well as the actor signal, including when using a proximal teacher.
+        student_support = ~torch.isneginf(prev_logprobs)
+        mask = mask * student_support.to(mask.dtype)
+        teacher_student_gap = torch.where(student_support, teacher_student_gap, 0.0)
+        distill_advantages = torch.where(student_support, distill_advantages, 0.0)
 
         if self.subtract_global_baseline:
             valid_advantages = torch.masked_select(distill_advantages, mask.bool())
