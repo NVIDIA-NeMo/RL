@@ -206,13 +206,11 @@ def _tokenize_chat_text(
     *,
     include_thinking_in_loss: bool,
     native_semantic_messages: list[dict[str, Any]] | None,
-    skip_overlength: bool,
     tools: list[dict[str, Any]] | None = None,
 ) -> RenderedChatDocument:
     """Tokenize one rendered document and bind supervision to logical turns.
 
-    Production callers reject overflow. The explicit lower-level truncation
-    option remains available for inspecting retained token boundaries.
+    Reject documents that exceed the context limit instead of truncating them.
     """
     if include_thinking_in_loss and native_semantic_messages is None:
         for turn, message in enumerate(messages):
@@ -228,11 +226,11 @@ def _tokenize_chat_text(
         return_offsets_mapping=True,
         add_special_tokens=False,
         truncation=True,
-        max_length=max_len + int(skip_overlength),
+        max_length=max_len + 1,
     )
     ids = list(encoded["input_ids"])
     offsets = [(int(start), int(end)) for start, end in encoded["offset_mapping"]]
-    if skip_overlength and len(ids) > max_len:
+    if len(ids) > max_len:
         raise ValueError(
             f"Chat document exceeds context length {max_len}; overlength rows are rejected"
         )
@@ -377,7 +375,7 @@ def _tokenize_chat_text(
     for index in doc.eot_indices:
         if index >= 0:
             doc.assistant_mask[index] = 1
-    if not any(doc.assistant_mask) and skip_overlength:
+    if not any(doc.assistant_mask):
         raise ValueError("Chat document has no selected assistant supervision")
     if native_semantic_messages is not None:
         doc.answer_parts = _native_answer_parts_for_document(
@@ -426,7 +424,6 @@ def _render_and_tokenize_chat(
     message_loss_mask: list[int] | None = None,
     include_thinking_in_loss: bool,
     native_thinking_alignment: bool,
-    skip_overlength: bool,
 ) -> RenderedChatDocument:
     selected = normalize_message_loss_mask(messages, message_loss_mask)
     if tools is not None:
@@ -462,7 +459,6 @@ def _render_and_tokenize_chat(
         max_len,
         include_thinking_in_loss=include_thinking_in_loss,
         native_semantic_messages=messages if native_thinking_alignment else None,
-        skip_overlength=skip_overlength,
         tools=tools,
     )
 

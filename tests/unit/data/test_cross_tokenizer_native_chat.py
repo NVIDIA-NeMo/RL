@@ -198,7 +198,6 @@ def test_native_thinking_alignment_excludes_model_specific_whitespace() -> None:
         256,
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
-        skip_overlength=True,
     )
     teacher_doc = _render_and_tokenize_chat(
         teacher,
@@ -206,7 +205,6 @@ def test_native_thinking_alignment_excludes_model_specific_whitespace() -> None:
         256,
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
-        skip_overlength=True,
     )
     assert student_doc is not None
     assert teacher_doc is not None
@@ -247,7 +245,6 @@ def test_native_thinking_alignment_flags_wrong_teacher_eot_position() -> None:
         256,
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
-        skip_overlength=True,
     )
     teacher_doc = _render_and_tokenize_chat(
         teacher,
@@ -255,7 +252,6 @@ def test_native_thinking_alignment_flags_wrong_teacher_eot_position() -> None:
         256,
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
-        skip_overlength=True,
     )
     assert student_doc is not None
     assert teacher_doc is not None
@@ -500,7 +496,6 @@ def test_structured_tool_call_with_empty_content_is_supervised(style: str) -> No
         message_loss_mask=[0, 1, 0, 0],
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
-        skip_overlength=True,
     )
     assert document is not None
 
@@ -705,7 +700,6 @@ def test_native_tool_parts_preserve_ce_and_align_matching_payloads(
             message_loss_mask=selected,
             include_thinking_in_loss=True,
             native_thinking_alignment=True,
-            skip_overlength=True,
         )
         assert expected is not None
         length = len(expected.input_ids)
@@ -857,7 +851,6 @@ def test_missing_unselected_historical_reasoning_is_rejected():
             message_loss_mask=[0, 0, 1],
             include_thinking_in_loss=True,
             native_thinking_alignment=True,
-            skip_overlength=True,
         )
 
 
@@ -871,7 +864,6 @@ def test_empty_selected_native_message_is_explicit_error(content):
             512,
             include_thinking_in_loss=True,
             native_thinking_alignment=True,
-            skip_overlength=True,
         )
 
 
@@ -898,7 +890,6 @@ def test_ambiguous_embedded_chatml_delimiters_are_rejected(location):
             tools=tools,
             include_thinking_in_loss=True,
             native_thinking_alignment=True,
-            skip_overlength=True,
         )
 
 
@@ -925,7 +916,6 @@ def test_json_string_tool_arguments_are_preserved():
         512,
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
-        skip_overlength=True,
     )
     assert messages == original
     assert '"flag": true' in doc.rendered_text
@@ -950,7 +940,6 @@ def test_template_only_tool_separators_are_excluded_from_ce():
         1024,
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
-        skip_overlength=True,
     )
     parts = doc.answer_parts[0]
     assert parts is not None
@@ -1017,7 +1006,6 @@ def test_ordinary_canonical_spans_bind_repeated_logical_turns():
             512,
             include_thinking_in_loss=False,
             native_thinking_alignment=False,
-            skip_overlength=True,
         )
         for tokenizer in (student, teacher)
     ]
@@ -1060,7 +1048,6 @@ def test_ordinary_transformed_turn_cannot_match_later_repeated_content():
             256,
             include_thinking_in_loss=False,
             native_thinking_alignment=False,
-            skip_overlength=True,
         )
 
 
@@ -1102,7 +1089,6 @@ def test_ordinary_content_matching_role_header_binds_body():
         256,
         include_thinking_in_loss=False,
         native_thinking_alignment=False,
-        skip_overlength=True,
     )
     start, end = doc.assistant_spans[0]
     assert start == len("<|im_start|>assistant\n")
@@ -1162,7 +1148,6 @@ def test_ordinary_inline_reasoning_can_receive_loss():
         256,
         include_thinking_in_loss=True,
         native_thinking_alignment=False,
-        skip_overlength=True,
     )
     supervised = tokenizer.decode(
         [token for token, keep in zip(doc.input_ids, doc.assistant_mask) if keep]
