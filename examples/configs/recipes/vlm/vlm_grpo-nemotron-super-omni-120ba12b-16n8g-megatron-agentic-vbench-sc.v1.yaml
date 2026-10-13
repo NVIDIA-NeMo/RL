@@ -92,9 +92,10 @@ policy:
       async_engine: true
       reasoning_parser_plugin: /opt/nemo-rl/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
     vllm_kwargs:
-      # OpenCode's read tool sends images inline (base64 data URLs).
+      # OpenCode's read tool sends images inline (base64 data URLs). Long video
+      # investigations exceeded 64 accumulated frame reads before turn 32.
       limit_mm_per_prompt:
-        image: 64
+        image: 128
       mm_processor_cache_gb: 0
       skip_mm_profiling: true
       # The inherited kernel_config disables FlashInfer autotuning. Do not also
@@ -152,6 +153,11 @@ async_rl:
   rollout_failure:
     # Context compaction requires full step batches.
     min_step_batch_fraction: 1
+    # Preserve that full batch if one sibling is structurally invalid. The
+    # in-order sampler stamps target steps, so a spare prompt can replace it.
+    on_dropped_prompt: replace
+    max_replacement_attempts: 4
+    replacement_reserve_prompts: 1
     nemo_gym:
       # Backstop for a hung prompt-group stream (Harbor build + 32-turn episode).
       rollout_timeout_s: 7200

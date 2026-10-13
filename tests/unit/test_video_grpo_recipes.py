@@ -91,3 +91,33 @@ def test_agentic_vbench_recipes_select_one_flashinfer_autotune_setting(name: str
 
     assert "enable_flashinfer_autotune" not in kwargs
     assert kwargs["kernel_config"]["enable_flashinfer_autotune"] is False
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "vlm_grpo-nemotron-super-omni-120ba12b-8n8g-megatron-agentic-vbench-sc.v2.yaml",
+        "vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc.v1.yaml",
+        "vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml",
+    ],
+)
+def test_agentic_vbench_recipes_allow_long_inline_image_histories(name: str):
+    recipe = _load_recipe(name)
+    image_limit = recipe["policy"]["generation"]["vllm_kwargs"][
+        "limit_mm_per_prompt"
+    ]["image"]
+
+    assert image_limit >= 128
+
+
+def test_agentic_vbench_in_order_recipe_replaces_dropped_prompt_groups():
+    recipe = _load_recipe(
+        "vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc.v1.yaml"
+    )
+    failure = recipe["async_rl"]["rollout_failure"]
+
+    assert recipe["async_rl"]["sampler"]["name"] == "in_order"
+    assert failure["min_step_batch_fraction"] == 1
+    assert failure["on_dropped_prompt"] == "replace"
+    assert failure["max_replacement_attempts"] >= 1
+    assert failure["replacement_reserve_prompts"] >= 1

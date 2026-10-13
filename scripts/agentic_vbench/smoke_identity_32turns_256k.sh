@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Agentic-VBench identity smoke on the unified-teacher branch: evaluation harness
-# budget (32 turns, 8192 output tokens), the policy's native 256k window, ordinary
-# token capture (no context rewrite: OpenCode compaction and pruning off), 8 nodes
-# (4 training / 4 generation), 8 assembly tasks x 4 generations, 2 steps,
-# checkpoint every step, chained cycles so a cluster cancellation resumes.
+# budget (32 turns, 8192 output tokens), the policy's native 256k window, and
+# framework-owned context reconstruction with OpenCode compaction and pruning
+# disabled. This produces one unrevised segment per rollout while avoiding the
+# unresolved-parent failures seen with ordinary capture and stock OpenCode.
 #   AGENTIC_VBENCH_BACKEND_DIR=$PWD/data/agentic_vbench/backend-cc-3 \
 #     bash scripts/agentic_vbench/smoke_identity_32turns_256k.sh
 set -euo pipefail
@@ -26,6 +26,7 @@ export ENV_FILE=${ENV_FILE:-/dev/null}
 export GYM_VENV_DIR=${GYM_VENV_DIR:-$AVB_DATA_ROOT/gym_venvs_unified_teacher}
 : "${MODEL_PATH:?MODEL_PATH must point to a complete Hugging Face checkpoint visible on every node}"
 export MODEL_PATH
+export CONFIG_IN_CONTAINER=${CONFIG_IN_CONTAINER:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml}
 export NUM_NODES=${NUM_NODES:-8}
 export GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 export NUM_GEN_NODES=${NUM_GEN_NODES:-4}
@@ -34,8 +35,10 @@ export SAVE_PERIOD=${SAVE_PERIOD:-1}
 export CHECKPOINT_KEEP_TOP_K=${CHECKPOINT_KEEP_TOP_K:-1}
 export JOB_CYCLES=${JOB_CYCLES:-3}
 export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-04:00:00}
-# Ordinary token capture on this branch: no context rewrite anywhere.
-export CONTEXT_COMPACTION=false
+# Framework-owned capture is required for stock OpenCode. OpenCode itself does
+# not compact in this identity arm, so the model still trains on the unrevised
+# context rather than a summary.
+export CONTEXT_COMPACTION=true
 export AGENTIC_VBENCH_COMPACTION_AUTO=false
 export AGENTIC_VBENCH_COMPACTION_PRUNE=false
 export AGENTIC_VBENCH_CONCURRENCY=${AGENTIC_VBENCH_CONCURRENCY:-16}

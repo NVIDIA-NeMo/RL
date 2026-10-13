@@ -126,9 +126,10 @@ policy:
       max_model_len: ${policy.max_total_sequence_length}
       reasoning_parser_plugin: /opt/nemo-rl/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
     vllm_kwargs:
-      # OpenCode's read tool sends images inline (base64 data URLs).
+      # OpenCode's read tool sends images inline (base64 data URLs). Long video
+      # investigations exceeded 64 accumulated frame reads before turn 32.
       limit_mm_per_prompt:
-        image: 64
+        image: 128
       mm_processor_cache_gb: 0
       skip_mm_profiling: true
       # Prefill chunk: do not size it to the whole 256k window.
