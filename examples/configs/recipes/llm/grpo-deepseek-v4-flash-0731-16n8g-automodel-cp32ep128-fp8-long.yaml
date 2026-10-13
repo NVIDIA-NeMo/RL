@@ -4,7 +4,8 @@
 # actor deep-ep 1.2.1+10d4dd7 and DeepGEMM (tf32_hc_prenorm_gemm).
 # Validated runtime: torch 2.13.0+cu130, TE 2.18.0, vLLM 0.29.0;
 # DeepEP is now pinned to 1.2.1+10d4dd7 for actor and rollout. The original
-# 16k validation used rollout 1.2.1+17cfb81; the unified rollout needs GPU validation.
+# 100-step validation used rollout 1.2.1+17cfb81. Unified rollout has short
+# continuation coverage; see the DeepSeek V4 model guide for validation scope.
 # Build the matching NeMo-RL image.
 # Set policy.model_name to your verified checkpoint path when running offline.
 # Derived from the 16k experiment without GPU-progress/capture diagnostics.
@@ -189,7 +190,7 @@ env:
     num_workers: 8
     math_verify_impl: dapo_math_verify
 logger:
-  wandb_enabled: false
+  wandb_enabled: true
   tensorboard_enabled: true
   num_val_samples_to_print: 2
   num_train_samples_to_print: 2

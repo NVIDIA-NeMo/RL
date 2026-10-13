@@ -1,169 +1,119 @@
-# DeepSeek V4 Flash
+# DeepSeek V4 Support
 
-This guide describes GRPO training of DeepSeek V4 Flash and Flash Base with the
-AutoModel training backend and vLLM generation.
+This guide describes the current state of DeepSeek V4 support in NeMo-RL: what
+works today, how to reproduce a reference run, the limitations you should expect,
+and what we are working on next.
 
 > [!IMPORTANT]
-> **Status: Functionally Ready.** The reference recipe has been validated with
-> an end-to-end colocated run on 16 H100 nodes. Its five-step smoke test is
-> registered in the recurring nightly suite. This is not a long-run convergence
-> claim; see [Known Limitations](#known-limitations) for precision alignment and
-> hardware coverage.
+> **Status: Functional Ready.** DeepSeek V4 Flash-0731 is runnable end-to-end
+> with the **AutoModel (DTensor)** training backend and **vLLM** generation.
+> The reference recipe uses true FP8 training and router replay, with Expert
+> Parallelism and Context Parallelism validated together at a **16k** sequence
+> length on **16 H100 nodes (128 GPUs)**. A checkpoint-resumed GRPO run reached
+> step 109 with stable training metrics.
 
 ## Support Status
 
-| Model | Training backend | Validated training parallelism | Generation backend | Status |
-| --- | --- | --- | --- | --- |
-| `deepseek-ai/DeepSeek-V4-Flash-0731` | AutoModel | TP1 + CP8 + EP128 | vLLM with TP8 + EP1 | Functionally Ready |
-| `deepseek-ai/DeepSeek-V4-Flash-Base` | AutoModel | TP1 + CP8 + EP128 | vLLM with TP8 + EP1 | Functionally Ready |
+We track model support in two stages:
 
-## Validated Scope
+| Stage | Meaning |
+| --- | --- |
+| **Functional Ready** | Runnable end-to-end and numerically validated with an initial training run. |
+| **Long-run convergence validated** | Trains stably over a full-length run with a healthy, reproducible reward curve. |
 
-- **Models**: `deepseek-ai/DeepSeek-V4-Flash-0731` and
-  `deepseek-ai/DeepSeek-V4-Flash-Base`.
-- **Algorithm**: GRPO with `DAPOMath17K` for training and
-  `DAPOMathAIME2024` for validation.
-- **Training backend**: AutoModel with BF16 training, activation checkpointing,
-  TileLang attention, and the DeepEP expert dispatcher.
-- **Training parallelism**: TP1, CP8, and EP128 on 128 GPUs. CP and EP are
-  model-owned parallel dimensions that coexist on the same device mesh; they
-  are not multiplicative.
-- **Generation backend**: vLLM with TP8, EP1, blockwise FP8 weights, and the
-  `fp8_ds_mla` KV cache.
-- **Sequence length**: 1,024 prompt tokens plus up to 2,048 response tokens,
-  for a maximum total sequence length of 3,072.
-- **Reference allocation**: 16 nodes with 8 H100 GPUs per node.
-- **Deployment**: Colocated training and generation on the same GPUs. Only
-  this deployment on H100 has been tested.
-- **MTP**: Disabled by setting `num_nextn_predict_layers: 0`.
+DeepSeek V4 Flash-0731 on the **AutoModel** backend is **Functional Ready**, with
+more than 100 CP32 training updates recorded at a 16k context budget. Generation
+KL remained stable and gradients remained finite throughout the recorded run.
 
-Recipe YAML files under `examples/configs/recipes/` are the source of truth for
-resource, parallelism, dataset, and checkpointing settings.
+**Reading the curves:** the meaningful result here is stable, non-diverging
+training at 16k, not a large reward climb.
+
+## What's Supported
+
+| Model | Training backend | Parallelism | Training precision | Inference backend | Status |
+| --- | --- | --- | --- | --- | --- |
+| `deepseek-ai/DeepSeek-V4-Flash-0731` | AutoModel (DTensor) | EP128 + CP32 | True FP8 | vLLM (FP8) | Functional Ready (16k, 100+ updates) |
+
+Current scope and limitations:
+
+- **Training backend**: [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel).
+- **Parallelism**: Expert Parallelism and Context Parallelism, validated together
+  at a 16,384-token sequence budget on 128 H100 GPUs. CP and EP coexist on the
+  same device mesh; their sizes are not multiplicative.
+- **Inference backend**: [vLLM](https://github.com/vllm-project/vllm) with TP8.
+- **Precision**: Transformer Engine FP8 linear and expert compute on the training
+  side, with FP8 generation in vLLM. Parameters and operations that require
+  higher precision retain it.
 
 ## How to Run
 
-### 1. Prepare the Environment
+### 1. Build the environment
 
-Use the dependency lock and AutoModel submodule recorded by the NeMo RL
-revision that contains this guide. From the repository root, run:
+Build a container from this branch so the pinned dependencies and AutoModel
+submodule are included in the worker environments:
 
 ```bash
+git checkout dsv4-fp8-r3
 git submodule update --init --recursive
-uv sync --locked
 ```
 
-For a large multi-node run, use a container built from the same checkout so its
-backend-specific worker environments match the lockfile. See the
-[installation guide](../../../about/installation.md) and
-[Dependency Management](../../../design-docs/dependency-management.md) for
-container and development setup details.
+See [Docker Containers](../../../docker.md) for building the image and
+[Dependency Management](../../../design-docs/dependency-management.md) for how
+worker environments are resolved. The recipe uses PyTorch 2.13.0, Transformer
+Engine 2.18.0, vLLM 0.29.0, and the DeepEP revision pinned by this branch.
 
-The recipe downloads the following model and datasets from Hugging Face:
+### 2. Reference recipes
 
-- `deepseek-ai/DeepSeek-V4-Flash-0731` or
-  `deepseek-ai/DeepSeek-V4-Flash-Base`
-- `BytedTsinghua-SIA/DAPO-Math-17k`
-- `BytedTsinghua-SIA/AIME-2024`
+**AutoModel (Expert + Context Parallel), 16k** — `DeepSeek-V4-Flash-0731`,
+validated on **16× H100 nodes (128 GPUs)**:
 
-Set `HF_HOME` to a cache visible from every node:
+[`examples/configs/recipes/llm/grpo-deepseek-v4-flash-0731-16n8g-automodel-cp32ep128-fp8-long.yaml`](../../../../examples/configs/recipes/llm/grpo-deepseek-v4-flash-0731-16n8g-automodel-cp32ep128-fp8-long.yaml)
 
-```bash
-export HF_HOME=<path-to-shared-huggingface-cache>
-export WANDB_API_KEY=<your-wandb-api-key>
-```
+The recipe trains on DAPO Math (`DAPOMath17K`). Key settings:
 
-The reference recipe enables W&B logging. If W&B is not configured, pass
-`logger.wandb_enabled=false` when launching.
-
-### 2. Choose the Reference Recipe
-
-| Model | Algorithm | Backend | Scale | Recipe |
-| --- | --- | --- | --- | --- |
-| DeepSeek-V4-Flash-0731 | GRPO | AutoModel | 16n8g | [`grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128.yaml`](../../../../examples/configs/recipes/llm/grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128.yaml) |
-
-The associated
-[`grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128.sh`](../../../../tests/test_suites/llm/grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128.sh)
-test runs five training steps and is registered as a recurring nightly
-functional test in [`nightly.txt`](../../../../tests/test_suites/nightly.txt).
+- Training: true FP8, `expert_parallel_size: 128`,
+  `context_parallel_size: 32`, and sequence length **16384**.
+- Context budget: up to 1,024 prompt tokens and 15,360 response tokens.
+- Train/inference alignment: Transformer Engine block FP8 training, FP8
+  generation with power-of-two scales, and expert router replay.
+- Attention: DSV4 TileLang sparse attention on the training side and
+  `FLASHMLA_SPARSE_DSV4` in vLLM.
+- Batch: 32 prompts with 8 generations each, for a global batch of 256.
+- Thinking is enabled with `reasoning_effort: low`; MTP is disabled.
 
 ### 3. Launch
 
-From a 16-node allocation with 8 H100 GPUs per node, launch the standard GRPO
-entry point:
+DeepSeek V4 Flash uses the standard GRPO entrypoint. Set the usual environment
+variables and launch with the reference config:
 
 ```bash
+export HF_HOME=<your-hf-cache>
+export HF_DATASETS_CACHE=<your-datasets-cache>
+export WANDB_API_KEY=<your-wandb-key>
+
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128.yaml
+  --config examples/configs/recipes/llm/grpo-deepseek-v4-flash-0731-16n8g-automodel-cp32ep128-fp8-long.yaml
 ```
 
-The recipe defaults to `DeepSeek-V4-Flash-0731`. To run Flash Base with the
-same configuration, override the model and tokenizer:
+For multi-node setup, follow the standard NeMo-RL
+[cluster instructions](../../../cluster.md) and the [GRPO guide](../../grpo.md).
 
-```bash
-uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128.yaml \
-  policy.model_name=deepseek-ai/DeepSeek-V4-Flash-Base \
-  policy.tokenizer.name=deepseek-ai/DeepSeek-V4-Flash-Base
-```
+### Reference training curves
 
-See the [GRPO guide](../../grpo.md) for algorithm and common configuration
-details and [Cluster Setup](../../../cluster.md) for multi-node launch setup.
-Before changing the node count, review the training and generation parallel
-dimensions instead of changing `cluster.num_nodes` alone.
+**AutoModel + Context Parallel (16k)** — produced with DeepSeek-V4-Flash-0731
+on DAPO Math, using 16× H100 nodes, true FP8 training, and router replay.
+The checkpoint-resumed run reached step 109; the curves below show the CP32
+portion from steps 6–100. Blue lines are per-step metrics and orange lines are
+trailing 10-step means.
 
-## Important Recipe Settings
+![DeepSeek-V4-Flash-0731 GRPO training metrics on DAPO Math (AutoModel + Context Parallel, 16k)](../../../assets/deepseek/deepseek-v4-flash-16k-cp32-stability.png)
 
-- `policy.dequantize_base_checkpoint: true` loads either checkpoint as BF16
-  weights for training. Flash-0731 stores its expert weights in FP4, while
-  Flash Base stores them in FP8. Training-side FP8 fake quantization is not
-  enabled.
-- `policy.hf_config_overrides.expert_dtype: fp8` selects the FP8 expert layout
-  used for generation. Keep the checkpoint's own `quantization_config` intact
-  so AutoModel can dequantize the training weights correctly.
-- Generation uses DeepGEMM with UE8M0 power-of-two scales. Keep
-  `VLLM_USE_DEEP_GEMM_E8M0=1`, `use_deep_gemm: true`, and
-  `pow2_weight_scaling_factors: true` aligned.
-- `policy.generation.vllm_kwargs.attention_config.backend: FLASHMLA_SPARSE_DSV4`
-  pins the validated FlashMLA sparse attention backend.
-- The policy tokenizer uses `chat_template: deepseek_v4`, while vLLM uses
-  `tokenizer_mode: deepseek_v4`. The reference recipe disables thinking mode.
-- Eager execution (`enforce_eager: true`) remains part of the validated
-  configuration.
+Generation KL averaged 0.00786, with its first and last ten-step means at
+0.00838 and 0.00755. Gradients remained finite, including the subsequent nine
+updates through step 109. These results demonstrate training stability at the
+16k context budget; sample lengths vary within that budget.
 
-## Reference Training Curves
+## Known Issues
 
-The following curves were produced with `DeepSeek-V4-Flash-0731` on the
-16-node H100 configuration described above. They show the raw, unsmoothed
-training and validation metrics through training step 50.
-
-![DeepSeek-V4-Flash-0731 DAPO-GRPO training reward, validation accuracy, response length, entropy, generation KL error, and gradient norm through step 50](../../../assets/deepseek/deepseek-v4-flash-0731-grpo-50steps.png)
-
-## Known Limitations
-
-- The checked-in support is limited to `DeepSeek-V4-Flash-0731` and
-  `DeepSeek-V4-Flash-Base` with the AutoModel training backend and vLLM
-  generation. DeepSeek V4 Pro, Megatron training, and SGLang generation are not
-  covered by this guide.
-- **Hardware and deployment coverage**: Only colocated training and generation
-  on H100 GPUs have been tested. Non-colocated deployments and Blackwell GPUs
-  have not been validated. On Blackwell, DeepGEMM with E8M0 scales has a
-  potential refit issue: changes to the FP8 scale layout can leave the MoE
-  kernel referencing stale scales.
-- Training uses dequantized BF16 weights, while generation uses refitted FP8
-  weights. This numerical precision mismatch causes significant train/inference
-  inconsistency. The current recipe does not include training-side
-  quantization-aware training (QAT) to reduce this mismatch.
-- MTP is disabled in the reference configuration.
-- Long-run convergence has not been documented for this recipe.
-
-The separate
-[`deepseek-v4-support` development branch](https://github.com/NVIDIA-NeMo/RL/tree/deepseek-v4-support)
-includes QAT through training-side FP8 fake quantization. It reduces the
-train/inference mismatch and has enabled stable training beyond 100 steps.
-See the [development branch guide](https://github.com/NVIDIA-NeMo/RL/blob/deepseek-v4-support/docs/guides/deepseek-v4.md)
-for its recipes and validation results.
-These results apply to that development branch, not the current recipe. The
-branch uses an older NeMo-RL codebase and a customized AutoModel dependency,
-so its changes cannot be merged directly into `main`. We plan to upstream the
-relevant changes incrementally into NeMo-RL `main` and the upstream dependency
-frameworks, including AutoModel.
+- The 16k recipe has demonstrated training stability, but a reproducible reward
+  improvement and full convergence have not yet been established.

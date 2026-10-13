@@ -7,7 +7,8 @@ complete support matrix, see [Model Support](../../../about/model-support.md).
 
 - **[DeepSeek V3](../../deepseek.md)** — Prepare a BF16 Hugging Face checkpoint for DeepSeek V3.
 - **[DeepSeek V4 Flash](deepseek-v4-flash.md)** — Run GRPO with DeepSeek V4
-  Flash or Flash Base using the AutoModel training backend and vLLM generation.
+  Flash-0731 using AutoModel FP8 training and vLLM generation, with CP32/EP128
+  16k-context stability results.
 
 ```{toctree}
 :hidden:
