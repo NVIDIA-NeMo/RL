@@ -50,6 +50,7 @@ from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
 from nemo_rl.models.policy.draft_config import draft_refit_enabled
+from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -241,6 +242,12 @@ The validation set you pass in will directly be used for validation with no addi
     print("Final config:")
     pprint.pprint(config)
 
+    # Before init_ray(), so the resolved telemetry env is snapshotted into the Ray runtime_env.
+    # That env includes the Slurm identity, which init_ray() strips from what workers inherit.
+    # It reaches every worker, NeMo-Gym's servers included.
+    # A no-op unless telemetry is on.
+    init_telemetry_driver(config, algorithm="grpo")
+
     with rl_init_timer.time("ray_connect"):
         # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
         maybe_configure_data_plane_env(config.data_plane)
@@ -368,6 +375,7 @@ The validation set you pass in will directly be used for validation with no addi
             policy_generation.shutdown()
         except Exception as error:
             print(f"Error shutting down generation: {error}", flush=True)
+        shutdown_telemetry()
 
 
 if __name__ == "__main__":

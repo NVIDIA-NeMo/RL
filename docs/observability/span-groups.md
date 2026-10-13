@@ -491,11 +491,11 @@ exists to fence off. Gating it on `rollout` instead would put that volume in
 dataset size. The group has to describe the volume, not the phase, even though
 these spans sit inside the rollout.
 
-Completing the trace on the server side is a change in the Gym repository, not
-this one — its app has to call `nemo.lens.contrib.fastapi.instrument_fastapi`.
-Until it does, the header arrives and is ignored, and Gym's internal spans (if
-any) stay in their own traces. Everything up to and including the client-side
-HTTP span still nests correctly.
+On the server side, each Gym server instruments its FastAPI app when telemetry
+is on, so it adopts the incoming header as its parent. The agent, resources
+server, and model server spans therefore land in the same trace as
+`rl.gym.run_rollouts`. The FastAPI instrumentation comes from the
+`nemo-gym[telemetry]` extra, which the `nemo_gym` extra installs.
 
 Two failure modes degrade quietly rather than breaking a rollout. Without
 `nemo-lens[aiohttp]` installed the constructor logs a warning once and Gym's

@@ -58,6 +58,7 @@ def _clear_telemetry_env() -> None:
     for key in list(os.environ):
         if key.startswith(("NEMO_RL_OTEL", "NEMO_LENS")) or key in (
             "OTEL_SERVICE_NAME",
+            "OTEL_RESOURCE_ATTRIBUTES",
             "NRL_WORKER_GROUP",
         ):
             del os.environ[key]

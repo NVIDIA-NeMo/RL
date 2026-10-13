@@ -18,6 +18,7 @@ from nemo_rl.telemetry.setup import (
     _build_resource_attributes,
     _dig,
     _worker_resource_attributes,
+    export_telemetry_identity_to_subprocesses,
     get_telemetry_handle,
     init_telemetry_driver,
     init_telemetry_worker,
@@ -234,6 +235,109 @@ def test_init_driver_publishes_env_even_when_telemetry_is_disabled():
 
     assert os.environ["NEMO_RL_OTEL_SPAN_GROUPS"] == "per_step"
     assert not telemetry_enabled_in_env()
+
+
+def _otel_resource_attributes() -> dict[str, str]:
+    from nemo.lens.resources.attributes import parse_otel_resource_attributes
+
+    return parse_otel_resource_attributes(os.environ.get("OTEL_RESOURCE_ATTRIBUTES"))
+
+
+def test_init_driver_hands_the_slurm_job_identity_to_workers(monkeypatch):
+    """``init_ray()`` strips ``SLURM_*`` before workers inherit the environment.
+
+    The driver, which still has them, carries the job identity in ``OTEL_RESOURCE_ATTRIBUTES``.
+    That variable survives into a worker and into the processes it spawns, such as NeMo-Gym's servers.
+    """
+    from nemo.lens.semconv import (
+        SLURM_CLUSTER_NAME,
+        SLURM_JOB_ID,
+        SLURM_JOB_NAME,
+        SLURM_TOPOLOGY_ADDR,
+        SLURM_TOPOLOGY_ADDR_PATTERN,
+    )
+
+    for key in [k for k in os.environ if k.startswith("SLURM_")]:
+        monkeypatch.delenv(key)
+    monkeypatch.setenv("SLURM_JOB_ID", "4145189")
+    monkeypatch.setenv("SLURM_CLUSTER_NAME", "aws-cmh-slurm-1")
+    monkeypatch.setenv("SLURM_JOB_NAME", "from-slurm")
+    monkeypatch.setenv("SLURM_TOPOLOGY_ADDR", "block1.node7")
+    monkeypatch.setenv("SLURM_TOPOLOGY_ADDR_PATTERN", "block.node")
+    # Exported by the launcher, e.g. with lens's sbatch helper.
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", f"{SLURM_JOB_NAME}=from-launcher")
+
+    init_telemetry_driver(_FakeMasterConfig(TelemetryConfig(enabled=False)), "grpo")
+
+    attrs = _otel_resource_attributes()
+    assert attrs[SLURM_JOB_ID] == "4145189"
+    assert attrs[SLURM_CLUSTER_NAME] == "aws-cmh-slurm-1"
+    assert attrs[SLURM_JOB_NAME] == "from-launcher", (
+        "a launcher-exported value must win"
+    )
+    # The driver's node, not the job's: each worker detects its own.
+    assert SLURM_TOPOLOGY_ADDR not in attrs
+    assert SLURM_TOPOLOGY_ADDR_PATTERN not in attrs
+
+
+def test_init_driver_adds_no_resource_attributes_outside_slurm(monkeypatch):
+    for key in [k for k in os.environ if k.startswith("SLURM_")]:
+        monkeypatch.delenv(key)
+
+    init_telemetry_driver(_FakeMasterConfig(TelemetryConfig(enabled=False)), "grpo")
+
+    assert "OTEL_RESOURCE_ATTRIBUTES" not in os.environ
+
+
+def test_campaign_stage_reaches_subprocesses_through_the_environment(monkeypatch):
+    monkeypatch.setenv("NEMO_RL_OTEL_CAMPAIGN_STAGE", "SFT")
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment=prod")
+
+    export_telemetry_identity_to_subprocesses()
+
+    assert _otel_resource_attributes() == {
+        "nv.dl.campaign.stage": "SFT",
+        "deployment.environment": "prod",
+    }
+
+
+def test_campaign_stage_for_subprocesses_defaults_to_rl():
+    export_telemetry_identity_to_subprocesses()
+
+    assert _otel_resource_attributes() == {"nv.dl.campaign.stage": "RL"}
+
+
+def test_campaign_stage_for_subprocesses_keeps_a_launcher_value(monkeypatch):
+    monkeypatch.setenv("NEMO_RL_OTEL_CAMPAIGN_STAGE", "RL")
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "nv.dl.campaign.stage=EVAL")
+
+    export_telemetry_identity_to_subprocesses()
+
+    assert _otel_resource_attributes() == {"nv.dl.campaign.stage": "EVAL"}
+
+
+def test_run_id_reaches_subprocesses_through_the_lens_fallback(monkeypatch):
+    """Gym's servers must report this run's id, not one Gym generates for itself."""
+    monkeypatch.setenv("NEMO_RL_OTEL_RUN_ID", "4145189")
+
+    export_telemetry_identity_to_subprocesses()
+
+    assert os.environ["NEMO_LENS_RUN_ID"] == "4145189"
+
+
+def test_run_id_for_subprocesses_keeps_a_launcher_value(monkeypatch):
+    monkeypatch.setenv("NEMO_RL_OTEL_RUN_ID", "4145189")
+    monkeypatch.setenv("NEMO_LENS_RUN_ID", "job-wide")
+
+    export_telemetry_identity_to_subprocesses()
+
+    assert os.environ["NEMO_LENS_RUN_ID"] == "job-wide"
+
+
+def test_no_run_id_is_exported_without_one():
+    export_telemetry_identity_to_subprocesses()
+
+    assert "NEMO_LENS_RUN_ID" not in os.environ
 
 
 def test_vllm_native_tracing_needs_the_master_switch(monkeypatch):

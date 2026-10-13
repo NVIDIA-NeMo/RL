@@ -98,6 +98,72 @@ def _campaign_stage(algorithm: str) -> str:
     return _CAMPAIGN_STAGE_BY_ALGORITHM.get(algorithm, _DEFAULT_CAMPAIGN_STAGE)
 
 
+# Standard OTel env var that every OTel SDK, and so every lens process, merges into its resource.
+# It survives a Ray runtime_env and a subprocess spawn.
+# That makes it the channel to processes that no NeMo-RL code initialises.
+_OTEL_RESOURCE_ATTRIBUTES_ENV = "OTEL_RESOURCE_ATTRIBUTES"
+
+
+def _add_otel_resource_attributes(additions: dict[str, Any]) -> None:
+    """Add *additions* to this process's ``OTEL_RESOURCE_ATTRIBUTES``.
+
+    Keys already present win, so a value the launcher exported is never replaced.
+    Lens's ``set_otel_resource_attributes`` merges the same way at the current pin.
+    From lens v0.3.0 on, it replaces the whole variable instead.
+    Calling it from the ``NemoGym`` actor would then discard the Slurm attributes the driver exported.
+    Lens's ``extend_otel_resource_attributes`` keeps the merge, but its signature differs between those revisions.
+    The merge therefore uses lens's parse and format helpers, which behave the same on both.
+    """
+    from nemo.lens.resources.attributes import (
+        format_otel_resource_attributes,
+        parse_otel_resource_attributes,
+    )
+
+    current = parse_otel_resource_attributes(
+        os.environ.get(_OTEL_RESOURCE_ATTRIBUTES_ENV)
+    )
+    merged = {**additions, **current}
+    if merged != current:
+        os.environ[_OTEL_RESOURCE_ATTRIBUTES_ENV] = format_otel_resource_attributes(
+            merged
+        )
+
+
+def _export_slurm_resource_attributes() -> None:
+    """Carry the driver's Slurm job identity to every Ray worker.
+
+    ``init_ray()`` strips ``SLURM_*`` from the environment it hands workers.
+    A worker, and anything it spawns such as NeMo-Gym's servers, therefore cannot detect Slurm itself.
+    Lens reads its Slurm keys from ``OTEL_RESOURCE_ATTRIBUTES`` for exactly that case.
+    The topology keys describe the driver's node rather than the job, so each process detects its own.
+    """
+    from nemo.lens.resources.slurm import derive_slurm_resource_attributes
+    from nemo.lens.semconv import SLURM_TOPOLOGY_ADDR, SLURM_TOPOLOGY_ADDR_PATTERN
+
+    attrs = derive_slurm_resource_attributes(os.environ)
+    attrs.pop(SLURM_TOPOLOGY_ADDR, None)
+    attrs.pop(SLURM_TOPOLOGY_ADDR_PATTERN, None)
+    if attrs:
+        _add_otel_resource_attributes(attrs)
+
+
+def export_telemetry_identity_to_subprocesses() -> None:
+    """Expose this run's campaign stage and run id to the processes this one spawns.
+
+    For processes that are not NeMo-RL workers and so never call :func:`init_telemetry_worker`.
+    In practice these are NeMo-Gym's servers, which the ``NemoGym`` actor starts as subprocesses.
+    Gym has no notion of a campaign stage, so its spans carry one only when an RL job launched it.
+    The run id goes through lens's own ``NEMO_LENS_RUN_ID`` fallback.
+    Gym's spans then group under this run instead of under an id Gym generates for itself.
+    """
+    stage = os.environ.get(_CAMPAIGN_STAGE_ENV, "").strip() or _DEFAULT_CAMPAIGN_STAGE
+    _add_otel_resource_attributes({_CAMPAIGN_STAGE_ATTR: stage})
+
+    run_id = os.environ.get(_RUN_ID_ENV, "").strip()
+    if run_id:
+        os.environ.setdefault(f"{_OTEL_FALLBACK_PREFIX}_RUN_ID", run_id)
+
+
 # TelemetryConfig field -> NEMO_RL_OTEL_* env var. ``service_name`` maps to the
 # standard ``OTEL_SERVICE_NAME`` (lens reads it directly, unprefixed).
 _ENV_FIELD_MAP = {
@@ -261,6 +327,8 @@ def init_telemetry_driver(
     # Projected here for the same reason, and because a worker has no algorithm
     # of its own to derive the stage from.
     os.environ.setdefault(_CAMPAIGN_STAGE_ENV, _campaign_stage(algorithm))
+    # Here, before init_ray() strips SLURM_* from what workers inherit.
+    _export_slurm_resource_attributes()
 
     from nemo.lens import NemoLensConfig, setup_telemetry
 
