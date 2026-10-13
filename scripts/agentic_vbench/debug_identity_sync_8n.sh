@@ -28,9 +28,12 @@ export NUM_GEN_NODES=${NUM_GEN_NODES:-4}
 export SEGMENT_SIZE=${SEGMENT_SIZE:-4}
 export NUM_PROMPTS=${NUM_PROMPTS:-8}
 export NUM_GENERATIONS=${NUM_GENERATIONS:-4}
-export MAX_STEPS=${MAX_STEPS:-1}
+export MAX_STEPS=${MAX_STEPS:-1000000}
+# The dataloader cycles because max_num_epochs is null; keep the materialized
+# manifest compact instead of coupling its size to the production horizon.
+export TRAIN_REPEATS=${TRAIN_REPEATS:-4}
 export SAVE_PERIOD=${SAVE_PERIOD:-1}
-export JOB_CYCLES=${JOB_CYCLES:-1}
+export JOB_CYCLES=${JOB_CYCLES:-6}
 export SLURM_QOS=${SLURM_QOS:-short}
 export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-02:00:00}
 export CONTEXT_COMPACTION=true
