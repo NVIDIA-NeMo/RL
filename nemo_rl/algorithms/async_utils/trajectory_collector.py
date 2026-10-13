@@ -84,9 +84,15 @@ from nemo_rl.utils.timer import ThreadSafeTimer
 def _prefix_caching_may_be_enabled(generation_cfg: Mapping[str, Any]) -> bool:
     """Whether the vLLM prefix cache is (or defaults to) enabled.
 
-    ``vllm_cfg.enable_prefix_caching`` unset resolves to True on Ampere+ GPUs in
+    Only the vLLM backend is covered: other backends own their cache lifecycle
+    elsewhere (Megatron via ``mcore_generation_config.kv_cache_management_mode``,
+    SGLang via ``sglang_cfg.disable_radix_cache``, TRT-LLM inside its refit) and
+    never trip the stale-prefix-cache warning. ``vllm_cfg.enable_prefix_caching``
+    unset resolves to True on Ampere+ GPUs in
     ``vllm_worker._resolve_enable_prefix_caching``; mirror that without touching CUDA.
     """
+    if generation_cfg.get("backend") != "vllm":
+        return False
     vllm_cfg = generation_cfg.get("vllm_cfg") or {}
     value = vllm_cfg.get("enable_prefix_caching")
     return True if value is None else bool(value)
@@ -102,7 +108,8 @@ def _warn_stale_prefix_cache_once(backend: str) -> None:
         "computed by older weights. This staleness is unbounded within the job "
         "(it is not limited to in-flight requests) and grows the train-vs-rollout "
         "logprob mismatch step over step. Set "
-        "grpo.async_grpo.recompute_kv_cache_after_weight_updates=true (default) or "
+        "recompute_kv_cache_after_weight_updates=true (under grpo.async_grpo or "
+        "ppo.async_ppo; the class default) or "
         "policy.generation.vllm_cfg.enable_prefix_caching=false.",
         flush=True,
     )
@@ -1175,6 +1182,21 @@ class AsyncTrajectoryCollector:
                 if invalidated:
                     print(
                         "✅ Invalidated generation backend KV caches after weight update"
+                    )
+                elif (
+                    drained
+                    and not self.async_config.recompute_kv_cache_after_weight_updates
+                ):
+                    # Nobody asked for a recompute; a backend that keeps (or does
+                    # not expose) its cache after a drained refit is following its
+                    # own configuration, e.g. Megatron generation under
+                    # kv_cache_management_mode persist/offload. Say so without
+                    # raising a warning on every refit.
+                    print(
+                        "ℹ️ Generation backend kept its KV caches across this drained "
+                        "refit (recompute_kv_cache_after_weight_updates=false and the "
+                        "backend does not flush on request, e.g. Megatron "
+                        "kv_cache_management_mode != 'recompute')"
                     )
                 else:
                     print(

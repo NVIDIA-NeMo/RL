@@ -19,6 +19,7 @@ import threading
 import time
 import unittest.mock as mock
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import ray
@@ -38,6 +39,7 @@ from nemo_rl.algorithms.async_utils import (
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
 from nemo_rl.algorithms.async_utils.trajectory_collector import (
+    _prefix_caching_may_be_enabled,
     _stamped_task_indices,
     _unanimous_task_index,
     _warn_stale_prefix_cache_once,
@@ -2705,32 +2707,49 @@ class TestAsyncTrajectoryCollector:
         assert collector.policy_generation.pause_generation_for_refit_calls == []
         collector.wait_for_pending_generations.assert_called_once_with()
 
+    @pytest.mark.parametrize("recompute_kv_cache", [False, True])
     def test_non_vllm_async_backend_uses_pause_contract_and_legacy_fallback(
-        self, capsys: pytest.CaptureFixture[str]
+        self, capsys: pytest.CaptureFixture[str], recompute_kv_cache: bool
     ) -> None:
+        """A backend without the pause hook neither pauses nor drains, and keeps
+        the legacy contract: invalidate after the update only when the flag asks
+        for it. The vLLM stale-prefix-cache warning must not fire for it."""
         _warn_unsupported_in_flight_refit_pause_once.cache_clear()
+        _warn_stale_prefix_cache_once.cache_clear()
         collector = self.create_local_collector()
-        collector.master_config.policy["generation"] = {"backend": "megatron"}
+        collector.master_config.policy["generation"] = {
+            "backend": "megatron",
+            "mcore_generation_config": {"kv_cache_management_mode": "persist"},
+        }
         async_cfg = collector.master_config.grpo.async_grpo
         async_cfg.in_flight_weight_updates = True
-        async_cfg.recompute_kv_cache_after_weight_updates = False
+        async_cfg.recompute_kv_cache_after_weight_updates = recompute_kv_cache
         collector.policy_generation.pause_generation_for_refit_supported = False
         collector.policy_generation.resume_generation_after_refit_supported = False
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
         collector.wait_for_pending_generations = mock.Mock()
 
         collector.prepare_for_refit()
 
-        assert collector.policy_generation.pause_generation_for_refit_calls == [False]
+        assert collector.policy_generation.pause_generation_for_refit_calls == [
+            recompute_kv_cache
+        ]
         collector.wait_for_pending_generations.assert_not_called()
         assert not collector._refit_pause_cleared.is_set()
 
         collector.resume_after_refit()
 
         assert collector.policy_generation.resume_generation_after_refit_calls == 1
+        # Legacy fallback: no drain, so invalidate only when the flag asks for it.
+        assert collector.policy_generation.invalidate_kv_cache.call_count == int(
+            recompute_kv_cache
+        )
         assert collector._refit_pause_cleared.is_set()
         output = capsys.readouterr().out
         assert output.count("has no native generation pause/resume support") == 1
+        assert "prefix cache is NOT invalidated" not in output
         _warn_unsupported_in_flight_refit_pause_once.cache_clear()
+        _warn_stale_prefix_cache_once.cache_clear()
 
     def test_resume_failure_after_successful_pause_keeps_collection_paused(
         self,
@@ -2829,6 +2848,71 @@ class TestAsyncTrajectoryCollector:
         collector.resume_after_refit()
 
         assert "prefix cache is NOT invalidated" not in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        ("generation_cfg", "expected"),
+        [
+            ({"backend": "vllm", "vllm_cfg": {"async_engine": True}}, True),
+            ({"backend": "vllm", "vllm_cfg": {"enable_prefix_caching": True}}, True),
+            ({"backend": "vllm", "vllm_cfg": {"enable_prefix_caching": False}}, False),
+            ({"backend": "megatron"}, False),
+            ({"backend": "sglang", "use_async_rollouts": True}, False),
+            ({"backend": "trtllm", "trtllm_cfg": {"async_engine": True}}, False),
+        ],
+    )
+    def test_stale_prefix_cache_guard_is_vllm_only(
+        self, generation_cfg: dict[str, Any], expected: bool
+    ) -> None:
+        """The guard reads the vLLM knob only; other backends own their caches
+        elsewhere and must never be told to edit ``vllm_cfg``."""
+        assert _prefix_caching_may_be_enabled(generation_cfg) is expected
+
+    @pytest.mark.parametrize(
+        ("recompute_kv_cache", "expected_marker", "absent_marker"),
+        [
+            (
+                False,
+                "ℹ️ Generation backend kept its KV caches",
+                "⚠️ KV cache invalidation",
+            ),
+            (
+                True,
+                "⚠️ KV cache invalidation",
+                "ℹ️ Generation backend kept its KV caches",
+            ),
+        ],
+    )
+    def test_drained_refit_reports_kept_cache_only_when_recompute_not_requested(
+        self,
+        capsys: pytest.CaptureFixture[str],
+        recompute_kv_cache: bool,
+        expected_marker: str,
+        absent_marker: str,
+    ) -> None:
+        """A drained refit asks the backend to invalidate regardless of the flag.
+        When the backend declines (Megatron generation under persist/offload
+        returns False) and the user did not ask for a recompute, that is its
+        configured behaviour: report it without a per-refit warning. The
+        warning stays when the user did ask for a recompute."""
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": "megatron",
+            "mcore_generation_config": {"kv_cache_management_mode": "persist"},
+        }
+        async_cfg = collector.master_config.grpo.async_grpo
+        async_cfg.in_flight_weight_updates = False
+        async_cfg.recompute_kv_cache_after_weight_updates = recompute_kv_cache
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=False)
+        collector.wait_for_pending_generations = mock.Mock()
+
+        collector.prepare_for_refit()
+        collector.resume_after_refit()
+
+        collector.policy_generation.invalidate_kv_cache.assert_called_once_with()
+        assert collector._refit_pause_cleared.is_set()
+        output = capsys.readouterr().out
+        assert expected_marker in output
+        assert absent_marker not in output
 
     def test_dynamo_cache_invalidation_failure_is_fatal_and_unblocks_waiters(self):
         collector = self.create_local_collector()
