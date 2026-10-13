@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import datetime
 import hashlib
 import json
 import os
@@ -516,7 +517,9 @@ def setup_distributed(config) -> None:
     # Ensure clean slate before import
     destroy_parallel_state()
     # Initialize process group
-    torch.distributed.init_process_group("nccl")
+    timeout_minutes = config["megatron_cfg"].get("distributed_timeout_minutes")
+    timeout = datetime.timedelta(minutes=timeout_minutes) if timeout_minutes else None
+    torch.distributed.init_process_group("nccl", timeout=timeout)
 
 
 def validate_and_set_config(
@@ -2107,6 +2110,10 @@ def _create_megatron_config(
         )
 
     dist_cfg = DistributedInitConfig()
+    if config["megatron_cfg"].get("distributed_timeout_minutes"):
+        dist_cfg.distributed_timeout_minutes = config["megatron_cfg"][
+            "distributed_timeout_minutes"
+        ]
     if "use_gloo_process_groups" in config["megatron_cfg"]:
         dist_cfg.use_gloo_process_groups = config["megatron_cfg"][
             "use_gloo_process_groups"
