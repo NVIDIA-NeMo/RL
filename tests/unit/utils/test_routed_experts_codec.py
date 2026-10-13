@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+
 import pytest
 import torch
 
 from nemo_rl.utils.routed_experts_codec import (
     decode_routed_experts,
     encode_routed_experts,
+    routed_experts_tensor_metadata,
 )
 
 
@@ -60,3 +63,24 @@ def test_encode_rejects_bad_inputs():
         encode_routed_experts(torch.zeros(3, 2, dtype=torch.int16))
     with pytest.raises(ValueError, match="dtype"):
         encode_routed_experts(torch.zeros(2, 3, 2, dtype=torch.int64))
+
+
+def test_tensor_metadata_binds_dtype_shape_and_little_endian_values():
+    routes = torch.tensor([[[1, -1]], [[256, 2]]], dtype=torch.int16)
+    metadata = routed_experts_tensor_metadata(routes)
+    assert metadata == {
+        "dtype": "int16",
+        "shape": [2, 1, 2],
+        "sha256": hashlib.sha256(b"\x01\x00\xff\xff\x00\x01\x02\x00").hexdigest(),
+    }
+    assert routed_experts_tensor_metadata(routes.to(torch.int32)) != metadata
+    assert routed_experts_tensor_metadata(routes.reshape(1, 2, 2)) != metadata
+    routes[0, 0, 0] += 1
+    assert routed_experts_tensor_metadata(routes) != metadata
+
+
+def test_tensor_metadata_is_independent_of_storage_strides():
+    routes = torch.arange(24, dtype=torch.int16).reshape(4, 3, 2).transpose(1, 2)
+    assert routed_experts_tensor_metadata(routes) == routed_experts_tensor_metadata(
+        routes.contiguous()
+    )
