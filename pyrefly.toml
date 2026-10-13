@@ -234,7 +234,7 @@ project-includes = [
   "nemo_rl/models/generation/remote_vllm/remote_vllm_generation.py",
   "nemo_rl/models/generation/remote_vllm/preflight.py",
   "nemo_rl/models/generation/remote_vllm/client.py",
-  "nemo_rl/models/generation/remote_vllm/config.py",
+  "nemo_rl/models/generation/remote_vllm_config.py",
   "nemo_rl/models/generation/remote_vllm/__init__.py",
   "nemo_rl/models/generation/dynamo/__init__.py",
   "nemo_rl/models/generation/dynamo/arguments.py",
