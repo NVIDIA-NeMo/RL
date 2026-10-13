@@ -2301,6 +2301,18 @@ def test_nemo_gym_rollout_hit_max_tokens_length_incomplete_response(reason):
     assert nemo_gym_rollout_hit_max_tokens(_incomplete_response(reason), 10, 128)
 
 
+def test_nemo_gym_rollout_hit_max_tokens_per_turn_cap_counts_as_truncated():
+    # A final turn stopped by its per-turn max_output_tokens cap reports the
+    # same reason as a context overflow, but with generated output. The final
+    # generation was length-cut, so it deliberately counts as truncated even
+    # though the context (10 of 128 tokens) was not exhausted.
+    full_result = _incomplete_response("max_output_tokens")
+    full_result["response"]["output"] = [
+        {"type": "message", "role": "assistant", "content": "partial answer"}
+    ]
+    assert nemo_gym_rollout_hit_max_tokens(full_result, 10, 128)
+
+
 @pytest.mark.parametrize(
     "full_result",
     [

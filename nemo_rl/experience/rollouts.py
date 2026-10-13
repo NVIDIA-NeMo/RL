@@ -2984,6 +2984,24 @@ def nemo_gym_rollout_hit_max_tokens(
     no tokens, so the chain stops short of the limit. Count the rollout as
     truncated if it reached the limit, or if the final response is incomplete
     for a length reason.
+
+    The length reason is deliberately not restricted to context exhaustion: a
+    final response stopped by its per-turn ``max_output_tokens`` cap carries the
+    same ``incomplete_details.reason`` and also counts as truncated, even when
+    the accumulated token count is below ``max_total_tokens_per_sample``. Its
+    final generation was length-cut, so it belongs in ``truncation_rate`` and is
+    a valid ``overlong_filtering`` target. Responses that are incomplete for
+    another reason (e.g. ``content_filter``), responses without
+    ``incomplete_details``, and absent or malformed metadata are not truncation.
+
+    Args:
+        full_result: The Gym rollout result; its ``response`` key holds the
+            final Responses object when the agent produced one.
+        total_tokens: Token count of the rollout's full message log.
+        max_total_tokens_per_sample: The generation backend's context limit.
+
+    Returns:
+        True if the rollout was cut off by a token limit.
     """
     if total_tokens >= max_total_tokens_per_sample:
         return True
