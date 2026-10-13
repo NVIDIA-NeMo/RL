@@ -74,10 +74,10 @@ def make_policy_factory(
 
     from nemo_rl.models.policy.tq_policy import TQPolicy
 
-    policy_data_plane_config: DataPlaneConfig = cfg
+    enabled_cfg = cfg
 
     def _make_policy(**kwargs: Any) -> TQPolicy:
-        return TQPolicy(**kwargs, dp_cfg=policy_data_plane_config)
+        return TQPolicy(**kwargs, dp_cfg=enabled_cfg)
 
     return _make_policy
 
