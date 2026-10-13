@@ -110,6 +110,10 @@ case "$NRL_MOUNT_HOST_ENROOT" in
 esac
 # Seconds the head srun may outlive the driver before the job is ended anyway (0 disables).
 DRIVER_EXIT_GRACE_S=${DRIVER_EXIT_GRACE_S:-180}
+if [[ ! "$DRIVER_EXIT_GRACE_S" =~ ^[0-9]+$ ]]; then
+  echo "Error: DRIVER_EXIT_GRACE_S must be a non-negative integer number of seconds (0 disables), got '$DRIVER_EXIT_GRACE_S'." >&2
+  exit 1
+fi
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-1301}
@@ -1257,9 +1261,10 @@ if [[ -n "$COMMAND" ]]; then
   # here because it also watches the head, whose exit is the normal success path.
   #
   # Dead-driver watchdog: once the driver has exited, the head srun normally ends
-  # within seconds. If it is still running DRIVER_EXIT_GRACE_S later (e.g. teardown
-  # blocked on a hung filesystem), end the job with the driver's exit code instead
-  # of holding the allocation until the time limit.
+  # within seconds (up to ~65 s more while the Alloy sidecar drains, when
+  # LOKI_PUSH_URL is set). If it is still running DRIVER_EXIT_GRACE_S later (e.g.
+  # teardown blocked on a hung filesystem), end the job with the driver's exit code
+  # instead of holding the allocation until the time limit.
   set +e
   _driver_exited_at=""
   while kill -0 "${SRUN_PIDS["ray-head"]}" 2>/dev/null; do
