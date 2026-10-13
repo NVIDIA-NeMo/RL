@@ -26,6 +26,7 @@ from typing import Any, AsyncGenerator, Optional, Union, cast
 
 import numpy as np
 import ray
+import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -264,7 +265,10 @@ class TrtllmGeneration(GenerationInterface):
 
         # NCCL_CUMEM_ENABLE=1 is needed for the non-colocated NCCL collective
         # broadcast; colocated shares the policy's NCCL group so don't touch it.
-        env_vars: dict[str, str] = {}
+        # Share the driver's run seed across replicas and TP ranks.
+        env_vars: dict[str, str] = {
+            "NEMO_RL_TRTLLM_SEED": str(torch.initial_seed()),
+        }
         if not self.colocated_enabled:
             env_vars["NCCL_CUMEM_ENABLE"] = "1"
 
