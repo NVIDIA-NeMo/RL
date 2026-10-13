@@ -17,12 +17,11 @@ import threading
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
-
 from typing import Any
 
 import pytest
-from ray import cloudpickle
 from pydantic import TypeAdapter, ValidationError
+from ray import cloudpickle
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.remote_vllm import (
