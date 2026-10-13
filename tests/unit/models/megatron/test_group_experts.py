@@ -34,9 +34,11 @@ pytest.importorskip("megatron.bridge")
 
 from nemo_rl.models.policy.workers.megatron_policy_worker import (  # noqa: E402
     MegatronPolicyWorkerImpl,
-    _materialize_refit_spec,
 )
-from nemo_rl.weight_sync.nccl_reshard_utils import LocalParamSpec  # noqa: E402
+from nemo_rl.weight_sync.nccl_reshard_utils import (  # noqa: E402
+    LocalParamSpec,
+    RefitCtx,
+)
 
 pytestmark = pytest.mark.mcore
 
@@ -44,7 +46,7 @@ pytestmark = pytest.mark.mcore
 def _group(proj, grouped_name, expert_groups):
     worker = object.__new__(MegatronPolicyWorkerImpl)
     grouped = worker._group_experts(proj, grouped_name, expert_groups)
-    return _materialize_refit_spec(grouped).buf
+    return grouped.materialize().buf
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -55,9 +57,9 @@ def test_group_experts_stacks_in_order(dtype: torch.dtype):
     e2 = e0 + 2
     groups = {
         (prefix, "gate_proj"): [
-            LocalParamSpec(base=e0),
-            LocalParamSpec(base=e1),
-            LocalParamSpec(base=e2),
+            LocalParamSpec(base=e0, wire_dtype=dtype),
+            LocalParamSpec(base=e1, wire_dtype=dtype),
+            LocalParamSpec(base=e2, wire_dtype=dtype),
         ]
     }
     out = _group("gate_proj", f"{prefix}.gate_proj.weight", groups)
@@ -79,6 +81,67 @@ def test_group_experts_empty_group_raises():
     prefix = "model.layers.0.mlp.experts"
     with pytest.raises(AssertionError, match="no local experts.*PP-filter"):
         _group("gate_proj", f"{prefix}.gate_proj.weight", {(prefix, "gate_proj"): []})
+
+
+@pytest.mark.parametrize("mismatch", ["declaration", "buffer"])
+def test_group_experts_rejects_mixed_dtypes_before_stacking(
+    monkeypatch: pytest.MonkeyPatch, mismatch: str
+) -> None:
+    prefix = "model.layers.0.mlp.experts"
+    groups = {
+        (prefix, "gate_proj"): [
+            LocalParamSpec(
+                base=torch.ones(2, 2, dtype=dtype),
+                wire_dtype=dtype if mismatch == "declaration" else torch.bfloat16,
+            )
+            for dtype in (torch.bfloat16, torch.float32)
+        ]
+    }
+
+    def stack(tensors: list[torch.Tensor]) -> torch.Tensor:
+        pytest.fail("mixed dtype declarations must be rejected before torch.stack")
+
+    monkeypatch.setattr(torch, "stack", stack)
+    expected = (
+        "Grouped refit source.*mixed wire dtypes"
+        if mismatch == "declaration"
+        else "Refit buffer dtype.*wire_dtype"
+    )
+    with pytest.raises(ValueError, match=expected):
+        _group("gate_proj", f"{prefix}.gate_proj.weight", groups)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_source_map_rejects_metadata_dtype_mismatch(
+    dtype: torch.dtype, grouped: bool
+) -> None:
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.my_pp_stage = 0
+    prefix = "model.layers.0.mlp.experts"
+    name = (
+        f"{prefix}.gate_proj.weight"
+        if grouped
+        else "model.layers.0.mlp.gate_proj.weight"
+    )
+    source_name = f"{prefix}.0.gate_proj.weight" if grouped else name
+
+    def pre(base: torch.Tensor) -> RefitCtx:
+        pytest.fail("map validation must not materialize source buffers")
+
+    worker._iter_local_hf_param_shards = lambda: [
+        (source_name, LocalParamSpec(base=torch.empty(2, 2), pre=pre, wire_dtype=dtype))
+    ]
+    metadata_dtype = torch.float32 if dtype != torch.float32 else torch.float16
+    param = {"name": name, "dtype": str(metadata_dtype)}
+    if grouped:
+        param["grouped_expert_proj"] = "gate_proj"
+    info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {"model.layers.0": [param]},
+    }
+    with pytest.raises(ValueError, match="declares wire dtype.*from metadata"):
+        worker._build_source_hf_to_local_param_map(info)
 
 
 # --------------------------------------------------------------------------
@@ -103,9 +166,12 @@ def test_build_hf_to_local_param_map_train_side(dtype: torch.dtype):
     e0 = torch.randn(128, 16, dtype=dtype)  # local expert 0 gate_proj
     e1 = torch.randn(128, 16, dtype=dtype)  # local expert 1 gate_proj
     w._iter_local_hf_param_shards = lambda: [
-        ("model.layers.0.mlp.down_proj.weight", LocalParamSpec(base=direct)),
-        (f"{prefix}.1.gate_proj.weight", LocalParamSpec(base=e1)),
-        (f"{prefix}.0.gate_proj.weight", LocalParamSpec(base=e0)),
+        (
+            "model.layers.0.mlp.down_proj.weight",
+            LocalParamSpec(base=direct, wire_dtype=dtype),
+        ),
+        (f"{prefix}.1.gate_proj.weight", LocalParamSpec(base=e1, wire_dtype=dtype)),
+        (f"{prefix}.0.gate_proj.weight", LocalParamSpec(base=e0, wire_dtype=dtype)),
     ]
     refit_info = {
         "layer_names": ["model.layers.0"],
@@ -114,10 +180,12 @@ def test_build_hf_to_local_param_map_train_side(dtype: torch.dtype):
                 {
                     "name": "model.layers.0.mlp.down_proj.weight",
                     "global_shape": [8, 16],
+                    "dtype": str(dtype),
                 },
                 {
                     "name": f"{prefix}.gate_proj.weight",
                     "global_shape": [2, 128, 16],
+                    "dtype": str(dtype),
                     "grouped_expert_proj": "gate_proj",
                 },
             ]
@@ -130,12 +198,14 @@ def test_build_hf_to_local_param_map_train_side(dtype: torch.dtype):
     # Direct: base is the live local view, sent as-is (no hooks).
     d = pmap.get("model.layers.0.mlp.down_proj.weight")
     assert d.base is direct and d.pre is None and d.post is None
+    assert d.wire_dtype == dtype
 
     # Grouped expert: pre stacks live views in expert-index order on each refit,
     # even when the shard iterator supplies those experts in a different order.
     g = pmap.get(f"{prefix}.gate_proj.weight")
     assert g.base is None and g.pre is not None and g.post is None
-    ctx = _materialize_refit_spec(g)
+    assert g.wire_dtype == dtype
+    ctx = g.materialize()
     assert ctx.buf.shape == (2, 128, 16)
     assert ctx.buf.dtype == dtype
     assert torch.equal(ctx.buf[0], e0) and torch.equal(ctx.buf[1], e1)
@@ -143,8 +213,8 @@ def test_build_hf_to_local_param_map_train_side(dtype: torch.dtype):
     direct.add_(1)
     e0.add_(2)
     e1.add_(3)
-    assert _materialize_refit_spec(d).buf is direct
-    refreshed = _materialize_refit_spec(g).buf
+    assert d.materialize().buf is direct
+    refreshed = g.materialize().buf
     assert refreshed.dtype == dtype
     assert torch.equal(refreshed[0], e0) and torch.equal(refreshed[1], e1)
     assert not torch.equal(refreshed, ctx.buf)

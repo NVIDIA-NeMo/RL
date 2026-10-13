@@ -198,8 +198,10 @@ every misc parameter; the order is load-bearing because producer and consumer wa
 lockstep during the packed broadcast.
 
 Finally, both sides build their `hf_to_local_param_map`: a mapping from each bulk HF
-parameter name to a `LocalParamSpec(base, pre, post)` describing how that parameter is
-realized **locally**:
+parameter name to a `LocalParamSpec(base, pre, post, wire_dtype)` describing how that
+parameter is realized **locally**. `wire_dtype` defaults to `torch.bfloat16`;
+unquantized FP16/FP32 sources and their receivers set it explicitly to match the
+advertised metadata. Grouped experts declare one common wire dtype.
 
 * On the **training side**, each `pre(base)` independently reads current local
   parameter values, dequantizes quantized storage, selects the corresponding HF
@@ -224,14 +226,14 @@ Every training step (with in-flight weight updates, concurrently with generation
 
 * `base` identifies local storage; it is not necessarily the transfer buffer.
 * `pre(base)` prepares a `RefitCtx` whose `buf` is a canonical HF shard matching
-  the advertised transfer dtype.
+  `spec.wire_dtype`. `spec.materialize()` runs this hook and checks the buffer dtype.
   Omitting `pre` is valid only when `base` already satisfies that contract.
 * `post(ctx)` commits received values to local storage, including quantization and
   scale updates. It runs after the transfer on the corresponding CUDA stream.
 
 * The **training side** walks `per_layer_params`, skipping parameters owned by other PP
-  stages. For each parameter it resolves the `LocalParamSpec`, runs `pre`
-  (dequantization or expert stacking) if present, wraps the local shard in a
+  stages. For each parameter it resolves the `LocalParamSpec`, calls `materialize()`
+  (which runs `pre` for dequantization or expert stacking), wraps the local shard in a
   `DTensorRef` (which reports the *global* shape while holding only the local tensor),
   and calls
   `xferdtensor(src, src_mesh, src_placements, None, dst_mesh, dst_placements, group,
@@ -239,7 +241,7 @@ Every training step (with in-flight weight updates, concurrently with generation
 * The **generation side** walks the same metadata in the same order — every rank in a
   comm group must issue the same sequence of transfers. Per-PP-stage parameter groups
   are distributed across `NRL_REFIT_NUM_STREAMS` CUDA streams so different stages'
-  reshards overlap. For each parameter it runs `pre` (receive-buffer allocation), calls
+  reshards overlap. For each parameter it calls `materialize()` (receive-buffer allocation and dtype validation), then
   `xferdtensor(None, ..., dst, ..., group, stream)`, then `post` (copy back into the
   fused parameter, requantize local storage, or load staged TRTLLM experts). After every transfer completes, the
   TRTLLM path finalizes vLLM's native layerwise reload once to restore the packed runtime
@@ -334,7 +336,7 @@ names/attributes change):
    training ranks first (per-stage-local for the bulk groups), generation ranks after.
 3. The `nccl_reshard_refit()` loop — walk `per_layer_params` in metadata order (grouped
    by `pp_stage` across `NRL_REFIT_NUM_STREAMS` streams), resolve each `LocalParamSpec`,
-   run `pre`, call `xferdtensor`, run `post`. It only touches the generic spec/metadata
+   call `materialize()`, call `xferdtensor`, run `post`. It only touches the generic spec/metadata
    contracts, never your layout.
 4. The misc producer/consumer — reuses the conventional packed-broadcast path.
 

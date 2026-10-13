@@ -268,7 +268,6 @@ def test_local_hf_shards_follow_bridge_specs(dtype: torch.dtype) -> None:
 
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
-        _materialize_refit_spec,
     )
 
     fused = torch.nn.Parameter(
@@ -295,18 +294,16 @@ def test_local_hf_shards_follow_bridge_specs(dtype: torch.dtype) -> None:
     for index, name in enumerate(("gate", "up")):
         spec = shards[f"model.layers.0.mlp.{name}_proj.weight"]
         assert spec.base is fused and spec.pre is not None and spec.post is None
-        result = _materialize_refit_spec(spec).buf
+        assert spec.wire_dtype == dtype
+        result = spec.materialize().buf
         assert result.dtype == dtype and result.is_contiguous()
         assert torch.equal(result, fused[index * 2 : (index + 1) * 2])
     fused[0, 0] = 99
-    assert (
-        _materialize_refit_spec(shards["model.layers.0.mlp.gate_proj.weight"]).buf[0, 0]
-        == 99
-    )
+    assert shards["model.layers.0.mlp.gate_proj.weight"].materialize().buf[0, 0] == 99
     fused.data = torch.full_like(fused, 1.0009765625)
     for spec in shards.values():
         assert torch.equal(
-            _materialize_refit_spec(spec).buf,
+            spec.materialize().buf,
             torch.full((2, 2), 1.0009765625, dtype=dtype),
         )
 
@@ -1540,9 +1537,10 @@ def test_refit_dequantizes_with_metadata_before_selecting_hf_view(
     monkeypatch.setattr(fp8_utils, "dequantize_fp8_tensor", decode)
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     spec = worker._local_refit_source_spec(source, LocalHFParamSpec("gate", -2, 0, 2))
+    assert spec.wire_dtype == torch.bfloat16
 
     for _ in range(2):
-        result = worker_module._materialize_refit_spec(spec).buf
+        result = spec.materialize().buf
         expected = (source.to(torch.float32) * scales).to(torch.bfloat16)
         assert result.dtype == torch.bfloat16 and result.is_contiguous()
         assert torch.equal(result, expected[..., :2, :])
@@ -1587,11 +1585,17 @@ def test_megatron_refit_quantized_hooks_read_current_fused_source(
     )
     assert gate_spec.base is quantized_source and gate_spec.pre is not None
     assert up_spec.base is quantized_source and up_spec.pre is not None
+    assert (
+        gate_spec.wire_dtype
+        == up_spec.wire_dtype
+        == grouped_spec.wire_dtype
+        == torch.bfloat16
+    )
     dequantize.assert_not_called()
 
-    gate = worker_module._materialize_refit_spec(gate_spec).buf
-    up = worker_module._materialize_refit_spec(up_spec).buf
-    grouped = worker_module._materialize_refit_spec(grouped_spec).buf
+    gate = gate_spec.materialize().buf
+    up = up_spec.materialize().buf
+    grouped = grouped_spec.materialize().buf
 
     assert not logical_weight[:, :2].is_contiguous()
     assert gate.is_contiguous()
@@ -1604,7 +1608,7 @@ def test_megatron_refit_quantized_hooks_read_current_fused_source(
     assert dequantize.call_args_list == [call(quantized_source)] * 4
 
     quantized_source.add_(16)
-    refreshed = worker_module._materialize_refit_spec(grouped_spec).buf
+    refreshed = grouped_spec.materialize().buf
     assert torch.equal(refreshed[0], quantized_source[:, :2].to(torch.bfloat16))
     assert torch.equal(refreshed[1], quantized_source[:, 2:].to(torch.bfloat16))
     assert not torch.equal(refreshed, grouped)
@@ -1701,6 +1705,10 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
         ctx = materialize_first(base)
         if failure_stage == "pre":
             raise RuntimeError("injected pre failure")
+        if failure_stage == "dtype":
+            ctx.buf = ctx.buf.to(
+                torch.float32 if wire_dtype != torch.float32 else torch.float16
+            )
         return ctx
 
     def post(ctx: worker_module.RefitCtx) -> None:
@@ -1721,15 +1729,9 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
     monkeypatch.setattr(transfer_module, "xferdtensor", transfer)
 
     if failure_stage is not None:
-        first_meta = worker.nccl_reshard_refit_info["per_layer_params"][layer_names[0]][
-            0
-        ]
         if failure_stage == "dtype":
-            first_meta["dtype"] = str(
-                torch.float32 if wire_dtype != torch.float32 else torch.float16
-            )
-            expected_error = AssertionError
-            expected_message = "dtype .*expected"
+            expected_error = ValueError
+            expected_message = "dtype .*wire_dtype"
         else:
             expected_error = RuntimeError
             expected_message = f"injected {failure_stage} failure"
@@ -1738,7 +1740,6 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
         assert len(materialized_sources) == 1
         assert completed == []
         worker._broadcast_misc_params_packed.assert_not_called()
-        first_meta["dtype"] = str(wire_dtype)
         failure_stage = None
         materialized_sources.clear()
         transferred.clear()
@@ -1821,7 +1822,7 @@ def test_megatron_refit_pre_hooks_use_current_cuda_stream(
                 "synchronize",
                 MagicMock(side_effect=AssertionError("pre must not synchronize CUDA")),
             )
-            output = worker_module._materialize_refit_spec(grouped).buf
+            output = grouped.materialize().buf
         expected = quantized_source[:, :2].to(torch.bfloat16)
     stream.synchronize()
     assert output.is_contiguous()

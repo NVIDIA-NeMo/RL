@@ -323,11 +323,6 @@ def _get_refit_task_source(task: Any) -> Optional[torch.Tensor]:
     return source
 
 
-def _materialize_refit_spec(spec: LocalParamSpec) -> RefitCtx:
-    """Run a spec's pre hook or transfer its base as-is, as the receivers do."""
-    return spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
-
-
 def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
     """Return HF layer names whose weights originate from Megatron's MTP module.
 
@@ -3349,7 +3344,10 @@ class MegatronPolicyWorkerImpl(
             logical = _dequantize_refit_source(base)
             return RefitCtx(buf=spec.select(logical).contiguous())
 
-        return LocalParamSpec(base=tensor, pre=pre)
+        wire_dtype = (
+            torch.bfloat16 if _is_quantized_refit_source(tensor) else tensor.dtype
+        )
+        return LocalParamSpec(base=tensor, pre=pre, wire_dtype=wire_dtype)
 
     def _iter_local_hf_param_shards(self) -> Iterator[tuple[str, LocalParamSpec]]:
         """Yield (hf_name, local_tp_shard) for this rank's locally owned FFN params.
@@ -3963,15 +3961,18 @@ class MegatronPolicyWorkerImpl(
             "PP-filter / expert-group-metadata inconsistency"
         )
         members = tuple(expert_specs)
+        wire_dtype = members[0].wire_dtype
+        if any(member.wire_dtype != wire_dtype for member in members):
+            raise ValueError(
+                f"Grouped refit source {grouped_name!r} has mixed wire dtypes."
+            )
 
         def pre(base: Any) -> RefitCtx:
             return RefitCtx(
-                buf=torch.stack(
-                    [_materialize_refit_spec(member).buf for member in members]
-                )
+                buf=torch.stack([member.materialize().buf for member in members])
             )
 
-        return LocalParamSpec(base=None, pre=pre)
+        return LocalParamSpec(base=None, pre=pre, wire_dtype=wire_dtype)
 
     def _build_source_hf_to_local_param_map(
         self, refit_info: dict[str, Any]
@@ -3983,6 +3984,8 @@ class MegatronPolicyWorkerImpl(
           necessary and selects the HF view, preserving unquantized dtypes.
         - grouped MoE expert: ``pre`` materializes the ordered per-expert specs
           and stacks them into ``[E_local, ...]`` each refit.
+        Every spec declares its wire dtype, checked against transfer metadata
+        before any source buffers are materialized.
         """
         param_map = dict(self._iter_local_hf_param_shards())
         expert_groups = self._build_expert_groups(param_map)
@@ -3994,7 +3997,7 @@ class MegatronPolicyWorkerImpl(
                     continue
                 name = p["name"]
                 if p.get("grouped_expert_proj"):
-                    mapping[name] = self._group_experts(
+                    spec = self._group_experts(
                         p["grouped_expert_proj"], name, expert_groups
                     )
                 else:
@@ -4003,7 +4006,12 @@ class MegatronPolicyWorkerImpl(
                         raise RuntimeError(
                             f"No local Megatron refit source maps to {name!r}."
                         )
-                    mapping[name] = spec
+                if spec.wire_dtype != _STR_TO_DTYPE[p["dtype"]]:
+                    raise ValueError(
+                        f"Bulk refit source {name!r} declares wire dtype "
+                        f"{spec.wire_dtype}, expected {p['dtype']} from metadata."
+                    )
+                mapping[name] = spec
         return HFToLocalParamMap(specs=mapping)
 
     def build_hf_to_local_param_map(
@@ -4130,13 +4138,9 @@ class MegatronPolicyWorkerImpl(
                 assert spec is not None, (
                     f"no spec for {param_info['name']!r} in hf_to_local_param_map"
                 )
-                ctx = _materialize_refit_spec(spec)
+                ctx = spec.materialize()
                 assert ctx.buf is not None, (
                     f"no local tensor for {param_info['name']!r}"
-                )
-                assert ctx.buf.dtype == _STR_TO_DTYPE[param_info["dtype"]], (
-                    f"bulk refit source {param_info['name']!r} has dtype "
-                    f"{ctx.buf.dtype}, expected {param_info['dtype']}"
                 )
                 src_tensor = DTensorRef(
                     local_tensor=ctx.buf, global_shape=param_info["global_shape"]

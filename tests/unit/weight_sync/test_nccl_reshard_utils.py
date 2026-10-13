@@ -29,7 +29,9 @@ import torch
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_rl.weight_sync.nccl_reshard_utils import (
+    LocalParamSpec,
     MeshInfo,
+    RefitCtx,
     _extract_layer_name,
     build_mesh_info,
     build_nccl_reshard_refit_info,
@@ -42,6 +44,57 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     make_nccl_reshard_refit_info_wire_safe,
     restore_refit_info_placements,
 )
+
+
+def test_local_param_spec_defaults_to_bf16():
+    base = torch.ones(2, dtype=torch.bfloat16)
+    spec = LocalParamSpec(base=base)
+
+    assert spec.wire_dtype == torch.bfloat16
+    assert spec.materialize().buf is base
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_local_param_spec_preserves_explicit_wire_dtype(dtype):
+    base = torch.ones(2, dtype=dtype)
+    spec = LocalParamSpec(base=base, wire_dtype=dtype)
+
+    assert spec.materialize().buf is base
+
+
+@pytest.mark.parametrize("with_hook", [False, True])
+def test_local_param_spec_rejects_buffer_dtype_mismatch(with_hook):
+    base = torch.ones(2, dtype=torch.float32)
+    spec = LocalParamSpec(
+        base=base,
+        pre=(lambda tensor: RefitCtx(buf=tensor)) if with_hook else None,
+    )
+
+    with pytest.raises(ValueError, match="torch.float32.*wire_dtype torch.bfloat16"):
+        spec.materialize()
+    assert base.dtype == torch.float32
+
+
+def test_local_param_spec_runs_pre_fresh_and_leaves_commit_to_caller():
+    base = torch.ones(2, dtype=torch.float32)
+    commits = []
+
+    def pre(tensor):
+        return RefitCtx(buf=tensor.to(torch.bfloat16), extra={"base": tensor})
+
+    # Keep existing positional base/pre/post construction compatible.
+    spec = LocalParamSpec(base, pre, commits.append)
+    first = spec.materialize()
+    base.fill_(3)
+    second = spec.materialize()
+
+    assert not commits
+    assert second.extra["base"] is base
+    torch.testing.assert_close(first.buf, torch.ones(2, dtype=torch.bfloat16))
+    torch.testing.assert_close(second.buf, torch.full((2,), 3, dtype=torch.bfloat16))
+    assert spec.post is not None
+    spec.post(second)
+    assert commits == [second]
 
 
 # --------------------------------------------------------------------------

@@ -82,8 +82,8 @@ def test_destination_receives_wire_dtype_and_casts_live_storage(dtype, wire_dtyp
     with torch.no_grad():
         for index, name in enumerate((GATE, UP)):
             spec = specs.get(name)
-            ctx = spec.pre(spec.base)
-            assert ctx.buf.dtype == wire_dtype
+            ctx = spec.materialize()
+            assert spec.wire_dtype == ctx.buf.dtype == wire_dtype
             assert ctx.buf.shape == (4, 4)
             # These values distinguish FP16/FP32 from a lossy BF16 round trip.
             expected = torch.full((4, 4), index + 1.003, dtype=wire_dtype)
@@ -103,8 +103,8 @@ def test_matching_destination_dtype_retains_direct_live_view(dtype):
     )
     _, specs = _make_map(destination, dtype)
     spec = specs.get(GATE)
-    ctx = spec.pre(spec.base)
-    assert ctx.buf.dtype == dtype
+    ctx = spec.materialize()
+    assert spec.wire_dtype == ctx.buf.dtype == dtype
     assert ctx.buf.data_ptr() == destination.data_ptr()
     assert spec.post is None
 
@@ -189,8 +189,8 @@ def test_bulk_quantized_writer_waits_for_complete_fused_weight(
         expected.chunk(2, dim=-2)[1].fill_(67 * cycle)
         for index, name in enumerate((GATE, UP)):
             spec = specs.get(name)
-            ctx = spec.pre(spec.base)
-            assert ctx.buf.dtype == wire_dtype
+            ctx = spec.materialize()
+            assert spec.wire_dtype == ctx.buf.dtype == wire_dtype
             ctx.buf.copy_(expected.chunk(2, dim=-2)[index])
             spec.post(ctx)
             assert quantized_copy.call_count == cycle - 1 + index
@@ -233,8 +233,8 @@ def test_grouped_expert_receiver_preserves_wire_dtype(wire_dtype):
     for cycle in (1, 2):
         for part, param_info in enumerate(metadata):
             spec = specs.get(param_info["name"])
-            ctx = spec.pre(spec.base)
-            assert ctx.buf.dtype == wire_dtype
+            ctx = spec.materialize()
+            assert spec.wire_dtype == ctx.buf.dtype == wire_dtype
             assert ctx.buf.shape == (2, 4, 4)
             for expert in range(2):
                 ctx.buf[expert].fill_(cycle + part + expert + 0.003)
@@ -304,8 +304,8 @@ def test_quantized_fused_destination_commits_values_and_scales_on_current_stream
         with torch.no_grad(), torch.cuda.stream(stream):
             for index, name in enumerate((GATE, UP)):
                 spec = specs.get(name)
-                ctx = spec.pre(spec.base)
-                assert ctx.buf.dtype == wire_dtype
+                ctx = spec.materialize()
+                assert spec.wire_dtype == ctx.buf.dtype == wire_dtype
                 ctx.buf.copy_(expected.chunk(2)[index])
                 spec.post(ctx)
                 if index == 0:

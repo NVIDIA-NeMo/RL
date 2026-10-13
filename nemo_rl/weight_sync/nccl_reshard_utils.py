@@ -92,6 +92,8 @@ class LocalParamSpec:
             e.g., Create a temporary buffer for the merged param.
         post: ``RefitCtx -> None``; runs after xferdtensor
             e.g., copy back the received buffer into the merged param.
+        wire_dtype: dtype required for ``RefitCtx.buf``, defaulting to BF16.
+            Independent of the dtype or quantization format of local storage.
 
     Layout-specific backends can receive into canonical storage in ``pre``, load
     each logical component in ``post``, and use a transport-level finalizer after
@@ -101,6 +103,17 @@ class LocalParamSpec:
     base: Any
     pre: Optional[Callable[[Any], "RefitCtx"]] = None
     post: Optional[Callable[["RefitCtx"], None]] = None
+    wire_dtype: torch.dtype = torch.bfloat16
+
+    def materialize(self) -> RefitCtx:
+        """Prepare the buffer and check the dtype declared by this spec."""
+        ctx = self.pre(self.base) if self.pre is not None else RefitCtx(buf=self.base)
+        if ctx.buf.dtype != self.wire_dtype:
+            raise ValueError(
+                f"Refit buffer dtype {ctx.buf.dtype} does not match "
+                f"wire_dtype {self.wire_dtype}."
+            )
+        return ctx
 
 
 @dataclass

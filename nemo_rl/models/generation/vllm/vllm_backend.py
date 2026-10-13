@@ -1738,7 +1738,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             def post(ctx: RefitCtx) -> None:
                 ctx.extra["region"].copy_(ctx.buf)
 
-            return LocalParamSpec(base=vllm_param, pre=pre, post=post)
+            return LocalParamSpec(
+                base=vllm_param, pre=pre, post=post, wire_dtype=wire_dtype
+            )
 
         def _trtllm_grouped_expert_spec(
             param_info: dict[str, Any],
@@ -1848,7 +1850,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         f"vLLM reported {sorted(loaded_names)!r}"
                     )
 
-            return LocalParamSpec(base=None, pre=pre, post=post)
+            return LocalParamSpec(base=None, pre=pre, post=post, wire_dtype=wire_dtype)
 
         def _fp8_receiver_quant_spec(
             value_param: torch.Tensor,
@@ -1916,7 +1918,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 ctx.extra["value_region"].copy_(value)
                 ctx.extra["scale_region"].copy_(scale)
 
-            return LocalParamSpec(base=value_param.data, pre=pre, post=post)
+            return LocalParamSpec(
+                base=value_param.data, pre=pre, post=post, wire_dtype=wire_dtype
+            )
 
         # Get dict of vllm_param and merged_slice for each hf_name
         vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
@@ -2283,9 +2287,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
             # spec.pre/post run on the caller's current stream (this stage's
             # stream); xferdtensor should use the same stream.
-            ctx = (
-                spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
-            )
+            ctx = spec.materialize()
             dst_tensor = DTensorRef(ctx.buf, param_info["global_shape"])
             xferdtensor(
                 None,

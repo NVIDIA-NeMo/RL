@@ -1765,7 +1765,7 @@ class MegatronGenerationRefitMixin:
                 for received, piece in zip(ctx.buf.unbind(0), grouped, strict=True):
                     self._commit_megatron_bulk_refit_piece(piece, received)
 
-            return LocalParamSpec(base=None, pre=pre, post=post)
+            return LocalParamSpec(base=None, pre=pre, post=post, wire_dtype=wire_dtype)
 
         def staged_spec(
             piece: _MegatronBulkRefitPiece, wire_dtype: torch.dtype
@@ -1778,15 +1778,19 @@ class MegatronGenerationRefitMixin:
             def post(ctx: RefitCtx) -> None:
                 self._commit_megatron_bulk_refit_piece(piece, ctx.buf)
 
-            return LocalParamSpec(base=None, pre=pre, post=post)
+            return LocalParamSpec(base=None, pre=pre, post=post, wire_dtype=wire_dtype)
 
-        def direct_spec(piece: _MegatronBulkRefitPiece) -> LocalParamSpec:
+        def direct_spec(
+            piece: _MegatronBulkRefitPiece, wire_dtype: torch.dtype
+        ) -> LocalParamSpec:
             assert piece.destination is not None
 
             def pre(base: torch.Tensor) -> RefitCtx:
                 return RefitCtx(buf=piece.spec.select(base))
 
-            return LocalParamSpec(base=piece.destination, pre=pre)
+            return LocalParamSpec(
+                base=piece.destination, pre=pre, wire_dtype=wire_dtype
+            )
 
         specs = {}
         for layer_name in refit_info["layer_names"]:
@@ -1827,7 +1831,7 @@ class MegatronGenerationRefitMixin:
                 specs[name] = (
                     staged_spec(piece, wire_dtype)
                     if piece.task.is_quantized or piece.destination.dtype != wire_dtype
-                    else direct_spec(piece)
+                    else direct_spec(piece, wire_dtype)
                 )
 
         return HFToLocalParamMap(specs=specs)
@@ -2023,9 +2027,7 @@ class MegatronGenerationRefitMixin:
                 raise RuntimeError(
                     f"Megatron M-to-N refit has no destination for {param_info['name']!r}."
                 )
-            ctx = (
-                spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
-            )
+            ctx = spec.materialize()
             destination = DTensorRef(ctx.buf, param_info["global_shape"])
             xferdtensor(
                 None,
