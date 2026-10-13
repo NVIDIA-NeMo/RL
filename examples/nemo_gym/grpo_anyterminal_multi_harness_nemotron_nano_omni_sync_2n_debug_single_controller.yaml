@@ -104,14 +104,11 @@ env:
             context_window: ${add:${policy.max_total_sequence_length},-512}
             max_input_tokens: ${add:${policy.max_total_sequence_length},-4608}
             max_output_tokens: 4096
-            # OpenCode's native step setting is advisory: after emitting its
-            # final text-only turn it can compact and regenerate indefinitely.
-            # The Gym adapter stops at the committed final-turn boundary.
+            # Bound all completed root model calls, including compactions, so
+            # a weak debug model cannot compact and regenerate indefinitely.
             max_model_turns: 17
-            # Stop a weak debug model from alternating build and compaction
-            # until the outer agent timeout. OpenCode forces a final text-only
-            # answer at this boundary; GRPO epochs and optimizer steps remain
-            # controlled independently by grpo.max_num_{epochs,steps}.
+            # This limits only the per-rollout agent. GRPO epochs and optimizer
+            # steps remain controlled independently by grpo.max_num_{epochs,steps}.
             opencode_config:
               agent:
                 build:

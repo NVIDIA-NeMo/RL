@@ -93,8 +93,9 @@ env:
             context_window: ${add:${policy.max_total_sequence_length},-512}
             max_input_tokens: ${add:${policy.max_total_sequence_length},-4608}
             max_output_tokens: 4096
-            # Preserve the 32 working turns plus OpenCode's final text-only
-            # response, then enforce a committed-turn boundary in Gym.
+            # Bound total completed root model calls, including compactions.
+            # With the production context, compaction should be rare and this
+            # normally preserves the 32 working turns plus a final response.
             max_model_turns: 33
             # Keep pathological build/compaction cycles finite without
             # limiting GRPO training. Production rollouts retain twice the

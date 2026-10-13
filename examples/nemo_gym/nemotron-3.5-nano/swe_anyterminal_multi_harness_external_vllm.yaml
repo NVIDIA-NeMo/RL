@@ -98,9 +98,10 @@ env:
             context_window: ${add:${policy.max_total_sequence_length},-512}
             max_input_tokens: ${add:${policy.max_total_sequence_length},-33280}
             max_output_tokens: 32768
-            # Keep the long-context production rollout bounded independently
-            # of the 9,000-second outer timeout. The extra turn carries
-            # OpenCode's final text-only response after 64 working turns.
+            # Keep total completed root calls, including compactions, bounded
+            # independently of the 9,000-second outer timeout. With this long
+            # context, compaction should be rare and the extra turn normally
+            # carries OpenCode's final response after 64 working turns.
             max_model_turns: 65
             opencode_config:
               agent:
