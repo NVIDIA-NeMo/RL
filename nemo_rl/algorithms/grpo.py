@@ -2712,9 +2712,12 @@ def _baseline_valid_mask(
     * Truncated rollouts keep voting. Call this before ``overlong_filtering``
       rewrites ``loss_multiplier``, so a truncated but otherwise real rollout
       still counts toward the baseline, as ``docs/guides/grpo.md`` documents
-      for these loops. The SingleController ``advantage_stage`` folds
-      ``truncated`` into its ``valid_mask`` instead; reconciling the two is a
-      separate policy decision, not made here.
+      for these loops. Rows that ``compute_and_apply_seq_logprob_error_masking``
+      masks later in the step keep voting for the same reason: that masking
+      runs after this mask is taken. The SingleController ``advantage_stage``
+      instead passes its final sample mask, which folds ``mask_sample``,
+      ``truncated`` (under ``overlong_filtering``) and seq-logprob-error rows
+      into ``valid_mask``, so the two paths differ on those two row classes.
     """
     valid_mask = torch.ones_like(rewards)
     if "mask_sample" in repeated_batch:
