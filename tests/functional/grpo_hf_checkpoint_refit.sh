@@ -52,6 +52,9 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     cluster.num_nodes=1 \
     cluster.gpus_per_node=2 \
     grpo.max_num_steps=10 \
+    grpo.val_period=0 \
+    grpo.val_at_start=false \
+    grpo.val_at_end=false \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
@@ -62,7 +65,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # A broken refit corrupts the gen weights -> the importance-sampling ratio
-# (train vs gen logprobs) explodes; assert it stays sane across the 2 steps.
+# (train vs gen logprobs) explodes; assert it stays sane across all ten steps.
 uv run tests/check_metrics.py $JSON_METRICS \
     'len(data["train/token_mult_prob_error"]) >= 10' \
     'max(data["train/token_mult_prob_error"]) < 1.05'
