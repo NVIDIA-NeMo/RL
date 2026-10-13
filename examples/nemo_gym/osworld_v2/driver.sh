@@ -15,6 +15,26 @@ OVERRIDES=(
 if [[ -n "${OSWORLD_SEED:-}" ]]; then
   OVERRIDES+=("grpo.seed=$OSWORLD_SEED")
 fi
+if [[ -n "${OSWORLD_LR_WARMUP_ITERS:-}" ]]; then
+  OVERRIDES+=(
+    "policy.megatron_cfg.scheduler.lr_warmup_iters=$OSWORLD_LR_WARMUP_ITERS"
+  )
+fi
+if [[ -n "${OSWORLD_MAX_TOTAL_SEQUENCE_LENGTH:-}" ]]; then
+  OVERRIDES+=(
+    "policy.max_total_sequence_length=$OSWORLD_MAX_TOTAL_SEQUENCE_LENGTH"
+  )
+fi
+if [[ -n "${OSWORLD_TRAIN_MB_TOKENS:-}" ]]; then
+  OVERRIDES+=(
+    "policy.sequence_packing.train_mb_tokens=$OSWORLD_TRAIN_MB_TOKENS"
+  )
+fi
+if [[ -n "${OSWORLD_LOGPROB_MB_TOKENS:-}" ]]; then
+  OVERRIDES+=(
+    "policy.sequence_packing.logprob_mb_tokens=$OSWORLD_LOGPROB_MB_TOKENS"
+  )
+fi
 
 exec "$OSWORLD_DRIVER_PYTHON" \
   examples/nemo_gym/launch_osworld_v2_cc.py \
