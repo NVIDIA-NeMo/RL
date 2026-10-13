@@ -1,0 +1,53 @@
+# ArgMaxRL: inherits from grpo_math_1B.yaml and overrides only what differs.
+defaults: grpo_math_1B.yaml
+
+grpo:
+  adv_estimator:
+    name: "argmaxrl"
+    # Plain ArgMaxRL weights as in the paper. Set minus_baseline: true for the
+    # baseline-subtracted variant (leave-one-out via use_leave_one_out_baseline).
+    minus_baseline: false
+    use_leave_one_out_baseline: false
+
+checkpointing:
+  checkpoint_dir: "results/argmaxrl"
+
+# Graded reward: math_multi_reward sums correctness/integer/format (each 0 or 1)
+# into total_reward in {0, 1, 2, 3}. Replaces parent's train/validation/default.
+data:
+  _override_: true
+
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 1
+
+  use_multiple_dataloader: false
+
+  train:
+    dataset_name: "gsm8k"
+    split: train
+  validation:
+    dataset_name: "gsm8k"
+    split: test
+
+  default:
+    prompt_file: null
+    system_prompt_file: "examples/prompts/gsm8k.txt"
+    processor: "math_hf_data_processor"
+    env_name: "math_multi_reward"
+
+env:
+  math_multi_reward:
+    num_workers: 8
+    math_verify_impl: "hf_math_verify"
+
+logger:
+  wandb:
+    project: "argmaxrl-dev"
+    name: "argmaxrl-dev-logger"
+  swanlab:
+    project: "argmaxrl-dev"
+    name: "argmaxrl-dev-logger"
+  mlflow:
+    experiment_name: "argmaxrl-dev"
+    run_name: "argmaxrl-dev-logger"
