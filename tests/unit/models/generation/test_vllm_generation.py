@@ -1024,7 +1024,9 @@ def test_configure_generation_config_uses_real_startup_weights_without_draft_ref
     assert configured["_draft_weights_from_refit"] is False
 
 
-@pytest.mark.parametrize("transport", ["vllm_s3_sparse", "vllm_zmq_sparse"])
+@pytest.mark.parametrize(
+    "transport", ["vllm_s3_sparse", "vllm_zmq_sparse", "hf_checkpoint"]
+)
 def test_configure_generation_config_uses_real_delta_baseline(transport: str):
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["refit_transport"] = transport

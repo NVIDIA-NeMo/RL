@@ -14,12 +14,11 @@
 
 from pathlib import Path
 from types import SimpleNamespace
-from nemo_rl.weight_sync.hf_checkpoint_config import HfCheckpointRefitConfig
 
 import pytest
 
+from nemo_rl.models.generation.hf_checkpoint_config import HfCheckpointRefitConfig
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
-
 from nemo_rl.weight_sync.hf_checkpoint_weight_synchronizer import (
     HfCheckpointWeightSynchronizer,
 )

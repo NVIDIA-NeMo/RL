@@ -19,9 +19,9 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional
 
+from nemo_rl.models.generation.hf_checkpoint_config import HfCheckpointRefitConfig
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
-from nemo_rl.weight_sync.hf_checkpoint_config import HfCheckpointRefitConfig
 
 
 class HfCheckpointWeightSynchronizer(WeightSynchronizer):

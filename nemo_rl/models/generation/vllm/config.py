@@ -23,8 +23,8 @@ from pydantic import (
     PositiveInt,
 )
 
+from nemo_rl.models.generation.hf_checkpoint_config import HfCheckpointRefitConfig
 from nemo_rl.models.generation.interfaces import GenerationConfig
-from nemo_rl.weight_sync.hf_checkpoint_config import HfCheckpointRefitConfig
 
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal[

@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration for refitting generation from a shared HF checkpoint."""
+"""Generation configuration for refitting from a shared HF checkpoint."""
 
 from pathlib import Path
+
 from pydantic import BaseModel, Field, model_validator
 
 
