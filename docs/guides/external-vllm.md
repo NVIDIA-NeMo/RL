@@ -55,7 +55,7 @@ native TP/PP/DP workers. Independent replicas, P/D disaggregation, and router
 control fan-out are outside this stack.
 
 Prepare Gym's workplace-assistant data using the existing
-[Gym setup instructions](https://docs.nvidia.com/nemo/gym/0.1.0/tutorials/nemo-rl-grpo/setup.html#training-nemo-rl-grpo-setup).
+[Gym setup instructions](https://docs.nvidia.com/nemo/gym/main/tutorials/training-tutorials/nemo-rl-grpo/setup/).
 The external functional tests keep the full tool list and prepare the public
 dataset automatically. The public example uses ten steps, one agent call per
 sample, and Reinforce++ without a per-prompt baseline so mixed task rewards
