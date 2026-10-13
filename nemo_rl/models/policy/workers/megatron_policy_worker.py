@@ -20,13 +20,14 @@ import time
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
 
 import ray
 import torch
+from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
 from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
@@ -287,6 +288,172 @@ def _is_quantized_refit_source(tensor: torch.Tensor) -> bool:
     )
 
     return is_float8tensor(tensor) or is_grouped_tensor_with_quantized_storage(tensor)
+
+
+@dataclass(frozen=True)
+class _RefitSource:
+    """Live parameter and its HF selector, before any precision conversion."""
+
+    tensor: torch.Tensor
+    hf_view: LocalHFParamSpec
+
+
+def _dequantize_refit_source_group(
+    tensors: tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    """Pack live expert storage and decode the whole group once, without a cache."""
+    if not tensors:
+        raise ValueError("Cannot prepare an empty refit expert group.")
+    shape = torch.Size(tensors[0].size())
+    if any(torch.Size(tensor.size()) != shape for tensor in tensors):
+        raise ValueError("Refit expert group members must have matching shapes.")
+    quantized = [
+        not isinstance(tensor, torch.Tensor) or _is_quantized_refit_source(tensor)
+        for tensor in tensors
+    ]
+    if not any(quantized):
+        if any(tensor.dtype != tensors[0].dtype for tensor in tensors):
+            raise ValueError("Refit expert group members must have matching dtypes.")
+        return torch.stack(tensors)
+    if not all(quantized):
+        raise ValueError("Cannot mix quantized and unquantized refit expert storage.")
+
+    # Defer optional TE storage classes until quantized experts need preparation.
+    from transformer_engine.pytorch.tensor.storage.float8_blockwise_tensor_storage import (
+        Float8BlockwiseQTensorStorage,
+    )
+    from transformer_engine.pytorch.tensor.storage.float8_tensor_storage import (
+        Float8TensorStorage,
+    )
+    from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import (
+        MXFP8TensorStorage,
+    )
+
+    first = tensors[0]
+    is_mxfp8 = isinstance(first, MXFP8TensorStorage)
+    is_scalar_fp8 = isinstance(first, Float8TensorStorage)
+    if is_mxfp8:
+        storage_type = MXFP8TensorStorage
+    elif is_scalar_fp8:
+        storage_type = Float8TensorStorage
+    else:
+        storage_type = Float8BlockwiseQTensorStorage
+    if not all(isinstance(tensor, storage_type) for tensor in tensors):
+        raise ValueError(
+            "Grouped refit requires one uniform MXFP8, blockwise FP8, or scalar FP8 storage format."
+        )
+    if len(shape) < 2:
+        raise ValueError("Quantized refit expert group members must be matrices.")
+    fp8_dtype = first._fp8_dtype
+    if any(tensor._fp8_dtype != fp8_dtype for tensor in tensors):
+        raise ValueError("Refit expert group members must have matching FP8 dtypes.")
+    layout = (
+        first._with_gemm_swizzled_scales
+        if is_mxfp8
+        else True
+        if is_scalar_fp8
+        else first._is_2D_scaled
+    )
+    if not is_scalar_fp8 and any(
+        (tensor._with_gemm_swizzled_scales if is_mxfp8 else tensor._is_2D_scaled)
+        != layout
+        for tensor in tensors
+    ):
+        raise ValueError("Refit expert group members must have matching scale layouts.")
+    columnwise = not is_scalar_fp8 and first._rowwise_data is None
+    if not is_scalar_fp8 and any(
+        (tensor._rowwise_data is None) != columnwise for tensor in tensors
+    ):
+        raise ValueError(
+            "Refit expert group members must use the same storage direction."
+        )
+
+    rows, cols = shape.numel() // shape[-1], shape[-1]
+    if columnwise:
+        rows, cols = cols, rows
+    raw_data, raw_scales = [], []
+    for tensor in tensors:
+        if is_scalar_fp8:
+            data, scales = tensor._data, tensor._scale_inv
+            if scales is None or scales.numel() != 1:
+                raise ValueError(
+                    "Scalar FP8 expert storage requires one scale per expert."
+                )
+            # A scalar scale is a constant grid of block scales. Expanding the
+            # metadata lets the same packed block decoder handle all experts.
+            scales = scales.reshape(1, 1).expand(
+                (rows + 127) // 128, ((cols + 127) // 128 + 3) // 4 * 4
+            )
+        else:
+            data = tensor._columnwise_data if columnwise else tensor._rowwise_data
+            scales = (
+                tensor._columnwise_scale_inv
+                if columnwise
+                else tensor._rowwise_scale_inv
+            )
+        if data is None or scales is None:
+            raise ValueError(
+                "Quantized refit expert storage is missing data or scales."
+            )
+        if columnwise and is_mxfp8:
+            # MX columnwise bytes retain logical orientation; blockwise bytes
+            # are already transposed. Swizzled scales encode this transpose.
+            data = data.reshape(cols, rows).T
+            scales = (
+                scales.reshape((rows + 127) // 128 * 128, -1) if layout else scales.T
+            )
+        raw_data.append(data.reshape(rows, cols))
+        raw_scales.append(scales)
+    scale_dtype = torch.uint8 if is_mxfp8 else torch.float32
+    if any(data.dtype != torch.uint8 for data in raw_data) or any(
+        scales.dtype != scale_dtype for scales in raw_scales
+    ):
+        raise ValueError(
+            "Quantized refit expert data or scale storage has an invalid dtype."
+        )
+
+    data = torch.stack(raw_data)
+    if is_mxfp8 or layout:
+        # Whole 128-row tiles preserve independent expert blocks and, for MX,
+        # the GEMM scale swizzle. Never crop a swizzled member's scale padding.
+        padded_rows = (rows + 127) // 128 * 128
+        if padded_rows != rows:
+            data = torch.nn.functional.pad(data, (0, 0, 0, padded_rows - rows))
+        scales = torch.cat(raw_scales, dim=0)
+    else:
+        padded_rows = rows
+        scales = torch.cat([scale[:, :rows] for scale in raw_scales], dim=1)
+        scale_padding = (-len(tensors) * rows) % 4
+        if scale_padding:
+            scales = torch.nn.functional.pad(scales, (0, scale_padding))
+    data = data.reshape(len(tensors) * padded_rows, cols)
+    if is_mxfp8:
+        packed = MXFP8TensorStorage(
+            rowwise_data=data,
+            rowwise_scale_inv=scales,
+            columnwise_data=None,
+            columnwise_scale_inv=None,
+            fp8_dtype=fp8_dtype,
+            quantizer=None,
+            with_gemm_swizzled_scales=layout,
+            fake_dtype=torch.bfloat16,
+        )
+    else:
+        packed = Float8BlockwiseQTensorStorage(
+            rowwise_data=data,
+            rowwise_scale_inv=scales,
+            columnwise_data=None,
+            columnwise_scale_inv=None,
+            fp8_dtype=fp8_dtype,
+            quantizer=None,
+            is_2D_scaled=layout,
+            fake_dtype=torch.bfloat16,
+        )
+    decoded = packed.dequantize(dtype=torch.bfloat16)
+    decoded = decoded.reshape(len(tensors), padded_rows, cols)[:, :rows]
+    if columnwise:
+        decoded = decoded.transpose(-2, -1)
+    return decoded.reshape(len(tensors), *shape)
 
 
 def _dequantize_refit_source(tensor: torch.Tensor) -> torch.Tensor:
@@ -3336,18 +3503,32 @@ class MegatronPolicyWorkerImpl(
             yield param_name, scale_tensor
 
     def _local_refit_source_spec(
-        self, tensor: torch.Tensor, spec: Any
+        self, tensor: torch.Tensor, spec: LocalHFParamSpec
     ) -> LocalParamSpec:
         """Convert the current full parameter to logical weights before HF slicing."""
 
-        def pre(base: torch.Tensor) -> RefitCtx:
-            logical = _dequantize_refit_source(base)
-            return RefitCtx(buf=spec.select(logical).contiguous())
+        def pre(base: _RefitSource) -> RefitCtx:
+            # Defer optional MCore helpers until this bulk source is prepared.
+            from megatron.core.fp8_utils import (
+                get_grouped_quantized_members,
+                is_grouped_tensor_with_quantized_storage,
+            )
+
+            if is_grouped_tensor_with_quantized_storage(base.tensor):
+                members = get_grouped_quantized_members(
+                    base.tensor, create_if_missing=True
+                )
+                logical = _dequantize_refit_source_group(tuple(members))
+            else:
+                logical = _dequantize_refit_source(base.tensor)
+            return RefitCtx(buf=base.hf_view.select(logical).contiguous())
 
         wire_dtype = (
             torch.bfloat16 if _is_quantized_refit_source(tensor) else tensor.dtype
         )
-        return LocalParamSpec(base=tensor, pre=pre, wire_dtype=wire_dtype)
+        return LocalParamSpec(
+            base=_RefitSource(tensor, spec), pre=pre, wire_dtype=wire_dtype
+        )
 
     def _iter_local_hf_param_shards(self) -> Iterator[tuple[str, LocalParamSpec]]:
         """Yield (hf_name, local_tp_shard) for this rank's locally owned FFN params.
@@ -3900,10 +4081,10 @@ class MegatronPolicyWorkerImpl(
         )
 
     def _build_expert_groups(self, param_map):
-        """Group this rank's local expert params into stack-ready source specs.
+        """Group this rank's live source specs in numeric expert order.
 
         Keyed by (prefix, proj_type) and resolved to ordered ``param_map``
-        specs ready for materialization and ``torch.stack`` in the group's
+        specs whose raw parameters are packed and decoded together in the group's
         ``pre`` hook at each refit.
 
         Megatron exposes each expert's projection as a separate param; this bins
@@ -3953,7 +4134,7 @@ class MegatronPolicyWorkerImpl(
         grouped_name: str,
         expert_groups: dict[tuple[str, str], list[LocalParamSpec]],
     ) -> LocalParamSpec:
-        """Build a pre hook that stacks local experts into ``[E_local, ...]``."""
+        """Decode a complete expert group, then select its HF projection."""
         prefix = grouped_name.rsplit(f".{proj}.weight", 1)[0]
         expert_specs = expert_groups.get((prefix, proj))
         assert expert_specs, (
@@ -3966,13 +4147,33 @@ class MegatronPolicyWorkerImpl(
             raise ValueError(
                 f"Grouped refit source {grouped_name!r} has mixed wire dtypes."
             )
+        sources = tuple(member.base for member in members)
+        shape = sources[0].tensor.shape
 
-        def pre(base: Any) -> RefitCtx:
-            return RefitCtx(
-                buf=torch.stack([member.materialize().buf for member in members])
+        def grouped_view(source: _RefitSource) -> LocalHFParamSpec:
+            view = source.hf_view
+            # Preserve the source axis when prepending the expert dimension,
+            # including mappings that describe the split with a positive axis.
+            if view.split_dim is not None:
+                view = replace(view, split_dim=view.split_dim % len(shape) + 1)
+            return replace(view, name=grouped_name)
+
+        hf_view = grouped_view(sources[0])
+        if any(
+            source.tensor.shape != shape or grouped_view(source) != hf_view
+            for source in sources
+        ):
+            raise ValueError(
+                f"Grouped refit source {grouped_name!r} has incompatible HF views."
             )
 
-        return LocalParamSpec(base=None, pre=pre, wire_dtype=wire_dtype)
+        def pre(base: tuple[_RefitSource, ...]) -> RefitCtx:
+            logical = _dequantize_refit_source_group(
+                tuple(source.tensor for source in base)
+            )
+            return RefitCtx(buf=hf_view.select(logical).contiguous())
+
+        return LocalParamSpec(base=sources, pre=pre, wire_dtype=wire_dtype)
 
     def _build_source_hf_to_local_param_map(
         self, refit_info: dict[str, Any]
@@ -3980,10 +4181,11 @@ class MegatronPolicyWorkerImpl(
         """Build the Megatron-backend ``hf_to_local_param_map`` (HFToLocalParamMap).
 
         Wraps this rank's local Megatron shards into ``LocalParamSpec``s:
-        - local weight: ``base`` is the live parameter; ``pre`` dequantizes if
-          necessary and selects the HF view, preserving unquantized dtypes.
-        - grouped MoE expert: ``pre`` materializes the ordered per-expert specs
-          and stacks them into ``[E_local, ...]`` each refit.
+        - local weight: ``base`` describes the live parameter and HF selector;
+          ``pre`` dequantizes if necessary and selects the HF view, preserving
+          unquantized dtypes.
+        - grouped MoE expert: ``pre`` packs the ordered live parameters and their
+          scales, dequantizes the group once, then selects its HF projection.
         Every spec declares its wire dtype, checked against transfer metadata
         before any source buffers are materialized.
         """

@@ -293,7 +293,7 @@ def test_local_hf_shards_follow_bridge_specs(dtype: torch.dtype) -> None:
 
     for index, name in enumerate(("gate", "up")):
         spec = shards[f"model.layers.0.mlp.{name}_proj.weight"]
-        assert spec.base is fused and spec.pre is not None and spec.post is None
+        assert spec.base.tensor is fused and spec.pre is not None and spec.post is None
         assert spec.wire_dtype == dtype
         result = spec.materialize().buf
         assert result.dtype == dtype and result.is_contiguous()
@@ -1502,6 +1502,60 @@ def test_megatron_refit_bridge_tasks_export_logical_quantized_weights(
     assert dequantize.call_args_list == [call(quantized_source), call(bf16_source)]
 
 
+def test_logical_refit_tasks_preserve_generic_grouped_dequantization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from megatron.core import fp8_utils
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    @dataclass(frozen=True)
+    class Task:
+        param_weight: torch.Tensor
+
+    source = torch.arange(32, dtype=torch.uint8).reshape(2, 4, 4)
+    members = tuple(source.unbind(0))
+    scales = torch.tensor([2.0, 8.0]).reshape(2, 1, 1)
+    monkeypatch.setattr(
+        fp8_utils,
+        "is_grouped_tensor_with_quantized_storage",
+        lambda tensor: tensor is source,
+    )
+    member_views = MagicMock(return_value=members)
+    monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", member_views)
+
+    def decode(member: torch.Tensor) -> torch.Tensor:
+        index = next(i for i, candidate in enumerate(members) if candidate is member)
+        return member.float() * scales[index]
+
+    member_decode = MagicMock(side_effect=decode)
+    monkeypatch.setattr(fp8_utils, "dequantize_fp8_tensor", member_decode)
+    packed_decode = MagicMock(side_effect=AssertionError("bulk-only decoder called"))
+    monkeypatch.setattr(worker_module, "_dequantize_refit_source_group", packed_decode)
+
+    task = Task(source)
+    for _ in range(2):
+        exported = list(
+            worker_module.MegatronPolicyWorkerImpl._iter_logical_refit_conversion_tasks(
+                [task]
+            )
+        )
+        assert exported[0] is not task and task.param_weight is source
+        assert exported[0].param_weight.dtype == torch.bfloat16
+        torch.testing.assert_close(
+            exported[0].param_weight,
+            (source.float() * scales).to(torch.bfloat16),
+            rtol=0,
+            atol=0,
+        )
+        source.add_(1)
+        scales.mul_(2)
+
+    assert member_views.call_args_list == [call(source, create_if_missing=True)] * 2
+    assert member_decode.call_args_list == [call(member) for member in members] * 2
+    packed_decode.assert_not_called()
+
+
 @pytest.mark.parametrize("grouped_storage", [False, True])
 def test_refit_dequantizes_with_metadata_before_selecting_hf_view(
     monkeypatch: pytest.MonkeyPatch, grouped_storage: bool
@@ -1516,15 +1570,17 @@ def test_refit_dequantizes_with_metadata_before_selecting_hf_view(
     # fails this test. Non-unit row scales also distinguish decoding from a cast.
     shape = (2, 4, 4) if grouped_storage else (4, 4)
     source = torch.arange(math.prod(shape), dtype=torch.uint8).reshape(shape)
-    members = list(source.unbind(0)) if grouped_storage else [source]
     scales = torch.tensor([2.0, 4.0, 8.0, 16.0]).reshape(4, 1)
-    decoded_members = []
 
     def decode(member: torch.Tensor) -> torch.Tensor:
-        assert any(member is original for original in members)
+        assert not grouped_storage and member is source
         assert member.shape == (4, 4)
-        decoded_members.append(member)
         return (member.to(torch.float32) * scales).to(torch.bfloat16)
+
+    def decode_group(members: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        assert grouped_storage and len(members) == 2
+        assert all(member.shape == (4, 4) for member in members)
+        return (torch.stack(members).float() * scales).to(torch.bfloat16)
 
     monkeypatch.setattr(
         fp8_utils,
@@ -1532,9 +1588,12 @@ def test_refit_dequantizes_with_metadata_before_selecting_hf_view(
         lambda tensor: grouped_storage and tensor is source,
     )
     monkeypatch.setattr(fp8_utils, "is_float8tensor", lambda tensor: tensor is source)
-    member_views = MagicMock(return_value=members)
+    member_views = MagicMock(side_effect=lambda *args, **kwargs: list(source.unbind(0)))
+    single_decode = MagicMock(side_effect=decode)
+    grouped_decode = MagicMock(side_effect=decode_group)
     monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", member_views)
-    monkeypatch.setattr(fp8_utils, "dequantize_fp8_tensor", decode)
+    monkeypatch.setattr(fp8_utils, "dequantize_fp8_tensor", single_decode)
+    monkeypatch.setattr(worker_module, "_dequantize_refit_source_group", grouped_decode)
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     spec = worker._local_refit_source_spec(source, LocalHFParamSpec("gate", -2, 0, 2))
     assert spec.wire_dtype == torch.bfloat16
@@ -1544,12 +1603,15 @@ def test_refit_dequantizes_with_metadata_before_selecting_hf_view(
         expected = (source.to(torch.float32) * scales).to(torch.bfloat16)
         assert result.dtype == torch.bfloat16 and result.is_contiguous()
         assert torch.equal(result, expected[..., :2, :])
-        source.add_(1)
+        source.data = source.data + 1
         scales.mul_(2)
-    assert len(decoded_members) == 2 * len(members)
     if grouped_storage:
         assert member_views.call_args_list == [call(source, create_if_missing=True)] * 2
+        assert grouped_decode.call_count == 2
+        single_decode.assert_not_called()
     else:
+        assert single_decode.call_count == 2
+        grouped_decode.assert_not_called()
         member_views.assert_not_called()
 
 
@@ -1561,58 +1623,70 @@ def test_megatron_refit_quantized_hooks_read_current_fused_source(
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
 
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
-    quantized_source = torch.arange(16, dtype=torch.uint8).reshape(2, 4, 2)
-    logical_weight = quantized_source.to(torch.bfloat16)
-    dequantize = MagicMock(side_effect=lambda tensor: tensor.to(torch.bfloat16))
+    sources = tuple(
+        torch.arange(8, dtype=torch.uint8).reshape(4, 2) + offset for offset in (0, 16)
+    )
+    scales = torch.tensor([[2.0, 4.0, 8.0, 16.0], [3.0, 5.0, 7.0, 11.0]]).unsqueeze(-1)
+
+    def decode_group(tensors: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        assert len(tensors) == len(sources)
+        assert all(actual is source for actual, source in zip(tensors, sources))
+        # Unequal expert scales make a raw-byte cast or crossed expert order wrong.
+        return (torch.stack(tensors).float() * scales).to(torch.bfloat16)
+
+    grouped_decode = MagicMock(side_effect=decode_group)
     monkeypatch.setattr(
         worker_module,
         "_is_quantized_refit_source",
-        lambda tensor: tensor is quantized_source,
+        lambda tensor: any(tensor is source for source in sources),
     )
-    monkeypatch.setattr(worker_module, "_dequantize_refit_source", dequantize)
-
-    gate_spec = worker._local_refit_source_spec(
-        quantized_source, LocalHFParamSpec("gate", -2, 0, 2)
-    )
-    up_spec = worker._local_refit_source_spec(
-        quantized_source, LocalHFParamSpec("up", -2, 1, 2)
-    )
+    monkeypatch.setattr(worker_module, "_dequantize_refit_source_group", grouped_decode)
+    single_decode = MagicMock(side_effect=AssertionError("individual decode called"))
+    monkeypatch.setattr(worker_module, "_dequantize_refit_source", single_decode)
     prefix = "model.layers.0.mlp.experts"
-    grouped_spec = worker._group_experts(
-        "gate_proj",
-        f"{prefix}.gate_proj.weight",
-        {(prefix, "gate_proj"): [gate_spec, up_spec]},
+    groups = {
+        (prefix, proj): [
+            worker._local_refit_source_spec(
+                source,
+                LocalHFParamSpec(f"{prefix}.{index}.{proj}.weight", -2, split, 2),
+            )
+            for index, source in enumerate(sources)
+        ]
+        for split, proj in enumerate(("gate_proj", "up_proj"))
+    }
+    for members in groups.values():
+        for member, source in zip(members, sources):
+            assert member.base.tensor is source
+            member.pre = MagicMock(side_effect=AssertionError("individual pre called"))
+    grouped_specs = tuple(
+        worker._group_experts(proj, f"{prefix}.{proj}.weight", groups)
+        for proj in ("gate_proj", "up_proj")
     )
-    assert gate_spec.base is quantized_source and gate_spec.pre is not None
-    assert up_spec.base is quantized_source and up_spec.pre is not None
-    assert (
-        gate_spec.wire_dtype
-        == up_spec.wire_dtype
-        == grouped_spec.wire_dtype
-        == torch.bfloat16
-    )
-    dequantize.assert_not_called()
-
-    gate = gate_spec.materialize().buf
-    up = up_spec.materialize().buf
-    grouped = grouped_spec.materialize().buf
-
-    assert not logical_weight[:, :2].is_contiguous()
-    assert gate.is_contiguous()
-    assert up.is_contiguous()
-    assert grouped.shape == (2, 2, 2, 2)
-    assert torch.equal(gate, logical_weight[:, :2])
-    assert torch.equal(up, logical_weight[:, 2:])
-    assert torch.equal(grouped[0], logical_weight[:, :2])
-    assert torch.equal(grouped[1], logical_weight[:, 2:])
-    assert dequantize.call_args_list == [call(quantized_source)] * 4
-
-    quantized_source.add_(16)
-    refreshed = grouped_spec.materialize().buf
-    assert torch.equal(refreshed[0], quantized_source[:, :2].to(torch.bfloat16))
-    assert torch.equal(refreshed[1], quantized_source[:, 2:].to(torch.bfloat16))
-    assert not torch.equal(refreshed, grouped)
-    assert dequantize.call_args_list == [call(quantized_source)] * 6
+    grouped_decode.assert_not_called()
+    previous = None
+    for cycle in range(2):
+        expected = (torch.stack(sources).float() * scales).to(torch.bfloat16)
+        outputs = []
+        for split, spec in enumerate(grouped_specs):
+            result = spec.materialize().buf
+            assert spec.wire_dtype == result.dtype == torch.bfloat16
+            assert result.shape == (2, 2, 2) and result.is_contiguous()
+            assert torch.equal(result, expected.chunk(2, dim=1)[split])
+            assert grouped_decode.call_count == cycle * 2 + split + 1
+            outputs.append(result)
+        if previous is not None:
+            assert all(
+                not torch.equal(before, after)
+                for before, after in zip(previous, outputs)
+            )
+        previous = outputs
+        for source in sources:
+            source.data = source.data + 3
+        scales.mul_(2)
+    single_decode.assert_not_called()
+    for members in groups.values():
+        for member in members:
+            member.pre.assert_not_called()
 
 
 @pytest.mark.parametrize("source_dtype", [torch.uint8, torch.float16, torch.float32])
@@ -1776,20 +1850,22 @@ def test_megatron_refit_pre_hooks_use_current_cuda_stream(
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        quantized_source = torch.arange(16, device="cuda", dtype=torch.uint8).reshape(
-            2, 4, 2
+        quantized_source = torch.arange(8, device="cuda", dtype=torch.uint8).reshape(
+            4, 2
         )
 
-        def dequantize(tensor: torch.Tensor) -> torch.Tensor:
+        def dequantize_group(tensors: tuple[torch.Tensor, ...]) -> torch.Tensor:
             assert torch.cuda.current_stream() == stream
-            return tensor.to(torch.bfloat16)
+            return torch.stack(tensors).to(torch.bfloat16)
 
         monkeypatch.setattr(
             worker_module,
             "_is_quantized_refit_source",
             lambda tensor: tensor is quantized_source,
         )
-        monkeypatch.setattr(worker_module, "_dequantize_refit_source", dequantize)
+        monkeypatch.setattr(
+            worker_module, "_dequantize_refit_source_group", dequantize_group
+        )
         member = worker._local_refit_source_spec(
             quantized_source, LocalHFParamSpec("gate", -2, 0, 2)
         )
@@ -1823,7 +1899,7 @@ def test_megatron_refit_pre_hooks_use_current_cuda_stream(
                 MagicMock(side_effect=AssertionError("pre must not synchronize CUDA")),
             )
             output = grouped.materialize().buf
-        expected = quantized_source[:, :2].to(torch.bfloat16)
+        expected = quantized_source[:2].to(torch.bfloat16)
     stream.synchronize()
     assert output.is_contiguous()
     assert torch.equal(output[0], expected) and torch.equal(output[1], expected)

@@ -64,7 +64,11 @@ single `ValueError` listing every violation. The current requirements are:
   persistent DDP/autograd views remain valid; ordinary gradient buffers and
   optimizer state are offloaded only when
   `policy.offload_policy_before_refit` is true.
-* **Bulk transfers use canonical HF layout.** Quantized sources are dequantized
+* **Bulk transfers use canonical HF layout, with experts grouped for efficiency.**
+  `group_expert_params_in_metadata` defines one transfer per expert group and
+  projection, adding a leading expert dimension to the HF weight layout.
+  Source hooks prepare that complete group rather than independent expert buffers.
+  Quantized sources are dequantized
   to `torch.bfloat16`; unquantized sources retain their original dtype.
   Source `ctx.buf`, advertised metadata, and receiver buffers share that dtype.
   Destination hooks own storage conversion and quantization. The misc path and
@@ -207,9 +211,12 @@ advertised metadata. Grouped experts declare one common wire dtype.
   parameter values, dequantizes quantized storage, selects the corresponding HF
   slice, and produces a contiguous buffer in the advertised dtype. Selection follows
   dequantization so fused gate/up slices use the complete source's quantization metadata.
-  Grouped MoE hooks materialize their ordered expert members and stack them into
-  `[num_local_experts, ...]`. There is no shared source cache or cache lifecycle
-  in the transfer loop; repeated preparation observes parameter updates immediately.
+  Grouped MoE hooks pack the ordered experts' encoded weights and scales, decode
+  the entire group once, then select the HF projection into
+  `[num_local_experts, ...]`. Fused gate and up transfers each decode the complete
+  group independently. The hooks retain live parameter references and HF selectors;
+  they read current weights and scales each time. There is no shared source cache
+  or cache lifecycle in the transfer loop.
 * On the **generation side**, canonical storage matching the transfer dtype can
   receive in place. Other storage uses `pre` to allocate staging in the advertised
   dtype and `post` to cast, assemble, or quantize the received values. Fused gate/up and grouped expert layouts retain
@@ -233,7 +240,7 @@ Every training step (with in-flight weight updates, concurrently with generation
 
 * The **training side** walks `per_layer_params`, skipping parameters owned by other PP
   stages. For each parameter it resolves the `LocalParamSpec`, calls `materialize()`
-  (which runs `pre` for dequantization or expert stacking), wraps the local shard in a
+  (which runs `pre` for dequantization or grouped preparation), wraps the local shard in a
   `DTensorRef` (which reports the *global* shape while holding only the local tensor),
   and calls
   `xferdtensor(src, src_mesh, src_placements, None, dst_mesh, dst_placements, group,
@@ -290,7 +297,7 @@ generation side maps those HF names onto whatever its own storage layout is.
 * **Training side** (`megatron_policy_worker.py`): producing the HF-named state-dict
   metadata; building `hf_to_local_param_map` — resolving each HF name to the local
   Megatron tensor view and providing `pre` hooks for quantized-source
-  independent dequantization to BF16, unquantized dtype preservation, and grouped-MoE stacking; the
+  independent dequantization to BF16, unquantized dtype preservation, and grouped-MoE decoding; the
   `init_collective` / `init_nccl_reshard_comm_group` bootstrap methods; the
   `nccl_reshard_refit()` send loop; the misc packed-broadcast producer.
 * **Generation side** (`vllm_backend.py`): building `hf_to_local_param_map` — mapping HF
