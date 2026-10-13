@@ -228,13 +228,13 @@ class TestInOrderEvictMatchesSelect:
         for group_index in range(127):
             buffer.add(f"g{group_index}", weight=0, target_step=0)
         sampler = InOrderSampler(buffer, max_lookahead_versions=1)
-        sampler.set_group_multiple(2)
 
         first_meta, first_count = _run(
             sampler.select(
                 current_train_weight=0,
                 min_prompt_groups=32,
                 max_prompt_groups=128,
+                group_multiple=2,
             )
         )
         assert first_count == 126
@@ -246,6 +246,7 @@ class TestInOrderEvictMatchesSelect:
                 current_train_weight=0,
                 min_prompt_groups=2,
                 max_prompt_groups=2,
+                group_multiple=2,
             )
         )
         assert waiting_meta is None
@@ -257,6 +258,7 @@ class TestInOrderEvictMatchesSelect:
                 current_train_weight=0,
                 min_prompt_groups=2,
                 max_prompt_groups=2,
+                group_multiple=2,
             )
         )
         assert final_count == 2
@@ -654,13 +656,13 @@ class TestReadyFirstSelect:
         for group_index in range(3):
             buffer.add(f"g{group_index}", weight=0)
         sampler = ReadyFirstSampler(buffer, max_staleness_versions=1)
-        sampler.set_group_multiple(2)
 
         first_meta, first_count = _run(
             sampler.select(
                 current_train_weight=0,
                 min_prompt_groups=2,
                 max_prompt_groups=4,
+                group_multiple=2,
             )
         )
         assert first_count == 2
@@ -672,6 +674,7 @@ class TestReadyFirstSelect:
                 current_train_weight=0,
                 min_prompt_groups=2,
                 max_prompt_groups=4,
+                group_multiple=2,
             )
         )
         assert waiting_meta is None

@@ -478,13 +478,7 @@ class _GatedSampler(BaseSampler):
     def __init__(self, buffer: TQReplayBuffer, *, gate_window: int) -> None:
         super().__init__(buffer)
         self._gate_window = 0
-        self._group_multiple = 1
         self.set_gate_window(gate_window)
-
-    def set_group_multiple(self, group_multiple: int) -> None:
-        if group_multiple < 1:
-            raise ValueError("group_multiple must be positive")
-        self._group_multiple = group_multiple
 
     def set_gate_window(self, gate_window: int) -> None:
         if gate_window < 0:
