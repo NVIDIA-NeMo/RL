@@ -126,17 +126,17 @@ one route row for each token in the call delta.
 
 The canonical MInf stager owns both that payload and Gym's admission, including
 `prev_len`. Before committing the call it appends an all-`-1` terminal row to
-form `[T, L, K]`, then slices `routes[prev_len:]`. The result has exactly
-`delta_len` rows and is committed as the call's digest-bound `routed_experts`
-extra. `-1` is the replay fallback sentinel: at that position the trainer lets
-its current router select experts. This deliberately differs from vLLM, which
-uses an in-range placeholder for its terminal row. All other positions normally
-reuse MInf's expert identities while still computing the current policy's
-router scores and probabilities for those experts. One multi-turn exception is
-the parent call's last sampled token: MInf records its real route while
-prefilling the child request at `prev_len - 1`, but the child's
-`routes[prev_len:]` delta slice drops that row, so the already-committed parent
-position remains `-1` and falls back to the current router.
+form `[T, L, K]`, then slices from `prev_len`. A child call starts the slice
+one row earlier, at `prev_len - 1`: the parent's last sampled token never
+entered a parent forward pass, so only the child's prefill routed it. The
+result has `delta_len` rows (plus that boundary row for a child) and is
+committed as the call's digest-bound `routed_experts` extra; route assembly
+writes the boundary row over the parent's terminal row, exactly as for vLLM.
+`-1` is the replay fallback sentinel: at that position the trainer lets its
+current router select experts. After assembly only the rollout's final token
+keeps it. All other positions reuse MInf's expert identities while still
+computing the current policy's router scores and probabilities for those
+experts.
 
 ```mermaid
 flowchart LR

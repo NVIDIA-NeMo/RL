@@ -619,9 +619,9 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
 
     Stages a two-call chain through TQMegatronTokenStager (the only path that
     runs _delta_align_minf_routing_indices) and asserts the published
-    ``[B, S, L, K]`` tensor: each call contributes ``delta_len`` rows, the
-    last of which is the ``-1`` sentinel row for the token MInf never routed,
-    so a non-zero sentinel fraction is expected here (unlike the vLLM fixture).
+    ``[B, S, L, K]`` tensor. Call 1's last token is sampled but never fed in,
+    so only call 2's prefill routes it; call 2's leading boundary row fills
+    that slot, leaving ``-1`` only on the row's final token.
     """
     group_id = "grpr3minf"
     rollout_id = f"{group_id}_g0"
@@ -641,7 +641,8 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
         routes=routes_c1,
     )
     # Call 2: continuation over the 4-token prefix plus a new user turn
-    # [20, 21] and generated [22] -> 7 tokens, 6 routed, delta rows 4..6.
+    # [20, 21] and generated [22] -> 7 tokens, 6 routed, staged rows 3..6
+    # (row 3 is the boundary row for call 1's last token).
     routes_c2 = (100 + np.arange(6 * 2 * 2, dtype=np.int16)).reshape(6, 2, 2)
     coords_c2 = _stage_minf_call(
         stager,
@@ -687,10 +688,8 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
     )
     assert not finalized.dropped
     assert finalized.metrics["finalize/routed_experts_row_coverage"] == 1.0
-    # One sentinel row per call (the T-th token MInf never routes): 2 of 7.
-    assert finalized.metrics[
-        "finalize/routed_experts_sentinel_token_fraction"
-    ] == pytest.approx(2 / 7)
+    # Only the final token lacks a route, and it is not counted.
+    assert finalized.metrics["finalize/routed_experts_sentinel_token_fraction"] == 0
 
     rows = tq_client.get_samples(
         sample_ids=[rollout_id],
@@ -712,7 +711,7 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
     published = torch.as_tensor(rows["routed_experts"][0]).reshape(-1, 2, 2)
     assert published[:seq_len].tolist() == [
         *routes_c1.tolist(),
-        sentinel,
+        routes_c2[3].tolist(),
         routes_c2[4].tolist(),
         routes_c2[5].tolist(),
         sentinel,

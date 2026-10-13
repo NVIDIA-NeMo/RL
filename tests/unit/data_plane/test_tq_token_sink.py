@@ -919,9 +919,12 @@ def test_megatron_stager_delta_aligns_token_in_routes(tq_client, staging_partiti
         tq_client, staging_partition=staging_partition
     ).fetch_for_finalization(["minf-r0/c2"], include_route_fragments=True)
     assert fetched.snapshot.token_ids_delta == [13, 14, 15]
-    assert fetched.routed_len == 3
+    # One leading boundary row: the parent's last token (12), routed only by
+    # this call's prefill.
+    assert fetched.routed_len == 4
     assert fetched.fragment is not None
     assert fetched.fragment.routes.tolist() == [
+        routes[2].tolist(),
         routes[3].tolist(),
         routes[4].tolist(),
         [[-1, -1], [-1, -1]],

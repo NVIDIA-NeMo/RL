@@ -40,7 +40,10 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
     resolve_admission_prefix,
 )
-from nemo_rl.experience.route_assembly import ROUTE_MISSING_SENTINEL
+from nemo_rl.experience.route_assembly import (
+    ROUTE_MISSING_SENTINEL,
+    boundary_route_rows,
+)
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
@@ -59,6 +62,10 @@ def _delta_align_minf_routing_indices(
     expected_route_dims: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Convert MInf ``[T - 1, L, K]`` routes to Gym's delta-token layout.
+
+    A continuation also keeps the row for the previous turn's last token: the
+    previous call sampled it without feeding it in, so only this call's
+    prefill routed it.
 
     ``expected_route_dims`` is the model-owned ``(L, K)``; when given, a payload
     whose layer or top-k axis differs is rejected here, at the first request,
@@ -101,7 +108,7 @@ def _delta_align_minf_routing_indices(
     )
     if expected_routes:
         aligned[:-1].copy_(routes)
-    return aligned[prev_len:]
+    return aligned[prev_len - boundary_route_rows(prev_len) :]
 
 
 class TQMegatronPromptPreparer:
