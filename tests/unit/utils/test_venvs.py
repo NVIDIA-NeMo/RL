@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import subprocess
+from collections.abc import Callable
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -105,8 +106,14 @@ def test_make_actor_runtime_env_builds_local_venv_for_uv_python_executable():
     assert runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] == "/fake/venv"
 
 
-def _fake_run(fail_times: int, calls: list):
-    def fake_run(cmd, env=None, check=True):
+def _fake_run(
+    fail_times: int, calls: list[list[str]]
+) -> Callable[..., subprocess.CompletedProcess[bytes]]:
+    """Return a ``subprocess.run`` stand-in that fails the first ``fail_times`` calls."""
+
+    def fake_run(
+        cmd: list[str], env: dict[str, str] | None = None, check: bool = True
+    ) -> subprocess.CompletedProcess[bytes]:
         calls.append(list(cmd))
         if len(calls) <= fail_times:
             raise subprocess.CalledProcessError(1, cmd)
@@ -116,7 +123,7 @@ def _fake_run(fail_times: int, calls: list):
 
 
 def test_run_with_retries_reruns_all_commands_after_failure():
-    calls = []
+    calls: list[list[str]] = []
     with (
         patch.dict(os.environ, {"NEMO_RL_UV_SYNC_ATTEMPTS": "3"}),
         patch.object(venvs.subprocess, "run", side_effect=_fake_run(2, calls)),
@@ -135,7 +142,7 @@ def test_run_with_retries_reruns_all_commands_after_failure():
 
 
 def test_run_with_retries_reraises_after_last_attempt():
-    calls = []
+    calls: list[list[str]] = []
     with (
         patch.dict(
             os.environ,
@@ -154,7 +161,7 @@ def test_run_with_retries_reraises_after_last_attempt():
 
 
 def test_run_with_retries_single_attempt_does_not_sleep():
-    calls = []
+    calls: list[list[str]] = []
     with (
         patch.dict(os.environ, {"NEMO_RL_UV_SYNC_ATTEMPTS": "1"}),
         patch.object(venvs.subprocess, "run", side_effect=_fake_run(10, calls)),
