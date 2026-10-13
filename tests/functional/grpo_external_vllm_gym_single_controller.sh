@@ -6,6 +6,8 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")
 MODEL=${EXTERNAL_VLLM_TEST_MODEL:-Qwen/Qwen3-0.6B}
+MAX_MODEL_LEN=${EXTERNAL_VLLM_TEST_MAX_MODEL_LEN:-4096}
+MAX_NEW_TOKENS=${EXTERNAL_VLLM_TEST_MAX_NEW_TOKENS:-512}
 RUN_DIR=${EXTERNAL_VLLM_TEST_RUN_DIR:-$SCRIPT_DIR/grpo_external_vllm_gym_single_controller}
 SERVER_PORT=${EXTERNAL_VLLM_TEST_PORT:-19210}
 BASE_URL=${EXTERNAL_VLLM_TEST_BASE_URL:-http://127.0.0.1:$SERVER_PORT/v1}
@@ -24,7 +26,7 @@ if [[ -z "${EXTERNAL_VLLM_TEST_BASE_URL:-}" ]]; then
     CUDA_VISIBLE_DEVICES=${EXTERNAL_VLLM_TEST_SERVICE_GPU:-1} VLLM_SERVER_DEV_MODE=1 \
     "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" --served-model-name policy --port "$SERVER_PORT" \
-    --max-model-len 512 --gpu-memory-utilization 0.7 \
+    --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization 0.7 \
     --enable-auto-tool-choice --tool-call-parser hermes \
     > "$RUN_DIR/server.log" 2>&1 &
     SERVER_PID=$!
@@ -54,12 +56,14 @@ CUDA_VISIBLE_DEVICES=$TRAIN_GPUS \
 SC_TEST_RUN_DIR="$RUN_DIR/train" \
     bash "$SCRIPT_DIR/grpo_async_gym_single_controller.sh" \
     policy.model_name="$MODEL" \
+    policy.max_total_sequence_length="$MAX_MODEL_LEN" \
+    policy.generation.max_new_tokens="$MAX_NEW_TOKENS" \
     policy.generation.backend=remote_vllm \
     ++policy.generation.refit_transport=hf_checkpoint \
     ++policy.generation.refit_cfg.hf_checkpoint.checkpoint_dir="$EXPORT_DIR" \
     ++policy.generation.remote_vllm_cfg.base_url="$BASE_URL" \
     ++policy.generation.remote_vllm_cfg.served_model_name=policy \
-    ++policy.generation.remote_vllm_cfg.max_model_len=512 \
+    ++policy.generation.remote_vllm_cfg.max_model_len="$MAX_MODEL_LEN" \
     ++policy.generation.remote_vllm_cfg.refit={} \
     cluster.gpus_per_node=1 \
     ++token_capture.enabled=false \
