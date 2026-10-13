@@ -1627,6 +1627,43 @@ def test_clipped_pg_loss_tis_min_bound_defaults_to_zero(
     assert metrics["is_oob_ratio"] == pytest.approx(expected_oob_ratio)
 
 
+@pytest.mark.parametrize(
+    "max_kept_weight,expected_weights",
+    [(None, torch.tensor([1.25, 0.0, 10.0])), (5.0, torch.tensor([1.25, 0.0, 5.0]))],
+)
+def test_clipped_pg_loss_ipo_masks_tokens_by_probability_gap(
+    max_kept_weight, expected_weights
+):
+    data, _, _, _ = _setup_clipped_pg_test_data(device="cpu")
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        force_on_policy_ratio=True,
+        truncated_importance_sampling_type="ipo",
+        truncated_importance_sampling_ratio=0.3,
+        ipo_max_kept_weight=max_kept_weight,
+    )
+    loss_fn = ClippedPGLossFn(cfg)
+
+    data["advantages"][0, 1:] = torch.ones(3)
+    data["generation_logprobs"][0, 1:] = torch.log(torch.tensor([0.4, 0.2, 0.002]))
+    next_token_logprobs = torch.log(torch.tensor([[0.5, 0.9, 0.02]])).requires_grad_()
+
+    loss, metrics = loss_fn(
+        next_token_logprobs=next_token_logprobs,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
+    loss.backward()
+
+    torch.testing.assert_close(loss, -expected_weights.mean())
+    assert metrics["is_oob_ratio"] == pytest.approx(1.0 / 3.0)
+    assert ("ipo_clamped_token_fraction" in metrics) is (max_kept_weight is not None)
+    grad = next_token_logprobs.grad[0]
+    assert grad[1] == 0 and grad[0] != 0 and grad[2] != 0
+
+
 def test_clipped_pg_loss_seq_mask_tis():
     """Tests ClippedPGLossFn with seq-mask-tis, including nan_to_num on -inf.
 

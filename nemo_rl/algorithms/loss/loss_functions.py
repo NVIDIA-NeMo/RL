@@ -203,10 +203,12 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     #   "tis"          – clamp IS weights to [min, max], where min defaults to 0
     #   "icepop"       – zero out tokens with IS weight outside [min, max]
     #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
+    #   "ipo"          – zero out tokens with |p_train - p_infer| > ratio
     truncated_importance_sampling_type: Optional[str] = None
     truncated_importance_sampling_ratio: Optional[float] = None
     # Lower bound for TIS clipping, ICE-POP filtering, or seq-mask-tis filtering
     truncated_importance_sampling_ratio_min: Optional[float] = None
+    ipo_max_kept_weight: Optional[float] = None
 
     # --- On-policy ---
     # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
@@ -371,6 +373,7 @@ class ClippedPGLossFn(LossFunction):
         self.truncated_importance_sampling_ratio_min = (
             cfg.truncated_importance_sampling_ratio_min
         )
+        self.ipo_max_kept_weight = cfg.ipo_max_kept_weight
         self.use_on_policy_kl_approximation = cfg.use_on_policy_kl_approximation
         self.force_on_policy_ratio = cfg.force_on_policy_ratio  # Force ratio to 1.0
 
@@ -420,8 +423,9 @@ class ClippedPGLossFn(LossFunction):
                 "tis",
                 "icepop",
                 "seq-mask-tis",
+                "ipo",
             ), (
-                f"truncated_importance_sampling_type must be 'tis', 'icepop', or 'seq-mask-tis', "
+                f"truncated_importance_sampling_type must be 'tis', 'icepop', 'seq-mask-tis', or 'ipo', "
                 f"got {self.truncated_importance_sampling_type}"
             )
             assert (
@@ -521,6 +525,13 @@ class ClippedPGLossFn(LossFunction):
                 if self.truncated_importance_sampling_type == "seq-mask-tis"
                 else MetricNormalizer.TOKENS
             )
+            if (
+                self.truncated_importance_sampling_type == "ipo"
+                and self.ipo_max_kept_weight is not None
+            ):
+                self.metric_normalizations["ipo_clamped_token_fraction"] = (
+                    MetricNormalizer.TOKENS
+                )
         if self.opd_full is not None:
             # opd_full returns its own metric set from _opd_full_call; the
             # policy-gradient diagnostics above are never produced there.
@@ -821,6 +832,35 @@ class ClippedPGLossFn(LossFunction):
                     actor_importance_weights_expanded,
                     torch.zeros_like(actor_importance_weights_expanded),
                 )
+            elif self.truncated_importance_sampling_type == "ipo":
+                token_kept_mask = (
+                    torch.exp(prev_logprobs) - torch.exp(generation_logprobs)
+                ).abs() <= self.truncated_importance_sampling_ratio
+                _is_filter_metrics = {
+                    "is_oob_ratio": masked_mean(
+                        (~token_kept_mask).float(),
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ),
+                }
+                actor_importance_weights_expanded = torch.where(
+                    token_kept_mask,
+                    actor_importance_weights_expanded,
+                    torch.zeros_like(actor_importance_weights_expanded),
+                )
+                if self.ipo_max_kept_weight is not None:
+                    _is_filter_metrics["ipo_clamped_token_fraction"] = masked_mean(
+                        (
+                            actor_importance_weights_expanded > self.ipo_max_kept_weight
+                        ).float(),
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    )
+                    actor_importance_weights_expanded = (
+                        actor_importance_weights_expanded.clamp(
+                            max=self.ipo_max_kept_weight
+                        )
+                    )
             elif self.truncated_importance_sampling_type == "seq-mask-tis":
                 # geo_mean_i = exp( mean_t( log(π_prev / π_gen) ) )
                 log_is_ratio = torch.nan_to_num(
