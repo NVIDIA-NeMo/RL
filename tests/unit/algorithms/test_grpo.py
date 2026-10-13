@@ -5992,7 +5992,10 @@ def test_grpo_train_fractional_loss_weights_vote_fully_in_statistics(
 
     train_data = _run_grpo_train_step_on_batch(mock_grpo_components, train_func, batch)
 
-    # The pre-filter baseline/std (sync loop) and the estimator both count both rows.
+    # The sync loop computes one pre-filter baseline/std; the async loop has
+    # none (the estimator binds its own copy of the function). Both count
+    # both rows.
+    assert len(seen_valid_masks) == (1 if train_func is grpo_train else 0)
     for valid_mask in seen_valid_masks:
         assert torch.equal(valid_mask, torch.ones(2))
     estimator.compute_advantage.assert_called_once()
