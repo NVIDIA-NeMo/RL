@@ -395,7 +395,7 @@ class TestProcessMicrobatch:
             }
         )
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
             "sequence_packing": {"train_mb_tokens": train_mb_tokens},
             "make_sequence_length_divisible_by": 16,
         }
@@ -416,6 +416,48 @@ class TestProcessMicrobatch:
         )
 
         assert mock_pack_sequences.call_args[1]["min_seq_len"] == expected_min_seq_len
+
+    @pytest.mark.parametrize(
+        "train_mb_tokens,expected_packed_len",
+        [
+            (256, 256),  # packed length 204 fits: row padded to train_mb_tokens
+            (128, 208),  # oversized bin: row padded to a multiple of 16
+        ],
+    )
+    def test_sequence_packing_oversized_row_keeps_tokens_and_alignment(
+        self, mock_tokenizer, train_mb_tokens, expected_packed_len
+    ):
+        """Unmocked packing: an oversized row keeps every token and stays aligned."""
+        input_lengths = torch.tensor([32, 48, 60, 64])
+        input_ids = torch.arange(4 * 64).reshape(4, 64)
+        mb = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "sample_mask": torch.ones(4, dtype=torch.bool),
+            }
+        )
+        cfg = {
+            "automodel_cfg": {"sequence_parallel": False},
+            "sequence_packing": {"train_mb_tokens": train_mb_tokens},
+            "make_sequence_length_divisible_by": 16,
+        }
+
+        result = process_microbatch(
+            mb=mb,
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=True,
+            cfg=cfg,
+        )
+
+        assert result.input_ids.is_cuda
+        assert result.input_ids.shape == (1, expected_packed_len)
+        assert result.seq_len == expected_packed_len
+        real_tokens = torch.cat(
+            [input_ids[i, :n] for i, n in enumerate(input_lengths.tolist())]
+        )
+        assert torch.equal(result.input_ids[0, :204].cpu(), real_tokens)
+        assert result.flash_attn_kwargs.cu_seqlens_q.tolist() == [0, 32, 80, 140, 204]
 
     def test_with_multimodal_inputs(self, mock_tokenizer):
         image = torch.randn(1, 3, 224, 224)
