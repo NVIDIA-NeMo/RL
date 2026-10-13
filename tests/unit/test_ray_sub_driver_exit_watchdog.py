@@ -13,34 +13,70 @@
 # limitations under the License.
 """ray.sub ends the job when the head srun outlives the driver.
 
-The batch-side wait loop is extracted from ray.sub and run against a fake head
-process, so the test exercises the real shell code without Slurm.
+The batch-side wait loop and the DRIVER_EXIT_GRACE_S validation are extracted
+from ray.sub and run in bash against fake processes, so the tests exercise the
+real shell code without Slurm. The head container's marker write is checked in
+place inside the generated head command.
 """
 
+import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAY_SUB = REPO_ROOT / "ray.sub"
+MARKER_WRITE = '  echo "\\$exit_code" > "$LOG_DIR/DRIVER_EXITED" 2>/dev/null || true'
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 
 
+def _lines() -> list[str]:
+    return RAY_SUB.read_text().splitlines()
+
+
 def _batch_wait_loop() -> str:
-    lines = RAY_SUB.read_text().splitlines()
+    lines = _lines()
     start = lines.index('  _driver_exited_at=""')
     end = lines.index("  done", start)
     return "\n".join(lines[start : end + 1])
 
 
-def _run(tmp_path: Path, *, head_seconds: int, grace_s: int, driver_exited: bool):
+def _grace_validation() -> str:
+    lines = _lines()
+    start = lines.index("DRIVER_EXIT_GRACE_S=${DRIVER_EXIT_GRACE_S:-180}")
+    end = lines.index("fi", start)
+    return "\n".join(lines[start : end + 1])
+
+
+def _head_cmd() -> list[str]:
+    lines = _lines()
+    start = lines.index("head_cmd=$(cat <<EOF")
+    end = lines.index("EOF", start)
+    return lines[start + 1 : end]
+
+
+def _run(
+    tmp_path: Path,
+    *,
+    head_seconds: int,
+    grace_s: int,
+    marker: str | None,
+    dead_sidecar: bool = False,
+) -> subprocess.CompletedProcess[str]:
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    if driver_exited:
-        (log_dir / "DRIVER_EXITED").write_text("3\n")
+    if marker is not None:
+        (log_dir / "DRIVER_EXITED").write_text(marker)
+    # A worker srun that has already exited, as after a node failure during bringup.
+    sidecar = (
+        'true & SRUN_PIDS["ray-workers"]=$!; wait "${SRUN_PIDS["ray-workers"]}"'
+        if dead_sidecar
+        else ""
+    )
     script = f"""
 set -u
 declare -A SRUN_PIDS
@@ -48,7 +84,9 @@ LOG_DIR={log_dir}
 DRIVER_EXIT_GRACE_S={grace_s}
 sleep {head_seconds} >/dev/null 2>&1 &
 SRUN_PIDS["ray-head"]=$!
+echo "head-pid=$!"
 trap 'kill "${{SRUN_PIDS["ray-head"]}}" 2>/dev/null' EXIT
+{sidecar}
 {_batch_wait_loop()}
 echo head-exited
 """
@@ -57,28 +95,130 @@ echo head-exited
     )
 
 
-def test_ends_job_with_driver_exit_code_when_head_outlives_driver(tmp_path):
-    result = _run(tmp_path, head_seconds=30, grace_s=1, driver_exited=True)
+def _fake_head_pid(result: subprocess.CompletedProcess[str]) -> int:
+    (line,) = [
+        line for line in result.stdout.splitlines() if line.startswith("head-pid=")
+    ]
+    return int(line.removeprefix("head-pid="))
 
-    assert result.returncode == 3
-    assert "head-exited" not in result.stdout
-    assert "ending the job" in result.stderr
-    assert (tmp_path / "logs" / "ENDED").exists()
+
+def _assert_not_running(pid: int) -> None:
+    """The harness's EXIT trap must still kill the fake head when the loop `exit`s."""
+    if not Path("/proc/self").exists():  # no procfs: nothing to check
+        return
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except FileNotFoundError:
+            return
+        if state in ("Z", "X"):
+            return
+        time.sleep(0.05)
+    pytest.fail(f"fake head (pid {pid}) is still running after the wait loop exited")
 
 
 @pytest.mark.parametrize(
-    "grace_s,driver_exited",
+    "marker,expected_code",
     [
-        (0, True),  # watchdog disabled
-        (120, True),  # head exits within the grace period
-        (1, False),  # driver still running
+        ("3\n", 3),  # failed driver
+        ("0\n", 0),  # successful driver: the job still ends, with status 0
+        ("garbage\n", 1),  # unreadable marker falls back to 1
     ],
 )
-def test_waits_for_head(tmp_path, grace_s, driver_exited):
-    result = _run(
-        tmp_path, head_seconds=1, grace_s=grace_s, driver_exited=driver_exited
-    )
+def test_ends_job_with_driver_exit_code_when_head_outlives_driver(
+    tmp_path: Path, marker: str, expected_code: int
+) -> None:
+    result = _run(tmp_path, head_seconds=30, grace_s=1, marker=marker)
+
+    assert result.returncode == expected_code
+    assert "head-exited" not in result.stdout
+    assert "ending the job" in result.stderr
+    assert (tmp_path / "logs" / "ENDED").exists()
+    _assert_not_running(_fake_head_pid(result))
+
+
+@pytest.mark.parametrize(
+    "grace_s,marker",
+    [
+        (0, "3\n"),  # watchdog disabled
+        (120, "3\n"),  # head exits within the grace period
+        (1, None),  # driver still running: no marker
+    ],
+)
+def test_waits_for_head(tmp_path: Path, grace_s: int, marker: str | None) -> None:
+    result = _run(tmp_path, head_seconds=1, grace_s=grace_s, marker=marker)
 
     assert result.returncode == 0
     assert "head-exited" in result.stdout
+    assert "ending the job" not in result.stderr
     assert not (tmp_path / "logs" / "ENDED").exists()
+
+
+def test_sidecar_failure_signals_ended_without_waiting_for_the_grace_period(
+    tmp_path: Path,
+) -> None:
+    result = _run(
+        tmp_path, head_seconds=30, grace_s=120, marker=None, dead_sidecar=True
+    )
+
+    # The loop breaks out; the real script then `wait`s on the head and propagates it.
+    assert result.returncode == 0
+    assert "head-exited" in result.stdout
+    assert "exited before the head; failing fast" in result.stderr
+    assert "ending the job" not in result.stderr
+    assert (tmp_path / "logs" / "ENDED").exists()
+    _assert_not_running(_fake_head_pid(result))
+
+
+@pytest.mark.parametrize(
+    "value,expected_code,expected_value",
+    [
+        (None, 0, "180"),  # unset: default
+        ("0", 0, "0"),  # disabled
+        ("600", 0, "600"),
+        ("abc", 1, None),
+        ("1.5", 1, None),
+        ("-1", 1, None),
+    ],
+)
+def test_grace_period_must_be_a_non_negative_integer(
+    value: str | None, expected_code: int, expected_value: str | None
+) -> None:
+    script = f"""
+set -u
+{_grace_validation()}
+echo "grace=$DRIVER_EXIT_GRACE_S"
+"""
+    env = {k: v for k, v in os.environ.items() if k != "DRIVER_EXIT_GRACE_S"}
+    if value is not None:
+        env["DRIVER_EXIT_GRACE_S"] = value
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=30, env=env
+    )
+
+    assert result.returncode == expected_code
+    if expected_value is None:
+        assert "DRIVER_EXIT_GRACE_S must be a non-negative integer" in result.stderr
+    else:
+        assert f"grace={expected_value}" in result.stdout
+
+
+def test_head_writes_the_marker_right_after_the_driver_returns() -> None:
+    """The marker must carry the driver's status and be written before anything else.
+
+    The Alloy EXIT trap and `exit` follow; if teardown hangs there, the marker is
+    the only thing telling the submit host that the driver is done.
+    """
+    head = _head_cmd()
+    captured = head.index("  exit_code=\\$?")
+    statements = [
+        line for line in head[captured + 1 :] if not line.lstrip().startswith("#")
+    ]
+    assert statements[0] == MARKER_WRITE, (
+        "the DRIVER_EXITED write must directly follow `exit_code=$?` in the head "
+        f"command; found {statements[0]!r}"
+    )
+    assert "  exit \\$exit_code" in statements[1:4], (
+        "the head command must still exit with the driver's status after the marker"
+    )
