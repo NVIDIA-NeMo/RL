@@ -42,6 +42,10 @@ from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.automodel.router_replay import (
+    configure_router_replay,
+    router_replay_context,
+)
 from nemo_rl.models.automodel.setup import (
     setup_distributed,
     setup_model_and_optimizer,
@@ -90,13 +94,22 @@ from nemo_rl.utils.timer import Timer
 
 
 def _refit_tensor_dtype(
-    fqn: str, tensor: torch.Tensor, default_dtype: torch.dtype
+    model: nn.Module, fqn: str, tensor: torch.Tensor, default_dtype: torch.dtype
 ) -> torch.dtype:
-    """Preserve the FP32 dtype used by inference-critical MoE router state."""
-    is_router_correction_bias = fqn.rsplit(".", maxsplit=1)[-1] == (
-        "e_score_correction_bias"
+    """Preserve FP32 router state and DeepSeek V4's FP32 mHC/attention state."""
+    name = fqn.rsplit(".", maxsplit=1)[-1]
+    is_router_correction_bias = name == "e_score_correction_bias"
+    is_deepseek_v4 = (
+        getattr(getattr(model, "config", None), "model_type", None) == "deepseek_v4"
     )
-    if is_router_correction_bias and tensor.dtype == torch.float32:
+    is_v4_fp32_state = is_deepseek_v4 and (
+        name.startswith(("hc_attn_", "hc_ffn_", "hc_head_"))
+        or name == "attn_sink"
+        or fqn.endswith(".compressor.ape")
+    )
+    if (
+        is_router_correction_bias or is_v4_fp32_state
+    ) and tensor.dtype == torch.float32:
         return tensor.dtype
     return default_dtype
 
@@ -108,8 +121,8 @@ def dtensor_params_generator(
 
     Args:
         model: The model whose parameters to generate.
-        target_dtype: The default dtype for refit tensors. Source-FP32
-            ``e_score_correction_bias`` tensors retain FP32.
+        target_dtype: The default dtype for refit tensors. Source-FP32 router
+            biases and DeepSeek V4 mHC/sink/compressor-position state retain FP32.
 
     Yields:
         Tuples of (fully_qualified_name, tensor) where tensors are converted to
@@ -124,7 +137,9 @@ def dtensor_params_generator(
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            refit_dtype = _refit_tensor_dtype(adapted_fqn, adapted_tensor, target_dtype)
+            refit_dtype = _refit_tensor_dtype(
+                model, adapted_fqn, adapted_tensor, target_dtype
+            )
             yield (
                 adapted_fqn,
                 adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
@@ -361,6 +376,16 @@ class DTensorPolicyWorkerV2Impl(
             self.autocast_enabled,
         ) = model_and_optimizer_state
 
+        configure_router_replay(self.model, self.cfg)
+        if init_reference_model and (self.cfg.get("router_replay") or {}).get(
+            "enabled"
+        ):
+            raise ValueError(
+                "AutoModel router replay does not yet support a reference policy"
+            )
+        backend = getattr(self.model, "backend", None)
+        self.te_fp8 = backend.te_fp8 if backend is not None else None
+
         # Initialize reference model if requested. With deferred loading the
         # model still holds the base (model_name) weights here, so the KL
         # reference stays anchored to the same policy across resumes.
@@ -394,11 +419,21 @@ class DTensorPolicyWorkerV2Impl(
         if update_moe_gate_bias is not None:
             update_moe_gate_bias()
 
-    def _autocast_context(self) -> AbstractContextManager[Any]:
-        """Return the worker-owned precision context for one microbatch."""
-        if not self.autocast_enabled:
-            return nullcontext()
-        return torch.autocast(device_type="cuda", dtype=self.dtype)
+    @contextmanager
+    def _autocast_context(self) -> Generator[None, None, None]:
+        """Apply native AMP and the model-owned TE FP8 recipe per microbatch."""
+        amp = (
+            torch.autocast(device_type="cuda", dtype=self.dtype)
+            if self.autocast_enabled
+            else nullcontext()
+        )
+        fp8 = (
+            self.te_fp8.maybe_te_autocast()
+            if self.te_fp8 is not None
+            else nullcontext()
+        )
+        with amp, fp8:
+            yield
 
     def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
         """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
@@ -641,7 +676,13 @@ class DTensorPolicyWorkerV2Impl(
                     allow_flash_attn_args=self.allow_flash_attn_args,
                 )
 
-                with prepared.model_context_factory(), self._autocast_context():
+                with (
+                    router_replay_context(
+                        self.model, processed_mb, cp_sharder=prepared.cp_sharder
+                    ),
+                    prepared.model_context_factory(),
+                    self._autocast_context(),
+                ):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     token_logprobs, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
@@ -1075,7 +1116,7 @@ class DTensorPolicyWorkerV2Impl(
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
                 refit_dtype = _refit_tensor_dtype(
-                    adapted_fqn, adapted_tensor, self.dtype
+                    self.model, adapted_fqn, adapted_tensor, self.dtype
                 )
                 state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
 

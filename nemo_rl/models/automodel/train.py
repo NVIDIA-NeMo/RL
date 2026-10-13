@@ -61,6 +61,7 @@ from nemo_rl.models.automodel.data import (
     ProcessedMicrobatch,
     filter_multimodal_kwargs_for_model,
 )
+from nemo_rl.models.automodel.router_replay import router_replay_context
 from nemo_rl.models.policy import PolicyConfig
 
 # Union type for any post-processing function
@@ -484,7 +485,11 @@ def automodel_forward_backward(
             allow_flash_attn_args=allow_flash_attn_args,
         )
 
-        with prepared.model_context_factory(), autocast_context_factory():
+        with (
+            router_replay_context(model, processed_mb, cp_sharder=prepared.cp_sharder),
+            prepared.model_context_factory(),
+            autocast_context_factory(),
+        ):
             # Forward pass with post-processing
             result, metrics, _ = forward_with_post_processing_fn(
                 model=model,

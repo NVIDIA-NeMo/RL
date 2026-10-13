@@ -44,6 +44,10 @@ from nemo_automodel.components.distributed.config import (
 )
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
+from nemo_automodel.components.optim.optimizer import (
+    _drop_empty_local_shards,
+    _is_te_fused_adam,
+)
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from safetensors import safe_open
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
@@ -972,10 +976,12 @@ def setup_model_and_optimizer(
         # p.grad-is-None check, so passing frozen params (e.g. the visual
         # encoder in text-only training) causes DCP to save unused state that
         # later fails to reshard on resume.
-        optimizer = optimizer_cls(
-            (p for p in model.parameters() if p.requires_grad),
-            **optimizer_kwargs,
-        )
+        optimizer_params = [p for p in model.parameters() if p.requires_grad]
+        # Tiny V4 mHC parameters leave empty local shards on wide FSDP meshes.
+        # Reuse AutoModel's guard against TE multi_tensor_apply empty tensors.
+        if _is_te_fused_adam(optimizer_cls):
+            optimizer_params = _drop_empty_local_shards(optimizer_params)
+        optimizer = optimizer_cls(optimizer_params, **optimizer_kwargs)
 
     # Initialize scheduler
     scheduler = None
