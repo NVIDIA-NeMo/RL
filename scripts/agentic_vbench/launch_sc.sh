@@ -310,6 +310,7 @@ fi
   data.validation.data_path="${VAL_PATH}" \
   grpo.num_prompts_per_step="${num_prompts}" \
   grpo.num_generations_per_prompt="${num_generations}" \
+  grpo.max_num_epochs=null \
   grpo.max_num_steps="${max_steps}" \
   checkpointing.checkpoint_must_save_by="${checkpoint_must_save_by}" \
   policy.train_global_batch_size="${train_global_batch_size}" \

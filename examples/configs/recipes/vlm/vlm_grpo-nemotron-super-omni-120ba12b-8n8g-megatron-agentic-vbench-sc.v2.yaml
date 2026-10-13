@@ -15,7 +15,9 @@ grpo:
   # SC requires num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size.
   num_prompts_per_step: 8
   num_generations_per_prompt: 4
-  max_num_epochs: 1000
+  # Debug datasets are intentionally small and repeated. Leave the epoch bound
+  # unset so it cannot silently clamp max_num_steps.
+  max_num_epochs: null
   max_num_steps: 1000000
   # SC has no validation loop.
   val_period: 0

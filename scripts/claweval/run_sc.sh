@@ -91,8 +91,8 @@ if actual != expected:
 print(f"Validated {len(actual)} prompt-only ClawEval rows against all three task-package variants")
 PY
 
-# The launcher schema requires a finite integer. One million is the NeMo-RL GRPO
-# production default and is clamped by data epochs/job time, not a debugging step cap.
+# The schema requires a finite integer. One million is a production horizon,
+# while launch_sc explicitly disables the dataset-derived epoch clamp.
 export MAX_STEPS=${MAX_STEPS:-1000000}
 export CONFIG_IN_CONTAINER=${CONFIG_IN_CONTAINER:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-8n8g-megatron-claweval-sc.v2.yaml}
 export TRAINING_DEPS_SETUP_SCRIPT=/opt/nemo-rl/tools/ensure_agentic_vbench_deps.sh

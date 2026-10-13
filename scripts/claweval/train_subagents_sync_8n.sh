@@ -14,8 +14,8 @@ export NUM_GEN_NODES=${NUM_GEN_NODES:-4}
 export SEGMENT_SIZE=${SEGMENT_SIZE:-4}
 export NUM_PROMPTS=${NUM_PROMPTS:-8}
 export NUM_GENERATIONS=${NUM_GENERATIONS:-4}
-# NeMo-RL requires a finite schema value. This production horizon is bounded by
-# epochs, checkpoint deadline, and Slurm time—not by a one/few-step debug cap.
+# NeMo-RL requires a finite schema value. This production horizon is not reduced
+# by dataset epochs; the allocation lifetime remains the operational bound.
 export MAX_STEPS=${MAX_STEPS:-1000000}
 export SAVE_PERIOD=${SAVE_PERIOD:-1}
 export JOB_CYCLES=${JOB_CYCLES:-1}
