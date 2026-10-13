@@ -26,7 +26,17 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from time import monotonic, sleep
-from typing import Any, Dict, List, NotRequired, Optional, Protocol, Self, TypedDict
+from typing import (
+    Any,
+    Dict,
+    List,
+    NoReturn,
+    NotRequired,
+    Optional,
+    Protocol,
+    Self,
+    TypedDict,
+)
 
 import ray
 import torch
@@ -480,7 +490,7 @@ def _straggler_cutoff_wait_s(
     return max(0.0, min(deadlines) - elapsed_s)
 
 
-def _raise_typed_gym_failure(error: Exception) -> None:
+def _raise_typed_gym_failure(error: Exception) -> NoReturn:
     """Re-raise a failed ``/run`` as a picklable typed failure when it carries a status."""
     if hasattr(error, "response_content"):
         print("EXCEPTION RESULT", error.response_content, file=sys.stderr)
@@ -1473,23 +1483,29 @@ Depending on your data shape, you may want to change these values."""
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 if was_cut:
                     nemo_rl_result = _straggler_cut_placeholder(nemo_gym_row, tokenizer)
-                elif self._token_capture_enabled:
-                    # Receipt mode: fetch the ledger manifest and assemble the
-                    # receipt locally; token-free result. The canonical row is
-                    # rebuilt by the finalizer, so no message_log walk (and no
-                    # NaN check) applies here.
-                    nemo_rl_result = await self._postprocess_receipt_mode(
-                        nemo_gym_row, nemo_gym_result
-                    )
                 else:
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_row,
-                        nemo_gym_result,
-                        tokenizer,
-                        include_initial_multimodal_data=not deduplicate_multimodal_data,
+                    # Only a cut row carries no result; a finished rollout always
+                    # resolves to Gym's ``(row, result)`` pair.
+                    assert nemo_gym_result is not None, (
+                        "NeMo-Gym returned no result for a finished rollout"
                     )
-                    if _has_nan_generation_logprobs(nemo_rl_result):
-                        raise RuntimeError("Generation logprobs contain NaN")
+                    if self._token_capture_enabled:
+                        # Receipt mode: fetch the ledger manifest and assemble the
+                        # receipt locally; token-free result. The canonical row is
+                        # rebuilt by the finalizer, so no message_log walk (and no
+                        # NaN check) applies here.
+                        nemo_rl_result = await self._postprocess_receipt_mode(
+                            nemo_gym_row, nemo_gym_result
+                        )
+                    else:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            tokenizer,
+                            include_initial_multimodal_data=not deduplicate_multimodal_data,
+                        )
+                        if _has_nan_generation_logprobs(nemo_rl_result):
+                            raise RuntimeError("Generation logprobs contain NaN")
             num_results += 1
             timing_metrics = None
             if num_results == len(nemo_gym_examples):
