@@ -53,6 +53,7 @@ from nemo_rl.algorithms.grpo import (
     _create_advantage_estimator,
     _initial_policy_generation_stale,
     _log_mixed_rewards_and_advantages_information,
+    _next_step_runs_validation,
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
     _resolve_logprob_skip_flags,
@@ -1286,12 +1287,22 @@ def grpo_train_sync(
                         and (total_steps + 1) % ft_save_period == 0
                     )
                 )
-                # If the next step also runs validation, budget one more step's worth of
-                # time for it to make starting a step that cannot finish less likely.
-                next_step_validates = (
-                    val_period > 0
-                    and (total_steps + 2) >= val_start_at
-                    and (total_steps + 2) % val_period == 0
+                # If the next step also runs validation (periodic schedule or
+                # val_at_end), budget one more step's worth of time for it to make
+                # starting a step that cannot finish less likely.
+                next_step_validates = _next_step_runs_validation(
+                    total_steps=total_steps,
+                    current_step=current_step,
+                    current_epoch=current_epoch,
+                    steps_per_epoch=None
+                    if master_config.data["use_multiple_dataloader"]
+                    else len(wrapped_dataloader),
+                    max_num_steps=max_num_steps,
+                    max_num_epochs=max_num_epochs,
+                    val_period=val_period,
+                    val_start_at=val_start_at,
+                    val_at_end=val_at_end,
+                    is_last_step=is_last_step,
                 )
                 should_save_by_timeout = timeout.check_save(
                     extra_s=max(timeout.iteration_times)

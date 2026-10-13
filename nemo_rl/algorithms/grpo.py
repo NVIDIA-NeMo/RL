@@ -3114,6 +3114,50 @@ def _validation_early_stop_message(
     )
 
 
+def _next_step_runs_validation(
+    *,
+    total_steps: int,
+    current_step: int,
+    current_epoch: int,
+    steps_per_epoch: Optional[int],
+    max_num_steps: int,
+    max_num_epochs: int,
+    val_period: int,
+    val_start_at: int,
+    val_at_end: bool,
+    is_last_step: bool,
+) -> bool:
+    """Whether the step after the current one will run validation.
+
+    Mirrors ``should_run_validation`` in the sync training loops, evaluated for
+    the next step (1-indexed ``total_steps + 2``): the periodic schedule, or
+    ``val_at_end`` when the next step is the last one. ``steps_per_epoch`` is
+    ``None`` when the dataloader is infinite (``use_multiple_dataloader``) and
+    only ``max_num_steps`` bounds the run. The last step has no successor, so
+    this is False once ``is_last_step`` holds.
+    """
+    if is_last_step:
+        return False
+    next_step = total_steps + 2
+    if val_period > 0 and next_step >= val_start_at and next_step % val_period == 0:
+        return True
+    if not val_at_end:
+        return False
+    next_is_last_step = next_step >= max_num_steps
+    if steps_per_epoch is not None:
+        # Where the next step lands, following the current_step / current_epoch
+        # updates at the end of the loop body.
+        if current_step + 1 >= steps_per_epoch:
+            next_epoch, next_step_in_epoch = current_epoch + 1, 0
+        else:
+            next_epoch, next_step_in_epoch = current_epoch, current_step + 1
+        next_is_last_step = next_is_last_step or (
+            next_epoch + 1 == max_num_epochs
+            and next_step_in_epoch + 1 == steps_per_epoch
+        )
+    return next_is_last_step
+
+
 def _grpo_train_impl(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -4063,12 +4107,22 @@ def _grpo_train_impl(
                     )
                 )
                 # Check if timeout-based checkpointing is enabled in config.
-                # If the next step also runs validation, budget one more step's worth of
-                # time for it to make starting a step that cannot finish less likely.
-                next_step_validates = (
-                    val_period > 0
-                    and (total_steps + 2) >= val_start_at
-                    and (total_steps + 2) % val_period == 0
+                # If the next step also runs validation (periodic schedule or
+                # val_at_end), budget one more step's worth of time for it to make
+                # starting a step that cannot finish less likely.
+                next_step_validates = _next_step_runs_validation(
+                    total_steps=total_steps,
+                    current_step=current_step,
+                    current_epoch=current_epoch,
+                    steps_per_epoch=None
+                    if master_config.data["use_multiple_dataloader"]
+                    else len(wrapped_dataloader),
+                    max_num_steps=max_num_steps,
+                    max_num_epochs=max_num_epochs,
+                    val_period=val_period,
+                    val_start_at=val_start_at,
+                    val_at_end=val_at_end,
+                    is_last_step=is_last_step,
                 )
                 should_save_by_timeout = timeout.check_save(
                     extra_s=max(timeout.iteration_times)
