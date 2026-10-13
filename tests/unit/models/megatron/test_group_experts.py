@@ -244,7 +244,7 @@ def test_quantized_expert_group_decodes_once_with_current_scales(
     elif recipe == "blockwise":
         quantizer = Float8BlockQuantizer(
             tex.DType.kFloat8E4M3,
-            rowwise=not columnwise_only,
+            rowwise=not columnwise_only or block_dim == 2,
             columnwise=True,
             block_scaling_dim=block_dim,
         )
@@ -293,6 +293,14 @@ def test_quantized_expert_group_decodes_once_with_current_scales(
         for pair in ((3.0, 67.0), (0.125, 129.0))
     )
     members = tuple(q.quantize(value) for q, value in zip(quantizers, values))
+    # TE's 2D quantizer requires rowwise output even when only columnwise
+    # storage will be consumed. Retain it for updates, then remove it before
+    # both reference and grouped decoding to exercise the column-only path.
+    rowwise_buffers = (
+        tuple((member._rowwise_data, member._rowwise_scale_inv) for member in members)
+        if recipe == "blockwise" and block_dim == 2 and columnwise_only
+        else None
+    )
     original_decode = storage_type.dequantize
     previous = None
     for cycle in (1, 2):
@@ -300,9 +308,15 @@ def test_quantized_expert_group_decodes_once_with_current_scales(
             for index, (member, value, q) in enumerate(
                 zip(members, values, quantizers)
             ):
+                if rowwise_buffers is not None:
+                    member._rowwise_data, member._rowwise_scale_inv = rowwise_buffers[
+                        index
+                    ]
                 if recipe == "delayed":
                     q.scale.fill_(0.5 / (index + 1) * cycle)
                 q.update_quantized(value * cycle, member)
+                if rowwise_buffers is not None:
+                    member.update_usage(rowwise_usage=False, columnwise_usage=True)
         expected = torch.stack(
             [member.dequantize(dtype=torch.bfloat16) for member in members]
         )
