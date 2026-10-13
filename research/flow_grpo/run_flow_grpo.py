@@ -40,6 +40,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import Logger, get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
 
@@ -69,6 +70,7 @@ def main() -> None:
     if overrides:
         cfg = parse_hydra_overrides(cfg, overrides)
     cfg = OmegaConf.to_container(cfg, resolve=True)
+    check_outdated_config(cfg)
     print("Final config:")
     pprint.pprint(cfg)
 

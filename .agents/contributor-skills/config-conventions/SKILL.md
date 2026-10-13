@@ -134,7 +134,7 @@ disable_ppo_ratio = cfg.get("disable_ppo_ratio", False)
 normalize_rewards = grpo_config.get("normalize_rewards", True)
 
 # Chained .get() with hidden defaults at each level
-megatron_enable = config.get("megatron_cfg", {}).get("enabled", False)
+megatron_enabled = config.get("megatron_cfg", {}).get("enabled", False)
 ```
 
 If a `NotRequired` field is absent, the code should handle that explicitly — not paper over it with a magic default.

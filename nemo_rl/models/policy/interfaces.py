@@ -24,7 +24,7 @@ from nemo_rl.utils.timer import Timer
 
 
 class LogprobOutputSpec(TypedDict):
-    """logprobs: Tensor of log probabilities."""
+    """Token log probabilities; filtered unsupported tokens retain -inf."""
 
     logprobs: torch.Tensor
 

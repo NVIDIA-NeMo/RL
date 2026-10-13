@@ -13,7 +13,7 @@ policy:
   model_name: Qwen/Qwen2.5-Math-1.5B-Instruct
   tokenizer:
     name: Qwen/Qwen2.5-Math-1.5B-Instruct
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true
