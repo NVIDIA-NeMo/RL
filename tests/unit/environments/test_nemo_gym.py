@@ -1425,7 +1425,14 @@ def test_run_rollouts_takes_a_trace_carrier_without_disturbing_the_body():
         asyncio.run(stream.__anext__())
 
 
-def test_nemo_gym_postprocess_uses_batch_decode():
+@pytest.mark.parametrize(
+    "actor_cfg",
+    [{}, {"decode_prompt_strs": True}],
+    ids=["decode_prompt_strs_omitted", "decode_prompt_strs_true"],
+)
+def test_nemo_gym_postprocess_uses_batch_decode(actor_cfg):
+    """Omitted and explicit decode_prompt_strs=true both decode prompt_str."""
+
     class _Tokenizer:
         def __init__(self):
             self.batch_decode_calls = []
@@ -1454,7 +1461,7 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     }
 
     class _MockSelf:
-        cfg = {}
+        cfg = actor_cfg
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
@@ -1522,6 +1529,12 @@ def test_nemo_gym_postprocess_can_skip_prompt_decode():
         [4, 5],
         [6, 7],
     ]
+    for assistant_message, expected_logprobs in zip(
+        result["message_log"][1::2], [[-0.1], [-0.2, -0.3]]
+    ):
+        assert torch.equal(
+            assistant_message["generation_logprobs"], torch.tensor(expected_logprobs)
+        )
     for item, generation_str in zip(
         nemo_gym_result["response"]["output"], ["3", "6 7"]
     ):
