@@ -49,7 +49,6 @@ from nemo_rl.algorithms.grpo import (
     _initial_policy_generation_stale,
     _maybe_restore_async_replay_buffer_checkpoint,
     _needs_hf_refit_handshake,
-    _next_step_runs_validation,
     _raise_if_length_penalty_enabled_without_nemo_gym,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
@@ -5603,7 +5602,7 @@ def test_next_step_runs_validation_for_timeout_budget(overrides, expected):
         is_last_step=False,
     )
     kwargs.update(overrides)
-    assert _next_step_runs_validation(**kwargs) is expected
+    assert grpo_mod._next_step_runs_validation(**kwargs) is expected
 
 
 # ============================================================================
