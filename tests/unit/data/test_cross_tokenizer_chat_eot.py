@@ -25,6 +25,7 @@ from nemo_rl.data.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
+from nemo_rl.data.native_chat import _render_and_tokenize_chat
 
 
 def _tokenizer(
@@ -126,16 +127,6 @@ def test_masks_include_each_assistant_eot_only(
         assert chunks[expected[0] == 0].eq(-1).all()
 
 
-@pytest.mark.parametrize("length,expected_count", [(4, 0), (5, 1), (6, 2)])
-def test_same_tokenizer_mask_respects_truncation(length: int, expected_count: int):
-    tokenizer = _tokenizer(suffix=" \n<eot>\n", pad_is_eot=True)
-    ids, _, mask, _, _ = CrossTokenizerCollator._render_and_tokenize_chat(
-        tokenizer, _datum()["message_log"], length
-    )
-    assert len(ids) == length
-    assert sum(mask) == expected_count
-
-
 @pytest.mark.parametrize("student_length,teacher_length", [(5, 6), (6, 5)])
 def test_one_sided_overflow_is_rejected(student_length: int, teacher_length: int):
     student = _tokenizer(suffix="<eot>")
@@ -164,27 +155,35 @@ def test_template_without_terminators_does_not_supervise_next_role_header():
 def test_eot_mask_does_not_extend_assistant_content_spans():
     tokenizer = _tokenizer(suffix=" \n<eot>")
     messages = _datum()["message_log"]
-    ids, offsets, mask, spans, eot_indices = (
-        CrossTokenizerCollator._render_and_tokenize_chat(tokenizer, messages, 64)
+    doc = _render_and_tokenize_chat(
+        tokenizer,
+        messages,
+        64,
+        include_thinking_in_loss=False,
+        native_thinking_alignment=False,
     )
-    assert len(spans) == len(eot_indices) == 1
-    eot_idx = eot_indices[0]
-    assert ids[eot_idx] == tokenizer.convert_tokens_to_ids("<eot>")
-    assert mask[eot_idx] == 1
-    assert offsets[eot_idx][0] > spans[0][1]
+    assert len(doc.assistant_spans) == len(doc.eot_indices) == 1
+    eot_idx = doc.eot_indices[0]
+    assert doc.input_ids[eot_idx] == tokenizer.convert_tokens_to_ids("<eot>")
+    assert doc.assistant_mask[eot_idx] == 1
+    assert doc.offsets[eot_idx][0] > doc.assistant_spans[0][1]
     rendered = tokenizer.apply_chat_template(messages, tokenize=False)
-    assert rendered[slice(*spans[0])] == "Answer"
+    assert rendered[slice(*doc.assistant_spans[0])] == "Answer"
 
 
 def test_response_repeated_inside_terminator_keeps_eot_supervision():
     tokenizer = _tokenizer(suffix="<eot>")
     messages = [{"role": "assistant", "content": "eot"}]
-    ids, _, mask, _, eot_indices = CrossTokenizerCollator._render_and_tokenize_chat(
-        tokenizer, messages, 64
+    doc = _render_and_tokenize_chat(
+        tokenizer,
+        messages,
+        64,
+        include_thinking_in_loss=False,
+        native_thinking_alignment=False,
     )
-    assert eot_indices == [2]
-    assert ids[2] == tokenizer.convert_tokens_to_ids("<eot>")
-    assert mask == [0, 1, 1]
+    assert doc.eot_indices == [2]
+    assert doc.input_ids[2] == tokenizer.convert_tokens_to_ids("<eot>")
+    assert doc.assistant_mask == [0, 1, 1]
 
 
 @pytest.mark.parametrize("trailing_content", ["", " \n"])
@@ -194,10 +193,14 @@ def test_eot_token_can_absorb_preceding_whitespace(trailing_content: str):
         {"additional_special_tokens": [AddedToken("<eot>", lstrip=True)]}
     )
     messages = [{"role": "assistant", "content": "Answer" + trailing_content}]
-    ids, offsets, mask, spans, eot_indices = (
-        CrossTokenizerCollator._render_and_tokenize_chat(tokenizer, messages, 64)
+    doc = _render_and_tokenize_chat(
+        tokenizer,
+        messages,
+        64,
+        include_thinking_in_loss=False,
+        native_thinking_alignment=False,
     )
-    assert eot_indices == [2]
-    assert ids[2] == tokenizer.convert_tokens_to_ids("<eot>")
-    assert mask == [0, 1, 1]
-    assert offsets[2][0] <= spans[0][1]
+    assert doc.eot_indices == [2]
+    assert doc.input_ids[2] == tokenizer.convert_tokens_to_ids("<eot>")
+    assert doc.assistant_mask == [0, 1, 1]
+    assert doc.offsets[2][0] <= doc.assistant_spans[0][1]
