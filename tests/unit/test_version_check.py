@@ -24,6 +24,43 @@ import pytest
 from nemo_rl import _check_container_fingerprint
 
 
+def _run_fingerprint_check(monkeypatch, *, current, container, ignore=False):
+    """Drive `_check_container_fingerprint` with mocked fingerprints."""
+    import json
+
+    monkeypatch.setenv("NRL_CONTAINER", "1")
+    if ignore:
+        monkeypatch.setenv("NRL_IGNORE_VERSION_MISMATCH", "1")
+    else:
+        monkeypatch.delenv("NRL_IGNORE_VERSION_MISMATCH", raising=False)
+
+    current_json = json.dumps(current, indent=2, sort_keys=True)
+    container_json = json.dumps(container, indent=2, sort_keys=True)
+
+    def mock_run_path(path, run_name=None):
+        print(current_json)
+
+    with mock.patch("runpy.run_path", side_effect=mock_run_path):
+        with mock.patch("nemo_rl.Path") as mock_path:
+            mock_fp_script = mock.MagicMock()
+            mock_fp_script.exists.return_value = True
+
+            mock_container_fp_file = mock.MagicMock()
+            mock_container_fp_file.exists.return_value = True
+            mock_container_fp_file.read_text.return_value = container_json
+
+            def path_constructor(arg):
+                if "/opt/nemo_rl_container_fingerprint" in str(arg):
+                    return mock_container_fp_file
+                m = mock.MagicMock()
+                m.exists.return_value = True
+                m.__truediv__ = mock.MagicMock(return_value=mock_fp_script)
+                return m
+
+            mock_path.side_effect = path_constructor
+            _check_container_fingerprint()
+
+
 class TestContainerFingerprintCheck:
     """Test the container fingerprint check functionality."""
 
@@ -84,85 +121,28 @@ class TestContainerFingerprintCheck:
         # No exception raised
         assert True
 
-    @pytest.mark.skip(reason="Complex mocking - integration test more appropriate")
-    def test_check_raises_on_mismatch_without_ignore_flag(self, monkeypatch, tmp_path):
+    def test_check_raises_on_mismatch_without_ignore_flag(self, monkeypatch):
         """Test that check raises RuntimeError when fingerprints don't match."""
-        # Set up environment to simulate container
-        monkeypatch.setenv("NRL_CONTAINER", "1")
-        monkeypatch.delenv("NRL_IGNORE_VERSION_MISMATCH", raising=False)
+        with pytest.raises(RuntimeError, match="Container/Code Version Mismatch"):
+            _run_fingerprint_check(
+                monkeypatch,
+                current={"pyproject.toml": "current"},
+                container={"pyproject.toml": "container"},
+            )
 
-        # Create actual files with different fingerprints
-        container_fingerprint = "abc123def456"
-        code_fingerprint = "different999"
-
-        # Create a fake fingerprint script that just prints code_fingerprint
-        fake_script = tmp_path / "generate_fingerprint.py"
-        fake_script.write_text(f"#!/usr/bin/env python3\nprint('{code_fingerprint}')\n")
-
-        # Create container fingerprint file
-        container_fp_file = tmp_path / "nemo_rl_container_fingerprint"
-        container_fp_file.write_text(container_fingerprint)
-
-        # Patch Path to point to our temp files
-        original_path_init = Path.__init__
-
-        def mock_path_init(self, *args):
-            path_str = str(args[0]) if args else ""
-            if "/opt/nemo_rl_container_fingerprint" in path_str:
-                original_path_init(self, container_fp_file)
-            elif "generate_fingerprint.py" in path_str:
-                original_path_init(self, fake_script)
-            else:
-                original_path_init(self, *args)
-
-        with mock.patch.object(Path, "__init__", mock_path_init):
-            # Should raise RuntimeError
-            with pytest.raises(RuntimeError, match="Container/Code Version Mismatch"):
-                _check_container_fingerprint()
-
-    @pytest.mark.skip(reason="Complex mocking - integration test more appropriate")
     def test_check_logs_warning_with_ignore_flag(self, monkeypatch, caplog):
         """Test that check logs warning but continues when NRL_IGNORE_VERSION_MISMATCH is set."""
-        # Set up environment to simulate container with ignore flag
-        monkeypatch.setenv("NRL_CONTAINER", "1")
-        monkeypatch.setenv("NRL_IGNORE_VERSION_MISMATCH", "1")
+        import logging
 
-        # Create a mock fingerprint file with different fingerprint
-        container_fingerprint = "abc123def456"
-        code_fingerprint = "different999"
-
-        # Mock runpy to return a different fingerprint
-        def mock_run_path(path, run_name=None):
-            print(code_fingerprint)
-
-        with mock.patch("runpy.run_path", side_effect=mock_run_path):
-            # Mock the Path class
-            with mock.patch("nemo_rl.Path") as mock_path_class:
-                mock_repo_root = mock.MagicMock()
-                mock_fingerprint_script = mock.MagicMock()
-                mock_fingerprint_script.exists.return_value = True
-                mock_repo_root.__truediv__ = mock.MagicMock(
-                    return_value=mock_fingerprint_script
-                )
-
-                mock_container_fp = mock.MagicMock()
-                mock_container_fp.exists.return_value = True
-                mock_container_fp.read_text.return_value = container_fingerprint
-
-                def path_side_effect(arg):
-                    if str(arg) == "/opt/nemo_rl_container_fingerprint":
-                        return mock_container_fp
-                    return Path(arg)
-
-                mock_path_class.side_effect = path_side_effect
-
-                from nemo_rl import _check_container_fingerprint
-
-                # Should not raise, just log warning
-                _check_container_fingerprint()
-
-        # No exception raised
-        assert True
+        caplog.set_level(logging.WARNING)
+        _run_fingerprint_check(
+            monkeypatch,
+            current={"pyproject.toml": "current"},
+            container={"pyproject.toml": "container"},
+            ignore=True,
+        )
+        assert "Container/Code Version Mismatch" in caplog.text
+        assert "NRL_IGNORE_VERSION_MISMATCH is set" in caplog.text
 
     @pytest.mark.skip(reason="Complex mocking - integration test more appropriate")
     def test_check_handles_missing_fingerprint_file(self, monkeypatch):
