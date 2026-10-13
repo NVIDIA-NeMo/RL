@@ -36,21 +36,25 @@ export NUM_GEN_NODES=${NUM_GEN_NODES:-8}
 export SEGMENT_SIZE=${SEGMENT_SIZE:-8}
 export NUM_PROMPTS=${NUM_PROMPTS:-8}
 export NUM_GENERATIONS=${NUM_GENERATIONS:-4}
-export MAX_STEPS=${MAX_STEPS:-20}
+# Keep GRPO allocation-bounded.  Per-step checkpoints plus chained Slurm cycles
+# provide recovery; an artificial smoke-step cap must not terminate training.
+export MAX_STEPS=${MAX_STEPS:-1000000}
 # Children run concurrently with each other inside one episode, so a step's
 # episodes can hold more containers than rollouts; Harbor backend slots bound it.
 export AGENTIC_VBENCH_CONCURRENCY=${AGENTIC_VBENCH_CONCURRENCY:-$((NUM_PROMPTS * NUM_GENERATIONS))}
 # No compaction: the declared window is the policy's real 256k window.
 export AGENTIC_VBENCH_CONTEXT_TOKENS=${AGENTIC_VBENCH_CONTEXT_TOKENS:-262144}
+export AGENTIC_VBENCH_OUTPUT_TOKENS=${AGENTIC_VBENCH_OUTPUT_TOKENS:-8192}
+export AGENTIC_VBENCH_MAX_TURNS=${AGENTIC_VBENCH_MAX_TURNS:-32}
 # Full task budget (1800 s per episode); the GPU reaper exemption in launch_sc.sh
 # removes the kill-window reason for a shorter cap.
 export AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER=${AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER:-1.0}
 # Without compaction a 32-turn episode is one training row of its whole context.
-# On 8 training nodes rows of 92-93k tokens trained but a step holding 97k rows
-# OOM'd even with longer rows rejected (runs 2184181, 2184532); the ceiling moves
-# with image tokens and allocator state. Reject rows above 80k instead of
-# crashing the learner (rejected owners train nothing that step).
-export SUBAGENT_MAX_ROW_TOKENS=${SUBAGENT_MAX_ROW_TOKENS:-81920}
+# An 81,920-token ceiling was still unsafe on the 8-node TP8/EP16/CP1 learner:
+# run 2238533 completed step 0, then a near-80k multimodal row OOM'd the MoE
+# forward pass in step 1.  Keep the smoke at the production-tested 64k envelope;
+# rejected owners train nothing in that step instead of crashing all ranks.
+export SUBAGENT_MAX_ROW_TOKENS=${SUBAGENT_MAX_ROW_TOKENS:-65536}
 export SAVE_PERIOD=${SAVE_PERIOD:-1}
 export JOB_CYCLES=${JOB_CYCLES:-6}
 export SLURM_QOS=${SLURM_QOS:-short}
@@ -68,6 +72,10 @@ exec bash "$script_dir/smoke_off_32turns_256k.sh" \
   "+${agent}.opencode_subagents_enabled=true" \
   "+${agent}.opencode_subagent_max_depth=1" \
   "+${agent}.opencode_subagent_max_active=null" \
+  "+${agent}.max_turns=${AGENTIC_VBENCH_MAX_TURNS}" \
+  "+${agent}.model_context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS}" \
+  "+${agent}.model_output_capability_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS}" \
+  "+${agent}.opencode_delegation_prompt=${AGENTIC_VBENCH_DELEGATION_PROMPT}" \
   "+${agent}.opencode_compaction_auto=false" \
   "+${agent}.opencode_compaction_prune=false" \
   "$@"

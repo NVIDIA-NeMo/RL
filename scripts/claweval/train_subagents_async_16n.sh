@@ -23,6 +23,7 @@ export CLAW_EVAL_COMPACTION_PRUNE=false
 export CLAW_EVAL_TRAINING_MODE=subagent
 export CLAW_EVAL_SUBAGENTS_ENABLED=true
 export CLAW_EVAL_CONTEXT_TOKENS=${CLAW_EVAL_CONTEXT_TOKENS:-262144}
+export CLAW_EVAL_OUTPUT_TOKENS=${CLAW_EVAL_OUTPUT_TOKENS:-8192}
 export CLAW_EVAL_MAX_TURNS=${CLAW_EVAL_MAX_TURNS:-40}
 export CLAW_EVAL_CONCURRENCY=${CLAW_EVAL_CONCURRENCY:-$((NUM_PROMPTS * NUM_GENERATIONS))}
 export CLAW_EVAL_DELEGATION_PROMPT=${CLAW_EVAL_DELEGATION_PROMPT:-You may delegate suitable subtasks to subagents when useful. Review and integrate their results before producing the final answer.}
@@ -44,6 +45,10 @@ exec bash "$script_dir/run_sc.sh" \
   "+${agent}.opencode_subagents_enabled=true" \
   "+${agent}.opencode_subagent_max_depth=1" \
   "+${agent}.opencode_subagent_max_active=null" \
+  "+${agent}.max_turns=${CLAW_EVAL_MAX_TURNS}" \
+  "+${agent}.model_context_tokens=${CLAW_EVAL_CONTEXT_TOKENS}" \
+  "+${agent}.model_output_capability_tokens=${CLAW_EVAL_OUTPUT_TOKENS}" \
+  "+${agent}.opencode_delegation_prompt=${CLAW_EVAL_DELEGATION_PROMPT}" \
   "+${agent}.opencode_compaction_auto=false" \
   "+${agent}.opencode_compaction_prune=false" \
   "$@"
