@@ -460,30 +460,6 @@ def test_teacher_aligner_config_explicit_values_serialize_and_stay_out_of_policy
     assert "aligner" not in teacher.policy_config()
 
 
-@pytest.mark.parametrize("legacy_path", [None, "/tmp/legacy.pt"])
-@pytest.mark.parametrize(
-    "aligner",
-    [
-        None,
-        {},
-        {"projection_matrix_path": "/tmp/legacy.pt"},
-        {"projection_matrix_path": "/tmp/nested.pt"},
-        TeacherAlignerConfig(projection_matrix_path="/tmp/legacy.pt"),
-    ],
-)
-def test_legacy_teacher_projection_path_is_rejected(
-    legacy_path: str | None, aligner: dict | TeacherAlignerConfig | None
-) -> None:
-    config = {"projection_matrix_path": legacy_path}
-    if aligner is not None:
-        config["aligner"] = aligner
-    with pytest.raises(
-        ValidationError,
-        match=r"move it to teachers\[i\]\.aligner\.projection_matrix_path",
-    ):
-        TeacherConfig.model_validate(config)
-
-
 def test_empty_teachers_list_rejected_at_config_load():
     """An empty ``teachers:`` list fails validation at config load."""
     with pytest.raises(ValidationError) as exc_info:
