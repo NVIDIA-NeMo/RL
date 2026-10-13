@@ -667,6 +667,16 @@ def setup(
             f"backend='trtllm', got '{generation_config['backend']}'. Set it to "
             "false, or switch the backend."
         )
+    # The disagg frontends are only reachable over HTTP, so without NeMo-Gym
+    # the whole fleet would come up and fail at the first rollout instead.
+    if resolve_disagg_layout(generation_config).enabled and not should_use_nemo_gym(
+        master_config
+    ):
+        raise ValueError(
+            "policy.generation.disaggregation.enabled requires NeMo-Gym "
+            "rollouts (env.should_use_nemo_gym=true). Set it to false, or run "
+            "through the NeMo-Gym entrypoint."
+        )
 
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)

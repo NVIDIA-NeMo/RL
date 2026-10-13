@@ -572,7 +572,7 @@ def create_app(
         # 400 on these. They ride the declared fields instead
         # (choices[].token_ids, prompt_token_ids, logprobs) and the disagg
         # server's outbound adaptor re-attaches them to the message before Gym
-        # ever sees it -- see trtllm_disagg_server._attach_rollout_fields.
+        # ever sees it -- see trtllm_disagg_server.attach_rollout_fields.
         if disagg_params is None:
             msg_dict["prompt_token_ids"] = adj_prompt
             msg_dict["generation_token_ids"] = gen_token_ids

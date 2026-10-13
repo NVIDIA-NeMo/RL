@@ -214,7 +214,7 @@ class DisaggConfig(BaseModel, extra="allow"):
     num_frontend_workers: int = 1
 
     # Render and tokenize on the frontends instead of the prefill adapter,
-    # which is one process per engine and scales only by adding GPUs.
+    # which is one thread per engine and scales only by adding GPUs.
     # Frontends are CPU-only -- this is what num_frontend_workers buys.
     frontend_tokenize: bool = False
 

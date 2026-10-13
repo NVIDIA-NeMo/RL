@@ -19,8 +19,12 @@ from pydantic import BaseModel
 from nemo_rl.models.generation.interfaces import DisaggConfig, GenerationConfig
 
 
-class TrtllmDisaggServerConfig(BaseModel, extra="allow"):
-    """Forwarded verbatim to TRT-LLM's ``DisaggServerConfig`` -- nothing else.
+class TrtllmDisaggServerConfig(BaseModel, extra="forbid"):
+    """The ``DisaggServerConfig`` fields NeMo RL forwards to TRT-LLM.
+
+    ``extra="forbid"``: ``build_config`` forwards only the fields declared
+    here, so any other ``DisaggServerConfig`` key (``max_retries``, ...) would
+    pass validation and then silently do nothing.
 
     Not a :class:`DisaggConfig` subclass: the layout is a different thing, and
     inheriting would let this block declare layout keys nothing here reads.
@@ -163,12 +167,11 @@ def resolve_disagg_server_config(config: TrtllmConfig) -> TrtllmDisaggServerConf
 
     Kept separate from the layout rather than merged into one object: the two
     blocks answer different questions and go to different places -- the layout
-    sizes the engine fleet NeMo RL creates, this is forwarded verbatim to
-    TRT-LLM's ``DisaggServerConfig``.
+    sizes the engine fleet NeMo RL creates, this is forwarded to TRT-LLM's
+    ``DisaggServerConfig``.
     """
     raw = _as_dict(config["trtllm_cfg"].get("disagg_server"))
-    # A layout key here reads as configuration but nothing would apply it, and
-    # extra="allow" means pydantic would not complain either.
+    # Caught ahead of extra="forbid" only to point at where the key belongs.
     misplaced = sorted(set(raw) & set(DisaggConfig.model_fields))
     if misplaced:
         raise ValueError(

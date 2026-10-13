@@ -590,7 +590,10 @@ class TrtllmGeneration(GenerationInterface):
                         f"always tile: give every role tensor_parallel_size == "
                         f"GPUs per node (one engine per node), or make the replica "
                         f"width ({width}) divide GPUs per node (whole "
-                        f"replicas per node)."
+                        f"replicas per node). Engines are placed replica by "
+                        f"replica to keep each replica's KV handoff local, so "
+                        f"some mixed-TP layouts that would fit with a "
+                        f"different packing are rejected."
                     )
 
         if not tied_groups:

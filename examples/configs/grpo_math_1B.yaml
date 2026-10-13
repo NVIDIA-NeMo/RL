@@ -448,7 +448,7 @@ policy:
       num_frontend_workers: 1
       # Render the chat template and tokenize on the frontends instead of in
       # the prefill engine's adapter. Rendering cost grows with conversation
-      # length and the adapter is one process per prefill engine, which can
+      # length and the adapter is one thread per prefill engine, which can
       # only be scaled by adding GPUs; frontends are CPU-only, which is what
       # makes num_frontend_workers worth raising.
       frontend_tokenize: false

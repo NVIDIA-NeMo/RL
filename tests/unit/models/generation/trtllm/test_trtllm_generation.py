@@ -408,9 +408,15 @@ def test_the_layout_and_the_server_block_carry_disjoint_keys():
 
 
 def test_a_layout_key_under_disagg_server_is_rejected():
-    # extra="allow" would otherwise swallow it silently.
     with pytest.raises(ValueError, match="generation.disaggregation"):
         resolve_disagg_server_config(_config(disagg_server={"num_prefill_engines": 2}))
+
+
+def test_an_unforwarded_disagg_server_key_is_rejected():
+    # build_config forwards only the declared fields, so anything else would
+    # validate and then silently have no effect.
+    with pytest.raises(ValidationError, match="max_retries"):
+        resolve_disagg_server_config(_config(disagg_server={"max_retries": 5}))
 
 
 def test_a_plausible_but_wrong_router_is_rejected():

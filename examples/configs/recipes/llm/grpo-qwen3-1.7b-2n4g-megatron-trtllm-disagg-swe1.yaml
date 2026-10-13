@@ -39,8 +39,7 @@ policy:
         num_nodes: 1
     trtllm_cfg:
       # Per-role widths are identical here, so the top-level block is also the
-      # per-engine width; the override dicts below only carry the MoE split,
-      # which is a no-op for a dense model.
+      # per-engine width; no prefill_engine / decode_engine overrides are needed.
       tensor_parallel_size: 2
       precision: ${policy.precision}
       max_model_len: ${policy.max_total_sequence_length}

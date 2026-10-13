@@ -1,6 +1,6 @@
-# NemoRL<>TRTLLM Disaggregation Rollout  (Experimental)
+# NemoRL<>TRTLLM Disaggregation Rollout (Experimental)
 
-> **Experimental**: PD disaggregation is wired for the TensorRT-LLM backend on the  
+> **Experimental**: PD disaggregation is wired for the TensorRT-LLM backend on the
 > NeMo-Gym rollout path only.
 
 NeMo RL owns the *replica* (which engines exist, how they are placed, and their
@@ -9,8 +9,6 @@ delegates both the *KV handshake* and the *routing inside a replica* to the infe
 backend's own disaggregation front-end — for TensorRT-LLM, `OpenAIDisaggServer`.
 
 ## Design
-
-
 
 ### Topology
 
@@ -36,16 +34,17 @@ re-serializes the body, asks the routers, and makes two engine calls per turn.
 Chat-template rendering and tokenization are the expensive part of serving a turn on
 the CPU side, and they scale badly with conversation length: `build_spliced_prompt_ids`
 runs over the *whole* conversation, so a turn-30 request re-renders and re-tokenizes all
-30 turns. By default that work lands in the prefill adapter, which is one process per
-prefill engine — it can only be grown by adding prefill engines, i.e. GPUs.
+30 turns. By default that work lands in the prefill adapter, which is one thread inside
+each prefill engine's worker process — it can only be grown by adding prefill engines,
+i.e. GPUs.
 
 Disaggregation makes a cheaper place available. `frontend_tokenize` moves the rendering
-and tokenization onto the frontends, which attach `prompt_token_ids_b64` to the prefill leg
-so the adapter does no template work at all (a sample is shadow-validated prefill-side under
-`NRL_TRTLLM_TOKENIZE_SHADOW_RATE`, since the ids have to be bit-identical to what the
-adapter would have produced). Frontends are CPU-only actors with no GPU in their budget,
-so raising F spreads the tokenization cost over F processes at no GPU cost — this is what
-F is for, and what to size it against.
+and tokenization onto the frontends, which attach `prompt_token_ids_b64` to the prefill
+leg so the adapter does no template work at all (a sample is shadow-validated prefill-side
+under `NRL_TRTLLM_TOKENIZE_SHADOW_RATE`, since the ids have to be bit-identical to what
+the adapter would have produced). Frontends are CPU-only actors with no GPU in their
+budget, so raising F spreads the tokenization cost over F processes at no GPU cost — this
+is what F is for, and what to size it against.
 
 `TrtllmGeneration.dp_openai_server_base_urls` reports all N×F frontend URLs as one flat
 list, so NeMo-Gym sees "N×F instances" exactly as it sees N without disaggregation. Its
@@ -61,16 +60,17 @@ later turn reached a different frontend, that frontend would route it to a prefi
 that never saw the prefix — correct output, but a full re-prefill and the whole point of
 `ctx_router: conversation` lost.
 
-Replicas are disjoint: no engine belongs to two of them. That is what lets every frontend  
-keep its routing state in-process and removes any need for cross-replica coordination —  
+Replicas are disjoint: no engine belongs to two of them. That is what lets every frontend
+keep its routing state in-process and removes any need for cross-replica coordination —
 `coordinator_url` is `None`, even with F > 1.
 
 **Everything below the replica boundary is opaque to NeMo RL.** Once a request reaches a
 replica's `OpenAIDisaggServer`, that server alone decides which of its prefill engines
-serves the prefill, which of its decode engines serves the decode, whether a prefill leg is
-needed at all, and how the KV handshake between them is carried. NeMo RL never sees an individual
-engine on the request path; it only composes each replica's two pools and selects the
-router policies through `DisaggServerConfig` (see [Configuration](#configuration)).
+serves the prefill, which of its decode engines serves the decode, whether a prefill leg
+is needed at all, and how the KV handshake between them is carried. NeMo RL never sees an
+individual engine on the request path; it only composes each replica's two pools and
+selects the router policies through `DisaggServerConfig` (see
+[Configuration](#configuration)).
 
 The cost of that boundary is that context affinity is no longer free. When a replica had
 exactly one prefill engine, Gym's choice of URL *was* the choice of prefill engine. Now
@@ -86,19 +86,18 @@ Affinity is therefore established at three levels, and NeMo RL controls only the
 | prefill engine → ADP rank | which attention-DP rank holds the prefix | `ConversationParams.conversation_id` relayed on the request | none — a function of the id |
 
 The third row is why `trtllm_http_server` forwards the conversation id (Gym's session id,
-or the one the disagg service stamps onto `disaggregated_params` for its prefill/decode legs) to
-`llm.generate_async`: under attention-DP each rank owns a separate KV pool, so without the
-id a turn lands on an effectively random rank and re-prefills its history.
+sent as `conversation_params`; needs NVIDIA-NeMo/Gym#3582) to `llm.generate_async`: under
+attention-DP each rank owns a separate KV pool, so without the id a turn lands on an
+effectively random rank and re-prefills its history.
 
 ### Forming a replica
 
-`TrtllmGeneration` lays engines out replica by replica, contexts before generations, so  
-membership is positional and needs no negotiation. Once every engine has initialised and  
-reported its address, it builds the address pools for each replica — TRT-LLM still spells  
-the two legs ctx/gen on the wire, so `type='ctx'` entries for that replica's prefill  
-engines and `type='gen'` for its decode engines — and starts F  
-`DisaggServerActor`s against them, collecting one URL each. Those N×F URLs become  
-`dp_openai_server_base_urls`.
+`TrtllmGeneration` lays engines out replica by replica, contexts before generations, so
+membership is positional and needs no negotiation. Once every engine has initialised and
+reported its address, it builds the address pools for each replica — TRT-LLM still spells
+the two legs ctx/gen on the wire, so `type='ctx'` entries for that replica's prefill
+engines and `type='gen'` for its decode engines — and starts F `DisaggServerActor`s
+against them, collecting one URL each. Those N×F URLs become `dp_openai_server_base_urls`.
 
 Each frontend is a CPU-only Ray actor in its own process rather than a thread inside an
 engine worker: it is the request hot path for the whole replica, and sharing a process
@@ -107,25 +106,25 @@ properties are worth noting, all of which exist so a crashed frontend can come b
 *same* URL and Gym's sticky clients recover after their 5xx retries:
 
 - **Serving starts in `__init__`, not in `start()`.** Ray re-runs `__init__` on actor
-restart but never replays method calls. `start()` only waits for `/health` and asserts the
-serving thread is still alive.
+  restart but never replays method calls. `start()` only waits for `/health` and asserts
+  the serving thread is still alive.
 - **The node pin is hard.** Frontends spread round-robin over their own replica's engine
-nodes (`addrs[base + fe_idx % per_replica]`), so a frontend sits beside engines it talks
-to, and restarts are unlimited.
+  nodes (`addrs[base + fe_idx % per_replica]`), so a frontend sits beside engines it talks
+  to, and restarts are unlimited.
 - **Ports are deterministic**: `frontend_base_port + replica_idx * num_frontend_workers +
-frontend_idx`. Both indices are needed — several replicas can share a node, and an offset
-carrying only `frontend_idx` would have every replica's frontend 0 ask for the same port.
-That failure is silent: `uvicorn`'s bind failure calls `sys.exit(1)`, which only unwinds
-the daemon thread, and the `/health` probe is then answered 200 by whichever frontend won
-the bind. Hence the liveness assert in `start()`.
+  frontend_idx`. Both indices are needed — several replicas can share a node, and an
+  offset carrying only `frontend_idx` would have every replica's frontend 0 ask for the
+  same port. That failure is silent: `uvicorn`'s bind failure calls `sys.exit(1)`, which
+  only unwinds the daemon thread, and the `/health` probe is then answered 200 by
+  whichever frontend won the bind. Hence the liveness assert in `start()`.
 
 Every engine — context and generation alike — therefore has to run its own HTTP server,
 because an address is the only way `OpenAIDisaggServer` can reach one. That is the sole
 thing it is given about an engine.
 
 NeMo RL still created those engines and still holds their Ray actor handles, so refit does
-not go through the disagg server at all: `TrtllmGeneration` drives the engines directly, as
-it does without disaggregation. The same is true of sleep/wake, prefix-cache reset and
+not go through the disagg server at all: `TrtllmGeneration` drives the engines directly,
+as it does without disaggregation. The same is true of sleep/wake, prefix-cache reset and
 profiling. Delegation is confined to the request path; the control plane is unchanged.
 
 ### Node affinity
@@ -141,21 +140,20 @@ an engine is wider than a node it should at least stay inside one *segment* — 
 `segment_size` nodes of a single NVLink domain that `RayVirtualCluster` aligns placement
 to.
 
-**A replica should fit inside one node, or failing that one segment.** The prefill→decode KV
-transfer happens entirely within a replica, so its cost is set by the slowest link any of
-that replica's engines has to cross. A replica straddling a segment boundary pays network
-bandwidth on every handoff, and it pays it per turn.
+**A replica should fit inside one node, or failing that one segment.** The prefill→decode
+KV transfer happens entirely within a replica, so its cost is set by the slowest link any
+of that replica's engines has to cross. A replica straddling a segment boundary pays
+network bandwidth on every handoff, and it pays it per turn.
 
-Engines are laid out replica by replica with same-role engines contiguous, which keeps each role's GPUs adjacent.
+Engines are laid out replica by replica with same-role engines contiguous, which keeps
+each role's GPUs adjacent.
 
 Which of the two boundaries actually costs depends on the platform:
 
 - **HGX, 8 GPUs per node** — the NVLink domain *is* the node, so crossing one drops
-straight to the network. The node boundary is what matters.
+  straight to the network. The node boundary is what matters.
 - **GB200 NVL72** — Ray sees 4 GPUs per node and 18 of those nodes share one NVLink
-domain, so crossing a node is cheap. The segment is the boundary worth respecting.
-
-
+  domain, so crossing a node is cheap. The segment is the boundary worth respecting.
 
 ## Refit safety
 
@@ -240,7 +238,7 @@ single source of truth everything else derives from:
  \___________ replica 0 ___________/  \____ replica 1 ...
 ```
 
-Same-role engines are contiguous within a replica, which keeps each role's block of GPUs  
+Same-role engines are contiguous within a replica, which keeps each role's block of GPUs
 adjacent. The replica *count* is derived from the inference cluster's size rather than
 configured — `num_replicas = inference_GPUs / replica_width`, the same rule the DP-shard
 count follows without disaggregation — so `replica_width` must divide the inference GPU

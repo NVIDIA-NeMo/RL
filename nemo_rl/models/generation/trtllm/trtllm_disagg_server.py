@@ -294,7 +294,7 @@ def _build_adaptor_class() -> type:
         Note the outbound translation only moves fields that already survived
         the engine -> disagg-server hop. It cannot rescue a field the engine
         emitted that ``ChatCompletionResponse`` does not declare; those have to
-        travel in a declared field (see ``_generation_token_ids``).
+        travel in a declared field (see ``generation_token_ids``).
         """
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
