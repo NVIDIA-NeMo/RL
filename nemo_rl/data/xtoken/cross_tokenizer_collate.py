@@ -47,7 +47,10 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
 from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.data.native_chat import RenderedChatDocument, _render_and_tokenize_chat
+from nemo_rl.data.xtoken.native_chat import (
+    RenderedChatDocument,
+    _render_and_tokenize_chat,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
