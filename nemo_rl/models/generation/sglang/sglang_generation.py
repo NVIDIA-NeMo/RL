@@ -905,8 +905,8 @@ class SGLangGeneration(GenerationInterface):
         return []
 
     def prepare_refit_info(
-        self, state_dict_info: dict[str, Any] | None
-    ) -> list[str] | None:
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
         return None
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
