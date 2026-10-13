@@ -96,7 +96,7 @@ uv run python -m tools.x_token.minimal_projection_via_multitoken \
 
 uv run coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PROJECT_ROOT/nemo_rl" \
     examples/run_xtoken_off_policy_distillation.py \
-    --config tests/functional/xtoken_native_chat.yaml \
+    --config examples/configs/xtoken_native_chat.yaml \
     teachers.0.aligner.projection_matrix_path="$CHAT_PROJ_PATH" \
     data.train.data_path="$CHAT_DATA_PATH" \
     logger.log_dir="$CHAT_LOG_DIR" \
