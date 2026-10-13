@@ -79,6 +79,22 @@ class TestParse:
         with pytest.raises(ValueError, match=match):
             _parse_straggler_cutoff(raw)
 
+    @pytest.mark.parametrize(
+        "key", ["done_fraction", "grace_s", "min_elapsed_s", "max_wall_s"]
+    )
+    @pytest.mark.parametrize(
+        "value", [float("nan"), float("inf"), -float("inf"), "nan", "-inf"]
+    )
+    def test_rejects_non_finite_values(self, key, value):
+        # NaN passes every range check (each comparison is false) and would leave
+        # a cutoff that never fires; an infinite timer never fires either.
+        with pytest.raises(ValueError, match=f"{key} must be finite"):
+            _parse_straggler_cutoff({"enabled": True, key: value})
+
+    def test_rejects_non_numeric_values(self):
+        with pytest.raises(ValueError, match="grace_s must be a number"):
+            _parse_straggler_cutoff({"enabled": True, "grace_s": "soon"})
+
     def test_actor_config_keeps_the_block_out_of_gyms_global_config(self):
         cfg = _build_gym_actor_config(
             {"straggler_cutoff": {"enabled": True, "grace_s": 60}, "some_server": {}},
@@ -94,6 +110,16 @@ class TestParse:
         with pytest.raises(ValueError, match="done_fraction"):
             _build_gym_actor_config(
                 {"straggler_cutoff": {"enabled": True, "done_fraction": 2}},
+                base_urls=["http://x"],
+                model_name="m",
+                enable_router_replay=False,
+                use_fastokens=False,
+            )
+
+    def test_actor_config_rejects_non_finite_timers_on_the_driver(self):
+        with pytest.raises(ValueError, match="grace_s must be finite"):
+            _build_gym_actor_config(
+                {"straggler_cutoff": {"enabled": True, "grace_s": float("nan")}},
                 base_urls=["http://x"],
                 model_name="m",
                 enable_router_replay=False,

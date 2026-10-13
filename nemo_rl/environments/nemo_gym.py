@@ -353,12 +353,32 @@ class StragglerCutoffConfig:
     max_wall_s: Optional[float] = None
 
 
+def _finite_straggler_cutoff_value(key: str, value: Any) -> float:
+    """Return ``value`` as a finite float, naming the offending key otherwise.
+
+    Raises:
+        ValueError: If ``value`` is not a number, or is NaN or infinite.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"env.nemo_gym.straggler_cutoff.{key} must be a number, got {value!r}"
+        ) from error
+    if not math.isfinite(number):
+        raise ValueError(
+            f"env.nemo_gym.straggler_cutoff.{key} must be finite, got {value!r}"
+        )
+    return number
+
+
 def _parse_straggler_cutoff(raw: Any) -> Optional[StragglerCutoffConfig]:
     """Validate ``env.nemo_gym.straggler_cutoff``; ``None`` (off) unless ``enabled`` is true.
 
     Raises:
-        ValueError: On an unknown key or an out-of-range value, so a typo cannot
-            silently leave the cutoff off or misconfigured.
+        ValueError: On an unknown key, a non-numeric or non-finite value, or an
+            out-of-range value, so a typo cannot silently leave the cutoff off
+            or misconfigured.
     """
     if raw is None:
         return None
@@ -376,11 +396,25 @@ def _parse_straggler_cutoff(raw: Any) -> Optional[StragglerCutoffConfig]:
         return None
     defaults = StragglerCutoffConfig()
     max_wall_s = raw.get("max_wall_s")
+    # Finiteness before the range checks: NaN compares false against every
+    # bound, so it would pass them, and then the cutoff would never fire (a NaN
+    # grace collapses the wait to zero and the decision never trips); an
+    # infinite grace never fires either.
     cutoff = StragglerCutoffConfig(
-        done_fraction=float(raw.get("done_fraction", defaults.done_fraction)),
-        grace_s=float(raw.get("grace_s", defaults.grace_s)),
-        min_elapsed_s=float(raw.get("min_elapsed_s", defaults.min_elapsed_s)),
-        max_wall_s=float(max_wall_s) if max_wall_s is not None else None,
+        done_fraction=_finite_straggler_cutoff_value(
+            "done_fraction", raw.get("done_fraction", defaults.done_fraction)
+        ),
+        grace_s=_finite_straggler_cutoff_value(
+            "grace_s", raw.get("grace_s", defaults.grace_s)
+        ),
+        min_elapsed_s=_finite_straggler_cutoff_value(
+            "min_elapsed_s", raw.get("min_elapsed_s", defaults.min_elapsed_s)
+        ),
+        max_wall_s=(
+            _finite_straggler_cutoff_value("max_wall_s", max_wall_s)
+            if max_wall_s is not None
+            else None
+        ),
     )
     if not 0.0 < cutoff.done_fraction <= 1.0:
         raise ValueError(
