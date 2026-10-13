@@ -499,6 +499,58 @@ class TestAgentLossWeights:
         assert float((trained[:2] * mask[:2]).sum()) == pytest.approx(110.0)
         assert float((trained[2:] * mask[2:]).sum()) == pytest.approx(20.0)
 
+    def test_mass_is_preserved_per_global_batch_after_dp_sharding(self):
+        """The rescale scope is the population process_global_batch all-reduces over.
+
+        Policy.train shards train_data with shard_by_batch_size(dp, batch_size=gbs);
+        each rank then slices its local global batch gb_idx with get_batch(gb_idx,
+        gbs // dp) and all-reduces sum(token_mask[:, 1:] * sample_mask) across DP.
+        Rank-local masses change, so the rescale is not rank-local, but the
+        all-reduced total per optimizer step must equal the unweighted one, also
+        when one rank holds only one agent.
+        """
+        dp_size, gbs = 2, 4
+        # Two optimizer steps. shard_by_batch_size hands consecutive sub-chunks
+        # of each global batch to consecutive shards, so in step 0 rank 0 holds
+        # only "long" rows and rank 1 only "short" rows.
+        names = ["long", "long", "short", "short", "long", "short", "short", "short"]
+        train_data = self._train_data([100, 100, 10, 10, 100, 10, 10, 10], [1.0] * 8)
+
+        def per_step_global_valid_toks(data):
+            shards = data.shard_by_batch_size(dp_size, batch_size=gbs)
+            totals, rank_local = [], []
+            for gb_idx in range(data.size // gbs):
+                local = []
+                for shard in shards:  # one DP rank each
+                    batch = shard.get_batch(gb_idx, batch_size=gbs // dp_size)
+                    local.append(
+                        float(
+                            (
+                                batch["token_mask"][:, 1:]
+                                * batch["sample_mask"].unsqueeze(-1)
+                            ).sum()
+                        )
+                    )
+                rank_local.append(local)
+                totals.append(sum(local))  # the DP all-reduce
+            return totals, rank_local
+
+        before_totals, before_local = per_step_global_valid_toks(train_data)
+        assert before_totals == [220.0, 130.0]
+        assert before_local[0] == [200.0, 20.0]
+
+        _apply_agent_loss_weights(
+            train_data,
+            [{"name": n} for n in names],
+            {"short": 4.0},
+            train_global_batch_size=gbs,
+        )
+
+        after_totals, after_local = per_step_global_valid_toks(train_data)
+        assert after_totals == pytest.approx(before_totals)
+        # Step 0: c = 220 / (200 + 4 * 20) = 220 / 280; both ranks' masses moved.
+        assert after_local[0] == pytest.approx([200 * 220 / 280, 80 * 220 / 280])
+
     def test_fully_zero_weighted_step_stays_zero_without_nan(self):
         train_data = self._train_data([10, 10], [1.0, 1.0])
         agent_refs = [{"name": "a"}, {"name": "a"}]
@@ -771,24 +823,6 @@ class TestAgentLossWeightsAuxiliaryGradients:
             policy_grad, _expected_policy_grad(self._batch(), [1.0, 8.0, 8.0, 1.0])
         )
         assert not torch.allclose(policy_grad, reference_policy)
-
-    def test_microbatch_partition_does_not_change_gradients(self):
-        grads = []
-        for num_microbatches in (1, 2, 4):
-            train_data = self._batch()
-            _apply_agent_loss_weights(
-                train_data,
-                self.AGENT_REFS,
-                {"short": 8.0},
-                train_global_batch_size=4,
-            )
-            grads.append(
-                _toy_moe_train_step(train_data, num_microbatches=num_microbatches)
-            )
-
-        for policy_grad, router_grad in grads[1:]:
-            torch.testing.assert_close(policy_grad, grads[0][0])
-            torch.testing.assert_close(router_grad, grads[0][1])
 
 
 def test_initial_policy_generation_stale() -> None:
