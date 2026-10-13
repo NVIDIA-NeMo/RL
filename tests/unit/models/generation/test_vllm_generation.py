@@ -21,6 +21,7 @@ import sys
 import threading
 import types
 import warnings
+from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ import pytest
 import ray
 import requests
 import torch
+from fastapi import FastAPI, Request
 from pydantic import ValidationError
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -944,9 +946,26 @@ def _nemo_gym_recognizes_context_overflow(
     )
 
 
-def _setup_fake_vllm_chat_handler(monkeypatch):
-    """Build the /v1/chat/completions handler against the fake vLLM modules."""
+def _setup_fake_vllm_chat_handler(
+    monkeypatch, *, with_cancellation: Callable[..., Any] | None = None
+):
+    """Build the /v1/chat/completions handler against the fake vLLM modules.
+
+    Args:
+        monkeypatch: The pytest fixture used to install the fake module tree.
+        with_cancellation: Route decorator to use instead of the stub, e.g. the
+            real pinned vLLM one. The stub only tags the handler.
+
+    Returns:
+        The worker, the fake OpenAIServingChat instance, and the route handler.
+    """
     _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
+    if with_cancellation is not None:
+        monkeypatch.setattr(
+            sys.modules["vllm.entrypoints.serve.utils.api_utils"],
+            "with_cancellation",
+            with_cancellation,
+        )
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker.cfg = {
@@ -1088,42 +1107,19 @@ async def test_media_capture_rejected_keeps_its_own_code(monkeypatch):
 @pytest.mark.asyncio
 async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch):
     """A client disconnect cancels the chat handler and releases its capture state."""
-    _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
-
-    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {
-        "temperature": 1.0,
-        "top_p": 1.0,
-        "val_temperature": 0.0,
-        "val_top_p": 1.0,
-        "vllm_cfg": {},
-    }
-    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
-    worker._http_engine_client = worker.llm
-    worker._capture_calls = {}
-    worker.token_capture = None
-    worker._abort_request_capture = MagicMock()
-    worker.llm_async_engine_args = MagicMock()
-    worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
-        served_model_name="served-model", model="model-path"
-    )
-
-    app = _FakeFastAPIApp()
-    worker._setup_vllm_openai_api_server(app)
-    chat_handler = next(
-        handler for path, handler in app.routes if path == "/v1/chat/completions"
-    )
-    # The route is wrapped with vLLM's with_cancellation.
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    # The route is wrapped with vLLM's with_cancellation (the stub tags it).
     assert getattr(chat_handler, "cancels_on_disconnect", False)
 
     started = asyncio.Event()
 
-    async def create_chat_completion(request, _raw_request):
+    async def create_chat_completion(_request, _raw_request):
         started.set()
         await asyncio.Event().wait()  # generation that never finishes
 
-    openai_serving_chat.instances[0].create_chat_completion = create_chat_completion
-    request = types.SimpleNamespace(top_k=-1, top_p=1.0, temperature=1.0)
+    serving_chat.create_chat_completion = create_chat_completion
+    request = _fake_chat_request()
+    token_capture = _track_request_capture(worker, request)
     task = asyncio.create_task(chat_handler(request, MagicMock()))
     await started.wait()
     # with_cancellation cancels the handler task on http.disconnect.
@@ -1131,9 +1127,63 @@ async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    worker._abort_request_capture.assert_called_once_with(
-        request, reason="client_disconnect"
+    token_capture.fail_call.assert_called_once_with("call", reason="client_disconnect")
+    assert id(request) not in worker._capture_calls
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_pinned_with_cancellation_aborts_chat_completion_on_http_disconnect(
+    monkeypatch,
+):
+    """vLLM's real with_cancellation cancels the route body on http.disconnect.
+
+    Contract check against the pinned vLLM decorator with a real Starlette
+    Request: the disconnect listener wins the race, the handler task is
+    cancelled while it awaits generation, and the capture state is released
+    with reason ``client_disconnect``. The serving layer and engine stay
+    stubbed, so this does not show that the engine itself aborts the request.
+    """
+    # Deferred import: the real vLLM package is only present in the vllm extra.
+    from vllm.entrypoints.serve.utils.api_utils import with_cancellation
+
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(
+        monkeypatch, with_cancellation=with_cancellation
     )
+    # functools.wraps exposes the route's own signature, which is how FastAPI
+    # still injects `raw_request: Request` through the wrapper.
+    assert chat_handler.__wrapped__.__name__ == "create_chat_completion"
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def create_chat_completion(_request, _raw_request):
+        started.set()
+        try:
+            await asyncio.Event().wait()  # generation that never finishes
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    serving_chat.create_chat_completion = create_chat_completion
+    request = _fake_chat_request()
+    token_capture = _track_request_capture(worker, request)
+    released = asyncio.Event()
+    token_capture.fail_call.side_effect = lambda *_args, **_kwargs: released.set()
+
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    raw_request = Request({"type": "http", "app": FastAPI()}, receive=receive_queue.get)
+    task = asyncio.create_task(chat_handler(request, raw_request))
+    await asyncio.wait_for(started.wait(), 1)
+    await receive_queue.put({"type": "http.disconnect"})
+
+    # The wrapper returns None once the disconnect listener wins, as in vLLM's
+    # own routes; the handler task is cancelled behind it.
+    assert await asyncio.wait_for(task, 1) is None
+    await asyncio.wait_for(released.wait(), 1)
+    assert cancelled.is_set()
+    token_capture.fail_call.assert_called_once_with("call", reason="client_disconnect")
+    assert id(request) not in worker._capture_calls
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
