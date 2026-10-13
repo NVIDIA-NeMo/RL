@@ -53,6 +53,198 @@ except ImportError:
     NEMO_AUTOMODEL_AVAILABLE = False
 
 
+def create_test_config(
+    model_name: str,
+    tp: int = 1,
+    cp: int = 1,
+    sp: bool = False,
+    cpu_offload: bool = False,
+    activation_checkpointing: bool = False,
+    custom_parallel_plan: str | None = None,
+    precision: str = "float32",
+    expert_parallel_size: int = 1,
+    sequence_packing_enabled: bool = False,
+    automodel_kwargs: AutomodelKwargs | None = None,
+    enable_loras: bool = False,
+) -> PolicyConfig:
+    config = {
+        "model_name": model_name,
+        "tokenizer": {"name": model_name},
+        "generation_batch_size": 1,  # Small batch size for testing
+        "train_global_batch_size": 4,
+        "train_micro_batch_size": 1,
+        "learning_rate": 5e-6,
+        "logprob_batch_size": 1,
+        "precision": precision,
+        "offload_optimizer_for_logprob": False,
+        "generation": {
+            "backend": "hf",
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": None,
+            "max_new_tokens": 16,  # Small number of tokens for testing
+            "stop_token_ids": None,
+            "stop_strings": None,
+            "colocated": {
+                "enabled": True,
+                "resources": {
+                    "gpus_per_node": None,
+                    "num_nodes": None,
+                },
+            },
+        },
+        "automodel_cfg": {
+            "enabled": True,
+            "checkpoint": {
+                "model_save_format": "safetensors",
+                "save_consolidated": "false",
+                "single_rank_consolidation": False,
+                "consolidation_timeout_minutes": 30,
+            },
+            "cpu_offload": cpu_offload,
+            "sequence_parallel": sp,
+            "activation_checkpointing": activation_checkpointing,
+            "tensor_parallel_size": tp,
+            "context_parallel_size": cp,
+            "custom_parallel_plan": custom_parallel_plan,
+            "expert_parallel_size": expert_parallel_size,
+            "lora_cfg": {
+                "enabled": enable_loras,
+                "target_modules": [],
+                "exclude_modules": [],
+                "match_all_linear": True,
+                "dim": 32,
+                "alpha": 32,
+                "dropout": 0.0,
+                "dropout_position": "post",
+                "lora_A_init": "xavier",
+                "use_triton": True,
+            },
+        },
+        "dynamic_batching": {
+            "enabled": True,
+            "train_mb_tokens": 128,
+            "logprob_mb_tokens": 128,
+            "sequence_length_round": 4,
+        },
+        "sequence_packing": {
+            "enabled": sequence_packing_enabled,
+            "train_mb_tokens": 128,
+        },
+        "optimizer": {
+            "name": "torch.optim.AdamW",
+            "kwargs": {
+                "lr": 5e-6,
+                "weight_decay": 0.01,
+                "betas": [0.9, 0.999],
+                "eps": 1e-8,
+                "foreach": False,
+                "fused": False,
+            },
+        },
+        "scheduler": {
+            "name": "torch.optim.lr_scheduler.CosineAnnealingLR",
+            "kwargs": {
+                "T_max": 100,
+            },
+        },
+        "max_grad_norm": 1.0,
+    }
+    if automodel_kwargs is not None:
+        config["automodel_cfg"]["automodel_kwargs"] = automodel_kwargs
+    return config
+
+
+def update_lora_config(
+    config: PolicyConfig,
+    enabled: bool = True,
+    target_modules: list[str] = [],
+    exclude_modules: list[str] = [],
+    match_all_linear: bool = True,
+    dim: int = 32,
+    alpha: int = 32,
+    dropout: float = 0.0,
+    dropout_position: str = "post",
+    lora_A_init: str = "xavier",
+    use_triton: bool = True,
+):
+    if enabled:
+        config["automodel_cfg"]["checkpoint"]["model_save_format"] = "safetensors"
+
+    config["automodel_cfg"]["lora_cfg"].update(
+        {
+            "enabled": enabled,
+            "target_modules": target_modules,
+            "exclude_modules": exclude_modules,
+            "match_all_linear": match_all_linear,
+            "dim": dim,
+            "alpha": alpha,
+            "dropout": dropout,
+            "dropout_position": dropout_position,
+            "lora_A_init": lora_A_init,
+            "use_triton": use_triton,
+        }
+    )
+
+
+def create_test_batch(
+    batch_size: int = 8,
+    seq_len: int = 128,
+    vocab_size: int = 32000,
+    mode: str = "train",
+) -> BatchedDataDict:
+    """Create a test batch for training or logprob computation."""
+    torch.manual_seed(66)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            **(
+                {
+                    "labels": torch.randint(0, vocab_size, (batch_size, seq_len)),
+                    "sample_mask": torch.ones(batch_size).cuda(),
+                }
+                if mode == "train"
+                else {}
+            ),
+        }
+    )
+    data = data.to("cpu")
+    return data
+
+
+def calculate_token_logprobs(model_name: str, data: BatchedDataDict):
+    data = data.to("cuda")
+    input_ids = data["input_ids"]
+
+    with torch.no_grad():
+        # run the log prob of regular hf model here
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name, device_map="cuda", torch_dtype=torch.float32
+        )
+        hf_model.eval()
+        outputs = hf_model(**data)
+
+    log_probs = torch.nn.functional.log_softmax(
+        outputs.logits.to(torch.float32), dim=-1
+    )
+    next_tokens = input_ids[:, 1:]
+    log_probs = log_probs[:, :-1]
+    token_logprobs = log_probs.gather(dim=-1, index=next_tokens.unsqueeze(-1)).squeeze(
+        -1
+    )
+    token_logprobs = torch.cat(
+        [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
+    ).cpu()
+
+    data = data.to("cpu")
+    return token_logprobs
+
+
 class _FakeTrainableModel:
     def __init__(self):
         self.train_called = False
@@ -147,138 +339,6 @@ def test_update_moe_gate_bias_noop_when_unsupported():
 
     # Should be a no-op and must not raise.
     AutomodelPolicyWorkerImpl._update_moe_gate_bias_if_supported(worker)
-
-
-def create_test_config(
-    model_name: str,
-    tp: int = 1,
-    cp: int = 1,
-    sp: bool = False,
-    cpu_offload: bool = False,
-    activation_checkpointing: bool = False,
-    custom_parallel_plan: str | None = None,
-    precision: str = "float32",
-    expert_parallel_size: int = 1,
-    sequence_packing_enabled: bool = False,
-    automodel_kwargs: AutomodelKwargs | None = None,
-    enable_loras: bool = False,
-) -> PolicyConfig:
-    config = {
-        "model_name": model_name,
-        "tokenizer": {"name": model_name},
-        "generation_batch_size": 1,  # Small batch size for testing
-        "train_global_batch_size": 4,
-        "train_micro_batch_size": 1,
-        "learning_rate": 5e-6,
-        "logprob_batch_size": 1,
-        "precision": precision,
-        "offload_optimizer_for_logprob": False,
-        "generation": {
-            "backend": "hf",
-            "temperature": 1.0,
-            "top_p": 1.0,
-            "top_k": None,
-            "max_new_tokens": 16,  # Small number of tokens for testing
-            "stop_token_ids": None,
-            "stop_strings": None,
-            "colocated": {
-                "enabled": True,
-                "resources": {
-                    "gpus_per_node": None,
-                    "num_nodes": None,
-                },
-            },
-        },
-        "automodel_cfg": {
-            "enabled": True,
-            "checkpoint": {
-                "model_save_format": "safetensors",
-                "save_consolidated": "false",
-                "single_rank_consolidation": False,
-                "consolidation_timeout_minutes": 30,
-            },
-            "cpu_offload": cpu_offload,
-            "sequence_parallel": sp,
-            "activation_checkpointing": activation_checkpointing,
-            "tensor_parallel_size": tp,
-            "context_parallel_size": cp,
-            "custom_parallel_plan": custom_parallel_plan,
-            "expert_parallel_size": expert_parallel_size,
-            "lora": {
-                "enabled": enable_loras,
-                "target_modules": [],
-                "exclude_modules": [],
-                "match_all_linear": True,
-                "dim": 32,
-                "alpha": 32,
-                "dropout": 0.0,
-                "dropout_position": "post",
-                "lora_A_init": "xavier",
-                "use_triton": True,
-            },
-        },
-        "dynamic_batching": {
-            "enabled": True,
-            "train_mb_tokens": 128,
-            "logprob_mb_tokens": 128,
-            "sequence_length_round": 4,
-        },
-        "sequence_packing": {
-            "enabled": sequence_packing_enabled,
-            "train_mb_tokens": 128,
-        },
-        "optimizer": {
-            "name": "torch.optim.AdamW",
-            "kwargs": {
-                "lr": 5e-6,
-                "weight_decay": 0.01,
-                "betas": [0.9, 0.999],
-                "eps": 1e-8,
-                "foreach": False,
-                "fused": False,
-            },
-        },
-        "scheduler": {
-            "name": "torch.optim.lr_scheduler.CosineAnnealingLR",
-            "kwargs": {
-                "T_max": 100,
-            },
-        },
-        "max_grad_norm": 1.0,
-    }
-    if automodel_kwargs is not None:
-        config["automodel_cfg"]["automodel_kwargs"] = automodel_kwargs
-    return config
-
-
-def create_test_batch(
-    batch_size: int = 8,
-    seq_len: int = 128,
-    vocab_size: int = 32000,
-    mode: str = "train",
-) -> BatchedDataDict:
-    """Create a test batch for training or logprob computation."""
-    torch.manual_seed(66)
-    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
-    attention_mask = torch.ones(batch_size, seq_len)
-    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
-    data = BatchedDataDict(
-        {
-            "input_ids": input_ids,
-            "input_lengths": input_lengths,
-            "attention_mask": attention_mask,
-            **(
-                {
-                    "labels": torch.randint(0, vocab_size, (batch_size, seq_len)),
-                    "sample_mask": torch.ones(batch_size).cuda(),
-                }
-                if mode == "train"
-                else {}
-            ),
-        }
-    )
-    data = data.to("cpu")
-    return data
 
 
 @pytest.fixture(scope="module")
@@ -959,66 +1019,6 @@ def test_fresh_run_with_reference_model_does_not_defer(monkeypatch):
     assert setup_mock.call_args.kwargs["weights_path"] is None
     load_mock.assert_not_called()
     assert worker.reference_model_state_dict == {"ref": "state"}
-
-
-def update_lora_config(
-    config: PolicyConfig,
-    enabled: bool = True,
-    target_modules: list[str] = [],
-    exclude_modules: list[str] = [],
-    match_all_linear: bool = True,
-    dim: int = 32,
-    alpha: int = 32,
-    dropout: float = 0.0,
-    dropout_position: str = "post",
-    lora_A_init: str = "xavier",
-    use_triton: bool = True,
-):
-    if enabled:
-        config["automodel_cfg"]["checkpoint"]["model_save_format"] = "safetensors"
-
-    config["automodel_cfg"]["lora"].update(
-        {
-            "enabled": enabled,
-            "target_modules": target_modules,
-            "exclude_modules": exclude_modules,
-            "match_all_linear": match_all_linear,
-            "dim": dim,
-            "alpha": alpha,
-            "dropout": dropout,
-            "dropout_position": dropout_position,
-            "lora_A_init": lora_A_init,
-            "use_triton": use_triton,
-        }
-    )
-
-
-def calculate_token_logprobs(model_name: str, data: BatchedDataDict):
-    data = data.to("cuda")
-    input_ids = data["input_ids"]
-
-    with torch.no_grad():
-        # run the log prob of regular hf model here
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            model_name, device_map="cuda", torch_dtype=torch.float32
-        )
-        hf_model.eval()
-        outputs = hf_model(**data)
-
-    log_probs = torch.nn.functional.log_softmax(
-        outputs.logits.to(torch.float32), dim=-1
-    )
-    next_tokens = input_ids[:, 1:]
-    log_probs = log_probs[:, :-1]
-    token_logprobs = log_probs.gather(dim=-1, index=next_tokens.unsqueeze(-1)).squeeze(
-        -1
-    )
-    token_logprobs = torch.cat(
-        [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
-    ).cpu()
-
-    data = data.to("cpu")
-    return token_logprobs
 
 
 def _base_setup_impl(request, cluster):
