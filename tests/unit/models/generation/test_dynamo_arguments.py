@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import warnings
 
 import pytest
@@ -95,12 +96,54 @@ def _flag_value(argv: list[str], flag: str) -> str:
 
 
 def test_config_derives_world_size_and_rejects_removed_public_fields() -> None:
-    assert DynamoConfig.model_validate(_config()).engine_world_size == 2
+    validated = DynamoConfig.model_validate(_config())
+    assert validated.engine_world_size == 2
+    assert validated.dynamo_cfg.disaggregation is None
     for field in ("engine_world_size", "namespace", "dynamo_python", "etcd_port"):
         with pytest.raises(ValidationError, match=field):
             DynamoConfig.model_validate(
                 _config(dynamo_cfg={field: 1 if field.endswith("port") else "x"})
             )
+
+
+def test_disaggregation_config_derives_and_validates_exact_resource_count() -> None:
+    config = _config()
+    config["dynamo_cfg"]["disaggregation"] = {
+        "prefill_workers": 2,
+        "decode_workers": 1,
+    }
+    config["colocated"]["resources"] = {"gpus_per_node": 6, "num_nodes": 1}
+
+    validated = DynamoConfig.model_validate(config)
+    assert validated.managed_worker_count == 3
+    assert validated.managed_inference_world_size == 6
+
+    config["colocated"]["resources"]["num_nodes"] = None
+    DynamoConfig.model_validate(config)
+
+    config["colocated"]["resources"]["gpus_per_node"] = 4
+    with pytest.raises(ValidationError, match="configured=4, expected=6"):
+        DynamoConfig.model_validate(config)
+
+
+@pytest.mark.parametrize(
+    ("resources", "match"),
+    [
+        (None, "colocated.resources to be set"),
+        ({"gpus_per_node": None, "num_nodes": 1}, "explicit.*gpus_per_node"),
+    ],
+)
+def test_disaggregation_config_requires_inference_resources(resources, match) -> None:
+    config = _config()
+    config["dynamo_cfg"]["disaggregation"] = {
+        "prefill_workers": 1,
+        "decode_workers": 1,
+    }
+    if resources is not None:
+        config["colocated"]["resources"] = resources
+
+    with pytest.raises(ValidationError, match=match):
+        DynamoConfig.model_validate(config)
 
 
 @pytest.mark.parametrize(
@@ -249,6 +292,8 @@ def test_worker_argv_translates_structured_fields_and_warns_unclassified() -> No
         vllm_cfg=vllm_cfg,
         vllm_kwargs={"max_num_seqs": 16, "hf_overrides": {"rope_theta": 1e6}},
         dynamo_cfg=cfg,
+        worker_role="aggregated",
+        kv_event_port=None,
     )
 
     assert _flag_value(argv, "--model") == "model"
@@ -258,6 +303,41 @@ def test_worker_argv_translates_structured_fields_and_warns_unclassified() -> No
     assert _flag_value(argv, "--max-num-seqs") == "16"
     assert _flag_value(argv, "--hf-overrides") == '{"rope_theta":1000000.0}'
     assert "--enable-expert-parallel" in argv
+
+
+def test_disaggregated_worker_argv_owns_role_and_nixl_configuration() -> None:
+    cfg = DynamoCfg.model_validate(_dynamo_cfg())
+    common = {
+        "model_name": "model",
+        "namespace": "nemo-rl-1",
+        "seed": 7,
+        "vllm_cfg": _config()["vllm_cfg"],
+        "vllm_kwargs": {},
+        "dynamo_cfg": cfg,
+    }
+    decode_argv = build_dynamo_vllm_argv(
+        **common,
+        worker_role="decode",
+        kv_event_port=None,
+    )
+    prefill_argv = build_dynamo_vllm_argv(
+        **common,
+        worker_role="prefill",
+        kv_event_port=4201,
+    )
+
+    nixl_config = '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+    assert _flag_value(decode_argv, "--disaggregation-mode") == "decode"
+    assert _flag_value(decode_argv, "--kv-transfer-config") == nixl_config
+    assert "--kv-events-config" not in decode_argv
+    assert _flag_value(prefill_argv, "--disaggregation-mode") == "prefill"
+    assert _flag_value(prefill_argv, "--kv-transfer-config") == nixl_config
+    assert json.loads(_flag_value(prefill_argv, "--kv-events-config")) == {
+        "enable_kv_cache_events": True,
+        "endpoint": "tcp://*:4201",
+        "publisher": "zmq",
+        "topic": "kv-events",
+    }
 
 
 def test_worker_argv_rejects_replaced_and_managed_options() -> None:
@@ -277,6 +357,8 @@ def test_worker_argv_rejects_replaced_and_managed_options() -> None:
             vllm_cfg=_config()["vllm_cfg"],
             vllm_kwargs={},
             dynamo_cfg=DynamoCfg.model_validate(config),
+            worker_role="aggregated",
+            kv_event_port=None,
         )
 
 
@@ -359,6 +441,8 @@ def test_every_worker_config_field_reaches_argv(monkeypatch) -> None:
         vllm_cfg=_config()["vllm_cfg"],
         vllm_kwargs={},
         dynamo_cfg=cfg,
+        worker_role="aggregated",
+        kv_event_port=None,
     )
 
     configured_fields = {

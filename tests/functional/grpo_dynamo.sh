@@ -29,7 +29,7 @@ git config --global --add safe.directory "${PROJECT_ROOT}"
 
 dynamo_python=/opt/dynamo_venv/bin/python
 "${dynamo_python}" -c \
-  'import importlib.metadata as m; assert m.version("ai-dynamo") == "1.3.0.post1"; assert m.version("vllm") == "0.23.0"'
+  'import importlib.metadata as m; assert m.version("ai-dynamo") == "1.3.0.post1"; assert m.version("vllm") == "0.23.0"; assert m.version("nixl") == "1.1.0"; assert m.version("nixl-cu13") == "1.1.0"'
 grep -Fqx \
   'vllm PR #44814 merge commit c9e5bf813530fb9ce06024e075da0f520b0718c8' \
   /opt/dynamo_venv/VLLM_BACKPORTS
