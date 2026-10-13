@@ -692,6 +692,16 @@ class TestTimeoutChecker:
         checker.mark_iteration()
         assert checker.would_save(extra_s=1000.0) is False
 
+    def test_mark_iteration_without_start_iterations(self, monkeypatch):
+        now = [0.0]
+        monkeypatch.setattr("nemo_rl.utils.timer.time.time", lambda: now[0])
+        checker = TimeoutChecker(timeout="00:00:10:00", fit_last_save_time=True)
+        checker.mark_iteration()  # no start_iterations(): starts the first iteration
+        assert checker.iteration_times == []
+        now[0] += 200.0
+        checker.mark_iteration()
+        assert checker.iteration_times == [200.0]
+
     def test_iteration_tracking(self):
         checker = TimeoutChecker()
         checker.start_iterations()

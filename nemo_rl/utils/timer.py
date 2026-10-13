@@ -496,12 +496,14 @@ class TimeoutChecker:
     def start_iterations(self):
         self.previous_iteration_time = time.time()
 
-    def mark_iteration(self):
+    def mark_iteration(self) -> None:
         sys.stdout.flush()
         sys.stderr.flush()
 
         current_time = time.time()
-        if self.previous_iteration_time is not None:
-            elapsed_time = current_time - self.previous_iteration_time
+        if self.previous_iteration_time is None:
+            # Without start_iterations(), the first mark starts the first iteration.
             self.previous_iteration_time = current_time
-        self.iteration_times.append(elapsed_time)
+            return
+        self.iteration_times.append(current_time - self.previous_iteration_time)
+        self.previous_iteration_time = current_time
