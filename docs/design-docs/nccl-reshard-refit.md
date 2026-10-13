@@ -63,7 +63,7 @@ single `ValueError` listing every violation. The current requirements are:
   stays GPU-resident across refit so
   persistent DDP/autograd views remain valid; ordinary gradient buffers and
   optimizer state are offloaded only when
-  `policy.generation.mcore_generation_config.offload_policy_before_refit` is true.
+  `policy.offload_policy_before_refit` is true.
 * **Bulk transfers use canonical HF layout.** Quantized sources are dequantized
   to `torch.bfloat16`; unquantized sources retain their original dtype.
   Source `ctx.buf`, advertised metadata, and receiver buffers share that dtype.
