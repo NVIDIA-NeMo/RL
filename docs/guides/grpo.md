@@ -379,7 +379,9 @@ baseline and token-level batch normalization, the `env_baseline` behind the
   with `mask_sample`, rows with a zero loss weight, truncated rows under
   `overlong_filtering`, and rows removed by sequence-logprob-error masking.
   Their rewards still shape their siblings' baselines although they contribute
-  no loss. This matches the all-rows behaviour of earlier releases.
+  no loss. For the legacy and TransferQueue loops this is the all-rows
+  behaviour of earlier releases; SingleController previously excluded these
+  rows (`valid_mask=final_sample_mask`) and now lets them vote under `include`.
 - `exclude`: only rows with a nonzero loss weight vote, using the masks known at
   each stage: the environment, pre-existing loss-weight and overlong masks
   before the logprob pass (dynamic-sampling admission, baseline/std,
@@ -394,10 +396,19 @@ baseline is `2/3` under `include` and `1` under `exclude`; with rewards `[0, 1]`
 and loss weights `[0.5, 0.5]` the baseline is `0.5` for both rows under either
 policy.
 
-SingleController excludes token-capture placeholder rows (data-plane
-`sample_mask` of `0`, no usable tokens) under both policies: an
-environment-masked row with a usable rollout is a masked reward, a placeholder
-is not. The legacy and TransferQueue trainers carry no placeholder rows.
+SingleController excludes rows whose data-plane `sample_mask` is `0` under both
+policies: token-capture placeholders (no usable tokens) and datums whose
+dataset-level `loss_multiplier` is `0`. An environment-masked row with a usable
+rollout is a masked reward, a placeholder is not. The legacy and TransferQueue
+trainers carry no placeholder rows and let dataset-zero-weight rows vote under
+`include`; a dataset-level weight is shared by the whole prompt group, so this
+does not move any trainable sibling's group baseline.
+
+Independently of the policy, the TransferQueue trainer now zeroes the loss
+weight of rows the environment flags with `mask_sample` after dynamic sampling
+and reports `num_mask_sample_filtered`, as the legacy loop does. Earlier
+releases ignored the flag in that trainer and trained those rows at full loss
+weight.
 
 The policy and reference logprob passes receive the statistics participation
 mask instead of the loss weights. Under top-k/top-p filtering the workers zero

@@ -414,10 +414,12 @@ class AdvantageComputer:
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
         # Statistics participation is binary and independent of the loss
-        # weights (grpo._binary_participation). ``include`` lets every row the
-        # data plane marks usable vote, so token-capture placeholders
-        # (sample_mask 0) never do; ``exclude`` lets the rows with a nonzero
-        # final loss weight vote. PPO's GAE ignores valid_mask.
+        # weights (grpo._binary_participation). ``include`` lets every row with
+        # a nonzero data-plane sample_mask vote, so token-capture placeholders
+        # and datums with a dataset-level loss_multiplier of 0 never do (the
+        # legacy and TransferQueue loops let the latter vote under include);
+        # ``exclude`` lets the rows with a nonzero final loss weight vote.
+        # PPO's GAE ignores valid_mask.
         participation = final_sample_mask
         if (
             not cfg.is_ppo
