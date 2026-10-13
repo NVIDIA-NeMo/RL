@@ -162,12 +162,44 @@ def test_attach_is_a_noop_without_a_media_token_id():
     assert "media_token_validity_mask" not in batch
 
 
+def test_attach_drops_a_transported_mask_without_a_media_token_id():
+    """GRPO attaches masks to every multimodal batch; unsupported models drop them."""
+    batch = {
+        "input_ids": torch.tensor([[TXT, IMG]]),
+        "media_token_validity_mask": torch.tensor([[True, True]]),
+    }
+    attach_media_token_validity_mask(batch, None)
+    assert "media_token_validity_mask" not in batch
+
+
 def test_attach_is_a_noop_when_nothing_needs_masking():
     """No key at all, so the model keeps deriving its own."""
     packed = PackedTensor([torch.ones(1, 3, 2, 2)], dim_to_pack=0)
     batch = {"input_ids": torch.tensor([[TXT, IMG]]), "pixel_values": packed}
     attach_media_token_validity_mask(batch, IMG)
     assert "media_token_validity_mask" not in batch
+
+
+def test_attach_does_not_treat_loss_mask_as_media_provenance():
+    """Loss ownership cannot decide whether a token anchors attached media."""
+    packed = PackedTensor([torch.ones(1, 3, 2, 2)], dim_to_pack=0)
+    batch = {
+        "input_ids": torch.tensor([[IMG, TXT, IMG]]),
+        "token_mask": torch.tensor([[0, 1, 1]]),
+        "pixel_values": packed,
+    }
+    attach_media_token_validity_mask(batch, IMG)
+    assert "media_token_validity_mask" not in batch
+
+
+def test_attach_preserves_explicit_message_media_provenance():
+    explicit = torch.tensor([[True, True, False]])
+    batch = {
+        "input_ids": torch.tensor([[IMG, IMG, IMG]]),
+        "media_token_validity_mask": explicit,
+    }
+    attach_media_token_validity_mask(batch, IMG)
+    torch.testing.assert_close(batch["media_token_validity_mask"], explicit)
 
 
 def test_attach_ignores_a_batch_whose_input_ids_are_not_2d():

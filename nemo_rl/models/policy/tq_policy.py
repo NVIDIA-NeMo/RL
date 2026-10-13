@@ -138,6 +138,7 @@ class TQPolicy(TQDriverMixin, Policy):
         *args: Any,
         dp_cfg: DataPlaneRuntimeConfig,
         checkpointing: bool = False,
+        storage_unit_node_ids: Optional[list[str]] = None,
         tq_partition_id: str = "train",
         **kwargs: Any,
     ) -> None:
@@ -155,7 +156,10 @@ class TQPolicy(TQDriverMixin, Policy):
             )
         self.dp_cfg = dp_cfg
         self.dp_client = build_data_plane_client(
-            dp_cfg, bootstrap=True, checkpointing=checkpointing
+            dp_cfg,
+            bootstrap=True,
+            checkpointing=checkpointing,
+            storage_unit_node_ids=storage_unit_node_ids,
         )
         self.tq_partition_id = tq_partition_id
         self._router_replay_enabled = bool(
@@ -616,6 +620,8 @@ class TQPolicy(TQDriverMixin, Policy):
     # ``begin``, so no step identifier is threaded through the API):
     #   begin_train_step                    — open step; broadcast loss_fn/gbs/mbs
     #   train_microbatches_from_meta (N×)   — DP-sharded fwd/bwd, grads accumulate
+    #   pause_train_step_with_offloading — park params/optimizer; keep GPU grads
+    #   prepare_for_training              — restore an offloaded step
     #   finish_train_step                   — all_reduce + opt.step + sched.step
     #   abort_train_step                    — drop accumulators, no opt.step
     #
@@ -641,6 +647,17 @@ class TQPolicy(TQDriverMixin, Policy):
             gbs=batch_size,
             mbs=micro_batch_size,
             **trace_context_kwargs(),
+        )
+        ray.get(futures)
+
+    def pause_train_step_with_offloading(self) -> None:
+        """Pause the step, offloading parameters and optimizer state to CPU.
+
+        Pending gradients stay on GPU while the critic runs. Resume with
+        ``prepare_for_training``. Only Megatron DDP supports this lifecycle.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "pause_train_step_with_offloading", **trace_context_kwargs()
         )
         ray.get(futures)
 
