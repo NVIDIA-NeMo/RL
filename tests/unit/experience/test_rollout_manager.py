@@ -1062,14 +1062,19 @@ def test_receipt_completion_drops_mask_flag_when_gate_off():
 @pytest.mark.parametrize(
     ("response", "expected_truncated"),
     [
-        (
+        pytest.param(
             {
                 "status": "incomplete",
                 "incomplete_details": {"reason": "max_output_tokens"},
             },
             True,
+            id="length_incomplete",
         ),
-        ({"status": "completed", "incomplete_details": None}, False),
+        pytest.param(
+            {"status": "completed", "incomplete_details": None},
+            False,
+            id="completed",
+        ),
     ],
 )
 def test_result_to_completion_truncated_on_length_incomplete_response(
