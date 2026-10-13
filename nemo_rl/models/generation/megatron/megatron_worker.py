@@ -1794,7 +1794,11 @@ class MegatronGenerationRefitMixin:
                 name = param_info["name"]
                 wire_dtype_value = param_info.get("dtype")
                 wire_dtype = _STR_TO_DTYPE.get(str(wire_dtype_value))
-                if wire_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+                if wire_dtype is None or wire_dtype not in (
+                    torch.bfloat16,
+                    torch.float16,
+                    torch.float32,
+                ):
                     raise ValueError(
                         f"Unsupported Megatron bulk refit wire dtype "
                         f"{wire_dtype_value!r} for {name!r}."

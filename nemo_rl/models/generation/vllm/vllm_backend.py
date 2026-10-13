@@ -1934,7 +1934,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             param_info = param_info_by_name[hf_name]
             wire_dtype_value = param_info.get("dtype")
             wire_dtype = _STR_TO_DTYPE.get(str(wire_dtype_value))
-            if wire_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            if wire_dtype is None or wire_dtype not in (
+                torch.bfloat16,
+                torch.float16,
+                torch.float32,
+            ):
                 raise ValueError(
                     f"build_hf_to_local_param_map: unsupported wire dtype "
                     f"{wire_dtype_value!r} for {hf_name!r}"
