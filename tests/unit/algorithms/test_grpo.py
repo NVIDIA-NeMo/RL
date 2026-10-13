@@ -14,6 +14,7 @@
 
 import math
 import os
+import warnings
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -509,6 +510,42 @@ class TestAgentLossWeights:
         assert torch.equal(train_data["sample_mask"], torch.tensor([0.0, 0.0]))
         assert metrics["agent_loss_weights/a/effective_weight"] == 0.0
         assert metrics["agent_loss_weights/a/token_share_weighted"] == 0.0
+
+    def test_configured_agent_absent_from_batch_warns_and_logs_zero_samples(self):
+        # A misspelled name matches no row, so every row keeps weight 1.0 and the
+        # run would train exactly like an unset option; make that visible.
+        train_data = self._train_data([10, 10], [1.0, 1.0])
+        before = train_data["sample_mask"].clone()
+        agent_refs = [{"name": "short_tool_use_agent"}] * 2
+
+        with pytest.warns(UserWarning, match=r"\['short_tool_use_agnet'\]"):
+            metrics = _apply_agent_loss_weights(
+                train_data,
+                agent_refs,
+                {"short_tool_use_agnet": 8.0},
+                train_global_batch_size=2,
+            )
+
+        torch.testing.assert_close(train_data["sample_mask"], before)
+        absent = "agent_loss_weights/short_tool_use_agnet"
+        assert metrics[f"{absent}/weight"] == 8.0
+        assert metrics[f"{absent}/effective_weight"] == 0.0
+        assert metrics[f"{absent}/num_samples"] == 0.0
+        assert metrics[f"{absent}/token_share_unweighted"] == 0.0
+        assert metrics[f"{absent}/token_share_weighted"] == 0.0
+        present = "agent_loss_weights/short_tool_use_agent"
+        assert metrics[f"{present}/weight"] == 1.0
+        assert metrics[f"{present}/num_samples"] == 2.0
+
+        # The correctly spelled name is present, so no warning.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _apply_agent_loss_weights(
+                self._train_data([10, 10], [1.0, 1.0]),
+                agent_refs,
+                {"short_tool_use_agent": 8.0},
+                train_global_batch_size=2,
+            )
 
     def test_unset_weights_are_a_noop(self):
         train_data = self._train_data([4, 4], [1.0, 1.0])

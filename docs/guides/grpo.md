@@ -648,7 +648,7 @@ grpo:
     short_tool_use_agent: 8.0
 ```
 
-Each step logs `agent_loss_weights/<agent>/{weight,effective_weight,num_samples,token_share_unweighted,token_share_weighted}`: the configured $w_a$, the multiplier $c \, w_a$ that was actually applied to the agent's rows, and the agent's share of the trained-token mass before and after weighting. The option requires the NeMo-Gym rollout path and is applied by `grpo_train` and `async_grpo_train`; the data-plane and SingleController trainers reject it.
+Each step logs `agent_loss_weights/<agent>/{weight,effective_weight,num_samples,token_share_unweighted,token_share_weighted}`: the configured $w_a$, the multiplier $c \, w_a$ that was actually applied to the agent's rows, and the agent's share of the trained-token mass before and after weighting. A configured agent that appears in no row of the step is logged with `num_samples = 0` and `effective_weight = 0`, and a warning names it, so a misspelled agent name is visible instead of silently training as weight 1. The option requires the NeMo-Gym rollout path and is applied by `grpo_train` and `async_grpo_train`; the data-plane and SingleController trainers reject it.
 
 #### Advantage Clipping
 

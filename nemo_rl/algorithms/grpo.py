@@ -2632,8 +2632,10 @@ def _apply_agent_loss_weights(
 
     Returns per-agent metrics: the configured weight, the effective (normalized)
     multiplier applied to the agent's rows, its number of samples, and its share
-    of the trained-token mass before and after weighting. Returns ``{}`` when no
-    weights are configured.
+    of the trained-token mass before and after weighting. A configured agent
+    that matches no row of the batch is reported with zero samples and a
+    ``UserWarning`` names it, so a misspelled name does not pass as weight 1.0.
+    Returns ``{}`` when no weights are configured.
     """
     if not agent_loss_weights:
         return {}
@@ -2681,12 +2683,26 @@ def _apply_agent_loss_weights(
     weighted_tokens = trained_tokens * effective_weights
     total_raw = float(trained_tokens.sum())
     total_weighted = float(weighted_tokens.sum())
+    # A configured name that matches no row is weighted 1.0 by construction, so
+    # a typo would otherwise train exactly like an unset option. Report it with
+    # zero samples and warn; an agent can legitimately be absent from one step's
+    # prompt mix, so this is not a setup-time error.
+    configured = set(agent_loss_weights)
+    absent = sorted(configured - set(names))
+    if absent:
+        warnings.warn(
+            f"grpo.agent_loss_weights names {absent} match no agent_ref.name in "
+            f"this training batch (present: {sorted(set(names))}); check for typos.",
+            stacklevel=2,
+        )
     metrics: dict[str, float] = {}
-    for name in sorted(set(names)):
+    for name in sorted(set(names) | configured):
         rows = torch.tensor([n == name for n in names])
         key = f"agent_loss_weights/{name or 'unknown'}"
         metrics[f"{key}/weight"] = float(agent_loss_weights.get(name, 1.0))
-        metrics[f"{key}/effective_weight"] = float(effective_weights[rows].mean())
+        metrics[f"{key}/effective_weight"] = (
+            float(effective_weights[rows].mean()) if rows.any() else 0.0
+        )
         metrics[f"{key}/num_samples"] = float(rows.sum())
         metrics[f"{key}/token_share_unweighted"] = (
             float(trained_tokens[rows].sum()) / total_raw if total_raw > 0 else 0.0
