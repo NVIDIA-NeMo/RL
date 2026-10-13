@@ -2132,9 +2132,9 @@ def _build_gym_actor_config(
         # receipt; fail at setup rather than let the operator rely on a no-op.
         raise ValueError(
             "env.nemo_gym.mask_unusable_rollouts is not supported together with "
-            "env.nemo_gym.token_capture.enabled (receipt mode): receipt rollouts "
-            "bypass the token-echo converter that emits the placeholder sample. "
-            "Disable one of the two."
+            "token_capture.enabled (single-controller receipt mode): receipt "
+            "rollouts bypass the token-echo converter that emits the placeholder "
+            "sample. Disable one of the two."
         )
     port_range = {
         key: value
