@@ -1,83 +1,52 @@
 # DFlash Draft Body
 
-`DFlashBody` turns selected target-model hidden states into draft-block hidden
-states. Use `build_dflash_batch_plan` to select the blocks before calling the
-body. The caller supplies token embeddings for each block and computes the
-draft loss from the returned hidden states.
+The target model provides hidden states for an input sequence. The DFlash draft
+body uses these states as context for short blocks of draft-token positions.
+It updates all positions in a block together and returns hidden states for a
+separate draft-loss calculation. The body does not produce vocabulary logits.
 
-## Use the Body
+## How It Works
 
-Let `B` be the batch size, `S` the target sequence length, `A` the number of
-anchors per sample, `G` the number of draft tokens per block, `T` the number of
-target hidden-state taps, and `H` the hidden size.
+1. **Choose anchors.** An anchor is a valid position in the target sequence.
+   `build_dflash_batch_plan` chooses anchors and records which draft positions
+   belong to each one. The same input mask, sample IDs, optimizer step, and seed
+   produce the same plan. A sample with no valid window contributes no draft
+   loss.
+2. **Build draft blocks.** Each block has one anchor position followed by
+   `gamma` draft positions. The caller supplies an embedding for each position.
+   The target model supplies selected hidden states from its layers.
+3. **Update the blocks.** `DFlashBody` projects the target hidden states and
+   passes the block embeddings through draft decoder layers. Within a layer,
+   each block can read the target prefix before its anchor and all positions
+   in that same block. It cannot read another block. Attention computes outputs
+   for block positions only; it does not update the target sequence.
+4. **Compute the loss.** The body returns one hidden state per block position.
+   The caller uses `plan.loss_mask` to exclude the anchor and invalid positions
+   from the draft loss. The body returns zero for invalid positions.
 
-1. Build a boolean `token_valid_mask` with shape `[B, S]`. Give each sample a
-   stable `int64` ID in `sample_ids` with shape `[B]`.
-2. Build the plan. Use the same valid-token mask, sample IDs, optimizer step,
-   and seed to select the same anchors again.
-3. Collect `target_taps` with shape `[B, S, T, H]`. Build
-   `block_embeddings` with shape `[B * A, G + 1, H]`. Slot 0 holds the anchor
-   embedding; the other slots hold draft-token embeddings.
-4. Pass these tensors and the plan to `DFlashBody`. The result has shape
-   `[B * A, G + 1, H]`. Use `plan.loss_mask` to exclude the anchor and invalid
-   slots from the draft loss.
+This separation lets the caller reuse target-model context across draft blocks
+while keeping each block's attention independent.
 
-The example assumes that the caller has prepared the input tensors, process
-groups, and a `DFlashBodyConfig` that matches the model dimensions.
+## Component Boundary
 
-```python
-from nemo_rl.models.megatron.draft.block_plan import build_dflash_batch_plan
-from nemo_rl.models.megatron.draft.dflash import DFlashBody
+`DFlashBody` owns the draft projection, decoder layers, and normalization.
+It does not own token embeddings or an output head. The caller provides block
+embeddings and handles the output projection and loss. A standalone body
+checkpoint therefore contains body weights only.
 
-plan = build_dflash_batch_plan(
-    token_valid_mask,
-    sample_ids,
-    anchors_per_sample=anchors_per_sample,
-    gamma=gamma,
-    optimizer_step=optimizer_step,
-    seed=seed,
-)
-body = DFlashBody(
-    body_config,
-    tp_group=tp_group,
-    parallel_config=parallel_config,
-)
-draft_hidden = body(
-    target_taps=target_taps,
-    block_embeddings=block_embeddings,
-    plan=plan,
-)
-loss_mask = plan.loss_mask
-```
+The entry points are `build_dflash_batch_plan` in `block_plan.py`,
+`DFlashBody.forward` in `dflash.py`, and `dflash_block_only_attention` in
+`block_attention.py`. The GPU attention path uses FlexAttention. The CPU path
+is a reference implementation.
 
-The plan and both input tensors must be on the same device. Both input tensors
-must have the same floating-point dtype. The body does not create token
-embeddings or vocabulary logits. Its checkpoint contains body weights, not
-token embeddings or an output head.
+## Input Contract
 
-## Block Selection
-
-`build_dflash_batch_plan` selects `A` valid windows per sample. Each window
-contains one anchor position and `G` following positions. The plan stores
-positions, sample rows, and validity masks as tensors on the input device.
-The anchor slot does not contribute to the loss. If a sample has no valid
-window, its blocks are invalid and contribute no loss.
-
-## Body Computation
-
-`DFlashBody` projects the `T` target hidden states at each sequence position
-into one hidden state. Each decoder layer forms keys and values from these
-projected target states. It forms queries, keys, and values for the block
-slots. `dflash_block_only_attention` computes attention for block slots only:
-
-- A block can read valid target tokens before its anchor.
-- A block can read all slots in that same block.
-- A block cannot read slots in another block.
-
-The GPU path uses FlexAttention. The CPU path uses a reference implementation.
-The body sets the output of invalid slots to zero.
-
-## Parallelism
+The plan takes a valid-token mask with shape `[batch, sequence]` and one stable
+`int64` sample ID per row. The body takes target hidden-state taps with shape
+`[batch, sequence, taps, hidden]` and block embeddings with shape
+`[batch * anchors_per_sample, gamma + 1, hidden]`. It returns block hidden
+states with the same shape as the block embeddings. The plan and input tensors
+must share a device, and both input tensors must share a floating-point dtype.
 
 The body supports tensor parallelism (TP) with context parallelism (CP) set to
 1. Tests cover TP sizes 1, 2, and 4. The body rejects sequence parallelism and
