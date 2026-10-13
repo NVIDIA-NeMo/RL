@@ -39,6 +39,10 @@ export NUM_GENERATIONS=${NUM_GENERATIONS:-4}
 # Keep GRPO allocation-bounded.  Per-step checkpoints plus chained Slurm cycles
 # provide recovery; an artificial smoke-step cap must not terminate training.
 export MAX_STEPS=${MAX_STEPS:-1000000}
+# Dataset cardinality is independent of the optimizer horizon.  launch_sc sets
+# max_num_epochs=null, so the dataloader cycles these rows without materializing
+# one copy per possible GRPO step.
+export TRAIN_REPEATS=${TRAIN_REPEATS:-4}
 # Children run concurrently with each other inside one episode, so a step's
 # episodes can hold more containers than rollouts; Harbor backend slots bound it.
 export AGENTIC_VBENCH_CONCURRENCY=${AGENTIC_VBENCH_CONCURRENCY:-$((NUM_PROMPTS * NUM_GENERATIONS))}
