@@ -189,6 +189,7 @@ def test_run_single_rollout_preserves_native_media_across_turns(monkeypatch) -> 
         _stop_strings,
         *,
         native_generation_data=None,
+        session_id=None,
     ):
         calls.append(dict(native_generation_data or {}))
         return (
@@ -220,6 +221,7 @@ def test_run_single_rollout_preserves_native_media_across_turns(monkeypatch) -> 
         "nemo_rl.experience.rollout_manager.calculate_rewards", calculate_rewards
     )
     manager = object.__new__(AsyncRolloutImpl)
+    manager._policy_generation = SimpleNamespace(cfg={})
     manager._generate_response = generate_response
     manager._tokenizer = _Tokenizer()
     manager._task_to_env = {}
