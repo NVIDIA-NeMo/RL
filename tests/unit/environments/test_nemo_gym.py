@@ -2361,11 +2361,15 @@ def test_nemo_gym_postprocess_non_contiguous_chain_raises_by_default():
 
 
 def test_nemo_gym_postprocess_non_contiguous_chain_masked_when_enabled():
+    nemo_gym_result = _non_contiguous_result()
+    # An opaque router-replay payload on the dropped turn; it is never decoded.
+    nemo_gym_result["response"]["output"][1]["routed_experts"] = "opaque-blob"
+
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
             _MaskUnusableRolloutsSelf(),
             {},
-            _non_contiguous_result(),
+            nemo_gym_result,
             _UnusableRolloutTokenizer(),
         )
     )
@@ -2377,6 +2381,20 @@ def test_nemo_gym_postprocess_non_contiguous_chain_masked_when_enabled():
     full_result = result["full_result"]
     assert full_result["mask_sample"] is True
     assert full_result["_ng_unusable_rollout"] == "non_contiguous_token_chain"
+    # full_result keeps one shape for logging: the kept turn is decoded like
+    # any other row and the dropped tail is stripped of its token payloads.
+    kept, dropped = full_result["response"]["output"]
+    assert kept["prompt_str"] == "1 2"
+    assert kept["generation_str"] == "3 4"
+    for item in (kept, dropped):
+        for key in (
+            "prompt_token_ids",
+            "generation_token_ids",
+            "generation_log_probs",
+            "routed_experts",
+        ):
+            assert key not in item
+    assert "generation_str" not in dropped
 
 
 def _gym_flagged_no_generation_result():

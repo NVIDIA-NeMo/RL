@@ -1629,6 +1629,21 @@ Depending on your data shape, you may want to change these values."""
                 _mark_unusable_rollout(
                     nemo_gym_result, NEMO_GYM_UNUSABLE_NON_CONTIGUOUS_TOKEN_CHAIN
                 )
+                # The dropped tail keeps no token payloads either: every
+                # processed item pops them below ("to remove larger tensors from
+                # logging") and full_result is JSON-dumped into the W&B
+                # full_result table. Processed items already lost their
+                # generation_token_ids, so the predicate selects exactly this
+                # item and the ones after it.
+                for tail_item in nemo_gym_result["response"]["output"]:
+                    if _is_trainable_output_item(tail_item):
+                        for key in (
+                            "prompt_token_ids",
+                            "generation_token_ids",
+                            "generation_log_probs",
+                            "routed_experts",
+                        ):
+                            tail_item.pop(key, None)
                 break
             assert is_contiguous, f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
