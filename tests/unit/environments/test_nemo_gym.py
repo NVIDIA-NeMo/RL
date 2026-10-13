@@ -48,6 +48,7 @@ from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
     _count_structured_response_tokens,
+    _input_text,
     _wait_for_external_services,
     build_reward_component_columns,
     extract_external_service_readiness,
@@ -2319,7 +2320,10 @@ def test_nemo_gym_postprocess_no_generation_data_masked_when_enabled():
     assert assistant["role"] == "assistant"
     assert assistant["token_ids"].tolist() == [2]
     assert assistant["generation_logprobs"].tolist() == [0.0]
-    assert result["input_message_log"] == [user]
+    # The input log is the placeholder's single user turn (the same object, so
+    # a tensor-bearing dict comparison is not needed).
+    assert len(result["input_message_log"]) == 1
+    assert result["input_message_log"][0] is user
     full_result = result["full_result"]
     assert full_result["mask_sample"] is True
     assert full_result["_ng_unusable_rollout"] == "no_generation_data"
@@ -2482,6 +2486,85 @@ def test_nemo_gym_postprocess_no_generation_empty_input_gets_fixed_length_prompt
     assert user["token_ids"].tolist() == [expected_filler] * 128
     assert assistant["token_ids"].tolist() == [expected_filler]
     assert result["full_result"]["_ng_unusable_rollout"] == "no_generation_data"
+
+
+def test_nemo_gym_postprocess_no_generation_long_input_is_truncated_to_fixed_length():
+    """A prompt longer than the placeholder length keeps only its first 128 tokens."""
+    words = " ".join(f"w{i}" for i in range(300))
+    nemo_gym_result = {
+        "reward": 0.0,
+        "response": {"output": []},
+        "responses_create_params": {"input": [{"role": "user", "content": words}]},
+    }
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MaskUnusableRolloutsSelf(),
+            {},
+            nemo_gym_result,
+            _UnusableRolloutTokenizer(),
+        )
+    )
+
+    user, assistant = result["message_log"]
+    assert user["token_ids"].tolist() == [100 + i for i in range(128)]
+    assert assistant["token_ids"].tolist() == [2]
+    assert result["full_result"]["_ng_unusable_rollout"] == "no_generation_data"
+
+
+@pytest.mark.parametrize(
+    ("input_messages", "expected_text"),
+    [
+        ("plain string prompt", "plain string prompt"),
+        (
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "part one"},
+                        {"type": "input_image", "image_url": "data:x"},
+                        {"type": "input_text", "text": "part two"},
+                    ],
+                }
+            ],
+            "part one\npart two",
+        ),
+        (
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "usr"}],
+            "sys\nusr",
+        ),
+        (["not a dict", {"role": "user"}, {"role": "user", "content": 5}], ""),
+        ({"role": "user", "content": "a dict, not a list"}, ""),
+        (None, ""),
+    ],
+)
+def test_input_text_handles_every_responses_input_shape(input_messages, expected_text):
+    """The placeholder prompt text covers every Responses ``input`` shape Gym sends."""
+    assert _input_text(input_messages) == expected_text
+
+
+def test_nemo_gym_postprocess_no_generation_encode_failure_falls_back_to_filler():
+    """A tokenizer that cannot encode the text still yields a 128-token filler prompt."""
+
+    class _Raising(_UnusableRolloutTokenizer):
+        def encode(self, text, add_special_tokens=False):
+            raise RuntimeError("boom")
+
+    nemo_gym_result = {
+        "reward": 0.0,
+        "response": {"output": []},
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MaskUnusableRolloutsSelf(), {}, nemo_gym_result, _Raising()
+        )
+    )
+
+    user, assistant = result["message_log"]
+    assert user["token_ids"].tolist() == [2] * 128
+    assert assistant["token_ids"].tolist() == [2]
 
 
 _NEMOTRON_MEDIA_TOKEN_ID = 99
