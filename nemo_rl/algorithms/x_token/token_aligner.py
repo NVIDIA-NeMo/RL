@@ -22,9 +22,8 @@ Special tokens (BOS / EOS / pad, offset ``(0, 0)``) are paired separately by
 role. The result feeds the cross-tokenizer distillation loss.
 
 Public surface:
-    - :class:`AlignmentPair` — per-pair record produced by the alignment;
-      replaces the loose ``(s_tokens, t_tokens, s_start, s_end, t_start,
-      t_end, is_correct)`` tuples that the helpers used to pass around.
+    - :class:`AlignmentPair` — per-pair record containing student/teacher
+      token ranges and an ``is_correct`` flag filled by the aligner.
     - :class:`AlignmentBatch` — dense-padded per-batch alignment payload that
       covers all three loss modes (P-KL, gold_loss, xtoken_loss).
     - :class:`TokenAligner` — owns the two tokenizers and the projection
@@ -37,7 +36,7 @@ from __future__ import annotations
 
 import unicodedata
 from dataclasses import dataclass
-from typing import Any, Collection, List, Tuple
+from typing import Collection, List, Tuple
 
 import torch
 
@@ -191,8 +190,6 @@ class AlignmentPair:
     (orphan groups) use ``-1`` for the empty side's start/end indices.
 
     Attributes:
-        s_tokens: Student tokens covered by this pair.
-        t_tokens: Teacher tokens covered by this pair.
         s_start: Inclusive start index into the student token sequence
             (``-1`` for teacher-only insertions).
         s_end: Exclusive end index into the student token sequence
@@ -203,11 +200,10 @@ class AlignmentPair:
             (``-1`` for student-only insertions).
         is_correct: ``True`` when the decoded student and teacher span texts
             are equal, when an NFC-validated native repair matches them, or
-            when both spans are their tokenizer's EOS token.
+            when both spans are their tokenizer's EOS token. Defaults to
+            ``False`` until the aligner validates the pair.
     """
 
-    s_tokens: List[str]
-    t_tokens: List[str]
     s_start: int
     s_end: int
     t_start: int
@@ -643,42 +639,27 @@ class TokenAligner:
             special_token_ids=getattr(self.teacher_tokenizer, "all_special_ids", [])
             or [],
         )
-        raw_pairs = align_by_offsets_cluster(
+        pairs = align_by_offsets_cluster(
             student_ids,
             student_offsets,
             self.student_tokenizer,
             teacher_ids,
             teacher_offsets,
             self.teacher_tokenizer,
-            student_tokens_str=student_tokens_str,
-            teacher_tokens_str=teacher_tokens_str,
         )
-        pairs: List[AlignmentPair] = []
-        for s_tokens, t_tokens, s_start, s_end, t_start, t_end, _ in raw_pairs:
-            is_correct = False
-            if s_start >= 0 and t_start >= 0:
+        for pair in pairs:
+            if pair.s_start >= 0 and pair.t_start >= 0:
                 s_text = self.student_tokenizer.decode(
-                    student_ids[s_start:s_end],
+                    student_ids[pair.s_start : pair.s_end],
                     skip_special_tokens=False,
                     clean_up_tokenization_spaces=False,
                 )
                 t_text = self.teacher_tokenizer.decode(
-                    teacher_ids[t_start:t_end],
+                    teacher_ids[pair.t_start : pair.t_end],
                     skip_special_tokens=False,
                     clean_up_tokenization_spaces=False,
                 )
-                is_correct = s_text == t_text
-            pairs.append(
-                AlignmentPair(
-                    s_tokens=s_tokens,
-                    t_tokens=t_tokens,
-                    s_start=s_start,
-                    s_end=s_end,
-                    t_start=t_start,
-                    t_end=t_end,
-                    is_correct=is_correct,
-                )
-            )
+                pair.is_correct = s_text == t_text
         return pairs
 
     def align_one_offset_per_asst(
@@ -956,8 +937,6 @@ class TokenAligner:
                 for pair in slice_pairs:
                     turn_pairs.append(
                         AlignmentPair(
-                            s_tokens=pair.s_tokens,
-                            t_tokens=pair.t_tokens,
                             s_start=(
                                 s_indices[pair.s_start] if pair.s_start >= 0 else -1
                             ),
@@ -1025,8 +1004,6 @@ class TokenAligner:
                 )
                 combined.append(
                     AlignmentPair(
-                        s_tokens=student_eot_tokens,
-                        t_tokens=teacher_eot_tokens,
                         s_start=s_eot,
                         s_end=s_eot + 1,
                         t_start=t_eot,
@@ -1092,12 +1069,6 @@ class TokenAligner:
                 continue
             result.append(
                 AlignmentPair(
-                    s_tokens=self.student_tokenizer.convert_ids_to_tokens(
-                        student_ids[s_start:s_end]
-                    ),
-                    t_tokens=self.teacher_tokenizer.convert_ids_to_tokens(
-                        teacher_ids[t_start:t_end]
-                    ),
                     s_start=s_start,
                     s_end=s_end,
                     t_start=t_start,
@@ -1621,10 +1592,7 @@ def align_by_offsets_cluster(
     teacher_ids: List[int],
     teacher_offsets: List[Tuple[int, int]],
     teacher_tokenizer,
-    *,
-    student_tokens_str: List[str] | None = None,
-    teacher_tokens_str: List[str] | None = None,
-) -> List[Tuple[List[str], List[str], int, int, int, int, bool]]:
+) -> List[AlignmentPair]:
     """Cluster + strict char-end offset alignment for a single sample.
 
     Args:
@@ -1635,10 +1603,9 @@ def align_by_offsets_cluster(
         teacher_ids/offsets/tokenizer: same for teacher.
 
     Returns:
-        list of 7-tuples ``(s_tok_strs, t_tok_strs, s_start, s_end, t_start,
-        t_end, is_correct)`` — paired groups have ``is_correct=True`` and
-        contiguous position ranges on both sides; orphan groups have
-        ``is_correct=False`` and the empty side carries ``start=end=-1``.
+        Alignment pairs with contiguous token position ranges on both sides;
+        orphan groups use ``start=end=-1`` for the empty side. All pairs leave
+        ``is_correct=False`` for the caller to fill after text validation.
     """
     if len(student_ids) != len(student_offsets) or len(teacher_ids) != len(
         teacher_offsets
@@ -1669,26 +1636,15 @@ def align_by_offsets_cluster(
         teacher_tokenizer,
     )
 
-    if student_tokens_str is None:
-        student_tokens_str = student_tokenizer.convert_ids_to_tokens(student_ids)
-    if teacher_tokens_str is None:
-        teacher_tokens_str = teacher_tokenizer.convert_ids_to_tokens(teacher_ids)
-    if len(student_tokens_str) != len(student_ids):
-        raise ValueError("student token strings must match the token ID count")
-    if len(teacher_tokens_str) != len(teacher_ids):
-        raise ValueError("teacher token strings must match the token ID count")
-
-    aligned_pairs: List[Tuple[Any, ...]] = []
+    aligned_pairs: List[AlignmentPair] = []
     for s_pos, t_pos in groups:
-        s_toks = [student_tokens_str[i] for i in s_pos]
-        t_toks = [teacher_tokens_str[i] for i in t_pos]
-        s_start = s_pos[0] if s_pos else -1
-        s_end = s_pos[-1] + 1 if s_pos else -1
-        t_start = t_pos[0] if t_pos else -1
-        t_end = t_pos[-1] + 1 if t_pos else -1
-        is_correct = bool(s_pos and t_pos)
         aligned_pairs.append(
-            (s_toks, t_toks, s_start, s_end, t_start, t_end, is_correct)
+            AlignmentPair(
+                s_start=s_pos[0] if s_pos else -1,
+                s_end=s_pos[-1] + 1 if s_pos else -1,
+                t_start=t_pos[0] if t_pos else -1,
+                t_end=t_pos[-1] + 1 if t_pos else -1,
+            )
         )
 
     return aligned_pairs

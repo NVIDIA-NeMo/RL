@@ -182,7 +182,7 @@ def test_offset_cluster_decode_fix_preserves_multitoken_spans():
     assert result.teacher_chunk_id.tolist() == [[0]]
 
 
-def test_offset_cluster_reuses_tokens_converted_for_canonical_merge_scan():
+def test_offset_cluster_converts_tokens_once_for_canonical_merge_scan():
     student = _CountingOffsetTokenizer({1: "he", 2: "llo"})
     teacher = _CountingOffsetTokenizer({7: "hello"})
     aligner = TokenAligner(
@@ -542,11 +542,17 @@ def test_orphan_empty_decodes_are_incorrect():
     assert not any(pair.is_correct for pair in pairs)
 
 
-def test_kernel_rejects_inconsistent_preconverted_token_strings():
+@pytest.mark.parametrize(
+    ("student_offsets", "teacher_offsets"),
+    [([], [(0, 1)]), ([(0, 1)], [])],
+)
+def test_kernel_rejects_inconsistent_token_offsets(student_offsets, teacher_offsets):
     tokenizer = _OffsetTokenizer({1: "x"})
-    with pytest.raises(ValueError, match="student token strings"):
+    with pytest.raises(
+        ValueError, match="token IDs and offsets must have matching lengths"
+    ):
         ta.align_by_offsets_cluster(
-            [1], [(0, 1)], tokenizer, [1], [(0, 1)], tokenizer, student_tokens_str=[]
+            [1], student_offsets, tokenizer, [1], teacher_offsets, tokenizer
         )
 
 

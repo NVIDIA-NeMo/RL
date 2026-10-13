@@ -49,9 +49,9 @@ from nemo_rl.algorithms.x_token.token_aligner import (
 class _FakeTokenizer:
     """Minimal HF stand-in: id -> token string plus special-token role attrs.
 
-    The offset kernel only needs ``convert_ids_to_tokens`` (for the returned
-    token strings) and the ``*_token_id`` / ``all_special_ids`` attributes
-    used to classify ``(0, 0)``-offset positions by role.
+    The offset kernel uses the ``*_token_id`` / ``all_special_ids`` attributes
+    to classify ``(0, 0)``-offset positions by role. The aligner also converts
+    token strings for offset normalization and decodes spans for validation.
     """
 
     def __init__(
@@ -113,13 +113,11 @@ def _make_aligner(
 
 
 # ---------------------------------------------------------------------------
-# AlignmentPair dataclass shape (call sites unpack these fields by name).
+# AlignmentPair dataclass shape (call sites read these fields by name).
 # ---------------------------------------------------------------------------
 
 
 EXPECTED_ALIGNMENT_PAIR_FIELDS = (
-    "s_tokens",
-    "t_tokens",
     "s_start",
     "s_end",
     "t_start",
@@ -129,7 +127,7 @@ EXPECTED_ALIGNMENT_PAIR_FIELDS = (
 
 
 def test_alignment_pair_dataclass_has_expected_fields():
-    """``AlignmentPair`` pins the 7-field record ``_pairs_to_batch`` reads."""
+    """``AlignmentPair`` contains the five fields ``_pairs_to_batch`` reads."""
     assert is_dataclass(AlignmentPair)
     field_names = tuple(f.name for f in dc_fields(AlignmentPair))
     assert set(field_names) == set(EXPECTED_ALIGNMENT_PAIR_FIELDS), field_names
@@ -147,11 +145,12 @@ def test_kernel_one_to_one_identical_tokenization():
     offs = [(0, 5), (5, 11)]
     pairs = align_by_offsets_cluster(ids, offs, tok, ids, offs, tok)
 
-    assert len(pairs) == 2
-    for s_toks, t_toks, s0, s1, t0, t1, ok in pairs:
-        assert len(s_toks) == 1 and len(t_toks) == 1
-        assert (s1 - s0) == 1 and (t1 - t0) == 1
-        assert ok is True
+    assert pairs == [
+        AlignmentPair(s_start=0, s_end=1, t_start=0, t_end=1),
+        AlignmentPair(s_start=1, s_end=2, t_start=1, t_end=2),
+    ]
+    # The kernel finds ranges; decoded-text validation belongs to the aligner.
+    assert all(pair.is_correct is False for pair in pairs)
 
 
 def test_kernel_many_student_tokens_to_one_teacher_token():
@@ -164,11 +163,7 @@ def test_kernel_many_student_tokens_to_one_teacher_token():
         [1, 2], [(0, 2), (2, 5)], s_tok, [3], [(0, 5)], t_tok
     )
 
-    assert len(pairs) == 1
-    s_toks, t_toks, s0, s1, t0, t1, ok = pairs[0]
-    assert s_toks == ["He", "llo"] and t_toks == ["Hello"]
-    assert (s0, s1, t0, t1) == (0, 2, 0, 1)
-    assert ok is True
+    assert pairs == [AlignmentPair(s_start=0, s_end=2, t_start=0, t_end=1)]
 
 
 def test_kernel_coverage_divergence_emits_orphans():
@@ -180,9 +175,9 @@ def test_kernel_coverage_divergence_emits_orphans():
     pairs = align_by_offsets_cluster([1], [(0, 2)], s_tok, [2], [(0, 3)], t_tok)
 
     assert len(pairs) == 2
-    sidedness = {(bool(s), bool(t)) for s, t, *_ in pairs}
-    assert sidedness == {(True, False), (False, True)}
-    assert all(ok is False for *_, ok in pairs)
+    ranges = {(p.s_start, p.s_end, p.t_start, p.t_end) for p in pairs}
+    assert ranges == {(0, 1, -1, -1), (-1, -1, 0, 1)}
+    assert all(pair.is_correct is False for pair in pairs)
 
 
 def test_kernel_leading_specials_paired_by_role():
@@ -193,8 +188,10 @@ def test_kernel_leading_specials_paired_by_role():
         [7, 1], [(0, 0), (0, 2)], s_tok, [8, 1], [(0, 0), (0, 2)], t_tok
     )
 
-    assert pairs[0][0] == ["<bos>"] and pairs[0][1] == ["<s>"]
-    assert pairs[1][0] == ["Hi"] and pairs[1][1] == ["Hi"]
+    assert pairs == [
+        AlignmentPair(s_start=0, s_end=1, t_start=0, t_end=1),
+        AlignmentPair(s_start=1, s_end=2, t_start=1, t_end=2),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -329,8 +326,6 @@ def test_per_asst_whole_message_plus_eot():
     positions = [(p.s_start, p.s_end, p.t_start, p.t_end) for p in pairs]
     assert positions == [(1, 2, 1, 2), (2, 3, 2, 3), (3, 4, 3, 4)], positions
     assert pairs[-1].is_correct is True
-    assert pairs[-1].s_tokens == ["<eot>"]
-    assert pairs[-1].t_tokens == ["<eot>"]
 
 
 def test_per_asst_uses_shared_strict_decoded_matcher():
