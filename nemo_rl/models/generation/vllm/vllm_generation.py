@@ -567,10 +567,10 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
-    def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
+    def _report_dp_openai_server_base_urls(self) -> list[str]:
         """Report the data parallel OpenAI server base URLs of vLLM workers, only populated if it is async vLLM engine and the HTTP server is active."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
-            return [None]  # Not applicable since this is sync
+            return []  # No HTTP server to report since this is sync
 
         # Use run_all_workers_single_data for methods that don't need data
         futures = self.worker_group.run_all_workers_single_data(
@@ -581,14 +581,14 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
-    def _collect_reserved_urls(self) -> list[Optional[str]]:
+    def _collect_reserved_urls(self) -> list[str]:
         """Collect reserved URLs from DP leaders before model loading.
 
         Only called when defer_model_load=True. Workers have bound ports
         during __init__ and can report their reserved URLs immediately.
         """
         if not self.cfg["vllm_cfg"]["async_engine"]:
-            return [None]
+            return []
 
         futures = self.worker_group.run_all_workers_single_data(
             "get_reserved_url",
