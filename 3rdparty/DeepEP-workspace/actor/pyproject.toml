@@ -1,0 +1,20 @@
+# DeepEP setup.py needs CUDA even to discover its version. uv cannot select
+# two version-specific metadata overrides for two Git revisions of one package.
+# Give the actor revision static metadata and build the unmodified pinned source.
+[project]
+name = "deep-ep"
+version = "1.2.1+10d4dd7"
+requires-python = ">=3.13"
+dependencies = ["nvidia-ml-py>=12.0.0"]
+
+[build-system]
+requires = ["setuptools", "wheel", "torch", "packaging", "ninja"]
+build-backend = "_backend"
+backend-path = ["."]
+
+[tool.deepep]
+url = "https://github.com/deepseek-ai/DeepEP.git"
+ref = "10d4dd7377d5bce900fbb4b80cce863764892b95"
+
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "_backend.py" }, { env = "TORCH_CUDA_ARCH_LIST" }, { env = "CUDA_HOME" }]

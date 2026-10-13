@@ -3,7 +3,8 @@
 # Requires the matching Automodel FP8/partitioned-combine/round-fence changes,
 # actor deep-ep 1.2.1+10d4dd7 and DeepGEMM (tf32_hc_prenorm_gemm).
 # Validated runtime: torch 2.13.0+cu130, TE 2.18.0, vLLM 0.29.0;
-# rollout deep-ep remains 1.2.1+17cfb81. Install dependencies per worker env.
+# The automodel extra pins actor DeepEP/DeepGEMM; the vllm extra keeps
+# rollout deep-ep 1.2.1+17cfb81. Build the matching NeMo-RL image.
 # Set policy.model_name to your verified checkpoint path when running offline.
 # Derived from the 16k experiment without GPU-progress/capture diagnostics.
 defaults: ../../grpo_math_1B.yaml
