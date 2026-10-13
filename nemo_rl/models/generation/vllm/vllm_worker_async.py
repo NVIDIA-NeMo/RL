@@ -671,6 +671,7 @@ class VllmAsyncGenerationWorkerImpl(
         *,
         admission: Any | None,
         splice: PrefixSplice | None = None,
+        eos_token_id: int | None = None,
         verify_retained_media: bool = False,
     ) -> CapturedMedia | None:
         """Run off-loop: resolve retained geometry and snapshot processed pixels."""
@@ -777,7 +778,7 @@ class VllmAsyncGenerationWorkerImpl(
             prev_len=admission.prev_len,
             retained=retained,
             splice=splice,
-            eos_token_id=self.renderer.tokenizer.eos_token_id,
+            eos_token_id=eos_token_id,
             image_token_id=self._capture_image_token_id,
             patch_size=self._capture_patch_size,
             retained_tensors=retained_tensors,
@@ -1242,6 +1243,7 @@ class VllmAsyncGenerationWorkerImpl(
                     engine_prompt,
                     admission=serving_admission,
                     splice=splice,
+                    eos_token_id=self.renderer.tokenizer.eos_token_id,
                     verify_retained_media=verify_retained_media,
                 )
                 if media is not None and media.splice is not None:

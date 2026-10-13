@@ -1183,6 +1183,31 @@ def test_valid_media_metadata_checksum_needs_no_pixels_or_routes(retained_call):
     )
 
 
+def test_worker_forwards_request_renderer_eos_without_worker_renderer(monkeypatch):
+    worker = SimpleNamespace(
+        _capture_media=True,
+        _capture_image_token_id=18,
+        _capture_patch_size=1,
+    )
+    admission = SimpleNamespace(parent_call_id=None, prev_len=0)
+    captured = SimpleNamespace(items=(), tensors=None)
+    capture = Mock(return_value=captured)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.capture_processed_media",
+        capture,
+    )
+
+    result = VllmAsyncGenerationWorkerImpl._capture_request_media(
+        worker,
+        {"prompt_token_ids": [10, 2]},
+        admission=admission,
+        eos_token_id=2,
+    )
+
+    assert result is captured
+    assert capture.call_args.kwargs["eos_token_id"] == 2
+
+
 def test_worker_rejects_media_when_capture_disabled(retained_call):
     worker, admission, prompt, _ = retained_call
     worker._capture_media = False
