@@ -53,7 +53,6 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
-    need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
@@ -106,6 +105,7 @@ from nemo_rl.models.megatron.router_replay import (
 )
 from nemo_rl.models.megatron.setup import (
     build_inference_model,
+    enable_batch_invariant_mode,
     finalize_megatron_setup,
     handle_model_import,
     load_teacher_output_layer_weight,
@@ -123,6 +123,8 @@ from nemo_rl.models.megatron.train import (
     TopkLogitsPostProcessor,
     aggregate_training_statistics,
     megatron_forward_backward,
+    should_reduce_loss_across_context_parallel,
+    strip_context_parallel_local_loss_metric,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -604,6 +606,8 @@ class MegatronPolicyWorkerImpl(
         gpu_ids = ray.get_gpu_ids()
         local_rank = int(gpu_ids[0])
         os.environ["LOCAL_RANK"] = str(local_rank)
+        # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
+        enable_batch_invariant_mode(config)
         torch.cuda.set_device(local_rank)
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
@@ -1346,8 +1350,8 @@ class MegatronPolicyWorkerImpl(
                         curr_wd = self.scheduler.get_wd()
                         loss_metrics[LEARNING_RATE_KEY] = curr_lr
                         loss_metrics["wd"] = curr_wd
-                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
-                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                        loss_metrics["global_valid_seqs"] = global_valid_seqs.detach()
+                        loss_metrics["global_valid_toks"] = global_valid_toks.detach()
                         mb_losses.append(loss_metrics["loss"])
 
                 else:
@@ -1361,7 +1365,12 @@ class MegatronPolicyWorkerImpl(
                     mb_losses = [x["loss"] for x in gb_loss_metrics]
 
                 all_mb_metrics.extend(gb_loss_metrics)
-                losses.append(torch.tensor(mb_losses).sum().item())
+                if all(isinstance(loss, torch.Tensor) for loss in mb_losses):
+                    losses.append(torch.stack(mb_losses).sum())
+                else:
+                    losses.append(
+                        torch.tensor(mb_losses, device=global_valid_toks.device).sum()
+                    )
 
         if saved_extra_state is not None:
             self._restore_model_extra_state_dict(saved_extra_state)
@@ -1384,10 +1393,17 @@ class MegatronPolicyWorkerImpl(
             self.scheduler.step(increment=gbs)
 
         # Aggregate metrics across all microbatches
+        reduce_loss_across_cp = should_reduce_loss_across_context_parallel(data)
+        loss_reduction_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=reduce_loss_across_cp
+        )
         mb_metrics, global_loss = aggregate_training_statistics(
             all_mb_metrics=all_mb_metrics,
             losses=losses,
-            data_parallel_group=parallel_state.get_data_parallel_group(),
+            data_parallel_group=loss_reduction_group,
+        )
+        mb_metrics = strip_context_parallel_local_loss_metric(
+            mb_metrics, enabled=reduce_loss_across_cp
         )
 
         metrics = {
@@ -1585,6 +1601,9 @@ class MegatronPolicyWorkerImpl(
             # streaming chunks the controller has fed into this optimizer step
             # so far.
             "num_chunks": 0,
+            # Policy parameters/optimizer may be offloaded between PPO chunks;
+            # accumulated gradients remain resident until the step closes.
+            "offloaded": False,
             "draft_step_state": DraftStepState(),
             # Saved across the step so we can restore at finish/abort.
             "saved_grad_sync_func": None,
@@ -1752,6 +1771,8 @@ class MegatronPolicyWorkerImpl(
         regular ``train`` path.
         """
         state = self._assert_step_open()
+        if state.get("offloaded", False):
+            raise RuntimeError("prepare_for_training must restore the offloaded step")
         try:
             self._train_microbatch_body(state, data)
         except Exception:
@@ -1780,6 +1801,11 @@ class MegatronPolicyWorkerImpl(
         state: dict[str, Any],
         data: BatchedDataDict[Any],
     ) -> None:
+        if should_reduce_loss_across_context_parallel(data):
+            raise NotImplementedError(
+                "Direct packed SFT rows are not supported by the split training API"
+            )
+
         state["num_chunks"] += 1
         self._log_gpu_mem("chunk_enter")
         loss_fn = state["loss_fn"]
@@ -1945,6 +1971,8 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/finish_train_step")
     def finish_train_step(self) -> dict[str, Any]:
         state = self._assert_step_open()
+        if state.get("offloaded", False):
+            raise RuntimeError("prepare_for_training must restore the offloaded step")
         try:
             return self._finish_train_step_body(state)
         except Exception:
@@ -2310,7 +2338,6 @@ class MegatronPolicyWorkerImpl(
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
-          "token_mask": only for top-k/top-p filtering; masked out -inf positions.
         """
         self.timer.start("get_logprobs")
         no_grad = torch.no_grad()
@@ -2378,24 +2405,14 @@ class MegatronPolicyWorkerImpl(
                 router_replay_train=False,
             )
 
-        # Taken from config; every PP rank must build the same mask for the broadcast below.
-        has_token_mask = need_top_k_or_top_p_filtering(self.sampling_params)
-
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             tensors: dict[str, Optional[torch.Tensor]] = {
                 "logprobs": pad_and_concat(
                     [l["logprobs"] for l in list_of_logprobs], target_len=seq_length
                 )
             }
-            if has_token_mask:
-                # Pad token_mask with 0 so padded positions are excluded from the loss.
-                tensors["token_mask"] = pad_and_concat(
-                    [l["token_mask"] for l in list_of_logprobs], target_len=seq_length
-                )
         else:
             tensors = {"logprobs": None}
-            if has_token_mask:
-                tensors["token_mask"] = None
         broadcasted = broadcast_tensors_from_last_stage(tensors)
         logprobs = broadcasted["logprobs"]
 
@@ -2410,8 +2427,6 @@ class MegatronPolicyWorkerImpl(
         )
         cpu_logprobs.copy_(logprobs, non_blocking=False)
         result = BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
-        if has_token_mask:
-            result["token_mask"] = broadcasted["token_mask"].to("cpu")
         return result
 
     def _resolve_output_layer_owner(self) -> Optional[Any]:
@@ -4316,6 +4331,43 @@ class MegatronPolicyWorkerImpl(
         # The plan is consumed (provider mutated to the inference layout); release it.
         self._colocated_reshard_plan = None
 
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/pause_train_step_with_offloading")
+    def pause_train_step_with_offloading(self) -> None:
+        """Pause the step, offloading parameters and optimizer state to CPU.
+
+        Pending dense/expert gradients stay on GPU. Counts, metrics and disabled
+        reduction hooks are preserved until ``prepare_for_training`` resumes it.
+        """
+        state = self._assert_step_open()
+        if state.get("offloaded", False):
+            raise RuntimeError("the open train step is already offloaded")
+        if not isinstance(self.model, DistributedDataParallel):
+            raise ValueError("PPO streaming offload requires Megatron DDP")
+        if (
+            self.megatron_cfg.ddp.use_distributed_optimizer
+            and self.megatron_cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag
+        ):
+            raise ValueError(
+                "PPO streaming offload with the distributed optimizer requires "
+                "reuse_grad_buf_for_mxfp8_param_ag=False"
+            )
+
+        self.finalize_async_save()
+        # eval may materialize model-specific caches; do it before CPU offload.
+        self.model.eval()
+        state["offloaded"] = True
+        self.model = self.move_model(
+            self.model, "cpu", move_params=True, move_grads=False
+        )
+        # optimizer_cpu_offload offloads optimizer computation to CPU. Here we
+        # only park GPU optimizer state on CPU while another RL model runs.
+        if self.optimizer is not None and not self.optimizer_cpu_offload:
+            self.move_optimizer("cpu")
+        self._release_opd_full_teacher_lm_head()
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
         self.model = self.move_model(
@@ -4335,6 +4387,9 @@ class MegatronPolicyWorkerImpl(
             and not self.optimizer_cpu_offload
         ):
             self.move_optimizer("cuda")
+
+        if self._train_step_state is not None:
+            self._train_step_state["offloaded"] = False
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
@@ -4397,16 +4452,21 @@ class MegatronPolicyWorkerImpl(
             # Disabled hooks mean no optimizer update is waiting to be gathered.
             return
 
+        # Settle checkpoint reads before rewriting it.
+        self.finalize_async_save()
+        # PPO can park the policy before critic training. Param gathering writes
+        # into its buffers, so restore their storage first (a no-op if resident).
+        self.model = self.move_model(
+            self.model, "cuda", move_params=True, move_grads=False
+        )
         if self._uses_mxfp8_overlap_shared_param_buffer():
             # This path requantizes updated master shards into the shared buffer.
             # Hold that buffer materialized until the next training step.
-            self.finalize_async_save()
             self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
             return
 
         # BF16 master shards are already in the DDP parameter buffer; only the
-        # all-gather remains. Settle checkpoint reads before rewriting it.
-        self.finalize_async_save()
+        # all-gather remains.
         self.model.start_param_sync(force_sync=True)
         # Ensure exporters cannot observe a partially gathered buffer.
         torch.cuda.synchronize()

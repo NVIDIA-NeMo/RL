@@ -123,7 +123,7 @@ def test_build_checkpoint_config_forwards_explicit_settings():
 
 @pytest.mark.automodel
 def test_build_checkpoint_config_rejects_null_model_save_format():
-    with pytest.raises(ValueError, match="dtensor_cfg.checkpoint.model_save_format"):
+    with pytest.raises(ValueError, match="automodel_cfg.checkpoint.model_save_format"):
         build_checkpoint_config(
             {"checkpoint": {"model_save_format": None}},
             model_repo_id="org/model",
@@ -423,7 +423,7 @@ class TestAutomodelCheckpointManager:
     ):
         """finalize_async_save must block on staging *and* upload completion.
 
-        The manager is initialized with is_async=True by DTensorPolicyWorkerV2,
+        The manager is initialized with is_async=True by AutomodelPolicyWorker,
         so dcp.async_save writes from a separate process. Skipping either wait
         lets the caller rename tmp_step_N to step_N mid-write, producing a
         checkpoint with no optimizer shards and no .metadata.
@@ -465,22 +465,22 @@ class TestAutomodelCheckpointManager:
     def test_dtensor_worker_overrides_finalize_async_save(self):
         """The worker must not inherit the base class no-op.
 
-        DTensorPolicyWorkerV2 passes is_async=True, so grpo.py's
+        AutomodelPolicyWorker passes is_async=True, so grpo.py's
         wait_fn=policy.finalize_async_save has to resolve to a real wait.
         """
+        from nemo_rl.models.policy.workers.automodel_policy_worker import (
+            AutomodelPolicyWorkerImpl,
+        )
         from nemo_rl.models.policy.workers.base_policy_worker import (
             AbstractPolicyWorker,
         )
-        from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
-            DTensorPolicyWorkerV2Impl,
-        )
 
         assert (
-            DTensorPolicyWorkerV2Impl.finalize_async_save
+            AutomodelPolicyWorkerImpl.finalize_async_save
             is not AbstractPolicyWorker.finalize_async_save
         )
 
-        worker = object.__new__(DTensorPolicyWorkerV2Impl)
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.checkpoint_manager = MagicMock()
         worker.finalize_async_save()
         worker.checkpoint_manager.finalize_async_save.assert_called_once_with()
