@@ -627,7 +627,20 @@ Set `overlong_filtering` to true when training on tasks where truncation at the 
 
 When one NeMo-Gym batch mixes several agents (for example short single-step tool-use tasks next to long multi-turn agentic traces), token-level loss normalization gives each agent a share of the gradient proportional to its trained tokens. A 250-token rollout next to a 25,000-token rollout contributes about 1% of the update, so a short-episode environment can stop moving even though its rewards carry signal.
 
-`agent_loss_weights` maps an agent name (the rollout's `agent_ref.name`) to a weight $w_a$. Right before the policy update, each sample's mask becomes $m_i \cdot w_{a(i)}$; agents that are not listed keep weight 1. The loss normalizer sums the same weighted mask, so the weights are relative: they change each agent's share of the gradient, not its overall scale. Baselines, advantages, and dynamic sampling are computed before weighting and are unchanged.
+`agent_loss_weights` maps an agent name (the rollout's `agent_ref.name`) to a weight $w_a$; agents that are not listed keep weight 1. Right before the policy update, each sample's loss weight $m_i$ (`sample_mask`) becomes
+
+$$
+\tilde m_i = c \, w_{a(i)} \, m_i,
+\qquad
+c = \frac{\sum_i m_i \,\lvert o_i\rvert}{\sum_i w_{a(i)} \, m_i \,\lvert o_i\rvert},
+$$
+
+where $\lvert o_i\rvert$ is the number of trained tokens in response $i$ and both sums run over one optimizer-step global batch: each consecutive `policy.train_global_batch_size` rows of the training batch, which is how `Policy.train` forms the global batches that every worker normalizes over. Two properties follow:
+
+- **The weights are relative.** The policy loss divides its $\tilde m$-weighted numerator by $\sum_i \tilde m_i \lvert o_i\rvert$ (`global_valid_toks`; or by $\sum_i \tilde m_i$, `global_valid_seqs`, under sequence-level normalization), so $c$ cancels and each agent's share of the gradient is set only by the ratios of the $w_a$. Multiplying every weight by the same constant is an exact no-op.
+- **The valid-token mass is preserved.** $\sum_i \tilde m_i \lvert o_i\rvert = \sum_i m_i \lvert o_i\rvert$, so `global_valid_toks` is the same number it would be without agent weights. This matters for auxiliary objectives that are normalized by `global_valid_toks` but whose numerator does not carry `sample_mask`: the Megatron backend scales the MoE load-balancing and router z-loss gradients by `1 / global_valid_toks` through `MoEAuxLossAutoScaler`, so without the rescaling a uniform weight of 2 would halve those gradients. With it, they are exactly what they are without agent weights. MTP already weights its numerator by `token_mask * sample_mask`, so it follows the policy loss and is relative as well.
+
+Because $c$ is fixed before the global batch is split across data-parallel ranks and microbatches, the result does not depend on that partition. Baselines, advantages, dynamic sampling, and the sequence-logprob-error filter run before weighting and are unchanged. Rows whose `sample_mask` is already 0 stay 0, and fractional masks are scaled like any other. `global_valid_seqs` and `num_valid_samples` report $\sum_i \tilde m_i$, the normalized weighted mask.
 
 ```yaml
 grpo:
@@ -635,7 +648,7 @@ grpo:
     short_tool_use_agent: 8.0
 ```
 
-Each step logs `agent_loss_weights/<agent>/{weight,num_samples,token_share_unweighted,token_share_weighted}` so the effective mix is visible. The option requires the NeMo-Gym rollout path and is applied by `grpo_train` and `async_grpo_train`; the data-plane and SingleController trainers reject it.
+Each step logs `agent_loss_weights/<agent>/{weight,effective_weight,num_samples,token_share_unweighted,token_share_weighted}`: the configured $w_a$, the multiplier $c \, w_a$ that was actually applied to the agent's rows, and the agent's share of the trained-token mass before and after weighting. The option requires the NeMo-Gym rollout path and is applied by `grpo_train` and `async_grpo_train`; the data-plane and SingleController trainers reject it.
 
 #### Advantage Clipping
 
