@@ -192,10 +192,11 @@ def _rewind_splice_before_new_media(
         raise MediaCaptureRejected(
             "Rendered prefix has an unexpected media occurrence"
         )
-    return PrefixSplice(
-        splice.token_ids[: splice.model_cut_end] + tokens[template_cut_start:],
-        splice.model_cut_end,
-        template_cut_start,
+    return replace(
+        splice,
+        token_ids=splice.token_ids[: splice.model_cut_end]
+        + tokens[template_cut_start:],
+        template_cut_start=template_cut_start,
     )
 
 
