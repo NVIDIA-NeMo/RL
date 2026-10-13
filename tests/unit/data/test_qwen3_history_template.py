@@ -36,7 +36,6 @@ from nemo_rl.data.xtoken.cross_tokenizer_collate import (
 from nemo_rl.data.xtoken.native_chat import _render_and_tokenize_chat
 
 ROOT = Path(__file__).resolve().parents[3]
-FIXTURES = Path(__file__).parent / "fixtures/xtoken"
 REVISION = "1cfa9a7208912126459214e8b04321603b3df60c"
 TEMPLATE = ROOT / "examples/chat_templates/qwen3_history.jinja"
 FLAGS = {
@@ -79,6 +78,18 @@ def stock_qwen_tokenizer() -> PreTrainedTokenizerBase:
         {
             "name": "Qwen/Qwen3-4B",
             "tokenizer_kwargs": {"revision": REVISION},
+        }
+    )
+
+
+@pytest.fixture(scope="module")
+def stock_qwen_thinking_tokenizer() -> PreTrainedTokenizerBase:
+    return get_tokenizer(
+        {
+            "name": "Qwen/Qwen3-30B-A3B-Thinking-2507",
+            "tokenizer_kwargs": {
+                "revision": "144afc2f379b542fdd4e85a1fcd5e1f79112d95d"
+            },
         }
     )
 
@@ -223,18 +234,27 @@ def test_stock_generation_prompt_and_tool_serialization(
 
 
 @pytest.mark.parametrize("inline", [False, True])
-def test_training_history_matches_history_preserving_reference(qwen_tokenizer, inline):
+def test_training_history_matches_history_preserving_reference(
+    qwen_tokenizer: PreTrainedTokenizerBase,
+    stock_qwen_thinking_tokenizer: PreTrainedTokenizerBase,
+    inline: bool,
+) -> None:
     messages = conversation(inline)
     ours = qwen_tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=False
     )
-    custom = qwen_tokenizer.apply_chat_template(
+    reference_template = stock_qwen_thinking_tokenizer.get_chat_template()
+    # Preserve earlier reasoning by disabling only the upstream history guard.
+    history_condition = "loop.index0 > ns.last_query_index"
+    assert reference_template.count(history_condition) == 1
+    reference_template = reference_template.replace(history_condition, "true")
+    reference = stock_qwen_thinking_tokenizer.apply_chat_template(
         messages,
-        chat_template=(FIXTURES / "qwen_thinking_history_reference.jinja").read_text(),
+        chat_template=reference_template,
         tokenize=False,
         add_generation_prompt=False,
     )
-    assert ours == custom
+    assert ours == reference
 
 
 def _native_collator(student, teacher, *, same_tokenizer=False):
