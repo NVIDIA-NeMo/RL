@@ -234,3 +234,51 @@ def test_weights_only_load_does_not_enforce_optimizer_layout(monkeypatch):
 
     checkpoint.load_checkpoint_with_draft(optimizer_path="/ckpt/optim", **common)
     assert captured["expected_meta"]["optimizer_layout"] is not None
+
+
+def test_save_pairs_optimizer_with_composite_model(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import torch
+    from torch import nn
+
+    from nemo_rl.models.automodel.draft import checkpoint
+
+    saved = {}
+    monkeypatch.setattr(
+        checkpoint,
+        "save_draft_checkpoint",
+        lambda draft_model, weights_path, meta: saved.update(meta=meta),
+    )
+    draft = nn.Linear(4, 4, bias=False)
+    draft.config = type(
+        "Cfg", (), {"block_size": 7, "mask_token_id": 0, "target_layer_ids": [0]}
+    )()
+    optimizer = torch.optim.AdamW(
+        [
+            {"name": "policy", "params": [nn.Parameter(torch.zeros(1))]},
+            {"name": "draft", "params": list(draft.parameters()), "lr": 1e-4},
+        ]
+    )
+    manager, composite = MagicMock(), MagicMock()
+    checkpoint.save_checkpoint_with_draft(
+        checkpoint_manager=manager,
+        model=MagicMock(),
+        draft_model=draft,
+        composite_model=composite,
+        optimizer=optimizer,
+        scheduler=None,
+        weights_path="/ckpt/step_1/policy/weights",
+        optimizer_path="/ckpt/optim",
+        tokenizer=None,
+        tokenizer_path=None,
+        is_final_checkpoint=False,
+        peft_config=None,
+        draft_config=SimpleNamespace(
+            model_name="test/draft", speculator_type="dspark", train_embed_and_head=True
+        ),
+    )
+    assert manager.save_checkpoint.call_args.kwargs["optimizer"] is None
+    assert manager.checkpointer.save_optimizer.call_args.kwargs["model"] is composite
+    assert saved["meta"]["optimizer_layout"] is not None

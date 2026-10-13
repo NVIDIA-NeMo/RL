@@ -22,10 +22,8 @@ from nemo_rl.algorithms.utils import finalize_draft_ratio_metrics
 
 
 def test_finalize_ratio_metrics_reproduces_token_weighted_global_ratio():
-    # Two microbatches with very different token counts: a naive mean of the
-    # two per-microbatch ratios (0.9, 0.1) would give 0.5, but the correct
-    # token-weighted global ratio is (90 + 10) / (100 + 100) = 0.5 here by
-    # coincidence -- use unequal totals below to distinguish the two.
+    # Unequal token counts: naive mean of ratios is ~0.456 but the token-weighted
+    # global ratio is (90 + 10) / (100 + 900) = 0.1.
     mb1_num, mb1_den = 90.0, 100.0  # ratio 0.9, small microbatch
     mb2_num, mb2_den = 10.0, 900.0  # ratio ~0.011, large microbatch
     naive_mean_of_ratios = (mb1_num / mb1_den + mb2_num / mb2_den) / 2
