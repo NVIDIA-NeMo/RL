@@ -185,30 +185,52 @@ def test_served_capture_bypasses_codec_through_route_consumers(
         assert direct.fragment is None
         return
 
-    expected = torch.cat(
-        (prompt_routes, generated_routes, torch.tensor([[[0, 1]]], dtype=dtype))
-    )[prev_len:]
+    full_routes = torch.cat(
+        (prompt_routes, generated_routes, torch.tensor([[[-1, -1]]], dtype=dtype))
+    )
+    boundary_rows = 1 if prev_len else 0
+    start = prev_len - boundary_rows
+    expected = full_routes[start:]
     fragment = direct.fragment
     assert fragment.routes.dtype == dtype
     assert torch.equal(fragment.routes, expected)
     # The sink receives the native slice, without a second route-buffer copy.
     assert (
         fragment.routes.data_ptr()
-        == response.choices[0].message.routed_experts[prev_len:].data_ptr()
+        == response.choices[0].message.routed_experts[start:].data_ptr()
     )
-    length = len(prompt) + 1 - prev_len
+    length = len(prompt) + 1
+    spans = []
+    expected_assembled = full_routes.to(torch.int16)
+    if prev_len:
+        # Missing parent routes remain sentinels, except its last token: the
+        # continuation's prefill supplies that boundary row without a codec.
+        spans.append(RouteSpan("r/parent", prev_len - 1, 1, 0, 1, "0" * 64))
+        expected_assembled = expected_assembled.clone()
+        expected_assembled[:start] = -1
+    spans.append(
+        RouteSpan(
+            key,
+            len(prompt) - prev_len,
+            1,
+            len(expected),
+            1,
+            coords["extras_digest"],
+            boundary_rows=boundary_rows,
+        )
+    )
     plan = RouteAssemblyPlan(
         schema_version=ROUTE_PLAN_SCHEMA_VERSION,
         staging_partition="staging",
-        spans=(RouteSpan(key, length - 1, 1, length, 1, coords["extras_digest"]),),
-        cleanup_staging_keys=(key,),
+        spans=tuple(spans),
+        cleanup_staging_keys=tuple(span.staging_key for span in spans),
         expected_token_length=length,
     )
     assembled, error = execute_route_plan(
         plan, {key: fragment}, dims=(1, 2), canonical_len=length
     )
     assert error is None
-    assert torch.equal(assembled, expected.to(torch.int16))
+    assert torch.equal(assembled, expected_assembled)
     policy = _PolicyWorker(client)
     meta = KVBatchMeta(
         partition_id="canonical",

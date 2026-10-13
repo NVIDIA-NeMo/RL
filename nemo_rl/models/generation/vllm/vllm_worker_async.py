@@ -45,6 +45,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.experience.route_assembly import boundary_route_rows
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -788,7 +789,7 @@ class VllmAsyncGenerationWorkerImpl(
     def _delta_align_routed_experts(
         payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
     ) -> torch.Tensor | None:
-        """Slice native routes and bind their attachment metadata to the delta."""
+        """Slice native routes for the delta plus boundary row and bind metadata."""
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
             return None
@@ -806,7 +807,8 @@ class VllmAsyncGenerationWorkerImpl(
                     f"route shape {tuple(routed.shape)} does not match engine sequence "
                     f"length {expected_full_len}"
                 )
-            routed = routed[prev_len:]
+            start = prev_len - boundary_route_rows(prev_len)
+            routed = routed[start:]
             message["routed_experts"] = routed_experts_tensor_metadata(routed)
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(

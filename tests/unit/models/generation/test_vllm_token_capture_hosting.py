@@ -383,10 +383,11 @@ def test_request_capture_token_in_prev_len_chains_without_codec(monkeypatch, dty
     assert (coords["delta_len"], coords["cum_len"]) == (3, 6)
     assert sink.records[0].token_ids_delta == [20, 21, 22]
     staged_routes = sink.attachments[0]["routed_experts"]
-    torch.testing.assert_close(staged_routes, routes[3:])
+    # Include the previous turn's last token, now routed by this call's prefill.
+    torch.testing.assert_close(staged_routes, routes[2:])
     # Staging reuses the slice, preserving the compact dtype without a copy.
-    assert staged_routes.data_ptr() == routes[3:].data_ptr()
-    assert sink.records[0].extras["routed_experts"]["shape"] == [3, 1, 2]
+    assert staged_routes.data_ptr() == routes[2:].data_ptr()
+    assert sink.records[0].extras["routed_experts"]["shape"] == [4, 1, 2]
     assert "routed_experts" not in content["choices"][0]["message"]
 
 

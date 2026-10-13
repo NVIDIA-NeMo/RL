@@ -113,6 +113,9 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
 
+# Grafana Alloy (Apache-2.0), started by ray.sub when LOKI_PUSH_URL is set.
+COPY --from=grafana/alloy:v1.18.0 /bin/alloy /usr/local/bin/alloy
+
 # CMake (for CUDA extension builds: transformer-engine, mamba-ssm, etc.)
 RUN GITHUB_ARTIFACTORY=github.com \
     && CMAKE_VERSION=4.0.3 \
@@ -711,6 +714,12 @@ getent passwd "${RUNTIME_UID}" >/dev/null || useradd --no-log-init --uid "${RUNT
 install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /home/nemo-runtime /nemo_run \
     "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python
 chown "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
+# Sweep up anything still root-owned in the cache and venvs (the arm64 build left
+# nvidia/cusparselt root-owned). The runtime UID must be able to remove and replace files there
+# when it re-syncs offline. Only root-owned entries are touched, so files that already belong to
+# the runtime UID stay as they are and are not copied into this layer.
+find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
+    -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
 # Local build contexts can come from a checkout with umask 0007. COPY preserves those
 # root-owned modes; the runtime UID needs to read source files and traverse directories.
 chmod -R a+rX /opt/nemo-rl

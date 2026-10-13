@@ -377,7 +377,7 @@ def test_capture_bypasses_upstream_route_encoding_without_changing_plain_request
     assert capture_response.choices[0].routed_experts is None
     native = capture_response.choices[0].message.routed_experts
     torch.testing.assert_close(
-        native, torch.tensor([[[1, 2]], [[0, 1]]], dtype=torch.int16)
+        native, torch.tensor([[[1, 2]], [[-1, -1]]], dtype=torch.int16)
     )
     assert isinstance(plain_response.choices[0].routed_experts, str)
     assert isinstance(plain_response.choices[0].message.routed_experts, str)
