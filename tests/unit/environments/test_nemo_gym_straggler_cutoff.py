@@ -14,11 +14,14 @@
 """Batch-level straggler cutoff on the synchronous NeMo-Gym rollout path."""
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 
+import nemo_rl.experience.rollouts as rollouts_mod
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.nemo_gym import (
     STRAGGLER_CUT_KEY,
@@ -32,7 +35,10 @@ from nemo_rl.environments.nemo_gym import (
     _straggler_cutoff_wait_s,
 )
 from nemo_rl.experience.failures import GymTransportError
-from nemo_rl.experience.rollouts import _postprocess_single_nemo_gym_group
+from nemo_rl.experience.rollouts import (
+    _postprocess_single_nemo_gym_group,
+    run_async_nemo_gym_rollout,
+)
 from nemo_rl.utils.timer import Timer
 
 NemoGymClass = NemoGym.__ray_metadata__.modified_class
@@ -480,6 +486,184 @@ def test_run_rollouts_in_receipt_mode_runs_uncut(capsys):
     assert not any(STRAGGLER_CUT_KEY in item[2]["full_result"] for item in streamed)
     assert helper.completions.cancelled == []
     assert "receipt mode" in capsys.readouterr().err
+
+
+# ── driver ────────────────────────────────────────────────────────────────
+
+
+GENERATION_CONFIG = {
+    "max_new_tokens": 16,
+    "stop_strings": [],
+    "stop_token_ids": [],
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": None,
+}
+
+
+def _driver_rows(n: int) -> list[dict]:
+    return [
+        {
+            "task_source": "agent",
+            "agent_ref": {"name": "agent"},
+            "responses_create_params": {"input": "hi"},
+        }
+        for _ in range(n)
+    ]
+
+
+def test_allow_straggler_cutoff_requires_returns_entire_batch():
+    """A per-group stream could not tell a whole-batch cutoff where its batch ends."""
+
+    async def collect():
+        return [
+            result
+            async for result in run_async_nemo_gym_rollout(
+                policy_generation=SimpleNamespace(
+                    cfg={"max_total_sequence_length": 128}
+                ),
+                input_batch=BatchedDataDict({"extra_env_info": _driver_rows(2)}),
+                tokenizer=None,
+                task_to_env={},
+                generation_config=GENERATION_CONFIG,
+                num_generations=2,
+                log_full_result_tables=False,
+                allow_straggler_cutoff=True,
+            )
+        ]
+
+    with pytest.raises(
+        ValueError, match="allow_straggler_cutoff requires returns_entire_batch"
+    ):
+        asyncio.run(collect())
+
+
+class _ReadyRef:
+    """Ray hands back a reference per streamed row; the driver awaits it."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __await__(self):
+        async def _resolve():
+            return self.value
+
+        return _resolve().__await__()
+
+
+class _AsyncOnlyStream:
+    def __init__(self, values):
+        self.values = iter(values)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self.values)
+        except StopIteration as error:
+            raise StopAsyncIteration from error
+
+
+def _finished_result(rowidx: int) -> dict:
+    return {
+        "full_result": {"reward": 1.0},
+        "input_message_log": [{"role": "user", "token_ids": [rowidx, 7]}],
+        "message_log": [
+            {"role": "user", "token_ids": [rowidx, 7]},
+            {"role": "assistant", "token_ids": [3], "generation_logprobs": [0.0]},
+        ],
+    }
+
+
+def test_driver_gives_cut_rows_no_media_back(monkeypatch):
+    """With deduplicated media, a finished row gets its tensors back; a placeholder does not.
+
+    The placeholder's prompt is text only, so re-attaching pixel values would
+    hand the policy image tensors with no image placeholder tokens.
+    """
+    rows = _driver_rows(2)
+    media = [PackedTensor(torch.tensor([[float(i)]]), dim_to_pack=0) for i in range(2)]
+    input_batch = BatchedDataDict(
+        {
+            "extra_env_info": rows,
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "prompt",
+                        "token_ids": torch.tensor([1, 2]),
+                        "pixel_values": media[i],
+                    }
+                ]
+                for i in range(2)
+            ],
+            "loss_multiplier": torch.ones(2),
+        }
+    )
+
+    class _RunRollouts:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, rows, timer_prefix, deduplicate_multimodal_data, **kwargs):
+            assert deduplicate_multimodal_data is True
+            assert kwargs == {"allow_straggler_cutoff": True}
+            cut = _straggler_cut_placeholder(rows[1], _FakeTokenizer())
+            return _AsyncOnlyStream(
+                [
+                    _ReadyRef((0, {"name": "agent"}, _finished_result(0), None)),
+                    _ReadyRef(
+                        (1, {"name": "agent"}, cut, {"straggler_cutoff/num_cut": 1.0})
+                    ),
+                ]
+            )
+
+    captured: dict[str, Any] = {}
+
+    def _postprocess_group(**kwargs):
+        captured["results"] = kwargs["results"]
+        return rollouts_mod.NemoGymRolloutResult(
+            input_ids=torch.empty(0),
+            final_batch=kwargs["input_batch"],
+            rollout_metrics={},
+            task_index=None,
+        )
+
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_group
+    )
+    env = SimpleNamespace(run_rollouts=_RunRollouts())
+
+    async def collect():
+        return [
+            result
+            async for result in run_async_nemo_gym_rollout(
+                policy_generation=SimpleNamespace(
+                    cfg={"max_total_sequence_length": 128}
+                ),
+                input_batch=input_batch,
+                tokenizer=None,
+                task_to_env={"nemo_gym": env},
+                generation_config=GENERATION_CONFIG,
+                num_generations=2,
+                log_full_result_tables=False,
+                deduplicate_multimodal_data=True,
+                returns_entire_batch=True,
+                allow_straggler_cutoff=True,
+            )
+        ]
+
+    (rollout_result,) = asyncio.run(collect())
+    finished, cut = captured["results"]
+    assert cut["full_result"][STRAGGLER_CUT_KEY] is True
+    assert finished["message_log"][0]["pixel_values"] is media[0]
+    assert finished["input_message_log"][0]["pixel_values"] is media[0]
+    for message in cut["message_log"] + cut["input_message_log"]:
+        assert "pixel_values" not in message
+    # The single actor's stats pass through the roll-up unchanged.
+    assert rollout_result.rollout_metrics["straggler_cutoff/num_cut"] == 1.0
 
 
 # ── batch ─────────────────────────────────────────────────────────────────

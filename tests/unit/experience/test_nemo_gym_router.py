@@ -80,8 +80,10 @@ class _FakeRunRollouts:
         rows,
         timer_prefix,
         deduplicate_multimodal_data=False,
+        **kwargs,
     ):
         self._handle.calls.append((rows, timer_prefix))
+        self._handle.kwargs_seen.append(kwargs)
         return _FakeStream(
             rows,
             self._handle.shard_name,
@@ -96,6 +98,7 @@ class _FakeActor:
         self.fail = fail
         self.fail_on_await = fail_on_await
         self.calls = []
+        self.kwargs_seen = []
         self.run_rollouts = _FakeRunRollouts(self)
 
 
@@ -303,6 +306,33 @@ def test_the_merge_drains_every_shard_and_tags_each_row_with_its_own():
     assert {shard for _, _, shard in drained} == {"left", "right"}
     # Timing arrives once per shard, on that shard's last row.
     assert sum(timing is not None for _, timing, _ in drained) == 2
+
+
+@pytest.mark.parametrize("allow", [True, False])
+def test_the_merge_forwards_allow_straggler_cutoff_to_every_shard(allow):
+    """The flag reaches each actor as the keyword its ``run_rollouts`` declares.
+
+    It travels outside the positional payload-metrics tuple, so this is the
+    only place that checks the keyword is sent, and sent only when enabled.
+    """
+    left, right = _FakeActor("left"), _FakeActor("right")
+    buckets = [
+        ("left", left, _rows(["alpha"], num_generations=2)),
+        ("right", right, _rows(["beta"], num_generations=3)),
+    ]
+
+    async def drain():
+        return [
+            rowidx
+            async for rowidx, *_ in _merge_nemo_gym_instance_streams(
+                buckets, timer_prefix="timing/rollout", allow_straggler_cutoff=allow
+            )
+        ]
+
+    assert sorted(asyncio.run(drain())) == [0, 0, 1, 1, 2]
+    expected = {"allow_straggler_cutoff": True} if allow else {}
+    assert left.kwargs_seen == [expected]
+    assert right.kwargs_seen == [expected]
 
 
 def test_a_failing_shard_names_itself_rather_than_surfacing_a_bare_ray_error():
