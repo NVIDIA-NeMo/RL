@@ -280,7 +280,6 @@ def test_real_qwen_history_masks_and_kd(
         message_loss_mask=selected,
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
-        skip_overlength=True,
     )
     collator = _native_collator(student, teacher, same_tokenizer=same_tokenizer)
     batch = collator(

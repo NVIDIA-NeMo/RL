@@ -303,7 +303,6 @@ class CrossTokenizerCollator:
                 message_loss_mask=datum.get("message_loss_mask"),
                 include_thinking_in_loss=self.include_thinking_in_loss,
                 native_thinking_alignment=self.native_thinking_alignment,
-                skip_overlength=True,
             )
         except (ValueError, TypeError) as error:
             raise ValueError(f"{side}, sample idx={datum['idx']}: {error}") from error
@@ -421,34 +420,6 @@ class CrossTokenizerCollator:
             for field in dataclass_fields(alignment):
                 out[f"alignment_{i}_{field.name}"] = getattr(alignment, field.name)
         return BatchedDataDict(out)
-
-    @staticmethod
-    def _render_and_tokenize_chat(
-        tokenizer: PreTrainedTokenizerBase,
-        messages: List[dict],
-        ctx_length: int,
-    ) -> tuple[
-        List[int], List[tuple[int, int]], List[int], List[tuple[int, int]], List[int]
-    ]:
-        """Compatibility helper for inspecting retained truncation boundaries.
-
-        Production chat collation uses complete documents and rejects overflow.
-        """
-        doc = _render_and_tokenize_chat(
-            tokenizer,
-            messages,
-            ctx_length,
-            include_thinking_in_loss=False,
-            native_thinking_alignment=False,
-            skip_overlength=False,
-        )
-        return (
-            doc.input_ids,
-            doc.offsets,
-            doc.assistant_mask,
-            doc.assistant_spans,
-            doc.eot_indices,
-        )
 
     @staticmethod
     def _pad_chat_batch(
