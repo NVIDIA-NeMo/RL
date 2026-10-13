@@ -464,6 +464,24 @@ def test_run_rollouts_on_a_gym_without_aclose_runs_uncut(capsys):
     assert capsys.readouterr().err.count("running without the cutoff") == 1
 
 
+def test_run_rollouts_in_receipt_mode_runs_uncut(capsys):
+    helper = _FakeRolloutHelper({0: 0.0, 1: 0.2})
+    env = _actor(ENABLED, helper)
+    env._token_capture_enabled = True
+
+    async def receipt(row, result):
+        return {"message_log": [], "full_result": result}
+
+    env._postprocess_receipt_mode = receipt
+    streamed = _run(env, _rows(2), allow=True)
+
+    # A cancelled rollout has no receipt for the finalizer to rebuild, so the
+    # cutoff stays off in receipt mode and the batch runs to completion.
+    assert not any(STRAGGLER_CUT_KEY in item[2]["full_result"] for item in streamed)
+    assert helper.completions.cancelled == []
+    assert "receipt mode" in capsys.readouterr().err
+
+
 # ── batch ─────────────────────────────────────────────────────────────────
 
 
@@ -472,8 +490,13 @@ class _FakeGeneration:
 
 
 def _finished(reward: float) -> dict:
+    answer = {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "42"}],
+    }
     return {
-        "full_result": {"reward": reward, "response": {"output": []}, "turns": 3},
+        "full_result": {"reward": reward, "response": {"output": [answer]}, "turns": 3},
         "message_log": [
             {"role": "user", "token_ids": torch.tensor([3, 4])},
             {"role": "assistant", "token_ids": torch.tensor([1, 2])},
@@ -506,6 +529,33 @@ def test_cut_rows_never_train_and_stay_out_of_agent_metrics(mask_env_flagged_sam
     if mask_env_flagged_samples:
         assert final_batch["mask_sample"].tolist() == [False, True, False]
     assert final_batch["total_reward"].tolist() == [1.0, 0.0, 0.0]
-    # Per-agent full-result means cover the two real rollouts only.
+    # Per-agent full-result and token means cover the two real rollouts only.
     assert rollout_result.rollout_metrics["agent/turns/mean"] == 3.0
     assert rollout_result.rollout_metrics["agent/reward/mean"] == 0.5
+    assert rollout_result.rollout_metrics["agent/gen_tokens_per_sample/mean"] == 2.0
+
+
+def test_cut_rows_take_no_part_in_reward_penalties():
+    results = [
+        _finished(1.0),
+        _straggler_cut_placeholder({}, _FakeTokenizer()),
+        _finished(0.0),
+    ]
+    rollout_result = _postprocess_single_nemo_gym_group(
+        nemo_gym_rows=[{"agent_ref": {"name": "agent"}} for _ in results],
+        results=results,
+        timer=Timer(),
+        timer_prefix="timing/test",
+        policy_generation=_FakeGeneration(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(3)}),
+        tokenizer=_FakeTokenizer(),
+        log_full_result_tables=False,
+        reward_penalty_config={"penalize_empty_final_answer": True},
+    )
+
+    # The placeholder's response.output is empty, but it is not a model output
+    # that answered nothing: only the two real rollouts are checked, and both
+    # answered, so the rate is 0 over the scored rows rather than 1/3.
+    assert rollout_result.rollout_metrics["empty_final_answer_rate"] == 0.0
+    assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 0.0, 0.0]
+    assert rollout_result.final_batch["loss_multiplier"].tolist() == [1.0, 0.0, 1.0]

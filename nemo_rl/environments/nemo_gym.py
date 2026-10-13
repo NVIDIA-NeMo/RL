@@ -1387,6 +1387,18 @@ Depending on your data shape, you may want to change these values."""
             finally:
                 await inner.aclose()
 
+    def _warn_straggler_cutoff_unavailable(self, reason: str) -> None:
+        """Say once per actor why ``env.nemo_gym.straggler_cutoff`` is being ignored."""
+        if self._warned_straggler_cutoff_unavailable:
+            return
+        print(
+            f"[nemo_gym] env.nemo_gym.straggler_cutoff is enabled, but {reason}; "
+            "running without the cutoff.",
+            file=sys.stderr,
+            flush=True,
+        )
+        self._warned_straggler_cutoff_unavailable = True
+
     async def _stream_rollouts(
         self,
         nemo_gym_examples: list[dict],
@@ -1424,17 +1436,22 @@ Depending on your data shape, you may want to change these values."""
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         cutoff = self._straggler_cutoff if allow_straggler_cutoff else None
+        if cutoff is not None and self._token_capture_enabled:
+            # Receipt mode returns token-free receipts that the finalizer rebuilds
+            # from the capture ledger; a cancelled rollout has no receipt, so a
+            # placeholder row has no place in that pipeline.
+            self._warn_straggler_cutoff_unavailable(
+                "token capture (receipt mode) is on and a cancelled rollout has "
+                "no receipt"
+            )
+            cutoff = None
         if cutoff is not None and not hasattr(nemo_gym_result_iterator, "aclose"):
-            # Gym releases whose run_examples cannot cancel in-flight rollouts.
-            if not self._warned_straggler_cutoff_unavailable:
-                print(
-                    "[nemo_gym] env.nemo_gym.straggler_cutoff is enabled, but this "
-                    "NeMo-Gym's run_examples cannot cancel in-flight rollouts (no "
-                    "aclose()); running without the cutoff.",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                self._warned_straggler_cutoff_unavailable = True
+            # Gym releases whose run_examples cannot cancel in-flight rollouts
+            # (the pinned 17abf2dd returns a plain map; Gym#4029 adds aclose()).
+            self._warn_straggler_cutoff_unavailable(
+                "this NeMo-Gym's run_examples cannot cancel in-flight rollouts "
+                "(no aclose())"
+            )
             cutoff = None
         cutoff_stats: dict[str, float] = {}
         if cutoff is not None:

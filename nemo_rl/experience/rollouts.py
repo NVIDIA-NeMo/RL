@@ -3007,13 +3007,31 @@ def _postprocess_single_nemo_gym_group(
     (``identity_num_generations``); the synchronous path hands the whole batch
     in as one call, so it may hold several prompt groups. Defaults to the batch.
     """
+    # Rollouts the straggler cutoff cancelled are zero-reward placeholders, not
+    # model outputs: they take no part in reward shaping or the penalty checks
+    # (and their rates), and they never train (loss_multiplier is zeroed below).
+    straggler_cut = torch.tensor(
+        [bool(r["full_result"].get(STRAGGLER_CUT_KEY)) for r in results],
+        dtype=torch.bool,
+    )
+    scored_rows: list[dict] = []
+    scored_results: list[dict] = []
+    for nemo_gym_row, result, was_cut in zip(
+        nemo_gym_rows, results, straggler_cut.tolist()
+    ):
+        if not was_cut:
+            scored_rows.append(nemo_gym_row)
+            scored_results.append(result)
+
     # Length-based reward shaping for low-effort prompts
-    shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
+    shaping = _apply_effort_shaping(scored_results, scored_rows, effort_config)
 
     resolved_reward_penalty_config = resolve_reward_penalty_config(
         reward_penalty_config, tokenizer, thinking_tags=thinking_tags
     )
-    penalty_counts = apply_reward_penalties(results, resolved_reward_penalty_config)
+    penalty_counts = apply_reward_penalties(
+        scored_results, resolved_reward_penalty_config
+    )
 
     # Length penalties rewrite full_result["reward"] in place; keep the reward
     # as handed to the hook (``env_reward``) so training can still report the
@@ -3216,10 +3234,6 @@ def _postprocess_single_nemo_gym_group(
 
     # Rollouts cancelled by the straggler cutoff never train, whatever the
     # mask_sample settings say: their response is a one-token placeholder.
-    straggler_cut = torch.tensor(
-        [bool(r["full_result"].get(STRAGGLER_CUT_KEY)) for r in results],
-        dtype=torch.bool,
-    )
     loss_multiplier = input_batch["loss_multiplier"]
     if straggler_cut.any():
         loss_multiplier = torch.as_tensor(loss_multiplier).clone()
@@ -3263,7 +3277,7 @@ def _postprocess_single_nemo_gym_group(
     rollout_metrics.update(
         compute_reward_penalty_metrics(
             penalty_counts,
-            len(results),
+            len(scored_results),
             resolved_reward_penalty_config,
         )
     )
