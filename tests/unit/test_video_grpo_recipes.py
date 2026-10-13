@@ -110,10 +110,15 @@ def test_agentic_vbench_recipes_allow_long_inline_image_histories(name: str):
     assert image_limit >= 128
 
 
-def test_agentic_vbench_256k_debug_recipe_preserves_multimodal_parity_contract():
-    recipe = _load_recipe(
-        "vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml"
-    )
+@pytest.mark.parametrize(
+    "name",
+    [
+        "vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml",
+        "vlm_grpo-nemotron-super-omni-120ba12b-8n8g-megatron-claweval-sc.v2.yaml",
+    ],
+)
+def test_sync_video_debug_recipes_preserve_multimodal_parity_contract(name: str):
+    recipe = _load_recipe(name)
 
     assert recipe["grpo"]["debug_payload_metrics"] is True
     assert recipe["grpo"]["seq_logprob_error_threshold"] is None
