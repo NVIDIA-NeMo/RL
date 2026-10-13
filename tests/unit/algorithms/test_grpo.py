@@ -511,6 +511,30 @@ class TestAgentLossWeights:
         assert metrics["agent_loss_weights/a/effective_weight"] == 0.0
         assert metrics["agent_loss_weights/a/token_share_weighted"] == 0.0
 
+    def test_zero_weight_agent_is_excluded_and_mass_moves_to_the_others(self):
+        # Weight 0 is legal (the validator accepts >= 0): the agent's rows drop
+        # out and the remaining agents absorb the step's token mass.
+        assert GRPOConfig(agent_loss_weights={"a": 0.0}).agent_loss_weights == {
+            "a": 0.0
+        }
+        train_data = self._train_data([1000, 25, 25], [1.0, 1.0, 1.0])
+        agent_refs = [{"name": "long"}, {"name": "short"}, {"name": "short"}]
+
+        metrics = _apply_agent_loss_weights(
+            train_data, agent_refs, {"short": 0.0}, train_global_batch_size=3
+        )
+
+        # Raw mass 1050 is now carried by the 1000 long tokens alone: c = 1.05.
+        torch.testing.assert_close(
+            train_data["sample_mask"], torch.tensor([1.05, 0.0, 0.0])
+        )
+        assert self._global_valid_toks(train_data) == pytest.approx(1050.0)
+        assert metrics["agent_loss_weights/short/effective_weight"] == 0.0
+        assert metrics["agent_loss_weights/short/token_share_weighted"] == 0.0
+        assert metrics["agent_loss_weights/long/token_share_weighted"] == (
+            pytest.approx(1.0)
+        )
+
     def test_configured_agent_absent_from_batch_warns_and_logs_zero_samples(self):
         # A misspelled name matches no row, so every row keeps weight 1.0 and the
         # run would train exactly like an unset option; make that visible.
