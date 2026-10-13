@@ -328,7 +328,9 @@ _REWARD_PENALTY_FLAGS = (
 class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
-    max_num_epochs: int = 1
+    # None disables the dataset-epoch bound. The SingleController rollout pump
+    # then cycles the stateful dataloader until max_num_steps (or wall-time).
+    max_num_epochs: int | None = 1
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
     normalize_rewards: bool = True

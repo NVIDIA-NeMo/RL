@@ -1833,6 +1833,10 @@ class TestSetup:
 
         assert mc.grpo.max_num_steps == 2
 
+    def test_grpo_config_accepts_unbounded_epochs(self):
+        """The validated config model accepts the SC no-epoch-bound sentinel."""
+        assert GRPOConfig(max_num_epochs=None).max_num_epochs is None
+
     def test_max_num_steps_capped_by_dataloader_epochs(self, patched_factories):
         """grpo.max_num_steps drops to max_num_epochs * len(dataloader) when smaller."""
         mc = _make_master_config(

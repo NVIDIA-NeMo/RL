@@ -14,6 +14,10 @@ policy:
   # runs out of memory on the longest rows.
   max_total_sequence_length: 262144
   megatron_cfg:
+    # Match Rohit's NeMo-RL v2 production recipe: bf16 rounding in the final
+    # logits GEMM is a leading source of generation/trainer log-prob mismatch.
+    # The vLLM flag below must stay identical to this trainer-side setting.
+    fp32_lm_head: true
     # The identity fast run (2026-10-07) trained step 1 and then ran out of learner
     # memory in the step-2 backward pass with 70-80k-token rows (175 GiB on one
     # GPU). Two pipeline stages are not an option: NeMo-RL's refit broadcast
@@ -24,6 +28,10 @@ policy:
     pipeline_model_parallel_size: 1
     empty_unused_memory_level: 2
   generation:
+    vllm_cfg:
+      # Keep generation logits on the same fp32 LM-head path as Megatron so
+      # token_mult_prob_error measures model parity rather than output rounding.
+      fp32_lm_head: true
     vllm_kwargs:
       # Do not size the prefill chunk to the whole window: vLLM profiles and
       # warms up at max_num_batched_tokens, and 256k-token chunks would also
