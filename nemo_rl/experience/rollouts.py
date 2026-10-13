@@ -2963,9 +2963,13 @@ def run_nemo_gym_rollout_sync(
 
 
 # Responses ``incomplete_details.reason`` values that mean the final model call
-# ran out of tokens. NeMo-Gym maps a chat ``finish_reason="length"`` (including
-# the empty completion it returns when the prompt overflows the context window)
-# to ``max_output_tokens``.
+# ran out of tokens. NeMo-Gym normalizes every length stop to
+# ``max_output_tokens``: a chat ``finish_reason="length"`` (including the empty
+# completion it returns when the prompt overflows the context window) and the
+# Anthropic ``max_tokens`` / ``model_context_window_exceeded`` stop reasons. The
+# Responses schema admits no other length reason, so ``length`` and
+# ``max_tokens`` are defensive aliases for non-Gym producers; the pinned Gym
+# cannot emit them.
 _LENGTH_LIMIT_INCOMPLETE_REASONS = frozenset(
     {"max_output_tokens", "length", "max_tokens"}
 )
@@ -2997,7 +3001,10 @@ def nemo_gym_rollout_hit_max_tokens(
 
     Args:
         full_result: The Gym rollout result; its ``response`` key holds the
-            final Responses object when the agent produced one.
+            final Responses object when the agent produced one. Agents that
+            return the model's final Responses object carry
+            ``incomplete_details``; agents that synthesize their terminal
+            response do not, and fall back to the token-count check.
         total_tokens: Token count of the rollout's full message log.
         max_total_tokens_per_sample: The generation backend's context limit.
 
