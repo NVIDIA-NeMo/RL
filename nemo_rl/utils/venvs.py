@@ -54,9 +54,9 @@ def _run_with_retries(cmds: list[list[str]], env: dict[str, str]) -> None:
     """Run ``cmds`` in order with ``check=True``, retrying all of them on failure.
 
     Many workers sync venvs concurrently at job start, so a single transient failure
-    (an HTTP error status that ``UV_HTTP_RETRIES`` does not cover, or a race between
-    concurrent editable builds) would otherwise fail the whole job. The number of
-    attempts and the base delay between them are read from
+    (a 4xx such as 403 that uv's own ``UV_HTTP_RETRIES`` treats as fatal and does not
+    retry, or a race between concurrent editable builds) would otherwise fail the
+    whole job. The number of attempts and the base delay between them are read from
     ``NEMO_RL_UV_SYNC_ATTEMPTS`` (default 3) and ``NEMO_RL_UV_SYNC_RETRY_DELAY_S``
     (default 10). The delay grows linearly with the attempt number and is jittered.
     The last failure is re-raised unchanged.

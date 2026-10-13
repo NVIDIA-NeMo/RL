@@ -148,7 +148,7 @@ uv run examples/run_grpo.py
 
 This approach works on both single-node and multi-node setups. On multi-node runs, each node will independently rebuild its virtual environments.
 
-Each worker virtual environment is built by running `uv sync` followed by the worker's `uv run` command. Because every node syncs its environments at the same time at job start, a transient failure (for example an HTTP error status while downloading a wheel, which `UV_HTTP_RETRIES` does not cover, or a race between concurrent editable builds) is retried instead of failing the job: both commands are re-run in order with jittered linear backoff. Tune or disable the retries with:
+Each worker virtual environment is built by running `uv sync` followed by the worker's `uv run` command. Because every node syncs its environments at the same time at job start, a transient failure (for example a `403` from a release-asset URL, or a race between concurrent editable builds) is retried instead of failing the job: both commands are re-run in order with jittered linear backoff. uv's own `UV_HTTP_RETRIES` (default 3) retries connection errors and 5xx/408/429 responses but treats other 4xx such as 403 as fatal, and it does not cover the editable-build race. Tune or disable the retries with:
 
 ```bash
 export NEMO_RL_UV_SYNC_ATTEMPTS=3        # total attempts; 1 disables retries
