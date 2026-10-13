@@ -2548,6 +2548,19 @@ async def _merge_nemo_gym_instance_streams(
                 ray.cancel(stream)
 
 
+# The actor appends its batch-level ``straggler_cutoff/*`` stats to the same
+# last-row metrics dict as its timings (see ``NemoGym._stream_rollouts``). They
+# are not concurrent durations, so they do not roll up by max: the count adds
+# up over instances, the two flags are set if any instance tripped, and the
+# timestamps and done fraction describe one instance's cutoff event, so they
+# are reported per shard only.
+_STRAGGLER_CUTOFF_METRIC_PREFIX = "straggler_cutoff/"
+_SUMMED_STRAGGLER_CUTOFF_METRICS = frozenset({"straggler_cutoff/num_cut"})
+_ANY_INSTANCE_STRAGGLER_CUTOFF_METRICS = frozenset(
+    {"straggler_cutoff/armed", "straggler_cutoff/cut_by_max_wall"}
+)
+
+
 def _merge_nemo_gym_timing_metrics(
     timing_by_instance: dict[str, dict[str, Any]], timer_prefix: str
 ) -> dict[str, Any]:
@@ -2564,6 +2577,12 @@ def _merge_nemo_gym_timing_metrics(
     batch-wide average, which is the honest reading -- averaging percentages
     over instances with different row counts would not mean anything.
 
+    The ``straggler_cutoff/*`` stats that ride along are counts and flags, not
+    timings: ``num_cut`` is summed, ``armed`` and ``cut_by_max_wall`` are set
+    if any instance set them, and the rest (``armed_at_s``, ``cut_at_s``,
+    ``done_fraction_at_cut``) appear only per shard, under
+    ``straggler_cutoff/shard/<instance>/``.
+
     With one instance this returns exactly what it reported, so the unsharded
     path is unchanged.
     """
@@ -2573,6 +2592,16 @@ def _merge_nemo_gym_timing_metrics(
     merged: dict[str, Any] = {}
     for instance_label, metrics in timing_by_instance.items():
         for key, value in metrics.items():
+            if key.startswith(_STRAGGLER_CUTOFF_METRIC_PREFIX):
+                suffix = key[len(_STRAGGLER_CUTOFF_METRIC_PREFIX) :]
+                merged[
+                    f"{_STRAGGLER_CUTOFF_METRIC_PREFIX}shard/{instance_label}/{suffix}"
+                ] = value
+                if key in _SUMMED_STRAGGLER_CUTOFF_METRICS:
+                    merged[key] = merged.get(key, 0.0) + value
+                elif key in _ANY_INSTANCE_STRAGGLER_CUTOFF_METRICS:
+                    merged[key] = max(merged.get(key, 0.0), value)
+                continue
             suffix = (
                 key[len(timer_prefix) + 1 :] if key.startswith(timer_prefix) else key
             )

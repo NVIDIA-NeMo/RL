@@ -394,3 +394,54 @@ def test_replicas_report_separately_rather_than_overwriting_each_other():
 
 def test_no_shard_reported_timing_yields_no_metrics():
     assert _merge_nemo_gym_timing_metrics({}, "timing/rollout") == {}
+
+
+def test_straggler_cutoff_stats_add_up_over_shards_instead_of_taking_the_worst():
+    """Three shards cut 2, 3 and 0 rows: the batch cut 5, not 3.
+
+    The timestamps and the done fraction describe one shard's event each, so
+    a batch-wide max would pair shard a's fraction with shard b's max-wall
+    flag; they stay per shard.
+    """
+
+    def stats(num_cut, armed, cut_by_max_wall, **event):
+        return {
+            "timing/rollout/await_results": 4.0 + num_cut,
+            "straggler_cutoff/num_cut": num_cut,
+            "straggler_cutoff/armed": armed,
+            "straggler_cutoff/cut_by_max_wall": cut_by_max_wall,
+            **{f"straggler_cutoff/{key}": value for key, value in event.items()},
+        }
+
+    merged = _merge_nemo_gym_timing_metrics(
+        {
+            "a": stats(
+                2.0,
+                1.0,
+                0.0,
+                armed_at_s=600.0,
+                cut_at_s=900.0,
+                done_fraction_at_cut=0.9,
+            ),
+            "b": stats(3.0, 0.0, 1.0, cut_at_s=1200.0, done_fraction_at_cut=0.5),
+            "c": stats(0.0, 0.0, 0.0),
+        },
+        "timing/rollout",
+    )
+
+    assert merged["straggler_cutoff/num_cut"] == 5.0
+    assert merged["straggler_cutoff/armed"] == 1.0
+    assert merged["straggler_cutoff/cut_by_max_wall"] == 1.0
+    for per_event_key in ("armed_at_s", "cut_at_s", "done_fraction_at_cut"):
+        assert f"straggler_cutoff/{per_event_key}" not in merged
+    assert merged["straggler_cutoff/shard/a/num_cut"] == 2.0
+    assert merged["straggler_cutoff/shard/a/done_fraction_at_cut"] == 0.9
+    assert merged["straggler_cutoff/shard/b/cut_at_s"] == 1200.0
+    assert merged["straggler_cutoff/shard/b/cut_by_max_wall"] == 1.0
+    assert merged["straggler_cutoff/shard/c/num_cut"] == 0.0
+    # The timings that share the dict still roll up to the slowest shard.
+    assert merged["timing/rollout/await_results"] == 7.0
+    assert merged["timing/rollout/shard/a/await_results"] == 6.0
+    assert not any(
+        key.startswith("timing/rollout/shard/") and "straggler" in key for key in merged
+    )
