@@ -13,10 +13,11 @@
 # limitations under the License.
 """ray.sub ends the job when the head srun outlives the driver.
 
-The batch-side wait loop and the DRIVER_EXIT_GRACE_S validation are extracted
-from ray.sub and run in bash against fake processes, so the tests exercise the
-real shell code without Slurm. The head container's marker write is checked in
-place inside the generated head command.
+The batch-side head wait (the poll loop through the final `wait` and `exit`)
+and the DRIVER_EXIT_GRACE_S validation are extracted from ray.sub and run in
+bash against fake processes, so the tests exercise the real shell code without
+Slurm. The head container's marker write is checked in place inside the
+generated head command.
 """
 
 import os
@@ -30,6 +31,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAY_SUB = REPO_ROOT / "ray.sub"
 MARKER_WRITE = '  echo "\\$exit_code" > "$LOG_DIR/DRIVER_EXITED" 2>/dev/null || true'
+# Distinct from every driver code the tests use, so the job's exit status tells
+# whether it came from the head (`wait` propagation) or from the watchdog.
+HEAD_EXIT_CODE = 7
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 
@@ -38,10 +42,11 @@ def _lines() -> list[str]:
     return RAY_SUB.read_text().splitlines()
 
 
-def _batch_wait_loop() -> str:
+def _batch_head_wait() -> str:
+    """The COMMAND branch from the watchdog state through `wait` and `exit`."""
     lines = _lines()
     start = lines.index('  _driver_exited_at=""')
-    end = lines.index("  done", start)
+    end = lines.index("  exit $exit_code", start)
     return "\n".join(lines[start : end + 1])
 
 
@@ -65,30 +70,37 @@ def _run(
     head_seconds: int,
     grace_s: int,
     marker: str | None,
-    dead_sidecar: bool = False,
+    sidecar_dies_after_s: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Runs the extracted head wait against a fake head that exits HEAD_EXIT_CODE.
+
+    `sidecar_dies_after_s` adds a worker srun that exits before the head, as after
+    a node failure during bringup: 0 means it is already gone when the loop starts,
+    N > 0 that it dies N seconds in (the loop polls every 2 s).
+    """
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
     if marker is not None:
         (log_dir / "DRIVER_EXITED").write_text(marker)
-    # A worker srun that has already exited, as after a node failure during bringup.
-    sidecar = (
-        'true & SRUN_PIDS["ray-workers"]=$!; wait "${SRUN_PIDS["ray-workers"]}"'
-        if dead_sidecar
-        else ""
-    )
+    if sidecar_dies_after_s is None:
+        sidecar = ""
+    else:
+        sidecar = f'sleep {sidecar_dies_after_s} & SRUN_PIDS["ray-workers"]=$!'
+        if sidecar_dies_after_s == 0:
+            sidecar += '; wait "${SRUN_PIDS["ray-workers"]}"'
+    # The extracted tail turns `set -e` on, so a failed kill (head already gone)
+    # in the trap must not replace the exit status.
     script = f"""
 set -u
 declare -A SRUN_PIDS
 LOG_DIR={log_dir}
 DRIVER_EXIT_GRACE_S={grace_s}
-sleep {head_seconds} >/dev/null 2>&1 &
+sh -c 'sleep {head_seconds}; exit {HEAD_EXIT_CODE}' >/dev/null 2>&1 &
 SRUN_PIDS["ray-head"]=$!
 echo "head-pid=$!"
-trap 'kill "${{SRUN_PIDS["ray-head"]}}" 2>/dev/null' EXIT
+trap 'kill "${{SRUN_PIDS["ray-head"]}}" 2>/dev/null || true' EXIT
 {sidecar}
-{_batch_wait_loop()}
-echo head-exited
+{_batch_head_wait()}
 """
     return subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, timeout=60
@@ -131,8 +143,7 @@ def test_ends_job_with_driver_exit_code_when_head_outlives_driver(
 ) -> None:
     result = _run(tmp_path, head_seconds=30, grace_s=1, marker=marker)
 
-    assert result.returncode == expected_code
-    assert "head-exited" not in result.stdout
+    assert result.returncode == expected_code  # the driver's, not the head's
     assert "ending the job" in result.stderr
     assert (tmp_path / "logs" / "ENDED").exists()
     _assert_not_running(_fake_head_pid(result))
@@ -147,24 +158,40 @@ def test_ends_job_with_driver_exit_code_when_head_outlives_driver(
     ],
 )
 def test_waits_for_head(tmp_path: Path, grace_s: int, marker: str | None) -> None:
+    """The head's own status is what the job exits with."""
     result = _run(tmp_path, head_seconds=1, grace_s=grace_s, marker=marker)
 
-    assert result.returncode == 0
-    assert "head-exited" in result.stdout
+    assert result.returncode == HEAD_EXIT_CODE, result.stderr
     assert "ending the job" not in result.stderr
     assert not (tmp_path / "logs" / "ENDED").exists()
 
 
-def test_sidecar_failure_signals_ended_without_waiting_for_the_grace_period(
+def test_sidecar_failure_signals_ended_and_still_propagates_the_head_status(
     tmp_path: Path,
 ) -> None:
     result = _run(
-        tmp_path, head_seconds=30, grace_s=120, marker=None, dead_sidecar=True
+        tmp_path, head_seconds=1, grace_s=120, marker=None, sidecar_dies_after_s=0
     )
 
-    # The loop breaks out; the real script then `wait`s on the head and propagates it.
-    assert result.returncode == 0
-    assert "head-exited" in result.stdout
+    # The loop breaks out at the first poll, then `wait`s on the head as before.
+    assert result.returncode == HEAD_EXIT_CODE, result.stderr
+    assert "exited before the head; failing fast" in result.stderr
+    assert "ending the job" not in result.stderr
+    assert (tmp_path / "logs" / "ENDED").exists()
+    _assert_not_running(_fake_head_pid(result))
+
+
+def test_sidecar_failure_wins_over_an_expired_grace_period(tmp_path: Path) -> None:
+    """Both conditions hold on the t=2 s poll: the sidecar check runs first.
+
+    Pins the watchdog's placement after the sidecar check, so a dying sidecar
+    keeps its fail-fast path and the head's status instead of the driver's.
+    """
+    result = _run(
+        tmp_path, head_seconds=4, grace_s=1, marker="3\n", sidecar_dies_after_s=1
+    )
+
+    assert result.returncode == HEAD_EXIT_CODE, result.stderr
     assert "exited before the head; failing fast" in result.stderr
     assert "ending the job" not in result.stderr
     assert (tmp_path / "logs" / "ENDED").exists()
