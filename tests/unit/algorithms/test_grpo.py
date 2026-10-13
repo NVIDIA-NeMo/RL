@@ -380,18 +380,28 @@ class TestMaskSampleFilter:
 class TestAgentLossWeights:
     @staticmethod
     def _train_data(trained_tokens, sample_mask):
+        # process_global_batch sums token_mask[:, 1:] (position 0 has no
+        # prediction), so lead with a 0 column to make the counts below exact.
         width = max(trained_tokens)
         token_mask = torch.tensor(
-            [[1.0] * n + [0.0] * (width - n) for n in trained_tokens]
+            [[0.0] + [1.0] * n + [0.0] * (width - n) for n in trained_tokens]
         )
         return BatchedDataDict(
             {"token_mask": token_mask, "sample_mask": torch.tensor(sample_mask)}
         )
 
-    def test_weights_scale_sample_mask_and_report_token_shares(self):
+    @staticmethod
+    def _global_valid_toks(train_data) -> float:
+        """global_valid_toks as process_global_batch computes it on one rank."""
+        token_mask = train_data["token_mask"][:, 1:]
+        return float((token_mask * train_data["sample_mask"].unsqueeze(-1)).sum())
+
+    def test_weights_set_relative_shares_and_preserve_token_mass(self):
         # One long multi-turn trace next to two short tool-use rollouts: unweighted,
-        # the short agent is 2 * 25 / 1050 of the trained tokens; x8 lifts it to 400 / 1400.
+        # the short agent is 2 * 25 / 1050 of the trained tokens; x8 lifts it to
+        # 400 / 1400. The normalizer c = 1050 / 1400 = 0.75 keeps the mass at 1050.
         train_data = self._train_data([1000, 25, 25], [1.0, 1.0, 1.0])
+        valid_toks_before = self._global_valid_toks(train_data)
         agent_refs = [
             {"name": "long_agent"},
             {"name": "short_agent"},
@@ -399,12 +409,21 @@ class TestAgentLossWeights:
         ]
 
         metrics = _apply_agent_loss_weights(
-            train_data, agent_refs, {"short_agent": 8.0}
+            train_data, agent_refs, {"short_agent": 8.0}, train_global_batch_size=3
         )
 
-        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 8.0, 8.0]))
+        torch.testing.assert_close(
+            train_data["sample_mask"], torch.tensor([0.75, 6.0, 6.0])
+        )
+        assert self._global_valid_toks(train_data) == pytest.approx(valid_toks_before)
         assert metrics["agent_loss_weights/short_agent/weight"] == 8.0
         assert metrics["agent_loss_weights/long_agent/weight"] == 1.0
+        assert metrics[
+            "agent_loss_weights/short_agent/effective_weight"
+        ] == pytest.approx(6.0)
+        assert metrics[
+            "agent_loss_weights/long_agent/effective_weight"
+        ] == pytest.approx(0.75)
         assert metrics["agent_loss_weights/short_agent/num_samples"] == 2.0
         assert metrics[
             "agent_loss_weights/short_agent/token_share_unweighted"
@@ -416,13 +435,37 @@ class TestAgentLossWeights:
             "agent_loss_weights/long_agent/token_share_weighted"
         ] == pytest.approx(1000 / 1400)
 
+    @pytest.mark.parametrize("weight", [0.5, 2.0, 4.0])
+    def test_uniform_weights_are_an_exact_noop(self, weight):
+        train_data = self._train_data([1000, 25, 25], [1.0, 0.0, 0.5])
+        before = train_data["sample_mask"].clone()
+        agent_refs = [{"name": "a"}, {"name": "b"}, {"name": "b"}]
+
+        metrics = _apply_agent_loss_weights(
+            train_data,
+            agent_refs,
+            {"a": weight, "b": weight},
+            train_global_batch_size=3,
+        )
+
+        torch.testing.assert_close(train_data["sample_mask"], before)
+        assert metrics["agent_loss_weights/a/weight"] == weight
+        assert metrics["agent_loss_weights/a/effective_weight"] == pytest.approx(1.0)
+        assert metrics["agent_loss_weights/b/effective_weight"] == pytest.approx(1.0)
+
     def test_masked_rows_stay_masked_and_do_not_count_tokens(self):
         train_data = self._train_data([10, 10, 10], [1.0, 0.0, 0.5])
         agent_refs = [{"name": "a"}, {"name": "a"}, {"name": "b"}]
 
-        metrics = _apply_agent_loss_weights(train_data, agent_refs, {"a": 3.0})
+        metrics = _apply_agent_loss_weights(
+            train_data, agent_refs, {"a": 3.0}, train_global_batch_size=3
+        )
 
-        assert torch.equal(train_data["sample_mask"], torch.tensor([3.0, 0.0, 0.5]))
+        # Raw token mass 10 + 0 + 5 = 15, weighted 30 + 0 + 5 = 35, so c = 3 / 7.
+        torch.testing.assert_close(
+            train_data["sample_mask"], torch.tensor([9 / 7, 0.0, 1.5 / 7])
+        )
+        assert self._global_valid_toks(train_data) == pytest.approx(15.0)
         assert metrics["agent_loss_weights/a/token_share_unweighted"] == (
             pytest.approx(10 / 15)
         )
@@ -430,20 +473,78 @@ class TestAgentLossWeights:
             pytest.approx(30 / 35)
         )
 
+    def test_normalizes_within_each_optimizer_step_global_batch(self):
+        # Two optimizer steps (train_global_batch_size=2) with different agent
+        # mixes: each step keeps its own token mass, matching the per-global-batch
+        # global_valid_toks the workers compute.
+        train_data = self._train_data([100, 10, 10, 10], [1.0, 1.0, 1.0, 1.0])
+        agent_refs = [
+            {"name": "long"},
+            {"name": "short"},
+            {"name": "short"},
+            {"name": "short"},
+        ]
+
+        _apply_agent_loss_weights(
+            train_data, agent_refs, {"short": 4.0}, train_global_batch_size=2
+        )
+
+        mask = train_data["sample_mask"]
+        # Step 0: raw 110, weighted 100 + 40 = 140, c = 110 / 140.
+        torch.testing.assert_close(mask[:2], torch.tensor([110 / 140, 440 / 140]))
+        # Step 1 holds one agent only, so it is uniformly weighted: exact no-op.
+        torch.testing.assert_close(mask[2:], torch.tensor([1.0, 1.0]))
+        trained = train_data["token_mask"][:, 1:].sum(dim=-1)
+        assert float((trained[:2] * mask[:2]).sum()) == pytest.approx(110.0)
+        assert float((trained[2:] * mask[2:]).sum()) == pytest.approx(20.0)
+
+    def test_fully_zero_weighted_step_stays_zero_without_nan(self):
+        train_data = self._train_data([10, 10], [1.0, 1.0])
+        agent_refs = [{"name": "a"}, {"name": "a"}]
+
+        metrics = _apply_agent_loss_weights(
+            train_data, agent_refs, {"a": 0.0}, train_global_batch_size=2
+        )
+
+        assert torch.equal(train_data["sample_mask"], torch.tensor([0.0, 0.0]))
+        assert metrics["agent_loss_weights/a/effective_weight"] == 0.0
+        assert metrics["agent_loss_weights/a/token_share_weighted"] == 0.0
+
     def test_unset_weights_are_a_noop(self):
         train_data = self._train_data([4, 4], [1.0, 1.0])
 
-        assert _apply_agent_loss_weights(train_data, None, None) == {}
-        assert _apply_agent_loss_weights(train_data, None, {}) == {}
+        assert (
+            _apply_agent_loss_weights(train_data, None, None, train_global_batch_size=2)
+            == {}
+        )
+        assert (
+            _apply_agent_loss_weights(train_data, None, {}, train_global_batch_size=2)
+            == {}
+        )
         assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 1.0]))
 
     def test_missing_or_misaligned_agent_refs_raise(self):
         train_data = self._train_data([4, 4], [1.0, 1.0])
 
         with pytest.raises(ValueError, match="agent_ref"):
-            _apply_agent_loss_weights(train_data, None, {"a": 2.0})
+            _apply_agent_loss_weights(
+                train_data, None, {"a": 2.0}, train_global_batch_size=2
+            )
         with pytest.raises(ValueError, match="agent_ref"):
-            _apply_agent_loss_weights(train_data, [{"name": "a"}], {"a": 2.0})
+            _apply_agent_loss_weights(
+                train_data, [{"name": "a"}], {"a": 2.0}, train_global_batch_size=2
+            )
+
+    def test_invalid_global_batch_size_raises(self):
+        train_data = self._train_data([4, 4], [1.0, 1.0])
+
+        with pytest.raises(ValueError, match="train_global_batch_size"):
+            _apply_agent_loss_weights(
+                train_data,
+                [{"name": "a"}, {"name": "a"}],
+                {"a": 2.0},
+                train_global_batch_size=0,
+            )
 
     @pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf")])
     def test_config_rejects_invalid_weights(self, weight):
@@ -470,6 +571,163 @@ class TestAgentLossWeights:
 
         config.grpo.agent_loss_weights = None
         _validate_agent_loss_weights(config)
+
+
+class _PinnedMoEAuxLossAutoScaler(torch.autograd.Function):
+    """Megatron-LM ``MoEAuxLossAutoScaler`` (moe_utils.py @ b4d72b79, the Bridge pin).
+
+    Copied so the auxiliary-gradient regression below runs without Megatron: the
+    backward returns ``grad_output`` unchanged and ``ones_like(aux_loss) * scale``
+    for the auxiliary loss, where ``scale`` is whatever ``set_loss_scale`` set.
+    """
+
+    main_loss_backward_scale: torch.Tensor | None = None
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(aux_loss)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (aux_loss,) = ctx.saved_tensors
+        scale = _PinnedMoEAuxLossAutoScaler.main_loss_backward_scale
+        if scale is None:
+            scale = torch.tensor(1.0, device=aux_loss.device)
+        return grad_output, torch.ones_like(aux_loss) * scale
+
+    @staticmethod
+    def set_loss_scale(scale: torch.Tensor) -> None:
+        if _PinnedMoEAuxLossAutoScaler.main_loss_backward_scale is None:
+            _PinnedMoEAuxLossAutoScaler.main_loss_backward_scale = scale
+        else:
+            _PinnedMoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
+
+
+def _toy_token_features(train_data) -> torch.Tensor:
+    """Deterministic per-token features for the toy policy; fixed across calls."""
+    generator = torch.Generator().manual_seed(0)
+    num_rows, width = train_data["token_mask"][:, 1:].shape
+    return torch.randn(num_rows, width, 2, generator=generator)
+
+
+def _toy_moe_train_step(train_data, *, num_microbatches: int):
+    """One optimizer step of a toy per-token-normalized model with a MoE aux loss.
+
+    Mirrors the Megatron worker path that agent weights feed into:
+    ``global_valid_toks`` is ``sum(token_mask[:, 1:] * sample_mask)`` over the
+    global batch (``process_global_batch``); each microbatch's policy loss is its
+    ``token_mask * sample_mask``-weighted sum divided by that global count; the
+    router pre-multiplies its aux loss by the microbatch's token count, which
+    does not depend on ``sample_mask`` (router.py
+    ``attach_and_log_load_balancing_loss``); and the autoscaler applies
+    ``1 / global_valid_toks`` to the aux gradient
+    (``MegatronPolicyWorker._compute_moe_grad_scale``). Returns the policy and
+    router parameter gradients.
+    """
+    token_mask = train_data["token_mask"][:, 1:]
+    sample_mask = train_data["sample_mask"]
+    features = _toy_token_features(train_data)
+    global_valid_toks = (token_mask * sample_mask.unsqueeze(-1)).sum().clamp(min=1)
+    theta = torch.tensor([0.3, -0.7], requires_grad=True)
+    router = torch.tensor(0.5, requires_grad=True)
+    _PinnedMoEAuxLossAutoScaler.set_loss_scale(1.0 / global_valid_toks)
+    for rows in torch.arange(token_mask.shape[0]).chunk(num_microbatches):
+        per_token = features[rows] @ theta
+        policy_loss = (
+            per_token * token_mask[rows] * sample_mask[rows].unsqueeze(-1)
+        ).sum() / global_valid_toks
+        num_local_tokens = token_mask[rows].numel()
+        aux_loss = router.square() * num_local_tokens
+        _PinnedMoEAuxLossAutoScaler.apply(policy_loss, aux_loss).backward()
+    assert theta.grad is not None and router.grad is not None
+    return theta.grad.clone(), router.grad.clone()
+
+
+def _expected_policy_grad(train_data, weights: list[float]) -> torch.Tensor:
+    """Closed form of the toy policy gradient under relative weights ``weights``."""
+    token_mask = train_data["token_mask"][:, 1:]
+    mask = token_mask * train_data["sample_mask"].unsqueeze(-1)
+    weighted_mask = mask * torch.tensor(weights).unsqueeze(-1)
+    features = _toy_token_features(train_data)
+    return (features * weighted_mask.unsqueeze(-1)).sum((0, 1)) / weighted_mask.sum()
+
+
+class TestAgentLossWeightsAuxiliaryGradients:
+    """CPU autograd regression for the MoE auxiliary-gradient normalization.
+
+    Without the per-step rescaling, uniform agent weights 1 / 2 / 4 doubled and
+    quadrupled ``global_valid_toks`` while the router numerator stayed put, so the
+    auxiliary gradient came out as 2 / 1 / 0.5 of itself.
+    """
+
+    AGENT_REFS = [
+        {"name": "long"},
+        {"name": "short"},
+        {"name": "short"},
+        {"name": "other"},
+    ]
+
+    @staticmethod
+    def _batch():
+        return TestAgentLossWeights._train_data([12, 3, 3, 5], [1.0, 1.0, 0.5, 1.0])
+
+    @pytest.mark.parametrize("num_microbatches", [1, 2, 4])
+    def test_uniform_weights_leave_policy_and_aux_gradients_unchanged(
+        self, num_microbatches
+    ):
+        reference_policy, reference_router = _toy_moe_train_step(
+            self._batch(), num_microbatches=num_microbatches
+        )
+
+        for weight in (1.0, 2.0, 4.0):
+            train_data = self._batch()
+            _apply_agent_loss_weights(
+                train_data,
+                self.AGENT_REFS,
+                {"long": weight, "short": weight, "other": weight},
+                train_global_batch_size=4,
+            )
+            policy_grad, router_grad = _toy_moe_train_step(
+                train_data, num_microbatches=num_microbatches
+            )
+            torch.testing.assert_close(policy_grad, reference_policy)
+            torch.testing.assert_close(router_grad, reference_router)
+
+    def test_nonuniform_weights_reweight_policy_but_not_aux_gradient(self):
+        reference_policy, reference_router = _toy_moe_train_step(
+            self._batch(), num_microbatches=2
+        )
+        train_data = self._batch()
+
+        _apply_agent_loss_weights(
+            train_data, self.AGENT_REFS, {"short": 8.0}, train_global_batch_size=4
+        )
+        policy_grad, router_grad = _toy_moe_train_step(train_data, num_microbatches=2)
+
+        torch.testing.assert_close(router_grad, reference_router)
+        torch.testing.assert_close(
+            policy_grad, _expected_policy_grad(self._batch(), [1.0, 8.0, 8.0, 1.0])
+        )
+        assert not torch.allclose(policy_grad, reference_policy)
+
+    def test_microbatch_partition_does_not_change_gradients(self):
+        grads = []
+        for num_microbatches in (1, 2, 4):
+            train_data = self._batch()
+            _apply_agent_loss_weights(
+                train_data,
+                self.AGENT_REFS,
+                {"short": 8.0},
+                train_global_batch_size=4,
+            )
+            grads.append(
+                _toy_moe_train_step(train_data, num_microbatches=num_microbatches)
+            )
+
+        for policy_grad, router_grad in grads[1:]:
+            torch.testing.assert_close(policy_grad, grads[0][0])
+            torch.testing.assert_close(router_grad, grads[0][1])
 
 
 def test_initial_policy_generation_stale() -> None:
@@ -4602,21 +4860,51 @@ def test_grpo_train_clips_advantages_when_configured(
 def test_grpo_train_applies_agent_loss_weights(
     mock_grpo_components, train_func, monkeypatch
 ):
-    """grpo.agent_loss_weights scales the sample_mask handed to policy.train."""
+    """Both loops weight the batch after advantages with the trainer's global batch size."""
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
     mock_batch["agent_ref"] = [{"name": "short_agent"}]
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.agent_loss_weights = {"short_agent": 4.0}
+    calls = []
+
+    def recording_apply(
+        train_data, agent_refs, agent_loss_weights, *, train_global_batch_size
+    ):
+        calls.append(
+            (list(agent_refs), dict(agent_loss_weights), train_global_batch_size)
+        )
+        assert "advantages" in train_data
+        return _apply_agent_loss_weights(
+            train_data,
+            agent_refs,
+            agent_loss_weights,
+            train_global_batch_size=train_global_batch_size,
+        )
+
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.grpo._apply_agent_loss_weights", recording_apply
+    )
 
     _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch)
 
+    assert calls == [
+        (
+            [{"name": "short_agent"}],
+            {"short_agent": 4.0},
+            master_config.policy["train_global_batch_size"],
+        )
+    ]
     policy = mock_grpo_components["policy"]
     policy.train.assert_called_once()
-    assert policy.train.call_args[0][0]["sample_mask"].tolist() == [4.0]
+    # One agent is uniformly weighted, so the per-step rescaling makes it a no-op.
+    assert policy.train.call_args[0][0]["sample_mask"].tolist() == [1.0]
     logged = {}
     for call in mock_grpo_components["logger"].log_metrics.call_args_list:
         logged.update(call.args[0])
     assert logged["agent_loss_weights/short_agent/weight"] == 4.0
+    assert logged["agent_loss_weights/short_agent/effective_weight"] == pytest.approx(
+        1.0
+    )
     assert logged["agent_loss_weights/short_agent/num_samples"] == 1.0
 
 

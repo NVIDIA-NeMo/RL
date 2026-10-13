@@ -371,13 +371,17 @@ class GRPOConfig(BaseModel, extra="allow"):
     async_grpo: AsyncGRPOConfig | None = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
     # Optional per-agent loss weights for mixed NeMo-Gym batches, keyed on the
-    # rollout's ``agent_ref.name``: {agent_name: weight}. Each sample's loss
-    # weight (``sample_mask``) is multiplied by its agent's weight right before
-    # the policy update; agents not listed keep weight 1.0. Under token-level
-    # loss normalization the weights are relative: they change each agent's
-    # share of the gradient, not the overall scale (all weights 2.0 == no-op).
-    # Baselines, advantages and dynamic sampling are unaffected. NeMo-Gym only;
-    # the data-plane and SingleController trainers reject it. None disables.
+    # rollout's ``agent_ref.name``: {agent_name: weight}. Right before the policy
+    # update each sample's loss weight (``sample_mask``) is multiplied by its
+    # agent's weight (agents not listed keep 1.0) and the result is rescaled per
+    # optimizer-step global batch so the valid-token mass (``global_valid_toks``)
+    # is unchanged. The weights are therefore purely relative: they set each
+    # agent's share of the gradient, never its overall scale (all weights 2.0 is
+    # an exact no-op), and auxiliary objectives normalized by
+    # ``global_valid_toks`` (Megatron MoE load-balancing / z-loss) keep the
+    # gradient they have without weights. Baselines, advantages and dynamic
+    # sampling run before weighting. NeMo-Gym only; the data-plane and
+    # SingleController trainers reject it. None disables.
     agent_loss_weights: dict[str, float] | None = None
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
@@ -2602,23 +2606,50 @@ def _apply_agent_loss_weights(
     train_data: BatchedDataDict[ClippedPGLossDataDict],
     agent_refs: Optional[list[Any]],
     agent_loss_weights: Optional[dict[str, float]],
+    *,
+    train_global_batch_size: int,
 ) -> dict[str, float]:
-    """Scale each sample's loss weight by ``grpo.agent_loss_weights[agent_ref.name]``.
+    """Reweight each sample's loss weight by its agent without moving the token mass.
 
-    Multiplies ``train_data["sample_mask"]`` row-wise (agents not listed keep
-    1.0; already-masked rows stay 0) and returns per-agent metrics: the agent's
-    weight, its number of samples, and its share of the trained tokens before
-    and after weighting. Returns ``{}`` when no weights are configured.
+    Multiplies ``train_data["sample_mask"]`` row-wise by
+    ``grpo.agent_loss_weights[agent_ref.name]`` (agents not listed keep 1.0;
+    already-masked rows stay 0), then rescales the product within every
+    optimizer-step global batch so that ``sum(token_mask[:, 1:] * sample_mask)``
+    is unchanged. A global batch is each consecutive ``train_global_batch_size``
+    rows of ``train_data``: that is how ``Policy.train`` splits the batch
+    (``BatchedDataDict.shard_by_batch_size``) before every worker computes
+    ``global_valid_toks`` over it (``process_global_batch``).
+
+    The policy loss divides its ``sample_mask``-weighted numerator by that same
+    ``global_valid_toks`` (or by ``global_valid_seqs`` under sequence-level
+    normalization), so the rescaling cancels there and the weights stay purely
+    relative. It exists for the consumers of ``global_valid_toks`` whose
+    numerator never sees ``sample_mask``: Megatron scales the MoE load-balancing
+    and router z-loss gradients by ``1 / global_valid_toks`` through
+    ``MoEAuxLossAutoScaler``, so an unnormalized uniform weight of 2 would halve
+    them. Because the rescaling is fixed before the batch is split into
+    data-parallel shards and microbatches, it does not depend on either.
+
+    Returns per-agent metrics: the configured weight, the effective (normalized)
+    multiplier applied to the agent's rows, its number of samples, and its share
+    of the trained-token mass before and after weighting. Returns ``{}`` when no
+    weights are configured.
     """
     if not agent_loss_weights:
         return {}
     sample_mask = train_data["sample_mask"]
-    if agent_refs is None or len(agent_refs) != sample_mask.shape[0]:
+    num_samples = sample_mask.shape[0]
+    if agent_refs is None or len(agent_refs) != num_samples:
         raise ValueError(
             "grpo.agent_loss_weights is set but the training batch has no "
             "row-aligned agent_ref column (got "
             f"{None if agent_refs is None else len(agent_refs)} entries for "
-            f"{sample_mask.shape[0]} samples)."
+            f"{num_samples} samples)."
+        )
+    if train_global_batch_size < 1:
+        raise ValueError(
+            "grpo.agent_loss_weights needs policy.train_global_batch_size >= 1 to "
+            f"normalize per optimizer step; got {train_global_batch_size}."
         )
     names = [
         str(ref.get("name", "")) if isinstance(ref, dict) else str(ref or "")
@@ -2629,12 +2660,25 @@ def _apply_agent_loss_weights(
         dtype=sample_mask.dtype,
         device=sample_mask.device,
     )
+    # Same convention as process_global_batch: position 0 has no prediction.
     trained_tokens = (
-        train_data["token_mask"].sum(dim=-1).to(sample_mask.dtype) * sample_mask
-    ).cpu()
-    weighted_tokens = trained_tokens * weights.cpu()
-    train_data["sample_mask"] = sample_mask * weights
+        train_data["token_mask"][:, 1:].sum(dim=-1).to(sample_mask.dtype) * sample_mask
+    )
+    # Per optimizer step, rescale so the weighted token mass equals the raw one.
+    # A step whose trained rows all have weight 0 has nothing to preserve and
+    # keeps its zero mask.
+    normalizer = torch.ones_like(sample_mask)
+    for start in range(0, num_samples, train_global_batch_size):
+        rows = slice(start, start + train_global_batch_size)
+        weighted_mass = (trained_tokens[rows] * weights[rows]).sum()
+        if weighted_mass > 0:
+            normalizer[rows] = trained_tokens[rows].sum() / weighted_mass
+    effective_weights = weights * normalizer
+    train_data["sample_mask"] = sample_mask * effective_weights
 
+    trained_tokens = trained_tokens.cpu()
+    effective_weights = effective_weights.cpu()
+    weighted_tokens = trained_tokens * effective_weights
     total_raw = float(trained_tokens.sum())
     total_weighted = float(weighted_tokens.sum())
     metrics: dict[str, float] = {}
@@ -2642,6 +2686,7 @@ def _apply_agent_loss_weights(
         rows = torch.tensor([n == name for n in names])
         key = f"agent_loss_weights/{name or 'unknown'}"
         metrics[f"{key}/weight"] = float(agent_loss_weights.get(name, 1.0))
+        metrics[f"{key}/effective_weight"] = float(effective_weights[rows].mean())
         metrics[f"{key}/num_samples"] = float(rows.sum())
         metrics[f"{key}/token_share_unweighted"] = (
             float(trained_tokens[rows].sum()) / total_raw if total_raw > 0 else 0.0
@@ -3930,6 +3975,9 @@ def _grpo_train_impl(
                     train_data,
                     repeated_batch.get("agent_ref"),
                     master_config.grpo.agent_loss_weights,
+                    train_global_batch_size=master_config.policy[
+                        "train_global_batch_size"
+                    ],
                 )
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
@@ -5764,6 +5812,9 @@ def async_grpo_train(
                     train_data,
                     repeated_batch.get("agent_ref"),
                     master_config.grpo.agent_loss_weights,
+                    train_global_batch_size=master_config.policy[
+                        "train_global_batch_size"
+                    ],
                 )
 
                 print("▶ Preparing for training...")
