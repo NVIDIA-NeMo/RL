@@ -16,7 +16,6 @@
 
 from typing import Any
 
-
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 
 
