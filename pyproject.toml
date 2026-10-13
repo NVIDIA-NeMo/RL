@@ -149,7 +149,7 @@ automodel = [
   "nv-grouped-gemm",
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
   # Validated HybridEP backend for DeepSeek V4 CP32/EP128 training.
-  "deep_ep==1.2.1+10d4dd7",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@10d4dd7377d5bce900fbb4b80cce863764892b95",
   # DeepSeek V4 mHC uses tf32_hc_prenorm_gemm in the actor environment.
   "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
 ]
@@ -164,7 +164,7 @@ vllm = [
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
-  "deep_ep==1.2.1+17cfb81",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@10d4dd7377d5bce900fbb4b80cce863764892b95",
   # PyPI publishes the default cu130 wheels for both supported architectures.
   # https://github.com/vllm-project/vllm/releases/tag/v0.29.0
   "vllm==0.29.0",
@@ -226,7 +226,7 @@ mcore = [
   # silently falls back to the PyPI releases instead of the pinned git revs.
   "mamba-ssm",
   "causal-conv1d",
-  "deep_ep==1.2.1+17cfb81",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@10d4dd7377d5bce900fbb4b80cce863764892b95",
   "flashinfer-python==0.6.18.post1",
   "flashinfer-cubin==0.6.18.post1",
   "flashinfer-jit-cache==0.6.18.post1",
@@ -314,12 +314,6 @@ test = [
 ]
 
 [tool.uv.sources]
-# Separate static metadata for the independently validated DeepEP revisions.
-deep_ep = [
-  { path = "3rdparty/DeepEP-workspace/actor", extra = "automodel" },
-  { path = "3rdparty/DeepEP-workspace", extra = "vllm" },
-  { path = "3rdparty/DeepEP-workspace", extra = "mcore" },
-]
 # tensorrt-llm is built from source via a custom PEP 517 backend in 3rdparty/TensorRT-LLM-workspace/.
 # prepare_metadata_for_build_wheel returns static metadata fast (for `uv lock`);
 # build_wheel triggers the actual ~60-min compilation (during `uv sync --extra trtllm`).
@@ -466,9 +460,7 @@ override-dependencies = [
   "llguidance>=1.7.0,<1.8.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
-  # Replace Automodel's transitive source pin only. A global DeepEP override
-  # would also replace the separately validated vLLM and Megatron versions.
-  { package = { name = "nemo-automodel" }, dependencies = ["deep_ep"] },
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@10d4dd7377d5bce900fbb4b80cce863764892b95",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3.
@@ -667,6 +659,12 @@ name = "mamba-ssm"
 # This version has to match the version in the commit/rev/tag used
 version = "2.2.6.post3"
 requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
+
+[[tool.uv.dependency-metadata]]
+name = "deep_ep"
+# Keep synchronized with the shared actor/rollout/Megatron Git revision.
+version = "1.2.1+10d4dd7"
+requires-dist = ["torch", "packaging", "ninja", "nvidia-ml-py>=12.0.0"]
 
 [[tool.uv.dependency-metadata]]
 name = "deep_gemm"

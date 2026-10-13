@@ -85,10 +85,10 @@ constraints = [
     { name = "wheel", specifier = ">=0.46.2" },
 ]
 overrides = [
-    { package = { name = "nemo-automodel" }, dependencies = [{ name = "deep-ep" }] },
     { name = "apache-tvm-ffi", specifier = "==0.1.11" },
     { name = "av", marker = "sys_platform == 'never'" },
     { name = "decord2", marker = "sys_platform == 'never'" },
+    { name = "deep-ep", git = "https://github.com/deepseek-ai/DeepEP.git?rev=10d4dd7377d5bce900fbb4b80cce863764892b95" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.133.0,<0.137.0" },
     { name = "instanttensor", marker = "platform_machine == 'x86_64'", specifier = ">=0.1.9" },
     { name = "langchain", specifier = ">=0.3.28" },
@@ -118,6 +118,11 @@ overrides = [
 name = "causal-conv1d"
 version = "1.5.4"
 requires-dist = ["torch", "packaging", "ninja"]
+
+[[manifest.dependency-metadata]]
+name = "deep-ep"
+version = "1.2.1+10d4dd7"
+requires-dist = ["torch", "packaging", "ninja", "nvidia-ml-py>=12.0.0"]
 
 [[manifest.dependency-metadata]]
 name = "deep-gemm"
@@ -1360,32 +1365,13 @@ wheels = [
 [[package]]
 name = "deep-ep"
 version = "1.2.1+10d4dd7"
-source = { directory = "3rdparty/DeepEP-workspace/actor" }
-resolution-markers = [
-    "platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "platform_machine == 'aarch64' and sys_platform == 'linux'",
-]
+source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=10d4dd7377d5bce900fbb4b80cce863764892b95#10d4dd7377d5bce900fbb4b80cce863764892b95" }
 dependencies = [
+    { name = "ninja" },
     { name = "nvidia-ml-py" },
+    { name = "packaging" },
+    { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" } },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "nvidia-ml-py", specifier = ">=12.0.0" }]
-
-[[package]]
-name = "deep-ep"
-version = "1.2.1+17cfb81"
-source = { directory = "3rdparty/DeepEP-workspace" }
-resolution-markers = [
-    "platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "platform_machine == 'aarch64' and sys_platform == 'linux'",
-]
-dependencies = [
-    { name = "pynvml" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "pynvml" }]
 
 [[package]]
 name = "deep-gemm"
@@ -4030,7 +4016,7 @@ dependencies = [
 moe = [
     { name = "apache-tvm-ffi" },
     { name = "causal-conv1d" },
-    { name = "deep-ep", version = "1.2.1+10d4dd7", source = { directory = "3rdparty/DeepEP-workspace/actor" } },
+    { name = "deep-ep" },
     { name = "flash-linear-attention" },
     { name = "mamba-ssm" },
     { name = "nv-grouped-gemm" },
@@ -4361,7 +4347,7 @@ dependencies = [
 [package.optional-dependencies]
 automodel = [
     { name = "causal-conv1d" },
-    { name = "deep-ep", version = "1.2.1+10d4dd7", source = { directory = "3rdparty/DeepEP-workspace/actor" } },
+    { name = "deep-ep" },
     { name = "deep-gemm" },
     { name = "flash-attn" },
     { name = "mamba-ssm" },
@@ -4377,7 +4363,7 @@ automodel = [
 mcore = [
     { name = "causal-conv1d" },
     { name = "cupy-cuda13x" },
-    { name = "deep-ep", version = "1.2.1+17cfb81", source = { directory = "3rdparty/DeepEP-workspace" } },
+    { name = "deep-ep" },
     { name = "flash-attn" },
     { name = "flash-mla" },
     { name = "flashinfer-cubin", version = "0.6.18.post1", source = { registry = "https://flashinfer.ai/whl/" } },
@@ -4427,7 +4413,7 @@ trtllm = [
 ]
 vllm = [
     { name = "cuda-python", version = "13.4.1", source = { registry = "https://pypi.org/simple" } },
-    { name = "deep-ep", version = "1.2.1+17cfb81", source = { directory = "3rdparty/DeepEP-workspace" } },
+    { name = "deep-ep" },
     { name = "deep-gemm" },
     { name = "flashinfer-cubin", version = "0.6.18", source = { registry = "https://flashinfer.ai/whl/" } },
     { name = "flashinfer-jit-cache", version = "0.6.18+cu130", source = { registry = "https://flashinfer.ai/whl/cu130" } },
@@ -4496,9 +4482,9 @@ requires-dist = [
     { name = "cupy-cuda13x", marker = "extra == 'mcore'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
-    { name = "deep-ep", marker = "extra == 'automodel'", directory = "3rdparty/DeepEP-workspace/actor" },
-    { name = "deep-ep", marker = "extra == 'mcore'", directory = "3rdparty/DeepEP-workspace" },
-    { name = "deep-ep", marker = "extra == 'vllm'", directory = "3rdparty/DeepEP-workspace" },
+    { name = "deep-ep", marker = "extra == 'automodel'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=10d4dd7377d5bce900fbb4b80cce863764892b95" },
+    { name = "deep-ep", marker = "extra == 'mcore'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=10d4dd7377d5bce900fbb4b80cce863764892b95" },
+    { name = "deep-ep", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=10d4dd7377d5bce900fbb4b80cce863764892b95" },
     { name = "deep-gemm", marker = "extra == 'automodel'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=67fc64863d43521080bf2005e6528d0fceee9510" },
     { name = "deep-gemm", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=67fc64863d43521080bf2005e6528d0fceee9510" },
     { name = "fastokens", specifier = ">=0.2.0" },
@@ -6551,18 +6537,6 @@ wheels = [
 [package.optional-dependencies]
 crypto = [
     { name = "cryptography", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or (extra == 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nvrx' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-trtllm')" },
-]
-
-[[package]]
-name = "pynvml"
-version = "13.0.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "nvidia-ml-py" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/5c/57/da7dc63a79f59e082e26a66ac02d87d69ea316b35b35b7a00d82f3ce3d2f/pynvml-13.0.1.tar.gz", hash = "sha256:1245991d9db786b4d2f277ce66869bd58f38ac654e38c9397d18f243c8f6e48f", size = 35226, upload-time = "2025-09-05T20:33:25.377Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d7/4a/cac76c174bb439a0c46c9a4413fcbea5c6cabfb01879f7bbdb9fdfaed76c/pynvml-13.0.1-py3-none-any.whl", hash = "sha256:e2b20e0a501eeec951e2455b7ab444759cf048e0e13a57b08049fa2775266aa8", size = 28810, upload-time = "2025-09-05T20:33:24.13Z" },
 ]
 
 [[package]]
