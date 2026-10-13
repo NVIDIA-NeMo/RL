@@ -2286,7 +2286,14 @@ class VllmAsyncGenerationWorkerImpl(
         torch.cuda.empty_cache()
 
     async def pause_generation_async(self, *, clear_cache: bool) -> bool:
-        """Pause vLLM generation for an in-flight weight update."""
+        """Pause vLLM generation for an in-flight weight update.
+
+        The keep-mode ``clear_cache=True`` semantics NeMo RL relies on (every
+        running request is preempted and the prefix cache reset) are implemented
+        by vLLM 0.29.0 ``EngineCoreProc.pause_scheduler`` -> ``_finish_pause``,
+        although vLLM's HTTP router docstring calls the argument deprecated and
+        ignored in keep mode. Re-verify this on a vLLM bump.
+        """
         assert self.llm is not None, (
             "Attempting to pause generation with either an uninitialized vLLM or non-model-owner"
         )
