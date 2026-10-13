@@ -62,6 +62,10 @@ from nemo_rl.environments.nemo_gym_request import (
     _deep_merge_dict,
     _metadata_extra_body,
 )
+from nemo_rl.environments.nemo_gym_shards import (
+    apply_shard_overlay,
+    parse_shard_plan,
+)
 from nemo_rl.environments.nemotron_utils import (
     _expand_nemotron_video_placeholders,
     _flatten_nemotron_video_frame_messages,
@@ -1240,6 +1244,120 @@ def test_validate_reward_components_match_scalar():
                 },
             ]
         )
+
+
+def test_setup_nemo_gym_config_forwards_session_id_for_dynamo() -> None:
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "dynamo", "vllm_cfg": {}}},
+        env={
+            "nemo_gym": {
+                "num_gpu_nodes": 2,
+                "policy_model": {
+                    "responses_api_models": {
+                        "vllm_model": {"model_name": "keep-me"},
+                        "other_model": {"model_name": "untouched"},
+                    }
+                },
+            }
+        },
+    )
+
+    setup_nemo_gym_config(config, tokenizer=object())
+
+    nemo_gym = config.env["nemo_gym"]
+    responses_api_models = nemo_gym["policy_model"]["responses_api_models"]
+    vllm_model = responses_api_models["vllm_model"]
+    assert vllm_model["forward_session_id_as_conversation_id"] is True
+    assert vllm_model["model_name"] == "keep-me"
+    assert responses_api_models["other_model"] == {"model_name": "untouched"}
+    assert nemo_gym["num_gpu_nodes"] == 2
+
+
+def test_setup_nemo_gym_config_does_not_forward_session_id_for_vllm() -> None:
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "vllm", "vllm_cfg": {}}},
+        env={
+            "nemo_gym": {
+                "policy_model": {
+                    "responses_api_models": {"vllm_model": {"model_name": "keep-me"}}
+                }
+            }
+        },
+    )
+
+    setup_nemo_gym_config(config, tokenizer=object())
+
+    vllm_model = config.env["nemo_gym"]["policy_model"]["responses_api_models"][
+        "vllm_model"
+    ]
+    assert "forward_session_id_as_conversation_id" not in vllm_model
+
+
+def _dynamo_gym_config(nemo_gym_cfg: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        policy={"generation": {"backend": "dynamo", "vllm_cfg": {}}},
+        env={"nemo_gym": nemo_gym_cfg},
+    )
+
+
+def _forwards_session_id(nemo_gym_cfg: dict) -> object:
+    return nemo_gym_cfg["policy_model"]["responses_api_models"]["vllm_model"].get(
+        "forward_session_id_as_conversation_id"
+    )
+
+
+@pytest.mark.parametrize("policy_model", ["absent", "null", "claimed"])
+def test_setup_nemo_gym_config_forwards_session_id_in_every_shard(
+    policy_model,
+) -> None:
+    nemo_gym_cfg = {
+        "config_paths": None,
+        "shards": [
+            {"name": "a", "config_paths": ["a.yaml"]},
+            {"name": "b", "config_paths": ["b.yaml"]},
+        ],
+    }
+    if policy_model == "null":
+        nemo_gym_cfg["policy_model"] = None
+    elif policy_model == "claimed":
+        nemo_gym_cfg["policy_model"] = {
+            "responses_api_models": {"vllm_model": {"model_name": "keep-me"}}
+        }
+        nemo_gym_cfg["common_inherited_overlays"] = ["policy_model"]
+    config = _dynamo_gym_config(nemo_gym_cfg)
+
+    setup_nemo_gym_config(config, tokenizer=object())
+
+    # An unclaimed top-level policy_model overlay would fail the shard plan.
+    plan = parse_shard_plan(config.env["nemo_gym"])
+    assert plan is not None
+    for shard in plan.shards:
+        merged = apply_shard_overlay(config.env["nemo_gym"], plan, shard)
+        assert _forwards_session_id(merged) is True
+        if policy_model == "claimed":
+            vllm_model = merged["policy_model"]["responses_api_models"]["vllm_model"]
+            assert vllm_model["model_name"] == "keep-me"
+
+
+@pytest.mark.parametrize(
+    "nemo_gym_cfg",
+    [None, {"policy_model": None}, {"policy_model": {"responses_api_models": None}}],
+)
+def test_setup_nemo_gym_config_forwards_session_id_through_null_overlays(
+    nemo_gym_cfg,
+) -> None:
+    config = _dynamo_gym_config(nemo_gym_cfg)
+
+    setup_nemo_gym_config(config, tokenizer=object())
+
+    assert _forwards_session_id(config.env["nemo_gym"]) is True
+
+
+def test_setup_nemo_gym_config_rejects_non_mapping_policy_overlay() -> None:
+    config = _dynamo_gym_config({"policy_model": {"responses_api_models": "bad"}})
+
+    with pytest.raises(ValueError, match="responses_api_models overlay"):
+        setup_nemo_gym_config(config, tokenizer=object())
 
 
 @pytest.mark.nemo_gym

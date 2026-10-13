@@ -17,6 +17,7 @@
 import json
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from typing import Any
 
 import aiohttp
@@ -63,13 +64,17 @@ def http_post_json(
 
 
 async def async_http_post_json(
-    url: str, payload: dict[str, Any], timeout_s: float
+    url: str,
+    payload: dict[str, Any],
+    timeout_s: float,
+    *,
+    headers: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """POST JSON without blocking the rollout actor event loop."""
     timeout = aiohttp.ClientTimeout(total=timeout_s)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload) as response:
+            async with session.post(url, json=payload, headers=headers) as response:
                 body = await response.read()
                 if response.status >= 400:
                     return {

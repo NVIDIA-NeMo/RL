@@ -19,7 +19,7 @@ import json
 import threading
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
@@ -29,12 +29,16 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+
 _GYM_TOKEN_METADATA_FIELDS = (
     "prompt_token_ids",
     "generation_token_ids",
     "generation_log_probs",
 )
 _TOOL_ARGUMENT_MAPPING_ERROR = "Can only get item pairs from a mapping."
+DYNAMO_SESSION_ID_HEADER = "X-Dynamo-Session-ID"
 
 
 def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
@@ -299,6 +303,31 @@ def _inject_gym_token_metadata(response_body: dict[str, Any]) -> None:
     message["generation_log_probs"] = generation_logprobs
 
 
+def _conversation_id_from_request(request_body: dict[str, Any]) -> Optional[str]:
+    """Return the conversation ID NeMo-Gym attached to a chat-completion body.
+
+    Gym's vllm_model sets ``conversation_params.conversation_id`` to its session
+    ID when ``forward_session_id_as_conversation_id`` is enabled.
+
+    Raises:
+        ValueError: ``conversation_params`` is not an object, or its
+            ``conversation_id`` is not a non-empty string.
+    """
+    conversation_params = request_body.get("conversation_params")
+    if conversation_params is None:
+        return None
+    if not isinstance(conversation_params, dict):
+        raise ValueError("conversation_params must be a JSON object.")
+    conversation_id = conversation_params.get("conversation_id")
+    if conversation_id is None:
+        return None
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        raise ValueError(
+            "conversation_params.conversation_id must be a non-empty string."
+        )
+    return conversation_id
+
+
 def prepare_dynamo_chat_completion_request(
     request_body: dict[str, Any],
     *,
@@ -322,6 +351,9 @@ def prepare_dynamo_chat_completion_request(
     stripped_messages = _strip_gym_token_metadata(messages)
     prepared_body["messages"] = stripped_messages
     prepared_body.pop("required_prefix_token_ids", None)
+    # Dynamo's frontend rejects unknown chat-completion fields. The
+    # conversation ID travels as the Dynamo session header instead.
+    prepared_body.pop("conversation_params", None)
 
     required_prefix_token_ids = _derive_required_prefix_token_ids(messages)
     add_generation_prompt = _request_add_generation_prompt(prepared_body)
@@ -413,10 +445,9 @@ class DynamoTokenWrapperServer:
         self.thread: Optional[threading.Thread] = None
         self._client_session: Any = None
 
-    def start(self) -> str:
-        """Start the wrapper in a background uvicorn thread."""
+    def _build_app(self) -> "FastAPI":
+        """Build the FastAPI app that serves NeMo-Gym chat-completion requests."""
         import aiohttp
-        import uvicorn
         from fastapi import FastAPI, HTTPException, Request
         from fastapi.responses import JSONResponse
 
@@ -461,6 +492,7 @@ class DynamoTokenWrapperServer:
                 )
 
             try:
+                session_id = _conversation_id_from_request(request_body)
                 prepared_body = await asyncio.to_thread(
                     prepare_dynamo_chat_completion_request,
                     request_body,
@@ -474,6 +506,7 @@ class DynamoTokenWrapperServer:
             status_code, response_body = await self._forward_chat_completion(
                 prepared_body,
                 authorization=request.headers.get("authorization"),
+                session_id=session_id,
             )
             if 200 <= status_code < 300:
                 try:
@@ -485,6 +518,13 @@ class DynamoTokenWrapperServer:
                     )
             return JSONResponse(content=response_body, status_code=status_code)
 
+        return app
+
+    def start(self) -> str:
+        """Start the wrapper in a background uvicorn thread."""
+        import uvicorn
+
+        app = self._build_app()
         node_ip = _get_node_ip_local()
         free_port = _get_free_port_local(
             DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
@@ -512,6 +552,7 @@ class DynamoTokenWrapperServer:
         request_body: dict[str, Any],
         *,
         authorization: Optional[str],
+        session_id: Optional[str] = None,
     ) -> tuple[int, dict[str, Any]]:
         import aiohttp
 
@@ -519,6 +560,8 @@ class DynamoTokenWrapperServer:
         headers = {"Content-Type": "application/json"}
         if authorization:
             headers["Authorization"] = authorization
+        if session_id:
+            headers[DYNAMO_SESSION_ID_HEADER] = session_id
 
         session = self._client_session
         if session is None:

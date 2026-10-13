@@ -65,8 +65,8 @@ class _AsyncSession:
     async def __aexit__(self, *args):
         return None
 
-    def post(self, url, *, json):
-        self.requests.append((url, json))
+    def post(self, url, *, json, headers=None):
+        self.requests.append((url, json, headers))
         if self._error is not None:
             raise self._error
         return self._response
@@ -191,7 +191,34 @@ def test_async_http_post_json_uses_same_error_contract(
 
     assert response == expected
     assert generation_module._is_retryable_http_response(response) is retryable
-    assert session.requests == [("http://worker/route", {"value": 1})]
+    assert session.requests == [("http://worker/route", {"value": 1}, None)]
+
+
+def test_async_http_post_json_forwards_headers(monkeypatch) -> None:
+    session = _AsyncSession(_AsyncResponse(b'{"status":"ok"}'))
+    monkeypatch.setattr(
+        http_client.aiohttp,
+        "ClientSession",
+        lambda **kwargs: session,
+    )
+
+    response = asyncio.run(
+        http_client.async_http_post_json(
+            "http://worker/route",
+            {"value": 1},
+            timeout_s=3,
+            headers={"X-Dynamo-Session-ID": "trajectory-session"},
+        )
+    )
+
+    assert response == {"status": "ok"}
+    assert session.requests == [
+        (
+            "http://worker/route",
+            {"value": 1},
+            {"X-Dynamo-Session-ID": "trajectory-session"},
+        )
+    ]
 
 
 @pytest.mark.parametrize(
