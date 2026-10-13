@@ -45,7 +45,7 @@ single `ValueError` listing every violation. The current requirements are:
   configured ETP. An explicitly requested generation-side ETP > 1 with
   `inference_optimized` is rejected by config key name rather than surfacing as
   a raw MCore assert at model build.
-* **Supported precisions:** BF16, FP16, FP32, Transformer Engine blockwise FP8,
+* **Supported precisions:** BF16, FP16, FP32, Transformer Engine scalar or blockwise FP8,
   and MXFP8 sources; unquantized, blockwise FP8, and MXFP8 destinations.
   Megatron blockwise FP8 destinations require Transformer Engine layers;
   `inference_optimized` supports MXFP8. Blockwise FP8 training storage with
@@ -225,6 +225,15 @@ advertised metadata. Grouped experts declare one common wire dtype.
   FlashInfer TRTLLM grouped experts instead receive into canonical EP-local staging
   tensors; `post` loads each logical expert with its global expert ID through vLLM's
   native weight loader.
+
+Grouped quantized source preparation requires rowwise primary model weights and
+compact MXFP8 scales. MXFP8 shard dimensions must align to 32; blockwise FP8
+dimensions must align to 128 for either 1D or 2D scaling. Encoded weights are
+concatenated without padding or shape repair. Only the combined scale metadata
+is padded, after removing unused per-expert scale entries. Scalar FP8 preserves
+each expert's scale. Columnwise-only and swizzled compute layouts are rejected.
+The generic misc and `refit_transport=null` conversion paths keep their existing
+dequantization behavior.
 
 ### Execution Flow: Refit Time
 

@@ -301,24 +301,22 @@ class _RefitSource:
 def _dequantize_refit_source_group(
     tensors: tuple[torch.Tensor, ...],
 ) -> torch.Tensor:
-    """Pack live expert storage and decode the whole group once, without a cache."""
+    """Decode block-aligned primary expert weights once, without a cache.
+
+    TE primary weights retain rowwise data and compact scales. Pack their
+    logical scale entries, including only aggregate metadata padding; never
+    pad the weights or change an expert's quantization block boundaries.
+    Callers provide a uniform group with matching shapes, dtypes and recipes.
+    """
     if not tensors:
         raise ValueError("Cannot prepare an empty refit expert group.")
-    shape = torch.Size(tensors[0].size())
-    if any(torch.Size(tensor.size()) != shape for tensor in tensors):
-        raise ValueError("Refit expert group members must have matching shapes.")
-    quantized = [
-        not isinstance(tensor, torch.Tensor) or _is_quantized_refit_source(tensor)
-        for tensor in tensors
-    ]
-    if not any(quantized):
-        if any(tensor.dtype != tensors[0].dtype for tensor in tensors):
-            raise ValueError("Refit expert group members must have matching dtypes.")
+    first = tensors[0]
+    shape = torch.Size(first.size())
+    if isinstance(first, torch.Tensor) and not _is_quantized_refit_source(first):
         return torch.stack(tensors)
-    if not all(quantized):
-        raise ValueError("Cannot mix quantized and unquantized refit expert storage.")
 
     # Defer optional TE storage classes until quantized experts need preparation.
+    from transformer_engine.pytorch.constants import TE_DType_To_Torch
     from transformer_engine.pytorch.tensor.storage.float8_blockwise_tensor_storage import (
         Float8BlockwiseQTensorStorage,
     )
@@ -329,131 +327,69 @@ def _dequantize_refit_source_group(
         MXFP8TensorStorage,
     )
 
-    first = tensors[0]
-    is_mxfp8 = isinstance(first, MXFP8TensorStorage)
-    is_scalar_fp8 = isinstance(first, Float8TensorStorage)
-    if is_mxfp8:
+    if isinstance(first, MXFP8TensorStorage):
         storage_type = MXFP8TensorStorage
-    elif is_scalar_fp8:
+    elif isinstance(first, Float8BlockwiseQTensorStorage):
+        storage_type = Float8BlockwiseQTensorStorage
+    elif isinstance(first, Float8TensorStorage):
         storage_type = Float8TensorStorage
     else:
-        storage_type = Float8BlockwiseQTensorStorage
-    if not all(isinstance(tensor, storage_type) for tensor in tensors):
         raise ValueError(
-            "Grouped refit requires one uniform MXFP8, blockwise FP8, or scalar FP8 storage format."
+            "Grouped refit supports MXFP8, blockwise FP8, or scalar FP8 primary weights."
         )
-    if len(shape) < 2:
-        raise ValueError("Quantized refit expert group members must be matrices.")
-    fp8_dtype = first._fp8_dtype
-    if any(tensor._fp8_dtype != fp8_dtype for tensor in tensors):
-        raise ValueError("Refit expert group members must have matching FP8 dtypes.")
-    layout = (
-        first._with_gemm_swizzled_scales
-        if is_mxfp8
-        else True
-        if is_scalar_fp8
-        else first._is_2D_scaled
-    )
-    if not is_scalar_fp8 and any(
-        (tensor._with_gemm_swizzled_scales if is_mxfp8 else tensor._is_2D_scaled)
-        != layout
-        for tensor in tensors
-    ):
-        raise ValueError("Refit expert group members must have matching scale layouts.")
-    columnwise = not is_scalar_fp8 and first._rowwise_data is None
-    if not is_scalar_fp8 and any(
-        (tensor._rowwise_data is None) != columnwise for tensor in tensors
-    ):
-        raise ValueError(
-            "Refit expert group members must use the same storage direction."
+    if storage_type is Float8TensorStorage:
+        # Current/delayed scaling has one scale per expert; apply all scales
+        # together rather than manufacturing a blockwise quantization layout.
+        values = torch.stack([tensor._data for tensor in tensors]).view(
+            TE_DType_To_Torch[first._fp8_dtype]
+        )
+        scales = torch.stack([tensor._scale_inv.reshape(()) for tensor in tensors])
+        return (values.float() * scales.reshape(-1, *([1] * len(shape)))).to(
+            torch.bfloat16
         )
 
+    is_mxfp8 = storage_type is MXFP8TensorStorage
     rows, cols = shape.numel() // shape[-1], shape[-1]
-    if columnwise:
-        rows, cols = cols, rows
-    raw_data, raw_scales = [], []
-    for tensor in tensors:
-        if is_scalar_fp8:
-            data, scales = tensor._data, tensor._scale_inv
-            if scales is None or scales.numel() != 1:
-                raise ValueError(
-                    "Scalar FP8 expert storage requires one scale per expert."
-                )
-            # A scalar scale is a constant grid of block scales. Expanding the
-            # metadata lets the same packed block decoder handle all experts.
-            scales = scales.reshape(1, 1).expand(
-                (rows + 127) // 128, ((cols + 127) // 128 + 3) // 4 * 4
+    block_size = 32 if is_mxfp8 else 128
+    if rows % block_size or cols % block_size:
+        raise ValueError(
+            f"Refit expert shards must be aligned to {block_size}-element quantization blocks."
+        )
+    if first._rowwise_data is None or first._rowwise_scale_inv is None:
+        raise ValueError("Grouped refit requires rowwise primary-weight storage.")
+    scale_buffers = [tensor._rowwise_scale_inv for tensor in tensors]
+    if is_mxfp8:
+        if first._with_gemm_swizzled_scales:
+            raise ValueError(
+                "Grouped refit requires compact MXFP8 primary-weight scales."
+            )
+        scales = torch.cat([scale[:rows, : cols // 32] for scale in scale_buffers])
+        padding = (-scales.shape[1] % 4, -scales.shape[0] % 128)
+    else:
+        if first._is_2D_scaled:
+            scales = torch.cat(
+                [scale[: rows // 128, : cols // 128] for scale in scale_buffers]
             )
         else:
-            data = tensor._columnwise_data if columnwise else tensor._rowwise_data
-            scales = (
-                tensor._columnwise_scale_inv
-                if columnwise
-                else tensor._rowwise_scale_inv
+            scales = torch.cat(
+                [scale[: cols // 128, :rows] for scale in scale_buffers],
+                dim=1,
             )
-        if data is None or scales is None:
-            raise ValueError(
-                "Quantized refit expert storage is missing data or scales."
-            )
-        if columnwise and is_mxfp8:
-            # MX columnwise bytes retain logical orientation; blockwise bytes
-            # are already transposed. Swizzled scales encode this transpose.
-            data = data.reshape(cols, rows).T
-            scales = (
-                scales.reshape((rows + 127) // 128 * 128, -1) if layout else scales.T
-            )
-        raw_data.append(data.reshape(rows, cols))
-        raw_scales.append(scales)
-    scale_dtype = torch.uint8 if is_mxfp8 else torch.float32
-    if any(data.dtype != torch.uint8 for data in raw_data) or any(
-        scales.dtype != scale_dtype for scales in raw_scales
-    ):
-        raise ValueError(
-            "Quantized refit expert data or scale storage has an invalid dtype."
-        )
-
-    data = torch.stack(raw_data)
-    if is_mxfp8 or layout:
-        # Whole 128-row tiles preserve independent expert blocks and, for MX,
-        # the GEMM scale swizzle. Never crop a swizzled member's scale padding.
-        padded_rows = (rows + 127) // 128 * 128
-        if padded_rows != rows:
-            data = torch.nn.functional.pad(data, (0, 0, 0, padded_rows - rows))
-        scales = torch.cat(raw_scales, dim=0)
-    else:
-        padded_rows = rows
-        scales = torch.cat([scale[:, :rows] for scale in raw_scales], dim=1)
-        scale_padding = (-len(tensors) * rows) % 4
-        if scale_padding:
-            scales = torch.nn.functional.pad(scales, (0, scale_padding))
-    data = data.reshape(len(tensors) * padded_rows, cols)
-    if is_mxfp8:
-        packed = MXFP8TensorStorage(
-            rowwise_data=data,
-            rowwise_scale_inv=scales,
-            columnwise_data=None,
-            columnwise_scale_inv=None,
-            fp8_dtype=fp8_dtype,
-            quantizer=None,
-            with_gemm_swizzled_scales=layout,
-            fake_dtype=torch.bfloat16,
-        )
-    else:
-        packed = Float8BlockwiseQTensorStorage(
-            rowwise_data=data,
-            rowwise_scale_inv=scales,
-            columnwise_data=None,
-            columnwise_scale_inv=None,
-            fp8_dtype=fp8_dtype,
-            quantizer=None,
-            is_2D_scaled=layout,
-            fake_dtype=torch.bfloat16,
-        )
-    decoded = packed.dequantize(dtype=torch.bfloat16)
-    decoded = decoded.reshape(len(tensors), padded_rows, cols)[:, :rows]
-    if columnwise:
-        decoded = decoded.transpose(-2, -1)
-    return decoded.reshape(len(tensors), *shape)
+        padding = (-scales.shape[1] % 4, 0)
+    if any(padding):
+        scales = torch.nn.functional.pad(scales, (0, padding[0], 0, padding[1]))
+    data = torch.stack([tensor._rowwise_data for tensor in tensors]).reshape(-1, cols)
+    metadata = first.get_metadata()
+    metadata.update(
+        rowwise_data=data,
+        rowwise_scale_inv=scales,
+        columnwise_data=None,
+        columnwise_scale_inv=None,
+        quantizer=None,
+        fake_dtype=torch.bfloat16,
+    )
+    packed = storage_type(**metadata)
+    return packed.dequantize(dtype=torch.bfloat16).reshape(len(tensors), *shape)
 
 
 def _dequantize_refit_source(tensor: torch.Tensor) -> torch.Tensor:

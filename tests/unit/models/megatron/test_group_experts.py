@@ -191,24 +191,20 @@ def test_group_experts_selects_equivalent_axes_after_group_preparation(
     not torch.cuda.is_available(), reason="TE quantization requires CUDA"
 )
 @pytest.mark.parametrize(
-    "recipe,block_dim,swizzled,columnwise_only",
+    "recipe,block_dim,shape",
     [
-        pytest.param("mxfp8", None, False, False, id="mxfp8-compact-padded"),
-        pytest.param("mxfp8", None, True, False, id="mxfp8-swizzled-padded"),
-        pytest.param("mxfp8", None, True, True, id="mxfp8-swizzled-columnwise"),
-        pytest.param("blockwise", 1, False, False, id="blockwise-1d"),
-        pytest.param("blockwise", 2, False, False, id="blockwise-2d"),
-        pytest.param("blockwise", 1, False, True, id="blockwise-1d-columnwise"),
-        pytest.param("blockwise", 2, False, True, id="blockwise-2d-columnwise"),
-        pytest.param("current", None, False, False, id="scalar-current-scaling"),
-        pytest.param("delayed", None, False, False, id="scalar-delayed-scaling"),
+        pytest.param("mxfp8", None, (96, 160), id="mxfp8-padded-scales"),
+        pytest.param("mxfp8", None, (128, 128), id="mxfp8-aligned"),
+        pytest.param("blockwise", 1, (256, 128), id="blockwise-1d"),
+        pytest.param("blockwise", 2, (256, 128), id="blockwise-2d"),
+        pytest.param("current", None, (256, 128), id="scalar-current-scaling"),
+        pytest.param("delayed", None, (256, 128), id="scalar-delayed-scaling"),
     ],
 )
 def test_quantized_expert_group_decodes_once_with_current_scales(
     recipe: str,
     block_dim: int | None,
-    swizzled: bool,
-    columnwise_only: bool,
+    shape: tuple[int, int],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The optional TE quantizers and kernels are needed only for this GPU test.
@@ -229,27 +225,23 @@ def test_quantized_expert_group_decodes_once_with_current_scales(
         MXFP8TensorStorage,
     )
 
+    rows, columns = shape
     if recipe == "mxfp8":
         available, reason = te.is_mxfp8_available(return_reason=True)
         if not available:
             pytest.skip(reason)
 
     if recipe == "mxfp8":
-        quantizer = MXFP8Quantizer(
-            tex.DType.kFloat8E4M3, rowwise=not columnwise_only, columnwise=True
-        )
-        quantizer.optimize_for_gemm = swizzled
+        quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
         storage_type = MXFP8TensorStorage
-        rows, columns = 96, 160  # Both scale axes contain padding.
     elif recipe == "blockwise":
         quantizer = Float8BlockQuantizer(
             tex.DType.kFloat8E4M3,
-            rowwise=not columnwise_only or block_dim == 2,
+            rowwise=True,
             columnwise=True,
             block_scaling_dim=block_dim,
         )
         storage_type = Float8BlockwiseQTensorStorage
-        rows, columns = 256, 128
     if recipe in ("current", "delayed"):
         quantizers = tuple(
             Float8CurrentScalingQuantizer(
@@ -268,8 +260,7 @@ def test_quantized_expert_group_decodes_once_with_current_scales(
             )
             for index in range(2)
         )
-        storage_type = Float8BlockwiseQTensorStorage
-        rows, columns = 256, 128
+        storage_type = None
     else:
         quantizers = (quantizer, quantizer)
     column_indices = torch.arange(columns, device="cuda")
@@ -278,7 +269,7 @@ def test_quantized_expert_group_decodes_once_with_current_scales(
     )[(column_indices // 32) % 5]
     within_block = (1 + (column_indices % 8).float() / 8).to(torch.bfloat16)
     # Vary scale blocks along both axes and values within each row, so crossed
-    # or incorrectly unswizzled column scales cannot match the reference.
+    # scale rows or columns cannot match the reference.
     column_pattern = column_blocks * within_block
     values = tuple(
         torch.cat(
@@ -293,30 +284,16 @@ def test_quantized_expert_group_decodes_once_with_current_scales(
         for pair in ((3.0, 67.0), (0.125, 129.0))
     )
     members = tuple(q.quantize(value) for q, value in zip(quantizers, values))
-    # TE's 2D quantizer requires rowwise output even when only columnwise
-    # storage will be consumed. Retain it for updates, then remove it before
-    # both reference and grouped decoding to exercise the column-only path.
-    rowwise_buffers = (
-        tuple((member._rowwise_data, member._rowwise_scale_inv) for member in members)
-        if recipe == "blockwise" and block_dim == 2 and columnwise_only
-        else None
-    )
-    original_decode = storage_type.dequantize
+    original_decode = storage_type.dequantize if storage_type is not None else None
     previous = None
     for cycle in (1, 2):
         with torch.no_grad():
             for index, (member, value, q) in enumerate(
                 zip(members, values, quantizers)
             ):
-                if rowwise_buffers is not None:
-                    member._rowwise_data, member._rowwise_scale_inv = rowwise_buffers[
-                        index
-                    ]
                 if recipe == "delayed":
                     q.scale.fill_(0.5 / (index + 1) * cycle)
                 q.update_quantized(value * cycle, member)
-                if rowwise_buffers is not None:
-                    member.update_usage(rowwise_usage=False, columnwise_usage=True)
         expected = torch.stack(
             [member.dequantize(dtype=torch.bfloat16) for member in members]
         )
@@ -324,6 +301,24 @@ def test_quantized_expert_group_decodes_once_with_current_scales(
 
         def decode_once(tensor, *args, **kwargs):
             decoded_groups.append(tensor)
+            # Only scale metadata may need padding; raw expert weights must
+            # remain a direct concatenation of their original logical rows.
+            assert tensor._rowwise_data.shape == (len(members) * rows, columns)
+            assert torch.equal(
+                tensor._rowwise_data,
+                torch.cat([member._rowwise_data for member in members]),
+            )
+            if recipe == "mxfp8":
+                assert torch.equal(
+                    tensor._rowwise_scale_inv[: len(members) * rows, : columns // 32],
+                    torch.cat(
+                        [
+                            member._rowwise_scale_inv[:rows, : columns // 32]
+                            for member in members
+                        ]
+                    ),
+                )
+            assert original_decode is not None
             return original_decode(tensor, *args, **kwargs)
 
         member_decode = MagicMock(
@@ -331,24 +326,71 @@ def test_quantized_expert_group_decodes_once_with_current_scales(
         )
         with monkeypatch.context() as hooks:
             hooks.setattr(type(members[0]), "dequantize", member_decode)
-            hooks.setattr(storage_type, "dequantize", decode_once)
+            if storage_type is not None:
+                hooks.setattr(storage_type, "dequantize", decode_once)
             actual = worker_module._dequantize_refit_source_group(members)
         member_decode.assert_not_called()
-        assert len(decoded_groups) == 1
+        assert len(decoded_groups) == (1 if storage_type is not None else 0)
         assert actual.dtype == torch.bfloat16
         assert actual.shape == (2, rows, columns)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         if previous is not None:
             assert not torch.equal(actual, previous)
         previous = actual
-    failed_decode = MagicMock(side_effect=RuntimeError("group decode failed"))
-    with monkeypatch.context() as hooks:
-        hooks.setattr(type(members[0]), "dequantize", member_decode)
-        hooks.setattr(storage_type, "dequantize", failed_decode)
-        with pytest.raises(RuntimeError, match="group decode failed"):
-            worker_module._dequantize_refit_source_group(members)
-    failed_decode.assert_called_once()
-    member_decode.assert_not_called()
+    if storage_type is not None:
+        failed_decode = MagicMock(side_effect=RuntimeError("group decode failed"))
+        with monkeypatch.context() as hooks:
+            hooks.setattr(type(members[0]), "dequantize", member_decode)
+            hooks.setattr(storage_type, "dequantize", failed_decode)
+            with pytest.raises(RuntimeError, match="group decode failed"):
+                worker_module._dequantize_refit_source_group(members)
+        failed_decode.assert_called_once()
+        member_decode.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "layout,reason",
+    [
+        ("columnwise", "rowwise primary-weight storage"),
+        ("swizzled", "compact MXFP8 primary-weight scales"),
+        ("unaligned-blockwise", "aligned to 128-element quantization blocks"),
+    ],
+)
+def test_quantized_expert_group_requires_primary_weight_layout(
+    layout: str, reason: str
+) -> None:
+    # Real TE storage descriptors suffice; rejection runs before CUDA decoding.
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.storage.float8_blockwise_tensor_storage import (
+        Float8BlockwiseQTensorStorage,
+    )
+    from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import (
+        MXFP8TensorStorage,
+    )
+
+    if layout == "unaligned-blockwise":
+        source = Float8BlockwiseQTensorStorage(
+            rowwise_data=torch.zeros((96, 128), dtype=torch.uint8),
+            rowwise_scale_inv=torch.ones((1, 4), dtype=torch.float32),
+            columnwise_data=None,
+            columnwise_scale_inv=None,
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            quantizer=None,
+            is_2D_scaled=True,
+        )
+    else:
+        data = torch.zeros((96, 160), dtype=torch.uint8)
+        source = MXFP8TensorStorage(
+            rowwise_data=None if layout == "columnwise" else data,
+            rowwise_scale_inv=torch.ones((128, 8), dtype=torch.uint8),
+            columnwise_data=data,
+            columnwise_scale_inv=torch.ones((4, 256), dtype=torch.uint8),
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            quantizer=None,
+            with_gemm_swizzled_scales=layout == "swizzled",
+        )
+    with pytest.raises(ValueError, match=reason):
+        worker_module._dequantize_refit_source_group((source, source))
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
