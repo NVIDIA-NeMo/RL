@@ -237,30 +237,6 @@ class MasterConfig(BaseModel, extra="allow"):
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
 
-    @model_validator(mode="before")
-    @classmethod
-    def _reject_legacy_collator_keys(cls, value: Any) -> Any:
-        """Reject obsolete data keys before the shared schema discards them."""
-        if isinstance(value, dict) and isinstance(value.get("data"), dict):
-            destinations = {
-                "collator_mode": "mode",
-                "include_thinking_in_loss": "include_thinking_in_loss",
-                "native_thinking_alignment": "native_thinking_alignment",
-                "kd_alignment_regions": "kd_alignment_regions",
-                "num_packed_rows": "num_packed_rows",
-            }
-            migrations = [
-                f"data.{old} -> collator.{new}"
-                for old, new in destinations.items()
-                if old in value["data"]
-            ]
-            if migrations:
-                raise ValueError(
-                    "Collator options no longer belong under data; move them to "
-                    "the top-level collator block: " + ", ".join(migrations)
-                )
-        return value
-
 
 # ===============================================================================
 # Setup
