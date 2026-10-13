@@ -103,7 +103,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
     algo_config,
+    evaluation_only_checkpoints,
     is_ppo_run,
+    step_checkpoint_due,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
@@ -337,9 +339,17 @@ class SingleControllerActor:
             or self._algo_cfg.malformed_thinking_advantage is not None
         )
 
+        # The in-loss path evaluates seq_logprob_error_threshold in the trainer,
+        # so no separate policy-logprob pass or pre-training mask is needed.
+        self._seq_logprob_error_in_loss = (
+            master_config.loss_fn.seq_logprob_error_in_loss
+        )
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
-            and self._algo_cfg.seq_logprob_error_threshold is None
+            and (
+                self._algo_cfg.seq_logprob_error_threshold is None
+                or self._seq_logprob_error_in_loss
+            )
         )
         # _build_trainer initializes the reference model only for a positive KL
         # penalty, so the controller must use the same gate before requesting it.
@@ -546,6 +556,7 @@ class SingleControllerActor:
             self._master_config.checkpointing["enabled"]
             and self._sampler.supports_buffer_checkpoint
             and not self._master_config.checkpointing.get("save_data_plane")
+            and not evaluation_only_checkpoints(self._master_config)
         ):
             raise ValueError(
                 "SingleController checkpointing with a replay-checkpoint-capable "
@@ -2969,6 +2980,11 @@ class SingleControllerActor:
                         )
                     self._optimizer_commit_in_progress = True
 
+                # Offline evaluation attributes accuracy to the completed
+                # optimizer update, excluding subsequent refit/checkpoint I/O.
+                if is_policy_training_step:
+                    self._save_state.training_step_end_time_ms = int(time.time() * 1000)
+
                 # Aggregate step metrics
                 step_metrics = {}
                 if policy_result is not None:
@@ -3062,18 +3078,12 @@ class SingleControllerActor:
                 is_last_step = self._train_steps >= self._algo_cfg.max_num_steps or (
                     self._rollout_exhausted.is_set() and len(self._buffer) == 0
                 )
-                ft_save_period = self._master_config.checkpointing.get("ft_save_period")
                 # _train_steps was already incremented above, so it equals
                 # the legacy loop's 1-indexed `step + 1`.
-                should_save_by_step = (
-                    is_last_step
-                    or self._train_steps
-                    % self._master_config.checkpointing["save_period"]
-                    == 0
-                    or (
-                        ft_save_period is not None
-                        and self._train_steps % ft_save_period == 0
-                    )
+                should_save_by_step = step_checkpoint_due(
+                    self._master_config,
+                    train_steps=self._train_steps,
+                    is_last_step=is_last_step,
                 )
                 # Call once per step and reuse the bool.
                 should_save_by_timeout = self._timeout.check_save()
@@ -4523,6 +4533,9 @@ class SingleControllerActor:
         async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
             save_state.current_step = self._train_steps
             save_state.total_steps = self._train_steps
+            save_state.evaluation_only = evaluation_only_checkpoints(
+                self._master_config
+            )
             save_state.trainer_version = self._trainer_version
             save_state.current_epoch = self._current_epoch
             save_state.consumed_samples = self._consumed_samples
@@ -5078,7 +5091,14 @@ class SingleControllerActor:
                 # Real validity (token-capture placeholders carry sample_mask 0,
                 # and mask_sample/overlong/seq-logprob-error rows are folded in
                 # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
+                # Match legacy GRPO's all-response baseline only in the opt-in
+                # single-forward path. Its survivor mask becomes known in loss.
+                # Keep SC's existing survivor-based baseline when disabled.
+                # Token-capture placeholders are rejected with this mode at
+                # config validation, so no placeholder row can vote here.
+                valid_mask=(
+                    None if self._seq_logprob_error_in_loss else final_sample_mask
+                ),
                 **kwargs,
             )
             if self._is_ppo:

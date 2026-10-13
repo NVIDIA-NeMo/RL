@@ -342,7 +342,7 @@ def test_build_generation_passes_sglang_config():
 
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
-    master_config = _make_master_config(colocated=False, backend="trtllm")
+    master_config = _make_master_config(colocated=False, backend="unknown_backend")
     master_config.cluster = {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 8,
@@ -363,7 +363,7 @@ def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
 
     with pytest.raises(
         ValueError,
-        match="only supports vllm, sglang, or megatron generation; got 'trtllm'",
+        match="only supports vllm, sglang, trtllm, or megatron generation; got 'unknown_backend'",
     ):
         sc_setup_mod._build_clusters(master_config)
 
@@ -2879,3 +2879,136 @@ def test_load_opd_full_teacher_lm_heads_loads_one_head_per_unique_teacher(monkey
         "Qwen/teacher-a",
         "Qwen/teacher-b",
     ]
+
+
+def _trtllm_sc_config():
+    mc = _make_master_config(backend="trtllm", env={"should_use_nemo_gym": True})
+    mc.policy["model_name"] = "test-model"
+    mc.policy["generation"].update(
+        {
+            "model_name": "test-model",
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+            "trtllm_cfg": {
+                "async_engine": True,
+                "expose_http_server": True,
+                "max_model_len": 65536,
+                "tensor_parallel_size": 16,
+                "pipeline_parallel_size": 1,
+                "disaggregation": {
+                    "enabled": True,
+                    "ctx_trtllm_kwargs": {"tensor_parallel_size": 4},
+                    "gen_trtllm_kwargs": {"tensor_parallel_size": 16},
+                },
+            },
+        }
+    )
+    mc.async_rl.generation_fleet_health.refit_timeout_s = None
+    return mc
+
+
+def test_build_generation_passes_trtllm_config():
+    mc = _trtllm_sc_config()
+    cluster = MagicMock()
+    with patch.object(sc_setup_mod, "TrtllmGeneration") as constructor:
+        generation, _ = _REAL_BUILD_GENERATION(cluster, mc)
+    constructor.assert_called_once_with(cluster=cluster, config=mc.policy["generation"])
+    generation.finish_generation.assert_called_once_with()
+    with pytest.raises(ValueError, match="does not support deferred"):
+        _REAL_BUILD_GENERATION(cluster, mc, defer_model_load=True)
+
+
+def test_trtllm_max_sequence_length():
+    assert (
+        sc_setup_mod._generation_max_seq_len(_trtllm_sc_config().policy["generation"])
+        == 65536
+    )
+
+
+def test_trtllm_pd_gym_builds_generation_once_before_gym(patched_factories):
+    mc = _trtllm_sc_config()
+    fake_gen = patched_factories["fake_gen"]
+    fake_gen.dp_openai_server_base_urls = ["http://pd1:8000/v1", "http://pd2:8000/v1"]
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    events = []
+
+    def build(*args, **kwargs):
+        assert not kwargs.get("defer_model_load")
+        events.append("generation")
+        return fake_gen, 3.0
+
+    def gym(**kwargs):
+        assert events == ["generation"]
+        assert kwargs["base_urls"] == fake_gen.dp_openai_server_base_urls
+        events.append("gym")
+        return MagicMock(name="gym_shards"), 2.0
+
+    patched_factories["_build_generation"].side_effect = build
+    with patch.object(sc_setup_mod, "_spinup_gym", side_effect=gym):
+        args, timing = setup_single_controller(mc, MagicMock(pad_token_id=0))
+    assert events == ["generation", "gym"]
+    patched_factories["_build_generation"].assert_called_once()
+    fake_gen.load_and_start.assert_not_called()
+    assert args.gen_handle is fake_gen
+    assert timing.generation_init_time_s == 3.0
+    assert (
+        patched_factories["create_weight_synchronizer"].call_args.kwargs[
+            "generation_backend"
+        ]
+        == "trtllm"
+    )
+    assert (
+        patched_factories["create_weight_synchronizer"].call_args.kwargs[
+            "refit_timeout_s"
+        ]
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "fleet",
+        "restart",
+        "deadline",
+        "token_capture",
+        "router",
+        "sync_engine",
+        "http",
+        "native_pd",
+    ],
+)
+def test_trtllm_unsupported_options_fail_before_resources(patched_factories, option):
+    mc = _trtllm_sc_config()
+    if option == "fleet":
+        mc.async_rl.generation_fleet_health.enabled = True
+    elif option == "restart":
+        mc.async_rl.generation_fleet_health.restart_dead_shards = True
+    elif option == "deadline":
+        mc.async_rl.generation_fleet_health.refit_timeout_s = 300
+    elif option == "token_capture":
+        mc.token_capture.enabled = True
+    elif option == "router":
+        mc.async_rl.generation_router.enabled = True
+    elif option == "sync_engine":
+        mc.policy["generation"]["trtllm_cfg"]["async_engine"] = False
+    elif option == "http":
+        mc.policy["generation"]["trtllm_cfg"]["expose_http_server"] = False
+    elif option == "native_pd":
+        mc.env["should_use_nemo_gym"] = False
+    # Existing generic Gym guards reject these two before backend validation.
+    error = (
+        AssertionError
+        if option in ("sync_engine", "http")
+        else (ValueError, NotImplementedError)
+    )
+    with pytest.raises(error):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+    for name in [
+        "setup_response_data",
+        "_build_clusters",
+        "_build_generation",
+        "_build_trainer",
+    ]:
+        patched_factories[name].assert_not_called()

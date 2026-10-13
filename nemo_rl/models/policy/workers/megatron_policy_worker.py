@@ -2060,9 +2060,33 @@ class MegatronPolicyWorkerImpl(
         # from the same policy config on every DP rank, and Megatron runs
         # the same microbatch count on all of them.
         draft_step_state: DraftStepState = state["draft_step_state"]
-        policy_counts = torch.stack(
-            [state["local_valid_seqs"], state["local_valid_toks"]]
-        ).to(torch.float64)
+        in_loss_filter = (
+            isinstance(state["loss_fn"], ClippedPGLossFn)
+            and state["loss_fn"].requires_survivor_normalization
+        )
+        if in_loss_filter:
+            # train_microbatch broadcasts final-stage loss metrics to every PP
+            # stage. Sum all chunks locally, then the existing DP-only reduce
+            # below counts each sample once (never count TP/CP replicas).
+            # Each chunk backpropagates an unnormalized sum with N=1, so finish
+            # must divide directly by survivors, not apply the sync path's G/K.
+            policy_counts = state["local_valid_toks"].new_tensor(
+                [
+                    sum(
+                        m["seq_logprob_error_valid_seqs"]
+                        for m in state["all_mb_metrics"]
+                    ),
+                    sum(
+                        m["seq_logprob_error_valid_tokens"]
+                        for m in state["all_mb_metrics"]
+                    ),
+                ],
+                dtype=torch.float64,
+            )
+        else:
+            policy_counts = torch.stack(
+                [state["local_valid_seqs"], state["local_valid_toks"]]
+            ).to(torch.float64)
         to_reduce = torch.cat(
             [
                 policy_counts,
@@ -2075,6 +2099,12 @@ class MegatronPolicyWorkerImpl(
         global_valid_seqs = to_reduce[0]
         global_valid_toks = to_reduce[1]
         draft_step_state.set_global_counts(to_reduce[2:])
+        if in_loss_filter and global_valid_toks.item() == 0:
+            raise RuntimeError(
+                "No valid response tokens remain after in-loss sequence-logprob "
+                "filtering; refusing an empty optimizer update. Check "
+                "grpo.seq_logprob_error_threshold."
+            )
 
         if state["loss_type"] == LossType.TOKEN_LEVEL:
             n_true = global_valid_toks

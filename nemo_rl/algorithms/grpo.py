@@ -412,6 +412,13 @@ class GRPOSaveState:
     # SingleController only: exact last admitted dispatch batch. None preserves
     # compatibility with checkpoints that only recorded the trainer version.
     sampler_dispatch_index: Optional[int] = None
+    # SingleController only: True on weights-only deferred-evaluation endpoints,
+    # which cannot resume training. False on every other checkpoint.
+    evaluation_only: bool = False
+    # SingleController only: wall-clock end of the last completed optimizer
+    # update, in epoch milliseconds. Offline evaluation attributes accuracy to
+    # it. None until the first policy update and on older checkpoints.
+    training_step_end_time_ms: Optional[int] = None
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:
@@ -1151,40 +1158,9 @@ def setup(
                         "pipeline_parallel_size", 1
                     )
                 elif generation_config["backend"] == "trtllm":
-                    trtllm_cfg = generation_config.get("trtllm_cfg", {})
-                    disagg_cfg = trtllm_cfg.get("disaggregation") or {}
-                    if disagg_cfg.get("enabled"):
-                        # Under PD disaggregation the unit to keep inside one
-                        # NVLink domain is the *replica*, not the engine: an
-                        # engine's TP group all-reduces internally, but the KV
-                        # cache handed from the replica's context engines to its
-                        # generation engines crosses the transceiver on every
-                        # turn. Sizing this by the engine (below) yields
-                        # nodes_per_instance=1 whenever an engine fits in a node,
-                        # which skips domain pinning entirely and lets a replica
-                        # straddle racks -- correct, but with the KV transfer
-                        # demoted from NVLink to InfiniBand.
-                        #
-                        # No pipeline_parallel_size factor: TrtllmGeneration
-                        # asserts pp == 1, so folding it in would only suggest a
-                        # dimension this backend does not have.
-                        def _role_tp(role: str) -> int:
-                            overrides = disagg_cfg.get(f"{role}_trtllm_kwargs") or {}
-                            return int(
-                                overrides.get(
-                                    "tensor_parallel_size",
-                                    trtllm_cfg["tensor_parallel_size"],
-                                )
-                            )
-
-                        gpus_per_instance = int(
-                            disagg_cfg["num_context_engines"] * _role_tp("ctx")
-                            + disagg_cfg["num_generation_engines"] * _role_tp("gen")
-                        )
-                    else:
-                        gpus_per_instance = trtllm_cfg[
-                            "tensor_parallel_size"
-                        ] * trtllm_cfg.get("pipeline_parallel_size", 1)
+                    gpus_per_instance = TrtllmGeneration.gpus_per_instance(
+                        cast(TrtllmConfig, generation_config)
+                    )
                 elif generation_config["backend"] == "dynamo":
                     gpus_per_instance = DynamoConfig.model_validate(
                         generation_config
