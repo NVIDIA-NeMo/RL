@@ -379,9 +379,12 @@ class GRPOConfig(BaseModel, extra="allow"):
     # agent's share of the gradient, never its overall scale (all weights 2.0 is
     # an exact no-op), and auxiliary objectives normalized by
     # ``global_valid_toks`` (Megatron MoE load-balancing / z-loss) keep the
-    # gradient they have without weights. Baselines, advantages and dynamic
-    # sampling run before weighting. NeMo-Gym only; the data-plane and
-    # SingleController trainers reject it. None disables.
+    # gradient they have without weights, except that with
+    # ``loss_fn.seq_logprob_error_in_loss`` the worker renormalizes by the
+    # weighted surviving token mass (see docs/guides/grpo.md). Baselines,
+    # advantages and dynamic sampling run before weighting. A name that matches
+    # no rollout row warns and logs num_samples 0. NeMo-Gym only; the data-plane
+    # and SingleController trainers reject it. None disables.
     agent_loss_weights: dict[str, float] | None = None
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
@@ -2628,7 +2631,12 @@ def _apply_agent_loss_weights(
     and router z-loss gradients by ``1 / global_valid_toks`` through
     ``MoEAuxLossAutoScaler``, so an unnormalized uniform weight of 2 would halve
     them. Because the rescaling is fixed before the batch is split into
-    data-parallel shards and microbatches, it does not depend on either.
+    data-parallel shards and microbatches, it does not depend on either. One
+    caveat: with ``loss_fn.seq_logprob_error_in_loss`` the Megatron worker
+    rescales every gradient by ``global_valid_toks / kept_tokens``
+    (``_normalize_in_loss_seq_filter``) and ``kept_tokens`` sums the weighted
+    mask, so that guarantee holds exactly only when no row is rejected in-loss;
+    uniform weights remain an exact no-op.
 
     Returns per-agent metrics: the configured weight, the effective (normalized)
     multiplier applied to the agent's rows, its number of samples, and its share
