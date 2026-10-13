@@ -17,13 +17,13 @@ The collator runs inside DataLoader worker processes. It does:
 
 1. Tokenizes the student input once; this tokenization is shared by all
    teachers. In ``mode="text"``, tokenizes raw text without a chat template.
-   In ``mode="chat"``, renders the student's chat template and identifies
-   assistant content and end-of-turn tokens for the loss mask.
+   In ``mode="chat"``, renders the full conversation with the student's chat
+   template and supervises only the final assistant content and end-of-turn token.
 2. For each *cross-tokenizer* teacher, tokenizes with that teacher's
    tokenizer and aligns with its :class:`TokenAligner`. Text mode aligns
    the full text; chat mode renders the teacher's own chat template and
-   aligns assistant messages independently. Teacher scoring masks also
-   select assistant content and end-of-turn tokens in chat mode. Dense-padded alignment and
+   aligns the final assistant message. Teacher scoring masks also select only
+   the final assistant content and end-of-turn token. Dense-padded alignment and
    teacher inputs are emitted under ``alignment_{i}_*`` / ``teacher_{i}_*``.
 3. *Same-tokenizer* teachers (``aligners[i] is None``) emit nothing extra —
    their forward reuses the student tokenization, so projection and alignment
@@ -63,7 +63,8 @@ class CrossTokenizerCollatorConfig(BaseModel, extra="allow"):
         include_thinking_in_loss: Include reasoning text and its closing marker
             in assistant supervision, excluding the opening scaffold. Separate
             ``reasoning_content`` fields require native thinking alignment;
-            ordinary chat supports inline ``<think>`` content.
+            ordinary chat supports inline ``<think>`` content. Only the final
+            assistant turn is supervised; earlier turns remain context.
         native_thinking_alignment: Align reasoning, close, answer/tool and EOT
             independently on supported Qwen/Nano ChatML templates.
             Requires chat mode and thinking loss.
@@ -91,9 +92,9 @@ class CrossTokenizerCollator:
     (``teacher_{i}_*`` and ``alignment_{i}_*``). A *same-tokenizer* teacher
     (``aligners[i] is None``) emits nothing extra — its forward reuses the
     student tokenization, so projection and alignment are skipped entirely.
-    Chat mode applies each model's chat template, masks loss and teacher
-    scoring to assistant content and end-of-turn tokens, and aligns assistant
-    messages separately.
+    Chat mode applies each model's chat template to the full conversation,
+    masks loss and teacher scoring to the final assistant content and end-of-turn
+    token, and aligns only that final message.
 
     Args:
         config: Typed batching options, including text/chat mode and the
@@ -311,7 +312,7 @@ class CrossTokenizerCollator:
             raise ValueError(f"{side}, sample idx={datum['idx']}: {error}") from error
 
     def _call_chat(self, batch: List[DatumSpec]) -> BatchedDataDict[Any]:
-        """Render complete conversations and align selected assistant regions."""
+        """Render complete conversations and align their final assistant regions."""
         student_docs = [
             self._render_document(
                 self.student_tokenizer, datum, self.ctx_length_student, "student"
