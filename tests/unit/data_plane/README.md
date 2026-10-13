@@ -130,7 +130,7 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 
 - `test_decompose_message_log_basic_shapes` — Basic shapes of decompose output.
 - `test_decompose_message_log_no_assistant_turn` — No-assistant case handled.
-- `test_decompose_message_log_picks_first_assistant` — Multiple assistant turns → first wins for `response_token_lengths`.
+- `test_decompose_message_log_sums_assistant_turns` — Multiple assistant turns → `response_token_lengths` is their total.
 - `test_decompose_message_log_jagged_turn_count` — Different turn counts pad `turn_lengths` with zeros.
 - `test_decompose_message_log_missing_role_raises` — Missing `role` raises KeyError loudly.
 - `test_reconstruct_message_log_roundtrip` — decompose → flatten → reconstruct equivalent message_log.
