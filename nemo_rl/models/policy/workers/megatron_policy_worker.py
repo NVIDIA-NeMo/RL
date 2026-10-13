@@ -927,6 +927,7 @@ class MegatronPolicyWorkerImpl(
                 "train/gen_kl_error.",
                 model_role,
             )
+
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
         if not self._forward_pre_hook_enabled():
