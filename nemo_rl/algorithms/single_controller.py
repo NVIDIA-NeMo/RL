@@ -717,7 +717,6 @@ class SingleControllerActor:
                 num_prompts_per_step=num_prompts_per_step,
                 min_groups_for_streaming_train=self._async_cfg.min_groups_for_streaming_train,
             )
-            self._sampler.set_group_multiple(group_multiple)
         restored_dispatch_index = actor_args.save_state.sampler_dispatch_index
         # The saved dispatch index counts groups dispatched ahead of training, which
         # only a data-plane snapshot can give back. Without one (e.g. msc://), those
@@ -3411,24 +3410,28 @@ class SingleControllerActor:
                         ):
                             await asyncio.to_thread(self._trainer.prepare_for_training)
                         if has_valid_training_tokens:
-                            with (
-                                self._timer.time("policy_training"),
-                                managed_span(
-                                    RLSpanGroup.POLICY_UPDATE,
-                                    "rl.sc.policy_training",
-                                    tracer=self._tracer,
-                                ),
-                            ):
-                                if not step_open:
+                            for epoch in range(self._ppo_epochs):
+                                with (
+                                    self._timer.time("policy_training"),
+                                    managed_span(
+                                        RLSpanGroup.POLICY_UPDATE,
+                                        "rl.sc.policy_training",
+                                        tracer=self._tracer,
+                                        **{"rl.ppo_epoch": epoch + 1},
+                                    ),
+                                ):
+                                    if not step_open:
+                                        await asyncio.to_thread(
+                                            self._trainer.begin_train_step,
+                                            self._loss_fn,
+                                        )
+                                        step_open = True
                                     await asyncio.to_thread(
-                                        self._trainer.begin_train_step, self._loss_fn
+                                        self._trainer.train_microbatches_from_meta,
+                                        train_meta,
+                                        train_fields=self._train_fields,
                                     )
-                                    # Full-batch PPO closes each policy epoch;
-                                    # streaming keeps accumulating across chunks.
                                     if self._is_ppo and not self._streaming_ppo:
-                                        # Drain a snapshot of the old trainer
-                                        # identity before the first irreversible
-                                        # optimizer update, as on the streaming path.
                                         async with self._checkpoint_save_lock:
                                             self._optimizer_commit_in_progress = True
                                         policy_result = await asyncio.to_thread(
@@ -3619,7 +3622,7 @@ class SingleControllerActor:
                         if self._gen.blocks_training():
                             await asyncio.to_thread(self._trainer.finish_inference)
                     # GAE has produced the frozen predictions and targets for
-                    # every row. Critic epochs always see the full original batch.
+                    # every row. Critic epochs replay every selected chunk.
                     value_train_meta = value_train_metas[0].concat(
                         *value_train_metas[1:]
                     )
@@ -3639,7 +3642,7 @@ class SingleControllerActor:
                         ),
                     ):
                         value_result = await self._value_train_epochs(
-                            value_train_meta,
+                            value_train_metas,
                             num_epochs=self._critic_ppo_epochs,
                         )
                 else:
@@ -5782,26 +5785,6 @@ class SingleControllerActor:
                         await self._ppo_worker_call(self._value.abort_train_step)
         finally:
             await self._ppo_worker_call(self._value.finish_training)
-        assert result is not None
-        return result
-
-    async def _policy_train_epochs(self, metas: list[KVBatchMeta]) -> dict[str, Any]:
-        """Replay complete PPO epochs with one actor update per epoch."""
-        result: dict[str, Any] | None = None
-        for _ in range(self._ppo_epochs):
-            try:
-                await self._ppo_worker_call(
-                    self._trainer.begin_train_step, self._loss_fn
-                )
-                for meta in metas:
-                    await self._ppo_worker_call(
-                        self._trainer.train_microbatches_from_meta,
-                        meta,
-                        train_fields=self._train_fields,
-                    )
-                result = await self._ppo_worker_call(self._trainer.finish_train_step)
-            finally:
-                await self._ppo_worker_call(self._trainer.abort_train_step)
         assert result is not None
         return result
 

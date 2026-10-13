@@ -2983,7 +2983,7 @@ def _ppo_train_pump_controller(
     value: _NoOpValue | None = None,
     ppo_epochs: int = 1,
     critic_ppo_epochs: int | None = None,
-    value_training_mode: str = "split",
+    value_training_mode: str = "whole_batch",
 ) -> tuple[object, _NoOpValue]:
     ctrl = _train_pump_controller(sampler=sampler)
     value = _NoOpValue() if value is None else value
@@ -3062,6 +3062,7 @@ def test_train_pump_parks_the_policy_on_cpu_across_the_critic_stages(
     ctrl, _ = _ppo_train_pump_controller(
         sampler=_OneThenEmptySampler(meta),
         value=_NoOpValue(calls=calls, prefix="critic."),
+        value_training_mode="split",
     )
     ctrl._policy_logprobs_required = True
     ctrl._trainer = _OrderRecordingTrainer(calls)
@@ -3185,6 +3186,7 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
         policy_training_start_step=1,
         ppo_epochs=ppo_epochs,
         critic_ppo_epochs=critic_ppo_epochs,
+        value_training_mode="split",
     )
     stand_downs: list[bool] = []
     if engine_blocks_training:
@@ -3303,6 +3305,7 @@ def test_train_pump_runs_all_critic_epochs_after_actor_epochs(monkeypatch) -> No
         value=_NoOpValue(calls=calls, prefix="critic."),
         ppo_epochs=1,
         critic_ppo_epochs=3,
+        value_training_mode="split",
     )
     ctrl._trainer = _EpochRecordingTrainer(calls)
     ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
@@ -3495,6 +3498,25 @@ def _full_batch_ppo_controller(
     full_meta = metas[0].concat(*metas[1:])
     ctrl._sampler.select = AsyncMock(return_value=(full_meta, len(metas)))
     return ctrl, metas, calls
+
+
+def test_streaming_ppo_split_value_replays_each_chunk_per_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, metas, calls = _streaming_ppo_controller(monkeypatch, critic_epochs=2)
+    controller._algo_cfg.value_training_mode = "split"
+
+    asyncio.run(asyncio.wait_for(controller._train_pump(), timeout=1.0))
+
+    assert calls.count("policy.train_microbatches_from_meta") == len(metas)
+    assert calls.count("policy.finish_train_step") == 1
+    assert calls.count("critic.begin_train_step") == 2
+    assert calls.count("critic.train_microbatches_from_meta") == 2 * len(metas)
+    assert calls.count("critic.finish_train_step") == 2
+    assert calls.count("critic.abort_train_step") == 2
+    assert "critic.train_from_meta" not in calls
+    assert calls.index("refit") < calls.index("critic.begin_train_step")
+    assert controller._trainer_version == controller._train_steps == 1
 
 
 @pytest.mark.parametrize("warmup", [False, True])
