@@ -524,3 +524,44 @@ def test_record_to_train_batch_zeroes_unusable_rollout_sample_mask() -> None:
     )
 
     assert train_batch["sample_mask"].tolist() == [0.5, 0.0]
+
+
+def test_record_to_train_batch_keeps_unusable_placeholder_media_free() -> None:
+    """A text-only placeholder packs beside a multimodal sibling without media.
+
+    The placeholder row contributes an empty image row and no media placeholder
+    token, so the packed image rows and the placeholder tokens stay aligned the
+    way a native VLM forward (Nemotron Omni) requires.
+    """
+    pixel_values = PackedTensor(torch.zeros(1, 4), dim_to_pack=0)
+    real = _completion(route_start=10, reward=1.0, with_routes=False)
+    real.message_log[0]["token_ids"] = torch.tensor([10, 99])
+    real.message_log[0]["pixel_values"] = pixel_values
+    real.message_log[0]["media_token_validity_mask"] = torch.tensor([False, True])
+    placeholder = Completion(
+        message_log=[
+            {"role": "user", "content": "", "token_ids": torch.tensor([2] * 128)},
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor([2]),
+                "generation_logprobs": torch.tensor([0.0]),
+            },
+        ],
+        env_extras={NEMO_GYM_UNUSABLE_ROLLOUT_KEY: "no_generation_data"},
+        truncated=False,
+        reward=0.0,
+    )
+
+    train_batch = record_to_train_batch(
+        _record([real, placeholder]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+
+    assert train_batch["sample_mask"].tolist() == [1.0, 0.0]
+    assert train_batch["pixel_values"].as_tensor().shape[0] == 1
+    input_ids = train_batch["input_ids"]
+    assert input_ids[0].eq(99).sum().item() == 1
+    assert input_ids[1].eq(99).sum().item() == 0
+    assert train_batch["media_token_validity_mask"][1].any().item() is False
