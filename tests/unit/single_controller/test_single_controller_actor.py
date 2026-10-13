@@ -4310,13 +4310,12 @@ def test_parallel_ppo_inference_overlaps_and_joins_value_metadata() -> None:
             logprobs_started.set()
             await asyncio.wait_for(value_started.wait(), timeout=1.0)
 
-        controller = SimpleNamespace(
-            _run_value_inference=value_stage,
-            _run_policy_logprobs=logprobs,
-        )
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._run_value_inference = value_stage
+        controller._run_policy_logprobs = logprobs
         result = await asyncio.wait_for(
-            SingleControllerActor._run_parallel_ppo_inference(
-                controller,
+            controller._run_parallel_ppo_inference(
                 original_meta,
                 already_prepared=True,
                 preserve_train_step=True,
@@ -4389,13 +4388,12 @@ def test_parallel_ppo_inference_drains_peer_after_failure() -> None:
             await release_logprobs.wait()
             logprobs_finished.set()
 
-        controller = SimpleNamespace(
-            _run_value_inference=value_stage,
-            _run_policy_logprobs=logprobs,
-        )
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._run_value_inference = value_stage
+        controller._run_policy_logprobs = logprobs
         task = asyncio.create_task(
-            SingleControllerActor._run_parallel_ppo_inference(
-                controller,
+            controller._run_parallel_ppo_inference(
                 object(),
                 already_prepared=False,
                 preserve_train_step=False,
@@ -4431,13 +4429,12 @@ def test_parallel_ppo_inference_drains_both_tasks_on_cancellation() -> None:
             await release.wait()
             finished.append("logprobs")
 
-        controller = SimpleNamespace(
-            _run_value_inference=value_stage,
-            _run_policy_logprobs=logprobs,
-        )
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._run_value_inference = value_stage
+        controller._run_policy_logprobs = logprobs
         task = asyncio.create_task(
-            SingleControllerActor._run_parallel_ppo_inference(
-                controller,
+            controller._run_parallel_ppo_inference(
                 object(),
                 already_prepared=False,
                 preserve_train_step=False,
@@ -4811,7 +4808,7 @@ class _StreamingPPOValue(_NoOpValue):
         assert not self.inference_prepared, "critic was already prepared"
         assert preserve_train_step == self.step_open
         self.inference_prepared = True
-        super().prepare_for_inference()
+        super().prepare_for_inference(keep_resident=keep_resident)
 
     def get_values_from_meta(self, meta: KVBatchMeta) -> None:
         assert self.inference_prepared
@@ -4823,7 +4820,7 @@ class _StreamingPPOValue(_NoOpValue):
         assert self.inference_prepared
         assert preserve_train_step == self.step_open
         self.inference_prepared = False
-        super().finish_inference()
+        super().finish_inference(keep_resident=keep_resident)
 
     def prepare_for_training(self, keep_resident: bool = False) -> None:
         assert not self.inference_prepared
