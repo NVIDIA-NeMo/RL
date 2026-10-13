@@ -15,8 +15,10 @@
 """Tests for SingleController initialization and pump lifecycle."""
 
 import asyncio
+import json
 import math
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -948,7 +950,9 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     )
 
 
-def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
+def test_advantage_stage_reports_seq_logprob_metrics_without_masking(
+    tmp_path: Path,
+) -> None:
     batch_size, sequence_length = 2, 5
     generation_logprobs = torch.zeros(batch_size, sequence_length)
     generation_logprobs[1, 1:] = 1.0
@@ -981,9 +985,15 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig(seq_logprob_error_threshold=None)
+        grpo=GRPOConfig(
+            seq_logprob_error_threshold=None,
+            debug_payload_metrics=True,
+        ),
+        logger={"log_dir": str(tmp_path)},
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._train_steps = 7
+    ctrl._trainer_version = 9
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
         "rewards": [],
@@ -998,6 +1008,14 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        sequence_lengths=[sequence_length] * batch_size,
+        tags=[
+            {"weight_version": 9},
+            {
+                "weight_version": 9,
+                "pixel_values__row_shapes": [[4, 4]],
+            },
+        ],
     )
 
     _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -1016,6 +1034,18 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     assert ctrl._step_log_dict["num_mask_sample_filtered"] == [0]
     assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(math.e)
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "tmpe_diagnostics" / "samples.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert [record["sample_id"] for record in records] == ["sample-1", "sample-0"]
+    assert records[0]["step"] == 7
+    assert records[0]["trainer_version"] == 9
+    assert records[0]["sequence_length"] == sequence_length
+    assert records[0]["sequence_mult_prob_error"] == pytest.approx(math.e)
+    assert records[0]["tags"]["pixel_values__row_shapes"] == [[4, 4]]
 
 
 def test_advantage_stage_clips_training_values_and_metrics() -> None:

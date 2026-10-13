@@ -34,6 +34,9 @@ grpo:
   use_dynamic_sampling: false
   zero_variance_prompt_filtering: false
   deduplicate_multimodal_data: true
+  # Emit per-row parity evidence (including media-shape tags) so a TMPE
+  # regression can be attributed without masking the offending samples.
+  debug_payload_metrics: true
   overlong_filtering: true
 
 loss_fn:

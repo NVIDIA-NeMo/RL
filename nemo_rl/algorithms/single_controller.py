@@ -5380,6 +5380,64 @@ class SingleControllerActor:
                 rewards=rewards,
                 seq_logprob_error_threshold=seq_logprob_error_threshold,
             )
+            # Debug recipes need row-level evidence when aggregate TMPE hides a
+            # bad media/capture subset. Keep this diagnostics-only: it neither
+            # masks samples nor changes the optimizer batch. ``meta.tags``
+            # already carries the packed multimodal row shapes, logical-owner
+            # identity, and rollout weight version, so the JSONL is enough to
+            # correlate a parity outlier without retaining multi-GB tensors.
+            if self._algo_cfg.debug_payload_metrics:
+                delta = (
+                    masking_data["prev_logprobs"][:, 1:]
+                    - masking_data["generation_logprobs"][:, 1:]
+                ).abs()
+                valid = token_mask[:, 1:].bool() & final_sample_mask.bool().unsqueeze(
+                    -1
+                )
+                token_errors = torch.where(valid, delta.exp(), 0.0)
+                valid_counts = valid.sum(-1)
+                sequence_errors = token_errors.sum(-1) / valid_counts.clamp_min(1)
+                ranked_rows = sequence_errors.argsort(descending=True)[:8].tolist()
+                records: list[dict[str, Any]] = []
+                for row in ranked_rows:
+                    valid_count = int(valid_counts[row].item())
+                    if valid_count == 0:
+                        continue
+                    positions = (
+                        torch.where(valid[row], delta[row], -1.0)
+                        .topk(min(16, valid_count))
+                        .indices
+                    )
+                    records.append(
+                        {
+                            "step": self._train_steps,
+                            "trainer_version": self._trainer_version,
+                            "sample_id": meta.sample_ids[row],
+                            "sequence_length": (
+                                meta.sequence_lengths[row]
+                                if meta.sequence_lengths is not None
+                                else int(token_mask[row].numel())
+                            ),
+                            "valid_tokens": valid_count,
+                            "sequence_mult_prob_error": sequence_errors[row].item(),
+                            "positions": (positions + 1).tolist(),
+                            "policy_logprobs": masking_data["prev_logprobs"][
+                                row, positions + 1
+                            ].tolist(),
+                            "generation_logprobs": masking_data[
+                                "generation_logprobs"
+                            ][row, positions + 1].tolist(),
+                            "tags": (meta.tags or [{}] * meta.size)[row],
+                        }
+                    )
+                log_dir = self._master_config.logger.get("log_dir")
+                if log_dir:
+                    diagnostic_path = Path(log_dir) / "tmpe_diagnostics"
+                    diagnostic_path.mkdir(parents=True, exist_ok=True)
+                    with (diagnostic_path / "samples.jsonl").open("a") as output:
+                        for record in records:
+                            output.write(json.dumps(record, sort_keys=True) + "\n")
+                print(f"TMPE_DIAGNOSTICS {records}", flush=True)
             final_sample_mask = masking_data["sample_mask"]
             num_valid_seqs_after = float(
                 ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
