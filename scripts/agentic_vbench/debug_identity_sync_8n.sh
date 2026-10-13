@@ -40,8 +40,7 @@ export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$BASE_NAME}
 
 exec bash "$script_dir/smoke_off_32turns_256k.sh" \
   async_rl.sampler.name=in_order \
-  ~async_rl.sampler.max_staleness_versions \
-  +async_rl.sampler.max_lookahead_versions=0 \
+  async_rl.sampler.max_lookahead_versions=0 \
   "async_rl.min_groups_for_streaming_train=${NUM_PROMPTS}" \
   "async_rl.max_inflight_prompts=${NUM_PROMPTS}" \
   "async_rl.max_buffered_rollouts=${NUM_PROMPTS}" \
