@@ -6,17 +6,20 @@ defaults:
 grpo:
   async_grpo: null
   num_prompts_per_step: 4
-  num_generations_per_prompt: 2
-  max_num_steps: 2
+  num_generations_per_prompt: 4
+  max_num_steps: 10
+  adv_estimator:
+    name: reinforce_plus_plus
+    minus_baseline: false
   val_period: 0
   val_at_start: false
   val_at_end: false
 
 policy:
   model_name: Qwen/Qwen3-0.6B
-  train_global_batch_size: 8
+  train_global_batch_size: 16
   train_micro_batch_size: 1
-  max_total_sequence_length: 512
+  max_total_sequence_length: 8192
   dtensor_cfg:
     enabled: false
   megatron_cfg:
@@ -28,6 +31,7 @@ policy:
     sequence_parallel: false
   generation:
     backend: remote_vllm
+    max_new_tokens: 512
     vllm_cfg: null
     vllm_kwargs: null
     mcore_generation_config: null
@@ -65,6 +69,10 @@ token_capture:
 env:
   should_use_nemo_gym: true
   nemo_gym:
+    workplace_assistant_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
     policy_model:
       responses_api_models:
         vllm_model:

@@ -42,7 +42,7 @@ environment:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 VLLM_SERVER_DEV_MODE=1 vllm serve Qwen/Qwen3-0.6B \
-  --served-model-name policy --port 19210 --max-model-len 512 \
+  --served-model-name policy --port 19210 --max-model-len 8192 \
   --gpu-memory-utilization 0.7 \
   --enable-auto-tool-choice --tool-call-parser hermes
 ```
@@ -56,8 +56,10 @@ control fan-out are outside this stack.
 
 Prepare Gym's workplace-assistant data using the existing
 [Gym setup instructions](https://docs.nvidia.com/nemo/gym/0.1.0/tutorials/nemo-rl-grpo/setup.html#training-nemo-rl-grpo-setup).
-The functional smoke trims the tool list and prepares a small dataset
-automatically. For the public config, provide prepared JSONL files:
+The external functional tests keep the full tool list and prepare the public
+dataset automatically. The public example uses ten steps, one agent call per
+sample, and Reinforce++ without a per-prompt baseline so mixed task rewards
+produce actual policy updates even when siblings share a reward. For the public config, provide prepared JSONL files:
 
 ```bash
 export EXTERNAL_ROLLOUT_VLLM_URL=http://127.0.0.1:19210/v1
@@ -99,16 +101,24 @@ export VLLM_PLUGINS=nemo_rl_prefix_api
 ```
 
 Check `/v1/nemo-rl/prefix-token-capability` for activation. Enable inline
-prefixes with this override:
+prefixes by enabling Gym local capture for correlated parent lineage, while
+keeping responses inline. Use a fresh capture directory for each run and
+increase the agent call limit:
 
 ```text
+++env.nemo_gym.token_id_capture.enabled=true
+++env.nemo_gym.token_id_capture.all_agents=true
+++env.nemo_gym.token_id_capture.dir=/shared/gym-prefix-capture/run1
+++env.nemo_gym.token_id_capture.rebuild_response=false
 ++env.nemo_gym.policy_model.responses_api_models.vllm_model.supply_prefix_token_ids=true
+++env.nemo_gym.workplace_assistant_simple_agent.responses_api_agents.simple_agent.max_steps=6
 ```
 
 For external capture, set:
 
 ```text
 token_capture.enabled=true
+++env.nemo_gym.workplace_assistant_simple_agent.responses_api_agents.simple_agent.max_steps=6
 ++env.nemo_gym.policy_model.responses_api_models.vllm_model.return_token_id_information=false
 ++env.nemo_gym.policy_model.responses_api_models.vllm_model.supply_prefix_token_ids=false
 ```
@@ -134,6 +144,12 @@ uv run --extra mcore --extra nemo_gym bash tests/functional/grpo_external_vllm_p
 uv run --extra mcore --extra nemo_gym bash tests/functional/grpo_external_vllm_capture_gym.sh
 ```
 
-The external fixtures launch a separate server, wait for readiness, run the
-existing small-model SC/Gym training smoke through repeated refits, and clean
-up the server. The capture variant also checks that the finalizer ran.
+The external fixtures launch a separate server, wait for readiness, run at
+least ten training steps through repeated refits, and clean up the server.
+They require nonzero gradients and changed tensors across complete HF exports.
+The prefix variant requires a multi-turn trajectory. The capture variant
+requires finalized multi-call rows, token-in continuations, and zero invalid
+or poisoned capture rows. Set `EXTERNAL_VLLM_TEST_BASE_URL` to reuse an already
+running service, including a service in a separate container; start its plugin
+before the prefix or capture tests. That mode preserves the training process
+GPU assignment. The caller owns service teardown.
