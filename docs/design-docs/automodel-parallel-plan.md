@@ -20,7 +20,7 @@ The Hugging Face tensor parallel plan is available for most models via `._tp_pla
 
 ### 4. Default Base Plan
 
-When a model provides none of the above, Automodel falls back to a default base plan. Models loaded from a custom-code source (Hugging Face's `trust_remote_code=True` path) raise instead of taking this fallback, because the default plan's placements trip an assert inside PyTorch's redistribute.
+When a model provides none of the above, Automodel falls back to a default base plan. Models loaded from a custom-code source (Hugging Face's `trust_remote_code=True` path) raise instead of taking this fallback when `tp_size > 1`, because the default plan's placements trip an assert inside PyTorch's redistribute.
 
 ## Custom Parallel Plan Example
 
