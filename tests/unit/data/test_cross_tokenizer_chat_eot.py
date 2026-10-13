@@ -21,11 +21,11 @@ from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import PreTrainedTokenizerFast
 
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
-from nemo_rl.data.cross_tokenizer_collate import (
+from nemo_rl.data.xtoken.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
-from nemo_rl.data.native_chat import _render_and_tokenize_chat
+from nemo_rl.data.xtoken.native_chat import _render_and_tokenize_chat
 
 
 def _tokenizer(
