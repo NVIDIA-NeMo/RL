@@ -42,10 +42,10 @@ logger:
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
+    name: dpo-nanov3-30B3AB-1n8g-automodel-ep8
   tensorboard:
-    log_dir: tb_logs-dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
+    log_dir: tb_logs-dpo-nanov3-30B3AB-1n8g-automodel-ep8
   mlflow:
-    run_name: dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel
+    run_name: dpo-nanov3-30B3AB-1n8g-automodel-ep8
 cluster:
   gpus_per_node: 8

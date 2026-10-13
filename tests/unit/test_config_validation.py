@@ -386,8 +386,8 @@ def test_no_shipped_config_is_outdated(config_file):
 DEEPEP_FALLBACK_RECIPES = {
     Path("recipes/llm/sft-nanov3-30BA3B-2n8g-automodel.yaml"),
     Path("recipes/llm/sft-nanov3-30BA3B-2n4g-automodel.yaml"),
-    Path("recipes/llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.yaml"),
-    Path("recipes/llm/sft-gpt-oss-20b-1n4g-fsdp4ep4-automodel.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n8g-automodel-ep8.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n4g-automodel-ep4.yaml"),
     Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml"),
     Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml"),
 }

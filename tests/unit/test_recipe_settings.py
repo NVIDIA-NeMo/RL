@@ -26,8 +26,8 @@ RECIPE_ROOT = Path(__file__).parents[2] / "examples/configs/recipes"
     [
         "llm/sft-nanov3-30BA3B-2n8g-automodel.yaml",
         "llm/sft-nanov3-30BA3B-2n4g-automodel.yaml",
-        "llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.yaml",
-        "llm/sft-gpt-oss-20b-1n4g-fsdp4ep4-automodel.yaml",
+        "llm/sft-gpt-oss-20b-1n8g-automodel-ep8.yaml",
+        "llm/sft-gpt-oss-20b-1n4g-automodel-ep4.yaml",
         "vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml",
         "vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml",
     ],
@@ -56,7 +56,7 @@ def test_gemma4_cp_keeps_local_hybridep_inputs_aligned(
 @pytest.mark.parametrize(
     ("recipe_name", "dispatcher", "experts"),
     [
-        ("llm/dpo-nanov3-30B3AB-1n4g-fsdp4ep4-automodel.yaml", "torch", "torch_mm"),
+        ("llm/dpo-nanov3-30B3AB-1n4g-automodel-ep4.yaml", "torch", "torch_mm"),
         ("llm/grpo-glm47-flash-4n8g-automodel.yaml", "hybridep", "torch_mm"),
         ("llm/grpo-minimax-m27-dapo-8n8g-automodel.yaml", "hybridep", "torch_mm"),
         ("llm/grpo-moonlight-16b-automodel-1n8g-ep8.yaml", "hybridep", "torch_mm"),
