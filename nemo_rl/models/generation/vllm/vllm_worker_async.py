@@ -777,6 +777,7 @@ class VllmAsyncGenerationWorkerImpl(
             prev_len=admission.prev_len,
             retained=retained,
             splice=splice,
+            eos_token_id=self.renderer.tokenizer.eos_token_id,
             image_token_id=self._capture_image_token_id,
             patch_size=self._capture_patch_size,
             retained_tensors=retained_tensors,
@@ -1236,7 +1237,6 @@ class VllmAsyncGenerationWorkerImpl(
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
-                final_prompt_token_ids = splice.token_ids
                 media = await asyncio.to_thread(
                     worker_self._capture_request_media,
                     engine_prompt,
@@ -1244,6 +1244,9 @@ class VllmAsyncGenerationWorkerImpl(
                     splice=splice,
                     verify_retained_media=verify_retained_media,
                 )
+                if media is not None and media.splice is not None:
+                    splice = media.splice
+                final_prompt_token_ids = splice.token_ids
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
                 # Clamp after prefix replacement since the prompt length may have changed.

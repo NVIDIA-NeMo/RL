@@ -142,6 +142,61 @@ class CapturedMedia:
 
     items: tuple[CapturedMediaItem, ...]
     tensors: dict[str, torch.Tensor] | None
+    splice: PrefixSplice | None = None
+
+
+def _rewind_splice_before_new_media(
+    *,
+    tokens: list[int],
+    occurrences: list[tuple[int, Literal["image", "video"], Any, Any]],
+    retained_count: int,
+    splice: PrefixSplice,
+    eos_token_id: int | None,
+) -> PrefixSplice:
+    """Repair an EOS-count splice that swallowed the first new media message.
+
+    Some OpenAI chat templates count one more message terminator when an
+    assistant tool call is followed by a synthetic user media message.  The
+    generic splice then cuts at that user's EOS, classifying its images as old
+    history.  The exact model prefix still ends at the preceding EOS.  Rewind
+    to that boundary, but only when the retained occurrence count proves which
+    media item is the first new one.  All retained token, geometry, and pixel
+    checks still run after this coordinate repair.
+    """
+    prefix_count = sum(
+        span.offset + span.length <= splice.template_cut_start
+        for _, _, span, _ in occurrences
+    )
+    if prefix_count <= retained_count:
+        return splice
+    if eos_token_id is None or retained_count >= len(occurrences):
+        raise MediaCaptureRejected(
+            "Rendered prefix has an unexpected media occurrence"
+        )
+    first_new_span = occurrences[retained_count][2]
+    eos_positions = [
+        index
+        for index, token in enumerate(tokens[: first_new_span.offset])
+        if token == eos_token_id
+    ]
+    if not eos_positions:
+        raise MediaCaptureRejected(
+            "Rendered prefix has an unexpected media occurrence"
+        )
+    template_cut_start = eos_positions[-1]
+    repaired_prefix_count = sum(
+        span.offset + span.length <= template_cut_start
+        for _, _, span, _ in occurrences
+    )
+    if repaired_prefix_count != retained_count:
+        raise MediaCaptureRejected(
+            "Rendered prefix has an unexpected media occurrence"
+        )
+    return PrefixSplice(
+        splice.token_ids[: splice.model_cut_end] + tokens[template_cut_start:],
+        splice.model_cut_end,
+        template_cut_start,
+    )
 
 
 def verified_media_items(call: FetchedStagedCall) -> tuple[CapturedMediaItem, ...]:
@@ -308,6 +363,7 @@ def capture_processed_media(
     prev_len: int,
     retained: tuple[CapturedMediaItem, ...] = (),
     splice: PrefixSplice | None = None,
+    eos_token_id: int | None = None,
     image_token_id: int | None = None,
     patch_size: int | None = None,
     retained_tensors: tuple[StagedMediaTensors, ...] | None = None,
@@ -343,6 +399,14 @@ def capture_processed_media(
         )
     if occurrences and (patch_size is None or patch_size <= 0):
         raise MediaCaptureRejected("Media capture requires the model patch size")
+    if splice is not None:
+        splice = _rewind_splice_before_new_media(
+            tokens=tokens,
+            occurrences=occurrences,
+            retained_count=len(retained),
+            splice=splice,
+            eos_token_id=eos_token_id,
+        )
     added, seen, packed, sizes_parts, frame_counts = [], [], [], [], []
     corrected = {name: [] for name in placeholders}
     previous_end = 0
@@ -508,4 +572,4 @@ def capture_processed_media(
                 name: tensor.detach().cpu().clone() for name, tensor in delta.items()
             }
         engine_prompt["mm_placeholders"] = corrected
-    return CapturedMedia(tuple(added), tensors)
+    return CapturedMedia(tuple(added), tensors, splice)

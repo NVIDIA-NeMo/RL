@@ -61,7 +61,10 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
 )
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
-from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
+from nemo_rl.models.generation.openai_server_utils import (
+    PrefixSplice,
+    splice_prefix_tokens,
+)
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
@@ -445,6 +448,50 @@ def test_splice_coordinates_handle_reasoning_shift_and_repeated_pad_runs():
     assert captured.items[0].embedding_spans[0][0] == 9
     assert prompt["mm_placeholders"]["image"][1].offset == 9
     assert splice.token_ids == original + [12, 18, 18, 11]
+
+
+def test_splice_rewinds_before_new_media_when_eos_count_swallowed_message():
+    a, b = torch.ones(3, 2, 3), torch.full((3, 3, 2), 7.0)
+    original = [10, 18, 18, 11, 2]
+    first = capture_processed_media(
+        engine_prompt(original, [(Span(1, 2), a)]), prev_len=0
+    )
+    template = [10, 18, 18, 11, 2, 12, 18, 18, 13, 2, 14]
+    # The generic EOS count incorrectly selected the end of the new user media
+    # message.  The guarded media fallback must rewind to the preceding EOS.
+    bad_splice = PrefixSplice(original[:-1] + template[9:], 4, 9)
+    prompt = engine_prompt(
+        template, [(Span(1, 2), a), (Span(6, 2), b)]
+    )
+    captured = capture_processed_media(
+        prompt,
+        prev_len=len(original),
+        retained=first.items,
+        splice=bad_splice,
+        eos_token_id=2,
+    )
+    assert captured.splice == PrefixSplice(template, 4, 4)
+    assert [item.placeholder_offset for item in captured.items] == [6]
+    assert [span.offset for span in prompt["mm_placeholders"]["image"]] == [1, 6]
+
+
+def test_splice_does_not_rewind_unexpected_media_without_safe_eos_boundary():
+    a, b = torch.ones(3, 2, 3), torch.full((3, 3, 2), 7.0)
+    original = [10, 18, 18, 11]
+    first = capture_processed_media(
+        engine_prompt(original, [(Span(1, 2), a)]), prev_len=0
+    )
+    template = [10, 18, 18, 11, 12, 18, 18, 13]
+    with pytest.raises(MediaCaptureRejected, match="unexpected media"):
+        capture_processed_media(
+            engine_prompt(
+                template, [(Span(1, 2), a), (Span(5, 2), b)]
+            ),
+            prev_len=len(original),
+            retained=first.items,
+            splice=PrefixSplice(original + [13], 4, 7),
+            eos_token_id=2,
+        )
 
 
 def test_continuation_captures_only_new_media_and_rejects_changed_pixels():
