@@ -793,7 +793,7 @@ def setup_model_and_optimizer(
 
         if tp_size > 1 and sequence_parallel_enabled:
             raise AssertionError(
-                "It's a known issue that context parallel can't be used together with sequence parallel in DTensor worker. "
+                "It's a known issue that context parallel can't be used together with sequence parallel in the Automodel worker. "
                 "Please either set cp_size = 1 or disable sequence parallel. "
                 "See https://github.com/NVIDIA-NeMo/RL/issues/659 for more details."
             )
