@@ -8,6 +8,7 @@ PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")
 MODEL=${EXTERNAL_VLLM_TEST_MODEL:-Qwen/Qwen3-0.6B}
 MAX_MODEL_LEN=${EXTERNAL_VLLM_TEST_MAX_MODEL_LEN:-8192}
 MAX_NEW_TOKENS=${EXTERNAL_VLLM_TEST_MAX_NEW_TOKENS:-512}
+MAX_AGENT_STEPS=${EXTERNAL_VLLM_TEST_MAX_AGENT_STEPS:-1}
 RUN_DIR=${EXTERNAL_VLLM_TEST_RUN_DIR:-$SCRIPT_DIR/grpo_external_vllm_gym_single_controller}
 SERVER_PORT=${EXTERNAL_VLLM_TEST_PORT:-19210}
 BASE_URL=${EXTERNAL_VLLM_TEST_BASE_URL:-http://127.0.0.1:$SERVER_PORT/v1}
@@ -60,6 +61,8 @@ SC_TEST_RUN_DIR="$RUN_DIR/train" \
     policy.max_total_sequence_length="$MAX_MODEL_LEN" \
     policy.generation.max_new_tokens="$MAX_NEW_TOKENS" \
     grpo.num_generations_per_prompt=4 \
+    ++grpo.adv_estimator.name=reinforce_plus_plus \
+    ++grpo.adv_estimator.minus_baseline=false \
     policy.train_global_batch_size=16 \
     policy.generation.backend=remote_vllm \
     ++policy.generation.refit_transport=hf_checkpoint \
@@ -73,6 +76,7 @@ SC_TEST_RUN_DIR="$RUN_DIR/train" \
     ++env.nemo_gym.policy_model.responses_api_models.vllm_model.return_token_id_information=true \
     ++env.nemo_gym.policy_model.responses_api_models.vllm_model.request_prompt_and_generation_token_ids=true \
     ++env.nemo_gym.policy_model.responses_api_models.vllm_model.supply_prefix_token_ids=false \
+    ++env.nemo_gym.workplace_assistant_simple_agent.responses_api_agents.simple_agent.max_steps="$MAX_AGENT_STEPS" \
     "$@"
 
 uv run "$PROJECT_ROOT/tests/check_metrics.py" "$RUN_DIR/train/metrics.json" \
