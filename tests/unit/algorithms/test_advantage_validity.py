@@ -368,12 +368,14 @@ def test_reinforce_pp_empty_legacy_normalization_mask_is_finite():
 def test_reinforce_pp_include_policy_needs_real_logprobs_through_worker_filtering():
     """Worker top-k/top-p filtering, then Reinforce++ KL-in-reward under ``include``.
 
-    The workers zero every logprob outside ``token_mask * sample_mask`` for the
-    policy and the reference model alike. When that mask is the loss mask, a
-    loss-masked row that still votes in the statistics reaches the estimator
-    with a zero KL term and moves its siblings' normalized advantages. The
-    trainers therefore hand the worker the statistics mask; this pins the
-    estimator-side consequence with an independently computed reference.
+    The workers zero every policy logprob outside ``token_mask * sample_mask``;
+    the reference pass is never filtered (``use_reference_model`` disables
+    top-k/top-p). When that mask is the loss mask, a loss-masked row that still
+    votes in the statistics reaches the estimator with a zeroed policy logprob
+    against a real reference, a wrong KL term that moves its siblings'
+    normalized advantages. The trainers therefore hand the worker the
+    statistics mask; this pins the estimator-side consequence with an
+    independently computed reference.
     """
     prompt_ids = torch.zeros(3, 1, dtype=torch.long)
     rewards = torch.tensor([1.0, 0.0, 1.0])
@@ -415,6 +417,7 @@ def test_reinforce_pp_include_policy_needs_real_logprobs_through_worker_filterin
         )
 
     def advantages(worker_sample_mask):
+        # Only the policy pass is filtered; the reference pass stays real.
         return estimator.compute_advantage(
             prompt_ids,
             rewards,
@@ -422,7 +425,7 @@ def test_reinforce_pp_include_policy_needs_real_logprobs_through_worker_filterin
             valid_mask=statistics_mask,
             normalization_mask=token_mask,
             logprobs_policy=worker_filter(real_policy, worker_sample_mask),
-            logprobs_reference=worker_filter(reference, worker_sample_mask),
+            logprobs_reference=reference,
         )
 
     # Independent reference on the real logprobs: group mean over all rows,
@@ -437,8 +440,8 @@ def test_reinforce_pp_include_policy_needs_real_logprobs_through_worker_filterin
     torch.testing.assert_close(kept[token_mask.bool()], expected[token_mask.bool()])
     assert torch.isfinite(kept).all()
 
-    # Filtering with the loss mask zeroes row 2's logprobs (policy and
-    # reference) so its KL collapses to zero and the trainable rows move.
+    # Filtering with the loss mask zeroes row 2's policy logprobs against its
+    # real reference, so its KL term is wrong and the trainable rows move.
     dropped = advantages(loss_weights)
     trainable = (token_mask * loss_weights[:, None]).bool()
     assert not torch.allclose(dropped[trainable], expected[trainable])
