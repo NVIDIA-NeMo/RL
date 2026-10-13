@@ -276,6 +276,7 @@ ppo:
     max_trajectory_age_steps: 1
     warmup_generation_lead_steps: null
     in_flight_weight_updates: false
+    # Class default is true; the exemplar pins false. See item 5 of the async GRPO guide's Usage Tips.
     recompute_kv_cache_after_weight_updates: false
     drop_incomplete_targets_on_restore: false
 

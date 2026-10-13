@@ -154,7 +154,10 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     # new weights (also clears the prefix cache). False keeps their pre-update KV
     # (Magistral-style) AND leaves the prefix cache stale across weight updates,
     # which grows train-vs-rollout mismatch when prompts share prefixes; the
-    # collector warns in that case. Drained refits always invalidate caches.
+    # collector warns in that case on vLLM. Drained refits ask the backend to
+    # invalidate its caches regardless of this flag. Note: the shipped exemplar
+    # ppo_math_1B.yaml pins false, so recipes inheriting it keep false unless
+    # they set the key themselves.
     recompute_kv_cache_after_weight_updates: bool = True
     # Drops partial restored targets; replacement rollouts use subsequent prompts.
     drop_incomplete_targets_on_restore: bool = False

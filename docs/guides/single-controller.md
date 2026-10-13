@@ -449,7 +449,7 @@ Do not carry `max_num_epochs: -1` across either. [ppo.md](./ppo.md#asynchronous-
 | `enabled: true` | Implicit — SC is always async; use `sampler.max_lookahead_versions: 0` for sync semantics, `>= 1` for async |
 | `max_trajectory_age_steps: N` | `sampler.name: in_order` with `sampler.max_lookahead_versions: N` |
 | `warmup_generation_lead_steps` (PPO) | `sampler.warmup_lookahead_versions` — the lookahead to use while critic warmup is in progress |
-| `recompute_kv_cache_after_weight_updates` | `recompute_kv_cache_after_weight_updates` (same) |
+| `recompute_kv_cache_after_weight_updates` | `recompute_kv_cache_after_weight_updates` (same semantics, different class default: legacy `AsyncGRPOConfig`/`AsyncPPOConfig` default to `true`, `AsyncRLConfig` still defaults to `false`; SC invalidates only when it is `true` and does not warn about a stale vLLM prefix cache) |
 | `in_flight_weight_updates` | Always effectively true; `false`-equivalent behavior is not yet supported (drain-gate tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625)) |
 | *(no legacy equivalent — matches legacy full-batch train semantics)* | `min_groups_for_streaming_train: ${grpo.num_prompts_per_step}`, or `${ppo.num_prompts_per_step}` on a PPO run |
 | *(no legacy equivalent — matches legacy `max_trajectory_age + 1` batches in flight)* | `max_inflight_prompts: num_prompts_per_step × (max_lookahead_versions + 1)` |
