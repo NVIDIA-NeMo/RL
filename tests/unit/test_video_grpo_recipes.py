@@ -74,3 +74,20 @@ def test_video_recipe_materializes_one_sampling_contract_for_all_consumers():
     assert recipe["policy"]["generation"]["vllm_kwargs"]["media_io_kwargs"] == {
         "video": {"num_frames": 32}
     }
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "vlm_grpo-nemotron-super-omni-120ba12b-8n8g-megatron-agentic-vbench-sc.v2.yaml",
+        "vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc.v1.yaml",
+        "vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml",
+    ],
+)
+def test_agentic_vbench_recipes_select_one_flashinfer_autotune_setting(name: str):
+    """vLLM rejects simultaneous legacy and kernel_config autotune flags."""
+    recipe = _load_recipe(name)
+    kwargs = recipe["policy"]["generation"]["vllm_kwargs"]
+
+    assert "enable_flashinfer_autotune" not in kwargs
+    assert kwargs["kernel_config"]["enable_flashinfer_autotune"] is False

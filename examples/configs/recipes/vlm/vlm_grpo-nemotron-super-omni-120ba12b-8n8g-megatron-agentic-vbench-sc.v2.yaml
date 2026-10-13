@@ -133,8 +133,8 @@ policy:
       skip_mm_profiling: true
       # Prefill chunk: do not size it to the whole 256k window.
       max_num_batched_tokens: 32768
-      # FlashInfer MoE autotune with a cold cache took >20 min at 49k tokens.
-      enable_flashinfer_autotune: false
+      # The inherited kernel_config disables FlashInfer autotuning. Do not also
+      # set the legacy top-level flag: vLLM rejects both forms together.
     colocated:
       enabled: false
       resources:
