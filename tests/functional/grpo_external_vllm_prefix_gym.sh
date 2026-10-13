@@ -10,7 +10,14 @@ export VLLM_PLUGINS=nemo_rl_prefix_api
 export EXTERNAL_VLLM_TEST_REQUIRE_PREFIX=1
 export EXTERNAL_VLLM_TEST_MAX_AGENT_STEPS=${EXTERNAL_VLLM_TEST_MAX_AGENT_STEPS:-6}
 export EXTERNAL_VLLM_TEST_RUN_DIR=${EXTERNAL_VLLM_TEST_RUN_DIR:-$SCRIPT_DIR/grpo_external_vllm_prefix_gym/run}
+# Gym resolves inline prefixes from its correlated local capture lineage.
+# The controller still consumes inline token responses in this mode.
+CAPTURE_DIR=$(realpath -m "$EXTERNAL_VLLM_TEST_RUN_DIR/gym-prefix-capture")
 bash "$SCRIPT_DIR/grpo_external_vllm_gym_single_controller.sh" \
+    ++env.nemo_gym.token_id_capture.enabled=true \
+    ++env.nemo_gym.token_id_capture.all_agents=true \
+    ++env.nemo_gym.token_id_capture.dir="$CAPTURE_DIR" \
+    ++env.nemo_gym.token_id_capture.rebuild_response=false \
     ++env.nemo_gym.policy_model.responses_api_models.vllm_model.supply_prefix_token_ids=true \
     "$@"
 
