@@ -499,16 +499,14 @@ def stream_weights_via_ipc_zmq_impl(
 
     try:
         for name, tensor in params_generator:
-            # Initialize device and buffers on first tensor
-            if buffer_a is None:
-                buffer_device = tensor.device
-                if buffer_device.type == "cpu" and torch.cuda.is_available():
-                    buffer_device = torch.device("cuda", torch.cuda.current_device())
-                buffer_a = allocate_buffer(buffer_device)
-                buffer_b = allocate_buffer(buffer_device)
-                current_buffer = buffer_a
-
             aligned_size = calculate_aligned_size(tensor.nbytes)
+            # Resolve the transfer device without allocating staging storage.
+            # CPU exports still need CUDA storage for the IPC reducer.
+            buffer_device = (
+                current_buffer.device if current_buffer is not None else tensor.device
+            )
+            if buffer_device.type == "cpu" and torch.cuda.is_available():
+                buffer_device = torch.device("cuda", torch.cuda.current_device())
 
             # A parameter larger than a single staging buffer cannot be packed
             # with ordinary parameters. Ship it on its own rather than failing
@@ -518,10 +516,6 @@ def stream_weights_via_ipc_zmq_impl(
             # embedding can exceed one: DeepSeek-V3's model.embed_tokens.weight
             # is 1.73 GiB against a 1.65 GiB buffer.
             if aligned_size > buffer_size_bytes:
-                # Preserve the CUDA staging device before releasing the pair.
-                # The model bridge can yield a CPU tensor here after its own
-                # grouped-expert CUDA stack falls back on OOM.
-                transfer_device = current_buffer.device
                 if param_names:
                     await_recv = send_buffer_group_overlap(
                         current_buffer, param_names, used_bytes, await_recv
@@ -557,7 +551,7 @@ def stream_weights_via_ipc_zmq_impl(
                     else:
                         oversized_buffer = torch.empty(
                             aligned_size,
-                            device=transfer_device,
+                            device=buffer_device,
                             dtype=torch.uint8,
                             requires_grad=False,
                         )
@@ -581,6 +575,13 @@ def stream_weights_via_ipc_zmq_impl(
                 # overlap with this multi-GiB tensor after its consumer ACKed.
                 del tensor
                 continue
+
+            # Oversized exports never use the regular pair. Allocate it only
+            # when an ordinary parameter arrives, including after oversized ones.
+            if buffer_a is None:
+                buffer_a = allocate_buffer(buffer_device)
+                buffer_b = allocate_buffer(buffer_device)
+                current_buffer = buffer_a
 
             # Check if we need to send current buffer and switch to the other one
             if used_bytes + aligned_size > buffer_size_bytes:
