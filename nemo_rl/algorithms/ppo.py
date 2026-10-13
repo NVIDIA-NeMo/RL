@@ -39,6 +39,10 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     scale_rewards,
 )
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossDataDict,
@@ -271,12 +275,15 @@ def _apply_ppo_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: float | None,
+    *,
+    filtering_on: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
     """Apply optional mismatch masking and return the advantage mask and metrics."""
     metrics = compute_and_apply_seq_logprob_error_masking(
         train_data=train_data,
         rewards=rewards,
         seq_logprob_error_threshold=seq_logprob_error_threshold,
+        filtering_on=filtering_on,
     )
     metrics["num_masked_seqs_by_logprob_error"] = metrics.pop("num_masked_seqs")
 
@@ -1662,9 +1669,6 @@ def ppo_train(
                     )
                     prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
                     train_data["prev_logprobs"] = prev_lp_result["logprobs"]
-                    # Propagate the top-k/top-p neginf mask so the loss skips these positions.
-                    if "token_mask" in prev_lp_result:
-                        train_data["token_mask"] = prev_lp_result["token_mask"]
 
                     if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
@@ -1687,6 +1691,12 @@ def ppo_train(
                     rewards=rewards,
                     seq_logprob_error_threshold=(
                         master_config.ppo.seq_logprob_error_threshold
+                    ),
+                    filtering_on=need_top_k_or_top_p_filtering(
+                        TrainingSamplingParams(
+                            top_k=master_config.policy["generation"]["top_k"],
+                            top_p=master_config.policy["generation"]["top_p"],
+                        )
                     ),
                 )
 
@@ -2686,9 +2696,6 @@ def async_ppo_train(
                     )
                     prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
                     train_data["prev_logprobs"] = prev_lp_result["logprobs"]
-                    # Propagate the top-k/top-p neginf mask so the loss skips these positions.
-                    if "token_mask" in prev_lp_result:
-                        train_data["token_mask"] = prev_lp_result["token_mask"]
                     if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
                             policy.get_reference_policy_logprobs(
@@ -2709,6 +2716,12 @@ def async_ppo_train(
                     rewards=rewards,
                     seq_logprob_error_threshold=(
                         master_config.ppo.seq_logprob_error_threshold
+                    ),
+                    filtering_on=need_top_k_or_top_p_filtering(
+                        TrainingSamplingParams(
+                            top_k=master_config.policy["generation"]["top_k"],
+                            top_p=master_config.policy["generation"]["top_p"],
+                        )
                     ),
                 )
 
@@ -3086,6 +3099,12 @@ def async_ppo_train(
                     },
                     step + 1,
                     name="train/token_mult_prob_error_plot_sample",
+                    filtering_on=need_top_k_or_top_p_filtering(
+                        TrainingSamplingParams(
+                            top_k=master_config.policy["generation"]["top_k"],
+                            top_p=master_config.policy["generation"]["top_p"],
+                        )
+                    ),
                 )
             del train_data
 

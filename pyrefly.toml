@@ -25,6 +25,7 @@ replace-imports-with-any = [
 ]
 project-includes = [
   "nemo_rl/data/captured_media.py",
+  "nemo_rl/experience/reward_penalties.py",
   # TODO: enable these once we have 100 correctness
   #"nemo_rl/**/*.py",
   #"examples/**/*.py",
@@ -161,6 +162,7 @@ project-includes = [
   "nemo_rl/data_plane/factory.py",
   "nemo_rl/data_plane/grouping.py",
   "nemo_rl/data_plane/interfaces.py",
+  "nemo_rl/data_plane/mooncake_storage_unit.py",
   "nemo_rl/data_plane/observability.py",
   "nemo_rl/data_plane/preshard.py",
   "nemo_rl/data_plane/schema.py",
@@ -274,6 +276,7 @@ project-includes = [
   "nemo_rl/models/huggingface/__init__.py",
   "nemo_rl/models/megatron/__init__.py",
   "nemo_rl/models/megatron/alignment.py",
+  "nemo_rl/models/megatron/batch_invariant.py",
   "nemo_rl/models/megatron/draft/__init__.py",
   "nemo_rl/models/megatron/draft/optimizer.py",
   "nemo_rl/models/megatron/draft/step_state.py",

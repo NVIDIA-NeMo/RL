@@ -202,8 +202,9 @@ exemplar config at `examples/configs/xtoken_off_policy_distillation.yaml`. The e
 defaults to Llama-3.2-1B (student) ← Qwen3-4B (teacher) and the P-KL loss
 mode. For data it points `data.train.data_files` at the ungated, CC-BY-4.0
 NVIDIA **Nemotron-Pretraining-Specialized-v1.1** corpus
-(`Nemotron-Pretraining-Formal-Logic` subset) over `hf://`, so the recipe runs
-out of the box with no auth or extra setup. The `projection_matrix_path` below
+(`Nemotron-Pretraining-Formal-Logic` subset) by dataset id + `data.train.subset`,
+so the recipe runs out of the box with no auth or extra setup (and from the HF
+cache under `HF_HUB_OFFLINE=1`). The `projection_matrix_path` below
 points at the `cross_tokenizer_data/` directory that Steps 1–3 create, so run
 those first (or the `build_projection_matrix.sh` wrapper). Override paths via
 Hydra CLI:
@@ -219,9 +220,11 @@ uv run python examples/run_xtoken_off_policy_distillation.py \
 The exemplar config keeps each teacher's `projection_matrix_path` as `null`, so
 the projection matrix must always be supplied at the CLI (per teacher, e.g.
 `teachers.0.projection_matrix_path=...`) — this keeps the config reusable across
-(student, teacher) pairs. `data.train.data_files`
-already points at the default NVIDIA corpus described above; override it only
-to train on your own `.arrow`/`.parquet`/`.json`/`.txt` corpus.
+(student, teacher) pairs. `data.train.data_files` and `data.train.subset`
+already point at the default NVIDIA corpus described above; override them only
+to train on your own `.arrow`/`.parquet`/`.json`/`.txt` corpus. Set both, since a
+file path requires `subset` to be null:
+`data.train.data_files=/path/glob/*.arrow data.train.subset=null`.
 
 ### Loss-mode knobs
 
