@@ -6050,9 +6050,11 @@ def test_grpo_train_include_kl_in_reward_sees_real_logprobs_of_masked_rows(
     """root-4160-kl: include + Reinforce++ KL-in-reward + top-k filtering, through the worker filter.
 
     The fake policy applies the worker's ``mask_filtered_logprobs_outside_tokens``
-    step to fixed real logprobs. The masked row votes in the statistics, so its
-    logprobs must reach the estimator unzeroed; the unmasked row's advantages
-    then equal an independently computed reference.
+    step to fixed real policy logprobs; the fake reference pass returns real
+    logprobs unfiltered, as ``use_reference_model`` disables top-k/top-p. The
+    masked row votes in the statistics, so its policy logprobs must reach the
+    estimator unzeroed; the unmasked row's advantages then equal an
+    independently computed reference.
     """
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.masked_reward_policy = "include"
@@ -6085,7 +6087,7 @@ def test_grpo_train_include_kl_in_reward_sees_real_logprobs_of_masked_rows(
         "logprobs": worker_filter(real_policy, data)
     }
     policy.get_reference_policy_logprobs.side_effect = lambda data, **_kw: {
-        "reference_logprobs": worker_filter(reference, data)
+        "reference_logprobs": reference.clone()
     }
 
     train_data = _run_grpo_train_step_on_batch(mock_grpo_components, train_func, batch)
@@ -6093,7 +6095,7 @@ def test_grpo_train_include_kl_in_reward_sees_real_logprobs_of_masked_rows(
     token_mask = train_data["token_mask"].float()
     assert torch.equal(token_mask, torch.tensor([[0.0, 0.0, 0.0, 1.0, 1.0]] * 2))
     assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0]))
-    # The loss-masked row kept its real logprobs for the statistics.
+    # The loss-masked row kept its real policy logprobs for the statistics.
     torch.testing.assert_close(train_data["prev_logprobs"], real_policy)
     torch.testing.assert_close(train_data["reference_policy_logprobs"], reference)
     # Independent reference: group mean over both rows, k1 KL on the real
@@ -6103,11 +6105,10 @@ def test_grpo_train_include_kl_in_reward_sees_real_logprobs_of_masked_rows(
     stats = token_adv[token_mask.bool()]
     expected = (token_adv - stats.mean()) / stats.var(correction=0).sqrt()
     torch.testing.assert_close(train_data["advantages"][0, 3:], expected[0, 3:])
-    # Zeroed logprobs for the masked row (the loss mask as the worker filter)
-    # would have shifted the unmasked row.
+    # Zeroed policy logprobs for the masked row (the loss mask as the worker
+    # filter) against its real reference would have shifted the unmasked row.
     zeroed = (rewards - rewards.mean())[:, None] - 0.2 * (
-        real_policy * torch.tensor([[1.0], [0.0]])
-        - reference * torch.tensor([[1.0], [0.0]])
+        real_policy * torch.tensor([[1.0], [0.0]]) - reference
     )
     zeroed_stats = zeroed[token_mask.bool()]
     assert not torch.allclose(

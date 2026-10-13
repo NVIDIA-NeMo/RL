@@ -2792,16 +2792,18 @@ def _advantage_valid_mask(
 def _logprob_sample_mask(
     sample_mask: torch.Tensor, grpo_config: GRPOConfig
 ) -> torch.Tensor:
-    """Sample mask for the policy and reference logprob passes.
+    """Sample mask for the policy logprob pass (also handed to the reference pass).
 
-    Under top-k/top-p filtering the workers zero every logprob outside
-    ``token_mask * sample_mask`` (``mask_filtered_logprobs_outside_tokens``),
-    and they do so for the policy and the reference model alike. A row that
-    carries no loss but votes in the advantage statistics (``include``) would
-    then reach Reinforce++'s KL-in-reward and the batch normalization with
-    zeroed logprobs, so the statistics rows, not the loss rows, decide which
-    logprobs stay real. The training ``sample_mask`` is left unchanged; under
-    ``exclude`` both masks select the same rows.
+    Under top-k/top-p filtering the workers zero every policy logprob outside
+    ``token_mask * sample_mask`` (``mask_filtered_logprobs_outside_tokens``).
+    The reference pass is never filtered: ``use_reference_model`` disables
+    top-k/top-p, so reference logprobs are always real. A row that carries no
+    loss but votes in the advantage statistics (``include``) would therefore
+    reach Reinforce++'s KL-in-reward and the batch normalization with a zeroed
+    policy logprob against a real reference, so the statistics rows, not the
+    loss rows, decide which policy logprobs stay real. The training
+    ``sample_mask`` is left unchanged; under ``exclude`` both masks select the
+    same rows.
     """
     return _advantage_valid_mask(sample_mask, grpo_config)
 

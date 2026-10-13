@@ -401,11 +401,14 @@ is not. The legacy and TransferQueue trainers carry no placeholder rows.
 
 The policy and reference logprob passes receive the statistics participation
 mask instead of the loss weights. Under top-k/top-p filtering the workers zero
-every logprob outside `token_mask * sample_mask`, for the policy and the
-reference model alike, so a loss-masked row that votes under `include` keeps
-real logprobs and Reinforce++'s KL-in-reward and batch normalization see its
-real KL term. Under `exclude` both masks select the same rows. Training always
-receives the loss weights.
+every policy logprob outside `token_mask * sample_mask`; the reference pass is
+computed without filtering (see
+[Top-p and top-k filtering](#top-p-and-top-k-filtering)), so its logprobs are
+always real. A loss-masked row that votes under `include` therefore keeps real
+policy logprobs, and Reinforce++'s KL-in-reward and batch normalization see
+its real KL term instead of a zeroed policy logprob against a real reference.
+Under `exclude` both masks select the same rows. Training always receives the
+loss weights.
 
 Reinforce++ normalizes over the response tokens of participating rows, never
 over prompt or padding tokens; this also applies when `minus_baseline=false`.
