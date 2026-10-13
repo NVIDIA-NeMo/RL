@@ -4064,7 +4064,7 @@ def _grpo_train_impl(
                 )
                 # Check if timeout-based checkpointing is enabled in config.
                 # If the next step also runs validation, budget one more step's worth of
-                # time for it so we do not start a step that cannot finish in time.
+                # time for it to make starting a step that cannot finish less likely.
                 next_step_validates = (
                     val_period > 0
                     and (total_steps + 2) >= val_start_at

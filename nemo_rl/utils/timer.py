@@ -470,8 +470,9 @@ class TimeoutChecker:
         elapsed_time = current_time - self.start_time
 
         if self.fit_last_save_time and self.iteration_times:
-            # Budget for the slowest iteration seen so far rather than the mean, so a
-            # single slow iteration cannot run past the deadline.
+            # Budget for the slowest iteration seen so far rather than the mean. This is
+            # a heuristic over observed timings, not a hard bound: a step slower than
+            # any seen so far can still run past the deadline.
             predicted_iteration_time = max(self.iteration_times) + max(0.0, extra_s)
             if elapsed_time + predicted_iteration_time >= self.last_save_time:
                 return True
