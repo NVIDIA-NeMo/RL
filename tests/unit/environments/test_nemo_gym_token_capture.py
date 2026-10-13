@@ -217,7 +217,6 @@ def test_receipt_assembly_still_poisons_when_the_terminal_call_died_uncommitted(
 def test_a_failed_call_keeps_pending_write_custody() -> None:
     """Failure masks the rollout without transferring unfinished writes to cleanup."""
     from nemo_rl.environments.nemo_gym import _mask_undrained_receipt
-
     from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 
     env = _capture_env()

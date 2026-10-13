@@ -18,12 +18,14 @@ from responses_api_models.vllm_model.tests import test_framework_context as gym
 
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.environments.gym_selection import select_captured_calls
+from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import (
     ActionOutputFlags,
     RolloutReassembler,
     RolloutSelection,
     SegmentReceipt,
 )
+from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.capture_context import decide_capture_input
 from tests.unit.experience.test_logical_owner_finalization import PublicationDataPlane
 
@@ -356,6 +358,8 @@ def test_shared_paths_need_loss_ownership_beyond_planning(
         [1.0],
         [False],
         canonical_sample_ids=["group_g0"],
+        receipts=[receipt(records, terminal=records[-1])],
+        reward_checks=(None,),
     )
     assert prepared.valid_owner_count == 1
     assert all(row.valid for row in prepared.rows)
@@ -437,6 +441,8 @@ def test_shared_plan_and_masks_survive_selection_serialization(
             [1.0],
             [False],
             canonical_sample_ids=["group_g0"],
+            receipts=[wire],
+            reward_checks=(None,),
         )
         for plan in plans
     ]
@@ -481,3 +487,57 @@ def test_all_captured_membership_uses_existing_planner_boundary(
     )
     assert result.valid_row_count == 3
     assert_loss_once(forest, selected, records)
+
+
+@pytest.mark.parametrize("scored_index", [0, 1, 2, 3])
+def test_forest_shaping_and_observations_are_per_owner(
+    forest: ForestCapture, scored_index: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A shared root with two leaves plus a new root (compaction). The scored
+    # call can precede either endpoint, and must shape this owner's reward once.
+    complete = gym.RolloutTokenCapture.complete_call
+
+    def variable_completion(capture: Any, active: Any, **kwargs: Any) -> Any:
+        generated = kwargs["generated_token_ids"]
+        generated *= generated[0] - 1000
+        kwargs["generated_logprobs"] = [-0.25] * len(generated)
+        return complete(capture, active, **kwargs)
+
+    monkeypatch.setattr(gym.RolloutTokenCapture, "complete_call", variable_completion)
+    records, _ = forest.capture([None, 0, 0, None])
+    forest.finalizer._effort_config = EffortLevelsConfig(
+        low_weight=1, low_penalty=1, low_ub=10, low_string="budget"
+    )
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [receipt(records, terminal=records[scored_index])],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[selection(records)],
+        execution_row_multiple=4,
+        reward_checks=[RewardChecks(False, False, True)],
+        reward_log_contexts=[RewardLogContext("test-agent", None)],
+    )
+    assert result.valid_row_count == 3
+    assert len(result.meta.sample_ids) == 4
+    assert len(result.reward_observations) == 1
+    observation = result.reward_observations[0]
+    assert observation.sample_id == "group_g0"
+    assert observation.rollout_id == "attempt"
+    assert observation.reward == pytest.approx(2.0 - (scored_index + 1) / 10)
+    assert observation.log_context.agent_name == "test-agent"
+    assert result.metrics[f"finalize/effort/low/{scored_index + 1}"] == 1
+    for key in result.meta.sample_ids[:3]:
+        assert forest.plane.rows["canonical", key][
+            "total_reward"
+        ].item() == pytest.approx(2.0 - (scored_index + 1) / 10)
+    assert (
+        forest.plane.rows["canonical", result.meta.sample_ids[-1]][
+            "total_reward"
+        ].item()
+        == 0
+    )

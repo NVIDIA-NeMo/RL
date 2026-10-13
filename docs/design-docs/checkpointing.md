@@ -5,7 +5,7 @@ NeMo RL provides two checkpoint formats for Hugging Face models: Torch distribut
 ## Automodel consolidated checkpoints
 
 Automodel-backed policies accept three canonical values for
-`policy.dtensor_cfg.checkpoint.save_consolidated`: quoted `"false"`, `"final"`, and
+`policy.automodel_cfg.checkpoint.save_consolidated`: quoted `"false"`, `"final"`, and
 `"every"`.
 `"final"` exports Hugging Face weights only after a completed training run;
 timeout checkpoints remain resumable distributed checkpoints and are not treated as
@@ -14,10 +14,10 @@ final saves.
 > [!IMPORTANT]
 > NeMo RL no longer accepts YAML booleans for `save_consolidated`. Migrate
 > `checkpointing.save_consolidated: false` to
-> `policy.dtensor_cfg.checkpoint.save_consolidated: "false"`, and migrate
+> `policy.automodel_cfg.checkpoint.save_consolidated: "false"`, and migrate
 > `checkpointing.save_consolidated: true` to
-> `policy.dtensor_cfg.checkpoint.save_consolidated: "every"`.
-> PPO value models use the corresponding `value.dtensor_cfg.checkpoint` fields.
+> `policy.automodel_cfg.checkpoint.save_consolidated: "every"`.
+> PPO value models use the corresponding `value.automodel_cfg.checkpoint` fields.
 
 ## Converting Torch Distributed Checkpoints to Hugging Face Format
 

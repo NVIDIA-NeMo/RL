@@ -18,6 +18,7 @@ import time
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -40,9 +41,12 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.environments.nemo_gym import (
+    ExternalServiceReadinessConfig,
     NemoGym,
     NemoGymConfig,
+    _wait_for_external_services,
     build_reward_component_columns,
+    extract_external_service_readiness,
     extract_reward_components,
     setup_nemo_gym_config,
     validate_reward_components_match_scalar,
@@ -156,6 +160,115 @@ def test_multimodal_content_types_cover_responses_media_aliases():
         "audio",
         "audio_url",
     } <= MULTIMODAL_CONTENT_TYPES
+
+
+def _external_health_response(
+    *, status: str, healthy_backends: int, total_backends: int
+) -> MagicMock:
+    response = MagicMock()
+    response.status = 200
+    response.read.return_value = json.dumps(
+        {
+            "status": status,
+            "healthy_backends": healthy_backends,
+            "total_backends": total_backends,
+        }
+    ).encode()
+    response.__enter__.return_value = response
+    return response
+
+
+def test_external_service_readiness_waits_for_every_expected_backend():
+    config = ExternalServiceReadinessConfig(
+        services=[
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            }
+        ],
+        timeout_seconds=10,
+        poll_interval_seconds=1,
+        request_timeout_seconds=2,
+    )
+
+    with (
+        patch(
+            "nemo_rl.environments.nemo_gym.urllib.request.urlopen",
+            side_effect=[
+                _external_health_response(
+                    status="ok", healthy_backends=1, total_backends=2
+                ),
+                _external_health_response(
+                    status="ok", healthy_backends=2, total_backends=2
+                ),
+            ],
+        ) as urlopen,
+        patch("nemo_rl.environments.nemo_gym.sleep") as sleep,
+    ):
+        _wait_for_external_services(config)
+
+    assert urlopen.call_count == 2
+    sleep.assert_called_once_with(1)
+
+
+def test_external_service_readiness_times_out_with_last_observation():
+    config = ExternalServiceReadinessConfig(
+        services=[
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            }
+        ],
+        timeout_seconds=1,
+        poll_interval_seconds=1,
+        request_timeout_seconds=1,
+    )
+
+    now = 0.0
+
+    def advance(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    # Probes return instantly and only sleep advances the clock, so the last
+    # sleep ends exactly at the deadline, as it does in a real run.
+    with (
+        patch(
+            "nemo_rl.environments.nemo_gym.urllib.request.urlopen",
+            side_effect=[OSError("connection refused")],
+        ),
+        patch("nemo_rl.environments.nemo_gym.monotonic", side_effect=lambda: now),
+        patch("nemo_rl.environments.nemo_gym.sleep", side_effect=advance),
+    ):
+        with pytest.raises(TimeoutError, match="GENRM: request failed"):
+            _wait_for_external_services(config)
+
+
+def test_external_service_readiness_is_not_forwarded_to_gym():
+    nemo_gym_dict = {
+        "external_service_readiness": {
+            "services": [
+                {
+                    "name": "GENRM",
+                    "url": "http://10.0.0.1:9213/health",
+                    "expected_backends": 2,
+                }
+            ],
+            "timeout_seconds": 10,
+            "poll_interval_seconds": 1,
+            "request_timeout_seconds": 2,
+        },
+        "skip_venv_if_present": True,
+    }
+
+    readiness = extract_external_service_readiness(nemo_gym_dict)
+
+    assert readiness is not None
+    assert readiness.services[0].name == "GENRM"
+    assert "external_service_readiness" not in nemo_gym_dict
+    assert nemo_gym_dict == {"skip_venv_if_present": True}
 
 
 def test_extract_static_video_message_resolves_local_file(tmp_path):
@@ -848,7 +961,12 @@ def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path)
                 "attention_mask": torch.ones(1, token_count, dtype=torch.long),
             }
 
+        def convert_tokens_to_ids(self, token):
+            assert token == "<image>"
+            return 0
+
     class NemotronNanoVLV2Processor:
+        image_token = "<image>"
         model_input_names = [
             "input_ids",
             "attention_mask",
@@ -897,10 +1015,38 @@ def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path)
     assert pixel_values.as_tensor(mode="patchify").shape == (1, 240, 768)
     assert user_message["imgs_sizes"].as_tensor().tolist() == [[96, 160]] * 4
     assert user_message["num_frames"].as_tensor().tolist() == [4]
+    assert (
+        user_message["media_token_validity_mask"].shape
+        == user_message["token_ids"].shape
+    )
+    assert user_message["media_token_validity_mask"].sum().item() == 1
     extra_body = json.loads(
         datum["extra_env_info"]["responses_create_params"]["metadata"]["extra_body"]
     )
     assert "mm_processor_kwargs" not in extra_body
+
+    filtered = nemo_gym_example_to_video_datum_spec(
+        example,
+        processor=NemotronNanoVLV2Processor(),
+        max_seq_length=4,
+        idx=3,
+        task_name="nemo_gym",
+        data_config=SimpleNamespace(
+            num_frames=4,
+            video_sampling_style="nemotron_vl",
+            video_temporal_patch_size=2,
+            video_target_num_patches=64,
+            video_maintain_aspect_ratio=True,
+            min_generation_tokens=16,
+        ),
+    )
+    filtered_message = filtered["message_log"][0]
+    assert filtered["loss_multiplier"] == 0.0
+    assert (
+        filtered_message["media_token_validity_mask"].shape
+        == filtered_message["token_ids"].shape
+    )
+    assert not filtered_message["media_token_validity_mask"].any()
 
 
 def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():

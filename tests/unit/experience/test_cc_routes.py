@@ -18,12 +18,10 @@ Generation and storage are doubles; route extraction, commitments, verification,
 owner collapse, publication and cleanup execute their production code.
 """
 
-import json
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-import torch
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
@@ -152,9 +150,9 @@ def test_cc_routes_patch_only_predecessor_tail_within_each_segment(
         [_segment(worker, sink, "group_g1", child=False, base=50)],
     ]
     assert "predecessor_tail_route" not in sink.records[0].extras
-    assert sink.records[1].extras["predecessor_tail_route"] == [[17]]
+    assert "predecessor_tail_route" not in sink.records[1].extras
     ordinary = finalizer.finalize_rollout("group_g0", owners[0][0]["receipt"], reward=1)
-    assert ordinary.routed_experts[:, 0, 0].tolist() == [11, 12, -1, 13, 14, -1]
+    assert ordinary.routed_experts[:, 0, 0].tolist() == [11, 12, 17, 13, 14, -1]
     result = finalize(finalizer, owners)
     assert result.valid_row_count == result.total_row_count == 3
     for key, expected in zip(
@@ -169,57 +167,30 @@ def test_cc_routes_patch_only_predecessor_tail_within_each_segment(
     assert not any(partition == "staged" for partition, _ in data_plane.rows)
 
 
-@pytest.mark.parametrize(
-    "failure",
-    [
-        "missing",
-        "shape",
-        "negative",
-        "float",
-        "overflow",
-        "root",
-        "tamper",
-        "no_routes",
-    ],
-)
-def test_bad_committed_tail_or_tampering_invalidates_whole_owner(
+@pytest.mark.parametrize("failure", ["boundary_tamper", "no_routes"])
+def test_bad_committed_routes_invalidate_whole_owner(
     routes: tuple, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     data_plane, sink, worker, finalizer = routes
     first = _segment(worker, sink, "group_g0")
     extract = worker.token_capture.adapter.extract_extras
-
-    def extras(payload: dict) -> dict | None:
-        if failure == "no_routes":
-            return None
-        result = extract(payload)
-        if failure == "root" and "predecessor_tail_route" not in result:
-            result["predecessor_tail_route"] = [[1]]
-        elif "predecessor_tail_route" in result:
-            if failure == "missing":
-                del result["predecessor_tail_route"]
-            elif failure not in ("root", "tamper"):
-                result["predecessor_tail_route"] = {
-                    "shape": [[1, 2]],
-                    "negative": [[-1]],
-                    "float": [[1.0]],
-                    "overflow": [[32768]],
-                }[failure]
-        return result
-
-    monkeypatch.setattr(worker.token_capture.adapter, "extract_extras", extras)
+    if failure == "no_routes":
+        monkeypatch.setattr(
+            worker.token_capture.adapter, "extract_extras", lambda _: None
+        )
     second = _segment(worker, sink, "group_g0", base=30)
     monkeypatch.setattr(worker.token_capture.adapter, "extract_extras", extract)
     healthy = _segment(worker, sink, "group_g1", child=False, base=50)
-    if failure == "tamper":
+    if failure == "boundary_tamper":
         row = data_plane.rows["staged", second["manifest"].records[-1].staging_key]
-        encoded = json.dumps(
-            {"predecessor_tail_route": [[99]]}, separators=(",", ":")
-        ).encode()
-        row["extras_metadata_json"] = torch.tensor([list(encoded)], dtype=torch.uint8)
+        # The first route is the committed predecessor boundary. Changing only
+        # this entry must invalidate the entire owner, including other roots.
+        row["routed_experts"][0, 0, 0, 0] = 99
     result = finalize(finalizer, [[first, second], [healthy]])
     assert result.meta.sample_ids == ["group_g0_s0", "group_g0_s1", "group_g1_s0"]
     assert result.valid_row_count == 1
+    assert len(result.reward_observations) == 1
+    assert result.reward_observations[0].sample_id == "group_g1"
     assert data_plane.rows["canonical", "group_g0_s0"]["sample_mask"].item() == 0
     assert data_plane.rows["canonical", "group_g0_s1"]["sample_mask"].item() == 0
     assert data_plane.rows["canonical", "group_g1_s0"]["sample_mask"].item() == 1

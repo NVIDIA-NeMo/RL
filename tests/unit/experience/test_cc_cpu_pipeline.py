@@ -24,8 +24,10 @@ from nemo_gym.context_management import (
     ContextHistoryConfig,
     ContextManagedResponsesClient,
 )
-from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
-from nemo_gym.openai_utils import NeMoGymAsyncOpenAI
+from nemo_gym.openai_utils import (
+    NeMoGymAsyncOpenAI,
+    NeMoGymResponseCreateParamsNonStreaming,
+)
 from nemo_gym.server_utils import ServerClient
 from nemo_gym.token_id_capture.staging.records import RolloutManifest, StageResult
 from responses_api_agents.simple_agent_with_compaction.tests.test_client import (
