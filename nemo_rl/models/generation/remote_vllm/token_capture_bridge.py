@@ -30,9 +30,9 @@ import logging
 import socket
 import threading
 import time
-from typing import Any
 import urllib.error
 import urllib.request
+from typing import Any
 
 import ray
 import uvicorn

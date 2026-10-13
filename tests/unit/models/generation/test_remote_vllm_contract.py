@@ -16,13 +16,12 @@ import json
 import threading
 import urllib.request
 from types import SimpleNamespace
-
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from ray import cloudpickle
 from pydantic import TypeAdapter, ValidationError
+from ray import cloudpickle
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.remote_vllm import (
