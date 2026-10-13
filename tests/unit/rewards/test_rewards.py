@@ -159,6 +159,16 @@ def test_exact_answer_alphanumeric_reward():
     assert_allclose(reward, 0.0, atol=1e-6)
     assert is_correct is False
 
+    # Empty-after-normalize must not match (see #4275)
+    for gt, resp in (
+        ("", "<answer></answer>"),
+        ("!!!", "<answer>???</answer>"),
+        ("   ", "<answer>   </answer>"),
+    ):
+        reward, is_correct = exact_answer_alphanumeric_reward(gt, resp)
+        assert_allclose(reward, 0.0, atol=1e-6)
+        assert is_correct is False
+
 
 def test_bbox_giou_reward():
     ground_truth = "[0.1, 0.1, 0.5, 0.5]"
