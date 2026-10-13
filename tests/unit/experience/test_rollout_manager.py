@@ -955,6 +955,7 @@ def _nemo_gym_impl(
     reward_penalty_config=None,
     *,
     log_full_result_tables=False,
+    mask_infra_failures=False,
 ):
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,
@@ -971,6 +972,7 @@ def _nemo_gym_impl(
             "top_k": None,
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
+        mask_infra_failures=mask_infra_failures,
         log_full_result_tables=log_full_result_tables,
         reward_penalty_config=reward_penalty_config,
     )
@@ -1029,6 +1031,25 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
     ][0]
     assert "mask_sample" not in completion.env_extras["instance_config"]
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "masked", "infra", "timeout"),
+    [("agent_run_error", True, 1.0, 0.0), ("agent_timeout", False, 0.0, 1.0)],
+)
+def test_mask_infra_failures_keeps_only_infra_masked_when_gate_off(
+    failure_kind, masked, infra, timeout
+):
+    result = _mask_gate_result()
+    result["full_result"]["failure_kind"] = failure_kind
+    impl = _nemo_gym_impl(False, mask_infra_failures=True)
+    completion = impl._results_to_completions([result])[0][0]
+    assert ("mask_sample" in completion.env_extras["instance_config"]) is masked
+    assert completion.env_extras["infra_failure"] == infra
+    assert completion.env_extras["timeout_failure"] == timeout
+    metrics = impl._compute_rollout_metrics([completion], "agent")
+    assert metrics["infra_failure_rate"] == infra
+    assert metrics["timeout_rate"] == timeout
 
 
 def _mask_gate_receipt_result():

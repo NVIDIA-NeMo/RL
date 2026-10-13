@@ -119,6 +119,27 @@ def _contains_post_write_enrichment_error(error: BaseException) -> bool:
     return False
 
 
+def _is_infra_failure(full_result: Mapping[str, Any]) -> bool:
+    r = full_result
+    return bool(
+        r.get("error_kind") == "sandbox"
+        or r.get("sandbox_failed")
+        or r.get("failure_kind") == "agent_run_error"
+        or r.get("_ng_failure_class") == "judge_failed"
+        or (r.get("agent_error_kind") == "model_connection" and not r.get("resolved"))
+    )
+
+
+def _is_timeout_failure(full_result: Mapping[str, Any]) -> bool:
+    r = full_result
+    return not _is_infra_failure(r) and bool(
+        r.get("failure_kind") == "agent_timeout"
+        or r.get("agent_timed_out")
+        or r.get("container_timed_out")
+        or r.get("error_kind") == "eval_timeout"
+    )
+
+
 def _nemo_gym_metric_namespace(row: Mapping[str, Any]) -> str:
     """Return the best available namespace for NeMo-Gym rollout metrics."""
     agent_ref = row.get("agent_ref")
@@ -938,6 +959,7 @@ class AsyncNemoGymRolloutImpl:
         max_rollout_turns: int,
         generation_config: GenerationConfig,
         mask_env_flagged_samples: bool = True,
+        mask_infra_failures: bool = False,
         reward_penalty_config: Optional[dict[str, Any]] = None,
         # Optional so direct construction does not have to carry the resiliency wiring;
         # RolloutManager always passes both explicitly.
@@ -959,6 +981,7 @@ class AsyncNemoGymRolloutImpl:
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
+        self._mask_infra_failures = mask_infra_failures
         self._log_full_result_tables = log_full_result_tables
         self._reward_penalty_config = reward_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
@@ -1423,11 +1446,19 @@ class AsyncNemoGymRolloutImpl:
         # flag so later batch building never sees it. Receipt rollouts take the
         # same gate because the capture finalization request reads the flag
         # from the completion's env_extras.
-        if not self._mask_env_flagged_samples:
-            for result in results:
-                (result["full_result"].get("instance_config") or {}).pop(
-                    "mask_sample", None
-                )
+        for result in results:
+            full = result["full_result"]
+            infra = self._mask_infra_failures and _is_infra_failure(full)
+            if infra:
+                full["instance_config"] = {
+                    **(full.get("instance_config") or {}),
+                    "mask_sample": True,
+                }
+            elif not self._mask_env_flagged_samples:
+                (full.get("instance_config") or {}).pop("mask_sample", None)
+            if self._mask_infra_failures:
+                full["infra_failure"] = float(infra)
+                full["timeout_failure"] = float(_is_timeout_failure(full))
 
         penalty_counts = apply_reward_penalties(
             token_results, self._reward_penalty_config
@@ -1568,6 +1599,14 @@ class AsyncNemoGymRolloutImpl:
             "truncation_rate": truncation_rate,
             f"{agent_name}/truncation_rate": truncation_rate,
         }
+        if self._mask_infra_failures:
+            extras = [c.env_extras or {} for c in completions]
+            rollout_metrics["infra_failure_rate"] = (
+                sum(e.get("infra_failure", 0.0) for e in extras) / n
+            )
+            rollout_metrics["timeout_rate"] = (
+                sum(e.get("timeout_failure", 0.0) for e in extras) / n
+            )
 
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
@@ -1632,6 +1671,7 @@ class RolloutManager:
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
         mask_env_flagged_samples: bool = True,
+        mask_infra_failures: bool = False,
         reward_penalty_config: Optional[dict[str, Any]] = None,
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
@@ -1676,6 +1716,7 @@ class RolloutManager:
             generation_config=generation_config,
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores these.
             mask_env_flagged_samples=mask_env_flagged_samples,
+            mask_infra_failures=mask_infra_failures,
             log_full_result_tables=log_full_result_tables,
             reward_penalty_config=reward_penalty_config,
             # None means "no deadlines", which is what async_rl's own defaults resolve

@@ -2077,6 +2077,7 @@ def setup_single_controller(
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
+        mask_infra_failures=bool(master_config.env.get("mask_infra_failures")),
         log_full_result_tables=should_log_nemo_gym_full_result_tables(
             wandb_enabled=master_config.logger.wandb_enabled,
             wandb_config=master_config.logger.wandb,
