@@ -851,6 +851,12 @@ def _init_tq(
                 "SimpleStorage": {
                     "total_storage_size": simple_cfg.storage_capacity,
                     "num_data_storage_units": simple_cfg.num_storage_units,
+                    # TQ round-robins units (num_cpus=1, hard node affinity)
+                    # over every alive Ray node. A node that offers no CPU,
+                    # e.g. a head started with --num-cpus=0, could never
+                    # start one, so only nodes that advertise CPU qualify.
+                    # Ignored when units are pinned to planned nodes below.
+                    "required_node_resource": "CPU",
                 },
             },
         }

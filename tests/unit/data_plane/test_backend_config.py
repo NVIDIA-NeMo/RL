@@ -179,6 +179,28 @@ def _simple_overlay(monkeypatch, **simple) -> dict:
     return conf["backend"]["SimpleStorage"]
 
 
+def test_simple_storage_units_skip_nodes_without_cpu(monkeypatch) -> None:
+    """A head started with --num-cpus=0 must not get a storage unit.
+
+    TQ places each unit (num_cpus=1) with hard node affinity round-robin over
+    alive nodes, so a CPU-less node would leave its unit unschedulable. The
+    overlay asks TQ for nodes that advertise CPU; check TQ honors that.
+    """
+    import ray
+    from transfer_queue.storage.bootstrap import simple_storage_bootstrap
+
+    storage = _simple_overlay(monkeypatch)
+    assert storage["required_node_resource"] == "CPU"
+
+    cpu_less = {"NodeID": "a" * 56, "Alive": True, "Resources": {"memory": 1.0}}
+    worker = {"NodeID": "b" * 56, "Alive": True, "Resources": {"CPU": 8.0}}
+    monkeypatch.setattr(ray, "nodes", lambda: [cpu_less, worker])
+    strategies = simple_storage_bootstrap.get_node_round_robin_scheduling_strategies(
+        3, required_node_resource=storage["required_node_resource"]
+    )
+    assert [s.node_id for s in strategies] == [worker["NodeID"]] * 3
+
+
 def test_simple_ssd_offload_is_off_by_default(monkeypatch) -> None:
     # Whatever TQ's own base config carries, we must not turn it on.
     storage = _simple_overlay(monkeypatch)
