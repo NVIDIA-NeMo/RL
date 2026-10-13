@@ -21,7 +21,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omegaconf import OmegaConf
 
-from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.algorithms.utils import get_tokenizer, set_seed
 from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
 from nemo_rl.data.datasets.eval_datasets import _is_multimodal_dataset
 from nemo_rl.data.datasets.response_datasets import load_response_dataset
@@ -118,6 +118,10 @@ def main():
     config.generation = configure_generation_config(
         config.generation, tokenizer, is_eval=True
     )
+
+    # Dataset preprocessing can randomize prompts (e.g. GPQA answer choices).
+    # setup() seeds generation later, after the dataset has already been built.
+    set_seed(config.eval["seed"])
 
     # Setup data
     (
