@@ -15,6 +15,7 @@ topology first, then select one transport with
 | `colocated.enabled: false` | `nccl_reshard` | NCCL reshard | Provides the best performance for large models (>100s B models). |
 | `colocated.enabled: false` | `vllm_zmq_sparse` | Sparse delta over ZeroMQ | The link is bandwidth-limited and workers can reach a relay over TCP. |
 | `colocated.enabled: false` | `vllm_s3_sparse` | Sparse delta through S3 | Workers communicate through shared object storage. |
+| `colocated.enabled: false` | `hf_checkpoint` | Shared HF checkpoint | GRPO with a Megatron policy and async vLLM; all participants can access shared storage. |
 | `colocated.enabled: false` | `nixl` | NIXL checkpoint engine | The cluster has a fast UCX/RDMA fabric for full-weight refit. |
 
 `null` is the default. For non-colocated Megatron generation it selects the
@@ -45,6 +46,40 @@ The reload API path currently supports only `policy.generation.backend: vllm`,
 refit transports, and checkpoint-engine/NIXL transports. Eagle/MTP draft
 weights refitted from the trainer are not supported yet; use the legacy loader
 for those cases.
+
+## HF-Checkpoint Refit
+
+`hf_checkpoint` exports the live Megatron policy as a complete Hugging Face
+checkpoint for every refit, publishes an immutable version directory, then
+pauses generation, reloads the checkpoint on every vLLM worker, and resumes
+only after success. A failed reload leaves generation paused; a retry exports
+a new version rather than overwriting the failed attempt.
+
+This transport is currently wired only into GRPO. It requires a Megatron
+policy, non-colocated generation, and `vllm_cfg.async_engine: true`. ModelOpt
+quantization (`quant_cfg`) and trainer-refitted draft weights are unsupported.
+`refit_cfg.hf_checkpoint.checkpoint_dir` must be an absolute path on a shared
+filesystem visible to the driver, every policy node, and every vLLM node.
+
+```yaml
+policy:
+  generation:
+    colocated:
+      enabled: false
+    refit_transport: hf_checkpoint
+    refit_cfg:
+      hf_checkpoint:
+        checkpoint_dir: /shared/hf_exports
+    vllm_cfg:
+      async_engine: true
+```
+
+Every refit writes one full model checkpoint. Completed versions and failed
+staging directories are retained, so storage grows with the number of refits;
+for example, 30 billion BF16 parameters require roughly 60 GB per full export.
+Provision sufficient capacity, and remove old run exports after all workers
+have stopped using them. This transport trades shared-storage I/O and reload
+cost for a simple checkpoint-based weight exchange.
 
 ## Constraints
 

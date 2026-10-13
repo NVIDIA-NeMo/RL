@@ -69,6 +69,7 @@ class HfCheckpointWeightSynchronizer(WeightSynchronizer):
 
         self._stale = True
         version = self._next_version
+        self._next_version += 1  # Failed attempts must never reuse a version.
         final_path = self._checkpoint_root / f"version_{version:08d}"
         staging_path = self._checkpoint_root / f".version_{version:08d}.tmp"
         if final_path.exists() or staging_path.exists():
@@ -100,7 +101,6 @@ class HfCheckpointWeightSynchronizer(WeightSynchronizer):
             self._generation.reload_weights(str(final_path))
             self._generation.resume_generation_after_refit()
 
-        self._next_version += 1
         self._stale = False
 
     def shutdown(self) -> None:

@@ -1822,7 +1822,6 @@ class VllmAsyncGenerationWorkerImpl(
         await self.llm.collective_rpc(
             "reload_weights", kwargs={"weights_path": weights_path}
         )
-        await self._reset_encoder_cache_after_weight_update()
         return True
 
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:

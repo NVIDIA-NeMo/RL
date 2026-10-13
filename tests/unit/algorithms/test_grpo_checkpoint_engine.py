@@ -130,3 +130,18 @@ def test_refit_policy_generation_sglang_uses_attached_synchronizer(monkeypatch):
     policy.offload_after_refit.assert_not_called()
     generation.prepare_for_generation.assert_not_called()
     ray_get.assert_not_called()
+
+
+def test_hf_checkpoint_requires_scoped_config():
+    import pytest
+
+    from nemo_rl.models.generation.vllm.config import (
+        VllmConfig,
+        normalize_vllm_refit_config,
+    )
+
+    config = cast(VllmConfig, {"refit_transport": "hf_checkpoint"})
+    with pytest.raises(
+        ValueError, match="requires refit_cfg.hf_checkpoint.checkpoint_dir"
+    ):
+        normalize_vllm_refit_config(config)

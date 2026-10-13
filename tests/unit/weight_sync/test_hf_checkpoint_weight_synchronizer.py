@@ -214,3 +214,76 @@ def test_factory_rejects_unsupported_hf_topologies(
     )
     with pytest.raises(error):
         create_weight_synchronizer(policy, generation, "vllm", colocated)
+
+
+@pytest.mark.parametrize("failure_phase", ["export", "reload"])
+def test_retry_after_failure_uses_a_new_version(
+    tmp_path: Path, failure_phase: str
+) -> None:
+    events: list[tuple[str, object]] = []
+    policy = _Policy(events)
+    generation = _Generation(tmp_path, events)
+    original_export = policy.export_hf_checkpoint
+    original_reload = generation.reload_weights
+
+    def fail_export(output_path: str) -> None:
+        original_export(output_path)
+        raise RuntimeError("partial export")
+
+    def fail_reload(weights_path: str) -> None:
+        original_reload(weights_path)
+        raise RuntimeError("partial reload")
+
+    if failure_phase == "export":
+        policy.export_hf_checkpoint = fail_export
+    else:
+        generation.reload_weights = fail_reload
+    sync = HfCheckpointWeightSynchronizer(
+        policy, generation, HfCheckpointRefitConfig(checkpoint_dir=str(tmp_path))
+    )
+    sync.init_communicator()
+    with pytest.raises(RuntimeError, match="partial"):
+        sync.sync_weights()
+    assert sync.is_stale
+    assert "resume" not in [event[0] for event in events]
+
+    policy.export_hf_checkpoint = original_export
+    generation.reload_weights = original_reload
+    sync.sync_weights()
+
+    assert events[-2] == ("reload", str(tmp_path / "version_00000002"))
+    assert events[-1][0] == "resume"
+    assert not sync.is_stale
+    failed_path = (
+        ".version_00000001.tmp" if failure_phase == "export" else "version_00000001"
+    )
+    assert (tmp_path / failed_path / "model.safetensors").exists()
+
+
+def test_kv_scales_rejected_before_any_export(tmp_path: Path) -> None:
+    events: list[tuple[str, object]] = []
+    sync = HfCheckpointWeightSynchronizer(
+        _Policy(events),
+        _Generation(tmp_path, events),
+        HfCheckpointRefitConfig(checkpoint_dir=str(tmp_path)),
+    )
+    sync.init_communicator()
+    with pytest.raises(NotImplementedError, match="KV scales"):
+        sync.sync_weights(kv_scales={"layer.0": 0.5})
+    assert events == []
+
+
+def test_existing_published_version_advances_and_invalid_name_is_ignored(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "version_00000002").mkdir()
+    (tmp_path / "version_notanumber").mkdir()
+    events: list[tuple[str, object]] = []
+    sync = HfCheckpointWeightSynchronizer(
+        _Policy(events),
+        _Generation(tmp_path, events),
+        HfCheckpointRefitConfig(checkpoint_dir=str(tmp_path)),
+    )
+    sync.init_communicator()
+    sync.sync_weights()
+    assert events[-2] == ("reload", str(tmp_path / "version_00000003"))
