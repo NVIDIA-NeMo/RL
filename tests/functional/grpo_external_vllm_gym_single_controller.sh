@@ -55,14 +55,14 @@ SC_TEST_RUN_DIR="$RUN_DIR/train" \
     bash "$SCRIPT_DIR/grpo_async_gym_single_controller.sh" \
     policy.model_name="$MODEL" \
     policy.generation.backend=remote_vllm \
-    policy.generation.refit_transport=hf_checkpoint \
+    ++policy.generation.refit_transport=hf_checkpoint \
     ++policy.generation.refit_cfg.hf_checkpoint.checkpoint_dir="$EXPORT_DIR" \
     ++policy.generation.remote_vllm_cfg.base_url="$BASE_URL" \
     ++policy.generation.remote_vllm_cfg.served_model_name=policy \
     ++policy.generation.remote_vllm_cfg.max_model_len=512 \
     ++policy.generation.remote_vllm_cfg.refit={} \
     cluster.gpus_per_node=1 \
-    token_capture.enabled=false \
+    ++token_capture.enabled=false \
     ++env.nemo_gym.policy_model.responses_api_models.vllm_model.return_token_id_information=true \
     ++env.nemo_gym.policy_model.responses_api_models.vllm_model.request_prompt_and_generation_token_ids=true \
     ++env.nemo_gym.policy_model.responses_api_models.vllm_model.supply_prefix_token_ids=false \
