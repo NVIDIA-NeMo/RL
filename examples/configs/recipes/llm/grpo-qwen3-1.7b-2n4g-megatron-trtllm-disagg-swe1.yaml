@@ -114,6 +114,9 @@ policy:
         # The prefill engine prefills only each turn's delta and the receiving
         # engine skips blocks it already holds on transfer.
         enable_block_reuse: true
+        # Off for now: enabling partial reuse under disaggregation currently
+        # causes convergence issues.
+        enable_partial_reuse: false
 
 logger:
   log_dir: logs/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1

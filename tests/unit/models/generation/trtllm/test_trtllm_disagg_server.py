@@ -351,3 +351,82 @@ def test_an_engine_context_length_rejection_keeps_its_text():
 
     assert raised.status_code == 400
     assert "context length exceeded" in raised.detail
+
+
+# The shape NeMo-Gym sends for interleaved reasoning: it writes the extracted
+# <think> block into both fields, which makes TRT-LLM resolve the message to
+# ReasoningAssistantMessage -- the case whose tool_calls dumped as [].
+_REASONING_TOOL_CALL_MESSAGES = [
+    {"role": "user", "content": "fix the bug"},
+    {
+        "role": "assistant",
+        "content": "Let me look.",
+        "reasoning": "check the repo first",
+        "reasoning_content": "check the repo first",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "execute_bash",
+                    "arguments": '{"command": "ls"}',
+                },
+            }
+        ],
+    },
+    {"role": "tool", "tool_call_id": "call_1", "content": "a.py"},
+]
+
+
+def _dumped_tool_calls(dump: dict) -> list:
+    return [m.get("tool_calls") for m in dump["messages"] if m["role"] == "assistant"]
+
+
+def test_assistant_tool_calls_survive_every_dump_of_the_request():
+    # The disagg server dumps one request once per leg, and the frontend
+    # tokenizer dumps its own copy; every dump must carry the history's calls.
+    pytest.importorskip("tensorrt_llm.serve.openai_protocol")
+    from nemo_rl.models.generation.trtllm.trtllm_disagg_server import (
+        _chat_completion_request_cls,
+    )
+
+    request = _chat_completion_request_cls()(
+        model="m", messages=_REASONING_TOOL_CALL_MESSAGES
+    )
+
+    for _ in range(3):
+        dump = request.model_dump(mode="json", exclude_unset=True)
+        [tool_calls] = _dumped_tool_calls(dump)
+        assert [c["function"]["name"] for c in tool_calls] == ["execute_bash"]
+
+
+def test_the_frontend_tokenizer_renders_the_history_tool_calls(monkeypatch):
+    # With frontend_tokenize the ctx engine uses these ids verbatim, so a
+    # dropped tool call here is a dropped tool call in the trained prompt.
+    pytest.importorskip("tensorrt_llm.serve.openai_protocol")
+    import transformers
+
+    from nemo_rl.models.generation.trtllm import trtllm_http_server
+    from nemo_rl.models.generation.trtllm.trtllm_disagg_server import (
+        _build_frontend_tokenizer,
+    )
+
+    monkeypatch.setattr(
+        transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: MagicMock()
+    )
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", lambda *a, **k: MagicMock()
+    )
+    rendered = {}
+
+    async def fake_build(messages, tools, tokenizer, model_config, template_kwargs):
+        rendered["messages"] = messages
+        return [1, 2, 3]
+
+    monkeypatch.setattr(trtllm_http_server, "build_spliced_prompt_ids", fake_build)
+    tokenize = _build_frontend_tokenizer("m", {})
+
+    asyncio.run(tokenize({"model": "m", "messages": _REASONING_TOOL_CALL_MESSAGES}))
+
+    [tool_calls] = _dumped_tool_calls({"messages": rendered["messages"]})
+    assert [c["function"]["name"] for c in tool_calls] == ["execute_bash"]

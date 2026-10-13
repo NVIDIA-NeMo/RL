@@ -53,8 +53,8 @@ a `session_id -> client` map seeded by `sha256(session_id) % len(clients)`) bind
 trajectory to one frontend — and therefore to one replica — for its whole lifetime. Since
 each replica contributes exactly F of the N×F slots, replicas stay uniformly loaded.
 
-That stickiness is a **correctness** requirement, not just load-spreading. Each frontend
-holds its own `ctx_router` state in-process, so two frontends of the same replica have no
+That stickiness matters for performance, not just load-spreading. Each frontend holds
+its own `ctx_router` state in-process, so two frontends of the same replica have no
 shared view of which prefill engine holds a given conversation's prefix. If a trajectory's
 later turn reached a different frontend, that frontend would route it to a prefill engine
 that never saw the prefix — correct output, but a full re-prefill and the whole point of
@@ -214,8 +214,6 @@ policy:
       # an engine report itself as disaggregated at all.
       cache_transceiver_config:
         backend: NIXL                 # DEFAULT | UCX | NIXL | MOONCAKE | MPI
-      kv_cache_config:
-        enable_block_reuse: true      # see below
 ```
 
 Colocated generation is not supported yet; set `colocated.enabled: false`.

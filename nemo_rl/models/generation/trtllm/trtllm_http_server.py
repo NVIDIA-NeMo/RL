@@ -289,11 +289,10 @@ def create_app(
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
 
-    # Per-request template kwargs override these defaults.
-    _server_template_kwargs: dict[str, Any] = {
-        "enable_thinking": True,
-        **(default_chat_template_kwargs or {}),
-    }
+    # Per-request template kwargs override these defaults. Only what the config
+    # sets, like the vLLM server: an unset key falls back to the chat template's
+    # own default, and the disagg frontend's tokenizer renders the same way.
+    _server_template_kwargs: dict[str, Any] = dict(default_chat_template_kwargs or {})
 
     # Use the configured parser or infer one from the model config.
     _tool_parser_name = _resolve_tool_parser_name(tool_parser, model_name)
