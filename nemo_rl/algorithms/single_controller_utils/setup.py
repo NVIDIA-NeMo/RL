@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
 import ray
+from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
@@ -1032,6 +1033,74 @@ def _load_opd_full_teacher_lm_heads(
         )
 
 
+_MEGATRON_FREEZE_FIELDS = (
+    "freeze_vision_model",
+    "freeze_vision_projection",
+    "freeze_sound_encoder",
+    "freeze_sound_projection",
+)
+
+
+def _drop_optimizer_for_changed_megatron_freeze_contract(
+    weights_path: Optional[Path],
+    optimizer_path: Optional[Path],
+    policy_config: dict[str, Any],
+) -> Optional[Path]:
+    """Avoid loading optimizer shards whose parameter set cannot match.
+
+    Megatron excludes frozen tower parameters before it builds DDP and the
+    optimizer.  Changing a tower freeze flag across a resume therefore changes
+    the optimizer's sharded parameter layout.  The model weights remain valid,
+    but the old optimizer state does not.  Detect that transition from the
+    checkpoint's serialized provider config and perform a weight-only resume.
+    """
+
+    if weights_path is None or optimizer_path is None:
+        return optimizer_path
+    megatron_config = policy_config.get("megatron_cfg", {})
+    if not megatron_config.get("enabled", False):
+        return optimizer_path
+
+    run_configs = sorted(Path(weights_path).glob("iter_*/run_config.yaml"))
+    if not run_configs:
+        return optimizer_path
+
+    try:
+        checkpoint_config = OmegaConf.load(run_configs[-1])
+    except Exception as error:
+        warnings.warn(
+            "Could not inspect the Megatron checkpoint freeze contract; "
+            f"keeping optimizer resume enabled: {error}",
+            stacklevel=2,
+        )
+        return optimizer_path
+
+    changed: list[str] = []
+    for field in _MEGATRON_FREEZE_FIELDS:
+        if field not in megatron_config:
+            continue
+        checkpoint_value = OmegaConf.select(
+            checkpoint_config, f"model.{field}", default=None
+        )
+        if checkpoint_value is None:
+            continue
+        if bool(checkpoint_value) != bool(megatron_config[field]):
+            changed.append(
+                f"{field}={checkpoint_value}->{megatron_config[field]}"
+            )
+
+    if not changed:
+        return optimizer_path
+
+    warnings.warn(
+        "Megatron tower freeze contract changed across resume "
+        f"({', '.join(changed)}); loading model weights and training state but "
+        "rebuilding the structurally incompatible optimizer.",
+        stacklevel=2,
+    )
+    return None
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -1343,6 +1412,11 @@ def setup_single_controller(
     save_state = _get_grpo_save_state(loaded_state)
     weights_path, optimizer_path = checkpointer.get_resume_paths(
         trainer_checkpoint_path
+    )
+    optimizer_path = _drop_optimizer_for_changed_megatron_freeze_contract(
+        weights_path,
+        optimizer_path,
+        cast(dict[str, Any], policy_config),
     )
     if is_ppo_run(master_config):
         # Only a fresh run reads this; a resume ignores it and restores the critic

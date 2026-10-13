@@ -3162,3 +3162,56 @@ def test_load_opd_full_teacher_lm_heads_loads_one_head_per_unique_teacher(monkey
         "Qwen/teacher-a",
         "Qwen/teacher-b",
     ]
+
+
+def _write_megatron_run_config(weights_path: Path, **freeze_fields: bool) -> None:
+    run_config = weights_path / "iter_0000000" / "run_config.yaml"
+    run_config.parent.mkdir(parents=True)
+    OmegaConf.save({"model": freeze_fields}, run_config)
+
+
+def test_changed_megatron_freeze_contract_forces_weight_only_resume(tmp_path):
+    weights_path = tmp_path / "weights"
+    optimizer_path = tmp_path / "optimizer"
+    _write_megatron_run_config(
+        weights_path,
+        freeze_vision_model=False,
+        freeze_vision_projection=False,
+    )
+    policy_config = {
+        "megatron_cfg": {
+            "enabled": True,
+            "freeze_vision_model": True,
+            "freeze_vision_projection": True,
+        }
+    }
+
+    with pytest.warns(UserWarning, match="freeze contract changed"):
+        resolved = sc_setup_mod._drop_optimizer_for_changed_megatron_freeze_contract(
+            weights_path, optimizer_path, policy_config
+        )
+
+    assert resolved is None
+
+
+def test_unchanged_megatron_freeze_contract_keeps_optimizer_resume(tmp_path):
+    weights_path = tmp_path / "weights"
+    optimizer_path = tmp_path / "optimizer"
+    _write_megatron_run_config(
+        weights_path,
+        freeze_vision_model=True,
+        freeze_vision_projection=True,
+    )
+    policy_config = {
+        "megatron_cfg": {
+            "enabled": True,
+            "freeze_vision_model": True,
+            "freeze_vision_projection": True,
+        }
+    }
+
+    resolved = sc_setup_mod._drop_optimizer_for_changed_megatron_freeze_contract(
+        weights_path, optimizer_path, policy_config
+    )
+
+    assert resolved == optimizer_path
