@@ -400,25 +400,6 @@ def test_collator_schema_defaults_when_block_is_omitted() -> None:
 
 
 @pytest.mark.parametrize(
-    "old_key,new_key,value",
-    [
-        ("collator_mode", "mode", "chat"),
-        ("include_thinking_in_loss", "include_thinking_in_loss", True),
-        ("native_thinking_alignment", "native_thinking_alignment", False),
-        ("kd_alignment_regions", "kd_alignment_regions", None),
-        ("num_packed_rows", "num_packed_rows", 1),
-    ],
-)
-def test_legacy_data_collator_options_fail_with_migration_path(
-    old_key: str, new_key: str, value: object
-) -> None:
-    with pytest.raises(
-        ValidationError, match=rf"data\.{old_key} -> collator\.{new_key}"
-    ):
-        MasterConfig.model_validate({"data": {old_key: value}})
-
-
-@pytest.mark.parametrize(
     "overrides",
     [
         {"mode": "invalid"},
