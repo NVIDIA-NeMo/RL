@@ -2816,9 +2816,7 @@ class MegatronPolicyWorkerImpl(
             model_state_dict = {}
             for name, item in self.model.state_dict().items():
                 if isinstance(item, torch.Tensor):
-                    item = item.detach().to(
-                        device="cpu", non_blocking=True, copy=True
-                    )
+                    item = item.detach().to(device="cpu", non_blocking=True, copy=True)
                 model_state_dict[name] = item
 
             # Swap reference state into self.model. Use _apply_state_dict_to_model
