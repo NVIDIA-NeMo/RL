@@ -386,7 +386,13 @@ def _unusable_rollout_message_log(
 
 
 def _mark_unusable_rollout(nemo_gym_result: dict, reason: str) -> None:
-    """Flag a NeMo-Gym result whose sample must be masked from loss and baseline."""
+    """Flag a NeMo-Gym result whose sample must carry zero loss weight.
+
+    Rollout batching zeroes the row's loss weight on every path. Only the
+    single-controller advantage stage also drops it from the group baseline
+    (``final_sample_mask``); the batched and grpo_sync baselines still include
+    its reward (see #4160 / #4490).
+    """
     nemo_gym_result[MASK_SAMPLE] = True
     nemo_gym_result[NEMO_GYM_UNUSABLE_ROLLOUT_KEY] = reason
 

@@ -1402,7 +1402,11 @@ class AsyncNemoGymRolloutImpl:
             # no-generation placeholder of env.nemo_gym.mask_unusable_rollouts
             # replaces it with a fixed-length synthetic prompt, which must not
             # stand in for the group (prompt length, prompt ids, media) while a
-            # real sibling exists.
+            # real sibling exists. In such a mixed group record_to_train_batch
+            # cuts the placeholder's prompt_ids_for_adv row at the real prompt's
+            # length, so that row may span the placeholder's EOS generation
+            # token; this is safe because the single-controller baseline keys
+            # on GROUP_ID_TAG, not on prompt ids.
             prompt_message_log = next(
                 (
                     result["input_message_log"]
