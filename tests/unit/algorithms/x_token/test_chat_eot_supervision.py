@@ -26,7 +26,7 @@ from transformers import PreTrainedTokenizerFast
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 from nemo_rl.algorithms.x_token.loss_utils import LocalizedAlignment
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
-from nemo_rl.data.cross_tokenizer_collate import (
+from nemo_rl.data.xtoken.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
