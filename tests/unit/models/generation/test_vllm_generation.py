@@ -777,12 +777,41 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.renderer = kwargs["renderer"]
 
+    ChatCompletionResponse = type("ChatCompletionResponse", (), {})
+
+    class ErrorResponse:
+        """The shape the route reads back: ``.error.code`` and ``model_dump()``."""
+
+        def __init__(self, message: str = "", code: int = 400):
+            self.error = types.SimpleNamespace(message=message, code=code)
+
+        def model_dump(self):
+            return {"error": vars(self.error)}
+
     class OpenAIServingChat:
         instances = []
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            self.return_tokens_as_token_ids = kwargs.get("return_tokens_as_token_ids")
             self.instances.append(self)
+
+        async def chat_completion_full_generator(
+            self, request, result_generator, *args, **kwargs
+        ):
+            """Drain the engine generator the way vLLM 0.29 does.
+
+            vLLM catches the CancelledError of a cancelled handler task and
+            returns ``ErrorResponse("Client disconnected")`` instead of
+            re-raising it (``OpenAIServingChat.chat_completion_full_generator``
+            in ``vllm/entrypoints/openai/chat_completion/serving.py``).
+            """
+            try:
+                async for _ in result_generator:
+                    pass
+            except asyncio.CancelledError:
+                return ErrorResponse("Client disconnected")
+            return ChatCompletionResponse()
 
     class ServingTokenization:
         instances = []
@@ -827,7 +856,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     make_module(
         "vllm.entrypoints.openai.chat_completion.protocol",
         ChatCompletionRequest=type("ChatCompletionRequest", (), {}),
-        ChatCompletionResponse=type("ChatCompletionResponse", (), {}),
+        ChatCompletionResponse=ChatCompletionResponse,
     )
     make_module(
         "vllm.entrypoints.openai.chat_completion.serving",
@@ -835,12 +864,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     )
     make_module(
         "vllm.entrypoints.openai.engine.protocol",
-        ErrorResponse=type("ErrorResponse", (), {}),
+        ErrorResponse=ErrorResponse,
     )
     # vLLM 0.29 location of the engine protocol (vllm-project/vllm#54492).
     make_module(
         "vllm.entrypoints.serve.engine.protocol",
-        ErrorResponse=type("ErrorResponse", (), {}),
+        ErrorResponse=ErrorResponse,
     )
     make_module(
         "vllm.entrypoints.openai.models.protocol",
@@ -947,7 +976,10 @@ def _nemo_gym_recognizes_context_overflow(
 
 
 def _setup_fake_vllm_chat_handler(
-    monkeypatch, *, with_cancellation: Callable[..., Any] | None = None
+    monkeypatch,
+    *,
+    with_cancellation: Callable[..., Any] | None = None,
+    openai_serving_chat: type | None = None,
 ):
     """Build the /v1/chat/completions handler against the fake vLLM modules.
 
@@ -955,17 +987,29 @@ def _setup_fake_vllm_chat_handler(
         monkeypatch: The pytest fixture used to install the fake module tree.
         with_cancellation: Route decorator to use instead of the stub, e.g. the
             real pinned vLLM one. The stub only tags the handler.
+        openai_serving_chat: ``OpenAIServingChat`` base class to use instead of
+            the stub, e.g. the real pinned one with a stub constructor. It must
+            record its instances in a class-level ``instances`` list like the
+            stub does.
 
     Returns:
-        The worker, the fake OpenAIServingChat instance, and the route handler.
+        The worker, the OpenAIServingChat instance, and the route handler.
     """
-    _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
+    _, _, fake_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
     if with_cancellation is not None:
         monkeypatch.setattr(
             sys.modules["vllm.entrypoints.serve.utils.api_utils"],
             "with_cancellation",
             with_cancellation,
         )
+    serving_chat_cls = fake_serving_chat
+    if openai_serving_chat is not None:
+        monkeypatch.setattr(
+            sys.modules["vllm.entrypoints.openai.chat_completion.serving"],
+            "OpenAIServingChat",
+            openai_serving_chat,
+        )
+        serving_chat_cls = openai_serving_chat
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker.cfg = {
@@ -989,7 +1033,7 @@ def _setup_fake_vllm_chat_handler(
     chat_handler = next(
         handler for path, handler in app.routes if path == "/v1/chat/completions"
     )
-    return worker, openai_serving_chat.instances[0], chat_handler
+    return worker, serving_chat_cls.instances[0], chat_handler
 
 
 def _fake_chat_request():
@@ -999,6 +1043,10 @@ def _fake_chat_request():
         temperature=1.0,
         max_tokens=1,
         max_completion_tokens=None,
+        # Read by NeMoRLOpenAIServingChatMixin.chat_completion_full_generator.
+        return_tokens_as_token_ids=None,
+        logprobs=False,
+        top_logprobs=None,
     )
 
 
@@ -1007,6 +1055,48 @@ def _track_request_capture(worker, request):
     worker._capture_calls[id(request)] = types.SimpleNamespace(call="call")
     worker.token_capture = MagicMock()
     return worker.token_capture
+
+
+def _stalled_engine_generator(started: asyncio.Event, cancelled: asyncio.Event):
+    """Engine result generator for a generation that never finishes.
+
+    Sets ``started`` once awaited and ``cancelled`` when the awaiting task is
+    cancelled, then re-raises the way ``AsyncLLM.generate`` does.
+    """
+
+    async def generate():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        yield  # pragma: no cover - unreachable; makes this an async generator
+
+    return generate()
+
+
+def _route_through_full_generator(serving_chat, result_generator) -> None:
+    """Point create_chat_completion straight at chat_completion_full_generator.
+
+    Skips vLLM's request rendering and engine scheduling, so only the engine
+    result generator is stubbed: the request still goes through the RL mixin's
+    ``chat_completion_full_generator`` and the serving base class beneath it,
+    which is where a disconnect cancellation lands mid-generation.
+    """
+
+    async def create_chat_completion(request, _raw_request):
+        return await serving_chat.chat_completion_full_generator(
+            request,
+            result_generator,
+            request_id="chatcmpl-test",
+            model_name="served-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+        )
+
+    serving_chat.create_chat_completion = create_chat_completion
 
 
 @pytest.mark.asyncio
@@ -1106,18 +1196,22 @@ async def test_media_capture_rejected_keeps_its_own_code(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch):
-    """A client disconnect cancels the chat handler and releases its capture state."""
+    """A client disconnect cancels the chat handler and releases its capture state.
+
+    The fake serving layer mirrors vLLM 0.29: it swallows the cancellation and
+    returns ``ErrorResponse("Client disconnected")``. The RL mixin re-raises
+    it, so the route labels the capture ``client_disconnect`` rather than
+    ``error_response`` and the handler task finishes cancelled.
+    """
     worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
     # The route is wrapped with vLLM's with_cancellation (the stub tags it).
     assert getattr(chat_handler, "cancels_on_disconnect", False)
 
     started = asyncio.Event()
-
-    async def create_chat_completion(_request, _raw_request):
-        started.set()
-        await asyncio.Event().wait()  # generation that never finishes
-
-    serving_chat.create_chat_completion = create_chat_completion
+    cancelled = asyncio.Event()
+    _route_through_full_generator(
+        serving_chat, _stalled_engine_generator(started, cancelled)
+    )
     request = _fake_chat_request()
     token_capture = _track_request_capture(worker, request)
     task = asyncio.create_task(chat_handler(request, MagicMock()))
@@ -1127,6 +1221,7 @@ async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
 
+    assert cancelled.is_set()
     token_capture.fail_call.assert_called_once_with("call", reason="client_disconnect")
     assert id(request) not in worker._capture_calls
 
@@ -1136,36 +1231,48 @@ async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch):
 async def test_pinned_with_cancellation_aborts_chat_completion_on_http_disconnect(
     monkeypatch,
 ):
-    """vLLM's real with_cancellation cancels the route body on http.disconnect.
+    """A real http.disconnect cancels the route through the pinned serving layer.
 
-    Contract check against the pinned vLLM decorator with a real Starlette
-    Request: the disconnect listener wins the race, the handler task is
-    cancelled while it awaits generation, and the capture state is released
-    with reason ``client_disconnect``. The serving layer and engine stay
-    stubbed, so this does not show that the engine itself aborts the request.
+    Contract check against the two pinned vLLM pieces that decide the outcome:
+    ``with_cancellation``, fed a real Starlette Request carrying the
+    disconnect, and ``OpenAIServingChat.chat_completion_full_generator``,
+    which swallows the cancellation and returns
+    ``ErrorResponse("Client disconnected")``. The RL mixin re-raises it, so
+    the engine generator is cancelled and the capture state is released with
+    reason ``client_disconnect``. The engine itself stays stubbed, so this does
+    not show that the request is aborted in the engine.
     """
-    # Deferred import: the real vLLM package is only present in the vllm extra.
+    # Deferred imports: the real vLLM package is only present in the vllm
+    # extra, and they must run before the fake module tree is installed.
+    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
     from vllm.entrypoints.serve.utils.api_utils import with_cancellation
 
+    class PinnedServingChat(OpenAIServingChat):
+        """The pinned serving layer with no engine behind it."""
+
+        instances: list = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.return_tokens_as_token_ids = kwargs["return_tokens_as_token_ids"]
+            self.instances.append(self)
+
     worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(
-        monkeypatch, with_cancellation=with_cancellation
+        monkeypatch,
+        with_cancellation=with_cancellation,
+        openai_serving_chat=PinnedServingChat,
     )
     # functools.wraps exposes the route's own signature, which is how FastAPI
     # still injects `raw_request: Request` through the wrapper.
     assert chat_handler.__wrapped__.__name__ == "create_chat_completion"
+    # The RL mixin sits above the pinned serving class, as in the worker.
+    assert OpenAIServingChat in type(serving_chat).__mro__
 
     started = asyncio.Event()
     cancelled = asyncio.Event()
-
-    async def create_chat_completion(_request, _raw_request):
-        started.set()
-        try:
-            await asyncio.Event().wait()  # generation that never finishes
-        except asyncio.CancelledError:
-            cancelled.set()
-            raise
-
-    serving_chat.create_chat_completion = create_chat_completion
+    _route_through_full_generator(
+        serving_chat, _stalled_engine_generator(started, cancelled)
+    )
     request = _fake_chat_request()
     token_capture = _track_request_capture(worker, request)
     released = asyncio.Event()
