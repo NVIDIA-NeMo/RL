@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")
 MODEL=${EXTERNAL_VLLM_TEST_MODEL:-Qwen/Qwen3-0.6B}
-MAX_MODEL_LEN=${EXTERNAL_VLLM_TEST_MAX_MODEL_LEN:-4096}
+MAX_MODEL_LEN=${EXTERNAL_VLLM_TEST_MAX_MODEL_LEN:-8192}
 MAX_NEW_TOKENS=${EXTERNAL_VLLM_TEST_MAX_NEW_TOKENS:-512}
 RUN_DIR=${EXTERNAL_VLLM_TEST_RUN_DIR:-$SCRIPT_DIR/grpo_external_vllm_gym_single_controller}
 SERVER_PORT=${EXTERNAL_VLLM_TEST_PORT:-19210}
@@ -53,11 +53,14 @@ if [[ "${EXTERNAL_VLLM_TEST_REQUIRE_PREFIX:-0}" == 1 ]]; then
         | jq -e '.active == true and .required_prefix_token_ids == true' >/dev/null
 fi
 CUDA_VISIBLE_DEVICES=$TRAIN_GPUS \
+SC_TEST_KEEP_ALL_TOOLS=1 \
 SC_TEST_RUN_DIR="$RUN_DIR/train" \
     bash "$SCRIPT_DIR/grpo_async_gym_single_controller.sh" \
     policy.model_name="$MODEL" \
     policy.max_total_sequence_length="$MAX_MODEL_LEN" \
     policy.generation.max_new_tokens="$MAX_NEW_TOKENS" \
+    grpo.num_generations_per_prompt=4 \
+    policy.train_global_batch_size=16 \
     policy.generation.backend=remote_vllm \
     ++policy.generation.refit_transport=hf_checkpoint \
     ++policy.generation.refit_cfg.hf_checkpoint.checkpoint_dir="$EXPORT_DIR" \
@@ -73,6 +76,7 @@ SC_TEST_RUN_DIR="$RUN_DIR/train" \
     "$@"
 
 uv run "$PROJECT_ROOT/tests/check_metrics.py" "$RUN_DIR/train/metrics.json" \
-    'len(data["train/gen_kl_error"]) >= 10'
+    'len(data["train/gen_kl_error"]) >= 10' \
+    'max(data["train/grad_norm"]) > 0'
 uv run python "$SCRIPT_DIR/check_hf_refit_exports.py" "$EXPORT_DIR" \
     --minimum-versions 10 --output "$RUN_DIR/refit-validation.json"
