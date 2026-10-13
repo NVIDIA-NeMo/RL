@@ -408,7 +408,7 @@ def _chat_aligner(student_tok, teacher_tok) -> TokenAligner:
 
 
 class TestCollatorChatMode:
-    def test_teacher_scoring_masks_assistant_content_and_terminators(self):
+    def test_teacher_scoring_masks_only_final_assistant_content_and_terminator(self):
         student_tok = FakeChatTokenizer(
             {"system": ("[S]", ""), "user": ("[U]", ""), "assistant": ("[A]", "[E]")}
         )
@@ -458,7 +458,7 @@ class TestCollatorChatMode:
         )
 
         # Each model retains the full conversation as context, but scores only
-        # assistant content and EOT at its own token positions. Different templates
+        # final assistant content and EOT at its own positions. Different templates
         # prevent accidentally reusing the student's mask for the teacher.
         assert out["input_ids"].shape != out["teacher_0_input_ids"].shape
         for prefix, tokenizer in (("", student_tok), ("teacher_0_", teacher_tok)):
@@ -468,15 +468,18 @@ class TestCollatorChatMode:
                 ids = out[f"{prefix}input_ids"][i]
                 mask = out[f"{prefix}token_mask"][i]
                 expected_mask = torch.zeros_like(mask)
-                for message in messages:
-                    if message["role"] == "assistant":
-                        start = rendered.index(message["content"])
-                        expected_mask[start : start + len(message["content"]) + 1] = 1
+                final_content = messages[-1]["content"]
+                start = rendered.rindex(final_content)
+                expected_mask[start : start + len(final_content) + 1] = 1
 
                 assert out[f"{prefix}input_lengths"][i].item() == length
                 assert ids[:length].tolist() == [ord(char) for char in rendered]
                 assert torch.equal(mask, expected_mask)
                 assert ids[length:].eq(tokenizer.pad_token_id).all()
+                side = "teacher" if prefix else "student"
+                chunks = out[f"alignment_0_{side}_chunk_id"][i]
+                assert chunks[mask == 0].eq(-1).all()
+                assert chunks[mask == 1].ge(0).all()
 
             # The shorter conversation has padding in both tokenizations.
             assert out[f"{prefix}input_lengths"][1] < out[f"{prefix}input_ids"].shape[1]
