@@ -781,7 +781,7 @@ grpo:
   stop_at_entropy_patience: 5
 ```
 
-The value compared is the step-level `approx_entropy` that is logged. The loss reports it per microbatch already divided by the global token count, so the step value is the sum of the per-microbatch values, not their mean. Supported by `grpo_train`, `async_grpo_train` and the data-plane sync trainer; it requires a loss that reports `approx_entropy` (e.g. `ClippedPGLossFn` with `metrics_level: full`, the default) and otherwise warns once and never stops.
+The value compared is the step-level `approx_entropy` that is logged. The loss reports it per microbatch already divided by the global token count, so the step value is the sum of the per-microbatch values, not their mean. Supported by `grpo_train`, `async_grpo_train` and the data-plane sync trainer. It needs a loss that reports `approx_entropy`: `ClippedPGLossFn` does so only at `loss_fn.metrics_level: full` (the default), so pairing the stop with `metrics_level: minimal` is rejected at startup.
 
 ### GDPO: Group reward-Decoupled Normalization Policy Optimization for Multi-reward RL Optimization
 GDPO is a reinforcement learning optimization method designed for multi-reward training. While existing approaches commonly apply Group Relative Policy Optimization (GRPO) in multi-reward settings, the authors show that this leads to reward advantages collapse, reducing training signal resolution and causing unstable or failed convergence. GDPO resolves this issue by decoupling reward normalization across individual rewards, preserving their relative differences and enabling more faithful preference optimization. 

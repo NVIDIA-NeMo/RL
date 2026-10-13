@@ -59,6 +59,7 @@ from nemo_rl.algorithms.grpo import (
     _shutdown_completed_nemo_gym_startup,
     _startup_pipeline_ready,
     _step_approx_entropy,
+    _validate_entropy_stop,
     _validate_multimodal_dedup_capability,
     _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
@@ -5304,6 +5305,21 @@ def test_mixed_filtered_and_valid_microbatches_measure_the_valid_entropy(
 def test_grpo_config_rejects_invalid_entropy_stop(kwargs, message):
     with pytest.raises(ValueError, match=message):
         GRPOConfig(**kwargs)
+
+
+def test_validate_entropy_stop_requires_full_loss_metrics(mock_grpo_components):
+    """stop_at_entropy_below with metrics_level 'minimal' could never fire; reject it."""
+    config = mock_grpo_components["master_config"]
+    assert config.loss_fn.metrics_level == "full"
+    _validate_entropy_stop(config)  # disabled stop, full metrics
+    config.grpo.stop_at_entropy_below = 0.18
+    _validate_entropy_stop(config)  # enabled stop, full metrics
+    config.loss_fn.metrics_level = "minimal"
+    with pytest.raises(ValueError, match="metrics_level='full'"):
+        _validate_entropy_stop(config)
+    # Without the stop, minimal metrics stay allowed.
+    config.grpo.stop_at_entropy_below = None
+    _validate_entropy_stop(config)
 
 
 # Per-step ``all_mb_metrics`` overrides for the trainer-level entropy tests.

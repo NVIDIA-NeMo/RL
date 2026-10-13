@@ -539,6 +539,24 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
         )
 
 
+def _validate_entropy_stop(master_config: MasterConfig) -> None:
+    """``grpo.stop_at_entropy_below`` needs a loss that reports ``approx_entropy``.
+
+    ``ClippedPGLossFn`` reports it only at ``metrics_level: full``. With
+    ``minimal`` the stop could never fire, so reject the pairing here instead
+    of warning once at step 1 and training on to ``max_num_steps``.
+    """
+    if master_config.grpo.stop_at_entropy_below is None:
+        return
+    metrics_level = master_config.loss_fn.metrics_level
+    if metrics_level != "full":
+        raise ValueError(
+            "grpo.stop_at_entropy_below requires loss_fn.metrics_level='full' "
+            f"({APPROX_ENTROPY_KEY} is not reported at metrics_level="
+            f"{metrics_level!r})"
+        )
+
+
 def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
     """Reject configurations whose media transfer path is not qualified."""
     if not master_config.grpo.deduplicate_multimodal_data:
@@ -702,6 +720,7 @@ def setup(
 
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
+    _validate_entropy_stop(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -3177,16 +3196,17 @@ def _step_approx_entropy(train_results: dict[str, Any]) -> Optional[float]:
     fragments instead under-reads by the number of microbatches (e.g. 0.005
     instead of 0.31 with 64 microbatches) and would trip a floor at once.
 
-    None means the step measured nothing: the loss reports no
-    ``approx_entropy`` (e.g. ``metrics_level: minimal``), or the step trained
-    on no valid tokens. The workers stamp every microbatch's metrics with the
-    step's ``global_valid_toks``; when that is zero everywhere (dynamic
-    sampling off and every rollout filtered out, for instance) the Megatron
-    worker still reports ``approx_entropy == 0`` for finite, healthy logprobs,
-    because ``masked_mean`` divides an empty masked sum by ``0 + 1e-8``. That
-    zero is a diagnostic artefact, not measured entropy, so it must not count
-    as collapse. The AutoModel worker drops such microbatches, which leaves
-    no ``approx_entropy`` at all and is treated the same way.
+    None means the step measured nothing because it trained on no valid
+    tokens. (A loss that never reports ``approx_entropy`` is rejected by
+    ``setup()``, see ``_validate_entropy_stop``.) The workers stamp every
+    microbatch's metrics with the step's ``global_valid_toks``; when that is
+    zero everywhere (dynamic sampling off and every rollout filtered out, for
+    instance) the Megatron worker still reports ``approx_entropy == 0`` for
+    finite, healthy logprobs, because ``masked_mean`` divides an empty masked
+    sum by ``0 + 1e-8``. That zero is a diagnostic artefact, not measured
+    entropy, so it must not count as collapse. The AutoModel worker drops
+    such microbatches, which leaves no ``approx_entropy`` at all and is
+    treated the same way.
     """
     mb_metrics = train_results.get("all_mb_metrics") or {}
     values = mb_metrics.get(APPROX_ENTROPY_KEY)
@@ -3234,10 +3254,10 @@ class EntropyFloorStop:
             self.consecutive = 0
             if not self._warned_unmeasured:
                 warnings.warn(
-                    "grpo.stop_at_entropy_below is set but this step has no "
-                    f"'{APPROX_ENTROPY_KEY}' observation (the loss does not report "
-                    "it, or the step trained on no valid tokens); the step is not "
-                    "counted and the consecutive-low streak is reset."
+                    "grpo.stop_at_entropy_below is set but this step trained on "
+                    f"no valid tokens, so it has no '{APPROX_ENTROPY_KEY}' "
+                    "observation; the step is not counted and the "
+                    "consecutive-low streak is reset."
                 )
                 self._warned_unmeasured = True
             return None
