@@ -1,0 +1,70 @@
+[
+  {
+    "id": "add-native-env-positive-001",
+    "question": "I want to add a new RL environment for a tic-tac-toe game. How do I build it?",
+    "expected_skill": "add-native-environment",
+    "ground_truth": "The agent loads the add-native-environment skill and walks through the stages: task discovery (multi-step game), model selection, dataset creation (procedural), environment class implementing EnvironmentInterface, config, training script, and validation.",
+    "expected_behavior": [
+      "The agent read skills/add-native-environment/SKILL.md before acting",
+      "The agent identified this as a multi-step environment (assistant->verifier loop)",
+      "The agent recommended following the sliding puzzle pattern for multi-turn games",
+      "The agent mentioned registering in ENV_REGISTRY"
+    ]
+  },
+  {
+    "id": "add-native-env-positive-002",
+    "question": "How do I create a function-calling environment that uses a HuggingFace dataset?",
+    "expected_skill": "add-native-environment",
+    "ground_truth": "The agent loads the skill and guides through using an existing HF dataset with a new environment, emphasizing native tool format via apply_chat_template(tools=...).",
+    "expected_behavior": [
+      "The agent read skills/add-native-environment/SKILL.md before acting",
+      "The agent recommended using tokenizer.apply_chat_template(tools=...) for native tool format",
+      "The agent mentioned creating a RawDataset subclass and registering in DATASET_REGISTRY",
+      "The agent mentioned creating a data processor and registering in PROCESSOR_REGISTRY"
+    ]
+  },
+  {
+    "id": "add-native-env-positive-003",
+    "question": "I want to do RLHF training with a reward model on an instruction-following dataset. How do I set that up?",
+    "expected_skill": "add-native-environment",
+    "ground_truth": "The agent loads the skill and directs to Stage 8b about using the existing reward_model environment with DTensor, noting the Megatron limitation.",
+    "expected_behavior": [
+      "The agent read skills/add-native-environment/SKILL.md before acting",
+      "The agent mentioned the existing reward_model environment (no new env needed)",
+      "The agent noted DTensor is required and Megatron is not supported",
+      "The agent mentioned Skywork reward models as examples"
+    ]
+  },
+  {
+    "id": "add-native-env-positive-004",
+    "question": "My GRPO training reward is flat at 0%. What should I do?",
+    "expected_skill": "add-native-environment",
+    "ground_truth": "The agent loads the skill and provides task difficulty calibration guidance: the task is too hard for the model, try easier variants, check for non-zero reward in first 5 steps.",
+    "expected_behavior": [
+      "The agent read skills/add-native-environment/SKILL.md before acting",
+      "The agent suggested the task may be too hard for the model size",
+      "The agent recommended simplifying the task or adding partial rewards",
+      "The agent mentioned checking for non-zero reward in the first 5 steps"
+    ]
+  },
+  {
+    "id": "add-native-env-negative-001",
+    "question": "How do I launch a NeMo-RL recipe on Kubernetes?",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "The agent should not activate the add-native-environment skill for Kubernetes deployment questions.",
+    "expected_behavior": [
+      "The agent did not read or activate skills/add-native-environment/SKILL.md"
+    ]
+  },
+  {
+    "id": "add-native-env-negative-002",
+    "question": "Fix the ruff linting error in nemo_rl/algorithms/grpo.py",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "The agent should not activate the add-native-environment skill for linting fixes.",
+    "expected_behavior": [
+      "The agent did not read or activate skills/add-native-environment/SKILL.md"
+    ]
+  }
+]
