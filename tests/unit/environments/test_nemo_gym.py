@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import inspect
 import json
 import time
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -39,9 +41,12 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.environments.nemo_gym import (
+    ExternalServiceReadinessConfig,
     NemoGym,
     NemoGymConfig,
+    _wait_for_external_services,
     build_reward_component_columns,
+    extract_external_service_readiness,
     extract_reward_components,
     setup_nemo_gym_config,
     validate_reward_components_match_scalar,
@@ -66,6 +71,7 @@ from nemo_rl.experience.rollouts import (
     attach_static_multimodal_payload,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.telemetry.instrumentation import TRACE_CARRIER_KWARG
 
 # cluster and tokenizer are fixture imports
 from tests.unit.models.generation.test_vllm_generation import (
@@ -107,6 +113,10 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
             head_server_config = object()
             _token_capture_enabled = False
             _tokenizer = object()
+            # run_rollouts is a thin span-opening wrapper that delegates the
+            # streaming to _stream_rollouts, so the mock has to supply the real
+            # one for the generator below to produce anything.
+            _stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
 
             def _require_spinup(self):
                 pass
@@ -149,6 +159,115 @@ def test_multimodal_content_types_cover_responses_media_aliases():
         "audio",
         "audio_url",
     } <= MULTIMODAL_CONTENT_TYPES
+
+
+def _external_health_response(
+    *, status: str, healthy_backends: int, total_backends: int
+) -> MagicMock:
+    response = MagicMock()
+    response.status = 200
+    response.read.return_value = json.dumps(
+        {
+            "status": status,
+            "healthy_backends": healthy_backends,
+            "total_backends": total_backends,
+        }
+    ).encode()
+    response.__enter__.return_value = response
+    return response
+
+
+def test_external_service_readiness_waits_for_every_expected_backend():
+    config = ExternalServiceReadinessConfig(
+        services=[
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            }
+        ],
+        timeout_seconds=10,
+        poll_interval_seconds=1,
+        request_timeout_seconds=2,
+    )
+
+    with (
+        patch(
+            "nemo_rl.environments.nemo_gym.urllib.request.urlopen",
+            side_effect=[
+                _external_health_response(
+                    status="ok", healthy_backends=1, total_backends=2
+                ),
+                _external_health_response(
+                    status="ok", healthy_backends=2, total_backends=2
+                ),
+            ],
+        ) as urlopen,
+        patch("nemo_rl.environments.nemo_gym.sleep") as sleep,
+    ):
+        _wait_for_external_services(config)
+
+    assert urlopen.call_count == 2
+    sleep.assert_called_once_with(1)
+
+
+def test_external_service_readiness_times_out_with_last_observation():
+    config = ExternalServiceReadinessConfig(
+        services=[
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            }
+        ],
+        timeout_seconds=1,
+        poll_interval_seconds=1,
+        request_timeout_seconds=1,
+    )
+
+    now = 0.0
+
+    def advance(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    # Probes return instantly and only sleep advances the clock, so the last
+    # sleep ends exactly at the deadline, as it does in a real run.
+    with (
+        patch(
+            "nemo_rl.environments.nemo_gym.urllib.request.urlopen",
+            side_effect=[OSError("connection refused")],
+        ),
+        patch("nemo_rl.environments.nemo_gym.monotonic", side_effect=lambda: now),
+        patch("nemo_rl.environments.nemo_gym.sleep", side_effect=advance),
+    ):
+        with pytest.raises(TimeoutError, match="GENRM: request failed"):
+            _wait_for_external_services(config)
+
+
+def test_external_service_readiness_is_not_forwarded_to_gym():
+    nemo_gym_dict = {
+        "external_service_readiness": {
+            "services": [
+                {
+                    "name": "GENRM",
+                    "url": "http://10.0.0.1:9213/health",
+                    "expected_backends": 2,
+                }
+            ],
+            "timeout_seconds": 10,
+            "poll_interval_seconds": 1,
+            "request_timeout_seconds": 2,
+        },
+        "skip_venv_if_present": True,
+    }
+
+    readiness = extract_external_service_readiness(nemo_gym_dict)
+
+    assert readiness is not None
+    assert readiness.services[0].name == "GENRM"
+    assert "external_service_readiness" not in nemo_gym_dict
+    assert nemo_gym_dict == {"skip_venv_if_present": True}
 
 
 def test_extract_static_video_message_resolves_local_file(tmp_path):
@@ -674,7 +793,7 @@ def test_video_datum_uses_cached_frames_without_decoding_video(monkeypatch, tmp_
     frame_paths = []
     for index in range(4):
         frame_path = tmp_path / f"frame_{index:04d}.png"
-        Image.new("RGB", (8, 8), color=(index, 0, 0)).save(frame_path)
+        Image.new("RGB", (16, 16), color=(index, 0, 0)).save(frame_path)
         frame_paths.append(frame_path)
     example = {
         "responses_create_params": {
@@ -841,7 +960,12 @@ def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path)
                 "attention_mask": torch.ones(1, token_count, dtype=torch.long),
             }
 
+        def convert_tokens_to_ids(self, token):
+            assert token == "<image>"
+            return 0
+
     class NemotronNanoVLV2Processor:
+        image_token = "<image>"
         model_input_names = [
             "input_ids",
             "attention_mask",
@@ -885,13 +1009,43 @@ def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path)
     )
 
     user_message = datum["message_log"][0]
-    assert user_message["pixel_values"].as_tensor().shape == (4, 3, 96, 160)
+    pixel_values = user_message["pixel_values"]
+    assert pixel_values.as_tensor(mode="pad_to_max_shape").shape == (4, 3, 96, 160)
+    assert pixel_values.as_tensor(mode="patchify").shape == (1, 240, 768)
     assert user_message["imgs_sizes"].as_tensor().tolist() == [[96, 160]] * 4
     assert user_message["num_frames"].as_tensor().tolist() == [4]
+    assert (
+        user_message["media_token_validity_mask"].shape
+        == user_message["token_ids"].shape
+    )
+    assert user_message["media_token_validity_mask"].sum().item() == 1
     extra_body = json.loads(
         datum["extra_env_info"]["responses_create_params"]["metadata"]["extra_body"]
     )
     assert "mm_processor_kwargs" not in extra_body
+
+    filtered = nemo_gym_example_to_video_datum_spec(
+        example,
+        processor=NemotronNanoVLV2Processor(),
+        max_seq_length=4,
+        idx=3,
+        task_name="nemo_gym",
+        data_config=SimpleNamespace(
+            num_frames=4,
+            video_sampling_style="nemotron_vl",
+            video_temporal_patch_size=2,
+            video_target_num_patches=64,
+            video_maintain_aspect_ratio=True,
+            min_generation_tokens=16,
+        ),
+    )
+    filtered_message = filtered["message_log"][0]
+    assert filtered["loss_multiplier"] == 0.0
+    assert (
+        filtered_message["media_token_validity_mask"].shape
+        == filtered_message["token_ids"].shape
+    )
+    assert not filtered_message["media_token_validity_mask"].any()
 
 
 def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
@@ -961,8 +1115,8 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
         "nemo_rl.environments.nemo_gym_multimodal.process_nemotron_video_frames",
         lambda *args, **kwargs: {
             "input_ids": torch.tensor([[7, 18, 18, 9]]),
-            "pixel_values": torch.ones(4, 3, 8, 8),
-            "imgs_sizes": torch.tensor([[8, 8]] * 4),
+            "pixel_values": torch.ones(4, 3, 16, 16),
+            "imgs_sizes": torch.tensor([[16, 16]] * 4),
         },
     )
 
@@ -1237,6 +1391,36 @@ def test_run_rollouts_requires_an_installed_tokenizer():
     gym.rh = object()  # satisfies _require_spinup
 
     stream = gym.run_rollouts([{"_rowidx": 0}], "")
+    with pytest.raises(RuntimeError, match="set_tokenizer must be called"):
+        asyncio.run(stream.__anext__())
+
+
+def test_run_rollouts_takes_a_trace_carrier_without_disturbing_the_body():
+    """The span wrapper must be invisible to everything except the trace.
+
+    Ray records an actor method's signature from the *unwrapped* function and
+    validates ``.remote()`` arguments against it on the caller, so the reserved
+    kwarg has to be declared there or every dispatch raises ``TypeError``
+    before the task is submitted. Checked here as well as in
+    ``tests/unit/telemetry`` because this is the signature Ray actually reads.
+    """
+    gym_cls = NemoGym.__ray_metadata__.modified_class
+    gym = gym_cls({})
+    gym.rh = object()
+
+    # Still a generator, or Ray would schedule it on the wrong path.
+    assert inspect.isasyncgenfunction(gym_cls.run_rollouts)
+    ray_visible = inspect.signature(inspect.unwrap(gym_cls.run_rollouts))
+    assert TRACE_CARRIER_KWARG in ray_visible.parameters
+    ray_visible.bind(gym, [{"_rowidx": 0}], "", **{TRACE_CARRIER_KWARG: {}})
+    # And still callable the way an uninstrumented run calls it.
+    ray_visible.bind(gym, [{"_rowidx": 0}], "")
+
+    # Constructing the generator runs nothing, so the body's own errors still
+    # surface on first advance rather than at the call.
+    stream = gym.run_rollouts(
+        [{"_rowidx": 0}], "", **{TRACE_CARRIER_KWARG: {"traceparent": "00-a-b-01"}}
+    )
     with pytest.raises(RuntimeError, match="set_tokenizer must be called"):
         asyncio.run(stream.__anext__())
 
@@ -1628,6 +1812,10 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             rch = _RolloutCollectionHelper()
             head_server_config = object()
             _token_capture_enabled = False
+            # run_rollouts is a thin span-opening wrapper that delegates the
+            # streaming to _stream_rollouts, so the mock has to supply the real
+            # one for the generator below to produce anything.
+            _stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
 
             def _require_spinup(self):
                 pass
@@ -1750,6 +1938,10 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.
             _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
+            # run_rollouts is a thin span-opening wrapper that delegates the
+            # streaming to _stream_rollouts, so the mock has to supply the real
+            # one for the generator below to produce anything.
+            _stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
 
             def _require_spinup(self):
                 pass

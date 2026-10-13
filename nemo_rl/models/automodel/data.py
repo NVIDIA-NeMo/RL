@@ -32,6 +32,10 @@ from nemo_rl.models.huggingface.common import (
     pack_sequences,
 )
 
+# Passed only to forwards that name them explicitly; ``**kwargs`` forwards would
+# leak them into submodules that do not expect them.
+_EXPLICIT_ONLY_FORWARD_KWARGS = frozenset({"media_token_validity_mask"})
+
 
 @cache
 def _accepted_forward_kwargs(
@@ -50,6 +54,16 @@ def _accepted_forward_kwargs(
     )
 
 
+def drop_explicit_only_kwargs_not_in_forward(
+    model: nn.Module, kwargs: dict[str, Any]
+) -> None:
+    """Remove ``_EXPLICIT_ONLY_FORWARD_KWARGS`` that ``model.forward`` does not name."""
+    accepted_kwargs = _accepted_forward_kwargs(type(model))
+    for key in _EXPLICIT_ONLY_FORWARD_KWARGS:
+        if accepted_kwargs is None or key not in accepted_kwargs:
+            kwargs.pop(key, None)
+
+
 def _all_image_sizes_equal(imgs_sizes: torch.Tensor) -> bool:
     """Return True if every image in the batch has the same (height, width)."""
     if imgs_sizes.ndim != 2 or imgs_sizes.shape[0] <= 1:
@@ -64,12 +78,12 @@ def filter_multimodal_kwargs_for_model(
     accepted_kwargs = _accepted_forward_kwargs(type(model))
     if accepted_kwargs is None:
         return multimodal_kwargs
-    # A forward that cannot consume imgs_sizes also cannot crop the per-image
-    # pad_to_max_shape padding, so mixed-resolution batches would feed padded
-    # pixels to the vision encoder and mismatch the placeholder count. This is
+    # AutoModel materializes pixels with pad_to_max_shape. A forward that cannot
+    # consume imgs_sizes cannot crop that padding, so mixed-resolution batches
+    # would mismatch the placeholder count. This is
     # the AutoModel Nemotron Omni path (nvidia/Nemotron-3-Nano-Omni-30B-A3B-
     # Reasoning-BF16), whose HF forward takes pixel_values but not imgs_sizes,
-    # unlike the mcore NemotronOmniModel which crops via imgs_sizes.
+    # unlike mcore, which consumes native-resolution pre-patchified pixels.
     imgs_sizes = multimodal_kwargs.get("imgs_sizes")
     if (
         imgs_sizes is not None
@@ -298,14 +312,16 @@ def process_microbatch(
         flash_attn_kwargs = {}
 
     # Add vlm kwargs to model call
-    vlm_kwargs = mb.get_multimodal_dict(as_tensors=True, device=input_ids.device)
+    vlm_kwargs = mb.get_multimodal_dict(
+        True, input_ids.device, None, "pad_to_max_shape"
+    )
     if len(vlm_kwargs) > 0:
         # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
         position_ids = None
         assert not enable_seq_packing, (
             "multimodal kwargs are not supported for sequence packing"
         )
-        assert not cfg["dtensor_cfg"]["sequence_parallel"], (
+        assert not cfg["automodel_cfg"]["sequence_parallel"], (
             "Sequence parallel is not supported with multimodal since there's an issue when you do not pass position_ids. See https://github.com/NVIDIA-NeMo/Automodel/issues/652"
         )
 

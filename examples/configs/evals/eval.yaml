@@ -22,6 +22,7 @@ generation:
   vllm_cfg:
     async_engine: false
     precision: "bfloat16"
+    fp32_lm_head: false # Compute Nemotron-H logits with an fp32 LM head.
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
     expert_parallel_size: 1

@@ -57,6 +57,46 @@ def test_build_image_config_handles_dict_patch_and_downsample_ratio():
     assert config.pixel_std == [0.4, 0.5, 0.6]
 
 
+def test_build_image_config_carries_hf_dynamic_resolution_contract():
+    processor = _image_processor(
+        downsample_ratio=0.5,
+    )
+
+    config = build_image_preprocessing_config(
+        processor,
+        dynamic_resolution=True,
+        dynamic_resolution_model_length=16384,
+        dynamic_resolution_rounding_mode="round_plus_half",
+        dynamic_resolution_resize_mode="torch_bicubic_antialias",
+    )
+
+    assert config.dynamic_resolution_model_length == 16384
+    assert config.dynamic_resolution_rounding_mode == "round_plus_half"
+    assert config.dynamic_resolution_resize_mode == "torch_bicubic_antialias"
+
+
+def test_build_image_config_only_infers_standard_model_length():
+    processor = _image_processor(
+        max_model_len=16384,
+        _compute_target_patches=lambda *_args: None,
+    )
+
+    config = build_image_preprocessing_config(processor)
+
+    assert config.dynamic_resolution_model_length == 16384
+    assert config.dynamic_resolution_rounding_mode == "ceil"
+    assert config.dynamic_resolution_resize_mode == "pil"
+
+
+def test_build_image_config_model_length_override_precedes_processor():
+    config = build_image_preprocessing_config(
+        _image_processor(max_model_len=16384),
+        dynamic_resolution_model_length=8192,
+    )
+
+    assert config.dynamic_resolution_model_length == 8192
+
+
 @pytest.mark.parametrize(
     ("merge_fields", "expected_merge_size"),
     [
@@ -174,3 +214,21 @@ def test_build_video_config_overrides_patch_budget_without_mutating_image_config
     assert video_config.temporal_patch_size == 2
     assert video_config.frame_manifest_magic == b"manifest"
     assert video_config.video_maintain_aspect_ratio is False
+
+
+def test_pinned_megatron_core_has_the_token_capture_hooks() -> None:
+    """Megatron token capture needs the engine hooks from NVIDIA/Megatron-LM#7015.
+
+    ``MegatronGenerationMixin.setup_token_capture`` installs a
+    ``RequestPromptPreparer`` and a ``RequestPayloadStager`` on the live
+    ``DynamicInferenceEngine``. This file is mcore-marked with no importorskip,
+    so a Megatron-Bridge / Megatron-LM bump that drops the hooks fails here
+    rather than skipping.
+    """
+    from megatron.core.inference import inference_request
+    from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+
+    assert hasattr(inference_request, "RequestPayloadStager")
+    assert hasattr(inference_request, "RequestPromptPreparer")
+    assert hasattr(DynamicInferenceEngine, "payload_stager")
+    assert hasattr(DynamicInferenceEngine, "prompt_preparer")

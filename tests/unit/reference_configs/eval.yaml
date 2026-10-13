@@ -22,6 +22,7 @@ generation:
   vllm_cfg:
     async_engine: false
     precision: "bfloat16"
+    fp32_lm_head: false
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
     expert_parallel_size: 1
@@ -60,3 +61,6 @@ env:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  master_port_range_low: null
+  master_port_range_high: null
+  segment_size: null

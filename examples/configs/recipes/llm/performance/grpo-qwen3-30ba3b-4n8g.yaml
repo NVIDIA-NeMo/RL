@@ -16,7 +16,7 @@ policy:
   max_total_sequence_length: 4096
   sequence_packing:
     fuse_loss: true
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   optimizer: null
   scheduler: null

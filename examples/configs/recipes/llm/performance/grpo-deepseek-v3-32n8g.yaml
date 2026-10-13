@@ -18,7 +18,7 @@ policy:
   make_sequence_length_divisible_by: 1
   sequence_packing:
     fuse_loss: true
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     # HybridEP settings

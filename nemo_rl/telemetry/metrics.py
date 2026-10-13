@@ -12,28 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Best-effort mirroring of NeMo-RL's async efficiency metrics into OTel.
+"""Best-effort mirroring of NeMo-RL's per-step metrics into OTel.
 
 Kept out of ``nemo_rl.utils.logger`` (which pulls in torch/ray/wandb/etc.) so
 the mapping stays importable and testable without the heavy training stack.
 ``nemo_rl.utils.logger.Logger.log_metrics`` calls :func:`tee_rl_metrics_to_otel`
 after its normal fan-out to the file/wandb/mlflow backends.
 
-The async ``efficiency/*`` phase durations are emitted from instruments owned
-here, because they are keyed by NeMo-RL's own efficiency-category labels and
-lens has no fixed field for them.
+Every series is declared by NeMo-RL rather than by lens, via lens's
+consumer-driven metric registry: NeMo-RL owns the ``rl.*`` metric names, so a
+new series needs no lens release and no negotiation over field names. Four
+families are teed — the async ``efficiency/*`` phase durations, the training
+scalars, the ``vllm/*`` engine deltas, and the ``timing/setup`` startup phases.
+The first three ride the per-step ``train`` dicts; the last arrives once, at
+step 0.
+
+This module names no logger key of its own beyond the ``efficiency/*`` family
+it also produces. The scalar rows come from the modules that log them, through
+:mod:`nemo_rl.telemetry.vocabulary`, so adding an algorithm does not mean
+editing telemetry.
 
 ``Logger.log_metrics`` fans a step out as several dicts under different
 prefixes, and a key is only reachable from the prefix its own dict carries — so
-only the prefixes the efficiency dict actually arrives under are teed.
+only the prefixes those dicts actually arrive under are teed.
 """
 
 from __future__ import annotations
 
 import logging
-import weakref
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
+from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX, SetupTimingMetrics
 from nemo_rl.telemetry.instrumentation import (
     COLLECTOR_LOOP_CATEGORIES,
     RL_BUCKET_ATTR,
@@ -41,25 +50,27 @@ from nemo_rl.telemetry.instrumentation import (
     bucket_for_efficiency_category,
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
+from nemo_rl.telemetry.vocabulary import (
+    RUN_WINDOW_WALL_CLOCK_CATEGORIES,
+    as_scalar,
+    freeze_metrics,
+    recorded_metrics,
+    registry_key,
+    teed_metrics,
+)
 
 if TYPE_CHECKING:
+    from nemo.lens.instruments import MetricSpec
     from opentelemetry.metrics import Meter
 
 logger = logging.getLogger(__name__)
 
-# Logger prefixes this module tees. The efficiency dict is logged under the
-# driver's train prefixes, and a key is only reachable from the prefix its own
-# dict is logged under, so looking anywhere else would be dead work per step.
+# Prefixes carrying the per-step families. The efficiency, training-scalar and
+# vLLM dicts all arrive under the driver's train prefixes, and a key is only
+# reachable from the prefix its own dict is logged under, so looking anywhere
+# else would be dead work per step. ``SETUP_TIMING_PREFIX`` is the one
+# non-per-step prefix teed.
 _TRAIN_PREFIXES: tuple[Optional[str], ...] = ("train", "")
-
-
-def _scalar(value: Any) -> Optional[float]:
-    """Coerce a logged value to float, or None when it is not a usable scalar."""
-    # bool is a subclass of int, so it has to be excluded explicitly.
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value)
-
 
 # One dimensioned gauge rather than an instrument per category, so adding a
 # category needs no instrument change.
@@ -96,11 +107,18 @@ THREAD_SECONDS_MEASUREMENT = "thread_seconds"
 RL_EFFICIENCY_WINDOW_ATTR = "rl.efficiency.window"
 STEP_WINDOW = "step"
 RUN_WINDOW = "run"
-# Restated rather than imported: nemo_rl.algorithms.utils owns this split (it
-# excludes these from its per-step efficiency ratio) but pulls in torch, and
-# this module is deliberately importable without the training stack. A test
-# keeps the two copies in lockstep.
-_RUN_WINDOW_WALL_CLOCK_CATEGORIES: frozenset[str] = frozenset({"init/total"})
+
+# Startup phase durations, logged once at step 0 by every algorithm's setup
+# (``SetupTimingMetrics.to_metrics_dict`` in grpo.py / single_controller.py, a
+# plain dict of the same shape in ppo.py).
+#
+# Dimensioned like the efficiency series, and for a stronger reason: alongside
+# its declared fields ``SetupTimingMetrics`` carries a free-form ``extras`` dict
+# (the sparse-refit transports add ``vllm_<transport>_sparse_init_time_s`` at
+# runtime), so the phase set is not knowable at declaration time. A row per
+# phase would silently drop whatever it had not been taught about.
+RL_SETUP_DURATION_METRIC = "rl.setup.duration"
+RL_SETUP_PHASE_ATTR = "rl.setup.phase"
 
 # Keys that ``print_efficiency_summary`` puts in the Logger dict.
 _EFFICIENCY_KEY_PREFIX = "efficiency/"
@@ -108,7 +126,36 @@ _EFFICIENCY_SECONDS_SUFFIX = "_s"
 _EFFICIENCY_PCT_KEY = "efficiency/efficiency_pct"
 _EFFICIENCY_PCT_PER_STEP_KEY = "efficiency/efficiency_pct_is_per_step"
 
-_EFFICIENCY_INSTRUMENTS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+# --- lens metric registry -------------------------------------------------
+#
+# lens stopped shipping an ``rl`` instrument module: a consuming framework now
+# declares the metric families whose *names* it owns and records against them
+# (lens PR #46). Every name below is therefore NeMo-RL's to choose, which is
+# what removed the blocker that previously kept the training scalars off OTel
+# entirely -- they had to be mapped onto lens's fixed keyword fields, and that
+# mapping was never settled.
+RL_METRIC_GROUP = "rl"
+
+# Registry keys for the dimensioned series this module produces itself. Unlike
+# the teed rows these carry no logger key: one series covers every category,
+# with the category in an attribute.
+_EFFICIENCY_SECONDS_KEY = registry_key(RL_EFFICIENCY_SECONDS_METRIC)
+_EFFICIENCY_PCT_KEY_REGISTRY = registry_key(RL_EFFICIENCY_PCT_METRIC)
+_SETUP_DURATION_KEY = registry_key(RL_SETUP_DURATION_METRIC)
+
+# Registration is process-global in lens, so it has to happen once per process
+# and in every process that records -- driver and workers alike. Doing it lazily
+# on the first tee rather than at import keeps this module importable when the
+# installed lens predates the registry, which matters because
+# nemo_rl.utils.logger imports the tee at module scope: an import-time failure
+# here would take down training, not just telemetry.
+_REGISTERED = False
+
+#: Set when registration failed for a reason retrying cannot change, so the
+#: per-step tee stops re-attempting it. Separate from _REGISTERED because the
+#: two answer different questions: whether the group is usable, and whether
+#: asking again is worth the work.
+_REGISTRATION_FAILED = False
 
 _WARNED: set[str] = set()
 
@@ -129,6 +176,128 @@ def warn_once(key: str, message: str) -> None:
         return
     _WARNED.add(key)
     logger.warning(message, exc_info=True)
+
+
+def _metric_specs() -> list[MetricSpec]:
+    """Build the full ``MetricSpec`` list for the ``rl`` group."""
+    from nemo.lens.instruments import MetricSpec
+
+    specs = [
+        MetricSpec(
+            _EFFICIENCY_SECONDS_KEY,
+            RL_EFFICIENCY_SECONDS_METRIC,
+            "gauge",
+            unit="s",
+            description="Time attributed to one async efficiency category.",
+        ),
+        MetricSpec(
+            _EFFICIENCY_PCT_KEY_REGISTRY,
+            RL_EFFICIENCY_PCT_METRIC,
+            "gauge",
+            unit="%",
+            description=(
+                "Productive share of driver-side wall clock, over the window "
+                "named by the rl.efficiency.window attribute."
+            ),
+        ),
+    ]
+    specs.append(
+        MetricSpec(
+            _SETUP_DURATION_KEY,
+            RL_SETUP_DURATION_METRIC,
+            "gauge",
+            unit="s",
+            description=(
+                "Wall clock spent in one startup phase, named by the "
+                "rl.setup.phase attribute."
+            ),
+        )
+    )
+    specs.extend(
+        MetricSpec(
+            row.key,
+            row.name,
+            row.kind,
+            unit=row.unit,
+            description=row.description,
+        )
+        for row in (*teed_metrics(), *recorded_metrics())
+    )
+    return specs
+
+
+def ensure_metric_group_registered() -> bool:
+    """Declare the ``rl`` metric group with lens, once per process.
+
+    Returns:
+        Whether the group is available to record against. ``False`` means the
+        installed lens has no metric registry, which makes every tee below a
+        no-op rather than an error.
+    """
+    global _REGISTERED, _REGISTRATION_FAILED
+    if _REGISTERED:
+        return True
+    # Both failures below are permanent for the process, so the attempt is not
+    # repeated: the tee runs once per log_metrics, and retrying would rebuild
+    # every MetricSpec each step for a group that will never register.
+    if _REGISTRATION_FAILED:
+        return False
+    try:
+        from nemo.lens.instruments import register_metric_group
+
+        register_metric_group(RL_METRIC_GROUP, _metric_specs())
+    except (ImportError, AttributeError):
+        _REGISTRATION_FAILED = True
+        warn_once(
+            "registry",
+            "could not declare the 'rl' metric group; RL metrics will not be "
+            "exported (a lens build with the metric registry is required)",
+        )
+        return False
+    except ValueError as exc:
+        # Separated because this is our declaration, not the dependency: lens
+        # raises ValueError for a duplicate key, an empty spec list or a second
+        # registration of the group. Reporting those as "install a newer lens"
+        # sends the reader to the wrong file entirely.
+        _REGISTRATION_FAILED = True
+        warn_once(
+            "registry",
+            f"the '{RL_METRIC_GROUP}' metric group is declared invalidly, so RL "
+            f"metrics will not be exported; fix _metric_specs(): {exc}",
+        )
+        return False
+    # lens took the specs, so a row declared from here on has no instrument.
+    freeze_metrics()
+    _REGISTERED = True
+    return True
+
+
+def _record(
+    meter: Meter,
+    values: Mapping[str, float],
+    attributes: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Record against the ``rl`` group. ``record_metrics`` never raises."""
+    from nemo.lens.instruments import record_metrics
+
+    record_metrics(meter, RL_METRIC_GROUP, values, attributes=attributes)
+
+
+def record_rl_metrics(
+    values: Mapping[str, float],
+    attributes: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Record declared series by registry key. No-op unless exporting.
+
+    For values that never pass through ``Logger.log_metrics`` and so have no
+    teed row. Declare them with ``register_recorded_metrics`` first.
+    """
+    handle = get_telemetry_handle()
+    if handle is None or not handle.is_exporting:
+        return
+    if not ensure_metric_group_registered():
+        return
+    _record(handle.meter, values, attributes)
 
 
 def efficiency_measurements() -> dict[str, str]:
@@ -172,7 +341,7 @@ def efficiency_window(category: str, measurement: str) -> str:
     """Return the period one efficiency value covers (see the constants above)."""
     if measurement == WALL_CLOCK_MEASUREMENT:
         return (
-            RUN_WINDOW if category in _RUN_WINDOW_WALL_CLOCK_CATEGORIES else STEP_WINDOW
+            RUN_WINDOW if category in RUN_WINDOW_WALL_CLOCK_CATEGORIES else STEP_WINDOW
         )
     return RUN_WINDOW
 
@@ -193,45 +362,57 @@ def map_efficiency_seconds(
     seconds: dict[str, float] = {}
     for category in measurement_by_category:
         key = f"{_EFFICIENCY_KEY_PREFIX}{category}{_EFFICIENCY_SECONDS_SUFFIX}"
-        value = _scalar(metrics.get(key))
+        value = as_scalar(metrics.get(key))
         if value is None:
             continue
         seconds[category] = value
     return seconds
 
 
-def _get_efficiency_instruments(meter: Meter) -> dict[str, Any]:
-    """Create (once per Meter) the efficiency gauges."""
-    instruments = _EFFICIENCY_INSTRUMENTS.get(meter)
-    if instruments is None:
-        instruments = {
-            "seconds": meter.create_gauge(
-                name=RL_EFFICIENCY_SECONDS_METRIC,
-                unit="s",
-                description="Time attributed to one async efficiency category.",
-            ),
-            "pct": meter.create_gauge(
-                name=RL_EFFICIENCY_PCT_METRIC,
-                unit="%",
-                description=(
-                    "Productive share of driver-side wall clock, over the "
-                    "window named by the rl.efficiency.window attribute."
-                ),
-            ),
-        }
-        _EFFICIENCY_INSTRUMENTS[meter] = instruments
-    return instruments
+#: Which serialized key names a phase, and what a phase is called. Owned by
+#: ``SetupTimingMetrics``, whose field names the rule describes.
+setup_phase = SetupTimingMetrics.phase_name
+map_setup_seconds = SetupTimingMetrics.phase_seconds
+
+
+def _tee_setup_metrics(meter: Meter, metrics: dict[str, Any]) -> None:
+    """Emit the startup phase durations as ``rl.setup.duration``."""
+    for phase, value in map_setup_seconds(metrics).items():
+        # No rl.bucket, unlike the efficiency series: these phases nest and
+        # overlap by construction, so summing them by bucket would count
+        # startup several times over. Read one phase at a time.
+        _record(meter, {_SETUP_DURATION_KEY: value}, {RL_SETUP_PHASE_ATTR: phase})
+
+
+def map_teed_scalars(metrics: dict[str, Any]) -> dict[str, float]:
+    """Extract ``{registry key: value}`` for every declared scalar present.
+
+    Pure function (no OTel side effects) so it is trivially unit-testable.
+    """
+    values: dict[str, float] = {}
+    for teed in teed_metrics():
+        value = as_scalar(metrics.get(teed.logger_key))
+        if value is None:
+            continue
+        values[teed.key] = value
+    return values
+
+
+def _tee_scalars(meter: Meter, metrics: dict[str, Any]) -> None:
+    """Emit the declared training and vLLM scalars, unlabelled."""
+    values = map_teed_scalars(metrics)
+    if values:
+        _record(meter, values)
 
 
 def _tee_efficiency_metrics(meter: Meter, metrics: dict[str, Any]) -> None:
     """Emit the ``efficiency/*`` phase durations as ``rl.efficiency.*``."""
     measurement_by_category = efficiency_measurements()
     seconds = map_efficiency_seconds(metrics, measurement_by_category)
-    pct = _scalar(metrics.get(_EFFICIENCY_PCT_KEY))
+    pct = as_scalar(metrics.get(_EFFICIENCY_PCT_KEY))
     if not seconds and pct is None:
         return
 
-    instruments = _get_efficiency_instruments(meter)
     for category, value in seconds.items():
         measurement = measurement_by_category[category]
         attributes = {
@@ -242,7 +423,7 @@ def _tee_efficiency_metrics(meter: Meter, metrics: dict[str, Any]) -> None:
         bucket = bucket_for_efficiency_category(category)
         if bucket is not None:
             attributes[RL_BUCKET_ATTR] = bucket.value
-        instruments["seconds"].set(value, attributes=attributes)
+        _record(meter, {_EFFICIENCY_SECONDS_KEY: value}, attributes)
     if pct is not None:
         # Tagged like the per-category points even though it is a single series:
         # a ratio needs its window stated more than a duration does, since a
@@ -252,10 +433,11 @@ def _tee_efficiency_metrics(meter: Meter, metrics: dict[str, Any]) -> None:
         # per-step one -- and defaulting to the run window when the flag is
         # absent, since mislabelling a run ratio as per-step is the harmful
         # direction.
-        is_per_step = _scalar(metrics.get(_EFFICIENCY_PCT_PER_STEP_KEY))
-        instruments["pct"].set(
-            pct,
-            attributes={
+        is_per_step = as_scalar(metrics.get(_EFFICIENCY_PCT_PER_STEP_KEY))
+        _record(
+            meter,
+            {_EFFICIENCY_PCT_KEY_REGISTRY: pct},
+            {
                 RL_EFFICIENCY_MEASUREMENT_ATTR: WALL_CLOCK_MEASUREMENT,
                 RL_EFFICIENCY_WINDOW_ATTR: STEP_WINDOW if is_per_step else RUN_WINDOW,
             },
@@ -263,16 +445,18 @@ def _tee_efficiency_metrics(meter: Meter, metrics: dict[str, Any]) -> None:
 
 
 def tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> None:
-    """Mirror the async efficiency durations into OTel (no-op unless exporting).
+    """Mirror the per-step metrics into OTel (no-op unless exporting).
 
-    Only the ``efficiency/*`` durations logged alongside the driver's per-step
-    ``train`` scalars are teed. The OTel instruments are touched only when
-    telemetry is actively exporting; everything else short-circuits to a no-op.
+    Three families ride the driver's per-step ``train`` dicts and are teed: the
+    ``efficiency/*`` durations, the training scalars, and the ``vllm/*`` engine
+    deltas. The OTel instruments are touched only when telemetry is actively
+    exporting; everything else short-circuits to a no-op.
 
     Never raises. ``Logger.log_metrics`` calls this unguarded on every step, so
-    the guarantee has to live here: the emit path below has its own handler, and
-    this one covers everything around it -- reading the handle, dispatching on
-    the prefix -- so no shape of telemetry failure can reach a training step.
+    the guarantee has to live here: each emit path below has its own handler, and
+    this one covers everything around them -- reading the handle, dispatching on
+    the prefix, declaring the group -- so no shape of telemetry failure can reach
+    a training step.
     """
     try:
         _tee_rl_metrics_to_otel(metrics, prefix)
@@ -282,14 +466,34 @@ def tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> No
 
 def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> None:
     """Body of :func:`tee_rl_metrics_to_otel`, inside its exception guard."""
-    if prefix not in _TRAIN_PREFIXES:
+    is_setup = prefix == SETUP_TIMING_PREFIX
+    if not is_setup and prefix not in _TRAIN_PREFIXES:
         return
     telemetry = get_telemetry_handle()
     if telemetry is None or not telemetry.is_exporting:
         return
+    if not ensure_metric_group_registered():
+        return
 
+    if is_setup:
+        # Its own branch rather than a third handler below: this dict arrives
+        # once, at step 0, and shares no key with the per-step families, so
+        # scanning it for them (and them for it) would be dead work.
+        try:
+            _tee_setup_metrics(telemetry.meter, metrics)
+        except Exception:
+            warn_once("setup", "failed to tee setup timing metrics")
+        return
+
+    # Separate handlers so one broken family cannot silence the others: a bad
+    # value in a training scalar should not cost the run its efficiency series.
     try:
         _tee_efficiency_metrics(telemetry.meter, metrics)
     except Exception:
         # Broad by intent: observability must not break a training step.
         warn_once("efficiency", "failed to tee efficiency metrics")
+
+    try:
+        _tee_scalars(telemetry.meter, metrics)
+    except Exception:
+        warn_once("scalars", "failed to tee training/vLLM scalars")

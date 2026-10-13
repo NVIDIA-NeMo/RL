@@ -163,7 +163,13 @@ def test_factory_selects_hf_transport_without_collective_clusters(
     tmp_path: Path,
     draft,
 ) -> None:
-    policy = SimpleNamespace(cfg={"megatron_cfg": {"enabled": True}, "draft": draft})
+    policy = SimpleNamespace(
+        cfg={
+            "offload_policy_before_refit": False,
+            "megatron_cfg": {"enabled": True},
+            "draft": draft,
+        }
+    )
     generation = SimpleNamespace(
         cfg={
             "refit_transport": "hf_checkpoint",
@@ -177,7 +183,13 @@ def test_factory_selects_hf_transport_without_collective_clusters(
 
 @pytest.mark.parametrize("draft", [{"enabled": True}, Eagle3DraftConfig(enabled=True)])
 def test_factory_rejects_hf_draft_refit(tmp_path: Path, draft) -> None:
-    policy = SimpleNamespace(cfg={"megatron_cfg": {"enabled": True}, "draft": draft})
+    policy = SimpleNamespace(
+        cfg={
+            "offload_policy_before_refit": False,
+            "megatron_cfg": {"enabled": True},
+            "draft": draft,
+        }
+    )
     generation = SimpleNamespace(
         cfg={
             "refit_transport": "hf_checkpoint",
@@ -204,7 +216,12 @@ def test_factory_rejects_unsupported_hf_topologies(
     async_engine: bool,
     error: type[Exception],
 ) -> None:
-    policy = SimpleNamespace(cfg={"megatron_cfg": {"enabled": megatron}})
+    policy = SimpleNamespace(
+        cfg={
+            "offload_policy_before_refit": False,
+            "megatron_cfg": {"enabled": megatron},
+        }
+    )
     generation = SimpleNamespace(
         cfg={
             "refit_transport": "hf_checkpoint",

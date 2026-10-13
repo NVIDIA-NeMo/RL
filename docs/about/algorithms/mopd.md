@@ -36,6 +36,42 @@ tool / environment tokens contribute zero. Because the advantage subtracts a
 real `prev_logprobs`, MOPD requires the student log-probabilities to actually be
 computed — see [Configuration](#configuration).
 
+### Trust-region teacher (TROPD)
+
+Early in training the student and teacher can disagree sharply, and a token the
+teacher all but rules out produces a large negative advantage that dominates the
+update. TROPD replaces the teacher with a proximal teacher — a mixture of the
+teacher and the current student — so the target stays within a trust region of
+the student:
+
+```
+log π_prox(t) = log( α · π_teacher(t) + (1 − α) · π_student(t) )
+Â_t           = sg[ log π_prox(t) − log π_student(t) ]
+```
+
+The advantage is bounded below by `log(1 − α)`; `α = 1` is plain MOPD.
+Optionally, `subtract_global_baseline` then subtracts the mean advantage over
+every trained token in the step.
+
+```yaml
+grpo:
+  adv_estimator:
+    name: opd
+    proximal_teacher_alpha: 0.2      # in (0, 1]; 1.0 (default) is plain MOPD
+    subtract_global_baseline: true   # default false
+```
+
+`on_policy_distillation/teacher_student_logprob_gap_mean` always reports the raw
+`log π_teacher − log π_student` gap, so it stays comparable across α;
+`on_policy_distillation/adv_mean` and `adv_std` describe the advantage after
+TROPD and the global baseline, before `grpo.advantage_clip_low/high`.
+
+On the Single-Controller runtime the advantage stage runs once per streaming
+chunk, so `subtract_global_baseline: true` requires
+`async_rl.min_groups_for_streaming_train` to equal `grpo.num_prompts_per_step`
+(one chunk per step); setup rejects other values rather than centering each
+chunk on its own mean.
+
 ## Configuration
 
 Enable MOPD in two places: select the advantage estimator and add the
@@ -165,6 +201,22 @@ log-softmax. `teacher_lm_head_lifecycle` controls whether the teacher LM-head
 shard stays resident on GPU, is parked on CPU between steps, or is freed and
 reloaded each step.
 
+Both payloads support more than one teacher checkpoint. On the `hidden_states`
+path the student loads one LM-head shard per distinct teacher and every payload
+row is tagged with the teacher that produced it, so a single microbatch may mix
+teachers. Two consequences worth planning for: the resident LM-head cost grows
+linearly with the number of distinct teachers (`[vocab_size / TP, hidden_size]`
+each), which makes `teacher_lm_head_lifecycle` more important the more teachers
+a run has; and because one payload column carries them all, every teacher on
+this path must share the student's tokenizer and the same `hidden_size`. The
+`logits` path ships an already-projected distribution and needs neither a
+student-side LM head nor per-row tagging.
+
+Student pipeline parallelism works on both payloads. Megatron builds
+`output_layer` — and runs the loss — only on the last pipeline stage, so that is
+the only stage that projects the teacher's hidden states; the earlier stages
+still join the LM-head load collective, requesting nothing.
+
 `validate_decomposition` additionally reports the reverse KL against its
 entropy / cross-entropy decomposition. Note that this residual is an algebraic
 identity — all three kernels read the same logits, so a corrupted teacher
@@ -179,10 +231,8 @@ self-distillation.
 Rejected at construction rather than silently ignored:
 
 - Megatron backend and the Single-Controller runtime only.
-- Exactly one teacher checkpoint.
-- `teacher_payload: hidden_states` additionally requires student
-  `policy.megatron_cfg.pipeline_model_parallel_size: 1` and
-  `policy.generation.temperature: 1.0`. The `logits` path has neither
+- `teacher_payload: hidden_states` additionally requires
+  `policy.generation.temperature: 1.0`. The `logits` path has no such
   restriction.
 - `teacher_payload: hidden_states` also requires a teacher whose logits are
   exactly `output_layer(h)`. Models that transform the logits after that linear
@@ -200,6 +250,9 @@ Rejected at construction rather than silently ignored:
   `positive_example_nll_weight`, `use_kl_in_reward`, and
   `use_on_policy_kl_approximation` (the base MOPD recipe sets this one to
   `true`, so a derived full-vocabulary recipe must override it to `false`).
+- The [TROPD](#trust-region-teacher-tropd) knobs only reshape `advantages`, which
+  this loss ignores: `proximal_teacher_alpha < 1` and
+  `subtract_global_baseline: true` are rejected.
 
 ## Running MOPD
 

@@ -64,6 +64,7 @@ authoritative settings.
 | Qwen3.5-9B-Base | LLM | GRPO | Megatron | 1n8g | [`grpo-qwen3.5-9b-1n8g-megatron-fp8.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron-fp8.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8.yaml) |
+| Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 4n4g | [`grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 6n4g | [`grpo-qwen3.5-35ba3b-6n4g-async-1off-bf16-trtllm.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-6n4g-async-1off-bf16-trtllm.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | AutoModel | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | AutoModel | 4n8g | [`grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml) |
@@ -185,6 +186,12 @@ and
 General FP8 background lives in [FP8 Quantization](../../../fp8.md); the notes
 below are the Qwen3.5-specific sharp edges.
 
+For BF16 Megatron training with grouped-MoE MXFP8 rollouts and the FlashInfer
+TRTLLM MoE backend, use
+[`grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm.yaml).
+The recurring 20-step GB200 test checks reward, finite loss, and rollout-versus-
+training log-prob parity after each refit.
+
 ### Block Layout and Shape Constraints
 
 - Weights are quantized in `[128, 128]` blocks (e4m3) with one fp32
@@ -247,8 +254,8 @@ FP8 noise.
 
 ### Limitations
 
-- MXFP8 is not yet supported; tracked in
-  [#3694](https://github.com/NVIDIA-NeMo/RL/issues/3694).
+- Dense Qwen3.5 MXFP8 rollout has not yet completed recurring end-to-end
+  validation.
 
 ## `flash-linear-attention` Performance
 

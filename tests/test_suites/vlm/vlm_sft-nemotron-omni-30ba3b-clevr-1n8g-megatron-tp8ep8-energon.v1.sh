@@ -2,6 +2,7 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
+INHERITED_MAX_STEPS=${MAX_STEPS:-}
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
 GPUS_PER_NODE=8
@@ -10,6 +11,7 @@ MAX_STEPS=100
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=90
 # ===== END CONFIG =====
+MAX_STEPS=${INHERITED_MAX_STEPS:-$MAX_STEPS}
 
 exit_if_max_steps_reached
 
@@ -35,6 +37,6 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 if [[ $(jq 'to_entries | .[] | select(.key == "loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'data["loss"]["1"] > 1.0' \
-        'data["loss"]["100"] < 0.5' \
+        "data[\"loss\"][\"$MAX_STEPS\"] < 0.5" \
         'mean(data["total_step_time"], 2) < 40'
 fi

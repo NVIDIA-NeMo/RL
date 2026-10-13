@@ -168,6 +168,118 @@ self.val_dataset = None
 self.split_train_validation(split_validation_size, seed)
 ```
 
+### Megatron-LM offline-packed datasets
+
+Use `megatron_sft_packed` when each JSONL record groups one or more
+conversations that must remain in one training row and you want to bypass NeMo
+RL's generic online sequence-packing path. This dataset mode is available only
+with the Megatron backend.
+
+Each line must be a JSON object whose `messages` field is an ordered list of
+OpenAI-style messages. A packed row must start with a `system` message and end
+with an `assistant` message. To place multiple conversations in one row, start
+each additional conversation with another `system` message:
+
+```json
+{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"2+2?"},{"role":"assistant","content":"4"},{"role":"system","content":"You are concise."},{"role":"user","content":"Capital of France?"},{"role":"assistant","content":"Paris."}]}
+```
+
+A `.jsonl.packed` suffix is also accepted and is read as JSON Lines, so an
+offline packer can mark its output without the loader treating it as an unknown
+format.
+
+This path is text-only. Every message `content` must be a string; multimodal
+records are not supported.
+
+#### Producing a packed dataset
+
+Packing happens offline, before training. The producer decides how many
+conversations fit in one row; the loader only re-tokenizes what it is given.
+
+1. Pick the pack length and use it for both sides. The packer must target the
+   same `data.max_input_seq_length` the training config sets.
+2. Pick the tokenizer and the prompt format and use them for both sides. The
+   loader re-tokenizes each record with `megatron_sft.prompt_format`, so a more
+   verbose tokenization than the packer's overflows the row. The loader warns
+   and drops the overflowing tail rather than failing, so check the logs after
+   changing either.
+3. Greedily append whole conversations to a row until the next one would not
+   fit, then start a new row. Each conversation begins with its own `system`
+   message, which is what marks the segment boundary.
+4. For context parallelism, keep every conversation a multiple of
+   `2 * context_parallel_size` tokens, or let the loader pad each segment up to
+   that multiple.
+
+The processor tokenizes each record, then pads or right-truncates it to
+`data.max_input_seq_length`. A reference packer uses the loader's token-count
+helper, so its row boundaries match the loader for the same tokenizer and prompt
+format. It expects raw JSONL records with a `messages` array; every conversation
+must start with `system` and end with `assistant`:
+
+```bash
+uv run examples/converters/pack_megatron_sft_jsonl.py \
+  --input /path/to/raw.jsonl \
+  --output /path/to/train.jsonl.packed \
+  --tokenizer /path/to/tokenizer \
+  --max-seq-length 262144 \
+  --prompt-format identity \
+  --context-parallel-size 16
+```
+
+Use the same tokenizer, prompt format, sequence length, and CP size for packing
+and training. The packer warns if one conversation exceeds the row length; the
+loader truncates that conversation, so inspect warnings before training.
+
+Configure the dataset and the direct packed path as follows:
+
+```yaml
+sft:
+  only_unmask_final: false
+  val_micro_batch_size: 1
+
+policy:
+  train_micro_batch_size: 1
+  dtensor_cfg:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    context_parallel_size: 1
+    use_fused_linear_logprobs: false
+
+data:
+  train:
+    dataset_name: megatron_sft_packed
+    data_path: /path/to/train.jsonl.packed
+    megatron_sft:
+      prompt_format: identity
+      override_pad_token: null
+  validation:
+    dataset_name: megatron_sft_packed
+    data_path: /path/to/validation.jsonl.packed
+    megatron_sft:
+      prompt_format: identity
+      override_pad_token: null
+  default:
+    chat_key: messages
+```
+
+`megatron_sft.prompt_format` accepts `identity`, `nemotron-nano-v2`, or
+`nemotron-h-aligned`. The optional `override_pad_token` replaces the preset's
+pad token; assistant-prefix masking is defined by the prompt-format preset.
+
+For context parallelism, every conversation segment is padded to a multiple of
+`2 * context_parallel_size`. The size comes from
+`policy.megatron_cfg.context_parallel_size`, not the dataset entry. A
+direct-packed training or validation split cannot be mixed with
+regular datasets, and direct-packed SFT does not support dynamic batching,
+draft training, router replay, `sft.only_unmask_final=true`,
+`policy.sequence_packing.fuse_loss=true`, or fused linear log-probability loss. The relevant training or validation micro batch size must
+be 1. At context-parallel size 1, online `policy.sequence_packing.enabled` is
+not required. For context-parallel size greater than 1, set it to `true` as
+required by the MCore context-parallel path.
+
 ### Energon Multimodal Datasets
 
 The optional Energon SFT backend reads prepared WebDataset shards while the existing Hugging Face backend remains the default. `megatron-energon` ships in the `mcore` extra, and the Megatron policy workers pick that environment up from `ACTOR_ENVIRONMENT_REGISTRY`, so the driver runs under a plain `uv run`:
@@ -241,7 +353,37 @@ The processor runs inside Energon loader workers and returns the same tokenized 
 
 The v1 `SFTProcessorAdapter` and `HFMultimodalSFTProcessorAdapter` are narrow integration interfaces. They are planned to be replaced by a more comprehensive modular processor implementation; dataset loading and the policy-facing batch shape should remain stable through that change.
 
-Sequence packing is unavailable in this path, on both sides: `packing_buffer_size` and `max_samples_per_sequence` are typed null-only, and `policy.sequence_packing` (like `policy.dynamic_batching`) is rejected at startup with `SFTv2 requires fixed NeMo-RL batching.` Packing is deferred to a later stage of the Energon integration. Energon does not provide a separate offline sequence-packing pipeline either; offline preparation may store length and media-cost metadata, but should not pre-concatenate multimodal conversations.
+To let Energon form model-ready multimodal packs, set the packing buffer and
+enable fused sequence packing:
+
+```yaml
+policy:
+  sequence_packing:
+    enabled: true
+    fuse_loss: true
+    algorithm: balanced_greedy_knapsack
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    max_sequences_per_bin: 16  # optional conversation limit per physical pack
+data:
+  energon:
+    packing_buffer_size: 64    # enables Energon-owned packing
+    max_samples_per_sequence: null  # optional shard read-order control
+```
+
+Both config blocks are required because Energon builds the packs while the
+policy block selects and configures the packer. `max_sequences_per_bin` limits
+the conversations placed in one pack. The similarly named
+`max_samples_per_sequence` controls how many consecutive samples Energon reads
+from one shard; it does not affect pack layout.
+
+Without an Energon packing buffer, SFTv2 currently requires fixed batching.
+Dynamic batching and HybridEP flex dispatch are not supported with
+Energon-owned packs.
+
+With Energon-owned packing, each `sample_mask` entry represents one physical
+pack, so `num_valid_samples` counts non-empty packs rather than source
+conversations. NLL loss scaling is unchanged because it is normalized by
+`global_valid_toks`.
 
 Training dataloader checkpoints include the Energon worker state plus a fingerprint of the source, loader, and processor settings. Restore must occur before the first iteration, and a changed fingerprint fails instead of silently continuing with a different stream. SFTv2 accepts a single train source; use an Energon metadataset to blend prepared sources.
 
@@ -342,7 +484,7 @@ Upon completion of the training process, you can refer to our [evaluation guide]
 NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning of SFT models, including Nano‑v3 models, on both the DTensor and Megatron backends. To enable LoRA for SFT on the default DTensor backend:
 
 ```bash
-uv run examples/run_sft.py policy.dtensor_cfg.lora_cfg.enabled=true
+uv run examples/run_sft.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
 For the full reference — backend support, the DTensor vs Megatron schema comparison, config examples, parameter details, example recipes, and Hugging Face export — see the dedicated [LoRA guide](lora.md).

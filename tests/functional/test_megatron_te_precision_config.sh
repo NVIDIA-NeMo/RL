@@ -65,13 +65,21 @@ def apply_precision_config(recipe_file: str):
         "megatron_cfg": {
             "pipeline_dtype": "bfloat16",
             "te_precision_config_file": recipe_file,
-            "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+                "fp8_param": False,
+            },
         }
     }
     with warnings.catch_warnings(record=True) as warning_records:
         warnings.simplefilter("always")
         _apply_precision_config(model_cfg, config, torch.bfloat16)
     assert any("fp8_cfg" in str(w.message) for w in warning_records)
+    assert model_cfg.fp8 == "e4m3"
+    assert model_cfg.fp8_recipe == "mxfp8"
+    assert model_cfg.fp8_param is False
     return model_cfg
 
 

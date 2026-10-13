@@ -19,7 +19,7 @@ from typing import Any
 
 import numpy as np
 import soundfile as sf
-from datasets import Audio, load_dataset
+from datasets import Audio, Dataset, load_dataset
 
 from nemo_rl.data.datasets.response_datasets.avqa import _resample_audio
 from nemo_rl.data.interfaces import TaskDataSpec
@@ -40,15 +40,22 @@ class MMAUDataset:
     Args:
         dataset_name: HuggingFace dataset name.
         split: Dataset split to load.
+        max_samples: Maximum number of samples to load. None loads the full split.
     """
 
     def __init__(
         self,
         dataset_name: str = "TwinkStart/MMAU",
         split: str = "v05.15.25",
+        max_samples: int | None = None,
     ):
-        ds = load_dataset(dataset_name, split=split)
-        ds = ds.cast_column("audio", Audio(decode=False))
+        if max_samples is not None:
+            ds = load_dataset(dataset_name, split=split, streaming=True)
+            ds = ds.cast_column("audio", Audio(decode=False))
+            ds = Dataset.from_list(list(ds.take(max_samples)))
+        else:
+            ds = load_dataset(dataset_name, split=split)
+            ds = ds.cast_column("audio", Audio(decode=False))
 
         self.rekeyed_ds = ds
         self.task_spec = TaskDataSpec(task_name="mmau")

@@ -35,13 +35,86 @@ to ``np.ndarray(dtype=object)`` for the trainer.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from tensordict import TensorDict, TensorDictBase
 
-from nemo_rl.data_plane.schema import Layout
+from nemo_rl.data_plane.schema import OPD_FULL_FIELDS, Layout
+from nemo_rl.utils.timer import ThreadSafeTimer
+
+# Pad/unpad cost, which the per-op metrics cannot see: packing runs in the
+# caller before ``put_samples`` is entered, and ``_from_wire`` runs inside the
+# adapter's ``get_samples``, where it is billed as transport. Both are real CPU
+# work proportional to payload size.
+#
+# Module-level, not threaded through: every call site does have a client handle
+# (``column_io`` takes ``dp_client``; ``_from_wire`` is reached from an instance
+# method), so threading is possible at roughly fifteen lines across four sites.
+# The global buys reach for a free function at the cost of process-scoped state
+# that only one reader per process may drain.
+_CODEC_TIMER = ThreadSafeTimer()
+
+
+def record_codec_s(phase: str, elapsed_s: float) -> None:
+    """Record one pad/unpad measurement, in seconds.
+
+    Prefer :func:`timed_codec`; this is for callers that already measured.
+
+    Args:
+        phase: ``"pack"`` or ``"unpack"``.
+        elapsed_s: Seconds spent, as returned by ``time.perf_counter()`` deltas.
+    """
+    # should_log=False: Timer._fmt builds a timestamp and joins the context on
+    # every call, which costs more than the measurement itself on this path.
+    _CODEC_TIMER.record(phase, elapsed_s, should_log=False)
+
+
+@contextmanager
+def timed_codec(phase: str) -> Iterator[None]:
+    """Time a pad/unpad block, recording on every exit path.
+
+    Records in ``finally`` because the blocks it wraps return from more than
+    one place -- an early return once slipped past a hand-written bracket and
+    silently dropped every no-op unpack from the metric.
+
+    Not :meth:`Timer.time`: ``Timer.start`` raises if the label is already
+    running, and both phases run concurrently (the single-controller loop
+    dispatches through ``asyncio.to_thread``).
+    """
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        record_codec_s(phase, time.perf_counter() - started)
+
+
+def drain_codec_ms() -> dict[str, float]:
+    """Milliseconds spent packing and unpacking since the last drain.
+
+    ``Timer.drain`` pops and sums under one lock: ``reduce`` then ``reset``
+    would drop any sample recorded between them, and both phases run
+    concurrently.
+
+    Not every packing process has a reader -- the rollout actor calls
+    ``pack_jagged_fields`` but is not on the policy worker group, so nothing
+    drains it. Its samples accumulate unread, which is why the caller that
+    *does* drain should do so every step.
+
+    Returns:
+        ``{"pack": ms, "unpack": ms}``, omitting a phase that did not run.
+    """
+    out: dict[str, float] = {}
+    for phase in ("pack", "unpack"):
+        total = _CODEC_TIMER.drain(phase)
+        if total:
+            out[phase] = total * 1e3
+    return out
+
 
 if TYPE_CHECKING:
     # Type-only import. At runtime, BatchedDataDict is loaded lazily
@@ -159,30 +232,32 @@ def pack_jagged_fields(
         ``TensorDict`` with ``batch_size=[N]`` (N from ``lengths`` if
         given, else 0) ready for ``put_samples``.
     """
-    n = int(lengths.shape[0]) if lengths is not None else 0
-    token_aligned_fields = token_aligned_fields or frozenset()
-    packed: dict[str, Any] = {}
-    for k, v in fields.items():
-        if isinstance(v, np.ndarray) and v.dtype == object:
-            # tensordict==0.12.2 wire bug: a NonTensorStack stored as a
-            # TensorDict leaf returns as a LinkedList on parent
-            # __getitem__, losing identity. ndarray(dtype=object)
-            # round-trips intact.
-            packed[k] = v
-        elif isinstance(v, torch.Tensor):
-            if lengths is not None and k in token_aligned_fields:
-                packed[k] = pack_per_token_field(v, lengths)
+    with timed_codec("pack"):
+        n = int(lengths.shape[0]) if lengths is not None else 0
+        token_aligned_fields = token_aligned_fields or frozenset()
+        packed: dict[str, Any] = {}
+        for k, v in fields.items():
+            if isinstance(v, np.ndarray) and v.dtype == object:
+                # tensordict==0.12.2 wire bug: a NonTensorStack stored as a
+                # TensorDict leaf returns as a LinkedList on parent
+                # __getitem__, losing identity. ndarray(dtype=object)
+                # round-trips intact.
+                packed[k] = v
+            elif isinstance(v, torch.Tensor):
+                if lengths is not None and k in token_aligned_fields:
+                    packed[k] = pack_per_token_field(v, lengths)
+                else:
+                    packed[k] = v.detach().contiguous()
             else:
-                packed[k] = v.detach().contiguous()
-        else:
-            raise TypeError(
-                f"pack_jagged_fields: unsupported value type for {k!r}: {type(v)}. "
-                "Use torch.Tensor or np.ndarray(dtype=object). PackedTensor "
-                "must be converted to torch.nested at the wire boundary "
-                "(see sync_rollout_actor.py) so the codec's dispatch stays "
-                "binary."
-            )
-    return TensorDict(packed, batch_size=[n])
+                raise TypeError(
+                    f"pack_jagged_fields: unsupported value type for {k!r}: {type(v)}. "
+                    "Use torch.Tensor or np.ndarray(dtype=object). PackedTensor "
+                    "must be converted to torch.nested at the wire boundary "
+                    "(see sync_rollout_actor.py) so the codec's dispatch stays "
+                    "binary."
+                )
+        out = TensorDict(packed, batch_size=[n])
+        return out
 
 
 def pack_per_token_field(val: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -250,6 +325,45 @@ def response_from_nested(
 # ── materialize: wire TensorDict → trainer BatchedDataDict ────────────
 
 
+def pad_field(
+    key: str, value: torch.Tensor, pad: int | float, pad_to_seqlen: int
+) -> torch.Tensor:
+    """Rectangularize one per-row field and widen it to the forward width."""
+    from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+
+    # Per-sample media rows, not sequences: padding would lose row boundaries
+    # and widening their patch dim to a token seqlen inflates pixels ~40x.
+    if key in PACKED_MULTIMODAL_FIELDS:
+        return value
+    # opd_full teacher payloads never feed the forward; widening them to the
+    # forward target is what once turned them into a 100+ GiB allocation.
+    widen = key not in OPD_FULL_FIELDS
+    if value.is_nested:
+        rows = value.size(0)
+        seqlen = int(value.offsets().diff().max()) if rows else 0
+        width = max(seqlen, pad_to_seqlen) if widen else seqlen
+        size = (rows, width, *value.shape[2:])
+        return torch.nested.to_padded_tensor(value, pad, output_size=size)
+    if not widen or value.dim() < 2 or value.shape[1] >= pad_to_seqlen:
+        return value
+    width = [0, 0] * (value.dim() - 2) + [0, pad_to_seqlen - value.shape[1]]
+    return torch.nn.functional.pad(value, width, value=pad)
+
+
+def pad_batch(
+    data: "BatchedDataDict[Any]",
+    pad_value_dict: dict[str, int | float] | None,
+    pad_to_seqlen: int,
+    skip: Collection[str] = (),
+) -> "BatchedDataDict[Any]":
+    """Pad a ``layout='jagged'`` batch to what ``layout='padded'`` would return."""
+    pads = pad_value_dict or {}
+    for key, val in data.items():
+        if isinstance(val, torch.Tensor) and key not in skip:
+            data[key] = pad_field(key, val, pads.get(key, 0), pad_to_seqlen)
+    return data
+
+
 def materialize(
     td: TensorDict,
     layout: Layout = "padded",
@@ -276,8 +390,8 @@ def materialize(
             through — use only when the caller knows how to consume
             them.
         pad_value_dict: Per-field pad value used when ``layout='padded'``.
-        pad_to_seqlen: When > 0, right-pad the seq dim up to this
-            absolute length after ``to_padded_tensor``. Worker-side
+        pad_to_seqlen: When > 0 (padded layout only), right-pad the seq dim
+            up to this absolute length after ``to_padded_tensor``. Worker-side
             ``_fetch`` passes its forward-pass target here (rounded up
             to ``sequence_length_round`` for Megatron's microbatch
             iterator); driver-side ``read_columns`` leaves it 0 and
@@ -291,7 +405,6 @@ def materialize(
     from tensordict import NonTensorData, NonTensorStack
 
     from nemo_rl.data.multimodal_utils import (
-        PACKED_MULTIMODAL_FIELDS,
         reassemble_packed_multimodal,
     )
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -322,49 +435,11 @@ def materialize(
                 f"materialize() received unexpected leaf type for {key!r}: "
                 f"{type(val)}. Expected Tensor or NonTensorStack."
             )
-        # Multimodal packed fields stay nested. Their rows are per-sample
-        # media, not a padded sequence: ``to_padded_tensor`` would
-        # rectangularize to ``[B, max_rows, ...]`` and lose the row boundaries
-        # the model matches media to placeholders with.
-        #
-        # Staying nested does not preserve the per-segment shapes, though:
-        # ``to_wire`` flattens each row before TQ sees it, so
-        # ``per_sample_shapes`` records flat lengths and the true shapes ride
-        # ``KVBatchMeta.tags`` (see ``multimodal_row_tags``). Hence the ``tags``
-        # argument to ``reassemble_packed_multimodal`` below.
-        if val.is_nested and layout == "padded" and key not in PACKED_MULTIMODAL_FIELDS:
-            pad = pads.get(key, 0)
-            padded = torch.nested.to_padded_tensor(val, padding=pad)
-        else:
-            pad = pads.get(key, 0)
-            padded = val
-        # Apply `pad_to_seqlen` to ALL 2D+ tensors, not only the freshly-
-        # padded-from-nested case. Rectangular wire payloads (vLLM's
-        # right-padded output) ride the ``else`` branch above, so without
-        # this they'd skip the cross-DP forward pad target and break the
-        # microbatch iterator (truncate_tensors → narrow length>size).
-        #
-        # ``not padded.is_nested`` must be tested BEFORE ``shape[1]``: a
-        # nested tensor's dim 1 is ragged, and comparing it raises
-        # ``ValueError: ge: relation is indeterminate``. Anything still
-        # nested here was deliberately left so (multimodal packed fields,
-        # which skip ``to_padded_tensor`` above) and must not be padded
-        # anyway — their dim 1 is patch/image count, not seqlen, so
-        # extending it to a token seqlen inflates pixel_values ~40x.
-        if (
-            pad_to_seqlen > 0
-            and isinstance(padded, torch.Tensor)
-            and not padded.is_nested
-            and padded.dim() >= 2
-            and padded.shape[1] < pad_to_seqlen
-            and key not in PACKED_MULTIMODAL_FIELDS
-        ):
-            pad_spec = [0, 0] * (padded.dim() - 2) + [
-                0,
-                pad_to_seqlen - padded.shape[1],
-            ]
-            padded = torch.nn.functional.pad(padded, pad_spec, value=pad)
-        out[key] = padded
+        out[key] = (
+            pad_field(key, val, pads.get(key, 0), pad_to_seqlen)
+            if layout == "padded"
+            else val
+        )
     # Packed multimodal fields arrive flattened, with their shapes on the
     # per-sample ``tags`` rows. The multimodal layer owns that encoding; the
     # codec only asks it to fix up its own fields so no raw nested value

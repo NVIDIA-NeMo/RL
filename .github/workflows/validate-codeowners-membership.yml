@@ -1,0 +1,37 @@
+name: Validate CODEOWNERS Membership
+
+# Scheduled (not per-PR) check: every user/team referenced in
+# .github/CODEOWNERS — enforced and `# suggest:` lines alike, teams expanded
+# to their full current membership — must be a current NVIDIA-NeMo org
+# member. Alerts Slack on failure, since a scheduled run has no PR author
+# around to notice a red X on its own.
+#
+# Deliberately kept independent of cicd-main.yml rather than added as a job
+# there: this is a CODEOWNERS/org-membership hygiene check, unrelated to
+# whether the code/build/tests are healthy. Folding it into that pipeline's
+# gate would mean a departed org member turns the entire nightly CICD run
+# red — the same signal as "the build broke" — which conflates two
+# unrelated failure categories.
+#
+# Implementation lives in NVIDIA-NeMo/FW-CI-templates. See that repo's
+# .github/workflows/_validate_codeowners_membership.yml. No PAT is
+# introduced here that isn't already used elsewhere in this repo --
+# NVIDIA_MANAGEMENT_ORG_PAT is the same secret cicd-approve-test-queue.yml
+# already relies on.
+
+on:
+  schedule:
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-codeowners-membership:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_validate_codeowners_membership.yml@b0a3760374f50b3d6a7d5f8629e826dddca3b931 # v1.10.1
+    with:
+      workflow_ref: b0a3760374f50b3d6a7d5f8629e826dddca3b931  # pragma: allowlist secret
+    secrets:
+      NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
+      SLACK_TEAM_CHANNEL_WEBHOOK: ${{ secrets.SLACK_TEAM_CHANNEL_WEBHOOK }}

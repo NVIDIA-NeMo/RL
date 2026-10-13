@@ -2,6 +2,9 @@ defaults: ./grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-
 # Reduced mcore-lane smoke leg: 3 steps, no checkpointing, gen_kl_error-only
 # gate (see the suite). Exists so Megatron-Core/Bridge bumps exercise the 30B
 # megatron-inference stack without paying for the full nightly leg.
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 2
 checkpointing:
   checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym-quick
 logger:

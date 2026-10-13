@@ -12,7 +12,7 @@ checkpointing:
   save_period: 50
 policy:
   model_name: Qwen/Qwen3-4B-Base
-  dtensor_cfg:
+  automodel_cfg:
     tensor_parallel_size: 8
     context_parallel_size: 1
   make_sequence_length_divisible_by: 2
@@ -24,7 +24,7 @@ policy:
         num_nodes: 1
 teacher:
   model_name: Qwen/Qwen3-32B
-  dtensor_cfg:
+  automodel_cfg:
     tensor_parallel_size: 8
     context_parallel_size: 1
   make_sequence_length_divisible_by: 2

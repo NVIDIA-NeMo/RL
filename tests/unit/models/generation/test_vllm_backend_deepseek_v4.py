@@ -144,7 +144,7 @@ def test_weight_update_lifecycle_uses_layerwise_reload_for_deepseek_v4_fp8(
     monkeypatch.setattr(
         deepseek_v4_fp8,
         "restore_refit",
-        lambda added: call_order.append(("restore_refit", added)),
+        lambda added, model: call_order.append(("restore_refit", added, model)),
     )
     monkeypatch.setattr(
         vllm_reload,
@@ -188,7 +188,7 @@ def test_weight_update_lifecycle_uses_layerwise_reload_for_deepseek_v4_fp8(
         ("hpc", model),
         ("mtp", None),
         ("sync", None),
-        ("restore_refit", {"attn_sink"}),
+        ("restore_refit", {"attn_sink"}, model),
     ]
 
 
@@ -219,7 +219,9 @@ def test_deepseek_v4_layerwise_failure_restores_global_state(monkeypatch):
     monkeypatch.setattr(vllm_reload, "initialize_layerwise_reload", lambda _model: None)
     monkeypatch.setattr(deepseek_v4_fp8, "prepare_refit", lambda _model: {"attn_sink"})
     monkeypatch.setattr(
-        deepseek_v4_fp8, "restore_refit", lambda added: restored.append(added)
+        deepseek_v4_fp8,
+        "restore_refit",
+        lambda added, model: restored.append((added, model)),
     )
 
     failure = RuntimeError("stream failed")
@@ -229,7 +231,7 @@ def test_deepseek_v4_layerwise_failure_restores_global_state(monkeypatch):
 
     assert ext._nrl_layerwise_reload_failure is failure
     assert ext._nrl_layerwise_reload_active is False
-    assert restored == [{"attn_sink"}]
+    assert restored == [({"attn_sink"}, ext.model_runner.model)]
 
 
 @pytest.mark.parametrize("context_name", ["config", "device"])
@@ -271,7 +273,9 @@ def test_deepseek_v4_context_entry_failure_preserves_original_error(
             vllm_backend.torch, "device", lambda _device: FailingContext()
         )
     monkeypatch.setattr(
-        deepseek_v4_fp8, "restore_refit", lambda added: restored.append(added)
+        deepseek_v4_fp8,
+        "restore_refit",
+        lambda added, model: restored.append((added, model)),
     )
 
     with pytest.raises(RuntimeError, match="context entry failed") as exc_info:
@@ -281,7 +285,8 @@ def test_deepseek_v4_context_entry_failure_preserves_original_error(
     assert exc_info.value is failure
     assert ext._nrl_layerwise_reload_failure is failure
     assert ext._nrl_layerwise_reload_active is False
-    assert restored == [set()]
+    # prepare_refit never ran, so nothing was added to the skip lists.
+    assert restored == [(deepseek_v4_fp8.SkipNames(), ext.model_runner.model)]
 
 
 def test_weight_update_lifecycle_keeps_full_post_load_for_non_deepseek_models(
