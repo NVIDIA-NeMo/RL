@@ -9075,3 +9075,84 @@ def test_tq_env_baseline_site_uses_the_statistics_mask(
     else:
         # ... whereas under include it votes (non-leave-one-out mean 1/4).
         torch.testing.assert_close(env_baseline[:3], torch.full((3,), 0.25))
+
+
+@pytest.mark.parametrize("reward_policy", ["exclude", "include"])
+def test_tq_pct_diagnostics_use_the_statistics_mask(
+    mock_grpo_components, monkeypatch: pytest.MonkeyPatch, reward_policy: str
+) -> None:
+    """The TransferQueue driver's pct_* diagnostics count the rows that vote.
+
+    TransferQueue analog of
+    ``test_grpo_train_pct_diagnostics_use_the_statistics_population``: the
+    driver hands ``_log_mixed_rewards_and_advantages_information`` the mask it
+    hands ``compute_advantage``. Under ``exclude`` the masked row's
+    leave-one-out entry (neither 0 nor 1) is not counted as a mixed group;
+    under ``include`` the row votes and the group is mixed.
+    """
+    components = mock_grpo_components
+    cfg = components["master_config"]
+    cfg.data_plane = {"enabled": True}
+    cfg.grpo.max_num_steps = 1
+    cfg.grpo.val_period = 0
+    cfg.grpo.num_generations_per_prompt = 4
+    cfg.grpo.masked_reward_policy = reward_policy
+    cfg.grpo.overlong_filtering = False
+    cfg.grpo.seq_logprob_error_threshold = None
+    cfg.grpo.use_leave_one_out_baseline = True
+    cfg.loss_fn.use_kl_in_reward = False
+    batch = next(iter(components["train_dataloader"])).repeat_interleave(4)
+    batch["total_reward"] = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    batch["mask_sample"] = [False, False, False, True]
+    batch["truncated"] = torch.zeros(4, dtype=torch.bool)
+    meta, carry, rollout_metrics, actor_data = _tq_actor_rollout(
+        components, cfg, batch, monkeypatch
+    )
+    actor_data["prev_logprobs"] = torch.zeros_like(actor_data["generation_logprobs"])
+    actor_data["reference_policy_logprobs"] = torch.zeros_like(
+        actor_data["generation_logprobs"]
+    )
+
+    real_log = grpo_sync_mod._log_mixed_rewards_and_advantages_information
+    captured: dict[str, Any] = {}
+
+    def recording_log(**kwargs: Any) -> None:
+        real_log(**kwargs)
+        captured["valid_mask"] = kwargs["valid_mask"].clone()
+        captured["metrics"] = {
+            key: value
+            for key, value in kwargs["metrics"].items()
+            if key.startswith("baseline_reward/")
+        }
+        captured["histogram"] = next(
+            call.args[0]
+            for call in kwargs["logger"].log_histogram.call_args_list
+            if len(call.args) > 2 and call.args[2] == "train/baseline_reward/histogram"
+        )
+
+    monkeypatch.setattr(
+        grpo_sync_mod, "_log_mixed_rewards_and_advantages_information", recording_log
+    )
+    estimator = MagicMock(wraps=grpo_mod._create_advantage_estimator(cfg))
+    _run_tq_train_step(
+        components, cfg, meta, carry, rollout_metrics, actor_data, estimator
+    )
+
+    if reward_policy == "exclude":
+        # Three real rows rewarded 1 are an all-correct group; the masked row's
+        # leave-one-out entry (3 / 2) is not a reward level.
+        expected_valid_mask = torch.tensor([1.0, 1.0, 1.0, 0.0])
+        expected_pct = {"pct_0": 0.0, "pct_1": 100.0, "pct_mixed": 0.0}
+        expected_histogram = [1.0, 1.0, 1.0]
+    else:
+        # Every row votes: the real rows' entry is 2 / 3 and the masked row's 1.
+        expected_valid_mask = torch.ones(4)
+        expected_pct = {"pct_0": 0.0, "pct_1": 25.0, "pct_mixed": 75.0}
+        expected_histogram = [2 / 3, 2 / 3, 2 / 3, 1.0]
+    assert torch.equal(captured["valid_mask"], expected_valid_mask)
+    for name, value in expected_pct.items():
+        assert captured["metrics"][f"baseline_reward/{name}"] == value
+    torch.testing.assert_close(
+        torch.tensor(captured["histogram"].tolist()),
+        torch.tensor(expected_histogram),
+    )

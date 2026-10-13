@@ -1083,6 +1083,9 @@ def grpo_train_sync(
                     )
                     del prompt_ids_for_adv
 
+                    # The pct_* diagnostics count the statistics population of
+                    # the configured policy: the same mask handed to
+                    # compute_advantage, as in the legacy loop.
                     _log_mixed_rewards_and_advantages_information(
                         logger=logger,
                         total_steps=total_steps,
@@ -1090,6 +1093,7 @@ def grpo_train_sync(
                         baseline=baseline_for_log,
                         advantages=advantages,
                         env_baseline=env_baseline_for_log,
+                        valid_mask=advantage_valid_mask,
                     )
                     del baseline_for_log, env_baseline_for_log
 
