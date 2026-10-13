@@ -1119,6 +1119,36 @@ if [[ -n "$COMMAND" ]]; then
   # during bringup (e.g. a failed node), signal ENDED and stop promptly instead of
   # stalling until the head's 30-min worker deadline. check_srun_processes isn't used
   # here because it also watches the head, whose exit is the normal success path.
+  #
+  # A single worker task can also fail to launch (e.g. "srun: error: task 22 launch failed:
+  # Slurmd could not connect IO") while the batched worker srun keeps running the others, so
+  # the check above never fires and the head waits out its 30-min worker deadline. Every
+  # worker logs "worker <id> container started on <host>" within ~1 min of the head coming
+  # up; after WORKER_START_TIMEOUT_S, name the nodes that never did, exclude them from this
+  # chain's pending jobs (same job name; AUTO_EXCLUDE_BAD_NODES=0 to skip), and stop.
+  missing_worker_nodes() {
+    local started n missing=()
+    started=$(grep -ohE 'container started on [A-Za-z0-9._-]+' "$LOG_DIR"/ray-worker-*.log 2>/dev/null \
+      | awk '{print $NF}' | sort -u)
+    for n in "${nodes_array[@]}"; do
+      [[ "$n" == "$head_node" ]] && continue
+      grep -qxF "$n" <<<"$started" || missing+=("$n")
+    done
+    echo "${missing[*]}"
+  }
+  exclude_from_pending_chain() {
+    local bad j cur
+    bad=$(IFS=,; echo "$*")
+    for j in $(squeue -h -u "$(id -un)" -n "$SLURM_JOB_NAME" -t PENDING -o %i 2>/dev/null); do
+      cur=$(scontrol show job "$j" 2>/dev/null | grep -oP 'ExcNodeList=\K\S+')
+      [[ "$cur" == "(null)" ]] && cur=""
+      scontrol update JobId="$j" ExcNodeList="${cur:+$cur,}$bad" \
+        && echo "[INFO] Pending job $j of this chain now excludes ${cur:+$cur,}$bad" >&2
+    done
+  }
+  WORKER_START_TIMEOUT_S=${WORKER_START_TIMEOUT_S:-300}
+  WORKER_START_DEADLINE=$((SECONDS + WORKER_START_TIMEOUT_S))
+  _worker_starts_checked=0
   set +e
   while kill -0 "${SRUN_PIDS["ray-head"]}" 2>/dev/null; do
     for _name in ray-workers sandbox; do
@@ -1129,6 +1159,17 @@ if [[ -n "$COMMAND" ]]; then
         break 2
       fi
     done
+    if (( _num_workers > 0 && _worker_starts_checked == 0 && SECONDS > WORKER_START_DEADLINE )); then
+      _worker_starts_checked=1
+      _missing=$(missing_worker_nodes)
+      if [[ -n "$_missing" ]]; then
+        echo "[ERROR] No worker container started on: $_missing (${WORKER_START_TIMEOUT_S}s after the Ray head came up); failing fast." >&2
+        [[ "${AUTO_EXCLUDE_BAD_NODES:-1}" == "1" ]] && exclude_from_pending_chain $_missing
+        touch "$LOG_DIR/ENDED"
+        break
+      fi
+      log_phase "all $_num_workers worker containers started"
+    fi
     sleep 2
   done
   wait "${SRUN_PIDS["ray-head"]}"
