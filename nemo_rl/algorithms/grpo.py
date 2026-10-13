@@ -3019,19 +3019,38 @@ def _log_mixed_rewards_and_advantages_information(
     baseline: torch.Tensor,
     advantages: torch.Tensor,
     env_baseline: Optional[torch.Tensor] = None,
+    valid_mask: Optional[torch.Tensor] = None,
 ) -> None:
+    # The pct_* diagnostics assume binary rewards. When grpo.length_penalty
+    # rewrote total_reward, read them off the env-reward baseline instead.
+    pct_baseline = env_baseline if env_baseline is not None else baseline
+    if valid_mask is not None:
+        # Rows that did not vote in the baseline (see _baseline_valid_mask) get
+        # no reward level of their own: under the leave-one-out baseline their
+        # entry is sum(valid rewards) / (n_valid - 1), which is neither 0 nor 1
+        # and would be counted as "mixed". Report the voting population only.
+        keep = valid_mask.bool().to(baseline.device)
+        baseline = baseline[keep]
+        pct_baseline = pct_baseline[keep.to(pct_baseline.device)]
     # The histograms that are logged are logged with a prefix "train/" to the name, since that is what the remaining metrics will be logged with.
     logger.log_histogram(
         baseline.numpy(), total_steps + 1, "train/baseline_reward/histogram"
     )
-    # The pct_* diagnostics assume binary rewards. When grpo.length_penalty
-    # rewrote total_reward, read them off the env-reward baseline instead.
-    pct_baseline = env_baseline if env_baseline is not None else baseline
-    metrics["baseline_reward/pct_0"] = 100 * (pct_baseline == 0).float().mean().item()
-    metrics["baseline_reward/pct_1"] = 100 * (pct_baseline == 1).float().mean().item()
-    metrics["baseline_reward/pct_mixed"] = (
-        100 - metrics["baseline_reward/pct_0"] - metrics["baseline_reward/pct_1"]
-    )
+    if pct_baseline.numel() > 0:
+        metrics["baseline_reward/pct_0"] = (
+            100 * (pct_baseline == 0).float().mean().item()
+        )
+        metrics["baseline_reward/pct_1"] = (
+            100 * (pct_baseline == 1).float().mean().item()
+        )
+        metrics["baseline_reward/pct_mixed"] = (
+            100 - metrics["baseline_reward/pct_0"] - metrics["baseline_reward/pct_1"]
+        )
+    else:
+        # No row voted, so there is no population to take percentages of.
+        metrics["baseline_reward/pct_0"] = 0.0
+        metrics["baseline_reward/pct_1"] = 0.0
+        metrics["baseline_reward/pct_mixed"] = 0.0
 
     logger.log_histogram(
         advantages.numpy(), total_steps + 1, "train/advantages/histogram"
@@ -4007,9 +4026,9 @@ def _grpo_train_impl(
                         valid_mask=baseline_valid_mask,
                     )
                     del prompt_ids_for_adv
-                    del baseline_valid_mask
 
-                    # Log rewards and advantages information
+                    # Log rewards and advantages information. The pct_*
+                    # diagnostics count the same rows that voted in the baseline.
                     _log_mixed_rewards_and_advantages_information(
                         logger=logger,
                         total_steps=total_steps,
@@ -4017,8 +4036,10 @@ def _grpo_train_impl(
                         baseline=baseline_for_log,
                         advantages=train_data["advantages"],
                         env_baseline=env_baseline_for_log,
+                        valid_mask=baseline_valid_mask,
                     )
                     del baseline_for_log, env_baseline_for_log
+                    del baseline_valid_mask
 
                     penalty_metrics = (
                         _apply_configured_message_level_advantage_penalties(
