@@ -423,5 +423,12 @@ def test_native_collator_rejects_configured_history_truncation(flags):
     )
     with pytest.raises(ValueError, match="student, sample idx=29.*reasoning"):
         _native_collator(tokenizer, None, same_tokenizer=True)(
-            [{"message_log": conversation(), "loss_multiplier": 1.0, "idx": 29}]
+            [
+                {
+                    "message_loss_mask": [0, 1, 0, 1],
+                    "message_log": conversation(),
+                    "loss_multiplier": 1.0,
+                    "idx": 29,
+                }
+            ]
         )

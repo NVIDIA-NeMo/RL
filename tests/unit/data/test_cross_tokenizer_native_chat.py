@@ -196,6 +196,7 @@ def test_native_thinking_alignment_excludes_model_specific_whitespace() -> None:
         student,
         _messages(),
         256,
+        message_loss_mask=[0, 1],
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
     )
@@ -203,6 +204,7 @@ def test_native_thinking_alignment_excludes_model_specific_whitespace() -> None:
         teacher,
         _messages(),
         256,
+        message_loss_mask=[0, 1],
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
     )
@@ -243,6 +245,7 @@ def test_native_thinking_alignment_flags_wrong_teacher_eot_position() -> None:
         student,
         _messages(),
         256,
+        message_loss_mask=[0, 1],
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
     )
@@ -250,6 +253,7 @@ def test_native_thinking_alignment_flags_wrong_teacher_eot_position() -> None:
         teacher,
         _messages(),
         256,
+        message_loss_mask=[0, 1],
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
     )
@@ -300,6 +304,7 @@ def test_native_collator_wires_semantic_regions_and_tools() -> None:
         [
             {
                 "idx": 7,
+                "message_loss_mask": [0, 1],
                 "message_log": _messages(),
                 "tools": tools,
                 "loss_multiplier": 1.0,
@@ -357,6 +362,7 @@ def test_native_collator_supervises_corrected_canonical_tool_call_only() -> None
         [
             {
                 "idx": 12,
+                "message_loss_mask": [0, 1, 0, 1],
                 "message_log": messages,
                 "tools": tools,
                 "loss_multiplier": 1.0,
@@ -412,7 +418,16 @@ def test_kd_alignment_regions_filter_to_answer_and_eot() -> None:
         ),
         drop_first_assistant_chunk_kl_by_teacher=[False],
     )
-    result = collator([{"idx": 7, "message_log": _messages(), "loss_multiplier": 1.0}])
+    result = collator(
+        [
+            {
+                "idx": 7,
+                "message_loss_mask": [0, 1],
+                "message_log": _messages(),
+                "loss_multiplier": 1.0,
+            }
+        ]
+    )
 
     valid = result["alignment_0_pair_valid"][0]
     student_text = _decode_valid_spans(
@@ -538,6 +553,7 @@ def test_chat_collator_rejects_overlength_instead_of_left_truncating() -> None:
             [
                 {
                     "idx": 99,
+                    "message_loss_mask": [0, 1],
                     "message_log": _messages(),
                     "loss_multiplier": 1.0,
                 }
@@ -757,7 +773,16 @@ def test_native_parts_reject_unexpected_tool_serializer_difference() -> None:
         },
     ]
     with pytest.raises(ValueError, match="different student/teacher text"):
-        collator([{"idx": 0, "message_log": messages, "loss_multiplier": 1.0}])
+        collator(
+            [
+                {
+                    "idx": 0,
+                    "message_loss_mask": [0, 1],
+                    "message_log": messages,
+                    "loss_multiplier": 1.0,
+                }
+            ]
+        )
 
 
 @pytest.mark.parametrize("select_history", [False, True])
@@ -862,6 +887,7 @@ def test_empty_selected_native_message_is_explicit_error(content):
             tokenizer,
             [{"role": "assistant", "content": content}],
             512,
+            message_loss_mask=[1],
             include_thinking_in_loss=True,
             native_thinking_alignment=True,
         )
@@ -887,6 +913,7 @@ def test_ambiguous_embedded_chatml_delimiters_are_rejected(location):
             tokenizer,
             messages,
             1024,
+            message_loss_mask=[0, 1],
             tools=tools,
             include_thinking_in_loss=True,
             native_thinking_alignment=True,
@@ -914,6 +941,7 @@ def test_json_string_tool_arguments_are_preserved():
         tokenizer,
         messages,
         512,
+        message_loss_mask=[1],
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
     )
@@ -938,6 +966,7 @@ def test_template_only_tool_separators_are_excluded_from_ce():
         tokenizer,
         messages,
         1024,
+        message_loss_mask=[1],
         include_thinking_in_loss=True,
         native_thinking_alignment=True,
     )
@@ -963,7 +992,16 @@ def test_same_tokenizer_teacher_context_limit_is_enforced():
         drop_first_assistant_chunk_kl_by_teacher=[False],
     )
     with pytest.raises(ValueError, match="teacher 0, sample idx=9:.*overlength"):
-        collator([{"idx": 9, "message_log": _messages(), "loss_multiplier": 1.0}])
+        collator(
+            [
+                {
+                    "idx": 9,
+                    "message_loss_mask": [0, 1],
+                    "message_log": _messages(),
+                    "loss_multiplier": 1.0,
+                }
+            ]
+        )
 
 
 class _OrdinaryChatTokenizer(_NativeThinkingTokenizer):
@@ -1004,6 +1042,7 @@ def test_ordinary_canonical_spans_bind_repeated_logical_turns():
             tokenizer,
             messages,
             512,
+            message_loss_mask=[0, 1, 0, 1],
             include_thinking_in_loss=False,
             native_thinking_alignment=False,
         )
@@ -1025,7 +1064,16 @@ def test_ordinary_canonical_spans_bind_repeated_logical_turns():
         ctx_length_teachers=[512],
         drop_first_assistant_chunk_kl_by_teacher=[False],
     )
-    result = collator([{"idx": 0, "message_log": messages, "loss_multiplier": 1.0}])
+    result = collator(
+        [
+            {
+                "idx": 0,
+                "message_loss_mask": [0, 1, 0, 1],
+                "message_log": messages,
+                "loss_multiplier": 1.0,
+            }
+        ]
+    )
     aligned = _decode_valid_spans(
         student,
         result["input_ids"][0].tolist(),
@@ -1046,6 +1094,7 @@ def test_ordinary_transformed_turn_cannot_match_later_repeated_content():
                 {"role": "assistant", "content": "SAME"},
             ],
             256,
+            message_loss_mask=[0, 1],
             include_thinking_in_loss=False,
             native_thinking_alignment=False,
         )
@@ -1068,6 +1117,7 @@ def test_ordinary_boundary_whitespace_token_keeps_ce_but_is_not_exact_kd():
         [
             {
                 "idx": 0,
+                "message_loss_mask": [1],
                 "message_log": [{"role": "assistant", "content": " Hello"}],
                 "loss_multiplier": 1.0,
             }
@@ -1087,6 +1137,7 @@ def test_ordinary_content_matching_role_header_binds_body():
         tokenizer,
         [{"role": "assistant", "content": "assistant"}],
         256,
+        message_loss_mask=[1],
         include_thinking_in_loss=False,
         native_thinking_alignment=False,
     )
@@ -1146,6 +1197,7 @@ def test_ordinary_inline_reasoning_can_receive_loss():
         tokenizer,
         [{"role": "assistant", "content": "<think>reason</think>answer"}],
         256,
+        message_loss_mask=[1],
         include_thinking_in_loss=True,
         native_thinking_alignment=False,
     )

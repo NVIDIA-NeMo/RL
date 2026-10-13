@@ -444,9 +444,15 @@ class TestCollatorChatMode:
                 {"role": "assistant", "content": "Yes"},
             ],
         ]
+        message_masks = [[0, 0, 1, 0, 1], [0, 0, 1]]
         out = collator(
             [
-                {"loss_multiplier": 1.0, "idx": i, "message_log": messages}
+                {
+                    "loss_multiplier": 1.0,
+                    "idx": i,
+                    "message_loss_mask": message_masks[i],
+                    "message_log": messages,
+                }
                 for i, messages in enumerate(conversations)
             ]
         )
@@ -496,6 +502,7 @@ class TestCollatorChatMode:
         datum = {
             "loss_multiplier": 1.0,
             "idx": 0,
+            "message_loss_mask": [0, 1],
             "message_log": [
                 {"role": "user", "content": "hi"},
                 {"role": "assistant", "content": "Hello world"},
@@ -530,6 +537,7 @@ class TestCollatorChatMode:
                 {
                     "loss_multiplier": 1.0,
                     "idx": 0,
+                    "message_loss_mask": [0, 1],
                     "message_log": [
                         {"role": "user", "content": "hi"},
                         {"role": "assistant", "content": "ok"},
@@ -566,6 +574,7 @@ class TestCollatorChatMode:
         datum = {
             "loss_multiplier": 1.0,
             "idx": 0,
+            "message_loss_mask": [0, 1],
             "message_log": [
                 {"role": "user", "content": "hi"},
                 {"role": "assistant", "content": "ok"},
@@ -616,6 +625,7 @@ class TestCollatorChatMode:
                     {
                         "idx": 0,
                         "loss_multiplier": 1.0,
+                        "message_loss_mask": [1],
                         "message_log": [{"role": "assistant", "content": "hello"}],
                     }
                 ]

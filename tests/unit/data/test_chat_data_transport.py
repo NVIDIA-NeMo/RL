@@ -28,7 +28,7 @@ from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     OpenAIFormatDataset,
     PreservingDataset,
 )
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import (
     PROCESSOR_REGISTRY,
     chat_kd_processor,
@@ -108,6 +108,23 @@ def test_chat_processor_accepts_conversation_and_is_registered() -> None:
     assert result["message_loss_mask"] == row["message_loss_mask"]
 
 
+@pytest.mark.parametrize("processor", [kd_data_processor, chat_kd_processor])
+@pytest.mark.parametrize("mask_present", [False, True])
+def test_processors_default_missing_or_null_masks(
+    processor: TaskDataProcessFnCallable, mask_present: bool
+) -> None:
+    row = _row()
+    row.pop("message_loss_mask")
+    row["messages"].insert(0, {"role": "system", "content": "System instructions"})
+    if mask_present:
+        row["message_loss_mask"] = None
+
+    result = processor(row, TaskDataSpec(), None, None, 0)
+
+    assert result["message_loss_mask"] == [0, 0, 1, 0, 1]
+    assert result["message_log"] == row["messages"]
+
+
 @pytest.mark.parametrize("messages", [None, "answer", ["answer"]])
 def test_chat_processor_rejects_malformed_messages(messages) -> None:
     with pytest.raises(TypeError, match="list of message objects"):
@@ -167,10 +184,13 @@ def _write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
 
 @pytest.mark.parametrize("preserving", [False, True])
 @pytest.mark.parametrize("system_source", ["none", "prompt", "key"])
+@pytest.mark.parametrize("mask_present", [False, True])
 def test_dataset_shifts_loss_mask_for_inserted_system_message(
-    tmp_path: Path, preserving: bool, system_source: str
+    tmp_path: Path, preserving: bool, system_source: str, mask_present: bool
 ) -> None:
     row = _row()
+    if not mask_present:
+        row.pop("message_loss_mask")
     row.pop("tools")
     row["messages"][3].pop("tool_calls")
     row["system"] = "System instructions"
@@ -185,11 +205,16 @@ def test_dataset_shifts_loss_mask_for_inserted_system_message(
         str(path), use_preserving_dataset=preserving, **kwargs
     )
     actual = dataset.dataset[0]
-    expected_mask = [0, 0, 0, 1]
+    expected_mask = [0, 0, 0, 1] if mask_present else [0, 1, 0, 1]
     if system_source != "none":
         expected_mask.insert(0, 0)
         assert actual["messages"][0]["role"] == "system"
-    assert actual["message_loss_mask"] == expected_mask
+    if mask_present:
+        assert actual["message_loss_mask"] == expected_mask
+    else:
+        assert "message_loss_mask" not in actual
+    processed = kd_data_processor(actual, TaskDataSpec(), None, None, 0)
+    assert processed["message_loss_mask"] == expected_mask
     assert len(actual["messages"]) == len(expected_mask)
 
 
@@ -225,10 +250,23 @@ def test_preserving_dataset_to_processor_retains_heterogeneous_tool_payloads(
     }
 
 
-def test_dataset_rejects_invalid_mask_before_system_insertion(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "mask,match",
+    [
+        ([1, 0, 0, 1], "only assistant"),
+        ([0, 1], "one entry per message"),
+        ([0, 0, 0, 2], "binary integers"),
+    ],
+)
+def test_dataset_defers_mask_validation_to_processor(
+    tmp_path: Path, mask: list[int], match: str
+) -> None:
     path = tmp_path / "invalid.jsonl"
-    _write_rows(path, [{**_row(), "message_loss_mask": [1, 0, 0, 1]}])
-    with pytest.raises(ValueError, match="only assistant"):
-        OpenAIFormatDataset(
-            str(path), system_prompt="System", use_preserving_dataset=True
-        )
+    _write_rows(path, [{**_row(), "message_loss_mask": mask}])
+    dataset = OpenAIFormatDataset(
+        str(path), system_prompt="System", use_preserving_dataset=True
+    )
+    datum = dataset.dataset[0]
+    assert datum["message_loss_mask"] == [0, *mask]
+    with pytest.raises(ValueError, match=match):
+        kd_data_processor(datum, TaskDataSpec(), None, None, 0)

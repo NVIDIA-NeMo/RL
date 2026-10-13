@@ -33,7 +33,6 @@ from nemo_rl.algorithms.x_token.token_aligner import (
     NativeAlignmentRegions,
 )
 from nemo_rl.data.chat_templates import find_rendered_message_content_span
-from nemo_rl.data.chat_utils import normalize_message_loss_mask
 
 _THINK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
 _IM_START_ASSISTANT = "<|im_start|>assistant\n"
@@ -421,11 +420,11 @@ def _render_and_tokenize_chat(
     max_len: int,
     *,
     tools: list[dict[str, Any]] | None = None,
-    message_loss_mask: list[int] | None = None,
+    message_loss_mask: list[int],
     include_thinking_in_loss: bool,
     native_thinking_alignment: bool,
 ) -> RenderedChatDocument:
-    selected = normalize_message_loss_mask(messages, message_loss_mask)
+    """Render and tokenize chat using a message mask validated by the processor."""
     if tools is not None:
         if not isinstance(tools, list):
             raise ValueError("tools must be a list of function schemas")
@@ -455,7 +454,7 @@ def _render_and_tokenize_chat(
         tokenizer,
         text,
         messages,
-        selected,
+        message_loss_mask,
         max_len,
         include_thinking_in_loss=include_thinking_in_loss,
         native_semantic_messages=messages if native_thinking_alignment else None,

@@ -21,6 +21,8 @@ from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import PreTrainedTokenizerFast
 
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
+from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.processors import kd_data_processor
 from nemo_rl.data.xtoken.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
@@ -100,7 +102,7 @@ def _datum(*, multiple_turns: bool = False, trailing_content: str = "") -> dict:
                 {"role": "assistant", "content": "Done"},
             ]
         )
-    return {"message_log": messages, "loss_multiplier": 1.0, "idx": 0}
+    return kd_data_processor({"messages": messages}, TaskDataSpec(), None, None, 0)
 
 
 @pytest.mark.parametrize("separator", ["", " \n\n"])
@@ -159,6 +161,7 @@ def test_eot_mask_does_not_extend_assistant_content_spans():
         tokenizer,
         messages,
         64,
+        message_loss_mask=[0, 1],
         include_thinking_in_loss=False,
         native_thinking_alignment=False,
     )
@@ -178,6 +181,7 @@ def test_response_repeated_inside_terminator_keeps_eot_supervision():
         tokenizer,
         messages,
         64,
+        message_loss_mask=[1],
         include_thinking_in_loss=False,
         native_thinking_alignment=False,
     )
@@ -197,6 +201,7 @@ def test_eot_token_can_absorb_preceding_whitespace(trailing_content: str):
         tokenizer,
         messages,
         64,
+        message_loss_mask=[1],
         include_thinking_in_loss=False,
         native_thinking_alignment=False,
     )
