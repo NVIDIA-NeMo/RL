@@ -376,7 +376,7 @@ data:
   validation:
     data_path: ${oc.env:NEMO_GYM_SWE_VALIDATION_DATA_PATH}
   default:
-    dataset_name: NemoGymDataset
+    dataset_name: mlperf_lazy_dataset.LazyNemoGymDataset
     env_name: nemo_gym
     prompt_file: null
     system_prompt_file: null
