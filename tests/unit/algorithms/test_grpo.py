@@ -3048,6 +3048,118 @@ def test_grpo_train_every_baseline_site_excludes_masked_rows(
     assert torch.all(unmasked_env_baseline[:3] > 0)
 
 
+def test_grpo_train_dynamic_sampling_recomputes_valid_mask_on_assembled_batch(
+    mock_grpo_components: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """compute_advantage gets the mask of the cached+current training batch.
+
+    Two generation batches of 2 prompts x 3 generations. Batch 1: group 0 is
+    trivial (dropped); group 1 has one masked row and is kept in the cache.
+    Batch 2 has no masked rows and completes the step. The final 6-row batch is
+    [group 1 | group 2], so its mask ([1, 1, 0, 1, 1, 1]) differs from the mask
+    of the last generation batch (all ones): only a recompute on the assembled
+    batch can produce it.
+    """
+    original_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    input_batch = original_batch.repeat_interleave(2)
+    mock_grpo_components["train_dataloader"].__iter__ = lambda self: iter(
+        [input_batch, input_batch]
+    )
+    mock_grpo_components["train_dataloader"].__len__.return_value = 2
+    rollout_payloads = iter(
+        (
+            # groups [0,0,0,1,1,1]: group 0 trivial; group 1 kept, row 5 masked
+            (
+                torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0, 1.0]),
+                torch.tensor([False, False, False, False, False, True]),
+            ),
+            # groups [2,2,2,3,3,3]: both kept, no masked rows
+            (
+                torch.tensor([0.0, 1.0, 1.0, 1.0, 0.0, 0.0]),
+                torch.tensor([False] * 6),
+            ),
+        )
+    )
+
+    def rollout(**kwargs: Any) -> tuple[BatchedDataDict, dict[str, float]]:
+        batch = kwargs["input_batch"]
+        rewards, mask_sample = next(rollout_payloads)
+        batch["total_reward"] = rewards.clone()
+        batch["mask_sample"] = mask_sample.clone()
+        for messages in batch["message_log"]:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "token_ids": torch.tensor([4]),
+                }
+            )
+        return batch, {"mean_gen_tokens_per_sample": 1.0}
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def capture_compute_advantage(**kwargs: Any) -> torch.Tensor:
+        captured["valid_mask"] = kwargs["valid_mask"].clone()
+        captured["rewards"] = kwargs["rewards"].clone()
+        captured["prompt_ids"] = kwargs["prompt_ids"].clone()
+        raise RuntimeError("captured compute_advantage inputs")
+
+    mock_adv_estimator = MagicMock()
+    mock_adv_estimator.compute_advantage.side_effect = capture_compute_advantage
+    monkeypatch.setattr(
+        grpo_mod, "_create_advantage_estimator", lambda _cfg: mock_adv_estimator
+    )
+    monkeypatch.setattr(grpo_mod, "should_use_async_rollouts", lambda _: False)
+    monkeypatch.setattr(grpo_mod, "run_multi_turn_rollout", rollout)
+    monkeypatch.setattr(grpo_mod, "refit_policy_generation", lambda *a, **k: {})
+    monkeypatch.setattr(
+        grpo_mod,
+        "compute_and_apply_seq_logprob_error_masking",
+        lambda *a, **k: _mock_seq_logprob_error_result(),
+    )
+    monkeypatch.setattr(grpo_mod, "MemoryTracker", MagicMock)
+
+    cfg = mock_grpo_components["master_config"]
+    cfg.grpo.max_num_steps = cfg.grpo.max_num_epochs = 1
+    cfg.grpo.val_period = 0
+    cfg.grpo.val_at_start = cfg.grpo.val_at_end = False
+    cfg.grpo.num_prompts_per_step = 2
+    cfg.grpo.num_generations_per_prompt = 3
+    cfg.grpo.use_dynamic_sampling = True
+    cfg.grpo.dynamic_sampling_max_gen_batches = 2
+
+    policy = mock_grpo_components["policy"]
+    with (
+        _patched_logprob_phase(policy),
+        pytest.raises(RuntimeError, match="captured compute_advantage inputs"),
+    ):
+        grpo_mod.grpo_train(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            cfg,
+        )
+
+    # Final batch = cached group 1 (one masked row) + group 2 from batch 2.
+    assert captured["prompt_ids"].squeeze(1).tolist() == [1, 1, 1, 2, 2, 2]
+    torch.testing.assert_close(
+        captured["rewards"], torch.tensor([0.0, 1.0, 1.0, 0.0, 1.0, 1.0])
+    )
+    # Recomputed on the assembled batch; the last generation batch's own mask
+    # would have been all ones.
+    assert torch.equal(
+        captured["valid_mask"], torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 1.0])
+    )
+
+
 def test_log_mixed_rewards_pct_diagnostics_count_only_voting_rows() -> None:
     """A masked row's own leave-one-out baseline entry is not a reward level."""
     prompts = torch.zeros(4, 1, dtype=torch.long)
