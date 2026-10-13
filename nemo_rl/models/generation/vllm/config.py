@@ -87,8 +87,6 @@ class VllmSpecificArgs(TypedDict):
     # the vLLM worker then skips its per-refit re-quantization. Requires the
     # Megatron policy backend.
     refit_prequantize: NotRequired[bool]
-    # Cache and replay stable vLLM weight-loader routes across refits.
-    refit_cache_loader_routes: NotRequired[bool]
     # Deprecated in 0.8. Use quantization_ignore_patterns instead.
     quantization_ignored_layer_kws: NotRequired[list[str]]
     # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
@@ -268,10 +266,6 @@ def validate_vllm_quantization_config(config: VllmConfig) -> None:
             "refit_with_reload_api; prequantized refit uses receiver scale names "
             "that are not accepted by vLLM's native reload path."
         )
-    for field in ("refit_cache_loader_routes",):
-        value = vllm_cfg.get(field)
-        if value is not None and not isinstance(value, bool):
-            raise ValueError(f"policy.generation.vllm_cfg.{field} must be a boolean.")
 
 
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:

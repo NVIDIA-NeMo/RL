@@ -64,8 +64,6 @@ def fp8_module():
 def test_fp8_load_weights_without_callback_streams_to_cache_loader(
     fp8_module, monkeypatch
 ):
-    from nemo_rl.models.generation.vllm import vllm_backend
-
     fp8 = fp8_module
     source_weights = [("source", torch.ones(1))]
     quantized_weights = [("quantized", torch.ones(1))]
@@ -80,17 +78,17 @@ def test_fp8_load_weights_without_callback_streams_to_cache_loader(
             produced += 1
             yield weight
 
-    def load(model, weights, *, cache_loader_routes):
+    def load(*, weights):
         assert produced == 0
-        assert cache_loader_routes is False
         received.extend(weights)
 
     monkeypatch.setattr(fp8, "get_quantized_weight_iterator", quantize)
-    monkeypatch.setattr(fp8, "refit_cache_loader_routes_enabled", lambda _: False)
-    monkeypatch.setattr(vllm_backend, "load_weights_maybe_cached", load)
 
     fp8.load_weights(
-        source_weights, types.SimpleNamespace(model=object(), vllm_config=object())
+        source_weights,
+        types.SimpleNamespace(
+            model=types.SimpleNamespace(load_weights=load), vllm_config=object()
+        ),
     )
 
     assert received == quantized_weights
@@ -125,7 +123,6 @@ def test_init_fp8_uses_mxfp8_quantization_config(
             "kv_cache_dtype": "auto",
             "async_engine": async_engine,
             "is_mx": True,
-            "refit_cache_loader_routes": True,
             "use_deep_gemm": True,
             "refit_with_reload_api": refit_with_reload_api,
         },
@@ -1693,7 +1690,6 @@ def test_init_fp8_rejects_non_pow2_mxfp8_scales(fp8_module, monkeypatch, field, 
                 "kv_cache_dtype": "auto",
                 "async_engine": False,
                 "is_mx": True,
-                "refit_cache_loader_routes": False,
                 field: False,
             },
             "dummy-model",
@@ -1827,8 +1823,6 @@ def test_load_weights_preserves_prequantized_mxfp8_and_clamps_scales(
 ):
     from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 
-    from nemo_rl.models.generation.vllm import vllm_backend
-
     fp8 = fp8_module
     fp8.global_fp8_config = types.SimpleNamespace(
         is_mx=True,
@@ -1866,12 +1860,7 @@ def test_load_weights_preserves_prequantized_mxfp8_and_clamps_scales(
             else pytest.fail("unexpected receiver quantization input")
         ),
     )
-    monkeypatch.setattr(
-        vllm_backend,
-        "load_weights_maybe_cached",
-        lambda model, weights, *, cache_loader_routes: loaded.extend(weights),
-    )
-    model = object()
+    model = types.SimpleNamespace(load_weights=lambda *, weights: loaded.extend(weights))
 
     fp8.load_weights(
         [
@@ -1946,8 +1935,6 @@ def test_load_weights_rejects_prequantized_mxfp8_without_scale(fp8_module, monke
 
 
 def test_load_weights_preserves_non_mx_blockwise_fp8_payload(fp8_module, monkeypatch):
-    from nemo_rl.models.generation.vllm import vllm_backend
-
     fp8 = fp8_module
     fp8.global_fp8_config = types.SimpleNamespace(
         is_mx=False,
@@ -1961,16 +1948,12 @@ def test_load_weights_preserves_non_mx_blockwise_fp8_payload(fp8_module, monkeyp
         "_is_fp8_weight",
         lambda name, _model: name == "model.weight",
     )
-    monkeypatch.setattr(
-        vllm_backend,
-        "load_weights_maybe_cached",
-        lambda model, weights, *, cache_loader_routes: loaded.extend(weights),
-    )
-
     fp8.load_weights(
         [("model.weight", weight), ("model.weight_scale_inv", scale)],
         types.SimpleNamespace(
-            model=object(),
+            model=types.SimpleNamespace(
+                load_weights=lambda *, weights: loaded.extend(weights)
+            ),
             vllm_config=types.SimpleNamespace(additional_config={}),
         ),
     )
@@ -2926,8 +2909,6 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
     """
     import torch
 
-    from nemo_rl.models.generation.vllm import vllm_backend
-
     fp8 = fp8_module
     fp8.global_fp8_config = types.SimpleNamespace(
         is_mx=True,
@@ -2936,9 +2917,7 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
     model = _grouped_expert_model(fp8, monkeypatch, torch.bfloat16, wrap_language_model)
     loaded = []
     monkeypatch.setattr(
-        vllm_backend,
-        "load_weights_maybe_cached",
-        lambda model, weights, *, cache_loader_routes: loaded.extend(weights),
+        model, "load_weights", lambda *, weights: loaded.extend(weights), raising=False
     )
 
     gate_up = torch.randn(2, 256, 128).to(torch.bfloat16)
@@ -2996,8 +2975,6 @@ def test_load_weights_reroutes_prequantized_grouped_expert_scale_sidecars(
     """
     import torch
 
-    from nemo_rl.models.generation.vllm import vllm_backend
-
     fp8 = fp8_module
     fp8.global_fp8_config = types.SimpleNamespace(
         use_weight_pow2_scale=False,
@@ -3009,9 +2986,7 @@ def test_load_weights_reroutes_prequantized_grouped_expert_scale_sidecars(
     )
     loaded = []
     monkeypatch.setattr(
-        vllm_backend,
-        "load_weights_maybe_cached",
-        lambda model, weights, *, cache_loader_routes: loaded.extend(weights),
+        model, "load_weights", lambda *, weights: loaded.extend(weights), raising=False
     )
 
     num_experts, intermediate, hidden = 2, 512, 2048
@@ -3049,7 +3024,12 @@ def test_load_weights_reroutes_prequantized_grouped_expert_scale_sidecars(
         ],
         types.SimpleNamespace(
             model=model,
-            vllm_config=types.SimpleNamespace(additional_config={}),
+            vllm_config=types.SimpleNamespace(
+                additional_config={},
+                model_config=types.SimpleNamespace(
+                    architectures=["Qwen3_5MoeForConditionalGeneration"]
+                ),
+            ),
         ),
     )
 
@@ -3070,6 +3050,30 @@ def test_load_weights_reroutes_prequantized_grouped_expert_scale_sidecars(
     torch.testing.assert_close(loaded[4][1], gate_up_scale[1, intermediate:])
     assert loaded[5][1] is down
     assert loaded[6][1] is down_scale
+
+
+def test_prequantized_grouped_expert_scale_rejects_unvalidated_layout(
+    fp8_module, monkeypatch
+):
+    fp8 = fp8_module
+    fp8.global_fp8_config = types.SimpleNamespace(refit_prequantize=True)
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda *_args: True)
+    scale_name = "model.layers.0.mlp.experts.gate_up_proj_scale_from_checkpoint"
+    runner = types.SimpleNamespace(
+        model=object(),
+        vllm_config=types.SimpleNamespace(
+            model_config=types.SimpleNamespace(architectures=["GptOssForCausalLM"])
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Qwen3.5-MoE"):
+        list(
+            fp8.get_quantized_weight_iterator(
+                [(scale_name, torch.ones(2, 4, 4))],
+                runner,
+                refit_with_reload_api=False,
+            )
+        )
 
 
 def _assert_dequant_close(weight_fp8, scale_inv, source_bf16):
@@ -3104,8 +3108,6 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(
     """
     import torch
 
-    from nemo_rl.models.generation.vllm import vllm_backend
-
     fp8 = fp8_module
     fp8.global_fp8_config = types.SimpleNamespace(
         use_weight_pow2_scale=False, is_mx=False
@@ -3115,9 +3117,7 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(
     )
     loaded = []
     monkeypatch.setattr(
-        vllm_backend,
-        "load_weights_maybe_cached",
-        lambda model, weights, *, cache_loader_routes: loaded.extend(weights),
+        model, "load_weights", lambda *, weights: loaded.extend(weights), raising=False
     )
 
     intermediate, hidden = 256, 384

@@ -548,7 +548,8 @@ class GenerationInterface(ABC):
         Returns:
             Optionally, the parameter names the backend wants pre-quantized on
             the trainer before streaming (e.g. vllm_cfg.refit_prequantize);
-            None when no trainer-side pre-quantization is requested.
+            None when no trainer-side pre-quantization is requested. The vLLM
+            implementation also installs its FP8 configuration on the workers.
         """
         raise NotImplementedError
 

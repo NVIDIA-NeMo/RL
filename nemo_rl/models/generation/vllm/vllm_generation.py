@@ -1418,6 +1418,11 @@ class VllmGeneration(GenerationInterface):
         names = sorted(
             {name for result in ray.get(futures) if result for name in result}
         )
+        if self.cfg["vllm_cfg"].get("refit_prequantize") and not names:
+            raise RuntimeError(
+                "vllm_cfg.refit_prequantize=true, but vLLM reported no "
+                "FP8-eligible parameters; check the FP8 config and ignored layers."
+            )
         return names or None
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:

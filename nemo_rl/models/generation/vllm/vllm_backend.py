@@ -29,9 +29,6 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     resolve_rollout_rank,
 )
 from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
-from nemo_rl.models.generation.vllm.worker_utils import (
-    refit_cache_loader_routes_enabled,
-)
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -282,144 +279,6 @@ def fix_gemma3_vision_weight_name(key: str) -> str:
     )
 
 
-class _RefitLoaderCache:
-    """Recorded weight_loader calls for refit weight names.
-
-    vLLM's model.load_weights re-resolves every weight name through the
-    model's stacked/expert parameter mappings on each call; for large MoE
-    refits that is millions of substring checks per refit over a key set that
-    is static after the prepare_refit_info handshake. This cache records, per
-    name, the (loader, param, args, kwargs) of every weight_loader call the
-    first time a name is loaded and replays them directly afterwards.
-    """
-
-    def __init__(self) -> None:
-        self.calls: dict[str, list[tuple[Any, torch.nn.Parameter, tuple, dict]]] = {}
-        # Names whose loads never reached a wrapped weight_loader (skipped,
-        # transformed before dispatch, or default-loaded); these keep going
-        # through model.load_weights.
-        self.uncached: set[str] = set()
-        self.snapshot: dict[str, torch.nn.Parameter] = {}
-
-    def reset(self) -> None:
-        self.calls.clear()
-        self.uncached.clear()
-        self.snapshot.clear()
-
-
-def _cached_params_still_valid(model: Any, cache: _RefitLoaderCache) -> bool:
-    current = dict(model.named_parameters())
-    return all(current.get(name) is param for name, param in cache.snapshot.items())
-
-
-def _record_loader_calls(
-    model: Any, cache: _RefitLoaderCache, weights: list[tuple[str, torch.Tensor]]
-) -> set[str]:
-    """Run model.load_weights once while recording every weight_loader call.
-
-    Incoming weights are matched to loader calls by tensor object identity,
-    so only loads that pass the original tensor through a parameter's
-    weight_loader attribute are captured; everything else lands in
-    cache.uncached. Returns the loaded names from model.load_weights.
-    """
-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-
-    weight_names = {id(weight): name for name, weight in weights}
-    recorded: dict[str, list] = {}
-    originals: list[tuple[torch.nn.Parameter, Any]] = []
-
-    def make_recorder(loader):
-        def recorder(param, loaded_weight, *args, **kwargs):
-            name = weight_names.get(id(loaded_weight))
-            if name is not None:
-                recorded.setdefault(name, []).append((loader, param, args, kwargs))
-            return loader(param, loaded_weight, *args, **kwargs)
-
-        return recorder
-
-    try:
-        for param_name, param in model.named_parameters():
-            loader = getattr(param, "weight_loader", None)
-            # Leave loaders owned by vLLM's loading lifecycle unwrapped.
-            # The default loader may use a different argument list, while the
-            # online loader must remain installed so vLLM can finalize each
-            # layer without replaying through this cache recorder.
-            if (
-                loader is None
-                or loader is default_weight_loader
-                or getattr(loader, "__name__", None) == "online_process_loader"
-            ):
-                continue
-            cache.snapshot[param_name] = param
-            originals.append((param, loader))
-            param.weight_loader = make_recorder(loader)
-        loaded = model.load_weights(weights=weights)
-    finally:
-        for param, loader in originals:
-            param.weight_loader = loader
-
-    for name, _ in weights:
-        calls = recorded.get(name)
-        if calls is None:
-            cache.uncached.add(name)
-        else:
-            cache.calls[name] = calls
-    return loaded if loaded is not None else set()
-
-
-def load_weights_maybe_cached(
-    model: Any,
-    weights: Iterable[tuple[str, torch.Tensor]],
-    *,
-    cache_loader_routes: bool,
-) -> set[str]:
-    """Load weights, optionally replaying cached loader routes.
-
-    Cached parameter identities are re-validated against named_parameters()
-    on every call, so a process_weights_after_loading pass that replaces
-    parameter objects drops the cache instead of loading into orphans.
-    Returns the set of loaded weight names, mirroring model.load_weights.
-    """
-    if not cache_loader_routes:
-        return model.load_weights(weights=weights)
-
-    weights = list(weights)
-    cache = getattr(model, "_nrl_refit_loader_cache", None)
-    if cache is None:
-        cache = _RefitLoaderCache()
-        model._nrl_refit_loader_cache = cache
-
-    replay = []
-    fallback = []
-    record = []
-    for name, weight in weights:
-        if name in cache.calls:
-            replay.append((name, weight))
-        elif name in cache.uncached:
-            fallback.append((name, weight))
-        else:
-            record.append((name, weight))
-
-    if replay and not _cached_params_still_valid(model, cache):
-        cache.reset()
-        return model.load_weights(weights=weights)
-
-    loaded: set[str] = set()
-    for name, weight in replay:
-        for loader, param, args, kwargs in cache.calls[name]:
-            # Expert loaders return False for non-local shards; a name only
-            # counts as loaded when some call does not report failure.
-            if loader(param, weight, *args, **kwargs) is not False:
-                loaded.add(name)
-    if record:
-        loaded |= _record_loader_calls(model, cache, record)
-    if fallback:
-        fallback_loaded = model.load_weights(weights=fallback)
-        if fallback_loaded is not None:
-            loaded |= fallback_loaded
-    return loaded
-
-
 _GEMMA4_UNIFIED_MULTIMODAL_WEIGHT_MARKERS = (
     "model.embed_vision.",
     "model.embed_audio.",
@@ -585,13 +444,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         when the model's ``load_weights`` does not report one.
         """
         if not getattr(self, "_nrl_layerwise_reload_active", False):
-            return load_weights_maybe_cached(
-                self.model_runner.model,
-                weights,
-                cache_loader_routes=refit_cache_loader_routes_enabled(
-                    self.model_runner.vllm_config
-                ),
-            )
+            return self.model_runner.model.load_weights(weights=weights)
 
         source_storage_ptrs: set[int] = set()
 

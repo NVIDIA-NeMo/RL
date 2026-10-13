@@ -632,13 +632,6 @@ class MegatronPolicyWorkerImpl(
         self._refit_param_info_hf: Optional[
             dict[str, tuple[torch.Size, torch.dtype]]
         ] = None
-        # Pinned host staging for the reference-policy swap; only populated when
-        # megatron_cfg["pinned_reference_swap"] is enabled. Buffer contents are
-        # only live within a single use_reference_model call (every copy
-        # synchronizes before control leaves it) and each call re-reads
-        # model.state_dict(), so offload_before/after_refit moving or replacing
-        # param storages between calls cannot collide with these buffers.
-        self._pinned_swap_save_buffers: dict[str, torch.Tensor] = {}
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
@@ -2804,39 +2797,14 @@ class MegatronPolicyWorkerImpl(
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
-            # NotRequired key: absent means disabled, default lives in the exemplar YAML.
-            use_pinned_swap = bool(
-                self.cfg["megatron_cfg"].get("pinned_reference_swap")
-            )
-
             # Save original references
             model_state_dict = {}
             for name, item in self.model.state_dict().items():
                 if isinstance(item, torch.Tensor):
-                    # extra_state tensors stay on fresh pageable copies:
-                    # set_extra_state() may retain the tensor it is given, and
-                    # a reused pinned buffer would mutate it on the next swap.
-                    if use_pinned_swap and "extra_state" not in name:
-                        buf = self._pinned_swap_save_buffers.get(name)
-                        if buf is None:
-                            buf = torch.empty(
-                                item.shape,
-                                dtype=item.dtype,
-                                device="cpu",
-                                pin_memory=True,
-                            )
-                            self._pinned_swap_save_buffers[name] = buf
-                        buf.copy_(item.detach(), non_blocking=True)
-                        item = buf
-                    else:
-                        item = item.detach().to(
-                            device="cpu", non_blocking=True, copy=True
-                        )
+                    item = item.detach().to(
+                        device="cpu", non_blocking=True, copy=True
+                    )
                 model_state_dict[name] = item
-            if use_pinned_swap:
-                # D2H saves must land before the reference apply overwrites
-                # the params they read from.
-                torch.cuda.synchronize()
 
             # Swap reference state into self.model. Use _apply_state_dict_to_model
             # (rather than load_state_dict) so FP8 _extra_state with mismatched shape
@@ -2844,10 +2812,7 @@ class MegatronPolicyWorkerImpl(
             self._apply_state_dict_to_model(
                 self.reference_state_dict,
                 raise_if_key_missing=True,
-                non_blocking=use_pinned_swap,
             )
-            if use_pinned_swap:
-                torch.cuda.synchronize()
 
             if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                 gc.collect()
@@ -2879,10 +2844,7 @@ class MegatronPolicyWorkerImpl(
             self._apply_state_dict_to_model(
                 model_state_dict,
                 raise_if_key_missing=True,
-                non_blocking=use_pinned_swap,
             )
-            if use_pinned_swap:
-                torch.cuda.synchronize()
 
             if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                 gc.collect()
@@ -4691,28 +4653,7 @@ class MegatronPolicyWorkerImpl(
             move_grads=not keep_shared_buffer,
         )
         torch.randn(1).cuda()  # wake up torch allocator
-        if self.cfg["megatron_cfg"].get("refit_slim_offload_after"):
-            # Grad buffers were already offloaded by offload_before_refit at
-            # the start of the refit, so skip the full rerun (grad-buffer moves
-            # and a second gc/empty_cache pair). Cache clears must still honor
-            # their knobs: callers may have run a forward pass since (e.g.
-            # teacher logits in distillation), repopulating TE fp8 workspaces,
-            # the rotary-embedding lru_cache, and MoE dispatcher tensors.
-            if self.fp8_cfg and self.fp8_cfg.get("force_clear_fp8_caches", False):
-                self._clear_fp8_caches()
-            if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
-                self._clear_rope_and_moe_dispatcher_caches()
-            if (
-                hasattr(self, "optimizer")
-                and self.optimizer is not None
-                and not self.optimizer_cpu_offload
-                and self.offload_optimizer_for_refit
-            ):
-                self.move_optimizer("cpu")
-            gc.collect()
-            torch.cuda.empty_cache()
-        else:
-            self.offload_before_refit()  # rerun the old offload function
+        self.offload_before_refit()
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB

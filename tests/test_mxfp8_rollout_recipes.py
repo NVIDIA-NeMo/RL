@@ -251,7 +251,6 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     assert vllm_cfg["is_mx"] is True
     if expected.get("refit_optimizations"):
         assert vllm_cfg["refit_prequantize"] is True
-        assert vllm_cfg["refit_cache_loader_routes"] is True
         assert config["policy"]["megatron_cfg"]["enabled"] is True
     assert "quantization_ignored_layer_kws" not in vllm_cfg
     assert vllm_cfg["quantization_ignore_patterns"] == expected["ignore_patterns"]
@@ -298,7 +297,6 @@ def test_sync_qwen3_mxfp8_rollout_recipes_enable_refit_optimizations(
     vllm_cfg = config["policy"]["generation"]["vllm_cfg"]
 
     assert vllm_cfg["refit_prequantize"] is True
-    assert vllm_cfg["refit_cache_loader_routes"] is True
 
 
 @pytest.mark.parametrize(
@@ -316,7 +314,6 @@ def test_async_qwen3_mxfp8_rollout_recipes_skip_sync_refit_optimizations(
     vllm_cfg = config["policy"]["generation"]["vllm_cfg"]
 
     assert not vllm_cfg.get("refit_prequantize", False)
-    assert not vllm_cfg.get("refit_cache_loader_routes", False)
 
 
 def test_mxfp8_rollout_recipes_are_in_gb200_performance_suite() -> None:

@@ -48,9 +48,6 @@ from nemo_rl.models.generation.vllm.quantization.utils import (
     resolve_module_from_param_name,
 )
 from nemo_rl.models.generation.vllm.utils import is_grouped_moe_expert_weight_name
-from nemo_rl.models.generation.vllm.worker_utils import (
-    refit_cache_loader_routes_enabled,
-)
 
 logger = init_logger(__name__)
 
@@ -543,28 +540,29 @@ def get_module_from_param_name(model, name: str):
     return resolution.module
 
 
-_GROUPED_EXPERT_WEIGHT_SUFFIXES = (
-    "mlp.experts.gate_up_proj",
-    "mlp.experts.down_proj",
-)
-
-
-def _is_grouped_expert_weight(name: str) -> bool:
-    return name.endswith(_GROUPED_EXPERT_WEIGHT_SUFFIXES)
-
-
 def _grouped_expert_weight_name_from_scale(name: str) -> str | None:
     if not name.endswith(MXFP8_SCALE_SUFFIX):
         return None
     weight_name = name.removesuffix(MXFP8_SCALE_SUFFIX)
-    return weight_name if _is_grouped_expert_weight(weight_name) else None
+    return weight_name if is_grouped_moe_expert_weight_name(weight_name) else None
+
+
+def _require_qwen35_grouped_moe_layout(model_runner: Any, key: str) -> None:
+    model_config = getattr(model_runner.vllm_config, "model_config", None)
+    architectures = getattr(model_config, "architectures", None) or []
+    if not any(arch.startswith("Qwen3_5MoeFor") for arch in architectures):
+        raise ValueError(
+            f"Prequantized grouped MoE refit for {key!r} requires the validated "
+            f"Qwen3.5-MoE gate-then-up layout; got {architectures}. "
+            "Set vllm_cfg.refit_prequantize=false for this model."
+        )
 
 
 def _is_fp8_weight(name, model):
     if name not in fp8_state.seen_params:
         fp8_state.seen_params.add(name)
         # Filter out bias params
-        if name.endswith("weight") or _is_grouped_expert_weight(name):
+        if name.endswith("weight") or is_grouped_moe_expert_weight_name(name):
             module = get_module_from_param_name(model, name)
             # We currently only quantize linear layers
             if (
@@ -621,6 +619,7 @@ def get_quantized_weight_iterator(
             if global_fp8_config.refit_prequantize and _is_fp8_weight(
                 grouped_weight_name, model
             ):
+                _require_qwen35_grouped_moe_layout(model_runner, k)
                 yield from _reroute_grouped_moe_expert_scale(k, v)
             else:
                 yield k, v
@@ -645,6 +644,7 @@ def get_quantized_weight_iterator(
                         raise ValueError(
                             "MXFP8 E4M3 refit weights require refit_prequantize=true."
                         )
+                    _require_qwen35_grouped_moe_layout(model_runner, k)
                     yield k, v
                     continue
                 if global_fp8_config.is_mx:
@@ -716,13 +716,7 @@ def load_weights(
         model_load_weights(quantized_weights)
         return
 
-    from nemo_rl.models.generation.vllm.vllm_backend import load_weights_maybe_cached
-
-    load_weights_maybe_cached(
-        model_runner.model,
-        quantized_weights,
-        cache_loader_routes=refit_cache_loader_routes_enabled(model_runner.vllm_config),
-    )
+    model_runner.model.load_weights(weights=quantized_weights)
 
 
 def cast_tensor_to_fp8_blockwise(
@@ -1344,23 +1338,6 @@ def process_weights_after_loading_moe(self, layer) -> None:
         )
 
 
-# Shared gather destinations keyed by (tag, shape, device). They persist across
-# refits so the batched shuffle allocates nothing after the first pass; their
-# contents are rewritten on every call, so a sleep-mode discard is harmless.
-mxfp8_shuffle_scratch_buffers: dict[
-    tuple[str, tuple[int, ...], torch.device], torch.Tensor
-] = {}
-
-
-def _mxfp8_scratch(tag: str, shape: torch.Size, device: torch.device) -> torch.Tensor:
-    key = (tag, tuple(shape), device)
-    buf = mxfp8_shuffle_scratch_buffers.get(key)
-    if buf is None:
-        buf = torch.empty(shape, dtype=torch.uint8, device=device)
-        mxfp8_shuffle_scratch_buffers[key] = buf
-    return buf
-
-
 def _mxfp8_moe_row_permutations(
     layer,
     w13_weight: torch.Tensor,
@@ -1412,7 +1389,7 @@ def _shuffle_mxfp8_moe_batched(
     the row gathers run as a single dim-1 index_select over the whole
     [E, M, K] tensor and the scale swizzle as one 3D block_scale_interleave,
     whose flat output equals the stacked per-expert 2D outputs. Gathers write
-    into shared scratch buffers; callers copy_ into the persistent
+    into temporary buffers; callers copy_ into the persistent
     destinations (w13/w2 weights may alias their own gather source).
     """
     from flashinfer import block_scale_interleave
@@ -1428,29 +1405,15 @@ def _shuffle_mxfp8_moe_batched(
 
     w13_u8 = w13_weight.view(torch.uint8)
     w2_u8 = w2_weight.view(torch.uint8)
-    w13_shuffled = torch.index_select(
-        w13_u8, 1, perm_w13, out=_mxfp8_scratch("w13", w13_u8.shape, w13_u8.device)
-    )
-    w2_shuffled = torch.index_select(
-        w2_u8, 1, perm_w2, out=_mxfp8_scratch("w2", w2_u8.shape, w2_u8.device)
-    )
+    w13_shuffled = torch.index_select(w13_u8, 1, perm_w13)
+    w2_shuffled = torch.index_select(w2_u8, 1, perm_w2)
 
     w13_sf_u8 = pad_flashinfer_scale_k(w13_scale.view(torch.uint8))
     w2_sf_u8 = pad_flashinfer_scale_k(w2_scale.view(torch.uint8))
     # Same constraint shuffle_matrix_sf_a asserts on the per-expert path.
     assert w13_sf_u8.shape[1] % 128 == 0 and w2_sf_u8.shape[1] % 128 == 0
-    w13_sf_gathered = torch.index_select(
-        w13_sf_u8,
-        1,
-        perm_w13,
-        out=_mxfp8_scratch("w13_sf", w13_sf_u8.shape, w13_sf_u8.device),
-    )
-    w2_sf_gathered = torch.index_select(
-        w2_sf_u8,
-        1,
-        perm_w2,
-        out=_mxfp8_scratch("w2_sf", w2_sf_u8.shape, w2_sf_u8.device),
-    )
+    w13_sf_gathered = torch.index_select(w13_sf_u8, 1, perm_w13)
+    w2_sf_gathered = torch.index_select(w2_sf_u8, 1, perm_w2)
     w13_scale_shuffled = (
         block_scale_interleave(w13_sf_gathered)
         .view(MXFP8_SCALE_DTYPE)

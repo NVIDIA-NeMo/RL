@@ -580,9 +580,8 @@ def test_fp8_load_uses_buffer_safe_model_loader(monkeypatch):
 
 @pytest.mark.vllm
 @pytest.mark.parametrize("native_reload", [False, True])
-@pytest.mark.parametrize("cache_loader_routes", [False, True])
 def test_fp8_layerwise_reload_passes_entire_quantized_generator(
-    monkeypatch, native_reload, cache_loader_routes
+    monkeypatch, native_reload
 ):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
@@ -591,8 +590,7 @@ def test_fp8_layerwise_reload_passes_entire_quantized_generator(
     produced_weights = 0
 
     def model_load_weights(*, weights):
-        if not cache_loader_routes:
-            assert produced_weights == 0
+        assert produced_weights == 0
         received_weights.extend(weights)
         return {name for name, _ in received_weights}
 
@@ -619,9 +617,6 @@ def test_fp8_layerwise_reload_passes_entire_quantized_generator(
             yield weight
 
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
-    monkeypatch.setattr(
-        vllm_backend, "refit_cache_loader_routes_enabled", lambda _: cache_loader_routes
-    )
     monkeypatch.setattr(
         fp8, "get_quantized_weight_iterator", get_quantized_weight_iterator
     )
@@ -789,43 +784,6 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
     process.assert_called_once_with(model, model_config, ext.device)
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
     ext._maybe_process_fp8_kv_cache.assert_not_called()
-
-
-@pytest.mark.vllm
-def test_fp8_refit_preserves_weight_pool_shuffle_scratch(monkeypatch):
-    from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.quantization import fp8
-
-    model = SimpleNamespace(modules=lambda: [])
-    vllm_config = SimpleNamespace(
-        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
-        quant_config=object(),
-    )
-    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
-        vllm_backend.VllmInternalWorkerExtension
-    )
-    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
-    ext.model_config = object()
-    ext.device = torch.device("cpu")
-    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
-
-    scratch = torch.empty(1, dtype=torch.uint8)
-    scratch_buffers = {("w13", (1,), torch.device("cpu")): scratch}
-    monkeypatch.setattr(fp8, "mxfp8_shuffle_scratch_buffers", scratch_buffers)
-    monkeypatch.setattr(
-        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
-        MagicMock(),
-    )
-
-    with ext._weight_update_lifecycle("collective") as finalize:
-        finalize()
-
-    assert scratch_buffers == {
-        ("w13", (1,), torch.device("cpu")): scratch,
-    }
 
 
 @pytest.mark.vllm
@@ -1824,7 +1782,7 @@ def test_generation_prepare_refit_info_allows_mxfp8_grouped_moe(
 
 
 @pytest.mark.vllm
-def test_generation_prepare_refit_info_allows_prequantized_mxfp8_grouped_moe(
+def test_generation_prepare_refit_info_rejects_empty_prequant_selection(
     monkeypatch,
 ):
     from nemo_rl.models.generation.vllm import vllm_generation
@@ -1845,7 +1803,8 @@ def test_generation_prepare_refit_info_allows_prequantized_mxfp8_grouped_moe(
     monkeypatch.setattr(vllm_generation.ray, "get", MagicMock(return_value=[None]))
     state_dict_info = {"model.layers.0.mlp.experts.gate_up_proj": object()}
 
-    assert generation.prepare_refit_info(state_dict_info) is None
+    with pytest.raises(RuntimeError, match="reported no FP8-eligible parameters"):
+        generation.prepare_refit_info(state_dict_info)
     leader.prepare_refit_info.remote.assert_called_once_with(
         state_dict_info=state_dict_info
     )

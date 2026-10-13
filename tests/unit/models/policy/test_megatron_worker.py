@@ -1967,7 +1967,7 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
     assert exported[scale_name].shape == (64, 2)
 
 
-def test_reference_model_pinned_swap_restores_state_and_reuses_buffer(monkeypatch):
+def test_reference_model_swap_restores_state():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -1986,26 +1986,11 @@ def test_reference_model_pinned_swap_restores_state_and_reuses_buffer(monkeypatc
     }
     worker.cfg = {
         "megatron_cfg": {
-            "pinned_reference_swap": True,
             "empty_unused_memory_level": 0,
         }
     }
-    worker._pinned_swap_save_buffers = {}
     worker.should_disable_forward_pre_hook = False
     worker.sampling_params = None
-    allocations = []
-    original_empty = torch.empty
-
-    def empty(*args, **kwargs):
-        allocations.append(kwargs)
-        kwargs = {**kwargs, "pin_memory": False}
-        return original_empty(*args, **kwargs)
-
-    synchronize = MagicMock()
-    monkeypatch.setattr(torch, "empty", empty)
-    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
-
-    cached_buffer = None
     for _ in range(2):
         with worker.use_reference_model():
             torch.testing.assert_close(worker.model.weight, torch.tensor([11.0]))
@@ -2014,20 +1999,6 @@ def test_reference_model_pinned_swap_restores_state_and_reuses_buffer(monkeypatc
             )
         torch.testing.assert_close(worker.model.weight, torch.tensor([1.0]))
         torch.testing.assert_close(worker.model.extra_state_cache, torch.tensor([2.0]))
-        if cached_buffer is None:
-            cached_buffer = worker._pinned_swap_save_buffers["weight"]
-        else:
-            assert worker._pinned_swap_save_buffers["weight"] is cached_buffer
-
-    assert list(worker._pinned_swap_save_buffers) == ["weight"]
-    assert allocations == [
-        {
-            "dtype": torch.float32,
-            "device": "cpu",
-            "pin_memory": True,
-        }
-    ]
-    assert synchronize.call_count == 6
 
 
 def test_clear_rope_and_moe_dispatcher_caches_clears_tensor_state(monkeypatch):
@@ -2229,13 +2200,7 @@ def test_enable_refit_prequantize_rejects_indivisible_last_dim():
         worker.enable_refit_prequantize(["model.weight"])
 
 
-@pytest.mark.parametrize(
-    "slim,offload_optimizer",
-    [(False, True), (True, True), (True, False)],
-)
-def test_offload_after_refit_routes_cleanup_by_mode(
-    monkeypatch, slim, offload_optimizer
-):
+def test_offload_after_refit_uses_standard_cleanup(monkeypatch):
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -2246,7 +2211,6 @@ def test_offload_after_refit_routes_cleanup_by_mode(
     worker.move_model = MagicMock(return_value=model)
     worker.cfg = {
         "megatron_cfg": {
-            "refit_slim_offload_after": slim,
             "clear_memory_caches_before_refit": True,
         }
     }
@@ -2259,7 +2223,7 @@ def test_offload_after_refit_routes_cleanup_by_mode(
     worker._clear_rope_and_moe_dispatcher_caches = MagicMock()
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
-    worker.offload_optimizer_for_refit = offload_optimizer
+    worker.offload_optimizer_for_refit = True
     worker.move_optimizer = MagicMock()
     worker.offload_before_refit = MagicMock()
     worker.finalize_async_save = MagicMock()
@@ -2287,23 +2251,12 @@ def test_offload_after_refit_routes_cleanup_by_mode(
         model, "cpu", move_params=True, move_grads=True
     )
     model.eval.assert_called_once_with()
-    if slim:
-        worker._clear_fp8_caches.assert_called_once_with()
-        worker._clear_rope_and_moe_dispatcher_caches.assert_called_once_with()
-        if offload_optimizer:
-            worker.move_optimizer.assert_called_once_with("cpu")
-        else:
-            worker.move_optimizer.assert_not_called()
-        collect.assert_called_once_with()
-        empty_cache.assert_called_once_with()
-        worker.offload_before_refit.assert_not_called()
-    else:
-        worker.offload_before_refit.assert_called_once_with()
-        worker._clear_fp8_caches.assert_not_called()
-        worker._clear_rope_and_moe_dispatcher_caches.assert_not_called()
-        worker.move_optimizer.assert_not_called()
-        collect.assert_not_called()
-        empty_cache.assert_not_called()
+    worker.offload_before_refit.assert_called_once_with()
+    worker._clear_fp8_caches.assert_not_called()
+    worker._clear_rope_and_moe_dispatcher_caches.assert_not_called()
+    worker.move_optimizer.assert_not_called()
+    collect.assert_not_called()
+    empty_cache.assert_not_called()
 
 
 def test_megatron_prepare_for_training_restores_optimizer():

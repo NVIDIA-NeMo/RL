@@ -24,7 +24,6 @@ policy:
       precision: "fp8"
       is_mx: true
       refit_prequantize: false
-      refit_cache_loader_routes: false
       quantization_ignore_patterns:
         - model.layers.*.self_attn.*
         - model.layers.*.mlp.gate
