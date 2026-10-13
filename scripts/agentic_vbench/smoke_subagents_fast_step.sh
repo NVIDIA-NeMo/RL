@@ -20,7 +20,6 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 code_dir=$(cd "$script_dir/../.." && pwd)
 export AGENTIC_VBENCH_BACKEND_DIR=${AGENTIC_VBENCH_BACKEND_DIR:-$code_dir/data/agentic_vbench/backend-cc-4}
-export GYM_VENV_DIR=${GYM_VENV_DIR:-$code_dir/data/agentic_vbench/gym_venvs_cc_unified}
 # Framework-owned segments on, OpenCode compaction/pruning off, subagents on.
 export CONTEXT_COMPACTION=true
 export AGENTIC_VBENCH_COMPACTION_AUTO=false
@@ -54,6 +53,8 @@ export AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER=${AGENTIC_VBENCH_AGENT_TIMEOUT_MU
 export SUBAGENT_MAX_ROW_TOKENS=${SUBAGENT_MAX_ROW_TOKENS:-81920}
 export SAVE_PERIOD=${SAVE_PERIOD:-1}
 export JOB_CYCLES=${JOB_CYCLES:-6}
+export SLURM_QOS=${SLURM_QOS:-short}
+export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-02:00:00}
 export BASE_NAME=${BASE_NAME:-agentic_vbench_subagents_16n_fast_step_$(date -u +%Y%m%d-%H%M%S)}
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$BASE_NAME}
 agent=env.nemo_gym.agentic_vbench_agent.responses_api_agents.agentic_vbench_agent

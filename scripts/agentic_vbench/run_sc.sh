@@ -55,7 +55,9 @@ if [[ ! -s $TRAIN_PATH ]]; then
     ${train_limit:+--limit "$train_limit"} --repeats "$train_repeats" --output "$TRAIN_PATH"
 fi
 export TRAINING_DEPS_SETUP_SCRIPT=/opt/nemo-rl/tools/ensure_agentic_vbench_deps.sh
-export GYM_VENV_DIR=${GYM_VENV_DIR:-$AVB_DATA_ROOT/gym_venvs}
+# Leave GYM_VENV_DIR unset unless the caller chose one. launch_sc.sh then uses
+# the submitter-owned, prewarmed cc-pr4200 cache under PERSISTENT_CACHE instead
+# of silently selecting an empty checkout-local directory.
 export BASE_NAME=${BASE_NAME:-agentic_vbench_sc_$(date -u +%Y%m%d-%H%M%S)}
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$BASE_NAME}
 exec bash "$script_dir/launch_sc.sh" "$@"

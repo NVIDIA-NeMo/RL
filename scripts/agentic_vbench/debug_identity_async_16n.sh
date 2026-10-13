@@ -21,6 +21,8 @@ export NUM_GENERATIONS=${NUM_GENERATIONS:-4}
 export MAX_STEPS=${MAX_STEPS:-2}
 export SAVE_PERIOD=${SAVE_PERIOD:-1}
 export JOB_CYCLES=${JOB_CYCLES:-1}
+export SLURM_QOS=${SLURM_QOS:-short}
+export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-02:00:00}
 export CONTEXT_COMPACTION=true
 export AGENTIC_VBENCH_COMPACTION_AUTO=false
 export AGENTIC_VBENCH_COMPACTION_PRUNE=false
@@ -30,7 +32,8 @@ export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$BASE_NAME}
 inflight_groups=$((NUM_PROMPTS * 3))
 exec bash "$script_dir/smoke_off_32turns_256k.sh" \
   async_rl.sampler.name=ready_first \
-  async_rl.sampler.max_staleness_versions=2 \
+  ~async_rl.sampler.max_lookahead_versions \
+  +async_rl.sampler.max_staleness_versions=2 \
   "async_rl.min_groups_for_streaming_train=${NUM_PROMPTS}" \
   "async_rl.max_inflight_prompts=${inflight_groups}" \
   "async_rl.max_buffered_rollouts=${inflight_groups}" \
