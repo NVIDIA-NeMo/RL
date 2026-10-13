@@ -348,8 +348,11 @@ apt-get autoremove -y
 rm -rf /var/lib/apt/lists/*
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
-# The ray install will include the older aiohttp version in its cache
-find "${UV_CACHE_DIR}" -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+# Ray bundles an older aiohttp and yarl; remove both so the installed aiohttp
+# uses a compatible yarl instead of Ray's bundled copy.
+find "${UV_CACHE_DIR}" -type d \
+    \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
+       -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
 
 echo "${CACHE_KEY}" > "${UV_CACHE_DIR}/.cache-key"
 
@@ -555,7 +558,9 @@ rm -rf /tmp/trtllm-build-venv
 
 # The syncs above can repopulate the shared uv cache, so repeat the security
 # cleanup performed in the preceding dependency layer.
-find "${UV_CACHE_DIR}" -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+find "${UV_CACHE_DIR}" -type d \
+    \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
+       -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
 
 # Hand this layer's new cache and venv entries to the runtime UID. Entries from the dependency
 # layer already belong to it, so only files created here change owner and none is copied up.
