@@ -1,15 +1,12 @@
-# Keep attention, dense MLPs, and shared experts in BF16. Apply MXFP8 only to
-# routed-expert linears. Initialization-time settings such as fp8_param belong
-# in fp8_cfg; a matched module's own fp8_param must equal fp8_cfg.fp8_param.
+# MXFP8 on every Transformer Engine linear: attention QKV and projection, and the routed
+# experts. Modules that are not TE linears (the MoE router, embeddings, the output layer,
+# norms) are unaffected by these matchers and keep their usual precision.
 #
-# Use the same file on train and generation (generation inherits megatron_cfg): a module
-# that is MXFP8 on one side and BF16 on the other breaks bitwise equality.
+# Megatron-Core's MXFP8 batch-invariant parity tests are MoE-only; the dense attention
+# linears are covered end to end by the zero-KL nightly that uses this file.
+#
+# Use the same file on train and generation (generation inherits megatron_cfg).
 configs:
-  bf16:
-    transformer_engine_config_type: "TEQuantizationParams"
-    training_recipe:
-      override_quantized_autocast: true
-    evaluation_recipe: {}
   mxfp8:
     transformer_engine_config_type: "TEQuantizationParams"
     training_recipe:
@@ -37,29 +34,8 @@ configs:
       override_nonquantized_autocast: true
 
 matchers:
-  attn_qkv_bf16:
-    config: "bf16"
-    type: "glob"
-    pattern: "*.linear_qkv"
-    enabled: true
-  attn_proj_bf16:
-    config: "bf16"
-    type: "glob"
-    pattern: "*.linear_proj"
-    enabled: true
-  mlp_fc1_mxfp8:
+  linear_mxfp8:
     config: "mxfp8"
-    type: "glob"
-    pattern: "*.experts.linear_fc1"
-    enabled: true
-  mlp_fc2_mxfp8:
-    config: "mxfp8"
-    type: "glob"
-    pattern: "*.experts.linear_fc2"
-    enabled: true
-  # First match wins: keep this last so routed experts retain MXFP8.
-  fallthrough_bf16:
-    config: "bf16"
     type: "glob"
     pattern: "*"
     enabled: true
