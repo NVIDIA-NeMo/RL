@@ -469,10 +469,37 @@ def test_splice_rewinds_before_new_media_when_eos_count_swallowed_message():
         retained=first.items,
         splice=bad_splice,
         eos_token_id=2,
+        template_prefix_token_ids=original,
     )
     assert captured.splice == PrefixSplice(template, 4, 4)
     assert [item.placeholder_offset for item in captured.items] == [6]
     assert [span.offset for span in prompt["mm_placeholders"]["image"]] == [1, 6]
+
+
+def test_splice_rewind_selects_matching_assistant_boundary_before_tool_results():
+    a, b = torch.ones(3, 2, 3), torch.full((3, 3, 2), 7.0)
+    original = [10, 18, 18, 11, 70, 71, 2]
+    first = capture_processed_media(
+        engine_prompt(original, [(Span(1, 2), a)]), prev_len=0
+    )
+    # The assistant EOS after [70, 71] is the true splice boundary. A later
+    # tool-result EOS also precedes the new image, so media counts alone cannot
+    # distinguish them; the isolated assistant render's suffix can.
+    template = [10, 18, 18, 11, 70, 71, 2, 80, 81, 2, 90, 18, 18, 91, 2]
+    bad_splice = PrefixSplice(original[:-1] + template[14:], 6, 14)
+    prompt = engine_prompt(
+        template, [(Span(1, 2), a), (Span(11, 2), b)]
+    )
+    captured = capture_processed_media(
+        prompt,
+        prev_len=len(original),
+        retained=first.items,
+        splice=bad_splice,
+        eos_token_id=2,
+        template_prefix_token_ids=template[:7],
+    )
+    assert captured.splice == PrefixSplice(original + template[7:], 6, 6)
+    assert [item.placeholder_offset for item in captured.items] == [11]
 
 
 def test_splice_does_not_rewind_unexpected_media_without_safe_eos_boundary():
@@ -1183,7 +1210,7 @@ def test_valid_media_metadata_checksum_needs_no_pixels_or_routes(retained_call):
     )
 
 
-def test_worker_forwards_request_renderer_eos_without_worker_renderer(monkeypatch):
+def test_worker_forwards_request_renderer_boundary_without_worker_renderer(monkeypatch):
     worker = SimpleNamespace(
         _capture_media=True,
         _capture_image_token_id=18,
@@ -1202,10 +1229,12 @@ def test_worker_forwards_request_renderer_eos_without_worker_renderer(monkeypatc
         {"prompt_token_ids": [10, 2]},
         admission=admission,
         eos_token_id=2,
+        template_prefix_token_ids=[10, 2],
     )
 
     assert result is captured
     assert capture.call_args.kwargs["eos_token_id"] == 2
+    assert capture.call_args.kwargs["template_prefix_token_ids"] == [10, 2]
 
 
 def test_worker_rejects_media_when_capture_disabled(retained_call):

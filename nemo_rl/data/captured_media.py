@@ -152,6 +152,7 @@ def _rewind_splice_before_new_media(
     retained_count: int,
     splice: PrefixSplice,
     eos_token_id: int | None,
+    template_prefix_token_ids: list[int] | None,
 ) -> PrefixSplice:
     """Repair an EOS-count splice that swallowed the first new media message.
 
@@ -183,15 +184,43 @@ def _rewind_splice_before_new_media(
         raise MediaCaptureRejected(
             "Rendered prefix has an unexpected media occurrence"
         )
-    template_cut_start = eos_positions[-1]
-    repaired_prefix_count = sum(
-        span.offset + span.length <= template_cut_start
-        for _, _, span, _ in occurrences
-    )
-    if repaired_prefix_count != retained_count:
-        raise MediaCaptureRejected(
-            "Rendered prefix has an unexpected media occurrence"
+    candidates = [
+        position
+        for position in eos_positions
+        if sum(
+            span.offset + span.length <= position
+            for _, _, span, _ in occurrences
         )
+        == retained_count
+    ]
+    if not candidates:
+        raise MediaCaptureRejected(
+            "Rendered prefix has an unexpected media occurrence "
+            f"(generic_media={prefix_count}, retained={retained_count}, "
+            f"occurrences={len(occurrences)}, no safe EOS boundary)"
+        )
+    template_cut_start = candidates[-1]
+    if template_prefix_token_ids is not None:
+        scored = []
+        for position in candidates:
+            limit = min(len(template_prefix_token_ids), position + 1)
+            score = 0
+            while (
+                score < limit
+                and template_prefix_token_ids[-1 - score]
+                == tokens[position - score]
+            ):
+                score += 1
+            scored.append((score, position))
+        best_score = max(score for score, _ in scored)
+        best = [position for score, position in scored if score == best_score]
+        if best_score <= 1 or len(best) != 1:
+            raise MediaCaptureRejected(
+                "Rendered prefix has an unexpected media occurrence "
+                f"(generic_media={prefix_count}, retained={retained_count}, "
+                f"occurrences={len(occurrences)}, ambiguous EOS boundary)"
+            )
+        template_cut_start = best[0]
     return replace(
         splice,
         token_ids=splice.token_ids[: splice.model_cut_end]
@@ -365,6 +394,7 @@ def capture_processed_media(
     retained: tuple[CapturedMediaItem, ...] = (),
     splice: PrefixSplice | None = None,
     eos_token_id: int | None = None,
+    template_prefix_token_ids: list[int] | None = None,
     image_token_id: int | None = None,
     patch_size: int | None = None,
     retained_tensors: tuple[StagedMediaTensors, ...] | None = None,
@@ -407,6 +437,7 @@ def capture_processed_media(
             retained_count=len(retained),
             splice=splice,
             eos_token_id=eos_token_id,
+            template_prefix_token_ids=template_prefix_token_ids,
         )
     added, seen, packed, sizes_parts, frame_counts = [], [], [], [], []
     corrected = {name: [] for name in placeholders}
