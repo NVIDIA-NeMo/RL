@@ -59,6 +59,7 @@ from nemo_rl.experience.reward_penalties import (
     RewardLogContext,
     finalize_capture_reward,
 )
+from nemo_rl.experience.rollout_dump import load_dump_config
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
@@ -259,7 +260,9 @@ class RolloutReassembler:
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
         media_columns: Optional[MediaColumnSpec] = None,
+        rollout_dump: Optional[dict[str, Any]] = None,
     ) -> None:
+        self._dumper = load_dump_config(rollout_dump)
         self._reward_penalty_config = reward_penalty_config
         self._effort_config = effort_config
         self._dp_client = dp_client
@@ -767,6 +770,22 @@ class RolloutReassembler:
             metrics[f"finalize/capture_failure_reason_{reason_bucket}_count"] = float(
                 count
             )
+        if self._dumper is not None:
+            # The viewer dump must never fail a group.
+            try:
+                self._dumper.dump(
+                    version=fallback_weight_version,
+                    agent_name=next(
+                        (c.agent_name for c in log_contexts if c is not None), None
+                    ),
+                    group_id=group_id,
+                    prompt_idx=prompt_idx,
+                    rows=rows,
+                    raw_rewards=list(rewards),
+                    mask_sample=mask_sample,
+                )
+            except Exception as error:
+                print(f"  rollout dump failed for {group_id}: {error!r}", flush=True)
 
         group_min_wv = min(
             (r.min_wv for r in valid_rows if r.min_wv is not None),

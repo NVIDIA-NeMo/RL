@@ -2044,6 +2044,10 @@ def setup_single_controller(
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
                 ),
+                rollout_dump={
+                    "tokenizer": master_config.policy["model_name"],
+                    **((token_capture_cfg.model_extra or {}).get("rollout_dump") or {}),
+                },
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
