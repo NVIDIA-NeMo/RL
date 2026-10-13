@@ -1097,8 +1097,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
     Both directions on the critic: one the PPO path needs and does not have, and
-    one a GRPO run carries and would never build. Plus the reward-shaping and
-    sampling knobs SC reads on neither path.
+    one a GRPO run carries and would never build. Plus the reward-shaping,
+    sampling and loss-weighting knobs SC reads on neither path.
     """
     algo_cfg = algo_config(master_config)
 
@@ -1121,8 +1121,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
             ("reward_scaling", algo_cfg.reward_scaling.enabled),
             ("reward_shaping", algo_cfg.reward_shaping.enabled),
-            # getattr: PPO's config has no length_penalty field.
+            # getattr: PPO's config has no length_penalty / agent_loss_weights field.
             ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
+            # Applied by grpo_train / async_grpo_train right before policy.train.
+            ("agent_loss_weights", bool(getattr(algo_cfg, "agent_loss_weights", None))),
         )
         if enabled
     ]
@@ -1342,12 +1344,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
-
-    if getattr(algo_cfg, "agent_loss_weights", None):
-        raise NotImplementedError(
-            "grpo.agent_loss_weights is applied by grpo_train and "
-            "async_grpo_train only; SingleController does not support it yet."
-        )
 
     reward_penalties_enabled = any(
         getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
