@@ -50,6 +50,15 @@ def test_gemma_models(model_name):
 
 
 @pytest.mark.hf_gated
+def test_nemotron_super_vl_checkpoint_uses_load_format_auto():
+    # Guards against the checkpoint's model_type changing: the mocked test below
+    # cannot see that, and vLLM would silently fall back to load_format=dummy.
+    model_name = "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16"
+    assert is_nano_nemotron_vl_model(model_name)
+    assert ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(model_name)
+
+
+@pytest.mark.hf_gated
 @pytest.mark.parametrize(
     "model_name",
     [

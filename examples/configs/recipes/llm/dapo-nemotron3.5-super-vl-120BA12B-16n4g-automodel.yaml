@@ -32,8 +32,8 @@ defaults: ../../grpo_math_1B.yaml
 #     HybridEP dispatcher, which needs make_sequence_length_divisible_by=64.
 #   - Do not set automodel_cfg.env_vars.PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #     here (see the automodel_cfg comment): it breaks the IPC refit on some clusters.
-#   - Validated on 16 x 4-GPU GB200 nodes (AIME-2024 0.53 -> 0.79 over 50
-#     steps); fewer nodes run out of host memory at the first checkpoint save.
+#   - Validated on 16 x 4-GPU GB200 nodes (see the model guide for the training
+#     curves); fewer nodes run out of host memory at the first checkpoint save.
 grpo:
   max_num_epochs: 2
   val_at_start: true

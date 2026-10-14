@@ -10,11 +10,11 @@ settings that are specific to this model.
 
 | Model | Modality | Training backend | Parallelism | Inference | Precision |
 | --- | --- | --- | --- | --- | --- |
-| Nemotron 3.5 Super VL (120B-A12B) | LLM (text) | AutoModel (DTensor) | FSDP2 + EP | vLLM | BF16 compute, FP32 master |
+| Nemotron 3.5 Super VL (120B-A12B) | LLM (text) | Automodel | FSDP2 + EP | vLLM | BF16 compute, FP32 master |
 
 Notes:
 
-- **Training** runs on the AutoModel (DTensor) backend with FSDP2 over all
+- **Training** runs on the Automodel backend with FSDP2 over all
   parameters and expert parallelism (HybridEP dispatcher) for the routed
   experts.
 - **Generation** uses the pinned stock vLLM, which registers
@@ -52,7 +52,7 @@ configured.
 
 ## Example Recipe
 
-AutoModel (DTensor) training with colocated vLLM generation. The recipe YAML
+Automodel training with colocated vLLM generation. The recipe YAML
 under `examples/configs/recipes/` is the source of truth.
 
 | Algo | Data | Seq | Train EP | vLLM TP/EP | `max_new_tokens` | Nodes | Recipe |
@@ -124,7 +124,7 @@ details.
 ### Training curves
 
 The run uses the recipe defaults (16 x 4-GPU GB200 nodes, train EP4, vLLM
-TP4/EP4) with the AutoModel (DTensor) backend and colocated vLLM generation,
+TP4/EP4) with the Automodel backend and colocated vLLM generation,
 chained as 4-hour Slurm jobs that resume from the latest checkpoint. Curves are
 wandb exports; the x axis is the training step.
 
