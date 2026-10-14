@@ -29,6 +29,7 @@ from nemo_rl.algorithms.loss.interfaces import (
     LossType,
     MetricNormalizer,
 )
+from nemo_rl.algorithms.loss.score_centering import score_centering_term
 from nemo_rl.algorithms.utils import (
     calculate_kl,
     compute_seq_logprob_errors,
@@ -232,46 +233,6 @@ class ClippedPGLossDataDict(TypedDict):
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
     __extra__: Any
-
-
-def _score_centering_term(
-    topk_logprobs: torch.Tensor,
-    sampler_topk_logprobs: torch.Tensor,
-    is_bounds: Optional[tuple[float, float]],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-token ``sum_v sg(c_v) * log p_v`` whose gradient is the sampler-expected score.
-
-    Score centering (arXiv:2609.20807, Eq. 14) with the paper's top-k estimator:
-    the sampler's head ``q`` is exact and its tail is modeled as ``rho * p`` with
-    ``rho`` = sampler tail mass / trainer tail mass. Without importance sampling
-    the centering mass is ``q`` on the head and ``rho * p`` on the tail. With
-    token-level TIS, ``w = clamp(p / q, lo, hi)``, it is
-    ``q * w = clamp(p, lo * q, hi * q)`` on the head and ``alpha * p`` on the tail
-    with ``alpha = clamp(1, lo * rho, hi * rho)``. Since ``sum_v p_v grad log p_v``
-    is zero, the tail contributes ``-alpha * p_v`` on the head ids, so the
-    coefficient is ``c_v = mass_v - alpha * p_v``.
-
-    Args:
-        topk_logprobs: Trainer log-probs at the sampler's top-k ids, ``[B, S, k]``,
-            carrying the gradient.
-        sampler_topk_logprobs: The sampler's log-probs at those ids, ``[B, S, k]``.
-        is_bounds: ``(lo, hi)`` of the TIS clamp, or ``None`` when IS is off.
-
-    Returns:
-        The per-token term ``[B, S]`` and the sampler mass the head covers ``[B, S]``.
-    """
-    p = topk_logprobs.detach().exp()
-    q = sampler_topk_logprobs.exp()
-    head_mass = q.sum(-1)
-    rho = (1.0 - head_mass).clamp(min=0.0) / (1.0 - p.sum(-1)).clamp(min=1e-6)
-    if is_bounds is None:
-        mass, alpha = q, rho
-    else:
-        lo, hi = is_bounds
-        mass = torch.minimum(torch.maximum(p, lo * q), hi * q)
-        alpha = torch.minimum(torch.maximum(torch.ones_like(rho), lo * rho), hi * rho)
-    coefficients = mass - alpha.unsqueeze(-1) * p
-    return (coefficients * topk_logprobs).sum(-1), head_mass
 
 
 class ClippedPGLossFn(LossFunction):
@@ -953,7 +914,7 @@ class ClippedPGLossFn(LossFunction):
             assert next_token_topk_logprobs is not None, (
                 "score_centering requires next_token_topk_logprobs from prepare_loss_input"
             )
-            centering, head_mass = _score_centering_term(
+            centering, head_mass = score_centering_term(
                 next_token_topk_logprobs,
                 data["generation_topk_logprobs"][:, 1:],
                 self._score_centering_is_bounds,

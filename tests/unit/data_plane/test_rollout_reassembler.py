@@ -1914,7 +1914,9 @@ def test_finalize_rollout_rejects_a_topk_fragment_of_the_wrong_length(
     receipt, _, _, _ = _stage_fixture_with_topk(
         tq_client, "worked_example", rollout_id="topk_short", short_call="c2"
     )
-    row = _topk_finalizer(tq_client).finalize_rollout("topk_short", receipt, reward=1.0)
+    (row,) = _topk_finalizer(tq_client).finalize_rollout(
+        "topk_short", receipt, reward=1.0
+    )
     assert row.rejection_reason == "topk_length_mismatch:c2"
 
 
@@ -1923,7 +1925,63 @@ def test_finalize_rollout_rejects_a_row_without_topk(tq_client, topk_partitions)
     sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION_TOPK)
     for record in records:
         assert sink.stage(record).ok
-    row = _topk_finalizer(tq_client).finalize_rollout(
+    (row,) = _topk_finalizer(tq_client).finalize_rollout(
         "topk_none", receipt.model_dump(), reward=0.0
     )
     assert (row.rejection_reason or "").startswith("missing_staging_row")
+
+
+def test_finalize_rollout_aligns_topk_on_segment_rows(
+    tq_client, topk_partitions, monkeypatch
+):
+    rollout_id = "topk_seg"
+    receipt, row, expected_ids, expected_logprobs = _stage_fixture_with_topk(
+        tq_client, "worked_example", rollout_id=rollout_id
+    )
+    call_id, carry_len, generation_len = row.link_spans[0]
+    seg_len = carry_len + generation_len
+    assert seg_len < len(row.token_ids)
+
+    def fake(receipt_obj, snapshots):
+        # Terminal chain plus a compaction segment that is the terminal's first
+        # call alone, so its top-k must be that call's span, not the terminal's.
+        terminal = _rebuild_mod.verify_and_linearize(receipt_obj, snapshots)
+        segment = _chain_view(
+            terminal,
+            token_ids=list(terminal.token_ids[:seg_len]),
+            token_mask=list(terminal.token_mask[:seg_len]),
+            logprobs=list(terminal.logprobs[:seg_len]),
+            model_call_ids=[call_id],
+            link_spans=[(call_id, carry_len, generation_len)],
+            extras_commitments=[],
+            terminal_model_call_id=call_id,
+            chain_index=1,
+            chain_kind="compaction_segment",
+            segment_index=1,
+            boundary_parent_call_id=call_id,
+        )
+        return types.SimpleNamespace(
+            rows=[_chain_view(terminal), segment],
+            skipped=[],
+            num_roots=2,
+            num_boundary_roots=1,
+        )
+
+    monkeypatch.setattr(_rebuild_mod, "verify_and_linearize_all", fake)
+    finalizer = RolloutReassembler(
+        tq_client,
+        partition_id=CANONICAL_PARTITION_TOPK,
+        staging_partition=STAGING_PARTITION_TOPK,
+        pad_token_id=PAD,
+        max_seq_len=4096,
+        top_logprobs=TOPK,
+        segment_rows_enabled=True,
+        max_rows_per_rollout=2,
+    )
+    terminal, segment = finalizer.finalize_rollout(rollout_id, receipt, reward=1.0)
+
+    assert terminal.valid and segment.valid
+    assert torch.equal(terminal.generation_topk_ids, expected_ids)
+    assert torch.equal(terminal.generation_topk_logprobs, expected_logprobs)
+    assert torch.equal(segment.generation_topk_ids, expected_ids[:seg_len])
+    assert torch.equal(segment.generation_topk_logprobs, expected_logprobs[:seg_len])
