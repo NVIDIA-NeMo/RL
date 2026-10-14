@@ -201,13 +201,25 @@ def _rewind_splice_before_new_media(
         )
     template_cut_start = candidates[-1]
     if template_prefix_token_ids is not None:
+        prefix_eos_positions = [
+            index
+            for index, token in enumerate(template_prefix_token_ids)
+            if token == eos_token_id
+        ]
+        if not prefix_eos_positions:
+            raise MediaCaptureRejected(
+                "Rendered prefix has an unexpected media occurrence "
+                f"(generic_media={prefix_count}, retained={retained_count}, "
+                f"occurrences={len(occurrences)}, assistant EOS missing)"
+            )
+        prefix_anchor = prefix_eos_positions[-1]
         scored = []
         for position in candidates:
-            limit = min(len(template_prefix_token_ids), position + 1)
+            limit = min(prefix_anchor + 1, position + 1)
             score = 0
             while (
                 score < limit
-                and template_prefix_token_ids[-1 - score]
+                and template_prefix_token_ids[prefix_anchor - score]
                 == tokens[position - score]
             ):
                 score += 1

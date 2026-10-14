@@ -496,7 +496,9 @@ def test_splice_rewind_selects_matching_assistant_boundary_before_tool_results()
         retained=first.items,
         splice=bad_splice,
         eos_token_id=2,
-        template_prefix_token_ids=template[:7],
+        # Real chat-template renders include a newline token after assistant EOS.
+        # Boundary matching must anchor at EOS rather than the rendered tail.
+        template_prefix_token_ids=template[:7] + [99],
     )
     assert captured.splice == PrefixSplice(original + template[7:], 6, 6)
     assert [item.placeholder_offset for item in captured.items] == [11]
