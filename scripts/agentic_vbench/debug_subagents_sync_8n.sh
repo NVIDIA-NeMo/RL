@@ -39,17 +39,17 @@ export AGENTIC_VBENCH_MAX_TURNS=${AGENTIC_VBENCH_MAX_TURNS:-32}
 # the value as one argv entry, but Hydra still parses punctuation in the value;
 # an apostrophe in the v9 prompt made the live driver fail before setup.
 debug_delegation_prompt="Your first action must be exactly one task tool call before bash read or any other tool. "
-debug_delegation_prompt+="Delegate only candidate clip selection to the general subagent and ask it to return a compact JSON slot to clip mapping with at most one evidence sentence per slot. "
-debug_delegation_prompt+="Tell the child not to create solution.mp4 or solution.json. Do not inspect clips yourself and do not repeat or debate the child analysis. "
-debug_delegation_prompt+="When the child returns choose its mapping immediately then use bash and ffmpeg to create both required output files with a truthful manifest. "
-debug_delegation_prompt+="Verify that both files exist and that solution.json parses before answering. Keep each response short. If any choice is ambiguous choose the best candidate once and continue. "
+debug_delegation_prompt+="Delegate only mechanical media preparation to the general subagent. Ask it to write a duration table at /workspace/work/subagent_durations.tsv and labeled contact sheets under /workspace/work/subagent_contact_sheets. "
+debug_delegation_prompt+="Tell the child not to inspect or choose clips and not to create solution.mp4 or solution.json. "
+debug_delegation_prompt+="When the child returns read its duration table and inspect each prepared contact sheet once. Choose the best clip for every slot once without revisiting decisions. "
+debug_delegation_prompt+="Then use bash and ffmpeg to create both required output files with a truthful manifest. Verify that both files exist and that solution.json parses before answering. Keep each response short. "
 debug_delegation_prompt+="Never end while a required deliverable is missing. After verification succeeds return one brief final sentence."
 export AGENTIC_VBENCH_DELEGATION_PROMPT=${AGENTIC_VBENCH_DELEGATION_PROMPT:-"${debug_delegation_prompt}"}
-debug_subagent_prompt="Complete only candidate clip selection and never create solution.mp4 or solution.json. "
-debug_subagent_prompt+="Use one batched probe and frame extraction workflow then inspect each compact contact sheet once. "
-debug_subagent_prompt+="Choose the best clip for every requested slot without revisiting decisions. If ambiguous choose the best candidate once. "
-debug_subagent_prompt+="Return within 400 words using a compact JSON slot to clip mapping followed by at most one short evidence sentence per slot. "
-debug_subagent_prompt+="Do not narrate the work plan or repeat comparisons. Return immediately when the mapping is complete and stop before the output limit."
+debug_subagent_prompt="Complete only mechanical media preparation and never choose candidate clips. Never create solution.mp4 or solution.json. "
+debug_subagent_prompt+="Use ffprobe in one shell workflow to write /workspace/work/subagent_durations.tsv with one clip and duration per line. "
+debug_subagent_prompt+="Use one batched frame extraction workflow to create clearly labeled compact contact sheets for every candidate under /workspace/work/subagent_contact_sheets. "
+debug_subagent_prompt+="Do not view or analyze any extracted image and do not discuss the storyboard. Verify the duration table and contact sheet files exist. "
+debug_subagent_prompt+="Return only their paths and counts in at most three short lines then stop."
 export AGENTIC_VBENCH_SUBAGENT_PROMPT=${AGENTIC_VBENCH_SUBAGENT_PROMPT:-"${debug_subagent_prompt}"}
 export BASE_NAME=${BASE_NAME:-agentic_vbench_v2_subagents_sync_8n_$(date -u +%Y%m%d-%H%M%S)-$$}
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$BASE_NAME}
