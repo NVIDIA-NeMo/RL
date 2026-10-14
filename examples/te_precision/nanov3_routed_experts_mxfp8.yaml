@@ -1,0 +1,62 @@
+# MXFP8 on the routed experts (GroupedLinear linear_fc1 / linear_fc2) of Nemotron Nano v3,
+# a hybrid Mamba + MoE model. Everything else stays BF16: attention, the shared experts, the
+# Mamba mixer linears (in_proj, out_proj), embeddings and the output layer. A BF16 block
+# disables the outer MXFP8 autocast for the module and keeps its weights in BF16 storage, so
+# refit leaves them unquantized as well.
+#
+# Use the same file on train and generation (generation inherits megatron_cfg).
+configs:
+  bf16:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe: {}
+  mxfp8:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe:
+      fp8_quantization_recipe: "mxfp8"
+      fp8_format: "hybrid"
+      fp8_param: true
+      # Required under zero_train_gen_mismatch; see linear_mxfp8.yaml for what each covers.
+      override_quantized_autocast: true
+      override_nonquantized_autocast: true
+    # Grad-disabled model construction (the generation model) reads evaluation_recipe, so it
+    # repeats the training precision; an empty block would mean BF16.
+    evaluation_recipe:
+      fp8_quantization_recipe: "mxfp8"
+      fp8_format: "hybrid"
+      fp8_param: true
+      override_quantized_autocast: true
+      override_nonquantized_autocast: true
+
+matchers:
+  # First match wins.
+  qkv_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*linear_qkv*"
+    enabled: true
+  proj_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*linear_proj*"
+    enabled: true
+  # Before the routed experts so that no broader experts pattern can pull them into MXFP8.
+  shared_experts_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*.mlp.shared_experts.*"
+    enabled: true
+  experts_fc1_mxfp8:
+    config: "mxfp8"
+    type: "glob"
+    pattern: "*.mlp.experts.linear_fc1"
+    enabled: true
+  experts_fc2_mxfp8:
+    config: "mxfp8"
+    type: "glob"
+    pattern: "*.mlp.experts.linear_fc2"
+    enabled: true
+  fallthrough_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*"
+    enabled: true

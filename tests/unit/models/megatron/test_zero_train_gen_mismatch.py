@@ -348,9 +348,55 @@ def test_validate_provider_rejects_unsupported_architecture(key, value):
         zgm.validate_zero_train_gen_model_provider(config, model_cfg)
 
 
-def test_validate_provider_accepts_hybrid_mamba():
+_HYBRID_MAMBA_ENV_VARS = {"MAMBA_DETERMINISTIC": "1", "TRITON_CACHE_AUTOTUNING": "1"}
+
+
+@pytest.fixture
+def _clean_mamba_env(monkeypatch):
+    for key in _HYBRID_MAMBA_ENV_VARS:
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.mark.parametrize(
+    "model_cfg",
+    [
+        types.SimpleNamespace(hybrid_layer_pattern="M*-"),
+        types.SimpleNamespace(is_hybrid_model=True),
+    ],
+)
+def test_validate_provider_accepts_hybrid_mamba(_clean_mamba_env, model_cfg):
+    config = _policy_config()
+    config["megatron_cfg"]["env_vars"].update(_HYBRID_MAMBA_ENV_VARS)
+
+    zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+
+
+def test_validate_provider_accepts_hybrid_mamba_env_from_launch(
+    _clean_mamba_env, monkeypatch
+):
+    for key, value in _HYBRID_MAMBA_ENV_VARS.items():
+        monkeypatch.setenv(key, value)
     config = _policy_config()
     model_cfg = types.SimpleNamespace(hybrid_layer_pattern="M*-")
+
+    zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+
+
+@pytest.mark.parametrize("missing", sorted(_HYBRID_MAMBA_ENV_VARS))
+def test_validate_provider_requires_hybrid_mamba_env_pair(_clean_mamba_env, missing):
+    config = _policy_config()
+    config["megatron_cfg"]["env_vars"].update(
+        {k: v for k, v in _HYBRID_MAMBA_ENV_VARS.items() if k != missing}
+    )
+    model_cfg = types.SimpleNamespace(hybrid_layer_pattern="M*-")
+
+    with pytest.raises(ValueError, match=f"got {missing}=None"):
+        zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+
+
+def test_validate_provider_skips_mamba_env_for_non_hybrid(_clean_mamba_env):
+    config = _policy_config()
+    model_cfg = types.SimpleNamespace(hybrid_layer_pattern=None)
 
     zgm.validate_zero_train_gen_model_provider(config, model_cfg)
 
