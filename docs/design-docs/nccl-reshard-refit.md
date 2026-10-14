@@ -276,7 +276,8 @@ Quantized destination handling stays in the bulk hooks.
 Megatron's packed collective imports, including `refit_transport=null` and misc
 weights, retain their existing destination `copy_` behavior. vLLM keeps its MXFP8
 receiver hook separate from the blockwise FP8 hook, which uses the existing
-square-block FP8 quantizer.
+square-block FP8 quantizer. The MXFP8 hook passes BF16/FP16 receive buffers
+directly to its quantizer.
 
 ## Decoupling Backend-Agnostic Parts and Backend-Dependent Parts
 

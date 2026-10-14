@@ -940,7 +940,7 @@ def test_nccl_reshard_refit_runs_transport_lifecycle(monkeypatch):
     finalize.assert_called_once_with()
 
 
-@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16])
 def test_build_hf_to_local_param_map_quantizes_wire_weights_for_mxfp8(
     wire_dtype, monkeypatch
 ):
@@ -979,8 +979,7 @@ def test_build_hf_to_local_param_map_quantizes_wire_weights_for_mxfp8(
     )
 
     def fake_quantize(weight):
-        expected_dtype = torch.bfloat16 if wire_dtype == torch.float32 else wire_dtype
-        assert weight.dtype == expected_dtype
+        assert weight.dtype == wire_dtype
         return (
             torch.full_like(weight, 3, dtype=torch.float8_e4m3fn),
             torch.full(
@@ -1091,7 +1090,7 @@ def test_build_hf_to_local_param_map_uses_routed_expert_runtime_mxfp8_scale(
     assert torch.all(runtime_scale[:, :intermediate_size, :] == 7)
 
 
-@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16])
 def test_build_hf_to_local_param_map_quantizes_dense_gate_and_up_for_mxfp8(
     wire_dtype,
     monkeypatch,
@@ -1127,8 +1126,7 @@ def test_build_hf_to_local_param_map_quantizes_dense_gate_and_up_for_mxfp8(
     )
 
     def fake_quantize(weight):
-        expected_dtype = torch.bfloat16 if wire_dtype == torch.float32 else wire_dtype
-        assert weight.dtype == expected_dtype
+        assert weight.dtype == wire_dtype
         fill_value = int(weight[0, 0].item())
         return (
             torch.full_like(weight, fill_value, dtype=torch.float8_e4m3fn),
@@ -1345,7 +1343,7 @@ def test_receiver_quantizes_blockwise_fused_weights(
     not torch.cuda.is_available(), reason="MXFP8 quantization requires CUDA"
 )
 @pytest.mark.parametrize("grouped", [False, True])
-@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16])
 def test_mxfp8_receiver_quantizes_wire_weights_on_gpu(grouped, wire_dtype):
     from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -1390,12 +1388,7 @@ def test_mxfp8_receiver_quantizes_wire_weights_on_gpu(grouped, wire_dtype):
             ctx.buf.copy_(expected)
             previous_weight, previous_scales = weight.clone(), scales.clone()
             spec.post(ctx)
-            quantizer_input = (
-                expected.to(torch.bfloat16) if wire_dtype == torch.float32 else expected
-            )
-            expected_weight, expected_scales = fp8.quantize_mxfp8_weight(
-                quantizer_input
-            )
+            expected_weight, expected_scales = fp8.quantize_mxfp8_weight(expected)
             torch.testing.assert_close(
                 weight.chunk(2, dim=-2)[part].float(),
                 expected_weight.float(),

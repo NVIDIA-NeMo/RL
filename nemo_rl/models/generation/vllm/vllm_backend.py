@@ -1880,14 +1880,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     quantize_mxfp8_weight,
                 )
 
-                # FlashInfer's MXFP8 quantizer accepts BF16/FP16 inputs.
-                # Convert FP32 only here, after the full-precision transfer.
-                weight = (
-                    ctx.buf.to(torch.bfloat16)
-                    if ctx.buf.dtype == torch.float32
-                    else ctx.buf
-                )
-                value, scale = quantize_mxfp8_weight(weight)
+                value, scale = quantize_mxfp8_weight(ctx.buf)
                 ctx.extra["value_region"].copy_(value)
                 ctx.extra["scale_region"].copy_(scale)
 
