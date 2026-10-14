@@ -11,6 +11,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from nemo.lens import derive_nv_dl_run_uuid
 from pydantic import ValidationError
 
 from nemo_rl.telemetry.config import TelemetryConfig
@@ -142,20 +143,18 @@ def test_the_data_parallel_size_is_not_reported():
 def test_parallelism_sizes_use_the_resource_scoped_spelling():
     """``nv.dl.topology.size.*``, not the ``dl.tensor_parallel.*`` family.
 
-    Both spell the same quantity, but only the topology one is in lens's
-    ``DL_RESOURCE_TYPES``, which feeds the table
-    ``normalize_resource_attributes`` consults. Keys outside it are passed
-    through untyped rather than rejected, so the ``dl.*`` spelling would reach
-    the backend as a string -- it is the span and metric spelling.
+    Both spell the same quantity, and nothing on lens's side picks between
+    them: ``normalize_resource_attributes`` runs only over the attributes lens
+    derives from ``OTEL_RESOURCE_ATTRIBUTES``, while the ``resource_attributes``
+    handed in from here are merged as they are, so either spelling would arrive
+    intact. The convention is that the topology keys are the resource-scoped
+    spelling and ``dl.*`` the span and metric one, which makes getting it right
+    entirely this function's job -- hence the test.
     """
-    pytest.importorskip("nemo.lens")
-    from nemo.lens.semconv.resources import DL_RESOURCE_TYPES
-
     attrs = _build_resource_attributes(_FakeMasterConfig(), "grpo")
     assert "dl.tensor_parallel.size" not in attrs
     assert "dl.pipeline_parallel.size" not in attrs
-    assert "nv.dl.topology.size.tp" in DL_RESOURCE_TYPES
-    assert "dl.tensor_parallel.size" not in DL_RESOURCE_TYPES
+    assert attrs["nv.dl.topology.size.tp"] == 2
 
 
 def test_training_target_drops_a_non_positive_step_count():
@@ -222,7 +221,6 @@ def test_process_attributes_report_the_local_rank_when_the_launcher_set_one(
     process without the variable reports no local rank rather than defaulting
     to zero and claiming one.
     """
-    pytest.importorskip("nemo.lens")
     monkeypatch.setenv("LOCAL_RANK", "3")
     assert _process_attributes(rank=11, world_size=16)["nv.dl.local_rank"] == 3
 
@@ -237,9 +235,6 @@ def test_process_attributes_name_the_provider_and_the_run(monkeypatch):
     runs with Megatron ones joins on the derived value, so publishing the run
     id under this key would look populated and match nothing.
     """
-    pytest.importorskip("nemo.lens")
-    from nemo.lens import derive_nv_dl_run_uuid
-
     monkeypatch.delenv("LOCAL_RANK", raising=False)
     attrs = _process_attributes(rank=0, world_size=1, run_id="job-7")
     assert attrs["nv.dl.provider.name"] == "nemo-rl"

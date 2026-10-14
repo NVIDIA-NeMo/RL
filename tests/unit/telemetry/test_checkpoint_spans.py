@@ -23,29 +23,18 @@ rename, so the span assertions and that fixture belong together.
 import threading
 
 import pytest
-
-from nemo_rl.utils.checkpoint import CheckpointManager
-
-try:
-    from nemo.lens import NemoLensConfig, setup_telemetry
-    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-        InMemorySpanExporter,
-    )
-
-    from nemo_rl.telemetry.instrumentation import (
-        RL_ITERATION_ATTR,
-        iteration_scope,
-        managed_span,
-    )
-    from nemo_rl.telemetry.span_groups import RLSpanGroup
-
-    _HAS_LENS = True
-except ImportError:
-    _HAS_LENS = False
-
-pytestmark = pytest.mark.skipif(
-    not _HAS_LENS, reason="nemo-lens (+ opentelemetry sdk) not installed"
+from nemo.lens import NemoLensConfig, setup_telemetry
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
 )
+
+from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
+    iteration_scope,
+    managed_span,
+)
+from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils.checkpoint import CheckpointManager
 
 
 @pytest.fixture
