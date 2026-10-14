@@ -5,14 +5,14 @@ The documentation is maintained on `main`; execution uses the compatible source
 revisions listed below. For a current-source installation, see
 [SpeechLM GSPO from current source](gspo-speechlm-source.md).
 
-This guide describes how to post-train a Nemotron SpeechLM model for automatic
+This guide describes how to post-train Nemotron-3.5-Transcribe-30B-A4B for automatic
 speech recognition with Group Sequence Policy Optimization (GSPO), resume a run,
 and export the trained checkpoint for inference. The recipe uses the
 DTensor/Automodel training backend, vLLM rollouts, and transcript error-rate rewards.
 
 | Component | Configuration |
 | --- | --- |
-| Model | Compatible Nemotron SpeechLM 30B-A3B Hugging Face checkpoint |
+| Model | [nvidia/Nemotron-3.5-Transcribe-30B-A4B](https://huggingface.co/nvidia/Nemotron-3.5-Transcribe-30B-A4B) |
 | Training resources | 4 nodes, 8 GPUs per node |
 | Dataset | User-provided Parquet manifest and shared audio files |
 | Reward | Word error rate; character error rate for Mandarin ASR |
@@ -91,18 +91,35 @@ storage; the manifest contains paths to it.
 
 ### Model
 
-Start from a complete SpeechLM Hugging Face checkpoint containing the model
-configuration, tokenizer, and weights. The recipe's parameter names and expected
-tensor counts target this model architecture. A native distributed checkpoint
-is used for **resuming RL**, rather than as the initial HF model path.
+Download the following Hugging Face snapshot once to shared storage. It contains
+the complete model configuration, tokenizer, backbone configuration, and weights.
+Authenticate with Hugging Face before downloading if the repository requires
+access. The recipe starts a new RL run from these weights; it does not restore
+the model's earlier optimizer or training history.
 
 ```bash
-export SPEECHLM_GSPO_MODEL=/shared/models/speechlm-seed
+export SPEECHLM_GSPO_MODEL_ID=nvidia/Nemotron-3.5-Transcribe-30B-A4B
+export SPEECHLM_GSPO_MODEL_REVISION=471d3b578578edef8c1ed919190140ef7c1f6d8d
+export SPEECHLM_GSPO_MODEL=/shared/models/Nemotron-3.5-Transcribe-30B-A4B
+hf download "$SPEECHLM_GSPO_MODEL_ID" \
+  --revision "$SPEECHLM_GSPO_MODEL_REVISION" --local-dir "$SPEECHLM_GSPO_MODEL"
+
 export SPEECHLM_GSPO_DATA=/shared/data/asr/train.parquet
 export SPEECHLM_GSPO_OUTPUT_DIR=/shared/results/speechlm-gspo
 export HF_DATASETS_CACHE="$SPEECHLM_GSPO_OUTPUT_DIR/dataset-cache"
 mkdir -p "$SPEECHLM_GSPO_OUTPUT_DIR" "$HF_DATASETS_CACHE"
 ```
+
+All 269 configured trainable tensor names occur in this snapshot's safetensors
+header, and their shapes match the expected 1,074,318,400 parameters. However,
+the snapshot also contains 38 `ctc_timestamp.*` tensors that the prepared Speech
+integration does not yet handle. Its strict loader rejects these extra tensors.
+Loading and export support for this auxiliary timestamp artifact is required
+before this snapshot can run through the recipe unchanged.
+
+The earlier training validation below used an internal SpeechLM seed without
+that artifact. The Hub snapshot has not been loaded or trained with this recipe.
+Native distributed checkpoints are used for **resuming RL**.
 
 ### Manifest format
 

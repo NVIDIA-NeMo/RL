@@ -62,8 +62,12 @@ local tests do not establish a complete CUDA dependency installation.
 
 ## Data and seed
 
-The model path must be the **full Speech HF seed directory**, including config,
-tokenizer and safetensors. Native DCP resume outputs are a separate format.
+Use the **full Hugging Face snapshot** of
+`nvidia/Nemotron-3.5-Transcribe-30B-A4B`, including config, tokenizer, backbone
+configuration and safetensors. The [model download instructions](gspo-speechlm.md#model)
+pin its revision and describe the outstanding CTC timestamp artifact loading issue,
+which also affects the current-source strict loader.
+Native DCP resume outputs are a separate format.
 Use a local Parquet file with one recording per row:
 
 ```python
@@ -97,7 +101,7 @@ allocation. The recipe's complete selected-name list describes the intended
 Nemotron SpeechLM topology; setup rejects missing, extra or mismatched tensors.
 
 ```bash
-export SPEECHLM_GSPO_MODEL=/path/to/full/speech-seed-hf
+export SPEECHLM_GSPO_MODEL=/shared/models/Nemotron-3.5-Transcribe-30B-A4B
 export SPEECHLM_GSPO_DATA=/path/to/consumer.parquet
 export SPEECHLM_GSPO_OUTPUT_DIR=/path/to/fresh/output
 uv run --no-project "$SPEECHLM_GSPO_PYTHON" examples/run_vlm_grpo.py \
