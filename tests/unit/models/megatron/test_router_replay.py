@@ -56,6 +56,108 @@ def test_validate_router_replay_config_allows_prefix_cache_default():
 
 
 @pytest.mark.mcore
+def test_validate_router_replay_config_allows_megatron_generation():
+    from nemo_rl.models.megatron.router_replay import validate_router_replay_config
+
+    config = {
+        "router_replay": {"enabled": True},
+        "generation": {
+            "backend": "megatron",
+            "mcore_generation_config": {},
+        },
+        "megatron_cfg": {"enabled": True},
+    }
+
+    validate_router_replay_config(config)
+
+
+@pytest.mark.mcore
+def test_validate_router_replay_config_rejects_inherited_inference_pp():
+    """Inference PP defaults to training PP: no generation key set at all."""
+    from nemo_rl.models.megatron.router_replay import validate_router_replay_config
+
+    config = {
+        "router_replay": {"enabled": True},
+        "generation": {"backend": "megatron", "mcore_generation_config": {}},
+        "megatron_cfg": {"enabled": True, "pipeline_model_parallel_size": 4},
+    }
+
+    with pytest.raises(ValueError, match="pipeline_model_parallel_size=1"):
+        validate_router_replay_config(config)
+
+
+@pytest.mark.mcore
+def test_validate_router_replay_config_allows_generation_pp_override_to_one():
+    from nemo_rl.models.megatron.router_replay import validate_router_replay_config
+
+    config = {
+        "router_replay": {"enabled": True},
+        "generation": {
+            "backend": "megatron",
+            "mcore_generation_config": {"pipeline_model_parallel_size": 1},
+        },
+        "megatron_cfg": {"enabled": True, "pipeline_model_parallel_size": 4},
+    }
+
+    validate_router_replay_config(config)
+
+
+@pytest.mark.parametrize(
+    "mcore_generation_config",
+    [{"async_sched_mode": "async"}, {}],
+    ids=["explicit_async", "unset_defaults_to_async"],
+)
+@pytest.mark.mcore
+def test_validate_router_replay_config_allows_async_sched_mode(mcore_generation_config):
+    """MCore records routes under its async scheduler, the default mode."""
+    from nemo_rl.models.megatron.router_replay import validate_router_replay_config
+
+    config = {
+        "router_replay": {"enabled": True},
+        "generation": {
+            "backend": "megatron",
+            "mcore_generation_config": mcore_generation_config,
+        },
+        "megatron_cfg": {"enabled": True},
+    }
+
+    validate_router_replay_config(config)
+
+
+@pytest.mark.mcore
+def test_validate_router_replay_config_vllm_ignores_megatron_generation_gates():
+    """vLLM configs never go through merged_inference_megatron_cfg."""
+    from nemo_rl.models.megatron.router_replay import validate_router_replay_config
+
+    config = {
+        "router_replay": {"enabled": True},
+        "generation": {
+            "backend": "vllm",
+            "vllm_cfg": {},
+            "vllm_kwargs": {},
+            "mcore_generation_config": {"async_sched_mode": "async"},
+        },
+        "megatron_cfg": {"enabled": True, "pipeline_model_parallel_size": 4},
+    }
+
+    validate_router_replay_config(config)
+
+
+@pytest.mark.mcore
+def test_validate_router_replay_config_rejects_unsupported_generation_backend():
+    from nemo_rl.models.megatron.router_replay import validate_router_replay_config
+
+    config = {
+        "router_replay": {"enabled": True},
+        "generation": {"backend": "sglang"},
+        "megatron_cfg": {"enabled": True},
+    }
+
+    with pytest.raises(ValueError, match="requires vLLM or Megatron generation"):
+        validate_router_replay_config(config)
+
+
+@pytest.mark.mcore
 def test_normalize_routed_experts_dense_batch_uses_seq_major_order():
     from nemo_rl.models.megatron.router_replay import (
         _normalize_routed_experts_for_mcore,
@@ -1288,3 +1390,246 @@ def test_clear_global_router_replay_instances_clears_registry():
         assert RouterReplay.global_router_replay_instances == []
     finally:
         RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_reset_global_router_replay_instances_for_model_restores_served_routers():
+    """A reference-model build clears the registry; the reset repoints it."""
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        clear_global_router_replay_instances,
+        reset_global_router_replay_instances_for_model,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, layer_number):
+            super().__init__()
+            self.router_replay = RouterReplay()
+            self.layer_number = layer_number
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.router_1 = DummyRouter(layer_number=1)
+            self.router_3 = DummyRouter(layer_number=3)
+
+    try:
+        served = DummyModel()
+        reference = DummyModel()
+        assert len(RouterReplay.global_router_replay_instances) == 4
+
+        # setup_reference_model_state ends with this clear.
+        clear_global_router_replay_instances()
+        assert RouterReplay.global_router_replay_instances == []
+
+        reset_global_router_replay_instances_for_model(served)
+
+        assert RouterReplay.global_router_replay_instances == [
+            served.router_1.router_replay,
+            served.router_3.router_replay,
+        ]
+        assert reference.router_1.router_replay not in (
+            RouterReplay.global_router_replay_instances
+        )
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_reset_global_router_replay_instances_for_model_drops_other_models():
+    """Reshard + KL=0 leaves both models' routers registered; only the served stay."""
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        reset_global_router_replay_instances_for_model,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, layer_number):
+            super().__init__()
+            self.router_replay = RouterReplay()
+            self.layer_number = layer_number
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.router_1 = DummyRouter(layer_number=1)
+
+    try:
+        training = DummyModel()
+        inference = DummyModel()
+        assert len(RouterReplay.global_router_replay_instances) == 2
+
+        reset_global_router_replay_instances_for_model(inference)
+
+        assert RouterReplay.global_router_replay_instances == [
+            inference.router_1.router_replay
+        ]
+        assert training.router_1.router_replay not in (
+            RouterReplay.global_router_replay_instances
+        )
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_reset_global_router_replay_instances_for_model_requires_routers():
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        reset_global_router_replay_instances_for_model,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+    try:
+        with pytest.raises(RuntimeError, match="no RouterReplay instances"):
+            reset_global_router_replay_instances_for_model(torch.nn.Linear(2, 2))
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_reset_global_router_replay_instances_for_model_skips_mtp_routers(monkeypatch):
+    """MInf sizes its route buffer from the registry; MTP routers would add a
+    layer column that router_replay_dimensions_for_model does not count."""
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        reset_global_router_replay_instances_for_model,
+        router_replay_dimensions_for_model,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+    monkeypatch.delenv("NRL_ROUTER_REPLAY_EXCLUDE_MTP", raising=False)
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, layer_number):
+            super().__init__()
+            self.router_replay = RouterReplay()
+            self.layer_number = layer_number
+
+    class DummyMTPStack(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.is_mtp_layer = True
+            self.router = DummyRouter(layer_number=1)
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                num_layers=1, moe_layer_freq=[1], moe_router_topk=2
+            )
+            self.decoder_router = DummyRouter(layer_number=1)
+            self.mtp = DummyMTPStack()
+
+    try:
+        model = DummyModel()
+        reset_global_router_replay_instances_for_model(model)
+
+        assert RouterReplay.global_router_replay_instances == [
+            model.decoder_router.router_replay
+        ]
+        num_layers, _ = router_replay_dimensions_for_model(model)
+        assert len(RouterReplay.global_router_replay_instances) == num_layers
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_global_moe_layer_numbers_follow_hybrid_layer_pattern():
+    """Nemotron-H places MoE layers by 'E' in the hybrid pattern, not moe_layer_freq."""
+    from nemo_rl.models.megatron.router_replay import (
+        _global_moe_layer_numbers,
+        router_replay_dimensions,
+    )
+
+    # Nano 3.5 layout: 52 layers, 23 MoE ('E'); moe_layer_freq stays at its
+    # default of 1, which would otherwise predict 52 MoE layers.
+    pattern = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+    config = SimpleNamespace(
+        num_layers=52,
+        moe_layer_freq=1,
+        moe_router_topk=6,
+        hybrid_layer_pattern=pattern,
+    )
+
+    layers = _global_moe_layer_numbers(config)
+
+    assert len(layers) == 23
+    assert layers[:4] == [2, 4, 7, 9]
+    assert layers[-1] == 52
+    assert all(pattern[n - 1] == "E" for n in layers)
+    assert router_replay_dimensions(config) == (23, 6)
+
+
+@pytest.mark.mcore
+def test_global_moe_layer_numbers_hybrid_pattern_ignores_pipe_and_mtp():
+    from nemo_rl.models.megatron.router_replay import _global_moe_layer_numbers
+
+    # Deprecated alias, pipeline separator, and one MTP depth after '/'.
+    config = SimpleNamespace(
+        num_layers=4, moe_layer_freq=1, hybrid_override_pattern="ME|*E/ME"
+    )
+
+    assert _global_moe_layer_numbers(config) == [2, 4]
+
+
+@pytest.mark.mcore
+def test_global_moe_layer_numbers_hybrid_pattern_length_must_match_num_layers():
+    from nemo_rl.models.megatron.router_replay import _global_moe_layer_numbers
+
+    config = SimpleNamespace(num_layers=5, hybrid_layer_pattern="ME*E")
+
+    with pytest.raises(ValueError, match="hybrid layer pattern has 4 layers"):
+        _global_moe_layer_numbers(config)
+
+
+@pytest.mark.mcore
+def test_global_moe_layer_numbers_without_hybrid_pattern_uses_moe_layer_freq():
+    from nemo_rl.models.megatron.router_replay import _global_moe_layer_numbers
+
+    config = SimpleNamespace(num_layers=4, moe_layer_freq=[0, 1, 0, 1])
+
+    assert _global_moe_layer_numbers(config) == [2, 4]
+
+
+@pytest.mark.mcore
+def test_router_replay_layout_carries_moe_layers_and_total_layer_count():
+    """The deferred executor needs the MoE layer numbers and the total layer
+    count, not just the MoE count, to accept vLLM's full-layer route axis."""
+    from nemo_rl.experience.route_assembly import RouteLayout
+    from nemo_rl.models.megatron.router_replay import router_replay_layout
+
+    config = SimpleNamespace(
+        num_layers=6,
+        moe_layer_freq=1,
+        moe_router_topk=3,
+        hybrid_layer_pattern="MEM*EE",
+    )
+
+    layout = router_replay_layout(config)
+
+    assert layout == RouteLayout(
+        moe_layer_numbers=(2, 5, 6), total_num_layers=6, top_k=3
+    )
+    assert layout.num_moe_layers == 3
+    assert layout.dims == (3, 3)
+
+
+@pytest.mark.mcore
+def test_route_layout_column_indices_accept_moe_only_and_full_layer_payloads():
+    """One rule for both replay paths: a MoE-only payload maps layer i to
+    column i, a full-layer payload maps layer n to column n-1, else None."""
+    from nemo_rl.experience.route_assembly import RouteLayout
+
+    layout = RouteLayout(moe_layer_numbers=(2, 5, 6), total_num_layers=6, top_k=3)
+
+    assert layout.moe_column_indices(3) == (0, 1, 2)
+    assert layout.moe_column_indices(6) == (1, 4, 5)
+    assert layout.moe_column_indices(4) is None
