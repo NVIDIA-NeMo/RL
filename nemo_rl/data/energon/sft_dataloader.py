@@ -21,7 +21,7 @@ import os
 import traceback
 import urllib.parse
 from collections.abc import Callable
-from functools import partial
+from functools import partial, update_wrapper
 from typing import Any, Iterator, Literal, Mapping, Protocol, cast
 
 import torch
