@@ -697,7 +697,13 @@ NeMo RL also includes a convenient [built-in evaluator](examples/run_eval.py) fo
 uv run python examples/run_eval.py generation.model_name=/path/to/hugging-face-checkpoint
 ```
 
-If the checkpoint is in DCP or Megatron format, first [convert it to Hugging Face format](docs/design-docs/checkpointing.md). See `examples/configs/evals/eval.yaml` for the available configuration options.
+If the checkpoint is not in Hugging Face format, convert it first:
+
+- [Automodel DCP checkpoints](docs/design-docs/checkpointing.md#converting-torch-distributed-checkpoints-to-hugging-face-format)
+- [Megatron checkpoints](docs/design-docs/checkpointing.md#converting-megatron-checkpoints-to-hugging-face-format)
+- [Megatron LoRA adapter checkpoints](docs/design-docs/checkpointing.md#converting-megatron-lora-adapter-checkpoints-to-hugging-face-format)
+
+See `examples/configs/evals/eval.yaml` for the available configuration options.
 
 ## Set Up Clusters
 
