@@ -2227,6 +2227,7 @@ def test_spinup_refuses_an_empty_server_mapping_by_name():
     )
 
 
+@pytest.mark.nemo_gym
 def test_spinup_guards_the_merged_config_before_starting_gym(monkeypatch):
     """_spinup runs the guard on the config Gym merges (config_paths YAMLs
     first, the initial dict on top) and aborts before RunHelper exists, so a
