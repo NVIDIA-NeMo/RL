@@ -2925,7 +2925,9 @@ class SingleControllerActor:
 
         while self._train_steps < self._algo_cfg.max_num_steps:
             maybe_gpu_profile_step(self._trainer, self._train_steps + 1)
-            if self._gen is not self._trainer:
+            if self._gen is not self._trainer and isinstance(
+                self._gen, (VllmGeneration, MegatronGeneration)
+            ):
                 maybe_gpu_profile_step(self._gen, self._train_steps + 1)
             version_during_step = self._trainer_version
             groups_dispatched = 0
