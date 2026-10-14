@@ -1,0 +1,64 @@
+#!/bin/bash
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
+source $SCRIPT_DIR/common.env
+
+export NRL_IGNORE_TP_ACCURACY_CHECK=1
+export NRL_ROUTER_REPLAY_VALIDATE=1
+export NRL_R3_TRACE=1
+export NRL_R3_TRACE_VERIFY_FORWARD=1
+export NRL_R3_TRACE_STEPS=1
+export NRL_R3_TRACE_SAMPLES=1
+export NRL_R3_TRACE_MICROBATCHES=1
+export NRL_R3_TRACE_DIR="$LOG_DIR/r3_trace"
+
+# ===== BEGIN CONFIG =====
+NUM_NODES=3
+GPUS_PER_NODE=8
+STEPS_PER_RUN=3
+MAX_STEPS=3
+NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
+NUM_MINUTES=30
+# ===== END CONFIG =====
+
+exit_if_max_steps_reached
+
+cd $PROJECT_ROOT
+
+# check_r3_trace.py cross-checks every record in the trace dir, so a prior
+# attempt's producer records (written before it died) would have no matching
+# fetch and fail this attempt. Trace files are per-host/per-pid and appended,
+# so a retry never overwrites them.
+rm -rf "$NRL_R3_TRACE_DIR"
+
+uv run examples/run_grpo_single_controller.py \
+    --config $CONFIG_PATH \
+    ppo.max_num_steps=$MAX_STEPS \
+    logger.log_dir=$LOG_DIR \
+    logger.wandb_enabled=True \
+    logger.wandb.project=nemo-rl \
+    logger.wandb.name=$EXP_NAME \
+    logger.monitor_gpus=True \
+    logger.tensorboard_enabled=True \
+    checkpointing.enabled=False \
+    checkpointing.checkpoint_dir=$CKPT_DIR \
+    data_plane.observability.verify_tensor_hash=True \
+    $@ \
+    2>&1 | tee $RUN_LOG
+
+grep -q "Value init:" $RUN_LOG
+
+uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+
+if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    uv run tests/check_metrics.py $JSON_METRICS \
+        'median(data["train/token_mult_prob_error"]) < 1.02' \
+        "len(data[\"train/critic/loss\"]) == $MAX_STEPS" \
+        'max({**data.get("data_plane/cluster/step/hash/mismatches", {}), **data.get("data_plane/driver/step/hash/mismatches", {})}) == 0' \
+        'max({**data.get("data_plane/cluster/step/hash/rows_checked", {}), **data.get("data_plane/driver/step/hash/rows_checked", {})}) > 0'
+
+    uv run tools/check_r3_trace.py "$NRL_R3_TRACE_DIR" \
+        --require-forward-verify \
+        --require-cp-identity
+
+    rm -rf "$CKPT_DIR"
+fi
