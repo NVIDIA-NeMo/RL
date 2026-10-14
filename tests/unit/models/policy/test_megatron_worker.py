@@ -1502,7 +1502,7 @@ def test_megatron_refit_bridge_tasks_export_logical_quantized_weights(
     assert dequantize.call_args_list == [call(quantized_source), call(bf16_source)]
 
 
-def test_logical_refit_tasks_preserve_generic_grouped_dequantization(
+def test_logical_refit_tasks_dequantize_group_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from megatron.core import fp8_utils
@@ -1524,17 +1524,18 @@ def test_logical_refit_tasks_preserve_generic_grouped_dequantization(
     member_views = MagicMock(return_value=members)
     monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", member_views)
 
-    def decode(member: torch.Tensor) -> torch.Tensor:
-        index = next(i for i, candidate in enumerate(members) if candidate is member)
-        return member.float() * scales[index]
+    def decode_group(tensors: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        assert len(tensors) == len(members)
+        assert all(actual is member for actual, member in zip(tensors, members))
+        return (torch.stack(tensors).float() * scales).to(torch.bfloat16)
 
-    member_decode = MagicMock(side_effect=decode)
+    member_decode = MagicMock(side_effect=AssertionError("per-expert decode called"))
     monkeypatch.setattr(fp8_utils, "dequantize_fp8_tensor", member_decode)
-    packed_decode = MagicMock(side_effect=AssertionError("bulk-only decoder called"))
+    packed_decode = MagicMock(side_effect=decode_group)
     monkeypatch.setattr(worker_module, "_dequantize_refit_source_group", packed_decode)
 
     task = Task(source)
-    for _ in range(2):
+    for cycle in range(2):
         exported = list(
             worker_module.MegatronPolicyWorkerImpl._iter_logical_refit_conversion_tasks(
                 [task]
@@ -1542,6 +1543,8 @@ def test_logical_refit_tasks_preserve_generic_grouped_dequantization(
         )
         assert exported[0] is not task and task.param_weight is source
         assert exported[0].param_weight.dtype == torch.bfloat16
+        assert exported[0].param_weight.shape == source.shape
+        assert packed_decode.call_count == cycle + 1
         torch.testing.assert_close(
             exported[0].param_weight,
             (source.float() * scales).to(torch.bfloat16),
@@ -1552,8 +1555,7 @@ def test_logical_refit_tasks_preserve_generic_grouped_dequantization(
         scales.mul_(2)
 
     assert member_views.call_args_list == [call(source, create_if_missing=True)] * 2
-    assert member_decode.call_args_list == [call(member) for member in members] * 2
-    packed_decode.assert_not_called()
+    member_decode.assert_not_called()
 
 
 @pytest.mark.parametrize("grouped_storage", [False, True])

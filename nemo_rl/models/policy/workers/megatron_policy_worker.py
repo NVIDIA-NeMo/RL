@@ -404,9 +404,7 @@ def _dequantize_refit_source(tensor: torch.Tensor) -> torch.Tensor:
 
     if is_grouped_tensor_with_quantized_storage(tensor):
         members = get_grouped_quantized_members(tensor, create_if_missing=True)
-        return torch.stack(
-            [dequantize_fp8_tensor(member).to(torch.bfloat16) for member in members]
-        )
+        return _dequantize_refit_source_group(tuple(members))
     if is_float8tensor(tensor):
         return dequantize_fp8_tensor(tensor).to(torch.bfloat16)
     return tensor
@@ -3444,19 +3442,7 @@ class MegatronPolicyWorkerImpl(
         """Convert the current full parameter to logical weights before HF slicing."""
 
         def pre(base: _RefitSource) -> RefitCtx:
-            # Defer optional MCore helpers until this bulk source is prepared.
-            from megatron.core.fp8_utils import (
-                get_grouped_quantized_members,
-                is_grouped_tensor_with_quantized_storage,
-            )
-
-            if is_grouped_tensor_with_quantized_storage(base.tensor):
-                members = get_grouped_quantized_members(
-                    base.tensor, create_if_missing=True
-                )
-                logical = _dequantize_refit_source_group(tuple(members))
-            else:
-                logical = _dequantize_refit_source(base.tensor)
+            logical = _dequantize_refit_source(base.tensor)
             return RefitCtx(buf=base.hf_view.select(logical).contiguous())
 
         wire_dtype = (
