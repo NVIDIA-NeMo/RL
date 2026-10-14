@@ -1,3 +1,4 @@
+# SuperVL3p5 vision2code: 32 prompts x 16 generations = 512 samples per step.
 async_rl:
   diagnostics: false
   generation_fleet_health:
@@ -20,9 +21,9 @@ async_rl:
     no_healthy_backend_status: 409
     port_range_high: 1300
     port_range_low: 1202
-  max_buffered_rollouts: 384
-  max_inflight_prompts: 128
-  min_groups_for_streaming_train: 128
+  max_buffered_rollouts: 96
+  max_inflight_prompts: 32
+  min_groups_for_streaming_train: 32
   recompute_kv_cache_after_weight_updates: false
   rollout_failure:
     backoff_base_s: 1.0
@@ -40,7 +41,7 @@ async_rl:
       max_row_attempts: 3
       rollout_timeout_s: null
     on_dropped_prompt: replace
-    replacement_reserve_prompts: 256
+    replacement_reserve_prompts: 64
   sampler:
     max_staleness_versions: 2
     name: ready_first
@@ -76,7 +77,7 @@ data:
     system_prompt_file: null
   max_input_seq_length: 65536
   num_workers: 1
-  shuffle: false
+  shuffle: true
   train:
   - data_path: ${oc.env:MM_TRAINER_DATA_PATH}
     dataset_name: NemoGymDataset
@@ -96,54 +97,19 @@ data_plane:
     storage_capacity: 1000000
 env:
   nemo_gym:
-    code_gen:
-      resources_servers:
-        code_gen:
-          debug: false
-          num_processes: 1024
-          unit_test_timeout_secs: 10
     config_paths:
+    # Load the environment first, then replace its external policy endpoint
+    # with NeMo RL's training policy adapter. The judge remains external.
+    - resources_servers/vision2code/configs/vision2code.yaml
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
-    - resources_servers/gui_coordinate/configs/gui_coordinate.yaml
-    - resources_servers/math_with_judge/configs/math_with_judge.yaml
-    - resources_servers/mcqa/configs/mcqa.yaml
-    - resources_servers/string_match/configs/string_match.yaml
-    - responses_api_agents/image_tools_agent/configs/image_tools_agent.yaml
-    - resources_servers/sav_tracks/configs/sav_tracks.yaml
-    gui_coordinate_simple_agent:
-      responses_api_agents:
-        simple_agent:
-          max_steps: 1
-    image_tools_simple_agent:
-      responses_api_agents:
-        image_tools_agent:
-          crop_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/image_tool_outputs
-          duplicate_iou_threshold: 0.5
-          duplicate_tool_call_penalty: -0.02
-          force_final_after_duplicate: true
-          invalid_tool_call_penalty: -0.05
-          max_output_tokens: 4096
-          max_steps: 8
-          max_tool_calls: 6
-          max_tool_calls_per_turn: 1
-          terminate_on_invalid_tool_call: true
-          tool_success_reward: 0.02
-          tool_success_reward_cap: 0.2
     is_trajectory_collection: false
-    math_with_judge:
-      resources_servers:
-        math_with_judge:
-          judge_model_server:
-            name: policy_model
-          should_use_judge: false
-    math_with_judge_simple_agent:
-      responses_api_agents:
-        simple_agent:
-          max_steps: 1
-    mcqa_simple_agent:
-      responses_api_agents:
-        simple_agent:
-          max_steps: 1
+    # Match the hosted Qwen judge configuration; keep its endpoint independent
+    # of policy_model, which NeMo RL connects to the training vLLM fleet.
+    judge_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          uses_interleaved_reasoning: true
     nemo_gym_log_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/logs/nemo_gym
     pad_dynamic_image_shapes: true
     policy_max_input_tokens: 65536
@@ -165,23 +131,14 @@ env:
           uses_reasoning_parser: true
     port_range_high: 5999
     port_range_low: 5000
-    sav_box_tracks_agent:
-      responses_api_agents:
-        simple_agent:
-          max_steps: 1
-    sav_pt_tracks_agent:
-      responses_api_agents:
-        simple_agent:
-          max_steps: 1
-    sav_ref_tracks_agent:
-      responses_api_agents:
-        simple_agent:
-          max_steps: 1
     skip_venv_if_present: true
-    string_match_simple_agent:
-      responses_api_agents:
-        simple_agent:
-          max_steps: 1
+    vision2code:
+      resources_servers:
+        vision2code:
+          artifact_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/vision2code
+          judge_responses_create_params:
+            # Budget for judge reasoning and the final JSON score.
+            max_output_tokens: 8192
     tokenizer_config:
       chat_template: ${oc.env:MM_TRAINER_MODEL_PATH}/chat_template.jinja
       chat_template_kwargs:
@@ -190,7 +147,8 @@ env:
       name: ${oc.env:MM_TRAINER_MODEL_PATH}
       video:
         num_frames: 64
-    uv_venv_dir: ${oc.env:MM_TRAINER_GYM_VENV_DIR,/opt/gym_venvs}
+    uv_cache_dir: ${oc.env:UV_CACHE_DIR_OVERRIDE}
+    uv_venv_dir: ${oc.env:MM_TRAINER_GYM_VENV_DIR}
   should_log_nemo_gym_responses: true
   should_mask_flagged_samples: true
   should_use_nemo_gym: true
@@ -219,7 +177,7 @@ grpo:
   max_val_samples: null
   normalize_rewards: true
   num_generations_per_prompt: 16
-  num_prompts_per_step: 128
+  num_prompts_per_step: 32
   overlong_filtering: true
   reward_scaling:
     enabled: false
@@ -267,7 +225,7 @@ logger:
     log_nemo_gym_full_result_tables: false
     name: ${oc.env:MM_TRAINER_WANDB_NAME}
     project: ${oc.env:MM_TRAINER_WANDB_PROJECT,rohit-unified-teacher-supervl3p5}
-    resume: never
+    resume: ${oc.env:WANDB_RESUME,never}
   wandb_enabled: true
 loss_fn:
   disable_ppo_ratio: false
@@ -576,7 +534,7 @@ policy:
     name: ${oc.env:MM_TRAINER_MODEL_PATH}
     video:
       num_frames: 64
-  train_global_batch_size: 2048
+  train_global_batch_size: 512
   train_micro_batch_size: 1
 ppo: null
 reward_penalties:

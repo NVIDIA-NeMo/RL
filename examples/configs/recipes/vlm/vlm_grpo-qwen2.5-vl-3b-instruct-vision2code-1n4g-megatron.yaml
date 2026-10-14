@@ -1,0 +1,99 @@
+# Qwen2.5-VL Vision2Code smoke: four colocated training/rollout GPUs.
+defaults: ./vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n4g-megatrontp1.v1.yaml
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 4
+  max_num_steps: ${oc.decode:${oc.env:MAX_STEPS,5}}
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  skip_reference_policy_logprobs_calculation: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+
+policy:
+  model_name: ${oc.env:QWEN_VL_MODEL,Qwen/Qwen2.5-VL-3B-Instruct}
+  is_vlm: true
+  train_global_batch_size: 16
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  tokenizer:
+    tokenizer_kwargs:
+      min_pixels: 3136
+      max_pixels: 1003520
+  megatron_cfg:
+    scheduler:
+      lr_warmup_iters: 0
+  generation:
+    max_new_tokens: 4096
+    # Gym requires the HTTP server; inherit the base recipe's other vLLM settings.
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+    vllm_kwargs:
+      mm_processor_kwargs:
+        min_pixels: 3136
+        max_pixels: 1003520
+
+data:
+  _override_: true
+  max_input_seq_length: 4096
+  num_workers: 1
+  shuffle: true
+  use_multiple_dataloader: false
+  train:
+    - dataset_name: NemoGymDataset
+      data_path: ${oc.env:MM_TRAINER_DATA_PATH}
+  validation: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    system_prompt_file: null
+
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_mask_flagged_samples: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    config_paths:
+      - resources_servers/vision2code/configs/vision2code.yaml
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    tokenizer_config: ${policy.tokenizer}
+    policy_max_input_tokens: ${data.max_input_seq_length}
+    is_trajectory_collection: false
+    skip_venv_if_present: true
+    uv_venv_dir: ${oc.env:MM_TRAINER_GYM_VENV_DIR}
+    uv_cache_dir: ${oc.env:UV_CACHE_DIR_OVERRIDE}
+    nemo_gym_log_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/logs/nemo_gym
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+    judge_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          uses_interleaved_reasoning: true
+    vision2code:
+      resources_servers:
+        vision2code:
+          render_concurrency: 2
+          artifact_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/vision2code
+
+checkpointing:
+  checkpoint_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/checkpoints
+  metric_name: null
+  save_period: 5
+  keep_top_k: 1
+
+logger:
+  log_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/logs
+  wandb_enabled: ${oc.decode:${oc.env:WANDB_ENABLED,false}}
+  wandb:
+    project: vision2code-grpo
+    name: ${oc.env:MM_TRAINER_WANDB_ID}

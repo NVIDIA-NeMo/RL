@@ -490,15 +490,17 @@ class NemoGym(EnvironmentInterface):
             from nemo_rl.algorithms.utils import get_tokenizer
 
             self._processor = get_tokenizer(tokenizer_config, get_processor=True)
-            # attach_image_model_inputs_to_message assumes a placeholder-style
-            # processor (imgs_sizes / num_frames reconstruction + pad_to_max_shape
-            # PackedTensor build). A non-placeholder VLM would silently produce
-            # wrong multimodal tensors — fail at actor construction instead.
-            assert uses_image_placeholder(self._processor), (
-                "NemoGym multimodal path assumes a placeholder-style processor "
-                "(see _PLACEHOLDER_STYLE_PROCESSOR_NAMES in nemo_rl/data/multimodal_utils.py); "
-                f"got {type(self._processor).__name__}. Update "
-                "attach_image_model_inputs_to_message before enabling."
+            # Nemotron needs native-resolution CHW patchification; Qwen emits
+            # already flattened patches plus image_grid_thw. The shared attach
+            # helper preserves each representation and the rollout's token IDs.
+            assert (
+                uses_image_placeholder(self._processor)
+                or type(self._processor).__name__ == "Qwen2_5_VLProcessor"
+            ), (
+                "NemoGym image processing supports Nemotron placeholder-style "
+                "processors and Qwen2_5_VLProcessor; "
+                f"got {type(self._processor).__name__}. Add support to "
+                "attach_image_model_inputs_to_message before enabling it."
             )
 
     def _require_spinup(self) -> None:

@@ -1653,8 +1653,13 @@ def attach_image_model_inputs_to_message(
     # Processors that emit dynamic per-image resolutions return a ragged CHW list
     # for heterogeneous multi-image turns. Asking BatchFeature for PT tensors
     # would make it stack those and fail before the exact imgs_sizes are read off
-    # them. Off by default, so every other caller keeps the stacked path.
-    allow_ragged_output = pad_dynamic_image_shapes and len(images) > 1
+    # them. Qwen instead emits a flat patch matrix for all images, with their
+    # individual shapes in image_grid_thw; it must retain return_tensors="pt".
+    allow_ragged_output = (
+        uses_image_placeholder(processor)
+        and pad_dynamic_image_shapes
+        and len(images) > 1
+    )
     processed = processor(
         text=image_token * len(images),
         images=images,
@@ -1664,6 +1669,9 @@ def attach_image_model_inputs_to_message(
     if allow_ragged_output:
         processed = _materialize_ragged_pixel_values(processed, processor)
     model_inputs = extract_multimodal_model_inputs(processor, processed)
+    # These synthetic input_ids contain only image placeholders, so their
+    # sequence-aligned type IDs cannot describe the full rollout prompt.
+    # Megatron's Qwen adapter derives the type IDs from the rollout token IDs.
     message.update(
         {
             key: value

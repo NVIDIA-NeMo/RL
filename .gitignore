@@ -6,6 +6,7 @@
 *.tar
 *.tar.gz
 .venv
+.venv*/
 venv
 venvs
 __pycache__/
@@ -37,6 +38,10 @@ hf_home/
 hf_datasets_cache/
 *logs/
 /datasets/
+/RL_data/
+/data/RL_data.zip
+/containers/*.sqsh
+/containers/vision2code-render-check/
 wandb/
 checkpoints/
 results/

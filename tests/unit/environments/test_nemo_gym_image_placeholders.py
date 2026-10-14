@@ -15,8 +15,20 @@
 import pytest
 import torch
 from PIL import Image
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import (
+    PreTrainedTokenizerFast,
+    Qwen2_5_VLProcessor,
+    Qwen2VLImageProcessor,
+    Qwen2VLVideoProcessor,
+)
 
-from nemo_rl.data.multimodal_utils import attach_image_model_inputs_to_message
+from nemo_rl.data.multimodal_utils import (
+    PackedTensor,
+    attach_image_model_inputs_to_message,
+    uses_image_placeholder,
+)
 
 # --------------------------------------------------------------------------
 # ragged pixel_values path in attach_image_model_inputs_to_message
@@ -130,3 +142,75 @@ def test_attach_is_a_noop_without_images_or_processor():
         user_message, images=_images(1), processor=None
     )
     assert user_message == {}
+
+
+@pytest.fixture
+def qwen_processor() -> Qwen2_5_VLProcessor:
+    """Use the real image processor with an offline, minimal tokenizer."""
+    special_tokens = [
+        "[UNK]",
+        "<|image_pad|>",
+        "<|video_pad|>",
+        "<|vision_start|>",
+        "<|vision_end|>",
+    ]
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel(
+                {token: index for index, token in enumerate(special_tokens)},
+                unk_token="[UNK]",
+            )
+        ),
+        unk_token="[UNK]",
+        additional_special_tokens=special_tokens[1:],
+    )
+    return Qwen2_5_VLProcessor(
+        image_processor=Qwen2VLImageProcessor(min_pixels=3136, max_pixels=1003520),
+        video_processor=Qwen2VLVideoProcessor(),
+        tokenizer=tokenizer,
+    )
+
+
+@pytest.mark.parametrize("pad_dynamic_image_shapes", [False, True])
+@pytest.mark.parametrize("image_count", [1, 2])
+def test_qwen_attach_preserves_patches_grids_and_rollout_tokens(
+    qwen_processor, image_count, pad_dynamic_image_shapes
+):
+    # Different resolutions and colors expose both unwanted CHW padding and
+    # image reordering. Qwen merges each 2x2 patch group into one image token.
+    images = [
+        Image.new("RGB", (56, 56), color=(255, 0, 0)),
+        Image.new("RGB", (112, 56), color=(0, 255, 0)),
+    ][:image_count]
+    prompt = (
+        "Describe "
+        + "<|vision_start|><|image_pad|><|vision_end|>" * image_count
+        + " in Python."
+    )
+    full_prompt = qwen_processor(text=prompt, images=images, return_tensors="pt")
+    rollout_tokens = full_prompt["input_ids"][0].clone()
+    message = {"role": "user", "token_ids": rollout_tokens}
+
+    attach_image_model_inputs_to_message(
+        message,
+        images=images,
+        processor=qwen_processor,
+        pad_dynamic_image_shapes=pad_dynamic_image_shapes,
+    )
+
+    assert not uses_image_placeholder(qwen_processor)
+    assert message["token_ids"] is rollout_tokens
+    torch.testing.assert_close(rollout_tokens, full_prompt["input_ids"][0])
+    for key in ("pixel_values", "image_grid_thw"):
+        assert isinstance(message[key], PackedTensor)
+        assert message[key].preprocess_mode is None
+        torch.testing.assert_close(message[key].as_tensor(), full_prompt[key])
+    grid = message["image_grid_thw"].as_tensor()
+    torch.testing.assert_close(grid, torch.tensor([[1, 4, 4], [1, 4, 8]][:image_count]))
+    patch_count = int(grid.prod(dim=1).sum())
+    assert message["pixel_values"].as_tensor().shape == (patch_count, 1176)
+    assert int((rollout_tokens == qwen_processor.image_token_id).sum()) == (
+        patch_count // qwen_processor.image_processor.merge_size**2
+    )
+    # Synthetic image-only token/type IDs must not replace full-prompt data.
+    assert set(message) == {"role", "token_ids", "pixel_values", "image_grid_thw"}
