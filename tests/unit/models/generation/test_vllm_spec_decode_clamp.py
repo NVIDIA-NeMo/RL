@@ -14,6 +14,7 @@
 
 import pytest
 
+from nemo_rl.models.generation.vllm.utils import spec_decode_max_tokens
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 
@@ -31,7 +32,7 @@ def test_spec_decode_max_tokens_clamp(
     base_max_tokens, input_len, max_model_len, spec_lookahead, expected
 ):
     assert (
-        BaseVllmGenerationWorker._spec_decode_max_tokens(
+        spec_decode_max_tokens(
             base_max_tokens, input_len, max_model_len, spec_lookahead
         )
         == expected

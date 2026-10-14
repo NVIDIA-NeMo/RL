@@ -57,7 +57,9 @@ from nemo_rl.models.generation.vllm.utils import (
     HISTOGRAM_SUM_PART,
     encode_counter_key,
     format_prompt_for_vllm_generation,
+    mtp_drafter_setup,
     pad_and_align_routed_expert_indices,
+    spec_decode_max_tokens,
     validate_rollout_prompt,
 )
 from nemo_rl.models.generation.vllm.video_utils import (
@@ -589,20 +591,11 @@ class BaseVllmGenerationWorker:
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
-        # MTP speculative decoding with load_format="dummy" gets its policy
-        # weights via refit, but the MTP draft layer is not covered by refit, so
-        # those layers are loaded directly from the checkpoint after engine init
-        # (see VllmInternalWorkerExtension.load_mtp_weights_from_disk).
-        spec_cfg = vllm_kwargs.get("speculative_config")
-        mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
-        self._mtp_speculative_enabled = spec_cfg is not None and spec_cfg.get(
-            "method"
-        ) in ("deepseek_mtp", "mtp")
-        self._mtp_weights_from_refit = mtp_weights_from_refit
-        self._mtp_load_from_disk: bool = (
-            load_format == "dummy"
-            and self._mtp_speculative_enabled
-            and not mtp_weights_from_refit
+        self._mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
+        self._mtp_speculative_enabled, self._mtp_load_from_disk = mtp_drafter_setup(
+            vllm_kwargs.get("speculative_config"),
+            load_format=load_format,
+            weights_from_refit=self._mtp_weights_from_refit,
         )
 
         if (
@@ -841,22 +834,6 @@ class BaseVllmGenerationWorker:
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
-    @staticmethod
-    def _spec_decode_max_tokens(
-        base_max_tokens: int,
-        input_len: int,
-        max_model_len: int,
-        spec_lookahead: int,
-    ) -> int:
-        """Clamp max_tokens so speculative decoding never reads past max_model_len.
-
-        The drafter looks `spec_lookahead` tokens ahead, so generation must stop
-        at least `spec_lookahead + 1` tokens before the boundary.
-        """
-        return max(
-            1, min(base_max_tokens, max_model_len - input_len - (spec_lookahead + 1))
-        )
-
     @classmethod
     def _request_max_new_tokens(
         cls,
@@ -876,7 +853,7 @@ class BaseVllmGenerationWorker:
                 max_model_len=max_model_len,
             )
         if spec_lookahead > 0:
-            max_new_tokens = cls._spec_decode_max_tokens(
+            max_new_tokens = spec_decode_max_tokens(
                 max_new_tokens,
                 input_length,
                 max_model_len,
