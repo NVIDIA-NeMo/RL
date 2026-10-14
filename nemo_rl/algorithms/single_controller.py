@@ -3249,10 +3249,8 @@ class SingleControllerActor:
                         (
                             train_meta,
                             has_valid_training_tokens,
-                        ) = await self._advantage_stage(
-                            train_meta,
-                            trajectory_chunk_index=chunks_dispatched,
-                        )
+                        ) = await self._advantage_stage(train_meta)
+                    self._record_trajectories(train_meta, chunk_index=chunks_dispatched)
 
                     step_has_valid_training_tokens |= has_valid_training_tokens
                     if self._is_ppo:
@@ -5626,15 +5624,24 @@ class SingleControllerActor:
         return result
 
     def _should_log_trajectories(self, step: int) -> bool:
+        if self._trajectory_logger is None:
+            return False
         period = self._master_config.trajectory_logger.log_period
-        return self._trajectory_logger is not None and (step == 1 or step % period == 0)
+        return step == 1 or step % period == 0
 
-    async def _advantage_stage(
-        self,
-        meta: KVBatchMeta,
-        *,
-        trajectory_chunk_index: int = 0,
-    ) -> tuple[KVBatchMeta, bool]:
+    def _record_trajectories(self, meta: KVBatchMeta, *, chunk_index: int) -> None:
+        """Queue one chunk for the trajectory logger."""
+        step = self._train_steps + 1
+        if not self._should_log_trajectories(step):
+            return
+        assert self._trajectory_logger is not None
+        self._trajectory_logger_refs.append(
+            self._trajectory_logger.record.remote(
+                meta, step=step, chunk_index=chunk_index
+            )
+        )
+
+    async def _advantage_stage(self, meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
         """Fetch advantage inputs, compute advantages, and write them back.
 
         SC owns the prompt-group-scoped advantage stage because the selected
@@ -5715,17 +5722,7 @@ class SingleControllerActor:
             has_valid_training_tokens |= outcome.has_valid_training_tokens
         # Shards only ever add field names, never touch per-sample rows, so the
         # full-batch meta carrying the union of those names is the whole result.
-        meta = meta.with_fields(new_fields)
-        if self._should_log_trajectories(self._train_steps + 1):
-            assert self._trajectory_logger is not None
-            self._trajectory_logger_refs.append(
-                self._trajectory_logger.record.remote(
-                    meta,
-                    step=self._train_steps + 1,
-                    chunk_index=trajectory_chunk_index,
-                )
-            )
-        return meta, has_valid_training_tokens
+        return meta.with_fields(new_fields), has_valid_training_tokens
 
     async def _run_advantage_stage(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one advantage stage on the pool, or in-process without one."""

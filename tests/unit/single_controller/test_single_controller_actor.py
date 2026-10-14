@@ -191,6 +191,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         finalizer_actors=[],
         storage_units=(),
         advantage_actors=[],
+        trajectory_logger_actor=None,
         data_plane_checkpoint_metadata=None,
         partition_includes_multimodal_fields=False,
         bootstrap_identity=None,
@@ -1899,6 +1900,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
+    ctrl._trajectory_logger = None
     ctrl._train_fields = single_controller._train_fields_for_step(
         policy_logprobs_required=False,
         reference_logprobs_required=False,

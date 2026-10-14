@@ -175,6 +175,9 @@ Set `trajectory_logger.enabled: true` to write training trajectories as Parquet
 files, with one trajectory per row. `trajectory_logger.log_period` controls how
 often they are written, and `trajectory_logger.log_dir` sets the output location.
 
+This is experimental, separate from `async_rl.log_full_train_data` (see
+[Full training-data dumps](#full-training-data-dumps)).
+
 ## Checkpointing and Replay Recovery
 
 With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:
@@ -551,7 +554,9 @@ student/teacher logprobs when computed. Only padding beyond `input_lengths`
 is removed; response content is not capped. Values follow the legacy
 singleton-batch JSONL shape. Chunks stream through `.jsonl.partial` files;
 the final name is published only after the optimizer step completes. A
-partial file is not proof of a completed training step.
+partial file is not proof of a completed training step. For sampled,
+lower-overhead logging on large runs, see
+[Trajectory Parquet Logging](#trajectory-parquet-logging).
 
 The per-step `timing/train/train_data_dump` metric reports wall-clock seconds
 summed across chunk preparation/writes and final-file publication. Chunk dump
