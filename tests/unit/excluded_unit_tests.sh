@@ -135,36 +135,14 @@ EXCLUDED_UNIT_TESTS=(
     # MODELS — Policy (run in L0_Unit_Tests_{Automodel,Megatron}_Policy_*)
     ###########################################################################
 
-    # test_automodel_worker.py — keep 3 correctness checks, exclude the rest (~52-116s each).
+    # test_automodel_worker.py — keep 3 correctness checks, exclude the other GPU tests (~52-116s each).
     # Kept: test_single_gpu_training, test_loss_independent_of_microbatch_size_two_gpus,
     #        test_worker_logprob_tp2_or_cp2_matches_unsharded (minus its llama variants, below).
+    # The CPU/mock tests in this file (<1s) run too.
     # Listed one by one rather than --ignore'd on the file: the three kept checks live here too.
 
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_prepare_for_training_restores_optimizer
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_prepare_for_lp_inference_keep_train_buffers
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_update_moe_gate_bias_called_when_supported
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_update_moe_gate_bias_noop_when_unsupported
     --deselect=tests/unit/models/policy/test_automodel_worker.py::test_checkpoint_save_and_load
     --deselect=tests/unit/models/policy/test_automodel_worker.py::test_mixed_precision_training_and_logprobs
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestMaybeAdaptTensorToHF::test_no_adapter_returns_single_tuple
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestMaybeAdaptTensorToHF::test_adapter_converts_single_tensor
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestMaybeAdaptTensorToHF::test_adapter_with_quantization_flag
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestMaybeAdaptTensorToHF::test_adapter_excludes_extra_state_regex
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestAutomodelParamsGenerator::test_simple_model_yields_adapted_tensors
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestAutomodelParamsGenerator::test_dtype_conversion
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestAutomodelParamsGenerator::test_preserves_fp32_router_correction_bias
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestAutomodelParamsGenerator::test_contiguous_output
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestAutomodelParamsGenerator::test_with_adapter_model
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestAutomodelParamsGenerator::test_empty_model
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestAutomodelParamsGenerator::test_generator_is_iterable
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestAutomodelParamsGenerator::test_multiple_layers
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_prepare_refit_info_preserves_fp32_router_correction_bias
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestAutocastContext::test_disabled_returns_noop_context
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestAutocastContext::test_enabled_uses_worker_dtype
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_scopes_synchronous_checkpointing_to_dsv4
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_resume_with_reference_model_defers_checkpoint_load
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_resume_without_reference_model_passes_paths_through
-    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_fresh_run_with_reference_model_does_not_defer
     --deselect=tests/unit/models/policy/test_automodel_worker.py::TestSingleGPUCluster::test_single_gpu_logprob
     --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_lm_policy_init
     --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_worker_training

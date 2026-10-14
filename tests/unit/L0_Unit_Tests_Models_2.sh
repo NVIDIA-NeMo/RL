@@ -14,7 +14,7 @@
 
 #!/bin/bash
 # Shard: Model tests not covered by mcore/automodel/generation shards
-# Picks up base (unmarked) tests from models/policy/, models/huggingface/
+# Picks up base (unmarked) tests from every models/ subdirectory except generation/
 # Tests carrying the mcore or automodel marker are excluded by conftest.py filtering,
 # since this is a base run.
 
