@@ -355,14 +355,10 @@ class DynamoConfig(BaseModel, extra="allow"):
                     f"policy.generation.{quantization_field} is not supported "
                     "when backend='dynamo'"
                 )
-        speculative_config = self.vllm_kwargs.get("speculative_config") or (
-            self.vllm_cfg.model_extra or {}
-        ).get("speculative_config")
-        if speculative_config:
+        if (self.vllm_cfg.model_extra or {}).get("speculative_config"):
             raise ValueError(
-                "policy.generation.vllm_kwargs.speculative_config is not "
-                "supported by backend='dynamo' because draft weights are not "
-                "refit after step 0"
+                "policy.generation.vllm_cfg.speculative_config is not read by the "
+                "Dynamo backend; set policy.generation.vllm_kwargs.speculative_config"
             )
         if self.vllm_kwargs.get("quantization") is not None:
             raise ValueError(

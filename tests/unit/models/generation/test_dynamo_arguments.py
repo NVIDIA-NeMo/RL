@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import warnings
 
 import pytest
@@ -112,7 +113,15 @@ def test_config_derives_world_size_and_rejects_removed_public_fields() -> None:
         ({"colocated": {"enabled": True}}, "must be false"),
         ({"refit_transport": "mcore"}, "not supported when backend='dynamo'"),
         ({"quant_cfg": "nvfp4"}, "quant_cfg"),
-        ({"vllm_kwargs": {"speculative_config": {"model": "draft"}}}, "draft"),
+        (
+            {
+                "vllm_cfg": {
+                    **_config()["vllm_cfg"],
+                    "speculative_config": {"method": "ngram"},
+                },
+            },
+            "vllm_kwargs.speculative_config",
+        ),
         ({"vllm_kwargs": {"worker_extension_cls": "x.Y"}}, "worker_extension_cls"),
     ],
 )
@@ -304,6 +313,60 @@ def test_configure_generation_config_selects_dynamo_load_format() -> None:
             "load_format"
         ]
         == "auto"
+    )
+
+
+@pytest.mark.parametrize(
+    ("speculative_config", "trains_mtp", "load_format"),
+    [
+        ({"method": "mtp", "num_speculative_tokens": 1}, True, "dummy"),
+        (
+            {"method": "eagle3", "model": "draft", "num_speculative_tokens": 3},
+            False,
+            "auto",
+        ),
+    ],
+)
+def test_configure_generation_config_applies_speculative_rules_to_dynamo(
+    speculative_config, trains_mtp, load_format
+) -> None:
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+    config = _config(
+        stop_token_ids=None, vllm_kwargs={"speculative_config": speculative_config}
+    )
+    del config["vllm_cfg"]["load_format"]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        configured = configure_generation_config(
+            config, Tokenizer(), trains_mtp=trains_mtp
+        )
+
+    # A drafter that refit does not feed must start from real weights.
+    assert configured["vllm_cfg"]["load_format"] == load_format
+    assert configured["_mtp_weights_from_refit"] is trains_mtp
+    assert configured["_draft_weights_from_refit"] is False
+    DynamoConfig.model_validate(configured)
+
+
+def test_worker_argv_forwards_speculative_config_unless_disabled() -> None:
+    def argv_for(speculative_config):
+        return build_dynamo_vllm_argv(
+            model_name="model",
+            namespace="namespace",
+            seed=0,
+            vllm_cfg=_config()["vllm_cfg"],
+            vllm_kwargs={"speculative_config": speculative_config},
+            dynamo_cfg=DynamoCfg.model_validate(_dynamo_cfg()),
+        )
+
+    enabled = {"method": "mtp", "num_speculative_tokens": 2}
+    assert json.loads(_flag_value(argv_for(enabled), "--speculative-config")) == enabled
+    assert "--speculative-config" not in argv_for(
+        {"method": "mtp", "num_speculative_tokens": 0}
     )
 
 

@@ -954,3 +954,63 @@ def test_reshard_synchronizer_drives_dynamo_end_to_end(monkeypatch) -> None:
     ] * 2
     assert all(call["payload"]["refit_timeout_s"] == 30.0 for call in posts)
     assert not sync.is_stale
+
+
+@pytest.mark.parametrize(
+    ("mtp_from_refit", "load_format", "expected_rpcs"),
+    [
+        (
+            False,
+            "dummy",
+            ["configure_mtp_drafter_weight_source", "load_mtp_weights_from_disk"],
+        ),
+        (True, "dummy", ["configure_mtp_drafter_weight_source"]),
+        (False, "auto", ["configure_mtp_drafter_weight_source"]),
+    ],
+)
+def test_mtp_drafter_is_configured_on_every_engine(
+    monkeypatch, mtp_from_refit, load_format, expected_rpcs
+) -> None:
+    workers = [
+        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
+        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+    ]
+    _patch_runtime(monkeypatch, workers=workers)
+    posts = []
+    monkeypatch.setattr(
+        refit_module._post_worker_route,
+        "remote",
+        lambda **kwargs: posts.append(kwargs) or True,
+    )
+    monkeypatch.setattr(refit_module.ray, "get", lambda refs: refs)
+    config = _config(tp=2)
+    config["vllm_kwargs"] = {
+        "speculative_config": {"method": "mtp", "num_speculative_tokens": 1}
+    }
+    config["vllm_cfg"]["load_format"] = load_format
+    config["_mtp_weights_from_refit"] = mtp_from_refit
+
+    DynamoGeneration(cluster=object(), config=config)
+
+    rpcs = [call["payload"]["engine_rpc"] for call in posts]
+    # Each step reaches both engines before the next starts.
+    assert rpcs == [rpc for rpc in expected_rpcs for _ in workers]
+    assert posts[0]["payload"]["weights_from_refit"] is mtp_from_refit
+    if "load_mtp_weights_from_disk" in rpcs:
+        assert posts[-1]["payload"]["model_path"] == "Qwen/Qwen3-0.6B"
+
+
+def test_speculative_lookahead_stops_short_of_the_context_limit(monkeypatch) -> None:
+    _patch_runtime(monkeypatch)
+    config = _config()
+    config["vllm_cfg"]["max_model_len"] = 64
+    config["max_new_tokens"] = 32
+    config["vllm_kwargs"] = {
+        "speculative_config": {"method": "ngram", "num_speculative_tokens": 3}
+    }
+    generation = DynamoGeneration(cluster=object(), config=config)
+
+    assert generation._allowed_new_tokens(input_length=10) == 32
+    # 64 - 40 - (3 + 1): the drafter must not read past max_model_len.
+    assert generation._allowed_new_tokens(input_length=40) == 20
+    assert generation._allowed_new_tokens(input_length=62) == 1

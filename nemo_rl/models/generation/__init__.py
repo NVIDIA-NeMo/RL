@@ -199,6 +199,10 @@ def configure_generation_config(
         # set load_format
         if config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS:
             config["vllm_cfg"]["load_format"] = "auto"
+
+    # Speculative decoding, shared by the standard and managed Dynamo backends: both
+    # run NeMo RL's vLLM worker extension, which refits the drafter.
+    if config["backend"] in ("vllm", "dynamo"):
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
         if speculative_config and not is_eval and not has_refit_draft_weights:
             # Speculative decoding needs real draft weights at startup, since the
@@ -225,6 +229,7 @@ def configure_generation_config(
         # relies on drafter module sharing instead.
         config["_draft_full_refit"] = draft_full_refit
 
+    if config["backend"] == "vllm":
         # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
         if "skip_tokenizer_init" not in config["vllm_cfg"]:
             # set skip_tokenizer_init

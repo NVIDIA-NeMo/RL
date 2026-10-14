@@ -207,12 +207,10 @@ def build_dynamo_vllm_argv(
     for key, value in vllm_kwargs.items():
         if value is None:
             continue
-        if key == "speculative_config":
-            raise ValueError(
-                "policy.generation.vllm_kwargs.speculative_config is not "
-                "supported by backend='dynamo' because draft weights are not "
-                "refit after step 0"
-            )
+        # num_speculative_tokens=0 is how a launch script turns speculative decoding
+        # off without deleting the block; vLLM rejects it, so drop the block.
+        if key == "speculative_config" and value.get("num_speculative_tokens") == 0:
+            continue
         flag = _flag_for_key(key)
         normalised = _normalise_flag(flag)
         source = f"vllm_kwargs.{key}"

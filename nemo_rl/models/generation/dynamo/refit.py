@@ -233,6 +233,20 @@ class DynamoRefitChannel:
             for index, worker in enumerate(workers)
         ]
 
+    def call_on_every_engine(
+        self, engine_rpc: str, kwargs: dict[str, Any]
+    ) -> list[ray.ObjectRef]:
+        """Call a worker-extension method on every engine through the init route."""
+        return [
+            _post_worker_route.remote(
+                system_url=worker.system_url,
+                route=_INIT_ROUTE,
+                payload={"engine_rpc": engine_rpc, **kwargs},
+                timeout_s=self._init_timeout_s,
+            )
+            for worker in self._validated_workers()
+        ]
+
     def full_fleet_membership(self, train_world_size: int) -> RefitMembership:
         """Every engine, each a DP shard of TP x PP ranks after the trainers."""
         return desired_membership(

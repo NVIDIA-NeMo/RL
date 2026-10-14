@@ -9,9 +9,10 @@ the service ownership, startup, and weight-refit architecture.
 
 This integration is managed and vLLM-only. It does not connect to an external
 Dynamo deployment and does not support Kubernetes, DGD, SGLang, TensorRT-LLM,
-speculative decoding, FP8 KV caches, ModelOpt quantization, or model-parallel
-engine groups that span nodes. FP8 and MXFP8 weights (`vllm_cfg.precision: fp8`)
-are supported; see [FP8 generation](#fp8-generation).
+FP8 KV caches, ModelOpt quantization, or model-parallel engine groups that span
+nodes. FP8 and MXFP8 weights (`vllm_cfg.precision: fp8`) and speculative
+decoding are supported; see [FP8 generation](#fp8-generation) and
+[Speculative decoding](#speculative-decoding).
 
 ## Build the image
 
@@ -139,6 +140,22 @@ loads the model. Every refit then sends BF16 weights that the engine quantizes
 on receive. As with the vLLM backend, importance-sampling correction is
 required. FP8 KV caches stay unsupported, because their scales are refit only
 with synchronous rollouts.
+
+## Speculative decoding
+
+Set `policy.generation.vllm_kwargs.speculative_config` exactly as for the vLLM
+backend; it is passed to `dynamo.vllm` as `--speculative-config`, and
+`num_speculative_tokens: 0` turns it off. Drafter weights follow the vLLM
+backend's rules, because the same worker extension receives every refit:
+
+- A co-trained MTP head is fed by every refit.
+- Otherwise an MTP drafter is read from the checkpoint once at startup
+  (`load_mtp_weights_from_disk`), so dummy-loaded engines still draft correctly.
+- Other methods (for example Eagle3) without a refit-fed draft force
+  `load_format: auto`.
+
+Request budgets stop `num_speculative_tokens + 1` tokens short of
+`max_model_len`, so the drafter never reads past the context.
 
 ## Weight refit
 
