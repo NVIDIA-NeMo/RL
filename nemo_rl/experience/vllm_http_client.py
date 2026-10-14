@@ -21,6 +21,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any, AsyncGenerator
 
 from nemo_rl.experience.direct_capture import CaptureContext, current_capture
+from nemo_rl.experience.loop_bridge import HTTPBridgeConfig, queued_iterator
 from nemo_rl.experience.packed_logprobs import PackedLogprobBuffer, PackedLogprobCapture
 
 LOGGER = logging.getLogger(__name__)
@@ -33,9 +34,16 @@ class _AsyncLLMHTTPClient:
     Add each new member here and decide whether it must run on the engine loop.
     """
 
-    def __init__(self, engine_client: Any, engine_loop: asyncio.AbstractEventLoop):
+    def __init__(
+        self,
+        engine_client: Any,
+        engine_loop: asyncio.AbstractEventLoop,
+        *,
+        bridge_config: HTTPBridgeConfig | None = None,
+    ) -> None:
         self._engine_client = engine_client
         self._engine_loop = engine_loop
+        self._bridge_config = bridge_config or HTTPBridgeConfig()
         self.model_config = engine_client.model_config
         self.renderer = engine_client.renderer
         self.input_processor = engine_client.input_processor
@@ -63,6 +71,42 @@ class _AsyncLLMHTTPClient:
         except asyncio.CancelledError:
             future.cancel()
             raise
+
+    async def _pull_outputs(
+        self, source: AsyncGenerator[Any, None]
+    ) -> AsyncGenerator[Any, None]:
+        owner_task: asyncio.Task[Any] | None = None
+        completed = False
+
+        async def next_output() -> Any:
+            nonlocal owner_task
+            owner_task = asyncio.current_task()
+            return await anext(source)
+
+        async def close() -> None:
+            # Cancelling the concurrent Future acknowledges cancellation before
+            # its owner-loop Task has finished. Join it before closing the source.
+            if owner_task is not None and not owner_task.done():
+                if owner_task is not asyncio.current_task():
+                    if not owner_task.cancelling():
+                        owner_task.cancel()
+                    try:
+                        await owner_task
+                    except asyncio.CancelledError:
+                        pass
+            await source.aclose()
+
+        try:
+            while True:
+                try:
+                    output = await self._run_on_engine_loop(next_output)
+                except StopAsyncIteration:
+                    completed = True
+                    return
+                yield output
+        finally:
+            if not completed:
+                await self._run_on_engine_loop(close)
 
     def generate(
         self,
@@ -98,7 +142,6 @@ class _AsyncLLMHTTPClient:
         iterator = None
         completed = False
         captured = []
-        registered = False
         packed: PackedLogprobBuffer | None = None
         if context is not None and context.owner.config.logprob_capture == "packed":
             if self._packed_capture is None:
@@ -116,85 +159,97 @@ class _AsyncLLMHTTPClient:
             else False
         )
 
-        async def next_output() -> Any:
-            nonlocal iterator, registered
-            if iterator is None:
-                if packed is not None:
-                    assert self._packed_capture is not None
-                    self._packed_capture.register(
-                        request_id, packed, export_logprobs=export_logprobs
-                    )
-                    registered = True
+        async def engine_outputs() -> AsyncGenerator[Any, None]:
+            nonlocal iterator
+            if packed is not None:
+                assert self._packed_capture is not None
+                self._packed_capture.register(
+                    request_id, packed, export_logprobs=export_logprobs
+                )
+            try:
                 iterator = self._engine_client.generate(
                     prompt, sampling_params, request_id, **kwargs
                 )
-            try:
-                output = await anext(iterator)
-            except StopAsyncIteration:
+                try:
+                    async for output in iterator:
+                        yield output
+                finally:
+                    await iterator.aclose()
+            finally:
                 if packed is not None:
                     assert self._packed_capture is not None
                     self._packed_capture.unregister(request_id)
-                    registered = False
-                raise
-            return output
 
         async def abort() -> None:
-            try:
-                if iterator is not None:
-                    await self._engine_client.abort(request_id)
-            finally:
-                if registered:
-                    assert self._packed_capture is not None
-                    self._packed_capture.unregister(request_id)
+            if iterator is not None:
+                await self._engine_client.abort(request_id)
+
+        source = engine_outputs()
+        # Cumulative vLLM outputs alias lists that subsequent engine updates
+        # mutate. Do not introduce read-ahead for those outputs.
+        use_queue = (
+            self._bridge_config.mode == "queued"
+            and asyncio.get_running_loop() is not self._engine_loop
+            and sampling_params is not None
+            and sampling_params.output_kind.name in {"DELTA", "FINAL_ONLY"}
+        )
+        outputs = (
+            queued_iterator(
+                source,
+                self._engine_loop,
+                capacity=self._bridge_config.max_pending_outputs,
+            )
+            if use_queue
+            else self._pull_outputs(source)
+        )
 
         try:
-            while True:
-                try:
-                    output = await self._run_on_engine_loop(next_output)
-                    if (
-                        context is not None
-                        and packed is None
-                        and (delta or output.finished)
-                    ):
-                        captured.append(output)
-                    if context is not None and any(
-                        item.routed_experts is not None for item in output.outputs
-                    ):
-                        # Upstream vLLM also serializes routes in its serving
-                        # layer. Retain the original for staging, but hide the
-                        # tensor from the HTTP formatter without copying it.
-                        output = copy.copy(output)
-                        output.outputs = [copy.copy(item) for item in output.outputs]
-                        for item in output.outputs:
-                            item.routed_experts = None
-                    yield output
-                except StopAsyncIteration:
-                    completed = True
-                    return
+            async for output in outputs:
+                if (
+                    context is not None
+                    and packed is None
+                    and (delta or output.finished)
+                ):
+                    captured.append(output)
+                if context is not None and any(
+                    item.routed_experts is not None for item in output.outputs
+                ):
+                    # Upstream vLLM also serializes routes in its serving
+                    # layer. Retain the original for staging, but hide the
+                    # tensor from the HTTP formatter without copying it.
+                    output = copy.copy(output)
+                    output.outputs = [copy.copy(item) for item in output.outputs]
+                    for item in output.outputs:
+                        item.routed_experts = None
+                yield output
+            completed = True
         finally:
-            if ticket is not None:
-                if completed:
-                    if packed is not None:
-                        context.owner.submit(
-                            context,
-                            lambda: packed.extract(
-                                context.rollout.rollout_id,
-                                ordinal=ticket[0],
-                                weight_version=ticket[1],
-                                packing=context.owner.config.token_packing,
-                            ),
-                        )
+            try:
+                await outputs.aclose()
+            finally:
+                if ticket is not None:
+                    if completed:
+                        if packed is not None:
+                            context.owner.submit(
+                                context,
+                                lambda: packed.extract(
+                                    context.rollout.rollout_id,
+                                    ordinal=ticket[0],
+                                    weight_version=ticket[1],
+                                    packing=context.owner.config.token_packing,
+                                ),
+                            )
+                        else:
+                            context.owner.complete(
+                                context, request_id, *ticket, captured, delta=delta
+                            )
                     else:
-                        context.owner.complete(
-                            context, request_id, *ticket, captured, delta=delta
-                        )
-                else:
-                    context.owner.abort(context)
-            if not completed:
-                try:
-                    await self._run_on_engine_loop(abort)
-                except Exception:
-                    LOGGER.exception("Failed to abort vLLM request %s", request_id)
+                        context.owner.abort(context)
+                if not completed:
+                    try:
+                        await self._run_on_engine_loop(abort)
+                    except Exception:
+                        LOGGER.exception("Failed to abort vLLM request %s", request_id)
 
     # These members only read engine status or immutable configuration. Running
     # them on the engine loop added a cross-thread wait to each HTTP request.

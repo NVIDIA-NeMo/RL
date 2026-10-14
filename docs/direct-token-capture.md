@@ -117,9 +117,41 @@ amortized allocation slack. Prompt storage and routing arrays are additional.
 
 Capture-only logprobs stay on the engine loop until the single staging handoff;
 they do not travel in emitted HTTP output objects. No per-token capture futures
-or executor submissions are added. The existing engine-to-HTTP loop bridge still
-schedules each emitted output separately; batching that bridge is a separate,
-optional optimization. User-visible streaming intervals are unchanged.
+or executor submissions are added.
+
+The optional HTTP bridge queues output references between the engine and HTTP
+threads using one producer task per request. It applies to any environment using
+the worker HTTP endpoint, with or without token capture:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+      http_bridge:
+        mode: queued            # per_output (default) keeps the original bridge
+        max_pending_outputs: 16  # positive number of queued outputs per request
+```
+
+The queue wakes a waiting consumer immediately and drains available outputs
+without a per-output coroutine submission. After each queue-sized burst it yields
+the HTTP loop so other requests can run. It does not serialize payloads, change
+vLLM's streaming interval, merge outputs, or wait to fill a batch. Slow consumers
+apply backpressure when the queue fills; vLLM's upstream collector still has its
+own buffering/aggregation behavior. The bridge holds at most the configured
+number of queued outputs plus one producer-held output and the consumer's current
+output. This bounds output count, not bytes or upstream engine buffers.
+
+Queued handoff is used for DELTA and FINAL_ONLY outputs across different event
+loops. Cumulative outputs keep the pull bridge because vLLM exposes mutable
+cumulative token/logprob lists. Same-loop calls also keep direct iteration.
+Cancellation closes the source on its owner loop and waits for cleanup; incomplete
+calls invalidate capture. Completed capture is staged only after the producer has
+stopped. Set `mode: per_output` for an E2E comparison; capture settings and staged
+training data remain the same. Burst delivery changes scheduling, so compare
+first-token latency and tail latency as well as total throughput on the target
+deployment before enabling it broadly.
 
 `token_capture.direct.token_packing` selects `fused` (default) or `legacy` for
 E2E comparison. Fused capture packs prompt lists directly into an owned int64

@@ -91,6 +91,7 @@ class CapturedRequest:
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 
 
+from nemo_rl.experience.loop_bridge import HTTPBridgeConfig
 from nemo_rl.experience.vllm_http_client import _AsyncLLMHTTPClient
 
 
@@ -417,7 +418,15 @@ class VllmAsyncGenerationWorkerImpl(
             hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
             self._sparse_refit_receiver.set_worker_hostnames(hostnames)
         if self.llm is not None and self.cfg["vllm_cfg"].get("expose_http_server"):
-            self._http_engine_client = _AsyncLLMHTTPClient(self.llm, self._engine_loop)
+            bridge_settings = self.cfg["vllm_cfg"].get("http_bridge")
+            bridge_config = (
+                HTTPBridgeConfig.model_validate(bridge_settings)
+                if bridge_settings is not None
+                else HTTPBridgeConfig()
+            )
+            self._http_engine_client = _AsyncLLMHTTPClient(
+                self.llm, self._engine_loop, bridge_config=bridge_config
+            )
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
             )

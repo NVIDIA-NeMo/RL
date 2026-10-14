@@ -25,6 +25,7 @@ from pydantic import (
     PositiveInt,
 )
 
+from nemo_rl.experience.loop_bridge import HTTPBridgeConfig
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     get_num_routed_experts,
@@ -101,6 +102,8 @@ class VllmSpecificArgs(TypedDict):
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
+    # Optional output bridge; per_output (default) or bounded queued read-ahead.
+    http_bridge: NotRequired[HTTPBridgeConfig]
     # Environment variable containing the internal refit API key.
     http_refit_api_key_env_var: NotRequired[str | None]
     # Invalidate weight-dependent multimodal encoder outputs after a successful

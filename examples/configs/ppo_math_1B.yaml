@@ -301,6 +301,10 @@ policy:
       logprobs_mode: processed_logprobs
       http_server_num_replicas: 8
     vllm_cfg:
+      # HTTP output transport (requires async_engine and expose_http_server).
+      http_bridge:
+        mode: per_output # queued: one producer per DELTA/FINAL_ONLY request
+        max_pending_outputs: 16 # Positive queue bound per request; no batch timer
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"

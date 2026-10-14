@@ -277,6 +277,9 @@ policy:
       logprobs_mode: processed_logprobs
       http_server_num_replicas: 8
     vllm_cfg:
+      http_bridge:
+        mode: per_output
+        max_pending_outputs: 16
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"

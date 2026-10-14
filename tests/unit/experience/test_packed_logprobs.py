@@ -28,6 +28,7 @@ from nemo_rl.experience.direct_capture import (
     DirectCaptureConfig,
     current_capture,
 )
+from nemo_rl.experience.loop_bridge import HTTPBridgeConfig
 from nemo_rl.experience.packed_logprobs import PackedLogprobBuffer, PackedLogprobCapture
 from nemo_rl.experience.vllm_http_client import _AsyncLLMHTTPClient
 
@@ -232,12 +233,17 @@ def test_unknown_vllm_version_fails_before_installation(vllm_version):
     assert processor.add_request == original
 
 
+@pytest.mark.parametrize("bridge_mode", ["per_output", "queued"])
 @pytest.mark.parametrize(
     "failure", ["cancel", "engine_error", "overflow", "stage_error"]
 )
 def test_failure_drains_bindings_and_slots_without_training_partial_calls(
-    vllm_version, failure
+    vllm_version, failure, bridge_mode
 ):
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+
     async def run():
         stage_calls = []
 
@@ -300,8 +306,16 @@ def test_failure_drains_bindings_and_slots_without_training_partial_calls(
                 aborted.append(request_id)
                 self.output_processor.request_states.clear()
 
-        bridge = _AsyncLLMHTTPClient(Engine(), asyncio.get_running_loop())
-        bridge.enable_packed_capture()
+        bridge = _AsyncLLMHTTPClient(
+            Engine(),
+            loop,
+            bridge_config=HTTPBridgeConfig(mode=bridge_mode, max_pending_outputs=1),
+        )
+
+        async def install():
+            bridge.enable_packed_capture()
+
+        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(install(), loop))
         context = capture.enter("key")
         token = current_capture.set(context)
         stream = bridge.generate(
@@ -350,7 +364,13 @@ def test_failure_drains_bindings_and_slots_without_training_partial_calls(
         finally:
             capture.shutdown()
 
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(5)
+        assert not thread.is_alive()
+        loop.close()
 
 
 @pytest.mark.parametrize(
@@ -366,11 +386,12 @@ def test_unsupported_requests_fail_before_engine_admission(vllm_version, overrid
     assert not processor.request_states
 
 
+@pytest.mark.parametrize("bridge_mode", ["per_output", "queued"])
 @pytest.mark.parametrize("output_kind", ["DELTA", "CUMULATIVE", "FINAL_ONLY"])
 @pytest.mark.parametrize("public_logprobs", [None, 3, "token_ids"])
 @pytest.mark.parametrize("concurrent", [1, 2])
 def test_cross_loop_capture_uses_engine_batches_independent_of_http_chunks(
-    vllm_version, output_kind, public_logprobs, concurrent
+    vllm_version, output_kind, public_logprobs, concurrent, bridge_mode
 ):
     loop = asyncio.new_event_loop()
     ready = threading.Event()
@@ -442,7 +463,11 @@ def test_cross_loop_capture_uses_engine_batches_independent_of_http_chunks(
             pytest.fail("completed generation should not abort")
 
     engine = Engine()
-    bridge = _AsyncLLMHTTPClient(engine, loop)
+    bridge = _AsyncLLMHTTPClient(
+        engine,
+        loop,
+        bridge_config=HTTPBridgeConfig(mode=bridge_mode, max_pending_outputs=1),
+    )
 
     async def install():
         bridge.enable_packed_capture()

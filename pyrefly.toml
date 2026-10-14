@@ -29,6 +29,7 @@ project-includes = [
   "nemo_rl/experience/packed_logprobs.py",
   "nemo_rl/experience/direct_http.py",
   "nemo_rl/experience/vllm_http_client.py",
+  "nemo_rl/experience/loop_bridge.py",
   "nemo_rl/data_plane/direct_capture.py",
   "nemo_rl/data/captured_media.py",
   "nemo_rl/experience/reward_penalties.py",
