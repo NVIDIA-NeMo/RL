@@ -144,3 +144,21 @@ def test_torch_split_shims_are_still_needed() -> None:
         "(nemo_rl/data_plane/adapters/tq_mooncake_checkpoint.py) - drop the "
         "check outright; the pre-2.13 `names` comparison cannot be restored"
     )
+
+
+def test_dynamo_extra_is_the_vllm_extra_plus_dynamo() -> None:
+    """dynamo.vllm workers load NeMo RL's vLLM worker extension, so the dynamo extra
+    must carry every vllm-extra requirement unchanged, plus only the Dynamo runtime."""
+    extras = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"
+    ]
+    vllm = {str(Requirement(dep)) for dep in extras["vllm"]}
+    dynamo = {str(Requirement(dep)) for dep in extras["dynamo"]}
+
+    assert vllm <= dynamo, f"dynamo extra is missing {sorted(vllm - dynamo)}"
+    assert {canonicalize_name(Requirement(dep).name) for dep in dynamo - vllm} == {
+        "ai-dynamo",
+        "ai-dynamo-runtime",
+        "uvloop",
+        "blake3",
+    }

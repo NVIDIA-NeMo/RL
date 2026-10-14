@@ -45,8 +45,8 @@ from nemo_rl.models.generation.dynamo.arguments import (
 )
 from nemo_rl.models.generation.dynamo.config import DynamoConfig
 from nemo_rl.models.generation.dynamo.venv import (
-    get_dynamo_executable,
     get_dynamo_python,
+    get_dynamo_service_executable,
 )
 from nemo_rl.models.generation.dynamo.worker_pool import FixedDynamoWorkerPool
 
@@ -156,6 +156,13 @@ class ManagedDynamoRuntime:
             "DYN_HEALTH_CHECK_ENABLED": "false",
             "DYN_SDK_DISABLE_ANSI_LOGGING": "1",
             "DYN_RL_INIT_WEIGHTS_TIMEOUT_S": str(self._dynamo_cfg.control_timeout_s),
+            # A refit runs as a blocking collective_rpc inside EngineCore. Give the
+            # engine health check the same budget so a long refit is not mistaken
+            # for a hung engine and the worker killed.
+            "DYN_ENGINE_HEALTH_CHECK_TIMEOUT": str(self._dynamo_cfg.control_timeout_s),
+            # Matches the trainer side and VllmGeneration for non-colocated refit
+            # (NeMo-RL issue #564).
+            "NCCL_CUMEM_ENABLE": "1",
         }
         print(
             f"  [Dynamo] managed environment={redact_environment(self._manager_env)!r}",
@@ -223,7 +230,7 @@ class ManagedDynamoRuntime:
         self._etcd_data_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_etcd_")
         peer_url = f"http://{self._host}:{self._etcd_peer_port}"
         command = [
-            get_dynamo_executable("etcd"),
+            get_dynamo_service_executable("etcd"),
             "--listen-client-urls",
             f"http://0.0.0.0:{self._etcd_port}",
             "--advertise-client-urls",
@@ -263,7 +270,7 @@ class ManagedDynamoRuntime:
         self._nats_data_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_nats_")
         self._nats_process = subprocess.Popen(
             [
-                get_dynamo_executable("nats-server"),
+                get_dynamo_service_executable("nats-server"),
                 "-js",
                 "-sd",
                 self._nats_data_dir,
@@ -297,8 +304,9 @@ class ManagedDynamoRuntime:
             namespace=self._namespace,
             dynamo_cfg=self._dynamo_cfg,
         )
+        dynamo_python = get_dynamo_python()
         command = [
-            get_dynamo_python(),
+            dynamo_python,
             "-m",
             "dynamo.frontend",
             *argv,
@@ -307,6 +315,9 @@ class ManagedDynamoRuntime:
             f"  [Dynamo] launching frontend argv={redact_argv(command)!r}", flush=True
         )
         frontend_env = self._frontend_env()
+        dynamo_venv = os.path.dirname(os.path.dirname(dynamo_python))
+        frontend_env["VIRTUAL_ENV"] = dynamo_venv
+        frontend_env["UV_PROJECT_ENVIRONMENT"] = dynamo_venv
         tokenizer_env = {
             key: value
             for key, value in frontend_env.items()

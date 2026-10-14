@@ -14,13 +14,11 @@
 
 """Fixed Ray-managed pool of Dynamo vLLM subprocess owners."""
 
-import os
 from typing import Any
 
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH,
     DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW,
@@ -32,8 +30,8 @@ from nemo_rl.models.generation.dynamo.dynamo_worker import (
     DynamoGpuReservation,
     DynamoVllmWorker,
 )
-
-_WORKER_FQN = "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker"
+from nemo_rl.models.generation.dynamo.venv import DYNAMO_WORKER_FQN
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 
 def _vllm_port_for_node_slot(node_slot: int) -> int:
@@ -80,11 +78,9 @@ class FixedDynamoWorkerPool:
         if self._workers:
             raise RuntimeError("Managed Dynamo worker pool is already started.")
         placement_groups = self._cluster.get_placement_groups()
-        python_env = get_actor_python_env(_WORKER_FQN)
-        runtime_env: dict[str, Any] = {
-            "py_executable": python_env,
-            "env_vars": dict(os.environ),
-        }
+        # Builds the dynamo extra's venv on every node when uv-managed; the worker
+        # actor launches dynamo.vllm with that venv's interpreter.
+        runtime_env: dict[str, Any] = make_actor_runtime_env(DYNAMO_WORKER_FQN)
 
         group_index = 0
         engine_slots_by_node: dict[str, int] = {}

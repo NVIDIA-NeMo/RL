@@ -19,6 +19,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -36,10 +37,6 @@ from nemo_rl.models.generation.dynamo.config import (
     VLLM_PACKED_BUFFER_SIZE_BYTES,
     VLLM_PACKED_NUM_BUFFERS,
     DynamoConfig,
-)
-from nemo_rl.models.generation.dynamo.venv import (
-    get_dynamo_python,
-    get_dynamo_venv_dir,
 )
 
 
@@ -135,8 +132,17 @@ class DynamoVllmWorker:  # pragma: no cover
 
         validated_config = DynamoConfig.model_validate(config)
         dynamo_cfg = validated_config.dynamo_cfg
-        dynamo_python = get_dynamo_python()
-        dynamo_venv = str(get_dynamo_venv_dir())
+        # This actor runs in the dynamo extra's venv (actor_environments.py), which
+        # holds nemo_rl, vLLM and ai-dynamo, so dynamo.vllm can load NeMo RL's
+        # vLLM worker extension.
+        dynamo_python = sys.executable
+        dynamo_venv = sys.prefix
+        # The same on-disk vLLM source fixes the vLLM backend applies (tool-parser
+        # namespace, model loaders). Imports only vLLM's logger, never CUDA: this
+        # actor holds no GPU.
+        from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat
+
+        ensure_vllm_source_compat()
         vllm_cfg = validated_config.vllm_cfg.model_dump()
         vllm_kwargs = dict(validated_config.vllm_kwargs)
         configured_env = dict(vllm_cfg.get("env_vars") or {})

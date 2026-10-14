@@ -54,7 +54,10 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
         "nemo_gym",
     ],
     "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": ["sglang"],
-    "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": None,
+    # The actor launches dynamo.vllm and dynamo.frontend with its own interpreter,
+    # and those vLLM workers load NeMo RL's worker extension, so the venv needs
+    # nemo_rl, vLLM and ai-dynamo together.
+    "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": ["dynamo"],
     "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": [
         "automodel"
     ],

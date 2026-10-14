@@ -30,7 +30,7 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
     _managed_namespace,
 )
-from nemo_rl.models.generation.dynamo.venv import get_dynamo_venv_dir
+from nemo_rl.models.generation.dynamo import venv as dynamo_venv
 from nemo_rl.models.generation.dynamo.worker_pool import (
     FixedDynamoWorkerPool,
     _vllm_port_for_node_slot,
@@ -219,13 +219,51 @@ def test_managed_service_and_frontend_environments_are_runtime_owned(
     assert frontend_env["DYN_TOKENIZER_CACHE_BYTES"] == "4096"
 
 
-def test_dynamo_venv_uses_explicit_env_or_repository_fallback(monkeypatch) -> None:
-    monkeypatch.setenv("NEMO_RL_DYNAMO_VENV_DIR", "/custom/dynamo")
-    assert get_dynamo_venv_dir() == Path("/custom/dynamo")
+def test_dynamo_python_builds_the_dynamo_actor_venv(monkeypatch) -> None:
+    built = []
+    monkeypatch.setattr(
+        dynamo_venv,
+        "get_actor_python_env",
+        lambda fqn: "uv run --locked --extra dynamo",
+    )
+    monkeypatch.setattr(
+        dynamo_venv,
+        "create_local_venv",
+        lambda py_executable, venv_name: built.append((py_executable, venv_name))
+        or "/venvs/dynamo/bin/python",
+    )
 
-    monkeypatch.delenv("NEMO_RL_DYNAMO_VENV_DIR")
-    monkeypatch.setenv("NRL_CONTAINER", "1")
-    assert get_dynamo_venv_dir().parts[-2:] == ("venvs", "dynamo")
+    assert dynamo_venv.get_dynamo_python() == "/venvs/dynamo/bin/python"
+    assert built == [("uv run --locked --extra dynamo", dynamo_venv.DYNAMO_WORKER_FQN)]
+
+
+def test_dynamo_python_passes_an_interpreter_through(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dynamo_venv, "get_actor_python_env", lambda fqn: "/usr/bin/python3"
+    )
+    monkeypatch.setattr(
+        dynamo_venv,
+        "create_local_venv",
+        MagicMock(side_effect=AssertionError("no venv for an interpreter")),
+    )
+
+    assert dynamo_venv.get_dynamo_python() == "/usr/bin/python3"
+
+
+def test_dynamo_services_resolve_from_bin_dir_then_path(monkeypatch, tmp_path) -> None:
+    etcd = tmp_path / "etcd"
+    etcd.write_text("#!/bin/sh\n")
+    etcd.chmod(0o755)
+    monkeypatch.setenv("NEMO_RL_DYNAMO_BIN_DIR", str(tmp_path))
+    assert dynamo_venv.get_dynamo_service_executable("etcd") == str(etcd)
+    with pytest.raises(FileNotFoundError, match="NEMO_RL_DYNAMO_BIN_DIR"):
+        dynamo_venv.get_dynamo_service_executable("nats-server")
+
+    monkeypatch.delenv("NEMO_RL_DYNAMO_BIN_DIR")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert dynamo_venv.get_dynamo_service_executable("etcd") == str(etcd)
+    with pytest.raises(FileNotFoundError, match="not on PATH"):
+        dynamo_venv.get_dynamo_service_executable("nats-server")
 
 
 def test_vllm_node_local_port_bands_are_deterministic() -> None:
@@ -428,12 +466,8 @@ def test_worker_registers_process_group_immediately_after_launch(monkeypatch) ->
         lambda *args, **kwargs: FakeSocket(),
     )
     monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.dynamo_worker.get_dynamo_python",
-        lambda: "/opt/dynamo_venv/bin/python",
-    )
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.dynamo_worker.get_dynamo_venv_dir",
-        lambda: Path("/opt/dynamo_venv"),
+        "nemo_rl.models.generation.vllm.patches.ensure_vllm_source_compat",
+        lambda: None,
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.dynamo_worker.subprocess.Popen",
@@ -588,8 +622,8 @@ def test_fixed_pool_tracks_worker_before_metadata_failure(monkeypatch) -> None:
         WorkerFactory,
     )
     monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.worker_pool.get_actor_python_env",
-        lambda _fqn: "python",
+        "nemo_rl.models.generation.dynamo.worker_pool.make_actor_runtime_env",
+        lambda _fqn: {"py_executable": "python", "env_vars": {}},
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.worker_pool.PlacementGroupSchedulingStrategy",
@@ -679,8 +713,8 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
         WorkerFactory,
     )
     monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.worker_pool.get_actor_python_env",
-        lambda _fqn: "python",
+        "nemo_rl.models.generation.dynamo.worker_pool.make_actor_runtime_env",
+        lambda _fqn: {"py_executable": "python", "env_vars": {}},
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.worker_pool.PlacementGroupSchedulingStrategy",
