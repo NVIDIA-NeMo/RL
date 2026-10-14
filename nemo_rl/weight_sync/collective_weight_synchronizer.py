@@ -141,12 +141,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             else nullcontext()
         )
         with timer_context:
-            sender_spec = self._generation.get_collective_sender_spec()
             futures_train = self._policy.broadcast_weights_for_collective(
                 kv_scales=kv_scales,
                 refit_timeout_s=self._refit_timeout_s,
-                buffer_size_bytes=sender_spec.buffer_size_bytes,
-                num_buffers=sender_spec.num_buffers,
             )
             futures_inference = self._generation.update_weights_from_collective(
                 refit_timeout_s=self._refit_timeout_s
@@ -225,13 +222,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             inference_world_size = self._inference_cluster.world_size()
         world_size = train_world_size + inference_world_size
 
-        sender_spec = self._generation.get_collective_sender_spec()
         futures_train = self._policy.init_collective(
             ip,
             port,
             world_size,
             train_world_size=train_world_size,
-            nccl_peer=sender_spec.nccl_peer,
         )
         futures_inference = self._generation.init_collective(
             ip, port, world_size, train_world_size=train_world_size
@@ -332,19 +327,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # already have it is cheap and removes the need to track who is new.
         initialize_refit_metadata(self._policy, self._generation)
 
-        # nccl_peer, exactly as init_communicator passes it. The receiver's bootstrap is
-        # not negotiable: "nemo" publishes a raw unique ID and warms up with a rank-0
-        # broadcast, "vllm" adds a pickled ID key and warms up with an all-reduce. Omitting
-        # it here silently rebuilt with the "nemo" default, and mismatched warmups on one
-        # communicator HANG rather than error -- the exact failure this path exists to
-        # remove, reappearing inside the recovery.
-        sender_spec = self._generation.get_collective_sender_spec()
         futures_train = self._policy.init_collective(
             ip,
             port,
             membership.world_size,
             train_world_size=membership.train_world_size,
-            nccl_peer=sender_spec.nccl_peer,
         )
         futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)

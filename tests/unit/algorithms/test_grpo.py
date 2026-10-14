@@ -7024,27 +7024,12 @@ def test_noncolocated_refit_synchronizer_selection(
     )
 
 
-@pytest.mark.parametrize(
-    ("backend", "nccl_reshard", "expected"),
-    [
-        ("dynamo", True, 42.0),
-        # Dynamo's built-in collective refit cannot enforce a deadline.
-        ("dynamo", False, None),
-        ("vllm", True, None),
-    ],
-)
-def test_managed_refit_timeout_bounds_only_dynamo_nccl_reshard(
-    backend, nccl_reshard, expected
-):
+@pytest.mark.parametrize(("backend", "expected"), [("dynamo", 42.0), ("vllm", None)])
+def test_managed_refit_timeout_bounds_dynamo_refits(backend, expected):
     from nemo_rl.algorithms import grpo as grpo_mod
 
     generation_config = {"backend": backend, "dynamo_cfg": {"control_timeout_s": 42.0}}
-    assert (
-        grpo_mod._managed_refit_timeout_s(
-            generation_config, nccl_reshard_refit_enabled=nccl_reshard
-        )
-        == expected
-    )
+    assert grpo_mod._managed_refit_timeout_s(generation_config) == expected
 
 
 def test_grpo_train_shuts_down_environments_after_failure():

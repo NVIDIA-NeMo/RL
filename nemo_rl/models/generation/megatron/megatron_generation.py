@@ -526,7 +526,6 @@ class MegatronGeneration(GenerationInterface):
                     world_size=membership.world_size,
                     train_world_size=membership.train_world_size,
                     rank_offset=membership.train_world_size + rank - original_rank,
-                    nccl_peer=self.get_collective_sender_spec().nccl_peer,
                 )
             )
         return futures
