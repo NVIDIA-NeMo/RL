@@ -118,7 +118,13 @@ def dp():
     )
     client.register_partition(
         partition_id="train",
-        fields=list(DP_TRAIN_FIELDS) + ["pixel_values", "imgs_sizes", "num_frames"],
+        fields=list(DP_TRAIN_FIELDS)
+        + [
+            "pixel_values",
+            "imgs_sizes",
+            "num_frames",
+            "media_token_validity_mask",
+        ],
         num_samples=64,
         consumer_tasks=["train"],
     )
@@ -137,6 +143,7 @@ def stage(
     partition="staging",
     sink=None,
     expect="staged",
+    generation_token_ids=(31, 2),
 ):
     sink = sink or TQTokenSink(
         dp,
@@ -158,7 +165,11 @@ def stage(
         required_prefix_token_ids=prompt["prompt_token_ids"][:prev_len],
         parent_chain_hash=parent.chain_hash if parent else None,
     )
-    message = {"generation_token_ids": [31, 2], "generation_log_probs": [-0.25, -0.5]}
+    assert len(generation_token_ids) == 2
+    message = {
+        "generation_token_ids": list(generation_token_ids),
+        "generation_log_probs": [-0.25, -0.5],
+    }
     if routes:
         message["routed_experts"] = [[[0]]] * (len(prompt["prompt_token_ids"]) + 2)
     payload = {
@@ -171,7 +182,7 @@ def stage(
             payload,
             prev_len=prev_len,
             prompt_len=len(prompt["prompt_token_ids"]),
-            generated_len=2,
+            generated_len=len(generation_token_ids),
         )
     # Pixels ride beside the record as opaque attachments: one sink write.
     coords = capture.complete_call_from_response(
@@ -1478,6 +1489,8 @@ def test_rl_owned_multimodal_rows_reuse_foundation_media_and_cleanup(dp, routes)
         engine_prompt([10, 18, 18, 18], [(Span(1, 3), torch.ones(3, 4, 2))]),
         call_id="c3",
         routes=routes,
+        # A generated image-token vocabulary id is prose, not another anchor.
+        generation_token_ids=(18, 2),
     )
     selection = RolloutSelection(
         tuple(record.response_id for record in (first, second, rewritten)),
@@ -1506,6 +1519,12 @@ def test_rl_owned_multimodal_rows_reuse_foundation_media_and_cleanup(dp, routes)
     assert fields["pixel_values"].logical_segment_counts_by_row() == [1, 1, 1, 1]
     # Padding has a borrowed execution layout and zero loss; it owns no action.
     assert fields["sample_mask"].tolist() == [1.0, 1.0, 0.0, 0.0]
+    media_mask = fields["media_token_validity_mask"]
+    assert media_mask[0].nonzero().flatten().tolist() == [1, 2, 7, 8]
+    assert media_mask[1].nonzero().flatten().tolist() == [1, 2, 3]
+    assert not media_mask[1, 4]  # generated token id 18 stays ordinary text
+    torch.testing.assert_close(media_mask[2], media_mask[0])
+    torch.testing.assert_close(media_mask[3], media_mask[0])
     assert (
         fields["token_mask"][0].tolist()
         == [0.0] * 4 + [1.0] * 2 + [0.0] * 3 + [1.0] * 2

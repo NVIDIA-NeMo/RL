@@ -109,6 +109,9 @@ class FinalizedRollout:
     # Selected chain already proven by Gym; CC compares it to agent selection.
     model_call_ids: tuple[str, ...] = ()
     media: Optional[dict[str, PackedTensor]] = None
+    # Exact processor-owned image/video embedding positions. Generated special
+    # tokens outside authenticated capture spans remain ordinary text tokens.
+    media_token_validity_mask: Optional[list[bool]] = None
     penalty_counts: dict[str, int] = field(default_factory=dict)
     reward_metrics: dict[str, float] = field(default_factory=dict)
     output_masks: dict[str, list[bool]] = field(default_factory=dict)
@@ -434,7 +437,7 @@ class RolloutReassembler:
         # Media: the presence flags fetched with the base columns say which
         # terminal-chain calls carry pixels; one batched read pulls them,
         # after token verification so a rejected rollout never moves pixels.
-        media, media_failure = self._resolve_media(
+        media, media_token_validity_mask, media_failure = self._resolve_media(
             row, fetched_by_call, verify_occurrences=context_compaction
         )
         if media_failure is not None:
@@ -561,6 +564,7 @@ class RolloutReassembler:
             routed_experts=routed_experts,
             route_plan=route_plan,
             media=media,
+            media_token_validity_mask=media_token_validity_mask,
             penalty_counts=penalty_counts,
             reward_metrics=reward_metrics,
             model_call_ids=tuple(row.model_call_ids),
@@ -573,51 +577,89 @@ class RolloutReassembler:
         fetched_by_call: dict[str, FetchedStagedCall],
         *,
         verify_occurrences: bool = False,
-    ) -> tuple[Optional[dict[str, PackedTensor]], Optional[str]]:
-        """Read and validate the media columns along the terminal chain.
+    ) -> tuple[
+        Optional[dict[str, PackedTensor]],
+        Optional[list[bool]],
+        Optional[str],
+    ]:
+        """Read media and optionally rebuild its exact token-validity mask.
 
         Each call row holds only the media new to that call (the worker
         slices at the parent chain's item count), so the chain's parts are
         concatenated in order, like the token deltas. Returns
-        ``(media, rejection_reason)``. Text-only partitions and text rollouts
-        return ``(None, None)`` without touching storage; media-carrying
-        rollouts cost exactly one batched tensor read. The media columns live
-        on the call rows themselves, so cleanup needs no extra key.
+        ``(media, media_token_validity_mask, rejection_reason)``. Context
+        compaction authenticates processor embedding spans and converts them
+        into the exact mask. This keeps a generated image/audio vocabulary
+        token as text instead of making the model demand an extra feature.
+
+        Text-only partitions return no mask. Verified text-only rows receive
+        an all-false mask. Media-carrying rollouts cost exactly one batched
+        tensor read. The media columns live on the call rows themselves, so
+        cleanup needs no extra key.
         """
         if not self._capture_media:
-            return None, None
+            return None, None, None
         items: list[FetchedStagedCall] = []
         descriptors = []
-        for call_id, _carry_len, _generation_len in row.link_spans:
+        validity_mask = [False] * len(row.token_ids) if verify_occurrences else None
+        row_offset = 0
+        for call_id, carry_len, generation_len in row.link_spans:
             item = fetched_by_call.get(call_id)
             if item is None:
-                return None, f"media_chain_identity:{call_id}"
+                return None, None, f"media_chain_identity:{call_id}"
             if verify_occurrences:
                 try:
                     occurrences = verified_media_items(item)
                 except (KeyError, TypeError, ValueError) as error:
-                    return None, f"invalid_media_evidence:{error}"
+                    return None, None, f"invalid_media_evidence:{error}"
                 if item.media_present:
                     descriptors.append(occurrences)
+                assert validity_mask is not None
+                for occurrence in occurrences:
+                    for absolute_start, length in occurrence.embedding_spans:
+                        local_start = absolute_start - item.snapshot.prev_len
+                        start = row_offset + local_start
+                        end = start + length
+                        if (
+                            local_start < 0
+                            or local_start + length > carry_len
+                            or start < 0
+                            or end > len(validity_mask)
+                            or any(validity_mask[start:end])
+                        ):
+                            return (
+                                None,
+                                None,
+                                "invalid_media_evidence:overlapping or out-of-range "
+                                f"embedding span for {call_id}",
+                            )
+                        validity_mask[start:end] = [True] * length
             if item.media_present:
                 items.append(item)
+            row_offset += carry_len + generation_len
+        if validity_mask is not None and row_offset != len(row.token_ids):
+            return None, None, "media_chain_identity:link spans do not cover row"
         if not items:
-            return None, None
+            return None, validity_mask, None
         if len({item.media_has_frames for item in items}) != 1:
-            return None, "media_chain_incompatible:mixed image and video calls"
+            return (
+                None,
+                None,
+                "media_chain_incompatible:mixed image and video calls",
+            )
         try:
             parts = self._source.fetch_media(items)
             if verify_occurrences:
                 for occurrences, part in zip(descriptors, parts, strict=True):
                     verify_media_geometry(occurrences, part)
         except (KeyError, TypeError, ValueError) as error:
-            return None, f"invalid_media_columns:{error}"
+            return None, None, f"invalid_media_columns:{error}"
         try:
             combined = _concat_media(parts)
             media = _trainer_media(combined)
         except (TypeError, ValueError, RuntimeError) as error:
-            return None, f"media_chain_incompatible:{error}"
-        return media, None
+            return None, None, f"media_chain_incompatible:{error}"
+        return media, validity_mask, None
 
     def _execute_direct_plan(
         self,
@@ -1083,6 +1125,22 @@ class RolloutReassembler:
             train_batch["routed_experts"] = self._build_routed_experts_tensor(
                 rows, max_len=max_len, metrics=metrics
             )
+        if any(layout.media_token_validity_mask is not None for layout in layouts):
+            media_token_validity_mask = torch.zeros((n, max_len), dtype=torch.bool)
+            for index, layout in enumerate(layouts):
+                mask = layout.media_token_validity_mask
+                if mask is None:
+                    continue
+                if len(mask) != len(layout.token_ids):
+                    raise RuntimeError(
+                        "media token validity mask length "
+                        f"{len(mask)} does not match token length "
+                        f"{len(layout.token_ids)} for rollout {layout.rollout_id}"
+                    )
+                media_token_validity_mask[index, : len(mask)] = torch.tensor(
+                    mask, dtype=torch.bool
+                )
+            train_batch["media_token_validity_mask"] = media_token_validity_mask
         # Media rides the same packed/tagged transport as the token-echo path
         # (pack_payload encodes PackedTensor fields and mints row-shape tags).
         train_batch.update(_media_fields_for_group(layouts))
@@ -1517,6 +1575,7 @@ class RolloutReassembler:
                         routed_experts=None,
                         route_plan=None,
                         media=None,
+                        media_token_validity_mask=None,
                         output_masks={},
                     )
                     for _ in segments
