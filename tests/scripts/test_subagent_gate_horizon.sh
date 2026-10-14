@@ -67,12 +67,18 @@ assert_horizon scripts/agentic_vbench/debug_subagents_async_16n.sh "$tmp/agentic
 assert_horizon scripts/claweval/train_subagents_sync_8n.sh "$tmp/claw-sync.out"
 assert_horizon scripts/claweval/train_subagents_async_16n.sh "$tmp/claw-async.out"
 
-grep -Fqx 'SLURM_QOS=normal' "$tmp/agentic-sync.out"
-grep -Fqx 'SLURM_TIME_LIMIT=24:00:00' "$tmp/agentic-sync.out"
-grep -Fqx 'JOB_CYCLES=6' "$tmp/agentic-sync.out"
-grep -Fqx 'MIN_SLURM_TIME_SECONDS=86400' "$tmp/agentic-sync.out"
-grep -Fqx 'MIN_CHECKPOINT_BUDGET_SECONDS=82800' "$tmp/agentic-sync.out"
-grep -Fqx 'REQUIRE_RESUMABLE_JOB_CYCLES=true' "$tmp/agentic-sync.out"
+for output in \
+  "$tmp/agentic-sync.out" \
+  "$tmp/agentic-async.out" \
+  "$tmp/claw-sync.out" \
+  "$tmp/claw-async.out"; do
+  grep -Fqx 'SLURM_QOS=normal' "$output"
+  grep -Fqx 'SLURM_TIME_LIMIT=24:00:00' "$output"
+  grep -Fqx 'JOB_CYCLES=6' "$output"
+  grep -Fqx 'MIN_SLURM_TIME_SECONDS=86400' "$output"
+  grep -Fqx 'MIN_CHECKPOINT_BUDGET_SECONDS=82800' "$output"
+  grep -Fqx 'REQUIRE_RESUMABLE_JOB_CYCLES=true' "$output"
+done
 grep -Fqx 'NUM_NODES=8' "$tmp/agentic-sync.out"
 grep -Fqx 'NUM_GEN_NODES=4' "$tmp/agentic-sync.out"
 grep -Fqx 'SEGMENT_SIZE=4' "$tmp/agentic-sync.out"

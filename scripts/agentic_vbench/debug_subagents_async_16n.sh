@@ -23,7 +23,10 @@ export SAVE_PERIOD=${SAVE_PERIOD:-1}
 export CHECKPOINT_KEEP_TOP_K=${CHECKPOINT_KEEP_TOP_K:-2}
 export JOB_CYCLES=${JOB_CYCLES:-6}
 export SLURM_QOS=${SLURM_QOS:-normal}
-export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-02:00:00}
+export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-24:00:00}
+export MIN_SLURM_TIME_SECONDS=${MIN_SLURM_TIME_SECONDS:-86400}
+export MIN_CHECKPOINT_BUDGET_SECONDS=${MIN_CHECKPOINT_BUDGET_SECONDS:-82800}
+export REQUIRE_RESUMABLE_JOB_CYCLES=${REQUIRE_RESUMABLE_JOB_CYCLES:-true}
 export AGENTIC_VBENCH_MAX_TURNS=${AGENTIC_VBENCH_MAX_TURNS:-32}
 # Keep the first async gate behaviorally identical to the qualified sync gate.
 # Only the sampler topology and permitted policy staleness change below.

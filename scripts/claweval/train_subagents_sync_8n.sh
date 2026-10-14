@@ -26,7 +26,11 @@ export SAVE_PERIOD=${SAVE_PERIOD:-1}
 # Chain allocation-bounded cycles against the same checkpoint/W&B run.  This
 # preserves the effectively uncapped GRPO horizon across Slurm time limits.
 export JOB_CYCLES=${JOB_CYCLES:-6}
-export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-04:00:00}
+export SLURM_QOS=${SLURM_QOS:-normal}
+export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-24:00:00}
+export MIN_SLURM_TIME_SECONDS=${MIN_SLURM_TIME_SECONDS:-86400}
+export MIN_CHECKPOINT_BUDGET_SECONDS=${MIN_CHECKPOINT_BUDGET_SECONDS:-82800}
+export REQUIRE_RESUMABLE_JOB_CYCLES=${REQUIRE_RESUMABLE_JOB_CYCLES:-true}
 export CONTEXT_COMPACTION=true
 export CLAW_EVAL_COMPACTION_AUTO=false
 export CLAW_EVAL_COMPACTION_PRUNE=false
