@@ -1822,6 +1822,10 @@ class AsyncTrajectoryCollector:
             # a frontier restore report which prompts the retained buffer
             # already covers.
             group_task_index = input_task_index
+        if self._deterministic_progress is not None and group_task_index is None:
+            raise ValueError(
+                "Deterministic replay requires a prompt ordinal before enqueueing."
+            )
         if group_task_index is not None:
             trajectory_group[NEMO_GYM_TASK_INDEX_KEY] = group_task_index
         backoff_delay = 0.01
@@ -1846,7 +1850,10 @@ class AsyncTrajectoryCollector:
                     target_weight_version,
                 )
                 if status == "success":
-                    if self._deterministic_progress is not None:
+                    if (
+                        self._deterministic_progress is not None
+                        and group_task_index is not None
+                    ):
                         self._deterministic_progress.group_buffered(
                             target_weight_version, group_task_index
                         )

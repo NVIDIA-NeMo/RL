@@ -3266,6 +3266,50 @@ class TestAsyncTrajectoryCollector:
         assert collector.get_rollouts_state() == {"next_ng_task_index": 0}
         assert target_weight not in collector._generating_targets
 
+    @pytest.mark.parametrize(
+        "result_ordinal,input_ordinal", [(None, None), (0, None), (None, 0)]
+    )
+    def test_deterministic_enqueue_requires_prompt_ordinal(
+        self, result_ordinal, input_ordinal
+    ):
+        replay_buffer = mock.MagicMock()
+        replay_buffer.add.remote = mock.AsyncMock(return_value="success")
+        collector = self.create_local_collector(
+            replay_buffer=replay_buffer, deterministic=True
+        )
+        collector.running = True
+        progress = mock.Mock()
+        collector._deterministic_progress = progress
+        buffered = set()
+        result = trajectory_collector_mod.RolloutGroupResult(
+            group_index=0,
+            final_batch=BatchedDataDict({"value": torch.tensor([1, 2, 3])}),
+            rollout_metrics={},
+            task_index=result_ordinal,
+        )
+        enqueue = collector._enqueue_rollout_group(
+            rollout_result=result,
+            generation_weight_version=0,
+            target_weight_version=0,
+            expected_prompt_groups=2,
+            buffered_group_indices=buffered,
+            collection_started_at=time.perf_counter(),
+            input_task_index=input_ordinal,
+        )
+        if result_ordinal is None and input_ordinal is None:
+            with pytest.raises(ValueError, match="requires a prompt ordinal"):
+                asyncio.run(enqueue)
+            replay_buffer.add.remote.assert_not_called()
+            progress.group_buffered.assert_not_called()
+            assert not buffered
+        else:
+            asyncio.run(enqueue)
+            replay_buffer.add.remote.assert_awaited_once()
+            group = replay_buffer.add.remote.call_args.args[0]
+            assert group[NEMO_GYM_TASK_INDEX_KEY] == 0
+            progress.group_buffered.assert_called_once_with(0, 0)
+            assert buffered == {0}
+
     def test_native_batch_worker_enqueues_each_group(self, monkeypatch):
         """The common worker enqueues every native group without Gym metadata."""
 

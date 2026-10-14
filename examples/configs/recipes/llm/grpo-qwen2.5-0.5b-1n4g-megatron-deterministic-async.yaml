@@ -3,9 +3,6 @@ grpo:
   deterministic: true
   async_grpo:
     enabled: true
-    max_trajectory_age_steps: 1
-    max_generation_failures: 0
-    in_flight_weight_updates: false
   num_prompts_per_step: 4
   num_generations_per_prompt: 4
   max_num_steps: 3
@@ -36,13 +33,7 @@ policy:
         gpus_per_node: 2
     refit_transport: mcore
     max_new_tokens: 384
-    temperature: 1.0
-    top_p: 1.0
     mcore_generation_config:
-      cuda_graph_impl: local
-      inference_cuda_graph_scope: block
-      num_cuda_graphs: 4
-      enable_chunked_prefill: true
       enable_prefix_caching: true
       refit_backend: nccl
       buffer_size_gb: 1
@@ -57,7 +48,6 @@ data:
     dataset_name: GSM8K
     split: test
 checkpointing:
-  enabled: false
   checkpoint_dir: results/grpo-deterministic-async
   metric_name: null
   save_period: 1
