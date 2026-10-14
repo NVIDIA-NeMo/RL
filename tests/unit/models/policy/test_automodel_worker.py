@@ -341,7 +341,7 @@ def test_update_moe_gate_bias_noop_when_unsupported():
     AutomodelPolicyWorkerImpl._update_moe_gate_bias_if_supported(worker)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def two_gpu_virtual_cluster():
     cluster_name = "test"
     print(f"Creating virtual cluster '{cluster_name}'...")
@@ -1062,9 +1062,6 @@ def _base_setup_impl(request, cluster):
             token_logprobs = calculate_token_logprobs(model_name, data)
             yield policy, data, token_logprobs
 
-    except Exception as e:
-        print(f"Error during setup: {e}")
-        pytest.skip(f"Setup failed: {e}")
     finally:
         print("Cleaning up resources for test")
         if policy:
@@ -1556,7 +1553,7 @@ class TestTwoGPUCluster:
         [{"enable_loras": False}, {"enable_loras": True}],
         indirect=True,
     )
-    def test_lm_policy_init(self, policy_setup):
+    def test_lm_policy_init(self, policy_setup, request):
         policy = policy_setup
 
         # Verify we have two workers, one per GPU
@@ -1636,6 +1633,11 @@ class TestTwoGPUCluster:
             assert param_device == "cuda:0", (
                 f"Expected parameter device to be cuda:0, got {param_device}"
             )
+
+        # Check 10: With LoRA on, base weights are frozen, so the first trainable param
+        # is an adapter.
+        lora_on = request.node.callspec.params["policy_setup"]["enable_loras"]
+        assert (".lora_" in param_names[0]) == lora_on, param_names[0]
 
     @pytest.mark.timeout(360)
     @pytest.mark.automodel
