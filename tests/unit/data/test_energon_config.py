@@ -12,10 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 from pydantic import ValidationError
 
-from nemo_rl.data.energon.config import EnergonCookerConfig, EnergonTaskEncoderConfig
+from nemo_rl.data.energon.config import (
+    EnergonCookerConfig,
+    EnergonLoaderConfig,
+    EnergonTaskEncoderConfig,
+)
 from nemo_rl.data.energon.multimodal.registry import (
     LazyRegistry,
     selected_registry_identity,
@@ -66,3 +73,82 @@ def test_file_backed_cooker_loads_from_config_and_preserves_identity(tmp_path, k
         task_encoder=EnergonTaskEncoderConfig(), cookers=[config]
     )
     assert identity["cookers"][0]["object"] == "custom_cooker"
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"gc_collect_every_n_steps": -1},
+        {"cache_pool_num_workers": 0},
+        {"cache_pool_num_workers": -1},
+    ],
+)
+def test_loader_rejects_invalid_gc_and_cache_overrides(options: dict[str, int]) -> None:
+    with pytest.raises(ValidationError):
+        EnergonLoaderConfig(model_family="qwen", **options)
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("split_role", ["train", "validation"])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"gc_collect_every_n_steps": None, "cache_pool_num_workers": None},
+        {"gc_collect_every_n_steps": 0, "cache_pool_num_workers": 1},
+        {"gc_collect_every_n_steps": 100000, "cache_pool_num_workers": 3},
+    ],
+)
+def test_loader_preserves_energon_defaults_unless_overridden(
+    monkeypatch: pytest.MonkeyPatch, split_role: str, options: dict[str, int | None]
+) -> None:
+    # The loader imports the optional Energon runtime.
+    from nemo_rl.data.energon import sft_dataloader as module
+
+    config = EnergonLoaderConfig(model_family="qwen", **options)
+    monkeypatch.setattr(module, "_loader_config", lambda _: config)
+    monkeypatch.setattr(
+        module,
+        "build_processor_adapter",
+        Mock(return_value=SimpleNamespace(fingerprint="adapter")),
+    )
+    monkeypatch.setattr(
+        module,
+        "_task_encoder",
+        Mock(return_value=SimpleNamespace(cookers=[SimpleNamespace(need_cache=True)])),
+    )
+    monkeypatch.setattr(module, "_worker_config", Mock())
+    monkeypatch.setattr(module, "get_train_dataset", Mock())
+    monkeypatch.setattr(module, "get_val_dataset", Mock())
+    cache_pool, savable_loader = Mock(), Mock()
+    monkeypatch.setattr(module, "FileStoreCachePool", cache_pool)
+    monkeypatch.setattr(module, "get_savable_loader", savable_loader)
+
+    module.build_energon_sft_loader(
+        data_config={"energon": config, "shuffle": True},
+        source={
+            "path": "/data/prepared",
+            "split": split_role,
+            "virtual_epoch_length": 8,
+        },
+        processor=SimpleNamespace(tokenizer=object()),
+        batch_size=1,
+        max_sequence_length=128,
+        split_role=split_role,
+        logical_rank=0,
+        logical_world_size=1,
+        placement_fingerprint="placement",
+        only_unmask_final=False,
+    )
+
+    expected_pool = {"method": "raw"}
+    if config.cache_pool_num_workers is not None:
+        expected_pool["num_workers"] = config.cache_pool_num_workers
+    cache_pool.assert_called_once_with(**expected_pool)
+    assert savable_loader.call_count == 1
+    kwargs = savable_loader.call_args.kwargs
+    assert kwargs["cache_pool"] is cache_pool.return_value
+    if config.gc_collect_every_n_steps is None:
+        assert "gc_collect_every_n_steps" not in kwargs
+    else:
+        assert kwargs["gc_collect_every_n_steps"] == config.gc_collect_every_n_steps

@@ -174,11 +174,14 @@ class EnergonLoaderConfig(BaseModel, extra="allow"):
         default=None,
         description="Maximum file-store cache size in GiB; None uses Energon's limit.",
     )
-    cache_pool_num_workers: Annotated[int, Field(ge=1)] = Field(
-        default=1,
-        description="Number of FileStoreCachePool worker processes.",
+    cache_pool_num_workers: Annotated[int, Field(ge=1)] | None = Field(
+        default=None,
+        description="FileStoreCachePool copy threads; None uses Energon's default.",
     )
-    gc_collect_every_n_steps: Annotated[int, Field(ge=1)] = Field(
-        default=100000,
-        description="Loader steps between forced Python garbage collections.",
+    gc_collect_every_n_steps: Annotated[int, Field(ge=0)] | None = Field(
+        default=None,
+        description=(
+            "Loader steps between forced garbage collections; 0 disables, "
+            "None uses Energon's default."
+        ),
     )

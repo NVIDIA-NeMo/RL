@@ -516,10 +516,9 @@ def build_energon_sft_loader(
             task_encoder=task_encoder,
         )
 
-    cache_pool_kwargs: dict[str, Any] = {
-        "method": "raw",
-        "num_workers": loader_config.cache_pool_num_workers,
-    }
+    cache_pool_kwargs: dict[str, Any] = {"method": "raw"}
+    if loader_config.cache_pool_num_workers is not None:
+        cache_pool_kwargs["num_workers"] = loader_config.cache_pool_num_workers
     if loader_config.cache_pool_max_gbytes is not None:
         cache_pool_kwargs["max_cache_size_gbytes"] = loader_config.cache_pool_max_gbytes
     cache_pool = (
@@ -527,14 +526,19 @@ def build_energon_sft_loader(
         if any(cooker.need_cache for cooker in task_encoder.cookers)
         else None
     )
+    loader_kwargs: dict[str, Any] = {}
+    if loader_config.gc_collect_every_n_steps is not None:
+        loader_kwargs["gc_collect_every_n_steps"] = (
+            loader_config.gc_collect_every_n_steps
+        )
     loader = get_savable_loader(
         dataset,
         cache_pool=cache_pool,
         checkpoint_every_sec=loader_config.checkpoint_every_sec,
         prefetch_factor=loader_config.prefetch_factor,
         watchdog_timeout_seconds=loader_config.watchdog_timeout_seconds,
-        gc_collect_every_n_steps=loader_config.gc_collect_every_n_steps,
         fail_on_timeout=True,
+        **loader_kwargs,
     )
     return EnergonSFTDataLoader(
         loader,

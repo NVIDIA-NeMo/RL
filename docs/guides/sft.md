@@ -354,6 +354,15 @@ The processor runs inside Energon loader workers and returns the same tokenized 
 
 The v1 `SFTProcessorAdapter` and `HFMultimodalSFTProcessorAdapter` are narrow integration interfaces. They are planned to be replaced by a more comprehensive modular processor implementation; dataset loading and the policy-facing batch shape should remain stable through that change.
 
+Optional controls under `data.energon` preserve Energon's defaults when unset:
+
+| Field | Behavior |
+| --- | --- |
+| `gc_collect_every_n_steps` | Steps between garbage collections; `0` disables GC and `null` uses Energon's default. |
+| `cache_pool_num_workers` | Positive number of cache-copy threads; `null` uses Energon's default. |
+| `cache_pool_max_gbytes` | Positive cache-size limit in GiB; `null` uses Energon's limit. |
+| `nvdataset_cache_dir` | DSS cache root exported as `NVDATASET_CACHE_DIR`; `null` leaves the environment setting unchanged. |
+
 To let Energon form model-ready multimodal packs, configure packing on the
 task encoder and enable fused sequence packing:
 
