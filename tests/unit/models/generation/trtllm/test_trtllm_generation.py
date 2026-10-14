@@ -170,6 +170,27 @@ def test_cross_node_tp_replicas_use_unified_placement_group():
     ]
 
 
+def test_no_http_server_reports_an_empty_url_list():
+    """Without a server there is no per-rank slot, so the length said nothing.
+
+    This used to be one None per DP rank, which is truthy and carries a length
+    that reads like real URLs were collected.
+    """
+    generation = _bare_generation(dp_size=2)
+    generation.dp_size = 2
+
+    assert generation._report_dp_openai_server_base_urls() == []
+
+
+def test_exposed_http_server_reports_served_addresses(monkeypatch):
+    generation = _bare_generation(dp_size=2, expose_http_server=True)
+    generation.dp_size = 2
+    served = ["http://10.0.0.1:8000/v1", "http://10.0.0.2:8000/v1"]
+    monkeypatch.setattr(trtllm_generation.ray, "get", lambda futures: list(served))
+
+    assert generation._report_dp_openai_server_base_urls() == served
+
+
 @pytest.mark.asyncio
 async def test_generate_async_dispatches_round_robin_and_returns_leader_index():
     generation = _bare_generation(dp_size=2)
