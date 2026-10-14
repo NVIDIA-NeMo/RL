@@ -98,6 +98,21 @@ def test_launchers_dispatch_through_the_shared_helpers(launcher: str):
     )
 
 
+@pytest.mark.parametrize("launcher", LAUNCHERS)
+def test_launchers_bind_the_setup_nemo_gym_actor(launcher: str):
+    """The actor returned by setup must replace dataset-task routing.
+
+    NeMo-Gym is spun up during worker setup so that it targets the reserved
+    generation endpoints.  Rollout code reads that actor from the canonical
+    ``nemo_gym`` key; leaving only dataset task names fails after full model
+    initialization with ``KeyError: 'nemo_gym'``.
+    """
+    source = (REPO / "examples" / launcher).read_text()
+
+    assert 'task_to_env["nemo_gym"] = _nemo_gym' in source
+    assert 'val_task_to_env["nemo_gym"] = _nemo_gym' in source
+
+
 def test_sync_trainer_is_call_compatible_with_legacy_trainer():
     """Both trainers must accept the same call, because the VLM launcher
     picks one at runtime and passes a single fixed kwarg set.
