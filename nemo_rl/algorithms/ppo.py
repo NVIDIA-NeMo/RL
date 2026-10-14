@@ -39,6 +39,10 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     scale_rewards,
 )
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossDataDict,
@@ -123,7 +127,10 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
-from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    validate_offload_policy_before_refit,
+)
 
 # ===============================================================================
 # Configuration
@@ -271,12 +278,15 @@ def _apply_ppo_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: float | None,
+    *,
+    filtering_on: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
     """Apply optional mismatch masking and return the advantage mask and metrics."""
     metrics = compute_and_apply_seq_logprob_error_masking(
         train_data=train_data,
         rewards=rewards,
         seq_logprob_error_threshold=seq_logprob_error_threshold,
+        filtering_on=filtering_on,
     )
     metrics["num_masked_seqs_by_logprob_error"] = metrics.pop("num_masked_seqs")
 
@@ -514,6 +524,16 @@ def setup(
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
     backend = generation_config["backend"]
+    offload_policy_before_refit = policy_config["offload_policy_before_refit"]
+    validate_offload_policy_before_refit(
+        enabled=offload_policy_before_refit,
+        megatron_enabled=bool(
+            (policy_config.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=backend,
+        colocated=colocated_inference,
+        refit_transport=generation_config.get("refit_transport"),
+    )
     if not colocated_inference and backend != "vllm":
         raise NotImplementedError(
             "Non-colocated PPO generation currently supports only vLLM; "
@@ -968,6 +988,19 @@ def setup(
         worker_init_timing_metrics["sglang_weight_sync_init_time_s"] = (
             time.perf_counter() - t0
         )
+    elif not colocated_inference and offload_policy_before_refit:
+        assert policy_generation is not None
+        t0 = time.perf_counter()
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=False,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+        )
+        policy_generation.weight_synchronizer.init_communicator()
+        worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
     elif not colocated_inference:
         assert policy_generation is not None
         t0 = time.perf_counter()
@@ -1662,9 +1695,6 @@ def ppo_train(
                     )
                     prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
                     train_data["prev_logprobs"] = prev_lp_result["logprobs"]
-                    # Propagate the top-k/top-p neginf mask so the loss skips these positions.
-                    if "token_mask" in prev_lp_result:
-                        train_data["token_mask"] = prev_lp_result["token_mask"]
 
                     if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
@@ -1687,6 +1717,12 @@ def ppo_train(
                     rewards=rewards,
                     seq_logprob_error_threshold=(
                         master_config.ppo.seq_logprob_error_threshold
+                    ),
+                    filtering_on=need_top_k_or_top_p_filtering(
+                        TrainingSamplingParams(
+                            top_k=master_config.policy["generation"]["top_k"],
+                            top_p=master_config.policy["generation"]["top_p"],
+                        )
                     ),
                 )
 
@@ -2686,9 +2722,6 @@ def async_ppo_train(
                     )
                     prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
                     train_data["prev_logprobs"] = prev_lp_result["logprobs"]
-                    # Propagate the top-k/top-p neginf mask so the loss skips these positions.
-                    if "token_mask" in prev_lp_result:
-                        train_data["token_mask"] = prev_lp_result["token_mask"]
                     if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
                             policy.get_reference_policy_logprobs(
@@ -2709,6 +2742,12 @@ def async_ppo_train(
                     rewards=rewards,
                     seq_logprob_error_threshold=(
                         master_config.ppo.seq_logprob_error_threshold
+                    ),
+                    filtering_on=need_top_k_or_top_p_filtering(
+                        TrainingSamplingParams(
+                            top_k=master_config.policy["generation"]["top_k"],
+                            top_p=master_config.policy["generation"]["top_p"],
+                        )
                     ),
                 )
 
@@ -3086,6 +3125,12 @@ def async_ppo_train(
                     },
                     step + 1,
                     name="train/token_mult_prob_error_plot_sample",
+                    filtering_on=need_top_k_or_top_p_filtering(
+                        TrainingSamplingParams(
+                            top_k=master_config.policy["generation"]["top_k"],
+                            top_p=master_config.policy["generation"]["top_p"],
+                        )
+                    ),
                 )
             del train_data
 
