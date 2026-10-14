@@ -9,15 +9,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from copy import deepcopy
 import hashlib
 import json
+from copy import deepcopy
+from typing import Any
 
 import pytest
 
 from nemo_rl.environments.session_traces import (
     bind_session_generation_spans,
     session_training_semantics,
+    validate_session_resume_config,
     validate_session_trace_metadata,
     validate_session_training_config,
     validate_tagged_session_rollout,
@@ -57,6 +59,18 @@ def config() -> dict:
                 }
             },
         }
+    }
+
+
+def resume_config() -> dict:
+    return {
+        "env": config(),
+        "token_capture": {
+            "enabled": True,
+            "context_compaction": True,
+            "capture_dir": "/first-allocation/capture",
+        },
+        "logger": {"log_dir": "/first-allocation/logs"},
     }
 
 
@@ -118,6 +132,69 @@ def test_mode_and_limits_are_explicit_and_operational_paths_are_excluded() -> No
     resumed["nemo_gym"]["results_dir"] = "/resumed-allocation"
     assert validate_session_training_config(original) == "subagent"
     assert session_training_semantics(original) == session_training_semantics(resumed)
+
+
+def test_parallel_subagent_limit_is_valid_and_bound_on_resume() -> None:
+    original = resume_config()
+    agent = original["env"]["nemo_gym"]["swe"]["responses_api_agents"]["swe_agents"]
+    agent["opencode_subagent_max_active"] = None
+    assert validate_session_training_config(original["env"]) == "subagent"
+    validate_session_resume_config(original, deepcopy(original))
+
+
+def test_session_resume_allows_operational_path_changes() -> None:
+    original = resume_config()
+    resumed = deepcopy(original)
+    resumed["env"]["nemo_gym"]["results_dir"] = "/resumed-allocation"
+    resumed["token_capture"]["capture_dir"] = "/resumed-allocation/capture"
+    resumed["logger"]["log_dir"] = "/resumed-allocation/logs"
+    validate_session_resume_config(original, resumed)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("opencode_training_mode", "compaction"),
+        ("opencode_subagents_enabled", False),
+        ("opencode_subagent_max_depth", 2),
+        ("opencode_subagent_max_active", 2),
+        ("opencode_compaction_auto", True),
+        ("opencode_compaction_prune", True),
+        ("opencode_pruning_enabled", True),
+    ],
+)
+def test_session_resume_rejects_agent_semantic_drift(key: str, value: Any) -> None:
+    original = resume_config()
+    resumed = deepcopy(original)
+    resumed["env"]["nemo_gym"]["swe"]["responses_api_agents"]["swe_agents"][key] = value
+    with pytest.raises(ValueError, match="training_mode, subagent limits"):
+        validate_session_resume_config(original, resumed)
+
+
+def test_session_resume_rejects_training_and_capture_mode_drift() -> None:
+    original = resume_config()
+    resumed = deepcopy(original)
+    resumed["env"]["nemo_gym"]["training_mode"] = "compaction"
+    with pytest.raises(ValueError, match="training_mode, subagent limits"):
+        validate_session_resume_config(original, resumed)
+
+    for key in ("enabled", "context_compaction"):
+        resumed = deepcopy(original)
+        resumed["token_capture"][key] = False
+        with pytest.raises(ValueError, match="token_capture"):
+            validate_session_resume_config(original, resumed)
+
+
+def test_legacy_no_mode_resume_does_not_bind_new_session_controls() -> None:
+    saved = {
+        "env": {"nemo_gym": {}},
+        "token_capture": {"enabled": False, "context_compaction": False},
+    }
+    current = {
+        "env": {"nemo_gym": {}},
+        "token_capture": {"enabled": True, "context_compaction": True},
+    }
+    validate_session_resume_config(saved, current)
 
 
 @pytest.mark.parametrize(

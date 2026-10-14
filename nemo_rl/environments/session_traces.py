@@ -57,6 +57,51 @@ def session_training_semantics(env: Mapping[str, Any]) -> dict[str, Any]:
     return {"training_mode": gym.get("training_mode"), "agents": agents}
 
 
+def validate_session_resume_config(
+    saved: Mapping[str, Any], current: Mapping[str, Any]
+) -> None:
+    """Keep an explicit session-training contract fixed across a resume.
+
+    Checkpoints from runs without an explicit ``training_mode`` retain their
+    historical behavior. Once either side declares a mode, the NeMo-Gym mode,
+    OpenCode subagent/compaction controls, and the framework-owned capture mode
+    must match exactly. Operational paths and logging settings are deliberately
+    outside this contract.
+    """
+
+    def session_semantics(config: Mapping[str, Any]) -> dict[str, Any]:
+        env = config.get("env")
+        return session_training_semantics(env if isinstance(env, Mapping) else {})
+
+    saved_session = session_semantics(saved)
+    current_session = session_semantics(current)
+    if (
+        saved_session.get("training_mode") is None
+        and current_session.get("training_mode") is None
+    ):
+        return
+    if saved_session != current_session:
+        raise ValueError(
+            "Session training resume changed training_mode, subagent limits, "
+            "or OpenCode compaction controls"
+        )
+
+    def capture_semantics(config: Mapping[str, Any]) -> dict[str, Any]:
+        capture = config.get("token_capture")
+        if not isinstance(capture, Mapping):
+            capture = {}
+        return {
+            "enabled": capture.get("enabled"),
+            "context_compaction": capture.get("context_compaction"),
+        }
+
+    if capture_semantics(saved) != capture_semantics(current):
+        raise ValueError(
+            "Session training resume changed token_capture.enabled or "
+            "token_capture.context_compaction"
+        )
+
+
 def validate_session_training_config(env: Mapping[str, Any]) -> TrainingMode | None:
     """Require an explicit, consistent opt-in for subagent-only training."""
     semantics = session_training_semantics(env)

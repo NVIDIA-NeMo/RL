@@ -2572,6 +2572,87 @@ class TestSetup:
             sc_setup_mod._maybe_attach_fleet_health(generation, mc)
 
 
+def test_explicit_session_resume_requires_saved_config_before_setup_factories(
+    tmp_path: Path, patched_factories: dict[str, Any]
+) -> None:
+    checkpoint = tmp_path / "step_1"
+    checkpoint.mkdir()
+    mc = _make_master_config(env={"nemo_gym": {"training_mode": "subagent"}})
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint)
+
+    with (
+        patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer),
+        pytest.raises(FileNotFoundError, match="saved config"),
+    ):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    checkpointer.load_training_info.assert_not_called()
+    patched_factories["_build_clusters"].assert_not_called()
+
+
+def _session_resume_master_config() -> MasterConfig:
+    mc = _make_master_config(
+        env={
+            "nemo_gym": {
+                "training_mode": "subagent",
+                "swe": {
+                    "responses_api_agents": {
+                        "swe_agents": {
+                            "opencode_training_mode": "subagent",
+                            "opencode_subagents_enabled": True,
+                            "opencode_subagent_max_depth": 1,
+                            "opencode_subagent_max_active": 1,
+                        }
+                    }
+                },
+            }
+        }
+    )
+    mc.token_capture.enabled = True
+    mc.token_capture.context_compaction = True
+    return mc
+
+
+def _write_session_resume_config(checkpoint: Path, mc: MasterConfig) -> None:
+    OmegaConf.save(
+        {
+            "env": mc.env,
+            "token_capture": {
+                "enabled": mc.token_capture.enabled,
+                "context_compaction": mc.token_capture.context_compaction,
+            },
+        },
+        checkpoint / "config.yaml",
+    )
+
+
+def test_session_resume_checkpoint_accepts_saved_matching_semantics(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step_1"
+    checkpoint.mkdir()
+    mc = _session_resume_master_config()
+    _write_session_resume_config(checkpoint, mc)
+
+    sc_setup_mod._validate_session_resume_checkpoint(mc, str(checkpoint))
+
+
+def test_session_resume_checkpoint_rejects_saved_semantic_drift(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "step_1"
+    checkpoint.mkdir()
+    mc = _session_resume_master_config()
+    _write_session_resume_config(checkpoint, mc)
+    mc.env["nemo_gym"]["swe"]["responses_api_agents"]["swe_agents"][
+        "opencode_subagent_max_depth"
+    ] = 2
+
+    with pytest.raises(ValueError, match="training_mode, subagent limits"):
+        sc_setup_mod._validate_session_resume_checkpoint(mc, str(checkpoint))
+
+
 class TestNativeTQRecoverySetup:
     def test_simple_storage_setup_loads_tq_before_creating_controller_client(
         self, tmp_path, patched_factories

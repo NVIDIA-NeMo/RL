@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import time
 import warnings
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -104,6 +105,10 @@ from nemo_rl.environments.nemo_gym import (
     build_nemo_gym_actors,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
+)
+from nemo_rl.environments.session_traces import (
+    session_training_semantics,
+    validate_session_resume_config,
 )
 from nemo_rl.experience.mask_sample_rules import parse_mask_sample_rules
 from nemo_rl.experience.rollout_manager import (
@@ -1101,6 +1106,41 @@ def _drop_optimizer_for_changed_megatron_freeze_contract(
     return None
 
 
+def _validate_session_resume_checkpoint(
+    master_config: MasterConfig, trainer_checkpoint_path: Optional[str]
+) -> None:
+    """Reject session-mode drift before restoring any checkpoint state."""
+    if trainer_checkpoint_path is None:
+        return
+
+    current = {
+        "env": master_config.env,
+        "token_capture": {
+            "enabled": master_config.token_capture.enabled,
+            "context_compaction": master_config.token_capture.context_compaction,
+        },
+    }
+    current_env = current.get("env")
+    current_session = session_training_semantics(
+        current_env if isinstance(current_env, Mapping) else {}
+    )
+    saved_path = Path(trainer_checkpoint_path) / "config.yaml"
+    if not saved_path.is_file():
+        if current_session.get("training_mode") is not None:
+            raise FileNotFoundError(
+                "Explicit session training resume requires the checkpoint's "
+                f"saved config: {saved_path}"
+            )
+        # Older checkpoints without an explicit session mode may predate the
+        # saved-config contract. Preserve their existing resume behavior.
+        return
+
+    saved = OmegaConf.to_container(OmegaConf.load(saved_path), resolve=True)
+    if not isinstance(saved, Mapping):
+        raise ValueError(f"Checkpoint config must be a mapping: {saved_path}")
+    validate_session_resume_config(saved, current)
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -1405,6 +1445,7 @@ def setup_single_controller(
     # ==========================
     checkpointer = CheckpointManager(master_config.checkpointing)
     trainer_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    _validate_session_resume_checkpoint(master_config, trainer_checkpoint_path)
     loaded_state = cast(
         Optional[dict[str, Any]],
         checkpointer.load_training_info(trainer_checkpoint_path),
