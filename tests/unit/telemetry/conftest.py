@@ -70,6 +70,7 @@ def _reset_rl_telemetry() -> None:
 
     setup_mod._TELEMETRY_HANDLE = None
     setup_mod._TELEMETRY_INITIALISED = False
+    setup_mod._METRICS_ENABLED = False
 
     # Any test that brings telemetry up closes the vocabulary for the rest of
     # the process, and a module whose rows are declared by an import inside a

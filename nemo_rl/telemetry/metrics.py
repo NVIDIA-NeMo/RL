@@ -413,6 +413,46 @@ def _metric_specs() -> list[MetricSpec]:
         )
         for row in recorded_metrics()
     )
+    specs.extend(
+        MetricSpec(key, name, kind, unit=unit, description=description)
+        for key, name, kind, unit, description in (
+            (
+                "executor_queue_wait",
+                "rl.executor.queue_wait",
+                "histogram",
+                "ms",
+                "Offload submission to thread start, by bounded call site.",
+            ),
+            (
+                "executor_execution",
+                "rl.executor.execution",
+                "histogram",
+                "ms",
+                "Thread execution wall time, including any blocking I/O.",
+            ),
+            (
+                "executor_result_delivery",
+                "rl.executor.result_delivery",
+                "histogram",
+                "ms",
+                "Successful thread completion to awaiting coroutine resumption.",
+            ),
+            (
+                "executor_pending",
+                "rl.executor.pending",
+                "up_down_counter",
+                "{task}",
+                "Instrumented offloads queued or running; not total executor occupancy.",
+            ),
+            (
+                "event_loop_lag",
+                "rl.event_loop.lag",
+                "histogram",
+                "ms",
+                "Scheduling lateness of a one-second event-loop probe.",
+            ),
+        )
+    )
     return specs
 
 

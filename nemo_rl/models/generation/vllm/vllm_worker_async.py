@@ -25,11 +25,12 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
-from typing import Any, AsyncGenerator, Literal, Optional, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Literal, Optional, cast
 
 import ray
 import torch
@@ -110,6 +111,7 @@ from nemo_rl.models.generation.openai_server_utils import (
     PrefixSplice,
     splice_prefix_tokens,
 )
+from nemo_rl.telemetry.runtime import monitor_event_loop, run_in_thread
 from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.routed_experts_codec import (
     decode_routed_experts,
@@ -122,6 +124,10 @@ _RESTORED_PREFIX_TERMINAL_PROMPT_KEY = "__nemo_rl_restored_prefix_terminal__"
 # but nemo_gym is an optional extra. A drifted copy would 404 every cut, which Gym
 # treats as "regenerate", so test_generation_cut_route_matches_gym pins it.
 _GENERATION_CUT_ROUTE = "/ng-control/v1/generation-cut"
+
+if TYPE_CHECKING:
+    from nemo_gym.token_id_capture.staging.capture import ActiveCall
+    from starlette.types import Lifespan
 
 
 # Reasons already logged by this worker process; calls sharing a setting log once.
@@ -2814,7 +2820,8 @@ class VllmAsyncGenerationWorkerImpl(
                 # Off-loop: the sink write inside complete_call is a blocking
                 # TQ round trip (see the staging protocol's serving-host rule).
                 try:
-                    content = await asyncio.to_thread(
+                    content = await run_in_thread(
+                        "generation_terminal",
                         worker_self._finish_request_capture, request, content
                     )
                 except asyncio.CancelledError:
@@ -2937,6 +2944,20 @@ class VllmAsyncGenerationWorkerImpl(
         http_server_api_key = self.cfg["vllm_cfg"].get("http_server_api_key")
         if http_server_api_key:
             install_http_server_api_key_check(app, http_server_api_key)
+
+        # Wrap the final lifespan, preserving startup/shutdown handlers and any
+        # state supplied by API/refit setup instead of replacing their lifecycle.
+        server_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def lifespan(
+            server_app: FastAPI,
+        ) -> AsyncIterator[Mapping[str, Any] | None]:
+            async with monitor_event_loop("vllm_http"):
+                async with server_lifespan(server_app) as state:
+                    yield state
+
+        app.router.lifespan_context = cast("Lifespan[FastAPI]", lifespan)
 
         ########################################
         # Server spinup
