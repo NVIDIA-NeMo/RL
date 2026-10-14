@@ -94,3 +94,5 @@ research/template_project/tests/test_suites/llm/single_update_1n8g.sh
 
 # Full Flow-GRPO recipe requires an externally served GenRM OCR judge.
 research/flow_grpo/tests/test_suites/flow_grpo_qwen_image_ocr.sh
+
+research/logra/tests/test_suites/llm/grpo-qwen2.5-math-7b-1n8g-fsdp2tp1-logra.sh
