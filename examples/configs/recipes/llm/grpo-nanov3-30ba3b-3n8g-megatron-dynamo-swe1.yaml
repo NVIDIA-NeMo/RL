@@ -107,7 +107,6 @@ policy:
         tokenizer_cache: true
         tokenizer_cache_bytes: 4294967296
         router_mode: kv
-        router_reset_states: true
         extra_cli_args: []
     vllm_cfg:
       expert_parallel_size: 4

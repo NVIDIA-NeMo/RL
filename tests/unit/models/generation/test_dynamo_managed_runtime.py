@@ -87,7 +87,6 @@ def _config(*, tp: int = 1) -> dict:
                 "tokenizer_cache": False,
                 "tokenizer_cache_bytes": 50 * 1024 * 1024,
                 "router_mode": "kv",
-                "router_reset_states": True,
                 "extra_cli_args": [],
             },
         },
