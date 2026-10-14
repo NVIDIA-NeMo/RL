@@ -63,7 +63,7 @@ grep -Fqx 'SLURM_QOS=normal' "$tmp/agentic-sync.out"
 grep -Fqx 'SLURM_TIME_LIMIT=24:00:00' "$tmp/agentic-sync.out"
 grep -Fqx 'JOB_CYCLES=6' "$tmp/agentic-sync.out"
 grep -Fqx 'MIN_SLURM_TIME_SECONDS=86400' "$tmp/agentic-sync.out"
-grep -Fqx 'MIN_CHECKPOINT_BUDGET_SECONDS=86400' "$tmp/agentic-sync.out"
+grep -Fqx 'MIN_CHECKPOINT_BUDGET_SECONDS=82800' "$tmp/agentic-sync.out"
 grep -Fqx 'REQUIRE_RESUMABLE_JOB_CYCLES=true' "$tmp/agentic-sync.out"
 
 recipe=$repo_dir/examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml
