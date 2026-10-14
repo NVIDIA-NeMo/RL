@@ -25,10 +25,12 @@ new series needs no lens release and no negotiation over field names. Four
 families are teed — the async ``efficiency/*`` phase durations, the training
 scalars, the ``vllm/*`` engine deltas, and the ``timing/setup`` startup phases.
 The first three ride the per-step ``train`` dicts; the last arrives once, at
-step 0.
+step 0. Completed rollout save/restore dictionaries are also forwarded under
+their own ``timing/rollout_checkpoint`` and ``timing/rollout_recovery`` prefixes.
 
-This module names no logger key of its own beyond the ``efficiency/*`` family
-it also produces. The scalar rows come from the modules that log them, through
+The checkpoint mapping explicitly enumerates the controller's completed phase
+keys, and a source-drift test covers its save dictionary. The scalar rows come
+from the modules that log them, through
 :mod:`nemo_rl.telemetry.vocabulary`, so adding an algorithm does not mean
 editing telemetry.
 
@@ -40,6 +42,7 @@ only the prefixes those dicts actually arrive under are teed.
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX, SetupTimingMetrics
@@ -71,7 +74,8 @@ logger = logging.getLogger(__name__)
 # vLLM dicts all arrive under the driver's train prefixes, and a key is only
 # reachable from the prefix its own dict is logged under, so looking anywhere
 # else would be dead work per step. ``SETUP_TIMING_PREFIX`` is the one
-# non-per-step prefix teed.
+# startup prefix teed; rollout checkpoint/recovery prefixes are dispatched
+# separately below.
 _TRAIN_PREFIXES: tuple[Optional[str], ...] = ("train", "")
 
 # One dimensioned gauge rather than an instrument per category, so adding a
@@ -143,6 +147,40 @@ _EFFICIENCY_SECONDS_KEY = registry_key(RL_EFFICIENCY_SECONDS_METRIC)
 _EFFICIENCY_PCT_KEY_REGISTRY = registry_key(RL_EFFICIENCY_PCT_METRIC)
 _SETUP_DURATION_KEY = registry_key(RL_SETUP_DURATION_METRIC)
 
+# Fixed instruments and bounded labels: snapshot/step/rollout IDs never become
+# metric dimensions. Phase timings overlap; they carry no goodput bucket.
+_CHECKPOINT_PREFIXES = {
+    "timing/rollout_checkpoint": "save",
+    "timing/rollout_recovery": "restore",
+}
+_CHECKPOINT_DURATION_PHASES = {
+    "total_save_seconds": "total",
+    "tq_save_seconds": "tq",
+    "barrier_wait_seconds": "barrier_wait",
+    "exclusive_hold_seconds": "exclusive_hold",
+    "sidecar_save_seconds": "sidecar_save",
+    "snapshot_commit_seconds": "publication",
+    "total_load_seconds": "total",
+    "snapshot_resolution_seconds": "snapshot_resolution",
+    "dataloader_load_seconds": "dataloader_load",
+    "tq_load_seconds": "tq",
+    "replay_metadata_load_seconds": "replay_metadata_load",
+    "recovery_prepare_seconds": "recovery_prepare",
+    "redispatch_schedule_seconds": "redispatch_schedule",
+}
+_CHECKPOINT_LEVELS = {
+    "replay_rows": ("checkpoint_rows", "replay"),
+    "staging_rows": ("checkpoint_rows", "staging"),
+    "snapshot_rows": ("checkpoint_rows", "snapshot"),
+    "replay_groups": ("checkpoint_groups", "replay"),
+    "ledger_groups": ("checkpoint_groups", "ledger"),
+    "groups_complete_restored": ("checkpoint_groups", "complete_restored"),
+    "groups_unfinished_found": ("checkpoint_groups", "unfinished"),
+    "siblings_reused": ("checkpoint_siblings", "reused"),
+    "siblings_rerun": ("checkpoint_siblings", "rerun"),
+    "controller_sidecar_bytes": ("checkpoint_sidecar_bytes", "controller"),
+}
+
 # Registration is process-global in lens, so it has to happen once per process
 # and in every process that records -- driver and workers alike. Doing it lazily
 # on the first tee rather than at import keeps this module importable when the
@@ -210,6 +248,46 @@ def _metric_specs() -> list[MetricSpec]:
             description=(
                 "Wall clock spent in one startup phase, named by the "
                 "rl.setup.phase attribute."
+            ),
+        )
+    )
+    specs.extend(
+        MetricSpec(key, name, kind, unit=unit, description=description)
+        for key, name, kind, unit, description in (
+            (
+                "checkpoint_duration",
+                "rl.checkpoint.duration",
+                "histogram",
+                "s",
+                "One completed rollout save/restore phase; nested phases overlap.",
+            ),
+            (
+                "checkpoint_rows",
+                "rl.checkpoint.rows",
+                "gauge",
+                "{row}",
+                "Rows in the latest completed rollout checkpoint.",
+            ),
+            (
+                "checkpoint_groups",
+                "rl.checkpoint.groups",
+                "gauge",
+                "{group}",
+                "Groups saved or restored, by category.",
+            ),
+            (
+                "checkpoint_siblings",
+                "rl.checkpoint.siblings",
+                "gauge",
+                "{rollout}",
+                "Sealed siblings reused or unfinished siblings redispatched.",
+            ),
+            (
+                "checkpoint_sidecar_bytes",
+                "rl.checkpoint.sidecar_bytes",
+                "gauge",
+                "By",
+                "Controller sidecar bytes in the latest completed snapshot.",
             ),
         )
     )
@@ -423,6 +501,30 @@ def _tee_setup_metrics(meter: Meter, metrics: dict[str, Any]) -> None:
         _record(meter, {_SETUP_DURATION_KEY: value}, {RL_SETUP_PHASE_ATTR: phase})
 
 
+def _tee_checkpoint_metrics(
+    meter: Meter, metrics: dict[str, Any], *, operation: str
+) -> None:
+    for key, phase in _CHECKPOINT_DURATION_PHASES.items():
+        value = as_scalar(metrics.get(key))
+        if value is not None and math.isfinite(value) and value >= 0:
+            _record(
+                meter,
+                {"checkpoint_duration": value},
+                {"rl.checkpoint.operation": operation, "rl.checkpoint.phase": phase},
+            )
+    for key, (instrument, category) in _CHECKPOINT_LEVELS.items():
+        value = as_scalar(metrics.get(key))
+        if value is not None and math.isfinite(value) and value >= 0:
+            _record(
+                meter,
+                {instrument: value},
+                {
+                    "rl.checkpoint.operation": operation,
+                    "rl.checkpoint.category": category,
+                },
+            )
+
+
 def map_teed_scalars(metrics: dict[str, Any]) -> dict[str, float]:
     """Extract ``{registry key: value}`` for every declared scalar present.
 
@@ -506,12 +608,19 @@ def tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> No
 def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> None:
     """Body of :func:`tee_rl_metrics_to_otel`, inside its exception guard."""
     is_setup = prefix == SETUP_TIMING_PREFIX
-    if not is_setup and prefix not in _TRAIN_PREFIXES:
+    checkpoint_operation = _CHECKPOINT_PREFIXES.get(prefix) if prefix else None
+    if not is_setup and checkpoint_operation is None and prefix not in _TRAIN_PREFIXES:
         return
     telemetry = get_telemetry_handle()
     if telemetry is None or not telemetry.is_exporting:
         return
     if not ensure_metric_group_registered():
+        return
+
+    if checkpoint_operation is not None:
+        _tee_checkpoint_metrics(
+            telemetry.meter, metrics, operation=checkpoint_operation
+        )
         return
 
     if is_setup:

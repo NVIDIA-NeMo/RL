@@ -162,6 +162,115 @@ def _start_exporting_telemetry():
     return reader
 
 
+def test_checkpoint_save_and_restore_emit_separate_phase_histograms():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    tee_rl_metrics_to_otel(
+        {
+            "total_save_seconds": 30,
+            "tq_save_seconds": 12,
+            "snapshot_sequence": 99,
+            "replay_rows": 256,
+            "controller_sidecar_bytes": 4096,
+        },
+        "timing/rollout_checkpoint",
+    )
+    tee_rl_metrics_to_otel(
+        {"total_load_seconds": 8, "tq_load_seconds": 5, "siblings_reused": 16},
+        "timing/rollout_recovery",
+    )
+    data = reader.get_metrics_data()
+    durations = _gauge_points(data, "rl.checkpoint.duration")
+    assert {
+        (
+            p.attributes["rl.checkpoint.operation"],
+            p.attributes["rl.checkpoint.phase"],
+        ): p.sum
+        for p in durations
+    } == {
+        ("save", "total"): 30,
+        ("save", "tq"): 12,
+        ("restore", "total"): 8,
+        ("restore", "tq"): 5,
+    }
+    assert all(p.count == 1 for p in durations)
+    assert all("rl.bucket" not in p.attributes for p in durations)
+    assert _gauge_points(data, "rl.checkpoint.rows")[0].value == 256
+    assert _gauge_points(data, "rl.checkpoint.siblings")[0].value == 16
+    assert _gauge_points(data, "rl.checkpoint.sidecar_bytes")[0].value == 4096
+
+
+def test_checkpoint_mapping_skips_invalid_values_and_unknown_keys():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    tee_rl_metrics_to_otel(
+        {
+            "total_save_seconds": float("nan"),
+            "tq_save_seconds": float("inf"),
+            "barrier_wait_seconds": -1,
+            "sidecar_save_seconds": True,
+            "exclusive_hold_seconds": 0,
+            "replay_rows": "256",
+            "unknown_seconds": 123,
+            "snapshot_sequence": 100000,
+        },
+        "timing/rollout_checkpoint",
+    )
+    data = reader.get_metrics_data()
+    durations = _gauge_points(data, "rl.checkpoint.duration")
+    assert len(durations) == 1
+    assert durations[0].attributes["rl.checkpoint.phase"] == "exclusive_hold"
+    assert durations[0].sum == 0
+    assert _gauge_points(data, "rl.checkpoint.rows") == []
+
+
+def test_checkpoint_metrics_are_not_duplicated_under_train_or_other_prefixes():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    for prefix in ("train", "timing/checkpoint", "", None):
+        tee_rl_metrics_to_otel({"total_save_seconds": 10}, prefix)
+    assert _gauge_points(reader.get_metrics_data(), "rl.checkpoint.duration") == []
+
+
+def test_checkpoint_mapping_covers_current_save_fields():
+    import ast
+    from pathlib import Path
+
+    from nemo_rl.telemetry.metrics import (
+        _CHECKPOINT_DURATION_PHASES,
+        _CHECKPOINT_LEVELS,
+    )
+
+    path = (
+        Path(__file__).resolve().parents[3] / "nemo_rl/algorithms/single_controller.py"
+    )
+    save = next(
+        n
+        for n in ast.walk(ast.parse(path.read_text()))
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "_save_rollout_checkpoint"
+    )
+    assignment = next(
+        n
+        for n in ast.walk(save)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "checkpoint_metrics"
+            for target in n.targets
+        )
+    )
+    fields = {
+        key.value for key in assignment.value.keys if isinstance(key, ast.Constant)
+    }
+    # Snapshot identity is intentionally excluded from metric labels and values.
+    assert (
+        fields - {"snapshot_sequence"}
+        <= _CHECKPOINT_DURATION_PHASES.keys() | _CHECKPOINT_LEVELS.keys()
+    )
+
+
 def test_tee_emits_efficiency_seconds_tagged_by_measurement(monkeypatch):
     pytest.importorskip("nemo.lens")
     import nemo_rl.telemetry.metrics as metrics_mod
