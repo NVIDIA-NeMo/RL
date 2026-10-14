@@ -1,8 +1,49 @@
 # Metrics
 
-NeMo-RL emits five namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), and driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions).
+## Async runtime diagnostics
 
-Metrics are emitted **only when telemetry is exporting** — the driver always exports, so the `rl.*` series come from the driver's metrics logger.
+When telemetry and metric export are enabled, selected thread offloads and event
+loops publish these diagnostics through the existing Lens providers.
+
+| Metric | Kind / unit | Dimensions and meaning |
+|---|---|---|
+| `rl.executor.queue_wait` | Histogram / milliseconds | Submission to thread start |
+| `rl.executor.execution` | Histogram / milliseconds | Thread execution wall time, including blocking I/O |
+| `rl.executor.result_delivery` | Histogram / milliseconds | Successful function completion to coroutine resumption |
+| `rl.executor.pending` | Up-down counter / tasks | Instrumented work currently `queued` or `running` |
+| `rl.event_loop.lag` | Histogram / milliseconds | Scheduling lateness of a one-second loop probe |
+
+Executor dimensions are `rl.executor` (a bounded call-site label) and, where
+applicable, `rl.executor.state` or `rl.executor.status` (`success`, `error`). Sites
+currently observed are non-streaming vLLM terminal capture, controller replay-index
+load, and synchronous local data-plane calls explicitly offloaded through
+`call_data_plane`. They share the **existing default executor**; the labels do not
+name separate pools. Pending counts cover only those instrumented calls. A
+cancelled caller does not stop an already-running thread: that work remains counted
+until it finishes. A cancelled queued call or failed submission retires its count.
+
+Loop labels are `controller` and `vllm_http`. The HTTP probe lives in the FastAPI
+lifespan; the controller probe lives around its pump execution. Both are cancelled
+and awaited on exit. No probe task or offload bookkeeping is created when telemetry
+or metric export is disabled, including trace-only runs.
+
+For example, high terminal queue wait with low execution time indicates executor
+backlog. High execution time requires further CPU/I/O attribution. High result
+delivery delay together with loop lag suggests delayed coroutine scheduling; it
+does not prove storage was slow or identify a GIL holder. The probe can emit only
+after the loop runs again, so it is **not an independent hang watchdog**.
+
+Histograms retain distributions that can be aggregated across processes. Do not
+average worker p95s. Percentile resolution depends on the SDK/exporter's histogram
+aggregation and bucket boundaries; these helpers do not configure SDK views.
+Runtime durations use milliseconds so the default histogram bounds are useful
+for typical thread/loop delays. No step, checkpoint, rollout, or model-call IDs
+are metric labels. These helpers add no per-request file writes, global executor
+patch, or new thread pool.
+
+NeMo-RL emits async efficiency (`rl.efficiency.*`), startup (`rl.setup.duration`), training (`rl.reward.*`, `rl.policy.*`, …), vLLM engine (`rl.vllm.*`), driver-side generation (`gen_ai.*`), and async runtime (`rl.executor.*`, `rl.event_loop.*`) metrics. The `gen_ai.*` series follows the OTel GenAI semantic conventions.
+
+Metrics are emitted **only when telemetry is exporting**. The metrics logger forwards training/setup series; runtime diagnostics are emitted by the instrumented controller and generation processes, identified by their resource attributes.
 
 Every `rl.*` series is **declared by NeMo-RL**, not by lens. lens provides a consumer-driven metric registry: NeMo-RL calls `register_metric_group("rl", [...])` once per process with a `MetricSpec` per series, then records against it with `record_metrics(meter, "rl", ...)`. The declarations live in one table in `nemo_rl/telemetry/metrics.py`, so adding a series needs no lens release and no agreement on field names. `record_metrics` never raises into the caller and skips `None`.
 
