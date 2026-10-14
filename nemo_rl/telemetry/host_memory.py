@@ -381,7 +381,9 @@ class HostMemoryMonitor:
         """Initialise the monitor.
 
         Args:
-            collection_interval: Seconds between samples of every node.
+            collection_interval: Seconds between samples of every node. Must be
+                positive; :func:`start_host_memory_monitoring` is what enforces
+                that, since it is the only caller a run goes through.
         """
         self.collection_interval = collection_interval
         self._stop = threading.Event()
@@ -521,6 +523,17 @@ def start_host_memory_monitoring(collection_interval: float) -> None:
     """
     global _MONITOR
     if _MONITOR is not None:
+        return
+    # Refused rather than clamped to something sane: at zero the loop would
+    # scrape every raylet as fast as HTTP allows, and a descriptive series is
+    # not worth hammering the cluster for. Clamping would report a cadence the
+    # config did not ask for, which is harder to notice than no series at all.
+    if collection_interval <= 0:
+        warn_once(
+            "host_memory_interval",
+            "host memory monitoring needs a positive collection interval, not "
+            f"{collection_interval}; not starting it",
+        )
         return
     monitor = HostMemoryMonitor(collection_interval=collection_interval)
     try:

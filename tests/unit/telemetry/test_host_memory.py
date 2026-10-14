@@ -14,7 +14,6 @@ from types import SimpleNamespace
 import pytest
 
 import nemo_rl.telemetry.host_memory as host_memory
-import nemo_rl.telemetry.vocabulary as vocabulary
 from nemo_rl.telemetry.host_memory import (
     HOST_NAME_ATTR,
     NO_WORKER_GROUPS,
@@ -64,10 +63,6 @@ def _reset_host_memory_state():
     host_memory._WORKER_GROUP_NODES.clear()
     host_memory._SNAPSHOT.clear()
     stop_host_memory_monitoring()
-    # The driver test below freezes the metric vocabulary for the rest of the
-    # process. Nothing in the suite registers a metric after collection today,
-    # but a module that did would fail here rather than where it went wrong.
-    vocabulary._FROZEN = False
 
 
 def _fake_ray(monkeypatch, nodes):
@@ -566,6 +561,18 @@ def test_a_process_runs_at_most_one_monitor(monkeypatch):
     start_host_memory_monitoring(collection_interval=60.0)
 
     assert host_memory._MONITOR is first
+
+
+@pytest.mark.parametrize("interval", [0.0, -5.0])
+def test_a_nonpositive_interval_starts_nothing_rather_than_spinning(
+    monkeypatch, interval
+):
+    """At zero the loop would scrape every raylet as fast as HTTP allows."""
+    _fake_ray(monkeypatch, [])
+
+    start_host_memory_monitoring(collection_interval=interval)
+
+    assert host_memory._MONITOR is None
 
 
 def test_stopping_releases_the_monitor_so_a_later_run_can_start_one(monkeypatch):
