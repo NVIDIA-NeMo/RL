@@ -564,12 +564,9 @@ class ClippedPGLossFn(LossFunction):
         if self.force_on_policy_ratio:
             prev_logprobs = curr_logprobs.detach()
 
-        # The current forward can exclude additional top-k/top-p tokens.
+        # Loss preparation already narrowed token_mask for the current forward.
         # Keep the supplied global-batch denominator; do not renormalize each
         # microbatch independently after these loss-local exclusions.
-        token_mask = token_mask * ~(
-            torch.isneginf(curr_logprobs) | torch.isneginf(prev_logprobs)
-        )
         sample_mask = sample_mask * token_mask.bool().any(dim=-1)
         mask = token_mask * sample_mask.unsqueeze(-1)
 

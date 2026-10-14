@@ -593,7 +593,7 @@ def test_clipped_pg_loss_reinforce_mode():
 
 @pytest.mark.parametrize("force_on_policy_ratio", [False, True])
 @pytest.mark.parametrize("reference_policy_kl_penalty", [0.0, 0.01])
-def test_clipped_pg_loss_excludes_support_mismatches(
+def test_clipped_pg_loss_sanitizes_masked_operands(
     force_on_policy_ratio, reference_policy_kl_penalty
 ):
     data, _, _, _ = _setup_clipped_pg_test_data(seq_len=5, device="cpu")
@@ -601,6 +601,10 @@ def test_clipped_pg_loss_excludes_support_mismatches(
     data["prev_logprobs"][:, 1:] = torch.tensor([[0.0, -0.3, -float("inf"), -0.5]])
     data["generation_logprobs"][:, 1:] = torch.tensor([[0.0, -12.564064, -0.25, -0.5]])
     curr = torch.tensor([[0.0, -float("inf"), -0.25, -0.5]], requires_grad=True)
+    data["token_mask"][0, 2] = 0
+    if not force_on_policy_ratio:
+        data["token_mask"][0, 3] = 0
+    data["generation_logprobs"][0, 2] = -float("inf")
     loss_fn = ClippedPGLossFn(
         ClippedPGLossConfig(
             reference_policy_kl_penalty=reference_policy_kl_penalty,
@@ -611,13 +615,13 @@ def test_clipped_pg_loss_excludes_support_mismatches(
     loss, metrics = loss_fn(next_token_logprobs=curr, data=data, **counts)
     loss.backward()
 
-    # Compare with explicitly excluded tokens using the same global denominator.
+    # Compare with finite placeholders using the same mask and global denominator.
     expected_data = data.copy()
     expected_data["token_mask"] = data["token_mask"].clone()
-    expected_data["token_mask"][0, 2] = 0
-    if not force_on_policy_ratio:
-        expected_data["token_mask"][0, 3] = 0
-    expected_curr = curr.detach().clone().requires_grad_()
+    mask = expected_data["token_mask"].bool()
+    for field in ("prev_logprobs", "generation_logprobs"):
+        expected_data[field] = torch.where(mask, data[field], 0.0)
+    expected_curr = torch.where(mask[:, 1:], curr.detach(), 0.0).requires_grad_()
     expected_loss, expected_metrics = loss_fn(
         next_token_logprobs=expected_curr, data=expected_data, **counts
     )
@@ -641,6 +645,7 @@ def test_clipped_pg_loss_excludes_support_mismatches(
 @pytest.mark.parametrize("seq_logprob_error_in_loss", [False, True])
 def test_clipped_pg_loss_tokenless_rows_are_not_survivors(seq_logprob_error_in_loss):
     data, _, _, _ = _setup_clipped_pg_test_data(seq_len=3, device="cpu")
+    data["token_mask"][:, 1:] = 0
     curr = torch.full((1, 2), -float("inf"), requires_grad=True)
     loss_fn = ClippedPGLossFn(
         ClippedPGLossConfig(
@@ -679,7 +684,8 @@ def test_clipped_pg_loss_top_p_support_mismatch_backward():
     loss_input, data = prepare_loss_input(
         logits, data, loss_fn, sampling_params=TrainingSamplingParams(top_p=0.95)
     )
-    assert torch.isneginf(loss_input["next_token_logprobs"][0, 1])
+    assert loss_input["next_token_logprobs"][0, 1] == 0
+    assert data["token_mask"][0, 2] == 0
     loss, _ = loss_fn(
         data=data,
         global_valid_seqs=torch.tensor(1, device="cuda"),
