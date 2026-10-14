@@ -3356,9 +3356,7 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
             )
 
     synchronizer = MagicMock()
-    # is_sharded=False is what an unsharded job returns, and it lets the real
-    # agent-coverage check take its early return instead of scanning a mock dataset.
-    nemo_gym_shard_set = MagicMock(is_sharded=False)
+    nemo_gym_shard_set = MagicMock()
     build_nemo_gym_actors = MagicMock(return_value=nemo_gym_shard_set)
     monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: MagicMock())
     monkeypatch.setattr(
@@ -3383,6 +3381,11 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         grpo_mod, "create_weight_synchronizer", lambda **_kwargs: synchronizer
     )
     monkeypatch.setattr(grpo_mod, "build_nemo_gym_actors", build_nemo_gym_actors)
+    # The agent-coverage check asks an unsharded job's actor for its entries
+    # over Ray, which a mock actor cannot answer; the check has its own tests.
+    monkeypatch.setattr(
+        grpo_mod, "validate_dataset_agent_coverage", lambda *_args, **_kwargs: None
+    )
 
     dataset = MagicMock()
     dataset.__len__.return_value = 2
@@ -3720,6 +3723,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     # is_sharded=False is what an unsharded job returns, and it lets the real
     # agent-coverage check take its early return instead of scanning a mock dataset.
     nemo_gym_shard_set = MagicMock(is_sharded=False)
+
     build_nemo_gym_actors = MagicMock(return_value=nemo_gym_shard_set)
     monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: DummyLogger())
     monkeypatch.setattr(
@@ -3737,6 +3741,11 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         lambda *_args, **_kwargs: DummyTrtllmGeneration(),
     )
     monkeypatch.setattr(grpo_mod, "build_nemo_gym_actors", build_nemo_gym_actors)
+    # The agent-coverage check asks an unsharded job's actor for its entries
+    # over Ray, which a mock actor cannot answer; the check has its own tests.
+    # The mock records the call so the wiring of the splits is asserted below.
+    validate_coverage = MagicMock()
+    monkeypatch.setattr(grpo_mod, "validate_dataset_agent_coverage", validate_coverage)
 
     master_config = mock_grpo_components["master_config"]
     master_config.policy["model_name"] = "test-model"
@@ -3786,6 +3795,9 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         enable_router_replay=False,
         use_fastokens=False,
     )
+    validate_coverage.assert_called_once_with(
+        nemo_gym_shard_set, {"train": dataset, "validation": None}
+    )
 
 
 @pytest.mark.mcore
@@ -3831,7 +3843,7 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
         engine_ready.set()
 
     synchronizer.sync_weights.side_effect = sync_weights
-    nemo_gym_shard_set = MagicMock(is_sharded=False)
+    nemo_gym_shard_set = MagicMock()
 
     def build_nemo_gym_actors(_env_configs, **kwargs):
         assert kwargs["base_urls"] == reserved_urls
@@ -3863,6 +3875,11 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
         grpo_mod, "create_weight_synchronizer", lambda **_kwargs: synchronizer
     )
     monkeypatch.setattr(grpo_mod, "build_nemo_gym_actors", build_nemo_gym_actors)
+    # The agent-coverage check asks an unsharded job's actor for its entries
+    # over Ray, which a mock actor cannot answer; the check has its own tests.
+    monkeypatch.setattr(
+        grpo_mod, "validate_dataset_agent_coverage", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(grpo_mod.ray, "kill", ray_kill)
 
     master_config = mock_grpo_components["master_config"]
