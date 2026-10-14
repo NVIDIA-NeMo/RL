@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.refit_watchdog import REFIT_ABORTED_TOKEN, RefitAborted
 from nemo_rl.models.generation.dynamo import DynamoGeneration
 from nemo_rl.models.generation.dynamo import dynamo_generation as generation_module
 from nemo_rl.models.generation.dynamo import metrics as metrics_module
@@ -32,7 +33,6 @@ from nemo_rl.models.generation.dynamo.metrics import (
 )
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
 from nemo_rl.models.generation.interfaces import RefitFleetShape
-from nemo_rl.distributed.refit_watchdog import REFIT_ABORTED_TOKEN, RefitAborted
 from nemo_rl.utils.staged_payload import decode_staged_payload
 from nemo_rl.weight_sync.membership import desired_membership
 
