@@ -93,11 +93,10 @@ class RecordedMetric:
         description: Help text carried to the backend.
         callback: For the observable kinds only, what the exporter calls to
             read the series. Each cycle's points are exactly what it returns,
-            so an attribute set it stops yielding stops being exported -- which
-            is the reason to choose an observable kind over pushing to a gauge,
-            whose last value per attribute set is otherwise re-exported for the
-            rest of the run. Must be a function that outlives the process's
-            first export, not a closure built per call.
+            so an attribute set it stops yielding stops being exported, and it
+            is read on every export, where a pushed gauge reports only in the
+            cycles that follow a set. Must be a function that outlives the
+            process's first export, not a closure built per call.
     """
 
     name: str

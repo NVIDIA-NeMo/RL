@@ -127,7 +127,6 @@ These are set on spans for filtering — they answer "which one?" / "what kind?"
 | `rl.num_prompt_groups` | async rollout batch width, so a gap-filling batch is not read as an unexplained speed-up |
 | `rl.gym.batch_size` | how many examples one `rl.gym.run_rollouts` span covers — the NeMo-Gym counterpart to `rl.num_prompt_groups` |
 | `rl.idle.polls` | how many retries one `rl.idle.buffer_starvation` span covers on the single-controller path, where the span is coalesced over a poll loop. Read it against the duration: the same ten seconds is two thousand clean 5 ms polls or two hundred polls whose selection ran long, which are opposite diagnoses |
-| `rl.checkpoint.async_save` | whether bytes were still being written when the loop resumed. `true` means `rl.checkpoint.finalize` spans a real wait on the writer processes; `false` means the write finished inside the staging span and the finalize span is just a rename. Both shapes emit the same span, so without this a near-zero duration is ambiguous between the two |
 | `rl.rollout.attempt` | SingleController dispatch attempt: `0` is a first try, `> 0` a substitution after a skipped group, whose tokens were discarded |
 | `rl.target_step` | the training step an `rl.sc.generate_and_push` dispatch is aimed at; omitted when the dispatch is unstamped |
 | `rl.critic_epochs` | critic epochs covered by one `rl.sc.value_training` span |
@@ -146,17 +145,20 @@ rollout-side spans for that.
 
 ### `rl.iteration` is set once per step
 
-Each algorithm opens its step inside
+Most algorithms open their step inside
 `nemo_rl.telemetry.instrumentation.iteration_scope`, which stamps
 `rl.iteration` on every span started within it **in the driver process**. So
 the step umbrella, the leaves under it and the checkpoint span all carry the
 same value, and `rl.iteration = 412` selects the driver's whole step rather
-than the step span alone.
+than the step span alone. `grpo_train_sync`, `async_ppo_train`,
+`xtoken_off_policy_distillation_train` and `mpo_train` do not open the scope
+yet, so their spans carry no `rl.iteration`.
 
-A span that passes `rl.iteration` itself keeps its own value — the scope is
-applied by a span processor that skips keys already set. `rl.<algo>.evaluate`
-does exactly that, because validation also runs once before training starts,
-where it reports `rl.iteration = 0`: a sentinel for "no step has run yet".
+A span that passes `rl.iteration` itself keeps its own value — lens sets the
+caller's attributes after the span starts, so they overwrite the scope's value.
+`rl.<algo>.evaluate` does exactly that, because validation also runs once
+before training starts, where it reports `rl.iteration = 0`: a sentinel for
+"no step has run yet".
 
 Two kinds of span are deliberately outside the scope. `rl.<algo>.job` wraps the
 whole run and belongs to no single step. `rl.sc.generate_and_push` runs on the

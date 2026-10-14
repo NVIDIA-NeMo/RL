@@ -33,7 +33,6 @@ try:
     )
 
     from nemo_rl.telemetry.instrumentation import (
-        RL_CHECKPOINT_ASYNC_ATTR,
         RL_ITERATION_ATTR,
         iteration_scope,
         managed_span,
@@ -141,7 +140,6 @@ def test_the_span_is_filed_under_the_step_that_triggered_the_save(
 
     durable = _named(recorder, "rl.checkpoint.finalize")
     assert durable.attributes[RL_ITERATION_ATTR] == 7
-    assert durable.attributes[RL_CHECKPOINT_ASYNC_ATTR] is True
 
 
 def test_a_checkpoint_that_never_landed_is_not_reported_as_a_clean_one(
@@ -191,22 +189,3 @@ def test_a_span_that_cannot_be_opened_does_not_cost_the_checkpoint(
         checkpointer.finalize_pending()
 
     assert (checkpoint_dir / "step_7").exists()
-
-
-def test_a_sync_save_is_distinguishable_from_an_async_one(checkpointer, exporter):
-    """No ``wait_fn`` means the bytes already landed and this is just a rename.
-
-    Both shapes emit the same span, so without the attribute a near-zero
-    duration could be either one.
-    """
-    handle, recorder = exporter
-    tmp_dir = checkpointer.init_tmp_checkpoint(7, {"loss": 0.5})
-
-    checkpointer.begin_finalization(tmp_dir)
-    checkpointer.finalize_pending()
-    handle.shutdown()
-
-    assert (
-        _named(recorder, "rl.checkpoint.finalize").attributes[RL_CHECKPOINT_ASYNC_ATTR]
-        is False
-    )

@@ -24,7 +24,6 @@ import pytest
 from nemo_rl.telemetry.instrumentation import (
     EFFICIENCY_CATEGORY_BUCKET,
     RL_BUCKET_ATTR,
-    RL_CHECKPOINT_ASYNC_ATTR,
     RL_EFFICIENCY_CATEGORY_ATTR,
     RL_IDLE_POLLS_ATTR,
     RL_ITERATION_ATTR,
@@ -1231,7 +1230,7 @@ def test_checkpoint_finalize_span_outlives_the_step_that_triggered_it():
     def finalize(carrier):
         with (
             remote_trace_context(carrier),
-            checkpoint_finalize_span(7, async_save=True, tracer=handle.tracer),
+            checkpoint_finalize_span(7, tracer=handle.tracer),
         ):
             writers_done.wait(5)
 
@@ -1274,7 +1273,7 @@ def test_checkpoint_finalize_span_is_filed_under_the_triggering_step():
     def finalize(carrier):
         with (
             remote_trace_context(carrier),
-            checkpoint_finalize_span(7, async_save=True, tracer=handle.tracer),
+            checkpoint_finalize_span(7, tracer=handle.tracer),
         ):
             started.set()
             release.wait(5)
@@ -1291,7 +1290,6 @@ def test_checkpoint_finalize_span_is_filed_under_the_triggering_step():
 
     durable = _named(exporter, "rl.checkpoint.finalize")
     assert durable.attributes[RL_ITERATION_ATTR] == 7
-    assert durable.attributes[RL_CHECKPOINT_ASYNC_ATTR] is True
 
 
 @requires_lens
@@ -1302,7 +1300,7 @@ def test_checkpoint_finalize_span_is_parented_to_the_run():
     def finalize(carrier):
         with (
             remote_trace_context(carrier),
-            checkpoint_finalize_span(7, async_save=False, tracer=handle.tracer),
+            checkpoint_finalize_span(7, tracer=handle.tracer),
         ):
             pass
 
@@ -1327,7 +1325,7 @@ def test_checkpoint_finalize_span_carries_no_bucket():
         RLSpanGroup.CHECKPOINT, "rl.grpo.checkpointing", tracer=handle.tracer
     ):
         pass
-    with checkpoint_finalize_span(7, async_save=True, tracer=handle.tracer):
+    with checkpoint_finalize_span(7, tracer=handle.tracer):
         pass
     handle.shutdown()
 
@@ -1340,7 +1338,7 @@ def test_checkpoint_finalize_span_carries_no_bucket():
 def test_checkpoint_finalize_span_follows_the_checkpoint_group():
     """One switch turns staging and finalization on or off together."""
     handle, exporter = _setup("generation")
-    with checkpoint_finalize_span(7, async_save=True, tracer=handle.tracer):
+    with checkpoint_finalize_span(7, tracer=handle.tracer):
         pass
     handle.shutdown()
 

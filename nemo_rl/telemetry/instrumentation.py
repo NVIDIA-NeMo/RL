@@ -58,10 +58,12 @@ from nemo.lens import (
     span_attributes as _span_attributes,
 )
 
-# Span-attribute key lens declares itself. Re-exported so call sites take every
-# ``rl.*`` key from this one module, and so a rename lands in lens's semconv
-# instead of in a string literal scattered across the algorithms.
-from nemo.lens.semconv import RL_ALGORITHM
+# Which algorithm a run is: "grpo", "ppo", "dpo". Named here, not imported from
+# lens's semconv, even though lens declares the same string: lens declares it
+# and reads it nowhere, so importing it buys a dependency with no contract
+# behind it, and RL is the only producer. Same rule as every other ``rl.*`` key
+# in this module -- RL names the properties that are RL's.
+RL_ALGORITHM = "rl.algorithm"
 
 from nemo_rl.telemetry.span_groups import UMBRELLA_GROUP_VALUES, RLSpanGroup
 from nemo_rl.telemetry.vocabulary import (
@@ -91,14 +93,6 @@ RL_ITERATION_ATTR = "rl.iteration"
 # could be two thousand clean 5ms polls or two hundred polls whose selection
 # work ran long, which are opposite diagnoses.
 RL_IDLE_POLLS_ATTR = "rl.idle.polls"
-
-# Whether a checkpoint's bytes were still being written when the training loop
-# moved on. Distinguishes the two shapes ``rl.checkpoint.finalize`` can take:
-# with async save it spans a real wait on the writer processes, with sync save
-# the write already finished inside the staging span and this is just a rename.
-# Same span either way, so without this a near-zero duration is ambiguous
-# between "sync save" and "async save that had already landed".
-RL_CHECKPOINT_ASYNC_ATTR = "rl.checkpoint.async_save"
 
 __all__ = [
     "NO_SPAN",
@@ -133,7 +127,6 @@ __all__ = [
     "evaluate_span",
     "checkpoint_finalize_span",
     "RL_ALGORITHM",
-    "RL_CHECKPOINT_ASYNC_ATTR",
     "RL_EFFICIENCY_CATEGORY_ATTR",
     "RL_IDLE_POLLS_ATTR",
     "RL_ITERATION_ATTR",
@@ -347,10 +340,10 @@ def iteration_scope(iteration: int) -> Iterator[None]:
     happening in step 412" dependent on which sites remembered to pass it, and
     silently excludes every span added afterwards.
 
-    A span that passes the attribute itself keeps its own value: lens applies
-    the scope in a span processor that skips keys already set. ``evaluate_span``
-    relies on that, since validation also runs once before training and reports
-    iteration 0 there.
+    A span that passes the attribute itself keeps its own value: lens starts the
+    span before applying the caller's attributes, so those overwrite whatever
+    the scope stamped on. ``evaluate_span`` relies on that, since validation
+    also runs once before training and reports iteration 0 there.
 
     Only spans from the provider lens builds are stamped, which is every span
     NeMo-RL opens. Propagates like any :class:`~contextvars.ContextVar`: to
@@ -970,7 +963,6 @@ def evaluate_span(
 def checkpoint_finalize_span(
     iteration: Optional[int],
     *,
-    async_save: bool,
     tracer: Optional[Tracer] = None,
     **attributes: Any,
 ) -> Iterator[Any]:
@@ -989,8 +981,9 @@ def checkpoint_finalize_span(
     empty context) and wrong by the time the span closes (the loop has moved
     on). Stamping it explicitly keeps the span filed under the step whose
     weights it holds, not whichever step happened to be running at the rename.
-    Set directly rather than left to the scope because lens's span processor
-    skips keys already present, so an explicit value wins over an inherited one.
+    Set directly rather than left to the scope because lens applies the caller's
+    attributes after the span starts, so an explicit value overwrites an
+    inherited one.
 
     Unbucketed, like the collector's waits and for the same reason: it overlaps
     the next step's productive spans, so an ``overhead`` tag here would charge
@@ -999,13 +992,19 @@ def checkpoint_finalize_span(
     stays ``checkpoint`` so one group switch still turns every checkpoint span
     on or off together.
 
+    Carries no async-save flag. Whether the bytes were still in flight is not
+    knowable from here: every caller hands ``begin_finalization`` a wait
+    function regardless of the setting, because those functions no-op when
+    async save is off. The real setting lives per backend (Megatron's
+    ``mcore_state.cfg.checkpoint.async_save``, Automodel's ``is_async``), and
+    threading it through twelve call sites to label a span costs more than the
+    label is worth. Read the span's duration instead.
+
     Args:
         iteration: Step the checkpoint was triggered at, or None when it cannot
             be recovered from the directory name.
-        async_save: Whether the caller handed a wait function, i.e. whether
-            bytes were still being written when the training loop resumed.
     """
-    attrs: dict[str, Any] = {RL_CHECKPOINT_ASYNC_ATTR: async_save, **attributes}
+    attrs: dict[str, Any] = dict(attributes)
     if iteration is not None:
         attrs[RL_ITERATION_ATTR] = iteration
     with _managed_span(

@@ -138,13 +138,15 @@ def _observe_total(options: CallbackOptions) -> list[Observation]:
     return _observations(_TOTAL_KEY)
 
 
-#: Observable rather than pushed, because the attributes move: a host is
-#: labelled ``rl.worker_groups="none"`` until its groups are built, and the
-#: label changes again when they shut down. A synchronous gauge keeps its last
-#: value per attribute set and re-exports it every cycle for the rest of the
-#: run, so the startup-time point would sit next to the correct one forever and
-#: ``sum by (host.name)`` would count every host twice. An observable gauge is
-#: rebuilt from its callback each cycle, so the old label simply ends.
+#: Observable rather than pushed, because this samples once per collection
+#: interval rather than on the exporter's cycle. A synchronous gauge is wrong
+#: for that either way the SDK leans: on the locked 1.44.0 it drops its value
+#: at each collect, so the cycles between two samples carry no point at all,
+#: and from 1.45 it holds the last value per attribute set instead, which
+#: re-exports a host's startup-time ``rl.worker_groups="none"`` label long
+#: after its groups are built. An observable gauge is read on every export, so
+#: it always reports the latest snapshot and a label the callback stops
+#: yielding simply ends.
 HOST_MEMORY_RECORDED_METRICS = (
     RecordedMetric(
         RL_HOST_MEMORY_USED_METRIC,
@@ -167,9 +169,12 @@ HOST_MEMORY_RECORDED_METRICS = (
 
 register_recorded_metrics(HOST_MEMORY_RECORDED_METRICS)
 
-#: Matches ``GPUMonitoringConfig.collection_interval``, so the host-memory and
+#: Used only when the config carries no ``logger.gpu_monitoring`` block, which
+#: is why it is not the default of any parameter below -- a run that *does*
+#: configure a cadence must not be able to silently fall back to this one. Set
+#: to match ``GPUMonitoringConfig.collection_interval`` so the host-memory and
 #: GPU series line up on a dashboard rather than interleaving.
-DEFAULT_COLLECTION_INTERVAL = 10.0
+FALLBACK_COLLECTION_INTERVAL = 10.0
 
 #: Short, because the endpoint is a raylet on the cluster's own network and the
 #: loop would rather miss a sample than hold the interval open behind a node
@@ -294,8 +299,9 @@ def ray_nodes() -> list[RayNode]:
     Returns an empty list when Ray is not up, which makes the collection loop
     idle rather than fail: the driver starts telemetry before ``init_ray()``.
     """
-    # Deferred: this module is imported from nemo_rl.utils.logger at module
-    # scope, and must stay importable in a process that never initialises Ray.
+    # Deferred: this module is imported at module scope by
+    # nemo_rl.distributed.worker_groups, and must stay importable in a process
+    # that never initialises Ray.
     import ray
 
     if not ray.is_initialized():
@@ -357,9 +363,7 @@ class HostMemoryMonitor:
     and neither is worth coupling the threads to avoid.
     """
 
-    def __init__(
-        self, collection_interval: float = DEFAULT_COLLECTION_INTERVAL
-    ) -> None:
+    def __init__(self, collection_interval: float) -> None:
         """Initialise the monitor.
 
         Args:
@@ -454,7 +458,7 @@ class HostMemoryMonitor:
             _SNAPSHOT.update(sampled)
 
     def _scrape(self, node: RayNode) -> dict[str, float]:
-        """Fetch and parse one node's memory series, or ``{}`` if unreachable.
+        """Fetch and parse one node's memory series, or ``{}`` if unusable.
 
         A node that cannot be scraped is skipped rather than retried: the next
         interval is the retry, and a node that is down or overloaded is exactly
@@ -469,7 +473,21 @@ class HostMemoryMonitor:
                 f"could not scrape host memory from {node.metrics_url}",
             )
             return {}
-        return parse_memory_samples(response.text)
+        try:
+            return parse_memory_samples(response.text)
+        except ValueError:
+            # Guarded separately from the fetch, and not left to the guard
+            # around the sweep: prometheus_client raises ValueError on a body
+            # that is not the exposition format -- an HTML error page from a
+            # proxy in front of the raylet, a truncated response -- and letting
+            # that reach the sweep would abandon every other node's sample and
+            # leave the previous snapshot exporting, stale labels included, for
+            # as long as the page stayed broken.
+            warn_once(
+                f"host_memory_parse:{node.host}",
+                f"could not parse host memory from {node.metrics_url}",
+            )
+            return {}
 
     def _collection_loop(self) -> None:
         """Sample until stopped, on :attr:`collection_interval`."""
@@ -486,9 +504,7 @@ class HostMemoryMonitor:
 _MONITOR: Optional[HostMemoryMonitor] = None
 
 
-def start_host_memory_monitoring(
-    collection_interval: float = DEFAULT_COLLECTION_INTERVAL,
-) -> None:
+def start_host_memory_monitoring(collection_interval: float) -> None:
     """Start this process's monitor, if it has none. Never raises.
 
     Called from ``init_telemetry_driver``, which is what puts the monitor in

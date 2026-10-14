@@ -214,7 +214,7 @@ def _build_resource_attributes(
     Process identity comes from :func:`_process_attributes`, which the callers
     merge in.
     """
-    from nemo.lens.semconv import RL_ALGORITHM
+    from nemo_rl.telemetry.instrumentation import RL_ALGORITHM
 
     attrs: dict[str, Any] = {
         _CAMPAIGN_STAGE_ATTR: _campaign_stage(algorithm),
@@ -249,11 +249,14 @@ def _topology_attributes(master_config: Any) -> dict[str, Any]:
     """Parallelism sizes, under lens's resource-scoped topology keys.
 
     ``nv.dl.topology.size.*`` rather than the ``dl.tensor_parallel.size``
-    family: only the former is in lens's ``DL_RESOURCE_TYPES``, which feeds the
-    ``RESOURCE_TYPES`` table ``normalize_resource_attributes`` consults. A key
-    outside that table is passed through rather than rejected, so the ``dl.*``
-    spelling would survive but arrive as an untyped string -- it is the span
-    and metric spelling, not the resource one.
+    family, as a naming convention and nothing more: the former is the
+    resource-scoped spelling of a parallelism size, the latter the span and
+    metric spelling of the same quantity. Nothing enforces it from lens's side.
+    ``normalize_resource_attributes`` runs only over the attributes lens
+    derives from ``OTEL_RESOURCE_ATTRIBUTES`` (providers.py), while the
+    ``resource_attributes`` handed in from here are merged as they are, so
+    either spelling would arrive intact and untyped. Getting it right is on
+    this function.
 
     Read from the enabled backend alone, under that backend's own spelling: the
     two disagree on names as well as values, and Automodel has no pipeline
@@ -534,26 +537,43 @@ def init_telemetry_driver(
         # Deferred to break the cycle: host_memory reads get_telemetry_handle
         # from this module.
         from nemo_rl.telemetry.host_memory import (
-            DEFAULT_COLLECTION_INTERVAL,
+            FALLBACK_COLLECTION_INTERVAL,
             start_host_memory_monitoring,
         )
 
         # Here rather than in ``Logger`` beside the GPU monitor, even though the
         # two sample the same endpoints: the host-memory series is labelled with
         # the worker groups each node holds, and that map is a module global
-        # only the driver writes. The single-controller entry points run their
-        # ``Logger`` inside the controller actor, which would label every host
-        # as holding no group at all.
+        # visible only to the process that wrote it. The driver is where almost
+        # every worker group is built, so it is where the monitor sees the most.
+        # The single-controller entry points run their ``Logger`` inside the
+        # controller actor, which would label every host as holding no group.
+        #
+        # Not every group, though: ``RewardModelEnvironment`` is itself a Ray
+        # actor and builds its ``Policy`` there, so that group registers in the
+        # actor's copy of the map and the driver never learns about it. Its
+        # hosts report ``rl.worker_groups="none"``. The memory is still right --
+        # the label is what is incomplete -- and making it complete means
+        # sharing the map across processes, which is a named actor and a round
+        # trip per sample for a descriptive label. Documented instead.
         #
         # Shares the GPU monitor's cadence so the two line up on a dashboard,
         # read from the logger config rather than restated -- but not *gated* on
         # ``monitor_gpus``, which decides what reaches W&B and has no business
         # deciding whether an OTel series exists.
+        #
+        # The fallback is for the entry points whose config carries no logger
+        # block at all (eval). Spelled here rather than read from
+        # ``GPUMonitoringConfig``: importing that means importing
+        # ``nemo_rl.utils.logger``, which pulls mlflow, wandb and the rest of
+        # the logging stack into telemetry startup for one float.
         interval = _dig(
             master_config, "logger", "gpu_monitoring", "collection_interval"
         )
         start_host_memory_monitoring(
-            collection_interval=interval or DEFAULT_COLLECTION_INTERVAL
+            collection_interval=interval
+            if interval is not None
+            else FALLBACK_COLLECTION_INTERVAL
         )
 
     # Every resolved field, not just the headline ones: the env projection uses

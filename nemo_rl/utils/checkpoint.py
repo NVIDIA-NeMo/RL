@@ -56,7 +56,7 @@ PathLike = Union[str, "os.PathLike[Any]"]
 
 @contextmanager
 def _finalize_telemetry(
-    carrier: Mapping[str, str], step: Optional[int], *, async_save: bool
+    carrier: Mapping[str, str], step: Optional[int]
 ) -> Iterator[None]:
     """Open ``rl.checkpoint.finalize``, or carry on without it if that fails.
 
@@ -74,7 +74,7 @@ def _finalize_telemetry(
     stack = ExitStack()
     try:
         stack.enter_context(remote_trace_context(carrier))
-        stack.enter_context(checkpoint_finalize_span(step, async_save=async_save))
+        stack.enter_context(checkpoint_finalize_span(step))
     # Deliberately broad: the point is that no failure from the telemetry stack,
     # whatever it is, reaches the caller from here.
     except Exception as e:
@@ -84,10 +84,12 @@ def _finalize_telemetry(
             "Finalization continues untraced; the checkpoint is unaffected.",
             stacklevel=2,
         )
+    # Yielded outside the except block so that a rename which then also fails is
+    # not reported as having happened "during handling" of the telemetry error,
+    # which points the reader at observability instead of at the rename. A
+    # closed ExitStack re-enters as an empty one, so this covers both paths.
+    with stack:
         yield
-    else:
-        with stack:
-            yield
 
 
 def _load_megatron_common_state_dict(iteration_dir: Path) -> dict[str, Any]:
@@ -486,7 +488,7 @@ class CheckpointManager:
             # on it, and the span is entered through a guard so the reverse
             # cannot happen: telemetry must not be what skips the rename.
             try:
-                with _finalize_telemetry(carrier, step, async_save=wait_fn is not None):
+                with _finalize_telemetry(carrier, step):
                     if wait_fn is not None:
                         wait_fn()
                     self._rename_checkpoint(checkpoint_path)

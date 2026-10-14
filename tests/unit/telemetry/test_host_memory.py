@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 import nemo_rl.telemetry.host_memory as host_memory
+import nemo_rl.telemetry.vocabulary as vocabulary
 from nemo_rl.telemetry.host_memory import (
     HOST_NAME_ATTR,
     NO_WORKER_GROUPS,
@@ -25,6 +26,7 @@ from nemo_rl.telemetry.host_memory import (
     parse_memory_samples,
     ray_nodes,
     register_worker_group_nodes,
+    register_worker_group_placement,
     start_host_memory_monitoring,
     stop_host_memory_monitoring,
     worker_groups_on_node,
@@ -59,6 +61,10 @@ def _reset_host_memory_state():
     host_memory._WORKER_GROUP_NODES.clear()
     host_memory._SNAPSHOT.clear()
     stop_host_memory_monitoring()
+    # The driver test below freezes the metric vocabulary for the rest of the
+    # process. Nothing in the suite registers a metric after collection today,
+    # but a module that did would fail here rather than where it went wrong.
+    vocabulary._FROZEN = False
 
 
 def _fake_ray(monkeypatch, nodes):
@@ -121,12 +127,6 @@ def _start_exporting_telemetry():
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
     import nemo_rl.telemetry.setup as setup_mod
-
-    instruments = pytest.importorskip("nemo.lens.instruments")
-    if not hasattr(instruments, "register_metric_group"):
-        pytest.skip("installed nemo-lens has no metric registry (lens PR #46)")
-    if not hasattr(instruments, "create_metric_instruments"):
-        pytest.skip("installed nemo-lens has no observable kinds (lens PR #84)")
 
     reader = InMemoryMetricReader()
     setup_mod._TELEMETRY_HANDLE = setup_telemetry(
@@ -229,8 +229,80 @@ def test_a_shut_down_group_stops_claiming_its_nodes():
     assert worker_groups_on_node("n0") == NO_WORKER_GROUPS
 
 
+def _fake_placement_groups(monkeypatch, tables, *, raises=False):
+    """Install a ``placement_group_table`` answering from *tables*.
+
+    Keyed by ``id(pg)``, like the code under test, because a real placement
+    group is not hashable either.
+
+    Returns the list of placement groups it was asked about, in order, so a
+    test can tell one lookup from several.
+    """
+    asked = []
+
+    def placement_group_table(pg):
+        asked.append(pg)
+        if raises:
+            raise RuntimeError("GCS is unreachable")
+        return {"bundles_to_node_id": tables[id(pg)]}
+
+    ray = types.ModuleType("ray")
+    util = types.ModuleType("ray.util")
+    module = types.ModuleType("ray.util.placement_group")
+    module.placement_group_table = placement_group_table
+    util.placement_group = module
+    ray.util = util
+    # All three levels, since the import under test walks the package path.
+    monkeypatch.setitem(sys.modules, "ray", ray)
+    monkeypatch.setitem(sys.modules, "ray.util", util)
+    monkeypatch.setitem(sys.modules, "ray.util.placement_group", module)
+    return asked
+
+
+def test_a_groups_bundles_name_the_nodes_it_is_on(monkeypatch):
+    """The form the worker groups actually call with: (pg, bundle index)."""
+    pg = SimpleNamespace(name="policy_pg")
+    _fake_placement_groups(monkeypatch, {id(pg): {0: "n0", 1: "n1"}})
+
+    register_worker_group_placement("lm_policy", [(pg, 0), (pg, 1)])
+
+    assert worker_groups_on_node("n0") == "lm_policy"
+    assert worker_groups_on_node("n1") == "lm_policy"
+
+
+def test_a_placement_group_is_looked_up_once_however_many_bundles_it_holds(
+    monkeypatch,
+):
+    """One table covers every bundle, and the lookup is a GCS round trip."""
+    pg = SimpleNamespace(name="policy_pg")
+    asked = _fake_placement_groups(monkeypatch, {id(pg): {i: "n0" for i in range(4)}})
+
+    register_worker_group_placement("lm_policy", [(pg, i) for i in range(4)])
+
+    assert asked == [pg]
+
+
+def test_a_bundle_the_table_does_not_place_is_left_out(monkeypatch):
+    """A pending bundle has no node yet; the ones that do are still labelled."""
+    pg = SimpleNamespace(name="policy_pg")
+    _fake_placement_groups(monkeypatch, {id(pg): {0: "n0"}})
+
+    register_worker_group_placement("lm_policy", [(pg, 0), (pg, 1)])
+
+    assert worker_groups_on_node("n0") == "lm_policy"
+
+
+def test_an_unresolvable_placement_costs_only_the_label(monkeypatch):
+    """Attribution is descriptive; failing to resolve it must not reach Ray."""
+    pg = SimpleNamespace(name="policy_pg")
+    _fake_placement_groups(monkeypatch, {id(pg): {0: "n0"}}, raises=True)
+
+    register_worker_group_placement("lm_policy", [(pg, 0)])
+
+    assert worker_groups_on_node("n0") == NO_WORKER_GROUPS
+
+
 def test_each_host_is_reported_with_its_name_and_its_worker_groups(monkeypatch):
-    pytest.importorskip("nemo.lens")
     reader = _start_exporting_telemetry()
 
     _fake_ray(
@@ -249,7 +321,7 @@ def test_each_host_is_reported_with_its_name_and_its_worker_groups(monkeypatch):
     )
     register_worker_group_nodes("lm_policy", ["n0"])
 
-    HostMemoryMonitor().collect_once()
+    HostMemoryMonitor(collection_interval=10.0).collect_once()
 
     data = reader.get_metrics_data()
     used = {
@@ -275,12 +347,11 @@ def test_a_label_the_scrape_stops_reporting_stops_being_exported(monkeypatch):
     one. ``sum by (host.name)`` would then count every host twice, and
     filtering on ``none`` would show every training host as idle.
     """
-    pytest.importorskip("nemo.lens")
     reader = _start_exporting_telemetry()
 
     _fake_ray(monkeypatch, [_node("n0", hostname="dgx-000", address="10.0.0.1")])
     _fake_scrape(monkeypatch, {"http://10.0.0.1:8080/metrics": _SCRAPE})
-    monitor = HostMemoryMonitor()
+    monitor = HostMemoryMonitor(collection_interval=10.0)
 
     monitor.collect_once()
     at_startup = _gauge_points(reader.get_metrics_data(), RL_HOST_MEMORY_USED_METRIC)
@@ -304,7 +375,6 @@ def test_two_raylets_on_one_host_are_one_point_scraped_once(monkeypatch):
     so a point per node would double count under ``sum by (host.name)``. The
     worker groups of both are merged, since the label describes the host.
     """
-    pytest.importorskip("nemo.lens")
     reader = _start_exporting_telemetry()
 
     _fake_ray(
@@ -326,7 +396,7 @@ def test_two_raylets_on_one_host_are_one_point_scraped_once(monkeypatch):
     register_worker_group_nodes("lm_policy", ["n0"])
     register_worker_group_nodes("vllm_policy", ["n1"])
 
-    HostMemoryMonitor().collect_once()
+    HostMemoryMonitor(collection_interval=10.0).collect_once()
 
     points = _gauge_points(reader.get_metrics_data(), RL_HOST_MEMORY_USED_METRIC)
     assert len(points) == 1
@@ -343,7 +413,6 @@ def test_stopping_abandons_the_sweep_instead_of_finishing_it(monkeypatch):
     partial result is thrown away rather than published: it would otherwise end
     the series of every host the sweep had not reached.
     """
-    pytest.importorskip("nemo.lens")
     _start_exporting_telemetry()
 
     nodes = [
@@ -351,7 +420,7 @@ def test_stopping_abandons_the_sweep_instead_of_finishing_it(monkeypatch):
         for index in range(5)
     ]
     _fake_ray(monkeypatch, nodes)
-    monitor = HostMemoryMonitor()
+    monitor = HostMemoryMonitor(collection_interval=10.0)
     scraped: list[str] = []
 
     class _Response:
@@ -380,7 +449,6 @@ def test_a_stopped_monitor_leaves_nothing_behind_to_export(monkeypatch):
     So whatever the last scrape left behind would otherwise be exported, frozen,
     by every cycle between shutdown and process exit.
     """
-    pytest.importorskip("nemo.lens")
     reader = _start_exporting_telemetry()
 
     _fake_ray(monkeypatch, [_node("n0", hostname="dgx-000", address="10.0.0.1")])
@@ -389,7 +457,7 @@ def test_a_stopped_monitor_leaves_nothing_behind_to_export(monkeypatch):
     # An interval long enough that the loop samples once and then sleeps, so
     # the points under test are the ones collected below and not a race.
     start_host_memory_monitoring(collection_interval=3600.0)
-    HostMemoryMonitor().collect_once()
+    HostMemoryMonitor(collection_interval=10.0).collect_once()
     assert _gauge_points(reader.get_metrics_data(), RL_HOST_MEMORY_USED_METRIC)
 
     stop_host_memory_monitoring()
@@ -397,9 +465,39 @@ def test_a_stopped_monitor_leaves_nothing_behind_to_export(monkeypatch):
     assert not _gauge_points(reader.get_metrics_data(), RL_HOST_MEMORY_USED_METRIC)
 
 
+def test_an_unparsable_page_costs_only_its_own_point(monkeypatch):
+    """One broken page must not abandon the sweep and freeze the snapshot.
+
+    A proxy in front of a raylet can answer 200 with an HTML error page. Left to
+    the guard around the sweep, the ValueError would discard every other node's
+    sample, and the exporter would keep publishing the previous snapshot --
+    stale worker-group labels included -- for as long as the page stayed broken.
+    """
+    reader = _start_exporting_telemetry()
+
+    _fake_ray(
+        monkeypatch,
+        [
+            _node("n0", hostname="dgx-000", address="10.0.0.1"),
+            _node("n1", hostname="proxied", address="10.0.0.2"),
+        ],
+    )
+    _fake_scrape(
+        monkeypatch,
+        {
+            "http://10.0.0.1:8080/metrics": _SCRAPE,
+            "http://10.0.0.2:8080/metrics": "<html><body>502 Bad Gateway</body></html>",
+        },
+    )
+
+    HostMemoryMonitor(collection_interval=10.0).collect_once()
+
+    points = _gauge_points(reader.get_metrics_data(), RL_HOST_MEMORY_USED_METRIC)
+    assert [point.attributes[HOST_NAME_ATTR] for point in points] == ["dgx-000"]
+
+
 def test_an_unreachable_node_costs_only_its_own_point(monkeypatch):
     """The node that is wedged is exactly the one whose host memory matters."""
-    pytest.importorskip("nemo.lens")
     reader = _start_exporting_telemetry()
 
     _fake_ray(
@@ -411,7 +509,7 @@ def test_an_unreachable_node_costs_only_its_own_point(monkeypatch):
     )
     _fake_scrape(monkeypatch, {"http://10.0.0.1:8080/metrics": _SCRAPE})
 
-    HostMemoryMonitor().collect_once()
+    HostMemoryMonitor(collection_interval=10.0).collect_once()
 
     points = _gauge_points(reader.get_metrics_data(), RL_HOST_MEMORY_USED_METRIC)
     assert [point.attributes[HOST_NAME_ATTR] for point in points] == ["dgx-000"]
@@ -427,7 +525,7 @@ def test_collection_never_raises(monkeypatch):
     monkeypatch.setattr(host_memory, "ray_nodes", _explode)
     _start_exporting_telemetry()
 
-    HostMemoryMonitor().collect_once()
+    HostMemoryMonitor(collection_interval=10.0).collect_once()
 
 
 def test_nothing_is_scraped_when_telemetry_is_not_exporting(monkeypatch):
@@ -443,13 +541,13 @@ def test_nothing_is_scraped_when_telemetry_is_not_exporting(monkeypatch):
         lambda self, node: scraped.append(node) or {},
     )
 
-    HostMemoryMonitor().collect_once()
+    HostMemoryMonitor(collection_interval=10.0).collect_once()
 
     assert scraped == []
 
 
 def test_stopping_a_monitor_that_was_never_started_is_harmless():
-    HostMemoryMonitor().stop()
+    HostMemoryMonitor(collection_interval=10.0).stop()
 
 
 def test_a_process_runs_at_most_one_monitor(monkeypatch):
@@ -489,7 +587,6 @@ def test_the_driver_starts_the_monitor_that_the_worker_groups_register_with(
     ``Logger`` under single-controller GRPO and SFT v2 -- would read an empty
     map and label every host ``none``.
     """
-    pytest.importorskip("nemo.lens")
     from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 
     monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "true")
@@ -505,8 +602,11 @@ def test_the_driver_starts_the_monitor_that_the_worker_groups_register_with(
         cluster=None,
     )
     handle = init_telemetry_driver(config, algorithm="grpo")
-    if handle is None or not handle.is_exporting:
-        pytest.skip("telemetry did not come up exporting in this environment")
+    # Asserted rather than skipped: the lens guard at the top of this test
+    # already covers "no telemetry here", so a handle that comes up not
+    # exporting is the regression this test exists to catch, and skipping on it
+    # would hide exactly that.
+    assert handle is not None and handle.is_exporting
 
     assert host_memory._MONITOR is not None
     # Taken from the logger's GPU cadence rather than restated, so the two

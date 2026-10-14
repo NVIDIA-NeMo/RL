@@ -1,8 +1,8 @@
 # Metrics
 
-NeMo-RL emits five namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), and driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions).
+NeMo-RL emits six namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), and per-host memory (`rl.host.memory.*`).
 
-Metrics are emitted **only when telemetry is exporting** — the driver always exports, so the `rl.*` series come from the driver's metrics logger.
+Metrics are emitted **only when telemetry is exporting**. All of them are produced on the driver, which always exports: most pass through the driver's metrics logger, while `rl.host.memory.*` is scraped from every node by a driver-side monitor on its own timer.
 
 Every `rl.*` series is **declared by NeMo-RL**, not by lens. lens provides a consumer-driven metric registry: NeMo-RL calls `register_metric_group("rl", [...])` once per process with a `MetricSpec` per series, then records against it with `record_metrics(meter, "rl", ...)`. The declarations live in one table in `nemo_rl/telemetry/metrics.py`, so adding a series needs no lens release and no agreement on field names. `record_metrics` never raises into the caller and skips `None`.
 
@@ -218,9 +218,9 @@ The monitor is started by `init_telemetry_driver` and stopped by `shutdown_telem
 
 ### Why these are observable rather than pushed
 
-A host's `rl.worker_groups` label changes during a run: it is `none` until the worker groups are built, which is minutes in, and changes again when they regroup or shut down. Pushed to an ordinary gauge that would be a permanent error, not a transient one — the SDK keeps a synchronous gauge's last value *per attribute set* and re-exports it every cycle, and nothing in the OTel API can retract an attribute set. Every host's startup-time `none` point would sit next to its correctly labelled one for the rest of the run, so `sum by (host.name)` would count each host twice and filtering on `none` would show every training host as idle.
+The monitor samples on its own timer, once per collection interval, which does not line up with the exporter's cycle — and a synchronous gauge is reported only in the cycles that follow a `set`. On the locked SDK (1.44.0) the cycles in between would carry no point at all; from 1.45 the SDK holds a synchronous gauge's last value *per attribute set* instead, which trades the gaps for a staler problem, since nothing in the OTel API can retract an attribute set. A host's `rl.worker_groups` label does change during a run — it is `none` until the worker groups are built, which is minutes in, and changes again when they regroup or shut down — so on 1.45 every host's startup-time `none` point would sit next to its correctly labelled one for the rest of the run, and `sum by (host.name)` would count each host twice.
 
-An observable gauge is rebuilt from its callback on each collection cycle, so a label the callback stops reporting simply ends. The monitor therefore scrapes on its own timer into a snapshot that it *replaces* wholesale, and the callbacks return whatever is in it. Three consequences worth knowing:
+An observable gauge is read on every export instead, so it always reports the latest snapshot and a label the callback stops reporting simply ends. The monitor therefore scrapes on its own timer into a snapshot that it *replaces* wholesale, and the callbacks return whatever is in it. Three consequences worth knowing:
 
 - Scraping stays on the monitor's thread rather than inside the callback, so the exporter never blocks on HTTP to an unreachable node — a wait that would otherwise hold up every other metric in the process and grow with the cluster.
 - The scrape and export intervals are independent, so a point can be up to one collection interval old, and scrapes taken between two export cycles are never seen. Both are normal for a gauge.
@@ -236,7 +236,9 @@ It lists the worker groups resident on the host, sorted and comma-joined (`lm_po
 
 There is exactly one point per `host.name` per cycle. That matters where several raylets share a machine, as in a local multi-node cluster: each publishes the same whole-host memory on its own endpoint, so the monitor scrapes a host once and merges the worker groups of every node on it, rather than emitting a point per node that `sum by (host.name)` would add together.
 
-That registry is an ordinary module global, so it is visible only to the process that wrote it, and the writer is always the driver. This is why the monitor has to run there too: the single-controller entry points (`run_grpo_single_controller.py`, `run_sft_v2.py`) build their worker groups on the driver but their `Logger` inside the controller actor, so a monitor owned by the `Logger` would read an empty map and label every host `none` — right numbers, wrong label, on every point.
+That registry is an ordinary module global, so it is visible only to the process that wrote it. This is why the monitor has to run on the driver: the single-controller entry points (`run_grpo_single_controller.py`, `run_sft_v2.py`) build their worker groups on the driver but their `Logger` inside the controller actor, so a monitor owned by the `Logger` would read an empty map and label every host `none` — right numbers, wrong label, on every point.
+
+One known gap follows from the same property. `RewardModelEnvironment` is a Ray actor and builds its `Policy` inside itself, so that worker group registers in the actor's copy of the map and the driver never sees it: hosts running only the reward model report `none`. The memory figure is unaffected; only the label is incomplete. Closing it would mean sharing the map through a named actor and paying a round trip per sample, which is more than a descriptive label is worth.
 
 **Do not aggregate on it.** The value it labels is the *whole host's* memory:
 
