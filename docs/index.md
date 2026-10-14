@@ -325,6 +325,8 @@ guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
 guides/grpo-audio.md
 guides/gspo-speechlm.md
+recipes/speechlm-environment-v070.md
+guides/gspo-speechlm-source.md
 guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md
