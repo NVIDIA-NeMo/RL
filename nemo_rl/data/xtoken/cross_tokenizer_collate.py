@@ -18,7 +18,8 @@ The collator runs inside DataLoader worker processes. It does:
 1. Tokenizes the student input once; this tokenization is shared by all
    teachers. In ``mode="text"``, tokenizes raw text without a chat template.
    In ``mode="chat"``, renders the full conversation with the student's chat
-   template and supervises only the final assistant content and end-of-turn token.
+   template and supervises only the final assistant turn (by default its
+   content and end-of-turn token).
 2. For each *cross-tokenizer* teacher, tokenizes with that teacher's
    tokenizer and aligns with its :class:`TokenAligner`. Text mode aligns
    the full text; chat mode renders the teacher's own chat template and
@@ -50,6 +51,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.xtoken.native_chat import (
     RenderedChatDocument,
     _render_and_tokenize_chat,
+    _render_chat_text,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -94,8 +96,8 @@ class CrossTokenizerCollator:
     (``aligners[i] is None``) emits nothing extra — its forward reuses the
     student tokenization, so projection and alignment are skipped entirely.
     Chat mode applies each model's chat template to the full conversation,
-    masks loss and teacher scoring to the final assistant content and end-of-turn
-    token, and aligns only that final message.
+    masks teacher scoring (and, by default, loss) to the final assistant content
+    and end-of-turn token, and aligns only that final message.
 
     Args:
         config: Typed batching options, including text/chat mode and the
@@ -116,6 +118,23 @@ class CrossTokenizerCollator:
         make_seq_div_by_student: Round student sequence length up to a
             multiple of this value (typically TP * CP * 2 for Automodel).
         make_seq_div_by_teachers: Per-teacher sequence-length divisors.
+        reject_overlength_text: Text-mode policy for rows longer than a
+            context length. ``False`` truncates each side to its own context
+            length. ``True`` raises ``ValueError`` for a row whose student or
+            teacher tokenization exceeds that side's context length, so every
+            side covers the same text; same-tokenizer teachers check the
+            shared student tokenization against their own context length.
+            Chat mode always rejects overlength rows.
+        ce_covers_assistant_turn: Chat-mode CE target. ``False`` supervises
+            the final assistant content and end-of-turn token. ``True``
+            supervises every token of the final assistant turn (SFT-style),
+            including chat-template markers and any rendered reasoning, and
+            emits the content and end-of-turn mask as ``kd_token_mask``.
+            Alignment and teacher token masks are unchanged. The turn starts
+            where the rendering of all earlier messages ends, or at the start
+            of the rendering when there are none; that rendering must be a
+            prefix of the full rendering. Requires ``mode="chat"`` without
+            ``native_thinking_alignment``.
     """
 
     def __init__(
@@ -130,6 +149,8 @@ class CrossTokenizerCollator:
         drop_first_assistant_chunk_kl_by_teacher: List[bool],
         make_seq_div_by_student: int = 1,
         make_seq_div_by_teachers: Optional[List[int]] = None,
+        reject_overlength_text: bool = False,
+        ce_covers_assistant_turn: bool = False,
     ) -> None:
         n = len(aligners)
         assert len(teacher_tokenizers) == n and len(ctx_length_teachers) == n, (
@@ -181,6 +202,17 @@ class CrossTokenizerCollator:
                 "num_packed_rows > 1 (lockstep packing) is not yet implemented "
                 "in this collator; use num_packed_rows=1."
             )
+        if ce_covers_assistant_turn and config.mode != "chat":
+            raise ValueError(
+                "ce_covers_assistant_turn requires mode='chat'; text mode has "
+                "no chat-template assistant turn."
+            )
+        if ce_covers_assistant_turn and config.native_thinking_alignment:
+            raise ValueError(
+                "ce_covers_assistant_turn is not supported with "
+                "native_thinking_alignment=true, which defines its own "
+                "supervised regions."
+            )
         self.student_tokenizer = student_tokenizer
         self.teacher_tokenizers = teacher_tokenizers
         self.aligners = aligners
@@ -199,6 +231,8 @@ class CrossTokenizerCollator:
             if config.kd_alignment_regions is not None
             else None
         )
+        self.reject_overlength_text = reject_overlength_text
+        self.ce_covers_assistant_turn = ce_covers_assistant_turn
         # Downstream consumers assume real tokens occupy the leading
         # positions: ``input_lengths = attention_mask.sum(-1)`` plus the
         # ``[:length]`` slices in the policy forward and the token-chunk
@@ -234,6 +268,11 @@ class CrossTokenizerCollator:
                     "CrossTokenizerCollator text mode requires string content"
                 )
             texts.append(content)
+        idx = [datum["idx"] for datum in batch]
+        if self.reject_overlength_text:
+            self._reject_overlength_texts(
+                texts, idx, self.student_tokenizer, self.ctx_length_student, "student"
+            )
         student_input_ids, student_attention_mask, student_offsets = (
             self._tokenize_batch(
                 texts,
@@ -246,7 +285,6 @@ class CrossTokenizerCollator:
         sample_mask = torch.tensor(
             [datum["loss_multiplier"] for datum in batch], dtype=torch.float32
         )
-        idx = [datum["idx"] for datum in batch]
 
         out: dict[str, Any] = {
             # Student-side keys map onto Policy.train's expected names. A
@@ -262,7 +300,21 @@ class CrossTokenizerCollator:
             if aligner is None:
                 # Same-tokenizer teacher: no re-tokenization, no projection,
                 # no alignment. Its forward reuses the student tokenization.
+                if self.reject_overlength_text:
+                    for row_idx, length in zip(idx, out["input_lengths"].tolist()):
+                        if length > self.ctx_length_teachers[i]:
+                            raise ValueError(
+                                f"teacher {i}, sample idx={row_idx}: shared tokenization exceeds context length {self.ctx_length_teachers[i]}; overlength rows are rejected"
+                            )
                 continue
+            if self.reject_overlength_text:
+                self._reject_overlength_texts(
+                    texts,
+                    idx,
+                    self.teacher_tokenizers[i],
+                    self.ctx_length_teachers[i],
+                    f"teacher {i}",
+                )
             teacher_input_ids, teacher_attention_mask, teacher_offsets = (
                 self._tokenize_batch(
                     texts,
@@ -312,6 +364,51 @@ class CrossTokenizerCollator:
         except (ValueError, TypeError) as error:
             raise ValueError(f"{side}, sample idx={datum['idx']}: {error}") from error
 
+    def _final_turn_start(self, datum: DatumSpec, doc: RenderedChatDocument) -> int:
+        """Return the index of the first student token of the final assistant turn.
+
+        The turn spans from the end of the rendering of the earlier messages
+        (empty when there are none) to the end of the full rendering.
+        """
+        messages = datum["message_log"]
+        try:
+            # Same template controls as the full rendering; __init__ rejects
+            # native thinking alignment with this option.
+            history = (
+                _render_chat_text(
+                    self.student_tokenizer,
+                    messages[:-1],
+                    preserve_thinking=self.include_thinking_in_loss,
+                    tools=datum.get("tools"),
+                )
+                if len(messages) > 1
+                else ""
+            )
+        except (ValueError, TypeError) as error:
+            raise ValueError(f"student, sample idx={datum['idx']}: {error}") from error
+        if not doc.rendered_text.startswith(history):
+            raise ValueError(
+                f"student, sample idx={datum['idx']}: rendering the messages before the final assistant turn does not give a prefix of the full rendering; cannot locate the turn boundary"
+            )
+        turn_char = len(history)
+        first = next(
+            (i for i, (_, end) in enumerate(doc.offsets) if end > turn_char), None
+        )
+        if first is None:
+            raise ValueError(
+                f"student, sample idx={datum['idx']}: final assistant turn has no tokens"
+            )
+        # A token may absorb whitespace that ends the history, but not text.
+        if doc.rendered_text[doc.offsets[first][0] : turn_char].strip():
+            raise ValueError(
+                f"student, sample idx={datum['idx']}: token {first} crosses the final assistant turn boundary"
+            )
+        if any(doc.assistant_mask[:first]):
+            raise ValueError(
+                f"student, sample idx={datum['idx']}: assistant targets precede the final assistant turn"
+            )
+        return first
+
     def _call_chat(self, batch: List[DatumSpec]) -> BatchedDataDict[Any]:
         """Render complete conversations and align their final assistant regions."""
         student_docs = [
@@ -341,6 +438,18 @@ class CrossTokenizerCollator:
             ),
             "idx": [datum["idx"] for datum in batch],
         }
+        if self.ce_covers_assistant_turn:
+            turn_starts = torch.tensor(
+                [
+                    self._final_turn_start(datum, doc)
+                    for datum, doc in zip(batch, student_docs)
+                ],
+                dtype=torch.long,
+            )
+            positions = torch.arange(student_input_ids.shape[1], dtype=torch.long)
+            turn_mask = (positions[None, :] >= turn_starts[:, None]).long()
+            out["kd_token_mask"] = out["token_mask"]
+            out["token_mask"] = (student_attention_mask * turn_mask).long()
         for i, aligner in enumerate(self.aligners):
             if aligner is None:
                 for datum, doc in zip(batch, student_docs):
@@ -458,6 +567,22 @@ class CrossTokenizerCollator:
                 offsets[j, :n] = torch.tensor(off, dtype=torch.long)
                 assistant_mask[j, :n] = torch.tensor(mask, dtype=torch.long)
         return input_ids, attention_mask, offsets, assistant_mask
+
+    @staticmethod
+    def _reject_overlength_texts(
+        texts: List[str],
+        idx: List[int],
+        tokenizer: PreTrainedTokenizerBase,
+        ctx_length: int,
+        side: str,
+    ) -> None:
+        """Raise ``ValueError`` if any text tokenizes to more than ``ctx_length`` tokens."""
+        encoded = tokenizer(texts, truncation=False, add_special_tokens=False)
+        for row_idx, ids in zip(idx, encoded["input_ids"]):
+            if len(ids) > ctx_length:
+                raise ValueError(
+                    f"{side}, sample idx={row_idx}: text tokenization has {len(ids)} tokens, exceeding context length {ctx_length}; overlength rows are rejected"
+                )
 
     @staticmethod
     def _tokenize_batch(
