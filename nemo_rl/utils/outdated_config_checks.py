@@ -196,7 +196,7 @@ def reject_outdated_dynamo_router_reset_states(config: dict[str, Any]) -> None:
     if isinstance(frontend_args, dict) and "router_reset_states" in frontend_args:
         raise ValueError(
             "policy.generation.dynamo_cfg.frontend_args.router_reset_states was "
-            "removed: Dynamo 1.5 dropped the frontend's --router-reset-states flag. "
+            "removed: Dynamo 1.4 dropped the frontend's --router-reset-states flag. "
             "Delete the key."
         )
 

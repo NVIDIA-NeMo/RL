@@ -123,7 +123,7 @@ class DynamoRefitChannel:
         self._update_info: dict[str, Any] | None = None
 
     def client_copy(self) -> "DynamoRefitChannel":
-        """Return a serializable endpoint-only channel for rollout actors.
+        """Return a serializable copy without the driver-owned worker validator.
 
         The prepared update metadata travels with the copy: SingleController
         prepares refit on the driver and then pickles the synchronizer (and
@@ -279,8 +279,7 @@ class DynamoRefitChannel:
     def pause(self, *, clear_cache: bool) -> None:
         """Drain and pause every worker ahead of a weight update.
 
-        Workers that paused are resumed if any peer fails, so a failed pause
-        never leaves part of the fleet holding requests.
+        Workers that confirmed the pause are resumed if any peer fails.
         """
         paused_workers, pause_errors = self._pause_workers(clear_cache=clear_cache)
         if pause_errors:

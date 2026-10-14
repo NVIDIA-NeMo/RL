@@ -15,7 +15,7 @@
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
@@ -166,6 +166,24 @@ class DynamoGeneration(GenerationInterface):
                 "async_rl.generation_fleet_health.refit_timeout_s must be null with "
                 "policy.generation.backend='dynamo'; Dynamo workers cannot enforce a "
                 "refit deadline."
+            )
+        # Setup has already normalized this through DynamoConfig.
+        generation = cast(dict[str, Any], master_config.policy["generation"])
+        dynamo_cfg = generation["dynamo_cfg"]
+        if dynamo_cfg["control_timeout_s"] < dynamo_cfg["request_timeout_s"]:
+            raise ValueError(
+                "policy.generation.dynamo_cfg.control_timeout_s "
+                f"({dynamo_cfg['control_timeout_s']}) must be >= request_timeout_s "
+                f"({dynamo_cfg['request_timeout_s']}): it bounds the pre-refit drain, "
+                "which waits for running requests to finish."
+            )
+        if generation["vllm_cfg"]["enable_vllm_metrics_logger"]:
+            # Only the legacy GRPO loop reads and clears the driver's sampler; here
+            # it would accumulate samples for the whole run.
+            raise ValueError(
+                "policy.generation.vllm_cfg.enable_vllm_metrics_logger must be false "
+                "with policy.generation.backend='dynamo' under the SingleController; "
+                "nothing reads the Dynamo metrics sampler on this path."
             )
 
     def __init__(
@@ -334,8 +352,9 @@ class DynamoGeneration(GenerationInterface):
         """Serialize only HTTP clients needed by Ray rollout actors.
 
         Driver-owned subprocesses, threads, and Ray worker handles are excluded.
-        The endpoint-only refit channel is retained so AREAL-style cache
-        invalidation still reaches every managed worker after deserialization.
+        The refit channel's client copy is retained so weight updates and
+        AREAL-style cache invalidation still reach every managed worker after
+        deserialization.
         """
         refit_channel = self._refit_channel
         return {

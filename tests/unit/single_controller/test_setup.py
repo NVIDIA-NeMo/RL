@@ -93,7 +93,6 @@ from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
-from nemo_rl.models.generation.dynamo import DynamoGeneration
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.utils.config import (
     load_config,
@@ -172,7 +171,14 @@ def _make_master_config(
             "kv_cache_management_mode": "recompute",
         }
         policy_config["model_name"] = "test-model"
-    return MasterConfig.model_construct(
+    if backend == "dynamo":
+        # The fields DynamoGeneration.validate_settings reads, at accepted values.
+        generation_config["dynamo_cfg"] = {
+            "request_timeout_s": 900.0,
+            "control_timeout_s": 900.0,
+        }
+        generation_config["vllm_cfg"] = {"enable_vllm_metrics_logger": False}
+    master_config = MasterConfig.model_construct(
         data_plane={
             "enabled": dp_enabled,
             "impl": "transfer_queue",
@@ -218,6 +224,9 @@ def _make_master_config(
             **({} if sampler_cfg is None else {"sampler": sampler_cfg}),
         ),
     )
+    if backend == "dynamo":
+        master_config.async_rl.generation_fleet_health.refit_timeout_s = None
+    return master_config
 
 
 def _native_tq_metadata(
@@ -398,28 +407,6 @@ def test_generation_max_seq_len_reads_dynamo_vllm_cfg():
         )
         == 1024
     )
-
-
-def test_dynamo_rejects_fleet_health():
-    """The Dynamo frontend routes requests, so there are no shards to track."""
-    master_config = _make_master_config(backend="dynamo")
-    master_config.async_rl.generation_fleet_health.enabled = True
-
-    master_config.async_rl.generation_fleet_health.refit_timeout_s = None
-    with pytest.raises(ValueError, match="Dynamo frontend owns request routing"):
-        DynamoGeneration.validate_settings(master_config)
-
-    master_config.async_rl.generation_fleet_health.enabled = False
-    DynamoGeneration.validate_settings(master_config)
-
-
-def test_dynamo_rejects_refit_deadline():
-    """Dynamo workers cannot abort the refit collective, so no deadline is allowed."""
-    master_config = _make_master_config(backend="dynamo")
-    master_config.async_rl.generation_fleet_health.refit_timeout_s = 300.0
-
-    with pytest.raises(ValueError, match="refit_timeout_s must be null"):
-        DynamoGeneration.validate_settings(master_config)
 
 
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
@@ -1693,13 +1680,63 @@ class TestSetup:
         patched_factories["_build_clusters"].assert_not_called()
         patched_factories["_build_generation"].assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("misconfigure", "match"),
+        [
+            pytest.param(
+                lambda mc: setattr(
+                    mc.async_rl.generation_fleet_health, "enabled", True
+                ),
+                "Dynamo frontend owns request routing",
+                id="fleet_health",
+            ),
+            # 300.0 is the FleetHealthConfig default, so a Dynamo config that does
+            # not opt out would otherwise only fail at its first weight sync.
+            pytest.param(
+                lambda mc: setattr(
+                    mc.async_rl.generation_fleet_health, "refit_timeout_s", 300.0
+                ),
+                "refit_timeout_s must be null",
+                id="refit_deadline",
+            ),
+            pytest.param(
+                lambda mc: mc.policy["generation"]["dynamo_cfg"].update(
+                    control_timeout_s=600.0
+                ),
+                "must be >= request_timeout_s",
+                id="drain_timeout",
+            ),
+            pytest.param(
+                lambda mc: mc.policy["generation"]["vllm_cfg"].update(
+                    enable_vllm_metrics_logger=True
+                ),
+                "enable_vllm_metrics_logger must be false",
+                id="metrics_sampler",
+            ),
+        ],
+    )
+    def test_unsupported_dynamo_settings_fail_before_clusters(
+        self, patched_factories, misconfigure, match
+    ):
+        mc = _make_master_config(backend="dynamo")
+        misconfigure(mc)
+
+        with (
+            patch.object(sc_setup_mod.DynamoConfig, "model_validate") as validate,
+            pytest.raises(ValueError, match=match),
+        ):
+            validate.return_value.model_dump.return_value = mc.policy["generation"]
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_generation"].assert_not_called()
+
     def test_dynamo_generation_config_is_normalized(self, patched_factories):
         mc = _make_master_config(backend="dynamo")
-        mc.async_rl.generation_fleet_health.refit_timeout_s = None
         mc.policy["hf_config_overrides"] = {"rope_theta": 1.0}
         normalized = {
-            "backend": "dynamo",
-            "colocated": {"enabled": False, "resources": {}},
+            **mc.policy["generation"],
             "vllm_kwargs": {"hf_overrides": {"rope_theta": 1.0}},
         }
 

@@ -27,9 +27,10 @@ uses the policy tokenizer, preserves caller `nvext.extra_fields`, adds Dynamo
 engine metadata, and translates rendered multi-turn prefixes back to the exact
 caller token IDs.
 
-Serialized rollout copies contain only frontend URLs and immutable worker
-admin endpoints. They cannot own or stop services. Those endpoints are enough
-for AREAL-style post-refit cache invalidation; Magistral keeps its existing
+Serialized rollout copies contain only frontend URLs, immutable worker admin
+endpoints, and the prepared refit metadata. They cannot own or stop services.
+That is enough for the SingleController actor to issue weight updates and for
+AREAL-style post-refit cache invalidation; Magistral keeps its existing
 driver-side invalidation lifecycle.
 
 ## Weight refit
