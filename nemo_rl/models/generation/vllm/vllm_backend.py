@@ -1719,7 +1719,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
           and ``post`` sends each expert through vLLM's native weight loader.
         """
 
-        def _staged_param_spec(
+        def _default_param_spec(
             vllm_param: torch.Tensor,
             merged_slice: tuple[slice, ...] | None,
             wire_dtype: torch.dtype,
@@ -1890,16 +1890,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     )
                     value, scale = fp8.quantize_mxfp8_weight(weight)
                 elif ctx.buf.ndim == 2:
-                    value, scale = fp8.cast_tensor_to_fp8_blockwise(
-                        ctx.buf, block_size, allow_rectangular=True
-                    )
+                    value, scale = fp8.cast_tensor_to_fp8_blockwise(ctx.buf, block_size)
                     scale = scale.squeeze(-1)
                 else:
                     value = torch.empty_like(ctx.buf, dtype=value_param.dtype)
                     scale = torch.empty_like(ctx.extra["scale_region"])
                     for expert, weight in enumerate(ctx.buf.unbind(0)):
                         expert_value, expert_scale = fp8.cast_tensor_to_fp8_blockwise(
-                            weight, block_size, allow_rectangular=True
+                            weight, block_size
                         )
                         value[expert].copy_(expert_value)
                         scale[expert].copy_(expert_scale.squeeze(-1))
@@ -1990,13 +1988,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         raise ValueError(
                             f"Blockwise FP8 target {vllm_name!r} has no owning module"
                         )
-                    # MoE can refine the checkpoint grid to fit TP-local shards.
-                    # Its scale storage and kernel use this realized block shape.
-                    block_size = getattr(
-                        getattr(module, "quant_method", None), "moe_block_shape", None
-                    )
-                    if block_size is None:
-                        block_size = getattr(module, "weight_block_size", None)
+                    block_size = getattr(module, "weight_block_size", None)
                     if block_size is None:
                         block_size = module.quant_method.quant_config.weight_block_size
                     block_size = tuple(block_size)
@@ -2077,7 +2069,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         f"Unsupported refit destination dtype {vllm_param.dtype} "
                         f"for {hf_name!r}"
                     )
-                specs[hf_name] = _staged_param_spec(
+                specs[hf_name] = _default_param_spec(
                     vllm_param, merged_slice, wire_dtype
                 )
         return HFToLocalParamMap(specs=specs)
