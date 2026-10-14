@@ -22,10 +22,16 @@ exercise the single-cross-tokenizer-teacher case (index 0).
 
 from __future__ import annotations
 
+import zlib
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from tokenizers import Tokenizer
+from tokenizers.models import BPE, WordLevel
+from tokenizers.pre_tokenizers import WhitespaceSplit
+from transformers import PreTrainedTokenizerFast
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch, TokenAligner
 from nemo_rl.data.xtoken.cross_tokenizer_collate import (
@@ -132,6 +138,98 @@ def _fake_aligner(b: int, t_s: int, t_t: int, max_pairs: int = 2) -> MagicMock:
         teacher_chunk_id=torch.zeros((b, t_t), dtype=torch.long),
     )
     return aligner
+
+
+def _batch_checksums(batch: Any) -> dict[str, int]:
+    """CRC32 of every batch value: dtype, shape, and raw bytes for tensors."""
+    checksums = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            payload = f"{value.dtype}{tuple(value.shape)}".encode()
+            payload += value.contiguous().numpy().tobytes()
+        else:
+            payload = repr(value).encode()
+        checksums[key] = zlib.crc32(payload)
+    return checksums
+
+
+def _assert_batches_equal(actual: Any, expected: Any) -> None:
+    assert set(actual.keys()) == set(expected.keys())
+    for key, value in expected.items():
+        if isinstance(value, torch.Tensor):
+            assert actual[key].dtype == value.dtype, key
+            assert torch.equal(actual[key], value), key
+        else:
+            assert actual[key] == value, key
+
+
+_WORDS = ("alpha", "beta", "gamma", "delta", "epsilon")
+
+
+def _word_tokenizer() -> PreTrainedTokenizerFast:
+    """Real fast tokenizer with one token per whitespace-separated word."""
+    vocab = {token: i for i, token in enumerate(("[UNK]", "[PAD]", "<eos>", *_WORDS))}
+    backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = WhitespaceSplit()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        eos_token="<eos>",
+    )
+
+
+def _char_tokenizer() -> PreTrainedTokenizerFast:
+    """Real fast tokenizer with one token per non-space character."""
+    characters = sorted(set("".join(_WORDS)))
+    vocab = {
+        token: i for i, token in enumerate(("[UNK]", "[PAD]", "<eos>", *characters))
+    }
+    backend = Tokenizer(BPE(vocab=vocab, merges=[], unk_token="[UNK]"))
+    backend.pre_tokenizer = WhitespaceSplit()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        eos_token="<eos>",
+    )
+
+
+def _text_collator(
+    *,
+    ctx_length_student: int,
+    ctx_length_teachers: list[int],
+    **options: bool,
+) -> CrossTokenizerCollator:
+    """Word-level student, character-level teacher 0, same-tokenizer teacher 1."""
+    student = _word_tokenizer()
+    teacher = _char_tokenizer()
+    return CrossTokenizerCollator(
+        config=CrossTokenizerCollatorConfig(),
+        student_tokenizer=student,
+        teacher_tokenizers=[teacher, student],
+        aligners=[
+            TokenAligner(student, teacher, projection_matrix_path="unused.pt"),
+            None,
+        ],
+        ctx_length_student=ctx_length_student,
+        ctx_length_teachers=ctx_length_teachers,
+        drop_first_assistant_chunk_kl_by_teacher=[False, False],
+        make_seq_div_by_student=4,
+        make_seq_div_by_teachers=[3, 1],
+        **options,
+    )
+
+
+def _text_snapshot_batch() -> Any:
+    """Default text batch with a row that each side truncates."""
+    collator = _text_collator(ctx_length_student=4, ctx_length_teachers=[12, 4])
+    return collator(
+        [
+            _datum("alpha beta gamma delta epsilon", idx=3),
+            _datum("beta", idx=4, loss_multiplier=0.5),
+        ]
+    )
 
 
 # Expected keys consumed by xtoken_off_policy_distillation.py's per-teacher
@@ -259,6 +357,116 @@ class TestCollatorTruncation:
         # token_mask should be all 1s (4 real tokens, no padding).
         assert int(out["token_mask"][0].sum()) == 4
         assert int(out["input_lengths"][0]) == 4
+
+
+# Captured from the collator before the optional overlength and CE-turn
+# behaviors existed; the default batch must stay bitwise identical.
+_TEXT_SNAPSHOT_CHECKSUMS = {
+    "input_ids": 3661199532,
+    "input_lengths": 868467641,
+    "token_mask": 464442051,
+    "sample_mask": 586538992,
+    "idx": 1297290009,
+    "teacher_0_input_ids": 548984487,
+    "teacher_0_input_lengths": 137384594,
+    "teacher_0_token_mask": 3787835366,
+    "alignment_0_pair_valid": 64817739,
+    "alignment_0_pair_is_correct": 13516310,
+    "alignment_0_student_chunk_id": 1888554585,
+    "alignment_0_teacher_chunk_id": 1481747482,
+}
+
+
+def test_default_text_batch_matches_pinned_output():
+    batch = _text_snapshot_batch()
+    assert int(batch["input_lengths"][0]) == 4
+    assert int(batch["teacher_0_input_lengths"][0]) == 12
+    assert _batch_checksums(batch) == _TEXT_SNAPSHOT_CHECKSUMS
+
+
+class TestRejectOverlengthText:
+    def test_student_overlength_row_raises(self):
+        batch = [_datum("beta", idx=2), _datum("alpha beta gamma delta epsilon", idx=3)]
+        truncated = _text_collator(ctx_length_student=4, ctx_length_teachers=[64, 4])(
+            batch
+        )
+        assert truncated["input_lengths"].tolist() == [1, 4]
+        collator = _text_collator(
+            ctx_length_student=4,
+            ctx_length_teachers=[64, 4],
+            reject_overlength_text=True,
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"^student, sample idx=3: text tokenization has 5 tokens, "
+            r"exceeding context length 4; overlength rows are rejected$",
+        ):
+            collator(batch)
+
+    def test_cross_tokenizer_teacher_overlength_row_raises(self):
+        collator = _text_collator(
+            ctx_length_student=8,
+            ctx_length_teachers=[10, 8],
+            reject_overlength_text=True,
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"^teacher 0, sample idx=5: text tokenization has 14 tokens, "
+            r"exceeding context length 10; overlength rows are rejected$",
+        ):
+            collator([_datum("beta", idx=4), _datum("alpha beta gamma", idx=5)])
+
+    def test_same_tokenizer_teacher_overlength_row_raises(self):
+        collator = _text_collator(
+            ctx_length_student=8,
+            ctx_length_teachers=[64, 2],
+            reject_overlength_text=True,
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"^teacher 1, sample idx=6: shared tokenization exceeds context "
+            r"length 2; overlength rows are rejected$",
+        ):
+            collator([_datum("alpha beta gamma", idx=6)])
+
+    @pytest.mark.parametrize(
+        "texts,student_lengths,teacher_lengths",
+        [
+            # Row 6 exactly fills every context: 5 words, 26 characters.
+            (("alpha beta gamma delta epsilon", "delta"), [5, 1], [26, 5]),
+            # Every row is shorter than every context.
+            (("beta", "delta gamma"), [1, 2], [4, 10]),
+        ],
+    )
+    def test_rows_that_fit_match_default(self, texts, student_lengths, teacher_lengths):
+        batch = [
+            _datum(texts[0], idx=6),
+            _datum(texts[1], idx=7, loss_multiplier=0.0),
+        ]
+        expected = _text_collator(ctx_length_student=5, ctx_length_teachers=[26, 5])(
+            batch
+        )
+        actual = _text_collator(
+            ctx_length_student=5,
+            ctx_length_teachers=[26, 5],
+            reject_overlength_text=True,
+        )(batch)
+        assert expected["input_lengths"].tolist() == student_lengths
+        assert expected["teacher_0_input_lengths"].tolist() == teacher_lengths
+        # Both sides pad to their context length, rounded up to the divisor.
+        assert expected["input_ids"].shape == (2, 8)
+        assert expected["teacher_0_input_ids"].shape == (2, 27)
+        _assert_batches_equal(actual, expected)
+
+    def test_ce_covers_assistant_turn_requires_chat_mode(self):
+        with pytest.raises(
+            ValueError, match="ce_covers_assistant_turn requires mode='chat'"
+        ):
+            _text_collator(
+                ctx_length_student=8,
+                ctx_length_teachers=[64, 8],
+                ce_covers_assistant_turn=True,
+            )
 
 
 class TestCollatorSequenceDivisibility:
