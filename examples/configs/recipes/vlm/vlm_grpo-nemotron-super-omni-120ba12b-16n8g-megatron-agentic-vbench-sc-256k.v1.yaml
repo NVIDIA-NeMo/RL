@@ -7,6 +7,10 @@
 defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc.v1.yaml
 
 grpo:
+  # Production horizon. Qualification at 20 healthy steps is observational;
+  # it must not terminate the sync run or clamp a later async continuation.
+  max_num_epochs: null
+  max_num_steps: 1000000
   # Emit per-sequence generation/trainer parity diagnostics. This is
   # observational only: it neither filters samples nor changes the loss.
   debug_payload_metrics: true

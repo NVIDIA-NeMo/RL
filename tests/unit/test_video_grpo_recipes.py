@@ -126,6 +126,15 @@ def test_sync_video_debug_recipes_preserve_multimodal_parity_contract(name: str)
     assert recipe["policy"]["megatron_cfg"]["freeze_vision_projection"] is True
 
 
+def test_agentic_vbench_256k_recipe_keeps_the_production_horizon():
+    recipe = _load_recipe(
+        "vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml"
+    )
+
+    assert recipe["grpo"]["max_num_steps"] == 1_000_000
+    assert recipe["grpo"]["max_num_epochs"] is None
+
+
 def test_agentic_vbench_in_order_recipe_replaces_dropped_prompt_groups():
     recipe = _load_recipe(
         "vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc.v1.yaml"

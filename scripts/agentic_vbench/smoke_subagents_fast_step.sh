@@ -39,9 +39,13 @@ export NUM_GEN_NODES=${NUM_GEN_NODES:-8}
 export SEGMENT_SIZE=${SEGMENT_SIZE:-8}
 export NUM_PROMPTS=${NUM_PROMPTS:-8}
 export NUM_GENERATIONS=${NUM_GENERATIONS:-4}
-# Keep GRPO allocation-bounded.  Per-step checkpoints plus chained Slurm cycles
+# Keep GRPO allocation-bounded. Per-step checkpoints plus chained Slurm cycles
 # provide recovery; an artificial smoke-step cap must not terminate training.
-export MAX_STEPS=${MAX_STEPS:-1000000}
+if [[ ${MAX_STEPS:-1000000} != 1000000 ]]; then
+  echo "ERROR: subagent training requires MAX_STEPS=1000000; 20 steps is an observation gate, not a stop" >&2
+  exit 2
+fi
+export MAX_STEPS=1000000
 # Dataset cardinality is independent of the optimizer horizon.  launch_sc sets
 # max_num_epochs=null, so the dataloader cycles these rows without materializing
 # one copy per possible GRPO step.
@@ -86,4 +90,6 @@ exec bash "$script_dir/smoke_off_32turns_256k.sh" \
   "+${agent}.opencode_subagent_prompt=${AGENTIC_VBENCH_SUBAGENT_PROMPT}" \
   "+${agent}.opencode_compaction_auto=false" \
   "+${agent}.opencode_compaction_prune=false" \
-  "$@"
+  "$@" \
+  grpo.max_num_steps=1000000 \
+  grpo.max_num_epochs=null

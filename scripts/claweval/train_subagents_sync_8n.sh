@@ -17,7 +17,11 @@ export NUM_PROMPTS=${NUM_PROMPTS:-8}
 export NUM_GENERATIONS=${NUM_GENERATIONS:-4}
 # NeMo-RL requires a finite schema value. This production horizon is not reduced
 # by dataset epochs; the allocation lifetime remains the operational bound.
-export MAX_STEPS=${MAX_STEPS:-1000000}
+if [[ ${MAX_STEPS:-1000000} != 1000000 ]]; then
+  echo "ERROR: subagent training requires MAX_STEPS=1000000; 20 steps is an observation gate, not a stop" >&2
+  exit 2
+fi
+export MAX_STEPS=1000000
 export SAVE_PERIOD=${SAVE_PERIOD:-1}
 # Chain allocation-bounded cycles against the same checkpoint/W&B run.  This
 # preserves the effectively uncapped GRPO horizon across Slurm time limits.
@@ -81,4 +85,6 @@ exec bash "$script_dir/run_sc.sh" \
   "+${agent}.opencode_delegation_prompt=${CLAW_EVAL_DELEGATION_PROMPT}" \
   "+${agent}.opencode_compaction_auto=false" \
   "+${agent}.opencode_compaction_prune=false" \
-  "$@"
+  "$@" \
+  grpo.max_num_steps=1000000 \
+  grpo.max_num_epochs=null
