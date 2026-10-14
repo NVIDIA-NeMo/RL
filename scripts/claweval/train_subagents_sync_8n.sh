@@ -10,6 +10,7 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd "$script_dir/../.." && pwd)
 
+export SLURM_ACCOUNT=${SLURM_ACCOUNT:-nemotron_n4_omni}
 export NUM_NODES=${NUM_NODES:-8}
 export NUM_GEN_NODES=${NUM_GEN_NODES:-4}
 export SEGMENT_SIZE=${SEGMENT_SIZE:-4}

@@ -16,6 +16,7 @@ target=$1
 if [[ $target == */run_sc.sh ]]; then
   shift
   printf 'MAX_STEPS=%s\n' "${MAX_STEPS:-unset}"
+  printf 'SLURM_ACCOUNT=%s\n' "${SLURM_ACCOUNT:-unset}"
   printf 'SLURM_QOS=%s\n' "${SLURM_QOS:-unset}"
   printf 'SLURM_TIME_LIMIT=%s\n' "${SLURM_TIME_LIMIT:-unset}"
   printf 'JOB_CYCLES=%s\n' "${JOB_CYCLES:-unset}"
@@ -39,7 +40,9 @@ chmod +x "$tmp/bash"
 
 assert_horizon() {
   local wrapper=$1 output=$2 actual
-  MODEL_PATH=/checkpoint PATH="$tmp:$PATH" /bin/bash "$repo_dir/$wrapper" \
+  AGENTIC_VBENCH_BACKEND_DIR=/dedicated-agentic-backend \
+    CLAW_EVAL_BACKEND_DIR=/dedicated-claw-backend \
+    MODEL_PATH=/checkpoint PATH="$tmp:$PATH" /bin/bash "$repo_dir/$wrapper" \
     grpo.max_num_steps=20 grpo.max_num_epochs=1 >"$output"
   grep -Fqx 'MAX_STEPS=1000000' "$output"
   actual=$(grep '^ARG=grpo.max_num_steps=' "$output" | tail -1 || true)
@@ -55,7 +58,9 @@ assert_horizon() {
     return 1
   }
 
-  if MAX_STEPS=20 MODEL_PATH=/checkpoint PATH="$tmp:$PATH" /bin/bash \
+  if MAX_STEPS=20 AGENTIC_VBENCH_BACKEND_DIR=/dedicated-agentic-backend \
+    CLAW_EVAL_BACKEND_DIR=/dedicated-claw-backend \
+    MODEL_PATH=/checkpoint PATH="$tmp:$PATH" /bin/bash \
     "$repo_dir/$wrapper" >/dev/null 2>&1; then
     echo "$wrapper accepted a 20-step production horizon" >&2
     return 1
@@ -67,11 +72,27 @@ assert_horizon scripts/agentic_vbench/debug_subagents_async_16n.sh "$tmp/agentic
 assert_horizon scripts/claweval/train_subagents_sync_8n.sh "$tmp/claw-sync.out"
 assert_horizon scripts/claweval/train_subagents_async_16n.sh "$tmp/claw-async.out"
 
+if env -u AGENTIC_VBENCH_BACKEND_DIR \
+  MODEL_PATH=/checkpoint PATH="$tmp:$PATH" /bin/bash \
+  "$repo_dir/scripts/agentic_vbench/debug_subagents_async_16n.sh" \
+  >/dev/null 2>&1; then
+  echo 'Agentic async accepted an implicit/default backend' >&2
+  exit 1
+fi
+if env -u CLAW_EVAL_BACKEND_DIR \
+  MODEL_PATH=/checkpoint PATH="$tmp:$PATH" /bin/bash \
+  "$repo_dir/scripts/claweval/train_subagents_async_16n.sh" \
+  >/dev/null 2>&1; then
+  echo 'ClawEval async accepted an implicit/default backend' >&2
+  exit 1
+fi
+
 for output in \
   "$tmp/agentic-sync.out" \
   "$tmp/agentic-async.out" \
   "$tmp/claw-sync.out" \
   "$tmp/claw-async.out"; do
+  grep -Fqx 'SLURM_ACCOUNT=nemotron_n4_omni' "$output"
   grep -Fqx 'SLURM_QOS=normal' "$output"
   grep -Fqx 'SLURM_TIME_LIMIT=24:00:00' "$output"
   grep -Fqx 'JOB_CYCLES=6' "$output"

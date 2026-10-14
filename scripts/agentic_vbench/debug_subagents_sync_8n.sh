@@ -8,6 +8,7 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd "$script_dir/../.." && pwd)
 
+export SLURM_ACCOUNT=${SLURM_ACCOUNT:-nemotron_n4_omni}
 export CONFIG_IN_CONTAINER=${CONFIG_IN_CONTAINER:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml}
 export NUM_NODES=${NUM_NODES:-8}
 export NUM_GEN_NODES=${NUM_GEN_NODES:-4}

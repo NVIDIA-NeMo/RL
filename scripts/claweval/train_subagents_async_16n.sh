@@ -9,6 +9,8 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd "$script_dir/../.." && pwd)
 
+: "${CLAW_EVAL_BACKEND_DIR:?Set CLAW_EVAL_BACKEND_DIR to the dedicated live async backend}"
+export SLURM_ACCOUNT=${SLURM_ACCOUNT:-nemotron_n4_omni}
 export NUM_NODES=${NUM_NODES:-16}
 export NUM_GEN_NODES=${NUM_GEN_NODES:-8}
 export SEGMENT_SIZE=${SEGMENT_SIZE:-8}
@@ -54,6 +56,8 @@ export NRL_R3_TRACE_VERIFY_FORWARD=${NRL_R3_TRACE_VERIFY_FORWARD:-1}
 export NRL_R3_TRACE_DIR=${NRL_R3_TRACE_DIR:-$repo_dir/results/$BASE_NAME/r3_trace}
 
 inflight_groups=$((NUM_PROMPTS * 3))
+# ReadyFirst's max_staleness_versions is a dispatch-ahead window; late completed
+# groups remain selectable. Audit the realized `lag=` metric during this gate.
 agent=env.nemo_gym.claweval_agent.responses_api_agents.claweval_agent
 exec bash "$script_dir/run_sc.sh" \
   +policy.router_replay.enabled=true \
