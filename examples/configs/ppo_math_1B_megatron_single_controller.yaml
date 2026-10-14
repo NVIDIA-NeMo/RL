@@ -277,6 +277,7 @@ token_capture:
   # direct: native vLLM capture; ordinary per-rollout API keys, no Gym model hop.
   transport: gym
   direct:
+    token_packing: fused  # fused: owned buffer; legacy: tuple then pack (comparison)
     workers: 2
     max_pending_calls: 256
     max_rollouts: 4096

@@ -21,6 +21,7 @@ token_capture:
   enabled: true
   transport: direct   # default: gym
   direct:
+    token_packing: fused  # default; legacy retains tuple-based capture for comparison
     workers: 2
     max_pending_calls: 256
     max_rollouts: 4096
@@ -89,6 +90,23 @@ tensor row per call. Streaming retains delta chunks and the final routing array.
 The HTTP formatter receives a shallow output copy without the routing array, so
 upstream vLLM's own base64 encoder is bypassed too. There is no Gym ledger, prefix
 lookup, tree update, token JSON round trip, or awaited staging operation per call.
+
+`token_capture.direct.token_packing` selects `fused` (default) or `legacy` for
+E2E comparison. Fused capture packs prompt lists directly into an owned int64
+buffer and appends generated tokens; staging uses a tensor view of that buffer.
+It also accepts one-dimensional contiguous native signed-int64 prompt buffers
+(for example, `array("q")` or NumPy int64) and copies their bytes without a Python
+token walk. Other buffer layouts fail capture rather than being reinterpreted.
+Producers must keep the source stable while the captured output is retained,
+until the worker finishes copying it. Subsequent producer mutation cannot change
+the staged tokens. Packing and copying run in the existing background worker.
+
+The pinned [vLLM 0.29 output API](https://github.com/vllm-project/vllm/blob/v0.29.0/vllm/outputs.py)
+supplies prompt token lists, so current vLLM runs use the fused list path. Enabling
+this option does not make vLLM emit packed buffers or eliminate list conversion.
+Packed-input throughput requires a producer that already supplies those buffers.
+Both modes produce the same staged schema, masks, logprobs, and routing alignment;
+neither needs prefix or KV-cache ancestry.
 
 Finalization closes admission for the rollout, waits for active HTTP requests and
 staging jobs, and returns an idempotent receipt containing metadata only. Queue

@@ -19,7 +19,7 @@ from typing import Any
 import torch
 
 from nemo_rl.data_plane.tq_token_sink import TQStagingStore
-from nemo_rl.experience.direct_capture import NativeCall
+from nemo_rl.experience.direct_capture import NativeCall, PackedNativeCall
 
 DIRECT_STAGING_FIELDS = ["direct_tokens", "direct_logprobs", "direct_metadata"]
 
@@ -32,8 +32,25 @@ class NativeCallStore:
     def clear(self, keys: list[str]) -> None:
         self._store.clear(keys)
 
-    def stage(self, call: NativeCall) -> dict[str, Any]:
+    def stage(self, call: NativeCall | PackedNativeCall) -> dict[str, Any]:
         """Serialize token/routing arrays once as tensors; JSON holds scalars only."""
+        if isinstance(call, PackedNativeCall):
+            token_buffer = call.token_ids
+            prompt_length = call.prompt_length
+            generation_length = len(token_buffer) - prompt_length
+            if (
+                token_buffer.typecode != "q"
+                or token_buffer.itemsize != 8
+                or prompt_length <= 0
+                or generation_length <= 0
+                or generation_length != len(call.logprobs)
+            ):
+                raise ValueError("invalid packed native call")
+        else:
+            token_buffer = array("q", call.prompt)
+            token_buffer.extend(call.tokens)
+            prompt_length = len(call.prompt)
+            generation_length = len(call.tokens)
         key = f"direct/{uuid.uuid4().hex}"
         meta = {
             "staging_key": key,
@@ -41,14 +58,9 @@ class NativeCallStore:
             "model_call_id": call.call_id,
             "ordinal": call.ordinal,
             "weight_version": call.weight_version,
-            "prompt_length": len(call.prompt),
-            "generation_length": len(call.tokens),
+            "prompt_length": prompt_length,
+            "generation_length": generation_length,
         }
-        # torch.tensor(list-of-Python-ints) holds the GIL for ~0.8 ms at 32K
-        # tokens on the profiling Mac. Pack once in C, then let torch retain
-        # the buffer; this also avoids an extra concatenated tuple and copy.
-        token_buffer = array("q", call.prompt)
-        token_buffer.extend(call.tokens)
         fields = {
             "direct_tokens": torch.frombuffer(
                 token_buffer, dtype=torch.int64
@@ -66,7 +78,7 @@ class NativeCallStore:
                     "router replay requested but native routes are missing"
                 )
             routes = torch.as_tensor(call.routed_experts)
-            size = len(call.prompt) + len(call.tokens)
+            size = len(token_buffer)
             if routes.ndim != 3 or routes.shape[0] not in (size - 1, size):
                 raise ValueError("native routes do not cover the executed sequence")
             aligned = torch.full((size, *routes.shape[1:]), -1, dtype=torch.int16)

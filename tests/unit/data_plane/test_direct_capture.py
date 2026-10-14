@@ -13,10 +13,15 @@
 # limitations under the License.
 """Production native codec and row assembly using CPU tensors and a memory DP."""
 
+from array import array
+from dataclasses import replace
+from types import SimpleNamespace as NS
+
+import pytest
 import torch
 
 from nemo_rl.data_plane.direct_capture import NativeCallStore
-from nemo_rl.experience.direct_capture import NativeCall
+from nemo_rl.experience.direct_capture import NativeCall, PackedNativeCall, extract_call
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 
 
@@ -43,7 +48,42 @@ class MemoryDataPlane:
             self.rows.pop((partition_id, key))
 
 
-def stage_rollout(dp, *, routed=False):
+@pytest.fixture(params=["legacy", "fused_list", "fused_buffer"])
+def token_packing(request):
+    return request.param
+
+
+def captured_call(call, packing):
+    prompt = list(call.prompt) if packing != "fused_buffer" else array("q", call.prompt)
+    return extract_call(
+        call.rollout_id,
+        call.call_id,
+        call.ordinal,
+        call.weight_version,
+        [
+            NS(
+                prompt_token_ids=prompt,
+                finished=True,
+                outputs=[
+                    NS(
+                        index=0,
+                        token_ids=list(call.tokens),
+                        finish_reason="stop",
+                        logprobs=[
+                            {token: NS(logprob=value)}
+                            for token, value in zip(call.tokens, call.logprobs)
+                        ],
+                        routed_experts=call.routed_experts,
+                    )
+                ],
+            )
+        ],
+        delta=False,
+        packing="legacy" if packing == "legacy" else "fused",
+    )
+
+
+def stage_rollout(dp, *, routed=False, packing="legacy"):
     store = NativeCallStore(dp, "staging", router_replay=routed)
     calls = [
         NativeCall(
@@ -81,13 +121,13 @@ def stage_rollout(dp, *, routed=False):
         "format": "nrl_direct_v1",
         "rollout_id": "r",
         "failure": None,
-        "manifest": [store.stage(call) for call in calls],
+        "manifest": [store.stage(captured_call(call, packing)) for call in calls],
     }
 
 
-def test_native_roundtrip_main_branch_masks_and_excluded_calls():
+def test_native_roundtrip_main_branch_masks_and_excluded_calls(token_packing):
     dp = MemoryDataPlane()
-    receipt = stage_rollout(dp, routed=True)
+    receipt = stage_rollout(dp, routed=True, packing=token_packing)
     assembler = RolloutReassembler(
         dp,
         partition_id="train",
@@ -109,9 +149,11 @@ def test_native_roundtrip_main_branch_masks_and_excluded_calls():
     assert row.routed_experts[-1].eq(-1).all()
 
 
-def test_native_group_publishes_train_rows_and_clears_all_calls_including_excluded():
+def test_native_group_publishes_train_rows_and_clears_all_calls_including_excluded(
+    token_packing,
+):
     dp = MemoryDataPlane()
-    receipt = stage_rollout(dp)
+    receipt = stage_rollout(dp, packing=token_packing)
     assembler = RolloutReassembler(
         dp,
         partition_id="train",
@@ -137,9 +179,9 @@ def test_native_group_publishes_train_rows_and_clears_all_calls_including_exclud
     assert dp.rows["train", "group_g1"]["sample_mask"].item() == 0
 
 
-def test_native_receipt_rejects_tampered_identity():
+def test_native_receipt_rejects_tampered_identity(token_packing):
     dp = MemoryDataPlane()
-    receipt = stage_rollout(dp)
+    receipt = stage_rollout(dp, packing=token_packing)
     receipt["manifest"][0]["generation_length"] = 900
     assembler = RolloutReassembler(
         dp,
@@ -151,3 +193,18 @@ def test_native_receipt_rejects_tampered_identity():
     row = assembler.finalize_rollout("r", receipt, reward=1)
     assert not row.valid
     assert "identity mismatch" in row.rejection_reason
+
+
+@pytest.mark.parametrize("invalid", ["dtype", "prompt", "logprobs", "empty_generation"])
+def test_packed_staging_rejects_inconsistent_token_layout(invalid):
+    call = PackedNativeCall("r", "c", 0, 0, array("q", [1, 2, 3]), 2, (-0.25,), None)
+    if invalid == "dtype":
+        call = replace(call, token_ids=array("i", [1, 2, 3]))
+    elif invalid == "prompt":
+        call = replace(call, prompt_length=-1)
+    elif invalid == "logprobs":
+        call = replace(call, logprobs=())
+    else:
+        call = replace(call, prompt_length=3)
+    with pytest.raises(ValueError, match="packed native call"):
+        NativeCallStore(MemoryDataPlane(), "staging", router_replay=False).stage(call)
