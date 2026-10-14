@@ -3256,6 +3256,8 @@ class MegatronPolicyWorkerImpl(
 
     def _build_bulk_refit_conversion_tasks(self) -> list[Any]:
         """Use standard Bridge mappings and live parameters for bulk refit."""
+        # NCCL reshard bulk refit always uses megatron_bridge.get_conversion_tasks
+        # for logical, unquantized exports regardless of source weight precision.
         # Defer the optional draft-model helper until building export tasks.
         from nemo_rl.models.megatron.draft import draft_model_detached
 
@@ -3436,20 +3438,21 @@ class MegatronPolicyWorkerImpl(
             ).reshape(1)
             yield param_name, scale_tensor
 
-    def _local_refit_source_spec(
-        self, tensor: torch.Tensor, spec: LocalHFParamSpec
+    def _default_param_spec(
+        self, tensor: torch.Tensor, hf_spec: LocalHFParamSpec
     ) -> LocalParamSpec:
         """Convert the current full parameter to logical weights before HF slicing."""
 
         def pre(base: _RefitSource) -> RefitCtx:
             logical = _dequantize_refit_source(base.tensor)
+            # Select this HF projection's local shard, splitting fused gate/up if needed.
             return RefitCtx(buf=base.hf_view.select(logical).contiguous())
 
         wire_dtype = (
             torch.bfloat16 if _is_quantized_refit_source(tensor) else tensor.dtype
         )
         return LocalParamSpec(
-            base=_RefitSource(tensor, spec), pre=pre, wire_dtype=wire_dtype
+            base=_RefitSource(tensor, hf_spec), pre=pre, wire_dtype=wire_dtype
         )
 
     def _iter_local_hf_param_shards(self) -> Iterator[tuple[str, LocalParamSpec]]:
@@ -3481,11 +3484,11 @@ class MegatronPolicyWorkerImpl(
             if task.global_param_name.endswith("_scale_inv"):
                 continue
 
-            for spec in task.local_hf_param_specs():
-                if is_nccl_reshard_param(spec.name):
+            for hf_spec in task.local_hf_param_specs():
+                if is_nccl_reshard_param(hf_spec.name):
                     yield (
-                        spec.name,
-                        self._local_refit_source_spec(local_tensor, spec),
+                        hf_spec.name,
+                        self._default_param_spec(local_tensor, hf_spec),
                     )
 
     # ------------------------------------------------------------------
@@ -4113,6 +4116,7 @@ class MegatronPolicyWorkerImpl(
         Every spec declares its wire dtype, checked against transfer metadata
         before any source buffers are materialized.
         """
+        # param_map: dict[hf_name: str, spec: LocalParamSpec]
         param_map = dict(self._iter_local_hf_param_shards())
         expert_groups = self._build_expert_groups(param_map)
 

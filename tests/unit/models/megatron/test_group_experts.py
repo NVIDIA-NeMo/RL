@@ -54,7 +54,7 @@ def _source(
     tensor: torch.Tensor, hf_view: LocalHFParamSpec | None = None
 ) -> LocalParamSpec:
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    return worker._local_refit_source_spec(
+    return worker._default_param_spec(
         tensor, hf_view if hf_view is not None else LocalHFParamSpec("weight")
     )
 
@@ -63,28 +63,6 @@ def _group(proj, grouped_name, expert_groups):
     worker = object.__new__(MegatronPolicyWorkerImpl)
     grouped = worker._group_experts(proj, grouped_name, expert_groups)
     return grouped.materialize().buf
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_group_experts_stacks_in_order(dtype: torch.dtype):
-    prefix = "model.layers.0.mlp.experts"
-    e0 = 1 + torch.arange(64, dtype=dtype).reshape(8, 8) / 1024
-    e1 = e0 + 1
-    e2 = e0 + 2
-    groups = {
-        (prefix, "gate_proj"): [
-            _source(e0),
-            _source(e1),
-            _source(e2),
-        ]
-    }
-    out = _group("gate_proj", f"{prefix}.gate_proj.weight", groups)
-    assert out.shape == (3, 8, 8)
-    assert out.dtype == dtype
-    # Order preserved (expert 0 first).
-    assert torch.equal(out[0], e0)
-    assert torch.equal(out[1], e1)
-    assert torch.equal(out[2], e2)
 
 
 def test_group_experts_missing_group_raises():

@@ -210,13 +210,14 @@ def test_megatron_fp8_refit_tasks_preserve_backend_export() -> None:
 
 
 def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
-    """Bridge's FP8 export tasks must reach vLLM as fp8, not dequantized BF16.
+    """The misc/collective vLLM export retains Bridge's physical FP8 payload.
 
     ``_iter_logical_refit_conversion_tasks`` exists so a Megatron inference
-    engine (BF16 or MXFP8 only) can consume quantized training storage. Applying
-    it to the vLLM path would replace the physical fp8 ``...weight`` with BF16
+    engine can consume quantized training storage. Applying
+    it to the vLLM misc/collective path would replace ``...weight`` with BF16
     while its ``..._scale_inv`` sibling passed through untouched, so vLLM would
     rescale BF16 values with a blockwise scale - wrong weights, no error.
+    The NCCL bulk path prepares logical weights through separate source hooks.
     """
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
@@ -1597,7 +1598,7 @@ def test_refit_dequantizes_with_metadata_before_selecting_hf_view(
     monkeypatch.setattr(fp8_utils, "dequantize_fp8_tensor", single_decode)
     monkeypatch.setattr(worker_module, "_dequantize_refit_source_group", grouped_decode)
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
-    spec = worker._local_refit_source_spec(source, LocalHFParamSpec("gate", -2, 0, 2))
+    spec = worker._default_param_spec(source, LocalHFParamSpec("gate", -2, 0, 2))
     assert spec.wire_dtype == torch.bfloat16
 
     for _ in range(2):
@@ -1648,7 +1649,7 @@ def test_megatron_refit_quantized_hooks_read_current_fused_source(
     prefix = "model.layers.0.mlp.experts"
     groups = {
         (prefix, proj): [
-            worker._local_refit_source_spec(
+            worker._default_param_spec(
                 source,
                 LocalHFParamSpec(f"{prefix}.{index}.{proj}.weight", -2, split, 2),
             )
@@ -1762,7 +1763,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
                 name = f"{layer}.mlp.{proj}_proj.weight"
                 yield (
                     name,
-                    worker._local_refit_source_spec(
+                    worker._default_param_spec(
                         source,
                         LocalHFParamSpec(name, -2, split_index, 2),
                     ),
@@ -1868,7 +1869,7 @@ def test_megatron_refit_pre_hooks_use_current_cuda_stream(
         monkeypatch.setattr(
             worker_module, "_dequantize_refit_source_group", dequantize_group
         )
-        member = worker._local_refit_source_spec(
+        member = worker._default_param_spec(
             quantized_source, LocalHFParamSpec("gate", -2, 0, 2)
         )
         prefix = "model.layers.0.mlp.experts"

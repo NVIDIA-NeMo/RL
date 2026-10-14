@@ -146,13 +146,6 @@ def test_check_nccl_reshard_refit_support_collects_without_vllm_cfg() -> None:
     assert "policy.generation.backend must be 'vllm'" in str(exc_info.value)
 
 
-def test_check_nccl_reshard_refit_support_accepts_bf16_to_mxfp8() -> None:
-    config = _valid_nccl_reshard_config()
-    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
-
-    check_nccl_reshard_refit_support(config)
-
-
 @pytest.mark.parametrize("trainer_precision", ["float16", "float32", "bfloat16"])
 @pytest.mark.parametrize("gen_precision", ["float16", "float32", "bfloat16", "fp8"])
 @pytest.mark.parametrize("source_recipe", [None, "mxfp8"])

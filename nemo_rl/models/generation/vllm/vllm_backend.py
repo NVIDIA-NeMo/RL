@@ -1897,14 +1897,15 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         ) -> LocalParamSpec:
             scale_slice = None
             if merged_slice is not None:
-                # Gate/up split only the block-aligned intermediate dimension.
-                axis = value_param.ndim - 2
-                rows = merged_slice[axis]
-                scale_slices = list(merged_slice)
+                # Example: w13_weight [E=8, 2048, 4096], blocks [128, 128],
+                # and gate slice [:, 0:1024, :] into scales [8, 16, 32].
+                axis = value_param.ndim - 2  # 3 - 2 = 1: intermediate dimension.
+                rows = merged_slice[axis]  # Weight rows 0:1024.
+                scale_slices = list(merged_slice)  # [:, 0:1024, :].
                 scale_slices[axis] = slice(
                     rows.start // block_size[0], rows.stop // block_size[0]
-                )
-                scale_slice = tuple(scale_slices)
+                )  # Scale rows 0:8 (up uses 8:16).
+                scale_slice = tuple(scale_slices)  # [:, 0:8, :], shape [8, 8, 32].
 
             def pre(_base: torch.Tensor) -> RefitCtx:
                 value_region = (
@@ -1931,7 +1932,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 if ctx.buf.ndim == 2:
                     value, scale = cast_tensor_to_fp8_blockwise(ctx.buf, block_size)
                     scale = scale.squeeze(-1)
-                else:
+                else:  # ndim == 3: grouped experts.
                     value = torch.empty_like(ctx.buf, dtype=value_param.dtype)
                     scale = torch.empty_like(ctx.extra["scale_region"])
                     for expert, weight in enumerate(ctx.buf.unbind(0)):
@@ -2004,7 +2005,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         f"{scale_names!r}"
                     )
                 block_size = None
-                if scale_name.endswith("_scale_inv"):
+                if scale_name.endswith("_scale_inv"):  # Blockwise FP8.
                     module_name = vllm_name.rsplit(".", 1)[0]
                     module = vllm_modules.get(module_name)
                     if module is None:
@@ -2020,13 +2021,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                             f"Unsupported FP8 weight block size {block_size}"
                         )
                     scale_region = scale_param
+                    # Blockwise FP8 has one scale per 2D weight block.
                     expected_scale_shape = (
                         *vllm_param.shape[:-2],
                         (vllm_param.shape[-2] + block_size[0] - 1) // block_size[0],
                         (vllm_param.shape[-1] + block_size[1] - 1) // block_size[1],
                     )
                     expected_scale_dtype = torch.float32
-                else:
+                else:  # MXFP8.
                     value_region = (
                         vllm_param if merged_slice is None else vllm_param[merged_slice]
                     )

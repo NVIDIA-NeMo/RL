@@ -45,13 +45,7 @@ single `ValueError` listing every violation. The current requirements are:
   configured ETP. An explicitly requested generation-side ETP > 1 with
   `inference_optimized` is rejected by config key name rather than surfacing as
   a raw MCore assert at model build.
-* **Supported precisions:** BF16, FP16, FP32, Transformer Engine scalar or blockwise FP8,
-  and MXFP8 sources; unquantized, blockwise FP8, and MXFP8 destinations.
-  Megatron blockwise FP8 destinations require Transformer Engine layers;
-  `inference_optimized` supports MXFP8. Blockwise FP8 training storage with
-  vLLM still requires `precision='fp8'`, `is_mx=false` because of the misc path.
-  TE FP8 generation over unquantized parameters requires
-  `disable_parameter_transpose_cache=true` so refits refresh its compute weights.
+* **Supported precisions** are listed in the table below.
 * Megatron generation accepts unquantized or supported Transformer Engine FP8 training
   parameter storage, including blockwise FP8 and MXFP8 with `fp8_param=true`.
   Quantized sources are materialized as logical BF16 for transport; the
@@ -64,15 +58,6 @@ single `ValueError` listing every violation. The current requirements are:
   persistent DDP/autograd views remain valid; ordinary gradient buffers and
   optimizer state are offloaded only when
   `policy.offload_policy_before_refit` is true.
-* **Bulk transfers use canonical HF layout, with experts grouped for efficiency.**
-  `group_expert_params_in_metadata` defines one transfer per expert group and
-  projection, adding a leading expert dimension to the HF weight layout.
-  Source hooks prepare that complete group rather than independent expert buffers.
-  Quantized sources are dequantized
-  to `torch.bfloat16`; unquantized sources retain their original dtype.
-  Source `ctx.buf`, advertised metadata, and receiver buffers share that dtype.
-  Destination hooks own storage conversion and quantization. The misc path and
-  other refit transports retain their existing behavior.
 * BF16 FlashInfer TRTLLM MoE is supported through vLLM's native
   layerwise-reload path. Its grouped expert weights must use expert-parallel
   destination sharding with linear expert placement; tensor-sharded expert
@@ -98,7 +83,29 @@ single `ValueError` listing every violation. The current requirements are:
   rollouts refit through vLLM's layerwise-reload weight loaders, which the bulk
   `xferdtensor` writes bypass.
 
-Operational knobs:
+### Precision support
+
+The table describes supported storage combinations, subject to the backend and
+shard-layout requirements in this document.
+
+| Training parameter storage | vLLM unquantized | vLLM blockwise FP8 | vLLM MXFP8 | Megatron unquantized | Megatron blockwise FP8 | Megatron MXFP8 |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| BF16 / FP16 / FP32 (`fp8_param=false`) | ✅ | ✅ | ✅* | ✅ | ✅ | ✅ |
+| TE scalar FP8 (`fp8_param=true`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| TE blockwise FP8 (`fp8_param=true`) | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ |
+| TE MXFP8 (`fp8_param=true`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+* `*` vLLM's MXFP8 quantizer accepts BF16/FP16 input. Unquantized FP32 sources
+  retain FP32 on the wire and are not supported by this destination hook.
+* Blockwise FP8 training storage with vLLM requires `precision='fp8'`, `is_mx=false`
+  because the unchanged misc path exports physical FP8 weights and inverse scales.
+* Megatron blockwise FP8 destinations require Transformer Engine layers.
+  `inference_optimized` supports MXFP8 with `inference_grouped_gemm_backend` set to
+  `torch` or `flashinfer`.
+* TE FP8 generation over unquantized parameters requires
+  `disable_parameter_transpose_cache=true` so refits refresh its compute weights.
+
+### Operational knobs
 
 * `NRL_REFIT_NUM_STREAMS` (default `2`) — number of CUDA streams the generation side
   uses to overlap per-PP-stage bulk reshards. Having higher number can increase
@@ -148,6 +155,49 @@ The feature is integrated into the `nemo_rl/weight_sync/` framework. For vLLM,
 For Megatron generation, the existing `MegatronWeightSynchronizer` retains ownership of
 the inference-engine lifecycle and delegates only the transfer to an
 `NcclReshardWeightSynchronizer`.
+
+### Quantized parameter support
+
+Training and generation backends can store the same logical weight with different
+precision formats, fused layouts, and interleaving. The bulk path uses canonical HF
+layout so the transfer loop does not need to understand those storage differences.
+For quantized parameters, the workflow is **dequantize → BF16 transfer → requantize**:
+
+1. The source `pre(base)` hook reads the current weight and its quantization metadata,
+   dequantizes it to BF16, then selects the canonical HF slice into `ctx.buf`.
+2. The transfer uses that BF16 buffer, with matching metadata and receiver staging.
+3. The destination `post(ctx)` hook assembles any fused weight and quantizes it into
+   local storage, updating its weight and scales together. An unquantized destination
+   stores the received logical weight without requantization.
+
+This keeps source preparation and destination commit in the hooks, allowing new
+storage formats without changing the transfer loop. Unquantized sources retain their
+original BF16, FP16, or FP32 dtype; `LocalParamSpec.wire_dtype`, metadata, and buffers
+must agree. The misc path and other refit transports retain their existing behavior.
+
+### Grouped expert efficiency
+
+`group_expert_params_in_metadata` combines per-expert HF entries into one transfer
+per expert group and projection, adding a leading expert dimension to the HF layout.
+For quantized sources, the hook packs the group's encoded weights and scales,
+dequantizes the group once, then selects gate, up, or down into
+`[num_local_experts, ...]`. Gate and up each
+decode the complete fused group independently. Hooks read current weights and scales
+on every refit without a shared source cache.
+
+Grouping reduces dequantization and transfer launches. The vLLM MXFP8 destination
+also quantizes the received expert group together; its blockwise FP8 hook currently
+quantizes each expert within the group. Destination hooks preserve the assembly needed
+for fused weights and commit the corresponding scales.
+
+Grouped quantized source preparation requires rowwise primary model weights and
+compact MXFP8 scales. MXFP8 shard dimensions must align to 32; blockwise FP8
+dimensions must align to 128 for either 1D or 2D scaling. Encoded weights are
+concatenated without padding or shape repair. Only the combined scale metadata
+is padded, after removing unused per-expert scale entries. Scalar FP8 preserves
+each expert's scale. Columnwise-only and swizzled compute layouts are rejected.
+The generic misc and `refit_transport=null` conversion paths keep their existing
+dequantization behavior.
 
 ### Execution Flow: Setup Time
 
@@ -211,10 +261,8 @@ advertised metadata. Grouped experts declare one common wire dtype.
   parameter values, dequantizes quantized storage, selects the corresponding HF
   slice, and produces a contiguous buffer in the advertised dtype. Selection follows
   dequantization so fused gate/up slices use the complete source's quantization metadata.
-  Grouped MoE hooks pack the ordered experts' encoded weights and scales, decode
-  the entire group once, then select the HF projection into
-  `[num_local_experts, ...]`. Fused gate and up transfers each decode the complete
-  group independently. The hooks retain live parameter references and HF selectors;
+  Grouped MoE hooks prepare the complete expert group as described above.
+  The hooks retain live parameter references and HF selectors;
   they read current weights and scales each time. There is no shared source cache
   or cache lifecycle in the transfer loop.
 * On the **generation side**, canonical storage matching the transfer dtype can
@@ -225,15 +273,6 @@ advertised metadata. Grouped experts declare one common wire dtype.
   FlashInfer TRTLLM grouped experts instead receive into canonical EP-local staging
   tensors; `post` loads each logical expert with its global expert ID through vLLM's
   native weight loader.
-
-Grouped quantized source preparation requires rowwise primary model weights and
-compact MXFP8 scales. MXFP8 shard dimensions must align to 32; blockwise FP8
-dimensions must align to 128 for either 1D or 2D scaling. Encoded weights are
-concatenated without padding or shape repair. Only the combined scale metadata
-is padded, after removing unused per-expert scale entries. Scalar FP8 preserves
-each expert's scale. Columnwise-only and swizzled compute layouts are rejected.
-The generic misc and `refit_transport=null` conversion paths keep their existing
-dequantization behavior.
 
 ### Execution Flow: Refit Time
 

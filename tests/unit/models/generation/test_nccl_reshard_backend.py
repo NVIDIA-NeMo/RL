@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the vLLM-side nccl_reshard refit mapping (CPU, no GPU).
+"""Unit tests for the vLLM-side nccl_reshard mapping and receive hooks.
 
 Covers the FFN-only bulk path in ``nemo_rl/models/generation/vllm/vllm_backend.py``
 (``_build_hf_to_gen_backend_mapping`` + ``build_hf_to_local_param_map``), driven by
-a synthetic ``refit_info`` and a fake ``named_parameters()`` (no real vLLM model,
-no GPU).
+a synthetic ``refit_info`` and a fake ``named_parameters()`` (no real vLLM model).
+Mapping tests run on CPU; the MXFP8 quantizer integration test requires CUDA.
 
 ``vllm_backend`` does ``import vllm`` at module top, so these are vllm-marked and
 skipped where vllm is unavailable.
