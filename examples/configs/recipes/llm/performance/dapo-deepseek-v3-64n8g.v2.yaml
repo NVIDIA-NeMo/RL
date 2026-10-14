@@ -77,8 +77,12 @@ policy:
     vllm_cfg:
       async_engine: false
       tensor_parallel_size: 64
-      enforce_eager: true
     vllm_kwargs:
+      compilation_config:
+        # CUDA graphs (PIECEWISE) instead of enforce_eager. Not validated with a same-window A/B (64-node arms exceeded the
+        # resource budget), and FULL_AND_PIECEWISE was not tried; against CI history on the same container and code,
+        # generation/step -33% and wall 95 -> 77 min with check_metrics passing. See the rollout-perf skill (#4556).
+        cudagraph_mode: PIECEWISE
       # vLLM 0.20's default FlashInfer TRTLLM MoE backend isn't refit-compatible,
       # change to triton to keep same behavior as vLLM 0.17.
       moe_backend: triton
