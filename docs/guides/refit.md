@@ -112,6 +112,13 @@ policy:
         - model.layers.*.mlp.gate  # keep the router in BF16
 ```
 
+Unlike `vllm_cfg.quantization_ignore_patterns`, the default scope is routed experts
+only (vLLM quantizes every linear layer and the experts), and a list replaces that
+default instead of being appended to vLLM's ignore set. For example,
+`["*attn*"]` quantizes everything except attention, including routers and shared
+experts, unless they are also listed. The key is accepted for both block-FP8 and
+MXFP8 (vLLM requires MXFP8).
+
 This quantizes attention and the experts of a Qwen3 MoE model. List routers,
 shared experts, linear attention, and vision or MTP modules explicitly for models
 that have them. Setup fails if the patterns ignore every weight.

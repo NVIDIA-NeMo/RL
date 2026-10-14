@@ -30,6 +30,7 @@ from nemo_rl.models.generation.constants import (
     DYNAMO_BACKEND,
     MEGATRON_BACKEND,
     SGLANG_BACKEND,
+    TRTLLM_BACKEND,
     VLLM_BACKEND,
 )
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -61,7 +62,7 @@ def validate_offload_policy_before_refit(
         (None, "nccl_reshard")
         if generation_backend == VLLM_BACKEND
         else (None,)
-        if generation_backend == "trtllm"
+        if generation_backend == TRTLLM_BACKEND
         else (None, "mcore", "nccl_reshard")
         if generation_backend == MEGATRON_BACKEND
         else ()
@@ -114,7 +115,7 @@ def create_weight_synchronizer(
         SGLANG_BACKEND,
         MEGATRON_BACKEND,
         DYNAMO_BACKEND,
-        "trtllm",
+        TRTLLM_BACKEND,
     }
     if generation_backend not in _SUPPORTED_BACKENDS:
         raise ValueError(
