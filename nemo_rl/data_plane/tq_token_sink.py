@@ -34,6 +34,7 @@ use.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
         StageResult,
     )
 
+from nemo_rl.data_plane.async_utils import call_data_plane, complete_before_cancellation
 from nemo_rl.data_plane.schema import (
     PER_TOKEN_STAGING_FIELDS,
     ROUTE_ENCODING_ENVELOPE,
@@ -346,6 +348,33 @@ class TQStagingStore:
             tags=[tags or {}],
         )
 
+    async def async_put(
+        self,
+        key: str,
+        field_dict: dict[str, torch.Tensor],
+        *,
+        tags: dict[str, Any] | None = None,
+    ) -> None:
+        """Write a row through the client's awaited data-plane interface."""
+        await call_data_plane(
+            self._dp_client,
+            "async_put_samples",
+            sample_ids=[key],
+            partition_id=self._staging_partition,
+            fields=TensorDict(field_dict, batch_size=[1]),
+            tags=[tags or {}],
+        )
+
+    async def async_clear(self, keys: list[str]) -> None:
+        """Await cleanup of staged keys through the client's async interface."""
+        if keys:
+            await call_data_plane(
+                self._dp_client,
+                "async_clear_samples",
+                sample_ids=list(keys),
+                partition_id=self._staging_partition,
+            )
+
     def get(self, keys: list[str], *, select_fields: list[str]) -> TensorDict:
         return _call_dp(
             self._dp_client,
@@ -367,7 +396,7 @@ class TQStagingStore:
 
 
 class TQTokenSink:
-    """Gym ``StagingSink`` over ``DataPlaneClient.put_samples``.
+    """Gym synchronous and asynchronous sinks over the data-plane interface.
 
     ``stage`` is synchronous and returns only after TQ acknowledged the
     write, so the capture layer's fail-closed ordering (bytes durable before
@@ -378,6 +407,10 @@ class TQTokenSink:
     ``stage`` is thread-safe per the ``StagingSink`` contract: it holds no
     per-call mutable state, so the capture host may run writes for unrelated
     calls concurrently.
+
+    ``async_stage`` awaits the same combined write and returns the same result.
+    Cancellation settles any submitted write and reclaims its key before it
+    propagates, so an abandoned call cannot publish data after cleanup.
 
     ``capture_media`` mirrors the staging partition's schema: a media-enabled
     partition registers ``MEDIA_STAGING_FIELDS`` and every row written here
@@ -406,170 +439,17 @@ class TQTokenSink:
         *,
         attachments: Mapping[str, Any] | None = None,
     ) -> StageResult:
-        """Write the token row and its media attachments in one ``put``.
-
-        Success is returned only after the combined write was acknowledged,
-        so ``staged`` coordinates vouch for tokens and pixels together. TQ has
-        no transactional rollback: if the write raises, the attempted key is
-        discarded best-effort before the failure is reported (see
-        ``_discard_failed_write``).
-        """
+        """Acknowledge the combined token/media write only after it completes."""
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
 
         key = record.staging_key
         write_started = False
         try:
-            if attachments is not None and not self._capture_media:
-                raise ValueError(
-                    "media attachments require a media-enabled staging partition"
-                )
-            media = validate_media_tensors(attachments)
-            media_columns: dict[str, torch.Tensor] | None = None
-            if self._capture_media:
-                if self._media_pixel_dtype is None:
-                    raise ValueError("media-enabled staging requires media_pixel_dtype")
-                if media is not None and media.imgs.dtype != self._media_pixel_dtype:
-                    raise ValueError(
-                        f"media imgs dtype {media.imgs.dtype} does not match the "
-                        f"staging column dtype {self._media_pixel_dtype}"
-                    )
-                media_columns = _media_columns(
-                    media, _media_sentinels(self._media_pixel_dtype)
-                )
-            field_dict = {
-                "token_ids_delta": torch.from_numpy(
-                    np.array([record.token_ids_delta], dtype=np.int64)
-                ),
-                "token_mask_delta": torch.from_numpy(
-                    np.array([record.token_mask_delta], dtype=np.float32)
-                ),
-                "generation_logprobs_delta": torch.from_numpy(
-                    np.array([record.generation_log_probs_delta], dtype=np.float32)
-                ),
-                "schema_version": torch.tensor(
-                    [record.schema_version], dtype=torch.int64
-                ),
-                "digest_version": torch.tensor(
-                    [record.digest_version], dtype=torch.int64
-                ),
-                "extras_digest_version": torch.tensor(
-                    [record.extras_digest_version], dtype=torch.int64
-                ),
-                "rollout_id_utf8": _bytes_tensor(record.rollout_id.encode("utf-8")),
-                "model_call_id_utf8": _bytes_tensor(
-                    record.model_call_id.encode("utf-8")
-                ),
-                "parent_call_id_utf8": _bytes_tensor(
-                    (record.parent_call_id or "\0").encode("utf-8")
-                ),
-                "parent_call_id_present": torch.tensor(
-                    [record.parent_call_id is not None], dtype=torch.bool
-                ),
-                "capture_mode": torch.tensor(
-                    [_MODE_TO_CODE[record.mode]], dtype=torch.int64
-                ),
-                "prev_len": torch.tensor([record.prev_len], dtype=torch.int64),
-                "delta_len": torch.tensor([record.delta_len], dtype=torch.int64),
-                "cum_len": torch.tensor([record.cum_len], dtype=torch.int64),
-                "weight_version": torch.tensor(
-                    [record.weight_version], dtype=torch.int64
-                ),
-                "digest_bytes": _bytes_tensor(bytes.fromhex(record.digest)),
-                "extras_digest_bytes": _bytes_tensor(
-                    bytes.fromhex(record.extras_digest)
-                ),
-            }
-            chain_hash, chain_hash_present = _optional_digest_fields(record.chain_hash)
-            cumulative_hash, cumulative_hash_present = _optional_digest_fields(
-                record.cumulative_hash
-            )
-            field_dict.update(
-                {
-                    "chain_hash_bytes": chain_hash,
-                    "chain_hash_present": chain_hash_present,
-                    "cumulative_hash_bytes": cumulative_hash,
-                    "cumulative_hash_present": cumulative_hash_present,
-                }
-            )
-            extras_metadata = dict(record.extras) if record.extras is not None else None
-            routed = (
-                extras_metadata.pop("routed_experts", None)
-                if extras_metadata is not None
-                else None
-            )
-            metadata_json = json.dumps(
-                extras_metadata,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            ).encode("utf-8")
-            field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(metadata_json)
-            if self._capture_media:
-                # Detect metadata corruption without loading route or pixel tensors.
-                # This checksum is independent of Gym's combined extras commitment.
-                field_dict[MEDIA_METADATA_DIGEST_FIELD] = _bytes_tensor(
-                    hashlib.sha256(metadata_json).digest()
-                )
-            routed_len = 0
-            routed_encoding = ROUTE_ENCODING_NONE
-            if routed is not None:
-                delta_len = len(record.token_ids_delta)
-                if isinstance(routed, str):
-                    from nemo_rl.utils.routed_experts_codec import (
-                        decode_routed_experts,
-                    )
-
-                    dtype_name = routed.split(":", 3)[1]
-                    dtype = {
-                        "int8": torch.int8,
-                        "int16": torch.int16,
-                        "int32": torch.int32,
-                    }.get(dtype_name)
-                    if dtype is None:
-                        raise ValueError(
-                            f"unsupported routed_experts dtype {dtype_name!r}"
-                        )
-                    experts = decode_routed_experts(routed, dtype)
-                    routed_encoding = ROUTE_ENCODING_ENVELOPE
-                else:
-                    experts = torch.tensor(routed, dtype=torch.int16)
-                    routed_encoding = ROUTE_ENCODING_LIST
-                expected_len = delta_len + boundary_route_rows(record.prev_len)
-                if experts.dim() != 3 or experts.shape[0] != expected_len:
-                    raise ValueError(
-                        "routed_experts must already be delta-aligned: "
-                        f"got shape {tuple(experts.shape)} for "
-                        f"prev_len={record.prev_len}, delta_len={delta_len} "
-                        f"(expected {expected_len} rows)"
-                    )
-                field_dict[ROUTED_EXPERTS_FIELD] = experts.unsqueeze(0)
-                routed_len = int(experts.shape[0])
-            field_dict[ROUTED_EXPERTS_ENCODING_FIELD] = torch.tensor(
-                [routed_encoding], dtype=torch.int64
-            )
-            field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
-            if media_columns is not None:
-                field_dict.update(media_columns)
-            tags = [
-                {
-                    "rollout_id": record.rollout_id,
-                    "model_call_id": record.model_call_id,
-                    "parent_call_id": record.parent_call_id,
-                    "prev_len": record.prev_len,
-                    "delta_len": record.delta_len,
-                    "cum_len": record.cum_len,
-                    "weight_version": record.weight_version,
-                    "digest": record.digest,
-                    "schema_version": record.schema_version,
-                }
-            ]
+            field_dict, tags = self._stage_payload(record, attachments)
             write_started = True
-            self._store.put(key, field_dict, tags=tags[0])
-        except Exception as error:  # noqa: BLE001 — any failure must poison, not crash serving
-            # The reason string is dropped downstream (_failed_coords carries
-            # only the disposition) — this log line is the only place the
-            # actual stage failure is visible.
+            self._store.put(key, field_dict, tags=tags)
+        except Exception as error:  # noqa: BLE001 — capture failure boundary
             logging.getLogger(__name__).warning(
                 "TQTokenSink.stage failed for %s: %s: %s",
                 key,
@@ -582,6 +462,188 @@ class TQTokenSink:
                 ok=False, staging_key=key, error=f"{type(error).__name__}: {error}"
             )
         return StageResult(ok=True, staging_key=key)
+
+    async def async_stage(
+        self,
+        record: StagedCallRecord,
+        *,
+        attachments: Mapping[str, Any] | None = None,
+    ) -> StageResult:
+        """Acknowledge the combined token/media write only after it completes."""
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.records import StageResult
+
+        key = record.staging_key
+        write_started = False
+        try:
+            field_dict, tags = self._stage_payload(record, attachments)
+            write_started = True
+            await complete_before_cancellation(
+                self._store.async_put(key, field_dict, tags=tags)
+            )
+        except asyncio.CancelledError:
+            # The submitted write has settled before ownership reaches cleanup.
+            # Drain cleanup as well, including repeated cancellation at shutdown.
+            if write_started:
+                await complete_before_cancellation(
+                    self._discard_failed_write_async(key)
+                )
+            raise
+        except Exception as error:  # noqa: BLE001 — capture failure boundary
+            logging.getLogger(__name__).warning(
+                "TQTokenSink.stage failed for %s: %s: %s",
+                key,
+                type(error).__name__,
+                error,
+            )
+            if write_started:
+                await complete_before_cancellation(
+                    self._discard_failed_write_async(key)
+                )
+            return StageResult(
+                ok=False, staging_key=key, error=f"{type(error).__name__}: {error}"
+            )
+        return StageResult(ok=True, staging_key=key)
+
+    def _stage_payload(
+        self,
+        record: StagedCallRecord,
+        attachments: Mapping[str, Any] | None,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        """Build identical token, route and media columns for both I/O paths."""
+        if attachments is not None and not self._capture_media:
+            raise ValueError(
+                "media attachments require a media-enabled staging partition"
+            )
+        media = validate_media_tensors(attachments)
+        media_columns: dict[str, torch.Tensor] | None = None
+        if self._capture_media:
+            if self._media_pixel_dtype is None:
+                raise ValueError("media-enabled staging requires media_pixel_dtype")
+            if media is not None and media.imgs.dtype != self._media_pixel_dtype:
+                raise ValueError(
+                    f"media imgs dtype {media.imgs.dtype} does not match the "
+                    f"staging column dtype {self._media_pixel_dtype}"
+                )
+            media_columns = _media_columns(
+                media, _media_sentinels(self._media_pixel_dtype)
+            )
+        field_dict = {
+            "token_ids_delta": torch.from_numpy(
+                np.array([record.token_ids_delta], dtype=np.int64)
+            ),
+            "token_mask_delta": torch.from_numpy(
+                np.array([record.token_mask_delta], dtype=np.float32)
+            ),
+            "generation_logprobs_delta": torch.from_numpy(
+                np.array([record.generation_log_probs_delta], dtype=np.float32)
+            ),
+            "schema_version": torch.tensor([record.schema_version], dtype=torch.int64),
+            "digest_version": torch.tensor([record.digest_version], dtype=torch.int64),
+            "extras_digest_version": torch.tensor(
+                [record.extras_digest_version], dtype=torch.int64
+            ),
+            "rollout_id_utf8": _bytes_tensor(record.rollout_id.encode("utf-8")),
+            "model_call_id_utf8": _bytes_tensor(record.model_call_id.encode("utf-8")),
+            "parent_call_id_utf8": _bytes_tensor(
+                (record.parent_call_id or "\0").encode("utf-8")
+            ),
+            "parent_call_id_present": torch.tensor(
+                [record.parent_call_id is not None], dtype=torch.bool
+            ),
+            "capture_mode": torch.tensor(
+                [_MODE_TO_CODE[record.mode]], dtype=torch.int64
+            ),
+            "prev_len": torch.tensor([record.prev_len], dtype=torch.int64),
+            "delta_len": torch.tensor([record.delta_len], dtype=torch.int64),
+            "cum_len": torch.tensor([record.cum_len], dtype=torch.int64),
+            "weight_version": torch.tensor([record.weight_version], dtype=torch.int64),
+            "digest_bytes": _bytes_tensor(bytes.fromhex(record.digest)),
+            "extras_digest_bytes": _bytes_tensor(bytes.fromhex(record.extras_digest)),
+        }
+        chain_hash, chain_hash_present = _optional_digest_fields(record.chain_hash)
+        cumulative_hash, cumulative_hash_present = _optional_digest_fields(
+            record.cumulative_hash
+        )
+        field_dict.update(
+            {
+                "chain_hash_bytes": chain_hash,
+                "chain_hash_present": chain_hash_present,
+                "cumulative_hash_bytes": cumulative_hash,
+                "cumulative_hash_present": cumulative_hash_present,
+            }
+        )
+        extras_metadata = dict(record.extras) if record.extras is not None else None
+        routed = (
+            extras_metadata.pop("routed_experts", None)
+            if extras_metadata is not None
+            else None
+        )
+        metadata_json = json.dumps(
+            extras_metadata,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(metadata_json)
+        if self._capture_media:
+            # Detect metadata corruption without loading route or pixel tensors.
+            # This checksum is independent of Gym's combined extras commitment.
+            field_dict[MEDIA_METADATA_DIGEST_FIELD] = _bytes_tensor(
+                hashlib.sha256(metadata_json).digest()
+            )
+        routed_len = 0
+        routed_encoding = ROUTE_ENCODING_NONE
+        if routed is not None:
+            delta_len = len(record.token_ids_delta)
+            if isinstance(routed, str):
+                from nemo_rl.utils.routed_experts_codec import (
+                    decode_routed_experts,
+                )
+
+                dtype_name = routed.split(":", 3)[1]
+                dtype = {
+                    "int8": torch.int8,
+                    "int16": torch.int16,
+                    "int32": torch.int32,
+                }.get(dtype_name)
+                if dtype is None:
+                    raise ValueError(f"unsupported routed_experts dtype {dtype_name!r}")
+                experts = decode_routed_experts(routed, dtype)
+                routed_encoding = ROUTE_ENCODING_ENVELOPE
+            else:
+                experts = torch.tensor(routed, dtype=torch.int16)
+                routed_encoding = ROUTE_ENCODING_LIST
+            expected_len = delta_len + boundary_route_rows(record.prev_len)
+            if experts.dim() != 3 or experts.shape[0] != expected_len:
+                raise ValueError(
+                    "routed_experts must already be delta-aligned: "
+                    f"got shape {tuple(experts.shape)} for "
+                    f"prev_len={record.prev_len}, delta_len={delta_len} "
+                    f"(expected {expected_len} rows)"
+                )
+            field_dict[ROUTED_EXPERTS_FIELD] = experts.unsqueeze(0)
+            routed_len = int(experts.shape[0])
+        field_dict[ROUTED_EXPERTS_ENCODING_FIELD] = torch.tensor(
+            [routed_encoding], dtype=torch.int64
+        )
+        field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
+        if media_columns is not None:
+            field_dict.update(media_columns)
+        tags = [
+            {
+                "rollout_id": record.rollout_id,
+                "model_call_id": record.model_call_id,
+                "parent_call_id": record.parent_call_id,
+                "prev_len": record.prev_len,
+                "delta_len": record.delta_len,
+                "cum_len": record.cum_len,
+                "weight_version": record.weight_version,
+                "digest": record.digest,
+                "schema_version": record.schema_version,
+            }
+        ]
+        return field_dict, tags[0]
 
     def _discard_failed_write(self, key: str) -> None:
         """Reclaim whatever a failed combined write may have left behind.
@@ -597,6 +659,19 @@ class TQTokenSink:
         try:
             self._store.clear([key])
         except Exception as error:  # noqa: BLE001 — cleanup must not mask the stage failure
+            logging.getLogger(__name__).error(
+                "TQTokenSink could not discard the failed write for %s: %s: %s; "
+                "the staging partition may retain orphaned field keys",
+                key,
+                type(error).__name__,
+                error,
+            )
+
+    async def _discard_failed_write_async(self, key: str) -> None:
+        """Reclaim an unacknowledged row after its asynchronous write settles."""
+        try:
+            await self._store.async_clear([key])
+        except Exception as error:  # noqa: BLE001 — preserve the stage failure
             logging.getLogger(__name__).error(
                 "TQTokenSink could not discard the failed write for %s: %s: %s; "
                 "the staging partition may retain orphaned field keys",

@@ -38,16 +38,27 @@ again on both sides, so it is a debugging tool, not a metric. See
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import logging
 import zlib
 from bisect import bisect_left
-from collections.abc import Iterator, Sequence
+from collections.abc import Awaitable, Coroutine, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+from functools import wraps
 from pathlib import Path
 from time import monotonic
-from typing import Any, Callable, Literal, TypedDict, TypeGuard
+from typing import (
+    Any,
+    Callable,
+    Concatenate,
+    Literal,
+    ParamSpec,
+    TypedDict,
+    TypeGuard,
+    TypeVar,
+)
 
 EventStatus = Literal["ok", "error", "timeout"]
 
@@ -65,6 +76,7 @@ import numpy as np
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict, TensorDictBase
 
+from nemo_rl.data_plane.async_utils import complete_before_cancellation
 from nemo_rl.data_plane.codec import drain_codec_ms
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.telemetry.instrumentation import (
@@ -1271,6 +1283,43 @@ class DataPlaneStats:
     hash_verify: HashStats = field(default_factory=HashStats)
 
 
+@dataclass
+class _AsyncTiming:
+    """Inner-call time owned by one operation, including hash-read retries."""
+
+    inner_ms: float = 0.0
+
+
+_AsyncParams = ParamSpec("_AsyncParams")
+_AsyncResult = TypeVar("_AsyncResult")
+
+
+def _complete_observed_operation(
+    fn: Callable[
+        Concatenate[MetricsDataPlaneClient, _AsyncParams],
+        Coroutine[Any, Any, _AsyncResult],
+    ],
+) -> Callable[
+    Concatenate[MetricsDataPlaneClient, _AsyncParams], Coroutine[Any, Any, _AsyncResult]
+]:
+    """Finish accounting before cancellation or lifecycle operations can proceed."""
+
+    @wraps(fn)
+    async def wrapped(
+        self: MetricsDataPlaneClient,
+        *args: _AsyncParams.args,
+        **kwargs: _AsyncParams.kwargs,
+    ) -> _AsyncResult:
+        self._async_operations += 1
+        try:
+            result = await complete_before_cancellation(fn(self, *args, **kwargs))
+        finally:
+            self._async_operations -= 1
+        return result
+
+    return wrapped
+
+
 class MetricsDataPlaneClient(DataPlaneClient):
     """Wrap a ``DataPlaneClient`` with a per-op callback hook."""
 
@@ -1311,6 +1360,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # Bounded by the live key population, not by cumulative traffic.
         self._bytes_by_partition: dict[str, int] = {}
         self._keys_by_partition: dict[str, set[str]] = {}
+        self._partition_versions: dict[str, int] = {}
+        self._next_partition_version = itertools.count(1)
         self._rows_since_reconcile = 0
         self._hash_mismatches_logged = 0
         # Set by ``_emit`` to the inner client's wall time for the op just
@@ -1322,6 +1373,12 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # every trainer use get_step_metrics() without copying the
         # differencing and unit-conversion logic.
         self._prev_snapshot: dict[str, Any] = {}
+        self._async_operations = 0
+
+    @property
+    def async_io_enabled(self) -> bool:
+        """Whether the wrapped client enables its asynchronous I/O path."""
+        return self._inner.async_io_enabled
 
     @property
     def observability_enabled(self) -> bool:
@@ -1405,7 +1462,14 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # One process: the cluster arithmetic with n_procs=1 is exactly this.
         return _step_metrics(snap, prev, step_time_s, collect_ms)
 
-    def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:
+    def _record_put(
+        self,
+        partition_id: str,
+        keys: list[str],
+        n_bytes: int,
+        *,
+        reconcile: bool = True,
+    ) -> bool:
         """Attribute put bytes per key so a later ``clear_samples`` can subtract.
 
         Called after the underlying RPC succeeds so a failed put never
@@ -1422,9 +1486,14 @@ class MetricsDataPlaneClient(DataPlaneClient):
             partition_id: Partition the keys were written to.
             keys: Per-sample uids that were written.
             n_bytes: Total bytes written; released pro rata on clear.
+            reconcile: Run synchronous reconciliation when its row window expires.
+
+        Returns:
+            Whether the row window expired and reconciliation is due.
         """
         if not keys or n_bytes <= 0:
-            return
+            return False
+        self._partition_versions[partition_id] = next(self._next_partition_version)
         self._keys_by_partition.setdefault(partition_id, set()).update(keys)
         self._bytes_by_partition[partition_id] = (
             self._bytes_by_partition.get(partition_id, 0) + n_bytes
@@ -1438,7 +1507,10 @@ class MetricsDataPlaneClient(DataPlaneClient):
             # put fails on the next, so re-arming after would retry it on every
             # put for the rest of the run.
             self._rows_since_reconcile = 0
-            self._release_cleared_samples(partition_id)
+            if reconcile:
+                self._release_cleared_samples(partition_id)
+            return True
+        return False
 
     def _record_clear(self, partition_id: str, keys: list[str] | None) -> None:
         """Reverse the put accounting for ``keys``.
@@ -1458,6 +1530,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         live = self._keys_by_partition.get(partition_id)
         if live is None:
             return
+        self._partition_versions[partition_id] = next(self._next_partition_version)
         total = self._bytes_by_partition.get(partition_id, 0)
         # Count what was actually live, not what the caller listed. A clear
         # may name uids already dropped or belonging elsewhere, and billing
@@ -1474,6 +1547,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             freed = total
             del self._keys_by_partition[partition_id]
             self._bytes_by_partition.pop(partition_id, None)
+            self._partition_versions.pop(partition_id, None)
         else:
             freed = total * removed // (len(live) + removed) if removed else 0
             self._bytes_by_partition[partition_id] = total - freed
@@ -1500,7 +1574,22 @@ class MetricsDataPlaneClient(DataPlaneClient):
         if stale:
             self._record_clear(partition_id, list(stale))
 
-    def _bill_self(self, entered: float) -> None:
+    async def _async_release_cleared_samples(self, partition_id: str) -> None:
+        """Reconcile without blocking the caller loop or removing newer writes."""
+        version = self._partition_versions.get(partition_id, 0)
+        try:
+            live = set(await self._inner.async_list_sample_ids(partition_id))
+        except Exception:  # noqa: BLE001 - the put succeeded; retry next window
+            return
+        # A listing can race with another operation on this client. Its snapshot
+        # cannot invalidate accounting updated while the request was in flight.
+        if self._partition_versions.get(partition_id, 0) != version:
+            return
+        stale = self._keys_by_partition.get(partition_id, set()) - live
+        if stale:
+            self._record_clear(partition_id, list(stale))
+
+    def _bill_self(self, entered: float, inner_ms: float | None = None) -> None:
         """Charge this wrapper for the time it spent that was not the RPC.
 
         One ``monotonic`` per op on top of the two ``_run`` already takes.
@@ -1508,7 +1597,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
         reader to trust a benchmark run on some other machine.
         """
         elapsed_ms = (monotonic() - entered) * 1000.0
-        self._stats.self_ms += elapsed_ms - self._last_inner_ms
+        self._stats.self_ms += elapsed_ms - (
+            self._last_inner_ms if inner_ms is None else inner_ms
+        )
 
     # ── wire-in / wire-out fingerprinting (opt-in) ─────────────────────
 
@@ -1740,6 +1831,36 @@ class MetricsDataPlaneClient(DataPlaneClient):
             Whatever ``fn`` returned.
         """
         t0 = monotonic()
+        with self._op_span(op, partition_id) as span:
+            try:
+                if (
+                    op in ("save_checkpoint", "load_checkpoint", "close")
+                    and self._async_operations
+                ):
+                    raise RuntimeError(
+                        f"Cannot {op} while observed async data-plane operations are in flight"
+                    )
+                out = fn()
+            except TimeoutError:
+                _annotate(span, n_keys, n_bytes, "timeout")
+                self._emit(op, partition_id, n_keys, n_bytes, t0, "timeout")
+                raise
+            except Exception:
+                _annotate(span, n_keys, n_bytes, "error")
+                self._emit(op, partition_id, n_keys, n_bytes, t0, "error")
+                raise
+            # If the call returns a TensorDict, the read-side bytes are more
+            # informative than the input estimate.
+            if isinstance(out, TensorDict) and self._observability_enabled:
+                n_bytes = _td_bytes(out)
+            elif isinstance(out, KVBatchMeta) and not n_keys:
+                n_keys = len(out.sample_ids)
+            _annotate(span, n_keys, n_bytes, "ok")
+            self._emit(op, partition_id, n_keys, n_bytes, t0, "ok")
+            return out
+
+    def _op_span(self, op: str, partition_id: str) -> Any:
+        """Select the same telemetry scope for synchronous and async calls."""
         # Rollout puts are per-prompt (umbrella, no bucket); batch puts are
         # DATA_PLANE. See per_prompt_scope.
         per_prompt = in_per_prompt_scope()
@@ -1760,25 +1881,41 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 span_ctx = umbrella_span(RLSpanGroup.U_PER_PROMPT, name, **attributes)
             else:
                 span_ctx = managed_span(RLSpanGroup.DATA_PLANE, name, **attributes)
-        with span_ctx as span:
+        return span_ctx
+
+    async def _run_async(
+        self,
+        op: str,
+        partition_id: str,
+        fn: Callable[[], Awaitable[Any]],
+        *,
+        timing: _AsyncTiming,
+        n_keys: int = 0,
+        n_bytes: int = 0,
+    ) -> Any:
+        """Await one inner operation, retaining its own timing across suspensions."""
+        t0 = monotonic()
+        with self._op_span(op, partition_id) as span:
             try:
-                out = fn()
+                out = await fn()
             except TimeoutError:
                 _annotate(span, n_keys, n_bytes, "timeout")
-                self._emit(op, partition_id, n_keys, n_bytes, t0, "timeout")
+                timing.inner_ms += self._emit(
+                    op, partition_id, n_keys, n_bytes, t0, "timeout"
+                )
                 raise
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 _annotate(span, n_keys, n_bytes, "error")
-                self._emit(op, partition_id, n_keys, n_bytes, t0, "error")
+                timing.inner_ms += self._emit(
+                    op, partition_id, n_keys, n_bytes, t0, "error"
+                )
                 raise
-            # If the call returns a TensorDict, the read-side bytes are more
-            # informative than the input estimate.
             if isinstance(out, TensorDict) and self._observability_enabled:
                 n_bytes = _td_bytes(out)
             elif isinstance(out, KVBatchMeta) and not n_keys:
                 n_keys = len(out.sample_ids)
             _annotate(span, n_keys, n_bytes, "ok")
-            self._emit(op, partition_id, n_keys, n_bytes, t0, "ok")
+            timing.inner_ms += self._emit(op, partition_id, n_keys, n_bytes, t0, "ok")
             return out
 
     def _emit(
@@ -1789,7 +1926,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         n_bytes: int,
         t0: float,
         status: EventStatus,
-    ) -> None:
+    ) -> float:
         wall_ms = (monotonic() - t0) * 1000.0
         self._last_inner_ms = wall_ms
         on_event = self._on_event
@@ -1823,7 +1960,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         bucket.latency_hist[bisect_left(LATENCY_BUCKETS_MS, wall_ms)] += 1
         if status != "ok":
             bucket.errors += 1
-            return
+            return wall_ms
         stats.total_bytes += n_bytes
         stats.total_keys += n_keys
         stats.total_ops += 1
@@ -1834,6 +1971,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             stats.last_put_bytes_per_key = per_key
             if per_key > stats.max_bytes_per_key_seen:
                 stats.max_bytes_per_key_seen = per_key
+        return wall_ms
 
     def register_partition(
         self,
@@ -1998,6 +2136,137 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
         self._record_clear(partition_id, sample_ids_list)
         self._bill_self(entered)
+
+    @_complete_observed_operation
+    async def async_put_samples(
+        self,
+        sample_ids: list[str],
+        partition_id: str,
+        fields: TensorDict | None = None,
+        tags: list[dict[str, Any]] | None = None,
+    ) -> KVBatchMeta:
+        """Write through the inner async API and account only successful writes."""
+        entered = monotonic()
+        timing = _AsyncTiming()
+        n_bytes = _td_bytes(fields) if self._observability_enabled else 0
+        sample_ids_list = _as_list(sample_ids)
+        payload = fields
+        if self._verify_tensor_hash:
+            payload = self._stamp_hashes(sample_ids_list, fields)
+        out = await self._run_async(
+            "put",
+            partition_id,
+            lambda: self._inner.async_put_samples(
+                sample_ids_list, partition_id, fields=payload, tags=tags
+            ),
+            timing=timing,
+            n_keys=len(sample_ids_list),
+            n_bytes=n_bytes,
+        )
+        if self._record_put(partition_id, sample_ids_list, n_bytes, reconcile=False):
+            await self._async_release_cleared_samples(partition_id)
+        self._bill_self(entered, timing.inner_ms)
+        return out
+
+    @_complete_observed_operation
+    async def async_get_samples(
+        self,
+        sample_ids: list[str],
+        partition_id: str,
+        select_fields: list[str],
+    ) -> TensorDict:
+        """Read asynchronously, preserving mirror fallback and hash verification."""
+        entered = monotonic()
+        timing = _AsyncTiming()
+        sample_ids_list = _as_list(sample_ids)
+        fetch = (
+            _with_mirrors(select_fields)
+            if self._verify_tensor_hash
+            else list(select_fields)
+        )
+
+        async def read(columns: list[str]) -> TensorDict:
+            return await self._run_async(
+                "get",
+                partition_id,
+                lambda: self._inner.async_get_samples(
+                    sample_ids_list, partition_id, select_fields=columns
+                ),
+                timing=timing,
+                n_keys=len(sample_ids_list),
+            )
+
+        try:
+            out = await read(fetch)
+        except Exception as exc:  # noqa: BLE001 - a guard bug must not fail a read
+            if not self._verify_tensor_hash:
+                raise
+            self._hash_guard_failed("get", exc)
+            out = await read(list(select_fields))
+        if self._verify_tensor_hash:
+            self._check_hashes(partition_id, sample_ids_list, out)
+        self._bill_self(entered, timing.inner_ms)
+        return out
+
+    @_complete_observed_operation
+    async def async_get_data(
+        self, meta: KVBatchMeta, select_fields: list[str] | None = None
+    ) -> TensorDict:
+        """Resolve metadata with the same span, byte and hash rules as get_data."""
+        entered = monotonic()
+        timing = _AsyncTiming()
+        fetch = select_fields if select_fields is not None else meta.fields
+        if self._verify_tensor_hash and fetch is not None:
+            fetch = _with_mirrors(fetch)
+        out = await self._run_async(
+            "get_data",
+            meta.partition_id,
+            lambda: self._inner.async_get_data(meta, select_fields=fetch),
+            timing=timing,
+            n_keys=len(meta.sample_ids),
+        )
+        if self._verify_tensor_hash:
+            self._check_hashes(meta.partition_id, meta.sample_ids, out)
+        self._bill_self(entered, timing.inner_ms)
+        return out
+
+    @_complete_observed_operation
+    async def async_list_sample_ids(self, partition_id: str) -> list[str]:
+        """List keys without blocking the caller loop."""
+        return await self._run_async(
+            "list_sample_ids",
+            partition_id,
+            lambda: self._inner.async_list_sample_ids(partition_id),
+            timing=_AsyncTiming(),
+        )
+
+    @_complete_observed_operation
+    async def async_clear_samples(
+        self, sample_ids: list[str] | None, partition_id: str
+    ) -> None:
+        """Release live-byte accounting after the asynchronous clear completes."""
+        entered = monotonic()
+        timing = _AsyncTiming()
+        sample_ids_list = _as_list(sample_ids)
+        version = self._partition_versions.get(partition_id, 0)
+        await self._run_async(
+            "clear",
+            partition_id,
+            lambda: self._inner.async_clear_samples(sample_ids_list, partition_id),
+            timing=timing,
+            n_keys=len(sample_ids_list) if sample_ids_list is not None else 0,
+        )
+        if (
+            sample_ids_list is None
+            and self._partition_versions.get(partition_id, 0) != version
+        ):
+            # TQ implements clear-all as list followed by clear of that key
+            # snapshot. A write during those awaits may survive in storage;
+            # reconcile instead of discarding its newly recorded live bytes.
+            await self._async_release_cleared_samples(partition_id)
+        else:
+            self._record_clear(partition_id, sample_ids_list)
+        self._bill_self(entered, timing.inner_ms)
 
     def save_checkpoint(
         self,

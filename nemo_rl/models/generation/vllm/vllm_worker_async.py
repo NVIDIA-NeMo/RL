@@ -36,6 +36,7 @@ from nemo_rl.data.captured_media import (
     capture_processed_media,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.interfaces import DataPlaneConfig, async_data_plane_config
 from nemo_rl.data_plane.tq_token_sink import MediaMetadataIntegrityError
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -77,6 +78,7 @@ LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from nemo_gym.token_id_capture.staging.capture import ActiveCall
+    from nemo_gym.token_id_capture.staging.records import CommitCoords
 
 
 @dataclass
@@ -234,6 +236,7 @@ class VllmAsyncGenerationWorkerImpl(
         # version is stamped per model call at begin_call time and rotated by
         # the set_rollout_weight_version fan-out from the SC's _sync_weights.
         self.token_capture = None
+        self._capture_async_semaphore: asyncio.Semaphore | None = None
         self._rollout_weight_version = 0
         # In-flight captured calls keyed by id(request): the ActiveCall, the
         # exact engine prompt ids recorded at preprocess time, and the media
@@ -597,12 +600,32 @@ class VllmAsyncGenerationWorkerImpl(
         )
         self._staging_source = source
         self._chain_prefix.install(source)
-        install_capture(
-            self,
-            sink=sink,
-            weight_version_fn=lambda: self._rollout_weight_version,
-            adapter=VLLMCaptureAdapter(),
-        )
+        async_cfg = async_data_plane_config(cast(DataPlaneConfig, dp_cfg))
+        native_capture = async_cfg.enabled and dp_cfg["backend"] == "simple"
+        self._capture_async_semaphore = None
+        if native_capture:
+            # Optional companion Gym API is required only for the enabled path.
+            from nemo_gym.token_id_capture.staging.protocols import AsyncStagingSink
+
+            if not isinstance(sink, AsyncStagingSink):
+                raise TypeError("native capture requires an AsyncStagingSink")
+            # First acquisition happens on the HTTP loop. Include record/tensor
+            # preparation in admission, rather than bounding only the final PUT.
+            self._capture_async_semaphore = asyncio.Semaphore(async_cfg.max_inflight)
+            install_capture(
+                self,
+                sink=sink,
+                async_sink=sink,
+                weight_version_fn=lambda: self._rollout_weight_version,
+                adapter=VLLMCaptureAdapter(),
+            )
+        else:
+            install_capture(
+                self,
+                sink=sink,
+                weight_version_fn=lambda: self._rollout_weight_version,
+                adapter=VLLMCaptureAdapter(),
+            )
         return True
 
     async def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
@@ -831,18 +854,10 @@ class VllmAsyncGenerationWorkerImpl(
         choice["message"] = message
         payload["choices"] = [choice]
 
-    def _finish_request_capture(self, request: Any, content: dict) -> dict:
-        """Stage the finished call and ride its coords on the response.
-
-        Tokens and the call's new media tensors go to TQ in one write (the
-        media ride as opaque attachments beside the record), so ``staged``
-        coords vouch for both and any failure is ``capture_failed`` at call
-        time. Token ids, logprobs, and routes are stripped after staging, so
-        the worker->gate hop carries the completion and coords only.
-        """
-        state = self._capture_calls.pop(id(request), None)
-        if state is None:
-            return content
+    def _capture_completion_payload(
+        self, state: CapturedRequest, content: dict
+    ) -> dict:
+        """Prepare the same engine payload for synchronous and async capture."""
         call, prompt_token_ids = state.call, state.prompt_token_ids
         payload = dict(content)
         # vLLM's OpenAI response carries no prompt ids; the adapter reads the
@@ -868,11 +883,11 @@ class VllmAsyncGenerationWorkerImpl(
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
-        coords = self.token_capture.complete_call_from_response(
-            call,
-            payload,
-            attachments=state.media.tensors if state.media is not None else None,
-        )
+        return payload
+
+    @staticmethod
+    def _capture_response(content: dict, coords: "CommitCoords") -> dict:
+        """Strip staged tensors and attach acknowledged coordinates to a response."""
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
@@ -888,6 +903,43 @@ class VllmAsyncGenerationWorkerImpl(
                     message.pop(field, None)
         content["ng_commit_coords"] = coords.model_dump()
         return content
+
+    def _finish_request_capture(self, request: Any, content: dict) -> dict:
+        """Stage the finished call off the HTTP loop and return its coordinates."""
+        state = self._capture_calls.pop(id(request), None)
+        if state is None:
+            return content
+        payload = self._capture_completion_payload(state, content)
+        coords = self.token_capture.complete_call_from_response(
+            state.call,
+            payload,
+            attachments=state.media.tensors if state.media is not None else None,
+        )
+        return self._capture_response(content, coords)
+
+    async def _finish_request_capture_async(self, request: Any, content: dict) -> dict:
+        """Await native staging, including bounded preparation and cancellation cleanup."""
+        if self._capture_async_semaphore is None:
+            raise RuntimeError("native capture was not enabled during setup")
+        try:
+            async with self._capture_async_semaphore:
+                state = self._capture_calls.pop(id(request), None)
+                if state is None:
+                    return content
+                payload = self._capture_completion_payload(state, content)
+                coords = await self.token_capture.async_complete_call_from_response(
+                    state.call,
+                    payload,
+                    attachments=state.media.tensors
+                    if state.media is not None
+                    else None,
+                )
+                return self._capture_response(content, coords)
+        except asyncio.CancelledError:
+            # Waiting for admission has not claimed completion yet. Once the
+            # state was popped, Gym/sink own draining and cleanup of the write.
+            self._abort_request_capture(request, reason="cancelled_capture")
+            raise
 
     def _abort_request_capture(self, request: Any, *, reason: str) -> None:
         """Drop the in-flight capture state for a request that errored."""
@@ -1478,11 +1530,16 @@ class VllmAsyncGenerationWorkerImpl(
                 )
                 # Token capture: stage the delta and ride the coords on the
                 # response; strips logprobs/ids (no-op when capture is off).
-                # Off-loop: the sink write inside complete_call is a blocking
-                # TQ round trip (see the staging protocol's serving-host rule).
-                content = await asyncio.to_thread(
-                    worker_self._finish_request_capture, request, content
-                )
+                if worker_self._capture_async_semaphore is not None:
+                    content = await worker_self._finish_request_capture_async(
+                        request, content
+                    )
+                else:
+                    # The baseline and Mooncake path keep blocking capture work
+                    # off the HTTP loop. Native SimpleStorage awaits its sink.
+                    content = await asyncio.to_thread(
+                        worker_self._finish_request_capture, request, content
+                    )
                 return JSONResponse(content=content)
 
             worker_self._abort_request_capture(request, reason="streaming_response")

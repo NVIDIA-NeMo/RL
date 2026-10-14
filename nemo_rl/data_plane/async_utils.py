@@ -17,7 +17,36 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from collections.abc import Awaitable
+from typing import Any, TypeVar
+
+_Result = TypeVar("_Result")
+
+
+async def complete_before_cancellation(awaitable: Awaitable[_Result]) -> _Result:
+    """Settle an operation before allowing caller cancellation to propagate.
+
+    A dispatched write may still publish after its caller is cancelled. Keep
+    the caller's ownership and checkpoint scopes open until the operation has
+    settled, including when shutdown cancels the caller more than once. If the
+    operation fails during cancellation, consume its exception and preserve
+    the caller's original cancellation. Without cancellation, return or raise
+    the operation's result normally.
+    """
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except (asyncio.CancelledError, Exception):
+                # Cancellation never transfers ownership back before the
+                # operation finishes; its eventual failure is retrieved below.
+                pass
+        if not task.cancelled():
+            task.exception()
+        raise
 
 
 async def call_data_plane(
@@ -33,11 +62,16 @@ async def call_data_plane(
     issue other calls while this one is running. Callers should enable it only
     when that concurrency is supported or externally serialized.
 
+    Local clients that enable ``async_io_enabled`` use their async I/O methods
+    instead. Checkpoint and other control operations retain their existing
+    dispatch. The async implementation owns admission and cancellation safety;
+    this helper awaits completion within the caller's existing mutation scope.
+
     Args:
         client: Local ``DataPlaneClient`` or Ray actor handle.
         method_name: Data-plane method to invoke.
         offload_sync: Run a synchronous local implementation in a worker
-            thread. Ray methods are already asynchronous and ignore this flag.
+            thread. Ray methods and enabled async I/O methods ignore this flag.
         **kwargs: Keyword arguments forwarded to the data-plane method.
 
     Returns:
@@ -47,6 +81,14 @@ async def call_data_plane(
     remote = getattr(method, "remote", None)
     if remote is not None:
         return await remote(**kwargs)
+    if method_name in (
+        "get_data",
+        "put_samples",
+        "get_samples",
+        "list_sample_ids",
+        "clear_samples",
+    ) and getattr(client, "async_io_enabled", False):
+        return await getattr(client, f"async_{method_name}")(**kwargs)
     if offload_sync:
         result = await asyncio.to_thread(method, **kwargs)
     else:

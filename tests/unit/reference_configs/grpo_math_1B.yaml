@@ -588,6 +588,9 @@ data_plane:
   impl: transfer_queue
   backend: "simple"                  # TQ storage backend ('simple' or 'mooncake_cpu')
   claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
+  async_io:
+    enabled: false
+    max_inflight: 8
   simple:
     storage_capacity: 1000000        # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node

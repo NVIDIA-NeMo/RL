@@ -232,10 +232,15 @@ def _worker_with_capture(sink: _MemorySink):
         "_capture_admission",
         "_resolve_admission_prefix",
         "_enter_request_prefix",
+        "_capture_completion_payload",
+        "_abort_request_capture",
+        "_finish_request_capture_async",
     ):
         setattr(
             worker, name, getattr(VllmAsyncGenerationWorkerImpl, name).__get__(worker)
         )
+    worker._capture_response = VllmAsyncGenerationWorkerImpl._capture_response
+    worker._capture_async_semaphore = None
     worker.token_capture = RolloutTokenCapture(
         sink=sink,
         weight_version_fn=lambda: worker._rollout_weight_version,

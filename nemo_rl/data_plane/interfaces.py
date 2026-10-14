@@ -35,6 +35,7 @@ See ``nemo_rl/data_plane/README.md`` for the full design.
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +43,8 @@ from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, Typ
 
 from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt
 from tensordict import TensorDict
+
+from nemo_rl.data_plane.async_utils import complete_before_cancellation
 
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
 
@@ -117,6 +120,19 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     storage_unit_placement: list[str] | Literal["all"] = "all"
 
 
+class AsyncDataPlaneConfig(BaseModel, extra="forbid"):
+    """Opt-in asynchronous I/O for A/B experiments.
+
+    SimpleStorage uses native TQ coroutines. Other backends retain thread
+    offloading because their storage implementations can block. The limit is
+    per client, shared by all its asynchronous GET/PUT/list/clear operations;
+    it does not change rollout concurrency or write granularity.
+    """
+
+    enabled: bool = False
+    max_inflight: PositiveInt = 8
+
+
 class DataPlaneConfig(TypedDict):
     """Feature-gated config; defaults to disabled.
 
@@ -153,6 +169,15 @@ class DataPlaneConfig(TypedDict):
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
+    async_io: NotRequired[AsyncDataPlaneConfig]
+
+
+def async_data_plane_config(cfg: DataPlaneConfig) -> AsyncDataPlaneConfig:
+    """Resolve async settings with defaults owned by the config model."""
+    block = cfg.get("async_io")
+    if isinstance(block, AsyncDataPlaneConfig):
+        return block
+    return AsyncDataPlaneConfig.model_validate({} if block is None else block)
 
 
 _CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple", "mooncake_cpu"})
@@ -453,6 +478,53 @@ class DataPlaneClient(ABC):
     """
 
     # ── (A) task-mediated ───────────────────────────────────────────────
+
+    @property
+    def async_io_enabled(self) -> bool:
+        """Whether asynchronous callers should select the opt-in I/O path."""
+        return False
+
+    async def async_get_data(
+        self, meta: KVBatchMeta, select_fields: list[str] | None = None
+    ) -> TensorDict:
+        """Await a read, retaining the synchronous implementation as fallback."""
+        return await complete_before_cancellation(
+            asyncio.to_thread(self.get_data, meta, select_fields)
+        )
+
+    async def async_put_samples(
+        self,
+        sample_ids: list[str],
+        partition_id: str,
+        fields: TensorDict | None = None,
+        tags: list[dict[str, Any]] | None = None,
+    ) -> KVBatchMeta:
+        """Await a write; an admitted write settles before cancellation escapes."""
+        return await complete_before_cancellation(
+            asyncio.to_thread(self.put_samples, sample_ids, partition_id, fields, tags)
+        )
+
+    async def async_get_samples(
+        self, sample_ids: list[str], partition_id: str, select_fields: list[str]
+    ) -> TensorDict:
+        """Await an explicit-field read without blocking the caller's loop."""
+        return await complete_before_cancellation(
+            asyncio.to_thread(self.get_samples, sample_ids, partition_id, select_fields)
+        )
+
+    async def async_list_sample_ids(self, partition_id: str) -> list[str]:
+        """Await a metadata-only listing."""
+        return await complete_before_cancellation(
+            asyncio.to_thread(self.list_sample_ids, partition_id)
+        )
+
+    async def async_clear_samples(
+        self, sample_ids: list[str] | None, partition_id: str
+    ) -> None:
+        """Await deletion, settling it before propagating cancellation."""
+        await complete_before_cancellation(
+            asyncio.to_thread(self.clear_samples, sample_ids, partition_id)
+        )
 
     @abstractmethod
     def register_partition(

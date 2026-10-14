@@ -45,7 +45,10 @@ import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.async_utils import (
+    call_data_plane,
+    complete_before_cancellation,
+)
 from nemo_rl.data_plane.schema import (
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
@@ -1594,6 +1597,32 @@ class TQReplayBuffer:
         retain_training_claims: bool = False,
     ) -> int:
         """Remove stable groups while the caller owns a live mutation cut."""
+        cut.require_live()
+        removal = self._remove_groups_transaction(
+            cut,
+            group_ids,
+            clear_data_plane=clear_data_plane,
+            retain_training_claims=retain_training_claims,
+        )
+        if (
+            clear_data_plane
+            and getattr(self._dp_client, "async_io_enabled", False) is True
+        ):
+            # Draining only CLEAR can delete rows and then deliver cancellation
+            # before their replay slots are removed. Keep the parent's mutation
+            # cut live through both partition clears and the ownership update.
+            return await complete_before_cancellation(removal)
+        return await removal
+
+    async def _remove_groups_transaction(
+        self,
+        cut: DataPlaneMutationCut,
+        group_ids: list[str],
+        *,
+        clear_data_plane: bool,
+        retain_training_claims: bool,
+    ) -> int:
+        """Finish the data-plane deletion and its replay ownership transition."""
         cut.require_live()
         if clear_data_plane and retain_training_claims:
             raise ValueError("cleared rows cannot be retained as training claims")

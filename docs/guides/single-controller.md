@@ -534,6 +534,74 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported.
 
+### Experimental native async TQ I/O
+
+The draft async-I/O path is opt-in. Start from a working SingleController
+recipe with vLLM token capture and SimpleStorage. Keep the same source revision
+and recipe for both arms, changing only `data_plane.async_io.enabled`:
+
+```yaml
+data_plane:
+  enabled: true
+  backend: simple
+  async_io:
+    enabled: false  # A: existing synchronous APIs; true for B
+    max_inflight: 8
+```
+
+`AsyncDataPlaneConfig` owns these defaults. `max_inflight` must be positive;
+it bounds outstanding asynchronous operations per client. The vLLM capture
+host separately applies the same bound before capture preparation. This is
+not a cluster-wide limit and does not change the rollout scheduler's prompt
+concurrency. Sweep this limit separately from the initial API comparison;
+the synchronous baseline retains its existing executor-pool admission.
+
+With `enabled: true`, SimpleStorage uses the existing TQ v0.1.9
+`async_kv_*` APIs. The vLLM token-capture path awaits Gym's async completion
+contract and the data-plane PUT on the HTTP event loop, before returning
+capture coordinates. Synchronous tensor preparation and serialization still
+occupy that loop; only suspending I/O awaits let other requests run.
+The companion Gym revision pinned by this branch is required for that
+contract; the draft's `.gitmodules` points to the paired branch in the fork.
+Check out submodules from this branch and make the same Gym source
+available in the generation-worker environment; an older installed Gym is
+rejected at native-capture setup.
+
+Existing async data-plane dispatch also selects async GET/PUT/list/clear for
+SingleController orchestration, advantage processing, and replay commits.
+Synchronous model workers and the exclusively leased `RolloutReassemblerActor`
+retain their synchronous interfaces. There is no new finalizer concurrency,
+write coalescing, tensor schema, or storage lifetime. Megatron generation's
+capture host retains its synchronous path. Mooncake async callers use the
+thread-offloaded synchronous fallback, and its vLLM capture path remains
+thread-offloaded: pinned TQ's Mooncake GET can block the calling loop.
+
+An admitted local async operation settles before caller cancellation is
+propagated. Capture cancellation then attempts staging cleanup. Metrics
+accounting is included in this completion boundary. Local lifecycle methods
+reject pending async operations; the existing global checkpoint/ownership
+barriers are still required. This does not change remote Ray actor failure
+or unknown-outcome recovery semantics. Draining waits for TQ's public API;
+it does not add atomicity or recovery guarantees for a partially failed
+multi-storage-unit transfer inside TQ.
+
+For training A/B runs, preserve the model, dataset/order, seed, hardware,
+parallelism, storage-unit count, rollout concurrency, observability settings,
+and checkpoint schedule. Record the NeMo-RL/Gym/TQ revisions, resolved config,
+container and worker-environment identity, and run IDs. Repeat both arms and
+report startup separately from steady state. Compare:
+
+- end-to-end step time and trained tokens/second;
+- exposed generation wait and agent rollout completion time;
+- capture PUT/GET latency and throughput, with counts and payload bytes;
+- HTTP event-loop scheduling delay and request latency;
+- client/storage CPU RSS and GPU memory, at matched concurrency;
+- completed/dropped samples, errors, staging cleanup, and checkpoint/restart.
+
+The local CPU adapter results motivated this experiment; they do not establish
+a training speedup. Driver-only data-plane timing is not a measurement of all
+generation-worker capture costs. Collect worker-side measurements as well.
+
 ### Full training-data dumps
 
 Set `async_rl.log_full_train_data: true` to stream every consumed sample to

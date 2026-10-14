@@ -37,6 +37,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.async_utils import complete_before_cancellation
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
@@ -784,6 +785,109 @@ class TestTQReplayBufferReserveCommit:
 
 
 class TestTQReplayBufferRemove:
+    @pytest.mark.parametrize("blocked_partition", ["rollout_data", "staging"])
+    @pytest.mark.parametrize("by_group_id", [False, True])
+    def test_native_clear_cancellation_keeps_checkpoint_payload_and_metadata_aligned(
+        self, blocked_partition: str, by_group_id: bool
+    ) -> None:
+        async def exercise() -> None:
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            checkpoint_attempted = asyncio.Event()
+            checkpoint_barrier = DataPlaneCheckpointBarrier()
+
+            class BlockingAsyncClearClient(FakeDataPlaneClient):
+                async_io_enabled = True
+
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.staging_rows = {"staged-target"}
+
+                async def async_clear_samples(
+                    self, sample_ids: list[str], partition_id: str
+                ) -> None:
+                    async def clear() -> None:
+                        if partition_id == blocked_partition:
+                            entered.set()
+                            await release.wait()
+                        # The parent must retain its cut even while cancellation
+                        # is being drained by the nested storage operation.
+                        assert checkpoint_barrier._active_mutations == 1
+                        if partition_id == "staging":
+                            self.staging_rows.difference_update(sample_ids)
+                        else:
+                            super(BlockingAsyncClearClient, self).clear_samples(
+                                sample_ids, partition_id
+                            )
+
+                    await complete_before_cancellation(clear())
+
+            dp = BlockingAsyncClearClient()
+            buf = TQReplayBuffer(
+                dp,
+                partition_id="rollout_data",
+                staging_partition_id="staging",
+                pad_value_dict={"token_ids": 0},
+                include_message_violation_fields=False,
+            )
+            buf.set_data_plane_checkpoint_barrier(checkpoint_barrier)
+            keep_group = buf.reserve(weight_version=0)
+            target_group = buf.reserve(weight_version=0)
+            for group_id, sample_id, staging_keys in (
+                (keep_group, "keep", None),
+                (target_group, "target", ["staged-target"]),
+            ):
+                dp.put_samples([sample_id], "rollout_data")
+                await _commit_finalized(
+                    buf,
+                    group_id,
+                    KVBatchMeta("rollout_data", None, [sample_id]),
+                    0,
+                    0,
+                    staging_keys=staging_keys,
+                )
+
+            async def checkpoint() -> tuple[dict[str, Any], set[str], set[str]]:
+                checkpoint_attempted.set()
+                async with checkpoint_barrier.checkpoint():
+                    return (
+                        buf.metadata_state_dict(saved_capacity=4),
+                        set(dp._rows),
+                        set(dp.staging_rows),
+                    )
+
+            removal = asyncio.create_task(
+                buf.remove_group(target_group, remove_in_dp=True)
+                if by_group_id
+                else buf.remove([1], remove_in_dp=True)
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            snapshot = asyncio.create_task(checkpoint())
+            await checkpoint_attempted.wait()
+            try:
+                for message in ("first cancellation", "repeated cancellation"):
+                    removal.cancel(message)
+                    await asyncio.sleep(0)
+                    assert not removal.done()
+                    assert not snapshot.done()
+                    assert target_group in buf.group_ids
+            finally:
+                release.set()
+            with pytest.raises(asyncio.CancelledError, match="first cancellation"):
+                await removal
+            state, canonical_rows, staging_rows = await snapshot
+            assert [group["group_id"] for group in state["groups"]] == [keep_group]
+            metadata_rows = {
+                sample_id
+                for group in state["groups"]
+                for sample_id in group["meta"].sample_ids
+            }
+            assert metadata_rows == canonical_rows == {"keep"}
+            assert not staging_rows
+            assert buf.group_ids == (keep_group,)
+
+        asyncio.run(exercise())
+
     def test_remove_with_dp_clear_fails_without_bound_checkpoint_barrier(self):
         dp = FakeDataPlaneClient()
         buf = TQReplayBuffer(
