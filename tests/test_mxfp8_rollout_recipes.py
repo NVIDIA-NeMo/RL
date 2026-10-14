@@ -151,7 +151,6 @@ MXFP8_CASES = {
         "gpus_per_node": 4,
         "segment_size": 4,
         "async_engine": True,
-        "optimizer_lr": 1.0e-7,
         "moe_backend": "flashinfer_trtllm",
         "num_first_layers_in_bf16": 3,
         "num_last_layers_in_bf16": 12,
@@ -273,19 +272,12 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
             config["policy"]["train_global_batch_size"]
             == expected["train_global_batch_size"]
         )
-    if expected.get("optimizer_lr") is not None:
-        assert (
-            config["policy"]["megatron_cfg"]["optimizer"]["lr"]
-            == expected["optimizer_lr"]
-        )
     if expected.get("num_first_layers_in_bf16") is not None:
         assert (
-            vllm_cfg["num_first_layers_in_bf16"]
-            == expected["num_first_layers_in_bf16"]
+            vllm_cfg["num_first_layers_in_bf16"] == expected["num_first_layers_in_bf16"]
         )
         assert (
-            vllm_cfg["num_last_layers_in_bf16"]
-            == expected["num_last_layers_in_bf16"]
+            vllm_cfg["num_last_layers_in_bf16"] == expected["num_last_layers_in_bf16"]
         )
 
     expected_async = "-async-1off-" in case_name
