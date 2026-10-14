@@ -35,6 +35,12 @@ if [[ -n "${OSWORLD_LOGPROB_MB_TOKENS:-}" ]]; then
     "policy.sequence_packing.logprob_mb_tokens=$OSWORLD_LOGPROB_MB_TOKENS"
   )
 fi
+if [[ -n "${OSWORLD_TEMPERATURE:-}" ]]; then
+  OVERRIDES+=(
+    "policy.generation.temperature=$OSWORLD_TEMPERATURE"
+    "policy.generation.val_temperature=$OSWORLD_TEMPERATURE"
+  )
+fi
 
 exec "$OSWORLD_DRIVER_PYTHON" \
   examples/nemo_gym/launch_osworld_v2_cc.py \
