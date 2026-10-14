@@ -1,0 +1,9 @@
+defaults: grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50-is
+loss_fn:
+  use_importance_sampling_correction: true
+logger:
+  log_dir: logs/grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50-is
+  wandb:
+    name: grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50-is
