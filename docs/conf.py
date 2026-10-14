@@ -118,6 +118,9 @@ linkcheck_ignore = [
     ".*github\\.com.*",
     ".*githubusercontent\\.com.*",
     "https://huggingface\\.co/datasets/nvidia/Nemotron-RL-Lightning-Training-Blend",
+    # External university server; intermittently returns 502 and fails
+    # unrelated PRs' linkcheck (e.g. #4278's run).
+    "https://mn\\.cs\\.tsinghua\\.edu\\.cn/avqa.*",
 ]
 
 
