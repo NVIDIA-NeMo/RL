@@ -40,8 +40,13 @@ export AGENTIC_VBENCH_MAX_TURNS=${AGENTIC_VBENCH_MAX_TURNS:-32}
 # an apostrophe in the v9 prompt made the live driver fail before setup.
 debug_delegation_prompt="During this task call the task tool exactly once near the beginning to delegate one suitable bounded subtask to the general subagent. "
 debug_delegation_prompt+="Do not delegate the full task. Review and integrate the child result. Continue until every required deliverable exists. "
-debug_delegation_prompt+="Before producing the final answer verify the deliverables with bash. Do not produce a final answer while required deliverables are missing."
+debug_delegation_prompt+="When delegating explicitly ask the child to return only a concise bounded result and stop before its output limit. "
+debug_delegation_prompt+="Keep every response concise and call tools early. Before producing the final answer verify the deliverables with bash. "
+debug_delegation_prompt+="Do not produce a final answer while required deliverables are missing. After verification succeeds immediately return a brief final answer."
 export AGENTIC_VBENCH_DELEGATION_PROMPT=${AGENTIC_VBENCH_DELEGATION_PROMPT:-"${debug_delegation_prompt}"}
+debug_subagent_prompt="Complete only the delegated bounded subtask. Use tools early and keep every response concise. "
+debug_subagent_prompt+="Return a concise result to the parent as soon as the requested evidence is ready. Stop before the output limit."
+export AGENTIC_VBENCH_SUBAGENT_PROMPT=${AGENTIC_VBENCH_SUBAGENT_PROMPT:-"${debug_subagent_prompt}"}
 export BASE_NAME=${BASE_NAME:-agentic_vbench_v2_subagents_sync_8n_$(date -u +%Y%m%d-%H%M%S)-$$}
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$BASE_NAME}
 export WANDB_PROJECT=nemorl-v2-subagent-comapction-debug

@@ -31,6 +31,9 @@ export AGENTIC_VBENCH_SUBAGENTS_ENABLED=true
 delegation_prompt_default="You may delegate suitable subtasks to subagents when useful. "
 delegation_prompt_default+="Review and integrate their results before producing the final answer."
 export AGENTIC_VBENCH_DELEGATION_PROMPT=${AGENTIC_VBENCH_DELEGATION_PROMPT:-"${delegation_prompt_default}"}
+subagent_prompt_default="Complete only the delegated bounded subtask. Use tools early and keep every response concise. "
+subagent_prompt_default+="Return a concise result to the parent before the output limit."
+export AGENTIC_VBENCH_SUBAGENT_PROMPT=${AGENTIC_VBENCH_SUBAGENT_PROMPT:-"${subagent_prompt_default}"}
 export NUM_NODES=${NUM_NODES:-16}
 export NUM_GEN_NODES=${NUM_GEN_NODES:-8}
 export SEGMENT_SIZE=${SEGMENT_SIZE:-8}
@@ -80,6 +83,7 @@ exec bash "$script_dir/smoke_off_32turns_256k.sh" \
   "+${agent}.model_context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS}" \
   "+${agent}.model_output_capability_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS}" \
   "+${agent}.opencode_delegation_prompt=${AGENTIC_VBENCH_DELEGATION_PROMPT}" \
+  "+${agent}.opencode_subagent_prompt=${AGENTIC_VBENCH_SUBAGENT_PROMPT}" \
   "+${agent}.opencode_compaction_auto=false" \
   "+${agent}.opencode_compaction_prune=false" \
   "$@"
