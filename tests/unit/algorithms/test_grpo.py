@@ -3538,6 +3538,11 @@ def test_setup_hands_the_vllm_http_server_api_key_to_nemo_gym(monkeypatch) -> No
         grpo_mod, "create_weight_synchronizer", lambda **_kwargs: MagicMock()
     )
     monkeypatch.setattr(grpo_mod, "build_nemo_gym_actors", build_nemo_gym_actors)
+    # The agent-coverage check asks an unsharded job's actor for its entries
+    # over Ray, which a mock actor cannot answer; the check has its own tests.
+    monkeypatch.setattr(
+        grpo_mod, "validate_dataset_agent_coverage", lambda *_args, **_kwargs: None
+    )
 
     dataset = MagicMock()
     dataset.__len__.return_value = 2

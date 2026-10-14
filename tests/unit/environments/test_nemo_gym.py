@@ -2189,6 +2189,7 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
         )
 
 
+@pytest.mark.nemo_gym
 def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch):
     """The Gym head server serves the merged global config unredacted and the
     server commands inline it, so the key must reach Gym's servers as an
