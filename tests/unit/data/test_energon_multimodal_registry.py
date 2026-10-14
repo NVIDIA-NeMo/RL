@@ -17,6 +17,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from nemo_rl.data.energon.config import EnergonCookerConfig, EnergonTaskEncoderConfig
 from nemo_rl.data.energon.multimodal.registry import (
     COOKER_REGISTRY,
     TASK_ENCODER_REGISTRY,
@@ -122,18 +123,12 @@ def test_registry_resolves_and_fingerprints_file_backed_component(tmp_path):
         "    return prefix + sample\n"
     )
     registry = LazyRegistry("cooker")
+    config = EnergonCookerConfig(
+        python_file=str(component_file), object_name="custom_cooker"
+    )
 
-    resolved = registry.resolve_configured_for_model_family(
-        name=None,
-        python_file=str(component_file),
-        object_name="custom_cooker",
-        model_family="qwen",
-    )
-    identity = registry.configured_identity(
-        name=None,
-        python_file=str(component_file),
-        object_name="custom_cooker",
-    )
+    resolved = registry.resolve_configured_for_model_family(config, model_family="qwen")
+    identity = registry.configured_identity(config)
 
     assert resolved("sample", prefix="custom-") == "custom-sample"
     assert identity["python_file"] == str(component_file)
@@ -141,11 +136,7 @@ def test_registry_resolves_and_fingerprints_file_backed_component(tmp_path):
     assert len(identity["sha256"]) == 64
 
     component_file.write_text(component_file.read_text() + "\n# changed\n")
-    changed_identity = registry.configured_identity(
-        name=None,
-        python_file=str(component_file),
-        object_name="custom_cooker",
-    )
+    changed_identity = registry.configured_identity(config)
     assert changed_identity["sha256"] != identity["sha256"]
 
 
@@ -163,26 +154,16 @@ def test_registry_resolves_and_fingerprints_file_backed_package(tmp_path):
         "    return sample\n"
     )
     registry = LazyRegistry("cooker")
+    config = EnergonCookerConfig(
+        python_file=str(init_file), object_name="custom_cooker"
+    )
 
-    resolved = registry.resolve_configured_for_model_family(
-        name=None,
-        python_file=str(init_file),
-        object_name="custom_cooker",
-        model_family="qwen",
-    )
-    identity = registry.configured_identity(
-        name=None,
-        python_file=str(init_file),
-        object_name="custom_cooker",
-    )
+    resolved = registry.resolve_configured_for_model_family(config, model_family="qwen")
+    identity = registry.configured_identity(config)
 
     assert resolved("sample") == "sample"
     cooker_file.write_text(cooker_file.read_text() + "\n# changed\n")
-    changed_identity = registry.configured_identity(
-        name=None,
-        python_file=str(init_file),
-        object_name="custom_cooker",
-    )
+    changed_identity = registry.configured_identity(config)
     assert changed_identity["sha256"] != identity["sha256"]
 
 
@@ -193,15 +174,15 @@ def test_registry_rejects_invalid_file_backed_component_references(tmp_path):
 
     with pytest.raises(ValueError, match="must be absolute"):
         registry.resolve_configured(
-            name=None,
-            python_file="custom_cooker.py",
-            object_name="custom_cooker",
+            EnergonCookerConfig(
+                name=None, python_file="custom_cooker.py", object_name="custom_cooker"
+            )
         )
     with pytest.raises(TypeError, match="does not resolve"):
         registry.resolve_configured(
-            name=None,
-            python_file=str(component_file),
-            object_name="missing",
+            EnergonCookerConfig(
+                name=None, python_file=str(component_file), object_name="missing"
+            )
         )
 
 
@@ -226,9 +207,9 @@ def test_registry_resolves_file_backed_task_encoder(tmp_path):
     )
 
     resolved = LazyRegistry("task_encoder").resolve_configured_for_model_family(
-        name=None,
-        python_file=str(component_file),
-        object_name="CustomTaskEncoder",
+        EnergonTaskEncoderConfig(
+            name=None, python_file=str(component_file), object_name="CustomTaskEncoder"
+        ),
         model_family="qwen",
     )
 

@@ -254,16 +254,12 @@ def _loader_config(value: Any) -> EnergonLoaderConfig:
     if any(current in filters[:index] for index, current in enumerate(filters)):
         raise ValueError("Energon cooker has_subflavors filters must be unique.")
     TASK_ENCODER_REGISTRY.resolve_configured_for_model_family(
-        name=config.task_encoder.name,
-        python_file=config.task_encoder.python_file,
-        object_name=config.task_encoder.object_name,
+        config.task_encoder,
         model_family=config.model_family,
     )
     for cooker in config.cookers:
         cooker_fn = COOKER_REGISTRY.resolve_configured_for_model_family(
-            name=cooker.name,
-            python_file=cooker.python_file,
-            object_name=cooker.object_name,
+            cooker,
             model_family=config.model_family,
         )
         try:
@@ -379,9 +375,7 @@ def _task_encoder(
         cooker_function = cast(
             Callable[[CrudeSample], CanonicalSFTSample],
             COOKER_REGISTRY.resolve_configured(
-                name=cooker_config.name,
-                python_file=cooker_config.python_file,
-                object_name=cooker_config.object_name,
+                cooker_config,
             ),
         )
         if cooker_config.options:
@@ -397,9 +391,7 @@ def _task_encoder(
     encoder_type = cast(
         Any,
         TASK_ENCODER_REGISTRY.resolve_configured(
-            name=loader_config.task_encoder.name,
-            python_file=loader_config.task_encoder.python_file,
-            object_name=loader_config.task_encoder.object_name,
+            loader_config.task_encoder,
         ),
     )
     encoder_options = loader_config.task_encoder.options

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, ClassVar, Literal, Self
 
 from pydantic import AliasChoices, BaseModel, Field, model_validator
 
@@ -53,10 +53,11 @@ class EnergonPackingConfig(BaseModel, extra="forbid"):
     options: EnergonPackingOptions
 
 
-class EnergonTaskEncoderConfig(BaseModel, extra="allow"):
-    """One built-in or file-backed task encoder and optional packing."""
+class _EnergonComponentConfig(BaseModel, extra="allow"):
+    """Shared selection fields for built-in and file-backed Energon plugins."""
 
-    name: str | None = "generic_sft"
+    _label: ClassVar[str]
+    name: str | None
     python_file: str | None = None
     object_name: str | None = Field(
         default=None,
@@ -64,7 +65,6 @@ class EnergonTaskEncoderConfig(BaseModel, extra="allow"):
         serialization_alias="object",
     )
     options: dict[str, Any] = Field(default_factory=dict)
-    packing: EnergonPackingConfig | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -78,55 +78,34 @@ class EnergonTaskEncoderConfig(BaseModel, extra="allow"):
         return value
 
     @model_validator(mode="after")
-    def _validate_component_reference(self) -> "EnergonTaskEncoderConfig":
+    def _validate_component_reference(self) -> Self:
         if self.name is not None:
             if self.python_file is not None or self.object_name is not None:
                 raise ValueError(
-                    "Task encoder must use either name or python_file and object_name."
+                    f"{self._label} must use either name or python_file and object_name."
                 )
             return self
         if not self.python_file or not self.object_name:
             raise ValueError(
-                "File-backed task encoders require python_file and object_name."
+                f"File-backed {self._label.lower()}s require python_file and object_name."
             )
         return self
 
 
-class EnergonCookerConfig(BaseModel, extra="allow"):
+class EnergonTaskEncoderConfig(_EnergonComponentConfig):
+    """One built-in or file-backed task encoder and optional packing."""
+
+    _label: ClassVar[str] = "Task encoder"
+    name: str | None = "generic_sft"
+    packing: EnergonPackingConfig | None = None
+
+
+class EnergonCookerConfig(_EnergonComponentConfig):
     """One built-in or file-backed source cooker."""
 
+    _label: ClassVar[str] = "Cooker"
     name: str | None = "generic_conversation"
-    python_file: str | None = None
-    object_name: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("object_name", "object"),
-        serialization_alias="object",
-    )
-    options: dict[str, Any] = Field(default_factory=dict)
     has_subflavors: dict[str, str | int | float | bool | None] | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _from_registry_key(cls, value: Any) -> Any:
-        if isinstance(value, str):
-            return {"name": value}
-        if isinstance(value, dict) and "object_name" in value and "object" in value:
-            raise ValueError("Use only one of object_name or its legacy alias object.")
-        if isinstance(value, dict) and value.get("python_file") and "name" not in value:
-            return {**value, "name": None}
-        return value
-
-    @model_validator(mode="after")
-    def _validate_component_reference(self) -> "EnergonCookerConfig":
-        if self.name is not None:
-            if self.python_file is not None or self.object_name is not None:
-                raise ValueError(
-                    "Cooker must use either name or python_file and object_name."
-                )
-            return self
-        if not self.python_file or not self.object_name:
-            raise ValueError("File-backed cookers require python_file and object_name.")
-        return self
 
 
 class EnergonLoaderConfig(BaseModel, extra="allow"):

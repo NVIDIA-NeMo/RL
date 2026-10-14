@@ -92,17 +92,12 @@ class LazyRegistry:
         self._validate(key, resolved)
         return resolved
 
-    def resolve_configured(
-        self,
-        *,
-        name: str | None,
-        python_file: str | None,
-        object_name: str | None,
-    ) -> Any:
-        """Resolve either a built-in key or an object from a Python file."""
-        if name is not None:
-            return self.resolve(name)
-        path, digest = self._file_details(python_file)
+    def resolve_configured(self, config: ComponentConfig) -> Any:
+        """Resolve the configured built-in key or object from a Python file."""
+        if config.name is not None:
+            return self.resolve(config.name)
+        path, digest = self._file_details(config.python_file)
+        object_name = config.object_name
         if not object_name:
             raise ValueError(f"File-backed {self.kind} requires an object name.")
         module = self._load_file_module(path, digest)
@@ -123,17 +118,12 @@ class LazyRegistry:
             raise ValueError(f"Unknown {self.kind} registry key {key!r}.")
         return {"key": key, "version": entry.version}
 
-    def configured_identity(
-        self,
-        *,
-        name: str | None,
-        python_file: str | None,
-        object_name: str | None,
-    ) -> dict[str, str]:
-        """Return resume identity for a built-in or file-backed component."""
-        if name is not None:
-            return self.identity(name)
-        path, digest = self._file_details(python_file)
+    def configured_identity(self, config: ComponentConfig) -> dict[str, str]:
+        """Return resume identity for the configured built-in or file-backed plugin."""
+        if config.name is not None:
+            return self.identity(config.name)
+        path, digest = self._file_details(config.python_file)
+        object_name = config.object_name
         if not object_name:
             raise ValueError(f"File-backed {self.kind} requires an object name.")
         return {
@@ -148,19 +138,17 @@ class LazyRegistry:
 
     def resolve_configured_for_model_family(
         self,
+        config: ComponentConfig,
         *,
-        name: str | None,
-        python_file: str | None,
-        object_name: str | None,
         model_family: ModelFamily,
     ) -> Any:
         """Resolve a configured component and validate its model family."""
-        resolved = self.resolve_configured(
-            name=name,
-            python_file=python_file,
-            object_name=object_name,
+        resolved = self.resolve_configured(config)
+        label = (
+            config.name
+            if config.name is not None
+            else f"{config.python_file}:{config.object_name}"
         )
-        label = name if name is not None else f"{python_file}:{object_name}"
         return self._validate_model_family(label, resolved, model_family)
 
     def _validate_model_family(
@@ -285,19 +273,8 @@ def selected_registry_identity(
 ) -> dict[str, Any]:
     """Return stable identity data for all configured multimodal components."""
     return {
-        "task_encoder": TASK_ENCODER_REGISTRY.configured_identity(
-            name=task_encoder.name,
-            python_file=task_encoder.python_file,
-            object_name=task_encoder.object_name,
-        ),
-        "cookers": [
-            COOKER_REGISTRY.configured_identity(
-                name=cooker.name,
-                python_file=cooker.python_file,
-                object_name=cooker.object_name,
-            )
-            for cooker in cookers
-        ],
+        "task_encoder": TASK_ENCODER_REGISTRY.configured_identity(task_encoder),
+        "cookers": [COOKER_REGISTRY.configured_identity(cooker) for cooker in cookers],
     }
 
 

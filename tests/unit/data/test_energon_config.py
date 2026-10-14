@@ -65,9 +65,7 @@ def test_file_backed_cooker_loads_from_config_and_preserves_identity(tmp_path, k
         {"python_file": str(path), key: "custom_cooker"}
     )
     registry = LazyRegistry("cooker")
-    cooker = registry.resolve_configured(
-        name=config.name, python_file=config.python_file, object_name=config.object_name
-    )
+    cooker = registry.resolve_configured(config)
     assert cooker("sample") == "sample"
     identity = selected_registry_identity(
         task_encoder=EnergonTaskEncoderConfig(), cookers=[config]
@@ -152,3 +150,64 @@ def test_loader_preserves_energon_defaults_unless_overridden(
         assert "gc_collect_every_n_steps" not in kwargs
     else:
         assert kwargs["gc_collect_every_n_steps"] == config.gc_collect_every_n_steps
+
+
+@pytest.mark.parametrize(
+    ("config_type", "default_name", "specific_field"),
+    [
+        (EnergonCookerConfig, "generic_conversation", "has_subflavors"),
+        (EnergonTaskEncoderConfig, "generic_sft", "packing"),
+    ],
+)
+def test_component_defaults_shorthand_and_options_are_preserved(
+    config_type: type[EnergonCookerConfig | EnergonTaskEncoderConfig],
+    default_name: str,
+    specific_field: str,
+) -> None:
+    config = config_type()
+    expected = {
+        "name": default_name,
+        "python_file": None,
+        "object": None,
+        "options": {},
+        specific_field: None,
+    }
+
+    assert config.model_dump(mode="json", by_alias=True) == expected
+    assert (
+        config_type.model_validate(default_name).model_dump(mode="json", by_alias=True)
+        == expected
+    )
+    config.options["custom"] = True
+    assert config_type().options == {}
+
+
+@pytest.mark.parametrize(
+    ("config_type", "label"),
+    [(EnergonCookerConfig, "Cooker"), (EnergonTaskEncoderConfig, "Task encoder")],
+)
+@pytest.mark.parametrize("case", ["mixed", "missing_file", "missing_object"])
+def test_component_selection_preserves_error_messages(
+    config_type: type[EnergonCookerConfig | EnergonTaskEncoderConfig],
+    label: str,
+    case: str,
+) -> None:
+    if case == "mixed":
+        selection = {
+            "name": "registered",
+            "python_file": "/workspace/plugins.py",
+            "object_name": "custom_component",
+        }
+        expected = f"{label} must use either name or python_file and object_name."
+    else:
+        selection = {"name": None}
+        if case == "missing_file":
+            selection["object_name"] = "custom_component"
+        else:
+            selection["python_file"] = "/workspace/plugins.py"
+        expected = f"File-backed {label.lower()}s require python_file and object_name."
+
+    with pytest.raises(ValidationError) as error:
+        config_type.model_validate(selection)
+
+    assert error.value.errors()[0]["msg"] == f"Value error, {expected}"
