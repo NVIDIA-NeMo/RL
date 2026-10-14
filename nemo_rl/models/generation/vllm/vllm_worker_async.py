@@ -275,6 +275,27 @@ class VllmAsyncGenerationWorkerImpl(
         self.llm = None
         self.vllm_device_ids = None
 
+    async def start_gpu_profiling(self) -> None:
+        """Start GPU profiling on the inner TP workers.
+
+        The async engine's collective_rpc is a coroutine; the inherited sync
+        start_gpu_profiling would drop it un-awaited, so the inner TP workers
+        never receive cudaProfilerStart. Await it here so every inner worker starts.
+        This outer actor deliberately does not call cudaProfilerStart itself, so its
+        own nsys session never opens a capture and writes no report.
+        """
+        if self.llm is not None:
+            await self.llm.collective_rpc("start_gpu_profiling", args=tuple())
+
+    async def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling on the inner TP workers.
+
+        Awaits collective_rpc("stop_gpu_profiling") so cudaProfilerStop reaches every
+        inner worker and ends its capture.
+        """
+        if self.llm is not None:
+            await self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
+
     def _return_routed_experts_enabled(self) -> bool:
         engine_args = getattr(self, "llm_async_engine_args", None)
         if bool(getattr(engine_args, "enable_return_routed_experts", False)):
