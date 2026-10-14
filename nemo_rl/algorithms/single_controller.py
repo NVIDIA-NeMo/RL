@@ -224,6 +224,12 @@ log = logging.getLogger(__name__)
 # cleaner exit. Not configurable for the same reason.
 _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
 
+# Public metric names are emitted only after the optimizer step and its
+# controller-side commit complete.
+_POST_ADMISSION_TRACE_COUNT_METRIC = "session_traces/post_admission_trace_count"
+_POST_ADMISSION_PARENT_COUNT_METRIC = "session_traces/post_admission_parent_trace_count"
+_POST_ADMISSION_CHILD_COUNT_METRIC = "session_traces/post_admission_child_trace_count"
+
 
 @dataclass(frozen=True)
 class _RolloutCheckpointSaveResult:
@@ -290,6 +296,40 @@ def _pooled_opd_metrics(
         "on_policy_distillation/adv_mean": mean,
         "on_policy_distillation/adv_std": math.sqrt(max(variance, 0.0)),
     }
+
+
+def _post_admission_session_role_counts(
+    meta: KVBatchMeta, admitted_sample_mask: torch.Tensor
+) -> Optional[dict[str, int]]:
+    """Count parent/child trace rows admitted to the learner step.
+
+    ``admitted_sample_mask`` is the sample mask *after* final logical-owner
+    admission: the advantage stage has applied environment, overlong and
+    optional TMPE filtering, then fanned each logical owner's final validity
+    back to all of its physical session rows. Consequently, one invalid child
+    invalidates its entire owner and neither that child nor its parent can enter
+    these counts. This is the same row-admission mask that the policy worker
+    sums into ``global_valid_seqs``; it does not claim that a retained row has a
+    nonzero advantage or gradient.
+
+    This helper is deliberately telemetry-only and fail-open. Session metadata
+    is already validated before publication; if a corrupted batch nevertheless
+    contains an unrecognized/missing role, ``trace_count`` still records the
+    admitted row while the parent+child sum exposes the mismatch.
+    """
+    tags = meta.tags
+    if tags is None or not any("session_role" in tag for tag in tags):
+        return None
+    admitted_rows = admitted_sample_mask.bool().tolist()
+    counts = {"trace": 0, "parent": 0, "child": 0}
+    for admitted, tag in zip(admitted_rows, tags, strict=False):
+        if not admitted:
+            continue
+        counts["trace"] += 1
+        role = tag.get("session_role")
+        if role in ("parent", "child"):
+            counts[role] += 1
+    return counts
 
 
 def _train_fields_for_step(
@@ -2779,6 +2819,7 @@ class SingleControllerActor:
             consumed_group_count = 0
             step_finalizer_metrics: dict[str, list[float]] = {}
             logical_owners: set[str] = set()
+            post_admission_role_counts: list[dict[str, int]] = []
 
             with (
                 self._timer.time("total_step_time"),
@@ -3072,7 +3113,10 @@ class SingleControllerActor:
                         (
                             train_meta,
                             has_valid_training_tokens,
-                        ) = await self._advantage_stage(train_meta)
+                        ) = await self._advantage_stage(
+                            train_meta,
+                            role_count_accumulator=post_admission_role_counts,
+                        )
                     if context_compaction:
                         # The advantage stage has verified every owner/segment.
                         # Count those owners, not the physical rows or sampler tally.
@@ -3323,6 +3367,35 @@ class SingleControllerActor:
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
+                # These records were derived from the final owner-fanned loss
+                # mask in _advantage_stage. Do not publish them for an empty or
+                # aborted step: policy_result exists only after
+                # finish_train_step returned, and this log is reached only
+                # after the matching rows were cleaned up for the completed
+                # controller step.
+                if policy_result is not None and post_admission_role_counts:
+                    step_metrics.update(
+                        {
+                            _POST_ADMISSION_TRACE_COUNT_METRIC: float(
+                                sum(
+                                    record["trace"]
+                                    for record in post_admission_role_counts
+                                )
+                            ),
+                            _POST_ADMISSION_PARENT_COUNT_METRIC: float(
+                                sum(
+                                    record["parent"]
+                                    for record in post_admission_role_counts
+                                )
+                            ),
+                            _POST_ADMISSION_CHILD_COUNT_METRIC: float(
+                                sum(
+                                    record["child"]
+                                    for record in post_admission_role_counts
+                                )
+                            ),
+                        }
+                    )
                 per_group_rollout_metrics: dict[str, list[Any]] = {}
                 for group_metrics in selected_rollout_metrics:
                     for metric_name, value in group_metrics.items():
@@ -5283,7 +5356,12 @@ class SingleControllerActor:
         assert result is not None
         return result
 
-    async def _advantage_stage(self, meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
+    async def _advantage_stage(
+        self,
+        meta: KVBatchMeta,
+        *,
+        role_count_accumulator: Optional[list[dict[str, int]]] = None,
+    ) -> tuple[KVBatchMeta, bool]:
         """Fetch advantage inputs, compute advantages, and write them back.
 
         SC owns the prompt-group-scoped advantage stage because the selected
@@ -5291,6 +5369,12 @@ class SingleControllerActor:
         DP sharding. Tensor payloads still move through DataPlane: SC fetches
         only the configured advantage input columns and writes the computed
         ``advantages`` column back under the same ``sample_ids``.
+
+        Args:
+            meta: Metadata for one selected training chunk.
+            role_count_accumulator: Optional step-local telemetry sink. A role
+                record is appended only after the final owner-fanned sample
+                mask and advantage writeback succeed.
 
         Returns:
             The updated batch metadata and whether the batch contains at least
@@ -5596,6 +5680,10 @@ class SingleControllerActor:
                 partition_id=meta.partition_id,
                 fields=fields_for_put(meta, fields_to_put),
             )
+        if owner_batch is not None and role_count_accumulator is not None:
+            role_counts = _post_admission_session_role_counts(meta, final_sample_mask)
+            if role_counts is not None:
+                role_count_accumulator.append(role_counts)
         return (
             meta.with_fields(new_fields),
             has_valid_training_tokens,

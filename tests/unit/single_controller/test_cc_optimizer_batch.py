@@ -259,6 +259,68 @@ def test_complete_logical_batch_streams_all_segments_but_steps_once(
     assert not ctrl._dp_client.list_sample_ids("train")
 
 
+def test_role_counts_are_emitted_on_the_committed_step_after_owner_admission(
+    monkeypatch,
+):
+    batches = [
+        _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True),
+        _batch([("b", [(0.0, 3), (1.0, 2)])], padding=True),
+    ]
+    for meta, _ in batches:
+        assert meta.tags is not None
+        for tag in meta.tags:
+            if not tag["is_execution_padding"]:
+                tag["session_role"] = "parent" if tag["segment_index"] == 0 else "child"
+
+    # Reject one child row. Owner fanout rejects both traces of a_g0, while
+    # the other three logical owners still make this a nonempty optimizer step.
+    batches[0][1]["sample_mask"][1] = 0
+    ctrl, _ = _setup(monkeypatch, batches=batches)
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+
+    ctrl._trainer.finish_train_step.assert_called_once_with()
+    train_logs = [
+        call
+        for call in ctrl._logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ]
+    assert len(train_logs) == 1
+    metrics = train_logs[0].args[0]
+    assert train_logs[0].kwargs["step"] == ctrl._train_steps == 1
+    assert metrics["session_traces/post_admission_trace_count"] == 6.0
+    assert metrics["session_traces/post_admission_parent_trace_count"] == 3.0
+    assert metrics["session_traces/post_admission_child_trace_count"] == 3.0
+    assert (
+        metrics["session_traces/post_admission_parent_trace_count"]
+        + metrics["session_traces/post_admission_child_trace_count"]
+        == metrics["session_traces/post_admission_trace_count"]
+    )
+
+
+def test_role_counts_are_not_published_when_optimizer_finish_fails(monkeypatch):
+    batches = [
+        _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True),
+        _batch([("b", [(0.0, 3), (1.0, 2)])], padding=True),
+    ]
+    for meta, _ in batches:
+        assert meta.tags is not None
+        for tag in meta.tags:
+            if not tag["is_execution_padding"]:
+                tag["session_role"] = "parent" if tag["segment_index"] == 0 else "child"
+    ctrl, _ = _setup(monkeypatch, batches=batches)
+    ctrl._trainer.finish_train_step.side_effect = RuntimeError("optimizer failed")
+
+    with pytest.raises(RuntimeError, match="optimizer failed"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+
+    assert ctrl._train_steps == 0
+    assert not any(
+        call.kwargs.get("prefix") == "train"
+        for call in ctrl._logger.log_metrics.call_args_list
+    )
+
+
 @pytest.mark.parametrize(
     "failure,trained_chunks,reason",
     [

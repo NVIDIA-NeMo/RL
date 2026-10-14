@@ -329,6 +329,27 @@ def test_masked_owner_is_excluded_from_baseline_and_loss(filter_field, ordinary)
     ].count_nonzero() == 0
 
 
+def test_post_admission_role_counts_exclude_an_owner_with_an_invalid_child():
+    meta, data = _batch([("a", [(0.0, 2), (2.0, 2), (4.0, 1)])])
+    assert meta.tags is not None
+    for tag in meta.tags:
+        tag["session_role"] = "parent" if tag["segment_index"] == 0 else "child"
+
+    # The second owner's child is invalid. Final logical-owner admission must
+    # fan that rejection back to its parent, so neither row can be counted.
+    data["sample_mask"][3] = 0
+    ctrl = _controller(meta, data)
+    role_counts = []
+
+    _, valid = asyncio.run(
+        ctrl._advantage_stage(meta, role_count_accumulator=role_counts)
+    )
+
+    assert valid
+    assert data["sample_mask"].tolist() == [1, 1, 0, 0, 1]
+    assert role_counts == [{"trace": 3, "parent": 2, "child": 1}]
+
+
 def test_all_invalid_owners_take_existing_no_training_path():
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True)
     data["mask_sample"][:] = True
