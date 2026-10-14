@@ -382,7 +382,9 @@ def _task_encoder(
             ),
         )
         if cooker_config.options:
-            cooker_function = partial(cooker_function, **cooker_config.options)
+            cooker_function = update_wrapper(
+                partial(cooker_function, **cooker_config.options), cooker_function
+            )
         cooker_functions.append(
             Cooker(
                 cooker_function,
