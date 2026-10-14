@@ -8,11 +8,6 @@
 # weights), then resumes them afterwards.
 defaults: grpo_math_1B_megatron_single_controller.yaml
 
-async_rl:
-  generation_fleet_health:
-    # Dynamo workers cannot abort their refit collective, so no refit deadline.
-    refit_timeout_s: null
-
 policy:
   # Training uses the Megatron backend inherited from
   # grpo_math_1B_megatron_single_controller.yaml; the SingleController's split
