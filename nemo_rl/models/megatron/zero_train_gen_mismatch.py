@@ -513,7 +513,10 @@ def _validate_packages(out: ZeroTrainGenValidation) -> None:
 def validate_zero_train_gen_model_provider(
     config: PolicyConfig, model_cfg: Any
 ) -> None:
-    """Reject unsupported architectures using the resolved Bridge provider."""
+    """Reject unsupported architectures using the resolved Bridge provider.
+
+    Hybrid Mamba models are supported; Megatron-Core asserts MAMBA_DETERMINISTIC=1 for them.
+    """
     if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return
 
@@ -521,7 +524,6 @@ def validate_zero_train_gen_model_provider(
         field_name
         for field_name in (
             "multi_latent_attention",
-            "hybrid_layer_pattern",
             "experimental_attention_variant",
         )
         if getattr(model_cfg, field_name, None)

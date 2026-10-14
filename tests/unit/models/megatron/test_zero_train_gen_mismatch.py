@@ -337,7 +337,6 @@ def test_validate_requires_flash_attention_4(version):
     ("key", "value"),
     [
         ("multi_latent_attention", True),
-        ("hybrid_layer_pattern", "M*L"),
         ("experimental_attention_variant", "some_variant"),
     ],
 )
@@ -347,6 +346,13 @@ def test_validate_provider_rejects_unsupported_architecture(key, value):
 
     with pytest.raises(ValueError, match=key):
         zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+
+
+def test_validate_provider_accepts_hybrid_mamba():
+    config = _policy_config()
+    model_cfg = types.SimpleNamespace(hybrid_layer_pattern="M*-")
+
+    zgm.validate_zero_train_gen_model_provider(config, model_cfg)
 
 
 def test_validate_provider_is_noop_when_the_preset_is_off():
