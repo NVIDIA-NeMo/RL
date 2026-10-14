@@ -3459,8 +3459,11 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
     monkeypatch.setattr(grpo_mod, "Policy", lambda *_args, **_kwargs: DummyPolicy())
     monkeypatch.setattr(grpo_mod, "DynamoGeneration", DummyDynamoGeneration)
+    sync_kwargs = {}
     monkeypatch.setattr(
-        grpo_mod, "create_weight_synchronizer", lambda **_kwargs: synchronizer
+        grpo_mod,
+        "create_weight_synchronizer",
+        lambda **kwargs: sync_kwargs.update(kwargs) or synchronizer,
     )
     monkeypatch.setattr(grpo_mod, "build_nemo_gym_actors", build_nemo_gym_actors)
     # The agent-coverage check asks an unsharded job's actor for its entries
@@ -3486,6 +3489,9 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     assert dynamo_init.call_args.kwargs["cluster"] is inference_cluster
     assert DynamoConfig.model_validate(dynamo_config).engine_world_size == 4
     synchronizer.init_communicator.assert_called_once_with()
+    # The trainers abort at the engines' deadline instead of hanging in NCCL.
+    deadline_s = master_config.policy["generation"]["dynamo_cfg"]["control_timeout_s"]
+    assert sync_kwargs["refit_timeout_s"] == deadline_s
     build_nemo_gym_actors.assert_called_once_with(
         master_config.env,
         base_urls=["http://dynamo-wrapper.example/v1"],

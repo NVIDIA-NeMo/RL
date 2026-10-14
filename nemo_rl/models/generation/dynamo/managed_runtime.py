@@ -156,10 +156,6 @@ class ManagedDynamoRuntime:
             "DYN_HEALTH_CHECK_ENABLED": "false",
             "DYN_SDK_DISABLE_ANSI_LOGGING": "1",
             "DYN_RL_INIT_WEIGHTS_TIMEOUT_S": str(self._dynamo_cfg.control_timeout_s),
-            # A refit runs as a blocking collective_rpc inside EngineCore. Give the
-            # engine health check the same budget so a long refit is not mistaken
-            # for a hung engine and the worker killed.
-            "DYN_ENGINE_HEALTH_CHECK_TIMEOUT": str(self._dynamo_cfg.control_timeout_s),
             # Matches the trainer side and VllmGeneration for non-colocated refit
             # (NeMo-RL issue #564).
             "NCCL_CUMEM_ENABLE": "1",
