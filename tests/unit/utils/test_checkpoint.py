@@ -802,6 +802,14 @@ def async_manager(async_checkpoint_config):
     mgr.shutdown()
 
 
+def _join_background_finalization(manager):
+    """Wait for the finalize thread to finish without flushing its result."""
+    thread = manager._finalize_thread
+    assert thread is not None
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "finalization did not finish"
+
+
 class TestBeginFinalization:
     """Tests for CheckpointManager.begin_finalization()."""
 
@@ -902,6 +910,63 @@ class TestFinalizePending:
         async_manager.begin_finalization(tmp2, wait_fn=None)
         async_manager.finalize_pending()
         assert (checkpoint_dir / "step_2").exists()
+
+
+class TestRaiseIfFinalizationFailed:
+    """Tests for CheckpointManager.raise_if_finalization_failed()."""
+
+    def test_raises_failure_without_waiting_for_next_save(
+        self, async_manager, checkpoint_dir
+    ):
+        """A failure that already happened surfaces at the next step boundary."""
+
+        def failing_wait():
+            raise ValueError("Simulated async write failure")
+
+        tmp = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp, wait_fn=failing_wait)
+        _join_background_finalization(async_manager)
+
+        with pytest.raises(
+            RuntimeError, match="Background checkpoint finalization failed"
+        ) as error:
+            async_manager.raise_if_finalization_failed()
+
+        assert isinstance(error.value.__cause__, ValueError)
+        assert Path(tmp).is_dir()
+        assert not (checkpoint_dir / "step_1").exists()
+        # The error is raised once; the manager is clean afterwards.
+        async_manager.raise_if_finalization_failed()
+        async_manager.finalize_pending()
+
+    def test_does_not_block_on_inflight_finalization(
+        self, async_manager, checkpoint_dir
+    ):
+        """An in-flight finalization keeps running in the background."""
+        release = threading.Event()
+
+        def slow_wait():
+            release.wait(timeout=5)
+
+        tmp = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp, wait_fn=slow_wait)
+
+        async_manager.raise_if_finalization_failed()
+        assert async_manager.has_pending_finalization
+
+        release.set()
+        async_manager.finalize_pending()
+        assert (checkpoint_dir / "step_1").exists()
+
+    def test_noop_when_nothing_failed(self, async_manager, checkpoint_dir):
+        async_manager.raise_if_finalization_failed()
+
+        tmp = async_manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        async_manager.begin_finalization(tmp, wait_fn=None)
+        _join_background_finalization(async_manager)
+
+        async_manager.raise_if_finalization_failed()
+        assert (checkpoint_dir / "step_1").exists()
 
 
 class TestShutdown:
