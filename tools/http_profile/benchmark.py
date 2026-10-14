@@ -965,7 +965,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sizes", type=int, nargs="+", default=[2048, 8192, 32768])
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32])
-    parser.add_argument("--modes", choices=MODES, nargs="+", default=list(MODES))
+    parser.add_argument(
+        "--modes",
+        choices=MODES,
+        nargs="+",
+        default=[mode for mode in MODES if mode != "direct_native"],
+        help="direct_native additionally requires requirements-native.txt",
+    )
     parser.add_argument("--turns", type=int, default=4)
     parser.add_argument("--generated-tokens", type=int, default=128)
     parser.add_argument("--added-tokens", type=int, default=128)

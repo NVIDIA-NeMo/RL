@@ -143,6 +143,8 @@ Registration contributes to end-to-end throughput but is outside individual
 model-request latency. Finalization/drain is separately reported. Use `--trace`
 for Perfetto-compatible traces or `--profile` for CPU attribution; instrumented
 runs must not be used for speedup claims.
+The fake engine runs on the HTTP event loop; the production worker's cross-thread
+engine-loop handoff is not exercised by this benchmark.
 
 The harness records power state on macOS and alternates mode order between
 rounds. Keep battery/transition runs separate from AC results. Exact benchmark

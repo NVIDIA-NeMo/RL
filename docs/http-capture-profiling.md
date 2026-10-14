@@ -1,9 +1,9 @@
 # Profile Gym HTTP and token capture on a CPU workstation
 
 `tools/http_profile` compares the checkout's actual Gym HTTP/capture middleware
-with opaque forwarding and asynchronous tree capture prototypes. It runs on
-macOS without PyTorch, CUDA, a tokenizer, a model, or a training job. Serving
-behavior outside the benchmark is unchanged.
+with opaque forwarding prototypes and NRL's direct capture implementation. The
+default modes run on macOS without PyTorch; the opt-in `direct_native` arm uses
+CPU tensors. No mode requires CUDA, a tokenizer, a model, or a training job.
 
 The experiment models the chat-completions traffic an external SWE harness such
 as `harbor_agent_general` produces: independent rollout conversations, four
@@ -11,7 +11,8 @@ sequential turns, code and terminal text, and a tool schema. The latency benchma
 does not launch Harbor, containers, or an SWE task. A separate
 [Harbor credential smoke](#harbor-credentials-without-an-inference-proxy) below
 runs actual OpenCode agents in Docker against a fake model. The production Harbor
-adapter still needs per-rollout credential provisioning and backend attribution.
+adapter uses the generic rollout endpoint shim described in
+[Direct token capture](direct-token-capture.md) for credential provisioning.
 A conversation ID identifies one rollout, not its entire GRPO group.
 
 ## What is measured
@@ -24,6 +25,7 @@ measurement. All modes use the same backend fixture and client validation.
 | Mode | Response path | Capture |
 | --- | --- | --- |
 | `direct` | Client → backend | None; HTTP baseline |
+| `direct_native` | Client → backend with rollout API key | Production capture owner, engine bridge and native tensor codec; prebuilt engine outputs and memory storage |
 | `gym` | Client → actual Gym `VLLMModel` → backend | Disabled |
 | `gym_capture` | Actual Gym external-capture middleware and `VLLMWorkerCaptureHandler` | Actual `RolloutTokenCapture`, in-memory staging sink, actual fsync-backed `FileLineageStore`; awaited before response |
 | `opaque` | Request/response byte streams through an aiohttp proxy | None |
@@ -43,7 +45,7 @@ contract, not an implementation-equivalence test. In particular, distributed
 staging durability and existing ledger custody semantics are absent from the native
 prototype. Shared-prefix training, including [PR #4537](https://github.com/NVIDIA-NeMo/RL/pull/4537), is not a dependency.
 
-For the existing production vLLM external-capture path, the relevant switches are
+For the legacy `token_capture.transport: gym` vLLM capture path, the switches are
 `env.should_use_nemo_gym=true`, `policy.generation.backend=vllm`,
 `policy.generation.vllm_cfg.async_engine=true`,
 `policy.generation.vllm_cfg.expose_http_server=true`, `data_plane.enabled=true`,
@@ -379,18 +381,17 @@ job_config.model_dump(mode="json", context={"redact_sensitive_env": False})
 Use that only for the worker handoff; normal persisted configs should still use
 Harbor's redaction. Copy the agent config before adding a rollout's environment
 value, and do not mutate shared `os.environ` between concurrent rollouts. The
-smoke tests reproduce the redaction problem and use the corrected transport, but
-do **not** change the production Gym adapter or launch a Ray cluster.
+smoke tests reproduce the redaction problem and use the corrected transport;
+they do not launch a Ray cluster. The generic Gym endpoint shim in this change
+also applies the correction to the production Harbor adapter.
 
 The backend must accept these issued credentials and map them to a rollout inside
 its existing HTTP server. A static unrelated vLLM API key does not provide that
-mapping. Native capture still needs a backend integration: the current NRL capture
-handler expects ledger-provided `ng_capture`, so this is not enabled by simply
-changing YAML today. After registration, attribution is an in-process key lookup;
-no Gym forwarding hop or remote per-request identity lookup is needed. Tree
-updates can use the separately tested bounded resolver queue. Register/revoke and
-drain the rollout at its lifecycle boundaries; distinguish retries that actually
-generated tokens with separate backend call IDs.
+mapping. `token_capture.transport: direct` enables NRL's backend integration and
+registration lifecycle. After registration, attribution is an in-process key
+lookup; no Gym forwarding hop or remote per-request identity lookup is needed.
+Native staging uses a bounded pool and drains at rollout completion. Calls that
+actually generate tokens receive distinct capture IDs, including retries.
 
 ### Reproduce the Docker smoke
 
@@ -457,6 +458,8 @@ The `direct_native` arm exercises NRL's production native-output bridge, bounded
 capture pool, and tensor codec. It replaces the engine with prebuilt outputs and
 TransferQueue with memory; it has no Gym model proxy. It currently benchmarks
 non-MoE payloads. This is separate from the earlier opaque proxy prototype.
+The fake engine runs on the HTTP event loop, so this measurement excludes the
+production worker's HTTP-to-engine loop handoff as well as vLLM/GPU execution.
 
 Command (three rounds, alternating mode order, 128 calls per case):
 
@@ -476,6 +479,10 @@ uv run --no-project --cache-dir /tmp/nrl-http-uv-cache \
 | Current Gym capture | 17.025 ms | 154.418 ms | 96.5 | 12.650 ms |
 
 These are medians across rounds on AC power, not GPU throughput measurements.
+The [recorded summary](../tools/http_profile/baselines/macos-ac-2026-10-13/summary.json),
+[environment](../tools/http_profile/baselines/macos-ac-2026-10-13/environment.json),
+and [capture accounting](../tools/http_profile/baselines/macos-ac-2026-10-13/capture-accounting.json)
+are checked in so reviewers can inspect the run settings and variation.
 Native capture is ~29x lower latency than this Gym baseline at concurrency one,
 with ~0.166 ms remaining over direct. At concurrency 32 it is ~17x higher HTTP
 throughput than Gym, but only ~37% of direct throughput. Background work still
@@ -495,7 +502,12 @@ Perfetto diagnostic traces from a separate instrumented run are under
 into Perfetto; `native tensor staging` spans use the resolver thread IDs.
 Instrumented timings are excluded from the table.
 
-The production arm additionally needs CPU `torch` and `tensordict` plus the NRL
-import dependencies; install these in an isolated environment with `uv pip`.
+Install the production arm's additional CPU tensor dependencies before running it:
+
+```bash
+uv pip install --python /tmp/nrl-http-profile-venv/bin/python \
+  -r tools/http_profile/requirements-native.txt
+```
+
 See [Direct token capture](direct-token-capture.md) for configuration, generic
 Gym agent integration, training selection, and asymptotic payload costs.

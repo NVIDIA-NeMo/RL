@@ -1,0 +1,6 @@
+# Production native-capture arm on macOS; base HTTP harness plus CPU tensors.
+-r requirements.txt
+torch==2.10.0
+tensordict==0.14.3
+numpy==2.4.6
+nemo-lens[sdk,aiohttp] @ git+https://github.com/NVIDIA-NeMo/Lens.git@b0f977d414b2f89938604a0b7eaa78ee08bc8700

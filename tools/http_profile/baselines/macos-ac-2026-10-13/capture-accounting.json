@@ -1,0 +1,140 @@
+[
+  {
+    "mode": "direct_native",
+    "prompt_tokens": 32768,
+    "concurrency": 1,
+    "repeat": 0,
+    "power_before": {
+      "battery": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t100%; finishing charge; 0:16 remaining present: true",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+    },
+    "power_after": {
+      "battery": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t100%; finishing charge; 0:16 remaining present: true",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+    },
+    "queue": {
+      "submitted": 128,
+      "completed": 128,
+      "stored_calls": 128,
+      "pending": 0,
+      "rejected": 0,
+      "failures": [],
+      "drain_ms": 0.09808399772737175
+    }
+  },
+  {
+    "mode": "direct_native",
+    "prompt_tokens": 32768,
+    "concurrency": 32,
+    "repeat": 0,
+    "power_before": {
+      "battery": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t100%; finishing charge; 0:16 remaining present: true",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+    },
+    "power_after": {
+      "battery": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t100%; finishing charge; 0:16 remaining present: true",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+    },
+    "queue": {
+      "submitted": 128,
+      "completed": 128,
+      "stored_calls": 128,
+      "pending": 0,
+      "rejected": 0,
+      "failures": [],
+      "drain_ms": 0.14887500583427027
+    }
+  },
+  {
+    "mode": "direct_native",
+    "prompt_tokens": 32768,
+    "concurrency": 1,
+    "repeat": 1,
+    "power_before": {
+      "battery": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t100%; finishing charge; 0:16 remaining present: true",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+    },
+    "power_after": {
+      "battery": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t100%; finishing charge; 0:16 remaining present: true",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+    },
+    "queue": {
+      "submitted": 128,
+      "completed": 128,
+      "stored_calls": 128,
+      "pending": 0,
+      "rejected": 0,
+      "failures": [],
+      "drain_ms": 0.1075409963959828
+    }
+  },
+  {
+    "mode": "direct_native",
+    "prompt_tokens": 32768,
+    "concurrency": 32,
+    "repeat": 1,
+    "power_before": {
+      "battery": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t100%; finishing charge; 0:16 remaining present: true",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+    },
+    "power_after": {
+      "battery": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t100%; finishing charge; 0:16 remaining present: true",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+    },
+    "queue": {
+      "submitted": 128,
+      "completed": 128,
+      "stored_calls": 128,
+      "pending": 0,
+      "rejected": 0,
+      "failures": [],
+      "drain_ms": 0.10733299859566614
+    }
+  },
+  {
+    "mode": "direct_native",
+    "prompt_tokens": 32768,
+    "concurrency": 1,
+    "repeat": 2,
+    "power_before": {
+      "battery": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t100%; finishing charge; 0:16 remaining present: true",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+    },
+    "power_after": {
+      "battery": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t100%; finishing charge; 0:16 remaining present: true",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+    },
+    "queue": {
+      "submitted": 128,
+      "completed": 128,
+      "stored_calls": 128,
+      "pending": 0,
+      "rejected": 0,
+      "failures": [],
+      "drain_ms": 0.10120799561263993
+    }
+  },
+  {
+    "mode": "direct_native",
+    "prompt_tokens": 32768,
+    "concurrency": 32,
+    "repeat": 2,
+    "power_before": {
+      "battery": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t100%; finishing charge; 0:16 remaining present: true",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+    },
+    "power_after": {
+      "battery": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t100%; finishing charge; 0:16 remaining present: true",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded"
+    },
+    "queue": {
+      "submitted": 128,
+      "completed": 128,
+      "stored_calls": 128,
+      "pending": 0,
+      "rejected": 0,
+      "failures": [],
+      "drain_ms": 0.09504100307822227
+    }
+  }
+]
