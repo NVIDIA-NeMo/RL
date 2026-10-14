@@ -194,7 +194,7 @@ def test_collective_refit_requires_metadata():
         extension.update_weights_from_collective()
 
 
-def test_collective_refit_returns_false_when_reload_fails(monkeypatch):
+def test_collective_refit_aborts_and_raises_when_reload_fails(monkeypatch):
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
 
     extension, _, _, model_loader, engine = _extension(backend)
@@ -206,7 +206,8 @@ def test_collective_refit_returns_false_when_reload_fails(monkeypatch):
     monkeypatch.setattr(backend, "packed_broadcast_consumer", packed_consumer)
     monkeypatch.setattr(backend.torch.cuda, "synchronize", lambda: None)
 
-    assert extension.update_weights_from_collective() is False
+    with pytest.raises(RuntimeError, match="reload failed"):
+        extension.update_weights_from_collective()
     model_loader.begin_update_weights.assert_called_once_with()
     model_loader.finalize_update_weights.assert_not_called()
     model_loader.abort_update_weights.assert_called_once_with()
@@ -214,25 +215,22 @@ def test_collective_refit_returns_false_when_reload_fails(monkeypatch):
     engine.reset_prefix_cache.assert_not_called()
 
 
-def test_failed_fp8_refit_poisoning_requires_worker_restart(monkeypatch):
+def test_failed_refit_keeps_original_error_when_abort_fails(monkeypatch):
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
 
-    extension, _, model, model_loader, _ = _extension(backend)
-    model.model_config = SimpleNamespace(quant_config=object())
+    extension, _, _, model_loader, _ = _extension(backend)
 
     def packed_consumer(*, post_unpack_func, **_):
         post_unpack_func([("model.weight", torch.tensor([1.0]))])
 
-    model_loader.reload.side_effect = RuntimeError("partial reload failed")
+    model_loader.reload.side_effect = RuntimeError("reload failed")
     model_loader.abort_update_weights.side_effect = RuntimeError("abort failed")
     monkeypatch.setattr(backend, "packed_broadcast_consumer", packed_consumer)
     monkeypatch.setattr(backend.torch.cuda, "synchronize", lambda: None)
-    monkeypatch.setattr(backend.fp8_quantization, "is_fp8_model", lambda _: True)
 
-    with pytest.raises(RuntimeError, match="poisoned and must be restarted"):
+    with pytest.raises(RuntimeError, match="abort failed") as exc_info:
         extension.update_weights_from_collective()
-    with pytest.raises(RuntimeError, match="unusable.*must be restarted"):
-        extension.update_weights_from_collective()
+    assert str(exc_info.value.__context__) == "reload failed"
 
 
 @pytest.mark.parametrize("fp8", [False, True])
@@ -320,7 +318,7 @@ def test_ipc_zmq_detaches_mapper_staging_tensor_before_buffer_ack(monkeypatch):
     assert extension.zmq_socket.send.call_count == 3
 
 
-def test_ipc_zmq_offset_mismatch_returns_false_without_reload(monkeypatch):
+def test_ipc_zmq_offset_mismatch_aborts_and_raises_without_reload(monkeypatch):
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
     from nemo_rl.models.policy.utils import IPCProtocol
 
@@ -330,13 +328,14 @@ def test_ipc_zmq_offset_mismatch_returns_false_without_reload(monkeypatch):
     monkeypatch.setattr(backend, "rebuild_cuda_tensor_from_ipc", lambda h, d: buffer)
     monkeypatch.setattr(backend.torch.cuda, "current_stream", lambda: MagicMock())
 
-    # used_bytes (999) != computed offset (1024) -> assertion -> caught -> False.
+    # used_bytes (999) != computed offset (1024) -> assertion -> abort -> re-raised.
     extension.zmq_socket.recv_pyobj.side_effect = [
         ("ipc_handle", ["a", "b"], 999),
         IPCProtocol.COMPLETE,
     ]
 
-    assert extension.update_weights_via_ipc_zmq() is False
+    with pytest.raises(AssertionError, match="offset mismatch"):
+        extension.update_weights_via_ipc_zmq()
     model_loader.reload.assert_not_called()
     model_loader.begin_update_weights.assert_called_once_with()
     model_loader.finalize_update_weights.assert_not_called()

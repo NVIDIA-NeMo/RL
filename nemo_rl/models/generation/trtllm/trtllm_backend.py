@@ -25,7 +25,6 @@ Injected into TRT-LLM's RayGPUWorker via ``ray_worker_extension_cls``.
 
 import gc
 import os
-import traceback
 from typing import Any
 
 import torch
@@ -151,33 +150,6 @@ class NcclExtension(WorkerExtension):
             )
             _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
 
-    def _ensure_refit_usable(self) -> None:
-        failure = getattr(self, "_fp8_refit_failure", None)
-        if failure is not None:
-            raise RuntimeError(
-                "This TRT-LLM worker is unusable after a failed partial FP8 "
-                f"refit and must be restarted. Original failure: {failure}"
-            )
-
-    def _abort_weight_update_after_failure(
-        self, model: Any, model_loader: Any, error: Exception
-    ) -> None:
-        fp8_refit_failed = fp8_quantization.is_quantized_expert_refit(
-            model.model_config.quant_config
-        )
-        if fp8_refit_failed:
-            # Mark poisoned before abort (abort may fail): never serve partial FP8 weights.
-            self._fp8_refit_failure = repr(error)
-        try:
-            model_loader.abort_update_weights()
-        finally:
-            if fp8_refit_failed:
-                raise RuntimeError(
-                    "Partial FP8 refit failed after runtime weights may have "
-                    "been modified. The TRT-LLM worker is poisoned and must be "
-                    "restarted."
-                ) from error
-
     # ------------------------------------------------------------------ #
     #  NCCL weight receive + reload
     # ------------------------------------------------------------------ #
@@ -208,7 +180,6 @@ class NcclExtension(WorkerExtension):
         )
         model_engine = self.engine.model_engine
         model = model_engine.model
-        self._ensure_refit_usable()
 
         def load_model_weight_func(weight_list):
             if fp8_quantization.is_quantized_expert_refit(
@@ -251,12 +222,9 @@ class NcclExtension(WorkerExtension):
                     # also resets the prefix cache (NVIDIA/TensorRT-LLM#17937).
                     self.engine.recompute_active_requests()
                 self.finish_weight_update()
-            except Exception as e:
-                self._abort_weight_update_after_failure(
-                    model, model_engine.model_loader, e
-                )
-                print(f"Error in NcclExtension.update_weights_from_collective: {e}")
-                return False
+            except Exception:
+                model_engine.model_loader.abort_update_weights()
+                raise
 
         return True
 
@@ -291,7 +259,6 @@ class NcclExtension(WorkerExtension):
         )
         model_engine = self.engine.model_engine
         model = model_engine.model
-        self._ensure_refit_usable()
 
         buffer = None
         weights = None
@@ -361,13 +328,9 @@ class NcclExtension(WorkerExtension):
             gc.collect()
             torch.cuda.empty_cache()
             return True
-        except Exception as e:
-            self._abort_weight_update_after_failure(model, model_engine.model_loader, e)
-            print(
-                f"Error in NcclExtension.update_weights_via_ipc_zmq: {e}\n"
-                f"{traceback.format_exc()}"
-            )
-            return False
+        except Exception:
+            model_engine.model_loader.abort_update_weights()
+            raise
 
     def cleanup_zmq(self) -> None:
         """Close ZMQ socket if open — called from worker shutdown."""
