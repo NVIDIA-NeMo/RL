@@ -5430,15 +5430,19 @@ class SingleControllerActor:
         """Pause new rollout dispatches, synchronize weights, resume.
 
         SC owns the pause gate. vLLM serves through the refit; it supports live weight updates.
-        A colocated engine is instead already stood down: the synchronizer's sync is the wake,
-        and step 4 resumes dispatch.
+        Managed Dynamo cannot, so it drains around the transfer (steps 4 and 6). A colocated
+        engine is instead already stood down: the synchronizer's sync is the wake, and step 7
+        resumes dispatch.
 
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
           2. Optionally calibrate FP8 KV-cache scales.
           3. Materialize deferred policy parameter all-gathers.
-          4. weight_synchronizer.sync_weights(kv_scales=...)
-          5. _rollout_permitted.set()   — resume
+          4. generation.drain_for_weight_update()  — no-op except managed Dynamo
+          5. weight_synchronizer.sync_weights(kv_scales=...), retried once if recovery
+             rebuilds the group
+          6. generation.resume_after_weight_update()  — in finally, so also after a failed update
+          7. _rollout_permitted.set()   — resume
 
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
