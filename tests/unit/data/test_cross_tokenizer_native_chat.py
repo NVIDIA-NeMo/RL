@@ -30,6 +30,7 @@ from nemo_rl.data.xtoken.native_chat import (
     _render_and_tokenize_chat,
     _render_chat_text,
 )
+from tests.unit.data.test_cross_tokenizer_collate import _batch_checksums
 
 
 class _NativeThinkingTokenizer:
@@ -329,6 +330,99 @@ def test_native_collator_wires_semantic_regions_and_tools() -> None:
     )
     assert student_text == "reason</think>answer<|im_end|>"
     assert teacher_text == student_text
+
+
+def test_ce_covers_assistant_turn_rejects_native_thinking_alignment() -> None:
+    student, teacher, aligner = _native_pair()
+    with pytest.raises(
+        ValueError,
+        match="ce_covers_assistant_turn is not supported with "
+        "native_thinking_alignment=true",
+    ):
+        CrossTokenizerCollator(
+            student_tokenizer=student,
+            teacher_tokenizers=[teacher],
+            aligners=[aligner],
+            ctx_length_student=256,
+            ctx_length_teachers=[256],
+            config=CrossTokenizerCollatorConfig(
+                mode="chat",
+                include_thinking_in_loss=True,
+                native_thinking_alignment=True,
+            ),
+            drop_first_assistant_chunk_kl_by_teacher=[False],
+            ce_covers_assistant_turn=True,
+        )
+
+
+def _native_snapshot_batch():
+    """Default native batch with tool history and a same-tokenizer teacher."""
+    student, teacher, aligner = _native_pair()
+    call = (
+        "<tool_call>\n<function=lookup>\n<parameter=query>\nstatus\n"
+        "</parameter>\n</function>\n</tool_call>"
+    )
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+    collator = CrossTokenizerCollator(
+        student_tokenizer=student,
+        teacher_tokenizers=[teacher, student],
+        aligners=[aligner, None],
+        ctx_length_student=512,
+        ctx_length_teachers=[512, 512],
+        config=CrossTokenizerCollatorConfig(
+            mode="chat",
+            include_thinking_in_loss=True,
+            native_thinking_alignment=True,
+            kd_alignment_regions=["reasoning", "answer", "eot"],
+        ),
+        drop_first_assistant_chunk_kl_by_teacher=[False, False],
+        make_seq_div_by_student=8,
+        make_seq_div_by_teachers=[8, 1],
+    )
+    return collator(
+        [
+            {
+                "idx": 12,
+                "message_loss_mask": [0, 1, 0, 1],
+                "message_log": [
+                    {"role": "user", "content": "check"},
+                    {"role": "assistant", "content": f"<think>need tool</think>{call}"},
+                    {"role": "tool", "content": "secret tool result"},
+                    {"role": "assistant", "content": "<think>done</think>final"},
+                ],
+                "tools": tools,
+                "loss_multiplier": 1.0,
+            },
+            {
+                "idx": 13,
+                "message_loss_mask": [0, 1],
+                "message_log": _messages(),
+                "loss_multiplier": 0.5,
+            },
+        ]
+    )
+
+
+# Captured from the collator before the optional overlength and CE-turn
+# behaviors existed; the default batch must stay bitwise identical.
+_NATIVE_SNAPSHOT_CHECKSUMS = {
+    "input_ids": 2507018537,
+    "input_lengths": 3306459566,
+    "token_mask": 659834500,
+    "sample_mask": 586538992,
+    "idx": 1255379548,
+    "teacher_0_input_ids": 2619219324,
+    "teacher_0_input_lengths": 4208557102,
+    "teacher_0_token_mask": 2675954031,
+    "alignment_0_pair_valid": 1359780149,
+    "alignment_0_pair_is_correct": 1359780149,
+    "alignment_0_student_chunk_id": 205266258,
+    "alignment_0_teacher_chunk_id": 1512822273,
+}
+
+
+def test_default_native_batch_matches_pinned_output() -> None:
+    assert _batch_checksums(_native_snapshot_batch()) == _NATIVE_SNAPSHOT_CHECKSUMS
 
 
 def test_native_collator_keeps_historical_tool_call_as_context_only() -> None:
