@@ -73,6 +73,7 @@ from nemo_rl.experience.route_plan import (
     encoded_route_plan_size_bytes,
     validate_route_plan,
 )
+from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 
 @dataclass(frozen=True)
@@ -1107,6 +1108,11 @@ class RolloutReassembler:
             sample_ids = [row.rollout_id for row in rows]
             for tag, owner_tag in zip(tags, logical.tags, strict=True):
                 tag.update(owner_tag)
+        # The token-capture/reassembly path publishes canonical training rows
+        # directly instead of going through TQReplayBuffer.commit().  Trace the
+        # final payload here, after logical row IDs have been resolved, so R3's
+        # rollout-to-policy identity audit covers both publication paths.
+        trace_rollout_payload(keys=sample_ids, data=train_batch)
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
         _put_t0 = time.perf_counter()
         self._call_dp(

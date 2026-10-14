@@ -53,6 +53,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQTokenSource,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
+from nemo_rl.experience import rollout_reassembler as _reassembler_module  # noqa: E402
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler  # noqa: E402
 from nemo_rl.experience.route_plan import decode_route_plan  # noqa: E402
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
@@ -501,9 +502,17 @@ def _stage_fixture_with_routes(tq_client, name: str, *, rollout_id: str):
     return receipt.model_dump(), row, routes_by_call
 
 
-def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
+def test_finalize_group_publishes_routed_experts(
+    tq_client, r3_partitions, monkeypatch
+):
     group_id = "grpr3"
     rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    trace_calls = []
+    monkeypatch.setattr(
+        _reassembler_module,
+        "trace_rollout_payload",
+        lambda **kwargs: trace_calls.append(kwargs),
+    )
     receipt, expected, routes_by_call = _stage_fixture_with_routes(
         tq_client, "worked_example", rollout_id=rollout_ids[0]
     )
@@ -529,6 +538,13 @@ def test_finalize_group_publishes_routed_experts(tq_client, r3_partitions):
     assert "routed_experts" in finalized.meta.fields
     assert finalized.metrics["finalize/routed_experts_row_coverage"] == 1.0
     assert finalized.metrics["finalize/routed_experts_sentinel_token_fraction"] == 0.0
+    assert len(trace_calls) == 1
+    assert trace_calls[0]["keys"] == finalized.meta.sample_ids == rollout_ids
+    assert trace_calls[0]["data"]["input_lengths"].tolist() == [
+        len(expected.token_ids),
+        1,
+    ]
+    assert "routed_experts" in trace_calls[0]["data"]
 
     rows = tq_client.get_samples(
         sample_ids=rollout_ids,
