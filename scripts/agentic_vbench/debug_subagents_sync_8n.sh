@@ -38,14 +38,18 @@ export AGENTIC_VBENCH_MAX_TURNS=${AGENTIC_VBENCH_MAX_TURNS:-32}
 # Keep this Hydra override free of commas and apostrophes.  The launcher passes
 # the value as one argv entry, but Hydra still parses punctuation in the value;
 # an apostrophe in the v9 prompt made the live driver fail before setup.
-debug_delegation_prompt="During this task call the task tool exactly once near the beginning to delegate one suitable bounded subtask to the general subagent. "
-debug_delegation_prompt+="Do not delegate the full task. Review and integrate the child result. Continue until every required deliverable exists. "
-debug_delegation_prompt+="When delegating explicitly ask the child to return only a concise bounded result and stop before its output limit. "
-debug_delegation_prompt+="Keep every response concise and call tools early. Before producing the final answer verify the deliverables with bash. "
-debug_delegation_prompt+="Do not produce a final answer while required deliverables are missing. After verification succeeds immediately return a brief final answer."
+debug_delegation_prompt="Your first action must be exactly one task tool call before bash read or any other tool. "
+debug_delegation_prompt+="Delegate only candidate clip selection to the general subagent and ask it to return a compact JSON slot to clip mapping with at most one evidence sentence per slot. "
+debug_delegation_prompt+="Tell the child not to create solution.mp4 or solution.json. Do not inspect clips yourself and do not repeat or debate the child analysis. "
+debug_delegation_prompt+="When the child returns choose its mapping immediately then use bash and ffmpeg to create both required output files with a truthful manifest. "
+debug_delegation_prompt+="Verify that both files exist and that solution.json parses before answering. Keep each response short. If any choice is ambiguous choose the best candidate once and continue. "
+debug_delegation_prompt+="Never end while a required deliverable is missing. After verification succeeds return one brief final sentence."
 export AGENTIC_VBENCH_DELEGATION_PROMPT=${AGENTIC_VBENCH_DELEGATION_PROMPT:-"${debug_delegation_prompt}"}
-debug_subagent_prompt="Complete only the delegated bounded subtask. Use tools early and keep every response concise. "
-debug_subagent_prompt+="Return a concise result to the parent as soon as the requested evidence is ready. Stop before the output limit."
+debug_subagent_prompt="Complete only candidate clip selection and never create solution.mp4 or solution.json. "
+debug_subagent_prompt+="Use one batched probe and frame extraction workflow then inspect each compact contact sheet once. "
+debug_subagent_prompt+="Choose the best clip for every requested slot without revisiting decisions. If ambiguous choose the best candidate once. "
+debug_subagent_prompt+="Return within 400 words using a compact JSON slot to clip mapping followed by at most one short evidence sentence per slot. "
+debug_subagent_prompt+="Do not narrate the work plan or repeat comparisons. Return immediately when the mapping is complete and stop before the output limit."
 export AGENTIC_VBENCH_SUBAGENT_PROMPT=${AGENTIC_VBENCH_SUBAGENT_PROMPT:-"${debug_subagent_prompt}"}
 export BASE_NAME=${BASE_NAME:-agentic_vbench_v2_subagents_sync_8n_$(date -u +%Y%m%d-%H%M%S)-$$}
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$BASE_NAME}
