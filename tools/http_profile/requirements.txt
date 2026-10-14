@@ -1,4 +1,4 @@
-# Direct dependencies used for the 2026-10-13 macOS CPU baseline.
+# Direct dependencies for the CPU HTTP profiling harness.
 # Isolated environment: do not sync the GPU project dependencies.
 aiohttp==3.14.5
 fastapi==0.136.3

@@ -1,4 +1,4 @@
-# Production native-capture arm on macOS; base HTTP harness plus CPU tensors.
+# Production native-capture arm; base HTTP harness plus CPU tensors.
 -r requirements.txt
 torch==2.10.0
 tensordict==0.14.3
