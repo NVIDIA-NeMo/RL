@@ -613,6 +613,14 @@ class GenerationInterface(ABC):
             f"{type(self).__name__} generation backend"
         )
 
+    def setup_direct_capture(
+        self, dp_cfg, staging_partition: str, capture_config: dict
+    ) -> None:
+        """Install native HTTP capture on a supported generation backend."""
+        raise NotImplementedError(
+            f"direct capture is not supported for {type(self).__name__}"
+        )
+
     def setup_token_capture(
         self,
         dp_cfg: "DataPlaneConfig",

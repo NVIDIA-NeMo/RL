@@ -1827,10 +1827,21 @@ class SingleControllerActor:
         """Clear known request ownership while holding a barrier mutation slot."""
         cut.require_live()
         errors: list[BaseException] = []
+        canonical_ids = list(request.canonical_sample_ids)
+        if self._master_config.token_capture.direct.training_view == "full_tree":
+            from nemo_rl.experience.tree_training import tree_sample_ids
+
+            canonical_ids = [
+                sample_id
+                for root, receipt in zip(canonical_ids, request.receipts)
+                for sample_id in tree_sample_ids(
+                    root, len(receipt["manifest"]) if receipt else 0
+                )
+            ]
         try:
             await self._call_dp(
                 "clear_samples",
-                sample_ids=list(request.canonical_sample_ids),
+                sample_ids=canonical_ids,
                 partition_id=self._partition_id,
             )
         except Exception as error:

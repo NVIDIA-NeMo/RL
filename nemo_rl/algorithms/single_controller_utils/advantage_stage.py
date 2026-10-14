@@ -403,6 +403,15 @@ class AdvantageComputer:
             seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
 
+        from nemo_rl.experience.tree_training import project_trees
+
+        trees = project_trees(meta.tags, rewards, prompt_ids, final_sample_mask)
+        if trees is not None:
+            final_sample_mask = trees.valid[trees.inverse]
+            num_mask_sample_filtered = sum(
+                int(mask_sample[trees.inverse == index].any().item())
+                for index in range(len(trees.first))
+            )
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
@@ -439,7 +448,9 @@ class AdvantageComputer:
         # Value-model estimators (GAE) hand back the regression target alongside
         # the advantages; the group-relative ones return a bare tensor.
         returns: Optional[torch.Tensor] = None
-        if has_valid_training_tokens:
+        if has_valid_training_tokens and trees is not None:
+            advantages = trees.advantages(self._advantage_estimator, mask.shape)
+        elif has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
@@ -480,7 +491,11 @@ class AdvantageComputer:
             )
 
         response_advantages = torch.masked_select(advantages, mask.bool())
-        reward_partial = RewardPartial.from_rows(rewards, final_sample_mask)
+        reward_partial = (
+            RewardPartial.from_rows(trees.rewards, trees.valid)
+            if trees is not None
+            else RewardPartial.from_rows(rewards, final_sample_mask)
+        )
         opd_stat_sum = 0.0
         opd_stat_sumsq = 0.0
         opd_stat_count = 0

@@ -689,6 +689,36 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
+    @pytest.mark.parametrize(
+        "invalid", ["transport", "estimator", "sequence_ratio", "packing"]
+    )
+    def test_full_tree_rejects_incompatible_training_contract(
+        self, patched_factories, invalid
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.token_capture.enabled = True
+        mc.token_capture.transport = "direct"
+        mc.token_capture.direct.training_view = "full_tree"
+        mc.policy["sequence_packing"] = {"enabled": True}
+        mc.loss_fn.token_level_loss = True
+        mc.loss_fn.sequence_level_importance_ratios = False
+        mc.loss_fn.seq_logprob_error_in_loss = False
+        if invalid == "transport":
+            mc.token_capture.transport = "gym"
+            reason = "enabled direct token capture"
+        elif invalid == "estimator":
+            mc.grpo.adv_estimator.name = "reinforce_plus_plus"
+            reason = "GRPO advantage estimator"
+        elif invalid == "sequence_ratio":
+            mc.loss_fn.sequence_level_importance_ratios = True
+            reason = "token-level importance ratios"
+        else:
+            mc.policy["sequence_packing"]["enabled"] = False
+            reason = "requires sequence packing"
+        with pytest.raises(ValueError, match=reason):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+        patched_factories["_build_generation"].assert_not_called()
+
     @pytest.mark.parametrize("colocated", [False, True])
     def test_nvfp4_pertoken_rejected_before_setup_factories(
         self, patched_factories: dict[str, Any], colocated: bool

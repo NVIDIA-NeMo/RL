@@ -1157,6 +1157,34 @@ def _load(
     )
 
 
+@pytest.mark.parametrize("missing_call", [False, True])
+def test_full_tree_checkpoint_validates_rollouts_and_all_call_rows(missing_call):
+    from nemo_rl.experience.tree_training import TREE_ID, TREE_ROWS
+
+    group = _make_group_entry("group", weight=1, n=4)
+    group["meta"].tags = [
+        {"weight_version": 1, TREE_ID: root, TREE_ROWS: count}
+        for root, count in [("a", 3), ("a", 3), ("a", 3), ("b", 1)]
+    ]
+    if missing_call:
+        group["meta"] = group["meta"].subset([0, 1, 3])
+    state = _make_metadata_envelope([group])
+    dp = FakeDataPlaneClient()
+    restored = _make_buffer(dp)
+    if missing_call:
+        with pytest.raises(ValueError, match="incomplete rollout tree"):
+            _load(restored, state, expected_group_size=2)
+    else:
+        assert _load(restored, state, expected_group_size=2) == 1
+        assert (
+            restored.metadata_state_dict(saved_capacity=8)["groups"][0][
+                "meta"
+            ].sample_ids
+            == group["meta"].sample_ids
+        )
+    assert dp.put_calls == []
+
+
 class TestReplayManifestDigest:
     def test_rejects_non_json_metadata_with_field_path(self):
         group = _make_group_entry("group-1", weight=1)
