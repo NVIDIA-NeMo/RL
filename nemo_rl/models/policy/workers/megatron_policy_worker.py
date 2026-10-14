@@ -3582,6 +3582,7 @@ class MegatronPolicyWorkerImpl(
         # when pre-quantized refit is enabled for the parameter.
         for name, tensor in base_iter:
             yield from self._maybe_prequantize_param(name, tensor)
+            del tensor
 
         if include_draft and self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
