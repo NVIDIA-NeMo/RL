@@ -1,14 +1,42 @@
 # Metrics
 
-NeMo-RL emits five namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), and driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions).
+## Rollout checkpoint metrics
 
-Metrics are emitted **only when telemetry is exporting** — the driver always exports, so the `rl.*` series come from the driver's metrics logger.
+The logger's `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries
+also reach Lens. They reuse the controller's existing measurements; telemetry does
+not retime the save or restore. These series need no prefix-recovery branch.
+
+| Metric | Kind / unit | Dimensions and meaning |
+|---|---|---|
+| `rl.checkpoint.duration` | Histogram / seconds | `rl.checkpoint.operation` (`save`, `restore`) and `rl.checkpoint.phase` |
+| `rl.checkpoint.rows` | Gauge / rows | Latest replay, staging, or total snapshot rows |
+| `rl.checkpoint.groups` | Gauge / groups | Saved replay/ledger groups or restored complete/unfinished groups |
+| `rl.checkpoint.siblings` | Gauge / rollouts | Sealed siblings reused or unfinished siblings redispatched |
+| `rl.checkpoint.sidecar_bytes` | Gauge / bytes | Controller sidecar size |
+
+Checkpoint durations include total, TQ, barrier wait, exclusive hold, sidecar save,
+publication, snapshot selection, dataloader load, replay metadata load, recovery
+preparation, and redispatch scheduling, when the corresponding logger key exists.
+Counts use `rl.checkpoint.category`. Missing phases are absent, not zero. Phase
+durations nest and overlap: **do not sum them into checkpoint latency or goodput**.
+The restore total retains the existing logger's definition (sum of its measured
+restore phases); it is not allocation-to-ready wall time. These metrics describe
+completed operations, not a pending checkpoint's current phase.
+
+Histograms can be aggregated across processes; do not average worker p95s.
+Percentile resolution depends on the SDK/exporter's aggregation and bucket
+boundaries. No step, checkpoint, rollout, or model-call IDs are metric labels.
+Use the existing telemetry/exporter configuration to enable these measurements.
+
+NeMo-RL emits async efficiency (`rl.efficiency.*`), startup (`rl.setup.duration`), training (`rl.reward.*`, `rl.policy.*`, …), vLLM engine (`rl.vllm.*`), driver-side generation (`gen_ai.*`), and completed rollout checkpoint (`rl.checkpoint.*`) metrics. The `gen_ai.*` series follows the OTel GenAI semantic conventions.
+
+Metrics are emitted **only when telemetry is exporting**. The metrics logger forwards training, setup, and checkpoint series through its process-local telemetry handle; resource attributes identify the producing process.
 
 Every `rl.*` series is **declared by NeMo-RL**, not by lens. lens provides a consumer-driven metric registry: NeMo-RL calls `register_metric_group("rl", [...])` once per process with a `MetricSpec` per series, then records against it with `record_metrics(meter, "rl", ...)`. The declarations live in one table in `nemo_rl/telemetry/metrics.py`, so adding a series needs no lens release and no agreement on field names. `record_metrics` never raises into the caller and skips `None`.
 
 ## The tee
 
-The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — two prefixes are read, the driver's per-step `train` dicts (`prefix in ("train", "")`) and the one-off `timing/setup` dict at step 0, so other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting. The numbers you already see in W&B are therefore the same series you get in your OTLP backend, with no double bookkeeping.
+The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — the prefixes read include the driver's per-step `train` dicts (`prefix in ("train", "")`) and the one-off `timing/setup` dict at step 0, plus completed `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries. Other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting. The numbers you already see in W&B are therefore the same series you get in your OTLP backend, with no double bookkeeping.
 
 Each family has its own exception handler, so a bad value in one cannot silence the others.
 

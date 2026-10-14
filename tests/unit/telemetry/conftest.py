@@ -79,6 +79,12 @@ def _reset_rl_telemetry() -> None:
     # every test after it in the session.
     metrics_mod._REGISTRATION_FAILED = False
     metrics_mod._WARNED.clear()
+    # A preceding metrics test can freeze declarations before a later test
+    # imports another metric owner. Keep definitions, but reset registration's
+    # lifecycle guard along with the Lens registry above.
+    from nemo_rl.telemetry import vocabulary
+
+    vocabulary._FROZEN = False
     try:
         from nemo.lens.instruments import unregister_metric_group
 
