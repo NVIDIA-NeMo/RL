@@ -48,9 +48,10 @@ class StagedPayload:
 def encode_staged_payload(payload: Any) -> StagedPayload:
     """Encode ``payload`` as strict JSON, compress it, and split it into chunks.
 
-    Strict means no NaN/Infinity and no fallback encoder, so anything that is not
-    plain JSON (tensors, dtypes, tuples as keys) fails here rather than arriving
-    altered. Dict order is preserved, which callers rely on for ordered metadata.
+    Strict means no NaN/Infinity and no fallback encoder, so tensors, dtypes and
+    tuple keys fail here. JSON's own coercions still apply: tuples arrive as
+    lists, and int, float, bool and None keys arrive as strings. Dict order is
+    preserved, which callers rely on for ordered metadata.
     """
     raw = json.dumps(payload, allow_nan=False, separators=(",", ":")).encode()
     text = base64.b64encode(zlib.compress(raw)).decode("ascii")
