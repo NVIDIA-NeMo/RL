@@ -45,7 +45,7 @@ class EnergonPackingOptions(BaseModel, extra="forbid"):
         return self
 
 
-class EnergonPackingConfig(BaseModel, extra="allow"):
+class EnergonPackingConfig(BaseModel, extra="forbid"):
     """One task-encoder-owned packing implementation."""
 
     name: str
