@@ -204,6 +204,32 @@ def test_task_encoder_consumes_precomputed_loss_mask_mode_for_packs() -> None:
     assert local_batch_to_tensordict(fields, batch_size=1).batch_size == torch.Size([1])
 
 
+def test_unpacked_precomputed_loss_mask_reaches_token_mask() -> None:
+    # SFT normalization imports policy backends, so defer it until this test runs.
+    from nemo_rl.algorithms.sft import prepare_sft_batch
+
+    sample = _sample("s0", 4)
+    # Train on user tokens only, the opposite of the default assistant-role mask.
+    sample.message_log[0]["token_loss_mask"] = torch.ones(2, dtype=torch.long)
+    sample.message_log[1]["token_loss_mask"] = torch.zeros(2, dtype=torch.long)
+    encoder = GenericSFTTaskEncoder(
+        adapter=object(),
+        cooker_functions=[],
+        include_source_ids=True,
+        tokenizer=_Tokenizer(),
+        loss_mask_mode="precomputed",
+    )
+
+    prepared = prepare_sft_batch(
+        encoder.batch([sample]),
+        tokenizer=_Tokenizer(),
+        only_unmask_final=False,
+        make_sequence_length_divisible_by=1,
+    )
+
+    assert prepared["token_mask"].tolist() == [[1, 1, 0, 0]]
+
+
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize(
     "case",
