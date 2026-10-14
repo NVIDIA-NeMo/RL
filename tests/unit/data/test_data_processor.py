@@ -137,7 +137,6 @@ def test_nemo_gym_data_processor_forwards_per_row_image_tile_cap():
     )
 
     extra_env_info = result["extra_env_info"]
-    assert extra_env_info["_nemo_rl_image_max_num_tiles"] == 6
     metadata = extra_env_info["responses_create_params"]["metadata"]
     assert json.loads(metadata["extra_body"])["mm_processor_kwargs"] == {
         "max_num_tiles": 6

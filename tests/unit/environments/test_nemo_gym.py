@@ -33,6 +33,7 @@ from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
     ROLLOUT_MATCHED_MEDIA_KEY,
     PackedTensor,
+    attach_image_model_inputs_to_message,
     image_to_data_url,
     video_path_to_data_url,
 )
@@ -65,6 +66,7 @@ from nemo_rl.environments.nemotron_utils import (
 )
 from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
+    _reattach_static_multimodal_payloads_to_result,
     attach_static_multimodal_payload,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -491,6 +493,55 @@ def test_reattach_static_multimodal_payload_to_rollout_user_message():
     attach_static_multimodal_payload(target, source)
 
     assert target[1]["pixel_values"] is payload
+
+
+def test_reattach_keeps_rollout_matched_media_when_token_counts_already_match():
+    """Exact-count processor media is authoritative even without budget repair."""
+
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class _TextTokenizer:
+        model_input_names = ["input_ids"]
+
+    class _Processor:
+        image_token = "<image>"
+        image_processor = _ImageProcessor()
+        tokenizer = _TextTokenizer()
+        model_input_names = ["input_ids", "pixel_values", "num_tokens"]
+
+        def __call__(self, *, text, images, return_tensors):
+            assert text == "<image>"
+            assert len(images) == 1
+            assert return_tensors == "pt"
+            return {
+                "input_ids": torch.tensor([[1]]),
+                "pixel_values": torch.tensor([[7.0]]),
+                "num_tokens": torch.tensor([256]),
+            }
+
+    target_user = {"role": "user", "content": "question"}
+    attach_image_model_inputs_to_message(
+        target_user,
+        images=[Image.new("RGB", (2, 2))],
+        processor=_Processor(),
+        expected_num_tokens_per_image=[256],
+    )
+    rollout_media = target_user["pixel_values"]
+    assert target_user[ROLLOUT_MATCHED_MEDIA_KEY] is True
+
+    result = {
+        "input_message_log": [target_user],
+        "message_log": [target_user],
+    }
+    static_media = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    _reattach_static_multimodal_payloads_to_result(
+        result,
+        [{"role": "user", "content": "question", "pixel_values": static_media}],
+    )
+
+    assert target_user["pixel_values"] is rollout_media
+    assert ROLLOUT_MATCHED_MEDIA_KEY not in target_user
 
 
 def test_video_datum_uses_temporal_processor_contract(monkeypatch, tmp_path):

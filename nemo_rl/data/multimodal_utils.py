@@ -1715,7 +1715,6 @@ def attach_image_model_inputs_to_message(
             processed = reprocess_images_at_rollout_budgets(processor, images, expected)
             # Corrected tiles may be ragged even when the originals were not.
             allow_ragged_output = len(images) > 1
-            message[ROLLOUT_MATCHED_MEDIA_KEY] = True
     if allow_ragged_output:
         processed = _materialize_ragged_pixel_values(processed, processor)
     model_inputs = extract_multimodal_model_inputs(processor, processed)
@@ -1726,6 +1725,8 @@ def attach_image_model_inputs_to_message(
             if isinstance(value, PackedTensor)
         }
     )
+    if expected_num_tokens_per_image is not None:
+        message[ROLLOUT_MATCHED_MEDIA_KEY] = True
 
 
 _VIDEO_EXT_TO_MIME = {
