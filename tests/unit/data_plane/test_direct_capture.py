@@ -138,3 +138,71 @@ def test_native_receipt_rejects_tampered_identity():
     row = assembler.finalize_rollout("r", receipt, reward=1)
     assert not row.valid
     assert "identity mismatch" in row.rejection_reason
+
+
+def test_full_tree_keeps_fork_and_compaction_once_and_rewards_one_rollout():
+    dp = MemoryDataPlane()
+    receipt = stage_rollout(dp)
+    store = NativeCallStore(dp, "staging", router_replay=False)
+    receipt["manifest"].append(
+        store.stage(NativeCall("r", "compact", 3, 5, (90,), (91,), (-0.25,), None))
+    )
+    assembler = RolloutReassembler(
+        dp,
+        partition_id="train",
+        staging_partition="staging",
+        pad_token_id=0,
+        max_seq_len=32,
+        training_view="full_tree",
+    )
+    group = assembler.finalize_group(
+        "group",
+        ["r", "missing"],
+        [receipt, None],
+        [1, 0],
+        mask_sample=[False, False],
+        fallback_weight_version=0,
+        prompt_idx=0,
+        canonical_sample_ids=["group_g0", "group_g1"],
+    )
+    assert group.valid_row_count == 1  # roots, independent of calls per root
+    assert group.total_row_count == 2
+    assert len(group.meta.sample_ids) == 5
+    assert group.canonical_output_tokens == 5  # 1 parent + 1 fork + 2 child + 1 compact
+    assert len(group.reward_observations) == 1
+    assert group.metrics["finalize/direct_excluded_calls"] == 0
+    expected_masks = [[0, 0, 1], [0, 0, 1], [0, 0, 0, 0, 1, 1], [0, 1]]
+    for i, mask in enumerate(expected_masks):
+        sample_id = f"group_g0/call{i}"
+        assert dp.rows["train", sample_id]["token_mask"].tolist() == mask
+        assert dp.tags["train", sample_id]["rollout_tree_id"] == "group_g0"
+        assert dp.tags["train", sample_id]["rollout_tree_rows"] == 4
+    assert not any(partition == "staging" for partition, _ in dp.rows)
+
+
+def test_full_tree_rejects_entire_rollout_when_any_call_cannot_train():
+    dp = MemoryDataPlane()
+    receipt = stage_rollout(dp)
+    assembler = RolloutReassembler(
+        dp,
+        partition_id="train",
+        staging_partition="staging",
+        pad_token_id=0,
+        max_seq_len=4,
+        training_view="full_tree",
+    )
+    group = assembler.finalize_group(
+        "group",
+        ["r"],
+        [receipt],
+        [1],
+        mask_sample=[False],
+        fallback_weight_version=0,
+        prompt_idx=0,
+        canonical_sample_ids=["group_g0"],
+    )
+    assert group.valid_row_count == 0
+    assert group.total_row_count == 1
+    assert group.canonical_output_tokens == 0
+    assert group.meta.sample_ids == ["group_g0/call0"]
+    assert not any(partition == "staging" for partition, _ in dp.rows)

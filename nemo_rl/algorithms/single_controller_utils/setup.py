@@ -345,7 +345,12 @@ def _register_single_controller_partitions(
     dp_client.register_partition(
         partition_id=partition_id,
         fields=partition_fields,
-        num_samples=num_rollout_samples,
+        num_samples=num_rollout_samples
+        * (
+            token_capture_cfg.direct.max_calls_per_rollout
+            if token_capture_cfg.direct.training_view == "full_tree"
+            else 1
+        ),
         consumer_tasks=["prev_lp", "ref_lp", "train"],
         grpo_group_size=group_size,
     )
@@ -1225,6 +1230,33 @@ def setup_single_controller(
     # change the worker's environment.
     token_capture_cfg = master_config.token_capture
     capture_media = token_capture_cfg.enabled and processor is not None
+    if token_capture_cfg.direct.training_view == "full_tree":
+        if not token_capture_cfg.enabled or token_capture_cfg.transport != "direct":
+            raise ValueError("full_tree training requires enabled direct token capture")
+        if (
+            master_config.grpo is None
+            or master_config.grpo.adv_estimator.name != "grpo"
+        ):
+            raise ValueError(
+                "full_tree currently supports the GRPO advantage estimator"
+            )
+        if (
+            not master_config.loss_fn.token_level_loss
+            or master_config.loss_fn.sequence_level_importance_ratios
+        ):
+            raise ValueError(
+                "full_tree requires token-level loss and token-level importance ratios"
+            )
+        if master_config.loss_fn.seq_logprob_error_in_loss:
+            raise ValueError(
+                "full_tree sequence-error filtering must run in the advantage stage"
+            )
+
+        if not policy_config["sequence_packing"]["enabled"]:
+            raise ValueError(
+                "full_tree requires sequence packing for variable call counts"
+            )
+
     if token_capture_cfg.enabled and token_capture_cfg.transport == "direct":
         if generation_config["backend"] != "vllm":
             raise ValueError("direct token capture requires async vLLM")
@@ -2058,6 +2090,7 @@ def setup_single_controller(
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
+                training_view=token_capture_cfg.direct.training_view,
                 effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config

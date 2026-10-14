@@ -24,6 +24,7 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/experience/tree_training.py",
   "nemo_rl/experience/direct_capture.py",
   "nemo_rl/experience/direct_http.py",
   "nemo_rl/experience/vllm_http_client.py",

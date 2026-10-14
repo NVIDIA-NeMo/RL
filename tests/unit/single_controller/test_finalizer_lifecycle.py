@@ -114,7 +114,10 @@ def _controller(actor: object) -> Any:
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
-        token_capture=SimpleNamespace(staging_partition="staging"),
+        token_capture=SimpleNamespace(
+            staging_partition="staging",
+            direct=SimpleNamespace(training_view="main_branch"),
+        ),
         grpo=SimpleNamespace(num_prompts_per_step=1),
     )
     ctrl._trainer_version = 3
@@ -331,9 +334,12 @@ class _SyncDataPlaneClient:
         )
 
 
-def test_known_outcome_cleanup_runs_sync_clears_off_the_event_loop() -> None:
+@pytest.mark.parametrize("full_tree", [False, True])
+def test_known_outcome_cleanup_runs_sync_clears_off_the_event_loop(full_tree) -> None:
     ctrl = _controller(SimpleNamespace())
     ctrl._dp_client = _SyncDataPlaneClient()
+    if full_tree:
+        ctrl._master_config.token_capture.direct.training_view = "full_tree"
 
     async def _main() -> int:
         await ctrl._cleanup_known_finalization_request(_request())
@@ -342,7 +348,12 @@ def test_known_outcome_cleanup_runs_sync_clears_off_the_event_loop() -> None:
     loop_thread_id = asyncio.run(_main())
 
     assert ctrl._dp_client.clear_calls == [
-        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {
+            "sample_ids": ["group_g0/call0", "group_g0/call1"]
+            if full_tree
+            else ["group_g0"],
+            "partition_id": "canonical",
+        },
         {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
     ]
     assert ctrl._dp_client.clear_thread_ids

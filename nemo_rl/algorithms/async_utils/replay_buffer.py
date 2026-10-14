@@ -1781,8 +1781,9 @@ class TQReplayBuffer:
             expected_partition_id: Partition this buffer writes to; must
                 match the envelope.
             expected_group_size: num_generations_per_prompt; every group must
-                hold exactly this many rows (a changed group size silently
-                breaks the group-relative baseline).
+                hold exactly this many logical rollouts. Full-tree capture
+                may publish several call rows per rollout, which must all
+                be present (a changed group size breaks the baseline).
             expected_manifest_digest: Digest returned by the matching native
                 TQ checkpoint load. It must match the replay metadata file.
 
@@ -1858,8 +1859,15 @@ class TQReplayBuffer:
             num_lengths = (
                 len(meta.sequence_lengths) if meta.sequence_lengths is not None else -1
             )
+            from nemo_rl.experience.tree_training import validate_tree_tags
+
+            tree_ids = validate_tree_tags(meta.tags) if meta.tags is not None else None
+            logical_count = (
+                len(set(tree_ids)) if tree_ids is not None else len(meta.sample_ids)
+            )
             if not (
-                len(meta.sample_ids) == num_tags == num_lengths == expected_group_size
+                len(meta.sample_ids) == num_tags == num_lengths
+                and logical_count == expected_group_size
             ):
                 raise ValueError(
                     "Replay buffer checkpoint group misaligned: "

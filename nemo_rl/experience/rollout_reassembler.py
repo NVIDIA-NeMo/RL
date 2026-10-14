@@ -236,7 +236,9 @@ class RolloutReassembler:
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
+        training_view: str = "main_branch",
     ) -> None:
+        self._training_view = training_view
         self._reward_penalty_config = reward_penalty_config
         self._effort_config = effort_config
         self._dp_client = dp_client
@@ -576,6 +578,104 @@ class RolloutReassembler:
         except (KeyError, ValueError, IndexError) as error:
             return replace(row, rejection_reason=f"direct_capture:{error}")
 
+    def _finalize_direct_tree(
+        self,
+        rollout_id: str,
+        receipt: Optional[dict],
+        *,
+        reward: float,
+        reward_checks: RewardChecks | None,
+    ) -> list[FinalizedRollout]:
+        """Train each executed generation once; repeated contexts carry no loss."""
+        from nemo_rl.data_plane.direct_capture import NativeCallStore
+
+        keys = (
+            [entry["staging_key"] for entry in receipt["manifest"]] if receipt else []
+        )
+
+        def rejected(reason: str) -> list[FinalizedRollout]:
+            return [
+                FinalizedRollout(rollout_id, False, reason, [], [], [], 0, reward, keys)
+            ]
+
+        if receipt is None:
+            return rejected("missing_receipt")
+        if (
+            receipt.get("format") != "nrl_direct_v1"
+            or receipt["rollout_id"] != rollout_id
+        ):
+            return rejected("tree_receipt_identity")
+        if receipt["failure"]:
+            return rejected(receipt["failure"])
+        try:
+            calls = NativeCallStore(
+                self._dp_client,
+                self._staging_partition,
+                router_replay=self._router_replay_enabled,
+            ).fetch(receipt["manifest"], rollout_id)
+            if (
+                not calls
+                or len(set(keys)) != len(keys)
+                or len({call.ordinal for call in calls}) != len(calls)
+            ):
+                raise ValueError("empty tree or duplicate calls")
+            if len({call.call_id for call in calls}) != len(calls):
+                raise ValueError("duplicate call IDs")
+            if any(
+                len(call.prompt) + len(call.tokens) > self._max_seq_len
+                for call in calls
+            ):
+                raise ValueError("tree call exceeds policy max length")
+            # Rollout reward and penalties are evaluated once for the tree.
+            # Unwanted-token checks/effort length see all generated actions.
+            generated = [token for call in calls for token in call.tokens]
+            tree_reward, penalties, metrics = finalize_capture_reward(
+                reward,
+                checks=reward_checks,
+                penalty_config=self._reward_penalty_config,
+                effort_config=self._effort_config,
+                token_ids=generated,
+                link_spans=[(rollout_id, 0, len(generated))],
+            )
+            metrics.update(
+                {
+                    "finalize/direct_selected_calls": float(len(calls)),
+                    "finalize/direct_excluded_calls": 0.0,
+                    "finalize/direct_excluded_tokens": 0.0,
+                }
+            )
+            rows = []
+            keys_by_call = {
+                entry["model_call_id"]: entry["staging_key"]
+                for entry in receipt["manifest"]
+            }
+            for i, call in enumerate(sorted(calls, key=lambda call: call.ordinal)):
+                p, g = len(call.prompt), len(call.tokens)
+                rows.append(
+                    FinalizedRollout(
+                        rollout_id,
+                        True,
+                        None,
+                        list(call.prompt + call.tokens),
+                        [0.0] * p + [1.0] * g,
+                        [0.0] * p + list(call.logprobs),
+                        p,
+                        tree_reward,
+                        [keys_by_call[call.call_id]],
+                        call.weight_version,
+                        call.weight_version,
+                        routed_experts=call.routed_experts,
+                        penalty_counts=penalties
+                        if i == 0
+                        else {name: 0 for name in penalties},
+                        reward_metrics=metrics if i == 0 else {},
+                        selected_call_ids=(call.call_id,),
+                    )
+                )
+            return rows
+        except (KeyError, ValueError) as error:
+            return rejected(f"direct_tree:{error}")
+
     def _resolve_media(
         self,
         row: Any,
@@ -708,21 +808,47 @@ class RolloutReassembler:
             "reward_log_contexts must be one per rollout"
         )
         _group_t0 = time.perf_counter()
-        rows = [
-            self.finalize_rollout(
-                rollout_id, receipt, reward=reward, reward_checks=checks
+        root_sample_ids = list(canonical_sample_ids)
+        root_count = len(rollout_ids)
+        root_indices = []
+        rows = []
+        for i, (rollout_id, receipt, reward, checks) in enumerate(
+            zip(rollout_ids, receipts, rewards, checks_by_rollout)
+        ):
+            root_rows = (
+                self._finalize_direct_tree(
+                    rollout_id, receipt, reward=reward, reward_checks=checks
+                )
+                if self._training_view == "full_tree"
+                else [
+                    self.finalize_rollout(
+                        rollout_id, receipt, reward=reward, reward_checks=checks
+                    )
+                ]
             )
-            for rollout_id, receipt, reward, checks in zip(
-                rollout_ids, receipts, rewards, checks_by_rollout
-            )
-        ]
+            rows.extend(root_rows)
+            root_indices.extend([i] * len(root_rows))
+        counts = Counter(root_indices)
+        if self._training_view == "full_tree":
+            from nemo_rl.experience.tree_training import tree_sample_ids
+
+            canonical_sample_ids = [
+                sid
+                for i, root in enumerate(root_sample_ids)
+                for sid in tree_sample_ids(root, counts[i])
+            ]
+            mask_sample = [mask_sample[i] for i in root_indices]
+            log_contexts = [log_contexts[i] for i in root_indices]
+        root_first_rows = [root_indices.index(i) for i in range(root_count)]
+        valid_root_count = sum(rows[index].valid for index in root_first_rows)
         _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
         valid_rows = [row for row in rows if row.valid]
         staging_keys = [key for row in rows for key in row.staging_keys]
         metrics = {
             "finalize/invalid_row_rate": 1.0 - len(valid_rows) / len(rows),
+            "finalize/invalid_rollout_rate": 1.0 - valid_root_count / root_count,
             "finalize/calls_per_rollout": (
-                sum(len(row.staging_keys) for row in rows) / len(rows)
+                sum(len(row.staging_keys) for row in rows) / root_count
             ),
             # Fraction of valid rows that carry captured media. 1.0 on a VLM
             # run is the signal that the learner trains on captured pixels
@@ -927,6 +1053,11 @@ class RolloutReassembler:
             group_id=group_id,
             prompt_idx=prompt_idx,
         )
+        if self._training_view == "full_tree":
+            sample_ids = list(canonical_sample_ids)
+            for tag, root_index in zip(tags, root_indices):
+                tag["rollout_tree_id"] = root_sample_ids[root_index]
+                tag["rollout_tree_rows"] = counts[root_index]
         for tag, row in zip(tags, rows):
             if row.selected_call_ids or row.excluded_call_ids:
                 tag["direct_selected_call_ids"] = list(row.selected_call_ids)
@@ -1001,14 +1132,17 @@ class RolloutReassembler:
             ),
             metrics=metrics,
             reward_observations=[
-                FinalizedReward(sample_id, row.rollout_id, row.reward, context)
-                for sample_id, row, context in zip(
-                    canonical_sample_ids, rows, log_contexts
+                FinalizedReward(
+                    root_sample_ids[root_indices[index]],
+                    rows[index].rollout_id,
+                    rows[index].reward,
+                    log_contexts[index],
                 )
-                if row.valid
+                for index in root_first_rows
+                if rows[index].valid
             ],
-            valid_row_count=len(valid_rows),
-            total_row_count=len(rows),
+            valid_row_count=valid_root_count,
+            total_row_count=root_count,
         )
 
     # ── internals ───────────────────────────────────────────────────────────

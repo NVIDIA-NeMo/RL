@@ -592,7 +592,10 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         assert total_batch_size % batch_size == 0, (
             f"Total batch size ({total_batch_size}) is not a multiple of batch_size ({batch_size})"
         )
-        if not allow_uneven_shards:
+        # Packing balances bins, not row counts. A full rollout tree can have
+        # any number of calls; the packer already makes its bin count a
+        # multiple of DP without duplicating or dropping a sequence.
+        if not allow_uneven_shards and sequence_packing_args is None:
             assert batch_size % shards == 0, (
                 f"Batch size ({batch_size}) is not a multiple of shards ({shards})"
             )

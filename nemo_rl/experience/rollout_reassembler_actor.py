@@ -69,6 +69,7 @@ class RolloutReassemblerActorConfig:
     capture_media: bool
     reward_penalty_config: RewardPenaltyConfig | None = None
     effort_config: EffortLevelsConfig | None = None
+    training_view: str = "main_branch"
 
 
 @ray.remote(
@@ -97,6 +98,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             capture_media=config.capture_media,
             reward_penalty_config=config.reward_penalty_config,
             effort_config=config.effort_config,
+            training_view=config.training_view,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

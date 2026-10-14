@@ -21,6 +21,7 @@ token_capture:
   enabled: true
   transport: direct   # default: gym
   direct:
+    training_view: main_branch  # or full_tree (GRPO + sequence packing)
     workers: 2
     max_pending_calls: 256
     max_rollouts: 4096
@@ -105,6 +106,40 @@ selected generations receive loss; context/tool tokens are masked. Metrics repor
 `finalize/direct_selected_calls`, `finalize/direct_excluded_calls`, and
 `finalize/direct_excluded_tokens`. Train-row tags retain the selected and excluded
 call IDs. The complete receipt still accounts for every captured call.
+
+## Full-tree training
+
+Set `token_capture.direct.training_view: full_tree` to train every captured call,
+including forks, subagents, and calls after compaction. This view requires the
+`grpo` advantage estimator, `policy.sequence_packing.enabled: true`,
+`loss_fn.token_level_loss: true`, and token-level importance ratios. PPO,
+sequence-level importance ratios, and `loss_fn.seq_logprob_error_in_loss` are
+rejected at setup. Sequence-error filtering may run in the advantage stage.
+
+Each executed call becomes one row containing its exact prompt and generation.
+Only that call's generated tokens receive loss; earlier output repeated in its
+prompt is masked. Thus every generated action is trained once without identifying
+its parent or reconstructing a prefix tree. Independent or identical calls remain
+distinct actions. This is a dense training view: repeated contexts still incur
+learner computation. Shared-prefix attention/storage can replace this view later
+without changing capture, rollout identity, or reward semantics.
+
+Rewards, reward penalties, and GRPO baseline/std calculations operate once per
+rollout, regardless of how many calls it produced. The resulting advantage is
+broadcast to its calls. Effort shaping uses the sum of generated tokens across
+all calls. Token-level loss averages over generated actions, so longer trees
+contribute more tokens, as longer responses do in the existing token-level loss.
+An invalid call invalidates the whole rollout; a call filtered during advantage
+calculation masks its whole tree and excludes its reward from the baseline.
+Recovery admission counts logical rollouts, not call rows.
+
+Train-row tags retain `rollout_tree_id`, `rollout_tree_rows`, and captured call
+IDs. Checkpoint loading checks both the configured number of rollouts per GRPO
+group and completeness of each tree. Sequence packing balances bins across DP
+ranks even when the number of call rows is not divisible by DP; streaming chunks
+must still contain at least one sequence per rank. Dynamic batching alone is not
+currently supported for this view. Full-tree expansion and advantage projection
+run after rollout completion, outside the model HTTP path.
 
 ## Serialization and CPU costs
 

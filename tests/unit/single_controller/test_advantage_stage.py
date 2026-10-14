@@ -516,6 +516,82 @@ class _RowStore:
                 self.rows[sid][name] = fields[name][row].clone()
 
 
+@pytest.mark.parametrize("leave_one_out", [False, True])
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("filter_call", [False, True])
+def test_full_tree_advantages_use_rollout_rewards_once(
+    leave_one_out, normalize, filter_call
+):
+    from nemo_rl.experience.tree_training import TREE_ID, TREE_ROWS
+
+    # Three rollouts of very different sizes. Counting calls as GRPO samples
+    # biases both the baseline and std; filtering one call must mask its tree.
+    roots = [0, 0, 0, 1, 2, 2]
+    counts = [3, 1, 2]
+    root_rewards = torch.tensor([1.0, 0.0, 3.0])
+    ids = [f"call-{i}" for i in range(len(roots))]
+    rows = {
+        sid: {
+            "total_reward": root_rewards[root],
+            "token_mask": torch.tensor([0.0, 0.0, 1.0, 1.0]),
+            "sample_mask": torch.tensor(1.0),
+            "mask_sample": torch.tensor(filter_call and i == 1),
+            "truncated": torch.tensor(False),
+        }
+        for i, (sid, root) in enumerate(zip(ids, roots))
+    }
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="train",
+        sample_ids=ids,
+        fields=list(rows[ids[0]]),
+        sequence_lengths=[4] * len(ids),
+        tags=[
+            {GROUP_ID_TAG: "group", TREE_ID: str(root), TREE_ROWS: counts[root]}
+            for root in roots
+        ],
+    )
+    estimator_config = AdvEstimatorConfig(
+        use_leave_one_out_baseline=leave_one_out, normalize_rewards=normalize
+    )
+    estimator = GRPOAdvantageEstimator(estimator_config, None)
+    store = _RowStore(rows)
+    computer = AdvantageComputer(
+        store,
+        config=_config(algo=GRPOConfig(adv_estimator=estimator_config)),
+        advantage_estimator=estimator,
+    )
+    outcome = asyncio.run(computer.run(AdvantageRequest(meta=meta)))
+    valid_roots = torch.tensor([not filter_call, True, True], dtype=torch.float32)
+    expected = estimator.compute_advantage(
+        torch.zeros(3, 1), root_rewards, torch.ones(3, 4), valid_mask=valid_roots
+    )
+    for sid, root in zip(ids, roots):
+        torch.testing.assert_close(store.rows[sid]["advantages"], expected[root])
+        assert store.rows[sid]["sample_mask"].item() == valid_roots[root].item()
+    assert outcome.reward_partial == RewardPartial.from_rows(root_rewards, valid_roots)
+    assert outcome.num_mask_sample_filtered == int(filter_call)
+
+    # A token-level policy objective on these rows equals the explicit list of
+    # generated tokens, even though later calls contain earlier output as context.
+    parameter = torch.tensor(0.3, requires_grad=True)
+    actual_loss = sum(
+        (
+            parameter
+            * store.rows[sid]["advantages"]
+            * row["token_mask"]
+            * store.rows[sid]["sample_mask"]
+        ).sum()
+        for sid, row in rows.items()
+    )
+    explicit_loss = sum(
+        parameter * expected[root, 0] * 2 * valid_roots[root] for root in roots
+    )
+    actual_grad = torch.autograd.grad(actual_loss, parameter)[0]
+    expected_grad = torch.autograd.grad(explicit_loss, parameter)[0]
+    torch.testing.assert_close(actual_grad, expected_grad)
+
+
 def _rows() -> dict[str, dict[str, torch.Tensor]]:
     """One distinct prompt group per NUM_GROUPS, with varied rewards.
 

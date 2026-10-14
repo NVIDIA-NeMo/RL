@@ -128,6 +128,31 @@ def test_shard_meta_for_dp_partitions_keys_disjointly():
     assert sorted(flat) == sorted(_meta(n).sample_ids)  # same set, no dups, no minting
 
 
+def test_sequence_packing_accepts_variable_call_count_across_dp():
+    # Full trees may contain 7 call rows even with DP=4. Bins, not rows,
+    # must be divisible by DP, with every original call trained exactly once.
+    meta = _meta(7)
+    meta.tags = [{"owner": sid} for sid in meta.sample_ids]
+    shards, inverse = shard_meta_for_dp(
+        meta,
+        dp_world=4,
+        sequence_packing_args={
+            "algorithm": "first_fit_decreasing",
+            "max_tokens_per_microbatch": 32,
+            "input_lengths_key": "input_lengths",
+            "sequence_length_pad_multiple": 1,
+        },
+    )
+    flattened = [sid for shard in shards for sid in shard.sample_ids]
+    assert sorted(flattened) == sorted(meta.sample_ids)
+    assert (
+        len({len(shard.extra_info["micro_batch_indices"][0]) for shard in shards}) == 1
+    )
+    for shard in shards:
+        assert [tag["owner"] for tag in shard.tags] == shard.sample_ids
+    assert [flattened[i] for i in (inverse or range(7))] == meta.sample_ids
+
+
 def test_shard_meta_for_dp_preserves_partition_id():
     metas, _ = shard_meta_for_dp(_meta(4), dp_world=2, batch_size=4)
     assert all(m.partition_id == "train" for m in metas)

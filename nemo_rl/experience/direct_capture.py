@@ -25,7 +25,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, PositiveInt
 
@@ -33,6 +33,7 @@ from pydantic import BaseModel, PositiveInt
 class DirectCaptureConfig(BaseModel, extra="allow"):
     """Limits apply per model-serving worker, including in-flight calls."""
 
+    training_view: Literal["main_branch", "full_tree"] = "main_branch"
     workers: PositiveInt = 2
     max_pending_calls: PositiveInt = 256
     max_rollouts: PositiveInt = 4096
