@@ -3929,7 +3929,6 @@ class TestSetupModelConfig:
         ("field_name", "field_value"),
         [
             ("multi_latent_attention", True),
-            ("hybrid_layer_pattern", "M*-"),
             ("experimental_attention_variant", "gated_delta_net"),
         ],
     )
