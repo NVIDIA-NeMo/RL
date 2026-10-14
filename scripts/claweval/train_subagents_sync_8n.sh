@@ -8,6 +8,7 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo_dir=$(cd "$script_dir/../.." && pwd)
 
 export NUM_NODES=${NUM_NODES:-8}
 export NUM_GEN_NODES=${NUM_GEN_NODES:-4}
@@ -39,15 +40,27 @@ export CLAW_EVAL_CONCURRENCY=${CLAW_EVAL_CONCURRENCY:-$((NUM_PROMPTS * NUM_GENER
 # This synchronous run is the mechanism gate: require one bounded child call so
 # parent/child capture and optimization are exercised deterministically.  The
 # later production/async recipe keeps natural, optional delegation.
-debug_delegation_prompt="During this task, you must call the task tool exactly once to delegate one suitable bounded subtask to the general subagent. "
-debug_delegation_prompt+="Do not delegate the full task. Review and integrate the child's result before producing the final answer."
+debug_delegation_prompt="During this task call the task tool exactly once near the beginning to delegate one suitable bounded subtask to the general subagent. "
+debug_delegation_prompt+="Do not delegate the full task. Review and integrate the child result. Continue until every required deliverable exists. "
+debug_delegation_prompt+="Before producing the final answer verify the deliverables with bash. Do not produce a final answer while required deliverables are missing."
 export CLAW_EVAL_DELEGATION_PROMPT=${CLAW_EVAL_DELEGATION_PROMPT:-"${debug_delegation_prompt}"}
 export BASE_NAME=${BASE_NAME:-claweval_subagents_sync_8n_$(date -u +%Y%m%d-%H%M%S)}
 export WANDB_PROJECT=nemorl-v2-subagent-comapction-debug
 export WANDB_ENTITY=${WANDB_ENTITY:-adlr}
+# Match the AgenticVBench gate: Super is MoE, so vLLM generation routes must be
+# replayed by Megatron.  Trace and verify the first two steps instead of masking
+# any parity outlier with a sequence-error filter.
+export NRL_ROUTER_REPLAY_VALIDATE=${NRL_ROUTER_REPLAY_VALIDATE:-1}
+export NRL_R3_TRACE=${NRL_R3_TRACE:-1}
+export NRL_R3_TRACE_STEPS=${NRL_R3_TRACE_STEPS:-2}
+export NRL_R3_TRACE_SAMPLES=${NRL_R3_TRACE_SAMPLES:-2}
+export NRL_R3_TRACE_MICROBATCHES=${NRL_R3_TRACE_MICROBATCHES:-2}
+export NRL_R3_TRACE_VERIFY_FORWARD=${NRL_R3_TRACE_VERIFY_FORWARD:-1}
+export NRL_R3_TRACE_DIR=${NRL_R3_TRACE_DIR:-$repo_dir/results/$BASE_NAME/r3_trace}
 
 agent=env.nemo_gym.claweval_agent.responses_api_agents.claweval_agent
 exec bash "$script_dir/run_sc.sh" \
+  +policy.router_replay.enabled=true \
   async_rl.sampler.name=in_order \
   async_rl.sampler.max_lookahead_versions=0 \
   "async_rl.min_groups_for_streaming_train=${NUM_PROMPTS}" \
