@@ -476,11 +476,13 @@ class TQTokenSink:
         key = record.staging_key
         write_started = False
         try:
-            field_dict, tags = self._stage_payload(record, attachments)
-            write_started = True
-            await complete_before_cancellation(
-                self._store.async_put(key, field_dict, tags=tags)
+            field_dict, tags = await asyncio.to_thread(
+                self._stage_payload, record, attachments
             )
+            write_started = True
+            # The data-plane mutation API settles a submitted write before
+            # propagating cancellation, so cleanup cannot overtake the PUT.
+            await self._store.async_put(key, field_dict, tags=tags)
         except asyncio.CancelledError:
             # The submitted write has settled before ownership reaches cleanup.
             # Drain cleanup as well, including repeated cancellation at shutdown.

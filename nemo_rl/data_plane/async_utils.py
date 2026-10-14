@@ -64,8 +64,8 @@ async def call_data_plane(
 
     Local clients that enable ``async_io_enabled`` use their async I/O methods
     instead. Checkpoint and other control operations retain their existing
-    dispatch. The async implementation owns admission and cancellation safety;
-    this helper awaits completion within the caller's existing mutation scope.
+    dispatch. The async implementation settles submitted mutations before
+    cancellation; this helper preserves the caller's existing mutation scope.
 
     Args:
         client: Local ``DataPlaneClient`` or Ray actor handle.

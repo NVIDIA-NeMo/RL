@@ -56,6 +56,16 @@ class _Ledger(dict):
         self.pop(group_id)
 
 
+class _Capacity(asyncio.Semaphore):
+    def __init__(self, barrier: DataPlaneCheckpointBarrier) -> None:
+        super().__init__(0)
+        self.barrier = barrier
+
+    def release(self) -> None:
+        assert self.barrier._active_mutations == 0
+        super().release()
+
+
 def _controller():
     cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(cls)
@@ -69,7 +79,7 @@ def _controller():
     )
     ctrl._finalizer_metrics_by_group = {"group": {"metric": 1}}
     ctrl._finalizer_rewards_by_group = {"group": [1]}
-    ctrl._buffer_capacity = asyncio.Semaphore(0)
+    ctrl._buffer_capacity = _Capacity(ctrl._data_plane_checkpoint_barrier)
     return ctrl
 
 
@@ -86,8 +96,7 @@ async def _post_train_cleanup(ctrl):
         KVBatchMeta(partition_id=name, task_name="train", sample_ids=["sample"])
         for name in ("canonical", "staging")
     ]
-    async with ctrl._data_plane_checkpoint_barrier.mutation("sample_clears") as cut:
-        await ctrl._release_consumed_metas_unlocked(cut, metas, ["claim"], {"group"}, 2)
+    await ctrl._release_consumed_metas(metas, ["claim"], {"group"}, 2)
 
 
 @pytest.mark.parametrize("cleanup_kind", ["known_request", "post_train"])
@@ -100,11 +109,10 @@ def test_cancelled_cleanup_releases_ownership_before_checkpoint(
         client = ctrl._dp_client
         if cancel_partition == "staging":
             client.release["canonical"].set()
-        cleanup = (
-            ctrl._cleanup_known_finalization_request(_request())
-            if cleanup_kind == "known_request"
-            else _post_train_cleanup(ctrl)
-        )
+        if cleanup_kind == "known_request":
+            cleanup = ctrl._cleanup_known_finalization_request(_request())
+        else:
+            cleanup = _post_train_cleanup(ctrl)
         task = asyncio.create_task(cleanup)
         await client.entered[cancel_partition].wait()
         checkpoint_entered = asyncio.Event()
@@ -113,16 +121,15 @@ def test_cancelled_cleanup_releases_ownership_before_checkpoint(
             async with ctrl._data_plane_checkpoint_barrier.checkpoint():
                 checkpoint_entered.set()
                 assert client.rows == {"canonical": set(), "staging": set()}
-                if cleanup_kind == "known_request":
+                if cleanup_kind != "post_train":
                     ctrl._buffer.abort.assert_called_once_with("group")
                     assert not ctrl._rollout_recovery_ledger
                 else:
                     ctrl._buffer.release_training_claims.assert_called_once_with(
                         ["claim"]
                     )
-                    assert ctrl._buffer_capacity._value == 2
-                assert not ctrl._finalizer_metrics_by_group
-                assert not ctrl._finalizer_rewards_by_group
+                    assert not ctrl._finalizer_metrics_by_group
+                    assert not ctrl._finalizer_rewards_by_group
 
         snapshot = asyncio.create_task(checkpoint())
         for _ in range(2):
@@ -138,6 +145,15 @@ def test_cancelled_cleanup_releases_ownership_before_checkpoint(
         await snapshot
         assert checkpoint_entered.is_set()
         assert ctrl._data_plane_checkpoint_barrier._active_mutations == 0
+        if cleanup_kind == "known_request":
+            assert ctrl._finalizer_metrics_by_group == {"group": {"metric": 1}}
+            assert ctrl._finalizer_rewards_by_group == {"group": [1]}
+        else:
+            assert not ctrl._finalizer_metrics_by_group
+            assert not ctrl._finalizer_rewards_by_group
+        assert ctrl._buffer_capacity._value == (
+            2 if cleanup_kind == "post_train" else 0
+        )
 
     asyncio.run(scenario())
 
@@ -161,6 +177,39 @@ def test_failed_cleanup_preserves_ownership_and_propagates_error(cleanup_kind):
         assert "group" in ctrl._finalizer_rewards_by_group
         assert ctrl._buffer_capacity._value == 0
         assert ctrl._dp_client.rows == {"canonical": set(), "staging": {"sample"}}
+        assert ctrl._data_plane_checkpoint_barrier._active_mutations == 0
+
+    asyncio.run(scenario())
+
+
+def test_successful_committed_discard_releases_pending_finalizer_state() -> None:
+    async def scenario() -> None:
+        ctrl = _controller()
+        for event in ctrl._dp_client.release.values():
+            event.set()
+        await ctrl._discard_committed_group(_request())
+        ctrl._buffer.abort.assert_called_once_with("group")
+        assert not ctrl._rollout_recovery_ledger
+        assert not ctrl._finalizer_metrics_by_group
+        assert not ctrl._finalizer_rewards_by_group
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_post_train_cleanup_waiting_for_checkpoint_starts_no_writes() -> None:
+    async def scenario() -> None:
+        ctrl = _controller()
+        async with ctrl._data_plane_checkpoint_barrier.checkpoint():
+            task = asyncio.create_task(_post_train_cleanup(ctrl))
+            await asyncio.sleep(0)
+            assert not task.done()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert not any(event.is_set() for event in ctrl._dp_client.entered.values())
+        assert ctrl._dp_client.rows == {"canonical": {"sample"}, "staging": {"sample"}}
+        ctrl._buffer.release_training_claims.assert_not_called()
+        assert ctrl._buffer_capacity._value == 0
         assert ctrl._data_plane_checkpoint_barrier._active_mutations == 0
 
     asyncio.run(scenario())

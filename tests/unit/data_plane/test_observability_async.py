@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Accounting and ownership guarantees of asynchronous observed operations."""
+"""Metrics parity and await-safe accounting of asynchronous observed operations."""
 
 from __future__ import annotations
 
@@ -110,7 +110,7 @@ def test_async_round_trip_preserves_hashes_events_and_live_bytes():
         snap = client.snapshot()
         assert snap["bytes_outstanding"] == 0
         assert snap["peak_bytes_outstanding"] == 64
-        assert not client._partition_versions
+        assert not client._async_partition_versions
         assert snap["hash_verify"]["rows_recorded"] == 2
         assert snap["hash_verify"]["rows_checked"] == 4
         assert snap["hash_verify"]["mismatches"] == 0
@@ -151,7 +151,6 @@ def test_async_failed_put_has_status_but_no_live_bytes(failure):
         assert events[0]["status"] == (
             "timeout" if isinstance(failure, TimeoutError) else "error"
         )
-        assert client._async_operations == 0
         client.close()
 
     asyncio.run(scenario())
@@ -318,25 +317,74 @@ def test_async_clear_all_keeps_accounting_for_a_concurrent_surviving_put():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("cancel_phase", ["put", "reconcile"])
-def test_cancelled_put_finishes_accounting_before_lifecycle_is_allowed(
-    cancel_phase, tmp_path, monkeypatch
-):
+@pytest.mark.parametrize("operation", ["put", "get", "get_data", "list", "clear"])
+def test_async_metrics_do_not_add_cancellation_or_lifecycle_policy(operation):
     async def scenario():
         started = asyncio.Event()
         release = asyncio.Event()
+        cancelled = asyncio.Event()
+        closed = []
 
         class GatedClient(_AsyncClient):
-            async def async_put_samples(self, *args, **kwargs):
-                if cancel_phase == "put":
-                    started.set()
+            async def gate(self, *args, **kwargs):
+                started.set()
+                try:
                     await release.wait()
-                return await super().async_put_samples(*args, **kwargs)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
 
+            async_put_samples = gate
+            async_get_samples = gate
+            async_get_data = gate
+            async_list_sample_ids = gate
+            async_clear_samples = gate
+
+            def close(self):
+                closed.append(True)
+
+        inner = GatedClient()
+        events = []
+        client = MetricsDataPlaneClient(inner, on_event=events.append)
+        meta = NoOpDataPlaneClient.put_samples(inner, ["a"], "p", _fields())
+        calls = {
+            "put": lambda: client.async_put_samples(["b"], "p", _fields()),
+            "get": lambda: client.async_get_samples(["a"], "p", ["x"]),
+            "get_data": lambda: client.async_get_data(meta),
+            "list": lambda: client.async_list_sample_ids("p"),
+            "clear": lambda: client.async_clear_samples(["a"], "p"),
+        }
+        task = asyncio.create_task(calls[operation]())
+        await started.wait()
+        try:
+            # Lifecycle policy belongs to the underlying client, just as it
+            # does for sync operations; metrics must not add a rejection.
+            client.close()
+            assert closed == [True]
+            task.cancel()
+            await asyncio.sleep(0)
+            assert task.done()
+            assert cancelled.is_set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            op = "list_sample_ids" if operation == "list" else operation
+            assert [e["status"] for e in events if e["op"] == op] == ["error"]
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_async_cancellation_during_reconciliation_keeps_completed_put(monkeypatch):
+    async def scenario():
+        listing_started = asyncio.Event()
+        release_listing = asyncio.Event()
+
+        class GatedClient(_AsyncClient):
             async def async_list_sample_ids(self, partition_id):
-                if cancel_phase == "reconcile":
-                    started.set()
-                    await release.wait()
+                listing_started.set()
+                await release_listing.wait()
                 return await super().async_list_sample_ids(partition_id)
 
         inner = GatedClient()
@@ -344,27 +392,19 @@ def test_cancelled_put_finishes_accounting_before_lifecycle_is_allowed(
         client = MetricsDataPlaneClient(inner, on_event=events.append)
         monkeypatch.setattr(observability, "_RECONCILE_ROWS", 1)
         task = asyncio.create_task(client.async_put_samples(["a"], "p", _fields()))
-        await started.wait()
-        task.cancel()
-        await asyncio.sleep(0)
-        task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
-        for lifecycle in (
-            lambda: client.save_checkpoint(tmp_path / "blocked"),
-            lambda: client.load_checkpoint(tmp_path / "blocked"),
-            client.close,
-        ):
-            with pytest.raises(RuntimeError, match="async data-plane operations"):
-                lifecycle()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert NoOpDataPlaneClient.list_sample_ids(inner, "p") == ["a"]
-        assert client.snapshot()["bytes_outstanding"] == 32
-        assert [e["status"] for e in events if e["op"] == "put"] == ["ok"]
-        assert client._async_operations == 0
-        client.close()
+        await listing_started.wait()
+        try:
+            task.cancel()
+            await asyncio.sleep(0)
+            assert task.done()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert NoOpDataPlaneClient.list_sample_ids(inner, "p") == ["a"]
+            assert client.snapshot()["bytes_outstanding"] == 32
+            assert [e["status"] for e in events] == ["ok"]
+        finally:
+            release_listing.set()
+            await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
 

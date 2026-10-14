@@ -236,7 +236,7 @@ class VllmAsyncGenerationWorkerImpl(
         # version is stamped per model call at begin_call time and rotated by
         # the set_rollout_weight_version fan-out from the SC's _sync_weights.
         self.token_capture = None
-        self._capture_async_semaphore: asyncio.Semaphore | None = None
+        self._native_capture = False
         self._rollout_weight_version = 0
         # In-flight captured calls keyed by id(request): the ActiveCall, the
         # exact engine prompt ids recorded at preprocess time, and the media
@@ -602,16 +602,13 @@ class VllmAsyncGenerationWorkerImpl(
         self._chain_prefix.install(source)
         async_cfg = async_data_plane_config(cast(DataPlaneConfig, dp_cfg))
         native_capture = async_cfg.enabled and dp_cfg["backend"] == "simple"
-        self._capture_async_semaphore = None
+        self._native_capture = native_capture
         if native_capture:
             # Optional companion Gym API is required only for the enabled path.
             from nemo_gym.token_id_capture.staging.protocols import AsyncStagingSink
 
             if not isinstance(sink, AsyncStagingSink):
                 raise TypeError("native capture requires an AsyncStagingSink")
-            # First acquisition happens on the HTTP loop. Include record/tensor
-            # preparation in admission, rather than bounding only the final PUT.
-            self._capture_async_semaphore = asyncio.Semaphore(async_cfg.max_inflight)
             install_capture(
                 self,
                 sink=sink,
@@ -918,28 +915,19 @@ class VllmAsyncGenerationWorkerImpl(
         return self._capture_response(content, coords)
 
     async def _finish_request_capture_async(self, request: Any, content: dict) -> dict:
-        """Await native staging, including bounded preparation and cancellation cleanup."""
-        if self._capture_async_semaphore is None:
-            raise RuntimeError("native capture was not enabled during setup")
-        try:
-            async with self._capture_async_semaphore:
-                state = self._capture_calls.pop(id(request), None)
-                if state is None:
-                    return content
-                payload = self._capture_completion_payload(state, content)
-                coords = await self.token_capture.async_complete_call_from_response(
-                    state.call,
-                    payload,
-                    attachments=state.media.tensors
-                    if state.media is not None
-                    else None,
-                )
-                return self._capture_response(content, coords)
-        except asyncio.CancelledError:
-            # Waiting for admission has not claimed completion yet. Once the
-            # state was popped, Gym/sink own draining and cleanup of the write.
-            self._abort_request_capture(request, reason="cancelled_capture")
-            raise
+        """Keep capture preparation off the HTTP loop and await native staging."""
+        state = self._capture_calls.pop(id(request), None)
+        if state is None:
+            return content
+        payload = await asyncio.to_thread(
+            self._capture_completion_payload, state, content
+        )
+        coords = await self.token_capture.async_complete_call_from_response(
+            state.call,
+            payload,
+            attachments=state.media.tensors if state.media is not None else None,
+        )
+        return self._capture_response(content, coords)
 
     def _abort_request_capture(self, request: Any, *, reason: str) -> None:
         """Drop the in-flight capture state for a request that errored."""
@@ -1530,7 +1518,7 @@ class VllmAsyncGenerationWorkerImpl(
                 )
                 # Token capture: stage the delta and ride the coords on the
                 # response; strips logprobs/ids (no-op when capture is off).
-                if worker_self._capture_async_semaphore is not None:
+                if worker_self._native_capture:
                     content = await worker_self._finish_request_capture_async(
                         request, content
                     )

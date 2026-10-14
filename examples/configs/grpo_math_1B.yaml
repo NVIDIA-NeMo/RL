@@ -614,7 +614,6 @@ data_plane:
   claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
   async_io:
     enabled: false                  # opt-in native SimpleStorage I/O in async callers
-    max_inflight: 8                 # positive bound per async client/capture host
   # Backend-specific blocks: only the one named by `backend` is read, and an
   # absent block means that backend's defaults (see SimpleStorageConfig /
   # MooncakeCpuConfig in nemo_rl/data_plane/interfaces.py).

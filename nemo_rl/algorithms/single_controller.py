@@ -1881,10 +1881,6 @@ class SingleControllerActor:
         self._buffer.abort(request.group_id)
         if request.group_id in self._rollout_recovery_ledger:
             self._rollout_recovery_ledger.discard_group(cut, request.group_id)
-        # This group will not reach post-train release. Keep these removals
-        # with confirmed storage/ownership cleanup when cancellation is drained.
-        self._finalizer_metrics_by_group.pop(request.group_id, None)
-        self._finalizer_rewards_by_group.pop(request.group_id, None)
 
     async def _cleanup_known_finalization_request(
         self, request: "ReassemblyRequest"
@@ -1898,6 +1894,10 @@ class SingleControllerActor:
     async def _discard_committed_group(self, request: "ReassemblyRequest") -> None:
         """Release a committed group the controller declines to train on."""
         await self._cleanup_known_finalization_request(request)
+        # The group left the buffer unconsumed, so the post-step release for
+        # consumed groups never reaches its pending metrics and observations.
+        self._finalizer_metrics_by_group.pop(request.group_id, None)
+        self._finalizer_rewards_by_group.pop(request.group_id, None)
 
     async def _finalize_with_actor(
         self, request: "ReassemblyRequest"
@@ -2086,30 +2086,37 @@ class SingleControllerActor:
         if errors:
             raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
 
-    async def _release_consumed_metas_unlocked(
+    async def _release_consumed_metas(
         self,
-        cut: DataPlaneMutationCut,
         metas: list[KVBatchMeta],
         training_claim_ids: list[str],
         finalizer_group_ids: set[str],
         consumed_group_count: int,
     ) -> None:
         """Finish post-train storage and ownership release before cancellation."""
-        cut.require_live()
+        ownership_released = False
 
-        async def release() -> None:
+        async def release(cut: DataPlaneMutationCut) -> None:
+            nonlocal ownership_released
             await self._cleanup_consumed_metas_unlocked(cut, metas)
             self._buffer.release_training_claims(training_claim_ids)
             for group_id in finalizer_group_ids:
                 self._finalizer_metrics_by_group.pop(group_id, None)
                 self._finalizer_rewards_by_group.pop(group_id, None)
-            for _ in range(consumed_group_count):
-                self._buffer_capacity.release()
+            ownership_released = True
 
-        if getattr(self._dp_client, "async_io_enabled", False) is True:
-            await complete_before_cancellation(release())
-        else:
-            await release()
+        try:
+            async with self._data_plane_checkpoint_barrier.mutation(
+                "sample_clears"
+            ) as cut:
+                if getattr(self._dp_client, "async_io_enabled", False) is True:
+                    await complete_before_cancellation(release(cut))
+                else:
+                    await release(cut)
+        finally:
+            if ownership_released:
+                for _ in range(consumed_group_count):
+                    self._buffer_capacity.release()
 
     def _log_data_plane_metrics(self, total_step_time: float) -> None:
         """Log this step's data-plane cost. Never raises.
@@ -3603,16 +3610,12 @@ class SingleControllerActor:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
-                async with self._data_plane_checkpoint_barrier.mutation(
-                    "sample_clears"
-                ) as cut:
-                    await self._release_consumed_metas_unlocked(
-                        cut,
-                        consumed_metas,
-                        consumed_training_claim_ids,
-                        step_finalizer_group_ids,
-                        consumed_group_count,
-                    )
+                await self._release_consumed_metas(
+                    consumed_metas,
+                    consumed_training_claim_ids,
+                    step_finalizer_group_ids,
+                    consumed_group_count,
+                )
                 step_metrics.update(
                     {
                         name: statistics.fmean(values)

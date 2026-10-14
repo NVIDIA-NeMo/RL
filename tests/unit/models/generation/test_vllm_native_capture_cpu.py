@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
@@ -67,7 +68,7 @@ def _worker(worker_class: type, sink: _Sink) -> Any:
     worker.is_model_owner = True
     worker._capture_calls = {}
     worker._rollout_weight_version = 4
-    worker._capture_async_semaphore = asyncio.Semaphore(1)
+    worker._native_capture = True
     worker._chain_prefix = SimpleNamespace(install=lambda source: None)
     worker.install_token_capture = lambda capture: setattr(
         worker, "token_capture", capture
@@ -149,32 +150,75 @@ def test_host_awaits_capture_before_stripping_or_publishing(
     asyncio.run(scenario())
 
 
-def test_host_bounds_preparation_and_cleans_cancelled_admission(
+def test_host_does_not_add_a_capture_concurrency_limit(worker_class: type) -> None:
+    async def scenario() -> None:
+        sink = _Sink()
+        worker = _worker(worker_class, sink)
+        entered = asyncio.Queue()
+        original_stage = sink.async_stage
+
+        async def stage(record, *, attachments=None):
+            entered.put_nowait(record.model_call_id)
+            return await original_stage(record, attachments=attachments)
+
+        sink.async_stage = stage
+        requests = [_admit(worker, str(i))[0] for i in range(16)]
+        tasks = [
+            asyncio.create_task(
+                worker._finish_request_capture_async(request, _content())
+            )
+            for request in requests
+        ]
+        try:
+            async with asyncio.timeout(5):
+                assert {await entered.get() for _ in tasks} == {
+                    str(i) for i in range(16)
+                }
+            assert all(not task.done() for task in tasks)
+        finally:
+            sink.release.set()
+            await asyncio.gather(*tasks)
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_cpu_preparation_does_not_block_http_or_start_a_write(
     worker_class: type,
 ) -> None:
     async def scenario() -> None:
         sink = _Sink()
         worker = _worker(worker_class, sink)
-        first_request, _ = _admit(worker, "first")
-        first = asyncio.create_task(
-            worker._finish_request_capture_async(first_request, _content())
+        request, _ = _admit(worker, "cancelled")
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        loop_thread = threading.get_ident()
+        original = worker._capture_completion_payload
+
+        def prepare(state, content):
+            assert threading.get_ident() != loop_thread
+            started.set()
+            assert release.wait(5)
+            try:
+                return original(state, content)
+            finally:
+                finished.set()
+
+        worker._capture_completion_payload = prepare
+        task = asyncio.create_task(
+            worker._finish_request_capture_async(request, _content())
         )
-        await sink.entered.wait()
-        second_request, second_call = _admit(worker, "second")
-        second = asyncio.create_task(
-            worker._finish_request_capture_async(second_request, _content())
-        )
-        await asyncio.sleep(0)
-        assert not second_call.completed
-        assert id(second_request) in worker._capture_calls
-        second.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await second
-        assert second_call.completed
-        assert id(second_request) not in worker._capture_calls
-        sink.release.set()
-        await first
-        assert [record.model_call_id for record in sink.records] == ["first"]
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not sink.entered.is_set()
+            assert id(request) not in worker._capture_calls
+        finally:
+            release.set()
+            await asyncio.to_thread(finished.wait, 5)
+        assert not sink.entered.is_set()
 
     asyncio.run(scenario())
 
@@ -200,9 +244,9 @@ def test_setup_selects_native_only_for_enabled_simple(
     )
     asyncio.run(
         worker.setup_token_capture(
-            {"backend": backend, "async_io": {"enabled": enabled, "max_inflight": 2}},
+            {"backend": backend, "async_io": {"enabled": enabled}},
             "staging",
         )
     )
-    assert (worker._capture_async_semaphore is not None) == native
+    assert worker._native_capture == native
     assert (worker.token_capture._async_sink is sink) == native

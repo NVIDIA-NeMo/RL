@@ -546,21 +546,16 @@ data_plane:
   backend: simple
   async_io:
     enabled: false  # A: existing synchronous APIs; true for B
-    max_inflight: 8
 ```
-
-`AsyncDataPlaneConfig` owns these defaults. `max_inflight` must be positive;
-it bounds outstanding asynchronous operations per client. The vLLM capture
-host separately applies the same bound before capture preparation. This is
-not a cluster-wide limit and does not change the rollout scheduler's prompt
-concurrency. Sweep this limit separately from the initial API comparison;
-the synchronous baseline retains its existing executor-pool admission.
 
 With `enabled: true`, SimpleStorage uses the existing TQ v0.1.9
 `async_kv_*` APIs. The vLLM token-capture path awaits Gym's async completion
 contract and the data-plane PUT on the HTTP event loop, before returning
-capture coordinates. Synchronous tensor preparation and serialization still
-occupy that loop; only suspending I/O awaits let other requests run.
+capture coordinates. Capture extraction, digest computation, route processing,
+and tensor preparation remain offloaded to worker threads. Native TQ encoding
+and decoding follow the scheduling of TQ's async APIs.
+There are no additional concurrency limits; existing rollout and request
+admission settings are unchanged.
 The companion Gym revision pinned by this branch is required for that
 contract; the draft's `.gitmodules` points to the paired branch in the fork.
 Check out submodules from this branch and make the same Gym source
@@ -572,18 +567,18 @@ SingleController orchestration, advantage processing, and replay commits.
 Synchronous model workers and the exclusively leased `RolloutReassemblerActor`
 retain their synchronous interfaces. There is no new finalizer concurrency,
 write coalescing, tensor schema, or storage lifetime. Megatron generation's
-capture host retains its synchronous path. Mooncake async callers use the
+capture host and vLLM capture-prefix reads retain their synchronous paths.
+Mooncake async callers use the
 thread-offloaded synchronous fallback, and its vLLM capture path remains
 thread-offloaded: pinned TQ's Mooncake GET can block the calling loop.
 
-An admitted local async operation settles before caller cancellation is
-propagated. Capture cancellation then attempts staging cleanup. Metrics
-accounting is included in this completion boundary. Local lifecycle methods
-reject pending async operations; the existing global checkpoint/ownership
-barriers are still required. This does not change remote Ray actor failure
-or unknown-outcome recovery semantics. Draining waits for TQ's public API;
-it does not add atomicity or recovery guarantees for a partially failed
-multi-storage-unit transfer inside TQ.
+Submitted PUT/CLEAR operations settle before cancellation propagates, so
+rollback cannot overtake an unfinished write. Multi-step storage cleanup and
+ownership release remain inside the existing checkpoint barrier until both
+finish. Reads and listings remain cancellable. A cancelled mutation is reported
+as an error by the metrics wrapper; live-byte accounting can be incomplete for
+cancelled or partially failed mutations. No new retry or transfer-recovery
+policy is introduced.
 
 For training A/B runs, preserve the model, dataset/order, seed, hardware,
 parallelism, storage-unit count, rollout concurrency, observability settings,

@@ -38,10 +38,10 @@ import threading
 import time
 import warnings
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, cast
 
 import torch
 
@@ -65,7 +65,6 @@ from nemo_rl.data_plane.interfaces import (
 from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
 
 LOGGER = logging.getLogger(__name__)
-_Result = TypeVar("_Result")
 
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init — lifted from rl-arena/arena/backends.py.
@@ -1043,7 +1042,6 @@ class TQDataPlaneClient(DataPlaneClient):
     # unpickles a client without running the constructor.
     _gdr_requested: bool = False
     _gdr_put_confirmed: bool = False
-    _async_operations: int = 0
 
     def __init__(
         self,
@@ -1074,9 +1072,6 @@ class TQDataPlaneClient(DataPlaneClient):
         # actor; retain the config so process-local hooks can be reinstalled.
         self._cfg = cfg
         self._async_options = async_data_plane_config(cfg)
-        self._async_loop: asyncio.AbstractEventLoop | None = None
-        self._async_slots: asyncio.Semaphore | None = None
-        self._async_operations = 0
 
         # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing
         # — once tq.init/connect runs, Mooncake's engine.so reads the
@@ -1461,38 +1456,11 @@ class TQDataPlaneClient(DataPlaneClient):
         tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
 
     # Native async is opt-in; synchronous training workers retain their
-    # existing API. Each client has one async loop owner and bounded I/O.
+    # existing API and callers retain their existing concurrency controls.
 
     @property
     def async_io_enabled(self) -> bool:
         return self._async_options.enabled
-
-    async def _run_async_io(
-        self, operation: Callable[[], Awaitable[_Result]]
-    ) -> _Result:
-        if self._closed:
-            raise RuntimeError("Cannot use a closed data-plane client")
-        loop = asyncio.get_running_loop()
-        if self._async_loop is not loop:
-            if self._async_loop is not None and not self._async_loop.is_closed():
-                raise RuntimeError(
-                    "A data-plane client's async I/O must use one event loop"
-                )
-            self._async_loop = loop
-            self._async_slots = asyncio.Semaphore(self._async_options.max_inflight)
-        assert self._async_slots is not None
-        self._async_operations += 1
-        try:
-            await self._async_slots.acquire()
-            try:
-                # Do not let cleanup/checkpoint overtake a submitted PUT or
-                # CLEAR when its caller is cancelled (including repeated cancel).
-                result = await complete_before_cancellation(operation())
-            finally:
-                self._async_slots.release()
-        finally:
-            self._async_operations -= 1
-        return result
 
     async def async_get_data(
         self, meta: KVBatchMeta, select_fields: list[str] | None = None
@@ -1511,99 +1479,91 @@ class TQDataPlaneClient(DataPlaneClient):
         fields: TensorDict | None = None,
         tags: list[dict[str, Any]] | None = None,
     ) -> KVBatchMeta:
-        async def put() -> KVBatchMeta:
-            if not self.async_io_enabled or self._backend != "simple":
-                return await asyncio.to_thread(
+        """Settle a submitted write before cancellation can trigger caller cleanup."""
+        if not self.async_io_enabled or self._backend != "simple":
+            return await complete_before_cancellation(
+                asyncio.to_thread(
                     self.put_samples, sample_ids, partition_id, fields, tags
                 )
-            if not sample_ids:
-                return KVBatchMeta(
-                    partition_id=partition_id,
-                    task_name=None,
-                    sample_ids=[],
-                    fields=None,
-                )
-            wire_fields, field_names, user_tags = _prepare_put_fields(
-                sample_ids, fields, tags
             )
-            self._mark_data_operation_started()
-            await tq.async_kv_batch_put(
+        if not sample_ids:
+            return KVBatchMeta(
+                partition_id=partition_id,
+                task_name=None,
+                sample_ids=[],
+                fields=None,
+            )
+        wire_fields, field_names, user_tags = _prepare_put_fields(
+            sample_ids, fields, tags
+        )
+        self._mark_data_operation_started()
+        await complete_before_cancellation(
+            tq.async_kv_batch_put(
                 keys=list(sample_ids),
                 partition_id=partition_id,
                 fields=wire_fields,
                 tags=user_tags,
             )
-            return KVBatchMeta(
-                partition_id=partition_id,
-                task_name=None,
-                sample_ids=list(sample_ids),
-                fields=field_names,
-                tags=user_tags if user_tags else None,
-            )
-
-        return await self._run_async_io(put)
+        )
+        return KVBatchMeta(
+            partition_id=partition_id,
+            task_name=None,
+            sample_ids=list(sample_ids),
+            fields=field_names,
+            tags=user_tags if user_tags else None,
+        )
 
     async def async_get_samples(
         self, sample_ids: list[str], partition_id: str, select_fields: list[str]
     ) -> TensorDict:
-        async def get() -> TensorDict:
-            if not self.async_io_enabled or self._backend != "simple":
-                # Mooncake's async_get_data still calls a synchronous backend
-                # GET in pinned TQ v0.1.9, so keep it off the caller's loop.
-                return await asyncio.to_thread(
-                    self.get_samples, sample_ids, partition_id, select_fields
-                )
-            if not sample_ids:
-                return TensorDict({}, batch_size=(0,))
-            self._mark_data_operation_started()
-            td = await tq.async_kv_batch_get(
-                keys=list(sample_ids),
-                partition_id=partition_id,
-                select_fields=select_fields,
+        if not self.async_io_enabled or self._backend != "simple":
+            # Mooncake's async_get_data still calls a synchronous backend
+            # GET in pinned TQ v0.1.9, so keep it off the caller's loop.
+            return await asyncio.to_thread(
+                self.get_samples, sample_ids, partition_id, select_fields
             )
-            return _from_wire(td)
-
-        return await self._run_async_io(get)
+        if not sample_ids:
+            return TensorDict({}, batch_size=(0,))
+        self._mark_data_operation_started()
+        td = await tq.async_kv_batch_get(
+            keys=list(sample_ids),
+            partition_id=partition_id,
+            select_fields=select_fields,
+        )
+        return _from_wire(td)
 
     async def async_list_sample_ids(self, partition_id: str) -> list[str]:
-        async def listing() -> list[str]:
-            if not self.async_io_enabled or self._backend != "simple":
-                return await asyncio.to_thread(self.list_sample_ids, partition_id)
-            self._mark_data_operation_started()
-            partitions = await tq.async_kv_list(partition_id=partition_id)
-            return sorted(partitions.get(partition_id, {}).keys())
-
-        return await self._run_async_io(listing)
+        if not self.async_io_enabled or self._backend != "simple":
+            return await asyncio.to_thread(self.list_sample_ids, partition_id)
+        self._mark_data_operation_started()
+        partitions = await tq.async_kv_list(partition_id=partition_id)
+        return sorted(partitions.get(partition_id, {}).keys())
 
     async def async_clear_samples(
         self, sample_ids: list[str] | None, partition_id: str
     ) -> None:
-        async def clear() -> None:
-            if not self.async_io_enabled or self._backend != "simple":
-                await asyncio.to_thread(self.clear_samples, sample_ids, partition_id)
-                return
-            keys = sample_ids
-            if keys is None:
-                self._mark_data_operation_started()
-                listing = await tq.async_kv_list(partition_id=partition_id)
-                keys = list(listing.get(partition_id, {}).keys())
-                if not keys:
-                    warnings.warn(
-                        f"clear_samples(sample_ids=None, partition_id={partition_id!r}) "
-                        "found nothing to clear",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-            if keys:
-                self._mark_data_operation_started()
-                await tq.async_kv_clear(keys=list(keys), partition_id=partition_id)
-
-        await self._run_async_io(clear)
-
-    def _require_no_async_operations(self) -> None:
-        if self._async_operations:
-            raise RuntimeError(
-                "Drain asynchronous data-plane operations before lifecycle changes"
+        """Drain submitted deletion; listing before clear-all remains cancellable."""
+        if not self.async_io_enabled or self._backend != "simple":
+            await complete_before_cancellation(
+                asyncio.to_thread(self.clear_samples, sample_ids, partition_id)
+            )
+            return
+        keys = sample_ids
+        if keys is None:
+            self._mark_data_operation_started()
+            listing = await tq.async_kv_list(partition_id=partition_id)
+            keys = list(listing.get(partition_id, {}).keys())
+            if not keys:
+                warnings.warn(
+                    f"clear_samples(sample_ids=None, partition_id={partition_id!r}) "
+                    "found nothing to clear",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        if keys:
+            self._mark_data_operation_started()
+            await complete_before_cancellation(
+                tq.async_kv_clear(keys=list(keys), partition_id=partition_id)
             )
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
@@ -1615,7 +1575,6 @@ class TQDataPlaneClient(DataPlaneClient):
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """Save TQ controller metadata and storage data."""
-        self._require_no_async_operations()
         self._require_checkpointing_support()
         _connect_existing()
         tq.save_checkpoint(checkpoint_dir, metadata=metadata)
@@ -1628,7 +1587,6 @@ class TQDataPlaneClient(DataPlaneClient):
         TQ client, so the recovery coordinator must also guarantee globally
         clean setup ordering.
         """
-        self._require_no_async_operations()
         self._require_checkpointing_support()
         self._require_clean_for_load()
         # Validate the adapter-owned metadata before starting TQ's
@@ -1645,7 +1603,6 @@ class TQDataPlaneClient(DataPlaneClient):
         return dict(user_metadata)
 
     def close(self) -> None:
-        self._require_no_async_operations()
         if self._closed:
             return
         self._closed = True

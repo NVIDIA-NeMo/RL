@@ -240,7 +240,7 @@ def _worker_with_capture(sink: _MemorySink):
             worker, name, getattr(VllmAsyncGenerationWorkerImpl, name).__get__(worker)
         )
     worker._capture_response = VllmAsyncGenerationWorkerImpl._capture_response
-    worker._capture_async_semaphore = None
+    worker._native_capture = False
     worker.token_capture = RolloutTokenCapture(
         sink=sink,
         weight_version_fn=lambda: worker._rollout_weight_version,

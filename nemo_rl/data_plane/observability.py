@@ -43,22 +43,12 @@ import itertools
 import logging
 import zlib
 from bisect import bisect_left
-from collections.abc import Awaitable, Coroutine, Iterator, Sequence
+from collections.abc import Awaitable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from functools import wraps
 from pathlib import Path
 from time import monotonic
-from typing import (
-    Any,
-    Callable,
-    Concatenate,
-    Literal,
-    ParamSpec,
-    TypedDict,
-    TypeGuard,
-    TypeVar,
-)
+from typing import Any, Callable, Literal, TypedDict, TypeGuard
 
 EventStatus = Literal["ok", "error", "timeout"]
 
@@ -76,7 +66,6 @@ import numpy as np
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict, TensorDictBase
 
-from nemo_rl.data_plane.async_utils import complete_before_cancellation
 from nemo_rl.data_plane.codec import drain_codec_ms
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.telemetry.instrumentation import (
@@ -1290,36 +1279,6 @@ class _AsyncTiming:
     inner_ms: float = 0.0
 
 
-_AsyncParams = ParamSpec("_AsyncParams")
-_AsyncResult = TypeVar("_AsyncResult")
-
-
-def _complete_observed_operation(
-    fn: Callable[
-        Concatenate[MetricsDataPlaneClient, _AsyncParams],
-        Coroutine[Any, Any, _AsyncResult],
-    ],
-) -> Callable[
-    Concatenate[MetricsDataPlaneClient, _AsyncParams], Coroutine[Any, Any, _AsyncResult]
-]:
-    """Finish accounting before cancellation or lifecycle operations can proceed."""
-
-    @wraps(fn)
-    async def wrapped(
-        self: MetricsDataPlaneClient,
-        *args: _AsyncParams.args,
-        **kwargs: _AsyncParams.kwargs,
-    ) -> _AsyncResult:
-        self._async_operations += 1
-        try:
-            result = await complete_before_cancellation(fn(self, *args, **kwargs))
-        finally:
-            self._async_operations -= 1
-        return result
-
-    return wrapped
-
-
 class MetricsDataPlaneClient(DataPlaneClient):
     """Wrap a ``DataPlaneClient`` with a per-op callback hook."""
 
@@ -1360,8 +1319,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # Bounded by the live key population, not by cumulative traffic.
         self._bytes_by_partition: dict[str, int] = {}
         self._keys_by_partition: dict[str, set[str]] = {}
-        self._partition_versions: dict[str, int] = {}
-        self._next_partition_version = itertools.count(1)
         self._rows_since_reconcile = 0
         self._hash_mismatches_logged = 0
         # Set by ``_emit`` to the inner client's wall time for the op just
@@ -1373,7 +1330,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # every trainer use get_step_metrics() without copying the
         # differencing and unit-conversion logic.
         self._prev_snapshot: dict[str, Any] = {}
-        self._async_operations = 0
+        # Async listings can suspend while another async mutation completes.
+        # Unique markers avoid treating a clear-and-rewrite as the same state.
+        self._async_partition_versions: dict[str, object] = {}
 
     @property
     def async_io_enabled(self) -> bool:
@@ -1462,14 +1421,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # One process: the cluster arithmetic with n_procs=1 is exactly this.
         return _step_metrics(snap, prev, step_time_s, collect_ms)
 
-    def _record_put(
-        self,
-        partition_id: str,
-        keys: list[str],
-        n_bytes: int,
-        *,
-        reconcile: bool = True,
-    ) -> bool:
+    def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:
         """Attribute put bytes per key so a later ``clear_samples`` can subtract.
 
         Called after the underlying RPC succeeds so a failed put never
@@ -1486,14 +1438,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
             partition_id: Partition the keys were written to.
             keys: Per-sample uids that were written.
             n_bytes: Total bytes written; released pro rata on clear.
-            reconcile: Run synchronous reconciliation when its row window expires.
-
-        Returns:
-            Whether the row window expired and reconciliation is due.
         """
         if not keys or n_bytes <= 0:
-            return False
-        self._partition_versions[partition_id] = next(self._next_partition_version)
+            return
         self._keys_by_partition.setdefault(partition_id, set()).update(keys)
         self._bytes_by_partition[partition_id] = (
             self._bytes_by_partition.get(partition_id, 0) + n_bytes
@@ -1507,10 +1454,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             # put fails on the next, so re-arming after would retry it on every
             # put for the rest of the run.
             self._rows_since_reconcile = 0
-            if reconcile:
-                self._release_cleared_samples(partition_id)
-            return True
-        return False
+            self._release_cleared_samples(partition_id)
 
     def _record_clear(self, partition_id: str, keys: list[str] | None) -> None:
         """Reverse the put accounting for ``keys``.
@@ -1530,7 +1474,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
         live = self._keys_by_partition.get(partition_id)
         if live is None:
             return
-        self._partition_versions[partition_id] = next(self._next_partition_version)
         total = self._bytes_by_partition.get(partition_id, 0)
         # Count what was actually live, not what the caller listed. A clear
         # may name uids already dropped or belonging elsewhere, and billing
@@ -1547,7 +1490,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
             freed = total
             del self._keys_by_partition[partition_id]
             self._bytes_by_partition.pop(partition_id, None)
-            self._partition_versions.pop(partition_id, None)
         else:
             freed = total * removed // (len(live) + removed) if removed else 0
             self._bytes_by_partition[partition_id] = total - freed
@@ -1574,22 +1516,53 @@ class MetricsDataPlaneClient(DataPlaneClient):
         if stale:
             self._record_clear(partition_id, list(stale))
 
+    async def _async_record_put(
+        self, partition_id: str, keys: list[str], n_bytes: int
+    ) -> None:
+        """Mirror sync accounting, awaiting the same periodic reconciliation.
+
+        Keep the synchronous hot path unchanged: only asynchronous mutations
+        need a marker to invalidate a listing that suspended before they ran.
+        """
+        if not keys or n_bytes <= 0:
+            return
+        self._async_partition_versions[partition_id] = object()
+        self._keys_by_partition.setdefault(partition_id, set()).update(keys)
+        self._bytes_by_partition[partition_id] = (
+            self._bytes_by_partition.get(partition_id, 0) + n_bytes
+        )
+        self._stats.bytes_outstanding += n_bytes
+        if self._stats.bytes_outstanding > self._stats.peak_bytes_outstanding:
+            self._stats.peak_bytes_outstanding = self._stats.bytes_outstanding
+        self._rows_since_reconcile += len(keys)
+        if self._rows_since_reconcile >= _RECONCILE_ROWS:
+            self._rows_since_reconcile = 0
+            await self._async_release_cleared_samples(partition_id)
+
+    def _record_async_clear(self, partition_id: str, keys: list[str] | None) -> None:
+        """Apply the same byte accounting and invalidate older async listings."""
+        self._record_clear(partition_id, keys)
+        if partition_id in self._keys_by_partition:
+            self._async_partition_versions[partition_id] = object()
+        else:
+            self._async_partition_versions.pop(partition_id, None)
+
     async def _async_release_cleared_samples(self, partition_id: str) -> None:
         """Reconcile without blocking the caller loop or removing newer writes."""
-        version = self._partition_versions.get(partition_id, 0)
+        version = self._async_partition_versions.get(partition_id)
         try:
             live = set(await self._inner.async_list_sample_ids(partition_id))
         except Exception:  # noqa: BLE001 - the put succeeded; retry next window
             return
         # A listing can race with another operation on this client. Its snapshot
         # cannot invalidate accounting updated while the request was in flight.
-        if self._partition_versions.get(partition_id, 0) != version:
+        if self._async_partition_versions.get(partition_id) is not version:
             return
         stale = self._keys_by_partition.get(partition_id, set()) - live
         if stale:
-            self._record_clear(partition_id, list(stale))
+            self._record_async_clear(partition_id, list(stale))
 
-    def _bill_self(self, entered: float, inner_ms: float | None = None) -> None:
+    def _bill_self(self, entered: float) -> None:
         """Charge this wrapper for the time it spent that was not the RPC.
 
         One ``monotonic`` per op on top of the two ``_run`` already takes.
@@ -1597,9 +1570,12 @@ class MetricsDataPlaneClient(DataPlaneClient):
         reader to trust a benchmark run on some other machine.
         """
         elapsed_ms = (monotonic() - entered) * 1000.0
-        self._stats.self_ms += elapsed_ms - (
-            self._last_inner_ms if inner_ms is None else inner_ms
-        )
+        self._stats.self_ms += elapsed_ms - self._last_inner_ms
+
+    def _bill_async_self(self, entered: float, inner_ms: float) -> None:
+        """Use operation-local time because another await may overwrite the last RPC."""
+        elapsed_ms = (monotonic() - entered) * 1000.0
+        self._stats.self_ms += elapsed_ms - inner_ms
 
     # ── wire-in / wire-out fingerprinting (opt-in) ─────────────────────
 
@@ -1831,15 +1807,28 @@ class MetricsDataPlaneClient(DataPlaneClient):
             Whatever ``fn`` returned.
         """
         t0 = monotonic()
-        with self._op_span(op, partition_id) as span:
+        # Rollout puts are per-prompt (umbrella, no bucket); batch puts are
+        # DATA_PLANE. See per_prompt_scope.
+        per_prompt = in_per_prompt_scope()
+        group = RLSpanGroup.U_PER_PROMPT if per_prompt else RLSpanGroup.DATA_PLANE
+        if not is_span_group_enabled(group):
+            # Gate before building the name, the attribute dict and either
+            # helper's generator: this is the most frequent telemetry call site
+            # in the repo, once per data-plane op, and those allocations cost
+            # ~1.8us each on a run that never enabled telemetry.
+            span_ctx: Any = NO_SPAN
+        else:
+            name = f"rl.data_plane.{op}"
+            # Annotated rather than inferred as dict[str, str]: these are span
+            # attributes, whose values are heterogeneous, and the helpers below
+            # take a typed ``tracer`` ahead of their ``**attributes``.
+            attributes: dict[str, Any] = {_OP_ATTR: op, _PARTITION_ATTR: partition_id}
+            if per_prompt:
+                span_ctx = umbrella_span(RLSpanGroup.U_PER_PROMPT, name, **attributes)
+            else:
+                span_ctx = managed_span(RLSpanGroup.DATA_PLANE, name, **attributes)
+        with span_ctx as span:
             try:
-                if (
-                    op in ("save_checkpoint", "load_checkpoint", "close")
-                    and self._async_operations
-                ):
-                    raise RuntimeError(
-                        f"Cannot {op} while observed async data-plane operations are in flight"
-                    )
                 out = fn()
             except TimeoutError:
                 _annotate(span, n_keys, n_bytes, "timeout")
@@ -1860,7 +1849,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             return out
 
     def _op_span(self, op: str, partition_id: str) -> Any:
-        """Select the same telemetry scope for synchronous and async calls."""
+        """Select the async telemetry scope without changing the sync hot path."""
         # Rollout puts are per-prompt (umbrella, no bucket); batch puts are
         # DATA_PLANE. See per_prompt_scope.
         per_prompt = in_per_prompt_scope()
@@ -2137,7 +2126,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._record_clear(partition_id, sample_ids_list)
         self._bill_self(entered)
 
-    @_complete_observed_operation
     async def async_put_samples(
         self,
         sample_ids: list[str],
@@ -2145,7 +2133,12 @@ class MetricsDataPlaneClient(DataPlaneClient):
         fields: TensorDict | None = None,
         tags: list[dict[str, Any]] | None = None,
     ) -> KVBatchMeta:
-        """Write through the inner async API and account only successful writes."""
+        """Write through the inner async API and account only successful writes.
+
+        Cancellation is reported as an error, without imposing another drain
+        policy on the adapter. As with a partially failed write, occupancy can
+        be incomplete when the completed outcome is unknown to this wrapper.
+        """
         entered = monotonic()
         timing = _AsyncTiming()
         n_bytes = _td_bytes(fields) if self._observability_enabled else 0
@@ -2163,12 +2156,10 @@ class MetricsDataPlaneClient(DataPlaneClient):
             n_keys=len(sample_ids_list),
             n_bytes=n_bytes,
         )
-        if self._record_put(partition_id, sample_ids_list, n_bytes, reconcile=False):
-            await self._async_release_cleared_samples(partition_id)
-        self._bill_self(entered, timing.inner_ms)
+        await self._async_record_put(partition_id, sample_ids_list, n_bytes)
+        self._bill_async_self(entered, timing.inner_ms)
         return out
 
-    @_complete_observed_operation
     async def async_get_samples(
         self,
         sample_ids: list[str],
@@ -2205,10 +2196,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
             out = await read(list(select_fields))
         if self._verify_tensor_hash:
             self._check_hashes(partition_id, sample_ids_list, out)
-        self._bill_self(entered, timing.inner_ms)
+        self._bill_async_self(entered, timing.inner_ms)
         return out
 
-    @_complete_observed_operation
     async def async_get_data(
         self, meta: KVBatchMeta, select_fields: list[str] | None = None
     ) -> TensorDict:
@@ -2227,10 +2217,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
         if self._verify_tensor_hash:
             self._check_hashes(meta.partition_id, meta.sample_ids, out)
-        self._bill_self(entered, timing.inner_ms)
+        self._bill_async_self(entered, timing.inner_ms)
         return out
 
-    @_complete_observed_operation
     async def async_list_sample_ids(self, partition_id: str) -> list[str]:
         """List keys without blocking the caller loop."""
         return await self._run_async(
@@ -2240,7 +2229,6 @@ class MetricsDataPlaneClient(DataPlaneClient):
             timing=_AsyncTiming(),
         )
 
-    @_complete_observed_operation
     async def async_clear_samples(
         self, sample_ids: list[str] | None, partition_id: str
     ) -> None:
@@ -2248,7 +2236,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         entered = monotonic()
         timing = _AsyncTiming()
         sample_ids_list = _as_list(sample_ids)
-        version = self._partition_versions.get(partition_id, 0)
+        version = self._async_partition_versions.get(partition_id)
         await self._run_async(
             "clear",
             partition_id,
@@ -2258,15 +2246,15 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
         if (
             sample_ids_list is None
-            and self._partition_versions.get(partition_id, 0) != version
+            and self._async_partition_versions.get(partition_id) is not version
         ):
             # TQ implements clear-all as list followed by clear of that key
             # snapshot. A write during those awaits may survive in storage;
             # reconcile instead of discarding its newly recorded live bytes.
             await self._async_release_cleared_samples(partition_id)
         else:
-            self._record_clear(partition_id, sample_ids_list)
-        self._bill_self(entered, timing.inner_ms)
+            self._record_async_clear(partition_id, sample_ids_list)
+        self._bill_async_self(entered, timing.inner_ms)
 
     def save_checkpoint(
         self,

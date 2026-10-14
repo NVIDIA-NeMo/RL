@@ -124,13 +124,11 @@ class AsyncDataPlaneConfig(BaseModel, extra="forbid"):
     """Opt-in asynchronous I/O for A/B experiments.
 
     SimpleStorage uses native TQ coroutines. Other backends retain thread
-    offloading because their storage implementations can block. The limit is
-    per client, shared by all its asynchronous GET/PUT/list/clear operations;
-    it does not change rollout concurrency or write granularity.
+    offloading because their storage implementations can block. This selects
+    the I/O API without changing admission limits or write granularity.
     """
 
     enabled: bool = False
-    max_inflight: PositiveInt = 8
 
 
 class DataPlaneConfig(TypedDict):
@@ -488,9 +486,7 @@ class DataPlaneClient(ABC):
         self, meta: KVBatchMeta, select_fields: list[str] | None = None
     ) -> TensorDict:
         """Await a read, retaining the synchronous implementation as fallback."""
-        return await complete_before_cancellation(
-            asyncio.to_thread(self.get_data, meta, select_fields)
-        )
+        return await asyncio.to_thread(self.get_data, meta, select_fields)
 
     async def async_put_samples(
         self,
@@ -508,15 +504,13 @@ class DataPlaneClient(ABC):
         self, sample_ids: list[str], partition_id: str, select_fields: list[str]
     ) -> TensorDict:
         """Await an explicit-field read without blocking the caller's loop."""
-        return await complete_before_cancellation(
-            asyncio.to_thread(self.get_samples, sample_ids, partition_id, select_fields)
+        return await asyncio.to_thread(
+            self.get_samples, sample_ids, partition_id, select_fields
         )
 
     async def async_list_sample_ids(self, partition_id: str) -> list[str]:
         """Await a metadata-only listing."""
-        return await complete_before_cancellation(
-            asyncio.to_thread(self.list_sample_ids, partition_id)
-        )
+        return await asyncio.to_thread(self.list_sample_ids, partition_id)
 
     async def async_clear_samples(
         self, sample_ids: list[str] | None, partition_id: str

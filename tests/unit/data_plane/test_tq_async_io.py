@@ -40,16 +40,14 @@ def make_client(
     """Exercise the constructor without connecting to Ray or a storage server."""
     monkeypatch.setattr(adapter, "_connect_existing", lambda: None)
 
-    def make(
-        *, enabled: bool = True, max_inflight: int = 2
-    ) -> adapter.TQDataPlaneClient:
+    def make(*, enabled: bool = True) -> adapter.TQDataPlaneClient:
         return adapter.TQDataPlaneClient(
             {
                 "enabled": True,
                 "impl": "transfer_queue",
                 "backend": "simple",
                 "claim_meta_poll_interval_s": 0.5,
-                "async_io": {"enabled": enabled, "max_inflight": max_inflight},
+                "async_io": {"enabled": enabled},
             },
             bootstrap=False,
         )
@@ -210,12 +208,12 @@ def test_baseline_and_mooncake_use_sync_fallback_off_caller_thread(
     assert observed[0] != caller_thread
 
 
-def test_mixed_operations_share_one_inflight_limit(
+def test_mixed_operations_add_no_concurrency_limit(
     monkeypatch: pytest.MonkeyPatch,
     make_client: Callable[..., adapter.TQDataPlaneClient],
 ) -> None:
     async def exercise() -> None:
-        client = make_client(max_inflight=2)
+        client = make_client()
         entered: asyncio.Queue[str] = asyncio.Queue()
         release = asyncio.Event()
         active = 0
@@ -249,31 +247,35 @@ def test_mixed_operations_share_one_inflight_limit(
         monkeypatch.setattr(adapter.tq, "async_kv_batch_get", get)
         monkeypatch.setattr(adapter.tq, "async_kv_list", listing)
         monkeypatch.setattr(adapter.tq, "async_kv_clear", clear)
-        tasks = [
-            asyncio.create_task(client.async_put_samples(["a"], "p")),
-            asyncio.create_task(client.async_get_samples(["a"], "p", ["x"])),
-            asyncio.create_task(client.async_list_sample_ids("p")),
-            asyncio.create_task(client.async_clear_samples(["a"], "p")),
-        ]
-        await asyncio.wait_for(entered.get(), timeout=1)
-        await asyncio.wait_for(entered.get(), timeout=1)
-        await asyncio.sleep(0)
-        assert len(seen) == active == 2
-        release.set()
-        await asyncio.gather(*tasks)
-        assert peak == 2
-        assert sorted(seen) == ["clear", "get", "list", "put"]
-        assert client._async_operations == 0
+        tasks = []
+        for _ in range(4):
+            tasks.extend(
+                [
+                    asyncio.create_task(client.async_put_samples(["a"], "p")),
+                    asyncio.create_task(client.async_get_samples(["a"], "p", ["x"])),
+                    asyncio.create_task(client.async_list_sample_ids("p")),
+                    asyncio.create_task(client.async_clear_samples(["a"], "p")),
+                ]
+            )
+        try:
+            for _ in tasks:
+                await asyncio.wait_for(entered.get(), timeout=1)
+            assert len(seen) == active == 16
+        finally:
+            release.set()
+            await asyncio.gather(*tasks)
+        assert peak == 16
+        assert sorted(seen) == sorted(["clear", "get", "list", "put"] * 4)
 
     asyncio.run(exercise())
 
 
-def test_cancelled_submitted_write_settles_before_cleanup_and_lifecycle(
+def test_cancelled_submitted_write_settles_before_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     make_client: Callable[..., adapter.TQDataPlaneClient],
 ) -> None:
     async def exercise() -> None:
-        client = make_client(max_inflight=1)
+        client = make_client()
         entered = asyncio.Event()
         release = asyncio.Event()
         rows: set[str] = set()
@@ -291,8 +293,6 @@ def test_cancelled_submitted_write_settles_before_cleanup_and_lifecycle(
 
         monkeypatch.setattr(adapter.tq, "async_kv_batch_put", put)
         monkeypatch.setattr(adapter.tq, "async_kv_clear", clear)
-        close = Mock()
-        monkeypatch.setattr(adapter.tq, "close", close)
 
         async def owner() -> None:
             try:
@@ -307,55 +307,156 @@ def test_cancelled_submitted_write_settles_before_cleanup_and_lifecycle(
             await asyncio.sleep(0)
             assert not task.done()
             assert not actions
-        for operation in (
-            client.close,
-            lambda: client.save_checkpoint("unused"),
-            lambda: client.load_checkpoint("unused"),
-        ):
-            with pytest.raises(RuntimeError, match="Drain asynchronous"):
-                operation()
-        close.assert_not_called()
         release.set()
         with pytest.raises(asyncio.CancelledError, match="first cancellation"):
             await task
         assert actions == ["put", "clear"]
         assert not rows
-        assert client._async_operations == 0
-        client.close()
-        close.assert_called_once()
-        with pytest.raises(RuntimeError, match="closed"):
-            await client.async_put_samples(["late"], "p")
 
     asyncio.run(exercise())
 
 
-def test_cancelled_queued_write_is_not_submitted(
+@pytest.mark.parametrize("method", ["get_samples", "list_sample_ids"])
+def test_reads_and_listings_cancel_without_waiting_for_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    make_client: Callable[..., adapter.TQDataPlaneClient],
+    method: str,
+) -> None:
+    async def exercise() -> None:
+        client = make_client()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def operation(**kwargs: Any) -> None:
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        monkeypatch.setattr(adapter.tq, "async_kv_batch_get", operation)
+        monkeypatch.setattr(adapter.tq, "async_kv_list", operation)
+        awaitable = (
+            client.async_get_samples(["a"], "p", ["x"])
+            if method == "get_samples"
+            else client.async_list_sample_ids("p")
+        )
+        task = asyncio.create_task(awaitable)
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel("stop reading")
+        with pytest.raises(asyncio.CancelledError, match="stop reading"):
+            await asyncio.wait_for(task, timeout=1)
+        assert cancelled.is_set()
+        assert not release.is_set()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("backend,enabled", [("simple", False), ("mooncake_cpu", True)])
+@pytest.mark.parametrize("method", ["get_samples", "list_sample_ids"])
+def test_fallback_read_cancellation_does_not_wait_for_sync_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    make_client: Callable[..., adapter.TQDataPlaneClient],
+    backend: str,
+    enabled: bool,
+    method: str,
+) -> None:
+    async def exercise() -> None:
+        client = make_client(enabled=enabled)
+        client._backend = backend
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def operation(*args: Any) -> None:
+            loop.call_soon_threadsafe(entered.set)
+            try:
+                assert release.wait(timeout=5)
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(client, method, operation)
+        awaitable = (
+            client.async_get_samples(["a"], "p", ["x"])
+            if method == "get_samples"
+            else client.async_list_sample_ids("p")
+        )
+        task = asyncio.create_task(awaitable)
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel("stop reading")
+            done, _ = await asyncio.wait([task], timeout=1)
+            assert task in done
+            assert not finished.is_set()
+            with pytest.raises(asyncio.CancelledError, match="stop reading"):
+                await task
+        finally:
+            # Cancelling to_thread cannot stop its already-running thread.
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 1)
+
+    asyncio.run(exercise())
+
+
+def test_submitted_clear_settles_before_cancellation_propagates(
     monkeypatch: pytest.MonkeyPatch,
     make_client: Callable[..., adapter.TQDataPlaneClient],
 ) -> None:
     async def exercise() -> None:
-        client = make_client(max_inflight=1)
         entered = asyncio.Event()
         release = asyncio.Event()
-        submitted: list[str] = []
+        rows = {"a"}
 
-        async def put(**kwargs: Any) -> None:
-            submitted.extend(kwargs["keys"])
+        async def clear(**kwargs: Any) -> None:
             entered.set()
             await release.wait()
+            rows.difference_update(kwargs["keys"])
 
-        monkeypatch.setattr(adapter.tq, "async_kv_batch_put", put)
-        first = asyncio.create_task(client.async_put_samples(["first"], "p"))
+        monkeypatch.setattr(adapter.tq, "async_kv_clear", clear)
+        task = asyncio.create_task(make_client().async_clear_samples(["a"], "p"))
         await asyncio.wait_for(entered.wait(), timeout=1)
-        queued = asyncio.create_task(client.async_put_samples(["queued"], "p"))
+        task.cancel("stop clearing")
         await asyncio.sleep(0)
-        queued.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await queued
+        assert not task.done()
+        assert rows == {"a"}
         release.set()
-        await first
-        assert submitted == ["first"]
-        assert client._async_operations == 0
+        with pytest.raises(asyncio.CancelledError, match="stop clearing"):
+            await task
+        assert not rows
+
+    asyncio.run(exercise())
+
+
+def test_clear_all_can_cancel_during_listing_before_deletion(
+    monkeypatch: pytest.MonkeyPatch,
+    make_client: Callable[..., adapter.TQDataPlaneClient],
+) -> None:
+    async def exercise() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def listing(**kwargs: Any) -> dict:
+            entered.set()
+            await release.wait()
+            return {"p": {"a": {}}}
+
+        clear = Mock(side_effect=AssertionError("cancelled listing must not clear"))
+        monkeypatch.setattr(adapter.tq, "async_kv_list", listing)
+        monkeypatch.setattr(adapter.tq, "async_kv_clear", clear)
+        task = asyncio.create_task(make_client().async_clear_samples(None, "p"))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel("stop listing")
+            done, _ = await asyncio.wait([task], timeout=1)
+            assert task in done
+            with pytest.raises(asyncio.CancelledError, match="stop listing"):
+                await task
+            clear.assert_not_called()
+        finally:
+            release.set()
 
     asyncio.run(exercise())
 
@@ -399,7 +500,7 @@ def test_listing_clear_all_and_empty_operations_preserve_contracts(
     asyncio.run(exercise())
 
 
-def test_failed_operation_releases_capacity_and_does_not_retry_sync(
+def test_failed_operation_does_not_retry_sync(
     monkeypatch: pytest.MonkeyPatch,
     make_client: Callable[..., adapter.TQDataPlaneClient],
 ) -> None:
@@ -414,12 +515,11 @@ def test_failed_operation_releases_capacity_and_does_not_retry_sync(
     monkeypatch.setattr(adapter.tq, "async_kv_batch_put", native_put)
     sync_put = Mock(side_effect=AssertionError("duplicate sync write"))
     monkeypatch.setattr(adapter.tq, "kv_batch_put", sync_put)
-    client = make_client(max_inflight=1)
+    client = make_client()
 
     async def exercise() -> None:
         with pytest.raises(RuntimeError, match="unknown publication"):
             await client.async_put_samples(["a"], "p")
-        assert client._async_operations == 0
         await client.async_put_samples(["b"], "p")
 
     asyncio.run(exercise())
@@ -430,8 +530,7 @@ def test_failed_operation_releases_capacity_and_does_not_retry_sync(
 @pytest.mark.parametrize(
     "options",
     [
-        {"max_inflight": 0},
-        {"max_inflight": -1},
+        {"max_inflight": 8},
         {"enabled": "maybe"},
         {"unknown_option": 1},
     ],
@@ -455,7 +554,7 @@ def test_invalid_async_config_fails_before_connect(
     connect.assert_not_called()
 
 
-def test_client_rejects_another_live_loop_but_allows_closed_loop_replacement(
+def test_adapter_adds_no_live_event_loop_ownership_restriction(
     monkeypatch: pytest.MonkeyPatch,
     make_client: Callable[..., adapter.TQDataPlaneClient],
 ) -> None:
@@ -468,9 +567,6 @@ def test_client_rejects_another_live_loop_but_allows_closed_loop_replacement(
     second_loop = asyncio.new_event_loop()
     try:
         assert first_loop.run_until_complete(client.async_list_sample_ids("p")) == ["a"]
-        with pytest.raises(RuntimeError, match="one event loop"):
-            second_loop.run_until_complete(client.async_list_sample_ids("p"))
-        first_loop.close()
         assert second_loop.run_until_complete(client.async_list_sample_ids("p")) == [
             "a"
         ]

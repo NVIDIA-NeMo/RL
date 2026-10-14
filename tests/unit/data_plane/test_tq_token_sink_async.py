@@ -15,6 +15,7 @@
 """Native capture sink ownership tests with controllable storage completion."""
 
 import asyncio
+import threading
 from typing import Any
 
 import pytest
@@ -30,6 +31,7 @@ from nemo_gym.token_id_capture.staging import (  # noqa: E402
 )
 
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink  # noqa: E402
+from nemo_rl.data_plane.async_utils import complete_before_cancellation  # noqa: E402
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -76,9 +78,14 @@ class _Storage:
             raise OSError("partial write")
 
     async def async_put_samples(self, **kwargs) -> None:
-        self.entered.set()
-        await self.release.wait()
-        self.put_samples(**kwargs)
+        # Match the data-plane mutation API's completion-before-cancellation
+        # contract; the sink must reclaim a settled write after cancellation.
+        async def put():
+            self.entered.set()
+            await self.release.wait()
+            self.put_samples(**kwargs)
+
+        await complete_before_cancellation(put())
 
     async def async_clear_samples(self, *, sample_ids, partition_id) -> None:
         self.clear_entered.set()
@@ -213,6 +220,60 @@ def test_bad_attachments_fail_before_io() -> None:
         )
         assert not result.ok
         assert "media-enabled" in result.error
+        assert not storage.entered.is_set()
+        assert storage.events == []
+
+    asyncio.run(scenario())
+
+
+def test_tensor_preparation_stays_off_the_event_loop() -> None:
+    async def scenario() -> None:
+        storage = _Storage()
+        storage.release.set()
+        sink = TQTokenSink(storage, staging_partition="staging")
+        original = sink._stage_payload
+        loop_thread = threading.get_ident()
+        prepared = []
+
+        def prepare(record, attachments):
+            prepared.append(threading.get_ident())
+            return original(record, attachments)
+
+        sink._stage_payload = prepare
+        assert (await sink.async_stage(_record())).ok
+        assert len(prepared) == 1
+        assert prepared[0] != loop_thread
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_tensor_preparation_never_submits_a_write() -> None:
+    async def scenario() -> None:
+        storage = _Storage()
+        sink = TQTokenSink(storage, staging_partition="staging")
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        original = sink._stage_payload
+
+        def prepare(record, attachments):
+            started.set()
+            try:
+                assert release.wait(5)
+                return original(record, attachments)
+            finally:
+                finished.set()
+
+        sink._stage_payload = prepare
+        task = asyncio.create_task(sink.async_stage(_record()))
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 5)
         assert not storage.entered.is_set()
         assert storage.events == []
 

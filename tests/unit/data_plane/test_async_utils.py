@@ -190,6 +190,40 @@ def test_enabled_async_io_requires_the_async_method() -> None:
         asyncio.run(call_data_plane(client, "get_samples"))
 
 
+@pytest.mark.parametrize("method_name", ["get_data", "get_samples", "list_sample_ids"])
+def test_native_read_dispatch_preserves_cancellation(method_name: str) -> None:
+    async def exercise() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def read() -> None:
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        client = SimpleNamespace(
+            async_io_enabled=True,
+            **{method_name: lambda: None, f"async_{method_name}": read},
+        )
+        task = asyncio.create_task(call_data_plane(client, method_name))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel("read no longer needed")
+            done, _ = await asyncio.wait([task], timeout=1)
+            assert task in done
+            with pytest.raises(asyncio.CancelledError, match="read no longer needed"):
+                await task
+            assert cancelled.is_set()
+        finally:
+            release.set()
+
+    asyncio.run(exercise())
+
+
 def test_complete_before_cancellation_preserves_result_and_failure() -> None:
     async def exercise() -> None:
         async def value() -> int:
