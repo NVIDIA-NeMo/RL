@@ -51,14 +51,18 @@ must update and reverify these coupled locations:
   and resolved dependency set
 - root `pyproject.toml` and `uv.lock`, plus the isolated Dynamo project and
   lockfile: the `nvidia-nccl-cu13` pins must remain identical
-- `docker/dynamo/install.sh` and `tests/functional/grpo_dynamo.sh`: the vLLM
-  version, backport marker, and runtime assertions
+- `docker/dynamo/install.sh`, `tests/functional/grpo_dynamo.sh`, and
+  `tests/functional/grpo_dynamo_gym.sh`: the vLLM version, backport marker, and
+  runtime assertions
 - `docker/dynamo/patches/vllm-0.23.0-layerwise-reload-composed-loader.patch`:
   the version-specific #44814 backport
 - `tests/unit/distributed/test_stateless_process_group.py`: vLLM's
   `broadcast_from/0/0` weight-transfer wire key
-- `nemo_rl/models/generation/dynamo/token_wrapper.py`: the real Dynamo response
-  keys `nvext.engine_data.{prompt_token_ids,completion_token_ids,completion_logprobs}`;
+- `nemo_rl/models/generation/dynamo/token_wrapper.py`: the request-side
+  `nvext.extra_fields=["engine_data"]` signal and `nvext.token_data` prompt
+- `3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py`: the real
+  Dynamo response keys
+  `nvext.engine_data.{prompt_token_ids,completion_token_ids,completion_logprobs}`;
   reverify them against real Dynamo output because unit tests validate only the
   expected local response shape
 - `nemo_rl/models/generation/dynamo/managed_runtime.py`: the managed

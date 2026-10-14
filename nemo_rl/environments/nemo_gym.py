@@ -21,7 +21,7 @@ import threading
 import urllib.parse
 import urllib.request
 from collections import Counter
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Mapping, MutableMapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -1689,7 +1689,56 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 ########################################
 
 
+def _gym_policy_model_overlay(
+    nemo_gym_cfg: MutableMapping[str, Any],
+) -> MutableMapping[str, Any]:
+    """Return the Gym policy model's ``vllm_model`` overlay, creating it if needed.
+
+    A sharded job must claim every top-level Gym overlay, so when it has no
+    top-level ``policy_model`` the overlay goes in ``common_overrides``, which
+    reaches every shard. A null level is treated as empty.
+
+    Raises:
+        ValueError: A level of the overlay is neither a mapping nor null.
+    """
+    overlay_root = nemo_gym_cfg
+    if "shards" in nemo_gym_cfg and nemo_gym_cfg.get(_POLICY_SERVER_NAME) is None:
+        if nemo_gym_cfg.get("common_overrides") is None:
+            nemo_gym_cfg["common_overrides"] = {}
+        overlay_root = nemo_gym_cfg["common_overrides"]
+    node = overlay_root
+    for key in (_POLICY_SERVER_NAME, "responses_api_models", "vllm_model"):
+        if node.get(key) is None:
+            node[key] = {}
+        node = node[key]
+        if not isinstance(node, MutableMapping):
+            raise ValueError(f"env.nemo_gym {key} overlay must be a mapping or null.")
+    return node
+
+
 def setup_nemo_gym_config(config, tokenizer) -> None:
+    """Configure NeMo-Gym for the selected generation backend, in place.
+
+    For the Dynamo backend, this also configures the Gym policy model's
+    ``policy_model.responses_api_models.vllm_model`` overlay in
+    ``env.nemo_gym``, or in ``env.nemo_gym.common_overrides`` for a sharded job
+    without a top-level ``policy_model``. It appends ``"engine_data"`` to
+    ``extra_body.nvext.extra_fields`` and sets
+    ``derive_prefix_token_ids_from_messages: true``. Gym then reads Dynamo's
+    native token data and sends the exact multi-turn prefix that the Dynamo
+    token wrapper requires. Repeated calls do not change the result.
+
+    Args:
+        config: The master config. ``config.policy`` and ``config.env`` are
+            updated in place.
+        tokenizer: The policy tokenizer.
+
+    Raises:
+        ValueError: The generation backend is unsupported, or a level of the
+            Dynamo Gym policy model overlay is neither a mapping nor null, or
+            the overlay has a non-mapping ``extra_body`` or ``nvext``, or a
+            non-list ``nvext.extra_fields``.
+    """
     generation_config = config.policy["generation"]
 
     # Enable the backend's OpenAI-compatible server.
@@ -1710,6 +1759,39 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
+
+    if generation_config["backend"] == "dynamo":
+        if config.env.get("nemo_gym") is None:
+            config.env["nemo_gym"] = {}
+        model_cfg = _gym_policy_model_overlay(config.env["nemo_gym"])
+        extra_body = model_cfg.get("extra_body")
+        if extra_body is None:
+            model_cfg["extra_body"] = {}
+            extra_body = model_cfg["extra_body"]
+        if not isinstance(extra_body, MutableMapping):
+            raise ValueError(
+                "env.nemo_gym policy model extra_body must be a mapping or null."
+            )
+
+        nvext = extra_body.get("nvext")
+        if nvext is None:
+            extra_body["nvext"] = {}
+            nvext = extra_body["nvext"]
+        if not isinstance(nvext, MutableMapping):
+            raise ValueError(
+                "env.nemo_gym policy model extra_body.nvext must be a mapping or null."
+            )
+
+        extra_fields = nvext.setdefault("extra_fields", [])
+        if not isinstance(extra_fields, list):
+            raise ValueError(
+                "env.nemo_gym policy model nvext.extra_fields must be a list."
+            )
+        if "engine_data" not in extra_fields:
+            extra_fields.append("engine_data")
+        # The Dynamo token wrapper needs the newest assistant turn's exact
+        # tokens. Gym sends them only when this opt-in flag is set.
+        model_cfg["derive_prefix_token_ids_from_messages"] = True
 
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for

@@ -52,7 +52,7 @@ def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
         "stop_strings": ["stop"],
         "stop_token_ids": [1],
     }
-    config = SimpleNamespace(policy={"generation": generation})
+    config = SimpleNamespace(policy={"generation": generation}, env={})
 
     setup_nemo_gym_config(config, tokenizer=None)
 
