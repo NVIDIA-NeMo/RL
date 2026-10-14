@@ -87,6 +87,7 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
         get_collective_sender_spec=lambda: SimpleNamespace(nccl_peer="nemo"),
     )
     for name in (
+        "get_refit_fleet_shape",
         "rebuild_collective",
         "rebuild_nccl_reshard_comm_group",
         "prepare_nccl_reshard_refit_info",
