@@ -29,10 +29,10 @@ policy:
 logger:
   wandb:
     project: nemo-rl
-    name: sft-nanov3-30BA3B-2n8g-automodel
+    name: sft-nanov3-30BA3B-2n8g-automodel-ep8
   tensorboard:
-    log_dir: tb_logs-sft-nanov3-30BA3B-2n8g-automodel
+    log_dir: tb_logs-sft-nanov3-30BA3B-2n8g-automodel-ep8
   mlflow:
-    run_name: sft-nanov3-30BA3B-2n8g-automodel
+    run_name: sft-nanov3-30BA3B-2n8g-automodel-ep8
 cluster:
   gpus_per_node: 8

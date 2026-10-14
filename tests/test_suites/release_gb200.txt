@@ -49,4 +49,4 @@ tests/test_suites/llm/sft-llama3.1-70b-8n4g-tp2pp2-long-megatron.sh
 ################
 
 # Long 4b convergence
-tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-2n4g-automodel-long.v1.sh
+tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-2n4g-automodel-tp2cp2-long.v1.sh

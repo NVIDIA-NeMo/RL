@@ -30,7 +30,7 @@ Recipe YAML files under `examples/configs/recipes/` are the source of truth.
 | E2B | FSDP2, CP2 | 1n8g | [`dapo-gemma4-e2b-it-1n8g-automodel-cp2.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-e2b-it-1n8g-automodel-cp2.yaml) |
 | E4B | VLM FSDP2, CP1 | 1n8g | [`vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel.yaml) |
 | 12B | FSDP2, CP1 | 2n8g | [`dapo-gemma4-12b-it-2n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-12b-it-2n8g-automodel.yaml) |
-| 26B-A4B | FSDP2, EP32, CP1 | 4n8g | [`dapo-gemma4-26ba4b-it-4n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-26ba4b-it-4n8g-automodel.yaml) |
+| 26B-A4B | FSDP2, EP32, CP1 | 4n8g | [`dapo-gemma4-26ba4b-it-4n8g-automodel-ep32.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-26ba4b-it-4n8g-automodel-ep32.yaml) |
 | 26B-A4B | FSDP2, EP16, CP2 | 4n8g | [`dapo-gemma4-26ba4b-it-4n8g-automodel-ep16cp2.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-26ba4b-it-4n8g-automodel-ep16cp2.yaml) |
 | 31B | FSDP2, CP1 | 4n8g | [`dapo-gemma4-31b-it-4n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-31b-it-4n8g-automodel.yaml) |
 | 31B | FSDP2, CP2 | 4n8g | [`dapo-gemma4-31b-it-4n8g-automodel-cp2.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-31b-it-4n8g-automodel-cp2.yaml) |

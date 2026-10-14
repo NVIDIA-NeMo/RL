@@ -79,7 +79,7 @@ tests/test_suites/llm/dpo-llama3.1-8b-tulu3-1n8g-automodel.sh
 ################
 
 # Long 4b convergence
-tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-2n8g-automodel-tp2-long.v1.sh
+tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-2n8g-automodel-tp2cp2-long.v1.sh
  
 # 20 step functional tests on dynamic batching, non-colocated and seqence packing features
 tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-1n8g-automodel-tp2-dynamicbatch.v1.sh

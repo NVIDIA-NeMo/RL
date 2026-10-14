@@ -1,4 +1,4 @@
-defaults: ./dapo-gemma4-26ba4b-it-4n8g-automodel.yaml
+defaults: ./dapo-gemma4-26ba4b-it-4n8g-automodel-ep32.yaml
 policy:
   make_sequence_length_divisible_by: ${mul:64,${policy.automodel_cfg.context_parallel_size}}
   dynamic_batching:
