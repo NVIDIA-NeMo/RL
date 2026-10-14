@@ -33,6 +33,7 @@ from nemo_rl.data.captured_media import (
     CapturedMedia,
     CapturedMediaItem,
     MediaCaptureRejected,
+    MediaColumnSpec,
     capture_processed_media,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
@@ -45,6 +46,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.experience.route_assembly import boundary_route_rows
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -529,17 +531,18 @@ class VllmAsyncGenerationWorkerImpl(
         staging_partition: str,
         *,
         capture_media: bool = False,
-    ) -> bool:
+    ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
         Fan-out target (token_capture.enabled only): builds the in-worker
         data-plane client and TQTokenSink, then makes the single
         ``install_capture`` call wiring Gym's engine-blind capture core +
-        vLLM adapter into this worker. Returns whether capture was installed
-        (False on non-model-owner ranks, which serve no HTTP).
+        vLLM adapter into this worker. Returns the media column spec this
+        worker pinned the staging column to (``None`` for text-only capture
+        and on non-model-owner ranks, which serve no HTTP and install nothing).
         """
         if not self.is_model_owner:
-            return False
+            return None
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
         from nemo_gym.token_id_capture.staging import install_capture
@@ -547,7 +550,9 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 
-        dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        # Own no segment: a save would otherwise wait on this actor, whose event
+        # loop is busy serving rollouts. Capture writes land in other segments.
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
         # The Omni processor emits pixels in the engine's model dtype; the
         # sink pins its media column to it so text-call sentinels never
         # introduce a second dtype (TQ keeps one dtype per field).
@@ -600,7 +605,11 @@ class VllmAsyncGenerationWorkerImpl(
             weight_version_fn=lambda: self._rollout_weight_version,
             adapter=VLLMCaptureAdapter(),
         )
-        return True
+        if not capture_media:
+            return None
+        return MediaColumnSpec(
+            pixel_dtype=pixel_dtype, patch_size=self._capture_patch_size
+        )
 
     async def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """Run owner-local checkpoint I/O without blocking the actor event loop."""
@@ -785,7 +794,7 @@ class VllmAsyncGenerationWorkerImpl(
     def _delta_align_routed_experts(
         payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
     ) -> None:
-        """Normalize optional vLLM routes to the exact staged token delta."""
+        """Normalize optional vLLM routes to the staged token delta (plus boundary row)."""
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
             return
@@ -818,7 +827,8 @@ class VllmAsyncGenerationWorkerImpl(
                     f"route length {experts.shape[0]} does not match engine sequence "
                     f"length {expected_full_len}"
                 )
-            message["routed_experts"] = encode_routed_experts(experts[prev_len:])
+            start = prev_len - boundary_route_rows(prev_len)
+            message["routed_experts"] = encode_routed_experts(experts[start:])
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error

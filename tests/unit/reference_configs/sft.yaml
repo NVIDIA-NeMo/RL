@@ -37,6 +37,8 @@ policy:
   precision: "bfloat16"
 
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   automodel_cfg:
     enabled: true
@@ -141,6 +143,7 @@ policy:
     moe_permute_fusion: true
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
+    flash_attention_version: 2
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
