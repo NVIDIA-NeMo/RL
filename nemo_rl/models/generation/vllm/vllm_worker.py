@@ -87,14 +87,6 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 logger = logging.getLogger(__name__)
 
 
-def _resolve_sleep_level(sleep_level: int) -> int:
-    if type(sleep_level) is not int or sleep_level not in (1, 2):
-        raise ValueError(
-            f"sleep_level must be the integer 1 or 2, got {sleep_level!r}."
-        )
-    return sleep_level
-
-
 def _context_capped_max_new_tokens(
     *, configured_max_new_tokens: int, input_length: int, max_model_len: int
 ) -> int:
@@ -1586,7 +1578,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             self.llm.renderer, "clear_mm_cache"
         ):
             self.llm.renderer.clear_mm_cache()
-        self.llm.sleep(level=_resolve_sleep_level(sleep_level))
+        self.llm.sleep(level=sleep_level)
 
         gc.collect()
         torch.cuda.empty_cache()

@@ -201,9 +201,6 @@ class OptionalResourcesConfig(TypedDict):
 class ColocationConfig(TypedDict):
     enabled: bool
     resources: OptionalResourcesConfig
-    # Opt into vLLM sleep level 2 at safe lifecycle boundaries. Level 2
-    # discards rollout weights instead of retaining a host-memory backup.
-    discard_weights_on_sleep: NotRequired[bool]
 
 
 class CheckpointEngineConfig(TypedDict):

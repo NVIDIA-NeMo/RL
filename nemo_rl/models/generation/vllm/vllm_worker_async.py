@@ -67,7 +67,6 @@ from nemo_rl.models.generation.vllm.utils import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker import (
     BaseVllmGenerationWorker,
-    _resolve_sleep_level,
 )
 from nemo_rl.models.generation.openai_server_utils import (
     PrefixSplice,
@@ -2306,7 +2305,7 @@ class VllmAsyncGenerationWorkerImpl(
         # the receiver and sends data=None, causing an assertion error.
         if hasattr(self.llm, "reset_mm_cache"):
             await self.llm.reset_mm_cache()
-        await self.llm.sleep(level=_resolve_sleep_level(sleep_level))
+        await self.llm.sleep(level=sleep_level)
 
         gc.collect()
         torch.cuda.empty_cache()

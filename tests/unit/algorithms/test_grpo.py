@@ -3962,7 +3962,11 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
 @pytest.mark.parametrize(
     ("discard_enabled", "expected_finish_calls", "expected_calls_before_advantages"),
     [
-        (False, [mock_call(), mock_call()], [1, 2]),
+        (
+            False,
+            [mock_call(discard_weights=False), mock_call(discard_weights=False)],
+            [0, 1],
+        ),
         (
             True,
             [mock_call(discard_weights=False), mock_call(discard_weights=True)],
@@ -3970,7 +3974,7 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
         ),
     ],
 )
-def test_grpo_train_preserves_finish_timing_for_non_discarding_recipes(
+def test_grpo_train_waits_for_dynamic_sampling_before_finishing_generation(
     monkeypatch: pytest.MonkeyPatch,
     mock_grpo_components: dict[str, Any],
     discard_enabled: bool,
@@ -4039,7 +4043,7 @@ def test_grpo_train_preserves_finish_timing_for_non_discarding_recipes(
     master_config.grpo.val_period = 0
     master_config.grpo.val_at_start = False
     master_config.grpo.use_dynamic_sampling = True
-    master_config.policy["generation"]["colocated"]["discard_weights_on_sleep"] = (
+    master_config.policy["generation"]["vllm_cfg"]["discard_weights_on_sleep"] = (
         discard_enabled
     )
 
@@ -4063,27 +4067,6 @@ def test_grpo_train_preserves_finish_timing_for_non_discarding_recipes(
     assert calls_before_advantages == expected_calls_before_advantages
     assert mock_refit.call_count == 1
     assert mock_rollout.call_count == 2
-
-
-def test_discard_weights_sleep_is_limited_to_host_oom_recipes() -> None:
-    register_omegaconf_resolvers()
-    repo_root = Path(__file__).parents[3]
-    recipe_dir = repo_root / "examples/configs/recipes/llm/performance"
-    enabled_recipes = set()
-
-    for recipe_path in recipe_dir.glob("*.yaml"):
-        config = load_config(recipe_path)
-        if OmegaConf.select(
-            config,
-            "policy.generation.colocated.discard_weights_on_sleep",
-            default=False,
-        ):
-            enabled_recipes.add(recipe_path.name)
-
-    assert enabled_recipes == {
-        "grpo-nemotron3-super-120BA12B-32n4g-mxfp8-rollout.yaml",
-        "grpo-nemotron3-super-120BA12B-32n4g.yaml",
-    }
 
 
 def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path):

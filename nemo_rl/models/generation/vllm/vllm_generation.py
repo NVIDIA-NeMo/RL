@@ -241,6 +241,20 @@ class VllmGeneration(GenerationInterface):
             f"Please update your configuration to include all required VLLM parameters."
         )
 
+        discard_weights_on_sleep = self.cfg["vllm_cfg"].get("discard_weights_on_sleep")
+        if discard_weights_on_sleep is True:
+            if not self.cfg["colocated"]["enabled"]:
+                raise ValueError(
+                    "generation.vllm_cfg.discard_weights_on_sleep has no effect "
+                    "when generation.colocated.enabled is false."
+                )
+            if self._has_static_speculative_weights():
+                raise ValueError(
+                    "generation.vllm_cfg.discard_weights_on_sleep is not supported "
+                    "when speculative drafter weights are not restored by policy "
+                    "refit. Disable it for this configuration. See #2646."
+                )
+
         assert_reload_refit_config_supported(self.cfg)
 
         extension_fqn = self.cfg.get("worker_extension_cls_fqn")
@@ -1339,7 +1353,6 @@ class VllmGeneration(GenerationInterface):
         self,
         *args: Any,
         discard_weights: bool = False,
-        final_generation: bool = False,
         **kwargs: Any,
     ) -> bool:
         """Sleep workers and reset prefix cache.
@@ -1348,40 +1361,7 @@ class VllmGeneration(GenerationInterface):
             discard_weights: Use vLLM sleep level 2 to release weight storage.
                 Set this only when a full refit is guaranteed before the next
                 generation.
-            final_generation: The engine will not generate again. This permits
-                level 2 even when a static speculative drafter is not restored
-                by policy refit.
         """
-        if type(discard_weights) is not bool:
-            raise TypeError(
-                f"discard_weights must be a bool, got {type(discard_weights).__name__}."
-            )
-        if type(final_generation) is not bool:
-            raise TypeError(
-                f"final_generation must be a bool, got {type(final_generation).__name__}."
-            )
-
-        configured_discard = self.cfg["colocated"].get("discard_weights_on_sleep")
-        if configured_discard is not None and type(configured_discard) is not bool:
-            raise TypeError(
-                "generation.colocated.discard_weights_on_sleep must be a bool, "
-                f"got {type(configured_discard).__name__}."
-            )
-
-        use_level_2 = discard_weights and configured_discard is True
-        if (
-            use_level_2
-            and not final_generation
-            and self._has_static_speculative_weights()
-        ):
-            warn_once(
-                "vllm_static_speculative_weights_sleep",
-                "vLLM sleep level 2 was requested, but the speculative drafter "
-                "contains static weights that policy refit will not restore; "
-                "using sleep level 1 until the final generation instead.",
-            )
-            use_level_2 = False
-
         try:
             # Choose the appropriate method based on setting
             # non-colocated only needs reset prefix cache, no need to sleep.
@@ -1395,7 +1375,7 @@ class VllmGeneration(GenerationInterface):
                     if self.cfg["vllm_cfg"]["async_engine"]
                     else "reset_prefix_cache"
                 )
-            worker_kwargs = {"sleep_level": 2 if use_level_2 else 1}
+            worker_kwargs = {"sleep_level": 2 if discard_weights else 1}
             if not self.cfg["colocated"]["enabled"]:
                 worker_kwargs = {}
 
