@@ -60,21 +60,19 @@ def validate_offload_policy_before_refit(
         )
     supported_transports = (
         (None, "nccl_reshard")
-        if generation_backend == VLLM_BACKEND
+        if generation_backend in (VLLM_BACKEND, DYNAMO_BACKEND)
         else (None,)
         if generation_backend == TRTLLM_BACKEND
         else (None, "mcore", "nccl_reshard")
         if generation_backend == MEGATRON_BACKEND
-        else ("nccl_reshard",)
-        if generation_backend == DYNAMO_BACKEND
         else ()
     )
     if refit_transport not in supported_transports:
         raise ValueError(
-            "offload_policy_before_refit requires non-colocated vLLM or Megatron "
-            "generation with a collective, mcore, or nccl_reshard refit transport, "
-            "non-colocated TensorRT-LLM generation with the default collective "
-            "transport, or managed Dynamo generation with nccl_reshard."
+            "offload_policy_before_refit requires non-colocated vLLM, Dynamo or "
+            "Megatron generation with a collective, mcore, or nccl_reshard refit "
+            "transport, or non-colocated TensorRT-LLM generation with the default "
+            "collective transport."
         )
 
 

@@ -113,6 +113,7 @@ def test_config_derives_world_size_and_rejects_removed_public_fields() -> None:
         ({"refit_transport": "mcore"}, "not supported when backend='dynamo'"),
         ({"quant_cfg": "nvfp4"}, "quant_cfg"),
         ({"vllm_kwargs": {"speculative_config": {"model": "draft"}}}, "draft"),
+        ({"vllm_kwargs": {"worker_extension_cls": "x.Y"}}, "worker_extension_cls"),
     ],
 )
 def test_config_rejects_unsupported_modes(override, match) -> None:
@@ -122,6 +123,19 @@ def test_config_rejects_unsupported_modes(override, match) -> None:
     else:
         config = _config(**override)
     with pytest.raises(ValidationError, match=match):
+        DynamoConfig.model_validate(config)
+
+
+def test_config_rejects_encoder_cache_reset_and_accepts_reload_api() -> None:
+    config = _config()
+    config["vllm_cfg"]["reset_encoder_cache_after_weight_update"] = True
+    with pytest.raises(ValidationError, match="encoder cache"):
+        DynamoConfig.model_validate(config)
+
+    config = _config()
+    config["vllm_cfg"]["refit_with_reload_api"] = True
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         DynamoConfig.model_validate(config)
 
 
@@ -138,14 +152,28 @@ def test_config_accepts_collective_and_nccl_reshard_refit(refit_transport) -> No
             {"tensor_parallel_size": 2, "expert_parallel_size": 3},
             "expert_parallel_size",
         ),
-        ({"precision": "fp8"}, "precision"),
-        ({"kv_cache_dtype": "fp8"}, "kv_cache_dtype"),
+        ({"precision": "float16"}, "precision"),
+        ({"precision": "fp8", "kv_cache_dtype": "fp8"}, "kv_cache_dtype"),
+        ({"is_mx": True}, "require precision='fp8'"),
+        ({"num_last_layers_in_bf16": 2}, "require precision='fp8'"),
     ],
 )
 def test_config_rejects_unsupported_parallelism_and_precision(vllm_cfg, match) -> None:
     config = _config()
     config["vllm_cfg"].update(vllm_cfg)
     with pytest.raises(ValidationError, match=match):
+        DynamoConfig.model_validate(config)
+
+
+@pytest.mark.parametrize(
+    "fp8_fields",
+    [{}, {"is_mx": True}, {"num_first_layers_in_bf16": 1, "use_deep_gemm": True}],
+)
+def test_config_accepts_fp8_generation(fp8_fields) -> None:
+    config = _config()
+    config["vllm_cfg"].update({"precision": "fp8", **fp8_fields})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         DynamoConfig.model_validate(config)
 
 
@@ -300,7 +328,10 @@ def test_worker_argv_translates_structured_fields_and_warns_unclassified() -> No
     )
 
     assert _flag_value(argv, "--model") == "model"
-    assert _flag_value(argv, "--weight-transfer-config") == '{"backend":"nccl"}'
+    assert "--weight-transfer-config" not in argv
+    assert _flag_value(argv, "--worker-extension-cls") == (
+        "nemo_rl.models.generation.vllm.dynamo_worker_extension.DynamoWorkerExtension"
+    )
     assert _flag_value(argv, "--dyn-tool-call-parser") == "qwen3_coder"
     assert _flag_value(argv, "--dyn-reasoning-parser") == "nemotron_nano"
     assert _flag_value(argv, "--max-num-seqs") == "16"

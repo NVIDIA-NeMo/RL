@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NCCL refit protocol for a fixed managed Dynamo worker fleet."""
+"""NCCL refit for a fixed managed Dynamo worker fleet.
+
+Every managed engine loads NeMo RL's vLLM worker extension
+(``nemo_rl.models.generation.vllm.dynamo_worker_extension``). The driver calls its
+methods through Dynamo's per-worker ``/engine/*`` RL routes, which forward an
+``engine_rpc`` name to vLLM ``collective_rpc``; the weights themselves move over
+NCCL, exactly as for the vLLM backend.
+"""
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -21,17 +28,12 @@ from typing import Any
 import ray
 
 from nemo_rl.distributed.refit_watchdog import REFIT_ABORTED_TOKEN, RefitAborted
-from nemo_rl.models.generation.dynamo.config import (
-    VLLM_PACKED_BUFFER_SIZE_BYTES,
-    VLLM_PACKED_NUM_BUFFERS,
-)
 from nemo_rl.models.generation.dynamo.http_client import (
     format_dynamo_error,
     http_post_json,
 )
-from nemo_rl.models.generation.interfaces import CollectiveSenderSpec
 from nemo_rl.utils.staged_payload import encode_staged_payload
-from nemo_rl.weight_sync.membership import RefitMembership
+from nemo_rl.weight_sync.membership import RefitMembership, desired_membership
 
 # Dynamo's per-worker admin routes. Setup calls go to the init route, whose server
 # side kills the worker if the call outlives DYN_RL_INIT_WEIGHTS_TIMEOUT_S; refits go
@@ -122,35 +124,12 @@ def _stage_and_post_worker_route(  # pragma: no cover
     return True
 
 
-@ray.remote(num_cpus=0)
-def _update_worker_weights(  # pragma: no cover
-    *,
-    system_url: str,
-    update_info: dict[str, Any],
-    timeout_s: float,
-) -> bool:
-    common = {"allow_unpaused": True, "reset_prefix_cache": False}
-    steps: tuple[tuple[str, dict[str, Any]], ...] = (
-        ("start_weight_update", {}),
-        ("update_weights", {"update_info": update_info}),
-        ("finish_weight_update", {}),
-    )
-    for engine_rpc, kwargs in steps:
-        response = http_post_json(
-            f"{system_url}/engine/update_weights_from_distributed",
-            {"engine_rpc": engine_rpc, **common, **kwargs},
-            timeout_s,
-        )
-        if response.get("status") != "ok":
-            raise RuntimeError(
-                f"Dynamo worker {system_url} RPC {engine_rpc} failed: "
-                f"{format_dynamo_error(response)}"
-            )
-    return True
-
-
 class DynamoRefitChannel:
-    """Closed refit protocol shared by driver and serialized rollout copies."""
+    """Refit calls to every engine, shared by the driver and pickled client copies.
+
+    Refit metadata is prepared once and kept inside the engines, so a client copy
+    that SingleController ships to its actor needs only the endpoints.
+    """
 
     def __init__(
         self,
@@ -175,22 +154,14 @@ class DynamoRefitChannel:
         self._engine_world_size = engine_world_size
         self._control_timeout_s = control_timeout_s
         self._validate_workers = validate_workers
-        self._update_info: dict[str, Any] | None = None
 
     def client_copy(self) -> "DynamoRefitChannel":
-        """Return a serializable copy without the driver-owned worker validator.
-
-        The prepared update metadata travels with the copy: SingleController
-        prepares refit on the driver and then pickles the synchronizer (and
-        this generation client) into its actor, which issues every update.
-        """
-        copy = DynamoRefitChannel(
+        """Return a serializable endpoint-only channel for rollout actors."""
+        return DynamoRefitChannel(
             self._workers,
             engine_world_size=self._engine_world_size,
             control_timeout_s=self._control_timeout_s,
         )
-        copy._update_info = self._update_info
-        return copy
 
     def _validated_workers(self) -> tuple[DynamoWorkerEndpoint, ...]:
         if self._validate_workers is None:
@@ -262,6 +233,34 @@ class DynamoRefitChannel:
             for index, worker in enumerate(workers)
         ]
 
+    def full_fleet_membership(self, train_world_size: int) -> RefitMembership:
+        """Every engine, each a DP shard of TP x PP ranks after the trainers."""
+        return desired_membership(
+            absent_shards=[],
+            dp_size=self.num_engines,
+            total_gen_workers=self.inference_world_size,
+            train_world_size=train_world_size,
+        )
+
+    def init_collective(
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Join every engine to the NeMo RL ``model_update_group``."""
+        expected_world_size = train_world_size + self.inference_world_size
+        if world_size != expected_world_size:
+            raise ValueError(
+                f"NCCL world_size={world_size} does not match expected "
+                f"{expected_world_size}"
+            )
+        return self.rebuild_collective(
+            self.full_fleet_membership(train_world_size), ip, port
+        )
+
     def rebuild_collective(
         self, membership: RefitMembership, ip: str, port: int
     ) -> list[ray.ObjectRef]:
@@ -300,9 +299,9 @@ class DynamoRefitChannel:
             },
         )
 
-    def prepare_nccl_reshard_refit_info(self, wire_refit_info: dict[str, Any]) -> None:
-        """Stage the wire-safe reshard plan on every engine and build its map."""
-        staged = encode_staged_payload(wire_refit_info)
+    def _stage_on_every_engine(self, payload: Any, consumer: str) -> None:
+        """Stage ``payload`` on every engine and run the extension's consumer."""
+        staged = encode_staged_payload(payload)
         ray.get(
             [
                 _stage_and_post_worker_route.remote(
@@ -310,7 +309,7 @@ class DynamoRefitChannel:
                     key=staged.key,
                     chunks=staged.chunks,
                     payload={
-                        "engine_rpc": "nrl_prepare_nccl_reshard_refit_info_from_stage",
+                        "engine_rpc": consumer,
                         "key": staged.key,
                         "sha256": staged.sha256,
                     },
@@ -320,8 +319,33 @@ class DynamoRefitChannel:
             ]
         )
 
-    def nccl_reshard_refit(self, refit_timeout_s: float | None) -> list[ray.ObjectRef]:
-        """Receive one nccl_reshard refit on every engine."""
+    def prepare_refit_info(self, state_dict_info: dict[str, Any] | None) -> None:
+        """Stage the collective refit's ordered ``{name: (shape, dtype)}`` on every engine."""
+        if state_dict_info is None:
+            raise ValueError("state_dict_info must not be None for Dynamo refit")
+        entries = [
+            [name, list(shape), str(dtype).removeprefix("torch.")]
+            for name, (shape, dtype) in state_dict_info.items()
+        ]
+        self._stage_on_every_engine(entries, "nrl_prepare_refit_info_from_stage")
+
+    def prepare_nccl_reshard_refit_info(self, wire_refit_info: dict[str, Any]) -> None:
+        """Stage the wire-safe reshard plan on every engine and build its map."""
+        self._stage_on_every_engine(
+            wire_refit_info, "nrl_prepare_nccl_reshard_refit_info_from_stage"
+        )
+
+    def _refit_every_engine(
+        self,
+        engine_rpc: str,
+        refit_timeout_s: float | None,
+        kwargs: dict[str, Any],
+    ) -> list[ray.ObjectRef]:
+        """Run one refit receive on every engine through the update route.
+
+        The route has no server deadline; the extension's watchdog enforces
+        ``refit_timeout_s``, and the HTTP call is given longer than that.
+        """
         timeout_s = self._control_timeout_s
         if refit_timeout_s is not None:
             timeout_s = max(timeout_s, refit_timeout_s + _REFIT_CLIENT_MARGIN_S)
@@ -330,94 +354,30 @@ class DynamoRefitChannel:
                 system_url=worker.system_url,
                 route=_UPDATE_ROUTE,
                 payload={
-                    "engine_rpc": "nrl_nccl_reshard_refit",
+                    "engine_rpc": engine_rpc,
                     "allow_unpaused": True,
                     "reset_prefix_cache": False,
                     "refit_timeout_s": refit_timeout_s,
+                    **kwargs,
                 },
                 timeout_s=timeout_s,
             )
             for worker in self._validated_workers()
         ]
 
-    @property
-    def sender_spec(self) -> CollectiveSenderSpec:
-        """Return the peer and packing geometry declared to workers at init."""
-        return CollectiveSenderSpec(
-            nccl_peer="vllm",
-            buffer_size_bytes=VLLM_PACKED_BUFFER_SIZE_BYTES,
-            num_buffers=VLLM_PACKED_NUM_BUFFERS,
-            use_legacy_packing=True,
+    def update_weights_from_collective(
+        self, refit_timeout_s: float | None, *, refit_with_reload_api: bool
+    ) -> list[ray.ObjectRef]:
+        """Receive one packed-broadcast refit on every engine."""
+        return self._refit_every_engine(
+            "nrl_update_weights_from_collective",
+            refit_timeout_s,
+            {"refit_with_reload_api": refit_with_reload_api},
         )
 
-    def prepare(self, state_dict_info: dict[str, Any] | None) -> None:
-        if state_dict_info is None:
-            raise ValueError("state_dict_info must not be None for Dynamo refit")
-        names: list[str] = []
-        dtype_names: list[str] = []
-        shapes: list[list[int]] = []
-        for name, (shape, dtype) in state_dict_info.items():
-            names.append(name)
-            dtype_names.append(str(dtype).removeprefix("torch."))
-            shapes.append(list(shape))
-        self._update_info = {
-            "names": names,
-            "dtype_names": dtype_names,
-            "shapes": shapes,
-        }
-
-    def init_collective(
-        self,
-        ip: str,
-        port: int,
-        world_size: int,
-        *,
-        train_world_size: int,
-    ) -> list[ray.ObjectRef]:
-        expected_world_size = train_world_size + self.inference_world_size
-        if world_size != expected_world_size:
-            raise ValueError(
-                f"NCCL world_size={world_size} does not match expected "
-                f"{expected_world_size}"
-            )
-        workers = self._validated_workers()
-        return [
-            _post_worker_route.remote(
-                system_url=worker.system_url,
-                route="init_weights_update_group",
-                payload={
-                    "engine_rpc": "init_weight_transfer_engine",
-                    "init_info": {
-                        "master_address": ip,
-                        "master_port": port,
-                        "rank_offset": train_world_size
-                        + worker_index * self._engine_world_size,
-                        "world_size": world_size,
-                        # vLLM reads packing once at init and defaults it off;
-                        # omitting it desynchronizes the packed broadcast.
-                        "packed": True,
-                        "packed_buffer_size_bytes": VLLM_PACKED_BUFFER_SIZE_BYTES,
-                        "packed_num_buffers": VLLM_PACKED_NUM_BUFFERS,
-                    },
-                },
-                timeout_s=self._control_timeout_s,
-            )
-            for worker_index, worker in enumerate(workers)
-        ]
-
-    def update_weights(self) -> list[ray.ObjectRef]:
-        if self._update_info is None:
-            raise RuntimeError(
-                "prepare_refit_info() must be called before Dynamo weight updates"
-            )
-        return [
-            _update_worker_weights.remote(
-                system_url=worker.system_url,
-                update_info=self._update_info,
-                timeout_s=self._control_timeout_s,
-            )
-            for worker in self._validated_workers()
-        ]
+    def nccl_reshard_refit(self, refit_timeout_s: float | None) -> list[ray.ObjectRef]:
+        """Receive one nccl_reshard refit on every engine."""
+        return self._refit_every_engine("nrl_nccl_reshard_refit", refit_timeout_s, {})
 
     def _pause_workers(
         self, *, clear_cache: bool

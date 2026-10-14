@@ -2,15 +2,16 @@
 
 NeMo RL can launch and own Dynamo's control plane, frontend, and a fixed vLLM
 worker fleet inside a Slurm-backed Ray allocation. This mode supports direct
-GRPO and NeMo-Gym rollouts, NCCL weight refits, cache invalidation, and
+GRPO and NeMo-Gym rollouts, NCCL and `nccl_reshard` weight refits, cache invalidation, and
 `generation_metrics/*` telemetry sent to enabled loggers such as W&B.
 See the [Dynamo integration design](../design-docs/dynamo-integration.md) for
 the service ownership, startup, and weight-refit architecture.
 
 This integration is managed and vLLM-only. It does not connect to an external
 Dynamo deployment and does not support Kubernetes, DGD, SGLang, TensorRT-LLM,
-speculative decoding, quantized generation, or model-parallel engine groups
-that span nodes.
+speculative decoding, FP8 KV caches, ModelOpt quantization, or model-parallel
+engine groups that span nodes. FP8 and MXFP8 weights (`vllm_cfg.precision: fp8`)
+are supported; see [FP8 generation](#fp8-generation).
 
 ## Build the image
 
@@ -26,38 +27,30 @@ docker buildx build \
   .
 ```
 
-The opt-in layer installs `ai-dynamo[vllm]==1.5.1` in isolated Python
-3.12 under `/opt/dynamo_venv`, along with etcd v3.5.21 and NATS Server v2.11.6.
-It does not replace NeMo RL's normal Ray or vLLM dependencies: the standard
-NeMo RL vLLM environment currently uses vLLM 0.29.0, while this isolated
-Dynamo environment uses Dynamo's vLLM 0.28.0 pin. Both environments pin
-`nvidia-nccl-cu13==2.30.7` so their NCCL communicators use the same release.
-For a local source checkout, the same environment can be installed under
-`venvs/dynamo`:
+`BUILD_DYNAMO=1` prebuilds the `DynamoVllmWorker` actor venv from the root
+project's `dynamo` extra, and installs etcd v3.5.21 and NATS Server v2.11.6 into
+`/usr/local/bin` (`docker/install_dynamo_services.sh`). The `dynamo` extra is
+the `vllm` extra plus the base `ai-dynamo==1.5.1` package, so the Dynamo
+workers run the same vLLM (0.29.0), NCCL and `nemo_rl` code as NeMo RL's own
+vLLM workers. That is what lets each engine load NeMo RL's vLLM worker
+extension for refit (see [Weight refit](#weight-refit)). Only the base
+`ai-dynamo` package is installed: its `[vllm]` extra pins vLLM 0.28.0.
 
-```bash
-bash docker/dynamo/install.sh
-```
-
-Set `NEMO_RL_DYNAMO_VENV_DIR` to choose another location. The installer checks
-that Dynamo resolved vLLM 0.28.0 and NCCL 2.30.7, and that the installed vLLM
-contains the PR #44814 layerwise-reload fix.
+From a source checkout, the venv is built on first use under
+`venvs/nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker`, like
+every other actor venv. etcd and nats-server are looked up in
+`NEMO_RL_DYNAMO_BIN_DIR` when it is set, otherwise on `PATH`;
+`NEMO_RL_DYNAMO_BIN_DIR=$PWD/bin bash docker/install_dynamo_services.sh`
+installs them.
 
 A Dynamo upgrade must update and reverify these coupled locations:
 
-- `docker/dynamo/pyproject.toml` and `docker/dynamo/uv.lock`: the Dynamo pin
-  and resolved dependency set
-- root `pyproject.toml` and `uv.lock`, plus the isolated Dynamo project and
-  lockfile: the `nvidia-nccl-cu13` pins must remain identical
-- `docker/dynamo/install.sh`, `tests/functional/grpo_dynamo.sh`, and
-  `tests/functional/grpo_dynamo_single_controller.sh`: the vLLM version, the
-  #44814 fix check, and runtime assertions
-- `nemo_rl/models/generation/dynamo/refit.py` and
-  `validate_dynamo_vllm_args.py`: the vLLM weight-transfer payloads (packing is
-  declared in the init info; update rounds carry names, dtypes, and shapes;
-  `start_weight_update` takes no arguments)
-- `tests/unit/distributed/test_stateless_process_group.py`: vLLM's
-  `broadcast_from/0/0` weight-transfer wire key
+- root `pyproject.toml` and `uv.lock`: the `ai-dynamo` and
+  `ai-dynamo-runtime` pins in the `dynamo` extra, which must otherwise stay
+  identical to the `vllm` extra (`tests/unit/test_dependency_pins.py`)
+- `tests/functional/grpo_dynamo*.sh`: the asserted Dynamo and vLLM versions
+- `nemo_rl/models/generation/dynamo/refit.py`: the `/engine/*` RL routes it
+  posts to, which must still forward any `engine_rpc` to vLLM `collective_rpc`
 - `nemo_rl/models/generation/dynamo/token_wrapper.py`: the real Dynamo response
   keys `nvext.engine_data.{prompt_token_ids,completion_token_ids,completion_logprobs}`;
   reverify them against real Dynamo output because unit tests validate only the
@@ -97,22 +90,30 @@ equal to TP. Parser settings belong under `dynamo_cfg.worker_args`; inherited
 vLLM HTTP-parser settings are rejected with the corresponding Dynamo field.
 Service ports and the namespace are runtime-owned rather than public config.
 
-`vllm_cfg` settings are handled in five explicit classes:
+`vllm_cfg` settings are handled in seven explicit classes:
 
 | Class | Behavior | Examples |
 | --- | --- | --- |
 | Translated | Forwarded to `dynamo.vllm` | TP, PP, EP, dtype, model length |
+| Refit | Read by NeMo RL's worker extension inside each engine | `refit_with_reload_api` |
 | Moved | Startup error naming the Dynamo replacement | tool and reasoning parsers, HTTP serving chat kwargs |
-| Unsupported | Warning when active, or an error when it requests unsupported low precision | tokenizer skipping, MX and mixed BF16/FP8 helpers |
+| FP8 | Read by the vLLM backend's FP8 builder when `precision: fp8`; an error otherwise | `is_mx`, mixed BF16/FP8 layers, DeepGEMM, pow2 scales |
+| Unsupported | Warning when active | tokenizer skipping, context-length token capping |
 | Managed runtime | Consumed or enforced by NeMo RL rather than forwarded | HTTP-wrapper enablement, metrics sampling, processed rollout logprobs |
 | Inapplicable | Ignored because the managed path owns that behavior | async mode, progress bars, NeMo RL HTTP/ZMQ refit ports |
 
 The shared GRPO base config also supplies `mcore_generation_config` and
 `refit_cfg`. Dynamo accepts these inherited sections but does not use them;
-worker arguments come from `vllm_cfg`, and refit uses the collective weight
-synchronizer. Any other active top-level `policy.generation` setting that
-Dynamo does not honor, such as `bad_words` or `ignore_eos`, draws a startup
-warning.
+worker arguments come from `vllm_cfg`. Any other active top-level
+`policy.generation` setting that Dynamo does not honor, such as `bad_words` or
+`ignore_eos`, draws a startup warning.
+
+Set `policy.generation.refit_transport` to `null` for the packed NCCL broadcast
+(`CollectiveWeightSynchronizer`), or to `nccl_reshard` to send each Megatron
+training shard straight into the Dynamo engines' shards
+([NCCL reshard refit](../design-docs/nccl-reshard-refit.md)). `nccl_reshard`
+has the same requirements as with the vLLM backend: a Megatron policy, train
+ETP 1, generation PP 1, and EP equal to 1 or TP. Other transports are rejected.
 
 Enable and filter worker telemetry with both managed configuration sections:
 
@@ -127,11 +128,28 @@ policy:
       metrics_exclude_prefixes: null  # null excludes python_ and process_
 ```
 
-The NCCL sender also selects vLLM's peer protocol: the policy publishes both
-the raw NeMo RL unique ID and vLLM's pickled `ncclUniqueId`, then uses the
-all-reduce warmup expected by `PyNcclCommunicator`. This protocol choice and
-the packed 1-GiB/two-buffer geometry come from the generation backend rather
-than GRPO-specific branches.
+## FP8 generation
+
+`vllm_cfg.precision: fp8` (optionally with `is_mx`, mixed BF16 layers, DeepGEMM
+or pow2 scales) quantizes generation weights exactly as the vLLM backend does.
+The Dynamo worker actor runs the vLLM backend's FP8 builder and passes the
+result to `dynamo.vllm` as `--quantization fp8` and `--hf-overrides`; NeMo RL's
+worker extension applies the FP8 refit patches inside each engine before it
+loads the model. Every refit then sends BF16 weights that the engine quantizes
+on receive. As with the vLLM backend, importance-sampling correction is
+required. FP8 KV caches stay unsupported, because their scales are refit only
+with synchronous rollouts.
+
+## Weight refit
+
+Every managed engine loads NeMo RL's vLLM worker extension
+(`--worker-extension-cls`), the same receiver the vLLM backend uses. The driver
+calls it through Dynamo's per-worker `/engine/*` RL routes, which forward an
+`engine_rpc` name to vLLM `collective_rpc`. HTTP carries only control calls;
+the weights move over NCCL, using NeMo RL's own communicator protocol and
+packing on both sides. Each refit is bounded by `dynamo_cfg.control_timeout_s`:
+the extension aborts its communicators and the trainers raise instead of
+hanging.
 
 The fixed port layout is:
 
@@ -193,10 +211,9 @@ Current limits on this path:
   `backend: vllm` and `backend: megatron`.
 - Text policies only, and no MoE router replay: `policy.is_vlm` and
   `policy.router_replay.enabled` must be false.
-- Fleet health is not supported: keep `async_rl.generation_fleet_health.enabled`
-  false (the Dynamo frontend owns request routing) and set
-  `async_rl.generation_fleet_health.refit_timeout_s: null` (default 300), since
-  Dynamo workers cannot abort their refit collective.
+- `async_rl.generation_fleet_health.enabled` must stay false, because the
+  Dynamo frontend owns request routing. Its `refit_timeout_s` is honored: the
+  worker extension in each engine enforces it.
 - `dynamo_cfg.control_timeout_s` must be at least `dynamo_cfg.request_timeout_s`,
   because it bounds the drain.
 - `vllm_cfg.enable_vllm_metrics_logger` requires

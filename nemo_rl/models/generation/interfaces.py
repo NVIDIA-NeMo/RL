@@ -447,16 +447,6 @@ class RefitFleetShape:
     total_gen_workers: int
 
 
-@dataclass(frozen=True)
-class CollectiveSenderSpec:
-    """Policy-side protocol and packing geometry for NCCL weight transfer."""
-
-    nccl_peer: str = "nemo"
-    buffer_size_bytes: int | None = None
-    num_buffers: int | None = None
-    use_legacy_packing: bool = False
-
-
 def agreed_media_columns(
     reported: list["Optional[MediaColumnSpec]"],
 ) -> "Optional[MediaColumnSpec]":
@@ -637,10 +627,6 @@ class GenerationInterface(ABC):
         ``reject_unenforceable_refit_deadline`` rather than accept it silently.
         """
         raise NotImplementedError
-
-    def get_collective_sender_spec(self) -> CollectiveSenderSpec:
-        """Return policy-side NCCL protocol and packed-buffer requirements."""
-        return CollectiveSenderSpec()
 
     def get_inference_world_size(self) -> int | None:
         """Return a backend-specific collective world size when required."""

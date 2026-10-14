@@ -33,12 +33,10 @@ from nemo_rl.models.generation.dynamo.metrics import DynamoMetricsSampler
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
 from nemo_rl.models.generation.dynamo.token_wrapper import DynamoTokenWrapperServer
 from nemo_rl.models.generation.interfaces import (
-    CollectiveSenderSpec,
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
     RefitFleetShape,
-    reject_unenforceable_refit_deadline,
     verify_right_padding,
 )
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
@@ -175,14 +173,6 @@ class DynamoGeneration(GenerationInterface):
                 "async_rl.generation_fleet_health.enabled=true is not supported with "
                 "policy.generation.backend='dynamo'; the Dynamo frontend owns request "
                 "routing. Set async_rl.generation_fleet_health.enabled=false."
-            )
-        if fleet_health.refit_timeout_s is not None:
-            # Dynamo workers cannot abort their refit collective, so a deadline would
-            # be refused at the first weight update; fail before anything builds.
-            raise ValueError(
-                "async_rl.generation_fleet_health.refit_timeout_s must be null with "
-                "policy.generation.backend='dynamo'; Dynamo workers cannot enforce a "
-                "refit deadline."
             )
         # Setup has already normalized this through DynamoConfig.
         generation = cast(dict[str, Any], master_config.policy["generation"])
@@ -351,18 +341,6 @@ class DynamoGeneration(GenerationInterface):
             raise RuntimeError("Dynamo refit channel is unavailable")
         return channel.inference_world_size
 
-    def get_collective_sender_spec(self) -> CollectiveSenderSpec:
-        """Return the NCCL protocol and packing the trainer must use.
-
-        nccl_reshard's misc broadcast lands in NeMo RL's worker extension, which
-        speaks the NeMo protocol; the default collective refit still goes to vLLM's
-        built-in weight-transfer engine.
-        """
-        channel = self._require_refit_channel()
-        if self._uses_nccl_reshard:
-            return CollectiveSenderSpec()
-        return channel.sender_spec
-
     def get_refit_fleet_shape(self) -> RefitFleetShape:
         """One DP shard per Dynamo engine, each with TP x PP refit ranks."""
         channel = self._require_refit_channel()
@@ -370,10 +348,6 @@ class DynamoGeneration(GenerationInterface):
             dp_size=channel.num_engines,
             total_gen_workers=channel.inference_world_size,
         )
-
-    @property
-    def _uses_nccl_reshard(self) -> bool:
-        return self.cfg.get("refit_transport") == "nccl_reshard"
 
     def _require_refit_channel(self) -> DynamoRefitChannel:
         channel = self._refit_channel
@@ -718,11 +692,8 @@ class DynamoGeneration(GenerationInterface):
         *,
         train_world_size: int,
     ) -> list[ray.ObjectRef]:
-        """Initialize native vLLM NCCL transfer on every managed worker."""
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        return channel.init_collective(
+        """Join every engine's worker extension to the ``model_update_group``."""
+        return self._require_refit_channel().init_collective(
             ip,
             port,
             world_size,
@@ -732,13 +703,13 @@ class DynamoGeneration(GenerationInterface):
     def prepare_refit_info(
         self, state_dict_info: Optional[dict[str, Any]]
     ) -> Optional[list[str]]:
-        """Serialize checkpoint-format tensor metadata for native vLLM refit."""
+        """Hand the ordered tensor metadata to every engine's worker extension.
+
+        Returns None: managed Dynamo requests no trainer-side pre-quantization.
+        """
         if state_dict_info is None:
             return None
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        channel.prepare(state_dict_info)
+        self._require_refit_channel().prepare_refit_info(state_dict_info)
         return None
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
@@ -749,15 +720,19 @@ class DynamoGeneration(GenerationInterface):
     def update_weights_from_collective(
         self, refit_timeout_s: Optional[float] = None
     ) -> list[ray.ObjectRef]:
-        """Receive packed checkpoint-format weights on every Dynamo worker."""
-        reject_unenforceable_refit_deadline("Dynamo", refit_timeout_s)
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        return channel.update_weights()
+        """Receive one packed-broadcast refit on every engine.
+
+        The extension's watchdog enforces ``refit_timeout_s`` inside each engine.
+        """
+        return self._require_refit_channel().update_weights_from_collective(
+            refit_timeout_s,
+            refit_with_reload_api=bool(
+                self.cfg["vllm_cfg"].get("refit_with_reload_api")
+            ),
+        )
 
     # ------------------------------------------------------------------
-    # nccl_reshard refit, through NeMo RL's worker extension in each engine
+    # Membership and nccl_reshard refit, through the worker extension
     # ------------------------------------------------------------------
 
     def set_refit_membership(self, membership: RefitMembership) -> None:
@@ -768,11 +743,6 @@ class DynamoGeneration(GenerationInterface):
         self, membership: RefitMembership, ip: str, port: int
     ) -> list[ray.ObjectRef]:
         """Join every engine to the NeMo RL ``model_update_group``."""
-        if not self._uses_nccl_reshard:
-            raise NotImplementedError(
-                "Managed Dynamo's default collective refit uses vLLM's built-in "
-                "weight-transfer engine and cannot be rebuilt over a new membership."
-            )
         return self._require_refit_channel().rebuild_collective(membership, ip, port)
 
     def rebuild_nccl_reshard_comm_group(

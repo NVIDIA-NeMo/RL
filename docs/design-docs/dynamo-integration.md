@@ -35,29 +35,49 @@ driver-side invalidation lifecycle.
 
 ## Weight refit
 
-Dynamo uses `CollectiveWeightSynchronizer`. If each engine has world size `E`,
-worker `i` starts at rank `training_world_size + i * E`. The policy sender uses
-vLLM's peer initialization and a packed transfer with two 1-GiB buffers. vLLM
-reads the packing mode and geometry once, from the init info that NeMo-RL sends
-to `init_weight_transfer_engine`; each update round carries only tensor names,
-dtypes, and shapes. Before a worker starts, the isolated vLLM environment checks
-that its weight-transfer API accepts that init and update shape.
+Every engine loads `DynamoWorkerExtension`
+(`nemo_rl/models/generation/vllm/dynamo_worker_extension.py`), a subclass of the
+vLLM backend's `VllmInternalWorkerExtension`. `DynamoRefitChannel` drives it
+through Dynamo's per-worker `/engine/*` RL routes, which forward an
+`engine_rpc` name to vLLM `collective_rpc`; Dynamo needs no NeMo RL code of its
+own. Setup calls go to `init_weights_update_group`, whose server deadline is
+`dynamo_cfg.control_timeout_s`, and refits go to
+`update_weights_from_distributed` with `allow_unpaused=True`.
 
-Generation is drained before refit. The worker then runs vLLM's native
-`start_weight_update`, `update_weights`, and `finish_weight_update` transaction.
+Each engine is one DP shard of `E = TP x PP` refit ranks
+(`get_refit_fleet_shape`), and engine `i` gets rank prefix `i * E`; the
+extension adds its local rank. Both transports work this way:
+
+- **Collective** (`refit_transport: null`): `CollectiveWeightSynchronizer`
+  broadcasts packed full tensors over the NeMo RL `model_update_group`.
+- **NCCL reshard** (`refit_transport: nccl_reshard`):
+  `NcclReshardWeightSynchronizer` sends each training shard straight into the
+  engines' shards, plus a packed broadcast for the remaining parameters.
+
+The fleet is fixed, so any refit membership other than every engine is
+rejected. Three properties of the HTTP hop shape the extension's additions:
+
+- Dynamo discards the RPC's return value, so the `nrl_*` entry points raise
+  rather than return False, and an abort comes back as `RefitAborted`.
+- The admin server caps request bodies at 2 MiB, so refit metadata is staged in
+  chunks (`nemo_rl/utils/staged_payload.py`) and reassembled in the engine. It is
+  kept there, so a pickled client copy needs only the endpoints.
+- Engine RPC tasks never retry: re-posting a collective call to a dead worker
+  could never complete.
+
+GRPO bounds every Dynamo refit by `control_timeout_s`; the extension's watchdog
+aborts both sides' communicators instead of letting the trainers hang.
 KV-cache invalidation stays outside the generic synchronizer because GRPO's
 cache mode determines where it runs.
 
-## Dependency isolation
+## Dependencies
 
-`BUILD_DYNAMO=1` adds a Python 3.12 `/opt/dynamo_venv` to the standard image.
-It contains only `ai-dynamo[vllm]==1.5.1`, its pinned vLLM 0.28.0, etcd,
-and NATS. NeMo-RL's normal Ray and engine environments are unchanged; the
-standard NeMo-RL vLLM environment currently uses vLLM 0.29.0.
-
-Layerwise reload depends on vLLM PR #44814, which fixes reload accounting for
-composed loaders. vLLM 0.28.0 includes it, and the installer fails if the
-installed vLLM does not.
+`DynamoVllmWorker` runs in the `dynamo` extra's actor venv: the `vllm` extra
+(vLLM 0.29.0, nccl4py, `nemo_rl`) plus the base `ai-dynamo==1.5.1` package. The
+actor launches `dynamo.vllm` with its own interpreter and the driver resolves
+the same venv for `dynamo.frontend`, so the extension always finds the vLLM it
+was written for. `BUILD_DYNAMO=1` prebuilds that venv and installs etcd and
+NATS into the image.
 
 See [Managed Dynamo generation on Slurm](../guides/dynamo-generation.md) for
 build, configuration, and launch instructions.

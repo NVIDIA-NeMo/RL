@@ -14,6 +14,7 @@
 
 """Ray actors used by the fixed, managed Dynamo vLLM fleet."""
 
+import dataclasses
 import json
 import os
 import signal
@@ -33,11 +34,45 @@ from nemo_rl.models.generation.dynamo.arguments import (
     redact_argv,
     redact_environment,
 )
-from nemo_rl.models.generation.dynamo.config import (
-    VLLM_PACKED_BUFFER_SIZE_BYTES,
-    VLLM_PACKED_NUM_BUFFERS,
-    DynamoConfig,
-)
+from nemo_rl.models.generation.dynamo.config import DynamoConfig
+
+
+def _fp8_engine_args(
+    model_name: str,
+    vllm_cfg: dict[str, Any],
+    vllm_kwargs: dict[str, Any],
+    model_parallel_size: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str], dict[str, str]]:
+    """Translate ``precision: fp8`` into ``dynamo.vllm`` arguments and environment.
+
+    Uses the vLLM backend's FP8 builder, so both backends quantize identically.
+
+    Returns:
+        ``vllm_cfg`` with vLLM's working dtype (the quantization config makes the
+        weights FP8), ``vllm_kwargs`` with the FP8 quantization merged in, default
+        engine environment, and the environment that hands the FP8 config to NeMo
+        RL's worker extension inside each engine.
+    """
+    from nemo_rl.models.generation.vllm.quantization.fp8 import (
+        build_fp8_config,
+        fp8_engine_env,
+    )
+    from nemo_rl.models.generation.vllm.quantization.fp8_kwargs import (
+        FP8_CONFIG_ENV_VAR,
+        merge_fp8_kwargs,
+    )
+
+    fp8_config, fp8_kwargs = build_fp8_config(vllm_cfg, model_name, model_parallel_size)
+    # Already passed as --kv-cache-dtype from vllm_cfg.
+    fp8_kwargs.pop("kv_cache_dtype")
+    vllm_kwargs = dict(vllm_kwargs)
+    merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
+    return (
+        {**vllm_cfg, "precision": "bfloat16"},
+        vllm_kwargs,
+        fp8_engine_env(vllm_cfg, fp8_config),
+        {FP8_CONFIG_ENV_VAR: json.dumps(dataclasses.asdict(fp8_config))},
+    )
 
 
 @ray.remote(num_cpus=0)
@@ -145,12 +180,22 @@ class DynamoVllmWorker:  # pragma: no cover
         ensure_vllm_source_compat()
         vllm_cfg = validated_config.vllm_cfg.model_dump()
         vllm_kwargs = dict(validated_config.vllm_kwargs)
+        engine_env_defaults: dict[str, str] = {}
+        fp8_env: dict[str, str] = {}
+        if vllm_cfg["precision"] == "fp8":
+            vllm_cfg, vllm_kwargs, engine_env_defaults, fp8_env = _fp8_engine_args(
+                config["model_name"],
+                vllm_cfg,
+                vllm_kwargs,
+                validated_config.engine_world_size,
+            )
         configured_env = dict(vllm_cfg.get("env_vars") or {})
         worker_env = build_managed_worker_env(
-            base_env=os.environ,
+            base_env={**os.environ, **engine_env_defaults},
             configured_env=configured_env,
             manager_env={
                 **manager_env,
+                **fp8_env,
                 "CUDA_VISIBLE_DEVICES": ",".join(str(gpu) for gpu in cuda_devices),
                 "DYN_SYSTEM_PORT": str(system_port),
                 "PYTHONHASHSEED": "0",
@@ -213,17 +258,7 @@ class DynamoVllmWorker:  # pragma: no cover
         timeout_s: float,
     ) -> None:
         validator = Path(__file__).with_name("validate_dynamo_vllm_args.py")
-        command = [
-            dynamo_python,
-            str(validator),
-            json.dumps(argv),
-            json.dumps(
-                {
-                    "buffer_size_bytes": VLLM_PACKED_BUFFER_SIZE_BYTES,
-                    "num_buffers": VLLM_PACKED_NUM_BUFFERS,
-                }
-            ),
-        ]
+        command = [dynamo_python, str(validator), json.dumps(argv)]
         try:
             result = subprocess.run(
                 command,

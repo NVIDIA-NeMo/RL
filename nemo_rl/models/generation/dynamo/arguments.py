@@ -141,11 +141,6 @@ def build_dynamo_vllm_argv(
     builder.add("--event-plane", "nats", source="managed runtime")
     builder.add("--enable-rl", source="managed runtime")
     builder.add(
-        "--weight-transfer-config",
-        {"backend": "nccl"},
-        source="managed runtime",
-    )
-    builder.add(
         "--worker-extension-cls",
         DYNAMO_WORKER_EXTENSION_CLS,
         source="managed runtime",

@@ -106,3 +106,152 @@ def test_new_methods_do_not_shadow_the_vllm_worker() -> None:
     added = {name for name in vars(DynamoWorkerExtension) if not name.startswith("__")}
     assert "nrl_stage_chunk" in added
     assert not added & set(dir(Worker))
+
+
+def test_staged_collective_metadata_is_restored_in_order_with_dtypes() -> None:
+    import torch
+
+    ext = DynamoWorkerExtension()
+    received = []
+    ext.prepare_refit_info = received.append
+    entries = [["z.weight", [4, 8], "bfloat16"], ["a.bias", [8], "float32"]]
+
+    staged = _stage(ext, entries)
+    ext.nrl_prepare_refit_info_from_stage(staged.key, staged.sha256)
+
+    assert len(received) == 1
+    assert list(received[0].items()) == [
+        ("z.weight", (torch.Size([4, 8]), torch.bfloat16)),
+        ("a.bias", (torch.Size([8]), torch.float32)),
+    ]
+
+
+@pytest.mark.parametrize("dtype_name", ["not_a_dtype", "Tensor"])
+def test_staged_collective_metadata_rejects_unknown_dtypes(dtype_name) -> None:
+    ext = DynamoWorkerExtension()
+    ext.prepare_refit_info = lambda info: None
+    staged = _stage(ext, [["w", [2], dtype_name]])
+    with pytest.raises(ValueError, match="unknown dtype"):
+        ext.nrl_prepare_refit_info_from_stage(staged.key, staged.sha256)
+
+
+def test_a_collective_refit_that_reports_failure_raises() -> None:
+    ext = DynamoWorkerExtension()
+    calls = []
+    ext.update_weights_from_collective = lambda **kwargs: calls.append(kwargs)
+    with pytest.raises(RuntimeError, match="reported failure"):
+        ext.nrl_update_weights_from_collective(10.0, True)
+    assert calls == [{"refit_timeout_s": 10.0, "refit_with_reload_api": True}]
+    ext.update_weights_from_collective = lambda **kwargs: True
+    assert ext.nrl_update_weights_from_collective(None, False) is True
+
+
+@pytest.fixture()
+def fp8_module(monkeypatch):
+    """The FP8 module with its process-global state restored afterwards."""
+    import types
+
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    monkeypatch.setattr(fp8, "global_fp8_config", None)
+    monkeypatch.setattr(fp8, "fp8_state", fp8.FP8State())
+    monkeypatch.setattr(fp8, "fp8_patches_applied", False)
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    return fp8
+
+
+def test_build_fp8_config_has_no_process_side_effects(fp8_module, monkeypatch) -> None:
+    import os
+
+    fp8 = fp8_module
+    monkeypatch.delenv("VLLM_USE_DEEP_GEMM", raising=False)
+    run_engine_core = fp8.EngineCoreProc.run_engine_core
+    vllm_cfg = {
+        "precision": "fp8",
+        "kv_cache_dtype": "auto",
+        "use_deep_gemm": True,
+        "async_engine": True,
+    }
+
+    config, kwargs = fp8.build_fp8_config(vllm_cfg, "dummy-model", 2)
+
+    assert config.model_parallel_size == 2 and config.use_fp8_weights
+    assert kwargs["quantization"] == "fp8"
+    assert fp8.global_fp8_config is None
+    assert fp8.EngineCoreProc.run_engine_core is run_engine_core
+    assert "VLLM_USE_DEEP_GEMM" not in os.environ
+    assert fp8.fp8_engine_env(vllm_cfg, config) == {
+        "VLLM_USE_DEEP_GEMM": "1",
+        "VLLM_USE_DEEP_GEMM_E8M0": "0",
+    }
+
+
+def test_dynamo_fp8_engine_args_match_the_vllm_backend(fp8_module) -> None:
+    import dataclasses
+    import json
+
+    from nemo_rl.models.generation.dynamo.dynamo_worker import _fp8_engine_args
+    from nemo_rl.models.generation.vllm.quantization.fp8_kwargs import (
+        FP8_CONFIG_ENV_VAR,
+    )
+
+    vllm_cfg = {"precision": "fp8", "kv_cache_dtype": "auto", "is_mx": True}
+    user_kwargs = {"hf_overrides": {"max_position_embeddings": 4096}}
+
+    cfg, kwargs, defaults, fp8_env = _fp8_engine_args(
+        "dummy-model", vllm_cfg, user_kwargs, model_parallel_size=2
+    )
+
+    expected_config, expected_kwargs = fp8_module.build_fp8_config(
+        vllm_cfg, "dummy-model", 2
+    )
+    # vLLM's working dtype; the quantization config is what makes weights FP8.
+    assert cfg["precision"] == "bfloat16"
+    assert kwargs["quantization"] == "fp8"
+    # kv_cache_dtype already reaches dynamo.vllm from vllm_cfg.
+    assert "kv_cache_dtype" not in kwargs
+    assert kwargs["hf_overrides"]["max_position_embeddings"] == 4096
+    assert (
+        kwargs["hf_overrides"]["quantization_config"]
+        == expected_kwargs["hf_overrides"]["quantization_config"]
+    )
+    assert user_kwargs == {"hf_overrides": {"max_position_embeddings": 4096}}
+    assert defaults == {}
+    assert json.loads(fp8_env[FP8_CONFIG_ENV_VAR]) == dataclasses.asdict(
+        expected_config
+    )
+
+
+def test_the_extension_applies_fp8_patches_from_its_environment(
+    fp8_module, monkeypatch
+) -> None:
+    import dataclasses
+    import json
+
+    from nemo_rl.models.generation.vllm import dynamo_worker_extension
+    from nemo_rl.models.generation.vllm.quantization.fp8_kwargs import (
+        FP8_CONFIG_ENV_VAR,
+    )
+
+    fp8 = fp8_module
+    applied = []
+    monkeypatch.setattr(
+        fp8, "apply_fp8_patches", lambda self, config: applied.append(config)
+    )
+    config = fp8.FP8Config(model_parallel_size=2, is_mx=True)
+
+    monkeypatch.delenv(FP8_CONFIG_ENV_VAR, raising=False)
+    dynamo_worker_extension._apply_fp8_patches_from_env()
+    assert applied == []
+
+    monkeypatch.setenv(FP8_CONFIG_ENV_VAR, json.dumps(dataclasses.asdict(config)))
+    dynamo_worker_extension._apply_fp8_patches_from_env()
+    assert applied == [config]
+
+    monkeypatch.setattr(fp8, "fp8_patches_applied", True)
+    dynamo_worker_extension._apply_fp8_patches_from_env()
+    assert applied == [config]

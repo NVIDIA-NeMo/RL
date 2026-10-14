@@ -22,7 +22,8 @@
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
-# Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
+# Optional managed Dynamo runtime (the `dynamo` extra's actor venv plus etcd and
+# nats-server; needs vLLM, so SKIP_VLLM_BUILD also skips it):
 #   --build-arg BUILD_DYNAMO=1
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
@@ -194,6 +195,8 @@ ARG BUILD_CUSTOM_FLASHINFER_REF
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
 ARG SKIP_TRTLLM_BUILD
+# Build the managed Dynamo actor venv (the `dynamo` extra) only when set to 1.
+ARG BUILD_DYNAMO
 ARG BASE_IMAGE
 ARG UV_VERSION
 ARG TARGETARCH
@@ -321,6 +324,9 @@ UV_LINK_MODE=hardlink uv sync --frozen --all-groups --no-install-project
 SKIP_EXTRAS=""
 if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
     SKIP_EXTRAS="$SKIP_EXTRAS vllm"
+fi
+if [[ -n "${SKIP_VLLM_BUILD:-}" || "${BUILD_DYNAMO:-0}" != "1" ]]; then
+    SKIP_EXTRAS="$SKIP_EXTRAS dynamo"
 fi
 if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
     SKIP_EXTRAS="$SKIP_EXTRAS sglang"
@@ -587,7 +593,6 @@ FROM hermetic AS release
 
 # Re-declare build args for this stage
 ARG BUILD_DYNAMO
-ARG DYNAMO_PYTHON_VERSION=3.12.11
 ARG ETCD_VERSION=v3.5.21
 ARG NATS_VERSION=v2.11.6
 # Space-separated config paths whose NeMo Gym venvs are prefetched into the image
@@ -606,8 +611,6 @@ ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
-ENV NEMO_RL_DYNAMO_VENV_DIR=/opt/dynamo_venv
-
 # AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
 # The host's aws-efa-installer places libnccl-net-ofi.so under
 # /opt/amazon/ofi-nccl/lib and libfabric under /opt/amazon/efa/lib. Without
@@ -623,14 +626,14 @@ ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_P
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
 COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 
-# Keep Dynamo's Python 3.12 dependency graph isolated from NeMo-RL's normal
-# Ray/vLLM environments. Default image builds do not create this environment.
+# etcd and nats-server for the managed Dynamo runtime; its Python environment is the
+# `dynamo` extra's actor venv, built with the other actor venvs.
 RUN <<"EOF" bash -exu -o pipefail
 if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
-    echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
+    echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo services"
     exit 0
 fi
-bash docker/dynamo/install.sh
+bash docker/install_dynamo_services.sh
 EOF
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),

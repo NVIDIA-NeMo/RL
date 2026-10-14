@@ -224,8 +224,6 @@ def _make_master_config(
             **({} if sampler_cfg is None else {"sampler": sampler_cfg}),
         ),
     )
-    if backend == "dynamo":
-        master_config.async_rl.generation_fleet_health.refit_timeout_s = None
     return master_config
 
 
@@ -407,6 +405,14 @@ def test_generation_max_seq_len_reads_dynamo_vllm_cfg():
         )
         == 1024
     )
+
+
+def test_dynamo_accepts_refit_deadline():
+    """The worker extension inside each Dynamo engine enforces the refit deadline."""
+    master_config = _make_master_config(backend="dynamo")
+    master_config.async_rl.generation_fleet_health.refit_timeout_s = 300.0
+
+    sc_setup_mod.DynamoGeneration.validate_settings(master_config)
 
 
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
@@ -1699,15 +1705,6 @@ class TestSetup:
                 ),
                 "Dynamo frontend owns request routing",
                 id="fleet_health",
-            ),
-            # 300.0 is the FleetHealthConfig default, so a Dynamo config that does
-            # not opt out would otherwise only fail at its first weight sync.
-            pytest.param(
-                lambda mc: setattr(
-                    mc.async_rl.generation_fleet_health, "refit_timeout_s", 300.0
-                ),
-                "refit_timeout_s must be null",
-                id="refit_deadline",
             ),
             pytest.param(
                 lambda mc: mc.policy["generation"]["dynamo_cfg"].update(
