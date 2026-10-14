@@ -23,9 +23,11 @@ behavior so it cannot regress a third time.
 
 import pytest
 
+from nemo_rl.models.generation.vllm.quantization.fp8_kwargs import (
+    merge_fp8_kwargs as _merge_fp8_kwargs,
+)
 from nemo_rl.models.generation.vllm.vllm_worker import (
     _log_effective_quantization_ignore_patterns,
-    _merge_fp8_kwargs,
 )
 
 

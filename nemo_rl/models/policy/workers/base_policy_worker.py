@@ -47,7 +47,6 @@ class AbstractPolicyWorker:
         *,
         train_world_size: int,
         rank_offset: int = 0,
-        nccl_peer: str = "nemo",
     ) -> None:
         """Initialize the collective communication.
 
@@ -57,7 +56,6 @@ class AbstractPolicyWorker:
             world_size: Total world size (train_world_size + inference_world_size)
             train_world_size: Number of training workers (used in inference cluster)
             rank_offset: Offset added to this worker group's local rank.
-            nccl_peer: NCCL initialization protocol used by the inference workers
         """
         from nemo_rl.distributed.refit_watchdog import RELEASE_GRACE_S, release_within
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
@@ -69,7 +67,7 @@ class AbstractPolicyWorker:
         print(
             f"  refit: collective rendezvous [train] addr={ip}:{port} "
             f"rank={self.rank + rank_offset} world_size={world_size} "
-            f"train_world_size={train_world_size} peer={nccl_peer} "
+            f"train_world_size={train_world_size} "
             f"master={self.rank + rank_offset == 0}",
             flush=True,
         )
@@ -101,7 +99,7 @@ class AbstractPolicyWorker:
         # Release unused cached allocator blocks before NCCL communicator
         # initialization so transport buffers have sufficient device-memory headroom.
         torch.cuda.empty_cache()
-        self.model_update_group.init_nccl_communicator(device=device, peer=nccl_peer)
+        self.model_update_group.init_nccl_communicator(device=device)
 
     def init_nccl_reshard_comm_group(
         self,

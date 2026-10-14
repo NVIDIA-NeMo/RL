@@ -297,18 +297,13 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         # 1. model_update_group: shared channel for the misc packed-broadcast
         #    (and the FP8 KV-cache scales).  Same setup as the collective path.
         ip, port = self._train_cluster.get_master_address_and_port()
-        # nccl_peer, for the same reason the collective synchronizer passes it: the
-        # receiver's bootstrap is not negotiable, and omitting it rebuilds with the "nemo"
-        # default. Mismatched warmups on one communicator hang rather than error.
-        sender_spec = self._generation.get_collective_sender_spec()
         # The dispatch, so a missing [train] line below distinguishes "never asked" from
         # "asked and did not answer". The collective synchronizer prints its equivalent;
         # this path had none, which is why three rounds of diagnosis could not tell which
         # of the two it was.
         print(
             f"  refit: dispatching model_update_group rebuild addr={ip}:{port} "
-            f"world_size={world_size} train_world_size={train_world_size} "
-            f"peer={sender_spec.nccl_peer}",
+            f"world_size={world_size} train_world_size={train_world_size}",
             flush=True,
         )
         futures_train = self._policy.init_collective(
@@ -316,7 +311,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             port,
             world_size,
             train_world_size=train_world_size,
-            nccl_peer=sender_spec.nccl_peer,
         )
         futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)

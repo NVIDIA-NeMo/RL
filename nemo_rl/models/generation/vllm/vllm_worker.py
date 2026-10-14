@@ -175,52 +175,6 @@ def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     return enable_prefix_caching
 
 
-def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -> None:
-    """Merge fp8 init kwargs into ``vllm_kwargs`` in place, preserving user overrides.
-
-    ``init_fp8`` returns a nested ``hf_overrides`` (holding ``quantization_config``),
-    so a blanket ``vllm_kwargs.update(fp8_kwargs)`` would wholesale-replace any
-    user-supplied ``hf_overrides``. We pop ``hf_overrides`` before the shallow
-    update and merge it separately so that fp8's ``quantization_config`` is the
-    base while user overrides (e.g. ``max_position_embeddings``) survive and take
-    precedence. Required FP8 ignore entries are combined with user-provided ignore
-    entries so generated safety exclusions cannot be removed. This regression was
-    reintroduced once already; see #1413/#2904.
-    """
-    fp8_kwargs = dict(fp8_kwargs)
-    fp8_hf_overrides = fp8_kwargs.pop("hf_overrides", {})
-    vllm_kwargs.update(fp8_kwargs)
-    existing_hf_overrides = vllm_kwargs.get("hf_overrides") or {}
-    merged_hf_overrides = {**fp8_hf_overrides, **existing_hf_overrides}
-
-    fp8_quantization_config = fp8_hf_overrides.get("quantization_config")
-    existing_quantization_config = existing_hf_overrides.get("quantization_config")
-    if existing_quantization_config is None:
-        if fp8_quantization_config is not None:
-            merged_hf_overrides["quantization_config"] = fp8_quantization_config
-    elif not isinstance(existing_quantization_config, dict):
-        raise ValueError("hf_overrides.quantization_config must be a mapping")
-    elif isinstance(fp8_quantization_config, dict):
-        merged_quantization_config = {
-            **fp8_quantization_config,
-            **existing_quantization_config,
-        }
-        for key in ("ignore", "ignored_layers"):
-            generated_values = fp8_quantization_config.get(key, [])
-            user_values = existing_quantization_config.get(key, [])
-            if not isinstance(generated_values, list) or not isinstance(
-                user_values, list
-            ):
-                raise ValueError(f"quantization_config.{key} must be a list")
-            if generated_values or user_values:
-                merged_quantization_config[key] = list(
-                    dict.fromkeys([*generated_values, *user_values])
-                )
-        merged_hf_overrides["quantization_config"] = merged_quantization_config
-
-    vllm_kwargs["hf_overrides"] = merged_hf_overrides
-
-
 def _validate_worker_extension_cls(
     vllm_kwargs: dict[str, Any], required_worker_extension_cls: str
 ) -> None:
@@ -668,6 +622,9 @@ class BaseVllmGenerationWorker:
         # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
         if self.cfg["vllm_cfg"]["precision"] == "fp8":
             from nemo_rl.models.generation.vllm.quantization.fp8 import init_fp8
+            from nemo_rl.models.generation.vllm.quantization.fp8_kwargs import (
+                merge_fp8_kwargs,
+            )
 
             fp8_kwargs = init_fp8(
                 self.cfg["vllm_cfg"], self.model_name, model_parallel_size
@@ -675,7 +632,7 @@ class BaseVllmGenerationWorker:
 
             # Merge (rather than replace) so fp8's quantization_config coexists
             # with user-supplied hf_overrides, which take precedence.
-            _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
+            merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
