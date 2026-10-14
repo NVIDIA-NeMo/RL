@@ -367,6 +367,7 @@ def _task_encoder(
     adapter: Any,
     include_source_ids: bool,
     max_sequence_length: int,
+    sequence_length_pad_multiple: int,
     tokenizer: Any,
     only_unmask_final: bool,
 ) -> BaseSFTTaskEncoder:
@@ -396,23 +397,14 @@ def _task_encoder(
     )
     encoder_options = loader_config.task_encoder.options
     packing = loader_config.task_encoder.packing
-    if (
-        packing is not None
-        and packing.options.max_sequence_length != max_sequence_length
-    ):
-        raise ValueError(
-            "Energon pack capacity must match the SFT maximum sequence length."
-        )
     packer = None
-    sequence_length_pad_multiple = 1
     if packing is not None:
         packer = get_packer(
             packing.name,
-            packing.options.max_sequence_length,
+            max_sequence_length,
             max_sequences_per_bin=packing.options.max_sequences_per_bin,
             balanced_knapsack_delta=packing.options.balanced_knapsack_delta,
         )
-        sequence_length_pad_multiple = packing.options.sequence_length_pad_multiple
     return cast(
         BaseSFTTaskEncoder,
         encoder_type(
@@ -435,6 +427,7 @@ def build_energon_sft_loader(
     processor: Any,
     batch_size: int,
     max_sequence_length: int,
+    sequence_length_pad_multiple: int,
     split_role: Literal["train", "validation"],
     logical_rank: int,
     logical_world_size: int,
@@ -469,6 +462,7 @@ def build_energon_sft_loader(
         adapter=adapter,
         include_source_ids=True,
         max_sequence_length=max_sequence_length,
+        sequence_length_pad_multiple=sequence_length_pad_multiple,
         tokenizer=processor.tokenizer,
         only_unmask_final=only_unmask_final,
     )
@@ -554,9 +548,7 @@ def build_energon_sft_loader(
             max_sequences_per_bin=(
                 None if packing is None else packing.options.max_sequences_per_bin
             ),
-            sequence_length_pad_multiple=(
-                1 if packing is None else packing.options.sequence_length_pad_multiple
-            ),
+            sequence_length_pad_multiple=sequence_length_pad_multiple,
             only_unmask_final=only_unmask_final,
         ),
     )

@@ -494,11 +494,7 @@ def test_energon_config_validates_sequence_packing():
             "packing": {
                 "name": "balanced_greedy_knapsack",
                 "buffer_size": 10,
-                "options": {
-                    "max_sequence_length": 128,
-                    "sequence_length_pad_multiple": 8,
-                    "balanced_knapsack_delta": 5,
-                },
+                "options": {"balanced_knapsack_delta": 5},
             }
         },
     )
@@ -628,6 +624,7 @@ def test_train_loader_rejects_shuffle_false():
             logical_world_size=1,
             placement_fingerprint="same-placement",
             only_unmask_final=False,
+            sequence_length_pad_multiple=1,
         )
 
 

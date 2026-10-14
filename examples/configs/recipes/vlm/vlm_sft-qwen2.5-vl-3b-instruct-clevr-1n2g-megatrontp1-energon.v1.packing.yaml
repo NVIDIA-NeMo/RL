@@ -12,8 +12,6 @@ data:
         name: balanced_greedy_knapsack
         buffer_size: 64
         options:
-          max_sequence_length: ${data.max_input_seq_length}
-          sequence_length_pad_multiple: ${policy.make_sequence_length_divisible_by}
           max_sequences_per_bin: 16
 
 checkpointing:

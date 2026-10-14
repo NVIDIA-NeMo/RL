@@ -379,8 +379,6 @@ data:
         name: balanced_greedy_knapsack
         buffer_size: 64
         options:
-          max_sequence_length: ${policy.max_total_sequence_length}
-          sequence_length_pad_multiple: ${policy.make_sequence_length_divisible_by}
           max_sequences_per_bin: 16   # optional cap on source conversations per pack
           balanced_knapsack_delta: 0 # optional extra initial bins for this algorithm
     max_samples_per_sequence: null  # optional shard read-order control
@@ -392,9 +390,9 @@ consecutive samples Energon reads from one shard; it does not affect pack
 layout. Without an Energon packing configuration, SFTv2 requires fixed
 batching.
 `max_sequences_per_bin` defaults to no cap. `balanced_knapsack_delta` defaults
-to zero and is supported only by `balanced_greedy_knapsack`. The configured
-pack capacity must match `data.max_input_seq_length`, and its padding multiple
-must match `policy.make_sequence_length_divisible_by`.
+to zero and is supported only by `balanced_greedy_knapsack`. Pack capacity is taken from
+`data.max_input_seq_length`, and its padding multiple comes from
+`policy.make_sequence_length_divisible_by`.
 Dynamic batching and HybridEP flex dispatch are not supported with
 Energon-owned packs.
 

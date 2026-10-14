@@ -137,6 +137,7 @@ def test_loader_preserves_energon_defaults_unless_overridden(
         logical_world_size=1,
         placement_fingerprint="placement",
         only_unmask_final=False,
+        sequence_length_pad_multiple=1,
     )
 
     expected_pool = {"method": "raw"}

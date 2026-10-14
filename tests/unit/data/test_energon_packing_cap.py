@@ -23,11 +23,7 @@ from nemo_rl.data.energon.config import EnergonLoaderConfig, EnergonPackingOptio
 @pytest.mark.parametrize("cap", [0, -1])
 def test_packing_cap_rejects_nonpositive_values(cap: int) -> None:
     with pytest.raises(ValueError):
-        EnergonPackingOptions(
-            max_sequence_length=128,
-            sequence_length_pad_multiple=8,
-            max_sequences_per_bin=cap,
-        )
+        EnergonPackingOptions(max_sequences_per_bin=cap)
 
 
 @pytest.mark.mcore
@@ -43,11 +39,7 @@ def test_task_encoder_packing_cap_limits_actual_bin_membership(
             "packing": {
                 "name": "greedy_knapsack",
                 "buffer_size": 10,
-                "options": {
-                    "max_sequence_length": 128,
-                    "sequence_length_pad_multiple": 8,
-                    "max_sequences_per_bin": cap,
-                },
+                "options": {"max_sequences_per_bin": cap},
             }
         },
     )
@@ -64,6 +56,7 @@ def test_task_encoder_packing_cap_limits_actual_bin_membership(
         max_sequence_length=128,
         tokenizer=object(),
         only_unmask_final=False,
+        sequence_length_pad_multiple=8,
     )
     bins = encoder.packer.pack([8, 8, 8])
     assert sorted(index for packed in bins for index in packed) == [0, 1, 2]
@@ -82,11 +75,7 @@ def test_loader_identity_records_task_encoder_packing_cap(
     packing = {
         "name": "greedy_knapsack",
         "buffer_size": 10,
-        "options": {
-            "max_sequence_length": 128,
-            "sequence_length_pad_multiple": 8,
-            "max_sequences_per_bin": cap,
-        },
+        "options": {"max_sequences_per_bin": cap},
     }
     config = EnergonLoaderConfig(
         model_family="qwen", task_encoder={"packing": packing} if packed else {}
@@ -121,6 +110,7 @@ def test_loader_identity_records_task_encoder_packing_cap(
         logical_world_size=1,
         placement_fingerprint="placement",
         only_unmask_final=False,
+        sequence_length_pad_multiple=8,
     )
     assert loader.identity["max_sequences_per_bin"] == cap
     assert loader.identity["packing_algorithm"] == (
@@ -142,11 +132,7 @@ def test_task_encoder_balancing_delta(
             "packing": {
                 "name": algorithm,
                 "buffer_size": 10,
-                "options": {
-                    "max_sequence_length": 128,
-                    "sequence_length_pad_multiple": 8,
-                    "balanced_knapsack_delta": 5,
-                },
+                "options": {"balanced_knapsack_delta": 5},
             }
         },
     )
@@ -160,6 +146,7 @@ def test_task_encoder_balancing_delta(
             max_sequence_length=128,
             tokenizer=object(),
             only_unmask_final=False,
+            sequence_length_pad_multiple=8,
         )
 
     if algorithm == "balanced_greedy_knapsack":
@@ -177,8 +164,9 @@ def test_task_encoder_balancing_delta(
 
 @pytest.mark.mcore
 @pytest.mark.parametrize("split_role", ["train", "validation"])
+@pytest.mark.parametrize("capacity", [128, 256])
 def test_loader_constructs_real_packer_from_nested_options(
-    monkeypatch: pytest.MonkeyPatch, split_role: str
+    monkeypatch: pytest.MonkeyPatch, split_role: str, capacity: int
 ) -> None:
     # Loader construction requires the optional Energon runtime.
     from nemo_rl.data.energon import sft_dataloader as module
@@ -189,12 +177,7 @@ def test_loader_constructs_real_packer_from_nested_options(
             "packing": {
                 "name": "balanced_greedy_knapsack",
                 "buffer_size": 13,
-                "options": {
-                    "max_sequence_length": 128,
-                    "sequence_length_pad_multiple": 8,
-                    "max_sequences_per_bin": 1,
-                    "balanced_knapsack_delta": 2,
-                },
+                "options": {"max_sequences_per_bin": 1, "balanced_knapsack_delta": 2},
             }
         },
     )
@@ -226,12 +209,13 @@ def test_loader_constructs_real_packer_from_nested_options(
         },
         processor=SimpleNamespace(tokenizer=object()),
         batch_size=1,
-        max_sequence_length=128,
+        max_sequence_length=capacity,
         split_role=split_role,
         logical_rank=0,
         logical_world_size=1,
         placement_fingerprint="placement",
         only_unmask_final=False,
+        sequence_length_pad_multiple=8,
     )
     dataset = train_dataset if split_role == "train" else val_dataset
     kwargs = dataset.call_args.kwargs

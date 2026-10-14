@@ -254,6 +254,9 @@ class SFTSingleControllerActor:
             "batch_size": config.policy["train_global_batch_size"]
             // self._placement_plan.logical_world_size,
             "max_sequence_length": config.data["max_input_seq_length"],
+            "sequence_length_pad_multiple": config.policy[
+                "make_sequence_length_divisible_by"
+            ],
             "placement_fingerprint": self._placement_plan.placement_hash,
             "only_unmask_final": config.sft.only_unmask_final,
         }
@@ -505,11 +508,10 @@ def setup_sft_v2(
         ):
             raise ValueError("Energon packing does not support HybridEP flex dispatch.")
 
-        pad_multiple = packing.options.sequence_length_pad_multiple
-        if pad_multiple != master_config.policy["make_sequence_length_divisible_by"]:
+        pad_multiple = master_config.policy["make_sequence_length_divisible_by"]
+        if pad_multiple <= 0:
             raise ValueError(
-                "Energon packing sequence_length_pad_multiple must match policy."
-                "make_sequence_length_divisible_by."
+                "Energon packing requires make_sequence_length_divisible_by to be positive."
             )
         parallel_multiple = get_parallel_token_alignment(megatron_cfg)
         if pad_multiple % parallel_multiple != 0:
@@ -522,11 +524,6 @@ def setup_sft_v2(
                 "Energon packing requires max_input_seq_length to be divisible by "
                 "make_sequence_length_divisible_by."
             )
-        if packing.options.max_sequence_length != max_sequence_length:
-            raise ValueError(
-                "Energon pack capacity must match the SFT maximum sequence length."
-            )
-
         fp8_multiple = get_fp8_token_alignment(megatron_cfg) * parallel_multiple
         if fp8_multiple > parallel_multiple:
             if max_sequence_length % fp8_multiple != 0:

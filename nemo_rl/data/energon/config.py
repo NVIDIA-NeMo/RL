@@ -31,18 +31,8 @@ class EnergonSourceConfig(BaseModel, extra="allow"):
 class EnergonPackingOptions(BaseModel, extra="forbid"):
     """Options for task-encoder-owned sequence packing."""
 
-    max_sequence_length: Annotated[int, Field(ge=1)]
-    sequence_length_pad_multiple: Annotated[int, Field(ge=1)]
     max_sequences_per_bin: Annotated[int, Field(ge=1)] | None = None
     balanced_knapsack_delta: Annotated[int, Field(ge=0)] | None = None
-
-    @model_validator(mode="after")
-    def _validate_alignment(self) -> "EnergonPackingOptions":
-        if self.max_sequence_length % self.sequence_length_pad_multiple:
-            raise ValueError(
-                "Energon pack capacity must be divisible by its padding multiple."
-            )
-        return self
 
 
 class EnergonPackingConfig(BaseModel, extra="forbid"):

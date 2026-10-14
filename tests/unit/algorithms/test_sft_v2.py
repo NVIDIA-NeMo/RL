@@ -405,10 +405,7 @@ def test_setup_rejects_invalid_energon_packing_config(
                 task_encoder=SimpleNamespace(
                     packing=SimpleNamespace(
                         name=sequence_packing.get("algorithm", "greedy_knapsack"),
-                        options=SimpleNamespace(
-                            max_sequence_length=max_sequence_length,
-                            sequence_length_pad_multiple=pad_multiple,
-                        ),
+                        options=SimpleNamespace(),
                     )
                 )
             ),
@@ -426,53 +423,24 @@ def test_setup_rejects_invalid_energon_packing_config(
 
 
 @pytest.mark.parametrize(
-    "options,message",
-    [
-        (
-            {"sequence_length_pad_multiple": 4},
-            "sequence_length_pad_multiple must match",
-        ),
-        ({"max_sequence_length": 64}, "pack capacity must match"),
-    ],
+    "field", ["max_sequence_length", "sequence_length_pad_multiple"]
 )
-def test_setup_validates_nested_packing_options(
-    options: dict[str, int], message: str
-) -> None:
-    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
-
-    config = _valid_setup_config(
-        data_overrides={
-            "energon": EnergonLoaderConfig(
-                model_family="qwen",
-                task_encoder={
-                    "packing": {
-                        "name": "balanced_greedy_knapsack",
-                        "buffer_size": 64,
-                        "options": {
-                            "max_sequence_length": 128,
-                            "sequence_length_pad_multiple": 8,
-                            **options,
-                        },
-                    }
-                },
-            ),
-        },
-        policy_overrides={
-            "sequence_packing": {
-                "enabled": True,
-                "fuse_loss": True,
-                # The nested task encoder selects the packer, not this legacy key.
-                "algorithm": "unknown",
-            }
-        },
-    )
-    config.policy["make_sequence_length_divisible_by"] = 8
-    with pytest.raises(ValueError, match=message):
-        setup_sft_v2(config, MagicMock())
+def test_packing_options_reject_removed_geometry_fields(field: str) -> None:
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        EnergonLoaderConfig(
+            model_family="qwen",
+            task_encoder={
+                "packing": {
+                    "name": "greedy_knapsack",
+                    "buffer_size": 64,
+                    "options": {field: 8},
+                }
+            },
+        )
 
 
 @pytest.mark.parametrize("restored", [False, True])
-def test_setup_loaders_uses_nested_packing_without_obsolete_kwargs(
+def test_setup_loaders_passes_canonical_geometry_and_nested_packing(
     restored: bool,
 ) -> None:
     loader_config = EnergonLoaderConfig(
@@ -481,12 +449,7 @@ def test_setup_loaders_uses_nested_packing_without_obsolete_kwargs(
             "packing": {
                 "name": "balanced_greedy_knapsack",
                 "buffer_size": 64,
-                "options": {
-                    "max_sequence_length": 128,
-                    "sequence_length_pad_multiple": 8,
-                    "max_sequences_per_bin": 16,
-                    "balanced_knapsack_delta": 2,
-                },
+                "options": {"max_sequences_per_bin": 16, "balanced_knapsack_delta": 2},
             }
         },
     )
@@ -529,11 +492,12 @@ def test_setup_loaders_uses_nested_packing_without_obsolete_kwargs(
         kwargs = controller._trainer.worker_group.run_all_workers_single_data.call_args.kwargs
     assert kwargs["data_config"]["energon"] is loader_config
     assert kwargs["batch_size"] == 2
+    assert kwargs["max_sequence_length"] == 128
+    assert kwargs["sequence_length_pad_multiple"] == 8
     assert (
         not {
             "packing_algorithm",
             "max_sequences_per_bin",
-            "sequence_length_pad_multiple",
         }
         & kwargs.keys()
     )
@@ -570,10 +534,7 @@ def test_setup_rejects_unsupported_energon_packing_layouts(
                 task_encoder=SimpleNamespace(
                     packing=SimpleNamespace(
                         name="greedy_knapsack",
-                        options=SimpleNamespace(
-                            max_sequence_length=130,
-                            sequence_length_pad_multiple=policy_multiple,
-                        ),
+                        options=SimpleNamespace(),
                     )
                 )
             ),
@@ -615,3 +576,29 @@ def test_max_steps_is_bounded_by_virtual_epochs() -> None:
     )
 
     assert _max_train_steps(config) == 21
+
+
+@pytest.mark.parametrize("pad_multiple", [0, -1])
+def test_setup_rejects_nonpositive_canonical_packing_alignment(
+    pad_multiple: int,
+) -> None:
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    config = _valid_setup_config(
+        data_overrides={
+            "energon": EnergonLoaderConfig(
+                model_family="qwen",
+                task_encoder={
+                    "packing": {
+                        "name": "greedy_knapsack",
+                        "buffer_size": 64,
+                        "options": {},
+                    }
+                },
+            )
+        },
+        policy_overrides={"sequence_packing": {"enabled": True, "fuse_loss": True}},
+    )
+    config.policy["make_sequence_length_divisible_by"] = pad_multiple
+    with pytest.raises(ValueError, match="to be positive"):
+        setup_sft_v2(config, MagicMock())

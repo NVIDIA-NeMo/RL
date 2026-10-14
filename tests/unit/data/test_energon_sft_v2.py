@@ -158,6 +158,7 @@ def test_setup_sft_dataloader_calls_current_loader_api(restored: bool) -> None:
             placement_fingerprint="placement",
             only_unmask_final=False,
             restored_state=state,
+            sequence_length_pad_multiple=8,
         )
         build_loader.assert_called_once_with(
             data_config=data_config,
@@ -170,6 +171,7 @@ def test_setup_sft_dataloader_calls_current_loader_api(restored: bool) -> None:
             logical_world_size=2,
             placement_fingerprint="placement",
             only_unmask_final=False,
+            sequence_length_pad_multiple=8,
         )
         if restored:
             build_loader.return_value.load_state_dict.assert_called_once_with(state)
