@@ -31,6 +31,10 @@ Used by both :mod:`token_aligner` and
   :func:`get_sparse_projection_matrix` / :func:`get_topk_projection`
   process-local caches, :func:`slice_sparse_projection_rows`, and
   :func:`build_exact_token_map` (cached common/uncommon partition).
+- Same-tokenizer KD: :func:`same_tokenizer_topk_kl` /
+  :func:`same_tokenizer_full_vocab_kl` — per-position KL between student and
+  teacher on a shared tokenizer vocab, averaged over the positions that receive
+  KD (only those positions choose the top-K vocab list).
 """
 
 from __future__ import annotations
@@ -42,12 +46,15 @@ from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple, Union
 import torch
 from torch.distributed.tensor import DTensor
 
+from nemo_rl.algorithms.utils import masked_mean
 from nemo_rl.distributed.model_utils import (
     cp_shift_next,
     get_logprobs_from_vocab_parallel_logits,
     group_all_reduce_sum_with_grad,
     to_local_if_dtensor,
     vocab_parallel_argmax,
+    vocab_parallel_full_log_softmax,
+    vocab_parallel_gather_columns,
 )
 
 if TYPE_CHECKING:
@@ -258,6 +265,7 @@ def select_teacher_topk_indices(
     teacher_logits: torch.Tensor,
     k: int,
     *,
+    valid_mask: Optional[torch.Tensor] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Sorted global top-``k`` teacher-vocab ids by max importance over the microbatch.
@@ -265,20 +273,222 @@ def select_teacher_topk_indices(
     Importance is the per-vocab max over flattened ``(B*T)`` teacher logits. With
     ``cp_group`` world > 1 the sequence is CP-sharded, so the local max only sees
     this rank's slice; an ``all_reduce(MAX)`` makes every rank pick the same
-    subset. No gradient.
+    subset. ``valid_mask`` (shape ``teacher_logits.shape[:-1]``), when given,
+    marks the rows that take part in the max; if no row is valid on any CP rank,
+    the first ``k`` ids are returned. No gradient.
     """
     vocab_size = teacher_logits.shape[-1]
+    if valid_mask is not None and valid_mask.shape != teacher_logits.shape[:-1]:
+        raise ValueError(
+            "valid_mask must match teacher_logits without its vocabulary axis: "
+            f"expected {tuple(teacher_logits.shape[:-1])}, got "
+            f"{tuple(valid_mask.shape)}."
+        )
     with torch.no_grad():
         # reshape (not view): a preceding next-token shift can leave the teacher
         # logits non-contiguous.
         teacher_flat = teacher_logits.reshape(-1, vocab_size)
+        if valid_mask is not None:
+            valid_flat = valid_mask.to(device=teacher_logits.device, dtype=torch.bool)
+            teacher_flat = teacher_flat.masked_fill(
+                ~valid_flat.reshape(-1, 1), float("-inf")
+            )
         importance = teacher_flat.max(dim=0).values
         if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
             torch.distributed.all_reduce(
                 importance, op=torch.distributed.ReduceOp.MAX, group=cp_group
             )
+        if valid_mask is not None and torch.isneginf(importance).all():
+            return torch.arange(k, device=teacher_logits.device)
         top_indices = torch.topk(importance, k=k, dim=-1).indices
         return top_indices.sort().values
+
+
+def _same_tokenizer_kd_weights(
+    *,
+    kd_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Float ``[B, T]`` weights of the predictor positions that receive KD.
+
+    The predictor at position ``t`` receives KD when its target token
+    ``kd_mask[:, t + 1]`` is set (CP-aware next-token shift, so the global-last
+    position never does) and its sample is not masked out.
+    """
+    next_mask = cp_shift_next(to_local_if_dtensor(kd_mask), cp_group, fill=0)
+    sample_mask = to_local_if_dtensor(sample_mask)
+    return next_mask.float() * sample_mask.unsqueeze(-1).float()
+
+
+def _per_position_kl(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    *,
+    reverse_kl: bool,
+) -> torch.Tensor:
+    """Per-position KL summed over the vocab axis.
+
+    Forward is ``KL(teacher || student)``; reverse is ``KL(student || teacher)``.
+    """
+    if reverse_kl:
+        return torch.nn.functional.kl_div(
+            teacher_log_probs, student_log_probs, reduction="none", log_target=True
+        ).sum(dim=-1)
+    return torch.nn.functional.kl_div(
+        student_log_probs, teacher_log_probs, reduction="none", log_target=True
+    ).sum(dim=-1)
+
+
+def _masked_kd_mean(
+    per_position_kl: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    num_kd_tokens: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """``T**2``-scaled mean of a per-position KL over the global KD-token count."""
+    return (
+        masked_mean(per_position_kl, weights, global_normalization_factor=num_kd_tokens)
+        * temperature
+        * temperature
+    )
+
+
+def same_tokenizer_topk_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    *,
+    kd_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    num_kd_tokens: torch.Tensor,
+    vocab_size: int,
+    vocab_topk: int,
+    temperature: float,
+    reverse_kl: bool,
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Top-K per-position KL between student and teacher on a shared tokenizer vocab.
+
+    Student and teacher share a tokenizer, so positions align 1:1. One sorted
+    top-K vocab list is chosen from the teacher logits of the predictor rows
+    that receive KD only, MAX-reduced across CP so every CP rank uses the same
+    columns. The student's K columns are gathered TP-aware and both sides are
+    softmaxed within the K subset: the full-vocab partition function cancels,
+    so the all-gathered ``[B, T, V]`` student log-probs are never built. The
+    result is the KD-position mean (global denominator ``num_kd_tokens``)
+    scaled by ``temperature**2``.
+
+    Args:
+        student_logits: ``[B, T, V]`` student logits on this CP rank's
+            contiguous window (``[B, T, V/TP]`` when vocab-sharded across TP).
+        teacher_logits: ``[B, T, V_t]`` full-vocab teacher logits on the same
+            positions; columns past ``vocab_size`` (lm_head padding) are dropped.
+        kd_mask: ``[B, T]`` mask of target tokens that receive KD; the
+            predictor at ``t`` is supervised when ``kd_mask[:, t + 1]`` is set.
+        sample_mask: ``[B]`` per-sample mask.
+        num_kd_tokens: Global (DP/CP) count of KD positions, the mean's
+            denominator.
+        vocab_size: Shared tokenizer vocab size.
+        vocab_topk: Number of vocab columns K the KL is computed over (capped
+            at the teacher vocab width).
+        temperature: Softmax temperature.
+        reverse_kl: If True, ``KL(student || teacher)``; otherwise
+            ``KL(teacher || student)``.
+        tp_group: Tensor-parallel group the student vocab is sharded over.
+        cp_group: Context-parallel group the sequence is sharded over.
+
+    Returns:
+        Scalar KD loss.
+    """
+    teacher = teacher_logits
+    if teacher.shape[-1] > vocab_size:
+        teacher = teacher[..., :vocab_size]
+    k = min(vocab_topk, teacher.shape[-1])
+    weights = _same_tokenizer_kd_weights(
+        kd_mask=kd_mask, sample_mask=sample_mask, cp_group=cp_group
+    )
+    topk_idx = select_teacher_topk_indices(
+        teacher, k, valid_mask=weights.bool(), cp_group=cp_group
+    )
+
+    student_topk_logits = vocab_parallel_gather_columns(
+        student_logits, topk_idx, tp_group=tp_group
+    )
+    student_log_probs_k = torch.log_softmax(student_topk_logits / temperature, dim=-1)
+    teacher_log_probs_k = torch.log_softmax(
+        teacher[..., topk_idx].float() / temperature, dim=-1
+    )
+    per_position_kl = _per_position_kl(
+        student_log_probs_k, teacher_log_probs_k, reverse_kl=reverse_kl
+    )
+    return _masked_kd_mean(
+        per_position_kl,
+        weights,
+        num_kd_tokens=num_kd_tokens,
+        temperature=temperature,
+    )
+
+
+def same_tokenizer_full_vocab_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    *,
+    kd_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    num_kd_tokens: torch.Tensor,
+    temperature: float,
+    reverse_kl: bool,
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Full-vocab per-position KL between student and teacher on a shared tokenizer vocab.
+
+    Student and teacher share a tokenizer, so positions align 1:1. The student
+    log-probs are gathered to the full vocab across TP; the teacher is sliced to
+    the student width (drops lm_head padding). The result is the KD-position
+    mean (global denominator ``num_kd_tokens``) scaled by ``temperature**2``.
+
+    Args:
+        student_logits: ``[B, T, V]`` student logits on this CP rank's
+            contiguous window (``[B, T, V/TP]`` when vocab-sharded across TP).
+        teacher_logits: ``[B, T, V_t]`` full-vocab teacher logits on the same
+            positions, ``V_t >= V``.
+        kd_mask: ``[B, T]`` mask of target tokens that receive KD; the
+            predictor at ``t`` is supervised when ``kd_mask[:, t + 1]`` is set.
+        sample_mask: ``[B]`` per-sample mask.
+        num_kd_tokens: Global (DP/CP) count of KD positions, the mean's
+            denominator.
+        temperature: Softmax temperature.
+        reverse_kl: If True, ``KL(student || teacher)``; otherwise
+            ``KL(teacher || student)``.
+        tp_group: Tensor-parallel group the student vocab is sharded over.
+        cp_group: Context-parallel group the sequence is sharded over.
+
+    Returns:
+        Scalar KD loss.
+    """
+    student_log_probs = vocab_parallel_full_log_softmax(
+        student_logits, temperature, tp_group=tp_group
+    )
+    student_vocab_size = student_log_probs.shape[-1]
+    teacher = teacher_logits.float()
+    if teacher.shape[-1] > student_vocab_size:
+        teacher = teacher[..., :student_vocab_size]
+    teacher_log_probs = torch.log_softmax(teacher / temperature, dim=-1)
+    per_position_kl = _per_position_kl(
+        student_log_probs, teacher_log_probs, reverse_kl=reverse_kl
+    )
+    weights = _same_tokenizer_kd_weights(
+        kd_mask=kd_mask, sample_mask=sample_mask, cp_group=cp_group
+    )
+    return _masked_kd_mean(
+        per_position_kl,
+        weights,
+        num_kd_tokens=num_kd_tokens,
+        temperature=temperature,
+    )
 
 
 @dataclass
