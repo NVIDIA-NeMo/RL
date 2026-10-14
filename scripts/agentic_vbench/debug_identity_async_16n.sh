@@ -5,8 +5,9 @@
 #
 # Keeps the same framework-owned identity objective and 256k policy window as
 # the 8-node sync gate, then expands to 16 nodes (8 learner + 8 generation) and enables the
-# v2 ready-first asynchronous sampler with up to two stale policy versions and
-# three steps of prompt groups in flight. Run only after the sync gate has sane
+# v2 ready-first asynchronous sampler with a two-batch dispatch-ahead window
+# and three steps of prompt groups in flight. Late stragglers remain selectable.
+# Run only after the sync gate has sane
 # finite optimizer metrics, nonempty rows/rewards and raw TMPE near one.
 set -euo pipefail
 

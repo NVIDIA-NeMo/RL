@@ -10,6 +10,37 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd "$script_dir/../.." && pwd)
 
 : "${CLAW_EVAL_BACKEND_DIR:?Set CLAW_EVAL_BACKEND_DIR to the dedicated live async backend}"
+: "${SYNC_POLICY_CHECKPOINT:?Set SYNC_POLICY_CHECKPOINT to the qualified sync step_20/policy/weights directory}"
+[[ -d $SYNC_POLICY_CHECKPOINT ]] || {
+  echo "ERROR: SYNC_POLICY_CHECKPOINT is not a directory: $SYNC_POLICY_CHECKPOINT" >&2
+  exit 2
+}
+[[ -s $SYNC_POLICY_CHECKPOINT/latest_checkpointed_iteration.txt ]] || {
+  echo "ERROR: sync policy donor lacks latest_checkpointed_iteration.txt: $SYNC_POLICY_CHECKPOINT" >&2
+  exit 2
+}
+sync_iteration=
+IFS= read -r sync_iteration <"$SYNC_POLICY_CHECKPOINT/latest_checkpointed_iteration.txt" || true
+if [[ $sync_iteration == release ]]; then
+  sync_iteration_dir=release
+elif [[ $sync_iteration =~ ^[0-9]+$ ]]; then
+  printf -v sync_iteration_dir 'iter_%07d' "$((10#$sync_iteration))"
+else
+  echo "ERROR: sync policy donor has an invalid checkpoint tracker: $sync_iteration" >&2
+  exit 2
+fi
+[[ -s $SYNC_POLICY_CHECKPOINT/$sync_iteration_dir/run_config.yaml ]] || {
+  echo "ERROR: tracked sync policy iteration lacks run_config.yaml: $SYNC_POLICY_CHECKPOINT/$sync_iteration_dir" >&2
+  exit 2
+}
+for override in "$@"; do
+  case $override in
+    checkpointing.pretrained_checkpoint* | +checkpointing.pretrained_checkpoint* | ++checkpointing.pretrained_checkpoint* | '~checkpointing.pretrained_checkpoint'*)
+      echo "ERROR: the async gate owns checkpointing.pretrained_checkpoint; set only SYNC_POLICY_CHECKPOINT" >&2
+      exit 2
+      ;;
+  esac
+done
 export SLURM_ACCOUNT=${SLURM_ACCOUNT:-nemotron_n4_omni}
 export NUM_NODES=${NUM_NODES:-16}
 export NUM_GEN_NODES=${NUM_GEN_NODES:-8}
@@ -39,7 +70,7 @@ export CLAW_EVAL_MAX_TURNS=${CLAW_EVAL_MAX_TURNS:-40}
 export CLAW_EVAL_MAX_ROW_TOKENS=${CLAW_EVAL_MAX_ROW_TOKENS:-65536}
 export CLAW_EVAL_CONCURRENCY=${CLAW_EVAL_CONCURRENCY:-$((NUM_PROMPTS * NUM_GENERATIONS))}
 # Match the sync mechanism gate exactly; async validation changes only dispatch
-# order and bounded staleness, not whether parent/child rows are exercised.
+# order and its lookahead window, not whether parent/child rows are exercised.
 debug_delegation_prompt="During this task call the task tool exactly once near the beginning to delegate one suitable bounded subtask to the general subagent. "
 debug_delegation_prompt+="Do not delegate the full task. Review and integrate the child result. Continue until every required deliverable exists. "
 debug_delegation_prompt+="Before producing the final answer verify the deliverables with bash. Do not produce a final answer while required deliverables are missing."
@@ -80,5 +111,7 @@ exec bash "$script_dir/run_sc.sh" \
   "+${agent}.opencode_compaction_auto=false" \
   "+${agent}.opencode_compaction_prune=false" \
   "$@" \
+  "+checkpointing.pretrained_checkpoint.path=${SYNC_POLICY_CHECKPOINT}" \
+  +checkpointing.pretrained_checkpoint.format=megatron_bridge \
   grpo.max_num_steps=1000000 \
   grpo.max_num_epochs=null

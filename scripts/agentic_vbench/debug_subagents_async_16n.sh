@@ -9,6 +9,37 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd "$script_dir/../.." && pwd)
 
 : "${AGENTIC_VBENCH_BACKEND_DIR:?Set AGENTIC_VBENCH_BACKEND_DIR to the dedicated live async backend}"
+: "${SYNC_POLICY_CHECKPOINT:?Set SYNC_POLICY_CHECKPOINT to the qualified sync step_20/policy/weights directory}"
+[[ -d $SYNC_POLICY_CHECKPOINT ]] || {
+  echo "ERROR: SYNC_POLICY_CHECKPOINT is not a directory: $SYNC_POLICY_CHECKPOINT" >&2
+  exit 2
+}
+[[ -s $SYNC_POLICY_CHECKPOINT/latest_checkpointed_iteration.txt ]] || {
+  echo "ERROR: sync policy donor lacks latest_checkpointed_iteration.txt: $SYNC_POLICY_CHECKPOINT" >&2
+  exit 2
+}
+sync_iteration=
+IFS= read -r sync_iteration <"$SYNC_POLICY_CHECKPOINT/latest_checkpointed_iteration.txt" || true
+if [[ $sync_iteration == release ]]; then
+  sync_iteration_dir=release
+elif [[ $sync_iteration =~ ^[0-9]+$ ]]; then
+  printf -v sync_iteration_dir 'iter_%07d' "$((10#$sync_iteration))"
+else
+  echo "ERROR: sync policy donor has an invalid checkpoint tracker: $sync_iteration" >&2
+  exit 2
+fi
+[[ -s $SYNC_POLICY_CHECKPOINT/$sync_iteration_dir/run_config.yaml ]] || {
+  echo "ERROR: tracked sync policy iteration lacks run_config.yaml: $SYNC_POLICY_CHECKPOINT/$sync_iteration_dir" >&2
+  exit 2
+}
+for override in "$@"; do
+  case $override in
+    checkpointing.pretrained_checkpoint* | +checkpointing.pretrained_checkpoint* | ++checkpointing.pretrained_checkpoint* | '~checkpointing.pretrained_checkpoint'*)
+      echo "ERROR: the async gate owns checkpointing.pretrained_checkpoint; set only SYNC_POLICY_CHECKPOINT" >&2
+      exit 2
+      ;;
+  esac
+done
 export SLURM_ACCOUNT=${SLURM_ACCOUNT:-nemotron_n4_omni}
 export CONFIG_IN_CONTAINER=${CONFIG_IN_CONTAINER:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml}
 export NUM_NODES=${NUM_NODES:-16}
@@ -31,7 +62,7 @@ export MIN_CHECKPOINT_BUDGET_SECONDS=${MIN_CHECKPOINT_BUDGET_SECONDS:-82800}
 export REQUIRE_RESUMABLE_JOB_CYCLES=${REQUIRE_RESUMABLE_JOB_CYCLES:-true}
 export AGENTIC_VBENCH_MAX_TURNS=${AGENTIC_VBENCH_MAX_TURNS:-32}
 # Keep the first async gate behaviorally identical to the qualified sync gate.
-# Only the sampler topology and permitted policy staleness change below.
+# Only the sampler topology and dispatch-ahead window change below.
 debug_delegation_prompt="Your first action must be exactly one task tool call before bash read or any other tool. "
 debug_delegation_prompt+="Delegate only mechanical media preparation to the general subagent. Ask it to write a duration table at /workspace/work/subagent_durations.tsv and labeled contact sheets under /workspace/work/subagent_contact_sheets. "
 debug_delegation_prompt+="Also ask it to write and syntax check /workspace/work/build_solution.py which accepts one chosen clip ID per storyboard slot and mechanically creates solution.mp4 plus a truthful solution.json from the full clips. Require solution.json to be a top-level JSON object with a segments list and never a bare JSON list. Tell the child not to inspect or choose clips and not to create either deliverable itself. "
@@ -73,4 +104,6 @@ exec bash "$script_dir/smoke_subagents_fast_step.sh" \
   "async_rl.min_groups_for_streaming_train=${NUM_PROMPTS}" \
   "async_rl.max_inflight_prompts=${inflight_groups}" \
   "async_rl.max_buffered_rollouts=${inflight_groups}" \
-  "$@"
+  "$@" \
+  "+checkpointing.pretrained_checkpoint.path=${SYNC_POLICY_CHECKPOINT}" \
+  +checkpointing.pretrained_checkpoint.format=megatron_bridge

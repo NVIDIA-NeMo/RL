@@ -191,9 +191,10 @@ rollout_recovery:
 async_rl:
   diagnostics: false
   sampler:
-    # ready_first consumes whichever prompt groups finish first, up to two policy
-    # versions old: long agent episodes (10-25 min) otherwise leave the learner
-    # idle until the slowest group of the step lands (timing/train/exposed_generation).
+    # ready_first consumes whichever prompt groups finish first. This window
+    # allows generation to dispatch up to two admitted batches ahead; it is not
+    # a maximum trained-sample age, and late stragglers remain selectable.
+    # Monitor the realized `lag=` metric as well as exposed-generation time.
     name: ready_first
     max_staleness_versions: 2
   recompute_kv_cache_after_weight_updates: false

@@ -42,6 +42,8 @@ async_rl:
     on_dropped_prompt: replace
     replacement_reserve_prompts: 256
   sampler:
+    # Dispatch may lead the trainer by two admitted batches. ReadyFirst does not
+    # evict late stragglers, so this is not a hard maximum trained-sample age.
     max_staleness_versions: 2
     name: ready_first
   stall_watchdog:

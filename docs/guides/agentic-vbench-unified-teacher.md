@@ -53,7 +53,10 @@ one-row-per-rollout kind, so OpenCode's compaction and pruning stay off
 
 - `async_rl.sampler: ready_first` with `max_staleness_versions: 2`, three steps
   of prompt groups in flight (`max_inflight_prompts`/`max_buffered_rollouts`),
-  `on_dropped_prompt: shrink` (ready_first stamps no target step, so `replace`
+  and no stale-group eviction. The sampler knob permits generation dispatch up
+  to two admitted batches ahead; it is not a hard maximum trained-sample age,
+  because late stragglers remain selectable. Audit the realized `lag=` metric.
+  It uses `on_dropped_prompt: shrink` (ready_first stamps no target step, so `replace`
   is a no-op there), and the data-plane sizing from the base recipe. Watch
   `timing/train/exposed_generation` in W&B: the point of ready_first is to hide
   the 10-25 minute agent episodes behind training.
