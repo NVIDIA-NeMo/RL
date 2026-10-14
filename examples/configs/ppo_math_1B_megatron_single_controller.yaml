@@ -278,6 +278,7 @@ token_capture:
   transport: gym
   direct:
     training_view: main_branch  # full_tree is available for GRPO
+    token_packing: fused  # fused: owned buffer; legacy: tuple then pack (comparison)
     workers: 2
     max_pending_calls: 256
     max_rollouts: 4096

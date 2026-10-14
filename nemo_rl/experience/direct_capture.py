@@ -22,6 +22,8 @@ from __future__ import annotations
 import math
 import threading
 import time
+from array import array
+from collections.abc import Buffer, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -34,6 +36,7 @@ class DirectCaptureConfig(BaseModel, extra="allow"):
     """Limits apply per model-serving worker, including in-flight calls."""
 
     training_view: Literal["main_branch", "full_tree"] = "main_branch"
+    token_packing: Literal["fused", "legacy"] = "fused"
     workers: PositiveInt = 2
     max_pending_calls: PositiveInt = 256
     max_rollouts: PositiveInt = 4096
@@ -50,6 +53,44 @@ class NativeCall:
     tokens: tuple[int, ...]
     logprobs: tuple[float, ...]
     routed_experts: Any
+
+
+@dataclass(frozen=True)
+class PackedNativeCall:
+    """Worker-owned int64 tokens for staging; training still reads NativeCall."""
+
+    rollout_id: str
+    call_id: str
+    ordinal: int
+    weight_version: int
+    token_ids: array
+    prompt_length: int
+    logprobs: tuple[float, ...]
+    routed_experts: Any
+
+
+def _pack_tokens(prompt: Sequence[int] | Buffer, tokens: list[int]) -> array:
+    """Own a full sequence without an intermediate tuple or prefix inference."""
+    if isinstance(prompt, Buffer):
+        with memoryview(prompt) as source:
+            if (
+                source.ndim != 1
+                or not source.c_contiguous
+                or source.itemsize != 8
+                or source.format not in {"q", "l", "@q", "@l", "=q", "=l"}
+            ):
+                raise ValueError(
+                    "packed prompt tokens require contiguous native signed int64"
+                )
+            # Allocate the final size so appending the generation cannot copy
+            # the prompt again. The producer must keep source stable until copied.
+            packed = array("q", [0]) * (len(source) + len(tokens))
+            memoryview(packed).cast("B")[: source.nbytes] = source.cast("B")
+            packed[len(source) :] = array("q", tokens)
+            return packed
+    packed = array("q", prompt)
+    packed.extend(tokens)
+    return packed
 
 
 @dataclass
@@ -84,11 +125,14 @@ def extract_call(
     outputs: list[Any],
     *,
     delta: bool,
-) -> NativeCall:
+    packing: Literal["fused", "legacy"],
+) -> NativeCall | PackedNativeCall:
     """Read vLLM 0.29 RequestOutputs after they leave the HTTP path."""
     if not outputs or not outputs[-1].finished:
         raise ValueError("generation did not finish")
-    prompt = tuple(outputs[-1].prompt_token_ids)
+    prompt = outputs[-1].prompt_token_ids
+    if prompt is None or len(prompt) == 0:
+        raise ValueError("empty prompt")
     tokens: list[int] = []
     logprobs: list[float] = []
     selected = outputs if delta else outputs[-1:]
@@ -107,14 +151,25 @@ def extract_call(
             tokens.append(int(token))
             logprobs.append(value)
     final = outputs[-1].outputs[0]
-    if not prompt or not tokens or final.finish_reason not in {"stop", "length"}:
+    if not tokens or final.finish_reason not in {"stop", "length"}:
         raise ValueError("empty or aborted generation")
+    if packing == "fused":
+        return PackedNativeCall(
+            rollout_id,
+            call_id,
+            ordinal,
+            weight_version,
+            _pack_tokens(prompt, tokens),
+            len(prompt),
+            tuple(logprobs),
+            final.routed_experts,
+        )
     return NativeCall(
         rollout_id,
         call_id,
         ordinal,
         weight_version,
-        prompt,
+        tuple(prompt),
         tuple(tokens),
         tuple(logprobs),
         final.routed_experts,
@@ -127,7 +182,7 @@ class DirectCapture:
     def __init__(
         self,
         config: DirectCaptureConfig,
-        stage: Callable[[NativeCall], dict[str, Any]],
+        stage: Callable[[NativeCall | PackedNativeCall], dict[str, Any]],
         weight_version: Callable[[], int],
         *,
         clear: Callable[[list[str]], None],
@@ -208,6 +263,7 @@ class DirectCapture:
                         weight_version,
                         outputs,
                         delta=delta,
+                        packing=self.config.token_packing,
                     )
                 )
             finally:

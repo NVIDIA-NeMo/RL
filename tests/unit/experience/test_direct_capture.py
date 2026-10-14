@@ -15,6 +15,7 @@
 
 import asyncio
 import threading
+from array import array
 from types import SimpleNamespace as NS
 
 import pytest
@@ -23,6 +24,7 @@ from nemo_rl.experience.direct_capture import (
     DirectCapture,
     DirectCaptureConfig,
     NativeCall,
+    PackedNativeCall,
     current_capture,
     extract_call,
     select_main_branch,
@@ -86,13 +88,72 @@ def test_delta_logprobs_and_terminal_routes():
         5,
         [output((3,), finished=False), output((4,), routes=routes)],
         delta=True,
+        packing="legacy",
     )
     assert call.prompt == (1, 2)
     assert call.tokens == (3, 4)
     assert call.logprobs == (-0.25, -0.25)
     assert call.routed_experts is routes
     with pytest.raises(ValueError, match="finish"):
-        extract_call("r", "c", 0, 5, [output(finished=False)], delta=True)
+        extract_call(
+            "r", "c", 0, 5, [output(finished=False)], delta=True, packing="legacy"
+        )
+
+
+@pytest.mark.parametrize("delta", [False, True])
+@pytest.mark.parametrize("source", ["list", "array", "memoryview", "numpy"])
+def test_fused_capture_owns_exact_tokens_without_repacking_prompt_objects(
+    delta, source
+):
+    import numpy as np
+
+    class PackedOnly(array):
+        def __iter__(self):
+            pytest.fail("packed prompt must not be traversed as Python integers")
+
+    prompt = [1, 2**31, 2**40]
+    if source == "array":
+        prompt = PackedOnly("q", prompt)
+    elif source == "memoryview":
+        prompt = memoryview(array("q", prompt))
+    elif source == "numpy":
+        prompt = np.asarray(prompt, dtype=np.int64)
+    first, last = output((3,), finished=False), output((4,))
+    last.prompt_token_ids = prompt
+    call = extract_call("r", "c", 0, 7, [first, last], delta=delta, packing="fused")
+    assert isinstance(call, PackedNativeCall)
+    assert call.prompt_length == 3
+    assert call.token_ids.tolist() == [1, 2**31, 2**40] + ([3, 4] if delta else [4])
+    assert call.logprobs == (-0.25,) * (2 if delta else 1)
+    prompt[0] = 99
+    assert call.token_ids[0] == 1
+
+
+@pytest.mark.parametrize(
+    "kind", ["int32", "float64", "uint64", "strided", "matrix", "bytes", "swapped"]
+)
+def test_fused_capture_rejects_ambiguous_buffer_layouts(kind):
+    import numpy as np
+
+    sources = {
+        "int32": np.array([1, 2], dtype=np.int32),
+        "float64": np.array([1, 2], dtype=np.float64),
+        "uint64": np.array([1, 2], dtype=np.uint64),
+        "strided": np.arange(4, dtype=np.int64)[::2],
+        "matrix": np.array([[1, 2]], dtype=np.int64),
+        "bytes": b"12345678",
+        "swapped": np.array([1, 2], dtype=np.dtype("i8").newbyteorder("S")),
+    }
+    item = output()
+    item.prompt_token_ids = sources[kind]
+    with pytest.raises(ValueError, match="native signed int64"):
+        extract_call("r", "c", 0, 0, [item], delta=False, packing="fused")
+
+
+def test_packing_configuration_rejects_unknown_modes():
+    assert DirectCaptureConfig().token_packing == "fused"
+    with pytest.raises(ValueError, match="token_packing"):
+        DirectCaptureConfig(token_packing="unknown")
 
 
 def test_submission_is_nonblocking_and_overflow_cannot_silently_drop_calls():
@@ -125,10 +186,16 @@ def test_submission_is_nonblocking_and_overflow_cannot_silently_drop_calls():
         capture.shutdown()
 
 
-def test_engine_bridge_keeps_http_payload_native_and_captures_selected_logprobs():
+@pytest.mark.parametrize("packing", ["fused", "legacy"])
+def test_engine_bridge_keeps_http_payload_native_and_captures_selected_logprobs(
+    packing,
+):
     async def run():
         calls = []
-        capture = owner(lambda call: calls.append(call) or {"ordinal": call.ordinal})
+        capture = owner(
+            lambda call: calls.append(call) or {"ordinal": call.ordinal},
+            token_packing=packing,
+        )
 
         class Engine:
             model_config = renderer = input_processor = vllm_config = None
@@ -154,7 +221,10 @@ def test_engine_bridge_keeps_http_payload_native_and_captures_selected_logprobs(
             capture.leave(context)
         receipt = await asyncio.to_thread(capture.finalize, "key", timeout=5)
         assert receipt["failure"] is None
-        assert calls[0].tokens == (3, 4)
+        if packing == "fused":
+            assert calls[0].token_ids.tolist() == [1, 2, 3, 4]
+        else:
+            assert calls[0].tokens == (3, 4)
         assert calls[0].weight_version == 7
         capture.shutdown()
 
@@ -183,6 +253,7 @@ def test_failed_storage_invalidates_receipt_and_key_cannot_change_owner():
 def test_http_identity_control_auth_and_no_training_payload_in_response():
     import httpx
     from fastapi import FastAPI
+
     from nemo_rl.experience.direct_http import install_direct_control
 
     async def run():
