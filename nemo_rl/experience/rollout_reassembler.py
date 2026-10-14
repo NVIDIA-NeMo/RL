@@ -42,6 +42,9 @@ from typing import TYPE_CHECKING, Any, Optional, cast
 import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_PROMPT_LENGTHS,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
 from nemo_rl.data_plane.tq_token_sink import (
@@ -234,6 +237,7 @@ class RolloutReassembler:
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
+        include_shared_prefix_metadata: bool = False,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
         self._effort_config = effort_config
@@ -243,6 +247,7 @@ class RolloutReassembler:
         # ``token_capture.enabled and processor is not None``). Text-only runs
         # never read media columns; media-enabled runs must find them.
         self._capture_media = capture_media
+        self._include_shared_prefix_metadata = include_shared_prefix_metadata
         self._pad_token_id = int(pad_token_id)
         self._max_seq_len = int(max_seq_len)
         self._router_replay_enabled = router_replay_enabled
@@ -823,6 +828,15 @@ class RolloutReassembler:
         # Media rides the same packed/tagged transport as the token-echo path
         # (pack_payload encodes PackedTensor fields and mints row-shape tags).
         train_batch.update(_media_fields_for_group(rows))
+        if self._include_shared_prefix_metadata:
+            # Keep verified capture boundaries. Invalid placeholders remain exactly
+            # as the baseline produced them and force conventional fallback packing.
+            # The tensor column is the only transport; the driver derives row
+            # tags from it only when work-weighted sharding needs them.
+            train_batch[SHARED_PREFIX_PROMPT_LENGTHS] = torch.tensor(
+                [int(row.prompt_len) if row.valid else 0 for row in rows],
+                dtype=torch.long,
+            )
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=group_min_wv,
