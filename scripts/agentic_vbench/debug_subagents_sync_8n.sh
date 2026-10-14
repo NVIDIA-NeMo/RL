@@ -25,9 +25,16 @@ export TRAIN_REPEATS=${TRAIN_REPEATS:-4}
 export TRAIN_LIMIT=${TRAIN_LIMIT:-4}
 export SAVE_PERIOD=${SAVE_PERIOD:-1}
 export CHECKPOINT_KEEP_TOP_K=${CHECKPOINT_KEEP_TOP_K:-2}
+# Slurm allocations are resumable execution segments, not the GRPO horizon.
+# The old 2 h short-QoS default derived a 1 h 40 min controller deadline and
+# cleanly stopped v19 after step 4.  Use the longest batch_long allocation and
+# normal QoS; per-step checkpoints plus the serialized array continue the same
+# 1,000,000-step run across allocation boundaries.
 export JOB_CYCLES=${JOB_CYCLES:-6}
-export SLURM_QOS=${SLURM_QOS:-short}
-export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-02:00:00}
+export SLURM_QOS=${SLURM_QOS:-normal}
+export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-7-00:00:00}
+export MIN_SLURM_TIME_SECONDS=${MIN_SLURM_TIME_SECONDS:-86400}
+export REQUIRE_RESUMABLE_JOB_CYCLES=${REQUIRE_RESUMABLE_JOB_CYCLES:-true}
 # Use the recipe's full turn budget.  A 12-turn shortcut caused every completed
 # v8 rollout to terminate before solving the task, with zero reward and no
 # delegation, so it cannot serve as the subagent qualification gate.

@@ -66,7 +66,16 @@ _limit_to_seconds() {  # accepts HH:MM:SS, D-HH:MM:SS, D-HH, MM:SS, MM
   echo $(( d*86400 + 10#$h*3600 + 10#$m*60 + 10#$s ))
 }
 _seconds_to_ddhhmmss() { printf '%02d:%02d:%02d:%02d' $(($1/86400)) $(($1%86400/3600)) $(($1%3600/60)) $(($1%60)); }
-_budget_s=$(( $(_limit_to_seconds "$slurm_time_limit") - ${CHECKPOINT_MARGIN_SECONDS:-1200} ))
+slurm_time_seconds=$(_limit_to_seconds "$slurm_time_limit")
+min_slurm_time_seconds=${MIN_SLURM_TIME_SECONDS:-0}
+case "$min_slurm_time_seconds" in
+  ''|*[!0-9]*) echo "ERROR: MIN_SLURM_TIME_SECONDS must be a non-negative integer" >&2; exit 1 ;;
+esac
+if (( slurm_time_seconds < min_slurm_time_seconds )); then
+  echo "ERROR: Slurm allocation ${slurm_time_limit} is shorter than the required ${min_slurm_time_seconds}s resumable cycle" >&2
+  exit 1
+fi
+_budget_s=$(( slurm_time_seconds - ${CHECKPOINT_MARGIN_SECONDS:-1200} ))
 (( _budget_s < 600 )) && _budget_s=600
 checkpoint_must_save_by="${CHECKPOINT_MUST_SAVE_BY:-$(_seconds_to_ddhhmmss "$_budget_s")}"
 
@@ -107,6 +116,15 @@ export PATH="${python_toolchain_bin}:${PATH}"
 export AGENTIC_VBENCH_OUTPUT_ROOT="${AGENTIC_VBENCH_OUTPUT_ROOT:-${results_dir}/episodes}"
 slurm_log_dir="${results_dir}/slurm"
 job_cycles="${JOB_CYCLES:-1}"
+case "$job_cycles" in
+  ''|*[!0-9]*) echo "ERROR: JOB_CYCLES must be a positive integer" >&2; exit 1 ;;
+esac
+(( job_cycles >= 1 )) || { echo "ERROR: JOB_CYCLES must be at least 1" >&2; exit 1; }
+case "${REQUIRE_RESUMABLE_JOB_CYCLES:-false}" in
+  true) (( job_cycles >= 2 )) || { echo "ERROR: resumable training requires JOB_CYCLES >= 2" >&2; exit 1; } ;;
+  false) ;;
+  *) echo "ERROR: REQUIRE_RESUMABLE_JOB_CYCLES must be true or false" >&2; exit 1 ;;
+esac
 num_nodes="${NUM_NODES:-16}"
 gpus_per_node="${GPUS_PER_NODE:-8}"
 num_gen_nodes="${NUM_GEN_NODES:-8}"
@@ -359,6 +377,7 @@ echo "candidate=${candidate_name}"
 echo "sbatch_comment=${sbatch_comment}"
 echo "time_limit=${slurm_time_limit} checkpoint_must_save_by=${checkpoint_must_save_by}"
 echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} qos=${SLURM_QOS:-default} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template} vllm_load_format=${vllm_load_format}"
+echo "allocation_boundary_seconds=${slurm_time_seconds} grpo_horizon_steps=${max_steps} continuation_array=0-${last_array_task}%1"
 echo "context_compaction=${context_compaction}"
 if [[ -n ${CLAW_EVAL_SOURCE:-} ]]; then
   echo "claweval_compaction_auto=${CLAW_EVAL_COMPACTION_AUTO:-null} claweval_prune=${CLAW_EVAL_COMPACTION_PRUNE:-null} training_mode=${CLAW_EVAL_TRAINING_MODE:-null} subagents=${CLAW_EVAL_SUBAGENTS_ENABLED:-false} max_turns=${CLAW_EVAL_MAX_TURNS:-40} context_tokens=${CLAW_EVAL_CONTEXT_TOKENS:-49152} output_tokens=${CLAW_EVAL_OUTPUT_TOKENS:-8192}"
