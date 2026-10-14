@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -233,11 +234,6 @@ def _loader_config(value: Any) -> EnergonLoaderConfig:
         )
     if not config.cookers:
         raise ValueError("At least one Energon cooker must be configured.")
-    if any(
-        cooker.name == "generic_conversation" and cooker.options
-        for cooker in config.cookers
-    ):
-        raise ValueError("The generic conversation cooker has no options.")
     fallback_cookers = [
         index
         for index, cooker in enumerate(config.cookers)
@@ -264,12 +260,19 @@ def _loader_config(value: Any) -> EnergonLoaderConfig:
         model_family=config.model_family,
     )
     for cooker in config.cookers:
-        COOKER_REGISTRY.resolve_configured_for_model_family(
+        cooker_fn = COOKER_REGISTRY.resolve_configured_for_model_family(
             name=cooker.name,
             python_file=cooker.python_file,
             object_name=cooker.object_name,
             model_family=config.model_family,
         )
+        try:
+            inspect.signature(cooker_fn).bind_partial(None, **cooker.options)
+        except TypeError as error:
+            label = cooker.name or f"{cooker.python_file}:{cooker.object_name}"
+            raise ValueError(
+                f"Invalid options for Energon cooker {label!r}: {error}"
+            ) from error
     return config
 
 

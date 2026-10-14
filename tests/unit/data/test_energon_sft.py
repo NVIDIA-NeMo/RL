@@ -14,6 +14,7 @@
 
 import io
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -712,3 +713,63 @@ def test_config_validates_file_backed_component_references():
                     "cookers": cookers,
                 }
             )
+
+
+def test_config_rejects_generic_cooker_options_by_signature() -> None:
+    with pytest.raises(ValueError, match="unexpected keyword argument 'prefix'"):
+        _loader_config(
+            {
+                "model_family": "qwen",
+                "cookers": [
+                    {"name": "generic_conversation", "options": {"prefix": "custom"}}
+                ],
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("parameters", "options", "error"),
+    [
+        ("sample", {"prefix": "custom"}, "unexpected keyword argument 'prefix'"),
+        ("sample, /", {"prefix": "custom"}, "unexpected keyword argument 'prefix'"),
+        (
+            "sample, *, prefix=''",
+            {"typo": "custom"},
+            "unexpected keyword argument 'typo'",
+        ),
+        ("sample", {"sample": "custom"}, "multiple values for argument 'sample'"),
+        ("sample", {}, None),
+        ("sample, *, prefix=''", {"prefix": "custom"}, None),
+        ("sample, **kwargs", {"prefix": "custom"}, None),
+    ],
+)
+def test_config_validates_file_backed_cooker_options(
+    tmp_path: Path,
+    parameters: str,
+    options: dict[str, Any],
+    error: str | None,
+) -> None:
+    cooker_file = tmp_path / "custom_cooker.py"
+    cooker_file.write_text(
+        "from nemo_rl.data.energon.multimodal.model_families import "
+        "supports_model_families\n\n"
+        "@supports_model_families('qwen')\n"
+        f"def custom_cooker({parameters}):\n"
+        "    return sample\n"
+    )
+    loader_config = {
+        "model_family": "qwen",
+        "cookers": [
+            {
+                "python_file": str(cooker_file),
+                "object": "custom_cooker",
+                "options": options,
+            }
+        ],
+    }
+
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            _loader_config(loader_config)
+    else:
+        assert _loader_config(loader_config).cookers[0].options == options
