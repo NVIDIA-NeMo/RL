@@ -60,6 +60,8 @@ def validate_offload_policy_before_refit(
     supported_transports = (
         (None, "nccl_reshard")
         if generation_backend == VLLM_BACKEND
+        else (None,)
+        if generation_backend == "trtllm"
         else (None, "mcore", "nccl_reshard")
         if generation_backend == MEGATRON_BACKEND
         else ()
@@ -67,7 +69,9 @@ def validate_offload_policy_before_refit(
     if refit_transport not in supported_transports:
         raise ValueError(
             "offload_policy_before_refit requires non-colocated vLLM or Megatron "
-            "generation with a collective, mcore, or nccl_reshard refit transport."
+            "generation with a collective, mcore, or nccl_reshard refit transport, "
+            "or non-colocated TensorRT-LLM generation with the default collective "
+            "transport."
         )
 
 
@@ -110,6 +114,7 @@ def create_weight_synchronizer(
         SGLANG_BACKEND,
         MEGATRON_BACKEND,
         DYNAMO_BACKEND,
+        "trtllm",
     }
     if generation_backend not in _SUPPORTED_BACKENDS:
         raise ValueError(

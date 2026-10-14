@@ -224,7 +224,9 @@ def test_packed_broadcast_producer_consumer_roundtrip(
             for name, tensor in result:
                 unpacked_tensors[name] = tensor
 
-        assert consumer_group.current_index == 3
+        # Target is 2000 B; the two 2400 B tensors are isolated in their own
+        # batches: [800+40], [2400], [80], [2400], [2+80].
+        assert consumer_group.current_index == 5
 
     # Verify all parameters were unpacked
     assert len(unpacked_tensors) == len(params)
@@ -270,6 +272,48 @@ def test_packed_broadcast_single_large_tensor():
     # Verify the size matches the large tensor
     expected_size = large_tensor.numel() * large_tensor.element_size()
     assert mock_group.broadcasted_tensors[0].numel() == expected_size
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_isolates_large_tensor_after_small_tensor():
+    """An oversized tensor must not force a copy of the preceding prefix."""
+    params = [
+        ("small_weight", torch.randn(16, dtype=torch.float32).cuda()),
+        ("large_weight", torch.randn(100, dtype=torch.float32).cuda()),
+    ]
+    producer_group = MockCommunicationGroup()
+
+    with patch(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size", return_value=100
+    ):
+        packed_broadcast_producer(
+            iterator=iter(params),
+            group=producer_group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+        )
+
+        consumer_group = MockConsumerCommunicationGroup(
+            producer_group.broadcasted_tensors
+        )
+        unpacked_tensors = {}
+
+        def post_unpack_func(tensor_list):
+            unpacked_tensors.update(tensor_list)
+
+        packed_broadcast_consumer(
+            iterator=iter(create_mock_state_dict_info(params).items()),
+            group=consumer_group,
+            src=0,
+            post_unpack_func=post_unpack_func,
+        )
+
+    assert [tensor.numel() for tensor in producer_group.broadcasted_tensors] == [
+        params[0][1].nbytes,
+        params[1][1].nbytes,
+    ]
+    for name, original_tensor in params:
+        assert torch.equal(unpacked_tensors[name], original_tensor)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
