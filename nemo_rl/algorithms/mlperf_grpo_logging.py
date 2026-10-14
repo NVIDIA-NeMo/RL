@@ -258,6 +258,11 @@ class MLPerfGRPOLogger:
             self.constants.PIPELINE_PARALLELISM: megatron_cfg.get("pipeline_model_parallel_size"),
             self.constants.CONTEXT_PARALLELISM: megatron_cfg.get("context_parallel_size"),
             self.constants.EXPERT_PARALLELISM: megatron_cfg.get("expert_model_parallel_size"),
+            self.constants.CONFIG_FILENAME: f"config_{os.environ.get('DGXSYSTEM', 'UNKNOWN')}.sh",
+            # Numerical precision
+            self.constants.LOWEST_NUMERICAL_PRECISION_IN_LINEAR: os.environ.get("MLPERF_LINEAR_PRECISION", ""),
+            self.constants.LOWEST_NUMERICAL_PRECISION_IN_ATTN: os.environ.get("MLPERF_ATTN_PRECISION", ""),
+            self.constants.LOWEST_NUMERICAL_PRECISION_IN_COMM: os.environ.get("MLPERF_COMM_PRECISION", ""),
             # Generation parallelism
             "generation_backend": generation_cfg.get("backend"),
             "generation_tensor_parallelism": backend_cfg.get("tensor_parallel_size"),

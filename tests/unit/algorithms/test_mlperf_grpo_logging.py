@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any
+from unittest.mock import patch
 
 from nemo_rl.algorithms.mlperf_grpo_logging import (
     MLPerfGRPOLogger,
@@ -212,6 +214,33 @@ def test_mlperf_grpo_logger_tracks_lifecycle_and_target() -> None:
             "metadata": {},
         }
     ]
+
+
+def test_mlperf_grpo_logger_discloses_precision_and_config() -> None:
+    fake = _FakeMLLogger()
+    logger = MLPerfGRPOLogger(_config(), mllogger=fake)
+    with patch.dict(
+        os.environ,
+        {
+            "DGXSYSTEM": "GB300_reference",
+            "MLPERF_LINEAR_PRECISION": "fp8",
+            "MLPERF_ATTN_PRECISION": "bfloat16",
+            "MLPERF_COMM_PRECISION": "bfloat16",
+        },
+    ):
+        logger.log_hyperparams(train_dataset=range(700), val_dataset=range(251))
+
+    for key, value in {
+        "config_filename": "config_GB300_reference.sh",
+        "lowest_numerical_precision_in_linear": "fp8",
+        "lowest_numerical_precision_in_attn": "bfloat16",
+        "lowest_numerical_precision_in_comm": "bfloat16",
+    }.items():
+        assert [
+            kwargs["value"]
+            for method, kwargs in fake.calls
+            if method == "event" and kwargs.get("key") == key
+        ] == [value]
 
 
 def test_mlperf_grpo_logger_allows_disabled_target() -> None:

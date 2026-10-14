@@ -8,6 +8,11 @@ export RECIPE=${RECIPE:-qwen_35/configs/grpo_qwen35_397b_swe_openhands_async_gbs
 export MLPERF_TARGET_ACCURACY=${MLPERF_TARGET_ACCURACY:-1.0}
 export MLPERF_BENCHMARK_NAME=qwen35_397b_grpo
 
+# Lowest numerical precision used, logged for MLPerf compliance.
+export MLPERF_LINEAR_PRECISION="bfloat16"
+export MLPERF_ATTN_PRECISION="bfloat16"
+export MLPERF_COMM_PRECISION="bfloat16"
+
 # Idle-GPU reaper exemption: async GRPO idles the training pool while the
 # replay buffer fills from slow SWE rewards. sbatch reads SBATCH_COMMENT at
 # submission; an explicit --comment overrides it.
