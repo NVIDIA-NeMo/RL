@@ -44,6 +44,8 @@ debug_subagent_prompt+="Return only their paths and counts in at most four short
 export AGENTIC_VBENCH_SUBAGENT_PROMPT=${AGENTIC_VBENCH_SUBAGENT_PROMPT:-"${debug_subagent_prompt}"}
 export BASE_NAME=${BASE_NAME:-agentic_vbench_v2_subagents_async_16n_$(date -u +%Y%m%d-%H%M%S)-$$}
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$BASE_NAME}
+export WANDB_PROJECT=nemorl-v2-subagent-comapction-debug
+export WANDB_ENTITY=${WANDB_ENTITY:-adlr}
 # Super-GA is MoE: preserve generation-time expert routes when Megatron scores
 # and trains stale async rows. Trace the first two steps; never mask bad TMPE.
 export NRL_ROUTER_REPLAY_VALIDATE=${NRL_ROUTER_REPLAY_VALIDATE:-1}
