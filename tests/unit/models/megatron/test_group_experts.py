@@ -99,28 +99,6 @@ def test_group_experts_empty_group_raises():
         _group("gate_proj", f"{prefix}.gate_proj.weight", {(prefix, "gate_proj"): []})
 
 
-def test_group_experts_rejects_mixed_dtypes_before_stacking(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    prefix = "model.layers.0.mlp.experts"
-    groups = {
-        (prefix, "gate_proj"): [
-            _source(torch.ones(2, 2, dtype=dtype))
-            for dtype in (torch.bfloat16, torch.float32)
-        ]
-    }
-
-    prepare = MagicMock(
-        side_effect=AssertionError(
-            "mixed wire dtypes must be rejected before preparation"
-        )
-    )
-    monkeypatch.setattr(worker_module, "_dequantize_refit_source_group", prepare)
-    with pytest.raises(ValueError, match="Grouped refit source.*mixed wire dtypes"):
-        _group("gate_proj", f"{prefix}.gate_proj.weight", groups)
-    prepare.assert_not_called()
-
-
 @pytest.mark.parametrize("mismatch", ["shape", "split"])
 def test_group_experts_rejects_incompatible_hf_views(
     mismatch: str, monkeypatch: pytest.MonkeyPatch

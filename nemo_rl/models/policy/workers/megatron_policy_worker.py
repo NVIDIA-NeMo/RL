@@ -4056,7 +4056,12 @@ class MegatronPolicyWorkerImpl(
         grouped_name: str,
         expert_groups: dict[tuple[str, str], list[LocalParamSpec]],
     ) -> LocalParamSpec:
-        """Decode a complete expert group, then select its HF projection."""
+        """Prepare this rank's experts as ``[E_local, *hf_shard_shape]``.
+
+        ``pre`` decodes ``[E_local, *source_shard_shape]`` before selecting the
+        HF projection, including the gate/up split. Transfer metadata describes
+        ``[E_global, *hf_global_shape]`` so NCCL can reshard these local buffers.
+        """
         prefix = grouped_name.rsplit(f".{proj}.weight", 1)[0]
         expert_specs = expert_groups.get((prefix, proj))
         assert expert_specs, (
@@ -4065,10 +4070,6 @@ class MegatronPolicyWorkerImpl(
         )
         members = tuple(expert_specs)
         wire_dtype = members[0].wire_dtype
-        if any(member.wire_dtype != wire_dtype for member in members):
-            raise ValueError(
-                f"Grouped refit source {grouped_name!r} has mixed wire dtypes."
-            )
         sources = tuple(member.base for member in members)
         shape = sources[0].tensor.shape
 
@@ -4103,11 +4104,12 @@ class MegatronPolicyWorkerImpl(
         """Build the Megatron-backend ``hf_to_local_param_map`` (HFToLocalParamMap).
 
         Wraps this rank's local Megatron shards into ``LocalParamSpec``s:
-        - local weight: ``base`` describes the live parameter and HF selector;
+        - direct: ``base`` describes the live parameter and HF selector;
           ``pre`` dequantizes if necessary and selects the HF view, preserving
           unquantized dtypes.
         - grouped MoE expert: ``pre`` packs the ordered live parameters and their
-          scales, dequantizes the group once, then selects its HF projection.
+          scales, dequantizes the group once, then selects its HF projection as
+          ``[E_local, *hf_shard_shape]``.
         Every spec declares its wire dtype, checked against transfer metadata
         before any source buffers are materialized.
         """

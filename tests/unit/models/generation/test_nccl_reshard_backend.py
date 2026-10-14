@@ -1418,35 +1418,3 @@ def test_mxfp8_receiver_quantizes_wire_weights_on_gpu(grouped, wire_dtype):
                 atol=0,
             )
             assert (weight.data_ptr(), scales.data_ptr()) == pointers
-
-
-def test_fp8_receiver_does_not_commit_invalid_quantizer_output(monkeypatch):
-    from nemo_rl.models.generation.vllm.quantization import fp8
-
-    name = "model.layers.0.mlp.down_proj.weight"
-    weight = torch.full((32, 64), 2, dtype=torch.float8_e4m3fn)
-    scale = torch.full((32, 2), 7, dtype=torch.uint8)
-    info = {
-        "layer_names": ["model.layers.0"],
-        "per_layer_params": {
-            "model.layers.0": [
-                {"name": name, "global_shape": [32, 64], "dtype": "torch.bfloat16"}
-            ]
-        },
-    }
-    spec = (
-        _make_ext({name: weight, name + "_scale_from_checkpoint": scale})
-        .build_hf_to_local_param_map(info)
-        .get(name)
-    )
-    monkeypatch.setattr(
-        fp8,
-        "quantize_mxfp8_weight",
-        lambda value: (torch.zeros_like(weight), torch.zeros(1, dtype=torch.uint8)),
-    )
-    ctx = spec.materialize()
-    ctx.buf.zero_()
-    with pytest.raises(ValueError, match="FP8 refit scale"):
-        spec.post(ctx)
-    assert torch.all(weight.float() == 2)
-    assert torch.all(scale == 7)

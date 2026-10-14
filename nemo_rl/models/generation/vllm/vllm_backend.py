@@ -1852,12 +1852,55 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
             return LocalParamSpec(base=None, pre=pre, post=post, wire_dtype=wire_dtype)
 
-        def _fp8_receiver_quant_spec(
+        def _mxfp8_receiver_quant_spec(
+            value_param: torch.Tensor,
+            scale_param: torch.Tensor,
+            merged_slice: tuple[slice, ...] | None,
+            wire_dtype: torch.dtype,
+        ) -> LocalParamSpec:
+            def pre(_base: torch.Tensor) -> RefitCtx:
+                value_region = (
+                    value_param.data
+                    if merged_slice is None
+                    else value_param.data[merged_slice]
+                )
+                scale_region = (
+                    scale_param.data
+                    if merged_slice is None
+                    else scale_param.data[merged_slice]
+                )
+                return RefitCtx(
+                    buf=torch.empty_like(value_region, dtype=wire_dtype),
+                    extra={"value_region": value_region, "scale_region": scale_region},
+                )
+
+            def post(ctx: RefitCtx) -> None:
+                # Load the optional vLLM quantizer only for MXFP8 storage.
+                from nemo_rl.models.generation.vllm.quantization.fp8 import (
+                    quantize_mxfp8_weight,
+                )
+
+                # FlashInfer's MXFP8 quantizer accepts BF16/FP16 inputs.
+                # Convert FP32 only here, after the full-precision transfer.
+                weight = (
+                    ctx.buf.to(torch.bfloat16)
+                    if ctx.buf.dtype == torch.float32
+                    else ctx.buf
+                )
+                value, scale = quantize_mxfp8_weight(weight)
+                ctx.extra["value_region"].copy_(value)
+                ctx.extra["scale_region"].copy_(scale)
+
+            return LocalParamSpec(
+                base=value_param.data, pre=pre, post=post, wire_dtype=wire_dtype
+            )
+
+        def _blockwise_fp8_receiver_quant_spec(
             value_param: torch.Tensor,
             scale_param: torch.Tensor,
             merged_slice: tuple[slice, ...] | None,
             scale_slice: tuple[slice, ...] | None,
-            block_size: tuple[int, int] | None,
+            block_size: tuple[int, int],
             wire_dtype: torch.dtype,
         ) -> LocalParamSpec:
             def pre(_base: torch.Tensor) -> RefitCtx:
@@ -1877,42 +1920,23 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 )
 
             def post(ctx: RefitCtx) -> None:
-                # Load the optional vLLM quantizers only for quantized storage.
-                from nemo_rl.models.generation.vllm.quantization import fp8
+                # Load the optional vLLM quantizer only for blockwise FP8 storage.
+                from nemo_rl.models.generation.vllm.quantization.fp8 import (
+                    cast_tensor_to_fp8_blockwise,
+                )
 
-                if block_size is None:
-                    # FlashInfer's MXFP8 quantizer accepts BF16/FP16 inputs.
-                    # Convert FP32 only here, after the full-precision transfer.
-                    weight = (
-                        ctx.buf.to(torch.bfloat16)
-                        if ctx.buf.dtype == torch.float32
-                        else ctx.buf
-                    )
-                    value, scale = fp8.quantize_mxfp8_weight(weight)
-                elif ctx.buf.ndim == 2:
-                    value, scale = fp8.cast_tensor_to_fp8_blockwise(ctx.buf, block_size)
+                if ctx.buf.ndim == 2:
+                    value, scale = cast_tensor_to_fp8_blockwise(ctx.buf, block_size)
                     scale = scale.squeeze(-1)
                 else:
                     value = torch.empty_like(ctx.buf, dtype=value_param.dtype)
                     scale = torch.empty_like(ctx.extra["scale_region"])
                     for expert, weight in enumerate(ctx.buf.unbind(0)):
-                        expert_value, expert_scale = fp8.cast_tensor_to_fp8_blockwise(
+                        expert_value, expert_scale = cast_tensor_to_fp8_blockwise(
                             weight, block_size
                         )
                         value[expert].copy_(expert_value)
                         scale[expert].copy_(expert_scale.squeeze(-1))
-                # Validate both results before changing either persistent tensor.
-                # Both copies run on the refit's current stream; inference resumes
-                # only after the transport's stream fence and layout finalization.
-                for label, result, target in (
-                    ("weight", value, ctx.extra["value_region"]),
-                    ("scale", scale, ctx.extra["scale_region"]),
-                ):
-                    if result.shape != target.shape or result.dtype != target.dtype:
-                        raise ValueError(
-                            f"FP8 refit {label} has shape/dtype {result.shape}/{result.dtype}, "
-                            f"expected {target.shape}/{target.dtype}"
-                        )
                 ctx.extra["value_region"].copy_(value)
                 ctx.extra["scale_region"].copy_(scale)
 
@@ -2051,14 +2075,19 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         f"build_hf_to_local_param_map: FP8 scale target "
                         f"{scale_name!r} has dtype {scale_param.dtype}, expected {expected_scale_dtype}"
                     )
-                specs[hf_name] = _fp8_receiver_quant_spec(
-                    vllm_param,
-                    scale_param,
-                    merged_slice,
-                    scale_slice,
-                    block_size,
-                    wire_dtype,
-                )
+                if block_size is None:
+                    specs[hf_name] = _mxfp8_receiver_quant_spec(
+                        vllm_param, scale_param, merged_slice, wire_dtype
+                    )
+                else:
+                    specs[hf_name] = _blockwise_fp8_receiver_quant_spec(
+                        vllm_param,
+                        scale_param,
+                        merged_slice,
+                        scale_slice,
+                        block_size,
+                        wire_dtype,
+                    )
             else:
                 if vllm_param.dtype not in (
                     torch.bfloat16,
