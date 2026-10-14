@@ -35,6 +35,7 @@ from nemo_rl.telemetry.host_memory import (
     forget_worker_group_nodes,
     register_worker_group_placement,
 )
+from nemo_rl.telemetry.vocabulary import WORKER_GROUP_ENV
 from nemo_rl.utils.venvs import (
     add_hf_modules_cache_to_pythonpath,
     create_local_venv_on_each_node,
@@ -632,7 +633,7 @@ class RayWorkerGroup:
                         # RANK is group-local, so it alone cannot tell a policy
                         # worker from a generation worker. Observability consumers
                         # need the group to disambiguate them.
-                        "NRL_WORKER_GROUP": self.name_prefix,
+                        WORKER_GROUP_ENV: self.name_prefix,
                     }
                 )
                 # Remove Ray-specific environment variables, let the worker itself set them.

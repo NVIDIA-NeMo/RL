@@ -44,6 +44,16 @@ METRIC_NAME_PREFIX = "rl."
 #: Efficiency category covering startup, measured once before the training loop.
 INIT_TOTAL_CATEGORY = "init/total"
 
+#: Env var ``RayWorkerGroup`` exports so a worker's spans carry
+#: ``rl.worker_group``; telemetry reads it back when setting a worker up.
+WORKER_GROUP_ENV = "NRL_WORKER_GROUP"
+
+#: Keys ``algorithms/utils.py`` writes the efficiency ratio under and telemetry
+#: reads back. Named here, not at either end, because a rename on one side
+#: alone would leave the metric reading nothing with no error.
+EFFICIENCY_PCT_KEY = "efficiency/efficiency_pct"
+EFFICIENCY_PCT_PER_STEP_KEY = "efficiency/efficiency_pct_is_per_step"
+
 # Wall-clock categories whose value covers the whole run rather than one step.
 # The driver's Timer is reset every step, so its idle categories are per-step
 # deltas -- but init/total is measured once before the loop and republished

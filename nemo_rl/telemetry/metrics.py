@@ -51,6 +51,8 @@ from nemo_rl.telemetry.instrumentation import (
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.vocabulary import (
+    EFFICIENCY_PCT_KEY,
+    EFFICIENCY_PCT_PER_STEP_KEY,
     RUN_WINDOW_WALL_CLOCK_CATEGORIES,
     as_scalar,
     freeze_metrics,
@@ -123,8 +125,6 @@ RL_SETUP_PHASE_ATTR = "rl.setup.phase"
 # Keys that ``print_efficiency_summary`` puts in the Logger dict.
 _EFFICIENCY_KEY_PREFIX = "efficiency/"
 _EFFICIENCY_SECONDS_SUFFIX = "_s"
-_EFFICIENCY_PCT_KEY = "efficiency/efficiency_pct"
-_EFFICIENCY_PCT_PER_STEP_KEY = "efficiency/efficiency_pct_is_per_step"
 
 # --- lens metric registry -------------------------------------------------
 #
@@ -448,7 +448,7 @@ def _tee_efficiency_metrics(meter: Meter, metrics: dict[str, Any]) -> None:
     """Emit the ``efficiency/*`` phase durations as ``rl.efficiency.*``."""
     measurement_by_category = efficiency_measurements()
     seconds = map_efficiency_seconds(metrics, measurement_by_category)
-    pct = as_scalar(metrics.get(_EFFICIENCY_PCT_KEY))
+    pct = as_scalar(metrics.get(EFFICIENCY_PCT_KEY))
     if not seconds and pct is None:
         return
 
@@ -472,7 +472,7 @@ def _tee_efficiency_metrics(meter: Meter, metrics: dict[str, Any]) -> None:
         # per-step one -- and defaulting to the run window when the flag is
         # absent, since mislabelling a run ratio as per-step is the harmful
         # direction.
-        is_per_step = as_scalar(metrics.get(_EFFICIENCY_PCT_PER_STEP_KEY))
+        is_per_step = as_scalar(metrics.get(EFFICIENCY_PCT_PER_STEP_KEY))
         _record(
             meter,
             {_EFFICIENCY_PCT_KEY_REGISTRY: pct},

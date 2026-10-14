@@ -165,6 +165,7 @@ from nemo_rl.telemetry.instrumentation import (
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.vocabulary import INIT_TOTAL_CATEGORY, WORKER_GROUP_ENV
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -5045,7 +5046,7 @@ def async_grpo_train(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
         extra_env_vars={
             # Names this actor's spans the way RayWorkerGroup names its groups'.
-            "NRL_WORKER_GROUP": "trajectory_collector",
+            WORKER_GROUP_ENV: "trajectory_collector",
         },
     )
 
@@ -5221,8 +5222,8 @@ def async_grpo_train(
     # rather than only as a scalar. Unbucketed by construction (see
     # UNBUCKETED_SPAN_CATEGORIES): the generation fleet is busy for this whole
     # window, and its spans join this trace.
-    with efficiency_span("init/total", tracer=_tracer):
-        timer.start("init/total")
+    with efficiency_span(INIT_TOTAL_CATEGORY, tracer=_tracer):
+        timer.start(INIT_TOTAL_CATEGORY)
         wait_iterations = 0
         while True:
             buffer_size_current = ray.get(replay_buffer.size.remote())
@@ -5286,7 +5287,7 @@ def async_grpo_train(
 
         # Retained because the per-step timer.reset() below discards it; the
         # efficiency snapshot re-supplies it every step.
-        init_total_s = timer.stop("init/total")
+        init_total_s = timer.stop(INIT_TOTAL_CATEGORY)
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
@@ -6246,7 +6247,7 @@ def async_grpo_train(
             # at the end of every step drops it -- so re-supply the captured
             # value, or the series reports the real startup cost at step 1 and
             # zero for the rest of the run.
-            driver_efficiency["init/total"] = init_total_s
+            driver_efficiency[INIT_TOTAL_CATEGORY] = init_total_s
             merged_efficiency = {**driver_efficiency}
             for cat, dur in collector_efficiency.items():
                 merged_efficiency[cat] = merged_efficiency.get(cat, 0.0) + dur

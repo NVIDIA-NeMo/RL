@@ -468,12 +468,8 @@ class CheckpointManager:
         self.finalize_pending()
         self._pending_checkpoint_path = Path(checkpoint_path)
         self._finalize_error = None
-        # The step reaches here only in the staging directory's name, which
-        # ``init_tmp_checkpoint`` formats as ``tmp_step_{step}``; read back the
-        # same way :meth:`_rename_checkpoint` reads it, rather than adding a
-        # second spelling of the same parse to this file. Guarded and dropped
-        # to None on anything unexpected, since this only labels a span and a
-        # checkpoint staged under some other name must still be finalized.
+        # The step is only in the staging dir name (tmp_step_<n>); None if it
+        # does not parse, since this only labels a span.
         try:
             step = int(Path(checkpoint_path).name.split("_")[2])
         except (IndexError, ValueError):

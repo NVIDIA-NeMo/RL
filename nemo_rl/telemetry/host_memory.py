@@ -88,12 +88,18 @@ RL_WORKER_GROUPS_ATTR = "rl.worker_groups"
 #: been built yet when the sample is taken.
 NO_WORKER_GROUPS = "none"
 
+#: Ray's own series names, public because ``RayGpuMonitorLogger`` reads the
+#: same two for the W&B path. Typed once: renaming only one side would leave
+#: this module matching nothing and its series silently empty.
+RAY_NODE_MEM_USED = "ray_node_mem_used"
+RAY_NODE_MEM_TOTAL = "ray_node_mem_total"
+
 #: Prometheus series published by each raylet, and the key each is recorded
 #: against. Bytes already, despite the GB the W&B path reports: that divides by
 #: 1024**3 on the way out.
 _SERIES_BY_RAY_NAME = {
-    "ray_node_mem_used": RL_HOST_MEMORY_USED_METRIC,
-    "ray_node_mem_total": RL_HOST_MEMORY_TOTAL_METRIC,
+    RAY_NODE_MEM_USED: RL_HOST_MEMORY_USED_METRIC,
+    RAY_NODE_MEM_TOTAL: RL_HOST_MEMORY_TOTAL_METRIC,
 }
 
 _USED_KEY = registry_key(RL_HOST_MEMORY_USED_METRIC)
@@ -339,7 +345,15 @@ def parse_memory_samples(metrics_text: str) -> dict[str, float]:
     hundreds, and only the two in :data:`_SERIES_BY_RAY_NAME` are wanted.
     """
     values: dict[str, float] = {}
-    for family in text_string_to_metric_families(metrics_text):
+    # Parsing costs ~16 us a line and only two series are wanted, so drop the
+    # other lines first; each kept series keeps its HELP/TYPE lines.
+    wanted = tuple(_SERIES_BY_RAY_NAME)
+    kept = "\n".join(
+        line
+        for line in metrics_text.splitlines()
+        if line.removeprefix("# HELP ").removeprefix("# TYPE ").startswith(wanted)
+    )
+    for family in text_string_to_metric_families(kept):
         for sample in family.samples:
             name = _SERIES_BY_RAY_NAME.get(sample.name)
             if name is None:
@@ -415,24 +429,13 @@ class HostMemoryMonitor:
         handle = get_telemetry_handle()
         if handle is None or not handle.is_exporting:
             return
-        # Scraped on this thread rather than inside the callbacks so that the
-        # exporter never blocks on HTTP: a callback that waits on an
-        # unreachable node would hold up every other metric in the process, and
-        # the wait scales with the size of the cluster.
-        # Accumulated per host rather than per node, because the number is the
-        # host's: several raylets on one box -- a local multi-node setup -- each
-        # publish the same whole-host memory on their own endpoint. Keyed by
-        # node that would be two points carrying one host.name, which double
-        # counts under `sum by (host.name)` and contradicts the one-point-per-
-        # host reading the attribute is documented to have.
+        # Scraped here, not in the callbacks, so the exporter never waits on HTTP.
+        # Keyed by host, not node: raylets on one box all report the same memory.
         values_by_host: dict[str, dict[str, float]] = {}
         groups_by_host: dict[str, set[str]] = {}
         for node in ray_nodes():
-            # Between nodes, so stopping costs the scrape in flight rather than
-            # the rest of the cluster: this loop is one scrape timeout per node
-            # and runs them in sequence, which on a large cluster is minutes.
-            # Returning without publishing is the point -- a partial sweep would
-            # end the series of every host it had not reached yet.
+            # Checked between nodes; return without publishing, or unreached
+            # hosts' series end.
             if self._stop.is_set():
                 return
             groups_by_host.setdefault(node.host, set()).update(
@@ -448,12 +451,8 @@ class HostMemoryMonitor:
             for host, values in values_by_host.items()
         }
         with _SNAPSHOT_LOCK:
-            # Replaced, not merged: a host that has dropped out of the cluster
-            # or changed its worker-group label must stop being reported under
-            # the old one, and leaving the old key in would be the stale series
-            # this design exists to avoid. The cost is that a node which fails
-            # one scrape has a gap until the next, rather than a flat line at
-            # its last known value -- which is the honest reading anyway.
+            # Replaced, not merged, so a host that left or changed label stops
+            # reporting.
             _SNAPSHOT.clear()
             _SNAPSHOT.update(sampled)
 
@@ -552,10 +551,6 @@ def stop_host_memory_monitoring() -> None:
         monitor.stop()
     except Exception:
         warn_once("host_memory_stop", "could not stop host memory monitoring")
-    # Outside the guard: the callbacks stay registered for the life of the
-    # process -- OTel has no way to detach an observable instrument -- so a
-    # snapshot left behind here would keep being exported by every cycle after
-    # the monitor that produced it stopped, which is exactly the frozen series
-    # the observable kinds were chosen to avoid.
+    # Outside the guard: the callbacks outlive the monitor and would export this.
     with _SNAPSHOT_LOCK:
         _SNAPSHOT.clear()

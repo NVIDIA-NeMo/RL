@@ -47,6 +47,10 @@ import threading
 import uuid
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, cast
 
+# The one nemo_rl import at module scope: vocabulary imports nothing from
+# nemo_rl, so it cannot close a cycle with the modules that import this one.
+from nemo_rl.telemetry.vocabulary import WORKER_GROUP_ENV
+
 if TYPE_CHECKING:
     from nemo.lens import TelemetryHandle
 
@@ -64,9 +68,6 @@ _TELEMETRY_INITIALISED = False
 _OTEL_PREFIX = "NEMO_RL_OTEL"
 _OTEL_FALLBACK_PREFIX = "NEMO_LENS"
 _RUN_ID_ENV = f"{_OTEL_PREFIX}_RUN_ID"
-
-# Set per worker by ``RayWorkerGroup`` from the group's ``name_prefix``.
-_WORKER_GROUP_ENV = "NRL_WORKER_GROUP"
 
 # Reported as ``nv.dl.provider.name``: which training framework produced this
 # telemetry, for a backend collecting several of them. Spelled like the default
@@ -384,11 +385,8 @@ def _software_versions() -> dict[str, Any]:
     else:
         attrs[NV_DL_SOFTWARE_NCCL] = ".".join(str(part) for part in nccl_version)
 
-    # Read from the installed distribution's metadata rather than by importing
-    # the package. Importing transformer-engine pulls in its PyTorch extension,
-    # which is seconds of work and a chunk of memory in every process that sets
-    # up telemetry, and which raises ``OSError`` rather than ``ImportError``
-    # when the shared library will not load against the driver present.
+    # Metadata, not import: importing transformer-engine is slow and can raise
+    # OSError.
     try:
         te_version = importlib.metadata.version("transformer-engine")
     except importlib.metadata.PackageNotFoundError:
@@ -441,12 +439,8 @@ def _process_attributes(rank: int, world_size: int, run_id: str = "") -> dict[st
     local_rank = os.environ.get("LOCAL_RANK", "").strip()
     if local_rank.isdigit():
         attrs[NV_DL_LOCAL_RANK] = int(local_rank)
-    # Derived rather than set to ``run_id`` itself, which is already reported
-    # as lens's ``nemo.run.id``. ``nv.dl.run.uuid`` is a uuid5 over the
-    # scheduler's identity for this attempt, and a backend grouping RL runs
-    # with Megatron ones joins on that; a raw run id in the same key would
-    # match nothing. Returns None off a scheduler with no run id to fall back
-    # on, which cannot happen here but is handled rather than asserted.
+    # uuid5 of the run id, not the raw id: backends join RL and Megatron runs
+    # on it.
     run_uuid = derive_nv_dl_run_uuid(run_id=run_id) if run_id else None
     if run_uuid:
         attrs[NV_DL_RUN_UUID] = run_uuid
@@ -541,32 +535,13 @@ def init_telemetry_driver(
             start_host_memory_monitoring,
         )
 
-        # Here rather than in ``Logger`` beside the GPU monitor, even though the
-        # two sample the same endpoints: the host-memory series is labelled with
-        # the worker groups each node holds, and that map is a module global
-        # visible only to the process that wrote it. The driver is where almost
-        # every worker group is built, so it is where the monitor sees the most.
-        # The single-controller entry points run their ``Logger`` inside the
-        # controller actor, which would label every host as holding no group.
+        # Here, not in ``Logger``: the worker-group map is a module global, and
+        # the driver is the process that builds almost every group. Almost --
+        # ``RewardModelEnvironment`` builds its ``Policy`` in its own actor, so
+        # its hosts report ``rl.worker_groups="none"``; see metrics.md.
         #
-        # Not every group, though: ``RewardModelEnvironment`` is itself a Ray
-        # actor and builds its ``Policy`` there, so that group registers in the
-        # actor's copy of the map and the driver never learns about it. Its
-        # hosts report ``rl.worker_groups="none"``. The memory is still right --
-        # the label is what is incomplete -- and making it complete means
-        # sharing the map across processes, which is a named actor and a round
-        # trip per sample for a descriptive label. Documented instead.
-        #
-        # Shares the GPU monitor's cadence so the two line up on a dashboard,
-        # read from the logger config rather than restated -- but not *gated* on
-        # ``monitor_gpus``, which decides what reaches W&B and has no business
-        # deciding whether an OTel series exists.
-        #
-        # The fallback is for the entry points whose config carries no logger
-        # block at all (eval). Spelled here rather than read from
-        # ``GPUMonitoringConfig``: importing that means importing
-        # ``nemo_rl.utils.logger``, which pulls mlflow, wandb and the rest of
-        # the logging stack into telemetry startup for one float.
+        # Not gated on monitor_gpus: that decides what reaches W&B, not OTel.
+        # The fallback covers the entry points with no logger block at all.
         interval = _dig(
             master_config, "logger", "gpu_monitoring", "collection_interval"
         )
@@ -620,7 +595,7 @@ def _worker_resource_attributes(
         _CAMPAIGN_STAGE_ATTR: os.environ.get(_CAMPAIGN_STAGE_ENV, "").strip()
         or _DEFAULT_CAMPAIGN_STAGE
     }
-    group = worker_group or os.environ.get(_WORKER_GROUP_ENV, "").strip()
+    group = worker_group or os.environ.get(WORKER_GROUP_ENV, "").strip()
     if group:
         attrs[_WORKER_GROUP_ATTR] = group
     if extra:
@@ -696,7 +671,7 @@ def init_telemetry_worker(
         handle = setup_telemetry(config, resource_attributes=attrs)
         logger.info(
             "nemo-lens worker telemetry initialised (group=%s, rank=%s/%s, exporting=%s)",
-            os.environ.get(_WORKER_GROUP_ENV, "?"),
+            os.environ.get(WORKER_GROUP_ENV, "?"),
             rank,
             world_size,
             handle.is_exporting,

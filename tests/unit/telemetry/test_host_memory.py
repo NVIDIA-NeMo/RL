@@ -48,6 +48,9 @@ ray_node_mem_total{{SessionName="s"}} {_TOTAL_BYTES}
 # HELP ray_node_cpu_utilization CPU percentage.
 # TYPE ray_node_cpu_utilization gauge
 ray_node_cpu_utilization{{SessionName="s"}} 42.0
+# HELP ray_node_mem_used_percent Share of memory in use.
+# TYPE ray_node_mem_used_percent gauge
+ray_node_mem_used_percent{{SessionName="s"}} 3.0
 """
 
 
@@ -141,7 +144,11 @@ def _start_exporting_telemetry():
 
 
 def test_only_the_two_node_memory_series_are_read():
-    """A raylet publishes hundreds of series; all but two are noise here."""
+    """A raylet publishes hundreds of series; all but two are noise here.
+
+    ``ray_node_mem_used_percent`` is the near miss that matters: the parser
+    drops most lines on a prefix before parsing them, and that prefix keeps it.
+    """
     assert parse_memory_samples(_SCRAPE) == {
         "host_memory_used": _USED_BYTES,
         "host_memory_total": _TOTAL_BYTES,
