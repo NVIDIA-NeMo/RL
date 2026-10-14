@@ -565,6 +565,22 @@ def _needs_hf_refit_handshake(
     return not (nccl_reshard_refit_enabled and not colocated_inference)
 
 
+def _managed_refit_timeout_s(
+    generation_config: Any, *, nccl_reshard_refit_enabled: bool
+) -> Optional[float]:
+    """Deadline for one non-colocated refit set up by the managed path.
+
+    Managed Dynamo reaches its engines over HTTP, so a generation-side failure can
+    return early while the trainers sit in NCCL waiting for it. Under nccl_reshard the
+    worker extension enforces a deadline on both sides; reuse the Dynamo control
+    timeout so the trainers abort instead of hanging. Dynamo's built-in collective
+    refit cannot enforce one, and every other backend keeps its current behavior.
+    """
+    if generation_config["backend"] == "dynamo" and nccl_reshard_refit_enabled:
+        return generation_config["dynamo_cfg"]["control_timeout_s"]
+    return None
+
+
 def _uses_managed_noncolocated_refit(
     generation_backend: str,
     nccl_reshard_refit_enabled: bool,
@@ -1885,12 +1901,14 @@ def setup(
     if refit_transport is not None and not (
         backend == "vllm"
         or (backend == "megatron" and refit_transport in ("mcore", "nccl_reshard"))
+        or (backend == "dynamo" and refit_transport == "nccl_reshard")
     ):
         raise NotImplementedError(
             f"refit_transport={refit_transport!r} is not supported for "
             f"policy.generation.backend={backend!r}. "
             "Set policy.generation.refit_transport=null. Megatron generation "
-            "supports refit_transport='mcore' or 'nccl_reshard'."
+            "supports refit_transport='mcore' or 'nccl_reshard'; Dynamo "
+            "generation supports 'nccl_reshard'."
         )
 
     if backend == "megatron":
@@ -1921,6 +1939,10 @@ def setup(
                 colocated=False,
                 train_cluster=train_cluster,
                 inference_cluster=inference_cluster,
+                refit_timeout_s=_managed_refit_timeout_s(
+                    generation_config,
+                    nccl_reshard_refit_enabled=nccl_reshard_refit_enabled,
+                ),
             )
             policy_generation.weight_synchronizer.init_communicator()
         else:

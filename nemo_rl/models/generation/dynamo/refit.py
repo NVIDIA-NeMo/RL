@@ -20,6 +20,7 @@ from typing import Any
 
 import ray
 
+from nemo_rl.distributed.refit_watchdog import REFIT_ABORTED_TOKEN, RefitAborted
 from nemo_rl.models.generation.dynamo.config import (
     VLLM_PACKED_BUFFER_SIZE_BYTES,
     VLLM_PACKED_NUM_BUFFERS,
@@ -29,6 +30,19 @@ from nemo_rl.models.generation.dynamo.http_client import (
     http_post_json,
 )
 from nemo_rl.models.generation.interfaces import CollectiveSenderSpec
+from nemo_rl.utils.staged_payload import encode_staged_payload
+from nemo_rl.weight_sync.membership import RefitMembership
+
+# Dynamo's per-worker admin routes. Setup calls go to the init route, whose server
+# side kills the worker if the call outlives DYN_RL_INIT_WEIGHTS_TIMEOUT_S; refits go
+# to the update route, which has no server deadline.
+_INIT_ROUTE = "init_weights_update_group"
+_UPDATE_ROUTE = "update_weights_from_distributed"
+# Margin past the server's init deadline, so the client never gives up first and
+# leaves a worker that is about to exit looking merely slow.
+_INIT_ROUTE_CLIENT_MARGIN_S = 30.0
+# Margin past a refit's own deadline for the HTTP call that carries it.
+_REFIT_CLIENT_MARGIN_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -46,7 +60,30 @@ class DynamoWorkerEndpoint:
         )
 
 
-@ray.remote(num_cpus=0)
+def _post_route(
+    system_url: str, route: str, payload: dict[str, Any], timeout_s: float
+) -> None:
+    """POST one admin route and raise unless Dynamo reports success.
+
+    A refit the NeMo RL extension aborted reaches Dynamo as a plain exception and
+    comes back only as its message, so it is re-raised as RefitAborted here.
+    """
+    response = http_post_json(f"{system_url}/engine/{route}", payload, timeout_s)
+    if response.get("status") == "ok":
+        return
+    message = (
+        f"Dynamo worker {system_url} route {route} "
+        f"(engine_rpc={payload.get('engine_rpc')}) failed: "
+        f"{format_dynamo_error(response)}"
+    )
+    if REFIT_ABORTED_TOKEN in message:
+        raise RefitAborted(message)
+    raise RuntimeError(message)
+
+
+# No retries: re-POSTing a collective call after a worker died can never complete,
+# and would hold the engine's admin lock behind a call nobody else will join.
+@ray.remote(num_cpus=0, max_retries=0)
 def _post_worker_route(  # pragma: no cover
     *,
     system_url: str,
@@ -54,16 +91,34 @@ def _post_worker_route(  # pragma: no cover
     payload: dict[str, Any],
     timeout_s: float,
 ) -> bool:
-    response = http_post_json(
-        f"{system_url}/engine/{route}",
-        payload,
-        timeout_s,
-    )
-    if response.get("status") != "ok":
-        raise RuntimeError(
-            f"Dynamo worker {system_url} route {route} failed: "
-            f"{format_dynamo_error(response)}"
+    _post_route(system_url, route, payload, timeout_s)
+    return True
+
+
+@ray.remote(num_cpus=0, max_retries=0)
+def _stage_and_post_worker_route(  # pragma: no cover
+    *,
+    system_url: str,
+    key: str,
+    chunks: Sequence[str],
+    payload: dict[str, Any],
+    timeout_s: float,
+) -> bool:
+    """Send a staged payload chunk by chunk, then the call that consumes it."""
+    for index, data in enumerate(chunks):
+        _post_route(
+            system_url,
+            _INIT_ROUTE,
+            {
+                "engine_rpc": "nrl_stage_chunk",
+                "key": key,
+                "index": index,
+                "total": len(chunks),
+                "data": data,
+            },
+            timeout_s,
         )
+    _post_route(system_url, _INIT_ROUTE, payload, timeout_s)
     return True
 
 
@@ -151,6 +206,134 @@ class DynamoRefitChannel:
     @property
     def inference_world_size(self) -> int:
         return len(self._workers) * self._engine_world_size
+
+    @property
+    def num_engines(self) -> int:
+        return len(self._workers)
+
+    @property
+    def _init_timeout_s(self) -> float:
+        return self._control_timeout_s + _INIT_ROUTE_CLIENT_MARGIN_S
+
+    def check_full_fleet(self, membership: RefitMembership) -> None:
+        """Reject any membership but every engine, in order: the fleet is fixed."""
+        full_fleet = {
+            index: index * self._engine_world_size for index in range(self.num_engines)
+        }
+        if (
+            membership.shard_prefixes != full_fleet
+            or membership.workers_per_shard != self._engine_world_size
+        ):
+            raise NotImplementedError(
+                "Managed Dynamo has a fixed worker fleet; refit membership must be "
+                f"every engine {full_fleet} with {self._engine_world_size} ranks "
+                f"each, got {membership.shard_prefixes} with "
+                f"{membership.workers_per_shard}."
+            )
+
+    def _post_to_each_engine(
+        self,
+        membership: RefitMembership,
+        engine_rpc: str,
+        kwargs: dict[str, Any],
+    ) -> list[ray.ObjectRef]:
+        """Call a worker-extension method on every engine through the init route.
+
+        Each engine gets its rank prefix; the extension adds its local rank to it.
+        """
+        self.check_full_fleet(membership)
+        workers = self._validated_workers()
+        return [
+            _post_worker_route.remote(
+                system_url=worker.system_url,
+                route=_INIT_ROUTE,
+                payload={
+                    "engine_rpc": engine_rpc,
+                    "rank_prefix": membership.shard_prefixes[index],
+                    **kwargs,
+                },
+                timeout_s=self._init_timeout_s,
+            )
+            for index, worker in enumerate(workers)
+        ]
+
+    def rebuild_collective(
+        self, membership: RefitMembership, ip: str, port: int
+    ) -> list[ray.ObjectRef]:
+        """Join every engine to the NeMo RL ``model_update_group``."""
+        return self._post_to_each_engine(
+            membership,
+            "init_collective",
+            {
+                "ip": ip,
+                "port": port,
+                "world_size": membership.world_size,
+                "train_world_size": membership.train_world_size,
+            },
+        )
+
+    def rebuild_nccl_reshard_comm_group(
+        self,
+        membership: RefitMembership,
+        *,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Join every engine to the per-training-PP-stage bulk reshard groups."""
+        return self._post_to_each_engine(
+            membership,
+            "init_nccl_reshard_comm_group",
+            {
+                "pp_ips": list(pp_ips),
+                "pp_ports": list(pp_ports),
+                "pp_size": pp_size,
+                "train_ranks_per_stage": train_ranks_per_stage,
+                "sub_world_size": sub_world_size,
+            },
+        )
+
+    def prepare_nccl_reshard_refit_info(self, wire_refit_info: dict[str, Any]) -> None:
+        """Stage the wire-safe reshard plan on every engine and build its map."""
+        staged = encode_staged_payload(wire_refit_info)
+        ray.get(
+            [
+                _stage_and_post_worker_route.remote(
+                    system_url=worker.system_url,
+                    key=staged.key,
+                    chunks=staged.chunks,
+                    payload={
+                        "engine_rpc": "nrl_prepare_nccl_reshard_refit_info_from_stage",
+                        "key": staged.key,
+                        "sha256": staged.sha256,
+                    },
+                    timeout_s=self._init_timeout_s,
+                )
+                for worker in self._validated_workers()
+            ]
+        )
+
+    def nccl_reshard_refit(self, refit_timeout_s: float | None) -> list[ray.ObjectRef]:
+        """Receive one nccl_reshard refit on every engine."""
+        timeout_s = self._control_timeout_s
+        if refit_timeout_s is not None:
+            timeout_s = max(timeout_s, refit_timeout_s + _REFIT_CLIENT_MARGIN_S)
+        return [
+            _post_worker_route.remote(
+                system_url=worker.system_url,
+                route=_UPDATE_ROUTE,
+                payload={
+                    "engine_rpc": "nrl_nccl_reshard_refit",
+                    "allow_unpaused": True,
+                    "reset_prefix_cache": False,
+                    "refit_timeout_s": refit_timeout_s,
+                },
+                timeout_s=timeout_s,
+            )
+            for worker in self._validated_workers()
+        ]
 
     @property
     def sender_spec(self) -> CollectiveSenderSpec:

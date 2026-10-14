@@ -187,35 +187,28 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
     def _desired_membership(
         self, absent_shards: Sequence[int], train_world_size: int
     ) -> Optional[RefitMembership]:
-        """The membership to track, or None for a backend that owns no DP worker group.
+        """The membership to track, or None for a backend with no DP shards.
 
-        NOT every GenerationInterface has one. vLLM and TRT-LLM do; Dynamo, Megatron and
-        SGLang do not, and the interface declares nothing either way -- so reading
-        ``self._generation.worker_group`` assumes a vLLM shape that this synchronizer is
-        not entitled to assume. It holds a GenerationInterface, and Dynamo reaches it
-        through the ordinary non-colocated branch of the factory.
-
-        That assumption broke L1_Functional_Tests_Dynamo on the plain grpo.py path:
-
-            grpo.py:1747  policy_generation.weight_synchronizer.init_communicator()
-            AttributeError: 'DynamoGeneration' object has no attribute 'worker_group'
+        The backend reports its shards through ``get_refit_fleet_shape``. SGLang has
+        none, and reading ``worker_group`` directly assumed a vLLM shape this
+        synchronizer is not entitled to assume: that once broke
+        L1_Functional_Tests_Dynamo with an AttributeError in ``init_communicator``.
 
         None means "this backend has no shards to track", which is the same thing an
         unrecorded membership already meant: every reconcile falls through to "nothing to
         do", exactly as it behaved before membership tracking existed. Re-admission is only
         meaningful where shards exist.
 
-        Deliberately NOT mirrored on the reshard synchronizer. nccl_reshard is a vLLM-only
-        transport that REQUIRES a worker group, so a missing one there is a
-        misconfiguration that should fail loudly rather than silently degrade.
+        Deliberately NOT mirrored on the reshard synchronizer, which builds its plan per
+        generation rank and so fails loudly when a backend reports no shards.
         """
-        worker_group = getattr(self._generation, "worker_group", None)
-        if worker_group is None:
+        shape = self._generation.get_refit_fleet_shape()
+        if shape is None:
             return None
         return desired_membership(
             absent_shards=absent_shards,
-            dp_size=worker_group.dp_size,
-            total_gen_workers=len(worker_group.workers),
+            dp_size=shape.dp_size,
+            total_gen_workers=shape.total_gen_workers,
             train_world_size=train_world_size,
         )
 

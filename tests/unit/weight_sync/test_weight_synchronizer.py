@@ -24,7 +24,10 @@ from nemo_rl.models.generation.constants import (
     SGLANG_BACKEND,
     VLLM_BACKEND,
 )
-from nemo_rl.models.generation.interfaces import CollectiveSenderSpec
+from nemo_rl.models.generation.interfaces import (
+    CollectiveSenderSpec,
+    RefitFleetShape,
+)
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
 )
@@ -92,6 +95,9 @@ def _mock_generation(**overrides):
     # fail there, on a comparison, several frames from the cause.
     gen.worker_group.dp_size = 2
     gen.worker_group.workers = [MagicMock(), MagicMock()]
+    gen.get_refit_fleet_shape.return_value = RefitFleetShape(
+        dp_size=2, total_gen_workers=2
+    )
     gen.get_collective_sender_spec.return_value = CollectiveSenderSpec()
     gen.get_inference_world_size.return_value = None
     for k, v in overrides.items():
@@ -985,8 +991,9 @@ class TestNcclReshardWeightSynchronizer:
         gen = _mock_generation(cfg={"backend": "vllm"})
         gen.init_nccl_reshard_comm_group.return_value = [MagicMock()]
         # tp_size=4 over a 4-GPU generation world -> one DP shard.
-        gen.worker_group.dp_size = 1
-        gen.worker_group.workers = [MagicMock() for _ in range(4)]
+        gen.get_refit_fleet_shape.return_value = RefitFleetShape(
+            dp_size=1, total_gen_workers=4
+        )
         train_cluster = _mock_cluster(world_size=2)
         train_cluster.num_gpus_per_node = 8
         train_cluster.get_available_address_and_port.return_value = (
@@ -1325,6 +1332,8 @@ class TestFactory:
             (True, True, VLLM_BACKEND, False, "http"),
             (True, True, SGLANG_BACKEND, False, None),
             (True, False, VLLM_BACKEND, False, None),
+            # Dynamo's built-in collective refit is not validated with offload.
+            (True, True, DYNAMO_BACKEND, False, None),
         ],
     )
     def test_refit_memory_release_config_rejects_unsupported_setup(
@@ -1338,6 +1347,15 @@ class TestFactory:
                 colocated=colocated,
                 refit_transport=transport,
             )
+
+    def test_refit_memory_release_config_accepts_dynamo_nccl_reshard(self):
+        validate_offload_policy_before_refit(
+            enabled=True,
+            megatron_enabled=True,
+            generation_backend=DYNAMO_BACKEND,
+            colocated=False,
+            refit_transport="nccl_reshard",
+        )
 
     def test_colocated_vllm_returns_ipc(self):
         policy = _mock_policy()
