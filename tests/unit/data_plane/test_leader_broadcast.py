@@ -32,7 +32,6 @@ import torch.multiprocessing as mp
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.worker_mixin import (
     _broadcast_batched_data_dict,
-    _broadcast_int16_tensor,
     _broadcast_packed_wire,
     _pack_route_fragments,
     _unpack_route_fragments,
@@ -452,29 +451,6 @@ def test_leader_broadcast_reports_descriptor_error_to_all_ranks(tmp_path):
     assert results[1][0] == 1
     assert results[1][1].startswith("err: RuntimeError:")
     assert all("source_ids" in outcome for _, outcome in results)
-
-
-def test_int16_broadcast_uses_bounded_wire_chunks(monkeypatch):
-    tensor = torch.arange(10, dtype=torch.int16)
-    broadcast_sizes = []
-
-    def fake_broadcast(wire, *, src, group):
-        del src, group
-        broadcast_sizes.append(wire.numel())
-
-    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
-
-    result = _broadcast_int16_tensor(
-        tensor,
-        is_leader=True,
-        src=0,
-        group=object(),
-        chunk_elements=3,
-    )
-
-    assert result.data_ptr() == tensor.data_ptr()
-    assert torch.equal(result, torch.arange(10, dtype=torch.int16))
-    assert broadcast_sizes == [3, 3, 3, 1]
 
 
 def test_packed_wire_broadcast_uses_bounded_chunks(monkeypatch):

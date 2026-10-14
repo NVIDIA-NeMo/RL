@@ -73,6 +73,7 @@ FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 
 _ROUTE_BLOB = "_route_fragment_blob"
 _ROUTE_INDEX = "_route_fragment_index"
+_PACKED_WIRE_BROADCAST_CHUNK_BYTES = 256 * 1024 * 1024
 
 
 def _pack_route_fragments(
@@ -132,6 +133,73 @@ def _unpack_route_fragments(
         }
         for entries in index
     ]
+
+
+def _broadcast_packed_wire(
+    source: Optional[torch.Tensor],
+    *,
+    total_elements: int,
+    dtype: torch.dtype,
+    src_device: str,
+    bcast_device: Any,
+    is_leader: bool,
+    src: int,
+    group: Any,
+    chunk_bytes: int = _PACKED_WIRE_BROADCAST_CHUNK_BYTES,
+) -> Optional[torch.Tensor]:
+    """Stream a packed column through bounded collective-device buffers."""
+    if total_elements < 0:
+        raise ValueError(f"total_elements must be non-negative, got {total_elements}")
+    if chunk_bytes <= 0:
+        raise ValueError(f"chunk_bytes must be positive, got {chunk_bytes}")
+
+    destination_device = torch.device(src_device)
+    collective_device = torch.device(bcast_device)
+    element_size = torch.empty((), dtype=dtype).element_size()
+    chunk_elements = max(1, chunk_bytes // element_size)
+
+    if is_leader:
+        if source is None:
+            raise ValueError("packed-wire leader must provide a source tensor")
+        if source.numel() != total_elements:
+            raise ValueError(
+                "packed-wire source size does not match descriptor: "
+                f"{source.numel()} != {total_elements}"
+            )
+        if not source.is_contiguous():
+            raise ValueError("packed-wire source tensor must be contiguous")
+        destination = None
+    else:
+        destination = torch.empty(
+            total_elements,
+            dtype=dtype,
+            device=destination_device,
+        )
+
+    for start in range(0, total_elements, chunk_elements):
+        end = min(start + chunk_elements, total_elements)
+        if is_leader:
+            assert source is not None
+            wire = source[start:end]
+            if wire.device.type != collective_device.type:
+                wire = wire.to(collective_device)
+        else:
+            assert destination is not None
+            destination_slice = destination[start:end]
+            if destination_slice.device.type == collective_device.type:
+                wire = destination_slice
+            else:
+                wire = torch.empty(
+                    end - start,
+                    dtype=dtype,
+                    device=collective_device,
+                )
+        collective_wire = wire.view(torch.uint8) if dtype == torch.int16 else wire
+        torch.distributed.broadcast(collective_wire, src=src, group=group)
+        if not is_leader and wire.data_ptr() != destination_slice.data_ptr():
+            destination_slice.copy_(wire)
+
+    return destination
 
 
 def _broadcast_batched_data_dict(
@@ -282,38 +350,37 @@ def _broadcast_batched_data_dict(
             del values
         elif kind == "packed_tensor":
             header, shapes, dtype_str, source_device = entry[2:]
+            dtype = getattr(torch, dtype_str.split(".")[-1])
+            numel = sum(
+                torch.Size(shape).numel() for shape in shapes if shape is not None
+            )
             if is_leader:
                 segments = packed_segments.pop(key)
-                tensor = (
-                    torch.cat(
-                        [
-                            segment.to(bcast_device).contiguous().view(-1)
-                            for segment in segments
-                        ]
-                    )
+                source = (
+                    torch.cat([segment.contiguous().view(-1) for segment in segments])
                     if segments
                     else torch.empty(
                         0,
-                        dtype=getattr(torch, dtype_str.split(".")[-1]),
-                        device=bcast_device,
+                        dtype=dtype,
+                        device=torch.device(source_device),
                     )
                 )
             else:
-                dtype = getattr(torch, dtype_str.split(".")[-1])
-                numel = sum(
-                    torch.Size(shape).numel() for shape in shapes if shape is not None
-                )
-                tensor = torch.empty(numel, dtype=dtype, device=bcast_device)
-            if tensor.numel():
-                wire = (
-                    tensor.view(torch.uint8) if tensor.dtype == torch.int16 else tensor
-                )
-                torch.distributed.broadcast(wire, src=src, group=group)
-                del wire
+                source = None
+            tensor = _broadcast_packed_wire(
+                source,
+                total_elements=numel,
+                dtype=dtype,
+                src_device=source_device,
+                bcast_device=bcast_device,
+                is_leader=is_leader,
+                src=src,
+                group=group,
+            )
             if not is_leader:
-                if torch.device(source_device).type != torch.device(bcast_device).type:
-                    tensor = tensor.to(source_device)
+                assert tensor is not None
                 out[key] = header.rebuild_from_broadcast_parts(shapes, tensor)
+            del source
             del tensor
         else:
             if not is_leader:
