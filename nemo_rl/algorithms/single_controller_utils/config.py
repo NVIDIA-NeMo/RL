@@ -631,6 +631,9 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         return self
 
 
+from nemo_rl.experience.direct_capture import DirectCaptureConfig
+
+
 class TokenCaptureConfig(BaseModel, extra="allow"):
     """Ledger-authoritative token capture (token-in/token-out via NeMo-Gym).
 
@@ -640,6 +643,9 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     """
 
     enabled: bool = False
+    transport: Literal["gym", "direct"] = "gym"
+    direct: DirectCaptureConfig = Field(default_factory=DirectCaptureConfig)
+
     # TQ partition holding per-call staged token deltas (cleared by the
     # finalizer; distinct from the canonical rollout partition).
     staging_partition: str = "rollout_staging"

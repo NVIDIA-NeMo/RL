@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
@@ -104,6 +104,8 @@ class FinalizedRollout:
     media: Optional[dict[str, PackedTensor]] = None
     penalty_counts: dict[str, int] = field(default_factory=dict)
     reward_metrics: dict[str, float] = field(default_factory=dict)
+    selected_call_ids: tuple[str, ...] = ()
+    excluded_call_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -281,6 +283,10 @@ class RolloutReassembler:
         invalid row whose reason feeds the metrics; the group publisher
         substitutes a placeholder.
         """
+        if receipt is not None and receipt.get("format") == "nrl_direct_v1":
+            return self._finalize_direct(
+                rollout_id, receipt, reward=reward, reward_checks=reward_checks
+            )
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.rebuild import (
             RebuildError,
@@ -477,6 +483,98 @@ class RolloutReassembler:
             penalty_counts=penalty_counts,
             reward_metrics=reward_metrics,
         )
+
+    def _finalize_direct(
+        self,
+        rollout_id: str,
+        receipt: dict,
+        *,
+        reward: float,
+        reward_checks: RewardChecks | None,
+    ) -> FinalizedRollout:
+        from nemo_rl.data_plane.direct_capture import NativeCallStore
+        from nemo_rl.experience.direct_capture import select_main_branch
+
+        keys = [entry["staging_key"] for entry in receipt["manifest"]]
+        row = FinalizedRollout(rollout_id, False, None, [], [], [], 0, reward, keys)
+        if receipt["rollout_id"] != rollout_id or receipt["failure"]:
+            return replace(
+                row, rejection_reason=receipt["failure"] or "identity_mismatch"
+            )
+        try:
+            if len(set(keys)) != len(keys):
+                raise ValueError("duplicate staging keys")
+            calls = NativeCallStore(
+                self._dp_client,
+                self._staging_partition,
+                router_replay=self._router_replay_enabled,
+            ).fetch(receipt["manifest"], rollout_id)
+            if len({call.ordinal for call in calls}) != len(calls) or len(
+                {call.call_id for call in calls}
+            ) != len(calls):
+                raise ValueError("duplicate native call identity")
+            branch, excluded = select_main_branch(calls)
+            terminal = branch[-1]
+            tokens = list(terminal.prompt + terminal.tokens)
+            if len(tokens) > self._max_seq_len:
+                raise ValueError("sequence exceeds policy max length")
+            mask, logprobs = [0.0] * len(tokens), [0.0] * len(tokens)
+            routes = (
+                terminal.routed_experts.clone()
+                if terminal.routed_experts is not None
+                else None
+            )
+            spans = []
+            offset = 0
+            for call in branch:
+                start, end = len(call.prompt), len(call.prompt) + len(call.tokens)
+                mask[start:end] = [1.0] * len(call.tokens)
+                logprobs[start:end] = call.logprobs
+                spans.append((call.call_id, start - offset, len(call.tokens)))
+                offset = end
+                if routes is not None:
+                    # The route at position t predicts token t+1. Preserve the
+                    # ancestor's executed routes at every trainable position.
+                    routes[start - 1 : end - 1] = call.routed_experts[
+                        start - 1 : end - 1
+                    ]
+            reward, penalties, metrics = finalize_capture_reward(
+                reward,
+                checks=reward_checks,
+                penalty_config=self._reward_penalty_config,
+                effort_config=self._effort_config,
+                token_ids=tokens,
+                link_spans=spans,
+            )
+            metrics.update(
+                {
+                    "finalize/direct_selected_calls": float(len(branch)),
+                    "finalize/direct_excluded_calls": float(len(excluded)),
+                    "finalize/direct_excluded_tokens": float(
+                        sum(len(call.tokens) for call in excluded)
+                    ),
+                }
+            )
+            return FinalizedRollout(
+                rollout_id,
+                True,
+                None,
+                tokens,
+                mask,
+                logprobs,
+                len(branch[0].prompt),
+                reward,
+                keys,
+                min(call.weight_version for call in branch),
+                max(call.weight_version for call in branch),
+                routed_experts=routes,
+                penalty_counts=penalties,
+                reward_metrics=metrics,
+                selected_call_ids=tuple(call.call_id for call in branch),
+                excluded_call_ids=tuple(call.call_id for call in excluded),
+            )
+        except (KeyError, ValueError, IndexError) as error:
+            return replace(row, rejection_reason=f"direct_capture:{error}")
 
     def _resolve_media(
         self,
@@ -829,6 +927,10 @@ class RolloutReassembler:
             group_id=group_id,
             prompt_idx=prompt_idx,
         )
+        for tag, row in zip(tags, rows):
+            if row.selected_call_ids or row.excluded_call_ids:
+                tag["direct_selected_call_ids"] = list(row.selected_call_ids)
+                tag["direct_excluded_call_ids"] = list(row.excluded_call_ids)
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
             span_count = 0

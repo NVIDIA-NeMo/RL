@@ -24,6 +24,10 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/experience/direct_capture.py",
+  "nemo_rl/experience/direct_http.py",
+  "nemo_rl/experience/vllm_http_client.py",
+  "nemo_rl/data_plane/direct_capture.py",
   "nemo_rl/data/captured_media.py",
   "nemo_rl/experience/reward_penalties.py",
   # TODO: enable these once we have 100 correctness
