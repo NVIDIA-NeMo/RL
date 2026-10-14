@@ -48,6 +48,7 @@ run_dry() {
     SLURM_QOS=normal \
     SLURM_TIME_LIMIT=7-00:00:00 \
     MIN_SLURM_TIME_SECONDS=86400 \
+    MIN_CHECKPOINT_BUDGET_SECONDS=86400 \
     REQUIRE_RESUMABLE_JOB_CYCLES=true \
     JOB_CYCLES=6 \
     "$@" \
@@ -57,7 +58,7 @@ run_dry() {
 run_dry "$tmp/results" >"$tmp/output"
 
 grep -Fqx 'time_limit=7-00:00:00 checkpoint_must_save_by=06:23:40:00' "$tmp/output"
-grep -Fqx 'allocation_boundary_seconds=604800 grpo_horizon_steps=1000000 continuation_array=0-5%1' "$tmp/output"
+grep -Fqx 'allocation_boundary_seconds=604800 controller_boundary_seconds=603600 grpo_horizon_steps=1000000 continuation_array=0-5%1' "$tmp/output"
 grep -F -- '--time=7-00:00:00' "$tmp/output" >/dev/null
 grep -F -- '--array=0-5%1' "$tmp/output" >/dev/null
 grep -F -- '--qos=normal' "$tmp/output" >/dev/null
@@ -67,6 +68,11 @@ grep -F 'checkpointing.checkpoint_must_save_by="06:23:40:00"' "$tmp/results/trai
 
 if run_dry "$tmp/too-short" SLURM_TIME_LIMIT=02:00:00 >/dev/null 2>&1; then
   echo 'launcher accepted a cycle below MIN_SLURM_TIME_SECONDS' >&2
+  exit 1
+fi
+
+if run_dry "$tmp/short-controller" CHECKPOINT_MUST_SAVE_BY=00:01:40:00 >/dev/null 2>&1; then
+  echo 'launcher accepted a controller boundary below MIN_CHECKPOINT_BUDGET_SECONDS' >&2
   exit 1
 fi
 

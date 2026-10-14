@@ -20,6 +20,7 @@ if [[ $target == */run_sc.sh ]]; then
   printf 'SLURM_TIME_LIMIT=%s\n' "${SLURM_TIME_LIMIT:-unset}"
   printf 'JOB_CYCLES=%s\n' "${JOB_CYCLES:-unset}"
   printf 'MIN_SLURM_TIME_SECONDS=%s\n' "${MIN_SLURM_TIME_SECONDS:-unset}"
+  printf 'MIN_CHECKPOINT_BUDGET_SECONDS=%s\n' "${MIN_CHECKPOINT_BUDGET_SECONDS:-unset}"
   printf 'REQUIRE_RESUMABLE_JOB_CYCLES=%s\n' "${REQUIRE_RESUMABLE_JOB_CYCLES:-unset}"
   for arg do printf 'ARG=%s\n' "$arg"; done
   exit 0
@@ -62,6 +63,7 @@ grep -Fqx 'SLURM_QOS=normal' "$tmp/agentic-sync.out"
 grep -Fqx 'SLURM_TIME_LIMIT=7-00:00:00' "$tmp/agentic-sync.out"
 grep -Fqx 'JOB_CYCLES=6' "$tmp/agentic-sync.out"
 grep -Fqx 'MIN_SLURM_TIME_SECONDS=86400' "$tmp/agentic-sync.out"
+grep -Fqx 'MIN_CHECKPOINT_BUDGET_SECONDS=86400' "$tmp/agentic-sync.out"
 grep -Fqx 'REQUIRE_RESUMABLE_JOB_CYCLES=true' "$tmp/agentic-sync.out"
 
 recipe=$repo_dir/examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml

@@ -66,6 +66,12 @@ _limit_to_seconds() {  # accepts HH:MM:SS, D-HH:MM:SS, D-HH, MM:SS, MM
   echo $(( d*86400 + 10#$h*3600 + 10#$m*60 + 10#$s ))
 }
 _seconds_to_ddhhmmss() { printf '%02d:%02d:%02d:%02d' $(($1/86400)) $(($1%86400/3600)) $(($1%3600/60)) $(($1%60)); }
+_deadline_to_seconds() {  # accepts the controller's DD:HH:MM:SS format
+  local raw=$1 d h m s extra
+  IFS=: read -r d h m s extra <<<"$raw"
+  [[ -z $extra && $d =~ ^[0-9]+$ && $h =~ ^[0-9]+$ && $m =~ ^[0-9]+$ && $s =~ ^[0-9]+$ ]] || return 1
+  echo $(( 10#$d*86400 + 10#$h*3600 + 10#$m*60 + 10#$s ))
+}
 slurm_time_seconds=$(_limit_to_seconds "$slurm_time_limit")
 min_slurm_time_seconds=${MIN_SLURM_TIME_SECONDS:-0}
 case "$min_slurm_time_seconds" in
@@ -78,6 +84,21 @@ fi
 _budget_s=$(( slurm_time_seconds - ${CHECKPOINT_MARGIN_SECONDS:-1200} ))
 (( _budget_s < 600 )) && _budget_s=600
 checkpoint_must_save_by="${CHECKPOINT_MUST_SAVE_BY:-$(_seconds_to_ddhhmmss "$_budget_s")}"
+min_checkpoint_budget_seconds=${MIN_CHECKPOINT_BUDGET_SECONDS:-0}
+case "$min_checkpoint_budget_seconds" in
+  ''|*[!0-9]*) echo "ERROR: MIN_CHECKPOINT_BUDGET_SECONDS must be a non-negative integer" >&2; exit 1 ;;
+esac
+checkpoint_budget_seconds=none
+if [[ $checkpoint_must_save_by != null ]]; then
+  checkpoint_budget_seconds=$(_deadline_to_seconds "$checkpoint_must_save_by") || {
+    echo "ERROR: CHECKPOINT_MUST_SAVE_BY must be null or DD:HH:MM:SS" >&2
+    exit 1
+  }
+  if (( checkpoint_budget_seconds < min_checkpoint_budget_seconds )); then
+    echo "ERROR: controller checkpoint boundary ${checkpoint_must_save_by} is shorter than the required ${min_checkpoint_budget_seconds}s" >&2
+    exit 1
+  fi
+fi
 
 # Context compaction: "true" enables NeMo-RL's framework-owned context
 # reconstruction (token_capture.context_compaction). OpenCode's own compaction is
@@ -377,7 +398,7 @@ echo "candidate=${candidate_name}"
 echo "sbatch_comment=${sbatch_comment}"
 echo "time_limit=${slurm_time_limit} checkpoint_must_save_by=${checkpoint_must_save_by}"
 echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} qos=${SLURM_QOS:-default} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template} vllm_load_format=${vllm_load_format}"
-echo "allocation_boundary_seconds=${slurm_time_seconds} grpo_horizon_steps=${max_steps} continuation_array=0-${last_array_task}%1"
+echo "allocation_boundary_seconds=${slurm_time_seconds} controller_boundary_seconds=${checkpoint_budget_seconds} grpo_horizon_steps=${max_steps} continuation_array=0-${last_array_task}%1"
 echo "context_compaction=${context_compaction}"
 if [[ -n ${CLAW_EVAL_SOURCE:-} ]]; then
   echo "claweval_compaction_auto=${CLAW_EVAL_COMPACTION_AUTO:-null} claweval_prune=${CLAW_EVAL_COMPACTION_PRUNE:-null} training_mode=${CLAW_EVAL_TRAINING_MODE:-null} subagents=${CLAW_EVAL_SUBAGENTS_ENABLED:-false} max_turns=${CLAW_EVAL_MAX_TURNS:-40} context_tokens=${CLAW_EVAL_CONTEXT_TOKENS:-49152} output_tokens=${CLAW_EVAL_OUTPUT_TOKENS:-8192}"
