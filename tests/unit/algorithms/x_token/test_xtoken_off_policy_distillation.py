@@ -993,7 +993,7 @@ def _bare_averaged_logits_loss_fn(projection_matrix_paths):
     return fn
 
 
-def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
+def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path(monkeypatch):
     # Two cross-tokenizer teachers (non-null projection paths) whose logits
     # happen to share a shape must NOT take the direct per-position KL fast
     # path: it assumes the student's tokenizer and would mismatch the
@@ -1011,11 +1011,14 @@ def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
 
     def _fast_path(*args, **kwargs):
         raise AssertionError(
-            "direct_full_vocab_kl reached for cross-tokenizer teachers"
+            "same_tokenizer_full_vocab_kl reached for cross-tokenizer teachers"
         )
 
     fn._compute_teacher_kd = _fallback
-    fn._direct_full_vocab_kl = _fast_path
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.loss_functions.same_tokenizer_full_vocab_kl",
+        _fast_path,
+    )
 
     # Equal-shaped teacher logits (the misleading signal) but teacher length 13
     # vs the student's length 10.
@@ -1037,10 +1040,12 @@ def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
     assert total_kd.item() == pytest.approx(2.0 * 1.0 + 3.0 * 2.0)
 
 
-def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path():
+def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
     # All-null projection paths => genuine same-tokenizer teachers, so the
     # averaging + single direct-KL fast path is the correct branch.
     fn = _bare_averaged_logits_loss_fn([None, None])
+    fn.temperature = 1.0
+    fn.reverse_kl = False
 
     fast_calls = []
 
@@ -1048,7 +1053,10 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path():
         fast_calls.append(1)
         return torch.tensor(1.23)
 
-    fn._direct_full_vocab_kl = _fast_path
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.loss_functions.same_tokenizer_full_vocab_kl",
+        _fast_path,
+    )
     fn._compute_teacher_kd = MagicMock(
         side_effect=AssertionError("fallback reached for same-tokenizer teachers")
     )

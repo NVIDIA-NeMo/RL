@@ -16,21 +16,28 @@
 Most tests here are CPU-only. ``Fp32SparseMM`` is GPU-pinned via
 ``custom_fwd(device_type="cuda")`` and is intentionally not covered. The TP/CP
 > 1 code paths require real collectives, so they live in the multi-GPU NCCL
-tests at the bottom of this file (skipped when < 2 GPUs are available).
+tests at the bottom of this file (skipped when < 2 GPUs are available). The
+same-tokenizer KD helpers' CP=2 path runs on CPU over gloo.
 """
 
 from __future__ import annotations
 
+import datetime
+import functools
 import os
 import traceback
 from pathlib import Path
+from typing import Any, Callable, Optional
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import ray
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
+from nemo_rl.algorithms.utils import masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     _EXACT_TOKEN_MAP_CACHE,
     _SPARSE_PROJECTION_CACHE,
@@ -45,10 +52,19 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     localize_alignment,
     parse_projection_file,
     prepare_xtoken_cross_tokenizer_loss_input,
+    same_tokenizer_full_vocab_kl,
+    same_tokenizer_topk_kl,
+    select_teacher_topk_indices,
     slice_sparse_projection_cols,
     valid_chunk_mask,
 )
-from nemo_rl.distributed.model_utils import group_all_reduce_sum_with_grad
+from nemo_rl.distributed.model_utils import (
+    cp_shift_next,
+    group_all_reduce_sum_with_grad,
+    to_local_if_dtensor,
+    vocab_parallel_full_log_softmax,
+    vocab_parallel_gather_columns,
+)
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
     ACTOR_ENVIRONMENT_REGISTRY,
@@ -964,3 +980,650 @@ class TestSliceSparseProjectionCols:
         sliced = slice_sparse_projection_cols(sparse, cols).to_dense()
 
         assert torch.equal(sliced, dense)
+
+
+# ---------------------------------------------------------------------------
+# Same-tokenizer KD helpers: same_tokenizer_topk_kl /
+# same_tokenizer_full_vocab_kl.
+#
+# The oracle below is a frozen copy of the same-tokenizer KD math from before
+# the shared helpers existed; the helpers must match it bitwise. Keep it frozen
+# (do not update it to track the helpers).
+# ---------------------------------------------------------------------------
+
+_V = 24  # shared tokenizer vocab size
+_PAD = 8  # lm_head padding columns past the shared vocab
+
+
+def _old_select_teacher_topk_indices(
+    teacher_logits: torch.Tensor,
+    k: int,
+    *,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    vocab_size = teacher_logits.shape[-1]
+    with torch.no_grad():
+        teacher_flat = teacher_logits.reshape(-1, vocab_size)
+        importance = teacher_flat.max(dim=0).values
+        if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
+            torch.distributed.all_reduce(
+                importance, op=torch.distributed.ReduceOp.MAX, group=cp_group
+            )
+        top_indices = torch.topk(importance, k=k, dim=-1).indices
+        return top_indices.sort().values
+
+
+def _old_same_vocab_masked_kl(
+    per_pos: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    global_valid_toks: torch.Tensor,
+    *,
+    temperature: float,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    T = temperature
+    next_mask = cp_shift_next(to_local_if_dtensor(token_mask), cp_group, fill=0)
+    sample_mask = to_local_if_dtensor(sample_mask)
+    mask = next_mask.float() * sample_mask.unsqueeze(-1).float()
+    return (
+        masked_mean(per_pos, mask, global_normalization_factor=global_valid_toks)
+        * T
+        * T
+    )
+
+
+def _old_direct_topk_kl(
+    student_logits: torch.Tensor,
+    teacher_full_logits: torch.Tensor,
+    *,
+    kd_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    num_kd_tokens: torch.Tensor,
+    vocab_size: int,
+    vocab_topk: int,
+    temperature: float,
+    reverse_kl: bool,
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    T = temperature
+    v_s = vocab_size
+    teacher = teacher_full_logits
+    if teacher.shape[-1] > v_s:
+        teacher = teacher[..., :v_s]
+    vocab_topk = min(vocab_topk, teacher.shape[-1])
+    topk_idx = _old_select_teacher_topk_indices(teacher, vocab_topk, cp_group=cp_group)
+    student_topk_logits = vocab_parallel_gather_columns(
+        student_logits, topk_idx, tp_group=tp_group
+    )
+    student_log_probs_k = torch.log_softmax(student_topk_logits / T, dim=-1)
+    teacher_log_probs_k = torch.log_softmax(teacher[..., topk_idx].float() / T, dim=-1)
+    if reverse_kl:
+        per_pos = torch.nn.functional.kl_div(
+            teacher_log_probs_k,
+            student_log_probs_k,
+            reduction="none",
+            log_target=True,
+        ).sum(dim=-1)
+    else:
+        per_pos = torch.nn.functional.kl_div(
+            student_log_probs_k,
+            teacher_log_probs_k,
+            reduction="none",
+            log_target=True,
+        ).sum(dim=-1)
+    return _old_same_vocab_masked_kl(
+        per_pos,
+        kd_mask,
+        sample_mask,
+        num_kd_tokens,
+        temperature=T,
+        cp_group=cp_group,
+    )
+
+
+def _old_direct_full_vocab_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    *,
+    kd_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    num_kd_tokens: torch.Tensor,
+    temperature: float,
+    reverse_kl: bool,
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    T = temperature
+    student_log_probs = vocab_parallel_full_log_softmax(
+        student_logits, T, tp_group=tp_group
+    )
+    v_s = student_log_probs.shape[-1]
+    teacher = teacher_logits.float()
+    if teacher.shape[-1] > v_s:
+        teacher = teacher[..., :v_s]
+    teacher_log_probs = torch.log_softmax(teacher / T, dim=-1)
+    if reverse_kl:
+        per_pos = torch.nn.functional.kl_div(
+            teacher_log_probs, student_log_probs, reduction="none", log_target=True
+        ).sum(dim=-1)
+    else:
+        per_pos = torch.nn.functional.kl_div(
+            student_log_probs, teacher_log_probs, reduction="none", log_target=True
+        ).sum(dim=-1)
+    return _old_same_vocab_masked_kl(
+        per_pos,
+        kd_mask,
+        sample_mask,
+        num_kd_tokens,
+        temperature=T,
+        cp_group=cp_group,
+    )
+
+
+def _manual_kd_weights(
+    kd_mask: torch.Tensor, sample_mask: torch.Tensor
+) -> torch.Tensor:
+    """Predictor ``t`` receives KD iff target ``t + 1`` does and its sample is kept."""
+    weights = torch.zeros(kd_mask.shape, dtype=torch.float32)
+    weights[:, :-1] = kd_mask[:, 1:].float()
+    return weights * sample_mask.float().unsqueeze(-1)
+
+
+def _manual_topk_columns(teacher_logits: torch.Tensor, k: int) -> torch.Tensor:
+    """Sorted top-``k`` columns by per-vocab max over every teacher row."""
+    importance = teacher_logits.reshape(-1, teacher_logits.shape[-1]).float()
+    return torch.topk(importance.max(dim=0).values, k).indices.sort().values
+
+
+def _manual_kd_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    weights: torch.Tensor,
+    num_kd_tokens: float,
+    *,
+    temperature: float,
+    reverse_kl: bool,
+    columns: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """float64 ``sum_t(w_t * KL_t) / num_kd_tokens * T**2`` from explicit sums."""
+    student = student_logits.double()
+    teacher = teacher_logits.double()
+    if columns is not None:
+        student = student[..., columns]
+        teacher = teacher[..., columns]
+    log_q = torch.log_softmax(student / temperature, dim=-1)
+    log_p = torch.log_softmax(teacher / temperature, dim=-1)
+    if reverse_kl:
+        per_pos = (log_q.exp() * (log_q - log_p)).sum(dim=-1)
+    else:
+        per_pos = (log_p.exp() * (log_p - log_q)).sum(dim=-1)
+    return (per_pos * weights.double()).sum() / num_kd_tokens * temperature**2
+
+
+def _same_tokenizer_kd(
+    path: str,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    *,
+    vocab_topk: int = 4,
+    **kwargs: Any,
+) -> torch.Tensor:
+    if path == "topk":
+        return same_tokenizer_topk_kl(
+            student_logits,
+            teacher_logits,
+            vocab_size=_V,
+            vocab_topk=vocab_topk,
+            **kwargs,
+        )
+    assert path == "full_vocab"
+    return same_tokenizer_full_vocab_kl(student_logits, teacher_logits, **kwargs)
+
+
+def _loss_and_grad(
+    kd_fn: Callable[..., torch.Tensor],
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """KD loss and its gradient w.r.t. a fresh leaf copy of the student logits."""
+    student = student_logits.detach().clone().requires_grad_(True)
+    loss = kd_fn(student, teacher_logits, **kwargs)
+    loss.backward()
+    assert student.grad is not None
+    return loss.detach(), student.grad
+
+
+def _kd_masks(
+    kind: str, batch: int, seq: int, generator: torch.Generator
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(kd_mask [B, T], sample_mask [B])`` for one masking pattern."""
+    if kind == "all_kd":
+        return torch.ones(batch, seq), torch.ones(batch)
+    if kind == "no_kd":
+        return torch.zeros(batch, seq), torch.ones(batch)
+    assert kind == "partial"
+    kd_mask = (torch.rand(batch, seq, generator=generator) < 0.6).float()
+    sample_mask = torch.ones(batch)
+    sample_mask[1] = 0.0
+    return kd_mask, sample_mask
+
+
+class TestSameTokenizerKdMatchesPreviousMath:
+    @pytest.mark.parametrize("mask_kind", ["all_kd", "partial", "no_kd"])
+    @pytest.mark.parametrize(
+        "teacher_width", [_V, _V + _PAD], ids=["no_pad", "lm_head_pad"]
+    )
+    @pytest.mark.parametrize("vocab_topk", [4, 8, _V, _V + _PAD])
+    @pytest.mark.parametrize(
+        "teacher_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"]
+    )
+    @pytest.mark.parametrize("temperature", [1.0, 2.0])
+    @pytest.mark.parametrize("reverse_kl", [False, True], ids=["fwd", "rev"])
+    def test_topk_bitwise_for_any_mask(
+        self,
+        reverse_kl: bool,
+        temperature: float,
+        teacher_dtype: torch.dtype,
+        vocab_topk: int,
+        teacher_width: int,
+        mask_kind: str,
+    ):
+        batch, seq = 3, 7
+        generator = torch.Generator().manual_seed(0)
+        student = torch.randn(batch, seq, teacher_width, generator=generator)
+        teacher = torch.randn(batch, seq, teacher_width, generator=generator) * 3
+        # lm_head padding columns dominate every row, so they would take the
+        # top-K slots if they were not dropped.
+        teacher[..., _V:] = 25.0
+        teacher = teacher.to(teacher_dtype)
+        kd_mask, sample_mask = _kd_masks(mask_kind, batch, seq, generator)
+        kwargs = dict(
+            kd_mask=kd_mask,
+            sample_mask=sample_mask,
+            num_kd_tokens=_manual_kd_weights(kd_mask, sample_mask).sum(),
+            vocab_size=_V,
+            vocab_topk=vocab_topk,
+            temperature=temperature,
+            reverse_kl=reverse_kl,
+            tp_group=None,
+            cp_group=None,
+        )
+
+        new_loss, new_grad = _loss_and_grad(
+            same_tokenizer_topk_kl, student, teacher, **kwargs
+        )
+        old_loss, old_grad = _loss_and_grad(
+            _old_direct_topk_kl, student, teacher, **kwargs
+        )
+
+        assert torch.isfinite(new_loss)
+        assert torch.equal(new_loss, old_loss)
+        assert torch.equal(new_grad, old_grad)
+
+    @pytest.mark.parametrize("mask_kind", ["all_kd", "partial", "no_kd"])
+    @pytest.mark.parametrize(
+        "teacher_width", [_V, _V + _PAD], ids=["no_pad", "lm_head_pad"]
+    )
+    @pytest.mark.parametrize(
+        "teacher_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"]
+    )
+    @pytest.mark.parametrize("temperature", [1.0, 2.0])
+    @pytest.mark.parametrize("reverse_kl", [False, True], ids=["fwd", "rev"])
+    def test_full_vocab_bitwise_for_any_mask(
+        self,
+        reverse_kl: bool,
+        temperature: float,
+        teacher_dtype: torch.dtype,
+        teacher_width: int,
+        mask_kind: str,
+    ):
+        # No top-K choice is involved, so the full-vocab helper must match the
+        # previous math bitwise for any mask.
+        batch, seq = 3, 7
+        generator = torch.Generator().manual_seed(2)
+        student = torch.randn(batch, seq, _V, generator=generator)
+        teacher = torch.randn(batch, seq, teacher_width, generator=generator) * 3
+        teacher[..., _V:] = 25.0
+        teacher = teacher.to(teacher_dtype)
+        kd_mask, sample_mask = _kd_masks(mask_kind, batch, seq, generator)
+        kwargs = dict(
+            kd_mask=kd_mask,
+            sample_mask=sample_mask,
+            num_kd_tokens=_manual_kd_weights(kd_mask, sample_mask).sum(),
+            temperature=temperature,
+            reverse_kl=reverse_kl,
+            tp_group=None,
+            cp_group=None,
+        )
+
+        new_loss, new_grad = _loss_and_grad(
+            same_tokenizer_full_vocab_kl, student, teacher, **kwargs
+        )
+        old_loss, old_grad = _loss_and_grad(
+            _old_direct_full_vocab_kl, student, teacher, **kwargs
+        )
+
+        assert torch.equal(new_loss, old_loss)
+        assert torch.equal(new_grad, old_grad)
+
+
+class TestSameTokenizerKdReduction:
+    @staticmethod
+    def _inputs(
+        teacher_width: int = _V,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        generator = torch.Generator().manual_seed(4)
+        student = torch.randn(3, 7, _V, generator=generator)
+        teacher = torch.randn(3, 7, teacher_width, generator=generator) * 2
+        kd_mask, sample_mask = _kd_masks("partial", 3, 7, generator)
+        return student, teacher, kd_mask, sample_mask
+
+    @pytest.mark.parametrize("temperature", [1.0, 2.0])
+    @pytest.mark.parametrize("reverse_kl", [False, True], ids=["fwd", "rev"])
+    @pytest.mark.parametrize("path", ["topk", "full_vocab"])
+    def test_matches_manual_reference(
+        self, path: str, reverse_kl: bool, temperature: float
+    ):
+        student, teacher, kd_mask, sample_mask = self._inputs()
+        weights = _manual_kd_weights(kd_mask, sample_mask)
+        assert 0 < weights.sum() < weights.numel()
+        # A DP/CP-global count larger than this rank's local KD rows.
+        num_kd_tokens = weights.sum().item() + 5.0
+        vocab_topk = 6
+        columns = _manual_topk_columns(teacher, vocab_topk) if path == "topk" else None
+
+        loss = _same_tokenizer_kd(
+            path,
+            student,
+            teacher,
+            vocab_topk=vocab_topk,
+            kd_mask=kd_mask,
+            sample_mask=sample_mask,
+            num_kd_tokens=torch.tensor(num_kd_tokens),
+            temperature=temperature,
+            reverse_kl=reverse_kl,
+            tp_group=None,
+            cp_group=None,
+        )
+        expected = _manual_kd_loss(
+            student,
+            teacher,
+            weights,
+            num_kd_tokens,
+            temperature=temperature,
+            reverse_kl=reverse_kl,
+            columns=columns,
+        )
+
+        torch.testing.assert_close(loss.double(), expected, rtol=1e-5, atol=1e-6)
+
+    @pytest.mark.parametrize("path", ["topk", "full_vocab"])
+    def test_doubling_num_kd_tokens_halves_the_loss(self, path: str):
+        student, teacher, kd_mask, sample_mask = self._inputs()
+        kwargs = dict(
+            kd_mask=kd_mask,
+            sample_mask=sample_mask,
+            temperature=1.5,
+            reverse_kl=False,
+            tp_group=None,
+            cp_group=None,
+        )
+
+        loss = _same_tokenizer_kd(
+            path, student, teacher, num_kd_tokens=torch.tensor(9.0), **kwargs
+        )
+        loss_doubled = _same_tokenizer_kd(
+            path, student, teacher, num_kd_tokens=torch.tensor(18.0), **kwargs
+        )
+
+        assert loss > 0
+        torch.testing.assert_close(loss_doubled * 2, loss, rtol=1e-6, atol=0.0)
+
+    @pytest.mark.parametrize("reverse_kl", [False, True], ids=["fwd", "rev"])
+    def test_topk_drops_lm_head_padding(self, reverse_kl: bool):
+        student, teacher, kd_mask, sample_mask = self._inputs(_V + _PAD)
+        student = torch.cat([student, torch.full((3, 7, _PAD), 50.0)], dim=-1)
+        # Padding columns would win every top-K slot if they were kept.
+        teacher[..., _V:] = 50.0
+        kwargs = dict(
+            kd_mask=kd_mask,
+            sample_mask=sample_mask,
+            num_kd_tokens=_manual_kd_weights(kd_mask, sample_mask).sum(),
+            vocab_size=_V,
+            vocab_topk=4,
+            temperature=1.0,
+            reverse_kl=reverse_kl,
+            tp_group=None,
+            cp_group=None,
+        )
+
+        loss, grad = _loss_and_grad(same_tokenizer_topk_kl, student, teacher, **kwargs)
+        unpadded_loss, unpadded_grad = _loss_and_grad(
+            same_tokenizer_topk_kl,
+            student[..., :_V].contiguous(),
+            teacher[..., :_V].contiguous(),
+            **kwargs,
+        )
+
+        assert torch.equal(loss, unpadded_loss)
+        assert torch.equal(grad[..., :_V], unpadded_grad)
+        assert not grad[..., _V:].any()
+
+    @pytest.mark.parametrize("reverse_kl", [False, True], ids=["fwd", "rev"])
+    def test_full_vocab_slices_teacher_to_student_width(self, reverse_kl: bool):
+        student, teacher, kd_mask, sample_mask = self._inputs(_V + _PAD)
+        teacher[..., _V:] = 50.0
+        weights = _manual_kd_weights(kd_mask, sample_mask)
+        kwargs = dict(
+            kd_mask=kd_mask,
+            sample_mask=sample_mask,
+            num_kd_tokens=weights.sum(),
+            temperature=1.0,
+            reverse_kl=reverse_kl,
+            tp_group=None,
+            cp_group=None,
+        )
+
+        loss, grad = _loss_and_grad(
+            same_tokenizer_full_vocab_kl, student, teacher, **kwargs
+        )
+        unpadded_loss, unpadded_grad = _loss_and_grad(
+            same_tokenizer_full_vocab_kl,
+            student,
+            teacher[..., :_V].contiguous(),
+            **kwargs,
+        )
+
+        assert torch.equal(loss, unpadded_loss)
+        assert torch.equal(grad, unpadded_grad)
+        torch.testing.assert_close(
+            loss.double(),
+            _manual_kd_loss(
+                student,
+                teacher[..., :_V],
+                weights,
+                weights.sum().item(),
+                temperature=1.0,
+                reverse_kl=reverse_kl,
+            ),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+
+# ---------------------------------------------------------------------------
+# CP=2 over gloo (CPU): the sequence is split contiguously across 2 ranks. Both
+# ranks must choose the single-process top-K list, the CP-aware next-token shift
+# must let a rank's last predictor read the next rank's first target, and the
+# per-rank losses must sum to the single-process loss.
+# ---------------------------------------------------------------------------
+
+_CP2_SEQ = 8
+_CP2_TOPK = 4
+_CP2_RANK1_COLUMN = 20
+
+
+def _cp2_case_inputs(
+    case: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Global ``(student, teacher, kd_mask, sample_mask)``, identical on every rank."""
+    generator = torch.Generator().manual_seed(6)
+    student = torch.randn(2, _CP2_SEQ, _V, generator=generator)
+    teacher = torch.randn(2, _CP2_SEQ, _V + _PAD, generator=generator) * 3
+    teacher[..., _V:] = 50.0
+    # Dominant on one row of rank 1's window only, so rank 0 can only choose it
+    # through the CP all_reduce(MAX).
+    teacher[1, _CP2_SEQ - 2, _CP2_RANK1_COLUMN] = 30.0
+    if case == "kd_across_rank_boundary":
+        # Sample 0's predictor 3 (last row on rank 0) supervises target 4,
+        # which lives on rank 1.
+        kd_mask = torch.tensor(
+            [[0, 0, 0, 0, 1, 1, 1, 0], [0, 1, 1, 1, 1, 1, 1, 1]], dtype=torch.float32
+        )
+    elif case == "one_rank_without_kd":
+        # Every KD predictor sits on rank 0 (positions 0-3).
+        kd_mask = torch.tensor(
+            [[0, 1, 1, 1, 0, 0, 0, 0], [0, 0, 1, 1, 0, 0, 0, 0]], dtype=torch.float32
+        )
+    else:
+        assert case == "no_kd_anywhere"
+        kd_mask = torch.zeros(2, _CP2_SEQ)
+    sample_mask = torch.ones(2)
+    return student, teacher, kd_mask, sample_mask
+
+
+def _check_same_tokenizer_cp2(
+    rank: int, world_size: int, cp_group: torch.distributed.ProcessGroup
+) -> None:
+    local_seq = _CP2_SEQ // world_size
+    window = slice(rank * local_seq, (rank + 1) * local_seq)
+    for case in ("kd_across_rank_boundary", "one_rank_without_kd", "no_kd_anywhere"):
+        student, teacher, kd_mask, sample_mask = _cp2_case_inputs(case)
+        weights = _manual_kd_weights(kd_mask, sample_mask)
+
+        # Same KD weights the helper builds on this rank.
+        local_weights = cp_shift_next(
+            kd_mask[:, window].contiguous(), cp_group, fill=0
+        ).float() * sample_mask.unsqueeze(-1)
+        assert torch.equal(local_weights, weights[:, window]), case
+
+        chosen = select_teacher_topk_indices(
+            teacher[:, window, :_V].contiguous(), _CP2_TOPK, cp_group=cp_group
+        )
+        single = select_teacher_topk_indices(teacher[..., :_V], _CP2_TOPK)
+        assert torch.equal(chosen, single), (case, chosen, single)
+        assert torch.equal(
+            single, _manual_topk_columns(teacher[..., :_V], _CP2_TOPK)
+        ), case
+        peers = [torch.empty_like(chosen) for _ in range(world_size)]
+        dist.all_gather(peers, chosen, group=cp_group)
+        assert all(torch.equal(peer, chosen) for peer in peers), (case, peers)
+        assert _CP2_RANK1_COLUMN in chosen.tolist(), (case, chosen)
+        if case == "one_rank_without_kd":
+            assert not weights[:, local_seq:].any()
+
+        for path in ("topk", "full_vocab"):
+            for reverse_kl in (False, True):
+                kd_fn = functools.partial(
+                    _same_tokenizer_kd, path, vocab_topk=_CP2_TOPK
+                )
+                common = dict(
+                    sample_mask=sample_mask,
+                    num_kd_tokens=weights.sum(),
+                    temperature=1.5,
+                    reverse_kl=reverse_kl,
+                    tp_group=None,
+                )
+                single_loss, single_grad = _loss_and_grad(
+                    kd_fn,
+                    student,
+                    teacher,
+                    kd_mask=kd_mask,
+                    cp_group=None,
+                    **common,
+                )
+                local_loss, local_grad = _loss_and_grad(
+                    kd_fn,
+                    student[:, window].contiguous(),
+                    teacher[:, window].contiguous(),
+                    kd_mask=kd_mask[:, window].contiguous(),
+                    cp_group=cp_group,
+                    **common,
+                )
+                total = local_loss.reshape(1).clone()
+                dist.all_reduce(total, op=dist.ReduceOp.SUM, group=cp_group)
+                label = (case, path, reverse_kl, rank)
+                torch.testing.assert_close(
+                    total[0], single_loss, rtol=1e-6, atol=1e-7, msg=str(label)
+                )
+                torch.testing.assert_close(
+                    local_grad,
+                    single_grad[:, window],
+                    rtol=1e-6,
+                    atol=1e-7,
+                    msg=str(label),
+                )
+                if case == "no_kd_anywhere" or (
+                    case == "one_rank_without_kd" and rank == 1
+                ):
+                    assert local_loss.item() == 0.0, label
+                    assert not local_grad.any(), label
+                else:
+                    assert local_loss.item() > 0.0, label
+
+
+def _same_tokenizer_cp2_worker(
+    rank: int, world_size: int, init_file: str, result_queue: Any
+) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(seconds=120),
+    )
+    try:
+        cp_group = dist.new_group(ranks=list(range(world_size)))
+        _check_same_tokenizer_cp2(rank, world_size, cp_group)
+        result_queue.put((rank, None))
+    except BaseException:
+        result_queue.put((rank, traceback.format_exc()))
+        raise
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not (dist.is_available() and dist.is_gloo_available()),
+    reason="gloo backend unavailable",
+)
+def test_same_tokenizer_kd_cp2_gloo_matches_single_process(tmp_path: Path):
+    world_size = 2
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    procs = [
+        ctx.Process(
+            target=_same_tokenizer_cp2_worker,
+            args=(rank, world_size, str(tmp_path / "init"), result_queue),
+        )
+        for rank in range(world_size)
+    ]
+    for proc in procs:
+        proc.start()
+    try:
+        results = dict(result_queue.get(timeout=300) for _ in procs)
+    finally:
+        for proc in procs:
+            proc.join(timeout=60)
+            if proc.is_alive():
+                proc.terminate()
+
+    failures = {rank: err for rank, err in results.items() if err is not None}
+    assert not failures, "\n".join(
+        f"rank {rank} failed:\n{err}" for rank, err in sorted(failures.items())
+    )
+    assert sorted(results) == list(range(world_size))
+    assert [proc.exitcode for proc in procs] == [0] * world_size
