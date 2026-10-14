@@ -22,7 +22,10 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    WindowedSampler,
+    WindowedSamplerConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import AdvantageComputer
 from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
 from nemo_rl.data_plane import KVBatchMeta
@@ -242,7 +245,8 @@ def test_complete_logical_batch_streams_all_segments_but_steps_once(
                     cut, group_id, meta, min(row_versions), max(row_versions)
                 )
         ctrl._buffer = buffer
-        ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=2)
+        ctrl._async_cfg.sampler = WindowedSamplerConfig(max_staleness_versions=3)
+        ctrl._sampler = WindowedSampler(buffer, max_staleness_versions=3)
         await asyncio.wait_for(ctrl._train_pump(), timeout=3)
         assert buffer.meta_list == []
 

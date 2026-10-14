@@ -3263,8 +3263,8 @@ class SingleControllerActor:
                             ):
                                 raise ValueError(
                                     "CC optimizer batch requires logical rows with "
-                                    "padding flags, borrowed-input flags, and a weight "
-                                    "version inside the current generation window "
+                                    "padding flags, borrowed-input flags, and integer "
+                                    "generation versions inside the current window "
                                     f"[{min_generation_version}, "
                                     f"{version_during_step}]"
                                 )
