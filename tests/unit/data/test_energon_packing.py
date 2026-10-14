@@ -232,8 +232,43 @@ def test_unpacked_precomputed_loss_mask_reaches_token_mask() -> None:
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize(
+    ("loss_mask_mode", "only_unmask_final", "error"),
+    [
+        ("unsupported", False, "Unsupported"),
+        ("precomputed", True, "only_unmask_final"),
+    ],
+)
+def test_encoder_rejects_invalid_loss_mask_configuration_at_init(
+    packed: bool,
+    loss_mask_mode: str,
+    only_unmask_final: bool,
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        GenericSFTTaskEncoder(
+            adapter=object(),
+            cooker_functions=[],
+            include_source_ids=True,
+            packer=get_packer(PackingAlgorithm.CONCATENATIVE, 4) if packed else None,
+            tokenizer=_Tokenizer(),
+            loss_mask_mode=loss_mask_mode,  # type: ignore[arg-type]
+            only_unmask_final=only_unmask_final,
+        )
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize(
     "case",
-    ["missing", "shape", "non_binary", "non_vector", "unsupported_mode", "final_only"],
+    [
+        "missing",
+        "missing_tokens",
+        "non_tensor_mask",
+        "non_tensor_tokens",
+        "shape",
+        "non_binary",
+        "non_vector",
+        "non_vector_tokens",
+    ],
 )
 def test_precomputed_loss_masks_reject_invalid_inputs(case: str, packed: bool) -> None:
     # The unpacked validation lives in SFT, which imports the policy backends.
@@ -245,6 +280,14 @@ def test_precomputed_loss_masks_reject_invalid_inputs(case: str, packed: bool) -
     message = sample.message_log[0]
     if case == "missing":
         del message["token_loss_mask"]
+    elif case == "missing_tokens":
+        del message["token_ids"]
+    elif case == "non_tensor_mask":
+        message["token_loss_mask"] = [1, 1]
+    elif case == "non_tensor_tokens":
+        message["token_ids"] = [1, 2]
+    elif case == "non_vector_tokens":
+        message["token_ids"] = torch.ones(1, 2, dtype=torch.long)
     elif case == "shape":
         message["token_loss_mask"] = torch.ones(1)
     elif case == "non_binary":
@@ -256,17 +299,9 @@ def test_precomputed_loss_masks_reject_invalid_inputs(case: str, packed: bool) -
         cooker_functions=[],
         include_source_ids=True,
         tokenizer=_Tokenizer(),
-        loss_mask_mode="unsupported" if case == "unsupported_mode" else "precomputed",
-        only_unmask_final=case == "final_only",
+        loss_mask_mode="precomputed",
     )
-    error = (
-        "Unsupported"
-        if case == "unsupported_mode"
-        else "only_unmask_final"
-        if case == "final_only"
-        else "binary vectors"
-    )
-    with pytest.raises(ValueError, match=error):
+    with pytest.raises(ValueError, match="binary vectors"):
         if packed:
             encoder.batch(
                 [
@@ -279,7 +314,7 @@ def test_precomputed_loss_masks_reject_invalid_inputs(case: str, packed: bool) -
             prepare_sft_batch(
                 encoder.batch([sample]),
                 tokenizer=_Tokenizer(),
-                only_unmask_final=case == "final_only",
+                only_unmask_final=False,
                 make_sequence_length_divisible_by=1,
             )
 

@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -26,6 +26,7 @@ from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
     message_log_to_flat_messages,
+    validate_precomputed_loss_masks,
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.packing import SequencePacker
@@ -91,7 +92,7 @@ def prepare_packed_sft_batch(
     *,
     tokenizer: PreTrainedTokenizerBase,
     only_unmask_final: bool,
-    loss_mask_mode: str | None = None,
+    loss_mask_mode: Literal["precomputed"] | None = None,
 ) -> BatchedDataDict[Any]:
     """Create model tensors for a batch of physical Energon packs."""
     if not packs or tokenizer.pad_token_id is None:
@@ -124,22 +125,7 @@ def prepare_packed_sft_batch(
             [dict(message) for message in sample.message_log] for sample in pack.samples
         ]
         if loss_mask_mode == "precomputed":
-            for log in logs:
-                for message in log:
-                    tokens = message.get("token_ids")
-                    mask = message.get("token_loss_mask")
-                    if (
-                        not isinstance(tokens, torch.Tensor)
-                        or not isinstance(mask, torch.Tensor)
-                        or tokens.ndim != 1
-                        or mask.ndim != 1
-                        or tokens.shape != mask.shape
-                        or bool(((mask != 0) & (mask != 1)).any())
-                    ):
-                        raise ValueError(
-                            "Precomputed packed SFT masks must be binary vectors "
-                            "matching each token vector."
-                        )
+            validate_precomputed_loss_masks(logs)
         else:
             add_loss_mask_to_message_log(
                 logs,

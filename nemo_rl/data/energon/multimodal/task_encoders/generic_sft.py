@@ -18,7 +18,7 @@ import hashlib
 import json
 from collections.abc import Sequence
 from copy import deepcopy
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 import torch
 from megatron.energon import SampleDecoder, stateless
@@ -273,7 +273,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         tokenizer: Any | None = None,
         sequence_length_pad_multiple: int = 1,
         only_unmask_final: bool = False,
-        loss_mask_mode: str | None = None,
+        loss_mask_mode: Literal["precomputed"] | None = None,
     ) -> None:
         """Configure conversation encoding and optional sequence packing.
 
@@ -291,6 +291,12 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
                 not support only_unmask_final=True. Both modes support packed
                 and unpacked conversations.
         """
+        if loss_mask_mode not in (None, "precomputed"):
+            raise ValueError(f"Unsupported SFT loss_mask_mode={loss_mask_mode!r}.")
+        if loss_mask_mode == "precomputed" and only_unmask_final:
+            raise ValueError(
+                "only_unmask_final cannot override precomputed SFT loss masks."
+            )
         super().__init__(cooker_functions=cooker_functions)
         self.adapter = adapter
         self.include_source_ids = include_source_ids
