@@ -26,29 +26,40 @@ computed from the live router, so gradients keep flowing into it.
 import types
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, cast
 
 import torch
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.moe.router_replay import RouterReplay
 from torch import nn
 
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.data import ProcessedMicrobatch
 from nemo_rl.models.generation.interfaces import ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, PolicyConfig
 
 
 @dataclass
 class ReplayGate:
     """A policy MoE gate whose expert selection nemo-rl can replay."""
 
+    name: str  # module name, for error messages
     layer: Optional[int]  # index i of the ``layers.<i>`` decoder block owning the gate
     num_experts: Optional[int]
     handle: RouterReplay
 
 
 def validate_automodel_router_replay_config(config: PolicyConfig) -> None:
-    """Reject setups where R3 cannot get routes or gate tokens would not align with them."""
+    """Reject setups where R3 cannot get routes or gate tokens would not align with them.
+
+    Raises:
+        ValueError: If generation is not vLLM (the only backend that returns routes),
+            or policy.automodel_cfg is disabled.
+        NotImplementedError: If sequence packing, context parallelism or sequence
+            parallelism is on; the gate would then see tokens that do not line up with
+            the ``[batch, seq]`` routes.
+    """
     if not router_replay_enabled(config):
         return
     generation = config.get("generation")
@@ -58,6 +69,11 @@ def validate_automodel_router_replay_config(config: PolicyConfig) -> None:
             "rollout routed_experts."
         )
     automodel_cfg = config["automodel_cfg"]
+    if not automodel_cfg["enabled"]:
+        raise ValueError(
+            "validate_automodel_router_replay_config needs policy.automodel_cfg.enabled."
+        )
+    automodel_cfg = cast(AutomodelConfig, automodel_cfg)
     packing = config.get("sequence_packing")
     unsupported = {
         "sequence_packing": bool(packing and packing["enabled"]),
@@ -79,6 +95,10 @@ def require_automodel_moe_model(
 
     Call after ``force_hf`` is settled; otherwise HF rejects the injected
     ``moe_overrides`` with an opaque ``TypeError``.
+
+    Raises:
+        ValueError: If ``force_hf`` is set or the architecture has no Automodel
+            implementation.
     """
     architectures = getattr(model_config, "architectures", None) or []
     if (
@@ -113,6 +133,7 @@ def _replaying_apply(handle: RouterReplay, indices: torch.Tensor) -> torch.Tenso
     replay = handle._nrl_replay
     if replay is None:
         return RouterReplay.apply(handle, indices)
+    handle._nrl_consulted = True
     target, keep_live = replay
     if target.shape != indices.shape:
         raise ValueError(
@@ -138,11 +159,15 @@ def router_replay_gates(model: nn.Module) -> list[ReplayGate]:
         if handle is None or any(part.startswith("mtp") for part in name.split(".")):
             continue
         handle._nrl_replay = None
+        handle._nrl_consulted = False
         handle.apply = types.MethodType(_replaying_apply, handle)
         gates.append(
             ReplayGate(
+                name=name,
                 layer=_decoder_layer_index(name),
-                num_experts=getattr(module, "n_experts", None),
+                # The standard Gate names it n_experts; Gemma4Gate names it num_experts.
+                num_experts=getattr(module, "n_experts", None)
+                or getattr(module, "num_experts", None),
                 handle=handle,
             )
         )
@@ -157,27 +182,37 @@ def _payload_layers(gates: list[ReplayGate], num_payload_layers: int) -> list[in
     """
     if num_payload_layers == len(gates):
         return list(range(len(gates)))
-    layers = [gate.layer for gate in gates]
-    if None in layers or max(layers) >= num_payload_layers:
+    layers = [gate.layer for gate in gates if gate.layer is not None]
+    if len(layers) != len(gates) or max(layers) >= num_payload_layers:
         raise ValueError(
             f"routed_experts has {num_payload_layers} layer slots, which matches neither the "
-            f"{len(gates)} MoE gates nor their decoder-layer indices {layers}."
+            f"{len(gates)} MoE gates nor their decoder-layer indices "
+            f"{[gate.layer for gate in gates]}."
         )
     return layers
 
 
-def microbatch_routed_experts(data_dict: Any, input_ids: torch.Tensor) -> torch.Tensor:
+def microbatch_routed_experts(
+    data_dict: BatchedDataDict[Any], input_ids: torch.Tensor
+) -> torch.Tensor:
     """The microbatch's ``routed_experts`` (token-aligned with ``input_ids``), padding unreplayed.
 
-    Batching right-pads ``routed_experts`` with 0, i.e. ``[0, 0, ..., 0]`` rows that repeat
-    one expert; positions past each sequence's ``input_lengths`` get the missing-route
-    sentinel so they keep the live selection instead.
+    Right padding of ``routed_experts`` is 0 on the driver path (``[0, ..., 0]`` rows would
+    repeat one expert) and -1 from the data plane; positions past each sequence's
+    ``input_lengths`` get the missing-route sentinel so they keep the live selection.
+
+    Raises:
+        ValueError: If the microbatch has no ``routed_experts`` or they are not
+            ``[batch, seq, layer slots, topk]`` aligned with ``input_ids``.
     """
     routed_experts = data_dict.get("routed_experts")
     if routed_experts is None:
         raise ValueError(
-            "policy.router_replay.enabled but the batch carries no routed_experts; "
-            "vLLM must run with enable_return_routed_experts (set by configure_vllm_for_router_replay)."
+            "policy.router_replay.enabled but this microbatch carries no routed_experts. "
+            "The rollout must return them (vLLM enable_return_routed_experts, set by "
+            "configure_vllm_for_router_replay), and every data path from the rollout to "
+            "this forward must keep the field (TQ field selection, or an algorithm's own "
+            "data whitelist)."
         )
     if routed_experts.dim() != 4 or tuple(routed_experts.shape[:2]) != tuple(
         input_ids.shape
@@ -225,7 +260,7 @@ def _validated_targets(
         row, gate_idx = (int(i) for i in invalid.nonzero()[0])
         gate = gates[gate_idx]
         raise ValueError(
-            f"Corrupt routed_experts for the MoE gate in decoder layer {gate.layer}: token "
+            f"Corrupt routed_experts for MoE gate {gate.name}: token "
             f"{row % seq} of microbatch sample {row // seq} has route "
             f"{targets[row, gate_idx].tolist()}. Experts must be distinct ids in "
             f"[0, {gate.num_experts}); only an all-{ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL} row "
@@ -242,19 +277,36 @@ def replay_routes(
 
     Wrap both the forward and the backward of a microbatch so activation-checkpoint
     recomputation replays the same selection.
+
+    Raises:
+        ValueError: If the routes do not match the gates' layer slots or contain a
+            corrupt row.
+        RuntimeError: If a gate never consulted its replay handle during the block,
+            i.e. its routing was not replayed.
     """
     targets, keep_live = _validated_targets(gates, routed_experts)
     try:
         for i, gate in enumerate(gates):
             gate.handle._nrl_replay = (targets[:, i], keep_live[:, i])
+            gate.handle._nrl_consulted = False
         yield
+        # A gate class that builds a RouterReplay handle but never calls
+        # replay_selection (e.g. Automodel's KimiK3Gate) would otherwise route live
+        # without any error.
+        skipped = [g.name for g in gates if not g.handle._nrl_consulted]
+        if skipped:
+            raise RuntimeError(
+                f"R3: MoE gates {skipped} own a RouterReplay handle but never consulted "
+                "it, so their rollout routes were not replayed; this gate class does not "
+                "support routing replay."
+            )
     finally:
         for gate in gates:
             gate.handle._nrl_replay = None
 
 
 def microbatch_replay_context(
-    gates: Optional[list[ReplayGate]], processed_mb: Any
+    gates: Optional[list[ReplayGate]], processed_mb: ProcessedMicrobatch
 ) -> AbstractContextManager[None]:
     """Replay the microbatch's rollout routes on ``gates``; a no-op when ``gates`` is None."""
     if gates is None:

@@ -28,6 +28,11 @@ return routed expert indices by setting `enable_return_routed_experts=True` in
 the vLLM kwargs. The generation payload is then carried through the normal
 rollout and policy data path as the `routed_experts` field.
 
+We recommend setting `policy.generation.vllm_cfg.enable_prefix_caching=false`
+with Router Replay. With prefix caching and chunked prefill, vLLM has
+occasionally returned incomplete `routed_experts` for a request, which Router
+Replay then rejects. Prefix caching is not required by either policy backend.
+
 For models that also train MoE-based MTP heads, Router Replay skips MTP
 routers by default. This keeps MTP routers on their native routing decisions
 while replaying vLLM routes only in the decoder layers. Set
@@ -54,12 +59,12 @@ routes in the `get_logprobs` forward and in the training forward and backward.
 Reference-policy logprobs never replay rollout routes. Current requirements:
 
 - The model must use an Automodel MoE implementation; the HF / `force_hf` path has
-  no replay hooks and fails at worker setup.
+  no replay hooks and fails at worker setup. A gate class that builds a replay hook
+  but never consults it (for example Automodel's Kimi K3 gate) fails with a
+  `RuntimeError` at the first replayed forward instead of silently routing live.
 - Sequence packing, `automodel_cfg.context_parallel_size > 1`, and
   `automodel_cfg.sequence_parallel` are not supported yet and fail at setup, as does
   `token_capture.defer_routed_experts_to_policy`.
-- Set `policy.generation.vllm_cfg.enable_prefix_caching=false` so vLLM computes, and
-  returns routes for, every prompt token instead of reusing cached prefixes.
 - vLLM may emit one route slot per MoE layer or one per decoder layer (hybrid
   models such as NemotronH); both layouts are mapped to the gates automatically.
 - Batch padding is never replayed. Rows other than all-`-1` missing routes that are
@@ -70,6 +75,7 @@ Example: `examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel-ep8-r
 and halves `train/gen_kl_error` (0.00037 vs 0.00086). Without Router Replay
 (`dapo-nanov3.5-30BA3B-4n8g-automodel-ep8.yaml`), 0-2 tokens per step disagreed by 10-31
 nats between vLLM and training, spiking the mean to 1e6-3e9 on about 20% of steps.
+The R3 recipe also turns vLLM prefix caching off, while the base recipe leaves it on.
 
 ## Validation
 

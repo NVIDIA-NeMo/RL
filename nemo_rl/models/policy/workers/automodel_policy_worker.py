@@ -378,8 +378,10 @@ class AutomodelPolicyWorkerImpl(
         )
         if self._router_replay_gates == []:
             raise RuntimeError(
-                "policy.router_replay.enabled but the model has no RouterReplay gates; R3 needs "
-                "an Automodel MoE implementation (not the HF / force_hf path)."
+                "policy.router_replay.enabled but the model has no RouterReplay gates. R3 "
+                "needs an MoE model whose Automodel class builds its gates from "
+                "moe_overrides (enable_routing_replay), with "
+                "automodel_kwargs.backend.fake_balanced_gate off."
             )
 
         # Initialize reference model if requested. With deferred loading the

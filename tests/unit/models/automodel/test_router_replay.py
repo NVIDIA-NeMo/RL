@@ -17,6 +17,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from torch.utils.checkpoint import (
+    CheckpointPolicy,
+    checkpoint,
+    create_selective_checkpoint_contexts,
+)
 
 try:
     from nemo_automodel._transformers.registry import ModelRegistry
@@ -83,7 +88,11 @@ def _config(**overrides):
     cfg = {
         "router_replay": {"enabled": True},
         "generation": {"backend": "vllm"},
-        "automodel_cfg": {"context_parallel_size": 1, "sequence_parallel": False},
+        "automodel_cfg": {
+            "enabled": True,
+            "context_parallel_size": 1,
+            "sequence_parallel": False,
+        },
         "sequence_packing": {"enabled": False},
     }
     cfg.update(overrides)
@@ -100,13 +109,26 @@ def _config(**overrides):
             NotImplementedError,
         ),
         (
-            {"automodel_cfg": {"context_parallel_size": 2, "sequence_parallel": False}},
+            {
+                "automodel_cfg": {
+                    "enabled": True,
+                    "context_parallel_size": 2,
+                    "sequence_parallel": False,
+                }
+            },
             NotImplementedError,
         ),
         (
-            {"automodel_cfg": {"context_parallel_size": 1, "sequence_parallel": True}},
+            {
+                "automodel_cfg": {
+                    "enabled": True,
+                    "context_parallel_size": 1,
+                    "sequence_parallel": True,
+                }
+            },
             NotImplementedError,
         ),
+        ({"automodel_cfg": {"enabled": False}}, ValueError),
     ],
 )
 def test_validate_rejects_unsupported_setups(overrides, error):
@@ -216,7 +238,9 @@ def test_replay_rejects_corrupt_routes(bad_route):
     model = _Model()
     gates = router_replay_gates(model)
     routed = torch.tensor([[[[1, 2], [3, 4]], [bad_route, [5, 6]], [[7, 8], [9, 10]]]])
-    with pytest.raises(ValueError, match="Corrupt routed_experts .* decoder layer 1"):
+    with pytest.raises(
+        ValueError, match=r"Corrupt routed_experts for MoE gate layers\.1\.mixer\.gate"
+    ):
         with replay_routes(gates, routed):
             pass
 
@@ -311,3 +335,132 @@ def test_replay_through_a_real_automodel_gate():
 @pytest.mark.automodel
 def test_microbatch_replay_context_is_noop_without_gates():
     assert isinstance(microbatch_replay_context(None, SimpleNamespace()), nullcontext)
+
+
+class _NumExpertsGate(nn.Module):
+    """Like Automodel's Gemma4Gate, which names its expert count ``num_experts``."""
+
+    def __init__(self):
+        super().__init__()
+        self.num_experts = NUM_EXPERTS
+        self.router_replay = RouterReplay()
+
+
+@pytest.mark.automodel
+def test_gate_with_num_experts_attribute_is_range_checked():
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Module()])
+    model.layers[0].gate = _NumExpertsGate()
+    (gate,) = router_replay_gates(model)
+    assert gate.num_experts == NUM_EXPERTS
+    with pytest.raises(ValueError, match="Corrupt routed_experts"):
+        with replay_routes([gate], torch.tensor([[[[NUM_EXPERTS, 1]]]])):
+            pass
+
+
+@pytest.mark.automodel
+def test_replay_raises_when_a_gate_never_consults_its_handle():
+    """A gate class that owns a handle but never calls it (Kimi K3) must not route live."""
+    model = _Model()
+    gates = router_replay_gates(model)
+    first, _ = model.gates()
+    with pytest.raises(RuntimeError, match=r"layers\.3\.mixer\.gate"):
+        with replay_routes(gates, torch.tensor([[[[7, 8], [9, 10]]]])):
+            first.router_replay.apply(torch.tensor([[0, 1]]))
+    assert all(g.handle._nrl_replay is None for g in gates)
+
+
+def _moe_config(dim):
+    return MoEConfig(
+        n_routed_experts=8,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=dim,
+        inter_dim=8,
+        moe_inter_dim=8,
+        norm_topk_prob=False,
+        softmax_before_topk=True,
+        dtype=torch.float32,
+        enable_routing_replay=True,
+    )
+
+
+class _GatedBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gate = Gate(_moe_config(dim))
+        nn.init.normal_(self.gate.weight)
+        self.experts = nn.Parameter(torch.randn(8, dim, dim) * 0.1)
+
+    def forward(self, x):
+        token_mask = torch.ones(x.shape[0], dtype=torch.bool)
+        weights, indices, _ = self.gate(x, token_mask, None)
+        out = torch.einsum("td,tkde->tke", x, self.experts[indices])
+        return x + (weights.unsqueeze(-1) * out).sum(1)
+
+
+def _router_topk_saved(ctx, func, *args, **kwargs):
+    # Like Automodel's ignore_router_for_ac: keep the router's topk, recompute the rest.
+    if func == torch.ops.aten.topk.default:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+@pytest.mark.automodel
+@pytest.mark.parametrize("ckpt", ["full", "selective"])
+def test_activation_checkpoint_recompute_replays_inside_the_context(ckpt):
+    """Backward inside replay_routes recomputes the replayed routes; outside it does not."""
+    torch.manual_seed(0)
+    dim, num_layers, tokens = 16, 3, 32
+    model = nn.Module()
+    model.layers = nn.ModuleList([_GatedBlock(dim) for _ in range(num_layers)])
+    gates = router_replay_gates(model)
+    x = torch.randn(tokens, dim)
+    routed = torch.stack(
+        [
+            torch.stack([torch.randperm(8)[:2] for _ in range(num_layers)])
+            for _ in range(tokens)
+        ]
+    ).unsqueeze(0)
+    routed[0, 3] = -1  # a missing route keeps the live selection
+
+    def forward(checkpointed):
+        h = x
+        for block in model.layers:
+            if not checkpointed:
+                h = block(h)
+            elif ckpt == "full":
+                h = checkpoint(block, h, use_reentrant=False)
+            else:
+                h = checkpoint(
+                    block,
+                    h,
+                    use_reentrant=False,
+                    context_fn=lambda: create_selective_checkpoint_contexts(
+                        _router_topk_saved
+                    ),
+                )
+        return h.square().sum()
+
+    def grads(backward_inside, checkpointed):
+        model.zero_grad()
+        with replay_routes(gates, routed):
+            loss = forward(checkpointed)
+            if backward_inside:
+                loss.backward()
+        if not backward_inside:
+            loss.backward()
+        return [p.grad.clone() for p in model.parameters()]
+
+    reference = grads(backward_inside=True, checkpointed=False)
+    for a, b in zip(reference, grads(backward_inside=True, checkpointed=True)):
+        torch.testing.assert_close(a, b)
+    outside = grads(backward_inside=False, checkpointed=True)
+    assert any(not torch.allclose(a, b) for a, b in zip(reference, outside))
