@@ -42,6 +42,13 @@ RAY_SUB="${RAY_SUB:-${SLURM_SUBMIT_DIR}/ray.sub}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
 EXTERNAL_VLLM_SHARED_ROOT="${EXTERNAL_VLLM_SHARED_ROOT:-/lustre}"
+EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS="${EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS:-5}"
+EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS="${EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS:-10}"
+# Token in COMMAND that is replaced by the Hydra override gating Gym rollouts on
+# external pool health. A placeholder rather than an append: appended text would
+# bind to whatever ends COMMAND (`| tee log`, `; echo done`, a `# comment`), and
+# training would start without the gate. Keep in sync with pool_config.sh.
+EXTERNAL_SERVICE_READINESS_PLACEHOLDER="__EXTERNAL_SERVICE_READINESS__"
 
 if [[ ! -f "${RAY_SUB}" ]]; then
   echo "[FATAL] ray.sub does not exist: ${RAY_SUB}" >&2
@@ -61,6 +68,15 @@ if [[ "${EXTERNAL_VLLM_SHARED_ROOT}" != /* ]]; then
   echo "[FATAL] EXTERNAL_VLLM_SHARED_ROOT must be absolute" >&2
   exit 1
 fi
+for readiness_variable in \
+  EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS \
+  EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS; do
+  readiness_value="${!readiness_variable}"
+  if [[ ! "${readiness_value}" =~ ^[0-9]+$ ]] || (( readiness_value <= 0 )); then
+    echo "[FATAL] ${readiness_variable} must be a positive integer" >&2
+    exit 1
+  fi
+done
 
 read -r -a pool_names <<< "${EXTERNAL_VLLM_POOLS}"
 if (( ${#pool_names[@]} == 0 )); then
@@ -201,6 +217,10 @@ for pool in "${pool_names[@]}"; do
     max_startup_timeout="${startup_timeouts[${pool}]}"
   fi
 done
+if [[ "${COMMAND}" != *"${EXTERNAL_SERVICE_READINESS_PLACEHOLDER}"* ]]; then
+  echo "[FATAL] Driver command is missing ${EXTERNAL_SERVICE_READINESS_PLACEHOLDER} for the external-service readiness gate" >&2
+  exit 1
+fi
 
 shared_paths=("${BASE_LOG_DIR}" "${EXTERNAL_VLLM_TOOLS_DIR_HOST}")
 for pool in "${pool_names[@]}"; do
@@ -318,6 +338,25 @@ check_service_steps() {
       return 1
     fi
   done
+}
+
+check_ray_sub_step() {
+  local status
+  if [[ -n "${ray_sub_pid}" ]] && ! kill -0 "${ray_sub_pid}" 2>/dev/null; then
+    if wait "${ray_sub_pid}"; then
+      status=0
+    else
+      status=$?
+    fi
+    ray_sub_pid=""
+    echo "[FATAL] NeMo RL exited during external vLLM startup with status ${status}" >&2
+    return 1
+  fi
+}
+
+check_startup_steps() {
+  check_service_steps
+  check_ray_sub_step
 }
 
 resolve_node_ip() {
@@ -548,6 +587,8 @@ for pool in "${pool_names[@]}"; do
 done
 
 ray_head_ip=$(resolve_node_ip "${ray_head_node}")
+external_service_readiness_override='{services:['
+readiness_separator=""
 for pool in "${pool_names[@]}"; do
   pool_urls["${pool}"]="http://${ray_head_ip}:${lb_ports[${pool}]}/v1"
   echo "[INFO] Starting ${display_names[${pool}]} load balancer at ${pool_urls[${pool}]}"
@@ -570,7 +611,31 @@ for pool in "${pool_names[@]}"; do
     bash -lc "PYTHON='${EXTERNAL_VLLM_LB_PYTHON}' /opt/external-vllm-tools/lb_watchdog.sh '${lb_ports[${pool}]}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}'" &
   lb_step_pids+=("$!")
   lb_step_labels+=("${display_names[${pool}]} load balancer")
+
+  COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
+  external_service_readiness_override+="${readiness_separator}{name:${pool},url:\"http://${ray_head_ip}:${lb_ports[${pool}]}/health\",expected_backends:${replicas[${pool}]}}"
+  readiness_separator=","
 done
+external_service_readiness_override+='],timeout_seconds:'
+external_service_readiness_override+="${max_startup_timeout}"
+external_service_readiness_override+=',poll_interval_seconds:'
+external_service_readiness_override+="${EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS}"
+external_service_readiness_override+=',request_timeout_seconds:'
+external_service_readiness_override+="${EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS}"
+external_service_readiness_override+='}'
+readiness_arg="++env.nemo_gym.external_service_readiness='${external_service_readiness_override}'"
+COMMAND="${COMMAND//${EXTERNAL_SERVICE_READINESS_PLACEHOLDER}/${readiness_arg}}"
+export COMMAND
+
+echo "[INFO] Starting NeMo RL while external vLLM pools load"
+# ray.sub predates hetjobs and consumes the unsuffixed allocation variables.
+# Restrict those variables to component 0; srun also defaults to hetgroup 0.
+# `env` execs bash directly, so ray_sub_pid is the process that owns its traps.
+env \
+  SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}" \
+  SLURM_JOB_NUM_NODES="${#ray_nodes[@]}" \
+  bash "${RAY_SUB}" &
+ray_sub_pid=$!
 
 deadline=$((SECONDS + max_startup_timeout))
 while true; do
@@ -591,7 +656,7 @@ while true; do
     fi
   done
   (( all_ready == 1 )) && break
-  check_service_steps
+  check_startup_steps
   if (( SECONDS >= deadline )); then
     echo "[FATAL] Timed out waiting for all external vLLM pools" >&2
     exit 1
@@ -601,7 +666,7 @@ done
 
 for pool in "${pool_names[@]}"; do
   until curl -sfm 10 "${pool_urls[${pool}]}/models" >/dev/null 2>&1; do
-    check_service_steps
+    check_startup_steps
     if (( SECONDS >= deadline )); then
       echo "[FATAL] ${display_names[${pool}]} load balancer failed its end-to-end /models probe" >&2
       exit 1
@@ -609,19 +674,8 @@ for pool in "${pool_names[@]}"; do
     sleep 5
   done
   echo "${pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_url"
-  COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
 done
-export COMMAND
-
-echo "[INFO] External vLLM pools are healthy; starting NeMo RL"
-# ray.sub predates hetjobs and consumes the unsuffixed allocation variables.
-# Restrict those variables to component 0; srun also defaults to hetgroup 0.
-# `env` execs bash directly, so ray_sub_pid is the process that owns its traps.
-env \
-  SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}" \
-  SLURM_JOB_NUM_NODES="${#ray_nodes[@]}" \
-  bash "${RAY_SUB}" &
-ray_sub_pid=$!
+echo "[INFO] External vLLM pools are healthy; NeMo RL startup can proceed"
 
 while kill -0 "${ray_sub_pid}" 2>/dev/null; do
   if ! check_service_steps; then

@@ -143,6 +143,7 @@ from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
+from nemo_rl.models.megatron.zero_train_gen_mismatch import validate_zero_train_gen_kl
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -182,7 +183,10 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
-from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    validate_offload_policy_before_refit,
+)
 from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_support
 
 # ===============================================================================
@@ -552,6 +556,19 @@ def _needs_hf_refit_handshake(
     return not (nccl_reshard_refit_enabled and not colocated_inference)
 
 
+def _uses_managed_noncolocated_refit(
+    generation_backend: str,
+    nccl_reshard_refit_enabled: bool,
+    offload_policy_before_refit: bool,
+) -> bool:
+    """Whether non-colocated setup must attach a weight synchronizer."""
+    return (
+        nccl_reshard_refit_enabled
+        or generation_backend == "dynamo"
+        or offload_policy_before_refit
+    )
+
+
 def _shutdown_completed_nemo_gym_startup(
     future: Future[tuple[NemoGymShardSet, float]] | None,
 ) -> None:
@@ -868,6 +885,9 @@ def setup(
         )
 
     _validate_use_kl_in_reward_compat(master_config)
+
+    # Fail on an invalid zero-KL config before Ray allocates GPUs.
+    validate_zero_train_gen_kl(policy_config, check_environment=False)
 
     # ==========================
     #          Cluster
@@ -1263,6 +1283,16 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
+    offload_policy_before_refit = policy_config["offload_policy_before_refit"]
+    validate_offload_policy_before_refit(
+        enabled=offload_policy_before_refit,
+        megatron_enabled=bool(
+            (policy_config.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=backend,
+        colocated=colocated_inference,
+        refit_transport=generation_config.get("refit_transport"),
+    )
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
     generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
     remote_transport = None
@@ -1839,7 +1869,11 @@ def setup(
     ):
         t0 = time.perf_counter()
         # init collective
-        if nccl_reshard_refit_enabled or backend == "dynamo":
+        if _uses_managed_noncolocated_refit(
+            generation_backend=backend,
+            nccl_reshard_refit_enabled=nccl_reshard_refit_enabled,
+            offload_policy_before_refit=offload_policy_before_refit,
+        ):
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
                 generation=policy_generation,
@@ -2921,6 +2955,8 @@ def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: Optional[float],
+    *,
+    filtering_on: bool = False,
 ) -> dict:
     """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
 
@@ -2935,6 +2971,7 @@ def compute_and_apply_seq_logprob_error_masking(
         rewards: Reward tensor for computing statistics on masked sequences.
         seq_logprob_error_threshold: If set, mask sequences with mult_prob_error
                                     exceeding this threshold. If None, only compute metrics.
+        filtering_on: Whether policy top-k/top-p can produce unsupported -inf tokens.
 
     Returns:
         Dict with keys: max_seq_mult_prob_error, mean_seq_mult_prob_error,
@@ -2946,6 +2983,11 @@ def compute_and_apply_seq_logprob_error_masking(
     sample_mask = train_data["sample_mask"]
     prev_logprobs = train_data["prev_logprobs"][:, 1:]
     generation_logprobs = train_data["generation_logprobs"][:, 1:]
+    if filtering_on:
+        # Narrow only the diagnostic mask; the shared mask still owns KL terms.
+        token_mask = token_mask * (
+            ~torch.isneginf(prev_logprobs) & ~torch.isneginf(generation_logprobs)
+        ).to(token_mask.dtype)
     seq_mult_prob_error, valid_seq_mask = compute_seq_logprob_errors(
         policy_logprobs=prev_logprobs,
         generation_logprobs=generation_logprobs,
@@ -3714,10 +3756,6 @@ def _grpo_train_impl(
                     if not skip_prev_logprobs:
                         prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
                         train_data["prev_logprobs"] = prev_lp_result["logprobs"]
-                        # When top-k/top-p filtering is enabled, the worker returns a mask that has
-                        # -inf positions zeroed. Propagate it so the loss reduction skips them.
-                        if "token_mask" in prev_lp_result:
-                            train_data["token_mask"] = prev_lp_result["token_mask"]
                     else:
                         print(
                             "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
@@ -3763,6 +3801,12 @@ def _grpo_train_impl(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
+                        filtering_on=need_top_k_or_top_p_filtering(
+                            TrainingSamplingParams(
+                                top_k=master_config.policy["generation"]["top_k"],
+                                top_p=master_config.policy["generation"]["top_p"],
+                            )
+                        ),
                     )
                     seq_logprob_error_metrics = seq_error_result
                     if "num_masked_seqs" in seq_logprob_error_metrics:
@@ -4174,6 +4218,12 @@ def _grpo_train_impl(
                     },
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
+                    filtering_on=need_top_k_or_top_p_filtering(
+                        TrainingSamplingParams(
+                            top_k=master_config.policy["generation"]["top_k"],
+                            top_p=master_config.policy["generation"]["top_p"],
+                        )
+                    ),
                 )
             del train_data
             if (
@@ -5518,9 +5568,6 @@ def async_grpo_train(
                     if not skip_prev_logprobs:
                         prev_lp_result = policy.get_logprobs(train_data, timer=timer)
                         train_data["prev_logprobs"] = prev_lp_result["logprobs"]
-                        # Propagate the top-k/top-p neginf token mask.
-                        if "token_mask" in prev_lp_result:
-                            train_data["token_mask"] = prev_lp_result["token_mask"]
                     else:
                         train_data["prev_logprobs"] = torch.zeros_like(
                             train_data["generation_logprobs"]
@@ -5559,6 +5606,12 @@ def async_grpo_train(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
+                        filtering_on=need_top_k_or_top_p_filtering(
+                            TrainingSamplingParams(
+                                top_k=master_config.policy["generation"]["top_k"],
+                                top_p=master_config.policy["generation"]["top_p"],
+                            )
+                        ),
                     )
                     seq_logprob_error_metrics = seq_error_result
                     if "num_masked_seqs" in seq_logprob_error_metrics:
