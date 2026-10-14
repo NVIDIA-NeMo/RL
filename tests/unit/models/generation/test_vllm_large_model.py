@@ -154,7 +154,9 @@ async def test_vllm_large_model(
         )
         print(f"Total GPUs required: {tensor_parallel_size * pipeline_parallel_size}")
 
-        async_policy = VllmGeneration(two_node_cluster, vllm_config)
+        async_policy = VllmGeneration(
+            two_node_cluster, vllm_config, use_fastokens=False
+        )
 
         print("Running async generation...")
         collected_indexed_outputs = []

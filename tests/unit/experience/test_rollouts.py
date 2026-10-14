@@ -1210,7 +1210,9 @@ def multi_step_setup_vllm_sync(
         vllm_config = configure_generation_config(
             vllm_config, rollout_tokenizer, is_eval=is_eval
         )
-        vllm_generation = VllmGeneration(rollout_cluster, vllm_config)
+        vllm_generation = VllmGeneration(
+            rollout_cluster, vllm_config, use_fastokens=False
+        )
         vllm_generation.finish_generation()
         yield (
             vllm_generation,
@@ -1252,7 +1254,9 @@ def multi_step_setup_vllm_async(
         vllm_config = configure_generation_config(
             vllm_config, rollout_tokenizer, is_eval=is_eval
         )
-        vllm_generation = VllmGeneration(rollout_cluster, vllm_config)
+        vllm_generation = VllmGeneration(
+            rollout_cluster, vllm_config, use_fastokens=False
+        )
         vllm_generation.finish_generation()
         yield (
             vllm_generation,
@@ -1622,7 +1626,9 @@ def sliding_puzzle_setup_vllm(
         )
         # Ensure max_new_tokens is sufficient
         vllm_config["max_new_tokens"] = 500
-        vllm_generation = VllmGeneration(rollout_cluster, vllm_config)
+        vllm_generation = VllmGeneration(
+            rollout_cluster, vllm_config, use_fastokens=False
+        )
         vllm_generation.finish_generation()
         yield (
             vllm_generation,

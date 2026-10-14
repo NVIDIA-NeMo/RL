@@ -393,7 +393,7 @@ config = configure_generation_config(config, tokenizer)
 
 # Initialize the cluster and generation backend
 cluster = RayVirtualCluster(...)
-generator = VllmGeneration(cluster, config)
+generator = VllmGeneration(cluster, config, use_fastokens=False)
 
 # Prepare input data
 input_data = BatchedDataDict(...)

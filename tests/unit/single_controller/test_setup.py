@@ -347,6 +347,20 @@ def test_build_generation_passes_sglang_config():
     generation.finish_generation.assert_called_once_with()
 
 
+def test_build_generation_forwards_use_fastokens_to_vllm():
+    """policy.tokenizer.use_fastokens reaches the async vLLM HTTP tokenizer."""
+    master_config = _make_master_config(backend="vllm")
+    master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
+    master_config.policy["tokenizer"]["use_fastokens"] = True
+    inference_cluster = MagicMock(name="inference_cluster")
+
+    with patch.object(sc_setup_mod, "VllmGeneration") as mock_vllm:
+        sc_setup_mod._build_generation(inference_cluster, master_config)
+
+    mock_vllm.assert_called_once()
+    assert mock_vllm.call_args.kwargs["use_fastokens"] is True
+
+
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
     master_config = _make_master_config(colocated=False, backend="trtllm")

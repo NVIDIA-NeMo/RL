@@ -617,6 +617,7 @@ def _build_generation(
             cluster=inference_cluster,
             config=vllm_config,
             defer_model_load=defer_model_load,
+            use_fastokens=bool(master_config.policy["tokenizer"].get("use_fastokens")),
         )
 
     elif backend == "sglang":

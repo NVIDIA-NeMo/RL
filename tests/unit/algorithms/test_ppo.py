@@ -1514,6 +1514,7 @@ def _make_noncolocated_setup_config(
     return MasterConfig.model_construct(
         policy={
             "model_name": "fake-model",
+            "tokenizer": {"use_fastokens": False},
             "train_global_batch_size": 1,
             "train_micro_batch_size": 1,
             "offload_policy_before_refit": False,
@@ -2187,6 +2188,17 @@ def test_noncolocated_vllm_offload_before_refit_uses_weight_synchronizer(monkeyp
     assert generation.weight_synchronizer is weight_sync
     policy.init_collective.assert_not_called()
     generation.init_collective.assert_not_called()
+
+
+@pytest.mark.parametrize("use_fastokens", [False, True])
+def test_ppo_forwards_use_fastokens_to_vllm(monkeypatch, use_fastokens):
+    """policy.tokenizer.use_fastokens reaches the async vLLM HTTP tokenizer."""
+    config = _make_noncolocated_setup_config()
+    config.policy["tokenizer"]["use_fastokens"] = use_fastokens
+
+    *_, generation_factory, _ = _run_noncolocated_setup(monkeypatch, config)
+
+    assert generation_factory.call_args.kwargs["use_fastokens"] is use_fastokens
 
 
 @pytest.mark.parametrize(

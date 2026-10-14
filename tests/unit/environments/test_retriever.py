@@ -155,7 +155,7 @@ def test_vllm_retrieve(cluster, tokenizer, rag_env):
     # Create vLLM generation
     vllm_config = basic_vllm_test_config.copy()
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
-    vllm_generation = VllmGeneration(cluster, vllm_config)
+    vllm_generation = VllmGeneration(cluster, vllm_config, use_fastokens=False)
 
     # Create RAG environment
     task_to_env = {"document_retrieval": rag_env}

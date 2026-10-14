@@ -80,7 +80,7 @@ def main() -> None:
         )
         vllm_generation = None
         try:
-            vllm_generation = VllmGeneration(cluster, config)
+            vllm_generation = VllmGeneration(cluster, config, use_fastokens=False)
             output = vllm_generation.generate_text(
                 BatchedDataDict({"prompts": ["The capital of France is"]}),
                 greedy=True,

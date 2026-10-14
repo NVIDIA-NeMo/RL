@@ -142,7 +142,7 @@ def test_vllm_quant_refit(cluster, async_engine):
     vllm_policy = None
     megatron_policy = None
     try:
-        vllm_policy = VllmGeneration(cluster, vllm_config)
+        vllm_policy = VllmGeneration(cluster, vllm_config, use_fastokens=False)
 
         # Before refit: vLLM quantizers should have no positive amax (uncalibrated)
         futures = vllm_policy.worker_group.run_all_workers_single_data(
@@ -234,7 +234,7 @@ def test_vllm_kv_quant_refit(cluster, recipe, uses_constant_amax, monkeypatch):
     vllm_policy = None
     megatron_policy = None
     try:
-        vllm_policy = VllmGeneration(cluster, vllm_config)
+        vllm_policy = VllmGeneration(cluster, vllm_config, use_fastokens=False)
 
         futures = vllm_policy.worker_group.run_all_workers_single_data(
             "get_quantizer_stats"

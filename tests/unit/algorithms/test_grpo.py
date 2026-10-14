@@ -3093,6 +3093,7 @@ def test_setup_dtensor_fp8_kv_cache_guard(
     master_config.data.update(shuffle=False, num_workers=0)
     master_config.policy.update(
         model_name="deepseek-v4-test",
+        tokenizer={"use_fastokens": False},
         automodel_cfg={"enabled": True},
         megatron_cfg={"enabled": False},
     )

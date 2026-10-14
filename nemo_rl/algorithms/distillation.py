@@ -536,6 +536,7 @@ def setup(
                 cluster=inference_cluster,
                 config=generation_config,
                 defer_model_load=True,
+                use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
             )
 
             def init_vllm_deferred():
@@ -591,7 +592,9 @@ def setup(
             nemo_gym_actor = cast(EnvironmentInterface, results["nemo_gym"])
         else:
             student_generation = VllmGeneration(
-                cluster=inference_cluster, config=generation_config
+                cluster=inference_cluster,
+                config=generation_config,
+                use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
             )
             student_generation.finish_generation()
         print(

@@ -76,6 +76,7 @@ dependencies = [
   "awscrt>=0.35.0",                                                                                           # for parallel S3 refit transport
   "zstandard",                                                                                                # for sparse refit body compression
   "fastokens>=0.2.0",                                                                                         # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
+  "orjson>=3.11.6",                                                                                           # native vLLM HTTP server JSON; imported by nemo_rl.models.generation.vllm
   # OpenTelemetry instrumentation. Base (not extra) so it reaches every worker
   # venv; `telemetry.enabled` in the config is the on/off switch. Sourced from
   # git in [tool.uv.sources] — see the note there; the floor is above the

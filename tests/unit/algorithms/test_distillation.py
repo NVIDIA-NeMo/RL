@@ -1035,6 +1035,7 @@ def test_distillation_setup_non_colocated_smoke(
                 "offload_policy_before_refit": offload_policy_before_refit,
                 "offload_optimizer_for_refit": True,
                 "model_name": "test-policy",
+                "tokenizer": {"use_fastokens": False},
             },
             "teacher": {
                 "model_name": "test-teacher",
@@ -1169,7 +1170,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         **{
             "policy": {
                 "model_name": "test-policy",
-                "tokenizer": {"name": "test-policy", "use_fastokens": False},
+                "tokenizer": {"name": "test-policy", "use_fastokens": True},
                 "offload_policy_before_refit": False,
                 "offload_optimizer_for_refit": True,
                 "generation": {
@@ -1248,9 +1249,10 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
             return {}
 
     class DummyVllmGeneration:
-        def __init__(self, cluster, config, defer_model_load=False):
+        def __init__(self, cluster, config, defer_model_load=False, *, use_fastokens):
             self.cfg = config
             self.defer_model_load = defer_model_load
+            self.use_fastokens = use_fastokens
             self.dp_openai_server_base_urls = ["http://reserved-vllm"]
             self.load_and_start_called = False
             self.finish_generation_called = False
@@ -1298,6 +1300,8 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
 
     assert created_vllm
     assert created_vllm[0].defer_model_load is True
+    # policy.tokenizer.use_fastokens reaches the async vLLM HTTP tokenizer.
+    assert created_vllm[0].use_fastokens is True
     assert created_vllm[0].load_and_start_called
     if vllm_start_fails:
         nemo_gym_actor.shutdown.assert_called_once_with()
@@ -1318,7 +1322,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         model_name="test-policy",
         tokenizer=tokenizer,
         enable_router_replay=False,
-        use_fastokens=False,
+        use_fastokens=True,
     )
     assert master_config.env["nemo_gym"] == nemo_gym_env_before
 
