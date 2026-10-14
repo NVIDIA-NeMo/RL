@@ -57,8 +57,8 @@ def test_gemma4_cp_keeps_local_hybridep_inputs_aligned(
     ("recipe_name", "dispatcher", "experts"),
     [
         ("llm/dpo-nanov3-30B3AB-1n4g-automodel-ep4.yaml", "torch", "torch_mm"),
-        ("llm/grpo-glm47-flash-4n8g-automodel.yaml", "hybridep", "torch_mm"),
-        ("llm/grpo-minimax-m27-dapo-8n8g-automodel.yaml", "hybridep", "torch_mm"),
+        ("llm/grpo-glm47-flash-4n8g-automodel-ep32.yaml", "hybridep", "torch_mm"),
+        ("llm/grpo-minimax-m27-dapo-8n8g-automodel-ep64.yaml", "hybridep", "torch_mm"),
         ("llm/grpo-moonlight-16b-automodel-1n8g-ep8.yaml", "hybridep", "torch_mm"),
         (
             "llm/grpo-nemotron3-super-120BA12B-16n8g-automodel-ep8.v2.yaml",
@@ -66,9 +66,9 @@ def test_gemma4_cp_keeps_local_hybridep_inputs_aligned(
             "torch_mm",
         ),
         ("llm/dapo-gemma4-26ba4b-it-4n8g-automodel-ep32.yaml", "hybridep", "gmm"),
-        ("llm/dapo-nanov3.5-30BA3B-4n8g-automodel.yaml", "hybridep", "gmm"),
+        ("llm/dapo-nanov3.5-30BA3B-4n8g-automodel-ep8.yaml", "hybridep", "gmm"),
         ("llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml", "hybridep", "gmm"),
-        ("llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml", "hybridep", "gmm"),
+        ("llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel-ep32.yaml", "hybridep", "gmm"),
         (
             "vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml",
             "deepep",
