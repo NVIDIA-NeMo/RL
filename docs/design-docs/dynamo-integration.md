@@ -36,9 +36,11 @@ driver-side invalidation lifecycle.
 
 Dynamo uses `CollectiveWeightSynchronizer`. If each engine has world size `E`,
 worker `i` starts at rank `training_world_size + i * E`. The policy sender uses
-vLLM's peer initialization and its fixed packed-transfer geometry: two 1-GiB
-buffers. The isolated vLLM environment validates the same constants before a
-worker starts.
+vLLM's peer initialization and a packed transfer with two 1-GiB buffers. vLLM
+reads the packing mode and geometry once, from the init info that NeMo-RL sends
+to `init_weight_transfer_engine`; each update round carries only tensor names,
+dtypes, and shapes. Before a worker starts, the isolated vLLM environment checks
+that its weight-transfer API accepts that init and update shape.
 
 Generation is drained before refit. The worker then runs vLLM's native
 `start_weight_update`, `update_weights`, and `finish_weight_update` transaction.
@@ -48,17 +50,13 @@ cache mode determines where it runs.
 ## Dependency isolation
 
 `BUILD_DYNAMO=1` adds a Python 3.12 `/opt/dynamo_venv` to the standard image.
-It contains only `ai-dynamo[vllm]==1.3.0.post1`, its pinned vLLM 0.23.0, etcd,
+It contains only `ai-dynamo[vllm]==1.5.1`, its pinned vLLM 0.28.0, etcd,
 and NATS. NeMo-RL's normal Ray and engine environments are unchanged; the
 standard NeMo-RL vLLM environment currently uses vLLM 0.29.0.
 
-vLLM 0.23.0 predates PR #44814, which fixes layerwise reload accounting for
-composed loaders. The installer asserts the exact vLLM version, checks and
-applies the backport, and records upstream merge commit
-`c9e5bf813530fb9ce06024e075da0f520b0718c8` in
-`/opt/dynamo_venv/VLLM_BACKPORTS`. Remove the backport only after Dynamo pins a
-vLLM release containing that fix. At that point delete the patch, application
-logic, marker assertion, and backport text rather than rebasing the patch.
+Layerwise reload depends on vLLM PR #44814, which fixes reload accounting for
+composed loaders. vLLM 0.28.0 includes it, and the installer fails if the
+installed vLLM does not.
 
 See [Managed Dynamo generation on Slurm](../guides/dynamo-generation.md) for
 build, configuration, and launch instructions.

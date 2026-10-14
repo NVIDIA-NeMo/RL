@@ -1,0 +1,75 @@
+# SingleController variant with the Ray-managed Dynamo vLLM backend.
+#
+# Rollouts follow the native-backend path: the SingleController sends each turn
+# to the Dynamo frontend over HTTP, builds the rollout record from the response,
+# and commits it to the TransferQueue data plane. Before every weight update the
+# SingleController drains and pauses the Dynamo workers (in-flight requests
+# finish on the old weights, new ones wait), then resumes them afterwards.
+defaults: grpo_math_1B_megatron_single_controller.yaml
+
+async_rl:
+  generation_fleet_health:
+    # Dynamo workers cannot abort their refit collective, so no refit deadline.
+    refit_timeout_s: null
+
+policy:
+  # Training uses the Megatron backend inherited from
+  # grpo_math_1B_megatron_single_controller.yaml; the SingleController's split
+  # training API is implemented by the Megatron policy worker.
+  generation:
+    backend: dynamo
+    dynamo_cfg:
+      engine: vllm
+      startup_timeout_s: 600
+      request_timeout_s: 900
+      # Also bounds the pre-refit drain, which waits for in-flight requests.
+      control_timeout_s: 600
+      metrics_include_prefixes: null
+      metrics_exclude_prefixes: null
+      worker_args:
+        tool_call_parser: null
+        reasoning_parser: null
+        exclude_tools_when_tool_choice_none: true
+        enable_structural_tag: false
+        structural_tag_scope: auto
+        structural_tag_schema: auto
+        custom_jinja_template: null
+        endpoint_types: [chat, completions]
+        extra_cli_args: []
+      frontend_args:
+        tokenizer: default
+        tokenizer_cache: false
+        tokenizer_cache_bytes: 52428800
+        router_mode: kv
+        extra_cli_args: []
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      precision: bfloat16
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      kv_cache_dtype: auto
+      enforce_eager: true
+      expose_http_server: false
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 1.0
+      env_vars:
+        NCCL_MNNVL_ENABLE: "0"
+    vllm_kwargs:
+      max_num_seqs: 16
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 1
+
+logger:
+  log_dir: results/grpo-math-1b-dynamo-single-controller
+  wandb:
+    name: grpo-dynamo-single-controller-dev
+  swanlab:
+    name: grpo-dynamo-single-controller-dev
+  mlflow:
+    run_name: grpo-dynamo-single-controller-dev

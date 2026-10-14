@@ -93,6 +93,7 @@ from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
+from nemo_rl.models.generation.dynamo import DynamoGeneration
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.utils.config import (
     load_config,
@@ -354,6 +355,73 @@ def test_build_generation_passes_sglang_config():
     generation.finish_generation.assert_called_once_with()
 
 
+def test_build_generation_constructs_dynamo_from_normalized_config():
+    """DynamoGeneration receives the generation config setup already validated."""
+    master_config = _make_master_config(backend="dynamo")
+    master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
+    inference_cluster = MagicMock(name="inference_cluster")
+
+    with patch.object(sc_setup_mod, "DynamoGeneration") as mock_dynamo:
+        generation, _ = sc_setup_mod._build_generation(
+            inference_cluster,
+            master_config,
+        )
+
+    mock_dynamo.assert_called_once_with(
+        cluster=inference_cluster,
+        config=master_config.policy["generation"],
+    )
+    assert master_config.policy["generation"]["model_name"] == "Qwen/Qwen3-0.6B"
+    generation.finish_generation.assert_called_once_with()
+
+
+def test_build_generation_rejects_deferred_dynamo_load():
+    master_config = _make_master_config(backend="dynamo")
+    master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
+
+    with (
+        patch.object(sc_setup_mod, "DynamoGeneration") as mock_dynamo,
+        pytest.raises(AssertionError, match="defer_model_load"),
+    ):
+        sc_setup_mod._build_generation(
+            MagicMock(name="inference_cluster"),
+            master_config,
+            defer_model_load=True,
+        )
+    mock_dynamo.assert_not_called()
+
+
+def test_generation_max_seq_len_reads_dynamo_vllm_cfg():
+    assert (
+        sc_setup_mod._generation_max_seq_len(
+            {"backend": "dynamo", "vllm_cfg": {"max_model_len": 1024}}
+        )
+        == 1024
+    )
+
+
+def test_dynamo_rejects_fleet_health():
+    """The Dynamo frontend routes requests, so there are no shards to track."""
+    master_config = _make_master_config(backend="dynamo")
+    master_config.async_rl.generation_fleet_health.enabled = True
+
+    master_config.async_rl.generation_fleet_health.refit_timeout_s = None
+    with pytest.raises(ValueError, match="Dynamo frontend owns request routing"):
+        DynamoGeneration.validate_settings(master_config)
+
+    master_config.async_rl.generation_fleet_health.enabled = False
+    DynamoGeneration.validate_settings(master_config)
+
+
+def test_dynamo_rejects_refit_deadline():
+    """Dynamo workers cannot abort the refit collective, so no deadline is allowed."""
+    master_config = _make_master_config(backend="dynamo")
+    master_config.async_rl.generation_fleet_health.refit_timeout_s = 300.0
+
+    with pytest.raises(ValueError, match="refit_timeout_s must be null"):
+        DynamoGeneration.validate_settings(master_config)
+
+
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
     master_config = _make_master_config(colocated=False, backend="trtllm")
@@ -377,7 +445,7 @@ def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
 
     with pytest.raises(
         ValueError,
-        match="only supports vllm, sglang, or megatron generation; got 'trtllm'",
+        match="only supports vllm, sglang, megatron, or dynamo generation; got 'trtllm'",
     ):
         sc_setup_mod._build_clusters(master_config)
 
@@ -1608,6 +1676,44 @@ class TestSetup:
 
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
+
+    def test_invalid_dynamo_config_fails_before_clusters(self, patched_factories):
+        mc = _make_master_config(backend="dynamo")
+
+        with (
+            patch.object(
+                sc_setup_mod.DynamoConfig,
+                "model_validate",
+                side_effect=ValueError("bad dynamo config"),
+            ),
+            pytest.raises(ValueError, match="bad dynamo config"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_generation"].assert_not_called()
+
+    def test_dynamo_generation_config_is_normalized(self, patched_factories):
+        mc = _make_master_config(backend="dynamo")
+        mc.async_rl.generation_fleet_health.refit_timeout_s = None
+        mc.policy["hf_config_overrides"] = {"rope_theta": 1.0}
+        normalized = {
+            "backend": "dynamo",
+            "colocated": {"enabled": False, "resources": {}},
+            "vllm_kwargs": {"hf_overrides": {"rope_theta": 1.0}},
+        }
+
+        with patch.object(sc_setup_mod.DynamoConfig, "model_validate") as validate:
+            validate.return_value.model_dump.return_value = normalized
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        (raw_config,), _ = validate.call_args
+        assert raw_config["vllm_kwargs"]["hf_overrides"] == {"rope_theta": 1.0}
+        assert mc.policy["generation"] is normalized
+        assert actor_args.gen_handle is patched_factories["fake_gen"]
+        _, sync_kwargs = patched_factories["create_weight_synchronizer"].call_args
+        assert sync_kwargs["generation_backend"] == "dynamo"
+        assert sync_kwargs["colocated"] is False
 
     def test_returns_actor_args(self, patched_factories):
         mc = _make_master_config()

@@ -177,6 +177,30 @@ def reject_outdated_mcore_generation_keys(config: dict[str, Any]) -> None:
             )
 
 
+def reject_outdated_dynamo_router_reset_states(config: dict[str, Any]) -> None:
+    """Fail when the Dynamo frontend's removed router-reset-states key is present.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    policy = config.get("policy")
+    if not isinstance(policy, dict):
+        return
+    generation = policy.get("generation")
+    if not isinstance(generation, dict):
+        return
+    dynamo_cfg = generation.get("dynamo_cfg")
+    if not isinstance(dynamo_cfg, dict):
+        return
+    frontend_args = dynamo_cfg.get("frontend_args")
+    if isinstance(frontend_args, dict) and "router_reset_states" in frontend_args:
+        raise ValueError(
+            "policy.generation.dynamo_cfg.frontend_args.router_reset_states was "
+            "removed: Dynamo 1.5 dropped the frontend's --router-reset-states flag. "
+            "Delete the key."
+        )
+
+
 def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -193,3 +217,4 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_dataset_config(config)
     reject_outdated_metric_name_format(config)
     reject_outdated_mcore_generation_keys(config)
+    reject_outdated_dynamo_router_reset_states(config)

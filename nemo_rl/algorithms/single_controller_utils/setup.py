@@ -120,6 +120,7 @@ from nemo_rl.experience.rollouts import (
     should_mask_flagged_samples,
 )
 from nemo_rl.models.generation import resolve_generation_class
+from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetHealth,
@@ -129,6 +130,7 @@ from nemo_rl.models.generation.generation_router import (
     GenerationRouterActor,
     GenerationRouterImpl,
 )
+from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -515,6 +517,10 @@ def _build_clusters(
                 gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
                     "pipeline_parallel_size", 1
                 )
+            elif backend == "dynamo":
+                gpus_per_instance = DynamoConfig.model_validate(
+                    generation_config_dict
+                ).engine_world_size
             elif backend == "sglang":
                 gpus_per_instance = generation_config_dict["sglang_cfg"].get(
                     "gpus_per_server", 1
@@ -526,7 +532,7 @@ def _build_clusters(
             else:
                 raise ValueError(
                     "single_controller_utils.setup only supports vllm, sglang, "
-                    f"or megatron generation; got {backend!r}"
+                    f"megatron, or dynamo generation; got {backend!r}"
                 )
             nodes_per_instance = (
                 gpus_per_instance + inference_gpus_per_node - 1
@@ -589,7 +595,7 @@ def _build_generation(
     tokenizer: Optional[PreTrainedTokenizerBase] = None,
     processor: Optional[AutoProcessor] = None,
 ) -> tuple[Any, float]:
-    """Spin up the generation backend (vLLM, SGLang, or Megatron).
+    """Spin up the generation backend (vLLM, SGLang, Megatron, or managed Dynamo).
 
     Args:
         inference_cluster: Ray virtual cluster the generation workers run on.
@@ -602,7 +608,8 @@ def _build_generation(
 
     Returns:
         A tuple of (generation object, wall time spent in this call). The
-        generation object is a VllmGeneration, SGLangGeneration, or MegatronGeneration.
+        generation object is a VllmGeneration, SGLangGeneration, MegatronGeneration,
+        or DynamoGeneration.
     """
     t0 = time.perf_counter()
     generation_config = master_config.policy["generation"]
@@ -652,10 +659,21 @@ def _build_generation(
             skip_weight_load=True,
         )
 
+    elif backend == "dynamo":
+        assert not defer_model_load, (
+            "defer_model_load is only supported for the vllm backend"
+        )
+        # setup_single_controller validated and normalized this config through
+        # DynamoConfig before allocating clusters.
+        gen = DynamoGeneration(
+            cluster=inference_cluster,
+            config=cast(dict[str, Any], generation_config),
+        )
+
     else:
         raise ValueError(
-            "single_controller_utils.setup only supports vllm, sglang, or megatron "
-            f"generation; got {backend!r}"
+            "single_controller_utils.setup only supports vllm, sglang, megatron, or "
+            f"dynamo generation; got {backend!r}"
         )
 
     if not defer_model_load:
@@ -807,11 +825,12 @@ def _spinup_gym(
 def _generation_max_seq_len(generation_config) -> int:
     """Return the per-backend max sequence length.
 
-    vllm uses vllm_cfg.max_model_len; sglang uses sglang_cfg.context_length;
-    megatron uses mcore_generation_config.max_model_len.
+    vllm and dynamo (which manages vLLM workers) use vllm_cfg.max_model_len;
+    sglang uses sglang_cfg.context_length; megatron uses
+    mcore_generation_config.max_model_len.
     """
     backend = generation_config["backend"]
-    if backend == "vllm":
+    if backend in ("vllm", "dynamo"):
         return generation_config["vllm_cfg"]["max_model_len"]
     if backend == "sglang":
         return generation_config["sglang_cfg"]["context_length"]
@@ -1237,6 +1256,18 @@ def setup_single_controller(
     checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+
+    if generation_config["backend"] == "dynamo":
+        # Validate the complete managed-Dynamo boundary before allocating Ray
+        # placement groups or starting any external services, as grpo.setup does.
+        dynamo_config = cast(dict[str, Any], generation_config)
+        dynamo_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
+            policy_config.get("hf_config_overrides") or {}
+        )
+        generation_config = cast(
+            GenerationConfig, DynamoConfig.model_validate(dynamo_config).model_dump()
+        )
+        policy_config["generation"] = generation_config
 
     # Token capture: validate the supported combination loudly at setup
     # (NeMo-Gym rollout path; vLLM with async_engine=true, or Megatron with

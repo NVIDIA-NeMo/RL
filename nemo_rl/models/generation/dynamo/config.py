@@ -25,9 +25,9 @@ from pydantic import (
     model_validator,
 )
 
-# Must match vLLM's packed weight-transfer defaults exactly. The Dynamo
-# producer and consumer recompute chunk boundaries without negotiation. Verify
-# these values whenever Dynamo's pinned vLLM changes.
+# Packed weight-transfer geometry. NeMo RL declares it to each Dynamo worker in
+# the NCCL init info, and the trainer packs with the same values, so both sides
+# recompute identical chunk boundaries.
 VLLM_PACKED_BUFFER_SIZE_BYTES = 1024**3
 VLLM_PACKED_NUM_BUFFERS = 2
 
@@ -129,7 +129,6 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
         "least-loaded",
         "device-aware-weighted",
     ]
-    router_reset_states: bool
     extra_cli_args: list[str]
 
 
