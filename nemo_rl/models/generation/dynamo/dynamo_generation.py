@@ -40,7 +40,11 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
-from nemo_rl.models.generation.vllm.utils import assert_reload_refit_config_supported
+from nemo_rl.models.generation.vllm.utils import (
+    assert_reload_refit_config_supported,
+    mtp_drafter_setup,
+    spec_decode_max_tokens,
+)
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.weight_sync.membership import RefitMembership
 
@@ -502,12 +506,7 @@ class DynamoGeneration(GenerationInterface):
         return payload
 
     def _allowed_new_tokens(self, input_length: int) -> int:
-        """Return the generation budget for a prompt.
-
-        With speculative decoding the drafter looks ``num_speculative_tokens``
-        ahead, so generation stops that many tokens plus one before the context
-        limit, as in the vLLM backend.
-        """
+        """Return the generation budget for a prompt, with the vLLM backend's spec-decode clamp."""
         remaining_ctx = int(self.cfg["vllm_cfg"]["max_model_len"]) - input_length
         if remaining_ctx <= 0:
             raise ValueError(
@@ -518,7 +517,12 @@ class DynamoGeneration(GenerationInterface):
         speculative_config = self.cfg["vllm_kwargs"].get("speculative_config") or {}
         lookahead = int(speculative_config.get("num_speculative_tokens") or 0)
         if lookahead > 0:
-            allowed = max(1, min(allowed, remaining_ctx - (lookahead + 1)))
+            allowed = spec_decode_max_tokens(
+                allowed,
+                input_length,
+                int(self.cfg["vllm_cfg"]["max_model_len"]),
+                lookahead,
+            )
         return allowed
 
     def _assert_response_within_context(
@@ -748,27 +752,23 @@ class DynamoGeneration(GenerationInterface):
         )
 
     def _configure_mtp_drafter(self) -> None:
-        """Tell every engine where its MTP drafter's weights come from.
-
-        The same post-start step the vLLM backend runs: a drafter the trainer
-        co-trains is fed by every refit; otherwise, with dummy-loaded engines, its
-        weights are read from the checkpoint once.
-        """
-        speculative_config = self.cfg["vllm_kwargs"].get("speculative_config") or {}
-        if (
-            speculative_config.get("method") not in ("deepseek_mtp", "mtp")
-            or speculative_config.get("num_speculative_tokens") == 0
-        ):
+        """Run the vLLM backend's post-start MTP drafter setup on every engine."""
+        weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
+        enabled, load_from_disk = mtp_drafter_setup(
+            self.cfg["vllm_kwargs"].get("speculative_config"),
+            load_format=self.cfg["vllm_cfg"]["load_format"],
+            weights_from_refit=weights_from_refit,
+        )
+        if not enabled:
             return
         channel = self._require_refit_channel()
-        weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
         ray.get(
             channel.call_on_every_engine(
                 "configure_mtp_drafter_weight_source",
                 {"weights_from_refit": weights_from_refit},
             )
         )
-        if self.cfg["vllm_cfg"]["load_format"] == "dummy" and not weights_from_refit:
+        if load_from_disk:
             ray.get(
                 channel.call_on_every_engine(
                     "load_mtp_weights_from_disk",
