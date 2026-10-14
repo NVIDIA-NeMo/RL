@@ -12,9 +12,6 @@ async_rl:
   # The pre-refit drain clears every Dynamo worker's KV and prefix cache, and no
   # request runs until the new weights are loaded, so a second flush is not needed.
   recompute_kv_cache_after_weight_updates: false
-  generation_fleet_health:
-    # Dynamo workers cannot abort their refit collective, so no refit deadline.
-    refit_timeout_s: null
 
 policy:
   # Training uses the Megatron backend inherited from
