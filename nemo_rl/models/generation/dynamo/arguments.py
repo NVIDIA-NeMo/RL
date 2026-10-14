@@ -37,6 +37,12 @@ _MANAGED_FLAGS = {
     "--distributed-executor-backend",
 }
 
+# NeMo RL's vLLM worker extension, which every managed engine loads so the driver
+# can drive refit through Dynamo's /engine/* RL routes.
+DYNAMO_WORKER_EXTENSION_CLS = (
+    "nemo_rl.models.generation.vllm.dynamo_worker_extension.DynamoWorkerExtension"
+)
+
 _CREDENTIAL_FLAGS = {
     "--access-token",
     "--api-key",
@@ -137,6 +143,11 @@ def build_dynamo_vllm_argv(
     builder.add(
         "--weight-transfer-config",
         {"backend": "nccl"},
+        source="managed runtime",
+    )
+    builder.add(
+        "--worker-extension-cls",
+        DYNAMO_WORKER_EXTENSION_CLS,
         source="managed runtime",
     )
     builder.add("--trust-remote-code", source="managed runtime")

@@ -339,10 +339,12 @@ class DynamoConfig(BaseModel, extra="allow"):
                 "policy.generation.colocated.enabled must be false when "
                 "backend='dynamo'"
             )
-        if extra.get("refit_transport") is not None:
+        refit_transport = extra.get("refit_transport")
+        if refit_transport not in (None, "nccl_reshard"):
             raise ValueError(
-                "policy.generation.refit_transport must be null when "
-                "backend='dynamo'; managed Dynamo supports NCCL collective refit only"
+                f"policy.generation.refit_transport={refit_transport!r} is not "
+                "supported when backend='dynamo'; use null (NCCL collective refit) "
+                "or 'nccl_reshard'"
             )
         for quantization_field in ("quant_cfg", "real_quant"):
             if extra.get(quantization_field):

@@ -14,6 +14,7 @@
 
 import asyncio
 import pickle
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -34,6 +35,13 @@ from nemo_rl.models.generation.dynamo.metrics import (
     parse_prometheus_metrics,
 )
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
+from nemo_rl.models.generation.interfaces import (
+    CollectiveSenderSpec,
+    RefitFleetShape,
+)
+from nemo_rl.distributed.refit_watchdog import REFIT_ABORTED_TOKEN, RefitAborted
+from nemo_rl.utils.staged_payload import decode_staged_payload
+from nemo_rl.weight_sync.membership import desired_membership
 
 
 def _config(*, tp: int = 1, expose_http_server: bool = False) -> dict[str, Any]:
@@ -665,3 +673,290 @@ def test_direct_completions_are_not_limited_by_default_thread_pool(
 
     assert entered_count == request_count
     assert len(responses) == request_count
+
+
+def _reshard_generation(monkeypatch, *, refit_transport="nccl_reshard"):
+    """A two-engine, TP=2 DynamoGeneration whose engine RPCs are recorded, not sent."""
+    workers = [
+        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
+        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+    ]
+    _patch_runtime(monkeypatch, workers=workers)
+    posts: list[dict[str, Any]] = []
+    staged: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        refit_module._post_worker_route,
+        "remote",
+        lambda **kwargs: posts.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        refit_module._stage_and_post_worker_route,
+        "remote",
+        lambda **kwargs: staged.append(kwargs) or True,
+    )
+    monkeypatch.setattr(refit_module.ray, "get", lambda refs: refs)
+    config = _config(tp=2)
+    config["refit_transport"] = refit_transport
+    generation = DynamoGeneration(cluster=object(), config=config)
+    return generation, posts, staged
+
+
+def _full_fleet():
+    return desired_membership(
+        absent_shards=[], dp_size=2, total_gen_workers=4, train_world_size=3
+    )
+
+
+def test_nccl_reshard_drives_the_worker_extension_on_every_engine(
+    monkeypatch,
+) -> None:
+    generation, posts, staged = _reshard_generation(monkeypatch)
+    membership = _full_fleet()
+
+    assert generation.get_refit_fleet_shape() == RefitFleetShape(
+        dp_size=2, total_gen_workers=4
+    )
+    # The trainer's misc broadcast must speak the extension's NeMo protocol.
+    assert generation.get_collective_sender_spec() == CollectiveSenderSpec()
+    generation.set_refit_membership(membership)
+
+    assert generation.rebuild_collective(membership, "10.1.0.1", 1500) == [True] * 2
+    assert [call["route"] for call in posts] == ["init_weights_update_group"] * 2
+    assert [call["payload"] for call in posts] == [
+        {
+            "engine_rpc": "init_collective",
+            "rank_prefix": prefix,
+            "ip": "10.1.0.1",
+            "port": 1500,
+            "world_size": 7,
+            "train_world_size": 3,
+        }
+        for prefix in (0, 2)
+    ]
+    # Past the server's init deadline (control_timeout_s=10), never before it.
+    assert all(call["timeout_s"] == 40 for call in posts)
+
+    posts.clear()
+    generation.rebuild_nccl_reshard_comm_group(
+        membership,
+        pp_ips=["10.1.0.1"],
+        pp_ports=[1600],
+        pp_size=1,
+        train_ranks_per_stage=3,
+        sub_world_size=7,
+    )
+    assert [call["payload"] for call in posts] == [
+        {
+            "engine_rpc": "init_nccl_reshard_comm_group",
+            "rank_prefix": prefix,
+            "pp_ips": ["10.1.0.1"],
+            "pp_ports": [1600],
+            "pp_size": 1,
+            "train_ranks_per_stage": 3,
+            "sub_world_size": 7,
+        }
+        for prefix in (0, 2)
+    ]
+
+    refit_info = {
+        "per_layer_params": {"layers.0": [{"name": "w", "global_shape": [4, 8]}]},
+        "misc_meta": {"embed": {"shape": [8, 4], "dtype": "bfloat16"}},
+    }
+    generation.prepare_nccl_reshard_refit_info(refit_info)
+    assert [call["system_url"] for call in staged] == [
+        "http://10.0.0.2:4000",
+        "http://10.0.0.3:4000",
+    ]
+    for call in staged:
+        payload = call["payload"]
+        assert payload["engine_rpc"] == "nrl_prepare_nccl_reshard_refit_info_from_stage"
+        assert payload["key"] == call["key"]
+        assert decode_staged_payload(call["chunks"], payload["sha256"]) == refit_info
+
+    posts.clear()
+    assert generation.nccl_reshard_refit(refit_timeout_s=100) == [True] * 2
+    assert [call["route"] for call in posts] == ["update_weights_from_distributed"] * 2
+    assert all(
+        call["payload"]
+        == {
+            "engine_rpc": "nrl_nccl_reshard_refit",
+            "allow_unpaused": True,
+            "reset_prefix_cache": False,
+            "refit_timeout_s": 100,
+        }
+        for call in posts
+    )
+    # The HTTP call outlives the refit's own deadline.
+    assert all(call["timeout_s"] == 160 for call in posts)
+
+    # SingleController issues refits from a pickled copy in its own actor.
+    restored = pickle.loads(pickle.dumps(generation))
+    posts.clear()
+    assert restored.nccl_reshard_refit() == [True] * 2
+    assert [call["system_url"] for call in posts] == [
+        "http://10.0.0.2:4000",
+        "http://10.0.0.3:4000",
+    ]
+    assert all(call["payload"]["refit_timeout_s"] is None for call in posts)
+    assert all(call["timeout_s"] == 10 for call in posts)
+
+
+def test_dynamo_refit_membership_must_be_the_whole_fixed_fleet(monkeypatch) -> None:
+    generation, posts, _ = _reshard_generation(monkeypatch)
+    one_engine_lost = desired_membership(
+        absent_shards=[1], dp_size=2, total_gen_workers=4, train_world_size=3
+    )
+
+    with pytest.raises(NotImplementedError, match="fixed worker fleet"):
+        generation.set_refit_membership(one_engine_lost)
+    with pytest.raises(NotImplementedError, match="fixed worker fleet"):
+        generation.rebuild_collective(one_engine_lost, "10.1.0.1", 1500)
+    assert posts == []
+
+
+def test_dynamo_collective_refit_keeps_the_builtin_vllm_protocol(monkeypatch) -> None:
+    generation, _, _ = _reshard_generation(monkeypatch, refit_transport=None)
+
+    assert generation.get_collective_sender_spec().nccl_peer == "vllm"
+    with pytest.raises(NotImplementedError, match="built-in"):
+        generation.rebuild_collective(_full_fleet(), "10.1.0.1", 1500)
+
+
+def test_engine_route_errors_surface_and_aborts_stay_recognizable(
+    monkeypatch,
+) -> None:
+    responses = iter(
+        [
+            {"status": "ok"},
+            {"status": "error", "message": "boom"},
+            {"status": "error", "message": f"{REFIT_ABORTED_TOKEN} deadline passed"},
+        ]
+    )
+    monkeypatch.setattr(
+        refit_module, "http_post_json", lambda url, payload, timeout_s: next(responses)
+    )
+    post = refit_module._post_worker_route._function
+    kwargs = {
+        "system_url": "http://w:4000",
+        "route": "update_weights_from_distributed",
+        "payload": {"engine_rpc": "nrl_nccl_reshard_refit"},
+        "timeout_s": 1.0,
+    }
+
+    assert post(**kwargs) is True
+    with pytest.raises(RuntimeError, match="nrl_nccl_reshard_refit.*boom"):
+        post(**kwargs)
+    with pytest.raises(RefitAborted):
+        post(**kwargs)
+
+
+def test_engine_rpc_tasks_are_never_retried() -> None:
+    # A re-POST of a collective after a worker died can never complete.
+    for task in (
+        refit_module._post_worker_route,
+        refit_module._stage_and_post_worker_route,
+    ):
+        assert task._default_options["max_retries"] == 0
+
+
+def test_staging_posts_every_chunk_in_order_before_the_call(monkeypatch) -> None:
+    sent = []
+    monkeypatch.setattr(
+        refit_module,
+        "http_post_json",
+        lambda url, payload, timeout_s: sent.append((url, payload)) or {"status": "ok"},
+    )
+    call = {"engine_rpc": "nrl_prepare_nccl_reshard_refit_info_from_stage"}
+
+    refit_module._stage_and_post_worker_route._function(
+        system_url="http://w:4000",
+        key="k",
+        chunks=["c0", "c1", "c2"],
+        payload=call,
+        timeout_s=1.0,
+    )
+
+    assert [url for url, _ in sent] == [
+        "http://w:4000/engine/init_weights_update_group"
+    ] * 4
+    assert [payload for _, payload in sent] == [
+        {
+            "engine_rpc": "nrl_stage_chunk",
+            "key": "k",
+            "index": index,
+            "total": 3,
+            "data": f"c{index}",
+        }
+        for index in range(3)
+    ] + [call]
+
+
+def test_reshard_synchronizer_drives_dynamo_end_to_end(monkeypatch) -> None:
+    """NcclReshardWeightSynchronizer over a real DynamoGeneration: 3 trainers, 2x TP2."""
+    from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
+        NcclReshardWeightSynchronizer,
+    )
+
+    generation, posts, staged = _reshard_generation(monkeypatch)
+    trainer_calls: dict[str, Any] = {}
+    policy = SimpleNamespace(
+        cfg={
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "expert_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+            },
+            "generation": generation.cfg,
+        },
+        init_collective=lambda *args, **kwargs: trainer_calls.setdefault(
+            "init_collective", (args, kwargs)
+        )
+        and ["train-init"],
+        init_nccl_reshard_comm_group=lambda **kwargs: trainer_calls.setdefault(
+            "bulk", kwargs
+        )
+        and ["train-bulk"],
+        prepare_nccl_reshard_refit_info=lambda *args,
+        **kwargs: trainer_calls.setdefault("plan", (args, kwargs))
+        and {
+            "per_layer_params": {},
+            "misc_meta": {"w": {"shape": [2], "dtype": "bfloat16"}},
+        },
+        nccl_reshard_refit=lambda **kwargs: trainer_calls.setdefault("refit", kwargs)
+        and ["train-refit"],
+    )
+    train_cluster = SimpleNamespace(
+        world_size=lambda: 3,
+        num_gpus_per_node=8,
+        get_master_address_and_port=lambda: ("10.1.0.1", 1500),
+        get_available_address_and_port=lambda pg_idx, bundle_idx: ("10.1.0.1", 1600),
+    )
+    sync = NcclReshardWeightSynchronizer(
+        policy=policy,
+        generation=generation,
+        train_cluster=train_cluster,
+        inference_cluster=None,
+        refit_timeout_s=30.0,
+    )
+
+    sync.init_communicator()
+
+    _, init_kwargs = trainer_calls["init_collective"]
+    assert init_kwargs["nccl_peer"] == "nemo"
+    gen_rpcs = [call["payload"]["engine_rpc"] for call in posts]
+    assert gen_rpcs == ["init_collective"] * 2 + ["init_nccl_reshard_comm_group"] * 2
+    assert [call["payload"]["rank_prefix"] for call in posts] == [0, 2, 0, 2]
+    # The reshard plan is built for every Dynamo rank: 2 engines x TP2.
+    plan_args, _ = trainer_calls["plan"]
+    assert plan_args[1]["tp_size"] == 2 and plan_args[3] == 4
+    assert len(staged) == 2
+
+    posts.clear()
+    sync.sync_weights()
+
+    assert trainer_calls["refit"]["refit_timeout_s"] == 30.0
+    assert [call["payload"]["engine_rpc"] for call in posts] == [
+        "nrl_nccl_reshard_refit"
+    ] * 2
+    assert all(call["payload"]["refit_timeout_s"] == 30.0 for call in posts)
+    assert not sync.is_stale

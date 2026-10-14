@@ -27,12 +27,14 @@ rm -rf "${EXP_DIR}"
 mkdir -p "${LOG_DIR}"
 git config --global --add safe.directory "${PROJECT_ROOT}"
 
-dynamo_venv_dir=${NEMO_RL_DYNAMO_VENV_DIR:-/opt/dynamo_venv}
-dynamo_python=${dynamo_venv_dir}/bin/python
+# Managed Dynamo runs from the dynamo extra's actor venv (vLLM + ai-dynamo + nemo_rl),
+# built here if needed; etcd and nats-server come from NEMO_RL_DYNAMO_BIN_DIR or PATH.
+dynamo_python=$(uv run --no-sync python -c \
+  'from nemo_rl.models.generation.dynamo.venv import get_dynamo_python; print(get_dynamo_python())' | tail -n 1)
 "${dynamo_python}" -c \
-  'import importlib.metadata as m; assert m.version("ai-dynamo") == "1.5.1"; assert m.version("vllm") == "0.28.0"'
-"${dynamo_venv_dir}/bin/etcd" --version
-"${dynamo_venv_dir}/bin/nats-server" --version
+  'import importlib.metadata as m; assert m.version("ai-dynamo") == "1.5.1"; assert m.version("vllm") == "0.29.0"'
+uv run --no-sync python -c \
+  'from nemo_rl.models.generation.dynamo.venv import get_dynamo_service_executable as e; e("etcd"); e("nats-server")'
 
 cd "${PROJECT_ROOT}"
 uv run --no-sync coverage run -a \
@@ -73,7 +75,7 @@ uv run --no-sync tests/check_metrics.py \
   "${metrics_json}" \
   'max(data["train/token_mult_prob_error"]) < 1.05'
 
-if pgrep -f "[d]ynamo.frontend|[d]ynamo.vllm|[V]LLM::EngineCore|${dynamo_venv_dir}/bin/[e]tcd|${dynamo_venv_dir}/bin/[n]ats-server"; then
+if pgrep -f "[d]ynamo.frontend|[d]ynamo.vllm|[V]LLM::EngineCore|[n]emorl_dynamo_etcd_|[n]emorl_dynamo_nats_"; then
   echo "Managed Dynamo processes remain after GRPO shutdown" >&2
   exit 1
 fi

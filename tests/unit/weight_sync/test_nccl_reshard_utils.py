@@ -119,6 +119,40 @@ def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
     check_nccl_reshard_refit_support(_valid_nccl_reshard_config())
 
 
+def test_check_nccl_reshard_refit_support_accepts_dynamo() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["backend"] = "dynamo"
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize(
+    ("vllm_cfg", "vllm_kwargs", "megatron_cfg", "expected_violation"),
+    [
+        ({"pipeline_parallel_size": 2}, {}, {}, "pipeline_parallel_size must be 1"),
+        (
+            {"tensor_parallel_size": 4, "expert_parallel_size": 2},
+            {},
+            {},
+            "expert_parallel_size must be 1 or equal to tensor_parallel_size",
+        ),
+        ({}, {"enable_eplb": True}, {}, "enable_eplb must be False"),
+        ({}, {}, {"expert_tensor_parallel_size": 2}, "must be 1"),
+    ],
+)
+def test_check_nccl_reshard_refit_support_applies_vllm_rules_to_dynamo(
+    vllm_cfg, vllm_kwargs, megatron_cfg, expected_violation
+) -> None:
+    """Dynamo engines are vLLM engines loading the same receiver."""
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["backend"] = "dynamo"
+    config.policy["generation"]["vllm_cfg"].update(vllm_cfg)
+    config.policy["generation"]["vllm_kwargs"] = vllm_kwargs
+    config.policy["megatron_cfg"].update(megatron_cfg)
+
+    with pytest.raises(ValueError, match=expected_violation):
+        check_nccl_reshard_refit_support(config)
+
+
 def test_check_nccl_reshard_refit_support_rejects_megatron_etp_with_vllm() -> None:
     config = _valid_nccl_reshard_config()
     config.policy["megatron_cfg"]["expert_tensor_parallel_size"] = 2
@@ -221,7 +255,7 @@ def test_blockwise_compute_without_fp8_storage_keeps_logical_misc(gen_precision,
         ),
         (
             {"backend": "sglang"},
-            "policy.generation.backend must be 'vllm' or 'megatron' (got 'sglang')",
+            "policy.generation.backend must be 'vllm', 'dynamo' or 'megatron' (got 'sglang')",
         ),
     ],
 )

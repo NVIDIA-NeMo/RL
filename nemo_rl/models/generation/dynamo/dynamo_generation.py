@@ -37,10 +37,12 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    RefitFleetShape,
     reject_unenforceable_refit_deadline,
     verify_right_padding,
 )
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
+from nemo_rl.weight_sync.membership import RefitMembership
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
@@ -350,11 +352,34 @@ class DynamoGeneration(GenerationInterface):
         return channel.inference_world_size
 
     def get_collective_sender_spec(self) -> CollectiveSenderSpec:
-        """Return vLLM's NCCL protocol and packed-transfer geometry."""
+        """Return the NCCL protocol and packing the trainer must use.
+
+        nccl_reshard's misc broadcast lands in NeMo RL's worker extension, which
+        speaks the NeMo protocol; the default collective refit still goes to vLLM's
+        built-in weight-transfer engine.
+        """
+        channel = self._require_refit_channel()
+        if self._uses_nccl_reshard:
+            return CollectiveSenderSpec()
+        return channel.sender_spec
+
+    def get_refit_fleet_shape(self) -> RefitFleetShape:
+        """One DP shard per Dynamo engine, each with TP x PP refit ranks."""
+        channel = self._require_refit_channel()
+        return RefitFleetShape(
+            dp_size=channel.num_engines,
+            total_gen_workers=channel.inference_world_size,
+        )
+
+    @property
+    def _uses_nccl_reshard(self) -> bool:
+        return self.cfg.get("refit_transport") == "nccl_reshard"
+
+    def _require_refit_channel(self) -> DynamoRefitChannel:
         channel = self._refit_channel
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
-        return channel.sender_spec
+        return channel
 
     def shutdown(self) -> bool:
         """Stop process-local helpers and any driver-owned managed runtime."""
@@ -730,6 +755,57 @@ class DynamoGeneration(GenerationInterface):
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
         return channel.update_weights()
+
+    # ------------------------------------------------------------------
+    # nccl_reshard refit, through NeMo RL's worker extension in each engine
+    # ------------------------------------------------------------------
+
+    def set_refit_membership(self, membership: RefitMembership) -> None:
+        """Accept only the full fleet: managed Dynamo engines are never replaced."""
+        self._require_refit_channel().check_full_fleet(membership)
+
+    def rebuild_collective(
+        self, membership: RefitMembership, ip: str, port: int
+    ) -> list[ray.ObjectRef]:
+        """Join every engine to the NeMo RL ``model_update_group``."""
+        if not self._uses_nccl_reshard:
+            raise NotImplementedError(
+                "Managed Dynamo's default collective refit uses vLLM's built-in "
+                "weight-transfer engine and cannot be rebuilt over a new membership."
+            )
+        return self._require_refit_channel().rebuild_collective(membership, ip, port)
+
+    def rebuild_nccl_reshard_comm_group(
+        self,
+        membership: RefitMembership,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Join every engine to the per-training-PP-stage bulk reshard groups."""
+        return self._require_refit_channel().rebuild_nccl_reshard_comm_group(
+            membership,
+            pp_ips=pp_ips,
+            pp_ports=pp_ports,
+            pp_size=pp_size,
+            train_ranks_per_stage=train_ranks_per_stage,
+            sub_world_size=sub_world_size,
+        )
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Ship the wire-safe reshard plan to every engine and wait for its map."""
+        self._require_refit_channel().prepare_nccl_reshard_refit_info(refit_info)
+
+    def nccl_reshard_refit(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        """Receive one nccl_reshard refit on every engine.
+
+        The extension's watchdog enforces ``refit_timeout_s`` inside each engine.
+        """
+        return self._require_refit_channel().nccl_reshard_refit(refit_timeout_s)
 
     def invalidate_kv_cache(self) -> bool:
         """Flush every fixed Dynamo worker's prefix/KV cache."""

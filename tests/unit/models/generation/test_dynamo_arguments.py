@@ -110,7 +110,7 @@ def test_config_derives_world_size_and_rejects_removed_public_fields() -> None:
         ({"sglang_cfg": {"foo": 1}}, "sglang_cfg"),
         ({"trtllm_cfg": {"foo": 1}}, "trtllm_cfg"),
         ({"colocated": {"enabled": True}}, "must be false"),
-        ({"refit_transport": "nccl_reshard"}, "must be null"),
+        ({"refit_transport": "mcore"}, "not supported when backend='dynamo'"),
         ({"quant_cfg": "nvfp4"}, "quant_cfg"),
         ({"vllm_kwargs": {"speculative_config": {"model": "draft"}}}, "draft"),
     ],
@@ -123,6 +123,12 @@ def test_config_rejects_unsupported_modes(override, match) -> None:
         config = _config(**override)
     with pytest.raises(ValidationError, match=match):
         DynamoConfig.model_validate(config)
+
+
+@pytest.mark.parametrize("refit_transport", [None, "nccl_reshard"])
+def test_config_accepts_collective_and_nccl_reshard_refit(refit_transport) -> None:
+    config = DynamoConfig.model_validate(_config(refit_transport=refit_transport))
+    assert config.model_extra["refit_transport"] == refit_transport
 
 
 @pytest.mark.parametrize(
