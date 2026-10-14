@@ -151,6 +151,11 @@ test -x "$OSWORLD_DRIVER_PYTHON"
 test -x "$OSWORLD_COMPONENT_PYTHON"
 test -r "$NANO_OMNI_MODEL_NAME/config.json"
 test -r "$NANO_OMNI_CHAT_TEMPLATE"
+if [[ ! -f "$OSWORLD_BRIDGE_ROOT/src/megatron/bridge/__init__.py" ]] \
+  || [[ ! -f "$OSWORLD_BRIDGE_ROOT/3rdparty/Megatron-LM/megatron/core/__init__.py" ]]; then
+  echo "Megatron-Bridge submodules are unavailable under $OSWORLD_BRIDGE_ROOT" >&2
+  exit 2
+fi
 if [[ -n "${OSWORLD_EVAL_MODE:-}" ]]; then
   test -s "$OSWORLD_GRPO_VAL_DATA"
 else

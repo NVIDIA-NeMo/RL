@@ -166,6 +166,13 @@ if [[ "$OSWORLD_DRIVER_SCRIPT" != "eval_driver.sh" ]]; then
   test -s "$OSWORLD_GRPO_TRAIN_DATA"
 fi
 test -r "$RAY_SUB"
+MEGATRON_BRIDGE_ROOT="$RL_ROOT/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+if [[ ! -f "$MEGATRON_BRIDGE_ROOT/src/megatron/bridge/__init__.py" ]] \
+  || [[ ! -f "$MEGATRON_BRIDGE_ROOT/3rdparty/Megatron-LM/megatron/core/__init__.py" ]]; then
+  echo "Megatron-Bridge submodules are not initialized." >&2
+  echo "Run: git submodule update --init --recursive 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge" >&2
+  exit 2
+fi
 
 OSWORLD_CHAIN_LENGTH="${OSWORLD_CHAIN_LENGTH:-1}"
 OSWORLD_GRPO_MAX_STEPS="${OSWORLD_GRPO_MAX_STEPS:-300}"
