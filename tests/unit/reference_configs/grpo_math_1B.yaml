@@ -414,7 +414,7 @@ policy:
       num_decode_engines: 1
       num_frontend_workers: 1
       frontend_tokenize: false
-      frontend_base_port: 17300
+      frontend_base_port: 8300
     # null = topology default (IPC colocated, NCCL non-colocated). For
     # non-colocated Megatron generation it selects the packed collective; use
     # mcore for native refit.

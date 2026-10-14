@@ -129,16 +129,19 @@ profiling. Delegation is confined to the request path; the control plane is unch
 
 ### Node affinity
 
-Placement matters at two scales, and both are preferences rather than hard requirements.
+Placement matters at two scales. Keeping a replica together is a preference; keeping an
+engine together is a rule wherever it is possible.
 
-**An engine should fit inside one node.** An engine's width is whatever its parallelism
-multiplies out to — tensor parallelism alone on the TRT-LLM path, which asserts `pp == 1`;
-TP × PP on a backend with pipeline stages. Tensor-parallel collectives are the
-bandwidth-hungry part, so TP is the dimension that most wants to stay node-local, while
-pipeline stages only pass activations between neighbours and tolerate a slower link. When
-an engine is wider than a node it should at least stay inside one *segment* — the
-`segment_size` nodes of a single NVLink domain that `RayVirtualCluster` aligns placement
-to.
+**An engine that fits in a node is never split across nodes.** An engine's width is
+whatever its parallelism multiplies out to — tensor parallelism alone on the TRT-LLM path,
+which asserts `pp == 1`; TP × PP on a backend with pipeline stages. Tensor-parallel
+collectives are the bandwidth-hungry part, so TP is the dimension that most wants to stay
+node-local, while pipeline stages only pass activations between neighbours and tolerate a
+slower link. Engines are therefore packed node by node, and a layout whose engines do not
+tile each node exactly is rejected at startup rather than having one engine straddle a
+node boundary. Only an engine wider than a node spans nodes (TRT-LLM runs TP across
+nodes), and it should at least stay inside one *segment* — the `segment_size` nodes of a
+single NVLink domain that `RayVirtualCluster` aligns placement to.
 
 **A replica should fit inside one node, or failing that one segment.** The prefill→decode
 KV transfer happens entirely within a replica, so its cost is set by the slowest link any
@@ -179,11 +182,13 @@ policy:
     # backend that grows disaggregation describes its fleet with these.
     disaggregation:
       enabled: true
-      num_prefill_engines: 2          # M — per replica
-      num_decode_engines: 3           # K — per replica, independent of M
+      # Replica width 1 x 4 + 2 x 2 = 8 GPUs, which tiles both 4- and 8-GPU
+      # nodes without splitting an engine.
+      num_prefill_engines: 1          # M — per replica
+      num_decode_engines: 2           # K — per replica, independent of M
       num_frontend_workers: 2         # F — disagg servers per replica; N*F <= 256
       frontend_tokenize: true         # render + tokenize on the frontends
-      frontend_base_port: 17300       # port = base + replica_idx * F + frontend_idx
+      frontend_base_port: 8300        # port = base + replica_idx * F + frontend_idx; below 9000
     trtllm_cfg:
       tensor_parallel_size: 2
       expose_http_server: true        # every engine needs a disagg-capable endpoint
@@ -191,8 +196,10 @@ policy:
       # Only the knobs that may legitimately differ between prefill and decode:
       # TP, the MoE split, gpu_memory_utilization, max_batch_size,
       # max_num_tokens, trtllm_kwargs. precision / max_model_len / the parsers
-      # are shared by the whole replica and are rejected here. Each role must
-      # satisfy moe_tp * moe_ep == its own TP.
+      # are shared by the whole replica and are rejected here. A role's
+      # trtllm_kwargs are deep-merged over generation.trtllm_kwargs, so a
+      # nested block such as kv_cache_config adds to the shared one. Each role
+      # must satisfy moe_tp * moe_ep == its own TP.
       prefill_engine:
         tensor_parallel_size: 4
         moe_tensor_parallel_size: 2

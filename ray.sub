@@ -185,6 +185,7 @@ fi
 #   6001-6999    Sandbox uWSGI workers (SANDBOX_BASE_PORT)
 #   7000-8999    vLLM engine rendezvous (VLLM_PORT in vllm_worker.py)
 #   8265         Ray Dashboard (DASHBOARD_PORT; reserved carve-out inside the 7000-8999 band)
+#   [8300, 8556) PD-disagg frontends (carve-out inside the 7000-8999 band; generation.disaggregation.frontend_base_port)
 #   8600-8799    SGLang router (carve-out inside the 7000-8999 band; only one rollout backend runs)
 #   8800-8999    SGLang Prometheus metrics (carve-out inside the 7000-8999 band)
 MIN_WORKER_PORT=${MIN_WORKER_PORT:-2000}

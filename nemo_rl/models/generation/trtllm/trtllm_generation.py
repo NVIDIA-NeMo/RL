@@ -22,7 +22,7 @@ to time-multiplex GPU memory between training and inference phases.
 import asyncio
 import os
 from collections import defaultdict
-from typing import Any, AsyncGenerator, Literal, Optional, Union, cast
+from typing import Any, AsyncGenerator, Optional, Union, cast
 
 import numpy as np
 import ray
@@ -32,7 +32,6 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
-    DisaggConfig,
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
@@ -40,11 +39,10 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmConfig,
-    TrtllmDisaggServerConfig,
-    TrtllmEngineArgs,
     replica_width,
     resolve_disagg_layout,
     resolve_disagg_server_config,
+    role_engine_config,
     role_tensor_parallel_size,
 )
 
@@ -63,11 +61,7 @@ class TrtllmGeneration(GenerationInterface):
         engine_tp = trtllm_cfg["tensor_parallel_size"]
         if disagg.enabled:
             engine_tp = max(
-                int(
-                    (trtllm_cfg.get(f"{role}_engine") or {}).get(
-                        "tensor_parallel_size", engine_tp
-                    )
-                )
+                role_tensor_parallel_size(config, role)
                 for role in ("prefill", "decode")
             )
         pp = trtllm_cfg.get("pipeline_parallel_size", 1)
@@ -124,8 +118,8 @@ class TrtllmGeneration(GenerationInterface):
         # Validated once here rather than per access: every disagg default
         # lives on the schema, so the rest of this class reads attributes
         # instead of re-deriving a default per key.
-        self._disagg = resolve_disagg_layout(config)
-        self._disagg_server = resolve_disagg_server_config(config)
+        self._disagg_cfg = resolve_disagg_layout(config)
+        self._disagg_server_cfg = resolve_disagg_server_config(config)
 
         # Per-engine role and TP width, in engine order -- the single source of
         # truth for how the cluster is sliced. Without disaggregation every
@@ -160,7 +154,7 @@ class TrtllmGeneration(GenerationInterface):
         # both TP and the MoE split can differ between prefill and decode.
         if self._disagg_cfg.enabled:
             engine_configs = [
-                (f"trtllm_cfg.{role}_engine", self._role_kwargs(role))
+                (f"trtllm_cfg.{role}_engine", role_engine_config(self.cfg, role))
                 for role in ("prefill", "decode")
             ]
         else:
@@ -265,7 +259,7 @@ class TrtllmGeneration(GenerationInterface):
 
         worker_cls = "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker"
         worker_builder = RayWorkerBuilder(
-            worker_cls, self._config_with_engine_overrides(node_bundle_indices)
+            worker_cls, self._config_with_engine_roles(node_bundle_indices)
         )
 
         # NCCL_CUMEM_ENABLE=1 is needed for the non-colocated NCCL collective
@@ -318,49 +312,6 @@ class TrtllmGeneration(GenerationInterface):
     # ------------------------------------------------------------------ #
     #  Engine layout
     # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _role_overrides(
-        trtllm_cfg: Any, role: Literal["prefill", "decode"]
-    ) -> dict[str, Any]:
-        """``trtllm_cfg.{role}_engine``, or empty when unset.
-
-        Only the keys of ``TrtllmEngineArgs`` may appear. The rest of
-        ``trtllm_cfg`` describes the model or the engine's contract with the
-        rest of the system, so a role differing on one would not serve the same
-        policy as its replica-mate -- and an unknown key here is not inert, it
-        is spread into the AsyncLLM constructor. Rejected here rather than
-        ignored, because silently dropping a knob someone wrote down is worse
-        than refusing to start.
-        """
-        overrides = dict(trtllm_cfg.get(f"{role}_engine") or {})
-        allowed = (
-            TrtllmEngineArgs.__required_keys__ | TrtllmEngineArgs.__optional_keys__
-        )
-        unsupported = sorted(set(overrides) - allowed)
-        if unsupported:
-            raise ValueError(
-                f"trtllm_cfg.{role}_engine may only override "
-                f"{sorted(allowed)}, "
-                f"got {unsupported}. Settings shared by every engine of the "
-                f"replica belong on trtllm_cfg itself, and engine kwargs "
-                f"shared by both roles on generation.trtllm_kwargs."
-            )
-        return overrides
-
-    def _role_kwargs(self, role: Literal["prefill", "decode"]) -> dict[str, Any]:
-        """This role's engine config: ``trtllm_cfg`` with its overrides applied.
-
-        The overridable set is ``TrtllmEngineArgs``; TP and the MoE split are
-        the ones that usually differ between prefill and decode. The sibling
-        role's block is dropped so an engine never sees the other one's.
-        """
-        shared = {
-            k: v
-            for k, v in self.cfg["trtllm_cfg"].items()
-            if k not in ("prefill_engine", "decode_engine")
-        }
-        return {**shared, **self._role_overrides(self.cfg["trtllm_cfg"], role)}
 
     def _plan_engines(self, world_size: int) -> tuple[list[str], list[int], int]:
         r"""Per-engine ``(role, width)``, in engine order.
@@ -415,25 +366,25 @@ class TrtllmGeneration(GenerationInterface):
         tps = ([prefill_tp] * num_prefill + [decode_tp] * num_decode) * num_replicas
         return roles, tps, num_replicas
 
-    def _config_with_engine_overrides(
+    def _config_with_engine_roles(
         self, node_bundle_indices: Optional[list[tuple[int, list[int]]]]
     ) -> TrtllmConfig:
-        """Attach each engine's role and construction overrides to the worker config.
+        """Attach each engine's prefill/decode role to the worker config.
 
-        Engine parallelism is fixed when ``AsyncLLM`` is built, and a worker
-        cannot infer its own values from its TP width -- two roles may share a
-        width and still want different expert layouts. ``RayWorkerBuilder`` hands
-        every worker the same config, so the driver attaches a map keyed by
-        :meth:`_engine_key` and each worker looks up its own entry.
+        ``RayWorkerBuilder`` hands every worker the same config, and a worker
+        cannot tell its role from its TP width -- both roles may share one. So
+        the driver attaches a map keyed by :meth:`_engine_key` and each worker
+        looks up its own entry, then reads that role's engine config, which
+        :func:`resolve_role_overrides` already resolved.
 
-        The prefill/decode *role* is per request in TRT-LLM, so an engine
-        does not strictly need to know it; it is recorded anyway because the
-        transceiver config and the role's kwargs are chosen from it.
+        The role is per request in TRT-LLM, so an engine does not strictly
+        need to know it; it is recorded because the engine's config and its
+        cache transceiver are chosen from it.
         """
         if node_bundle_indices is None or not self._disagg_cfg.enabled:
             return self.cfg
 
-        overrides: dict[str, dict[str, Any]] = {}
+        engine_roles: dict[str, dict[str, Any]] = {}
         role_counts: dict[str, int] = {}
         for (pg_idx, bundles), role in zip(
             node_bundle_indices, self._engine_roles, strict=True
@@ -445,19 +396,14 @@ class TrtllmGeneration(GenerationInterface):
             ordinal = role_counts.get(role, 0)
             role_counts[role] = ordinal + 1
             # Every engine gets an entry: the worker treats a missing key as a
-            # driver/worker mismatch, so absence must never read as "no
-            # overrides for this engine".
-            overrides[self._engine_key(pg_idx, bundles)] = {
-                "_disagg_role": role,
-                "_disagg_role_ordinal": ordinal,
-                # Under disaggregation _plan_engines only emits these two.
-                **self._role_overrides(
-                    self.cfg["trtllm_cfg"], cast(Literal["prefill", "decode"], role)
-                ),
+            # driver/worker mismatch, so absence must never read as "no role".
+            engine_roles[self._engine_key(pg_idx, bundles)] = {
+                "role": role,
+                "ordinal": ordinal,
             }
 
         cfg = dict(self.cfg)
-        cfg["trtllm_cfg"] = {**self.cfg["trtllm_cfg"], "_engine_overrides": overrides}
+        cfg["trtllm_cfg"] = {**self.cfg["trtllm_cfg"], "_engine_roles": engine_roles}
         return cast(TrtllmConfig, cfg)
 
     @staticmethod
@@ -466,7 +412,7 @@ class TrtllmGeneration(GenerationInterface):
 
         Both sides of the worker boundary compute this from the same
         ``(pg_idx, local_bundle_indices)`` tuple, so the worker can look up its
-        own per-engine overrides without the driver needing per-worker init
+        own role without the driver needing per-worker init
         kwargs. Keying on the tuple rather than deriving a global ordinal keeps
         it correct for both the unified-PG and per-node-PG layouts, whose local
         bundle indices mean different things.
@@ -585,9 +531,10 @@ class TrtllmGeneration(GenerationInterface):
                         why = f"{free} GPU(s) are left over with no engines to place"
                     raise ValueError(
                         f"Engine layout does not tile placement group {pg_idx} "
-                        f"({pg.bundle_count} GPUs): {why}. An engine cannot span "
-                        f"nodes. Engine widths in order: {engine_tps}. Two layouts "
-                        f"always tile: give every role tensor_parallel_size == "
+                        f"({pg.bundle_count} GPUs): {why}. An engine that fits in "
+                        f"a node is never split across nodes. Engine widths in "
+                        f"order: {engine_tps}. Two layouts always tile: give "
+                        f"every role tensor_parallel_size == "
                         f"GPUs per node (one engine per node), or make the replica "
                         f"width ({width}) divide GPUs per node (whole "
                         f"replicas per node). Engines are placed replica by "
@@ -606,22 +553,12 @@ class TrtllmGeneration(GenerationInterface):
     #  PD disaggregation
     # ------------------------------------------------------------------ #
 
-    @property
-    def _disagg_cfg(self) -> DisaggConfig:
-        return self._disagg
-
-    @property
-    def _disagg_server_cfg(self) -> TrtllmDisaggServerConfig:
-        return self._disagg_server
-
     def _assert_direct_dispatch_allowed(self) -> None:
-        """Reject the token-in-token-out path while PD is enabled.
+        """Reject the direct engine-dispatch path while PD is enabled.
 
-        ``generate`` / ``generate_async`` round-robin straight to DP leaders,
-        bypassing the group entry points. That would still produce correct
-        tokens -- each engine can prefill and decode on its own -- but it would
-        run *without* disaggregation while the user believes they are
-        exercising it. Fail loudly instead.
+        ``generate`` and ``generate_async`` send requests straight to the DP
+        leader engines, bypassing the disagg servers, so the rollout would run
+        without disaggregation. PD is only wired for the HTTP / NeMo-Gym path.
         """
         if self._disagg_cfg.enabled:
             raise RuntimeError(
@@ -647,7 +584,7 @@ class TrtllmGeneration(GenerationInterface):
             return self._disagg_server_urls
 
         disagg = self._disagg_cfg
-        server = self._disagg_server
+        server = self._disagg_server_cfg
         num_prefill = disagg.num_prefill_engines
         num_decode = disagg.num_decode_engines
         per_replica = num_prefill + num_decode
@@ -677,8 +614,8 @@ class TrtllmGeneration(GenerationInterface):
         )
         # Deterministic ports: a restarted frontend re-binds the same port on
         # its pinned node, so the URL Gym holds stays valid across crashes.
-        # Keep the base outside virtual_cluster's random master-port window
-        # (1400-1999). The offset must carry BOTH indices: several replicas can
+        # Keep every port below 9000, the ephemeral floor on some DGX/GB200
+        # nodes (virtual_cluster's port table). The offset must carry BOTH indices: several replicas can
         # land on one node (a node holds `gpus_per_node / replica_width`
         # replicas), and with only frontend_idx in it every replica's frontend
         # 0 would ask for the same port -- the losers die inside their daemon

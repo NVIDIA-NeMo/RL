@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.trtllm.config import resolve_role_overrides
 from nemo_rl.models.generation.trtllm.trtllm_worker_async import (
     TrtllmAsyncGenerationWorkerImpl,
 )
@@ -308,17 +309,19 @@ def _engine_kwargs(async_llm, cfg) -> dict:
     return async_llm.call_args.kwargs
 
 
-def _disagg_worker_config(**trtllm_kwargs):
+def _disagg_worker_config(trtllm_kwargs=None, *, prefill_trtllm_kwargs=None):
     # The shape the driver ships: the layout under generation.disaggregation,
-    # and this engine's role stamped into trtllm_cfg._engine_overrides.
+    # the role blocks resolved (configure_generation_config), and this engine's
+    # role stamped into trtllm_cfg._engine_roles.
     cfg = _config()
     cfg["colocated"] = {"enabled": False}
     cfg["disaggregation"] = {"enabled": True}
-    cfg["trtllm_cfg"]["_engine_overrides"] = {
-        "0:0": {"_disagg_role": "prefill", "_disagg_role_ordinal": 0}
-    }
-    if trtllm_kwargs:
-        cfg["trtllm_cfg"]["trtllm_kwargs"] = trtllm_kwargs
+    if trtllm_kwargs is not None:
+        cfg["trtllm_kwargs"] = trtllm_kwargs
+    if prefill_trtllm_kwargs is not None:
+        cfg["trtllm_cfg"]["prefill_engine"] = {"trtllm_kwargs": prefill_trtllm_kwargs}
+    cfg = resolve_role_overrides(cfg)
+    cfg["trtllm_cfg"]["_engine_roles"] = {"0:0": {"role": "prefill", "ordinal": 0}}
     return cfg
 
 
@@ -333,11 +336,72 @@ def test_a_disaggregated_engine_gets_the_default_cache_transceiver(
 
 
 def test_an_explicit_cache_transceiver_config_is_not_overridden(recorded_async_llm):
-    cfg = _disagg_worker_config(cache_transceiver_config={"backend": "NIXL"})
+    cfg = _disagg_worker_config({"cache_transceiver_config": {"backend": "NIXL"}})
 
     kwargs = _engine_kwargs(recorded_async_llm, cfg)
 
     assert kwargs["cache_transceiver_config"] == {"backend": "NIXL"}
+
+
+def test_a_role_kv_cache_config_adds_to_the_shared_one(recorded_async_llm):
+    # A role naming only its pool size must keep the shared reuse settings:
+    # replacing the whole block would bring back TRT-LLM's default
+    # enable_partial_reuse=True, which the disagg recipe turns off.
+    cfg = _disagg_worker_config(
+        {
+            "kv_cache_config": {
+                "enable_block_reuse": True,
+                "enable_partial_reuse": False,
+            },
+            "cache_transceiver_config": {"backend": "NIXL"},
+        },
+        prefill_trtllm_kwargs={
+            "kv_cache_config": {"max_tokens": 4096},
+            "cache_transceiver_config": {"kv_transfer_timeout_ms": 600000},
+        },
+    )
+
+    kwargs = _engine_kwargs(recorded_async_llm, cfg)
+
+    assert kwargs["kv_cache_config"].kwargs == {
+        "enable_block_reuse": True,
+        "enable_partial_reuse": False,
+        "max_tokens": 4096,
+    }
+    assert kwargs["cache_transceiver_config"] == {
+        "backend": "NIXL",
+        "kv_transfer_timeout_ms": 600000,
+    }
+
+
+def test_a_role_kv_cache_config_keeps_the_role_memory_fraction(recorded_async_llm):
+    # A role's own kv_cache_config must not displace its gpu_memory_utilization.
+    cfg = _config()
+    cfg["colocated"] = {"enabled": False}
+    cfg["disaggregation"] = {"enabled": True}
+    cfg["trtllm_cfg"]["gpu_memory_utilization"] = 0.7
+    cfg["trtllm_cfg"]["prefill_engine"] = {
+        "gpu_memory_utilization": 0.4,
+        "trtllm_kwargs": {"kv_cache_config": {"max_tokens": 4096}},
+    }
+    cfg = resolve_role_overrides(cfg)
+    cfg["trtllm_cfg"]["_engine_roles"] = {"0:0": {"role": "prefill", "ordinal": 0}}
+
+    kwargs = _engine_kwargs(recorded_async_llm, cfg)
+
+    assert kwargs["kv_cache_config"].kwargs == {
+        "max_tokens": 4096,
+        "free_gpu_memory_fraction": 0.4,
+    }
+
+
+def test_a_disaggregated_engine_reads_its_role_block(recorded_async_llm):
+    cfg = _disagg_worker_config()
+    cfg["trtllm_cfg"]["prefill_engine"]["max_batch_size"] = 2
+
+    kwargs = _engine_kwargs(recorded_async_llm, cfg)
+
+    assert kwargs["max_batch_size"] == 2
 
 
 @pytest.mark.parametrize("disaggregation", [None, {"enabled": False}])

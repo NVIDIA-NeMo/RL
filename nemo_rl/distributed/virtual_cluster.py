@@ -160,6 +160,9 @@ def uv_py_executable(extras: Sequence[str]) -> str:
 #                                                 sidecar per allocated node, driver included)
 #   6001-6999    NeMo-Skills sandbox uWSGI       (SANDBOX_BASE_PORT)
 #   7000-8999    vLLM engine rendezvous          (VLLM_PORT env var, 100-port spacing)
+#   [8300, 8556) PD-disagg frontends             (generation.disaggregation.frontend_base_port;
+#                                                 carved out of the vLLM band like SGLang below,
+#                                                 256 = the replicas * frontends cap)
 #   8600-8799    SGLang router                   (DEFAULT_SGLANG_ROUTER_PORT_RANGE_*, hard-coded;
 #                                                 carved out of the vLLM band — only one rollout
 #                                                 backend runs at a time)
@@ -185,6 +188,13 @@ DEFAULT_VLLM_PORTS_PER_ENGINE = 100
 # safe because only one rollout backend runs at a time, and a vLLM run only
 # climbs past 8600 with >=16 engines on a single node.  Both bands also steer
 # clear of the Ray dashboard carve-out at 8265 (see ray.sub).
+# PD-disagg frontend ports: deterministic, base + replica_idx *
+# num_frontend_workers + frontend_idx, so a restarted frontend re-binds the URL
+# Gym holds. Carved out of the vLLM band (TRT-LLM is the only backend with
+# disaggregation) above the Ray dashboard at 8265; 256 ports is the
+# replicas * frontends cap that TRT-LLM's request ids impose.
+DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW = 8300
+DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH = 8556
 DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW = 8600
 DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH = 8799
 DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW = 8800

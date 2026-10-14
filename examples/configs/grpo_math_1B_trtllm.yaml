@@ -19,11 +19,13 @@ policy:
       recompute_kv_cache_after_weight_updates: ${grpo.async_grpo.recompute_kv_cache_after_weight_updates}
       # Per-role engine overrides: these win over the shared values above for
       # that role's engines. Read only when disaggregation.enabled, hence
-      # inert here. Overridable set is TrtllmEngineArgs.
+      # inert here. Overridable set is TrtllmEngineArgs. Interpolated rather
+      # than pinned, so a recipe that raises the shared TP and enables
+      # disaggregation gets that TP on both roles.
       prefill_engine:
-        tensor_parallel_size: 1
+        tensor_parallel_size: ${..tensor_parallel_size}
       decode_engine:
-        tensor_parallel_size: 1
+        tensor_parallel_size: ${..tensor_parallel_size}
       disagg_server:
         # Stateful, so a trajectory's turns keep reaching the prefill engine
         # holding its prefix: conversation | kv_cache_aware

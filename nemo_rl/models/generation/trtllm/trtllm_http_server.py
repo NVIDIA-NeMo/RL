@@ -110,14 +110,6 @@ def normalize_chat_inputs(
     return dump["messages"], dump["tools"]
 
 
-def _tokenizer_backend_name(tokenizer: Any) -> str:
-    """Return the concrete backend that performs encode/decode operations."""
-    backend = getattr(tokenizer, "_tokenizer", None)
-    implementation = backend if backend is not None else tokenizer
-    implementation_type = type(implementation)
-    return f"{implementation_type.__module__}.{implementation_type.__name__}"
-
-
 async def build_spliced_prompt_ids(
     messages: list[dict],
     tools: "list[dict] | None",

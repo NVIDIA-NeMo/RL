@@ -453,9 +453,10 @@ policy:
       # makes num_frontend_workers worth raising.
       frontend_tokenize: false
       # Base port for the frontends' deterministic ports
-      # (base + replica_idx * num_frontend_workers + frontend_idx). Keep it
-      # outside virtual_cluster's random master-port window (1400-1999).
-      frontend_base_port: 17300
+      # (base + replica_idx * num_frontend_workers + frontend_idx). Like every
+      # service port they must stay below 9000, the ephemeral floor on some
+      # DGX/GB200 nodes; [8300, 8556) is their band in virtual_cluster.py.
+      frontend_base_port: 8300
     # null = topology default (IPC colocated, NCCL non-colocated). For
     # non-colocated Megatron generation it selects the packed collective; use
     # mcore for native refit.

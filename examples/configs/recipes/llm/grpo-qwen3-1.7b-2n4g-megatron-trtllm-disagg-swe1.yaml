@@ -85,8 +85,8 @@ policy:
       # sha256(session_id) client selection is exercised rather than
       # collapsing to the single-frontend path.
       num_frontend_workers: 2
-      # Outside virtual_cluster's master-port window (1400-1999).
-      frontend_base_port: 17300
+      # Below 9000, in virtual_cluster's disagg frontend band.
+      frontend_base_port: 8300
       frontend_tokenize: true
     trtllm_kwargs:
       # KV cache transceiver: an AsyncLLM argument like any other, so it

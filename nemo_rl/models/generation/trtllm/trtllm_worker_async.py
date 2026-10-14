@@ -28,7 +28,7 @@ Weight updates flow through ``NcclExtension`` inside TRT-LLM's internal
 import asyncio
 import gc
 import os
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import ray
 import torch
@@ -41,7 +41,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
-from nemo_rl.models.generation.trtllm.config import TrtllmConfig
+from nemo_rl.models.generation.trtllm.config import TrtllmConfig, role_engine_config
 
 
 def _tag_nsys_output(output_spec: str, tag: str) -> str:
@@ -104,7 +104,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             init_kwargs["bundle_indices"] = bundle_indices[1]
             # The placement-group index completes the engine's identity, which
             # the worker uses to find its own entry in trtllm_cfg's
-            # _engine_overrides map (see TrtllmGeneration._engine_key). Local
+            # _engine_roles map (see TrtllmGeneration._engine_key). Local
             # bundle indices alone are ambiguous across per-node PGs, which
             # each restart numbering at 0.
             init_kwargs["bundle_pg_idx"] = bundle_indices[0]
@@ -116,23 +116,23 @@ class TrtllmAsyncGenerationWorkerImpl:
     def __repr__(self) -> str:
         return "TrtllmAsyncGenerationWorker"
 
-    def _engine_overrides(self) -> dict[str, Any]:
-        """This engine's entry in the driver-built ``_engine_overrides`` map.
+    def _engine_role(self) -> dict[str, Any]:
+        """This engine's entry in the driver-built ``_engine_roles`` map.
 
         Keyed by ``(placement group index, local bundle indices)`` -- the same
         tuple ``TrtllmGeneration`` used to create this worker, so the two sides
         agree without per-worker init kwargs. Returns ``{}`` for uniform runs,
         which carry no map at all.
         """
-        overrides = self.cfg["trtllm_cfg"].get("_engine_overrides")
-        if not overrides or self._bundle_indices is None:
+        engine_roles = self.cfg["trtllm_cfg"].get("_engine_roles")
+        if not engine_roles or self._bundle_indices is None:
             return {}
         key = f"{self._bundle_pg_idx}:" + ",".join(str(i) for i in self._bundle_indices)
-        entry = overrides.get(key)
+        entry = engine_roles.get(key)
         if entry is None:
             raise RuntimeError(
-                f"No engine override entry for {key!r}. Known keys: "
-                f"{sorted(overrides)}. TrtllmGeneration._engine_key() and this "
+                f"No engine role entry for {key!r}. Known keys: "
+                f"{sorted(engine_roles)}. TrtllmGeneration._engine_key() and this "
                 f"lookup must stay in sync."
             )
         return entry
@@ -153,15 +153,24 @@ class TrtllmAsyncGenerationWorkerImpl:
         )
         self.is_model_owner = bundle_indices is not None
         self._bundle_indices = bundle_indices
-        # This engine's effective config: the shared trtllm_cfg with this
-        # engine's role overrides merged over it. Everything that describes the
-        # engine -- constructor kwargs, the HTTP server's limits -- must read
-        # this, never the raw trtllm_cfg, or a role's overrides apply to some
-        # settings and not others. Equal to trtllm_cfg without disaggregation.
-        self.engine_cfg: dict[str, Any] = {
-            **self.cfg["trtllm_cfg"],
-            **self._engine_overrides(),
-        }
+        # Stamped by the driver on every engine exactly when disaggregation is
+        # enabled (TrtllmGeneration._config_with_engine_roles); None otherwise.
+        engine_role = self._engine_role()
+        self._disagg_role: Optional[Literal["prefill", "decode"]] = engine_role.get(
+            "role"
+        )
+        self._disagg_role_ordinal: Optional[int] = engine_role.get("ordinal")
+        # This engine's config: its role's block, which resolve_role_overrides
+        # already merged over the shared trtllm_cfg, or trtllm_cfg itself
+        # without disaggregation. Everything that describes the engine --
+        # constructor kwargs, the HTTP server's limits -- must read this, never
+        # the raw trtllm_cfg, or a role's overrides apply to some settings and
+        # not others.
+        self.engine_cfg: dict[str, Any] = (
+            role_engine_config(self.cfg, self._disagg_role)
+            if self._disagg_role is not None
+            else dict(self.cfg["trtllm_cfg"])
+        )
         self._fraction_of_gpus = fraction_of_gpus
         self._seed = seed
         self.llm = None
@@ -249,9 +258,16 @@ class TrtllmAsyncGenerationWorkerImpl:
         # reject unknown keys) — pass them via kv_cache_config instead. The rest
         # of trtllm_kwargs is spread as top-level AsyncLLM kwargs below.
         # A role may override kv_cache_config too: prefill and decode engines
-        # usually want different KV pool sizes.
-        extra_trtllm_kwargs = dict(self.cfg.get("trtllm_kwargs") or {})
-        extra_trtllm_kwargs.update(engine_cfg.get("trtllm_kwargs") or {})
+        # usually want different KV pool sizes. A role's trtllm_kwargs are
+        # already deep-merged over the shared ones (resolve_role_overrides).
+        extra_trtllm_kwargs = dict(
+            (
+                engine_cfg["trtllm_kwargs"]
+                if self._disagg_role is not None
+                else self.cfg.get("trtllm_kwargs")
+            )
+            or {}
+        )
         kv_cache_kwargs = dict(extra_trtllm_kwargs.pop("kv_cache_config", None) or {})
 
         # gpu_memory_utilization is a dedicated engine_cfg knob for
@@ -268,9 +284,9 @@ class TrtllmAsyncGenerationWorkerImpl:
         # symmetric here; which pool an engine lands in is decided by the
         # replica's disagg server from its address alone. The layout lives at
         # generation.disaggregation, not in trtllm_cfg, so it is never in
-        # engine_cfg; the driver stamps _disagg_role on every engine exactly
-        # when disaggregation is enabled (_config_with_engine_overrides).
-        if engine_cfg.get("_disagg_role") is not None:
+        # engine_cfg; the driver stamps a role on every engine exactly when
+        # disaggregation is enabled (_config_with_engine_roles).
+        if self._disagg_role is not None:
             from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
             # Tuning the transceiver (runtime, bounce size, timeouts) is an
@@ -320,8 +336,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             "trtllm_async_generation_worker"
         ).get("nsight")
         if _nsight and "ray_worker_nsight_options" not in llm_kwargs:
-            _disagg_role = self.engine_cfg.get("_disagg_role")
-            if _disagg_role:
+            if self._disagg_role is not None:
                 # Under disaggregation every engine reports the same worker
                 # name, so the report name distinguishes them only by the %p
                 # pid -- which means matching a report to the context or
@@ -333,7 +348,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                 _nsight = dict(_nsight)
                 _nsight["o"] = _tag_nsys_output(
                     _nsight["o"],
-                    f"{_disagg_role}{self.engine_cfg['_disagg_role_ordinal']}",
+                    f"{self._disagg_role}{self._disagg_role_ordinal}",
                 )
             llm_kwargs["ray_worker_nsight_options"] = _nsight
 

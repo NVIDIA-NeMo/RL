@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict, cast
 
 from pydantic import BaseModel
 
@@ -72,7 +72,7 @@ class TrtllmEngineKnobs(TypedDict, total=False):
 class TrtllmEngineArgs(TrtllmEngineKnobs):
     """One role's engine overrides: ``trtllm_cfg.{prefill,decode}_engine``."""
 
-    # This role's AsyncLLM kwargs, merged over the replica-wide
+    # This role's AsyncLLM kwargs, deep-merged over the replica-wide
     # generation.trtllm_kwargs -- how prefill and decode get different tuning.
     # No counterpart on the shared block: those already live one level up.
     trtllm_kwargs: NotRequired[dict[str, Any]]
@@ -98,9 +98,11 @@ class TrtllmSpecificArgs(TrtllmEngineKnobs):
     tool_parser: NotRequired[str]
     reasoning_parser: NotRequired[str]
 
-    # Per-role engine overrides under PD disaggregation, merged over the
-    # shared values above. Keys outside TrtllmEngineArgs are rejected at
-    # startup by TrtllmGeneration._role_overrides.
+    # Per-role engine overrides under PD disaggregation. As written, a role
+    # names only what differs from the shared values above, and keys outside
+    # TrtllmEngineArgs are rejected at startup. resolve_role_overrides then
+    # replaces each with that role's complete engine config, which is all
+    # anything downstream reads.
     prefill_engine: NotRequired[TrtllmEngineArgs]
     decode_engine: NotRequired[TrtllmEngineArgs]
 
@@ -113,7 +115,7 @@ class TrtllmConfig(GenerationConfig):
     # covered by TrtllmSpecificArgs (e.g. sampler_type, enable_attention_dp).
     # Spread into the engine constructor as `**trtllm_kwargs`, and shared by
     # every engine -- a single engine's are trtllm_cfg.{prefill,decode}_engine.trtllm_kwargs,
-    # which are merged over these.
+    # which are deep-merged over these.
     trtllm_kwargs: NotRequired[dict[str, Any]]
 
 
@@ -135,15 +137,89 @@ def resolve_disagg_layout(config: TrtllmConfig) -> DisaggConfig:
     return DisaggConfig.model_validate(_as_dict(config.get("disaggregation")))
 
 
+def _deep_merge(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    """``update`` over ``base``, nested dicts merged key by key; inputs untouched."""
+    merged = dict(base)
+    for key, value in update.items():
+        if isinstance(merged.get(key), dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def resolve_role_overrides(config: TrtllmConfig) -> TrtllmConfig:
+    """Resolve ``trtllm_cfg.{prefill,decode}_engine`` into complete engine configs.
+
+    The one place the "a role wins over the shared value" rule is applied. As
+    written, a role block names only what differs (``TrtllmEngineArgs``).
+    Afterwards each is that role's whole engine config: the shared
+    ``trtllm_cfg`` with the role's keys on top, and ``trtllm_kwargs`` deep-merged
+    over ``generation.trtllm_kwargs``, so a role's nested block (say
+    ``kv_cache_config: {max_tokens: N}``) adds to the shared one instead of
+    replacing it. Everything downstream reads the resolved block and merges
+    nothing itself.
+
+    A role key outside ``TrtllmEngineArgs`` is rejected: the rest of
+    ``trtllm_cfg`` describes the model or the engine's contract with the rest of
+    the system, so a role differing on one would not serve the same policy as
+    its replica-mate. Silently dropping a knob someone wrote down would be
+    worse than refusing to start.
+
+    Returns ``config`` unchanged without disaggregation, where the role blocks
+    are inert. Idempotent: a resolved block only repeats the shared values
+    outside ``TrtllmEngineArgs``, and those pass the check.
+    """
+    if not resolve_disagg_layout(config).enabled:
+        return config
+
+    # A plain dict here: the role blocks are addressed by computed key.
+    trtllm_cfg = cast(dict[str, Any], config["trtllm_cfg"])
+    shared = {
+        k: v
+        for k, v in trtllm_cfg.items()
+        if k not in ("prefill_engine", "decode_engine", "disagg_server")
+    }
+    allowed = TrtllmEngineArgs.__required_keys__ | TrtllmEngineArgs.__optional_keys__
+    resolved = dict(trtllm_cfg)
+    for role in ("prefill", "decode"):
+        overrides = dict(trtllm_cfg.get(f"{role}_engine") or {})
+        unsupported = sorted(
+            k for k in set(overrides) - allowed if overrides[k] != shared.get(k)
+        )
+        if unsupported:
+            raise ValueError(
+                f"trtllm_cfg.{role}_engine may only override {sorted(allowed)}, "
+                f"got {unsupported}. Settings shared by every engine of the "
+                f"replica belong on trtllm_cfg itself, and engine kwargs shared "
+                f"by both roles on generation.trtllm_kwargs."
+            )
+        resolved[f"{role}_engine"] = {
+            **shared,
+            **overrides,
+            "trtllm_kwargs": _deep_merge(
+                dict(config.get("trtllm_kwargs") or {}),
+                dict(overrides.get("trtllm_kwargs") or {}),
+            ),
+        }
+    return cast(TrtllmConfig, {**config, "trtllm_cfg": resolved})
+
+
+def role_engine_config(
+    config: TrtllmConfig, role: Literal["prefill", "decode"]
+) -> dict[str, Any]:
+    """The whole engine config of ``role``. ``config`` must be role-resolved.
+
+    See :func:`resolve_role_overrides`.
+    """
+    return cast(dict[str, Any], config["trtllm_cfg"])[f"{role}_engine"]
+
+
 def role_tensor_parallel_size(
     config: TrtllmConfig, role: Literal["prefill", "decode"]
 ) -> int:
-    """TP of one engine of ``role``: ``trtllm_cfg.{role}_engine`` over the shared TP."""
-    trtllm_cfg = config["trtllm_cfg"]
-    overrides = trtllm_cfg.get(f"{role}_engine") or {}
-    return int(
-        overrides.get("tensor_parallel_size", trtllm_cfg["tensor_parallel_size"])
-    )
+    """TP of one engine of ``role``. ``config`` must be role-resolved."""
+    return int(role_engine_config(config, role)["tensor_parallel_size"])
 
 
 def replica_width(config: TrtllmConfig) -> int:

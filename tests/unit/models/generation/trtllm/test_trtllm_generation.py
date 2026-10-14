@@ -28,6 +28,7 @@ from nemo_rl.models.generation.trtllm.config import (
     replica_width,
     resolve_disagg_layout,
     resolve_disagg_server_config,
+    resolve_role_overrides,
 )
 from nemo_rl.models.generation.trtllm.trtllm_generation import TrtllmGeneration
 
@@ -87,8 +88,8 @@ def _bare_generation(*, colocated=True, dp_size=2, **trtllm_overrides):
     generation.worker_group.workers = [object()] * dp_size
     # Aggregated shape: a replica is one engine, one worker wide, so engine i
     # is owned by worker i. __init__ derives these; these tests bypass it.
-    generation._disagg = resolve_disagg_layout(generation.cfg)
-    generation._disagg_server = resolve_disagg_server_config(generation.cfg)
+    generation._disagg_cfg = resolve_disagg_layout(generation.cfg)
+    generation._disagg_server_cfg = resolve_disagg_server_config(generation.cfg)
     generation.num_replicas = dp_size
     generation.num_engines = dp_size
     generation._engine_tps = [1] * dp_size
@@ -387,7 +388,7 @@ def test_disagg_defaults_come_from_the_schema_not_the_call_sites():
         assert layout.num_decode_engines == 1
         assert layout.num_frontend_workers == 1
         assert layout.frontend_tokenize is False
-        assert layout.frontend_base_port == 17300
+        assert layout.frontend_base_port == 8300
 
         server = resolve_disagg_server_config(cfg)
         assert server.ctx_router == "conversation"
@@ -472,11 +473,11 @@ def test_unknown_disagg_keys_are_preserved_for_older_configs():
 def test_plan_engines_lays_replicas_out_contiguously(
     trtllm_overrides, world_size, expected_roles, expected_tps, expected_replicas
 ):
-    cfg = _config(**trtllm_overrides)
+    cfg = resolve_role_overrides(_config(**trtllm_overrides))
     generation = TrtllmGeneration.__new__(TrtllmGeneration)
     generation.cfg = cfg
     generation.tp_size = cfg["trtllm_cfg"]["tensor_parallel_size"]
-    generation._disagg = resolve_disagg_layout(cfg)
+    generation._disagg_cfg = resolve_disagg_layout(cfg)
 
     roles, tps, num_replicas = generation._plan_engines(world_size)
 
@@ -491,9 +492,11 @@ def test_a_disaggregated_replica_spans_all_of_its_engines(as_model):
     # grpo.setup() sizes NVLink-domain placement with this, so both shapes
     # must work.
     layout = {"enabled": True, "num_prefill_engines": 1, "num_decode_engines": 2}
-    cfg = _config(
-        disaggregation=DisaggConfig.model_validate(layout) if as_model else layout,
-        prefill_engine={"tensor_parallel_size": 2},
+    cfg = resolve_role_overrides(
+        _config(
+            disaggregation=DisaggConfig.model_validate(layout) if as_model else layout,
+            prefill_engine={"tensor_parallel_size": 2},
+        )
     )
 
     # One TP2 prefill engine plus two TP1 decode engines.
@@ -505,15 +508,110 @@ def test_an_aggregated_replica_is_one_engine():
 
 
 def test_plan_engines_rejects_a_replica_width_that_does_not_tile_the_cluster():
-    cfg = _config(
-        disaggregation={"enabled": True},
-        prefill_engine={"tensor_parallel_size": 2},
-        decode_engine={"tensor_parallel_size": 1},
+    cfg = resolve_role_overrides(
+        _config(
+            disaggregation={"enabled": True},
+            prefill_engine={"tensor_parallel_size": 2},
+            decode_engine={"tensor_parallel_size": 1},
+        )
     )
     generation = TrtllmGeneration.__new__(TrtllmGeneration)
     generation.cfg = cfg
     generation.tp_size = cfg["trtllm_cfg"]["tensor_parallel_size"]
-    generation._disagg = resolve_disagg_layout(cfg)
+    generation._disagg_cfg = resolve_disagg_layout(cfg)
 
     with pytest.raises(AssertionError, match="replica width 3 GPUs"):
         generation._plan_engines(8)
+
+
+# -------------------------------------------------------------------------- #
+#  Role overrides
+# -------------------------------------------------------------------------- #
+
+
+def _disagg_config(**trtllm_overrides):
+    return _config(disaggregation={"enabled": True}, **trtllm_overrides)
+
+
+def test_a_role_block_resolves_to_its_whole_engine_config():
+    cfg = resolve_role_overrides(
+        _disagg_config(
+            tensor_parallel_size=2,
+            prefill_engine={"tensor_parallel_size": 4, "max_batch_size": 2},
+            disagg_server={"ctx_router": "conversation"},
+        )
+    )
+    prefill = cfg["trtllm_cfg"]["prefill_engine"]
+    decode = cfg["trtllm_cfg"]["decode_engine"]
+
+    # The role's keys win; everything else comes from the shared block.
+    assert prefill["tensor_parallel_size"] == 4
+    assert prefill["max_batch_size"] == 2
+    assert prefill["precision"] == "bfloat16"
+    assert decode["tensor_parallel_size"] == 2
+    assert decode["max_batch_size"] == 8
+    # Neither the sibling role nor the disagg server is part of an engine.
+    for block in (prefill, decode):
+        assert not {"prefill_engine", "decode_engine", "disagg_server"} & set(block)
+
+
+def test_role_trtllm_kwargs_merge_key_by_key_over_the_shared_ones():
+    cfg = _disagg_config(
+        decode_engine={
+            "trtllm_kwargs": {
+                "kv_cache_config": {"max_tokens": 4096},
+                "cache_transceiver_config": {"kv_transfer_timeout_ms": 600000},
+            }
+        }
+    )
+    cfg["trtllm_kwargs"] = {
+        "kv_cache_config": {"enable_block_reuse": True, "enable_partial_reuse": False},
+        "cache_transceiver_config": {"backend": "NIXL"},
+        "enable_chunked_prefill": True,
+    }
+
+    resolved = resolve_role_overrides(cfg)
+
+    assert resolved["trtllm_cfg"]["decode_engine"]["trtllm_kwargs"] == {
+        "kv_cache_config": {
+            "enable_block_reuse": True,
+            "enable_partial_reuse": False,
+            "max_tokens": 4096,
+        },
+        "cache_transceiver_config": {
+            "backend": "NIXL",
+            "kv_transfer_timeout_ms": 600000,
+        },
+        "enable_chunked_prefill": True,
+    }
+    assert (
+        resolved["trtllm_cfg"]["prefill_engine"]["trtllm_kwargs"]
+        == cfg["trtllm_kwargs"]
+    )
+    # The shared block itself is left alone.
+    assert cfg["trtllm_kwargs"]["kv_cache_config"] == {
+        "enable_block_reuse": True,
+        "enable_partial_reuse": False,
+    }
+
+
+def test_a_role_key_outside_the_engine_knobs_is_rejected():
+    with pytest.raises(ValueError, match=r"prefill_engine may only override"):
+        resolve_role_overrides(_disagg_config(prefill_engine={"precision": "float16"}))
+
+
+def test_resolving_twice_is_the_same_as_once():
+    cfg = _disagg_config(prefill_engine={"tensor_parallel_size": 2})
+    cfg["trtllm_kwargs"] = {"kv_cache_config": {"enable_partial_reuse": False}}
+
+    once = resolve_role_overrides(cfg)
+
+    assert resolve_role_overrides(once) == once
+
+
+@pytest.mark.parametrize("disaggregation", [None, {"enabled": False}])
+def test_role_blocks_are_left_as_written_without_disaggregation(disaggregation):
+    # Inert without disaggregation, so not even validated.
+    cfg = _config(disaggregation=disaggregation, prefill_engine={"precision": "x"})
+
+    assert resolve_role_overrides(cfg) is cfg

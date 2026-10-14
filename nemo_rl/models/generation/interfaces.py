@@ -21,6 +21,7 @@ import torch
 from pydantic import BaseModel
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
 
 # The universal contract is hf_export: the source exports an HF-named,
 # backend-independent representation that each destination converts locally.
@@ -219,9 +220,11 @@ class DisaggConfig(BaseModel, extra="allow"):
     frontend_tokenize: bool = False
 
     # base + replica_idx * num_frontend_workers + frontend_idx. Deterministic
-    # so a restarted frontend re-binds the same port and its URL stays valid;
-    # keep it clear of virtual_cluster's random master-port window (1400-1999).
-    frontend_base_port: int = 17300
+    # so a restarted frontend re-binds the same port and its URL stays valid.
+    # Like every service port it must stay below 9000, the ephemeral floor on
+    # some DGX/GB200 nodes; the default band is virtual_cluster's
+    # DEFAULT_DISAGG_FRONTEND_PORT_RANGE_*.
+    frontend_base_port: int = DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
 
 
 class ColocationConfig(TypedDict):
