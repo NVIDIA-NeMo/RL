@@ -17,12 +17,13 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import threading
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 import torch
@@ -55,11 +56,13 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossInputType
+from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import (
     OnPolicyDistillationConfig,
     get_opd_full_config,
     opd_full_teacher_index_field,
 )
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -759,24 +762,6 @@ class TestSetup:
             NotImplementedError, match="token-capture finalizer does not emit"
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
-
-        patched_factories["setup_response_data"].assert_not_called()
-        patched_factories["_build_clusters"].assert_not_called()
-
-    def test_vlm_token_capture_rejects_non_vllm_backend(self, patched_factories):
-        # Media capture is only implemented in the vLLM worker: a VLM run (any
-        # processor) with token capture must fail loudly on other backends.
-        mc = _make_master_config(
-            backend="megatron",
-            megatron_enabled=True,
-            env={"should_use_nemo_gym": True},
-        )
-        mc.token_capture.enabled = True
-
-        with pytest.raises(NotImplementedError, match="only implemented for the vLLM"):
-            setup_single_controller(
-                mc, MagicMock(pad_token_id=0), processor=MagicMock()
-            )
 
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
@@ -3147,3 +3132,177 @@ def test_load_opd_full_teacher_lm_heads_loads_one_head_per_unique_teacher(monkey
         "Qwen/teacher-a",
         "Qwen/teacher-b",
     ]
+
+
+# ── multimodal token capture guards ──────────────────────────────────────────
+
+
+def _make_gym_megatron_capture_config() -> MasterConfig:
+    mc = _make_master_config(backend="megatron", megatron_enabled=True)
+    mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = True
+    mc.policy["generation"]["stop_strings"] = None
+    mc.policy["generation"]["stop_token_ids"] = None
+    mc.policy["generation"]["top_k"] = None
+    mc.logger.log_dir = "/tmp/test-megatron-token-capture-mm"
+    mc.token_capture.enabled = True
+    return mc
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
+def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
+    patched_factories, algorithm
+):
+    """Capture rows carry their own media, so dedup has nothing to share: a GRPO
+    run asking for it is rejected. A PPO run has no ``grpo`` block; the guard
+    must not read it. The guard is the last check in the token-capture block,
+    so reaching the OPD lookup that follows it proves the guard let the PPO
+    config through.
+    """
+
+    class _PassedTokenCaptureBlock(Exception):
+        pass
+
+    mc = _make_gym_megatron_capture_config()
+    if algorithm == "grpo":
+        mc.grpo.deduplicate_multimodal_data = True
+        expectation = pytest.raises(ValueError, match="deduplicate_multimodal_data")
+    else:
+        mc.ppo = PPOConfig.model_construct(**dict(mc.grpo))
+        mc.grpo = None
+        mc.value = {"megatron_cfg": {"enabled": True}, "train_global_batch_size": 8}
+        mc.value_loss_fn = MseValueLossConfig()
+        expectation = pytest.raises(_PassedTokenCaptureBlock)
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(
+            sc_setup_mod.opd_module,
+            "get_opd_full_config",
+            side_effect=_PassedTokenCaptureBlock,
+        ) as mock_gate,
+        expectation,
+    ):
+        setup_single_controller(
+            mc, MagicMock(pad_token_id=0), processor=MagicMock(name="processor")
+        )
+
+    if algorithm == "grpo":
+        mock_gate.assert_not_called()
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+    else:
+        mock_gate.assert_called_once()
+
+
+@pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])
+def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
+    patched_factories, multimodal
+):
+    """Only a multimodal Megatron capture run registers the engine-media
+    columns on the staging partition and turns media capture on in the
+    workers and the finalizer; a text run keeps the base schema."""
+    mc = _make_gym_megatron_capture_config()
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    fake_gym_actor = MagicMock(name="nemo_gym_actor")
+    port_holders = [MagicMock(name="port_holder_rank_0")]
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(
+            sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_actor
+        ) as mock_spinup,
+        patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+        patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+        patch.object(sc_setup_mod, "ray"),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[MagicMock(name="finalizer_0")],
+        ) as mock_finalizers,
+    ):
+        mock_megatron.reserve_http_server_addresses.return_value = (
+            ["http://10.0.0.1:5555/v1"],
+            {0: 5555},
+            port_holders,
+        )
+        actor_args, _ = setup_single_controller(
+            mc,
+            MagicMock(pad_token_id=0),
+            processor=MagicMock(name="processor") if multimodal else None,
+        )
+
+    assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
+        "megatron"
+    )
+    dp_client = patched_factories["build_data_plane_client"].return_value
+    staging_calls = [
+        call
+        for call in dp_client.register_partition.call_args_list
+        if call.kwargs.get("partition_id") == mc.token_capture.staging_partition
+    ]
+    assert len(staging_calls) == 1
+    fields = set(staging_calls[0].kwargs["fields"])
+    if multimodal:
+        assert set(MEDIA_STAGING_FIELDS) <= fields
+    else:
+        assert set(MEDIA_STAGING_FIELDS).isdisjoint(fields)
+    finalizer_config = mock_finalizers.call_args.args[1]
+    assert finalizer_config.capture_media is multimodal
+    actor_args.gen_handle.setup_token_capture.assert_called_once_with(
+        ANY, mc.token_capture.staging_partition, capture_media=multimodal
+    )
+    # What the workers pinned the media column to is what the finalizers get.
+    assert (
+        finalizer_config.media_columns
+        is actor_args.gen_handle.setup_token_capture.return_value
+    )
+
+
+@pytest.mark.mcore
+def test_offloaded_payload_exposes_multimodal_capture_fields():
+    """Pin the engine payload field the multimodal stager reads with getattr
+    defaults and the prefix-stitching keys the Megatron preparer writes."""
+    # Deferred import: megatron-core is a heavy, optional dependency.
+    from megatron.core.inference import inference_request
+
+    if not hasattr(inference_request, "RequestPayloadStager"):
+        pytest.skip(
+            "pinned megatron-core predates MInf capture hooks (Megatron-LM #7015)"
+        )
+    names = {
+        field.name
+        for field in dataclasses.fields(inference_request.OffloadedRequestPayload)
+    }
+    assert "media_tensors" in names
+    for name in ("PREFIX_MEDIA_COUNT_FIELD", "PREFIX_EXPANDED_TOKEN_COUNT_FIELD"):
+        assert hasattr(inference_request, name), name
+
+
+@pytest.mark.mcore
+def test_minf_image_preprocessing_emits_float32_pixels():
+    """Pin the premise behind the Megatron stager's pixel cast: MInf's wire
+    image path hands the payload stager float32 packed patches whatever the
+    model's params dtype, so the stager must cast them to the vision encoder's
+    weight dtype (the sink's pinned media column) rather than stage them as is."""
+    # Deferred import: megatron-core is a heavy, optional dependency.
+    Image = pytest.importorskip("PIL.Image")
+    pytest.importorskip("torchvision")
+    from megatron.core.inference.config import ImageProcessingConfig
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (
+        preprocess_image,
+    )
+
+    # 4x4 RGB with 2x2 patches: dynamic resolution keeps it at a 2x2 patch grid.
+    config = ImageProcessingConfig(
+        patch_dim=2,
+        dynamic_resolution=True,
+        pixel_mean=[0.5, 0.5, 0.5],
+        pixel_std=[0.5, 0.5, 0.5],
+    )
+    imgs, imgs_sizes = preprocess_image(Image.new("RGB", (4, 4)), config)
+
+    assert imgs.dtype == torch.float32
+    assert tuple(imgs.shape) == (1, 4, 3 * 2 * 2)
+    assert imgs_sizes.dtype == torch.int32
+    assert imgs_sizes.tolist() == [[4, 4]]
