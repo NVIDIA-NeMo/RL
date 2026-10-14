@@ -14,6 +14,7 @@
 
 """Builds the loss-function input dict from model logits."""
 
+import contextlib
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -43,6 +44,7 @@ from nemo_rl.distributed.model_utils import (
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
     get_next_token_topk_logprobs_from_logits,
+    logits_shared_for_backward,
 )
 
 if TYPE_CHECKING:
@@ -255,16 +257,23 @@ def prepare_loss_input(
             logprobs = logprobs.to(torch.float32)
             logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
         else:
-            logprobs = get_next_token_logprobs_from_logits(
-                input_ids=data["input_ids"],
-                next_token_logits=logits,
-                vocab_parallel_rank=vocab_parallel_rank,
-                vocab_parallel_group=vocab_parallel_group,
-                context_parallel_group=context_parallel_group,
-                sampling_params=sampling_params,
-                chunk_size=chunk_size,
-                cp_sharder=cp_sharder,
-            )
+            # Score centering gathers these logits again below, so the sampled-token
+            # log-prob backward must not reuse their storage for its gradient.
+            with (
+                logits_shared_for_backward()
+                if getattr(loss_fn, "score_centering", False)
+                else contextlib.nullcontext()
+            ):
+                logprobs = get_next_token_logprobs_from_logits(
+                    input_ids=data["input_ids"],
+                    next_token_logits=logits,
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    sampling_params=sampling_params,
+                    chunk_size=chunk_size,
+                    cp_sharder=cp_sharder,
+                )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
         if need_top_k_or_top_p_filtering(sampling_params):

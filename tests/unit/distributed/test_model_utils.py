@@ -36,7 +36,9 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
     gather_logits_at_global_indices,
+    get_next_token_logprobs_from_logits,
     get_next_token_topk_logprobs_from_logits,
+    logits_shared_for_backward,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -433,6 +435,60 @@ def test_get_next_token_topk_logprobs_from_logits_single_device():
     torch.testing.assert_close(actual, expected)
     actual.sum().backward()
     assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+@pytest.fixture
+def single_rank_gloo_group():
+    """A world-size-1 gloo group, enough to drive the vocab-parallel code path on CPU."""
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29517")
+    torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
+    yield torch.distributed.group.WORLD
+    torch.distributed.destroy_process_group()
+
+
+def test_score_centering_logits_survive_the_sampled_logprob_backward(single_rank_gloo_group):
+    """Score centering gathers the same fp32 logits as the sampled-token log-prob.
+
+    ChunkedDistributedLogprob's backward reuses its saved fp32 logits' storage for the gradient,
+    which breaks the top-k gather's saved logits (autograd version check, job 1240321) unless the
+    sampled-token call runs inside logits_shared_for_backward().
+    """
+    torch.manual_seed(0)
+    B, S, V, k, chunk = 1, 12, 16, 4, 5
+
+    def run(shared: bool) -> torch.Tensor:
+        leaf = torch.randn(B, S, V, requires_grad=True)
+        logits = leaf * 1.0  # fp32 and not a leaf, as the LM head output is
+        input_ids = torch.randint(0, V, (B, S))
+        topk_ids = torch.randint(0, V, (B, S, k), dtype=torch.int32)
+        common = dict(
+            next_token_logits=logits,
+            vocab_parallel_rank=0,
+            vocab_parallel_group=single_rank_gloo_group,
+            chunk_size=chunk,
+        )
+        topk = get_next_token_topk_logprobs_from_logits(topk_ids=topk_ids, **common)
+        # Created last, so autograd runs its backward (the storage reuse) before the gather's.
+        if shared:
+            with logits_shared_for_backward():
+                logprobs = get_next_token_logprobs_from_logits(input_ids=input_ids, **common)
+        else:
+            logprobs = get_next_token_logprobs_from_logits(input_ids=input_ids, **common)
+        (logprobs.sum() + topk.sum()).backward()
+
+        reference = leaf.detach().clone().requires_grad_(True)
+        log_softmax = torch.log_softmax(reference, dim=-1)[:, :-1]
+        ref_loss = log_softmax.gather(-1, input_ids[:, 1:, None]).sum() + log_softmax.gather(
+            -1, topk_ids.long()[:, 1:]
+        ).sum()
+        ref_loss.backward()
+        torch.testing.assert_close(leaf.grad, reference.grad)
+        return leaf.grad
+
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        run(shared=False)
+    run(shared=True)
 
 
 @pytest.mark.parametrize(

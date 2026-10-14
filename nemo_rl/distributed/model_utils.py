@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable
+import contextlib
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -224,6 +225,24 @@ class DistributedLogprob(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None
 
 
+# ChunkedDistributedLogprob's backward reuses the saved fp32 logits' storage for the gradient (see
+# there). That is only valid while nothing else saved those logits; logits_shared_for_backward()
+# turns it off for the calls made inside it (score centering also gathers the same logits).
+_REUSE_LOGITS_STORAGE_IN_BACKWARD = True
+
+
+@contextlib.contextmanager
+def logits_shared_for_backward() -> Iterator[None]:
+    """Keep ChunkedDistributedLogprob from overwriting its saved logits in backward."""
+    global _REUSE_LOGITS_STORAGE_IN_BACKWARD
+    previous = _REUSE_LOGITS_STORAGE_IN_BACKWARD
+    _REUSE_LOGITS_STORAGE_IN_BACKWARD = False
+    try:
+        yield
+    finally:
+        _REUSE_LOGITS_STORAGE_IN_BACKWARD = previous
+
+
 class ChunkedDistributedLogprob(torch.autograd.Function):
     """Custom autograd function for computing log probabilities in a distributed setting.
 
@@ -284,6 +303,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             ctx.save_for_backward(vocab_parallel_logits, target_mask, masked_target)
             ctx.chunk_size = chunk_size
             ctx.tp_group = tp_group
+            ctx.reuse_logits_storage = _REUSE_LOGITS_STORAGE_IN_BACKWARD
 
         return log_probs
 
@@ -309,7 +329,8 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         # fails autograd's version check loudly rather than reading the grad. Leaf
         # tensors belong to the caller and are never overwritten.
         reuse_logits_storage = (
-            vocab_parallel_logits.dtype == torch.float32
+            ctx.reuse_logits_storage
+            and vocab_parallel_logits.dtype == torch.float32
             and not vocab_parallel_logits.is_leaf
         )
         grad_input: torch.Tensor = (
