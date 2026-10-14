@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import inspect
 from typing import Any
 
 import pytest
@@ -120,3 +121,13 @@ async def test_bypass_delegates_to_real_vllm_formatter() -> None:
         assert serving._create_chat_logprobs(**kwargs) is None
     assert serving._create_chat_logprobs(**kwargs) == ordinary
     assert engine_logprobs[0][7].logprob == -0.5
+
+    # The bypass only runs while vLLM builds full-response logprobs through
+    # this method. If vLLM moves the call, the override is silently skipped.
+    full_generator = inspect.getsource(
+        chat.OpenAIServingChat.chat_completion_full_generator
+    )
+    assert "self._create_chat_logprobs(" in full_generator, (
+        "vLLM no longer calls _create_chat_logprobs from "
+        "chat_completion_full_generator; the captured-logprobs bypass is dead"
+    )
