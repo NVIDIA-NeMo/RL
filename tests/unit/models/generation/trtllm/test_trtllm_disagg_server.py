@@ -386,7 +386,7 @@ def test_assistant_tool_calls_survive_every_dump_of_the_request():
     # The disagg server dumps one request once per leg, and the frontend
     # tokenizer dumps its own copy; every dump must carry the history's calls.
     pytest.importorskip("tensorrt_llm.serve.openai_protocol")
-    from nemo_rl.models.generation.trtllm.trtllm_disagg_server import (
+    from nemo_rl.models.generation.trtllm.trtllm_http_server import (
         _chat_completion_request_cls,
     )
 

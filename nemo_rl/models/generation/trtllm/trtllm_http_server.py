@@ -61,6 +61,55 @@ def _choice_declares_token_ids() -> bool:
     return "token_ids" in ChatCompletionResponseChoice.model_fields
 
 
+@functools.cache
+def _chat_completion_request_cls() -> type:
+    """``ChatCompletionRequest`` whose assistant ``tool_calls`` survive dumping.
+
+    The OpenAI message types declare ``tool_calls`` as an ``Iterable``, which
+    validates into a lazy ``ValidatorIterator``. For an assistant message that
+    carries both ``reasoning`` and ``reasoning_content`` -- what NeMo-Gym sends
+    -- the union resolves to TRT-LLM's ``ReasoningAssistantMessage`` and
+    ``model_dump`` then emits ``tool_calls: []``, so the prompt is rendered
+    without the conversation's earlier tool calls. Materializing the iterator
+    right after validation keeps them. Deferred so importing this module does
+    not require tensorrt_llm.
+    """
+    from pydantic import model_validator
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    class _ChatCompletionRequest(ChatCompletionRequest):
+        @model_validator(mode="after")
+        def _materialize_tool_calls(self) -> "_ChatCompletionRequest":
+            for message in self.messages:
+                tool_calls = message.get("tool_calls")
+                if tool_calls is not None and not isinstance(tool_calls, list):
+                    message["tool_calls"] = list(tool_calls)
+            return self
+
+    return _ChatCompletionRequest
+
+
+def normalize_chat_inputs(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+    """``messages`` and ``tools`` as TRT-LLM's ``ChatCompletionRequest`` dumps them.
+
+    Every path that renders the chat template goes through here, so the engine
+    answering Gym directly and the disagg route render the same prompt. Key
+    order matters: templates serialize each tool verbatim (``tool | tojson``),
+    and validation reorders a tool's keys to the model's declaration order,
+    ``{"type", "function"}`` -- what the disagg server hands its engines and
+    what vLLM renders -- while Gym sends ``{"function", "type"}``.
+    """
+    dump = _chat_completion_request_cls()(
+        # Required by the model but never rendered.
+        model="",
+        messages=messages,
+        tools=tools,
+    ).model_dump(mode="json", exclude_unset=True)
+    return dump["messages"], dump["tools"]
+
+
 def _tokenizer_backend_name(tokenizer: Any) -> str:
     """Return the concrete backend that performs encode/decode operations."""
     backend = getattr(tokenizer, "_tokenizer", None)
@@ -338,8 +387,12 @@ def create_app(
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
         body: dict = await _decode_request_body(request)
-        messages: list[dict] = body.get("messages", [])
-        tools: list[dict] | None = body.get("tools")
+        try:
+            messages, tools = normalize_chat_inputs(
+                body.get("messages", []), body.get("tools")
+            )
+        except ValueError as e:  # pydantic.ValidationError is a ValueError
+            return JSONResponse(status_code=400, content={"error": str(e)})
         logprobs_requested = body.get("logprobs", False)
 
         # Conversation affinity for attention-DP routing; affects perf only.

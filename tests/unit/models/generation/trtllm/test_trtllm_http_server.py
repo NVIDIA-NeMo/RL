@@ -341,3 +341,96 @@ def test_the_context_leg_returns_the_int_list_by_default(
 
     assert body["prompt_token_ids"] == [1, 2, 3]
     assert "prompt_token_ids_b64" not in body
+
+
+# What Gym's converter sends: each tool's keys in the OpenAI SDK's TypedDict
+# order, "function" before "type".
+_GYM_ORDER_TOOL = {
+    "function": {
+        "name": "execute_bash",
+        "description": "Run a command.",
+        "parameters": {"type": "object", "properties": {}},
+        "strict": True,
+    },
+    "type": "function",
+}
+
+
+def test_normalized_tools_put_type_first_like_the_disagg_route_and_vllm():
+    # Templates serialize each tool verbatim (`tool | tojson`), so key order is
+    # part of the prompt.
+    pytest.importorskip("tensorrt_llm.serve.openai_protocol")
+    from nemo_rl.models.generation.trtllm.trtllm_http_server import (
+        normalize_chat_inputs,
+    )
+
+    _, [tool] = normalize_chat_inputs(
+        [{"role": "user", "content": "hi"}], [_GYM_ORDER_TOOL]
+    )
+
+    assert list(tool) == ["type", "function"]
+    assert tool["function"] == _GYM_ORDER_TOOL["function"]
+
+
+def test_normalized_messages_keep_the_ids_the_splice_reads():
+    # _compute_splice_inputs takes the on-policy prefix from these; losing them
+    # silently re-renders every later turn from the template.
+    pytest.importorskip("tensorrt_llm.serve.openai_protocol")
+    from nemo_rl.models.generation.trtllm.trtllm_http_server import (
+        normalize_chat_inputs,
+    )
+
+    assistant = {
+        "role": "assistant",
+        "content": "done",
+        "reasoning": "think",
+        "reasoning_content": "think",
+        "prompt_token_ids": [1, 2],
+        "generation_token_ids": [3, 4],
+    }
+
+    messages, tools = normalize_chat_inputs(
+        [{"role": "user", "content": "hi"}, assistant], None
+    )
+
+    assert messages[1]["prompt_token_ids"] == [1, 2]
+    assert messages[1]["generation_token_ids"] == [3, 4]
+    assert tools is None
+
+
+def test_the_chat_route_renders_gym_tools_in_normalized_order(monkeypatch):
+    # The engine answering Gym directly must render what the disagg frontend
+    # renders; it used to pass Gym's raw tool dicts straight to the template.
+    pytest.importorskip("tensorrt_llm.serve.openai_protocol")
+    from fastapi.testclient import TestClient
+
+    from nemo_rl.models.generation.trtllm import trtllm_http_server
+
+    rendered = {}
+
+    async def fake_build(messages, tools, tokenizer, model_config, template_kwargs):
+        rendered["tools"] = tools
+        # Stop before generation; the route answers a ValueError with a 400.
+        raise ValueError("rendered")
+
+    monkeypatch.setattr(trtllm_http_server, "build_spliced_prompt_ids", fake_build)
+    app = trtllm_http_server.create_app(
+        llm=SimpleNamespace(_hf_model_config=object(), _generation_config=None),
+        tokenizer=SimpleNamespace(eos_token_id=0),
+        model_name="m",
+        max_seq_len=16,
+        sampling_config={"temperature": 1.0, "top_p": 1.0, "top_k": None},
+        tool_parser="qwen3",
+    )
+
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [_GYM_ORDER_TOOL],
+        },
+    )
+
+    assert response.status_code == 400
+    assert [list(tool) for tool in rendered["tools"]] == [["type", "function"]]

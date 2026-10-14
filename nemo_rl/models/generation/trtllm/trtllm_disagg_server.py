@@ -19,7 +19,6 @@ the router policies; everything below that -- engine choice per leg, the KV
 handshake -- is the disagg server's.
 """
 
-import functools
 import json
 import logging
 import threading
@@ -268,34 +267,6 @@ class _DropGymOnlyRequestFields:
         await self.app(scope, _receive, send)
 
 
-@functools.cache
-def _chat_completion_request_cls() -> type:
-    """``ChatCompletionRequest`` whose assistant ``tool_calls`` survive dumping.
-
-    The OpenAI message types declare ``tool_calls`` as an ``Iterable``, which
-    validates into a lazy ``ValidatorIterator``. For an assistant message that
-    carries both ``reasoning`` and ``reasoning_content`` -- what NeMo-Gym sends
-    -- the union resolves to TRT-LLM's ``ReasoningAssistantMessage`` and
-    ``model_dump`` then emits ``tool_calls: []``, so the prompt is rendered
-    without the conversation's earlier tool calls. Materializing the iterator
-    right after validation keeps them. Deferred so importing this module does
-    not require tensorrt_llm.
-    """
-    from pydantic import model_validator
-    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
-
-    class _ChatCompletionRequest(ChatCompletionRequest):
-        @model_validator(mode="after")
-        def _materialize_tool_calls(self) -> "_ChatCompletionRequest":
-            for message in self.messages:
-                tool_calls = message.get("tool_calls")
-                if tool_calls is not None and not isinstance(tool_calls, list):
-                    message["tool_calls"] = list(tool_calls)
-            return self
-
-    return _ChatCompletionRequest
-
-
 def _build_adaptor_class() -> type:
     """Build ``OpenAIDisaggServerAdaptor`` lazily.
 
@@ -308,6 +279,10 @@ def _build_adaptor_class() -> type:
     from tensorrt_llm.serve.openai_protocol import (
         ChatCompletionRequest,
         UCompletionRequest,
+    )
+
+    from nemo_rl.models.generation.trtllm.trtllm_http_server import (
+        _chat_completion_request_cls,
     )
 
     chat_request_cls = _chat_completion_request_cls()
@@ -445,27 +420,24 @@ def _build_frontend_tokenizer(
 
     from nemo_rl.models.generation.trtllm.trtllm_http_server import (
         build_spliced_prompt_ids,
+        normalize_chat_inputs,
     )
 
-    chat_request_cls = _chat_completion_request_cls()
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
 
     async def _tokenize(payload: dict[str, Any]) -> str:
-        # Normalize through the SAME pydantic model and dump flags the disagg
-        # client uses toward the engines (model_dump(mode="json",
-        # exclude_unset=True), openai_client.py). The ctx adapter renders the
-        # POST-VALIDATION dicts -- pydantic inserts defaults and fixes key
-        # order (e.g., tools entries become {"type": "function", "function":
-        # ...}), and the chat template serializes them verbatim, so rendering
-        # the raw gym payload instead diverges at the tools JSON on turn-1
-        # prompts (caught by shadow validation).
-        norm = chat_request_cls(**payload).model_dump(mode="json", exclude_unset=True)
-        per_request = norm.get("chat_template_kwargs") or {}
+        # The ctx adapter renders these ids verbatim, so normalize exactly as
+        # it would have before rendering: tools reach the template as
+        # {"type": "function", "function": ...}, not in Gym's key order.
+        messages, tools = normalize_chat_inputs(
+            payload.get("messages") or [], payload.get("tools")
+        )
+        per_request = payload.get("chat_template_kwargs") or {}
         effective = {**server_template_kwargs, **per_request}
         ids = await build_spliced_prompt_ids(
-            norm.get("messages") or [],
-            norm.get("tools"),
+            messages,
+            tools,
             tokenizer,
             model_config,
             effective,
