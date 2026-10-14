@@ -48,14 +48,14 @@ class MemoryDataPlane:
             self.rows.pop((partition_id, key))
 
 
-@pytest.fixture(params=["legacy", "fused_list", "fused_buffer"])
+@pytest.fixture(params=["legacy", "fused_list", "fused_buffer", "packed_logprobs"])
 def token_packing(request):
     return request.param
 
 
 def captured_call(call, packing):
     prompt = list(call.prompt) if packing != "fused_buffer" else array("q", call.prompt)
-    return extract_call(
+    result = extract_call(
         call.rollout_id,
         call.call_id,
         call.ordinal,
@@ -81,6 +81,9 @@ def captured_call(call, packing):
         delta=False,
         packing="legacy" if packing == "legacy" else "fused",
     )
+    if packing == "packed_logprobs":
+        result = replace(result, logprobs=array("f", result.logprobs))
+    return result
 
 
 def stage_rollout(dp, *, routed=False, packing="legacy"):
@@ -208,3 +211,23 @@ def test_packed_staging_rejects_inconsistent_token_layout(invalid):
         call = replace(call, prompt_length=3)
     with pytest.raises(ValueError, match="packed native call"):
         NativeCallStore(MemoryDataPlane(), "staging", router_replay=False).stage(call)
+
+
+def test_packed_logprobs_stage_as_a_view_and_reject_wrong_dtype():
+    values = array("f", [-0.25, -0.5])
+    call = PackedNativeCall("r", "c", 0, 0, array("q", [1, 2, 3]), 1, values, None)
+
+    class InspectDataPlane(MemoryDataPlane):
+        def put_samples(self, **kwargs):
+            assert (
+                kwargs["fields"]["direct_logprobs"].data_ptr()
+                == values.buffer_info()[0]
+            )
+            super().put_samples(**kwargs)
+
+    store = NativeCallStore(InspectDataPlane(), "staging", router_replay=False)
+    manifest = store.stage(call)
+    values[0] = 99
+    assert store.fetch([manifest], "r")[0].logprobs == (-0.25, -0.5)
+    with pytest.raises(ValueError, match="float32"):
+        store.stage(replace(call, logprobs=array("d", [-0.25, -0.5])))

@@ -11,8 +11,9 @@
 # limitations under the License.
 """Native generation capture, independent of Gym and training row layout.
 
-The serving path retains engine outputs and submits one bounded job per call.
-Token walks, logprob extraction, routing tensors and storage run in the pool.
+The packed path accumulates native selected logprobs on the engine loop and
+submits one bounded job per call. The comparison path retains engine outputs.
+Prompt packing, validation, routing tensors and storage run in the pool.
 Only rollout finalization waits for those jobs. An incomplete or failed capture
 invalidates the rollout; it never becomes an apparently complete receipt.
 """
@@ -36,6 +37,8 @@ class DirectCaptureConfig(BaseModel, extra="allow"):
     """Limits apply per model-serving worker, including in-flight calls."""
 
     token_packing: Literal["fused", "legacy"] = "fused"
+    logprob_capture: Literal["packed", "python"] = "packed"
+    max_generated_tokens_per_call: PositiveInt = 262144
     workers: PositiveInt = 2
     max_pending_calls: PositiveInt = 256
     max_rollouts: PositiveInt = 4096
@@ -64,11 +67,11 @@ class PackedNativeCall:
     weight_version: int
     token_ids: array
     prompt_length: int
-    logprobs: tuple[float, ...]
+    logprobs: tuple[float, ...] | array
     routed_experts: Any
 
 
-def _pack_tokens(prompt: Sequence[int] | Buffer, tokens: list[int]) -> array:
+def _pack_tokens(prompt: Sequence[int] | Buffer, tokens: Sequence[int]) -> array:
     """Own a full sequence without an intermediate tuple or prefix inference."""
     if isinstance(prompt, Buffer):
         with memoryview(prompt) as source:
@@ -252,25 +255,41 @@ class DirectCapture:
         *,
         delta: bool,
     ) -> None:
+        self.submit(
+            context,
+            lambda: extract_call(
+                context.rollout.rollout_id,
+                f"{context.rollout.rollout_id}/{ordinal}",
+                ordinal,
+                weight_version,
+                outputs,
+                delta=delta,
+                packing=self.config.token_packing,
+            ),
+        )
+
+    def submit(
+        self,
+        context: CaptureContext,
+        extract: Callable[[], NativeCall | PackedNativeCall],
+    ) -> None:
+        """Transfer one completed call to the bounded staging pool."""
+
         def stage() -> dict[str, Any]:
             try:
-                return self._stage(
-                    extract_call(
-                        context.rollout.rollout_id,
-                        f"{context.rollout.rollout_id}/{ordinal}",
-                        ordinal,
-                        weight_version,
-                        outputs,
-                        delta=delta,
-                        packing=self.config.token_packing,
-                    )
-                )
+                return self._stage(extract())
             finally:
                 self._slots.release()
 
         # Submission and active-request accounting share the finalization lock.
         with self._condition:
-            context.rollout.jobs.append(self._pool.submit(stage))
+            try:
+                job = self._pool.submit(stage)
+            except RuntimeError:
+                context.rollout.failure = "capture_submission_failed"
+                self._slots.release()
+                raise
+            context.rollout.jobs.append(job)
 
     def abort(self, context: CaptureContext) -> None:
         with self._condition:

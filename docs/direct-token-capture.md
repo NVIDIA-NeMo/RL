@@ -22,6 +22,8 @@ token_capture:
   transport: direct   # default: gym
   direct:
     token_packing: fused  # default; legacy retains tuple-based capture for comparison
+    logprob_capture: packed  # default; python uses RequestOutput logprob objects
+    max_generated_tokens_per_call: 262144
     workers: 2
     max_pending_calls: 256
     max_rollouts: 4096
@@ -84,12 +86,39 @@ The separate control-plane bearer credential is not passed to the agent.
 
 ## Capture and the first training view
 
-The serving path reserves a bounded slot, retains engine output references, and
-submits a staging task. The task extracts native tokens/logprobs and writes one
-tensor row per call. Streaming retains delta chunks and the final routing array.
+The serving path reserves a bounded slot and accumulates accepted token IDs and
+selected float32 logprobs in owned flat buffers on the engine loop. It retains
+only the terminal output, then submits one staging task per call. The task packs
+the prompt, validates the captured values, and writes one tensor row per call.
+Source batches are copied immediately and can be reused; streaming does not
+retain a list of output objects or small NumPy views.
 The HTTP formatter receives a shallow output copy without the routing array, so
 upstream vLLM's own base64 encoder is bypassed too. There is no Gym ledger, prefix
 lookup, tree update, token JSON round trip, or awaited staging operation per call.
+
+`token_capture.direct.logprob_capture` selects `packed` (default) or `python` for
+E2E comparison. Packed mode installs a per-engine request-registration hook in
+the pinned vLLM 0.29.0 frontend. It intercepts selected logprobs before vLLM builds
+Python dictionaries and decoded logprob strings. It does not patch installed
+files, GPU kernels, or engine IPC. Other vLLM versions fail setup in packed mode;
+`python` retains the existing RequestOutput extraction path. Explicit API logprob
+requests still use vLLM's normal formatter, while capture copies just the selected
+column. Prompt logprob requests also retain normal API behavior.
+
+The packed accumulator has a hard generated-token cap per call, the smaller of
+`max_generated_tokens_per_call` (default 262144) and the request's `max_tokens`.
+Overflow records a capture failure, releases its arrays, and invalidates the
+rollout at finalization. It does not throw from the shared engine output handler.
+The cap is separate from an episode budget, which may sum prompt and generated
+tokens across calls. `max_pending_calls` bounds active and queued capture jobs.
+Generated capture storage is 8G bytes for IDs plus 4G bytes for logprobs, with
+amortized allocation slack. Prompt storage and routing arrays are additional.
+
+Capture-only logprobs stay on the engine loop until the single staging handoff;
+they do not travel in emitted HTTP output objects. No per-token capture futures
+or executor submissions are added. The existing engine-to-HTTP loop bridge still
+schedules each emitted output separately; batching that bridge is a separate,
+optional optimization. User-visible streaming intervals are unchanged.
 
 `token_capture.direct.token_packing` selects `fused` (default) or `legacy` for
 E2E comparison. Fused capture packs prompt lists directly into an owned int64
@@ -105,7 +134,7 @@ The pinned [vLLM 0.29 output API](https://github.com/vllm-project/vllm/blob/v0.2
 supplies prompt token lists, so current vLLM runs use the fused list path. Enabling
 this option does not make vLLM emit packed buffers or eliminate list conversion.
 Packed-input throughput requires a producer that already supplies those buffers.
-Both modes produce the same staged schema, masks, logprobs, and routing alignment;
+Both packing modes produce the same staged schema, masks, logprobs, and routing alignment;
 neither needs prefix or KV-cache ancestry.
 
 Finalization closes admission for the rollout, waits for active HTTP requests and
@@ -136,8 +165,9 @@ experts; the current training transport stores them as int16.
 | Agent → worker | Ordinary request JSON encode, HTTP, JSON decode/Pydantic validation | O(B) | Yes, also required by direct vLLM |
 | Native Gym compatibility | Responses ↔ Chat model conversion/dictionary validation | O(B + R) | Yes; absent for Chat clients |
 | vLLM rendering/engine transport | Existing tokenization and engine IPC | O(B + P + G + (P+G)LK) with routing | Existing backend work; unchanged |
-| Capture handoff | Reference retention, lock/slot accounting, executor submission | O(1) per output chunk | Yes; no payload encoding |
-| Native staging | Python integer buffers → owned binary arrays/tensor views; scalar metadata JSON | 8(P+G) + 4G bytes; O((P+G)LK) routes | Background pool; GIL contention can still delay HTTP |
+| Packed accumulation | Copy accepted IDs and selected float32 logprobs into owned arrays | O(G) total; 12G bytes plus allocation slack | Engine frontend; no Python logprob objects for capture-only requests |
+| Capture handoff | Admission accounting, terminal reference, one executor submission | O(1) per call | Yes; no payload encoding |
+| Native staging | Pack prompt and append generated IDs; reuse float32 logprob buffer as tensor view; scalar metadata JSON | 8(P+G) + 4G bytes; O((P+G)LK) routes | Background pool; GIL contention can still delay HTTP |
 | TransferQueue | Native tensor transport | O(P+G+(P+G)LK) | Background pool |
 | Worker → agent | Ordinary response JSON/SSE | O(R), excluding training arrays | Yes, also required by direct vLLM |
 | Rollout control | Register/finalize/release JSON | O(1), O(C), O(1) | Once per rollout; finalization waits for custody |
