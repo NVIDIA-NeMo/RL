@@ -257,11 +257,16 @@ async def test_async_collective_refit_propagates_every_worker_result(result):
 
 
 @pytest.mark.asyncio
-async def test_async_ipc_refit_returns_false_on_worker_exception():
+async def test_async_refit_surfaces_worker_exception():
     worker = _worker()
-    worker.llm.collective_rpc.side_effect = RuntimeError("refit failed")
+    worker.llm.collective_rpc.side_effect = RuntimeError("worker is poisoned")
 
-    assert await worker.update_weights_via_ipc_zmq_async() is False
+    with pytest.raises(RuntimeError, match="worker is poisoned"):
+        await worker.update_weights_via_ipc_zmq_async()
+    with pytest.raises(RuntimeError, match="worker is poisoned"):
+        await worker.update_weights_from_collective_async(
+            drain=True, recompute_kv=False
+        )
 
 
 class _RecordedConfig:
