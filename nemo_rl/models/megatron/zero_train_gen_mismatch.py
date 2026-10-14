@@ -70,6 +70,14 @@ _TE_NATIVE_ENV_VARS = {
     "CUBLAS_WORKSPACE_CONFIG": ":0:0",
 }
 
+# Hybrid Mamba models: the SSM Triton ops read both at import. Without
+# TRITON_CACHE_AUTOTUNING, MAMBA_DETERMINISTIC replaces autotuning with the cheapest
+# config.
+_HYBRID_MAMBA_ENV_VARS = {
+    "MAMBA_DETERMINISTIC": "1",
+    "TRITON_CACHE_AUTOTUNING": "1",
+}
+
 
 @dataclass
 class ZeroTrainGenValidation:
@@ -515,10 +523,32 @@ def validate_zero_train_gen_model_provider(
 ) -> None:
     """Reject unsupported architectures using the resolved Bridge provider.
 
-    Hybrid Mamba models are supported; Megatron-Core asserts MAMBA_DETERMINISTIC=1 for them.
+    Hybrid Mamba models are supported with MAMBA_DETERMINISTIC=1 and
+    TRITON_CACHE_AUTOTUNING=1, from policy.megatron_cfg.env_vars or the launch
+    environment.
     """
     if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return
+
+    if getattr(model_cfg, "is_hybrid_model", False) or "M" in (
+        getattr(model_cfg, "hybrid_layer_pattern", None) or ""
+    ):
+        env_vars = config["megatron_cfg"].get("env_vars") or {}
+        wrong = {}
+        for key, value in _HYBRID_MAMBA_ENV_VARS.items():
+            got = env_vars.get(key, os.environ.get(key))
+            if got != value:
+                wrong[key] = got
+        if wrong:
+            required = ", ".join(
+                f"{k}={v!r}" for k, v in _HYBRID_MAMBA_ENV_VARS.items()
+            )
+            got = ", ".join(f"{k}={v!r}" for k, v in wrong.items())
+            raise ValueError(
+                "zero_train_gen_mismatch on a hybrid Mamba model requires "
+                f"{required} together in policy.megatron_cfg.env_vars or the launch "
+                f"environment (got {got})."
+            )
 
     unsupported_fields = [
         field_name
