@@ -15,7 +15,7 @@
 
 import asyncio
 import logging
-from typing import Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import ray
 import torch
@@ -40,6 +40,9 @@ from nemo_rl.models.generation.interfaces import (
     reject_unenforceable_refit_deadline,
     verify_right_padding,
 )
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -143,6 +146,27 @@ def _parse_dynamo_completion_response(
 
 class DynamoGeneration(GenerationInterface):
     """Own a fixed Dynamo service fleet and expose it for NeMo-RL rollouts."""
+
+    @classmethod
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Reject SingleController settings the managed Dynamo backend cannot honor."""
+        fleet_health = master_config.async_rl.generation_fleet_health
+        if fleet_health.enabled:
+            # The Dynamo frontend routes every request across its worker fleet, so
+            # there are no NeMo RL-selected shards for fleet health to track.
+            raise ValueError(
+                "async_rl.generation_fleet_health.enabled=true is not supported with "
+                "policy.generation.backend='dynamo'; the Dynamo frontend owns request "
+                "routing. Set async_rl.generation_fleet_health.enabled=false."
+            )
+        if fleet_health.refit_timeout_s is not None:
+            # Dynamo workers cannot abort their refit collective, so a deadline would
+            # be refused at the first weight update; fail before anything builds.
+            raise ValueError(
+                "async_rl.generation_fleet_health.refit_timeout_s must be null with "
+                "policy.generation.backend='dynamo'; Dynamo workers cannot enforce a "
+                "refit deadline."
+            )
 
     def __init__(
         self,
@@ -651,3 +675,17 @@ class DynamoGeneration(GenerationInterface):
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
         return channel.flush_cache()
+
+    def drain_for_weight_update(self) -> None:
+        """Drain and pause every worker; layerwise reload is unsafe mid-request."""
+        channel = self._refit_channel
+        if channel is None:
+            raise RuntimeError("Dynamo refit channel is unavailable")
+        channel.pause()
+
+    def resume_after_weight_update(self) -> None:
+        """Resume every worker after a weight update."""
+        channel = self._refit_channel
+        if channel is None:
+            raise RuntimeError("Dynamo refit channel is unavailable")
+        channel.resume()

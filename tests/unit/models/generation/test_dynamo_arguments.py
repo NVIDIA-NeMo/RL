@@ -84,7 +84,6 @@ def _dynamo_cfg() -> dict:
             "tokenizer_cache": False,
             "tokenizer_cache_bytes": 50 * 1024 * 1024,
             "router_mode": "kv",
-            "router_reset_states": True,
             "extra_cli_args": [],
         },
     }
@@ -316,6 +315,8 @@ def test_frontend_argv_and_environment_are_runtime_owned() -> None:
         host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=cfg
     )
     assert _flag_value(argv, "--router-mode") == "kv"
+    assert not any(arg.startswith("--router-reset-states") for arg in argv)
+    assert not any(arg.startswith("--no-router-reset-states") for arg in argv)
 
     env = build_managed_worker_env(
         base_env={
