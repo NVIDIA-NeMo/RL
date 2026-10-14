@@ -46,7 +46,7 @@ run_dry() {
     CONFIG_IN_CONTAINER=recipe.yaml \
     MAX_STEPS=1000000 \
     SLURM_QOS=normal \
-    SLURM_TIME_LIMIT=7-00:00:00 \
+    SLURM_TIME_LIMIT=24:00:00 \
     MIN_SLURM_TIME_SECONDS=86400 \
     MIN_CHECKPOINT_BUDGET_SECONDS=86400 \
     REQUIRE_RESUMABLE_JOB_CYCLES=true \
@@ -57,14 +57,14 @@ run_dry() {
 
 run_dry "$tmp/results" >"$tmp/output"
 
-grep -Fqx 'time_limit=7-00:00:00 checkpoint_must_save_by=06:23:40:00' "$tmp/output"
-grep -Fqx 'allocation_boundary_seconds=604800 controller_boundary_seconds=603600 grpo_horizon_steps=1000000 continuation_array=0-5%1' "$tmp/output"
-grep -F -- '--time=7-00:00:00' "$tmp/output" >/dev/null
+grep -Fqx 'time_limit=24:00:00 checkpoint_must_save_by=00:23:40:00' "$tmp/output"
+grep -Fqx 'allocation_boundary_seconds=86400 controller_boundary_seconds=85200 grpo_horizon_steps=1000000 continuation_array=0-5%1' "$tmp/output"
+grep -F -- '--time=24:00:00' "$tmp/output" >/dev/null
 grep -F -- '--array=0-5%1' "$tmp/output" >/dev/null
 grep -F -- '--qos=normal' "$tmp/output" >/dev/null
 grep -F 'grpo.max_num_steps="1000000"' "$tmp/results/training_command.sh" >/dev/null
 grep -F 'grpo.max_num_epochs=null' "$tmp/results/training_command.sh" >/dev/null
-grep -F 'checkpointing.checkpoint_must_save_by="06:23:40:00"' "$tmp/results/training_command.sh" >/dev/null
+grep -F 'checkpointing.checkpoint_must_save_by="00:23:40:00"' "$tmp/results/training_command.sh" >/dev/null
 
 if run_dry "$tmp/too-short" SLURM_TIME_LIMIT=02:00:00 >/dev/null 2>&1; then
   echo 'launcher accepted a cycle below MIN_SLURM_TIME_SECONDS' >&2

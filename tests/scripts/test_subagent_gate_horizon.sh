@@ -60,7 +60,7 @@ assert_horizon scripts/claweval/train_subagents_sync_8n.sh "$tmp/claw-sync.out"
 assert_horizon scripts/claweval/train_subagents_async_16n.sh "$tmp/claw-async.out"
 
 grep -Fqx 'SLURM_QOS=normal' "$tmp/agentic-sync.out"
-grep -Fqx 'SLURM_TIME_LIMIT=7-00:00:00' "$tmp/agentic-sync.out"
+grep -Fqx 'SLURM_TIME_LIMIT=24:00:00' "$tmp/agentic-sync.out"
 grep -Fqx 'JOB_CYCLES=6' "$tmp/agentic-sync.out"
 grep -Fqx 'MIN_SLURM_TIME_SECONDS=86400' "$tmp/agentic-sync.out"
 grep -Fqx 'MIN_CHECKPOINT_BUDGET_SECONDS=86400' "$tmp/agentic-sync.out"
