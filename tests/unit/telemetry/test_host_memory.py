@@ -616,10 +616,8 @@ def test_the_driver_starts_the_monitor_that_the_worker_groups_register_with(
         cluster=None,
     )
     handle = init_telemetry_driver(config, algorithm="grpo")
-    # Asserted rather than skipped: the lens guard at the top of this test
-    # already covers "no telemetry here", so a handle that comes up not
-    # exporting is the regression this test exists to catch, and skipping on it
-    # would hide exactly that.
+    # Asserted, not skipped: lens is a core dependency, so a handle that is not
+    # exporting is the regression this test exists to catch.
     assert handle is not None and handle.is_exporting
 
     assert host_memory._MONITOR is not None

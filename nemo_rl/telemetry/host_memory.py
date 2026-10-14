@@ -477,13 +477,8 @@ class HostMemoryMonitor:
         try:
             return parse_memory_samples(response.text)
         except ValueError:
-            # Guarded separately from the fetch, and not left to the guard
-            # around the sweep: prometheus_client raises ValueError on a body
-            # that is not the exposition format -- an HTML error page from a
-            # proxy in front of the raylet, a truncated response -- and letting
-            # that reach the sweep would abandon every other node's sample and
-            # leave the previous snapshot exporting, stale labels included, for
-            # as long as the page stayed broken.
+            # Caught here so one bad page (an HTML error page, a truncated
+            # body) costs only this node's point, not the whole sweep.
             warn_once(
                 f"host_memory_parse:{node.host}",
                 f"could not parse host memory from {node.metrics_url}",
