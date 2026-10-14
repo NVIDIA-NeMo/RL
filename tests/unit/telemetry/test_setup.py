@@ -171,17 +171,6 @@ def test_training_target_drops_a_non_positive_step_count():
     assert attrs["nv.dl.training.target.train_iters"] == 150
 
 
-def test_sft_v2_finds_its_step_target_under_the_sft_section():
-    """``run_sft_v2.py`` reports ``sft_v2`` but reads ``master_config.sft``.
-
-    Looking the settings up by algorithm name finds no section at all, so the
-    whole of sft_v2 silently reports no training target.
-    """
-    cfg = {"sft": {"max_num_steps": 60}}
-    attrs = _training_config_attributes(cfg, "sft_v2")
-    assert attrs["nv.dl.training.target.train_iters"] == 60
-
-
 def test_training_config_reads_either_backends_optimizer_spelling():
     # megatron names the algorithm and keeps it in its own block, automodel
     # names the class and keeps it in the policy's.

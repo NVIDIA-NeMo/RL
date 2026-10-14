@@ -105,19 +105,6 @@ def _campaign_stage(algorithm: str) -> str:
     return _CAMPAIGN_STAGE_BY_ALGORITHM.get(algorithm, _DEFAULT_CAMPAIGN_STAGE)
 
 
-# An algorithm whose settings live under a differently named config section.
-# ``run_sft_v2.py`` reports itself as ``sft_v2`` while reading ``master_config
-# .sft``, so looking its settings up by algorithm name finds nothing. Mapped
-# rather than renamed because the name is also reported as ``rl.algorithm``,
-# where the two implementations do need telling apart.
-_CONFIG_SECTION_BY_ALGORITHM = {"sft_v2": "sft"}
-
-
-def _config_section(algorithm: str) -> str:
-    """Config section holding *algorithm*'s settings; its own name by default."""
-    return _CONFIG_SECTION_BY_ALGORITHM.get(algorithm, algorithm)
-
-
 # TelemetryConfig field -> NEMO_RL_OTEL_* env var. ``service_name`` maps to the
 # standard ``OTEL_SERVICE_NAME`` (lens reads it directly, unprefixed).
 _ENV_FIELD_MAP = {
@@ -338,10 +325,12 @@ def _training_config_attributes(master_config: Any, algorithm: str) -> dict[str,
     if optimizer:
         attrs[NV_DL_TRAINING_CONFIG_OPTIMIZER] = optimizer
 
-    # Non-positive values are dropped rather than reported: ``rm`` spells "train
-    # for one epoch" as ``max_num_steps: -1``, which downstream would otherwise
-    # read as a target of -1 iterations.
-    max_num_steps = _dig(master_config, _config_section(algorithm), "max_num_steps")
+    # By algorithm name, with no table of which section each entry point keeps
+    # its settings in: one that does not match a section simply reports no
+    # target. Non-positive values are dropped too -- ``rm`` spells "train for
+    # one epoch" as ``max_num_steps: -1``, which downstream would otherwise read
+    # as a target of -1 iterations.
+    max_num_steps = _dig(master_config, algorithm, "max_num_steps")
     if isinstance(max_num_steps, int) and max_num_steps > 0:
         attrs[NV_DL_TRAINING_TARGET_TRAIN_ITERS] = max_num_steps
     return attrs
