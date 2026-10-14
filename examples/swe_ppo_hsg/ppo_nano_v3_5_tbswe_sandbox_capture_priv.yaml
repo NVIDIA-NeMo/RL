@@ -850,9 +850,10 @@ token_capture:
   staging_partition: rollout_staging
   segment_rows:
     enabled: true
-    # Canonical row + up to 15 subagent rows; drops show as
-    # finalize/segments_dropped_by_cap.
-    max_per_rollout: 16
+    # Canonical row + up to 47 subagent rows; drops show as
+    # finalize/segments_dropped_by_cap. Raised from 16 for harnesses that
+    # delegate more than OpenCode (Claude Code, Hermes); OpenCode never hit 16.
+    max_per_rollout: 48
 rollout_recovery:
   default_granularity: sibling
   task_source_granularity_overrides: {}
