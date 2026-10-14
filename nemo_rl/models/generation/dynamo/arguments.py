@@ -28,6 +28,13 @@ _MANAGED_FLAGS = {
     "--model-name",
     "--model-path",
     "--endpoint",
+    # Refit loads NeMo RL's vLLM worker extension and addresses each engine's
+    # ranks as TP x PP; extra_cli_args must not replace or reshape either.
+    "--worker-extension-cls",
+    "--weight-transfer-config",
+    "--data-parallel-size",
+    "--data-parallel-size-local",
+    "--distributed-executor-backend",
 }
 
 _CREDENTIAL_FLAGS = {
