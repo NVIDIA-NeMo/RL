@@ -42,4 +42,4 @@ checkpointing:
 logger:
   wandb_enabled: true
   wandb:
-    name: dpo-tulu3-8b
+    name: dpo-llama3.1-8b-tulu3-1n8g-automodel

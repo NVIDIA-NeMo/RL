@@ -4,7 +4,7 @@ grpo:
   num_generations_per_prompt: 32
   max_num_steps: 2
 checkpointing:
-  checkpoint_dir: results/grpo-qwen2.5-32b-32n8g-automodel-tp8sp-actckpt
+  checkpoint_dir: results/grpo-qwen2.5-32b-32n8g-automodel-tp8-actckpt
 policy:
   model_name: Qwen/Qwen2.5-32B
   tokenizer:

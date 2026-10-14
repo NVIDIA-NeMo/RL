@@ -8,7 +8,7 @@ distillation:
 loss_fn:
   kl_type: reverse
 checkpointing:
-  checkpoint_dir: checkpoints/distillation-qwen3-32b-to-4b-base-noncolocated
+  checkpoint_dir: checkpoints/distillation-qwen3-32b-to-4b-base-2n8g-automodel-tp8-noncolocated
   save_period: 50
 policy:
   model_name: Qwen/Qwen3-4B-Base
@@ -35,9 +35,9 @@ teacher:
         gpus_per_node: 8
         num_nodes: 1
 logger:
-  log_dir: logs/distillation-qwen3-32b-to-4b-base-noncolocated
+  log_dir: logs/distillation-qwen3-32b-to-4b-base-2n8g-automodel-tp8-noncolocated
   wandb:
     project: nemo-rl
-    name: distillation-qwen3-32b-to-4b-base-noncolocated
+    name: distillation-qwen3-32b-to-4b-base-2n8g-automodel-tp8-noncolocated
 cluster:
   num_nodes: 2

@@ -4,7 +4,7 @@ grpo:
   num_generations_per_prompt: 32
   max_num_steps: 20
 checkpointing:
-  checkpoint_dir: results/grpo-gemma3-27b-it-8n8g-automodel-tp8sp-actckpt-long
+  checkpoint_dir: results/grpo-gemma3-27b-it-8n8g-automodel-tp8-actckpt-long
 policy:
   model_name: google/gemma-3-27b-it
   tokenizer:
@@ -29,12 +29,12 @@ policy:
 data:
   max_input_seq_length: 16384
 logger:
-  log_dir: logs/grpo-gemma3-27b-it-8n8g-automodel-tp8sp-actckpt-long
+  log_dir: logs/grpo-gemma3-27b-it-8n8g-automodel-tp8-actckpt-long
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-gemma3-27b-it-8n8g-automodel-tp8sp-actckpt-long
+    name: grpo-gemma3-27b-it-8n8g-automodel-tp8-actckpt-long
 cluster:
   gpus_per_node: 8
   num_nodes: 8

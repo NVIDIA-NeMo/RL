@@ -8,7 +8,7 @@ distillation:
 loss_fn:
   kl_type: reverse
 checkpointing:
-  checkpoint_dir: checkpoints/distillation-qwen3-32b-to-1.7b-base
+  checkpoint_dir: checkpoints/distillation-qwen3-32b-to-1.7b-base-1n8g-automodel-1n8g-automodel
 policy:
   train_global_batch_size: 32
   generation_batch_size: 32
@@ -52,7 +52,7 @@ teacher:
   - milestones:
     - 20
 logger:
-  log_dir: logs/distillation-qwen3-32b-to-1.7b-base
+  log_dir: logs/distillation-qwen3-32b-to-1.7b-base-1n8g-automodel-1n8g-automodel
   wandb:
     project: nemo-rl
-    name: distillation-qwen3-32b-to-1.7b-base
+    name: distillation-qwen3-32b-to-1.7b-base-1n8g-automodel

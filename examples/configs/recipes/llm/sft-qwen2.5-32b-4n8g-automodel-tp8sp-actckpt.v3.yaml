@@ -31,7 +31,7 @@ logger:
     project: nemo-rl
     name: sft-qwen2.5-32b-4n8g-automodel-tp8sp-actckpt
   tensorboard:
-    log_dir: tb_logs-sft-dev-openmathinstruct2
+    log_dir: tb_logs-sft-qwen2.5-32b-4n8g-automodel-tp8sp-actckpt
 cluster:
   gpus_per_node: 8
   num_nodes: 4
