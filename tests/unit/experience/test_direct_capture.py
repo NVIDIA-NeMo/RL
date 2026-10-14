@@ -50,7 +50,10 @@ def output(tokens=(3, 4), *, prompt=(1, 2), finished=True, routes=None):
 
 def owner(stage, **limits):
     capture = DirectCapture(
-        DirectCaptureConfig(**limits), stage, lambda: 7, clear=lambda keys: None
+        DirectCaptureConfig(logprob_capture="python", **limits),
+        stage,
+        lambda: 7,
+        clear=lambda keys: None,
     )
     capture.register("key", "rollout", temperature=1, top_p=1)
     return capture
@@ -211,7 +214,7 @@ def test_engine_bridge_keeps_http_payload_native_and_captures_selected_logprobs(
         bridge = _AsyncLLMHTTPClient(Engine(), asyncio.get_running_loop())
         context = capture.enter("key")
         token = current_capture.set(context)
-        sampling = NS(logprobs=None, output_kind=NS(name="DELTA"))
+        sampling = NS(logprobs=None, num_logprobs=None, output_kind=NS(name="DELTA"))
         try:
             outputs = [item async for item in bridge.generate(None, sampling, "call")]
             assert len(outputs) == 2
@@ -259,7 +262,7 @@ def test_http_identity_control_auth_and_no_training_payload_in_response():
     async def run():
         records = []
         capture = DirectCapture(
-            DirectCaptureConfig(),
+            DirectCaptureConfig(logprob_capture="python"),
             lambda call: records.append(call) or {"ordinal": call.ordinal},
             lambda: 0,
             clear=lambda keys: None,
@@ -286,7 +289,9 @@ def test_http_identity_control_auth_and_no_training_payload_in_response():
         @app.post("/v1/chat/completions")
         async def chat(body: dict):
             async for item in bridge.generate(
-                None, NS(logprobs=None, output_kind=NS(name="FINAL_ONLY")), "engine-id"
+                None,
+                NS(logprobs=None, num_logprobs=None, output_kind=NS(name="FINAL_ONLY")),
+                "engine-id",
             ):
                 assert item.outputs[0].routed_experts is None
             return {"text": "done"}
@@ -351,7 +356,9 @@ def test_cancelled_stream_is_aborted_and_cannot_be_trained_as_complete():
         context = capture.enter("key")
         token = current_capture.set(context)
         stream = bridge.generate(
-            None, NS(logprobs=None, output_kind=NS(name="DELTA")), "cancelled"
+            None,
+            NS(logprobs=None, num_logprobs=None, output_kind=NS(name="DELTA")),
+            "cancelled",
         )
         try:
             await anext(stream)

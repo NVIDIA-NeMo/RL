@@ -51,6 +51,12 @@ class NativeCallStore:
             token_buffer.extend(call.tokens)
             prompt_length = len(call.prompt)
             generation_length = len(call.tokens)
+        if isinstance(call.logprobs, array):
+            if call.logprobs.typecode != "f" or call.logprobs.itemsize != 4:
+                raise ValueError("packed logprobs require native float32")
+            logprob_buffer = call.logprobs
+        else:
+            logprob_buffer = array("f", call.logprobs)
         key = f"direct/{uuid.uuid4().hex}"
         meta = {
             "staging_key": key,
@@ -66,7 +72,7 @@ class NativeCallStore:
                 token_buffer, dtype=torch.int64
             ).unsqueeze(0),
             "direct_logprobs": torch.frombuffer(
-                array("f", call.logprobs), dtype=torch.float32
+                logprob_buffer, dtype=torch.float32
             ).unsqueeze(0),
             "direct_metadata": torch.frombuffer(
                 bytearray(json.dumps(meta).encode()), dtype=torch.uint8

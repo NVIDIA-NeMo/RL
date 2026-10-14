@@ -226,6 +226,8 @@ token_capture:
   direct:
     training_view: main_branch  # full_tree is available for GRPO
     token_packing: fused  # fused: owned buffer; legacy: tuple then pack (comparison)
+    logprob_capture: packed  # packed: bounded native float32 capture; python: comparison
+    max_generated_tokens_per_call: 262144  # packed capture cap; overflow invalidates rollout
     workers: 2
     max_pending_calls: 256
     max_rollouts: 4096

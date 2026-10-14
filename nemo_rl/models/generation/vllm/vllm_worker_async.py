@@ -445,6 +445,9 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane.direct_capture import NativeCallStore
         from nemo_rl.experience.direct_capture import DirectCapture, DirectCaptureConfig
 
+        config = DirectCaptureConfig.model_validate(capture_config["direct"])
+        if config.logprob_capture == "packed":
+            self._http_engine_client.enable_packed_capture()
         client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
         store = NativeCallStore(
             client,
@@ -454,7 +457,7 @@ class VllmAsyncGenerationWorkerImpl(
         self._direct_capture_auth = capture_config["control_auth_token"]
         self._direct_capture_timeout = capture_config["control_timeout_s"]
         self._direct_capture = DirectCapture(
-            DirectCaptureConfig.model_validate(capture_config["direct"]),
+            config,
             store.stage,
             lambda: self._rollout_weight_version,
             clear=store.clear,
