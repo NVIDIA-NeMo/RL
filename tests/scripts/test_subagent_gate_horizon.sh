@@ -22,6 +22,14 @@ if [[ $target == */run_sc.sh ]]; then
   printf 'MIN_SLURM_TIME_SECONDS=%s\n' "${MIN_SLURM_TIME_SECONDS:-unset}"
   printf 'MIN_CHECKPOINT_BUDGET_SECONDS=%s\n' "${MIN_CHECKPOINT_BUDGET_SECONDS:-unset}"
   printf 'REQUIRE_RESUMABLE_JOB_CYCLES=%s\n' "${REQUIRE_RESUMABLE_JOB_CYCLES:-unset}"
+  printf 'NUM_NODES=%s\n' "${NUM_NODES:-unset}"
+  printf 'NUM_GEN_NODES=%s\n' "${NUM_GEN_NODES:-unset}"
+  printf 'SEGMENT_SIZE=%s\n' "${SEGMENT_SIZE:-unset}"
+  printf 'WANDB_PROJECT=%s\n' "${WANDB_PROJECT:-unset}"
+  printf 'NRL_ROUTER_REPLAY_VALIDATE=%s\n' "${NRL_ROUTER_REPLAY_VALIDATE:-unset}"
+  printf 'NRL_R3_TRACE=%s\n' "${NRL_R3_TRACE:-unset}"
+  [[ -n ${AGENTIC_VBENCH_DELEGATION_PROMPT:-} ]] && printf 'DELEGATION_PROMPT_SET=true\n'
+  [[ -n ${AGENTIC_VBENCH_SUBAGENT_PROMPT:-} ]] && printf 'SUBAGENT_PROMPT_SET=true\n'
   for arg do printf 'ARG=%s\n' "$arg"; done
   exit 0
 fi
@@ -65,6 +73,17 @@ grep -Fqx 'JOB_CYCLES=6' "$tmp/agentic-sync.out"
 grep -Fqx 'MIN_SLURM_TIME_SECONDS=86400' "$tmp/agentic-sync.out"
 grep -Fqx 'MIN_CHECKPOINT_BUDGET_SECONDS=82800' "$tmp/agentic-sync.out"
 grep -Fqx 'REQUIRE_RESUMABLE_JOB_CYCLES=true' "$tmp/agentic-sync.out"
+grep -Fqx 'NUM_NODES=8' "$tmp/agentic-sync.out"
+grep -Fqx 'NUM_GEN_NODES=4' "$tmp/agentic-sync.out"
+grep -Fqx 'SEGMENT_SIZE=4' "$tmp/agentic-sync.out"
+grep -Fqx 'WANDB_PROJECT=nemorl-v2-subagent-comapction-debug' "$tmp/agentic-sync.out"
+grep -Fqx 'NRL_ROUTER_REPLAY_VALIDATE=1' "$tmp/agentic-sync.out"
+grep -Fqx 'NRL_R3_TRACE=1' "$tmp/agentic-sync.out"
+grep -Fqx 'DELEGATION_PROMPT_SET=true' "$tmp/agentic-sync.out"
+grep -Fqx 'SUBAGENT_PROMPT_SET=true' "$tmp/agentic-sync.out"
+grep -Fqx 'ARG=+policy.router_replay.enabled=true' "$tmp/agentic-sync.out"
+grep -Fqx 'ARG=async_rl.sampler.name=in_order' "$tmp/agentic-sync.out"
+grep -Fqx 'ARG=+env.nemo_gym.training_mode=subagent' "$tmp/agentic-sync.out"
 
 recipe=$repo_dir/examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml
 grep -Fqx '  max_num_epochs: null' "$recipe"
