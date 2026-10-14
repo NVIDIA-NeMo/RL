@@ -132,23 +132,5 @@ O(sum(P+G+(P+G)LK)). A shared-prefix storage/learner implementation can change t
 without changing model HTTP requests or capture identity. This path does not
 depend on the shared-prefix training-worker PR.
 
-## CPU profiling
-
-`tools.http_profile.benchmark --modes direct direct_native gym_capture` compares
-one identical synthetic HTTP workload. `direct_native` runs the production engine
-bridge, capture owner, and tensor codec; engine outputs are prebuilt and TQ is an
-in-memory sink. It includes token-to-tensor conversion, unlike the earlier opaque
-proxy prototype. It does not measure GPUs, tokenization, real TQ, or route arrays.
-Registration contributes to end-to-end throughput but is outside individual
-model-request latency. Finalization/drain is separately reported. Use `--trace`
-for Perfetto-compatible traces or `--profile` for CPU attribution; instrumented
-runs must not be used for speedup claims.
-The fake engine runs on the HTTP event loop; the production worker's cross-thread
-engine-loop handoff is not exercised by this benchmark.
-
-The harness alternates mode order between rounds. Keep power and thermal
-conditions consistent across comparisons. Commands and methodology are documented
-in [HTTP profiling](http-capture-profiling.md). Keep generated results local in the
-ignored `results/` directory.
 GPU correctness, replay completeness under prefix caching, and GRPO convergence
 still require cluster validation before production use.

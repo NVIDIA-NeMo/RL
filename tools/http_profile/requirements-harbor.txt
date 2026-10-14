@@ -1,5 +1,0 @@
-# Optional, isolated Docker credential smoke; no GPU dependencies.
-harbor==0.22.0
-aiohttp==3.14.5
-pytest==9.1.1
-ruff==0.17.0
