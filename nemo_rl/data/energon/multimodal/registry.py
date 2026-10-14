@@ -128,7 +128,7 @@ class LazyRegistry:
             raise ValueError(f"File-backed {self.kind} requires an object name.")
         return {
             "python_file": str(path),
-            "object": object_name,
+            "object_name": object_name,
             "sha256": digest,
         }
 

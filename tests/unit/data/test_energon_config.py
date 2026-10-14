@@ -30,15 +30,16 @@ from nemo_rl.data.energon.multimodal.registry import (
 
 
 @pytest.mark.parametrize("config_type", [EnergonCookerConfig, EnergonTaskEncoderConfig])
-@pytest.mark.parametrize("key", ["object_name", "object"])
-def test_file_backed_component_accepts_object_name_and_legacy_alias(config_type, key):
+def test_file_backed_component_uses_object_name(
+    config_type: type[EnergonCookerConfig | EnergonTaskEncoderConfig],
+) -> None:
     config = config_type.model_validate(
-        {"python_file": "/workspace/plugins.py", key: "custom_component"}
+        {"python_file": "/workspace/plugins.py", "object_name": "custom_component"}
     )
     assert config.name is None
     assert config.object_name == "custom_component"
-    assert "object" not in config_type.model_fields
-    assert config.model_dump(mode="json", by_alias=True)["object"] == "custom_component"
+    assert "object" not in config.model_dump()
+    assert config.model_dump(mode="json")["object_name"] == "custom_component"
     assert (
         config_type.model_validate(config.model_dump()).object_name
         == "custom_component"
@@ -46,31 +47,32 @@ def test_file_backed_component_accepts_object_name_and_legacy_alias(config_type,
 
 
 @pytest.mark.parametrize("config_type", [EnergonCookerConfig, EnergonTaskEncoderConfig])
-def test_file_backed_component_rejects_duplicate_object_names(config_type):
-    with pytest.raises(ValidationError, match="Use only one"):
-        config_type.model_validate(
-            {
-                "python_file": "/workspace/plugins.py",
-                "object_name": "custom_component",
-                "object": "another_component",
-            }
-        )
+@pytest.mark.parametrize("include_object_name", [False, True])
+def test_file_backed_component_rejects_object_key(
+    config_type: type[EnergonCookerConfig | EnergonTaskEncoderConfig],
+    include_object_name: bool,
+) -> None:
+    value = {"python_file": "/workspace/plugins.py", "object": "custom_component"}
+    if include_object_name:
+        value["object_name"] = "custom_component"
+    with pytest.raises(
+        ValidationError, match="object is not supported; use object_name"
+    ):
+        config_type.model_validate(value)
 
 
-@pytest.mark.parametrize("key", ["object_name", "object"])
-def test_file_backed_cooker_loads_from_config_and_preserves_identity(tmp_path, key):
+def test_file_backed_cooker_loads_from_config_and_preserves_identity(tmp_path) -> None:
     path = tmp_path / "cooker.py"
     path.write_text("def custom_cooker(sample):\n    return sample\n")
     config = EnergonCookerConfig.model_validate(
-        {"python_file": str(path), key: "custom_cooker"}
+        {"python_file": str(path), "object_name": "custom_cooker"}
     )
-    registry = LazyRegistry("cooker")
-    cooker = registry.resolve_configured(config)
+    cooker = LazyRegistry("cooker").resolve_configured(config)
     assert cooker("sample") == "sample"
     identity = selected_registry_identity(
         task_encoder=EnergonTaskEncoderConfig(), cookers=[config]
     )
-    assert identity["cookers"][0]["object"] == "custom_cooker"
+    assert identity["cookers"][0]["object_name"] == "custom_cooker"
 
 
 @pytest.mark.parametrize(
@@ -169,16 +171,13 @@ def test_component_defaults_shorthand_and_options_are_preserved(
     expected = {
         "name": default_name,
         "python_file": None,
-        "object": None,
+        "object_name": None,
         "options": {},
         specific_field: None,
     }
 
-    assert config.model_dump(mode="json", by_alias=True) == expected
-    assert (
-        config_type.model_validate(default_name).model_dump(mode="json", by_alias=True)
-        == expected
-    )
+    assert config.model_dump(mode="json") == expected
+    assert config_type.model_validate(default_name).model_dump(mode="json") == expected
     config.options["custom"] = True
     assert config_type().options == {}
 

@@ -309,8 +309,7 @@ def _loader_identity(
     """Describe what a restored loader must still agree with."""
     identity = {
         "source": source.model_dump(mode="json"),
-        # Preserve the serialized plugin names used in existing loader identities.
-        "loader": loader_config.model_dump(mode="json", by_alias=True),
+        "loader": loader_config.model_dump(mode="json"),
         "adapter": adapter_fingerprint,
         "split_role": split_role,
         # Energon rescales a restored worker offset only when it can find a

@@ -132,7 +132,7 @@ def test_registry_resolves_and_fingerprints_file_backed_component(tmp_path):
 
     assert resolved("sample", prefix="custom-") == "custom-sample"
     assert identity["python_file"] == str(component_file)
-    assert identity["object"] == "custom_cooker"
+    assert identity["object_name"] == "custom_cooker"
     assert len(identity["sha256"]) == 64
 
     component_file.write_text(component_file.read_text() + "\n# changed\n")

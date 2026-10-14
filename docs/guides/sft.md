@@ -423,8 +423,7 @@ data:
         object_name: cook_nemotron_conversation
 ```
 
-Use `object_name` to select the exported class or function. The older YAML key
-`object` remains accepted as an alias; do not specify both keys.
+Use `object_name` to select the exported class or function.
 
 For `GenericSFTTaskEncoder`, `loss_mask_mode=None` (the default) creates masks
 from assistant roles. With `loss_mask_mode="precomputed"`, each message must

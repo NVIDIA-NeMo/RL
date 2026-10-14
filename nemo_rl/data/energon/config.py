@@ -14,7 +14,7 @@
 
 from typing import Annotated, Any, ClassVar, Literal, Self
 
-from pydantic import AliasChoices, BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from nemo_rl.data.energon.multimodal.model_families import ModelFamily
 
@@ -49,11 +49,7 @@ class _EnergonComponentConfig(BaseModel, extra="allow"):
     _label: ClassVar[str]
     name: str | None
     python_file: str | None = None
-    object_name: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("object_name", "object"),
-        serialization_alias="object",
-    )
+    object_name: str | None = None
     options: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
@@ -61,8 +57,8 @@ class _EnergonComponentConfig(BaseModel, extra="allow"):
     def _from_registry_key(cls, value: Any) -> Any:
         if isinstance(value, str):
             return {"name": value}
-        if isinstance(value, dict) and "object_name" in value and "object" in value:
-            raise ValueError("Use only one of object_name or its legacy alias object.")
+        if isinstance(value, dict) and "object" in value:
+            raise ValueError("object is not supported; use object_name.")
         if isinstance(value, dict) and value.get("python_file") and "name" not in value:
             return {**value, "name": None}
         return value
