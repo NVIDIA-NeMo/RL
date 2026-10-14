@@ -37,13 +37,19 @@ def _config(**vllm_cfg):
     return {"model_name": "m", "vllm_cfg": {"async_engine": True, **vllm_cfg}}
 
 
-def test_no_key_without_the_knob_or_without_the_server():
+def test_no_key_without_the_knob():
     """Off by default: the workers get the config as is and no key exists."""
     config = _config(expose_http_server=True)
     assert http_server_api_key_and_worker_config(config) == (None, config)
-    # The knob alone does nothing when no HTTP server is exposed.
-    config = _config(http_server_api_key_required=True)
-    assert http_server_api_key_and_worker_config(config) == (None, config)
+
+
+def test_the_knob_without_the_server_is_refused():
+    """No server to protect and no key for Gym: the setting fails at setup
+    instead of silently doing nothing."""
+    with pytest.raises(ValueError, match="requires vllm_cfg.expose_http_server"):
+        http_server_api_key_and_worker_config(
+            _config(http_server_api_key_required=True)
+        )
 
 
 def test_a_key_set_in_the_configuration_is_refused():

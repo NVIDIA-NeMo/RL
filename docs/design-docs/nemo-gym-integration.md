@@ -50,7 +50,8 @@ Gym result payloads are needed for a short debugging run.
 The exposed vLLM HTTP server binds every interface of its node and, by default,
 checks no credential on its OpenAI routes; the NeMo Gym model server sends the
 placeholder key `dummy_key`. Set `policy.generation.vllm_cfg.http_server_api_key_required: true`
-to require a bearer token instead: NeMo RL generates one random key per job,
+to require a bearer token instead (the setting needs `expose_http_server: true`
+and is refused at setup without it): NeMo RL generates one random key per job,
 every vLLM worker refuses a `/v1/*` or `/tokenize` request without
 `Authorization: Bearer <key>` (HTTP 401), and the same key reaches the NeMo Gym
 model server as `policy_api_key`. The saved and logged job configuration never

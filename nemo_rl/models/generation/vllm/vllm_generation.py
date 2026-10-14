@@ -83,13 +83,14 @@ def http_server_api_key_and_worker_config(
 ) -> tuple[Optional[str], VllmConfig]:
     """Generate the exposed HTTP server's bearer token and the worker config carrying it.
 
-    Reads ``vllm_cfg.expose_http_server`` and ``vllm_cfg.http_server_api_key_required``
-    from ``config``. When both are set, a random URL-safe key is generated and placed
-    as ``vllm_cfg.http_server_api_key`` in a shallow copy of ``config``; the workers
+    Reads ``vllm_cfg.http_server_api_key_required`` and ``vllm_cfg.expose_http_server``
+    from ``config``. When the flag is off, no key exists and ``config`` is returned as
+    the worker config. When it is on, a random URL-safe key is generated and placed as
+    ``vllm_cfg.http_server_api_key`` in a shallow copy of ``config``; the workers
     receive that copy and refuse OpenAI-route requests without the key. ``config``
     itself is never modified, so the job's saved and logged configuration does not
-    carry the key. When either flag is off, no key exists and ``config`` is returned
-    as the worker config.
+    carry the key. The flag without an exposed server is a configuration error:
+    there would be no server to protect and no key to hand to Gym.
 
     Returns:
         ``(api_key, worker_config)``; ``api_key`` is None when no key is required.
@@ -104,11 +105,13 @@ def http_server_api_key_and_worker_config(
             "VllmGeneration and must not be set in the configuration; set "
             "vllm_cfg.http_server_api_key_required: true instead."
         )
-    if not (
-        vllm_cfg.get("expose_http_server")
-        and vllm_cfg.get("http_server_api_key_required")
-    ):
+    if not vllm_cfg.get("http_server_api_key_required"):
         return None, config
+    if not vllm_cfg.get("expose_http_server"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.http_server_api_key_required requires "
+            "vllm_cfg.expose_http_server: true"
+        )
     api_key = secrets.token_urlsafe(32)
     worker_config = {**config, "vllm_cfg": {**vllm_cfg, "http_server_api_key": api_key}}
     return api_key, worker_config
