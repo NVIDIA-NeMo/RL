@@ -1234,11 +1234,17 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
-        response_token_counts = _count_structured_response_tokens(
-            tokenizer,
-            reasoning_text=nemo_gym_result.pop("reasoning_text", ""),
-            answer_text=nemo_gym_result.pop("answer_text", ""),
-        )
+        reasoning_text = nemo_gym_result.get("reasoning_text")
+        answer_text = nemo_gym_result.get("answer_text")
+        response_token_counts = None
+        if isinstance(reasoning_text, str) and isinstance(answer_text, str):
+            response_token_counts = _count_structured_response_tokens(
+                tokenizer,
+                reasoning_text=reasoning_text,
+                answer_text=answer_text,
+            )
+            nemo_gym_result.pop("reasoning_text")
+            nemo_gym_result.pop("answer_text")
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -1429,7 +1435,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                         container[key], raw_initial_sources
                     )
 
-        result = {
+        result: dict[str, Any] = {
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,

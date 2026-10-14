@@ -2324,8 +2324,8 @@ def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     assert metrics["agent-b/total_tokens_per_sample/histogram"] == [3, 3]
     assert metrics["agent-b/gen_tokens_per_sample/mean"] == pytest.approx(2.0)
     assert metrics["agent-b/gen_tokens_per_sample/histogram"] == [2, 2]
-    assert metrics["agent-a/optional_score/mean"] == 1.0
-    assert metrics["agent-b/optional_score/mean"] == 3.0
+    assert metrics["agent-a/optional_score/mean"] == 0.5
+    assert metrics["agent-b/optional_score/mean"] == 1.5
     assert rollout_result.final_batch["truncated"].tolist() == is_truncated
 
 
@@ -2449,6 +2449,14 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
                                 "input_message_log": [
                                     {"role": "user", "token_ids": [1]}
                                 ],
+                                "reasoning_token_count": 4,
+                                "response_token_count": 5,
+                                "token_extraction_valid": True,
+                                "full_result": {
+                                    "reward": 2.0,
+                                    "reward_score_raw": 2.0,
+                                    "reward_rubric_aggregate_valid": None,
+                                },
                             },
                             None,
                         )
@@ -2462,6 +2470,14 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
                                 "input_message_log": [
                                     {"role": "user", "token_ids": [1]}
                                 ],
+                                "reasoning_token_count": 2,
+                                "response_token_count": 3,
+                                "token_extraction_valid": True,
+                                "full_result": {
+                                    "reward": 1.0,
+                                    "reward_score_raw": 1.0,
+                                    "reward_rubric_aggregate_valid": 1.0,
+                                },
                             },
                             {"remote_time": 2.0},
                         )
@@ -2530,12 +2546,16 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     assert completions == ["first", "second"]
     assert prompt_message_log[0]["role"] == "user"
     torch.testing.assert_close(prompt_message_log[0]["token_ids"], torch.tensor([1]))
-    assert metrics == {
-        "completion_count": 2,
-        "agent": "agent",
-        "remote_time": 2.0,
-        "timing/test/routing/group_share/nemo_gym": 1,
-    }
+    assert metrics["completion_count"] == 2
+    assert metrics["agent"] == "agent"
+    assert metrics["remote_time"] == 2.0
+    assert metrics["timing/test/routing/group_share/nemo_gym"] == 1
+    assert metrics["reward_score_raw/mean"] == pytest.approx(1.5)
+    assert metrics["reward_rubric_aggregate_valid/mean"] == pytest.approx(1.0)
+    assert metrics["reasoning_tokens_per_sample/mean"] == pytest.approx(3.0)
+    assert metrics["response_tokens_per_sample/mean"] == pytest.approx(4.0)
+    assert metrics["reasoning_response_token_extraction_failure_rate"] == 0.0
+    assert metrics["zero_advantage_group_pct"] == 0.0
 
 
 def test_nemo_gym_rollout_record_persists_runtime_resolved_agent_ref():
@@ -2696,7 +2716,10 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
         selected.append(environment)
         for row in pending:
             rowidx = row["_rowidx"]
-            results[rowidx] = {"input_message_log": [{"token_ids": [1]}]}
+            results[rowidx] = {
+                "input_message_log": [{"token_ids": [1]}],
+                "full_result": {"reward": 1.0},
+            }
             shaping_by_rowidx[rowidx] = SimpleNamespace(
                 length_rewards_low=[],
                 rewards_low=[],

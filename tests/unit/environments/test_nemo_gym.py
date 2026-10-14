@@ -1313,8 +1313,27 @@ def test_run_rollouts_takes_a_trace_carrier_without_disturbing_the_body():
         asyncio.run(stream.__anext__())
 
 
-@pytest.mark.parametrize("has_token_diagnostics", [False, True])
-def test_nemo_gym_postprocess_uses_batch_decode(has_token_diagnostics):
+@pytest.mark.parametrize(
+    ("token_fields", "expected_count"),
+    [
+        pytest.param({}, None, id="missing"),
+        pytest.param(
+            {
+                "reasoning_text": "think carefully",
+                "answer_text": "final answer",
+            },
+            2,
+            id="genrm",
+        ),
+        pytest.param({"reasoning_text": None}, None, id="aegis-without-reasoning"),
+        pytest.param(
+            {"reasoning_text": "safety reasoning"},
+            None,
+            id="aegis-with-reasoning",
+        ),
+    ],
+)
+def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
     class _Tokenizer:
         def __init__(self):
             self.batch_decode_calls = []
@@ -1329,8 +1348,6 @@ def test_nemo_gym_postprocess_uses_batch_decode(has_token_diagnostics):
 
     tokenizer = _Tokenizer()
     nemo_gym_result = {
-        "reasoning_text": "think carefully",
-        "answer_text": "final answer",
         "response": {
             "output": [
                 {
@@ -1351,9 +1368,7 @@ def test_nemo_gym_postprocess_uses_batch_decode(has_token_diagnostics):
         },
         "responses_create_params": {"input": []},
     }
-    if not has_token_diagnostics:
-        nemo_gym_result.pop("reasoning_text")
-        nemo_gym_result.pop("answer_text")
+    nemo_gym_result.update(token_fields)
 
     class _MockSelf:
         cfg = {}
@@ -1372,10 +1387,14 @@ def test_nemo_gym_postprocess_uses_batch_decode(has_token_diagnostics):
     assert result["message_log"][1]["token_ids"].tolist() == [3]
     assert result["message_log"][2]["token_ids"].tolist() == [4, 5]
     assert result["message_log"][3]["token_ids"].tolist() == [6, 7]
-    expected_count = 2 if has_token_diagnostics else None
     assert result["reasoning_token_count"] == expected_count
     assert result["response_token_count"] == expected_count
-    assert result["token_extraction_valid"] is has_token_diagnostics
+    assert result["token_extraction_valid"] is (expected_count is not None)
+    for key, value in token_fields.items():
+        if expected_count is None:
+            assert result["full_result"][key] == value
+        else:
+            assert key not in result["full_result"]
     assert nemo_gym_result["response"]["output"][0]["prompt_str"] == "1 2"
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
