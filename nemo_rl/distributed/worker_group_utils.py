@@ -63,7 +63,6 @@ def get_nsight_config_if_pattern_matches(worker_name: str) -> dict[str, Any]:
                 # Profile will only start/stop when torch.cuda.profiler.start()/stop() is called
                 "capture-range": "cudaProfilerApi",
                 "capture-range-end": "stop",
-                "cuda-graph-trace": "node",
             }
             # User-supplied flags from NRL_NSYS_EXTRA_OPTIONS override the defaults
             # above. Use this to add flags like gpu-metrics-device, cuda-memory-usage,
