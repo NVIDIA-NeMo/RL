@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from nemo_rl.models.generation.dynamo import venv as dynamo_venv
 from nemo_rl.models.generation.dynamo.dynamo_worker import (
     DynamoGpuReservation,
     DynamoVllmWorker,
@@ -30,7 +31,6 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
     _managed_namespace,
 )
-from nemo_rl.models.generation.dynamo import venv as dynamo_venv
 from nemo_rl.models.generation.dynamo.worker_pool import (
     FixedDynamoWorkerPool,
     _vllm_port_for_node_slot,
