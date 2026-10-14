@@ -15,13 +15,14 @@
 import asyncio
 import gc
 import importlib
+import logging
 import os
 import threading
 import time
 import warnings
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Mapping, Optional
 
 import requests
 import torch
@@ -205,6 +206,23 @@ class _MegatronBulkRefitPiece:
     dtype: torch.dtype
     device: torch.device
     destination: torch.Tensor | None
+
+
+def _http_sampling_defaults(generation_cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """Sampling defaults for HTTP requests that omit temperature, top_p or top_k.
+
+    Training recomputes log probabilities with the configured generation sampling
+    parameters. Without explicit server defaults, an omitted request field falls
+    back to the server's hardcoded value or to the model's generation_config.json,
+    so the request would sample off-policy.
+    """
+    top_p = generation_cfg["top_p"]
+    top_k = generation_cfg["top_k"]
+    return {
+        "default_temperature": float(generation_cfg["temperature"]),
+        "default_top_p": 1.0 if top_p is None else float(top_p),
+        "default_top_k": 0 if top_k is None or top_k < 0 else int(top_k),
+    }
 
 
 def _resolve_coordinator_policy(
@@ -793,7 +811,7 @@ class MegatronGenerationMixin:
                 rng=random.Random(torch.distributed.get_rank())
             )
 
-        server_kwargs: dict[str, Any] = {}
+        server_kwargs: dict[str, Any] = _http_sampling_defaults(self.cfg["generation"])
         if "http_server_num_replicas" in gen_cfg:
             server_kwargs["num_replicas"] = int(gen_cfg["http_server_num_replicas"])
 
@@ -1334,8 +1352,15 @@ class MegatronGenerationMixin:
         tasks = [
             asyncio.create_task(_generate_single_item(i)) for i in range(data.size)
         ]
-        for result in asyncio.as_completed(tasks):
-            yield await result
+        try:
+            for result in asyncio.as_completed(tasks):
+                yield await result
+        finally:
+            # Closing the stream or failing one item must cancel its siblings.
+            # Cancellation propagates through wrap_future to the inference loop.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _generate_with_persistent_engine(
         self,
@@ -1353,19 +1378,36 @@ class MegatronGenerationMixin:
 
         print(f"[Rank {dist_rank}] Submitting {len(prompts)} requests to coordinator")
 
-        futures = []
-        for prompt, multi_modal_data, request_sampling_params in zip(
-            prompts, multi_modal_data_list, sampling_params, strict=True
-        ):
-            futures.append(
-                self.inference_client.add_request(
-                    prompt,
-                    request_sampling_params,
-                    multi_modal_data=multi_modal_data,
+        pending_requests = []
+        try:
+            for prompt, multi_modal_data, request_sampling_params in zip(
+                prompts, multi_modal_data_list, sampling_params, strict=True
+            ):
+                pending_requests.append(
+                    self.inference_client.add_request_with_id(
+                        prompt,
+                        request_sampling_params,
+                        multi_modal_data=multi_modal_data,
+                    )
                 )
-            )
 
-        results: list[DynamicInferenceRequest] = await asyncio.gather(*futures)
+            results: list[DynamicInferenceRequest] = await asyncio.gather(
+                *(future for _, future in pending_requests)
+            )
+        except BaseException:
+            # CancelledError is a BaseException. Cancelling only the local
+            # futures leaves requests running in Megatron's coordinator.
+            for request_id, future in pending_requests:
+                try:
+                    self.inference_client.abort_request(request_id)
+                except Exception:
+                    logging.exception("Failed to abort Megatron request %s", request_id)
+                finally:
+                    future.cancel()
+            await asyncio.gather(
+                *(future for _, future in pending_requests), return_exceptions=True
+            )
+            raise
         print(f"[Rank {dist_rank}] Completed {len(results)} requests")
         return results
 
