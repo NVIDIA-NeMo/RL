@@ -1892,10 +1892,20 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             value_param: torch.Tensor,
             scale_param: torch.Tensor,
             merged_slice: tuple[slice, ...] | None,
-            scale_slice: tuple[slice, ...] | None,
             block_size: tuple[int, int],
             wire_dtype: torch.dtype,
         ) -> LocalParamSpec:
+            scale_slice = None
+            if merged_slice is not None:
+                # Gate/up split only the block-aligned intermediate dimension.
+                axis = value_param.ndim - 2
+                rows = merged_slice[axis]
+                scale_slices = list(merged_slice)
+                scale_slices[axis] = slice(
+                    rows.start // block_size[0], rows.stop // block_size[0]
+                )
+                scale_slice = tuple(scale_slices)
+
             def pre(_base: torch.Tensor) -> RefitCtx:
                 value_region = (
                     value_param.data
@@ -1993,11 +2003,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         f"for {hf_name!r} has no scale parameter among "
                         f"{scale_names!r}"
                     )
-                value_region = (
-                    vllm_param if merged_slice is None else vllm_param[merged_slice]
-                )
                 block_size = None
-                scale_slice = merged_slice
                 if scale_name.endswith("_scale_inv"):
                     module_name = vllm_name.rsplit(".", 1)[0]
                     module = vllm_modules.get(module_name)
@@ -2013,37 +2019,22 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         raise ValueError(
                             f"Unsupported FP8 weight block size {block_size}"
                         )
-                    if merged_slice is not None:
-                        scale_slices = list(merged_slice)
-                        for axis, region_slice in enumerate(merged_slice):
-                            block = (
-                                block_size[axis - vllm_param.ndim]
-                                if axis >= vllm_param.ndim - 2
-                                else 1
-                            )
-                            start, stop, step = region_slice.indices(
-                                vllm_param.shape[axis]
-                            )
-                            if (
-                                step != 1
-                                or start % block
-                                or (stop != vllm_param.shape[axis] and stop % block)
-                            ):
-                                raise ValueError(
-                                    f"FP8 merged slice for {hf_name!r} must align with "
-                                    f"weight block size {block_size}"
-                                )
-                            scale_slices[axis] = slice(
-                                start // block, (stop + block - 1) // block
-                            )
-                        scale_slice = tuple(scale_slices)
+                    scale_region = scale_param
                     expected_scale_shape = (
-                        *value_region.shape[:-2],
-                        (value_region.shape[-2] + block_size[0] - 1) // block_size[0],
-                        (value_region.shape[-1] + block_size[1] - 1) // block_size[1],
+                        *vllm_param.shape[:-2],
+                        (vllm_param.shape[-2] + block_size[0] - 1) // block_size[0],
+                        (vllm_param.shape[-1] + block_size[1] - 1) // block_size[1],
                     )
                     expected_scale_dtype = torch.float32
                 else:
+                    value_region = (
+                        vllm_param if merged_slice is None else vllm_param[merged_slice]
+                    )
+                    scale_region = (
+                        scale_param
+                        if merged_slice is None
+                        else scale_param[merged_slice]
+                    )
                     if value_region.shape[-1] % 32 != 0:
                         raise ValueError(
                             f"build_hf_to_local_param_map: MXFP8 target for {hf_name!r} "
@@ -2054,9 +2045,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         value_region.shape[-1] // 32,
                     )
                     expected_scale_dtype = torch.uint8
-                scale_region = (
-                    scale_param if scale_slice is None else scale_param[scale_slice]
-                )
                 if tuple(scale_region.shape) != expected_scale_shape:
                     raise ValueError(
                         f"build_hf_to_local_param_map: FP8 scale target "
@@ -2077,7 +2065,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         vllm_param,
                         scale_param,
                         merged_slice,
-                        scale_slice,
                         block_size,
                         wire_dtype,
                     )
