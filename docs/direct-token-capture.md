@@ -132,7 +132,7 @@ O(sum(P+G+(P+G)LK)). A shared-prefix storage/learner implementation can change t
 without changing model HTTP requests or capture identity. This path does not
 depend on the shared-prefix training-worker PR.
 
-## CPU measurements
+## CPU profiling
 
 `tools.http_profile.benchmark --modes direct direct_native gym_capture` compares
 one identical synthetic HTTP workload. `direct_native` runs the production engine
@@ -146,8 +146,9 @@ runs must not be used for speedup claims.
 The fake engine runs on the HTTP event loop; the production worker's cross-thread
 engine-loop handoff is not exercised by this benchmark.
 
-The harness records power state on macOS and alternates mode order between
-rounds. Keep battery/transition runs separate from AC results. Exact benchmark
-commands and measured results are recorded in [HTTP profiling](http-capture-profiling.md).
+The harness alternates mode order between rounds. Keep power and thermal
+conditions consistent across comparisons. Commands and methodology are documented
+in [HTTP profiling](http-capture-profiling.md). Keep generated results local in the
+ignored `results/` directory.
 GPU correctness, replay completeness under prefix caching, and GRPO convergence
 still require cluster validation before production use.

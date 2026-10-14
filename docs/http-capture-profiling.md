@@ -2,8 +2,8 @@
 
 `tools/http_profile` compares the checkout's actual Gym HTTP/capture middleware
 with opaque forwarding prototypes and NRL's direct capture implementation. The
-default modes run on macOS without PyTorch; the opt-in `direct_native` arm uses
-CPU tensors. No mode requires CUDA, a tokenizer, a model, or a training job.
+default modes run on a CPU workstation without PyTorch; the opt-in `direct_native`
+arm uses CPU tensors. No mode requires CUDA, a tokenizer, a model, or a training job.
 
 The experiment models the chat-completions traffic an external SWE harness such
 as `harbor_agent_general` produces: independent rollout conversations, four
@@ -76,10 +76,12 @@ uv run --no-project --python /tmp/nrl-http-profile-venv/bin/python \
 ```
 
 Use an isolated environment rather than syncing the GPU project's dependencies.
-The requirements record the direct dependencies used for the Mac experiment;
-`environment.json` records all installed versions, interpreter, platform, commits,
-options, and (on subsequent runs) hashes of the benchmark sources. This environment
-is a CPU experiment, not Gym's production dependency lock.
+The requirements pin the CPU harness dependencies. `environment.json` records
+all installed versions, interpreter, platform, commits, options, and hashes of the
+benchmark sources. This environment is a CPU experiment, not Gym's production
+dependency lock. Keep generated
+results, profiles, traces, and environment metadata in the ignored `results/`
+directory; do not commit them.
 
 Defaults: initial contexts of 2,048/8,192/32,768 synthetic tokens, 1/8/32 concurrent
 rollouts, 128 measured requests per case, three repeats, four turns per rollout,
@@ -227,68 +229,13 @@ as newly generated actions. Dense consumption can ship independently of optional
 shared-prefix execution. Sustained service needs enough resolver capacity and an
 explicit overflow policy; fast HTTP with a growing capture backlog is insufficient.
 
-## Mac measurements, 2026-10-13
+## Sustained capture load
 
-The initial uninstrumented matrix completed 24,192 measured requests: seven modes,
-nine context/concurrency cases, three repeats, 128 requests each. All response and
-capture checks passed. At a 32,768-token initial context:
-
-| Path | p50, concurrency 1 | p50, concurrency 32 | CPU/request, concurrency 32 |
-| --- | ---: | ---: | ---: |
-| Direct stub | 0.330 ms | 6.034 ms | 0.204 ms |
-| Gym without capture | 1.160 ms | 16.642 ms | 0.772 ms |
-| Gym external capture | 15.873 ms | 171.800 ms | 12.639 ms |
-| Opaque, no capture | 0.579 ms | 7.736 ms | 0.487 ms |
-| Opaque, inline tree | 0.815 ms | 13.964 ms | 0.832 ms |
-| Opaque, tree thread | 0.608 ms | 10.896 ms | 0.788 ms |
-| Opaque, tree process | 0.606 ms | 8.082 ms | 0.816 ms |
-
-These are medians of the three per-run p50/CPU measurements on one Mac, not GPU
-inference predictions. The native process added about 27 µs over the opaque proxy
-at concurrency 1; the complete native path still added about 276 µs over direct
-HTTP. At concurrency 32, moving the tree out of the backend process helped latency,
-but added CPU remained visible. The process queue peaked at 66 records/8.47 MiB,
-with up to 16.42 ms queue wait and a median 12.85 ms drain after responses.
-
-The CPU profile located repeated binary digest encoding and integrity validation
-in the legacy backend: 16 calls made 32 `compute_staging_digest` calls. Python
-integer/float packing and validation dominated; the SHA function itself was small.
-The diagnostic trace showed awaited ledger append/fsync averaging 4.36 ms in its
-small sample. These instrumentation runs explain mechanisms; their elapsed times
-are not mixed into the baseline table.
-
-With a configured 16 ms backend delay, 8,192-token initial contexts and concurrency
-1, median first-body-byte latency was 3.524 ms direct, 4.163 ms for opaque process
-capture, and 32.904 ms for Gym capture. Full response p50 was 20.148/20.816/33.687 ms
-respectively. This demonstrates Gym's buffer-and-replay behavior and byte forwarding;
-it is not a measurement of model TTFT.
-
-Local raw artifacts are under `results/http_profile/mac-cpu-baseline`,
-`mac-streaming`, `mac-profiles`, `mac-traces`, `mac-sharded-traces`, and
-`mac-resolver-delay-traces`.
-Results are intentionally outside version control. The Perfetto traces were loaded
-with official `trace_processor_shell` v57.2, including verification of the
-enqueue-to-resolver flow links. All seven traces imported with zero parser errors
-and the expected flow counts; details are in `results/http_profile/trace-validation.json`.
-A longer-burst check is recorded in `mac-sustained`.
-
-The longer check materially changed the conclusion: with 2,048 requests per burst,
-32 concurrent rollouts and 32K initial contexts, the single process rejected 766
-records after filling its 256-record queue. That run is a failure, not a valid
-throughput result; its diagnostic is preserved. Moving work off the response path
-does not ensure enough consumer capacity.
-
-With two rollout-sharded resolver processes and the same total queue budget,
-all three 2,048-request repeats passed. In `mac-sustained-sharded`, median HTTP
-throughput was 3,746 requests/s versus 4,057 for adjacent opaque/no-capture runs
-(7.7% lower); p50 was 8.717 versus 8.092 ms. Median post-response drain was 15.44 ms,
-and total server CPU was 0.989 versus 0.459 ms/request. This approaches the opaque
-proxy's HTTP performance, while the extra CPU and final capture barrier remain
-measurable. It does not establish indefinite steady-state stability or equivalence
-to direct vLLM. Next CPU targets are binary/shared-memory buffer handoff and less
-Python tree work; a production service also needs completed-tree eviction.
-
-Reproduce that comparison with:
+Longer bursts help distinguish HTTP response latency from capture capacity.
+Check rejected records, queue peaks, and post-response drain time as well as
+throughput. A run that overflows its capture queue is a failed run. Shard resolver
+work by rollout when comparing multiple processes, and keep the total queue
+budget fixed across comparisons.
 
 ```bash
 uv run --no-project --python /tmp/nrl-http-profile-venv/bin/python \
@@ -358,8 +305,8 @@ as well; inheritance is not universal across arbitrary agents.
 
 Use a custom provider name such as `nrl` for Chat Completions. OpenCode 1.18.18's
 built-in `openai` provider explicitly selects the Responses API; overriding its
-SDK with `@ai-sdk/openai-compatible` fails before sending a request. This was
-reproduced in the initial smoke. The final smoke uses `nrl` for all three routes.
+SDK with `@ai-sdk/openai-compatible` fails before sending a request. The smoke
+uses `nrl` for all three routes.
 See [OpenCode's pinned provider implementation](https://github.com/anomalyco/opencode/blob/v1.18.18/packages/opencode/src/provider/provider.ts),
 [provider configuration](https://opencode.ai/docs/providers/), and
 [environment references](https://opencode.ai/docs/config/).
@@ -405,13 +352,13 @@ uv run --no-project --python /tmp/nrl-harbor-key-venv/bin/python \
   python -m pytest --noconftest tools/http_profile/test_harbor_keys.py -q
 uv run --no-project --python /tmp/nrl-harbor-key-venv/bin/python \
   python -m tools.http_profile.harbor_key_smoke \
-  --image akomaragiri89904/bixbench:opencode-1.18.18 \
+  --image "$HARBOR_SMOKE_IMAGE" \
   --output results/http_profile/harbor-keys
 ```
 
-Use an available Linux image with OpenCode, bash and `stdbuf` installed; the image
-above was already present on this workstation. The test requires Docker Desktop's
-`host.docker.internal` route and binds a temporary host HTTP listener. It replaces
+Set `HARBOR_SMOKE_IMAGE` to a Linux image with OpenCode, bash and `stdbuf`
+installed. The test requires Docker Desktop's `host.docker.internal` route and
+binds a temporary host HTTP listener. It replaces
 only Harbor's installer with a version check to reuse the image; `Job.create`,
 trial environment propagation, OpenCode's production `run()`, real HTTP/SSE,
 tool execution, verification, and teardown run normally. All credentials are
@@ -428,15 +375,6 @@ the agent. An unregistered key is rejected before JSON parsing. `summary.json`
 records observations and assertion failures; the command exits nonzero on a failed
 trial or missing tool round trip.
 
-On this workstation, Harbor 0.22.0 with OpenCode 1.18.18 passed all three modes in
-`results/http_profile/harbor-keys-02/summary.json`: six trials, three overlapping
-request pairs, 18 correctly attributed model requests, six injected/recovered
-HTTP 503s, six successful tool round trips and verifier rewards of 1. All requests
-used streaming; none contained the tested custom conversation/rollout fields or
-headers. The unknown-key probe returned 401. The four credential unit tests also
-passed. This establishes credential propagation and isolation, not native token
-capture correctness or a new latency result.
-
 ## Tests
 
 ```bash
@@ -452,62 +390,36 @@ identical generations, non-waiting submission, explicit overflow and duplicate-I
 failure reporting, drain/reset, trace flow metadata and concurrent ASGI tracks.
 
 
-## Production native capture (AC power)
+## Production native capture
 
 The `direct_native` arm exercises NRL's production native-output bridge, bounded
 capture pool, and tensor codec. It replaces the engine with prebuilt outputs and
 TransferQueue with memory; it has no Gym model proxy. It currently benchmarks
-non-MoE payloads. This is separate from the earlier opaque proxy prototype.
-The fake engine runs on the HTTP event loop, so this measurement excludes the
-production worker's HTTP-to-engine loop handoff as well as vLLM/GPU execution.
-
-Command (three rounds, alternating mode order, 128 calls per case):
-
-```bash
-uv run --no-project --cache-dir /tmp/nrl-http-uv-cache \
-  --python /tmp/nrl-http-profile-venv/bin/python \
-  python -m tools.http_profile.benchmark \
-  --modes direct direct_native gym_capture --sizes 32768 \
-  --concurrency 1 32 --requests 128 --rounds 3 \
-  --output results/http_profile/direct-native-ac-02
-```
-
-| Mode | C=1 p50 | C=32 p50 | C=32 requests/s | C=32 server CPU/call |
-|---|---:|---:|---:|---:|
-| Direct baseline | 0.416 ms | 5.738 ms | 4408 | 0.208 ms |
-| Production native capture | 0.582 ms | 13.828 ms | 1621 | 0.598 ms |
-| Current Gym capture | 17.025 ms | 154.418 ms | 96.5 | 12.650 ms |
-
-These are medians across rounds on AC power, not GPU throughput measurements.
-The [recorded summary](../tools/http_profile/baselines/macos-ac-2026-10-13/summary.json),
-[environment](../tools/http_profile/baselines/macos-ac-2026-10-13/environment.json),
-and [capture accounting](../tools/http_profile/baselines/macos-ac-2026-10-13/capture-accounting.json)
-are checked in so reviewers can inspect the run settings and variation.
-Native capture is ~29x lower latency than this Gym baseline at concurrency one,
-with ~0.166 ms remaining over direct. At concurrency 32 it is ~17x higher HTTP
-throughput than Gym, but only ~37% of direct throughput. Background work still
-competes for the GIL; moving it to a thread does not make CPU consumption vanish.
-All captured calls were accounted for; measured drain was about 0.1 ms per case.
-Registration is included in total case throughput, outside individual request
-latencies. No real TQ transfer or routing-array cost is included.
-
-The first implementation used `torch.tensor` on Python integer sequences.
-A local 32K-token microbenchmark measured ~0.76 ms for this operation versus
-~0.24 ms for `array('q')` plus a `torch.frombuffer` view. The production codec
-uses the latter. The earlier `direct-native-01` run spans the battery/AC
-transition and is not used for these performance claims.
-
-Perfetto diagnostic traces from a separate instrumented run are under
-`results/http_profile/direct-native-trace-03/`. Import the `*.trace.json` files
-into Perfetto; `native tensor staging` spans use the resolver thread IDs.
-Instrumented timings are excluded from the table.
+non-MoE payloads. The fake engine runs on the HTTP event loop, so the comparison
+excludes the production worker's HTTP-to-engine loop handoff as well as vLLM/GPU
+execution, tokenization, real TQ transfer, and routing-array costs.
 
 Install the production arm's additional CPU tensor dependencies before running it:
 
 ```bash
 uv pip install --python /tmp/nrl-http-profile-venv/bin/python \
   -r tools/http_profile/requirements-native.txt
+uv run --no-project --python /tmp/nrl-http-profile-venv/bin/python \
+  python -m tools.http_profile.benchmark \
+  --modes direct direct_native gym_capture --sizes 32768 \
+  --concurrency 1 32 --requests 128 --rounds 3 \
+  --output results/http_profile/direct-native
 ```
+
+The harness alternates mode order between rounds. Registration is included in
+case throughput, outside individual request latencies. Finalization/drain is
+reported separately. Background staging still competes for the GIL, so compare
+server CPU and sustained throughput alongside request latency. Keep power and
+thermal conditions consistent across runs.
+
+Use a separate run with `--trace` for Perfetto diagnostics. The `native tensor
+staging` spans use the resolver thread IDs. Instrumented timings must not be used
+for speedup claims.
 
 See [Direct token capture](direct-token-capture.md) for configuration, generic
 Gym agent integration, training selection, and asymptotic payload costs.

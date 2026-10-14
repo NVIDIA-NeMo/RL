@@ -40,6 +40,8 @@ hf_datasets_cache/
 wandb/
 checkpoints/
 results/
+# Keep generated profiling baselines out of source directories.
+/tools/http_profile/baselines/
 code_snapshots*/
 .cache/
 
