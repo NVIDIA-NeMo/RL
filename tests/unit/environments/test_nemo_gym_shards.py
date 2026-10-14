@@ -18,6 +18,7 @@ from omegaconf import OmegaConf
 
 from nemo_rl.environments.nemo_gym_shards import (
     GYM_LOG_DIR_KEY,
+    GYM_VENV_DIR_KEY,
     ShardConfigError,
     ShardPlan,
     ShardSetupError,
@@ -680,6 +681,25 @@ def test_apply_shard_log_dir_sanitizes_the_shard_name():
     config = apply_shard_log_dir({GYM_LOG_DIR_KEY: "/logs"}, "team/judged")
 
     assert config[GYM_LOG_DIR_KEY] == "/logs/team_judged"
+
+
+def test_apply_shard_log_dir_separates_replica_venv_dirs():
+    """Replicas building one venv dir race the same ``uv sync``; each gets its own."""
+    config = {GYM_VENV_DIR_KEY: "/venvs/run", GYM_LOG_DIR_KEY: "/logs/gym"}
+
+    first = apply_shard_log_dir(config, "tools", replica_index=0)
+    second = apply_shard_log_dir(config, "tools", replica_index=1)
+
+    assert first[GYM_VENV_DIR_KEY] == "/venvs/run/tools/0"
+    assert second[GYM_VENV_DIR_KEY] == "/venvs/run/tools/1"
+    assert first[GYM_LOG_DIR_KEY] == "/logs/gym/tools/0"
+    assert config[GYM_VENV_DIR_KEY] == "/venvs/run"
+
+
+def test_apply_shard_log_dir_handles_a_venv_dir_without_a_log_dir():
+    config = apply_shard_log_dir({GYM_VENV_DIR_KEY: "/venvs/run"}, "judged")
+
+    assert config == {GYM_VENV_DIR_KEY: "/venvs/run/judged"}
 
 
 def test_find_gym_config_entries_ignores_scalars_and_known_keys():
