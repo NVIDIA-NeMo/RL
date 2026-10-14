@@ -393,6 +393,11 @@ def test_collective_refit_forwards_the_reload_api_choice(monkeypatch) -> None:
     generation.update_weights_from_collective()
 
     assert posts[0]["payload"]["refit_with_reload_api"] is True
+    # As on the vLLM backend, reload refit cannot also update a co-trained drafter.
+    config["vllm_kwargs"] = {"speculative_config": {"method": "mtp"}}
+    config["_mtp_weights_from_refit"] = True
+    with pytest.raises(AssertionError, match="MTP draft weights"):
+        DynamoGeneration(cluster=object(), config=config)
 
 
 def test_cache_invalidation_resumes_workers_that_paused_before_peer_failure(

@@ -441,7 +441,10 @@ def test_worker_argument_validation_has_startup_timeout(monkeypatch) -> None:
         )
 
 
-def test_worker_registers_process_group_immediately_after_launch(monkeypatch) -> None:
+@pytest.mark.parametrize("precision", ["bfloat16", "fp8"])
+def test_worker_registers_process_group_immediately_after_launch(
+    monkeypatch, precision
+) -> None:
     class FakeSocket:
         def __enter__(self):
             return self
@@ -469,18 +472,34 @@ def test_worker_registers_process_group_immediately_after_launch(monkeypatch) ->
         "nemo_rl.models.generation.vllm.patches.ensure_vllm_source_compat",
         lambda: None,
     )
+    launched = {}
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.dynamo_worker.subprocess.Popen",
-        lambda *args, **kwargs: process,
+        lambda command, env, **kwargs: launched.update(command=command, env=env)
+        or process,
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.dynamo_worker.ray.get", lambda ref: ref
     )
     monkeypatch.setattr(worker_cls, "_validate_argv", MagicMock())
     monkeypatch.setattr(worker_cls, "_wait_for_system_port", MagicMock())
+    # The FP8 builder itself needs vLLM and is covered with the worker extension;
+    # this checks that its output reaches dynamo.vllm.
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.dynamo_worker._fp8_engine_args",
+        lambda model_name, vllm_cfg, vllm_kwargs, model_parallel_size: (
+            {**vllm_cfg, "precision": "bfloat16"},
+            {**vllm_kwargs, "quantization": "fp8"},
+            {"VLLM_USE_DEEP_GEMM": "1"},
+            {"NRL_VLLM_FP8_CONFIG": "{}"},
+        ),
+    )
+    monkeypatch.delenv("VLLM_USE_DEEP_GEMM", raising=False)
+    config = _config()
+    config["vllm_cfg"]["precision"] = precision
 
     worker_cls(
-        _config(),
+        config,
         namespace="nemo-rl-test",
         group_name="worker-0",
         cuda_devices=[0],
@@ -493,6 +512,15 @@ def test_worker_registers_process_group_immediately_after_launch(monkeypatch) ->
     )
 
     assert reservation.register_process_group.calls == [((4321,), {})]
+    command, env = launched["command"], launched["env"]
+    assert command[command.index("--dtype") + 1] == "bfloat16"
+    if precision == "fp8":
+        assert command[command.index("--quantization") + 1] == "fp8"
+        assert env["NRL_VLLM_FP8_CONFIG"] == "{}"
+        assert env["VLLM_USE_DEEP_GEMM"] == "1"
+    else:
+        assert "--quantization" not in command
+        assert "NRL_VLLM_FP8_CONFIG" not in env
 
 
 def test_shutdown_guards_each_owned_resource_independently(monkeypatch) -> None:

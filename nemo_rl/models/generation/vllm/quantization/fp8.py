@@ -291,16 +291,24 @@ def _get_fp8_parameter_names(config: PretrainedConfig) -> list[str]:
 
 
 def build_fp8_config(
-    vllm_cfg, model_name, model_parallel_size
+    vllm_cfg: dict[str, Any], model_name: str, model_parallel_size: int
 ) -> tuple[FP8Config, dict[str, Any]]:
     """Validate FP8 rollout settings and derive the engine's FP8 arguments.
 
     Side-effect free, so a process that only launches an engine (managed Dynamo)
     can use it; :func:`init_fp8` adds the in-process patch hooks.
 
+    Args:
+        vllm_cfg: ``policy.generation.vllm_cfg``.
+        model_name: HF model name or path; its config gives the layer count.
+        model_parallel_size: TP x PP of one engine.
+
     Returns:
         The ``FP8Config`` the engine workers' patches read, and the vLLM engine
         kwargs (``quantization``, ``kv_cache_dtype``, ``hf_overrides``).
+
+    Raises:
+        ValueError: On an invalid FP8, KV-cache or BF16-layer setting.
     """
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
@@ -484,7 +492,7 @@ def build_fp8_config(
     return fp8_config, vllm_kwargs
 
 
-def fp8_engine_env(vllm_cfg, fp8_config: FP8Config) -> dict[str, str]:
+def fp8_engine_env(vllm_cfg: dict[str, Any], fp8_config: FP8Config) -> dict[str, str]:
     """Environment the engine needs for FP8: DeepGEMM unless the recipe uses MXFP8.
 
     ``VLLM_USE_DEEP_GEMM_E8M0`` is a default; an explicit setting wins.

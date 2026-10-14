@@ -39,6 +39,8 @@ from nemo_rl.models.generation.interfaces import (
     RefitFleetShape,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.utils import assert_reload_refit_config_supported
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.weight_sync.membership import RefitMembership
 
@@ -206,6 +208,9 @@ class DynamoGeneration(GenerationInterface):
     ):
         validated_config = DynamoConfig.model_validate(config)
         self.cfg = validated_config.model_dump()
+        # The same refit-path limits as the vLLM backend: every engine refits
+        # through NeMo RL's vLLM worker extension.
+        assert_reload_refit_config_supported(cast(VllmConfig, self.cfg))
         self._dynamo_cfg = validated_config.dynamo_cfg
         dynamo_cfg = self._dynamo_cfg
         vllm_cfg = validated_config.vllm_cfg

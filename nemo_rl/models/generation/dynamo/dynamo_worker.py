@@ -173,7 +173,7 @@ class DynamoVllmWorker:  # pragma: no cover
         dynamo_python = sys.executable
         dynamo_venv = sys.prefix
         # The same on-disk vLLM source fixes the vLLM backend applies (tool-parser
-        # namespace, model loaders). Imports only vLLM's logger, never CUDA: this
+        # namespace, Eagle3 draft lm_head, model loaders). Imports only vLLM's logger, never CUDA: this
         # actor holds no GPU.
         from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat
 

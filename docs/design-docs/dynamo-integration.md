@@ -65,8 +65,10 @@ rejected. Three properties of the HTTP hop shape the extension's additions:
 - Engine RPC tasks never retry: re-posting a collective call to a dead worker
   could never complete.
 
-GRPO bounds every Dynamo refit by `control_timeout_s`; the extension's watchdog
-aborts both sides' communicators instead of letting the trainers hang.
+Every refit has a deadline: GRPO uses `dynamo_cfg.control_timeout_s`, the
+SingleController `async_rl.generation_fleet_health.refit_timeout_s`. When it
+passes, the extension and the trainers each abort their own communicators and
+raise, so neither side hangs in NCCL.
 KV-cache invalidation stays outside the generic synchronizer because GRPO's
 cache mode determines where it runs.
 

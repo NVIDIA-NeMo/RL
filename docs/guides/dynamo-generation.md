@@ -52,6 +52,8 @@ A Dynamo upgrade must update and reverify these coupled locations:
 - `tests/functional/grpo_dynamo*.sh`: the asserted Dynamo and vLLM versions
 - `nemo_rl/models/generation/dynamo/refit.py`: the `/engine/*` RL routes it
   posts to, which must still forward any `engine_rpc` to vLLM `collective_rpc`
+  with the request body as keyword arguments
+  (`test_every_engine_rpc_the_driver_sends_binds_to_the_extension`)
 - `nemo_rl/models/generation/dynamo/token_wrapper.py`: the real Dynamo response
   keys `nvext.engine_data.{prompt_token_ids,completion_token_ids,completion_logprobs}`;
   reverify them against real Dynamo output because unit tests validate only the
@@ -164,9 +166,11 @@ Every managed engine loads NeMo RL's vLLM worker extension
 calls it through Dynamo's per-worker `/engine/*` RL routes, which forward an
 `engine_rpc` name to vLLM `collective_rpc`. HTTP carries only control calls;
 the weights move over NCCL, using NeMo RL's own communicator protocol and
-packing on both sides. Each refit is bounded by `dynamo_cfg.control_timeout_s`:
-the extension aborts its communicators and the trainers raise instead of
-hanging.
+packing on both sides. Each refit has a deadline: GRPO uses
+`dynamo_cfg.control_timeout_s`, and the SingleController uses
+`async_rl.generation_fleet_health.refit_timeout_s` (300 s by default; `null`
+disables it). When it passes, the extension and the trainers each abort their
+own communicators and raise instead of hanging.
 
 The fixed port layout is:
 

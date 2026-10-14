@@ -27,19 +27,33 @@ pytestmark = pytest.mark.vllm
 
 def _stage(ext: DynamoWorkerExtension, payload, *, skip: int | None = None):
     staged = encode_staged_payload(payload)
-    for index, data in enumerate(staged.chunks):
+    # Last chunk first: the engine must reassemble by index, not by arrival.
+    for index in reversed(range(len(staged.chunks))):
         if index != skip:
-            ext.nrl_stage_chunk(staged.key, index, len(staged.chunks), data)
+            ext.nrl_stage_chunk(
+                staged.key, index, len(staged.chunks), staged.chunks[index]
+            )
     return staged
+
+
+def _incompressible_blob() -> str:
+    """Random hex that zlib cannot shrink, so a payload spans several chunks."""
+    import random
+
+    return random.Random(0).randbytes(3 << 20).hex()
 
 
 def test_staged_reshard_plan_reaches_prepare_unchanged() -> None:
     ext = DynamoWorkerExtension()  # no __init__, as when vLLM mixes it in
     received = []
     ext.prepare_nccl_reshard_refit_info = received.append
-    plan = {"per_layer_params": {"layers.0": [{"name": "w"}]}, "misc_meta": {}}
+    plan = {
+        "per_layer_params": {"layers.0": [{"name": "w"}]},
+        "misc_meta": {"blob": _incompressible_blob()},
+    }
 
     staged = _stage(ext, plan)
+    assert len(staged.chunks) > 1
     ext.nrl_prepare_nccl_reshard_refit_info_from_stage(staged.key, staged.sha256)
 
     assert received == [plan]
@@ -64,14 +78,10 @@ def test_a_new_key_discards_a_partially_staged_payload() -> None:
 def test_a_missing_chunk_or_bad_digest_is_refused() -> None:
     ext = DynamoWorkerExtension()
     ext.prepare_nccl_reshard_refit_info = lambda info: None
-    payload = {"blob": "x" * (3 << 20), "salt": list(range(1000))}
-
-    staged = _stage(ext, payload, skip=0)
-    if len(staged.chunks) > 1:
-        with pytest.raises(RuntimeError, match="missing chunks"):
-            ext.nrl_prepare_nccl_reshard_refit_info_from_stage(
-                staged.key, staged.sha256
-            )
+    staged = _stage(ext, {"blob": _incompressible_blob()}, skip=1)
+    assert len(staged.chunks) > 1
+    with pytest.raises(RuntimeError, match=r"missing chunks \[1\]"):
+        ext.nrl_prepare_nccl_reshard_refit_info_from_stage(staged.key, staged.sha256)
 
     staged = _stage(ext, {"a": 1})
     with pytest.raises(ValueError, match="digest"):
@@ -230,6 +240,7 @@ def test_the_extension_applies_fp8_patches_from_its_environment(
     fp8_module, monkeypatch
 ) -> None:
     import dataclasses
+    import importlib.util
     import json
 
     from nemo_rl.models.generation.vllm import dynamo_worker_extension
@@ -249,9 +260,94 @@ def test_the_extension_applies_fp8_patches_from_its_environment(
     assert applied == []
 
     monkeypatch.setenv(FP8_CONFIG_ENV_VAR, json.dumps(dataclasses.asdict(config)))
-    dynamo_worker_extension._apply_fp8_patches_from_env()
+    # vLLM imports the extension before it builds the model, and that import is
+    # the only place a managed Dynamo engine gets the patches. Run the module body
+    # in a fresh module object, leaving sys.modules untouched.
+    spec = importlib.util.find_spec(dynamo_worker_extension.__name__)
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
     assert applied == [config]
 
     monkeypatch.setattr(fp8, "fp8_patches_applied", True)
     dynamo_worker_extension._apply_fp8_patches_from_env()
     assert applied == [config]
+
+
+def test_every_engine_rpc_the_driver_sends_binds_to_the_extension(monkeypatch) -> None:
+    """Dynamo forwards each request body to collective_rpc as keyword arguments, so
+    a renamed extension parameter would fail only inside the engine, at a refit.
+    """
+    import inspect
+    from types import SimpleNamespace
+
+    import torch
+
+    from nemo_rl.models.generation.dynamo import refit
+    from nemo_rl.models.generation.dynamo.dynamo_generation import DynamoGeneration
+
+    # Keys each Dynamo 1.5.1 route consumes itself (dynamo/vllm/handlers.py).
+    route_keys = {
+        "init_weights_update_group": {"engine_rpc"},
+        "update_weights_from_distributed": {
+            "engine_rpc",
+            "allow_unpaused",
+            "reset_prefix_cache",
+            "weight_version",
+        },
+    }
+    posts = []
+    monkeypatch.setattr(
+        refit,
+        "http_post_json",
+        lambda url, payload, timeout_s: posts.append((url.rsplit("/", 1)[-1], payload))
+        or {"status": "ok"},
+    )
+    for task in (refit._post_worker_route, refit._stage_and_post_worker_route):
+        monkeypatch.setattr(task, "remote", task._function)
+    monkeypatch.setattr(refit.ray, "get", lambda refs: refs)
+    channel = refit.DynamoRefitChannel(
+        [{"instance_id": "a", "system_url": "http://w:4000"}],
+        engine_world_size=1,
+        control_timeout_s=10,
+    )
+    fleet = channel.full_fleet_membership(train_world_size=1)
+
+    channel.rebuild_collective(fleet, "10.0.0.1", 1500)
+    channel.rebuild_nccl_reshard_comm_group(
+        fleet,
+        pp_ips=["10.0.0.1"],
+        pp_ports=[1600],
+        pp_size=1,
+        train_ranks_per_stage=1,
+        sub_world_size=2,
+    )
+    channel.prepare_refit_info({"w": (torch.Size([2]), torch.bfloat16)})
+    channel.prepare_nccl_reshard_refit_info({"per_layer_params": {}, "misc_meta": {}})
+    channel.update_weights_from_collective(30.0, refit_with_reload_api=False)
+    channel.nccl_reshard_refit(30.0)
+    spec = {"method": "mtp", "num_speculative_tokens": 1}
+    DynamoGeneration._configure_mtp_drafter(
+        SimpleNamespace(
+            cfg={
+                "model_name": "m",
+                "vllm_cfg": {"load_format": "dummy"},
+                "vllm_kwargs": {"speculative_config": spec},
+            },
+            _require_refit_channel=lambda: channel,
+        )
+    )
+
+    for route, payload in posts:
+        method = getattr(DynamoWorkerExtension, payload["engine_rpc"])
+        kwargs = {k: v for k, v in payload.items() if k not in route_keys[route]}
+        inspect.signature(method).bind(None, **kwargs)  # raises on any mismatch
+    assert {payload["engine_rpc"] for _, payload in posts} == {
+        "init_collective",
+        "init_nccl_reshard_comm_group",
+        "nrl_stage_chunk",
+        "nrl_prepare_refit_info_from_stage",
+        "nrl_prepare_nccl_reshard_refit_info_from_stage",
+        "nrl_update_weights_from_collective",
+        "nrl_nccl_reshard_refit",
+        "configure_mtp_drafter_weight_source",
+        "load_mtp_weights_from_disk",
+    }

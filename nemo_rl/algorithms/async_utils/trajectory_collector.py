@@ -1068,12 +1068,10 @@ class AsyncTrajectoryCollector:
         generation_cfg = self.master_config.policy["generation"]
         backend = generation_cfg["backend"]
         if backend == "dynamo":
-            # Dynamo's native layerwise reload temporarily materializes model
-            # parameters while the NCCL update is in progress.  It is not safe
-            # to execute an already-issued vLLM request concurrently with that
-            # reload (in particular for NemotronH/Mamba parameters), even when
-            # the update route accepts allow_unpaused=True.  Stop new trajectory
-            # starts above and drain every active trajectory before refitting.
+            # Dynamo refits through update routes called with allow_unpaused=True,
+            # so a request already in an engine would decode on half-updated
+            # weights. Stop new trajectory starts above and drain every active
+            # trajectory before refitting.
             is_async_engine = False
         else:
             is_async_engine = should_use_async_rollouts(generation_cfg)

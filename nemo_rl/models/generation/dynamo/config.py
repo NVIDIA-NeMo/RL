@@ -228,7 +228,7 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
                 "backend='dynamo' requires expert_parallel_size to be 1 or "
                 "equal tensor_parallel_size"
             )
-        if self.precision.lower() not in {"bf16", "bfloat16", "fp8"}:
+        if self.precision not in {"bfloat16", "fp8"}:
             raise ValueError(
                 f"policy.generation.vllm_cfg.precision={self.precision!r} is not "
                 "supported by backend='dynamo'; use 'bfloat16' or 'fp8'"
