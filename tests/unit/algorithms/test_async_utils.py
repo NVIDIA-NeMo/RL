@@ -67,6 +67,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     _warn_unsupported_in_flight_refit_pause_once,
 )
+from nemo_rl.utils.determinism import keyed_seed
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
 
@@ -1354,6 +1355,7 @@ class TestAsyncTrajectoryCollector:
     def create_local_collector(
         self,
         replay_buffer=None,
+        deterministic=False,
         next_nemo_gym_task_index: int = 0,
         max_generation_failures: int = 0,
         pending_batch=None,
@@ -1367,6 +1369,7 @@ class TestAsyncTrajectoryCollector:
         mock_tokenizer = mock.MagicMock()
         task_to_env = {}
         master_config = self.create_mock_config()
+        master_config.grpo.deterministic = deterministic
         master_config.grpo.async_grpo.max_generation_failures = max_generation_failures
         if replay_buffer is None:
             replay_buffer = mock.MagicMock()
@@ -1385,6 +1388,78 @@ class TestAsyncTrajectoryCollector:
             resume_frontier_ordinal=resume_frontier_ordinal,
             resume_covered_task_indices=resume_covered_task_indices,
         )
+
+    def test_version_notification_during_limit_check_is_not_lost(self):
+        collector = self.create_local_collector()
+        collector.running = True
+
+        def concurrent_version_update():
+            collector.set_weight_version(1)
+            return True
+
+        def wait_for_notification():
+            assert collector._generation_limit_cleared.is_set()
+            collector.running = False
+
+        collector._should_pause_for_generation_limits = concurrent_version_update
+        collector._generation_limit_cleared.wait = wait_for_notification
+        collector._run_collection_loop(iter(()))
+
+    def test_deterministic_dispatch_uses_manifest_seeds(self, monkeypatch):
+        replay_buffer = mock.MagicMock()
+        replay_buffer.get_trajectories_needed.remote.return_value = 2
+        collector = self.create_local_collector(
+            replay_buffer=replay_buffer, deterministic=True
+        )
+        collector._get_next_target_for_generation = lambda version: 0
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda ref: ref)
+        captured = []
+
+        async def worker(**kwargs):
+            captured.append(kwargs)
+
+        collector._run_rollout_batch_worker = worker
+        batch = self.create_mock_batch(size=2)
+        collector._stamp_task_indices(batch)
+        collector._process_batch(batch)
+        for thread in tuple(collector._live_threads):
+            thread.join(timeout=2)
+        assert len(captured) == 1
+        assert captured[0]["generation_weight_version"] == 0
+        assert captured[0]["target_weight_version"] == 0
+        assert captured[0]["repeated_batch"]["sampling_seed"].tolist() == [
+            keyed_seed(
+                collector.master_config.grpo.seed, "async_train", ordinal, sibling
+            )
+            for ordinal in (0, 1)
+            for sibling in range(3)
+        ]
+        # A subsequent target cannot accidentally reuse the previous batch.
+        collector._get_next_target_for_generation = lambda version: 1
+        with pytest.raises(ValueError, match="manifest"):
+            collector._process_batch(batch)
+        with pytest.raises(RuntimeError, match="manifest"):
+            collector.wait_for_deterministic_batch(0)
+
+    def test_deterministic_refit_releases_weights_before_reward_threads(self):
+        collector = self.create_local_collector(deterministic=True)
+        progress = collector._deterministic_progress
+        assert collector._calculate_target_weights(0) == [0, 1]
+        for target in (0, 1):
+            progress.register(
+                target=target, version=0, ordinals=[target * 2, target * 2 + 1]
+            )
+            for row in range(6):
+                progress.generation_complete(target, row)
+        collector.wait_for_pending_generations = mock.Mock(
+            side_effect=AssertionError("Reward threads must not gate refit")
+        )
+        collector.prepare_for_refit()
+        assert not collector._refit_pause_cleared.is_set()
+        collector.set_weight_version(1)
+        assert collector._calculate_target_weights(1) == [2]
+        collector.resume_after_refit()
+        assert collector._refit_pause_cleared.is_set()
 
     def _prime_collection_loop(self, collector):
         """Unblock every wait-event so _collection_loop() runs to completion."""
