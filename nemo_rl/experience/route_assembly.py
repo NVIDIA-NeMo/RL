@@ -123,6 +123,7 @@ def execute_route_plan(
     *,
     dims: tuple[int, int],
     canonical_len: int,
+    backpatch_predecessor_tail: bool = False,
 ) -> tuple[Optional[torch.Tensor], Optional[str]]:
     """Assemble one canonical route tensor from staged fragments.
 
@@ -135,6 +136,9 @@ def execute_route_plan(
             direct-mode finalizer supplies dims learned from the fetched
             fragments.
         canonical_len: The published row's token length.
+        backpatch_predecessor_tail: CC requires complete delta routes and the
+            committed continuation route for the preceding final token. Each
+            plan is one segment, so no patch can cross a compaction root.
 
     Returns:
         ``(tensor, None)`` on success — ``[canonical_len, num_moe_layers,
@@ -160,6 +164,8 @@ def execute_route_plan(
             generation_len=span.generation_len,
             staged_route_len=span.staged_route_len - span.boundary_rows,
         )
+        if backpatch_predecessor_tail and mode != "full":
+            return None, ROUTE_FAILURE_MISSING_FRAGMENT
         if mode != "sentinel":
             fragment = fragments.get(span.staging_key)
             if fragment is None:

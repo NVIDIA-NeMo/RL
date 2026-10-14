@@ -1,0 +1,12 @@
+# FlashREINFORCE smoke recipe with Dr.GRPO group-mean advantages.
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_v2_cc_flash_b8n8_checkpoint.yaml
+
+grpo:
+  baseline_population: all_owners
+  adv_estimator:
+    name: dr_grpo
+
+logger:
+  wandb:
+    name: osworld-v2-flash-b8n8-dr-grpo

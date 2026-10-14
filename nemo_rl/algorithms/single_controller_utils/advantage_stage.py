@@ -38,6 +38,11 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from nemo_rl.algorithms.advantage_estimator import (
+    DrGRPOAdvantageEstimator,
+    GRPOAdvantageEstimator,
+    ReinforceBaselineAdvantageEstimator,
+)
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     _clip_grpo_advantages,
@@ -48,6 +53,10 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+    build_logical_owner_batch,
+    has_logical_owners,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -59,7 +68,11 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
-from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
+from nemo_rl.data_plane.schema import (
+    INPUT_IDS,
+    INPUT_LENGTHS,
+    PROMPT_LOSS_WEIGHT,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.train_data_dump import TrainDataDump
 
@@ -80,7 +93,7 @@ if TYPE_CHECKING:
 # whenever normalize_advantages is set -- and a shard is not that batch.
 # Membership is opt-in for exactly that reason: a new estimator counts as
 # unshardable until someone checks it.
-SHARD_INVARIANT_ESTIMATORS = frozenset({"grpo", "opd"})
+SHARD_INVARIANT_ESTIMATORS = frozenset({"grpo", "dr_grpo", "opd"})
 
 
 @dataclass(frozen=True)
@@ -95,6 +108,7 @@ class AdvantageStageConfig:
     teacher_logprobs_required: bool
     message_level_advantage_penalties_enabled: bool
     shardable: bool
+    prompt_mean_token_mean: bool
     # Where the per-step training dump writes, or None when it is disabled.
     # The stage owns the dump because it is the only place that still holds
     # the untruncated tensors: the controller stopped fetching them when the
@@ -147,7 +161,13 @@ class AdvantageStageConfig:
                 algo_cfg.invalid_tool_call_advantage is not None
                 or algo_cfg.malformed_thinking_advantage is not None
             ),
-            shardable=algo_cfg.adv_estimator.name in SHARD_INVARIANT_ESTIMATORS,
+            shardable=(
+                algo_cfg.adv_estimator.name in SHARD_INVARIANT_ESTIMATORS
+                and loss_cfg.loss_agg_mode != "prompt-mean-token-mean"
+            ),
+            prompt_mean_token_mean=(
+                loss_cfg.loss_agg_mode == "prompt-mean-token-mean"
+            ),
             # logger is still a TypedDict, so this is the same value the
             # Logger exposes as base_log_dir.
             train_data_dump_dir=(
@@ -212,6 +232,46 @@ class AdvantageRequest:
     # names its file after it and the pool has no view of the controller's
     # counter. Unset when the dump is off, which is the default.
     train_step: Optional[int] = None
+
+
+def prompt_mean_token_mean_weights(
+    meta: KVBatchMeta,
+    *,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Encode ``T / (P * T_prompt)`` once per physical training row."""
+    if (
+        token_mask.ndim != 2
+        or token_mask.shape[0] != meta.size
+        or sample_mask.shape != (meta.size,)
+    ):
+        raise ValueError("prompt loss weights require row-aligned masks")
+
+    group_ids = row_group_ids(meta)
+    row_token_counts = (
+        token_mask[:, 1:].float() * sample_mask.float().unsqueeze(-1)
+    ).sum(dim=-1)
+    prompt_token_counts: dict[str, torch.Tensor] = {}
+    for group_id, row_count in zip(group_ids, row_token_counts, strict=True):
+        prompt_token_counts[group_id] = (
+            prompt_token_counts.get(group_id, torch.zeros_like(row_count)) + row_count
+        )
+
+    valid_prompt_counts = {
+        group_id: count for group_id, count in prompt_token_counts.items() if count > 0
+    }
+    total_tokens = row_token_counts.sum()
+    if not valid_prompt_counts or total_tokens <= 0:
+        return torch.zeros_like(sample_mask, dtype=torch.float32)
+
+    prompt_count = len(valid_prompt_counts)
+    weights = torch.zeros_like(sample_mask, dtype=torch.float32)
+    for row, group_id in enumerate(group_ids):
+        prompt_tokens = valid_prompt_counts.get(group_id)
+        if prompt_tokens is not None:
+            weights[row] = total_tokens / (prompt_count * prompt_tokens)
+    return weights
 
 
 def split_meta_by_prompt_group(
@@ -325,13 +385,35 @@ class AdvantageComputer:
         meta = request.meta
         cfg = self._config
         adv_cfg = cfg.advantage
+        logical = has_logical_owners(meta)
+        if logical:
+            supported = (
+                cfg.algo.adv_estimator.name == "grpo"
+                and isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+            ) or (
+                cfg.algo.adv_estimator.name == "dr_grpo"
+                and isinstance(self._advantage_estimator, DrGRPOAdvantageEstimator)
+            ) or (
+                cfg.algo.adv_estimator.name == "reinforce_baseline"
+                and isinstance(
+                    self._advantage_estimator,
+                    ReinforceBaselineAdvantageEstimator,
+                )
+            )
+            if cfg.is_ppo or not isinstance(cfg.algo, GRPOConfig) or not supported:
+                raise ValueError(
+                    "CC logical owners require a supported GRPO estimator"
+                )
+        input_fields = cfg.input_fields()
+        if logical and adv_cfg.prompt_ids_field not in input_fields:
+            input_fields.append(adv_cfg.prompt_ids_field)
 
         data = await call_data_plane(
             self._dp_client,
             "get_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
-            select_fields=cfg.input_fields(),
+            select_fields=input_fields,
         )
 
         # Group by the group a row was generated in, not by its prompt tokens.
@@ -339,10 +421,30 @@ class AdvantageComputer:
         # each prompt 100 times -- and the token key gave them one shared
         # baseline whenever they landed in the same call, so the result moved
         # with chunk boundaries and with how the shards fell.
-        prompt_ids = group_index_column(row_group_ids(meta))
+        group_ids = row_group_ids(meta)
+        if logical:
+            assert meta.tags is not None
+            if any(
+                group_id != tag.get("dispatch_group_id")
+                for group_id, tag in zip(group_ids, meta.tags, strict=True)
+            ):
+                raise ValueError(
+                    "CC dispatch identity disagrees with the prompt-group tag"
+                )
+        prompt_ids = group_index_column(group_ids)
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
+        rewards_clipped = False
+        if isinstance(cfg.algo, GRPOConfig) and (
+            cfg.algo.reward_clip_low is not None
+            or cfg.algo.reward_clip_high is not None
+        ):
+            rewards = rewards.clamp(
+                min=cfg.algo.reward_clip_low,
+                max=cfg.algo.reward_clip_high,
+            )
+            rewards_clipped = True
         token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
@@ -403,7 +505,31 @@ class AdvantageComputer:
             seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
 
+        owner_batch = None
+        if logical:
+            original_prompts = tensor_field(data, adv_cfg.prompt_ids_field)
+            # Preserve equality when padding would alias [x] and [x, 0].
+            prompt_lengths = original_prompts.new_tensor(
+                [row.numel() for row in data[adv_cfg.prompt_ids_field].unbind()]
+            )
+            original_prompts = torch.cat(
+                (prompt_lengths.unsqueeze(-1), original_prompts), dim=1
+            )
+            owner_batch = build_logical_owner_batch(
+                meta,
+                prompt_ids=original_prompts,
+                rewards=rewards,
+                sample_mask=final_sample_mask,
+                expected_group_size=cfg.algo.num_generations_per_prompt,
+            )
+            final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
         mask = token_mask * final_sample_mask.unsqueeze(-1)
+        baseline_mask = final_sample_mask
+        if (
+            isinstance(cfg.algo, GRPOConfig)
+            and cfg.algo.baseline_population == "all_owners"
+        ):
+            baseline_mask = torch.ones_like(final_sample_mask)
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
@@ -439,7 +565,34 @@ class AdvantageComputer:
         # Value-model estimators (GAE) hand back the regression target alongside
         # the advantages; the group-relative ones return a bare tensor.
         returns: Optional[torch.Tensor] = None
-        if has_valid_training_tokens:
+        if has_valid_training_tokens and owner_batch is not None:
+            rows = owner_batch.representative_rows
+            estimator_kwargs: dict[str, torch.Tensor] = {}
+            if isinstance(
+                self._advantage_estimator,
+                ReinforceBaselineAdvantageEstimator,
+            ):
+                estimator_kwargs["action_token_counts"] = (
+                    owner_batch.action_token_counts(mask[:, 1:])
+                )
+            owner_advantages = self._advantage_estimator.compute_advantage(
+                prompt_ids=owner_batch.group_ids,
+                rewards=rewards[rows],
+                mask=owner_batch.valid_mask.unsqueeze(-1),
+                valid_mask=baseline_mask[rows],
+                **estimator_kwargs,
+            )
+            if (
+                owner_advantages.shape != (len(rows), 1)
+                or not torch.isfinite(owner_advantages).all()
+            ):
+                raise ValueError(
+                    "CC estimator must return one finite advantage per logical owner"
+                )
+            advantages = (
+                owner_batch.fanout(owner_advantages[:, 0]).unsqueeze(-1).expand_as(mask)
+            )
+        elif has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
@@ -448,7 +601,7 @@ class AdvantageComputer:
                 # Real validity (token-capture placeholders carry sample_mask 0,
                 # and mask_sample/overlong/seq-logprob-error rows are folded in
                 # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
+                valid_mask=baseline_mask,
                 **kwargs,
             )
             if cfg.is_ppo:
@@ -480,7 +633,12 @@ class AdvantageComputer:
             )
 
         response_advantages = torch.masked_select(advantages, mask.bool())
-        reward_partial = RewardPartial.from_rows(rewards, final_sample_mask)
+        metric_rows = (
+            owner_batch.representative_rows if owner_batch is not None else slice(None)
+        )
+        reward_partial = RewardPartial.from_rows(
+            rewards[metric_rows], final_sample_mask[metric_rows]
+        )
         opd_stat_sum = 0.0
         opd_stat_sumsq = 0.0
         opd_stat_count = 0
@@ -546,9 +704,19 @@ class AdvantageComputer:
             train_data_dump_rows = len(meta.sample_ids)
 
         fields_to_put = {adv_cfg.output_field: advantages}
+        if cfg.prompt_mean_token_mean:
+            fields_to_put[PROMPT_LOSS_WEIGHT] = prompt_mean_token_mean_weights(
+                meta,
+                token_mask=token_mask,
+                sample_mask=final_sample_mask,
+            )
+        if rewards_clipped:
+            fields_to_put[adv_cfg.reward_field] = rewards
         if not torch.equal(final_sample_mask, sample_mask):
             fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
         new_fields = [adv_cfg.output_field]
+        if cfg.prompt_mean_token_mean:
+            new_fields.append(PROMPT_LOSS_WEIGHT)
         if returns is not None:
             fields_to_put[adv_cfg.returns_field] = returns
             new_fields.append(adv_cfg.returns_field)

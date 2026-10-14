@@ -19,7 +19,7 @@ import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Optional, TypeVar, cast
+from typing import Any, Callable, Literal, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -32,9 +32,11 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    DrGRPOAdvantageEstimator,
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
+    ReinforceBaselineAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
@@ -350,6 +352,9 @@ class GRPOConfig(BaseModel, extra="allow"):
     val_start_at: int = -1
     val_batch_size: int | None = 256  # None for NeMo-Gym compatibility
     val_at_start: bool = False
+    # By default, val_at_start retains its historical fresh-run-only behavior.
+    # Enable this for evaluation-only jobs that restore a trained checkpoint.
+    val_at_resume: bool = False
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool = False
@@ -372,6 +377,9 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_grpo: AsyncGRPOConfig | None = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
+    # SingleController baseline/std population. ``all_owners`` keeps masked
+    # rollout rewards in the baseline without making those rows trainable.
+    baseline_population: Literal["valid_owners", "all_owners"] = "valid_owners"
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool = False
@@ -383,6 +391,10 @@ class GRPOConfig(BaseModel, extra="allow"):
     batch_multiplier: float = 1.0
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
+    # Clamp scalar rollout rewards after any shaping/scaling and before
+    # advantage calculation. None leaves that side unbounded.
+    reward_clip_low: float | None = None
+    reward_clip_high: float | None = None
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: bool = False
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
@@ -405,6 +417,19 @@ class GRPOConfig(BaseModel, extra="allow"):
     # training rollout rewards (binary single-reward envs only); see
     # docs/guides/length-penalty.md. None/absent disables the feature.
     length_penalty: Optional[LengthPenaltyConfig] = None
+
+    @model_validator(mode="after")
+    def _validate_reward_clip_bounds(self) -> "GRPOConfig":
+        if (
+            self.reward_clip_low is not None
+            and self.reward_clip_high is not None
+            and self.reward_clip_low > self.reward_clip_high
+        ):
+            raise ValueError(
+                f"reward_clip_low ({self.reward_clip_low}) must not exceed "
+                f"reward_clip_high ({self.reward_clip_high})"
+            )
+        return self
 
 
 @dataclass
@@ -1306,6 +1331,10 @@ def setup(
         setup_timing_metrics.teacher_reservation_time_s = teacher_reservation_time
 
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    if not checkpointing_config.get("load_optimizer", True):
+        optimizer_path = None
+        if weights_path is not None:
+            print("  ✓ Restoring policy weights without optimizer state", flush=True)
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
@@ -2699,9 +2728,17 @@ def _create_advantage_estimator(master_config: MasterConfig):
     if adv_estimator_name == "gdpo":
         adv_estimator = GDPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GDPO advantage estimator (multi-reward)")
+    elif adv_estimator_name == "dr_grpo":
+        adv_estimator = DrGRPOAdvantageEstimator(adv_estimator_config, loss_config)
+        print("  ✓ Using Dr.GRPO advantage estimator (group mean, no std)")
     elif adv_estimator_name == "grpo":
         adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GRPO advantage estimator")
+    elif adv_estimator_name == "reinforce_baseline":
+        adv_estimator = ReinforceBaselineAdvantageEstimator(
+            adv_estimator_config, loss_config
+        )
+        print("  ✓ Using Molt REINFORCE group-mean baseline")
     elif adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
         opd_module.assert_trust_region_supported(master_config)
@@ -3166,6 +3203,7 @@ def _grpo_train_impl(
         grpo_save_state.total_valid_tokens
     )  # total valid tokens processed across all epochs
     val_at_start = master_config.grpo.val_at_start
+    val_at_resume = master_config.grpo.val_at_resume
     val_at_end = master_config.grpo.val_at_end
     val_period = master_config.grpo.val_period
     val_start_at = master_config.grpo.val_start_at
@@ -3179,7 +3217,7 @@ def _grpo_train_impl(
 
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
-    if val_at_start and current_step == 0:
+    if val_at_start and (current_step == 0 or val_at_resume):
         print("\n🔍 Running initial validation...", flush=True)
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
@@ -3198,7 +3236,7 @@ def _grpo_train_impl(
             val_dataloader,
             tokenizer,
             val_task_to_env,
-            step=0,
+            step=current_step,
             master_config=master_config,
             logger=logger,
             processor=processor,
@@ -4869,6 +4907,7 @@ def async_grpo_train(
     val_period = master_config.grpo.val_period
     val_start_at = master_config.grpo.val_start_at
     val_at_start = master_config.grpo.val_at_start
+    val_at_resume = master_config.grpo.val_at_resume
     val_at_end = master_config.grpo.val_at_end
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
@@ -5104,7 +5143,7 @@ def async_grpo_train(
     print("✅ Policy generation setup complete, proceeding to validation...")
 
     # Run validation at start if configured
-    if val_at_start and step == 0:
+    if val_at_start and (step == 0 or val_at_resume):
         print("\n🔍 Running initial validation...")
         # Pause trajectory collection during initial validation
         ray.get(trajectory_collector.pause.remote())
@@ -5116,7 +5155,7 @@ def async_grpo_train(
                 val_dataloader,
                 tokenizer,
                 val_task_to_env,
-                step=0,
+                step=step,
                 master_config=master_config,
                 logger=logger,
                 processor=processor,

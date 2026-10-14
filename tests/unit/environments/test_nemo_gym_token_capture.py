@@ -29,7 +29,9 @@ pytestmark = pytest.mark.nemo_gym
 
 def _capture_env() -> NemoGym:
     env_cls = NemoGym.__ray_metadata__.modified_class
-    return object.__new__(env_cls)
+    env = object.__new__(env_cls)
+    env._context_compaction = False
+    return env
 
 
 def _digest(label: str) -> str:
@@ -210,6 +212,184 @@ def test_receipt_assembly_still_poisons_when_the_terminal_call_died_uncommitted(
     )
     assert receipt["capture_poisoned"] is True
     assert receipt["failure_reason"] == "missing_terminal_row"
+
+
+def test_a_failed_call_keeps_pending_write_custody() -> None:
+    """Failure masks the rollout without transferring unfinished writes to cleanup."""
+    from nemo_rl.environments.nemo_gym import _mask_undrained_receipt
+
+    from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+
+    env = _capture_env()
+    manifest = {
+        "rollout_id": "r0",
+        "records": [
+            _manifest_record("c1"),
+            _manifest_record("c2", parent="c1"),
+        ],
+        "failures": [
+            {
+                "model_call_id": "c3",
+                "reason": "request_finished_without_staged_coordinates",
+            }
+        ],
+        "attempted_call_ids": ["c1", "c2", "c3"],
+        "pending_call_ids": ["c3"],
+    }
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_response_id="resp-c2", reward=1.0
+    )
+    receipt = _mask_undrained_receipt(receipt)
+    assert receipt["pending_call_ids"] == ["c3"]
+    assert receipt["capture_poisoned"] is True
+    staging_keys = _receipt_staging_keys(receipt)
+    assert set(staging_keys) == {"r0/c1", "r0/c2"}
+
+
+def test_a_truly_in_flight_pending_intent_keeps_the_receipt_unsealable() -> None:
+    """A pending intent with no failure row means the request may still be
+    executing; the receipt keeps it pending and the seal keeps refusing."""
+    from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+
+    env = _capture_env()
+    manifest = {
+        "rollout_id": "r0",
+        "records": [_manifest_record("c1")],
+        "failures": [],
+        "attempted_call_ids": ["c1", "c2"],
+        "pending_call_ids": ["c2"],
+    }
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_response_id="resp-c1", reward=0.0
+    )
+    assert receipt["pending_call_ids"] == ["c2"]
+    with pytest.raises(ValueError, match="Capture acknowledgement is unresolved"):
+        _receipt_staging_keys(receipt)
+
+
+def test_an_undrained_receipt_masks_instead_of_wedging() -> None:
+    """When the drain budget lapses with the call still executing, the
+    receipt must become sealable as a masked rollout, not abort the run."""
+    from nemo_rl.environments.nemo_gym import _mask_undrained_receipt
+    from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+
+    env = _capture_env()
+    manifest = {
+        "rollout_id": "r0",
+        "records": [_manifest_record("c1")],
+        "failures": [],
+        "attempted_call_ids": ["c1", "c2"],
+        "pending_call_ids": ["c2"],
+    }
+    receipt = _mask_undrained_receipt(
+        env._assemble_receipt(
+            "r0", manifest, terminal_response_id="resp-c1", reward=0.0
+        )
+    )
+    assert receipt["pending_call_ids"] == ["c2"]
+    assert receipt["capture_poisoned"] is True
+    assert receipt["failure_reason"] == "capture_incomplete"
+    assert _receipt_staging_keys(receipt) == ["r0/c1"]
+
+
+def test_the_terminal_manifest_read_drains_an_in_flight_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session ended at its budget can leave its last call executing in the
+    engine; the terminal manifest read polls until the call resolves."""
+    import nemo_rl.environments.nemo_gym as env_module
+
+    env = _capture_env()
+    pending = {
+        "rollout_id": "r0",
+        "records": [],
+        "failures": [],
+        "attempted_call_ids": ["c1"],
+        "pending_call_ids": ["c1"],
+    }
+    resolved = {
+        "rollout_id": "r0",
+        "records": [_manifest_record("c1")],
+        "failures": [],
+        "attempted_call_ids": ["c1"],
+        "pending_call_ids": [],
+    }
+    env._control = AsyncMock(side_effect=[pending, resolved])
+    monkeypatch.setattr(env_module, "_CAPTURE_DRAIN_POLL_S", 0.0)
+    manifest = asyncio.run(env._drained_manifest("r0"))
+    assert manifest["pending_call_ids"] == []
+    assert env._control.await_count == 2
+
+
+def test_the_drain_budget_bounds_the_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    import nemo_rl.environments.nemo_gym as env_module
+
+    env = _capture_env()
+    pending = {
+        "rollout_id": "r0",
+        "records": [],
+        "failures": [],
+        "attempted_call_ids": ["c1"],
+        "pending_call_ids": ["c1"],
+    }
+    env._control = AsyncMock(return_value=pending)
+    monkeypatch.setattr(env_module, "_CAPTURE_DRAIN_POLL_S", 0.0)
+    monkeypatch.setattr(env_module, "_CAPTURE_DRAIN_TIMEOUT_S", 0.0)
+    manifest = asyncio.run(env._drained_manifest("r0"))
+    assert manifest["pending_call_ids"] == ["c1"]
+    assert env._control.await_count == 1
+
+
+@pytest.mark.parametrize("cancel_during", ["manifest_read", "poll_sleep"])
+def test_capture_drain_propagates_cancellation(
+    monkeypatch: pytest.MonkeyPatch, cancel_during: str
+) -> None:
+    import nemo_rl.environments.nemo_gym as env_module
+
+    env = _capture_env()
+    pending = {"pending_call_ids": ["c1"], "failures": []}
+    env._control = AsyncMock(return_value=pending)
+    sleep = AsyncMock(side_effect=asyncio.CancelledError)
+    monkeypatch.setattr(env_module.asyncio, "sleep", sleep)
+    if cancel_during == "manifest_read":
+        env._control.side_effect = asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(env._drained_manifest("r0"))
+
+    assert env._control.await_count == 1
+    assert sleep.await_count == (cancel_during == "poll_sleep")
+    assert pending["pending_call_ids"] == ["c1"]
+
+
+def test_failure_ends_drain_without_acknowledging_pending_write() -> None:
+    from nemo_rl.environments.nemo_gym import _mask_undrained_receipt
+    from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+
+    env = _capture_env()
+    pending = {
+        "rollout_id": "r0",
+        "records": [_manifest_record("c1")],
+        "failures": [
+            {
+                "model_call_id": "c2",
+                "reason": "request_finished_without_staged_coordinates",
+            }
+        ],
+        "attempted_call_ids": ["c1", "c2"],
+        "pending_call_ids": ["c2"],
+    }
+    env._control = AsyncMock(return_value=pending)
+    manifest = asyncio.run(env._drained_manifest("r0"))
+    assert env._control.await_count == 1
+    receipt = _mask_undrained_receipt(
+        env._assemble_receipt(
+            "r0", manifest, terminal_response_id="resp-c1", reward=1.0
+        )
+    )
+    assert receipt["capture_poisoned"]
+    assert receipt["pending_call_ids"] == ["c2"]
+    assert _receipt_staging_keys(receipt) == ["r0/c1"]
 
 
 def test_receipt_assembly_poisons_when_the_terminal_row_is_missing() -> None:
@@ -542,3 +722,88 @@ def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None
     assert vllm_cfg["async_engine"] is True
     assert vllm_cfg["expose_http_server"] is True
     assert should_use_nemo_gym(config) is True
+
+
+def test_public_postprocess_waits_for_commit_instead_of_masking(monkeypatch) -> None:
+    import nemo_rl.environments.nemo_gym as mod
+    from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+
+    env = _capture_env()
+    pending = {
+        "rollout_id": "r0",
+        "records": [_manifest_record("c1")],
+        "failures": [],
+        "attempted_call_ids": ["c1", "c2"],
+        "pending_call_ids": ["c2"],
+    }
+    done = {
+        **pending,
+        "records": [_manifest_record("c1"), _manifest_record("c2", parent="c1")],
+        "pending_call_ids": [],
+    }
+    env._control = AsyncMock(side_effect=[pending, done])
+    monkeypatch.setattr(mod, "_CAPTURE_DRAIN_POLL_S", 0, raising=False)
+    result = asyncio.run(
+        env._postprocess_receipt_mode(
+            {"_ng_rollout_id": "r0"}, {"terminal_response_id": "resp-c2", "reward": 1.0}
+        )
+    )
+    assert env._control.await_count == 2
+    assert not result["receipt"]["capture_poisoned"]
+    assert result["receipt"]["terminal_model_call_id"] == "c2"
+    assert set(_receipt_staging_keys(result["receipt"])) == {"r0/c1", "r0/c2"}
+
+
+def test_public_postprocess_timeout_masks_without_taking_pending_write(
+    monkeypatch,
+) -> None:
+    import nemo_rl.environments.nemo_gym as mod
+    from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+
+    env = _capture_env()
+    pending = {
+        "rollout_id": "r0",
+        "records": [_manifest_record("c1")],
+        "failures": [],
+        "attempted_call_ids": ["c1", "c2"],
+        "pending_call_ids": ["c2"],
+    }
+    env._control = AsyncMock(return_value=pending)
+    monkeypatch.setattr(mod, "_CAPTURE_DRAIN_TIMEOUT_S", 0, raising=False)
+    result = asyncio.run(
+        env._postprocess_receipt_mode(
+            {"_ng_rollout_id": "r0"}, {"terminal_response_id": "resp-c1", "reward": 1.0}
+        )
+    )
+    receipt = result["receipt"]
+    keys = _receipt_staging_keys(receipt)
+    assert receipt["capture_poisoned"] and receipt["pending_call_ids"] == ["c2"]
+    assert keys == ["r0/c1"]
+
+
+def test_cc_failed_pending_was_already_masked() -> None:
+    from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+
+    env = _capture_env()
+    env._context_compaction, env.cfg = True, {}
+    pending = {
+        "rollout_id": "r0",
+        "records": [],
+        "failures": [
+            {
+                "model_call_id": "c1",
+                "reason": "request_finished_without_staged_coordinates",
+            }
+        ],
+        "attempted_call_ids": ["c1"],
+        "pending_call_ids": ["c1"],
+    }
+    env._control = AsyncMock(return_value=pending)
+    result = asyncio.run(
+        env._postprocess_receipt_mode(
+            {"_ng_rollout_id": "r0"}, {"reward": 0.0, "response": {"output": []}}
+        )
+    )
+    receipt = result["receipt"]
+    assert receipt["capture_poisoned"] and receipt["pending_call_ids"] == ["c1"]
+    assert _receipt_staging_keys(receipt) == []

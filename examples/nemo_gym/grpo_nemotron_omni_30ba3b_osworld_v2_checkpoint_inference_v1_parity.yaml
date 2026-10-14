@@ -1,0 +1,30 @@
+# Evaluate a restored NeMo RL v2 policy checkpoint with the same 361-task,
+# four-rollout OSWorld protocol as the SFT and NeMo RL v1 baselines.
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_v2_inference_v1_parity.yaml
+
+grpo:
+  # Match the training scheduler horizon while loading optimizer-embedded
+  # Megatron checkpoints. Early stop below makes this evaluation-only.
+  max_num_steps: 300
+  val_at_start: true
+  val_at_resume: true
+  stop_at_validation_metric: accuracy
+  stop_at_validation_threshold: -1.0
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: ${oc.env:OSWORLD_EVAL_CHECKPOINT_DIR}
+  metric_name: null
+  higher_is_better: false
+  save_period: 1
+  keep_top_k: 1
+  save_optimizer: true
+  load_optimizer: false
+  save_data_plane: false
+
+policy:
+  megatron_cfg:
+    scheduler:
+      lr_decay_iters: 300
+      lr_warmup_iters: 9

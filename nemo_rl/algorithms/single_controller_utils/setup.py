@@ -70,6 +70,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
+    cc_execution_row_multiple,
     is_ppo_run,
     validate_single_controller_config,
 )
@@ -333,7 +334,9 @@ def _register_single_controller_partitions(
         from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 
         partition_fields = fields_with_optional_routed_experts(
-            DP_TRAIN_FIELDS,
+            SC_ROLLOUT_SCHEMA_FIELDS
+            if token_capture_cfg.context_compaction
+            else DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
     if include_multimodal_fields:
@@ -847,8 +850,15 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
 
     # policy
     policy_config = master_config.policy
-    if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        policy_config["megatron_cfg"]["train_iters"] = policy_train_iters
+    megatron_cfg = policy_config.get("megatron_cfg", {})
+    if megatron_cfg.get("enabled", False):
+        # A continuation job may raise max_num_steps from the restored step to
+        # a later stop point. Keep Megatron's complete scheduler state invariant
+        # when the recipe declares a longer, fixed decay horizon.
+        scheduler_horizon = (megatron_cfg.get("scheduler") or {}).get("lr_decay_iters")
+        if scheduler_horizon is not None:
+            policy_train_iters = max(policy_train_iters, int(scheduler_horizon))
+        megatron_cfg["train_iters"] = policy_train_iters
 
     # value
     if ppo_config is None:
@@ -2081,6 +2091,25 @@ def setup_single_controller(
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
+        context_compaction=token_capture_cfg.context_compaction,
+        execution_row_multiple=(
+            cc_execution_row_multiple(
+                trainer.cfg,
+                dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
+                logprobs_required=(
+                    not (
+                        master_config.loss_fn.force_on_policy_ratio
+                        and algo_cfg.seq_logprob_error_threshold is None
+                    )
+                    or (
+                        master_config.loss_fn.reference_policy_kl_penalty > 0
+                        and not algo_cfg.skip_reference_policy_logprobs_calculation
+                    )
+                ),
+            )
+            if token_capture_cfg.context_compaction
+            else 1
+        ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
     )
 

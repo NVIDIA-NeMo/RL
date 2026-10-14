@@ -37,13 +37,13 @@ from nemo_rl.experience.reward_penalties import (
     RewardLogContext,
     parse_reward_log_context,
 )
-
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
+    from nemo_rl.experience.rollout_reassembler import RolloutSelection
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
-SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 4
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = frozenset({2, 3, 4})
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -86,7 +86,15 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "reward_checks",
         "reward_log_context",
         "staging_keys",
+        "logical_selection",
     }
+)
+_LEGACY_ATTEMPT_STATE_FIELDS = frozenset({"logical_segments"})
+_LOGICAL_SELECTION_STATE_FIELDS = frozenset(
+    {"response_ids", "truncated", "action_flags"}
+)
+_ACTION_OUTPUT_FLAGS_STATE_FIELDS = frozenset(
+    {"invalid_tool_call", "malformed_thinking"}
 )
 
 
@@ -193,6 +201,7 @@ class RolloutAttemptRecord:
     reward_checks: RewardChecks | None = None
     reward_log_context: RewardLogContext | None = None
     staging_keys: list[str] = field(default_factory=list)
+    logical_selection: Optional[RolloutSelection] = None
 
     @property
     def attempt_id(self) -> str:
@@ -302,6 +311,7 @@ class SiblingSealResult:
     mask_sample: bool
     reward_checks: RewardChecks | None = None
     reward_log_context: RewardLogContext | None = None
+    logical_selection: Optional[RolloutSelection] = None
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -315,6 +325,11 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
     """Validate a terminal Gate receipt and return its ordered staging keys."""
     if receipt is None:
         return []
+    pending = set(receipt.get("pending_call_ids", []))
+    if pending and not receipt.get("capture_poisoned"):
+        raise ValueError(
+            "Capture acknowledgement is unresolved; preserve staging until reconciliation"
+        )
     manifest = receipt.get("manifest")
     if not isinstance(manifest, list):
         raise ValueError("sealed rollout receipt must contain a manifest list")
@@ -326,7 +341,114 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
                 "staging_key values"
             )
         staging_keys.append(entry["staging_key"])
-    return staging_keys
+    owner = receipt.get("rollout_id")
+    if not pending.issubset(receipt.get("attempted_call_ids", [])) or any(
+        entry.get("model_call_id") in pending for entry in manifest
+    ):
+        raise ValueError("Pending calls must be attempted and uncommitted")
+    for call_id in receipt.get("attempted_call_ids", []):
+        if not isinstance(call_id, str) or not call_id or "/" in call_id:
+            raise ValueError("Invalid attempted capture call identity")
+        # Abandoned calls remain isolated by the attempt UUID. A worker may
+        # still write them; leave those rows for staging-partition teardown,
+        # as on the existing abandoned-dispatch path.
+        if call_id not in pending:
+            staging_keys.append(f"{owner}/{call_id}")
+    return list(dict.fromkeys(staging_keys))
+
+
+def _logical_selection_to_state(
+    logical_selection: Optional[RolloutSelection],
+) -> Optional[dict[str, Any]]:
+    """Encode one owner's durable CC selection using weights-only-safe values."""
+    if logical_selection is None:
+        return None
+    return {
+        "response_ids": list(logical_selection.response_ids),
+        "truncated": logical_selection.truncated,
+        "action_flags": [
+            {
+                "invalid_tool_call": flags.invalid_tool_call,
+                "malformed_thinking": flags.malformed_thinking,
+            }
+            for flags in logical_selection.action_flags
+        ],
+    }
+
+
+def _logical_selection_from_state(
+    *,
+    schema_version: int,
+    raw_selection: object,
+    raw_segments: object,
+) -> Optional[RolloutSelection]:
+    """Validate a durable selection or invalidate a pre-rebase segment plan."""
+    from nemo_rl.experience.rollout_reassembler import (
+        ActionOutputFlags,
+        RolloutSelection,
+    )
+
+    if schema_version < 4:
+        if raw_selection is not None:
+            raise ValueError(
+                "logical_selection is unsupported before recovery schema version 4"
+            )
+        if raw_segments is not None and not isinstance(raw_segments, list):
+            raise ValueError("logical_segments must be a list or None")
+        # Schema 3 persisted a pre-native-media SegmentReceipt plan. Current TQ
+        # rows authenticate media on each captured call, so the safe upgrade is
+        # to redispatch this physical cohort from its stable logical owner.
+        return None
+    if raw_segments is not None:
+        raise ValueError("recovery schema version 4 does not accept logical_segments")
+    if raw_selection is None:
+        return None
+    if not isinstance(raw_selection, dict):
+        raise ValueError("logical_selection must be a mapping or None")
+    _reject_unknown_fields(
+        raw_selection,
+        expected=_LOGICAL_SELECTION_STATE_FIELDS,
+        context="logical_selection",
+    )
+    response_ids = raw_selection.get("response_ids")
+    if not isinstance(response_ids, list) or not all(
+        isinstance(response_id, str) for response_id in response_ids
+    ):
+        raise ValueError("logical_selection response_ids must be a list of strings")
+    truncated = raw_selection.get("truncated")
+    if not isinstance(truncated, bool):
+        raise ValueError("logical_selection truncated must be a bool")
+    raw_action_flags = raw_selection.get("action_flags")
+    if not isinstance(raw_action_flags, list):
+        raise ValueError("logical_selection action_flags must be a list")
+    decoded_flags: list[ActionOutputFlags] = []
+    for raw_flags in raw_action_flags:
+        if not isinstance(raw_flags, dict):
+            raise ValueError("logical_selection action flags must be a mapping")
+        _reject_unknown_fields(
+            raw_flags,
+            expected=_ACTION_OUTPUT_FLAGS_STATE_FIELDS,
+            context="logical_selection action flags",
+        )
+        invalid_tool_call = raw_flags.get("invalid_tool_call")
+        malformed_thinking = raw_flags.get("malformed_thinking")
+        if not isinstance(invalid_tool_call, bool) or not isinstance(
+            malformed_thinking, bool
+        ):
+            raise ValueError("logical_selection action flags values must be bools")
+        decoded_flags.append(
+            ActionOutputFlags(
+                invalid_tool_call=invalid_tool_call,
+                malformed_thinking=malformed_thinking,
+            )
+        )
+    if len(decoded_flags) != len(response_ids):
+        raise ValueError("logical_selection action_flags must parallel response_ids")
+    return RolloutSelection(
+        response_ids=tuple(response_ids),
+        action_flags=tuple(decoded_flags),
+        truncated=truncated,
+    )
 
 
 class RolloutRecoveryLedger:
@@ -446,11 +568,27 @@ class RolloutRecoveryLedger:
         )
         record.runtime_prompt_payload = prompt_payload
 
-    def prepare_for_restart(self, cut: DataPlaneMutationCut) -> None:
+    def prepare_for_restart(
+        self,
+        cut: DataPlaneMutationCut,
+        *,
+        require_logical_selection: bool = False,
+    ) -> None:
         """Apply each group's persisted restore policy to interrupted attempts."""
         cut.require_live()
         self.assert_checkpoint_safe()
         for record in self._groups.values():
+            if require_logical_selection and any(
+                sibling.current_attempt.status is RolloutAttemptStatus.SEALED
+                and sibling.current_attempt.logical_selection is None
+                for sibling in record.siblings
+            ):
+                # Schema-v2/v3 checkpoints predate native durable CC selections.
+                # Their sealed rows cannot be reassembled safely, so discard the
+                # whole physical cohort and let inventory cleanup remove its
+                # now-unreferenced staging rows before redispatch.
+                self._abandon_entire_group(record)
+                continue
             if record.status is PromptGroupStatus.GENERATING:
                 if record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                     self._abandon_entire_group(record)
@@ -472,6 +610,7 @@ class RolloutRecoveryLedger:
             attempt.reward_checks = None
             attempt.reward_log_context = None
             attempt.staging_keys.clear()
+            attempt.logical_selection = None
         record.status = PromptGroupStatus.GENERATING
 
     def assert_checkpoint_safe(self) -> None:
@@ -603,6 +742,7 @@ class RolloutRecoveryLedger:
         mask_sample: bool,
         reward_checks: RewardChecks | None = None,
         reward_log_context: RewardLogContext | None = None,
+        logical_selection: Optional[RolloutSelection] = None,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -633,6 +773,7 @@ class RolloutRecoveryLedger:
                 and attempt.reward_checks == reward_checks
                 and attempt.reward_log_context == reward_log_context
                 and attempt.staging_keys == staging_keys
+                and attempt.logical_selection == logical_selection
             ):
                 return
             raise ValueError(
@@ -652,6 +793,7 @@ class RolloutRecoveryLedger:
         attempt.reward_checks = reward_checks
         attempt.reward_log_context = reward_log_context
         attempt.staging_keys = staging_keys
+        attempt.logical_selection = copy.deepcopy(logical_selection)
         attempt.status = RolloutAttemptStatus.SEALED
         if all(
             item.current_attempt.status == RolloutAttemptStatus.SEALED
@@ -723,6 +865,7 @@ class RolloutRecoveryLedger:
             attempt.reward_checks = result.reward_checks
             attempt.reward_log_context = result.reward_log_context
             attempt.staging_keys = staging_keys
+            attempt.logical_selection = copy.deepcopy(result.logical_selection)
             attempt.status = RolloutAttemptStatus.SEALED
         record.status = PromptGroupStatus.READY_TO_FINALIZE
 
@@ -767,6 +910,7 @@ class RolloutRecoveryLedger:
         list[bool],
         list[RewardChecks | None],
         list[RewardLogContext | None],
+        list[Optional[RolloutSelection]],
     ]:
         """Return sealed finalization inputs in stable sibling order."""
         record = self._require_group(group_id)
@@ -779,6 +923,7 @@ class RolloutRecoveryLedger:
         mask_sample: list[bool] = []
         checks: list[RewardChecks | None] = []
         log_contexts: list[RewardLogContext | None] = []
+        logical_selections: list[Optional[RolloutSelection]] = []
         for sibling in record.siblings:
             attempt = sibling.current_attempt
             if (
@@ -796,6 +941,7 @@ class RolloutRecoveryLedger:
             mask_sample.append(attempt.mask_sample)
             checks.append(attempt.reward_checks)
             log_contexts.append(attempt.reward_log_context)
+            logical_selections.append(copy.deepcopy(attempt.logical_selection))
         return (
             record.gate_rollout_ids,
             record.logical_rollout_ids,
@@ -804,6 +950,7 @@ class RolloutRecoveryLedger:
             mask_sample,
             checks,
             log_contexts,
+            logical_selections,
         )
 
     def mark_finalization_started(
@@ -916,6 +1063,9 @@ class RolloutRecoveryLedger:
                                     if attempt.reward_log_context is not None
                                     else None,
                                     "staging_keys": list(attempt.staging_keys),
+                                    "logical_selection": _logical_selection_to_state(
+                                        attempt.logical_selection
+                                    ),
                                 }
                                 for attempt in sibling.attempts
                             ],
@@ -960,6 +1110,7 @@ class RolloutRecoveryLedger:
         for raw_group in raw_groups:
             record = cls._group_from_state(
                 raw_group,
+                schema_version=schema_version,
                 seen_attempt_uuids=seen_attempt_uuids,
             )
             if record.group_id in ledger._groups:
@@ -996,6 +1147,7 @@ class RolloutRecoveryLedger:
         cls,
         raw_group: Any,
         *,
+        schema_version: int,
         seen_attempt_uuids: set[uuid.UUID],
     ) -> PromptGroupRecoveryRecord:
         if not isinstance(raw_group, dict):
@@ -1074,7 +1226,11 @@ class RolloutRecoveryLedger:
                     raise ValueError("rollout-recovery attempt must be a mapping")
                 _reject_unknown_fields(
                     attempt_state,
-                    expected=_ATTEMPT_STATE_FIELDS,
+                    expected=(
+                        _ATTEMPT_STATE_FIELDS | _LEGACY_ATTEMPT_STATE_FIELDS
+                        if schema_version < 4
+                        else _ATTEMPT_STATE_FIELDS
+                    ),
                     context="rollout-recovery attempt",
                 )
                 raw_attempt_uuid = attempt_state.get("attempt_uuid")
@@ -1114,6 +1270,11 @@ class RolloutRecoveryLedger:
                     attempt_state.get("reward_log_context")
                 )
                 staging_keys = attempt_state.get("staging_keys")
+                logical_selection = _logical_selection_from_state(
+                    schema_version=schema_version,
+                    raw_selection=attempt_state.get("logical_selection"),
+                    raw_segments=attempt_state.get("logical_segments"),
+                )
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
                 ):
@@ -1146,6 +1307,7 @@ class RolloutRecoveryLedger:
                     or checks is not None
                     or log_context is not None
                     or staging_keys
+                    or logical_selection is not None
                 ):
                     raise ValueError("only sealed attempts may retain receipt data")
                 attempts.append(
@@ -1158,6 +1320,7 @@ class RolloutRecoveryLedger:
                         reward_checks=checks,
                         reward_log_context=log_context,
                         staging_keys=list(staging_keys),
+                        logical_selection=logical_selection,
                     )
                 )
             siblings.append(

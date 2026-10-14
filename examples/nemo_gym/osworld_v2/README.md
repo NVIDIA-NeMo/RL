@@ -1,0 +1,302 @@
+# NeMo RL v2 + OSWorld
+
+This directory is the portable launcher for the validated OSWorld training path:
+
+- NeMo RL v2 `SingleController`
+- `TransferQueue` data plane
+- 4 nodes x 8 GPUs
+- FlashREINFORCE B=8/N=8 smoke and B=17/N=16 production profiles
+- REINFORCE group-mean baseline or Dr.GRPO advantages
+- rewards clipped to `[0, 1]`
+- raw token-level importance sampling with a sampled-token binary-KL sequence
+  gate at `0.01`
+- prompt-mean/token-mean loss aggregation
+- R3/router replay and context-compaction trajectory splitting
+- windowed sampling with maximum staleness 1
+- full step-boundary policy, optimizer, dataloader, sampler, and TransferQueue
+  checkpoint/resume
+
+The default smoke recipe is
+`examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_v2_cc_flash_b8n8_dr_grpo_checkpoint.yaml`.
+The final AgentEnv target is B=17/N=16 (272 logical trajectories per optimizer
+step), available with either Dr.GRPO or the REINFORCE baseline. AgentEnv
+restores each rollout from the same prebuilt microVM template; the configured
+N owners remain independent trajectories.
+Mid-turn VM snapshots are not part of this release; recovery is at a completed
+optimizer-step boundary.
+
+## 1. Prerequisites
+
+The validated launcher requires:
+
+- Linux x86_64, Slurm, and Pyxis/Enroot.
+- Four homogeneous nodes with eight supported NVIDIA GPUs each.
+- A filesystem visible at the same absolute path from the submit host and every
+  compute node.
+- The qualified immutable `.sqsh` image described below.
+- A local Nemotron-Omni SFT checkpoint in Hugging Face layout, including
+  `config.json` and `chat_template.jinja`.
+- An OpenSandbox deployment with a live API credential, a warm KVM pool named
+  `osworld-kvm` (or set `OSWORLD_POOL_REF`), and capacity for at least eight
+  concurrent training VMs (32 for an unsharded evaluation). Every compute node
+  must resolve and reach the protected OpenSandbox API; each VM must expose the
+  OSWorld control API on port 5000.
+- Alternatively, an AgentEnv deployment with a snapshot-backed OSWorld
+  template, API credential, and pinned TLS CA. The validated template is
+  `osworld-slim-pixel-parity-20261001`.
+- Access to GitHub/Python package indexes the first time NeMo Gym builds its
+  shared component environment. The OSWorld dependency is pinned to
+  `terrykong/OSWorld@5d8c93592be588ab8e9909bed82f3b480fd4f533`,
+  Ray to a supported `>=2.58` release and the OpenSandbox SDK to the versions
+  pinned by the checked-out RL/Gym lockfiles.
+
+## 2. Clone the pinned code
+
+```bash
+git clone --recurse-submodules \
+  --branch linglinj/flashreinforce-agentenv-osworld \
+  https://github.com/jinglinglingling/RL.git nemo-rl-osworld-v2
+cd nemo-rl-osworld-v2
+git submodule update --init --recursive
+```
+
+The RL branch pins the matching Gym fork commit through the submodule, so no
+second manual checkout is required. Record the exact source state with:
+
+```bash
+git rev-parse HEAD
+git submodule status
+```
+
+## 3. Copy the qualified container
+
+The 69.4 GB image is intentionally not stored in the git history. It is
+published as verified split assets in the private
+`jinglinglingling/nemo-rl-molt-osworld-backup` release
+`osworld-v2-qualified-69764640`. On a destination cluster, authenticate `gh`
+with access to that repository and reconstruct it directly into shared storage:
+
+```bash
+gh auth login
+bash examples/nemo_gym/osworld_v2/download_container.sh /shared/containers
+```
+
+Alternatively, copy `rl-osworld-v2-qualified-69764640.sqsh` from an existing
+cluster. In either case it must have this SHA-256 digest:
+
+```text
+1b4edcdeac017210e6abe25885372e025ac111c45aeb038bda334659436eb74e  rl-osworld-v2-qualified-69764640.sqsh
+```
+
+Verify it once:
+
+```bash
+sha256sum /shared/containers/rl-osworld-v2-qualified-69764640.sqsh
+```
+
+`submit.sh` verifies the digest again by default. Do not replace this image with
+a moving nightly tag; that was the source of earlier environment drift.
+
+## 4. Prepare the 361-task training dataset
+
+The Gym submodule includes the same 361 no-Google-Drive OSWorld tasks used by
+the v1-parity run. Build the 5-repeat, 1,805-row training file:
+
+```bash
+python examples/nemo_gym/prepare_osworld_context_compaction_data.py \
+  --input 3rdparty/Gym-workspace/Gym/resources_servers/osworld/data/test_nogdrive.jsonl \
+  --output /shared/data/osworld/train-5x.jsonl \
+  --num-repeats 5
+wc -l /shared/data/osworld/train-5x.jsonl
+# expected: 1805
+```
+
+The preparation script removes framework-owned rollout IDs and adds the
+official `osworld_nano_omni_agent` Gym route. SingleController creates fresh
+logical owner and attempt IDs at runtime.
+
+Prepare the corresponding one-copy, 361-task evaluation file:
+
+```bash
+python examples/nemo_gym/prepare_osworld_context_compaction_data.py \
+  --input 3rdparty/Gym-workspace/Gym/resources_servers/osworld/data/test_nogdrive.jsonl \
+  --output /shared/data/osworld/eval-361.jsonl \
+  --num-repeats 1
+wc -l /shared/data/osworld/eval-361.jsonl
+# expected: 361
+```
+
+## 5. Configure the cluster
+
+### Freeze the offline-DAPO RLVR band
+
+Never train directly from the live, periodically refreshed `band_live`
+directory. Freeze it atomically with its upload assets and custom evaluators:
+
+```bash
+python examples/nemo_gym/freeze_osworld_rlvr_band.py \
+  --source /path/to/export/rl_sets/band_live \
+  --output /shared/data/osworld/band-live-flash-v1 \
+  --num-repeats 1
+```
+
+The command enforces `calib_reps == 8` and `0 < passes < 8`, uses
+`manifest.jsonl` as the membership authority, rewrites every upload path into
+the frozen root, and emits `SHA256SUMS`. If delivery assets are inaccessible,
+the strict command fails. A temporary, explicit
+`--quarantine-unreadable-assets` mode records excluded task IDs in
+`quarantine.jsonl`; prefer having the delivery owner repair the assets.
+
+Set:
+
+```text
+OSWORLD_RLVR_SNAPSHOT=/shared/data/osworld/band-live-flash-v1
+OSWORLD_GRPO_TRAIN_DATA=/shared/data/osworld/band-live-flash-v1/train.jsonl
+OSWORLD_RECIPE=flash-b8n8-dr-grpo
+```
+
+The resource server loads only the current task's frozen custom evaluator
+modules. `submit.sh` identity-mounts the snapshot so rewritten host paths are
+valid on every node.
+
+Copy the template to a private location, fill in every required path and
+credential, and restrict its permissions:
+
+```bash
+cp examples/nemo_gym/osworld_v2/env.example /shared/private/osworld-v2.env
+chmod 600 /shared/private/osworld-v2.env
+${EDITOR:-vi} /shared/private/osworld-v2.env
+```
+
+Required values are:
+
+- `CONTAINER`
+- `NANO_OMNI_MODEL_NAME`
+- `NANO_OMNI_CHAT_TEMPLATE`
+- `OSWORLD_GRPO_TRAIN_DATA`
+- `OSWORLD_SANDBOX_PROVIDER=opensandbox` plus `OPENSANDBOX_BASE_URL` and its
+  API key, or `OSWORLD_SANDBOX_PROVIDER=agentenv` plus `AGENTENV_URL`,
+  `AGENTENV_API_KEY`, and `AGENTENV_TEMPLATE` (with `AGENTENV_TLS_CA` only for
+  an internal TLS issuer)
+- `SLURM_ACCOUNT` and `SLURM_PARTITION`
+- `OSWORLD_RESULTS_ROOT`
+
+The default 4-hour segment saves a clean checkpoint by 3h40m. If the cluster
+uses a different time limit, change both `OSWORLD_JOB_TIME` and
+`OSWORLD_CHECKPOINT_MUST_SAVE_BY`, leaving enough time for the synchronous
+full-model checkpoint.
+
+## 6. Submit
+
+An optional host-side dry run performs every check and builds the mount list
+without calling `sbatch`:
+
+```bash
+OSWORLD_SUBMIT_DRY_RUN=1 \
+  bash examples/nemo_gym/osworld_v2/submit.sh /shared/private/osworld-v2.env
+```
+
+Submit the training job:
+
+```bash
+bash examples/nemo_gym/osworld_v2/submit.sh \
+  /shared/private/osworld-v2.env
+```
+
+`OSWORLD_RECIPE` accepts `flash-b8n8-dr-grpo`,
+`flash-b8n8-reinforce`, `flash-b17n16-dr-grpo`, or
+`flash-b17n16-reinforce`. Qualify the B=8/N=8 profile first. The B=17/N=16
+profiles satisfy the strict `>16*16` logical-batch target. Qualify B=8/N=8
+end-to-end before spending a full B=17/N=16 optimizer step.
+
+Before calling `sbatch`, the launcher:
+
+1. validates all required files and the container checksum;
+2. prepares the four shared runtime libraries needed by the qualified image;
+3. mounts the checkout at `/opt/nemo-rl` and mounts model, data, cache, and
+   result paths at identical paths inside the container;
+4. syntax-checks the shell launchers; and
+5. configures the Ray head and workers to use the qualified driver venv.
+
+Each node then checks Python 3.13.14, Ray >=2.58, RL/Gym import provenance, and
+the fully resolved SingleController configuration before model loading begins.
+
+The command prints `series_root`, `checkpoint_dir`, and the submitted Job ID.
+Useful checks are:
+
+```bash
+squeue -j JOB_ID -o '%.18i %.12T %.30j %.10M %.20R'
+sacct -j JOB_ID --format=JobID,State,ExitCode,Elapsed
+cat SERIES_ROOT/submissions.tsv
+less SERIES_ROOT/segments/segment-001/slurm-JOB_ID.out
+less SERIES_ROOT/segments/segment-001/JOB_ID-logs/ray-driver.log
+```
+
+## 7. Continue or chain segments
+
+Checkpoints are written to `SERIES_ROOT/checkpoints/step_N`. To continue an
+existing series, set this in the private environment file and submit again:
+
+```bash
+OSWORLD_SERIES_ROOT=/shared/results/nemo-rl-v2-osworld/existing-series
+```
+
+The launcher chooses the next unused segment directory and the trainer restores
+the latest complete `step_N` automatically. To queue several segments at once,
+set `OSWORLD_CHAIN_LENGTH`. The default dependency is `afterok`; use
+`OSWORLD_CHAIN_DEPENDENCY=afterany` only when the site's expected time-limit
+termination is nonzero and the checkpoint has been independently verified.
+
+## 8. Evaluate the SFT model or a NeMo RL checkpoint
+
+Set `OSWORLD_GRPO_VAL_DATA` in the private environment file to the prepared
+361-task file. The SFT evaluation runs four independent rollouts per task on
+one 8-GPU node:
+
+```bash
+bash examples/nemo_gym/osworld_v2/submit_eval.sh sft \
+  /shared/private/osworld-v2.env
+```
+
+To evaluate a trained policy, also set `OSWORLD_EVAL_CHECKPOINT_DIR` to the
+directory containing complete `step_N` checkpoints, then run:
+
+```bash
+bash examples/nemo_gym/osworld_v2/submit_eval.sh checkpoint \
+  /shared/private/osworld-v2.env
+```
+
+The launcher selects the matching v1-parity recipe, requests one node, validates
+the fully resolved config on every node, and uses the same qualified image,
+mount construction, Gym environment, 361 tasks, and four-rollout protocol as
+the published comparison. Increase `OSWORLD_JOB_TIME` if the destination
+cluster cannot finish 1,444 episodes within its default wall time.
+
+For parallel evaluation, split `eval-361.jsonl` into disjoint shards and pass
+one shard as the final argument to each submission:
+
+```bash
+bash examples/nemo_gym/osworld_v2/submit_eval.sh checkpoint \
+  /shared/private/osworld-v2.env /shared/data/osworld/eval-q01.jsonl
+```
+
+Never overlap task rows across shards. Aggregate the total count of episodes
+with `reward == 1` over the total number of completed episodes.
+
+These intentionally use the legacy validation runner because SingleController
+does not own the evaluation loop. Training itself remains entirely on
+SingleController + TransferQueue.
+
+## Troubleshooting
+
+- A checksum mismatch means the container is not the validated image. Do not
+  suppress it unless the image was copied through a system that independently
+  verified content integrity.
+- A failure in `osworld-v2-node-preflight-ok` is an image, mount, submodule, or
+  Ray-version problem; training has not started.
+- OpenSandbox setup failures should be diagnosed from the Gym server logs and
+  guest control API before resubmitting. Confirm that the API key authorizes
+  protected create/release operations, `OSWORLD_POOL_REF` exists with enough
+  warm capacity, and all compute nodes can resolve `OPENSANDBOX_BASE_URL`.
+- NeMo Gym environments are not relocatable. Keep `OSWORLD_GYM_VENV_DIR` on the
+  shared destination cluster and let this image build it there.

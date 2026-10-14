@@ -58,6 +58,7 @@ from nemo_rl.experience.failures import (
     classify_rollout_failure,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY,
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
@@ -103,9 +104,49 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 
+_OSWORLD_LEGACY_IDENTITY_FIELDS = (
+    "context_compaction_contract_version",
+    "context_compaction_rollout_id",
+    "context_compaction_group_id",
+    "context_compaction_task_id",
+    "context_compaction_rollout_index",
+    "context_compaction_attempt_index",
+)
+
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
+
+
+def _osworld_task_id(row: Mapping[str, Any]) -> Optional[str]:
+    """Return a consistent OSWorld task id, or ``None`` for another route."""
+    agent_ref = row.get("agent_ref")
+    agent_name = agent_ref.get("name") if isinstance(agent_ref, Mapping) else None
+    metadata = row.get("verifier_metadata")
+    nested_task = (
+        metadata.get("osworld_task") if isinstance(metadata, Mapping) else None
+    )
+    legacy_task_id = row.get("context_compaction_task_id")
+    is_osworld = (
+        isinstance(nested_task, Mapping)
+        or legacy_task_id is not None
+        or (isinstance(agent_name, str) and "osworld" in agent_name.lower())
+    )
+    if not is_osworld:
+        return None
+
+    candidates = [
+        legacy_task_id,
+        metadata.get("task_id") if isinstance(metadata, Mapping) else None,
+        nested_task.get("id") if isinstance(nested_task, Mapping) else None,
+        metadata.get("id") if isinstance(metadata, Mapping) else None,
+    ]
+    task_ids = {value for value in candidates if isinstance(value, str) and value}
+    if len(task_ids) != 1:
+        raise ValueError(
+            "OSWorld trajectory identity requires one consistent non-empty task id"
+        )
+    return task_ids.pop()
 
 
 def _contains_post_write_enrichment_error(error: BaseException) -> bool:
@@ -950,6 +991,7 @@ class AsyncNemoGymRolloutImpl:
         # Length-based reward shaping for low-effort prompts; None disables it.
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        context_compaction: bool = False,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -961,6 +1003,7 @@ class AsyncNemoGymRolloutImpl:
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._log_full_result_tables = log_full_result_tables
         self._reward_penalty_config = reward_penalty_config
+        self._context_compaction = context_compaction
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._deadline_registry = deadline_registry
         self._max_gym_row_attempts = (
@@ -1123,11 +1166,34 @@ class AsyncNemoGymRolloutImpl:
             row[NEMO_GYM_GROUP_ID_KEY] = group_id
             row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempt
             row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
+            # A fork-capable environment can initialize this prompt once and
+            # clone exactly the siblings dispatched in this attempt. Recovery
+            # may dispatch only a subset, so the full configured N is wrong.
+            row[NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY] = list(indices)
             if rollout_ids is not None:
                 # Opaque run-body carrier (Gym's _ng_rollout_id key): the agent
                 # derives the id from the run body and stamps /ng-rollout/<id>
                 # on every model call, so the TQ sample id IS the capture key.
                 row["_ng_rollout_id"] = rollout_ids[i]
+                task_id = _osworld_task_id(row)
+                if task_id is not None:
+                    if row.get("trajectory_identity") is not None:
+                        raise ValueError(
+                            "OSWorld trajectory_identity is runtime-owned and must not be present in dataset rows"
+                        )
+                    # Current Gym prefers its route-neutral identity envelope.
+                    # Remove partial legacy CC coordinates so it cannot mistake
+                    # dataset provenance for the old all-or-nothing contract.
+                    for field in _OSWORLD_LEGACY_IDENTITY_FIELDS:
+                        row.pop(field, None)
+                    row["trajectory_identity"] = {
+                        "schema_version": 1,
+                        "rollout_id": rollout_ids[i],
+                        "group_id": group_id,
+                        "task_id": task_id,
+                        "rollout_index": i,
+                        "attempt_index": group_attempt,
+                    }
             rows.append(row)
         return rows
 
@@ -1160,10 +1226,12 @@ class AsyncNemoGymRolloutImpl:
         received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
 
-        # Read here, not in the actor: the scope is a ContextVar in this
-        # process, and NemoGym is a separate Ray actor.
+        options: dict[str, Any] = {"num_returns": "streaming"}
+        if self._context_compaction:
+            options["max_task_retries"] = 0
+        # Keep upstream telemetry dispatch while CC retries remain controller-owned.
         async for result_ref in dispatch_with_trace_context(
-            nemo_gym_env.run_rollouts.options(num_returns="streaming"),
+            nemo_gym_env.run_rollouts.options(**options),
             pending,
             timer_prefix,
             per_prompt=in_per_prompt_scope(),
@@ -1280,7 +1348,8 @@ class AsyncNemoGymRolloutImpl:
             last_error: Optional[Exception] = None
             max_row_attempts = (
                 1
-                if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+                if self._context_compaction
+                or recovery_granularity is RecoveryGranularity.PROMPT_GROUP
                 else self._max_gym_row_attempts
             )
             async with _Deadline(
@@ -1440,11 +1509,17 @@ class AsyncNemoGymRolloutImpl:
                 env_extras["ng_rollout_id"] = result["rollout_id"]
                 env_extras["ng_reward_checks"] = result.get("reward_checks")
                 env_extras["ng_reward_log_context"] = result.get("reward_log_context")
+                if self._context_compaction:
+                    if "logical_selection" not in result:
+                        raise ValueError(
+                            "CC dispatch requires an ordered response selection for every owner"
+                        )
+                    env_extras["ng_logical_selection"] = result["logical_selection"]
                 completions.append(
                     Completion(
                         message_log=result["message_log"],
                         env_extras=env_extras,
-                        truncated=False,
+                        truncated=bool(result.get("truncated")),
                         # Same defensive read the receipt producer uses
                         # (nemo_gym._postprocess_receipt_mode): a gym result with
                         # no reward finalizes as 0.0 rather than a KeyError.
@@ -1491,17 +1566,35 @@ class AsyncNemoGymRolloutImpl:
             # Token-free receipts: token accounting comes from the manifest
             # (cum_len of the deepest chain; delta sums as the generation
             # proxy) instead of a message_log walk.
-            manifests = [
-                (((c.env_extras or {}).get("ng_receipt") or {}).get("manifest") or [])
-                for c in completions
-            ]
+            if self._context_compaction:
+                manifests = [
+                    [
+                        record
+                        for record in ((c.env_extras or {})["ng_receipt"] or {}).get(
+                            "manifest", []
+                        )
+                        if record.get("response_id")
+                        in (c.env_extras or {})["ng_logical_selection"].response_ids
+                    ]
+                    for c in completions
+                ]
+            else:
+                manifests = [
+                    (
+                        ((c.env_extras or {}).get("ng_receipt") or {}).get("manifest")
+                        or []
+                    )
+                    for c in completions
+                ]
             # .get with 0: _assemble_receipt ships raw ledger rows unvalidated
             # when CallRecord validation fails (it only stamps
             # capture_poisoned), so a malformed row must degrade a metric, not
             # fail the group as a deterministic data failure.
             turn_count = [len(m) for m in manifests]
             total_tokens = [
-                max((entry.get("cum_len", 0) for entry in m), default=0)
+                sum(entry.get("delta_len", 0) for entry in m)
+                if self._context_compaction
+                else max((entry.get("cum_len", 0) for entry in m), default=0)
                 for m in manifests
             ]
             assistant_tokens = [
@@ -1575,7 +1668,13 @@ class AsyncNemoGymRolloutImpl:
             {
                 k: v
                 for k, v in (c.env_extras or {}).items()
-                if k not in ("ng_receipt", "ng_reward_checks", "ng_reward_log_context")
+                if k
+                not in (
+                    "ng_receipt",
+                    "ng_reward_checks",
+                    "ng_reward_log_context",
+                    "ng_logical_selection",
+                )
                 and not (receipt_mode and k == "reward")
             }
             for c in completions
@@ -1638,6 +1737,8 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        context_compaction: bool = False,
+        execution_row_multiple: int = 1,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1654,6 +1755,10 @@ class RolloutManager:
         # Shared with the impl's request deadlines so the controller can pause their clocks
         # while a colocated engine is in training mode.
         self._request_deadlines = RequestDeadlineRegistry()
+        self._context_compaction = context_compaction
+        self._execution_row_multiple = execution_row_multiple
+        if context_compaction and not use_nemo_gym:
+            raise ValueError("context compaction requires the NeMo-Gym rollout path")
 
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
@@ -1686,6 +1791,7 @@ class RolloutManager:
             retry_policy=self._retry_policy,
             stats=self._stats,
             effort_config=effort_config,
+            context_compaction=context_compaction,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
@@ -2160,6 +2266,12 @@ class RolloutManager:
         assert self._tq_buffer is not None, (
             "generate_for_finalization requires tq_buffer to be set at __init__"
         )
+        if (
+            self._context_compaction
+            and "loss_multiplier" in input_sample
+            and input_sample["loss_multiplier"] != 1.0
+        ):
+            raise ValueError("CC currently requires unit dataset loss_multiplier")
         owns_recovery_group = lineage_group_id is None
         recovery_group_id = lineage_group_id
         if recovery_group_id is None:
@@ -2193,6 +2305,11 @@ class RolloutManager:
                     inflight_registry=inflight_registry,
                 )
             except Exception as error:
+                if (
+                    self._context_compaction
+                    and classify_rollout_failure(error) is not FailureClass.INFRA
+                ):
+                    raise
                 reason = type(error).__name__
                 if classify_rollout_failure(error) is FailureClass.INFRA:
                     infra_attempts += 1
@@ -2294,6 +2411,11 @@ class RolloutManager:
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
+            logical_selection = None
+            if self._context_compaction:
+                logical_selection = env_extras.get("ng_logical_selection")
+                if not logical_selection:
+                    raise ValueError("CC completion must contain selected responses")
             gate_rollout_id = env_extras.get("ng_rollout_id")
             if receipt is not None and not isinstance(receipt, dict):
                 raise ValueError(
@@ -2337,6 +2459,7 @@ class RolloutManager:
                     mask_sample=mask_sample,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
+                    logical_selection=logical_selection,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2368,6 +2491,7 @@ class RolloutManager:
                     mask_sample=mask_sample,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
+                    logical_selection=logical_selection,
                 )
 
         try:
@@ -2401,7 +2525,17 @@ class RolloutManager:
                 mask_sample,
                 reward_checks,
                 reward_log_contexts,
+                logical_selections,
             ) = self._recovery_ledger.finalization_inputs(group_id)
+            durable_logical_selections = tuple(
+                selection for selection in logical_selections if selection is not None
+            )
+            if self._context_compaction and len(durable_logical_selections) != len(
+                rollout_ids
+            ):
+                raise ValueError(
+                    "CC finalization requires a durable selection for every owner"
+                )
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
@@ -2414,6 +2548,10 @@ class RolloutManager:
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
+                logical_selections=(
+                    durable_logical_selections if self._context_compaction else None
+                ),
+                execution_row_multiple=self._execution_row_multiple,
             )
             assert_metadata_only(request)
             return request
