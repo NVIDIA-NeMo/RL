@@ -1,11 +1,14 @@
-# Subagent RL for Agentic-VBench (port plan and status)
+# Subagent RL for Agentic-VBench
 
-Branch `arushig/agentic-vbench-subagents` (worktree `nemo-rl-ut-avb-subagents`)
-builds on the unified-teacher + context-compaction branch and adds subagent
-training modelled on `mengxiwu/nemo-rl-internal` branch
+The integration branch `ehsan/nemorl-v2-video-cc-subagents` builds on Rohit's
+NeMo-RL v2 unified-teacher line and adds video, R3, framework-owned context
+reconstruction, and subagent training modelled on `mengxiwu/nemo-rl-internal`
+branch
 `mengxiwu/compaction-subagent-nemorl-v2` (the `sand73` compaction/subagent
 harness, read on 2026-10-09 from a local clone at
 `/lustre/fsw/portfolios/nemotron/users/arushig/nemo-rl-internal-subagent`).
+Arushi's `arushig/agentic-vbench-subagents` remains a comparison branch, not the
+base of this integration.
 
 ## What the reference does
 
@@ -58,19 +61,19 @@ mechanism changes:
    behaviour changes in one way for every mode: the `task` tool is now denied
    unless subagents are enabled, so single-session runs are single-session by
    construction.
-2. **Session-aware capture (next):** the proxy keys sessions by the request's
-   leading context (system prompt and first user turn); a child session gets its
-   own capture rollout id under the episode (`<rollout>-c<k>`), so Gym's
-   sequential admission holds per session while siblings run in parallel. The
-   agent returns the child ids and `spawn_call_id` (the parent's `task`
-   tool-call id) in its verify response; the finalizer fetches all session
-   receipts of an owner and tags rows with `session_role`/`parent_session_id`.
-3. **Trainer semantics:** `env.nemo_gym.training_mode` plus
+2. **Session-aware capture (done):** the proxy keys sessions by the request's
+   leading context (system prompt and first user turn). A child session roots a
+   separate capture chain under the same rollout owner; later child calls match
+   that chain by longest complete prefix. The agent returns session traces and
+   `spawn_call_id` (the parent's `task` tool-call id) in its verify response;
+   the finalizer binds the selected chains and tags rows with
+   `session_role`/`parent_session_id`.
+3. **Trainer semantics (done):** `env.nemo_gym.training_mode` plus
    `async_rl.multi_trace_enabled` wiring in config validation, one reward vote
    per owner across session rows (`logical_rollout_batch`), resume checks
    (`validate_multitrace_resume_config`), and evidence
    (`trace_training_evidence`) logged per step.
-4. **Validation:** unit tests for session detection and tagging; a smoke with
+4. **Validation (in progress):** unit tests for session detection and tagging; a smoke with
    `AGENTIC_VBENCH_TRAINING_MODE=subagent` on assembly tasks checking observed
    parallel children, out-of-order returns, one reward vote per rollout, and
    zero poisoned calls; then the 20-step run.
@@ -132,7 +135,9 @@ token-echo multi-trace loop is not ported.
 Row length: without compaction an episode is one row of its whole context.
 On 8 training nodes rows of 92-93k tokens trained, 114k/123k rows OOM'd the
 learner (smoke 2184181), and a step holding 97k rows OOM'd with a 98k cap
-(smoke 2184532), so the launcher sets `token_capture.max_train_row_tokens=81920`
+(smoke 2184532). A later four-learner-node TP8/EP16 run also OOM'd on a
+near-80k accepted row, so the current launcher sets
+`token_capture.max_train_row_tokens=65536`
 (must be passed with Hydra `+`); longer rows are rejected (`row_too_long`,
 kept as the owner's rejection reason in the finalize metrics) and their owner
 trains nothing that step.
@@ -140,6 +145,30 @@ trains nothing that step.
 Masking semantics follow from the segments: a child's final answer is
 assistant text in the child's row and a tool result (prompt tokens) in the
 parent's row, so it is trained once.
+
+## Completion and overlong semantics
+
+The parent and all child rows are one logical owner. With the standard
+`overlong_filtering=true`, that owner is excluded if any of its segments ended
+with `finish_reason=length`; this prevents partial parent/child trajectories
+from reaching the optimizer. Do not bypass this contract by disabling
+filtering, raising the row ceiling, changing masks, or altering GRPO/PPO,
+rewards, advantages, clipping, the optimizer, or the TMPE calculation.
+
+The v15 synchronous R3 run demonstrated the distinction. Its second wave had
+rewards `[0 x14, 0.25, 1.0]`, but the two reward-bearing owners contained at
+least one length-terminated parent or child segment. The only three physical
+rows admitted to the learner belonged to reward-zero owners, so the resulting
+zero gradient was correct. Raw TMPE remained healthy (maximum `1.01184`).
+
+The harness fix gives the primary agent and the depth-one `general` child
+separate completion instructions. The child is told to complete only its
+bounded assignment, use tools early, return as soon as its evidence is ready,
+and stop before its output limit. The parent is told to request a concise child
+result and return a brief final answer immediately after verification. Token
+budgets, row limits, standard overlong filtering, and all RL mathematics remain
+unchanged. `opencode_subagent_prompt` is wired through the Gym config and
+`harbor_runner.py`; the child still has `task` denied, preserving depth one.
 
 ## Not ported
 
