@@ -391,6 +391,9 @@ class NemoGymConfig(TypedDict):
     pad_dynamic_image_shapes: NotRequired[
         bool
     ]  # Preserve heterogeneous shapes for native-resolution patchification
+    # Evaluation-only semantic responses may omit token receipts. When enabled,
+    # re-tokenize assistant text instead of rejecting the evaluated episode.
+    allow_token_free_results: NotRequired[bool]
     # Ledger-authoritative token capture (token_capture.enabled): the dumped
     # TokenCaptureConfig. Turns on external staging in Gym's policy model
     # server, switches run_rollouts to receipt mode, and assembles receipts
@@ -1735,6 +1738,68 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 output_item_dict["prompt_str"] = prompt_str
                 output_item_dict["generation_str"] = generation_str
 
+        if not nemo_rl_message_log and self.cfg.get("allow_token_free_results", False):
+            # Evaluation-only CC responses intentionally carry semantic history
+            # without training receipts. Re-tokenize assistant text locally so
+            # legacy validation can compute reward/length metrics. Training
+            # keeps this disabled and still fails closed below.
+            for output_item_dict in nemo_gym_result["response"]["output"]:
+                if (
+                    output_item_dict.get("type") != "message"
+                    or output_item_dict.get("role") != "assistant"
+                ):
+                    continue
+                content = output_item_dict.get("content")
+                if isinstance(content, str):
+                    generation_text = content
+                elif isinstance(content, list):
+                    generation_text = "".join(
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict)
+                        and part.get("type") in {"output_text", "text"}
+                        and isinstance(part.get("text"), str)
+                    )
+                else:
+                    generation_text = ""
+                if not generation_text:
+                    continue
+                generation_token_ids = tokenizer.encode(
+                    generation_text, add_special_tokens=False
+                )
+                if not generation_token_ids:
+                    continue
+                nemo_rl_message_log.extend(
+                    [
+                        {
+                            "role": "user",
+                            "content": "",
+                            "token_ids": torch.empty(0, dtype=torch.long),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "token_ids": torch.tensor(
+                                generation_token_ids, dtype=torch.long
+                            ),
+                            "generation_logprobs": torch.zeros(
+                                len(generation_token_ids), dtype=torch.float32
+                            ),
+                            "is_invalid_tool_call": False,
+                            "has_malformed_thinking": False,
+                        },
+                    ]
+                )
+                output_item_dict["prompt_str"] = ""
+                output_item_dict["generation_str"] = generation_text
+            if nemo_rl_message_log:
+                print(
+                    "NeMo-Gym validation: synthesized token-free semantic "
+                    f"message log with {len(nemo_rl_message_log) // 2} "
+                    "assistant turn(s)",
+                    flush=True,
+                )
+
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]
             try:
@@ -1994,6 +2059,9 @@ def _build_gym_actor_config(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    allow_token_free_results = bool(
+        nemo_gym_dict.pop("allow_token_free_results", False)
+    )
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
         key: value
@@ -2033,6 +2101,7 @@ def _build_gym_actor_config(
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        allow_token_free_results=allow_token_free_results,
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
