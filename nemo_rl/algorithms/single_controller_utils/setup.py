@@ -359,12 +359,23 @@ def _register_single_controller_partitions(
             STAGING_FIELDS,
         )
 
+        from nemo_rl.data_plane.direct_capture import DIRECT_STAGING_FIELDS
+
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
-            fields=list(STAGING_FIELDS)
+            fields=(
+                list(DIRECT_STAGING_FIELDS)
+                if token_capture_cfg.transport == "direct"
+                else list(STAGING_FIELDS)
+            )
             + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
             + (list(MEDIA_STAGING_FIELDS) if capture_media else []),
-            num_samples=num_rollout_samples,
+            num_samples=num_rollout_samples
+            * (
+                token_capture_cfg.direct.max_calls_per_rollout
+                if token_capture_cfg.transport == "direct"
+                else 1
+            ),
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
 
@@ -1214,6 +1225,14 @@ def setup_single_controller(
     # change the worker's environment.
     token_capture_cfg = master_config.token_capture
     capture_media = token_capture_cfg.enabled and processor is not None
+    if token_capture_cfg.enabled and token_capture_cfg.transport == "direct":
+        if generation_config["backend"] != "vllm":
+            raise ValueError("direct token capture requires async vLLM")
+        if capture_media or token_capture_cfg.defer_routed_experts_to_policy:
+            raise ValueError(
+                "direct capture supports text/tools and native router replay; media and deferred replay require gym transport"
+            )
+
     if capture_media:
         if generation_config["backend"] != "vllm":
             raise NotImplementedError(
@@ -1964,11 +1983,18 @@ def setup_single_controller(
     if token_capture_cfg.enabled:
         # Both active backends stage canonical Gym rows in serving workers;
         # only vLLM workers stage captured media beside them (capture_media).
-        generation.setup_token_capture(
-            dp_config,
-            token_capture_cfg.staging_partition,
-            capture_media=capture_media,
-        )
+        if token_capture_cfg.transport == "direct":
+            generation.setup_direct_capture(
+                dp_config,
+                token_capture_cfg.staging_partition,
+                token_capture_cfg.model_dump(),
+            )
+        else:
+            generation.setup_token_capture(
+                dp_config,
+                token_capture_cfg.staging_partition,
+                capture_media=capture_media,
+            )
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:

@@ -633,6 +633,20 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
+    def setup_direct_capture(
+        self, dp_cfg, staging_partition: str, capture_config: dict
+    ) -> None:
+        """Enable native output capture on every HTTP-serving DP leader."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "setup_direct_capture",
+                dp_cfg=dp_cfg,
+                staging_partition=staging_partition,
+                capture_config=capture_config,
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            )
+        )
+
     def setup_token_capture(
         self,
         dp_cfg: "DataPlaneConfig",

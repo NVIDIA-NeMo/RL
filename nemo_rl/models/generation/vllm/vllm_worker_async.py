@@ -20,7 +20,6 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
@@ -46,6 +45,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.experience.route_assembly import boundary_route_rows
+from nemo_rl.experience.direct_capture import current_capture
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -91,99 +91,7 @@ class CapturedRequest:
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 
 
-class _AsyncLLMHTTPClient:
-    """Keep HTTP generation on the loop that owns AsyncLLM request state.
-
-    The engine-client surface is explicit. Do not add a ``__getattr__`` fallback.
-    Add each new member here and decide whether it must run on the engine loop.
-    """
-
-    def __init__(self, engine_client: Any, engine_loop: asyncio.AbstractEventLoop):
-        self._engine_client = engine_client
-        self._engine_loop = engine_loop
-        self.model_config = engine_client.model_config
-        self.renderer = engine_client.renderer
-        self.input_processor = engine_client.input_processor
-        self.vllm_config = engine_client.vllm_config
-
-    async def _run_on_engine_loop(self, operation: Callable[[], Awaitable[Any]]) -> Any:
-        if asyncio.get_running_loop() is self._engine_loop:
-            return await operation()
-
-        future = asyncio.run_coroutine_threadsafe(operation(), self._engine_loop)
-        try:
-            return await asyncio.wrap_future(future)
-        except asyncio.CancelledError:
-            future.cancel()
-            raise
-
-    def generate(
-        self,
-        prompt: Any,
-        sampling_params: Any,
-        request_id: str,
-        **kwargs: Any,
-    ) -> AsyncGenerator[Any, None]:
-        return self._generate(prompt, sampling_params, request_id, kwargs)
-
-    async def _generate(
-        self,
-        prompt: Any,
-        sampling_params: Any,
-        request_id: str,
-        kwargs: dict[str, Any],
-    ) -> AsyncGenerator[Any, None]:
-        iterator = None
-        completed = False
-
-        async def next_output() -> Any:
-            nonlocal iterator
-            if iterator is None:
-                iterator = self._engine_client.generate(
-                    prompt, sampling_params, request_id, **kwargs
-                )
-            return await anext(iterator)
-
-        try:
-            while True:
-                try:
-                    yield await self._run_on_engine_loop(next_output)
-                except StopAsyncIteration:
-                    completed = True
-                    return
-        finally:
-            if not completed:
-                try:
-                    await self._run_on_engine_loop(
-                        lambda: self._engine_client.abort(request_id)
-                    )
-                except Exception:
-                    LOGGER.exception("Failed to abort vLLM request %s", request_id)
-
-    # These members only read engine status or immutable configuration. Running
-    # them on the engine loop added a cross-thread wait to each HTTP request.
-    @property
-    def errored(self) -> bool:
-        return self._engine_client.errored
-
-    @property
-    def dead_error(self) -> BaseException:
-        return self._engine_client.dead_error
-
-    def check_admission(self, n: int = 1, request_id: str | None = None) -> None:
-        """Queue-limit admission check vLLM >= 0.29 runs before every response.
-
-        ``OpenAIServing._preflight`` calls this (vllm-project/vllm#49445,
-        ``max_num_queued_reqs`` / ``max_num_queued_tokens``); without it every
-        chat completion 500s with ``'_AsyncLLMHTTPClient' object has no
-        attribute 'check_admission'``. It only reads scheduler config and
-        unfinished-request counters, so it stays off the engine loop like the
-        other status reads above. Raises vLLM's HTTP-mapped overflow errors.
-        """
-        self._engine_client.check_admission(n, request_id=request_id)
-
-    async def is_tracing_enabled(self) -> bool:
-        return await self._engine_client.is_tracing_enabled()
+from nemo_rl.experience.vllm_http_client import _AsyncLLMHTTPClient
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -234,6 +142,9 @@ class VllmAsyncGenerationWorkerImpl(
         # version is stamped per model call at begin_call time and rotated by
         # the set_rollout_weight_version fan-out from the SC's _sync_weights.
         self.token_capture = None
+        self._direct_capture = None
+        self._direct_capture_auth = ""
+        self._direct_capture_timeout = 60.0
         self._rollout_weight_version = 0
         # In-flight captured calls keyed by id(request): the ActiveCall, the
         # exact engine prompt ids recorded at preprocess time, and the media
@@ -523,6 +434,32 @@ class VllmAsyncGenerationWorkerImpl(
     def install_token_capture(self, capture: Any) -> None:
         """Gym's ``install_capture`` seam (the ``CaptureHost`` contract)."""
         self.token_capture = capture
+
+    async def setup_direct_capture(
+        self, dp_cfg, staging_partition: str, capture_config: dict
+    ) -> bool:
+        """Install native capture; no Gym ledger or token-echo protocol is used."""
+        if not self.is_model_owner:
+            return False
+        from nemo_rl.data_plane import build_data_plane_client
+        from nemo_rl.data_plane.direct_capture import NativeCallStore
+        from nemo_rl.experience.direct_capture import DirectCapture, DirectCaptureConfig
+
+        client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
+        store = NativeCallStore(
+            client,
+            staging_partition,
+            router_replay=self._return_routed_experts_enabled(),
+        )
+        self._direct_capture_auth = capture_config["control_auth_token"]
+        self._direct_capture_timeout = capture_config["control_timeout_s"]
+        self._direct_capture = DirectCapture(
+            DirectCaptureConfig.model_validate(capture_config["direct"]),
+            store.stage,
+            lambda: self._rollout_weight_version,
+            clear=store.clear,
+        )
+        return True
 
     async def setup_token_capture(
         self,
@@ -1254,13 +1191,20 @@ class VllmAsyncGenerationWorkerImpl(
                 ):
                     return response
 
-                if request.logprobs and return_as_token_id:
+                if (
+                    request.logprobs
+                    and return_as_token_id
+                    and current_capture.get() is None
+                ):
                     response = attach_token_information_to_chat_response_choices(
                         response,
                         final_res,
                     )
 
-                if worker_self._return_routed_experts_enabled():
+                if (
+                    worker_self._return_routed_experts_enabled()
+                    and current_capture.get() is None
+                ):
                     response = attach_routed_experts_to_chat_response_choices(
                         response,
                         final_res,
@@ -1350,10 +1294,14 @@ class VllmAsyncGenerationWorkerImpl(
         generation_config = self.cfg
 
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
-        @app.post("/v1/chat/completions")
-        async def create_chat_completion(
+        async def serve_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
+            context = current_capture.get()
+            if context is not None:
+                from nemo_rl.experience.direct_http import validate_direct_request
+
+                validate_direct_request(request, context.rollout)
             # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
             # Right now we explicitly assert set this to -1.
             assert request.top_k in (None, -1), (
@@ -1473,6 +1421,8 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
+                if current_capture.get() is not None:
+                    return generator
                 content = model_dump_chat_response_with_dynamic_message_fields(
                     generator
                 )
@@ -1487,6 +1437,56 @@ class VllmAsyncGenerationWorkerImpl(
 
             worker_self._abort_request_capture(request, reason="streaming_response")
             return StreamingResponse(content=generator, media_type="text/event-stream")
+
+        @app.post("/v1/chat/completions")
+        async def create_chat_completion(
+            request: NeMoRLChatCompletionRequest, raw_request: Request
+        ):
+            result = await serve_chat_completion(request, raw_request)
+            if isinstance(result, ChatCompletionResponse):
+                return JSONResponse(content=result.model_dump())
+            return result
+
+        from nemo_rl.experience.direct_http import install_direct_control
+
+        install_direct_control(
+            app,
+            capture=lambda: worker_self._direct_capture,
+            auth_token=lambda: worker_self._direct_capture_auth,
+            timeout=lambda: worker_self._direct_capture_timeout,
+        )
+
+        @app.post("/v1/responses")
+        async def create_response(body: dict, raw_request: Request):
+            if current_capture.get() is None:
+                from fastapi import HTTPException
+
+                raise HTTPException(400, "Responses requires direct capture")
+            from nemo_gym.openai_utils import (
+                NeMoGymResponseCreateParamsNonStreaming,
+                NeMoGymChatCompletion,
+            )
+            from nemo_gym.responses_converter import ResponsesConverter
+
+            body = NeMoGymResponseCreateParamsNonStreaming.model_validate(body)
+            converter = ResponsesConverter(
+                return_token_id_information=False,
+                uses_reasoning_parser=bool(serving_chat_kwargs.get("reasoning_parser")),
+            )
+            params = converter.responses_to_chat_completion_create_params(body)
+            request = NeMoRLChatCompletionRequest.model_validate(
+                params.model_dump(exclude_none=True)
+            )
+            result = await serve_chat_completion(request, raw_request)
+            if not isinstance(result, ChatCompletionResponse):
+                return result
+            return converter.chat_completion_to_response(
+                responses_create_params=body,
+                chat_completion=NeMoGymChatCompletion.model_validate(
+                    result.model_dump()
+                ),
+                preserve_envelope_id=True,
+            )
 
         ########################################
         # /tokenize endpoint
@@ -2364,6 +2364,9 @@ class VllmAsyncGenerationWorkerImpl(
                 await asyncio.to_thread(self.server_thread.join)
                 self.server_thread = None
 
+            if self._direct_capture is not None:
+                await asyncio.to_thread(self._direct_capture.shutdown)
+                self._direct_capture = None
             if self._sparse_refit_receiver is not None:
                 await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
 

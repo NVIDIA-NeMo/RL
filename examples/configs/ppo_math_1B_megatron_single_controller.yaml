@@ -274,6 +274,13 @@ data_plane:
 # single-controller recovery options require it.
 token_capture:
   enabled: false
+  # direct: native vLLM capture; ordinary per-rollout API keys, no Gym model hop.
+  transport: gym
+  direct:
+    workers: 2
+    max_pending_calls: 256
+    max_rollouts: 4096
+    max_calls_per_rollout: 512
   staging_partition: rollout_staging
 
 # Retry and restore policy for unfinished token-capture groups. "sibling" reuses
