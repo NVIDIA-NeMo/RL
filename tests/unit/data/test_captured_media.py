@@ -771,6 +771,7 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp
     )
 
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {}
     worker._capture_calls = {}
     worker._capture_calls_by_model_call_id = {}
     worker._completed_capture_calls = {}

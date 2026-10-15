@@ -524,6 +524,7 @@ class TQTokenSink:
                 chunk_sequence=chunk_sequence,
             ),
             attachments=attachments,
+            generation_cut_chunk=True,
         )
 
     def _stage_at_key(
@@ -532,6 +533,7 @@ class TQTokenSink:
         key: str,
         *,
         attachments: Mapping[str, Any] | None = None,
+        generation_cut_chunk: bool = False,
     ) -> StageResult:
         """Write the token row and its media attachments in one ``put``.
 
@@ -540,6 +542,10 @@ class TQTokenSink:
         no transactional rollback: if the write raises, the attempted key is
         discarded best-effort before the failure is reported (see
         ``_discard_failed_write``).
+
+        A generation-cut chunk carries exactly one route row per token and no
+        boundary row: only the resume path reads it back, and the resumed
+        call's canonical row supplies the boundary route the reassembler uses.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
@@ -661,7 +667,9 @@ class TQTokenSink:
                 else:
                     experts = torch.tensor(routed, dtype=torch.int16)
                     routed_encoding = ROUTE_ENCODING_LIST
-                expected_len = delta_len + boundary_route_rows(record.prev_len)
+                expected_len = delta_len + (
+                    0 if generation_cut_chunk else boundary_route_rows(record.prev_len)
+                )
                 if experts.dim() != 3 or experts.shape[0] != expected_len:
                     raise ValueError(
                         "routed_experts must already be delta-aligned: "
@@ -911,15 +919,22 @@ class TQTokenSource:
         """Gym ``StagingSource`` conformance: base snapshots only, in order."""
         return [item.snapshot for item in self.fetch_for_finalization(staging_keys)]
 
-    def fetch_generation_cut(self, staging_keys: list[str]) -> list[FetchedStagedCall]:
+    def fetch_generation_cut(
+        self,
+        staging_keys: list[str],
+        *,
+        include_route_fragments: bool = False,
+    ) -> list[FetchedStagedCall]:
         """Fetch prefix rows and any media needed to resume their model call.
 
-        The base read is shared across all requested keys. Media rows are then
-        read in at most two batches (still images and videos), preserving the
-        input order in the returned list. Text-only sources perform no second
-        read.
+        The base read is shared across all requested keys and carries route
+        fragments when router replay needs them. Media rows are then read in at
+        most two batches (still images and videos), preserving the input order
+        in the returned list. Text-only sources perform no second read.
         """
-        items = self.fetch_for_finalization(staging_keys)
+        items = self.fetch_for_finalization(
+            staging_keys, include_route_fragments=include_route_fragments
+        )
         if not self._capture_media or not any(item.media_present for item in items):
             return items
 
