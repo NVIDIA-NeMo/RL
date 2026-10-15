@@ -58,13 +58,14 @@ def test_capture_restores_real_route_at_multi_turn_boundary():
             payload, prev_len=previous, prompt_len=prompt, generated_len=generated
         )
         extras = VLLMCaptureAdapter().extract_extras(payload)
-        delta = decode_routed_experts(extras["routed_experts"], torch.int16)
+        fragment = decode_routed_experts(extras["routed_experts"], torch.int16)
         metadata = {
             key: value for key, value in extras.items() if key != "routed_experts"
         }
         if previous == 0:
             assert "routed_experts_prefix_boundary" not in extras
         else:
+            assert extras["routed_experts_prefix_len"] == previous
             assert (
                 decode_routed_experts(
                     extras["routed_experts_prefix_boundary"], torch.int16
@@ -72,14 +73,14 @@ def test_capture_restores_real_route_at_multi_turn_boundary():
                 == second[2:3].tolist()
             )
         fragments[key] = RouteFragment(
-            delta, ROUTE_ENCODING_ENVELOPE, json.dumps(metadata).encode()
+            fragment, ROUTE_ENCODING_ENVELOPE, json.dumps(metadata).encode()
         )
         spans.append(
             RouteSpan(
                 key,
                 prompt - previous,
                 generated,
-                len(delta),
+                len(fragment),
                 1,
                 compute_extras_digest(extras),
             )
@@ -139,4 +140,31 @@ def test_boundary_route_is_covered_by_fragment_digest():
     _, error = execute_route_plan(
         plan, {"first": fragment}, dims=(1, 2), canonical_len=1
     )
+    assert error == "fragment_integrity"
+
+
+def test_prefix_replacement_marker_is_covered_by_fragment_digest():
+    first = torch.tensor([[[0, 1]]], dtype=torch.int16)
+    second = torch.tensor([[[2, 3]], [[4, 5]]], dtype=torch.int16)
+    first_extras = {"routed_experts": encode_routed_experts(first)}
+    second_extras = {
+        "routed_experts": encode_routed_experts(second),
+        "routed_experts_prefix_len": 1,
+    }
+    fragments = {
+        "first": RouteFragment(first, ROUTE_ENCODING_ENVELOPE, b"{}"),
+        "second": RouteFragment(
+            second,
+            ROUTE_ENCODING_ENVELOPE,
+            json.dumps({"routed_experts_prefix_len": 2}).encode(),
+        ),
+    }
+    spans = (
+        RouteSpan("first", 0, 1, 1, 1, compute_extras_digest(first_extras)),
+        RouteSpan("second", 0, 1, 2, 1, compute_extras_digest(second_extras)),
+    )
+    plan = RouteAssemblyPlan(
+        ROUTE_PLAN_SCHEMA_VERSION, "staging", spans, ("first", "second"), 2
+    )
+    _, error = execute_route_plan(plan, fragments, dims=(1, 2), canonical_len=2)
     assert error == "fragment_integrity"

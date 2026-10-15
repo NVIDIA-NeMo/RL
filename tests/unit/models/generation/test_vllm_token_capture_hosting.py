@@ -604,7 +604,7 @@ def test_uncaptured_inference_does_not_expose_routes_without_token_bundle():
 
 
 @pytest.mark.parametrize("prev_len", [0, 3])
-def test_route_delta_preserves_actual_predecessor_tail(prev_len):
+def test_route_capture_preserves_full_prefix_and_actual_predecessor_tail(prev_len):
     import torch
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
 
@@ -630,9 +630,11 @@ def test_route_delta_preserves_actual_predecessor_tail(prev_len):
     extras = VLLMCaptureAdapter().extract_extras(payload)
     assert (
         decode_routed_experts(extras["routed_experts"], torch.int16).tolist()
-        == routes[prev_len:]
+        == routes
     )
     if prev_len:
+        assert extras["routed_experts_prefix_len"] == prev_len
         assert extras["predecessor_tail_route"] == [[prev_len - 1]]
     else:
+        assert "routed_experts_prefix_len" not in extras
         assert "predecessor_tail_route" not in extras

@@ -129,6 +129,10 @@ VALUE_SEED_FIELDS = LP_SEED_FIELDS
 DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS)
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
+# Digest-covered extras marker for a continuation whose staged route tensor is
+# the engine's full cumulative sequence rather than only this call's delta.
+# Its value is the exact canonical prefix length the consumer must replace.
+ROUTED_EXPERTS_PREFIX_LEN_FIELD = "routed_experts_prefix_len"
 ROUTED_LEN_FIELD = "routed_len"
 ROUTED_EXPERTS_ENCODING_FIELD = "routed_experts_encoding"
 ROUTED_EXTRAS_METADATA_FIELD = "extras_metadata_json"

@@ -21,6 +21,7 @@ canonical publication in deferred mode (the same reason maps to the existing
 counted sentinel fallback). The executor owns per-span extras-digest
 verification against Gym's receipt-bound commitments, span classification via
 Gym's decision table, full/tail slicing, sentinel fill, and shape checks — it
+also applies authenticated newest-prefix replacement for continuations. It
 returns a tensor or a failure reason and never decides policy.
 """
 
@@ -36,6 +37,7 @@ from nemo_rl.data_plane.schema import (
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
     ROUTED_EXPERTS_FIELD,
+    ROUTED_EXPERTS_PREFIX_LEN_FIELD,
 )
 from nemo_rl.experience.route_plan import RouteAssemblyPlan
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
@@ -56,6 +58,7 @@ ROUTE_FAILURE_LENGTH = "fragment_length"
 ROUTE_FAILURE_MODEL_SHAPE = "fragment_model_shape"
 ROUTE_FAILURE_ASSEMBLED_LENGTH = "assembled_length_mismatch"
 ROUTE_FAILURE_PREFIX_BOUNDARY = "prefix_boundary_mismatch"
+ROUTE_FAILURE_PREFIX_REPLACEMENT = "prefix_replacement_mismatch"
 
 
 @dataclass(frozen=True)
@@ -128,7 +131,7 @@ def execute_route_plan(
             direct-mode finalizer supplies dims learned from the fetched
             fragments.
         canonical_len: The published row's token length.
-        backpatch_predecessor_tail: CC requires complete delta routes and the
+        backpatch_predecessor_tail: CC requires complete routes and the
             committed continuation route for the preceding final token. Each
             plan is one segment, so no patch can cross a compaction root.
 
@@ -151,23 +154,50 @@ def execute_route_plan(
     position = 0
     for span in plan.spans:
         contribution = span.carry_len + span.generation_len
-        mode = classify_route_span(
-            carry_len=span.carry_len,
-            generation_len=span.generation_len,
-            staged_route_len=span.staged_route_len,
-        )
-        if backpatch_predecessor_tail and mode != "full":
-            return None, ROUTE_FAILURE_MISSING_FRAGMENT
-        if mode != "sentinel":
-            fragment = fragments.get(span.staging_key)
-            if fragment is None:
-                return None, ROUTE_FAILURE_MISSING_FRAGMENT
+        # A digest-covered prefix marker extends Gym's legacy full/tail span
+        # modes: the fragment contains [newest prefix, current delta]. We need
+        # its metadata before classifying its route length.
+        fragment = fragments.get(span.staging_key)
+        metadata: dict[str, Any] = {}
+        prefix_len: Any = None
+        if fragment is not None:
             if not verify_route_fragment_integrity(
                 fragment,
                 extras_digest_version=span.extras_digest_version,
                 expected_extras_digest=span.extras_digest,
             ):
                 return None, ROUTE_FAILURE_INTEGRITY
+            try:
+                decoded_metadata = json.loads(
+                    fragment.extras_metadata_json.decode("utf-8")
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None, ROUTE_FAILURE_INTEGRITY
+            if decoded_metadata is not None:
+                if not isinstance(decoded_metadata, dict):
+                    return None, ROUTE_FAILURE_INTEGRITY
+                metadata = decoded_metadata
+            prefix_len = metadata.get(ROUTED_EXPERTS_PREFIX_LEN_FIELD)
+        prefix_replacement = prefix_len is not None
+        if prefix_replacement:
+            if (
+                type(prefix_len) is not int
+                or prefix_len != position
+                or span.staged_route_len != prefix_len + contribution
+            ):
+                return None, ROUTE_FAILURE_PREFIX_REPLACEMENT
+            mode = "full"
+        else:
+            mode = classify_route_span(
+                carry_len=span.carry_len,
+                generation_len=span.generation_len,
+                staged_route_len=span.staged_route_len,
+            )
+        if backpatch_predecessor_tail and mode != "full":
+            return None, ROUTE_FAILURE_MISSING_FRAGMENT
+        if mode != "sentinel":
+            if fragment is None:
+                return None, ROUTE_FAILURE_MISSING_FRAGMENT
             routes = fragment.routes
             if routes.dim() != 3:
                 return None, ROUTE_FAILURE_RANK
@@ -175,8 +205,9 @@ def execute_route_plan(
                 return None, ROUTE_FAILURE_LENGTH
             if tuple(routes.shape[1:]) != (num_moe_layers, top_k):
                 return None, ROUTE_FAILURE_MODEL_SHAPE
-            metadata = json.loads(fragment.extras_metadata_json.decode("utf-8"))
-            boundary = (metadata or {}).get("routed_experts_prefix_boundary")
+            if prefix_replacement:
+                routed[:position] = routes[:position].to(torch.int16)
+            boundary = metadata.get("routed_experts_prefix_boundary")
             if boundary is not None:
                 if position == 0:
                     return None, ROUTE_FAILURE_PREFIX_BOUNDARY
@@ -189,8 +220,7 @@ def execute_route_plan(
                 routed[position - 1] = previous_route[0]
             if backpatch_predecessor_tail:
                 # Integrity was checked above over this exact metadata too.
-                metadata = json.loads(fragment.extras_metadata_json)
-                tail = (metadata or {}).get("predecessor_tail_route")
+                tail = metadata.get("predecessor_tail_route")
                 if position == 0:
                     if tail is not None:
                         return None, "unexpected_predecessor_tail"
@@ -210,7 +240,11 @@ def execute_route_plan(
                     ):
                         return None, "invalid_predecessor_tail"
                     routed[position - 1] = torch.tensor(tail, dtype=torch.int16)
-            if mode == "full":
+            if prefix_replacement:
+                routed[position : position + contribution] = routes[
+                    prefix_len:
+                ].to(torch.int16)
+            elif mode == "full":
                 routed[position : position + contribution] = routes.to(torch.int16)
             else:
                 tail_start = position + span.carry_len

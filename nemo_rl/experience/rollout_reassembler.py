@@ -50,6 +50,7 @@ from nemo_rl.data_plane.schema import (
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
     ROUTE_PLAN_TAG,
+    ROUTED_EXPERTS_PREFIX_LEN_FIELD,
     TRUNCATED,
 )
 from nemo_rl.data_plane.tq_token_sink import (
@@ -472,7 +473,18 @@ class RolloutReassembler:
                 commitment = commitments_by_call.get(call_id)
                 if record is None or item is None or commitment is None:
                     return rejected(f"route_span_identity:{call_id}", staging_keys)
-                if item.routed_len not in (0, record.delta_len):
+                prefix_len = (item.extras or {}).get(
+                    ROUTED_EXPERTS_PREFIX_LEN_FIELD
+                )
+                if prefix_len is None:
+                    route_len_valid = item.routed_len in (0, record.delta_len)
+                else:
+                    route_len_valid = (
+                        type(prefix_len) is int
+                        and prefix_len == record.prev_len
+                        and item.routed_len == record.cum_len
+                    )
+                if not route_len_valid:
                     return rejected(f"routed_len_mismatch:{call_id}", staging_keys)
                 if generation_len < 0 or generation_len > record.delta_len:
                     return rejected(

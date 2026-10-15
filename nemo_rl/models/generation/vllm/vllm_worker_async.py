@@ -38,6 +38,7 @@ from nemo_rl.data.captured_media import (
     verify_media_geometry,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_PREFIX_LEN_FIELD
 from nemo_rl.data_plane.tq_token_sink import MediaMetadataIntegrityError
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -813,13 +814,25 @@ class VllmAsyncGenerationWorkerImpl(
     def _delta_align_routed_experts(
         payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
     ) -> None:
-        """Normalize optional vLLM routes to the exact staged token delta."""
+        """Prepare optional vLLM routes for authenticated staged capture.
+
+        A continuation retains the engine's complete cumulative routes and
+        commits the canonical prefix length beside them. Reassembly can then
+        replace stale routes for every prior token with the newest prefill,
+        matching native multi-turn R3 semantics, before appending this call's
+        token delta.
+        """
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
             return
         choice = dict(choices[0])
         message = dict(choice.get("message") or {})
-        message.pop("predecessor_tail_route", None)
+        for field in (
+            "predecessor_tail_route",
+            "routed_experts_prefix_boundary",
+            ROUTED_EXPERTS_PREFIX_LEN_FIELD,
+        ):
+            message.pop(field, None)
         routed = message.get("routed_experts")
         if routed is None:
             return
@@ -854,7 +867,11 @@ class VllmAsyncGenerationWorkerImpl(
                 message["routed_experts_prefix_boundary"] = encode_routed_experts(
                     experts[prev_len - 1 : prev_len]
                 )
-            message["routed_experts"] = encode_routed_experts(experts[prev_len:])
+                message[ROUTED_EXPERTS_PREFIX_LEN_FIELD] = prev_len
+            # Do not discard the newly computed prompt-prefix routes. They
+            # are required to replace stale/fallback routes from earlier
+            # calls, not merely repair the single predecessor boundary.
+            message["routed_experts"] = encode_routed_experts(experts)
             if prev_len:
                 # The previous generation's final token gets its decode route
                 # when this continuation processes it as a prompt token.
@@ -863,7 +880,13 @@ class VllmAsyncGenerationWorkerImpl(
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
             )
-            message.pop("routed_experts", None)
+            for field in (
+                "routed_experts",
+                "routed_experts_prefix_boundary",
+                "predecessor_tail_route",
+                ROUTED_EXPERTS_PREFIX_LEN_FIELD,
+            ):
+                message.pop(field, None)
         choice["message"] = message
         payload["choices"] = [choice]
 
@@ -925,7 +948,7 @@ class VllmAsyncGenerationWorkerImpl(
         )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
-            # Token arrays and delta-aligned routes were staged to TQ above;
+            # Token arrays and authenticated routes were staged to TQ above;
             # remove the serializer's message fields before the worker->gate hop.
             message = choice.get("message")
             if isinstance(message, dict):
@@ -934,6 +957,8 @@ class VllmAsyncGenerationWorkerImpl(
                     "generation_token_ids",
                     "generation_log_probs",
                     "routed_experts",
+                    "routed_experts_prefix_boundary",
+                    ROUTED_EXPERTS_PREFIX_LEN_FIELD,
                     "predecessor_tail_route",
                 ):
                     message.pop(field, None)

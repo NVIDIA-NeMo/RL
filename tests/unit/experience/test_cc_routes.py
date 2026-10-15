@@ -77,8 +77,9 @@ def _segment(
         prompt = prefix + [10, 11]
         VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, prompt)
         payload = _served_content([12], [-0.25])
-        # Old prefix routes deliberately disagree everywhere. Only its last
-        # token may be overwritten; the new decode tail remains a sentinel.
+        # The continuation's recomputed prefix deliberately disagrees with
+        # every old route. Reassembly must replace all of it, while the new
+        # decode tail remains a sentinel.
         values = (
             [base + 1, base + 2, -1]
             if not ordinal
@@ -137,7 +138,7 @@ def routes() -> tuple:
     return data_plane, sink, worker, finalizer
 
 
-def test_cc_routes_patch_only_predecessor_tail_within_each_segment(
+def test_cc_routes_replace_prefix_with_newest_call_within_each_segment(
     routes: tuple,
 ) -> None:
     data_plane, sink, worker, finalizer = routes
@@ -150,13 +151,18 @@ def test_cc_routes_patch_only_predecessor_tail_within_each_segment(
     ]
     assert "predecessor_tail_route" not in sink.records[0].extras
     assert sink.records[1].extras["predecessor_tail_route"] == [[17]]
+    assert sink.records[1].extras["routed_experts_prefix_len"] == 3
     ordinary = finalizer.finalize_rollout("group_g0", owners[0][0]["receipt"], reward=1)
-    assert ordinary.routed_experts[:, 0, 0].tolist() == [11, 12, -1, 13, 14, -1]
+    assert ordinary.routed_experts[:, 0, 0].tolist() == [900, 901, 17, 13, 14, -1]
     result = finalize(finalizer, owners)
     assert result.valid_row_count == result.total_row_count == 3
     for key, expected in zip(
         result.meta.sample_ids,
-        ([11, 12, 17, 13, 14, -1], [31, 32, 37, 33, 34, -1], [51, 52, -1]),
+        (
+            [900, 901, 17, 13, 14, -1],
+            [900, 901, 37, 33, 34, -1],
+            [51, 52, -1],
+        ),
         strict=True,
     ):
         row = data_plane.rows["canonical", key]

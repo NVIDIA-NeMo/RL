@@ -63,6 +63,7 @@ from nemo_rl.data_plane.schema import (
     ROUTE_ENCODING_NONE,
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
+    ROUTED_EXPERTS_PREFIX_LEN_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
     ROUTED_LEN_FIELD,
 )
@@ -510,6 +511,15 @@ class TQTokenSink:
                 )
             routed_len = 0
             routed_encoding = ROUTE_ENCODING_NONE
+            prefix_len = (
+                (extras_metadata or {}).get(ROUTED_EXPERTS_PREFIX_LEN_FIELD)
+                if extras_metadata is not None
+                else None
+            )
+            if prefix_len is not None and routed is None:
+                raise ValueError(
+                    "routed_experts_prefix_len requires a routed_experts payload"
+                )
             if routed is not None:
                 delta_len = len(record.token_ids_delta)
                 if isinstance(routed, str):
@@ -532,10 +542,20 @@ class TQTokenSink:
                 else:
                     experts = torch.tensor(routed, dtype=torch.int16)
                     routed_encoding = ROUTE_ENCODING_LIST
-                if experts.dim() != 3 or experts.shape[0] != delta_len:
+                if prefix_len is None:
+                    expected_route_len = delta_len
+                else:
+                    if type(prefix_len) is not int or prefix_len != record.prev_len:
+                        raise ValueError(
+                            "routed_experts_prefix_len must equal record.prev_len: "
+                            f"got {prefix_len!r} for prev_len={record.prev_len}"
+                        )
+                    expected_route_len = record.cum_len
+                if experts.dim() != 3 or experts.shape[0] != expected_route_len:
                     raise ValueError(
-                        "routed_experts must already be delta-aligned: "
-                        f"got shape {tuple(experts.shape)} for delta_len={delta_len}"
+                        "routed_experts length does not match its capture mode: "
+                        f"got shape {tuple(experts.shape)} for expected_len="
+                        f"{expected_route_len}"
                     )
                 field_dict[ROUTED_EXPERTS_FIELD] = experts.unsqueeze(0)
                 routed_len = int(experts.shape[0])
