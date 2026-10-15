@@ -47,6 +47,8 @@ def main() -> None:
     """Connect to the private cluster and start the requested vLLM command."""
     worker_python = sys.executable
     _load_apply_vllm_patches()(worker_python)
+    if sys.argv[1:] == ["--apply-patches-only"]:  # non-head replica nodes
+        return
     ray.init(address="auto", runtime_env={"py_executable": worker_python})
 
     # vLLM is available only in the generation worker environment and must be

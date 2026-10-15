@@ -758,6 +758,14 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert "if (( vllm_status == 0 )); then" in source
 
 
+def test_non_head_replica_nodes_patch_vllm_before_ray_start():
+    source = (REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh").read_text()
+    worker_branch = source[source.index('[[ -s "${HEAD_IP_FILE}" ]] && break') - 600 :]
+
+    patch = worker_branch.index('serve_vllm_on_ray.py" --apply-patches-only')
+    assert patch < worker_branch.index("if ray start")
+
+
 def test_private_ray_and_vllm_ports_match_sub_ephemeral_layout():
     script = REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh"
     source = script.read_text()

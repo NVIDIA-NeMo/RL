@@ -505,6 +505,12 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
   fi
   exit "${vllm_status}"
 else
+  # serve_vllm_on_ray.py patches vLLM on the head node only; this node's Ray
+  # workers import vLLM from its own container, so patch it too before Ray starts.
+  if ! "${VLLM_PYTHON}" "${EXTERNAL_VLLM_TOOLS_DIR}/serve_vllm_on_ray.py" --apply-patches-only; then
+    echo "[${REPLICA_ID}] ERROR: applying NeMo RL's vLLM patches on this node failed" >&2
+    exit 1
+  fi
   for _ in $(seq 1 120); do
     [[ -s "${HEAD_IP_FILE}" ]] && break
     sleep 1
