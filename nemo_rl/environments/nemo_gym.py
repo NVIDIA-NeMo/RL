@@ -918,8 +918,10 @@ Depending on your data shape, you may want to change these values."""
         Gym does not start a process for them.
 
         Callers compare these names across actors to build the agent->shard map
-        and to catch an entry duplicated across shards. Names are all that is
-        interpreted; what an entry *means* is Gym's business.
+        and to catch an entry duplicated across shards; an unsharded job's
+        coverage check (``validate_dataset_agent_coverage``) reads them as the
+        entries a dataset row may name. Names are all that is interpreted; what
+        an entry *means* is Gym's business.
         """
         if self.rh is None:
             raise RuntimeError(
@@ -2410,21 +2412,28 @@ def validate_dataset_agent_coverage(
     Without this scan, a rare route can sit unseen for hours of training before
     its first dispatch fails.
 
-    Unsharded jobs are skipped: there is one actor, every route resolves to it,
-    and there is nothing a scan could discover.
+    A sharded job checks against the route map built at setup. An unsharded
+    job has one actor and no route map, so it asks that actor which entries
+    its resolved Gym config spawned and keeps the routable ones, agents and
+    resources servers, exactly as the sharded route map does. A model or
+    environment server is never a route, on one actor or on many.
 
     Args:
-        shard_set: The running actors, carrying the route map built at setup.
+        shard_set: The running actors. A sharded set carries the route map
+            built at setup; an unsharded set is asked for its entries here.
         datasets: Split name to dataset, for the error message. ``None`` values
             and datasets without gym rows are skipped.
 
     Raises:
         ShardSetupError: A split references routes no shard hosts.
     """
-    if not shard_set.is_sharded:
-        return
-
-    hosted = shard_set.hosted_routes
+    if shard_set.is_sharded:
+        hosted = shard_set.hosted_routes
+    else:
+        # The same filter the sharded route map applies; with one shard its
+        # duplicate checks are vacuous, so only the routable-type rule remains.
+        entries = ray.get(shard_set.all_handles[0].list_entries.remote())
+        hosted = frozenset(build_route_shard_map({DEFAULT_SHARD_NAME: entries}))
     for split, dataset in datasets.items():
         unhosted = sorted(_iter_dataset_agent_names(dataset) - hosted)
         if unhosted:
@@ -2437,9 +2446,8 @@ def validate_dataset_agent_coverage(
 def _iter_dataset_agent_names(dataset: Any) -> set[str]:
     """Collect the agent or task-source names a dataset's rows reference.
 
-    Sharded jobs lazily scan each stable source file once.
-    Unsharded jobs never call this function.
-    Custom or changed sources retain the row-scan fallback.
+    A stable source file is scanned once and its names cached; a custom or
+    changed source falls back to scanning the loaded rows.
     """
     if dataset is None:
         return set()
