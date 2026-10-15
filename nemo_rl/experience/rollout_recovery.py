@@ -348,9 +348,9 @@ def _attempt_staging_keys(
         # Round-trip validation also rejects tensor or malformed selection metadata.
         _selection_from_state(dataclasses.asdict(selection))
         if receipt is None:
-            raise ValueError("CC recovery requires an ordinary capture receipt")
+            raise ValueError("Segment recovery requires an ordinary capture receipt")
         if not selection.response_ids and not receipt.get("capture_poisoned"):
-            raise ValueError("Empty CC selection requires poisoned capture")
+            raise ValueError("Empty segment selection requires poisoned capture")
         for entry in receipt["manifest"]:
             call_id = entry.get("model_call_id")
             if (
@@ -359,10 +359,10 @@ def _attempt_staging_keys(
                 or "/" in call_id
                 or entry["staging_key"] != f"{gate_id}/{call_id}"
             ):
-                raise ValueError("CC recovery has foreign staging ownership")
+                raise ValueError("Segment recovery has foreign staging ownership")
         manifest_keys = [entry["staging_key"] for entry in receipt["manifest"]]
         if len(manifest_keys) != len(set(manifest_keys)):
-            raise ValueError("CC recovery has duplicate staging ownership")
+            raise ValueError("Segment recovery has duplicate staging ownership")
     return keys
 
 
@@ -379,7 +379,9 @@ def _selection_from_state(raw: Any) -> RolloutSelection | None:
     if not isinstance(raw, dict) or set(raw) != {
         field.name for field in dataclasses.fields(RolloutSelection)
     }:
-        raise ValueError("CC recovery selection must contain every descriptor field")
+        raise ValueError(
+            "Segment recovery selection must contain every descriptor field"
+        )
     responses, flags = raw["response_ids"], raw["action_flags"]
     if (
         not isinstance(responses, tuple)
@@ -397,7 +399,7 @@ def _selection_from_state(raw: Any) -> RolloutSelection | None:
         )
     ):
         raise ValueError(
-            "CC recovery selection has invalid response IDs or action flags"
+            "Segment recovery selection has invalid response IDs or action flags"
         )
     return RolloutSelection(
         response_ids=responses,
@@ -1192,7 +1194,7 @@ class RolloutRecoveryLedger:
                     and attempt_state.get("logical_segments") is not None
                 ):
                     raise ValueError(
-                        "Obsolete CC snapshots are unsupported; start a fresh run"
+                        "Obsolete pre-segment snapshots are unsupported; start a fresh run"
                     )
                 if schema_version >= 4 and "logical_selection" not in attempt_state:
                     raise ValueError("recovery attempt is missing logical_selection")

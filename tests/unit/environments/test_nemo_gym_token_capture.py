@@ -30,7 +30,7 @@ pytestmark = pytest.mark.nemo_gym
 def _capture_env() -> NemoGym:
     env_cls = NemoGym.__ray_metadata__.modified_class
     env = object.__new__(env_cls)
-    env._context_compaction = False
+    env._multi_segment_rollouts = False
     return env
 
 
@@ -755,11 +755,12 @@ def test_public_postprocess_timeout_masks_without_taking_pending_write(
     assert keys == ["r0/c1"]
 
 
-def test_cc_failed_pending_was_already_masked() -> None:
+def test_segment_failed_pending_was_already_masked() -> None:
     from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 
     env = _capture_env()
-    env._context_compaction, env.cfg = True, {}
+    env._multi_segment_rollouts = True
+    env.cfg = {"token_capture": {"call_selection": "all"}}
     pending = {
         "rollout_id": "r0",
         "records": [],

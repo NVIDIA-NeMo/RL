@@ -1132,7 +1132,7 @@ def _make_metadata_envelope(
     }
 
 
-def _make_cc_group_entry(
+def _make_segment_group_entry(
     group_id: str, segments: list[int], *, padding: bool = True
 ) -> dict[str, Any]:
     meta, _ = _logical_batch(
@@ -1710,7 +1710,7 @@ class TestCCReplayRestore:
         self, segments: list[int], padding: bool, tmp_path: Path
     ) -> None:
         groups = [
-            _make_cc_group_entry(name, segments, padding=padding)
+            _make_segment_group_entry(name, segments, padding=padding)
             for name in ("first", "second")
         ]
         # Exercise physical order independently of logical slot/segment order.
@@ -1769,7 +1769,7 @@ class TestCCReplayRestore:
     def test_invalid_metadata_is_rejected_before_index_mutation(
         self, corruption: str
     ) -> None:
-        group = _make_cc_group_entry("broken", [2, 1])
+        group = _make_segment_group_entry("broken", [2, 1])
         meta = group["meta"]
         if corruption == "partial_tags":
             del meta.tags[0]["segment_count"]
@@ -1805,16 +1805,20 @@ class TestCCReplayRestore:
             meta.sample_ids[1] = meta.sample_ids[0]
         # Recompute the digest so structural validation, not integrity mismatch,
         # rejects the bad group, even after an earlier sound group was validated.
-        state = _make_metadata_envelope([_make_cc_group_entry("sound", [1, 1]), group])
+        state = _make_metadata_envelope(
+            [_make_segment_group_entry("sound", [1, 1]), group]
+        )
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
-        with pytest.raises(ValueError, match="CC"):
+        with pytest.raises(
+            ValueError, match="[Ss]egment|[Ee]xecution padding|[Ll]ogical owners"
+        ):
             _load(buf, state)
         assert buf.size() == 0 and buf.meta_list == []
         assert dp.put_calls == dp.get_calls == dp.clear_calls == []
 
-    def test_cc_restore_preserves_digest_and_capacity_checks(self) -> None:
-        state = _make_metadata_envelope([_make_cc_group_entry("g", [3, 1])])
+    def test_segment_restore_preserves_digest_and_capacity_checks(self) -> None:
+        state = _make_metadata_envelope([_make_segment_group_entry("g", [3, 1])])
         for kwargs, message in [
             ({"max_groups": 0}, "more replay groups"),
             ({"expected_manifest_digest": "wrong"}, "loaded TQ checkpoint"),

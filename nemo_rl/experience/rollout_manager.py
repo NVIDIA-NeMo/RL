@@ -949,7 +949,7 @@ class AsyncNemoGymRolloutImpl:
         # Length-based reward shaping for low-effort prompts; None disables it.
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
-        context_compaction: bool = False,
+        multi_segment_rollouts: bool = False,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -961,7 +961,7 @@ class AsyncNemoGymRolloutImpl:
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._log_full_result_tables = log_full_result_tables
         self._reward_penalty_config = reward_penalty_config
-        self._context_compaction = context_compaction
+        self._multi_segment_rollouts = multi_segment_rollouts
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._deadline_registry = deadline_registry
         self._max_gym_row_attempts = (
@@ -1162,9 +1162,9 @@ class AsyncNemoGymRolloutImpl:
         env_timing_metrics: Optional[dict[str, Any]] = None
 
         options: dict[str, Any] = {"num_returns": "streaming"}
-        if self._context_compaction:
+        if self._multi_segment_rollouts:
             options["max_task_retries"] = 0
-        # Keep upstream telemetry dispatch while CC retries remain controller-owned.
+        # Keep upstream telemetry dispatch while segment retries remain controller-owned.
         async for result_ref in dispatch_with_trace_context(
             nemo_gym_env.run_rollouts.options(**options),
             pending,
@@ -1272,7 +1272,7 @@ class AsyncNemoGymRolloutImpl:
             last_error: Optional[Exception] = None
             max_row_attempts = (
                 1
-                if self._context_compaction
+                if self._multi_segment_rollouts
                 or recovery_granularity is RecoveryGranularity.PROMPT_GROUP
                 else self._max_gym_row_attempts
             )
@@ -1430,10 +1430,10 @@ class AsyncNemoGymRolloutImpl:
                 env_extras = dict(result["full_result"])
                 env_extras["ng_receipt"] = result["receipt"]
                 env_extras["ng_rollout_id"] = result["rollout_id"]
-                if self._context_compaction:
+                if self._multi_segment_rollouts:
                     if "logical_selection" not in result:
                         raise ValueError(
-                            "CC dispatch requires an ordered response selection for every owner"
+                            "Segment dispatch requires an ordered response selection for every owner"
                         )
                     env_extras["ng_logical_selection"] = result["logical_selection"]
                 completions.append(
@@ -1487,7 +1487,7 @@ class AsyncNemoGymRolloutImpl:
             # Token-free receipts: token accounting comes from the manifest
             # (cum_len of the deepest chain; delta sums as the generation
             # proxy) instead of a message_log walk.
-            if self._context_compaction:
+            if self._multi_segment_rollouts:
                 manifests = [
                     [
                         record
@@ -1514,7 +1514,7 @@ class AsyncNemoGymRolloutImpl:
             turn_count = [len(m) for m in manifests]
             total_tokens = [
                 sum(entry.get("delta_len", 0) for entry in m)
-                if self._context_compaction
+                if self._multi_segment_rollouts
                 else max((entry.get("cum_len", 0) for entry in m), default=0)
                 for m in manifests
             ]
@@ -1631,7 +1631,7 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
-        context_compaction: bool = False,
+        multi_segment_rollouts: bool = False,
         execution_row_multiple: int = 1,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
@@ -1649,10 +1649,10 @@ class RolloutManager:
         # Shared with the impl's request deadlines so the controller can pause their clocks
         # while a colocated engine is in training mode.
         self._request_deadlines = RequestDeadlineRegistry()
-        self._context_compaction = context_compaction
+        self._multi_segment_rollouts = multi_segment_rollouts
         self._execution_row_multiple = execution_row_multiple
-        if context_compaction and not use_nemo_gym:
-            raise ValueError("context compaction requires the NeMo-Gym rollout path")
+        if multi_segment_rollouts and not use_nemo_gym:
+            raise ValueError("multi-segment rollouts require the NeMo-Gym rollout path")
 
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
@@ -1685,7 +1685,7 @@ class RolloutManager:
             retry_policy=self._retry_policy,
             stats=self._stats,
             effort_config=effort_config,
-            context_compaction=context_compaction,
+            multi_segment_rollouts=multi_segment_rollouts,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
@@ -2160,12 +2160,6 @@ class RolloutManager:
         assert self._tq_buffer is not None, (
             "generate_for_finalization requires tq_buffer to be set at __init__"
         )
-        if (
-            self._context_compaction
-            and "loss_multiplier" in input_sample
-            and input_sample["loss_multiplier"] != 1.0
-        ):
-            raise ValueError("CC currently requires unit dataset loss_multiplier")
         owns_recovery_group = lineage_group_id is None
         recovery_group_id = lineage_group_id
         if recovery_group_id is None:
@@ -2303,10 +2297,12 @@ class RolloutManager:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
             selection = None
-            if self._context_compaction:
+            if self._multi_segment_rollouts:
                 selection = env_extras.get("ng_logical_selection")
                 if not selection:
-                    raise ValueError("CC completion must contain selected responses")
+                    raise ValueError(
+                        "Segment completion must contain selected responses"
+                    )
             gate_rollout_id = env_extras.get("ng_rollout_id")
             if receipt is not None and not isinstance(receipt, dict):
                 raise ValueError(
@@ -2428,7 +2424,7 @@ class RolloutManager:
                             group_id
                         ).siblings
                     )
-                    if self._context_compaction
+                    if self._multi_segment_rollouts
                     else None
                 ),
                 execution_row_multiple=self._execution_row_multiple,

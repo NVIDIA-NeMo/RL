@@ -76,14 +76,13 @@ def _setup(
     stage = _controller(*batches[0])
     ctrl._algo_cfg = stage._algo_cfg
     ctrl._algo_cfg.num_prompts_per_step = num_prompts
+    ctrl._algo_cfg.num_generations_per_prompt = 3 if failure == "gbs" else 2
     ctrl._algo_cfg.max_num_steps = 1
     ctrl._master_config.grpo = ctrl._algo_cfg
     ctrl._master_config.loss_fn = stage._master_config.loss_fn
-    ctrl._master_config.policy = {
-        "train_global_batch_size": 5 if failure == "gbs" else 2 * num_prompts
-    }
+    ctrl._master_config.policy = {"train_global_batch_size": 2 * num_prompts}
     ctrl._master_config.token_capture = TokenCaptureConfig(
-        enabled=True, context_compaction=True
+        enabled=True, multi_segment_rollouts=True
     )
     ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 1
     ctrl._advantage_estimator = stage._advantage_estimator
@@ -158,7 +157,7 @@ def test_padding_guard_precedes_every_forward_and_only_checks_dummy_batches(
         ctrl._trainer.finish_train_step.assert_called_once()
     if padding:
         group.run_all_workers_single_data.assert_called_with(
-            "validate_cc_execution_padding"
+            "validate_execution_padding"
         )
     else:
         group.run_all_workers_single_data.assert_not_called()
@@ -267,7 +266,7 @@ def test_complete_logical_batch_streams_all_segments_but_steps_once(
         ("duplicate", 1, "new, complete logical groups"),
         ("short", 1, "before a complete training step"),
         ("group_tally", 0, "new, complete logical groups"),
-        ("gbs", 2, "full logical sample count"),
+        ("gbs", 0, "group identity or cardinality"),
         ("missing_segment", 0, "every segment exactly once"),
     ],
 )
@@ -283,3 +282,12 @@ def test_invalid_logical_batch_never_completes_optimizer_step(
     ctrl._sync_weights.assert_not_awaited()
     assert ctrl._trainer_version == ctrl._train_steps == ctrl._consumed_samples == 0
     assert set(ctrl._dp_client.list_sample_ids("train")) == initial_ids
+
+
+def test_dropped_group_trains_a_short_step(monkeypatch):
+    ctrl, _ = _setup(monkeypatch, failure="short")
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
+    ctrl._batch_shortfall = {0: 1}
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+    ctrl._trainer.finish_train_step.assert_called_once_with()
+    assert ctrl._train_steps == 1

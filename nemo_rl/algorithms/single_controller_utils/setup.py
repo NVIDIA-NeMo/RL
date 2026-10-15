@@ -66,7 +66,7 @@ from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
-    cc_execution_row_multiple,
+    required_row_multiple,
     is_ppo_run,
     validate_single_controller_config,
 )
@@ -328,7 +328,7 @@ def _register_single_controller_partitions(
 
         partition_fields = fields_with_optional_routed_experts(
             SC_ROLLOUT_SCHEMA_FIELDS
-            if token_capture_cfg.context_compaction
+            if token_capture_cfg.multi_segment_rollouts
             else DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
@@ -2036,9 +2036,9 @@ def setup_single_controller(
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
-        context_compaction=token_capture_cfg.context_compaction,
+        multi_segment_rollouts=token_capture_cfg.multi_segment_rollouts,
         execution_row_multiple=(
-            cc_execution_row_multiple(
+            required_row_multiple(
                 trainer.cfg,
                 dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
                 logprobs_required=(
@@ -2052,7 +2052,7 @@ def setup_single_controller(
                     )
                 ),
             )
-            if token_capture_cfg.context_compaction
+            if token_capture_cfg.multi_segment_rollouts
             else 1
         ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),

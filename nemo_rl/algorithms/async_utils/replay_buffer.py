@@ -1781,7 +1781,7 @@ class TQReplayBuffer:
             expected_partition_id: Partition this buffer writes to; must
                 match the envelope.
             expected_group_size: num_generations_per_prompt; every group must
-                hold exactly this many logical responses. CC responses may span
+                hold exactly this many logical responses. Segmented responses may span
                 multiple rows, with additional ownerless execution padding.
             expected_manifest_digest: Digest returned by the matching native
                 TQ checkpoint load. It must match the replay metadata file.
@@ -1879,7 +1879,9 @@ class TQReplayBuffer:
                     meta, expected_group_size=expected_group_size
                 )
                 if set(owners) != {group["group_id"]}:
-                    raise ValueError("CC replay group_id disagrees with owner metadata")
+                    raise ValueError(
+                        "Segment replay group_id disagrees with owner metadata"
+                    )
             for sid in meta.sample_ids:
                 if sid in seen_sample_ids:
                     raise ValueError(

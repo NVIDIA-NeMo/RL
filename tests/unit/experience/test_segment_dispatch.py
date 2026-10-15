@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Preserve original CC actor replay guards under RL-owned selection."""
+"""Preserve original segment actor replay guards under RL-owned selection."""
 
 import asyncio
 from pathlib import Path
@@ -51,8 +51,8 @@ pytestmark = pytest.mark.nemo_gym
 
 def _env(harness):
     env = object.__new__(NemoGym.__ray_metadata__.modified_class)
-    env._context_compaction = True
-    env.cfg = {}
+    env._multi_segment_rollouts = True
+    env.cfg = {"token_capture": {"call_selection": "accepted_history"}}
 
     async def control(method, path):
         assert method == "GET"
@@ -63,7 +63,7 @@ def _env(harness):
     return env
 
 
-def test_cc_row_stream_disables_ray_replay_and_row_redispatch():
+def test_segment_row_stream_disables_ray_replay_and_row_redispatch():
     class Remote:
         def __init__(self):
             self.calls = 0
@@ -81,7 +81,7 @@ def test_cc_row_stream_disables_ray_replay_and_row_redispatch():
 
     remote = Remote()
     impl = _make_gym_impl(remote, row_attempts=5)
-    impl._context_compaction = True
+    impl._multi_segment_rollouts = True
     with pytest.raises(GymTransportError, match="stream response lost"):
         asyncio.run(
             impl._run_rollouts(
@@ -93,7 +93,7 @@ def test_cc_row_stream_disables_ray_replay_and_row_redispatch():
 
 
 @pytest.mark.parametrize("failure_type", [GymTransportError, ValueError, TimeoutError])
-def test_cc_group_uses_ordinary_retry_budgets(failure_type):
+def test_segment_group_uses_ordinary_retry_budgets(failure_type):
     attempts = []
 
     async def execute_then_lose_response(_sample):
@@ -113,7 +113,7 @@ def test_cc_group_uses_ordinary_retry_budgets(failure_type):
     manager = _make_capture_manager(
         buffer, retry_policy=policy, on_run=execute_then_lose_response
     )
-    manager._context_compaction = True
+    manager._multi_segment_rollouts = True
     if failure_type is ValueError:
         with pytest.raises(ValueError, match="response lost"):
             asyncio.run(manager.generate_for_finalization({"idx": 1}))
@@ -127,10 +127,10 @@ def test_cc_group_uses_ordinary_retry_budgets(failure_type):
     assert manager.stats.skipped == (0 if failure_type is ValueError else 1)
 
 
-def test_cc_hung_stream_deadline_drops_group_and_cancels_collection():
+def test_segment_hung_stream_deadline_drops_group_and_cancels_collection():
     method = _FakeGymMethod(rows_to_yield=1, hang_after=True)
     impl = _make_gym_impl(method, timeouts=RolloutTimeouts(rollout_s=0.01))
-    impl._context_compaction = True
+    impl._multi_segment_rollouts = True
 
     async def hung_stream(_sample):
         await impl._run_rollouts(_gym_rows(2), Timer(), "test")
@@ -146,17 +146,17 @@ def test_cc_hung_stream_deadline_drops_group_and_cancels_collection():
             max_consecutive_dropped_prompts=1,
         ),
     )
-    manager._context_compaction = True
+    manager._multi_segment_rollouts = True
     assert asyncio.run(manager.generate_for_finalization({"idx": 1})) is None
     assert method.cancelled == 1
     assert len(buffer.abort_calls) == 1 and not buffer.commit_calls
     assert manager.stats.skipped == 1
 
 
-def test_cc_seals_failed_owner_without_claiming_its_pending_write():
+def test_segment_seals_failed_owner_without_claiming_its_pending_write():
     buffer = _FakeCaptureBuffer()
     manager = _make_capture_manager(buffer)
-    manager._context_compaction = True
+    manager._multi_segment_rollouts = True
     manager._execution_row_multiple = 1
 
     async def completed(
@@ -220,7 +220,7 @@ def test_actor_creation_preserves_foundation_no_replay_defaults(monkeypatch, cc)
         tokenizer=None,
         enable_router_replay=False,
         use_fastokens=False,
-        token_capture={"enabled": True, "context_compaction": cc},
+        token_capture={"enabled": True, "multi_segment_rollouts": cc},
     )
     assert created is actor
     expected = {"runtime_env": {"existing": "runtime"}}
@@ -275,7 +275,7 @@ def _captured_result(harness, owner, count):
 @pytest.mark.parametrize(
     "interruption", ["runtime", "data_retry", "cold", "sealed_cold"]
 )
-def test_cc_retry_and_restart_reuse_durable_selection(
+def test_segment_retry_and_restart_reuse_durable_selection(
     recovery_stack, tmp_path: Path, granularity: str, interruption: str
 ):
     harness, plane, finalizer = recovery_stack
@@ -293,7 +293,7 @@ def test_cc_retry_and_restart_reuse_durable_selection(
             retry_policy=policy,
             recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
         )
-        manager._context_compaction = True
+        manager._multi_segment_rollouts = True
         manager._execution_row_multiple = 1
         return manager
 
@@ -390,13 +390,15 @@ def test_cc_retry_and_restart_reuse_durable_selection(
 
 @pytest.mark.parametrize("granularity", ["sibling", "prompt_group"])
 @pytest.mark.parametrize("damage", ["foreign", "pending"])
-def test_cc_unsafe_custody_never_reaches_cleanup(recovery_stack, granularity, damage):
+def test_segment_unsafe_custody_never_reaches_cleanup(
+    recovery_stack, granularity, damage
+):
     harness, plane, _ = recovery_stack
     buffer = _FakeCaptureBuffer()
     manager = _make_capture_manager(
         buffer, recovery_config=RolloutRecoveryConfig(default_granularity=granularity)
     )
-    manager._context_compaction = True
+    manager._multi_segment_rollouts = True
     calls = []
 
     async def run(

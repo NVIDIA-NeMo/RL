@@ -122,11 +122,11 @@ On resume, Single-Controller validates the TQ snapshot against the trainer check
 
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
 
-### Context-compaction recovery
+### Multi-segment recovery
 
-[Context-compaction runs](./context-compaction.md) use these same checkpoint
+[Multi-segment runs](./multi-segment-rollouts.md) use these same checkpoint
 settings and defaults, including buffered replay, unfinished groups and periodic
-rollout snapshots. No separate CC save-data option or buffer drain is required.
+rollout snapshots. No separate save-data option or buffer drain is required.
 
 The recovery ledger saves the ordinary attempt receipt and RL's `RolloutSelection`,
 not a segment plan. On restart, the existing planner reconstructs unfinished
@@ -135,7 +135,7 @@ training rows restore directly, including their logical-owner metadata and maske
 execution padding. Replay capacity and advantages count logical groups/owners,
 not physical segments.
 
-Recovery schema 4 is required for CC. Obsolete CC snapshots using per-segment
+Recovery schema 4 is required for multi-segment runs. Obsolete pre-segment snapshots using per-segment
 capture identities are rejected, including empty old recovery ledgers; there is
 no migration. Ordinary schema-2/3 recovery remains readable. The independent
 capture schema and its paired Gym/RL requirements are unchanged.

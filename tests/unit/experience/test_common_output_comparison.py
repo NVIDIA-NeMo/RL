@@ -51,7 +51,7 @@ from tests.unit.experience.common_output_comparison import (
     selected_response_ids,
     selection_with_observed_metadata,
 )
-from tests.unit.experience.test_cc_dispatch import _env
+from tests.unit.experience.test_segment_dispatch import _env
 from tests.unit.experience.test_logical_owner_finalization import (
     PublicationDataPlane,
     decide_capture_input,
@@ -69,9 +69,9 @@ pytestmark = pytest.mark.nemo_gym
 def test_shared_client_same_evidence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, compact: bool
 ) -> None:
-    baseline_root = os.environ.get("NEMO_RL_TEST_CC_BASELINE_ROOT")
+    baseline_root = os.environ.get("NEMO_RL_TEST_BASELINE_ROOT")
     if not baseline_root:
-        pytest.skip("set NEMO_RL_TEST_CC_BASELINE_ROOT to the pre-migration checkout")
+        pytest.skip("set NEMO_RL_TEST_BASELINE_ROOT to the pre-migration checkout")
     baseline_path = Path(baseline_root) / "nemo_rl/environments/nemo_gym.py"
     assert baseline_path.is_file(), baseline_path
     plane = PublicationDataPlane()
@@ -227,7 +227,7 @@ def test_shared_client_same_evidence(
                     {
                         "response": ordinary,
                         "reward": float(owners.index(owner) + 1),
-                        "context_compaction_result": legacy_result,
+                        "multi_segment_rollouts_result": legacy_result,
                     },
                 )
             assert previous == processed

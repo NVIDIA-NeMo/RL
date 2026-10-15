@@ -25,11 +25,16 @@ from nemo_gym.token_id_capture.staging.records import (
     RolloutManifest,
 )
 
-from nemo_rl.environments.gym_selection import select_captured_calls
+from nemo_rl.environments.gym_selection import (
+    resolve_call_selection,
+    select_all_calls,
+    select_captured_calls,
+    select_main_chain,
+)
 from nemo_rl.environments.nemo_gym import _normalize_gym_validity
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from tests.unit.experience.test_agent_output_compatibility import captured  # noqa: F401
-from tests.unit.experience.test_cc_dispatch import _env
+from tests.unit.experience.test_segment_dispatch import _env
 from tests.unit.experience.test_common_output_comparison import message, record
 from tests.unit.experience.test_external_exporter_compatibility import (
     ForkInstanceConfig,
@@ -67,6 +72,33 @@ def test_accepted_earlier_call_after_rejected_attempt_needs_no_parent_hint(
     )
     assert result["logical_selection"].response_ids == (first["id"], third["id"])
     assert second["id"] not in result["logical_selection"].response_ids
+
+
+def test_all_selection_keeps_subagent_chains_despite_a_failed_call(
+    captured: Any,  # noqa: F811
+) -> None:  # noqa: F811
+    captured.queue.extend(
+        {"role": "assistant", "content": text, "reasoning": None}
+        for text in ("main", "subagent")
+    )
+    main = captured.harness.post("owner", [{"role": "user", "content": "task"}]).json()
+    sub = captured.harness.post("owner", [{"role": "user", "content": "side"}]).json()
+    manifest = captured.harness.manifest("owner").model_dump(mode="json")
+    manifest["failures"] = [{"model_call_id": "lost-call", "reason": "capture_lost"}]
+    result = {"response": main, "reward": 1.0}
+
+    env = _env(captured.harness)
+    env._control = AsyncMock(return_value=manifest)
+    masked = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "owner"}, result)
+    )
+    assert masked["logical_selection"].response_ids == ()
+
+    env.cfg = {"token_capture": {"call_selection": "all"}}
+    trained = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "owner"}, result)
+    )
+    assert trained["logical_selection"].response_ids == (main["id"], sub["id"])
 
 
 @pytest.mark.parametrize(
@@ -114,6 +146,81 @@ def call(index: int, items: list[dict], *, parent: int | None = None) -> CallRec
             "last_output_item": items[-1],
         }
     )
+
+
+def test_select_all_calls_puts_the_scored_chain_first_then_subagent_chains() -> None:
+    # The subagent conversation (3 -> 4) is captured between the main calls.
+    records = [
+        call(1, [message("M1")]),
+        call(3, [message("S1")]),
+        call(4, [message("S2")], parent=3),
+        call(2, [message("M2")], parent=1),
+    ]
+    selected = select_all_calls(records, {"response": {"id": "response-2"}})
+    assert [r.response_id for r in selected] == [
+        "response-1",
+        "response-2",
+        "response-3",
+        "response-4",
+    ]
+
+
+def test_select_all_calls_ends_chains_at_failures_and_keeps_one_branch() -> None:
+    failed = call(4, [message("S2")], parent=3).model_copy(
+        update={"response_status": "failed"}
+    )
+    records = [
+        call(1, [message("M1")]),
+        call(2, [message("M2")], parent=1),
+        call(3, [message("S1")]),
+        failed,
+        call(5, [message("T1")]),
+        call(6, [message("T2")], parent=5),
+        call(7, [message("T2 retry")], parent=5),
+        call(9, [message("orphan")], parent=8),
+    ]
+    selected = select_all_calls(records, {"terminal_response_id": "response-2"})
+    assert [r.response_id for r in selected] == [
+        "response-1",
+        "response-2",
+        "response-3",
+        "response-5",
+        "response-7",
+    ]
+
+
+def test_main_chain_selection_ignores_other_conversations() -> None:
+    records = [
+        call(1, [message("M1")]),
+        call(3, [message("S1")]),
+        call(2, [message("M2")], parent=1),
+        call(4, [message("S2")], parent=3),
+    ]
+    selected = select_main_chain(records, {"response": {"id": "response-2"}})
+    assert [r.response_id for r in selected] == ["response-1", "response-2"]
+
+
+def test_call_selection_resolves_built_ins_and_custom_functions() -> None:
+    assert resolve_call_selection("all") is select_all_calls
+    assert resolve_call_selection("main_chain") is select_main_chain
+    assert resolve_call_selection("accepted_history") is select_captured_calls
+    custom = resolve_call_selection(f"{__name__}:select_main_chain")
+    assert custom is select_main_chain
+    with pytest.raises(ValueError, match="call_selection must be one of"):
+        resolve_call_selection("everything")
+
+
+def test_select_all_calls_requires_a_trainable_terminal() -> None:
+    failed = call(2, [message("M2")], parent=1).model_copy(
+        update={"response_status": "failed"}
+    )
+    records = [call(1, [message("M1")]), failed]
+    with pytest.raises(ValueError, match="Scored response is absent"):
+        select_all_calls(records, {"response": {"id": "response-9"}})
+    with pytest.raises(ValueError, match="Scored response is absent"):
+        select_all_calls(records, {"response": {"id": "response-2"}})
+    with pytest.raises(ValueError, match="reused call or response"):
+        select_all_calls(records + records[:1], {"response": {"id": "response-1"}})
 
 
 @pytest.mark.parametrize(
@@ -196,7 +303,7 @@ def test_exact_ids_distinguish_equal_text_across_reset_and_ignore_old_contract()
     records = [call(1, [a]), call(2, [b]), call(3, [c])]
     result = {
         "response": {"id": "response-3", "output": [b, c]},
-        "context_compaction_result": {
+        "multi_segment_rollouts_result": {
             "logical_rollout_id": "wrong",
             "selected_actions": [],
         },

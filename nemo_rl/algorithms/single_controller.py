@@ -108,7 +108,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
     is_ppo_run,
-    validate_cc_objective,
+    validate_multi_segment_objective,
 )
 from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
     build_logical_owner_batch,
@@ -1079,9 +1079,11 @@ class SingleControllerActor:
             )
         if (
             expected_schema_version < 4
-            and self._master_config.token_capture.context_compaction
+            and self._master_config.token_capture.multi_segment_rollouts
         ):
-            raise ValueError("Obsolete CC snapshots are unsupported; start a fresh run")
+            raise ValueError(
+                "Obsolete pre-segment snapshots are unsupported; start a fresh run"
+            )
         expected_group_count = metadata.get("rollout_recovery_group_count")
         if (
             isinstance(expected_group_count, bool)
@@ -1135,10 +1137,10 @@ class SingleControllerActor:
                         if (
                             attempt.status is RolloutAttemptStatus.SEALED
                             and (attempt.logical_selection is not None)
-                            != self._master_config.token_capture.context_compaction
+                            != self._master_config.token_capture.multi_segment_rollouts
                         ):
                             raise ValueError(
-                                "recovery selection disagrees with context_compaction mode"
+                                "recovery selection disagrees with multi_segment_rollouts mode"
                             )
             self._batch_shortfall = parsed_state.batch_shortfall
             canonical_state = self._buffer.metadata_state_dict(
@@ -2730,7 +2732,9 @@ class SingleControllerActor:
         policy_training_start_step = (
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
         )
-        context_compaction = self._master_config.token_capture.context_compaction
+        multi_segment_rollouts = (
+            self._master_config.token_capture.multi_segment_rollouts
+        )
 
         while self._train_steps < self._algo_cfg.max_num_steps:
             version_during_step = self._trainer_version
@@ -2907,7 +2911,7 @@ class SingleControllerActor:
                         consumed_metas.append(train_meta)
                         consumed_training_claim_ids.extend(selected_training_claim_ids)
                         consumed_group_count += num_groups
-                        if context_compaction:
+                        if multi_segment_rollouts:
                             if (
                                 not has_logical_owners(train_meta)
                                 or len(train_meta.tags or []) != train_meta.size
@@ -2919,7 +2923,7 @@ class SingleControllerActor:
                                 )
                             ):
                                 raise ValueError(
-                                    "CC optimizer batch requires logical rows with padding flags, borrowed-input flags, and integer generation versions"
+                                    "Segment optimizer batch requires logical rows with padding flags, borrowed-input flags, and integer generation versions"
                                 )
                             assert train_meta.tags is not None
                             if any(
@@ -2933,7 +2937,7 @@ class SingleControllerActor:
                                 await asyncio.to_thread(
                                     ray.get,
                                     self._trainer.worker_group.run_all_workers_single_data(
-                                        "validate_cc_execution_padding"
+                                        "validate_execution_padding"
                                     ),
                                 )
 
@@ -3046,7 +3050,7 @@ class SingleControllerActor:
                             train_meta,
                             has_valid_training_tokens,
                         ) = await self._advantage_stage(train_meta)
-                    if context_compaction:
+                    if multi_segment_rollouts:
                         # The advantage stage has verified every owner/segment.
                         # Count those owners, not the physical rows or sampler tally.
                         assert train_meta.tags is not None
@@ -3062,7 +3066,7 @@ class SingleControllerActor:
                             or logical_owners.intersection(chunk_owners)
                         ):
                             raise ValueError(
-                                "CC sampler chunk must contain new, complete logical groups"
+                                "Segment sampler chunk must contain new, complete logical groups"
                             )
                         logical_owners.update(chunk_owners)
 
@@ -3240,13 +3244,15 @@ class SingleControllerActor:
                 # Only the streaming path has anything left open: a PPO step is one
                 # chunk, so each epoch already closed its own optimizer step above.
                 if not self._is_ppo:
-                    if context_compaction and (
-                        groups_dispatched != self._algo_cfg.num_prompts_per_step
+                    if multi_segment_rollouts and (
+                        groups_dispatched
+                        != self._target_groups_for_step(version_during_step)
                         or len(logical_owners)
-                        != self._master_config.policy["train_global_batch_size"]
+                        != groups_dispatched * self._algo_cfg.num_generations_per_prompt
                     ):
                         raise ValueError(
-                            "CC optimizer step requires the full logical sample count"
+                            "Segment optimizer step requires every logical sample "
+                            "of each trained group"
                         )
                     if not step_open:
                         raise RuntimeError(
@@ -5277,10 +5283,10 @@ class SingleControllerActor:
                 or self._algo_cfg.adv_estimator.name != "grpo"
                 or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
             ):
-                raise ValueError(
-                    "CC logical owners require the standard GRPO estimator"
-                )
-            validate_cc_objective(self._algo_cfg, self._master_config.loss_fn)
+                raise ValueError("Logical owners require the standard GRPO estimator")
+            validate_multi_segment_objective(
+                self._algo_cfg, self._master_config.loss_fn
+            )
         if self._advantage_estimator is None:
             return meta, True
         adv_cfg = self._advantage_cfg
@@ -5371,7 +5377,7 @@ class SingleControllerActor:
                 sample_mask=final_sample_mask,
                 expected_group_size=self._algo_cfg.num_generations_per_prompt,
             )
-            final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
+            final_sample_mask = owner_batch.fanout(owner_batch.loss_weight)
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
@@ -5420,7 +5426,9 @@ class SingleControllerActor:
                 owner_advantages.shape != (len(rows), 1)
                 or not torch.isfinite(owner_advantages).all()
             ):
-                raise ValueError("GRPO must return one finite advantage per CC owner")
+                raise ValueError(
+                    "GRPO must return one finite advantage per logical owner"
+                )
             advantages = (
                 owner_batch.fanout(owner_advantages[:, 0]).unsqueeze(-1).expand_as(mask)
             )

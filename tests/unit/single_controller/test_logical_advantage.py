@@ -368,7 +368,7 @@ def test_failed_owner_single_placeholder_is_excluded_from_baseline_and_loss():
         "prompt_length_disagreement",
         "padding_owner",
         "padding_mask",
-        "nonbinary_mask",
+        "negative_mask",
         "duplicate_row_id",
         "boolean_segment",
         "boolean_group_size",
@@ -412,8 +412,8 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
         meta.tags[-1]["logical_rollout_id"] = "a_g0"
     elif bad_case == "padding_mask":
         data["sample_mask"][-1] = 1
-    elif bad_case == "nonbinary_mask":
-        data["sample_mask"][0] = 0.5
+    elif bad_case == "negative_mask":
+        data["sample_mask"][0] = -0.5
     elif bad_case == "duplicate_row_id":
         meta.sample_ids[1] = meta.sample_ids[0]
     elif bad_case == "boolean_segment":
@@ -423,7 +423,9 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
     elif bad_case == "padding_only":
         meta, data = meta.subset([3]), data[[3]]
     ctrl = _controller(meta, data)
-    with pytest.raises(ValueError, match="CC"):
+    with pytest.raises(
+        ValueError, match="[Ss]egment|[Ee]xecution padding|[Ll]ogical owners"
+    ):
         asyncio.run(ctrl._advantage_stage(meta))
     assert not ctrl._dp_client.puts
 
@@ -432,24 +434,54 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
     "grpo,loss",
     [
         ({"adv_estimator": {"name": "gdpo"}}, {}),
-        ({"advantage_clip_low": -1}, {}),
-        ({"seq_logprob_error_threshold": 2}, {}),
         ({"use_dynamic_sampling": True}, {}),
         ({"reward_scaling": {"enabled": True}}, {}),
         ({"reward_shaping": {"enabled": True}}, {}),
-        ({"calculate_advantages_on_gpu": True}, {}),
-        ({"invalid_tool_call_advantage": -5.0}, {}),
-        ({"malformed_thinking_advantage": 0.0}, {}),
         ({}, {"token_level_loss": False}),
         ({}, {"sequence_level_importance_ratios": True}),
-        ({}, {"truncated_importance_sampling_type": "seq-mask-tis"}),
         ({}, {"use_kl_in_reward": True}),
         ({}, {"positive_example_nll_weight": 1}),
     ],
 )
-def test_unsupported_cc_estimator_or_objective_is_rejected(grpo, loss):
+def test_unsupported_segment_estimator_or_objective_is_rejected(grpo, loss):
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])])
     ctrl = _controller(meta, data, grpo=grpo, loss=loss)
-    with pytest.raises(ValueError, match="CC"):
+    with pytest.raises(
+        ValueError, match="[Ss]egment|[Ee]xecution padding|[Ll]ogical owners"
+    ):
         asyncio.run(ctrl._advantage_stage(meta))
     assert not ctrl._dp_client.puts
+
+
+def test_advantage_clip_applies_to_every_segment_of_an_owner():
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1), (3.0, 3)])])
+    ctrl = _controller(
+        meta, data, grpo={"advantage_clip_low": -0.5, "advantage_clip_high": 0.5}
+    )
+    asyncio.run(ctrl._advantage_stage(meta))
+    advantages = data["advantages"][:, 0]
+    torch.testing.assert_close(
+        advantages, torch.tensor([-0.5, -0.5, -1 / 3, 0.5, 0.5, 0.5])
+    )
+
+
+def test_logprob_mismatch_in_one_segment_masks_the_whole_owner():
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1), (3.0, 1)])])
+    data["prev_logprobs"] = torch.zeros(4, 3)
+    data["generation_logprobs"] = torch.zeros(4, 3)
+    data["generation_logprobs"][1] = -5.0
+    ctrl = _controller(meta, data, grpo={"seq_logprob_error_threshold": 2.0})
+    ctrl._policy_logprobs_required = True
+    asyncio.run(ctrl._advantage_stage(meta))
+    assert data["sample_mask"].tolist() == [0, 0, 1, 1]
+    assert data["advantages"][2:, 0].tolist() == [-1.0, 1.0]
+
+
+def test_dataset_loss_multiplier_weights_every_segment_without_changing_advantages():
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1), (3.0, 1)])])
+    reference = _batch([("a", [(0.0, 2), (1.0, 1), (3.0, 1)])])
+    asyncio.run(_controller(*reference)._advantage_stage(reference[0]))
+    data["sample_mask"][:] = 0.25
+    asyncio.run(_controller(meta, data)._advantage_stage(meta))
+    assert data["sample_mask"].tolist() == [0.25] * 4
+    torch.testing.assert_close(data["advantages"], reference[1]["advantages"])

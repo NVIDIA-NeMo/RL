@@ -33,7 +33,7 @@ _OWNER_TAGS = frozenset(
 
 
 def has_logical_owners(meta: KVBatchMeta) -> bool:
-    """Detect even partially tagged CC batches so they cannot take ordinary GRPO."""
+    """Detect even partially tagged Segment batches so they cannot take ordinary GRPO."""
     return any(_OWNER_TAGS.intersection(tag) for tag in meta.tags or [])
 
 
@@ -45,6 +45,8 @@ class LogicalOwnerBatch:
     group_ids: torch.Tensor
     row_owner: torch.Tensor
     valid_mask: torch.Tensor
+    # The owner's dataset loss weight, zero when any of its rows is invalid.
+    loss_weight: torch.Tensor
 
     def fanout(self, values: torch.Tensor) -> torch.Tensor:
         """Broadcast one scalar per owner, with zero for ownerless padding."""
@@ -65,14 +67,16 @@ def validate_logical_owner_metadata(
         or len(meta.tags) != meta.size
         or len(set(meta.sample_ids)) != meta.size
     ):
-        raise ValueError("CC owner metadata must be row-aligned with unique sample IDs")
+        raise ValueError(
+            "Segment owner metadata must be row-aligned with unique sample IDs"
+        )
 
     assert meta.tags is not None
     tags = meta.tags
     groups: dict[str, dict[int, list[int]]] = {}
     for row, tag in enumerate(tags):
         if not _OWNER_TAGS.issubset(tag):
-            raise ValueError("CC batches require complete owner tags on every row")
+            raise ValueError("Segment batches require complete owner tags on every row")
         group = tag["dispatch_group_id"]
         size = tag["logical_group_size"]
         if (
@@ -82,7 +86,9 @@ def validate_logical_owner_metadata(
             or size != expected_group_size
             or type(tag["is_execution_padding"]) is not bool
         ):
-            raise ValueError("CC dispatch group identity or cardinality is invalid")
+            raise ValueError(
+                "Segment dispatch group identity or cardinality is invalid"
+            )
         slots = groups.setdefault(group, {})
         if tag["is_execution_padding"]:
             if (
@@ -92,7 +98,7 @@ def validate_logical_owner_metadata(
                 or type(tag["segment_count"]) is not int
                 or tag["segment_count"] != 0
             ):
-                raise ValueError("CC execution padding must be ownerless")
+                raise ValueError("Execution padding must be ownerless")
             continue
         slot, segment, count = (
             tag["logical_slot"],
@@ -108,19 +114,23 @@ def validate_logical_owner_metadata(
             or tag["logical_rollout_id"] != f"{group}_g{slot}"
             or meta.sample_ids[row] != f"{group}_g{slot}_s{segment}"
         ):
-            raise ValueError("CC owner/segment identity is invalid")
+            raise ValueError("Segment owner/segment identity is invalid")
         slots.setdefault(slot, []).append(row)
 
     for slots in groups.values():
         if set(slots) != set(range(expected_group_size)):
-            raise ValueError("CC estimator requires every logical slot in each group")
+            raise ValueError(
+                "Segment estimator requires every logical slot in each group"
+            )
         for rows in slots.values():
             counts = {tags[row]["segment_count"] for row in rows}
             indices = {tags[row]["segment_index"] for row in rows}
             if counts != {len(rows)} or indices != set(range(len(rows))):
-                raise ValueError("CC estimator requires every segment exactly once")
+                raise ValueError(
+                    "Segment estimator requires every segment exactly once"
+                )
     if not groups:
-        raise ValueError("CC metadata requires logical owners")
+        raise ValueError("Segment metadata requires logical owners")
     return groups
 
 
@@ -144,15 +154,16 @@ def build_logical_owner_batch(
         or rewards.shape != (meta.size,)
         or sample_mask.shape != (meta.size,)
         or not torch.isfinite(rewards).all()
-        or not ((sample_mask == 0) | (sample_mask == 1)).all()
+        or not torch.isfinite(sample_mask).all()
+        or (sample_mask < 0).any()
     ):
         raise ValueError(
-            "CC advantage inputs must be finite, binary-masked, row-aligned"
+            "Segment advantage inputs must be finite, non-negative-masked, row-aligned"
         )
     groups = validate_logical_owner_metadata(
         meta, expected_group_size=expected_group_size
     )
-    representatives, validity, group_ids = [], [], []
+    representatives, loss_weights, group_ids = [], [], []
     row_owner = torch.full((meta.size,), -1, dtype=torch.long, device=rewards.device)
     for group_index, slots in enumerate(groups.values()):
         for rows in slots.values():
@@ -162,13 +173,16 @@ def build_logical_owner_batch(
                 or not torch.equal(prompt_ids[row], prompt_ids[first])
                 for row in rows[1:]
             ):
-                raise ValueError("CC owner rows disagree on reward or original prompt")
+                raise ValueError(
+                    "Segment owner rows disagree on reward or original prompt"
+                )
             row_owner[rows] = len(representatives)
             representatives.append(first)
             group_ids.append(group_index)
-            validity.append(sample_mask[rows].amin())
+            loss_weights.append(sample_mask[rows].amin())
     if (sample_mask[row_owner < 0] != 0).any():
-        raise ValueError("CC execution padding must be masked")
+        raise ValueError("Execution padding must be masked")
+    loss_weight = torch.stack(loss_weights)
     return LogicalOwnerBatch(
         representative_rows=torch.tensor(
             representatives, dtype=torch.long, device=rewards.device
@@ -177,5 +191,6 @@ def build_logical_owner_batch(
             :, None
         ],
         row_owner=row_owner,
-        valid_mask=torch.stack(validity),
+        valid_mask=loss_weight.gt(0).to(loss_weight.dtype),
+        loss_weight=loss_weight,
     )

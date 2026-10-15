@@ -78,7 +78,7 @@ class ReassemblyRequest:
 
     @property
     def capture_receipts(self) -> tuple[Optional[dict[str, Any]], ...]:
-        """Return cleanup receipts only after validating CC capture ownership."""
+        """Return cleanup receipts only after validating segment capture ownership."""
         if self.logical_selections is None:
             return self.receipts
         from nemo_gym.token_id_capture.staging.records import (
