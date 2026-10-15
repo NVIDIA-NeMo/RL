@@ -631,9 +631,7 @@ def test_value_worker_parallelism_equivalence(
         # Reference worker: feature OFF.
         ref_config = _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
         tokenizer = get_tokenizer(ref_config["tokenizer"])
-        ref = Value(
-            cluster=cluster, config=ref_config, tokenizer=tokenizer, seed=42
-        )
+        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer, seed=42)
         values_ref = ref.get_values(data)["values"].detach().cpu()
 
         # Save weights, then reload into a feature-ON worker (same weights).
@@ -710,9 +708,7 @@ def test_value_worker_context_parallel_equivalence(tiny_qwen2_model_path, tmp_pa
         )
         _apply_config_updates(ref_config, {"sequence_packing": True})
         tokenizer = get_tokenizer(ref_config["tokenizer"])
-        ref = Value(
-            cluster=cluster, config=ref_config, tokenizer=tokenizer, seed=42
-        )
+        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer, seed=42)
         values_ref = ref.get_values(data)["values"].detach().cpu()
 
         # Save weights, then reload into the CP=2 worker (same weights).
