@@ -240,7 +240,7 @@ def test_csd_automodel_cp_layout_rejects_non_divisible_student_sequence():
         pytest.raises(
             ValueError,
             match=(
-                "X-token student sequence length must be divisible by the student "
+                "CSD student sequence length must be divisible by the student "
                 "context parallel size"
             ),
         ),
@@ -1540,9 +1540,9 @@ class XtokenShardTestActor:
             )
             # Teacher is full-vocab (only CP-sharded on the sequence).
             teacher_shard = teacher_full[:, t_lo : t_lo + tblk, :].detach().clone()
-            import nemo_rl.algorithms.loss.loss_functions as loss_functions_module
+            import nemo_rl.algorithms.loss.csd as csd_loss_module
 
-            original_cp_gather = loss_functions_module.allgather_cp_contiguous_tensor
+            original_cp_gather = csd_loss_module.allgather_cp_contiguous_tensor
 
             def reject_dense_teacher_sequence_gather(tensor, group, seq_dim=1):
                 if (
@@ -1558,7 +1558,7 @@ class XtokenShardTestActor:
                     )
                 return original_cp_gather(tensor, group, seq_dim)
 
-            loss_functions_module.allgather_cp_contiguous_tensor = (
+            csd_loss_module.allgather_cp_contiguous_tensor = (
                 reject_dense_teacher_sequence_gather
             )
             try:
@@ -1576,9 +1576,7 @@ class XtokenShardTestActor:
                     global_valid_chunks=None,  # => in-loss WORLD-reduce over ws
                 )
             finally:
-                loss_functions_module.allgather_cp_contiguous_tensor = (
-                    original_cp_gather
-                )
+                csd_loss_module.allgather_cp_contiguous_tensor = original_cp_gather
             sh_loss.backward()
             sh_grad = student_shard.grad.detach().clone()  # [B, S/cp, v_s/tp]
 
