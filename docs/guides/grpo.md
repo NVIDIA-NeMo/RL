@@ -651,6 +651,7 @@ When top-p or top-k filtering is enabled, the following conventions apply:
 - **`curr_logprobs` and `prev_logprobs`** are computed *with* filtering applied, for compatibility with the actor loss.
 - **`reference_policy_logprobs`** is computed *without* filtering (see the `use_reference_model` in the policy worker).
 - **KL divergence** uses `curr_logprobs_unfiltered`(`curr_logprobs` *without* filtering) so that it is consistent with the reference policy logprobs.
+- **`-inf` positions** caused by the training-side and inference-side disagreeing on the top-k/top-p filtered set are dropped from `token_mask`. They contribute to neither the actor loss nor the KL penalty, as the `token_mask` is applied to `curr_logprobs_unfiltered`.
 
 Under tensor parallelism (TP), enabling top-p or top-k adds communication overhead. The vocabulary is sharded across GPUs (vocab-parallel), while top-p and top-k require full-vocabulary probabilities. A naive all-gather of logits would require large additional memory. The implementation therefore switches to a batch–sequence-parallel layout via all-to-all communication, applies filtering over the full vocabulary, then switches back, avoiding materialization of the full vocabulary on any single rank.
 

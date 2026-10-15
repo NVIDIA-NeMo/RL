@@ -906,7 +906,7 @@ def setup(
             )
             # FP8 KV cache compatibility checks
             assert not (policy_config.get("automodel_cfg") or {}).get("enabled"), (
-                "DTensor backend is not supported with kv cache fp8 enabled."
+                "Automodel backend is not supported with kv cache fp8 enabled."
             )
             assert not should_use_async_rollouts(generation_config), (
                 "Async rollouts is not supported with kv cache fp8 enabled."
@@ -1659,12 +1659,16 @@ def ppo_train(
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
+                            "token_mask": train_data["token_mask"],
+                            "sample_mask": train_data["sample_mask"],
                             **extra_multimodal_data,
                         }
                     )
-                    train_data["prev_logprobs"] = policy.get_logprobs(
-                        logprob_data, timer=timer
-                    )["logprobs"]
+                    prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
+                    train_data["prev_logprobs"] = prev_lp_result["logprobs"]
+                    # Propagate the top-k/top-p neginf mask so the loss skips these positions.
+                    if "token_mask" in prev_lp_result:
+                        train_data["token_mask"] = prev_lp_result["token_mask"]
 
                     if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
@@ -2680,12 +2684,16 @@ def async_ppo_train(
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
+                            "token_mask": train_data["token_mask"],
+                            "sample_mask": train_data["sample_mask"],
                             **extra_multimodal_data,
                         }
                     )
-                    train_data["prev_logprobs"] = policy.get_logprobs(
-                        logprob_data, timer=timer
-                    )["logprobs"]
+                    prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
+                    train_data["prev_logprobs"] = prev_lp_result["logprobs"]
+                    # Propagate the top-k/top-p neginf mask so the loss skips these positions.
+                    if "token_mask" in prev_lp_result:
+                        train_data["token_mask"] = prev_lp_result["token_mask"]
                     if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
                             policy.get_reference_policy_logprobs(
