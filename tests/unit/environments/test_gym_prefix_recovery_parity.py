@@ -660,3 +660,80 @@ def test_cut_coverage_counts_distinct_prompt_groups() -> None:
         _SNAPSHOT_HELPER._require_cut_coverage(candidates, min_cuts=1, min_cut_groups=3)
     with pytest.raises(AssertionError, match="need 4 in 1"):
         _SNAPSHOT_HELPER._require_cut_coverage(candidates, min_cuts=4, min_cut_groups=1)
+
+
+def _restored_call_fixture(
+    *, trained_tokens: list[int]
+) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
+    # A three-token prompt, then one restored call: prefix [10, 11], tail [12, 13].
+    # The trainer masked token 12 (a top-p mismatch), splitting the call's mask.
+    selection = {
+        "cuts": [
+            {
+                "model_call_id": "call-a",
+                "group_id": "g",
+                "generation_index": 0,
+                "prefix_token_count": 2,
+            }
+        ]
+    }
+    prefix_hash = _HELPER._token_ids_sha256([10, 11])
+    log = (
+        "generation prefix restored: rollout_id=r-a1 model_call_id=new "
+        f"source_model_call_id=call-a prefix_tokens=2 prefix_digest=d "
+        f"weight_version_span=[0,0] prefix_ids_sha256={prefix_hash}\n"
+        "generation prefix completed: rollout_id=r-a1 model_call_id=new "
+        "source_model_call_id=call-a prefix_tokens=2 tail_tokens=2 "
+        "total_generation_tokens=4\n"
+    )
+    row = {
+        **_row(token_ids=trained_tokens),
+        "group_id": "g",
+        "token_loss_mask": [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0][: len(trained_tokens)],
+    }
+    return selection, log, [{"train_step": 1, "rows": [row]}]
+
+
+def test_restored_prefix_completion_survives_masked_tokens_inside_the_call() -> None:
+    selection, log, records = _restored_call_fixture(
+        trained_tokens=[1, 2, 3, 10, 11, 12, 13]
+    )
+
+    report = _SNAPSHOT_HELPER.assert_restored_prefixes_completed(
+        selection, log, records
+    )
+
+    assert report == [{"model_call_id": "call-a", "prefix_tokens": 2, "total": 4}]
+
+
+@pytest.mark.parametrize(
+    ("trained_tokens", "log_edit", "match"),
+    [
+        ([1, 2, 3, 10, 99, 12, 13], None, "does not begin its call"),
+        ([1, 10, 11, 12, 13], None, "shorter than its generation"),
+        ([1, 2, 3, 10, 11, 12, 13], ("tail_tokens=2", "tail_tokens=3"), "accounting"),
+        ([1, 2, 3, 10, 11, 12, 13], ("prefix_ids_sha256", "other_sha256"), "no prefix"),
+    ],
+    ids=["substituted_prefix", "dropped_tokens", "bad_accounting", "unlogged_restore"],
+)
+def test_restored_prefix_completion_rejects_a_broken_restore(
+    trained_tokens: list[int], log_edit: tuple[str, str] | None, match: str
+) -> None:
+    selection, log, records = _restored_call_fixture(trained_tokens=trained_tokens)
+    if log_edit is not None:
+        log = log.replace(*log_edit)
+
+    with pytest.raises(AssertionError, match=match):
+        _SNAPSHOT_HELPER.assert_restored_prefixes_completed(selection, log, records)
+
+
+def test_restored_prefix_completion_requires_exactly_one_completion() -> None:
+    selection, log, records = _restored_call_fixture(
+        trained_tokens=[1, 2, 3, 10, 11, 12, 13]
+    )
+    completed = log.splitlines()[1]
+
+    with pytest.raises(AssertionError, match="did not complete exactly once"):
+        _SNAPSHOT_HELPER.assert_restored_prefixes_completed(
+            selection, f"{log}{completed}\n", records
+        )
