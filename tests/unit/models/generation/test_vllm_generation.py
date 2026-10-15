@@ -1216,15 +1216,21 @@ async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch):
     request = _fake_chat_request()
     token_capture = _track_request_capture(worker, request)
     task = asyncio.create_task(chat_handler(request, MagicMock()))
-    await started.wait()
-    # with_cancellation cancels the handler task on http.disconnect.
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        # with_cancellation cancels the handler task on http.disconnect.
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-    assert cancelled.is_set()
-    token_capture.fail_call.assert_called_once_with("call", reason="client_disconnect")
-    assert id(request) not in worker._capture_calls
+        assert cancelled.is_set()
+        token_capture.fail_call.assert_called_once_with(
+            "call", reason="client_disconnect"
+        )
+        assert id(request) not in worker._capture_calls
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def test_chat_disconnect_releases_capture_queued_for_finalization(
