@@ -310,11 +310,13 @@ export NRL_FORCE_REBUILD_VENVS=false
 # Harbor/Podman scratch for this job's episodes, on the node running the Gym servers.
 export AGENTIC_VBENCH_RUNTIME_ROOT=/tmp/avb-runtime-\${SLURM_JOB_ID:-local}-\$\$
 mkdir -p "\${AGENTIC_VBENCH_RUNTIME_ROOT}"
-"\${uv_bin}" run --no-sync python -c "from transformers import AutoConfig, AutoProcessor, AutoTokenizer; p='${model_path}'; AutoConfig.from_pretrained(p, trust_remote_code=True); AutoProcessor.from_pretrained(p, trust_remote_code=True, use_fast=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print('Prewarmed HF dynamic modules cache')"
+# Import nemo_rl first in every fresh process so its Transformers dynamic-module
+# symlink-cache compatibility patch is active before trust_remote_code executes.
+"\${uv_bin}" run --no-sync python -c "import nemo_rl; from transformers import AutoConfig, AutoProcessor, AutoTokenizer; p='${model_path}'; AutoConfig.from_pretrained(p, trust_remote_code=True); AutoProcessor.from_pretrained(p, trust_remote_code=True, use_fast=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print('Prewarmed HF dynamic modules cache')"
 # Populate the cache with the exact Transformers environment used by vLLM.
 # A second fresh process verifies imports before concurrent actor model loads.
 for prewarm_pass in populate verify; do
-  /opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python -c "from transformers import AutoConfig, AutoProcessor, AutoTokenizer; p='${model_path}'; c=AutoConfig.from_pretrained(p, trust_remote_code=True); AutoProcessor.from_pretrained(p, trust_remote_code=True, use_fast=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print('vLLM prewarm: \${prewarm_pass}', type(c).__module__, type(c).__name__)"
+  /opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python -c "import nemo_rl; from transformers import AutoConfig, AutoProcessor, AutoTokenizer; p='${model_path}'; c=AutoConfig.from_pretrained(p, trust_remote_code=True); AutoProcessor.from_pretrained(p, trust_remote_code=True, use_fast=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print('vLLM prewarm: \${prewarm_pass}', type(c).__module__, type(c).__name__)"
 done
 # SKIP_REPLAY_RESTORE=1 (default): resume weights + dataloader cursor only. The
 # native TQ snapshot restore logs "dtype mismatch: existing=int64, incoming=
