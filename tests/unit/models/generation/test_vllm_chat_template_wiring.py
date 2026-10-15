@@ -192,7 +192,8 @@ def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=()):
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
         served_model_name="served-model", model="model-path"
     )
-    worker._capture_calls = {id(request): None for request in capture_requests}
+    if capture_requests:
+        worker._capture_calls = {id(request): None for request in capture_requests}
     worker.routed_experts_dtype = torch.int16
 
     worker._setup_vllm_openai_api_server(_FakeApp())
