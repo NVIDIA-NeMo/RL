@@ -117,12 +117,11 @@ def _is_full_draft_stream(draft_keys: "set[str] | list[str]") -> bool:
 
     The Automodel co-training path streams the drafter's entire state_dict
     (always including per-layer keys like ``layers.0.*``, and normally
-    ``embed_tokens`` too), regardless of method (dspark/dflash/eagle3). A
-    megatron co-training exporter may instead stream a PARTIAL drafter --
-    the megatron eagle3 exporter intentionally omits ``embed_tokens`` and
-    aliases its single collapsed layer as ``midlayer.*`` instead of
-    ``layers.0.*``, relying on drafter module sharing at serve time -- and
-    future megatron block drafters (dspark/dflash) may do the same.
+    ``embed_tokens`` too), regardless of method (dspark/dflash/eagle3). The
+    megatron eagle3 exporter instead streams a PARTIAL drafter -- it
+    intentionally omits ``embed_tokens`` and aliases its single collapsed
+    layer as ``midlayer.*`` instead of ``layers.0.*``, relying on drafter
+    module sharing at serve time.
 
     Neither signal alone is reliable, so the stream is treated as FULL
     unless it carries neither: a one-key batch slice carrying only
