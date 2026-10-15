@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import hashlib
+import inspect
 import os
+import sys
 from contextlib import contextmanager
 from functools import wraps
 from importlib.util import find_spec
@@ -97,12 +99,8 @@ _ROUTED_EXPERTS_CAPTURER_SOURCE = (
 )
 # This blob is shared by the live image's b31cc131 build and uv.lock's
 # 6f11a9c5 source revision, despite other differences between those commits.
-_ROUTED_EXPERTS_CAPTURER_V0251_SHA256 = (
-    "e2e02d6322fd45edc143bdf2553a0fe6e2a010e1da3fbcea0df5887485a211c1"  # pragma: allowlist secret
-)
-_ROUTED_EXPERTS_CAPTURER_COMPACT_SHA256 = (
-    "7aada566f750ae6c46d214b03f3b012757ea07f81ac3f0c2d6ce15956a4ad25b"  # pragma: allowlist secret
-)
+_ROUTED_EXPERTS_CAPTURER_V0251_SHA256 = "e2e02d6322fd45edc143bdf2553a0fe6e2a010e1da3fbcea0df5887485a211c1"  # pragma: allowlist secret
+_ROUTED_EXPERTS_CAPTURER_COMPACT_SHA256 = "7aada566f750ae6c46d214b03f3b012757ea07f81ac3f0c2d6ce15956a4ad25b"  # pragma: allowlist secret
 
 
 def _compact_routed_experts_capturer_source(content: str) -> str:
@@ -1384,6 +1382,80 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_radio_layerscale_loader(patch_logger)
 
 
+def _patch_vllm_dsv4_topk_padding(logger: Any) -> None:
+    """Pass the optional padding mask to the DSV4 MoE kernel.
+
+    Some builds have the ten-argument kernel but the nine-argument Python
+    wrapper. Patch the installed source before child processes import it;
+    existing callers pass None, preserving routing for all input rows.
+    This opt-in patch is intended for single-node external judge replicas.
+    """
+    old_snippet = """def topk_hash_softplus_sqrt(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    token_expert_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+    routed_scaling_factor: float = 1.0,
+    e_score_correction_bias: torch.Tensor | None = None,
+    input_tokens: torch.Tensor | None = None,
+    hash_indices_table: torch.Tensor | None = None,
+) -> None:
+    torch.ops._moe_C.topk_softplus_sqrt(
+        topk_weights,
+        topk_indices,
+        token_expert_indices,
+        gating_output,
+        renormalize,
+        routed_scaling_factor,
+        e_score_correction_bias,
+        input_tokens,
+        hash_indices_table,
+    )
+"""
+    new_snippet = old_snippet.replace(
+        "    hash_indices_table: torch.Tensor | None = None,\n",
+        "    hash_indices_table: torch.Tensor | None = None,\n"
+        "    is_padding: torch.Tensor | None = None,\n",
+    ).replace(
+        "        hash_indices_table,\n",
+        "        hash_indices_table,\n        is_padding,\n",
+    )
+    file_to_patch = _get_vllm_file("_custom_ops.py")
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if content.count(new_snippet) == 1 and old_snippet not in content:
+            logger.info("DSV4 topk padding wrapper already present.")
+        elif content.count(old_snippet) == 1 and new_snippet not in content:
+            if "vllm._custom_ops" in sys.modules:
+                raise RuntimeError(
+                    "Apply the DSV4 topk padding patch before importing vllm._custom_ops."
+                )
+            write_back(content.replace(old_snippet, new_snippet, 1))
+            logger.info("Patched DSV4 topk wrapper to pass is_padding=None by default.")
+        else:
+            raise RuntimeError(
+                f"Refusing to patch unknown DSV4 topk wrapper at {file_to_patch}."
+            )
+
+    # Import only after the source edit. Verify the actual loaded wrapper and
+    # compiled operator before spending time loading the judge's weights.
+    import torch
+    import vllm._custom_ops as ops
+
+    signature = inspect.signature(ops.topk_hash_softplus_sqrt)
+    schema = torch.ops._moe_C.topk_softplus_sqrt.default._schema
+    if (
+        "is_padding" not in signature.parameters
+        or len(schema.arguments) != 10
+        or schema.arguments[-1].name != "is_padding"
+        or str(schema.arguments[-1].type) != "Optional[Tensor]"
+    ):
+        raise RuntimeError(
+            f"Unsupported DSV4 wrapper/kernel pair: {signature}; {schema}"
+        )
+    logger.info("Verified DSV4 topk padding kernel schema: %s", schema)
+
+
 def _apply_external_vllm_patches() -> None:
     """Apply only compatibility patches required by external vLLM servers.
 
@@ -1397,6 +1469,8 @@ def _apply_external_vllm_patches() -> None:
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
+    if os.environ.get("NRL_DSV4_TOPK_PADDING_COMPAT", "0") == "1":
+        _patch_vllm_dsv4_topk_padding(patch_logger)
 
 
 def _apply_vllm_patches(
