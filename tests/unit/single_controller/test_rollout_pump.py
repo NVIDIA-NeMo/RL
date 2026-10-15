@@ -1229,6 +1229,117 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
     asyncio.run(_main())
 
 
+@pytest.mark.parametrize("replacement_available", [False, True])
+def test_actor_path_filters_zero_variance_groups_and_seeks_a_replacement(
+    replacement_available: bool,
+) -> None:
+    class _FilteringRolloutManager:
+        def __init__(self) -> None:
+            self.generated = 0
+            self.dropped_prompts = 0
+            self.stats = SimpleNamespace(committed=0, zero_variance_groups=0)
+            self.filter_zero_variance_groups = True
+
+        def record_group_rewards(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        def record_finalizer_dropped_prompt(self) -> None:
+            self.dropped_prompts += 1
+
+        async def generate_for_finalization(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+        ) -> Any:
+            del prompt, target_step, inflight_registry
+            self.generated += 1
+            return SimpleNamespace(group_id=f"g{self.generated}")
+
+    async def _main() -> None:
+        manager = _FilteringRolloutManager()
+        discarded: list[str] = []
+        credited_short: list[int | None] = []
+        finalized_zero_variance = [True, False]
+
+        async def _finalize(request: Any, *, target_step: int | None = None) -> Any:
+            del target_step
+            return SimpleNamespace(
+                valid_row_count=1,
+                total_row_count=1,
+                zero_variance=finalized_zero_variance[int(request.group_id[1:]) - 1],
+                reward_observations=[],
+            )
+
+        async def _discard(request: Any) -> None:
+            discarded.append(request.group_id)
+
+        replacements_offered = [{"role": "user", "content": "spare"}]
+
+        def _take_replacement(target_step: int | None, used: int) -> Any:
+            del target_step, used
+            if replacement_available and replacements_offered:
+                return BatchedDataDict({"message_log": [replacements_offered.pop()]})
+            return None
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1,
+            diagnostics=False,
+            rollout_failure=_failure_cfg(),
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(min_valid_fraction_per_group=None),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        ctrl._rollout_manager = manager
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = _finalize
+        ctrl._discard_committed_group = _discard
+        ctrl._take_replacement = _take_replacement
+        ctrl._credit_shortfall = credited_short.append
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict({"message_log": [[{"role": "user", "content": "first"}]]})
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        await asyncio.wait_for(ctrl._rollout_pump(), timeout=1.0)
+
+        # The all-equal group is always discarded and counted as filtered.
+        assert discarded == ["g1"]
+        assert manager.stats.zero_variance_groups == 1
+        # A filtered group is a policy drop, not a failure: it must not spend the
+        # failure budgets that record_finalizer_dropped_prompt feeds.
+        assert manager.dropped_prompts == 0
+        if replacement_available:
+            # The substitute is generated afresh and its group is the one committed.
+            assert manager.generated == 2
+            assert manager.stats.committed == 1
+            assert credited_short == []
+            assert ctrl._buffer_capacity._value == 0
+        else:
+            # No substitute left: the step closes short and the permit comes back.
+            assert manager.generated == 1
+            assert manager.stats.committed == 0
+            assert len(credited_short) == 1
+            assert ctrl._buffer_capacity._value == 1
+
+    asyncio.run(_main())
+
+
 @pytest.mark.parametrize("committed", [False, True])
 def test_actor_finalization_discards_recovery_ledger_ownership(
     committed: bool,
