@@ -638,7 +638,7 @@ class SingleControllerActor:
         # The saved dispatch index counts groups dispatched ahead of training, which
         # only a data-plane snapshot can give back. Without one (e.g. msc://), those
         # groups are gone, so counting them as dispatched would stall the resume.
-        buffered_groups_not_restored = bool(
+        buffered_groups_not_restored = (
             self._sampler.supports_buffer_checkpoint
             and actor_args.last_checkpoint_path is not None
             and data_plane_checkpoint_metadata is None

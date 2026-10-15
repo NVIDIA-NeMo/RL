@@ -141,11 +141,11 @@ from nemo_rl.models.megatron.router_replay import (
 from nemo_rl.models.policy import OnPolicyDistillationFullTransport, PolicyConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
-from nemo_rl.utils.checkpoint_storage import is_msc_path
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     validate_warm_start_checkpoint,
 )
+from nemo_rl.utils.checkpoint_storage import is_msc_path
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
@@ -1178,12 +1178,11 @@ def setup_single_controller(
                 )
             raise ValueError(error_message)
         if not sampler_supports_replay_recovery or checkpoint_dir_is_msc:
+            reason = " with an msc:// checkpoint_dir" if checkpoint_dir_is_msc else ""
             warnings.warn(
                 f"Sampler {master_config.async_rl.sampler.name!r} cannot recover "
-                "completed buffered rollouts"
-                + (" with an msc:// checkpoint_dir" if checkpoint_dir_is_msc else "")
-                + ". On resume, the dataloader cursor "
-                "is restored while buffered prompt groups are discarded.",
+                f"completed buffered rollouts{reason}. On resume, the dataloader "
+                "cursor is restored while buffered prompt groups are discarded.",
                 UserWarning,
                 stacklevel=2,
             )
