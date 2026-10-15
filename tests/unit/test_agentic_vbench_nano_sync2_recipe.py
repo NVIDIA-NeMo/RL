@@ -157,7 +157,7 @@ def test_nano_sync2_launcher_reuses_exact_subagent_prompt_and_r3_wrapper() -> No
     assert "NUM_PROMPTS=4" in text
     assert "NUM_GENERATIONS=4" in text
     assert "MAX_STEPS=1000000" in text
-    assert "AGENTIC_VBENCH_TASKS=assembly" in text
+    assert "AGENTIC_VBENCH_TASKS=${AGENTIC_VBENCH_TASKS:-assembly}" in text
     assert "assembly_first4_x4.jsonl" in text
     assert "backend-subagent-sync8-20261014-v20-long" in text
     assert "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16" in text
