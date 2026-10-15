@@ -503,10 +503,12 @@ class MegatronConfig(TypedDict):
     # Omitted: use the Megatron Bridge default.
     use_gloo_process_groups: NotRequired[bool]
     # Collective timeout (minutes) for the default process group and the
-    # Megatron model-parallel groups. Raise it when one rank can stall for
+    # Megatron model-parallel and replica groups. Raise it when one rank can stall for
     # longer than the default, e.g. a dist-checkpoint shard write on a slow
     # shared filesystem holds up the save-finalize / load collectives.
     # Omitted or None: the torch.distributed / Megatron Bridge default (10 min).
+    # Set it in every megatron_cfg that runs Megatron workers (in PPO, both
+    # policy and value).
     distributed_timeout_minutes: NotRequired[float | None]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).

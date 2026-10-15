@@ -508,14 +508,12 @@ def configure_refit_environment(config) -> None:
         os.environ["NCCL_CUMEM_ENABLE"] = "0" if backend == "sglang" else "1"
 
 
-def _distributed_timeout_minutes(config) -> Optional[float]:
+def _distributed_timeout_minutes(config: PolicyConfig | ValueConfig) -> Optional[float]:
     """Return ``megatron_cfg.distributed_timeout_minutes``, or None when unset."""
-    timeout_minutes = (config.get("megatron_cfg") or {}).get(
-        "distributed_timeout_minutes"
-    )
+    timeout_minutes = config["megatron_cfg"].get("distributed_timeout_minutes")
     if timeout_minutes is not None and timeout_minutes <= 0:
         raise ValueError(
-            "policy.megatron_cfg.distributed_timeout_minutes must be positive, "
+            "megatron_cfg.distributed_timeout_minutes must be positive, "
             f"got {timeout_minutes}"
         )
     return timeout_minutes

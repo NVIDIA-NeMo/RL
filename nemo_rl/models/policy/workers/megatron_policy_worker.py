@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import datetime
 import gc
 import logging
 import os
@@ -104,6 +105,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.megatron.setup import (
+    _distributed_timeout_minutes,
     build_inference_model,
     enable_batch_invariant_mode,
     finalize_megatron_setup,
@@ -537,10 +539,17 @@ class MegatronPolicyWorkerImpl(
         # ranks list, but new_group itself must be called collectively
         # across the full world. Sort by dp_rank to keep call order
         # consistent across processes.
+        timeout_minutes = _distributed_timeout_minutes(self.cfg)
         groups: dict[int, Any] = {}
         for dp in sorted(set(all_dp_ranks)):
             ranks = [r for r, d in enumerate(all_dp_ranks) if d == dp]
-            grp = torch.distributed.new_group(ranks=ranks, backend="nccl")
+            grp = torch.distributed.new_group(
+                ranks=ranks,
+                backend="nccl",
+                timeout=None
+                if timeout_minutes is None
+                else datetime.timedelta(minutes=timeout_minutes),
+            )
             groups[dp] = grp
         self._replica_group_cache = groups[my_dp_rank]
         return self._replica_group_cache
