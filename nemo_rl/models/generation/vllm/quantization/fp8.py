@@ -1458,7 +1458,7 @@ def _shuffle_mxfp8_moe_per_expert(
     is_gated: bool,
     epilogue_tile_m: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-expert reference shuffle, kept for NRL_MXFP8_SHUFFLE_VERIFY."""
+    """Per-expert reference shuffle for batched-shuffle parity tests."""
     from flashinfer import (
         reorder_rows_for_gated_act_gemm,
         shuffle_matrix_a,

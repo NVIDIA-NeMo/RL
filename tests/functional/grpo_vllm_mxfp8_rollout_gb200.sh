@@ -14,7 +14,6 @@ LOG_DIR=$EXP_DIR/logs
 JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
-export NRL_MXFP8_SHUFFLE_VERIFY=1
 
 rm -rf "$EXP_DIR" "$LOG_DIR"
 mkdir -p "$EXP_DIR" "$LOG_DIR"
