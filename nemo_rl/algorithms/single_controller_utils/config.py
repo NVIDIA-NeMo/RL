@@ -689,19 +689,21 @@ class TaskSourceRecoveryGranularity:
 
 
 _RECOVERY_TARGET_RANK = {
-    RecoveryTargetLevel.TURN: 0,
-    RecoveryTargetLevel.SIBLING: 1,
-    RecoveryTargetLevel.PROMPT_GROUP: 2,
+    RecoveryTargetLevel.PREFIX: 0,
+    RecoveryTargetLevel.TURN: 1,
+    RecoveryTargetLevel.SIBLING: 2,
+    RecoveryTargetLevel.PROMPT_GROUP: 3,
 }
 
 
 class RolloutRecoveryConfig(BaseModel, extra="allow"):
     """Retry and restore policy for unfinished token-capture prompt groups.
 
-    ``turn`` requests Gym participant recovery, ``sibling`` preserves completed
-    generations and restarts unfinished siblings, and ``prompt_group`` restarts
-    every sibling in an unfinished group. Overrides may only make a particular
-    task source or agent coarser than the global target.
+    ``prefix`` restores Gym participant state and decoded tokens from an active
+    model call, ``turn`` restarts an active call from its preceding durable turn,
+    ``sibling`` preserves completed generations and restarts unfinished siblings,
+    and ``prompt_group`` restarts every sibling in an unfinished group. Overrides
+    may only make a particular task source or agent coarser than the global target.
     """
 
     target_level: RecoveryTargetLevel = RecoveryTargetLevel.SIBLING
@@ -726,6 +728,8 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
             "task_granularity_overrides",
             "task_source_granularity_overrides",
             "agent_granularity_overrides",
+            "preserve_generation_prefixes",
+            "generation_chunk_flush_tokens",
         }.intersection(self.model_extra or {})
         if removed:
             raise ValueError(
@@ -750,19 +754,25 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
                     f"{mapping_name} may only force a coarser recovery level than "
                     f"target_level={self.target_level.value!r}; invalid={finer!r}"
                 )
-            if self.target_level is RecoveryTargetLevel.TURN and overrides:
+            if self.target_level.requires_gym_checkpoint and overrides:
                 # A checkpointing Gym deployment exports every live episode, so
                 # a coarser route on it would fall outside the commit scope.
                 raise ValueError(
-                    f"{mapping_name} is not supported with target_level='turn' "
-                    f"yet; got {sorted(overrides)!r}"
+                    f"{mapping_name} is not supported with "
+                    f"target_level={self.target_level.value!r} yet; "
+                    f"got {sorted(overrides)!r}"
                 )
         return self
 
     @property
     def turn_checkpointing_enabled(self) -> bool:
         """Whether Gym participant state is required for the requested target."""
-        return self.target_level is RecoveryTargetLevel.TURN
+        return self.target_level.requires_gym_checkpoint
+
+    @property
+    def generation_prefix_cuts_enabled(self) -> bool:
+        """Whether active model calls participate in Gym's checkpoint cut."""
+        return self.target_level.preserves_generation_prefix
 
     def resolve_for_prompt(
         self, prompt: Mapping[str, Any]
