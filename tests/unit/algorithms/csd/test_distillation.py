@@ -61,6 +61,9 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_non_student_seq_keys,
     xtoken_off_policy_distillation_train,
 )
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
+    CrossTokenizerCollatorConfig,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.logger import LoggerConfig
@@ -604,6 +607,90 @@ def test_setup_injects_vocab_sizes_into_loss_config():
     ] == [False]
     # Original master_config not mutated by the injection.
     assert cfg.loss_fn == original_loss_cfg
+
+
+_COLLATOR_OPTION_NAMES = (
+    "require_routed_experts",
+    "reject_overlength_text",
+    "add_special_tokens_in_text",
+    "ce_covers_assistant_turn",
+)
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "collator", "expected_options"),
+    [
+        pytest.param(
+            "csd",
+            {"mode": "text"},
+            {
+                "require_routed_experts": False,
+                "reject_overlength_text": True,
+                "add_special_tokens_in_text": True,
+            },
+            id="csd-text",
+        ),
+        pytest.param(
+            "csd",
+            {"mode": "chat"},
+            {
+                "require_routed_experts": False,
+                "reject_overlength_text": True,
+                "ce_covers_assistant_turn": True,
+            },
+            id="csd-chat",
+        ),
+        pytest.param(
+            "csd",
+            {
+                "mode": "chat",
+                "include_thinking_in_loss": True,
+                "native_thinking_alignment": True,
+            },
+            {"require_routed_experts": False, "reject_overlength_text": True},
+            id="csd-native-thinking-chat",
+        ),
+        pytest.param("xtoken", {"mode": "chat"}, {}, id="xtoken-chat"),
+    ],
+)
+def test_setup_passes_per_algorithm_collator_options(
+    algorithm, collator, expected_options
+):
+    cfg = _make_master_config()
+    cfg.collator = CrossTokenizerCollatorConfig(**collator)
+    if algorithm == "xtoken":
+        cfg.algorithm = "xtoken"
+        cfg.teachers[0].aligner.projection_matrix_path = "/tmp/projection.pt"
+
+    with (
+        patch.object(csd_mod, "CrossTokenizerCollator") as shared_collator_cls,
+        patch.object(csd_mod, "CrossTokenizerDistillationLossFn"),
+    ):
+        _, mocks = _patched_setup_call(cfg)
+
+    # CSD builds its subclass; X-Token builds the shared collator.
+    used, unused = (mocks["collator"], shared_collator_cls)
+    if algorithm == "xtoken":
+        used, unused = unused, used
+    unused.assert_not_called()
+    used.assert_called_once()
+    kwargs = used.call_args.kwargs
+    assert kwargs["config"] == cfg.collator
+    assert {
+        name: kwargs[name] for name in _COLLATOR_OPTION_NAMES if name in kwargs
+    } == expected_options
+
+
+def test_setup_requires_routed_experts_when_router_replay_is_enabled():
+    cfg = _make_master_config()
+    cfg.policy["automodel_cfg"]["enabled"] = False
+    cfg.policy["megatron_cfg"] = _megatron_cfg()
+    cfg.policy["router_replay"] = {"enabled": True}
+
+    _, mocks = _patched_setup_call(cfg)
+
+    mocks["collator"].assert_called_once()
+    assert mocks["collator"].call_args.kwargs["require_routed_experts"] is True
 
 
 def test_setup_sets_derived_train_iters_on_megatron_teacher_and_student():
