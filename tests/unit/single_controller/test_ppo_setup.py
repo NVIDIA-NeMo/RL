@@ -51,6 +51,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     setup_single_controller,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
+    RolloutFailureConfig,
     algo_config,
     validate_single_controller_config,
 )
@@ -476,12 +477,10 @@ class TestPPOValidation:
     @pytest.mark.parametrize(
         "enable",
         [
-            lambda cfg: setattr(cfg, "use_dynamic_sampling", True),
             lambda cfg: setattr(cfg.reward_scaling, "enabled", True),
             lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
         ],
         ids=[
-            "use_dynamic_sampling",
             "reward_scaling",
             "reward_shaping",
         ],
@@ -594,6 +593,76 @@ class TestPPOValidation:
         mc.async_rl.sampler = WindowedSamplerConfig()
 
         validate_single_controller_config(mc)
+
+
+def _dynamic_sampling_config(
+    *,
+    on_dropped_prompt: str = "replace",
+    sampler: str = "in_order",
+    max_replacement_attempts: int = 1,
+    num_generations_per_prompt: int = _NUM_GENERATIONS_PER_PROMPT,
+) -> MasterConfig:
+    """A GRPO SC config with dynamic sampling on and the knobs it validates."""
+    mc = _make_master_config()
+    mc.grpo.use_dynamic_sampling = True
+    mc.grpo.num_generations_per_prompt = num_generations_per_prompt
+    mc.policy["train_global_batch_size"] = (
+        _NUM_PROMPTS_PER_STEP * num_generations_per_prompt
+    )
+    # model_construct: with on_dropped_prompt="replace" the model itself rejects
+    # max_replacement_attempts < 1, which would hide the validator's own branch.
+    mc.async_rl = AsyncRLConfig(
+        min_groups_for_streaming_train=_NUM_PROMPTS_PER_STEP,
+        max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
+        sampler={"name": sampler},
+        rollout_failure=RolloutFailureConfig.model_construct(
+            on_dropped_prompt=on_dropped_prompt,
+            max_replacement_attempts=max_replacement_attempts,
+        ),
+    )
+    return mc
+
+
+class TestDynamicSamplingValidation:
+    """Dynamic sampling needs a substitute for every filtered group, or steps shrink."""
+
+    def test_accepts_replace_with_a_stamping_sampler(self):
+        validate_single_controller_config(_dynamic_sampling_config())
+
+    @pytest.mark.parametrize("sampler", ["in_order", "custom"])
+    def test_accepts_the_samplers_that_can_stamp_a_step(self, sampler):
+        validate_single_controller_config(_dynamic_sampling_config(sampler=sampler))
+
+    def test_rejects_shrink_since_a_filtered_group_is_never_substituted(self):
+        mc = _dynamic_sampling_config(on_dropped_prompt="shrink")
+
+        with pytest.raises(ValueError, match='on_dropped_prompt="replace"'):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_sampler_that_stamps_no_target_step(self):
+        mc = _dynamic_sampling_config(sampler="ready_first")
+
+        with pytest.raises(ValueError, match="stamps a target step"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_zero_replacement_attempts(self):
+        mc = _dynamic_sampling_config(max_replacement_attempts=0)
+
+        with pytest.raises(ValueError, match="max_replacement_attempts >= 1"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_single_generation_per_prompt(self):
+        mc = _dynamic_sampling_config(num_generations_per_prompt=1)
+
+        with pytest.raises(ValueError, match="num_generations_per_prompt >= 2"):
+            validate_single_controller_config(mc)
+
+    def test_ppo_still_rejects_dynamic_sampling_with_the_default_drop_policy(self):
+        mc = _ppo_master_config()
+        mc.ppo.use_dynamic_sampling = True
+
+        with pytest.raises(ValueError, match='on_dropped_prompt="replace"'):
+            validate_single_controller_config(mc)
 
 
 class TestAdvantageEstimatorSelection:
