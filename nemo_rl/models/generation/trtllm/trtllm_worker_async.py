@@ -158,6 +158,11 @@ class TrtllmAsyncGenerationWorkerImpl:
             backend="pytorch",
             tensor_parallel_size=tp_size,
             dtype=trtllm_cfg["precision"],
+            # "dummy" during training: the initial refit lands before the
+            # first request, so loading the checkpoint here is wasted startup
+            # time. configure_generation_config decides; "auto" is TRT-LLM's
+            # own default and the value evaluation gets.
+            load_format=trtllm_cfg.get("load_format", "auto"),
             max_seq_len=trtllm_cfg["max_model_len"],
             max_batch_size=trtllm_cfg["max_batch_size"],
             max_num_tokens=trtllm_cfg["max_num_tokens"],
@@ -278,14 +283,36 @@ class TrtllmAsyncGenerationWorkerImpl:
         if self._http_base_url is not None:
             return self._http_base_url
 
+        from nemo_rl.utils.fastokens import maybe_patch_fastokens
+
+        # Apply fastokens inside this Ray actor before constructing the tokenizer.
+        maybe_patch_fastokens(False)
+
         from transformers import AutoTokenizer
 
-        from nemo_rl.models.generation.trtllm.trtllm_http_server import start_server
+        from nemo_rl.models.generation.trtllm.trtllm_http_server import (
+            _tokenizer_backend_name,
+            start_server,
+        )
 
         tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
             trust_remote_code=True,
         )
+        tokenizer_backend = _tokenizer_backend_name(tokenizer)
+        print(f"[TrtllmAsyncWorker] HTTP tokenizer backend: {tokenizer_backend}")
+        # Assert the patch landed, not which private class implements it:
+        # fastokens renamed the shim (0.2.x `_compat._TokenizerShim` ->
+        # 0.3.x `_ConfiguredTokenizerShim`), and pinning the exact name makes
+        # this fail on every release that touches internals.
+        if os.environ.get(
+            "NRL_USE_FASTOKENS"
+        ) == "1" and not tokenizer_backend.startswith("fastokens."):
+            raise RuntimeError(
+                "NRL_USE_FASTOKENS=1, but the TRT-LLM HTTP tokenizer backend "
+                f"is {tokenizer_backend!r}; expected a fastokens shim "
+                "(fastokens.patch_transformers() did not take effect)"
+            )
         self._http_thread, self._http_base_url, self._http_server = start_server(
             llm=self.llm,
             tokenizer=tokenizer,
@@ -296,6 +323,15 @@ class TrtllmAsyncGenerationWorkerImpl:
                 "temperature": self.cfg["temperature"],
                 "top_p": self.cfg["top_p"],
                 "top_k": self.cfg["top_k"],
+            },
+            # Validation rollouts are stamped with this second profile by
+            # grpo.validate(); without it the server would reject them as
+            # off-policy, which is why validation previously had to be pinned to
+            # the train sampling params on this backend.
+            val_sampling_config={
+                "temperature": self.cfg["val_temperature"],
+                "top_p": self.cfg["val_top_p"],
+                "top_k": self.cfg["val_top_k"],
             },
             stop_token_ids=list(self.cfg.get("stop_token_ids") or []),
             default_chat_template_kwargs=self.cfg["trtllm_cfg"].get(

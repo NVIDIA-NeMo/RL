@@ -70,6 +70,10 @@ When these build arguments are set, the corresponding `uv sync --extra` commands
 > [!NOTE]
 > If you skip vLLM, SGLang, or TRT-LLM during the build but later try to use those backends at runtime, the dependencies will be fetched and built on-demand. This may add significant setup time on first use.
 
+## Using a Local TensorRT-LLM Checkout
+
+To skip the hour-long TensorRT-LLM wheel build, set `NRL_TRTLLM_EDITABLE` to the path of a TensorRT-LLM checkout you have already built (comma-separated for several). NeMo RL then installs it editable (`uv pip install --no-deps -e`) into the TensorRT-LLM worker environment instead of building the pinned wheel, and links that environment's cuDNN to the main one. The path must be reachable from every node.
+
 ## Custom Setup Commands
 
 By default, the Docker image installs [apptainer](https://apptainer.org/) (with a `singularity` symlink) via a pluggable `custom-setup` build stage. The default script is `docker/install_apptainer.sh`. You can override or skip this step at build time.

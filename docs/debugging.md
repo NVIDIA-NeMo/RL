@@ -14,6 +14,10 @@ NRL_LOG_LEVEL=DEBUG uv run examples/run_grpo.py --config examples/configs/grpo_m
 
 The level applies to the `nemo_rl` logger rather than the root logger, so raising it does not also turn on debug output for `torch`, `ray`, and other third-party libraries. Setting it in the driver environment is enough to cover workers: `nemo_rl/__init__.py` runs in Ray workers too, and their records reach the driver log with a `(pid=..., ip=...)` prefix.
 
+## Adjust the NCCL Timeout
+
+Megatron runs use a 60 minute NCCL timeout (PyTorch's default is 10) so transient stalls, such as a first-time kernel JIT compile, don't abort ranks. Set `NRL_NCCL_TIMEOUT_MINUTES` to change it. It applies to all process groups.
+
 ## Debug Worker/Actors on SLURM
 
 Since Ray programs can spawn multiple workers and actors, using the Ray Distributed Debugger is essential to accurately jump to breakpoints on each worker.
