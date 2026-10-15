@@ -58,7 +58,8 @@ export CLAW_EVAL_SUBAGENTS_ENABLED=true
 
 export WANDB_PROJECT=nemorl-v2-subagent-comapction-debug
 export WANDB_ENTITY=${WANDB_ENTITY:-adlr}
-export CLAW_EVAL_BACKEND_DIR=${CLAW_EVAL_BACKEND_DIR:-$repo_dir/data/agentic_vbench/backend-subagent-sync8-20261014-v20-long}
+: "${CLAW_EVAL_BACKEND_DIR:?Set CLAW_EVAL_BACKEND_DIR to a fresh dedicated live ClawEval backend}"
+export CLAW_EVAL_BACKEND_DIR
 export CLAW_EVAL_CREDENTIALS_FILE=${CLAW_EVAL_CREDENTIALS_FILE:-/lustre/fsw/portfolios/nemotron/users/ehosseiniasl/codex/credentials.env}
 
 export BASE_NAME=${BASE_NAME:-claweval_subagents_super_sync8_$(date -u +%Y%m%d-%H%M%S)_current_head}
