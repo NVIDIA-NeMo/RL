@@ -50,7 +50,7 @@ from nemo_rl.telemetry.instrumentation import (
     current_trace_carrier,
     remote_trace_context,
 )
-from nemo_rl.utils.checkpoint_storage import enable_msc, is_msc_path
+from nemo_rl.utils.checkpoint_storage import enable_msc_for, open_path
 
 PathLike = Union[str, "os.PathLike[Any]"]
 
@@ -299,7 +299,7 @@ class CheckpointManager:
         self.weights_only = bool(config.get("weights_only"))
         if self.weights_only and config.get("save_data_plane"):
             raise ValueError("weights_only requires save_data_plane=false")
-        self._msc = enable_msc() if is_msc_path(config["checkpoint_dir"]) else None
+        self._msc = enable_msc_for(config["checkpoint_dir"])
         if self._msc is not None and config.get("save_data_plane"):
             raise ValueError(
                 "MSC checkpoints do not yet support data-plane snapshots; set save_data_plane=false."
@@ -338,7 +338,7 @@ class CheckpointManager:
             optimizer_path is None if checkpoint exists but optimizer state was not saved.
         """
         if last_checkpoint_path:
-            storage = enable_msc() if is_msc_path(last_checkpoint_path) else None
+            storage = enable_msc_for(last_checkpoint_path)
             component_path = (storage.Path if storage else Path)(
                 last_checkpoint_path
             ) / model_component
@@ -768,8 +768,7 @@ class CheckpointManager:
         """
         if checkpoint_path is None:
             return None
-        open_file = enable_msc().open if is_msc_path(checkpoint_path) else open
-        with open_file(str(checkpoint_path) + "/training_info.json", "r") as f:
+        with open_path(str(checkpoint_path) + "/training_info.json") as f:
             info = json.load(f)
         if info.get("weights_only"):
             raise ValueError(
@@ -793,8 +792,8 @@ def _load_checkpoint_history(
             (step_number, checkpoint_path, info) for each checkpoint.
     """
     checkpoint_history: list[tuple[int, PathLike, dict[str, Any]]] = []
-    if is_msc_path(checkpoint_dir):
-        msc = enable_msc()
+    msc = enable_msc_for(checkpoint_dir)
+    if msc is not None:
         for marker in msc.glob(str(checkpoint_dir) + "/step_*/_SUCCESS"):
             step_dir = msc.Path(marker).parent
             if re.fullmatch(r"step_\d+", step_dir.name):

@@ -89,7 +89,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
 )
-from nemo_rl.utils.checkpoint_storage import enable_msc, is_msc_path
+from nemo_rl.utils.checkpoint_storage import enable_msc_for, path_exists
 
 _HF_CONFIG_PATCHED = False
 
@@ -670,7 +670,7 @@ def _resolve_iter_dir_from_root(
     Checks ``latest_checkpointed_iteration.txt`` first; falls back to scanning
     for ``iter_*`` subdirectories and taking the last one (lexicographic order).
     """
-    storage = enable_msc() if is_msc_path(path) else None
+    storage = enable_msc_for(path)
     fs = storage.os if storage else os
     open_file = storage.open if storage else open
     tracker = os.path.join(path, "latest_checkpointed_iteration.txt")
@@ -893,11 +893,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
           created.
     """
     pretrained_ckpt = config.get("pretrained_checkpoint")
-    storage = (
-        enable_msc()
-        if pretrained_ckpt and is_msc_path(pretrained_ckpt["path"])
-        else None
-    )
+    storage = enable_msc_for(pretrained_ckpt["path"] if pretrained_ckpt else None)
     fs = storage.os if storage else os
 
     if pretrained_ckpt is not None:
@@ -1054,11 +1050,7 @@ def setup_model_config(
                 pretrained_path, "iter_0000000", "run_config.yaml"
             )
 
-        if not (
-            enable_msc().os.path.exists(pretrained_run_config)
-            if is_msc_path(pretrained_run_config)
-            else os.path.exists(pretrained_run_config)
-        ):
+        if not path_exists(pretrained_run_config):
             raise FileNotFoundError(
                 f"Pretrained run config not found at {pretrained_run_config} on rank={rank}. "
                 "This usually means that the checkpoint conversion on rank=0 saved to a "

@@ -8,6 +8,7 @@ import pytest
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.checkpoint_storage import (
     enable_msc,
+    enable_msc_for,
     load_checkpoint_object,
     open_path,
     path_exists,
@@ -110,7 +111,9 @@ def test_plain_paths_bypass_msc(tmp_path):
 
 
 def test_save_dataloader_state_uses_shared_path_for_local_and_msc(tmp_path, manager):
-    save_dataloader_state = pytest.importorskip("nemo_rl.data.utils").save_dataloader_state
+    save_dataloader_state = pytest.importorskip(
+        "nemo_rl.data.utils"
+    ).save_dataloader_state
     save_dataloader_state({"samples_yielded": 1}, str(tmp_path), suffix="_math")
     assert load_checkpoint_object(tmp_path / "train_dataloader_math.pt") == {
         "samples_yielded": 1
@@ -121,3 +124,8 @@ def test_save_dataloader_state_uses_shared_path_for_local_and_msc(tmp_path, mana
     assert load_checkpoint_object(base + "/train_dataloader.pt") == {
         "samples_yielded": 2
     }
+
+
+def test_enable_msc_for_only_enables_for_msc_urls(tmp_path, manager):
+    assert enable_msc_for(None, str(tmp_path), "") is None
+    assert enable_msc_for(str(tmp_path), str(manager.checkpoint_dir)) is not None
