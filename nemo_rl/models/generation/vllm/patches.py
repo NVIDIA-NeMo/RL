@@ -535,13 +535,15 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
     unchanged step time, a collapsed reward, and a large
     train/token_mult_prob_error.
 
-    Applied as two INDEPENDENT edits rather than one block replacement. The
-    surrounding loader body differs between stock vLLM 0.25.1 and the
-    super_vl_rl_v0.25.1 fork that the CI images ship: the fork gates the legacy
-    branch on ``is_legacy``, inserts an ``elif not is_legacy:`` native-mapping
-    branch (which maps ``layer_scale{1,2}.lambda1`` -> ``ls{1,2}``), and makes
-    the ``weight_loader`` call shard-aware. Matching that whole body against a
-    single snippet is what made this patch no-op silently on the fork.
+    Applied as two INDEPENDENT edits rather than one block replacement, each
+    anchored on text that is stable across loader variants. Both anchors are
+    verified against stock vLLM 0.25.1 and 0.29.0. Custom vLLM builds that
+    reshape the surrounding loader body (for example by gating the legacy
+    branch or adding a native-name mapping branch) still take the required
+    edit, where matching the whole body as one snippet would silently no-op.
+
+    Refit calls ``load_weights`` once per size-limited batch, so names loaded
+    by any earlier call are remembered on the module and never re-filled.
     """
     try:
         file_to_patch = _get_vllm_file("model_executor/models/radio.py")
@@ -550,9 +552,9 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
         return
 
     # Edit 1 (optional): stop discarding explicit LayerScale weights from legacy
-    # checkpoints. Identical text in stock 0.25.1 and the fork. Native-format
-    # checkpoints do not need it -- the fork's native_layer_mapping already
-    # routes layer_scale{1,2}.lambda1 to ls{1,2}.
+    # radio_model.* checkpoints. Stock vLLM drops native-format
+    # layer_scale{1,2}.lambda1 names entirely; only custom builds with a native
+    # name mapping route them to ls{1,2}.
     skip_old = """                    # Skip layer-scale entries that vLLM doesn't use
                     if suffix in {"ls1", "ls2"} or suffix.startswith(("ls1.", "ls2.")):
                         continue
@@ -564,15 +566,20 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
     # RadioConfig defaults initializer_factor=1.0, and getattr keeps this safe
     # for configs that omit it. This is the edit that matters for the folded
     # checkpoints we train on, which contain no ls1/ls2 tensors whatsoever.
-    tail_old = """                loaded_params.add(vllm_key)
+    old_snippet = """                loaded_params.add(vllm_key)
 
         return loaded_params
 """
-    tail_new = """                loaded_params.add(vllm_key)
+    new_snippet = """                loaded_params.add(vllm_key)
 
         initializer_factor = getattr(self.config, "initializer_factor", 1.0)
+        # Refit calls load_weights once per batch. Remember every LayerScale name
+        # any batch has loaded, so a later batch does not reset it to the factor.
+        ever_loaded_ls = getattr(self, "_nemo_rl_loaded_layerscale", set())
+        ever_loaded_ls.update(n for n in loaded_params if n.endswith((".ls1", ".ls2")))
+        self._nemo_rl_loaded_layerscale = ever_loaded_ls
         for ls_name, ls_param in params_dict.items():
-            if ls_name.endswith((".ls1", ".ls2")) and ls_name not in loaded_params:
+            if ls_name.endswith((".ls1", ".ls2")) and ls_name not in ever_loaded_ls:
                 ls_param.data.fill_(initializer_factor)
                 loaded_params.add(ls_name)
 
@@ -589,7 +596,7 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
         if skip_removed:
             updated = updated.replace(skip_old, skip_new, 1)
 
-        if tail_old not in updated:
+        if old_snippet not in updated:
             # Without the fill loop the parameters stay at dummy init, so refuse
             # to write a half-applied patch and make the reason loud.
             logger.warning(
@@ -600,7 +607,7 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
                 file_to_patch,
             )
             return
-        updated = updated.replace(tail_old, tail_new, 1)
+        updated = updated.replace(old_snippet, new_snippet, 1)
 
         write_back(updated)
 
