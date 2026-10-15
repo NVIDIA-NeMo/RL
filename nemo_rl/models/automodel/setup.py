@@ -347,7 +347,7 @@ def validate_and_prepare_config(
 
     rope_scaling = hf_config_overrides.get("rope_scaling") or {}
     assert rope_scaling.get("rope_type") != "yarn", (
-        "YaRN RoPE scaling is not supported with the automodel (DTensor) backend. "
+        "YaRN RoPE scaling is not supported with the Automodel backend. "
         "Please use the Megatron backend (policy.megatron_cfg.enabled=True) for YaRN."
     )
 

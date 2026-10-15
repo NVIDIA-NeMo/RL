@@ -4,7 +4,7 @@ NeMo RL supports multiple training backends to accommodate different model sizes
 
 ## Available Backends
 
-- **Automodel** - PyTorch's next-generation distributed training with improved memory efficiency.
+- [**Automodel**](https://github.com/NVIDIA-NeMo/Automodel) - Accelerated PyTorch training with improved memory efficiency (PyTorch-native TP, SP, CP, EP, and FSDP2)
 - **Megatron** - NVIDIA's high-performance training framework for scaling to large models (>100B parameters).
 
 ## Supported Input Checkpoint Format

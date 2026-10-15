@@ -4,7 +4,7 @@ This guide outlines the parallelization strategy for Automodel training in NeMo 
 
 ## Fallback Priority
 
-Automodel selects the tensor-parallel plan, applying four strategies in the following order of fallback priority:
+When `tensor_parallel_size > 1`, Automodel picks the tensor-parallel plan for dense models in the following order of fallback priority. Automodel's own MoE models use only tiers 1 and 2 and raise if neither exists, and a few architectures with their own strategy (for example, Nemotron-H) always use a fixed plan and ignore `custom_parallel_plan`.
 
 ### 1. Custom Parallel Plan
 

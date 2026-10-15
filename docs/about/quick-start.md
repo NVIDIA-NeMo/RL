@@ -1,6 +1,6 @@
 # Quick Start
 
-Use this quick start to get going with either the native Automodel or Megatron Core training backends.
+Use this quick start to get going with either the Automodel or Megatron Core training backends.
 
 > [!NOTE]
 > Both training backends are independent — you can install and use either one on its own.
