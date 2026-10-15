@@ -55,10 +55,10 @@ rollouts using teacher log probabilities.
 
 ## Code and container
 
-Use the `super-v3.5-posttraining` branch and its pinned dependencies:
+Use the `super-v3.5-vl` branch and its pinned dependencies:
 
 ```bash
-git clone --recursive --branch super-v3.5-posttraining https://github.com/NVIDIA-NeMo/RL.git
+git clone --recursive --branch super-v3.5-vl https://github.com/NVIDIA-NeMo/RL.git
 cd RL
 ```
 
