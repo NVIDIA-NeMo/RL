@@ -15,6 +15,7 @@
 import ast
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -1138,6 +1139,10 @@ def _stub_env(tmp_path, **extra):
         stub = bin_dir / name
         stub.write_text(body)
         stub.chmod(0o755)
+    # The wrapper requires the tools directory under EXTERNAL_VLLM_SHARED_ROOT
+    # (replicas mount it), so work from a copy inside tmp_path.
+    tools = tmp_path / "tools"
+    shutil.copytree(REPO_ROOT / "tools/external_gym_vllm", tools)
     stub_log = tmp_path / "stub_log"
     stub_log.mkdir()
     env = {
@@ -1152,7 +1157,7 @@ def _stub_env(tmp_path, **extra):
         "CONTAINER": "training.sqsh",
         "MOUNTS": f"{tmp_path}:{tmp_path}",
         "EXTERNAL_VLLM_SHARED_ROOT": str(tmp_path),
-        "EXTERNAL_VLLM_TOOLS_DIR_HOST": str(REPO_ROOT / "tools/external_gym_vllm"),
+        "EXTERNAL_VLLM_TOOLS_DIR_HOST": str(tools),
         "EXTERNAL_VLLM_POOLS": "ALPHA BETA",
     }
     for pool, replicas, port in (("ALPHA", 2, 9213), ("BETA", 1, 9214)):
@@ -1455,17 +1460,17 @@ def _attach_env(tmp_path, ray_sleep="0", **extra):
     ray_sub.write_text(
         f'#!/bin/bash\necho "$COMMAND" > {tmp_path / "command_seen"}\nsleep {ray_sleep}\n'
     )
-    return _stub_env(
-        tmp_path,
-        SLURM_JOB_ID="900",
-        EXTERNAL_VLLM_POOL_DIR=str(tmp_path / "pool"),
-        EXTERNAL_VLLM_POOL_JOB="555",
-        COMMAND=_TRAIN_COMMAND,
-        RAY_SUB=str(ray_sub),
-        EXTERNAL_VLLM_ATTACH_POLL_S="0.1",
-        EXTERNAL_VLLM_ATTACH_WATCH_S="0.1",
-        **extra,
-    )
+    settings = {
+        "SLURM_JOB_ID": "900",
+        "EXTERNAL_VLLM_POOL_DIR": str(tmp_path / "pool"),
+        "EXTERNAL_VLLM_POOL_JOB": "555",
+        "COMMAND": _TRAIN_COMMAND,
+        "RAY_SUB": str(ray_sub),
+        "EXTERNAL_VLLM_ATTACH_POLL_S": "0.1",
+        "EXTERNAL_VLLM_ATTACH_WATCH_S": "0.1",
+    }
+    settings.update(extra)
+    return _stub_env(tmp_path, **settings)
 
 
 def test_attach_and_run_resolves_urls_and_the_readiness_gate_from_the_manifest(
@@ -1641,7 +1646,7 @@ def test_pool_config_submit_helpers_reuse_a_live_pool_and_depend_on_it_only_whil
     assert "missing __BETA_BASE_URL__ for pool BETA" in result.stderr
     assert (pool_dir / "submitted_job").read_text().strip() == "701"
     calls = (Path(env["STUB_LOG"]) / "sbatch_calls").read_text().splitlines()
-    tools = REPO_ROOT / "tools/external_gym_vllm"
+    tools = env["EXTERNAL_VLLM_TOOLS_DIR_HOST"]
     assert calls == [
         f"--parsable --nodes=3 --exclusive --gres=gpu:4 --export=ALL --time=12:00:00 {tools}/run_in_allocation.sh",
         f"--parsable --export=ALL --dependency=after:701+15 --nodes=68 {tools}/attach_and_run.sh",
