@@ -346,9 +346,9 @@ fi
   ++env.nemo_gym.uv_venv_dir="${gym_venv_dir}" \
   env.nemo_gym.skip_venv_if_present=true \
   policy.model_name="${model_path}" \
-  policy.generation.vllm_cfg.load_format="${vllm_load_format}" \
-  policy.tokenizer.chat_template="${tokenizer_chat_template}" \
-  policy.generation.vllm_cfg.http_server_serving_chat_kwargs.chat_template="${vllm_chat_template}" \
+  ++policy.generation.vllm_cfg.load_format="${vllm_load_format}" \
+  ++policy.tokenizer.chat_template="${tokenizer_chat_template}" \
+  ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.chat_template="${vllm_chat_template}" \
   data.train.data_path="${TRAIN_PATH}" \
   data.validation.data_path="${VAL_PATH}" \
   grpo.num_prompts_per_step="${num_prompts}" \

@@ -11,7 +11,11 @@ from nemo_rl.algorithms.single_controller_utils import MasterConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
-from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,6 +23,11 @@ RECIPE = (
     ROOT
     / "examples/configs/recipes/vlm"
     / "vlm_grpo-nemotron-nano-omni-30ba3b-2n8g-megatron-agentic-vbench-sc-256k.v1.yaml"
+)
+SUPER_RECIPE = (
+    ROOT
+    / "examples/configs/recipes/vlm"
+    / "vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml"
 )
 LAUNCHER = ROOT / "scripts/agentic_vbench/debug_subagents_sync_2n_nano.sh"
 
@@ -97,9 +106,7 @@ def test_nano_sync2_recipe_preserves_agentic_subagent_gate_contract() -> None:
     assert cfg["env"]["nemo_gym"]["config_paths"][-1].endswith(
         "agentic_vbench_train.yaml"
     )
-    assert cfg["logger"]["wandb"]["project"] == (
-        "nemorl-v2-subagent-comapction-debug"
-    )
+    assert cfg["logger"]["wandb"]["project"] == ("nemorl-v2-subagent-comapction-debug")
 
 
 def test_nano_sync2_launcher_reuses_exact_subagent_prompt_and_r3_wrapper() -> None:
@@ -117,3 +124,27 @@ def test_nano_sync2_launcher_reuses_exact_subagent_prompt_and_r3_wrapper() -> No
     assert "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16" in text
     assert "TOKENIZER_CHAT_TEMPLATE" in text
     assert "VLLM_CHAT_TEMPLATE" in text
+
+
+def test_exact_nano_and_super_recipes_accept_shared_optional_overrides() -> None:
+    register_omegaconf_resolvers()
+    env = {
+        "MODEL_PATH": "/tmp/omni-model",
+        "TRAIN_PATH": "/tmp/agentic-vbench-train.jsonl",
+        "VAL_PATH": "/tmp/agentic-vbench-train.jsonl",
+    }
+    overrides = [
+        "++policy.generation.vllm_cfg.load_format=auto",
+        "++policy.tokenizer.chat_template=/tmp/chat_template.jinja",
+        "++policy.generation.vllm_cfg.http_server_serving_chat_kwargs."
+        "chat_template=/tmp/chat_template.jinja",
+    ]
+
+    with patch.dict(os.environ, env, clear=False):
+        for recipe in (RECIPE, SUPER_RECIPE):
+            updated = parse_hydra_overrides(load_config(recipe), overrides)
+            assert updated.policy.generation.vllm_cfg.load_format == "auto"
+            assert updated.policy.tokenizer.chat_template.endswith(".jinja")
+            assert updated.policy.generation.vllm_cfg.http_server_serving_chat_kwargs.chat_template.endswith(
+                ".jinja"
+            )
