@@ -186,7 +186,7 @@ def test_handled_native_failure_is_never_a_scored_result(terminal, error_type):
     reply = _reply(row)
     reply["result"] = None
     reply["failure"] = {
-        "message": "verification failed",
+        "failure_reason": "verification failed",
         "terminal": terminal,
         "stage": "verification",
         "partial_response": {"id": "partial"},

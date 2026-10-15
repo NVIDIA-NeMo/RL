@@ -2170,13 +2170,35 @@ def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
-def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
-    rows = [
-        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
-        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
-    ]
+@pytest.mark.parametrize("row_format", ["legacy", "flat_native", "canonical_native"])
+def test_postprocess_nemo_gym_group_returns_task_index(
+    log_full_result_tables: bool, row_format: str
+) -> None:
+    rows = []
+    for _ in range(2):
+        task_input = {
+            "responses_create_params": {
+                "input": [{"role": "user", "content": "prompt"}]
+            }
+        }
+        profile_metadata = {
+            "profiled_rewards": [1.0, 1.0],
+            "profiled_output_lengths": [2, 2],
+            "profile_band": {"total": {"a": 2, "b": 6, "f": 0.5}},
+        }
+        if row_format == "canonical_native":
+            task_input["task_data"] = profile_metadata
+        else:
+            task_input.update(profile_metadata)
+        row = {"agent_ref": {"name": "agent"}, "_ng_task_index": 42}
+        if row_format == "legacy":
+            row.update(task_input)
+        else:
+            row["task_id"] = {"taskset": "math:train", "task_id": "first"}
+            row["task_input"] = task_input
+        rows.append(row)
     results = []
-    for reward in (1.0, 2.0):
+    for reward in (1.0, 0.0):
         input_message = {
             "role": "user",
             "content": "prompt",
@@ -2194,7 +2216,12 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
                         "generation_logprobs": torch.tensor([-0.1]),
                     },
                 ],
-                "full_result": {"reward": reward},
+                "full_result": {
+                    "reward": reward,
+                    "response": {
+                        "output": [{"type": "message", "content": [{"text": "answer"}]}]
+                    },
+                },
             }
         )
 
@@ -2211,10 +2238,22 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=log_full_result_tables,
+        length_penalty_config={
+            "default": {
+                "length_type": "chars",
+                "profiled_length_penalty": 0.2,
+                "profile_band_total": True,
+            }
+        },
     )
 
     assert rollout_result.task_index == 42
-    assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
+    # The profiled budget subtracts 0.2, then the band halves the remaining reward.
+    assert rollout_result.final_batch["total_reward"].tolist() == pytest.approx(
+        [0.4, 0.0]
+    )
+    assert rollout_result.final_batch["env_reward"].tolist() == [1.0, 0.0]
+    assert rollout_result.final_batch["agent_ref"] == [{"name": "agent"}] * 2
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
