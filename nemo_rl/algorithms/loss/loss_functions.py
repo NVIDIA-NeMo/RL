@@ -869,6 +869,7 @@ class ClippedPGLossFn(LossFunction):
         #                – zero out A<0 tokens whose IS weight < min, A>0 tokens
         #                  whose IS weight > max + k (k adapts to entropy), and
         #                  every token whose IS weight exceeds the outer bound
+        #   Paper: https://microsoft.ai/pdf/mai-thinking-1.pdf
         # "seq-mask-tis" – zero out entire sequences whose geometric-mean
         #                  IS ratio ∉ [min, max]; retained sequences keep
         #                  raw (non-truncated) token-level IS weights      (ref bounds: 0.999–1.002)
