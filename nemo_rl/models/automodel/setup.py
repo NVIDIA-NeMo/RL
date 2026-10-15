@@ -993,7 +993,21 @@ def setup_model_and_optimizer(
         # validate_and_prepare_config pins the policy config to float32 for
         # master weights, and a float32 draft would double its parameter and
         # transient memory in the already memory-tight co-training recipe.
-        # The shared optimizer's master weights preserve update precision.
+        # The shared optimizer's FP32 master weights preserve update precision
+        # -- without them, updates smaller than half a bf16 ULP are silently
+        # dropped, so require master weights rather than train a draft that
+        # looks like it's learning but isn't.
+        if init_optimizer and not _has_optimizer_fp32_master(
+            optimizer_cls, optimizer_kwargs
+        ):
+            raise ValueError(
+                "Draft co-training requires an optimizer with FP32 master "
+                "weights (e.g. transformer_engine's FusedAdam with "
+                "master_weights=true): without them the draft trains in pure "
+                f"{runtime_config.dtype}, silently dropping sub-ULP updates. "
+                f"Got {optimizer_cls.__name__} with "
+                f"master_weights={optimizer_kwargs.get('master_weights')!r}."
+            )
         draft_dtype = runtime_config.dtype
         if draft_algo == "eagle3":
             target_text_config = (

@@ -117,8 +117,6 @@ def draft_full_refit_enabled(policy_cfg: dict) -> bool:
     megatron eagle3 path streams a partial set instead. Feeds the
     ``draft_full_refit`` argument of :func:`configure_generation_config`.
 
-    DTensor is always the v2 (Automodel) backend now (DTensor v1 and its
-    dtensor_cfg._v2 toggle have been removed upstream), so
     automodel_cfg.enabled alone identifies the Automodel path.
     """
     from nemo_rl.models.policy.draft_config import coerce_draft_config

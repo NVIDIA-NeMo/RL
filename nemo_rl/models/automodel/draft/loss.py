@@ -333,7 +333,7 @@ def compute_dspark_loss(
         process_group: process group to all-reduce loss denominators over
             (typically the DP group); None to skip the all-reduce.
         return_terms: if True, also return a dict of detached diagnostic
-            terms (window-mean losses plus unreduced accept-rate/tau sums).
+            terms (global-denominator losses plus unreduced accept-rate/tau sums).
 
     Returns:
         ``backward_loss`` alone, or ``(backward_loss, terms)`` when
