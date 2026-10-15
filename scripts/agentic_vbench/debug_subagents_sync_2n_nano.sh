@@ -29,9 +29,9 @@ if [[ ${MAX_STEPS:-1000000} != 1000000 ]]; then
 fi
 export MAX_STEPS=1000000
 
-export AGENTIC_VBENCH_TASKS=assembly
-export TRAIN_LIMIT=4
-export TRAIN_REPEATS=4
+export AGENTIC_VBENCH_TASKS=${AGENTIC_VBENCH_TASKS:-assembly}
+export TRAIN_LIMIT=${TRAIN_LIMIT:-4}
+export TRAIN_REPEATS=${TRAIN_REPEATS:-4}
 export TRAIN_PATH=${TRAIN_PATH:-$repo_dir/data/agentic_vbench/train/assembly_first4_x4.jsonl}
 export VAL_PATH=${VAL_PATH:-$TRAIN_PATH}
 export AGENTIC_VBENCH_BACKEND_DIR=${AGENTIC_VBENCH_BACKEND_DIR:-$repo_dir/data/agentic_vbench/backend-subagent-sync8-20261014-v20-long}

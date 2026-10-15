@@ -133,6 +133,14 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     _maybe_restore_native_data_plane_checkpoint,
     _register_single_controller_partitions,
 )
+from nemo_rl.algorithms.single_controller_utils.tmpe_outlier_dump import (
+    TMPE_METRIC_FIELDS,
+    TMPE_OPTIONAL_MEDIA_FIELDS,
+    TMPE_OUTLIER_DUMP_FIELDS,
+    dump_tmpe_outlier_rows,
+    find_tmpe_outlier_rows,
+    tmpe_outlier_dump_config_from_env,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     apply_message_level_advantage_penalties,
@@ -415,6 +423,9 @@ class SingleControllerActor:
         self._algo_cfg = algo_config(master_config)
         self._async_cfg = master_config.async_rl
         self._is_ppo: bool = is_ppo_run(master_config)
+        # The configured output path is the default-off diagnostic gate.  A
+        # normal run therefore performs no extra data-plane reads or compares.
+        self._tmpe_outlier_dump_config = tmpe_outlier_dump_config_from_env()
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -3083,6 +3094,8 @@ class SingleControllerActor:
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     train_meta,
                                 )
+                        if self._policy_logprobs_required:
+                            await self._maybe_dump_tmpe_outliers(train_meta)
                     elif self._is_ppo:
                         # prepare_for_lp_inference is skipped here, and it is the only
                         # other call that parks the policy optimizer before the critic.
@@ -5724,6 +5737,72 @@ class SingleControllerActor:
         )
 
     # ── utility helpers ────────────────────────────────────────────────────
+
+    async def _maybe_dump_tmpe_outliers(self, meta: KVBatchMeta) -> None:
+        """Snapshot raw sequence-TMPE outliers after prev-logprob writeback.
+
+        This is deliberately best effort: a diagnostic must not change whether
+        a batch reaches advantage calculation or optimization. Read the three
+        small metric columns first, then fetch the large media payload only for
+        rows that cross the independent diagnostic threshold.
+        """
+
+        config = getattr(self, "_tmpe_outlier_dump_config", None)
+        if config is None:
+            return
+
+        try:
+            # read_from_dataplane stamps padding metadata on its argument. Work
+            # on copies so the diagnostic cannot affect later model dispatches.
+            diagnostic_meta = meta.subset(range(meta.size))
+            metric_data = await asyncio.to_thread(
+                self._trainer.read_from_dataplane,
+                diagnostic_meta,
+                select_fields=list(TMPE_METRIC_FIELDS),
+            )
+            outlier_indices, sequence_errors = await asyncio.to_thread(
+                find_tmpe_outlier_rows,
+                metric_data,
+                threshold=config.threshold,
+            )
+            if not outlier_indices:
+                return
+
+            outlier_meta = meta.subset(outlier_indices)
+            mandatory_fields = [
+                field
+                for field in TMPE_OUTLIER_DUMP_FIELDS
+                if field not in TMPE_OPTIONAL_MEDIA_FIELDS
+            ]
+            available_fields = set(meta.fields or [])
+            dump_fields = mandatory_fields + [
+                field
+                for field in TMPE_OPTIONAL_MEDIA_FIELDS
+                if field in available_fields
+            ]
+            outlier_data = await asyncio.to_thread(
+                self._trainer.read_from_dataplane,
+                outlier_meta,
+                select_fields=dump_fields,
+            )
+            written = await asyncio.to_thread(
+                dump_tmpe_outlier_rows,
+                data=outlier_data,
+                meta=outlier_meta,
+                sequence_errors=sequence_errors[outlier_indices],
+                config=config,
+                step=self._train_steps,
+                trainer_version=self._trainer_version,
+            )
+            log.info(
+                "Wrote %d sequence-TMPE outlier row(s) under %s",
+                len(written),
+                config.output_path,
+            )
+        except Exception:  # noqa: BLE001 - diagnostics cannot fail training
+            log.exception(
+                "Sequence-TMPE outlier dump failed; continuing training unchanged"
+            )
 
     def _advantage_input_fields(self) -> list[str]:
         adv_cfg = self._advantage_cfg

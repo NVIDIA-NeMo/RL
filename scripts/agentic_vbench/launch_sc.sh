@@ -230,6 +230,7 @@ selective_mounts="${code_dir}/nemo_rl:/opt/nemo-rl/nemo_rl"
 selective_mounts+=",${code_dir}/examples:/opt/nemo-rl/examples"
 selective_mounts+=",${code_dir}/tools:/opt/nemo-rl/tools"
 selective_mounts+=",${code_dir}/scripts:/opt/nemo-rl/scripts"
+selective_mounts+=",${code_dir}/tests:/opt/nemo-rl/tests"
 selective_mounts+=",${code_dir}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 selective_mounts+=",${code_dir}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
 # The mounts above shadow the image's copies: an uninitialized submodule would hide
@@ -301,6 +302,9 @@ export RAY_USAGE_STATS_ENABLED=0
 export PYTHONPATH=/opt/nemo-rl:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:\${PYTHONPATH:-}
 uv_bin=\$(command -v uv || echo /usr/local/bin/uv)
 test -x "\${uv_bin}"
+if [[ "\${RUN_TMPE_OUTLIER_TESTS:-0}" == 1 ]]; then
+  "\${uv_bin}" run --no-sync pytest -q tests/unit/single_controller/test_tmpe_outlier_dump.py
+fi
 export HF_HOME=${HF_HOME}
 export HF_MODULES_CACHE=${HF_MODULES_CACHE}
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
@@ -418,7 +422,7 @@ echo "checkpoints=${checkpoint_dir}"
 echo "token_capture=${token_capture_dir}"
 echo "job_local_cache_root=${job_local_cache_root}"
 # Record the AgenticVBench environment the Gym agent will read, for reproducibility.
-env | grep -E '^(AGENTIC_VBENCH_|AVB_DATA_ROOT|CLAW_EVAL_|TRAIN_PATH|VAL_PATH|MODEL_PATH|CONTEXT_COMPACTION|NRL_MEGATRON_|WANDB_MODE|WANDB_PROJECT|WANDB_ENTITY|TMPDIR|TORCHINDUCTOR_CACHE_DIR|TRITON_CACHE_DIR|CUDA_CACHE_PATH)' | grep -v -i 'key\|token\|secret' | sort > "${results_dir}/gym_environment.env"
+env | grep -E '^(AGENTIC_VBENCH_|AVB_DATA_ROOT|CLAW_EVAL_|TRAIN_PATH|VAL_PATH|MODEL_PATH|CONTEXT_COMPACTION|NEMO_RL_TMPE_|NRL_MEGATRON_|WANDB_MODE|WANDB_PROJECT|WANDB_ENTITY|TMPDIR|TORCHINDUCTOR_CACHE_DIR|TRITON_CACHE_DIR|CUDA_CACHE_PATH)' | grep -v -i 'key\|token\|secret' | sort > "${results_dir}/gym_environment.env"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   printf '%s\n' "${COMMAND}" > "${results_dir}/training_command.sh"
