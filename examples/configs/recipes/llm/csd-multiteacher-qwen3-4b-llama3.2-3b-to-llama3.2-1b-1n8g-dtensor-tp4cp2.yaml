@@ -46,6 +46,9 @@ teachers:
   offload_optimizer_for_logprob: false
   automodel_cfg:
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
@@ -95,6 +98,9 @@ teachers:
   offload_optimizer_for_logprob: false
   automodel_cfg:
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
