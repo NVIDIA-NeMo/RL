@@ -167,7 +167,11 @@ from nemo_rl.telemetry.instrumentation import (
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.telemetry.vocabulary import INIT_TOTAL_CATEGORY, WORKER_GROUP_ENV
-from nemo_rl.utils.checkpoint_storage import save_checkpoint_object
+from nemo_rl.utils.checkpoint_storage import (
+    enable_msc,
+    is_msc_path,
+    save_checkpoint_object,
+)
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -2734,13 +2738,16 @@ def _write_latest_checkpoint_status(
     status_path = os.path.join(
         str(checkpointer.checkpoint_dir), "latest_checkpoint_status.json"
     )
+    msc = enable_msc() if is_msc_path(status_path) else None
+    path_exists = msc.os.path.exists if msc else os.path.exists
+    open_file = msc.open if msc else open
     status: dict[str, Any] = {}
-    if os.path.exists(status_path):
-        with open(status_path) as f:
+    if path_exists(status_path):
+        with open_file(status_path) as f:
             status = json.load(f)
     status["last_successful_ckpt_save_completion"] = time.time()
     status["last_checkpoint_step"] = last_checkpoint_step
-    with open(status_path, "w") as f:
+    with open_file(status_path, "w") as f:
         json.dump(status, f)
 
 
