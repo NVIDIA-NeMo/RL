@@ -107,3 +107,17 @@ def test_plain_paths_bypass_msc(tmp_path):
     with open_path(tmp_path / "x.json", "w") as f:
         f.write("{}")
     assert not path_exists(tmp_path / "missing.json")
+
+
+def test_save_dataloader_state_uses_shared_path_for_local_and_msc(tmp_path, manager):
+    save_dataloader_state = pytest.importorskip("nemo_rl.data.utils").save_dataloader_state
+    save_dataloader_state({"samples_yielded": 1}, str(tmp_path), suffix="_math")
+    assert load_checkpoint_object(tmp_path / "train_dataloader_math.pt") == {
+        "samples_yielded": 1
+    }
+
+    base = str(manager.checkpoint_dir) + "/step_1"
+    save_dataloader_state({"samples_yielded": 2}, base)
+    assert load_checkpoint_object(base + "/train_dataloader.pt") == {
+        "samples_yielded": 2
+    }
