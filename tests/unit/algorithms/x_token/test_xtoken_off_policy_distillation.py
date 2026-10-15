@@ -1044,13 +1044,13 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
     # All-null projection paths => genuine same-tokenizer teachers, so the
     # averaging + single direct-KL fast path is the correct branch.
     fn = _bare_averaged_logits_loss_fn([None, None])
-    fn.temperature = 1.0
-    fn.reverse_kl = False
+    fn.temperature = 2.0
+    fn.reverse_kl = True
 
-    fast_calls = []
+    seen = []
 
-    def _fast_path(*args, **kwargs):
-        fast_calls.append(1)
+    def _fast_path(student, teacher, **kwargs):
+        seen.append(kwargs)
         return torch.tensor(1.23)
 
     monkeypatch.setattr(
@@ -1063,17 +1063,22 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
 
     logits = torch.zeros(2, 10, 32)
     teacher_full = {0: logits.clone(), 1: logits.clone()}
+    align, global_valid_toks = MagicMock(), torch.tensor(20.0)
 
     kd, metrics = fn._averaged_logits_kd(
         logits,
         {},
         teacher_full,
-        {0: MagicMock()},
-        torch.tensor(20.0),
+        {0: align},
+        global_valid_toks,
         tp_group=None,
         cp_group=None,
     )
-    assert fast_calls == [1]  # fast path taken exactly once
+    (kwargs,) = seen  # fast path taken exactly once
+    assert kwargs["kd_mask"] is align.student_token_mask
+    assert kwargs["sample_mask"] is align.sample_mask
+    assert kwargs["num_kd_tokens"] is global_valid_toks
+    assert (kwargs["temperature"], kwargs["reverse_kl"]) == (2.0, True)
     assert "kl_loss" in metrics
     assert kd.item() == pytest.approx(1.23)
 
