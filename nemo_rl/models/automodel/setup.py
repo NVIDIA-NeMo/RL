@@ -421,7 +421,7 @@ def validate_and_prepare_config(
     if cp_size > 1 and enable_seq_packing:
         raise ValueError(
             "Context parallel is not supported for sequence packing. "
-            "Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+            "Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-automodel for more details."
         )
 
     if sequence_parallel_enabled and tp_size == 1:
@@ -779,7 +779,7 @@ def setup_model_and_optimizer(
             raise AssertionError(
                 "Context parallel is not supported for Gemma3ForCausalLM. "
                 "Torch context parallel has many limitations. "
-                "Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+                "Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-automodel for more details."
             )
 
         if model_config.model_type == "gemma4_unified":
