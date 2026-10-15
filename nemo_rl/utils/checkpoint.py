@@ -43,6 +43,14 @@ import torch
 import yaml
 from pydantic import BaseModel
 
+from nemo_rl.utils.checkpoint_storage import (
+    as_checkpoint_path,
+    enable_msc_for,
+    is_msc_path,
+    open_path,
+    path_exists,
+)
+
 PathLike = Union[str, "os.PathLike[Any]"]
 
 
@@ -122,7 +130,8 @@ class PretrainedCheckpointConfig(TypedDict):
     only; DTensor backends continue to use HuggingFace weights via ``model_name``.
 
     Attributes:
-        path: Filesystem path to the checkpoint to load.
+        path: Filesystem path or ``msc://profile/path`` URL to load.
+            MSC profiles and a node-local cache are configured through ``MSC_CONFIG``.
 
             * For ``"megatron_bridge"`` format: may be either a **specific
               iteration directory** that contains a ``run_config.yaml`` file
@@ -245,7 +254,12 @@ class CheckpointManager:
                 "internally."
             )
 
-        self.checkpoint_dir = Path(config["checkpoint_dir"])
+        self._msc = enable_msc_for(config["checkpoint_dir"])
+        if self._msc is not None and config.get("save_data_plane"):
+            raise ValueError(
+                "MSC checkpoints do not yet support data-plane snapshots; set save_data_plane=false."
+            )
+        self.checkpoint_dir = as_checkpoint_path(config["checkpoint_dir"])
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
@@ -255,7 +269,7 @@ class CheckpointManager:
 
         # Async finalization state
         self._finalize_thread: Optional[threading.Thread] = None
-        self._pending_checkpoint_path: Optional[Path] = None
+        self._pending_checkpoint_path: Optional[PathLike] = None
         self._finalize_error: Optional[Exception] = None
         self._delete_executor = ThreadPoolExecutor(max_workers=1)
 
@@ -277,7 +291,7 @@ class CheckpointManager:
             optimizer_path is None if checkpoint exists but optimizer state was not saved.
         """
         if last_checkpoint_path:
-            component_path = Path(last_checkpoint_path) / model_component
+            component_path = as_checkpoint_path(last_checkpoint_path) / model_component
             weights_path = component_path / "weights"
             optimizer_path = component_path / "optimizer"
 
@@ -328,7 +342,8 @@ class CheckpointManager:
 
         Creates a temporary directory for a new checkpoint and saves training info
         and configuration. The directory is named 'tmp_step_{step}' and will be renamed
-        to 'step_{step}' when the checkpoint is completed.
+        to 'step_{step}' when the checkpoint is completed. MSC writes directly to
+        a fresh step prefix and publishes an ``_SUCCESS`` object on completion.
         We do it this way to allow the algorithm loop to save any files it wants to save
         in a safe, temporary directory.
 
@@ -340,18 +355,30 @@ class CheckpointManager:
         Returns:
             PathLike: Path to the temporary checkpoint directory.
         """
-        save_dir = self.checkpoint_dir / f"tmp_step_{step}"
-        # Remove a stale tmp_step_{step} left behind by an interrupted prior save
-        # so the new save starts clean.
-        if save_dir.exists():
-            t0 = time.monotonic()
-            shutil.rmtree(save_dir)
-            elapsed = time.monotonic() - t0
-            print(f"Removed stale {save_dir.name} in {elapsed:.2f}s")
+        if self._msc is not None:
+            save_dir = self.checkpoint_dir / f"step_{step}"
+            if path_exists(save_dir / "_SUCCESS"):
+                raise FileExistsError(
+                    f"Refusing to overwrite MSC checkpoint {save_dir}; use a fresh run prefix."
+                )
+            # A step without _SUCCESS is an interrupted save (never discoverable
+            # for resume); clear it so the resumed run can save the same step.
+            if self._msc.os.path.isdir(str(save_dir), strict=False):
+                self._msc.delete(str(save_dir), recursive=True)
+                print(f"Removed unpublished {save_dir.name}")
+        else:
+            save_dir = self.checkpoint_dir / f"tmp_step_{step}"
+            # Remove a stale tmp_step_{step} left behind by an interrupted prior
+            # save so the new save starts clean.
+            if save_dir.exists():
+                t0 = time.monotonic()
+                shutil.rmtree(save_dir)
+                elapsed = time.monotonic() - t0
+                print(f"Removed stale {save_dir.name} in {elapsed:.2f}s")
         save_dir.mkdir(parents=True, exist_ok=True)
 
         # save training info
-        with open(save_dir / "training_info.json", "w") as f:
+        with open_path(save_dir / "training_info.json", "w") as f:
             # make any numpy items serializable
             serializable_training_info = dict(training_info)
             for k, v in serializable_training_info.items():
@@ -361,12 +388,12 @@ class CheckpointManager:
 
         # save config
         if run_config is not None:
-            with open(save_dir / "config.yaml", "w") as f:
+            with open_path(save_dir / "config.yaml", "w") as f:
                 # JSON mode converts enums and other Pydantic-supported scalar
                 # types to the primitive values expected by safe YAML.
                 yaml.safe_dump(run_config.model_dump(mode="json"), f)
 
-        return Path(os.path.abspath(save_dir))
+        return str(save_dir) if self._msc else Path(os.path.abspath(save_dir))
 
     def _rename_checkpoint(self, checkpoint_path: PathLike) -> None:
         """Rename tmp_step_N to step_N.
@@ -375,6 +402,11 @@ class CheckpointManager:
         training), performs a pseudo-atomic swap via an intermediate old_step_N
         directory.
         """
+        if self._msc is not None:
+            # Publish only after all worker saves (including async completion) succeed.
+            with open_path(str(checkpoint_path) + "/_SUCCESS", "w") as stream:
+                json.dump({"version": 1}, stream)
+            return
         checkpoint_path = Path(checkpoint_path)
         step = checkpoint_path.name.split("_")[2]
         to_checkpoint_path = checkpoint_path.parent / f"step_{step}"
@@ -420,7 +452,7 @@ class CheckpointManager:
                 For sync saves: None (rename immediately).
         """
         self.finalize_pending()
-        self._pending_checkpoint_path = Path(checkpoint_path)
+        self._pending_checkpoint_path = as_checkpoint_path(checkpoint_path)
         self._finalize_error = None
 
         def _finalize():
@@ -582,7 +614,10 @@ class CheckpointManager:
         for step, path, _ in checkpoint_history:
             if step not in protected_steps:
                 print(f"Removing checkpoint {path} (step {step})")
-                shutil.rmtree(path)
+                if self._msc is not None:
+                    self._msc.delete(str(path), recursive=True)
+                else:
+                    shutil.rmtree(path)
 
     def get_best_checkpoint_path(self) -> Optional[str]:
         """Get the path to the best checkpoint based on the metric.
@@ -640,6 +675,9 @@ class CheckpointManager:
             Optional[str]: Path to the latest checkpoint, or None if no checkpoints exist.
         """
         # find checkpoint directory with highest step number
+        if self._msc is not None:
+            steps = _msc_step_dirs(self.checkpoint_dir)
+            return max(steps)[1] if steps else None
         step_dirs = [
             x
             for x in glob.glob(str(self.checkpoint_dir / "step_*"))
@@ -665,8 +703,20 @@ class CheckpointManager:
         """
         if checkpoint_path is None:
             return None
-        with open(Path(checkpoint_path) / "training_info.json", "r") as f:
+        with open_path(str(checkpoint_path) + "/training_info.json") as f:
             return json.load(f)
+
+
+def _msc_step_dirs(checkpoint_dir: PathLike) -> list[tuple[int, str]]:
+    """List ``(step, path)`` of published (``_SUCCESS``) steps under an MSC prefix."""
+    msc = enable_msc_for(checkpoint_dir)
+    assert msc is not None, f"{checkpoint_dir} is not an msc:// path"
+    steps = []
+    for marker in msc.glob(str(checkpoint_dir) + "/step_*/_SUCCESS"):
+        step_dir = msc.Path(marker).parent
+        if re.fullmatch(r"step_\d+", step_dir.name):
+            steps.append((int(step_dir.name.split("_")[1]), str(step_dir)))
+    return steps
 
 
 def _load_checkpoint_history(
@@ -682,6 +732,17 @@ def _load_checkpoint_history(
             (step_number, checkpoint_path, info) for each checkpoint.
     """
     checkpoint_history: list[tuple[int, PathLike, dict[str, Any]]] = []
+    if is_msc_path(checkpoint_dir):
+        steps = _msc_step_dirs(checkpoint_dir)
+
+        def read_info(step_dir: str) -> dict[str, Any]:
+            with open_path(step_dir + "/training_info.json") as f:
+                return json.load(f)
+
+        # One GET per step; read them concurrently instead of one by one.
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            infos = list(pool.map(read_info, [step_dir for _, step_dir in steps]))
+        return [(step, step_dir, info) for (step, step_dir), info in zip(steps, infos)]
 
     # Find all step directories
     step_dirs = [

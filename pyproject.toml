@@ -74,6 +74,7 @@ dependencies = [
   "nixl==1.3.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "pybase64",                                                                                                 # for sglang refit
   "awscrt>=0.35.0",                                                                                           # for parallel S3 refit transport
+  "multi-storage-client[boto3]>=0.50",                                                                        # for msc:// (S3) checkpoint storage; the driver's CheckpointManager runs in the base venv
   "zstandard",                                                                                                # for sparse refit body compression
   "fastokens>=0.2.0",                                                                                         # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
   # OpenTelemetry instrumentation. Base (not extra) so it reaches every worker
