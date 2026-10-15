@@ -56,7 +56,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_non_student_seq_keys,
     xtoken_off_policy_distillation_train,
 )
-from nemo_rl.data.xtoken.cross_tokenizer_collate import (
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )

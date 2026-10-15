@@ -55,12 +55,12 @@ from nemo_rl.algorithms.x_token.utils import (
     pad_distillation_val_batch,
 )
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
-from nemo_rl.data.xtoken.cross_tokenizer_collate import (
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
+from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig

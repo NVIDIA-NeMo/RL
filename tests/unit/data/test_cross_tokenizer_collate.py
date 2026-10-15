@@ -35,7 +35,7 @@ from tokenizers.processors import TemplateProcessing
 from transformers import PreTrainedTokenizerFast
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch, TokenAligner
-from nemo_rl.data.xtoken.cross_tokenizer_collate import (
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )

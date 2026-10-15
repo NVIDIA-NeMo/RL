@@ -21,11 +21,11 @@ from typing import Any
 import pytest
 
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
-from nemo_rl.data.xtoken.cross_tokenizer_collate import (
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
-from nemo_rl.data.xtoken.native_chat import (
+from nemo_rl.data.cross_tokenizer.native_chat import (
     _prepare_native_thinking_messages,
     _render_and_tokenize_chat,
     _render_chat_text,
