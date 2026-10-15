@@ -22,6 +22,7 @@ import threading
 import types
 import warnings
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -1224,6 +1225,64 @@ async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch):
     assert cancelled.is_set()
     token_capture.fail_call.assert_called_once_with("call", reason="client_disconnect")
     assert id(request) not in worker._capture_calls
+
+
+def test_chat_disconnect_releases_capture_queued_for_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disconnect releases capture when the executor has not started staging."""
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    response_type = sys.modules[
+        "vllm.entrypoints.openai.chat_completion.protocol"
+    ].ChatCompletionResponse
+    serving_chat.create_chat_completion = AsyncMock(return_value=response_type())
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async."
+        "model_dump_chat_response_with_dynamic_message_fields",
+        lambda _response: {"choices": []},
+    )
+    finish_capture = MagicMock()
+    monkeypatch.setattr(worker, "_finish_request_capture", finish_capture)
+    request = _fake_chat_request()
+    token_capture = _track_request_capture(worker, request)
+
+    async def exercise() -> None:
+        # Use a separate loop so its executor cannot affect other async tests.
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        busy = asyncio.Event()
+        release = threading.Event()
+
+        def occupy_executor() -> None:
+            loop.call_soon_threadsafe(busy.set)
+            release.wait()
+
+        blocker = loop.run_in_executor(None, occupy_executor)
+        task = None
+        try:
+            await asyncio.wait_for(busy.wait(), 5)
+            task = asyncio.create_task(chat_handler(request, MagicMock()))
+            # The serving stub completes synchronously; the handler's first
+            # suspension queues real asyncio.to_thread work behind the blocker.
+            await asyncio.sleep(0)
+            serving_chat.create_chat_completion.assert_awaited_once()
+            assert not task.done()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            token_capture.fail_call.assert_called_once_with(
+                "call", reason="client_disconnect"
+            )
+            assert id(request) not in worker._capture_calls
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            release.set()
+            await blocker
+        finish_capture.assert_not_called()
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.vllm

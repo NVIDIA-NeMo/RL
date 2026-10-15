@@ -1506,9 +1506,17 @@ class VllmAsyncGenerationWorkerImpl(
                 # response; strips logprobs/ids (no-op when capture is off).
                 # Off-loop: the sink write inside complete_call is a blocking
                 # TQ round trip (see the staging protocol's serving-host rule).
-                content = await asyncio.to_thread(
-                    worker_self._finish_request_capture, request, content
-                )
+                try:
+                    content = await asyncio.to_thread(
+                        worker_self._finish_request_capture, request, content
+                    )
+                except asyncio.CancelledError:
+                    # Queued executor work may never start after cancellation.
+                    # If staging already claimed the capture, abort is a no-op.
+                    worker_self._abort_request_capture(
+                        request, reason="client_disconnect"
+                    )
+                    raise
                 return JSONResponse(content=content)
 
             worker_self._abort_request_capture(request, reason="streaming_response")
