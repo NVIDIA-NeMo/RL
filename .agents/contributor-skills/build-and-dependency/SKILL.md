@@ -1,7 +1,6 @@
 ---
 name: build-and-dependency
-description: Build and dependency management for NeMo-RL. Covers Docker image building and running, uv usage, venv setup, and adding dependencies.
-when_to_use: Setting up a dev environment; building or running the Docker container; adding or removing a dependency; uv errors; 'how do I install', 'ModuleNotFoundError', 'build the image', 'run in Docker', 'uv sync fails'.
+description: Build and dependency management for NeMo-RL. Covers Docker image building and running, uv usage, venv setup, and adding dependencies. Use when setting up a dev environment; building or running the Docker container; adding or removing a dependency; uv errors; 'how do I install', 'ModuleNotFoundError', 'build the image', 'run in Docker', 'uv sync fails'.
 ---
 
 # Build and Dependency Guide

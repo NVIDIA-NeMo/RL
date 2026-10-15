@@ -1,7 +1,6 @@
 ---
 name: copyright
-description: NVIDIA copyright header requirements for NeMo-RL. Covers which files need headers and the exact header text.
-when_to_use: Adding a new file; checking copyright headers; 'missing copyright', 'NVIDIA header', 'license header', 'is a header required here', during code review.
+description: NVIDIA copyright header requirements for NeMo-RL. Covers which files need headers and the exact header text. Use when adding a new file; checking copyright headers; 'missing copyright', 'NVIDIA header', 'license header', 'is a header required here', during code review.
 ---
 
 # NVIDIA Copyright Header

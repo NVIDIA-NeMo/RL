@@ -1,7 +1,6 @@
 ---
 name: error-handling
-description: Error handling guidelines for NeMo-RL. Covers exception specificity, minimal try bodies, and else blocks.
-when_to_use: Writing or reviewing exception handling; 'try-except', 'catch all exceptions', 'bare except', 'how to handle errors', during code review.
+description: Error handling guidelines for NeMo-RL. Covers exception specificity, minimal try bodies, and else blocks. Use when writing or reviewing exception handling; 'try-except', 'catch all exceptions', 'bare except', 'how to handle errors', during code review.
 ---
 
 # Error Handling

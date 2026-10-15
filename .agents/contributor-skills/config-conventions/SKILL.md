@@ -1,7 +1,6 @@
 ---
 name: config-conventions
-description: Configuration conventions for NeMo-RL. YAML is the single source of truth for defaults. Covers BaseModel/TypedDict usage, dataclass for internal classes, exemplar YAML updates, and forbidden default patterns.
-when_to_use: Adding or modifying config fields; reviewing config changes; 'where do I set defaults', 'BaseModel pattern', 'TypedDict pattern', 'dataclass', 'exemplar YAML', 'forbidden default patterns', during code review of config files.
+description: Configuration conventions for NeMo-RL. YAML is the single source of truth for defaults. Covers BaseModel/TypedDict usage, dataclass for internal classes, exemplar YAML updates, and forbidden default patterns. Use when adding or modifying config fields; reviewing config changes; 'where do I set defaults', 'BaseModel pattern', 'TypedDict pattern', 'dataclass', 'exemplar YAML', 'forbidden default patterns', during code review of config files.
 ---
 
 # Configuration Conventions
