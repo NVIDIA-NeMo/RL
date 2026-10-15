@@ -72,7 +72,7 @@ from nemo_rl.algorithms.grpo import (
     _get_grpo_save_state,
     _initial_grpo_save_state,
 )
-from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
@@ -822,6 +822,7 @@ def _make_actor_args(
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None,
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None,
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None,
+    loss_fn: Optional[Any] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
         gen_handle=gen if gen is not None else _FakeGeneration(),
@@ -837,7 +838,7 @@ def _make_actor_args(
             else _FakeWeightSynchronizer()
         ),
         advantage_estimator=None,
-        loss_fn=object(),  # type: ignore[arg-type]
+        loss_fn=loss_fn if loss_fn is not None else object(),  # type: ignore[arg-type]
         rollout_manager=(  # type: ignore[arg-type]
             rollout_manager if rollout_manager is not None else _FakeRolloutManager()
         ),
@@ -1197,6 +1198,9 @@ class TestSaveTrigger:
         assert info_2["consumed_samples"] == 4  # 2 prompts/step * 2 steps
         # No validation ran, so the default val_reward is dropped.
         assert "val_reward" not in info_2
+        # No adaptive loss, so its controller state is omitted.
+        assert "last_entropy" not in info_2
+        assert "cur_adaptive_ppo_clip_k" not in info_2
 
         info_4 = _training_info(ckpt_dir, 4)
         assert info_4["current_step"] == 4
@@ -2576,6 +2580,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._checkpointer.save_optimizer = True
     actor._checkpointer.init_tmp_checkpoint.return_value = str(checkpoint_path)
     actor._is_ppo = True
+    actor._loss_fn = object()
     actor._trainer = _OrderRecordingPolicy(calls)
     actor._value = _OrderRecordingCritic(calls)
     return actor
@@ -2699,6 +2704,31 @@ class TestMetricName:
 
         info = _training_info(tmp_path / "checkpoints", 2)
         assert info["train:loss"] == 0.5
+
+    def test_adaptive_ppo_clip_state_advances_and_lands_in_training_info(
+        self, tmp_path
+    ):
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
+        loss_fn = ClippedPGLossFn(
+            ClippedPGLossConfig(
+                use_importance_sampling_correction=True,
+                truncated_importance_sampling_type="adaptive-ppo-clip",
+                truncated_importance_sampling_ratio=1.0,
+                truncated_importance_sampling_ratio_min=0.5,
+                tis_adaptive_ppo_clip_target_entropy=0.3,
+            )
+        )
+        # Entropy below target widens the bound by one step per train step.
+        trainer = _FakeTrainer(
+            step_metrics={"all_mb_metrics": {"approx_entropy": [0.04, 0.06]}}
+        )
+
+        _run_train_pump(mc, _make_actor_args(trainer=trainer, loss_fn=loss_fn))
+
+        assert loss_fn.cur_adaptive_ppo_clip_k == 0.5
+        info = _training_info(tmp_path / "checkpoints", 2)
+        assert info["cur_adaptive_ppo_clip_k"] == 0.5
+        assert info["last_entropy"] == pytest.approx(0.1)
 
     def test_train_metric_missing_key_raises(self, tmp_path):
         mc = _actor_master_config(

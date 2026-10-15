@@ -78,6 +78,7 @@ loss_fn:
   truncated_importance_sampling_type: null
   truncated_importance_sampling_ratio: null
   truncated_importance_sampling_ratio_min: null
+  tis_adaptive_ppo_clip_target_entropy: 0.3  # Only used by adaptive-ppo-clip.
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false
