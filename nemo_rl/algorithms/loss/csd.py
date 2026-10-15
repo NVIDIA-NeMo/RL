@@ -168,7 +168,7 @@ class CSDLossConfig(BaseModel, extra="allow"):
     teacher_to_student_table_paths: Optional[list[Optional[str]]] = None
 
     # Shift each noninitial chunk to predictor positions before computing KD.
-    kl_chunk_shift: bool = False
+    kl_chunk_shift: bool = True
     # Build exact common-token pairs from forward tables instead of projections.
     common_indices_from_subtoks: bool = False
     # Include the common-vocabulary partition at each mismatch chunk's start.

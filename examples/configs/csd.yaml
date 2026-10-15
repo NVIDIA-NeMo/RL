@@ -18,7 +18,7 @@ loss_fn:
   ce_loss_scale: 0.1
   dynamic_loss_scaling: true
   common_indices_from_subtoks: true
-  kl_chunk_shift: false
+  kl_chunk_shift: true
   csd_loss_fn: kl
   csd_last_pos_loss_fn: null
   csd_jsd_beta: 0.5
