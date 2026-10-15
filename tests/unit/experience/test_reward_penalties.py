@@ -108,6 +108,22 @@ class TestMaskSampleFlags:
             mask_sample, torch.tensor([True, False, False, False, False])
         )
 
+    def test_reads_top_level_mask_sample_beside_instance_config(self):
+        # NeMo-Gym's BaseVerifyResponse (and token-id capture) put mask_sample
+        # at the top level of the /run result. These rows pair a top-level
+        # value with an empty or absent instance_config mapping, so neither
+        # read can shadow the other.
+        results = [
+            {"full_result": {"mask_sample": True, "instance_config": {}}},
+            {"full_result": {"mask_sample": False, "instance_config": None}},
+            {"full_result": {"mask_sample": True}},
+            {"full_result": {"mask_sample": False}},
+        ]
+
+        mask_sample = _mask_sample_flags(r["full_result"] for r in results)
+
+        assert torch.equal(mask_sample, torch.tensor([True, False, True, False]))
+
 
 class TestShouldMaskFlaggedSamples:
     def test_reads_env_should_mask_flagged_samples(self):
@@ -167,6 +183,32 @@ class TestMaskEnvFlaggedSamplesBatchedGate:
 
     def test_gate_off_omits_mask_sample(self):
         assert "mask_sample" not in self._final_batch(False)
+
+
+class TestUnusableRolloutLossMultiplier:
+    @pytest.mark.parametrize("mask_env_flagged_samples", [True, False])
+    def test_unusable_rollout_gets_zero_loss_multiplier(self, mask_env_flagged_samples):
+        results = [_gate_result(False), _gate_result(False)]
+        results[1]["full_result"]["_ng_unusable_rollout"] = "no_generation_data"
+        results[1]["full_result"]["mask_sample"] = True
+        input_batch = BatchedDataDict({"loss_multiplier": torch.tensor([1.0, 0.5])})
+
+        rollout_result = _postprocess_single_nemo_gym_group(
+            nemo_gym_rows=[{"agent_ref": {"name": "agent"}} for _ in results],
+            results=results,
+            timer=Timer(),
+            timer_prefix="timing/test",
+            policy_generation=_FakeGeneration(),
+            input_batch=input_batch,
+            tokenizer=_FakeTokenizer(),
+            log_full_result_tables=False,
+            mask_env_flagged_samples=mask_env_flagged_samples,
+        )
+
+        loss_multiplier = rollout_result.final_batch["loss_multiplier"]
+        assert loss_multiplier.tolist() == [1.0, 0.0]
+        # The input batch is not mutated.
+        assert input_batch["loss_multiplier"].tolist() == [1.0, 0.5]
 
 
 # =====================================================================

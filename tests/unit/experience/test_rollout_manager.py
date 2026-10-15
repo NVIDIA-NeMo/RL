@@ -54,6 +54,7 @@ from nemo_rl.experience.interfaces import (
     Completion,
     PromptGroupRecord,
 )
+from nemo_rl.experience.payload import record_to_train_batch
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     AsyncRolloutImpl,
@@ -1011,6 +1012,9 @@ def _mask_gate_result():
         ],
         "full_result": {
             "reward": 1.0,
+            # Both forms of the env mask flag: the verify response's
+            # first-class field and the older instance_config mapping.
+            "mask_sample": True,
             "instance_config": {"mask_sample": True, "other_key": "kept"},
         },
     }
@@ -1020,6 +1024,7 @@ def test_result_to_completion_keeps_mask_flag_when_gate_on():
     completion = _nemo_gym_impl(True)._results_to_completions([_mask_gate_result()])[0][
         0
     ]
+    assert completion.env_extras["mask_sample"] is True
     assert completion.env_extras["instance_config"]["mask_sample"] is True
 
 
@@ -1027,8 +1032,27 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
     completion = _nemo_gym_impl(False)._results_to_completions([_mask_gate_result()])[
         0
     ][0]
+    assert "mask_sample" not in completion.env_extras
     assert "mask_sample" not in completion.env_extras["instance_config"]
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
+
+
+def test_gate_off_keeps_the_mask_flag_in_the_per_agent_metrics():
+    """Dropping the flag from the completions must not drop it from the metrics:
+    the gate-off mode exists for flags too coarse to honor, which is when the
+    flagged rate is worth watching. The metrics read the results the caller
+    still holds, not the completions."""
+    impl = _nemo_gym_impl(False)
+    result = _mask_gate_result()
+    completions, _ = impl._results_to_completions([result])
+    assert "mask_sample" not in completions[0].env_extras
+    # The caller's result is untouched by the gate.
+    assert result["full_result"]["mask_sample"] is True
+
+    metrics = impl._compute_rollout_metrics(
+        completions, "agent", full_results=[result["full_result"]]
+    )
+    assert metrics["agent/mask_sample/mean"] == 1.0
 
 
 def _mask_gate_receipt_result():
@@ -1038,6 +1062,9 @@ def _mask_gate_receipt_result():
         "rollout_id": "r0",
         "full_result": {
             "reward": 1.0,
+            # Both forms, as in _mask_gate_result, so the receipt branch's
+            # handling of the first-class field is observed too.
+            "mask_sample": True,
             "instance_config": {"mask_sample": True, "other_key": "kept"},
         },
     }
@@ -1047,6 +1074,7 @@ def test_receipt_completion_keeps_mask_flag_when_gate_on():
     completion = _nemo_gym_impl(True)._results_to_completions(
         [_mask_gate_receipt_result()]
     )[0][0]
+    assert completion.env_extras["mask_sample"] is True
     assert completion.env_extras["instance_config"]["mask_sample"] is True
     assert completion.truncated is False
 
@@ -1055,6 +1083,7 @@ def test_receipt_completion_drops_mask_flag_when_gate_off():
     completion = _nemo_gym_impl(False)._results_to_completions(
         [_mask_gate_receipt_result()]
     )[0][0]
+    assert "mask_sample" not in completion.env_extras
     assert "mask_sample" not in completion.env_extras["instance_config"]
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
@@ -1115,6 +1144,191 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
     assert (context.full_result_json is not None) is log_full_result_tables
     if log_full_result_tables:
         assert "reward" not in json.loads(context.full_result_json)
+
+
+_MEDIA_TOKEN_ID = 99
+
+
+def _unusable_placeholder_result():
+    """The no-generation placeholder of env.nemo_gym.mask_unusable_rollouts."""
+    user = {"role": "user", "content": "", "token_ids": [2] * 128}
+    return {
+        "message_log": [
+            user,
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": [2],
+                "generation_logprobs": [0.0],
+            },
+        ],
+        "input_message_log": [user],
+        "full_result": {
+            "reward": 0.0,
+            "mask_sample": True,
+            "_ng_unusable_rollout": "no_generation_data",
+        },
+    }
+
+
+def _real_multimodal_result():
+    """A Gym-authored rollout whose prompt holds one media placeholder token."""
+    user = {"role": "user", "content": "", "token_ids": [10, _MEDIA_TOKEN_ID]}
+    return {
+        "message_log": [
+            user,
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": [5, 6],
+                "generation_logprobs": [-0.1, -0.2],
+            },
+        ],
+        "input_message_log": [user],
+        "full_result": {"reward": 1.0},
+    }
+
+
+def _streaming_gym_env(results_by_rowidx):
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            del timer_prefix, per_prompt
+
+            async def stream():
+                for row in pending:
+                    rowidx = row["_rowidx"]
+
+                    async def result_ref(rowidx=rowidx):
+                        return (
+                            rowidx,
+                            {"name": "agent"},
+                            deepcopy(results_by_rowidx[rowidx]),
+                            None,
+                        )
+
+                    yield result_ref()
+
+            return stream()
+
+    return type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+
+
+def _multimodal_input_sample(pixel_values):
+    return {
+        "idx": 0,
+        "loss_multiplier": 1.0,
+        "message_log": [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor([10, _MEDIA_TOKEN_ID]),
+                "pixel_values": pixel_values,
+                "media_token_validity_mask": torch.tensor([False, True]),
+            }
+        ],
+        "extra_env_info": {
+            "agent_ref": {"name": "agent"},
+            "responses_create_params": {
+                "input": [{"role": "user", "content": "describe this image"}]
+            },
+        },
+    }
+
+
+def _multimodal_gym_impl(env, mask_env_flagged_samples):
+    return AsyncNemoGymRolloutImpl(
+        tokenizer=None,
+        task_to_env={"nemo_gym": env},
+        num_generations_per_prompt=2,
+        max_seq_len=1000,
+        max_rollout_turns=1,
+        generation_config={
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_new_tokens": 100,
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        },
+        mask_env_flagged_samples=mask_env_flagged_samples,
+    )
+
+
+@pytest.mark.parametrize("mask_env_flagged_samples", [True, False])
+def test_single_controller_placeholder_never_acquires_prompt_media(
+    mask_env_flagged_samples,
+):
+    """The RolloutManager path must not restore prompt media onto the placeholder.
+
+    Generation 0 is the no-generation placeholder, generation 1 a real
+    multimodal rollout. The group prompt comes from the real sibling, the
+    sibling gets the prompt's image tensors back, the placeholder stays
+    text-only, and the payload carries one image row with the placeholder's
+    sample mask zeroed whatever the env mask gate says.
+    """
+    pixel_values = PackedTensor(torch.zeros(1, 4), dim_to_pack=0)
+    env = _streaming_gym_env(
+        {0: _unusable_placeholder_result(), 1: _real_multimodal_result()}
+    )
+    impl = _multimodal_gym_impl(env, mask_env_flagged_samples)
+
+    record = _run(impl.run_rollout(_multimodal_input_sample(pixel_values)))
+
+    assert record.prompt[0]["token_ids"].tolist() == [10, _MEDIA_TOKEN_ID]
+    assert record.prompt[0]["pixel_values"] is pixel_values
+    placeholder, real = record.completions
+    assert placeholder.env_extras["_ng_unusable_rollout"] == "no_generation_data"
+    assert ("mask_sample" in placeholder.env_extras) is mask_env_flagged_samples
+    assert "pixel_values" not in placeholder.message_log[0]
+    assert "media_token_validity_mask" not in placeholder.message_log[0]
+    assert real.message_log[0]["pixel_values"] is pixel_values
+    assert real.message_log[0]["media_token_validity_mask"].tolist() == [False, True]
+
+    train_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+
+    assert train_batch["sample_mask"].tolist() == [0.0, 1.0]
+    assert train_batch["mask_sample"].tolist() == [mask_env_flagged_samples, False]
+    assert train_batch["input_lengths"].tolist() == [129, 4]
+    input_ids = train_batch["input_ids"]
+    # One projected image row for exactly one media placeholder token, and
+    # that token sits in the real row: the pinned Nemotron Omni alignment.
+    assert train_batch["pixel_values"].as_tensor().shape[0] == 1
+    assert input_ids.eq(_MEDIA_TOKEN_ID).sum().item() == 1
+    assert input_ids[0].eq(_MEDIA_TOKEN_ID).sum().item() == 0
+    validity = train_batch["media_token_validity_mask"]
+    assert validity[0].any().item() is False
+    assert validity[1].tolist()[:2] == [False, True]
+
+
+def test_single_controller_all_placeholder_group_stays_text_only():
+    """With no real sibling the group prompt is the placeholder prompt, media-free."""
+    pixel_values = PackedTensor(torch.zeros(1, 4), dim_to_pack=0)
+    env = _streaming_gym_env(
+        {0: _unusable_placeholder_result(), 1: _unusable_placeholder_result()}
+    )
+    impl = _multimodal_gym_impl(env, True)
+
+    record = _run(impl.run_rollout(_multimodal_input_sample(pixel_values)))
+
+    assert record.prompt[0]["token_ids"].numel() == 128
+    assert "pixel_values" not in record.prompt[0]
+    for completion in record.completions:
+        assert "pixel_values" not in completion.message_log[0]
+    train_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+    assert train_batch["sample_mask"].tolist() == [0.0, 0.0]
+    assert "pixel_values" not in train_batch
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
@@ -1917,9 +2131,18 @@ class _FakeCaptureBuffer(_FakeBuffer):
 
 
 def _receipt_record(
-    rollout_ids, receipts, instance_configs=None, *, loss_multiplier=1.0
+    rollout_ids,
+    receipts,
+    instance_configs=None,
+    *,
+    loss_multiplier=1.0,
+    verify_fields=None,
 ):
+    """``instance_configs`` nests each entry under ``instance_config``;
+    ``verify_fields`` spreads each entry's verify-response fields (such as the
+    first-class ``mask_sample``) into the completion's env_extras as they are."""
     instance_configs = instance_configs or [None] * len(rollout_ids)
+    verify_fields = verify_fields or [{}] * len(rollout_ids)
     completions = [
         Completion(
             message_log=[],
@@ -1928,11 +2151,14 @@ def _receipt_record(
                 "ng_receipt": receipt,
                 "ng_rollout_id": rid,
                 **({"instance_config": cfg} if cfg is not None else {}),
+                **fields,
             },
             truncated=False,
             reward=0.5,
         )
-        for rid, receipt, cfg in zip(rollout_ids, receipts, instance_configs)
+        for rid, receipt, cfg, fields in zip(
+            rollout_ids, receipts, instance_configs, verify_fields
+        )
     ]
     return PromptGroupRecord(
         prompt_idx=0,
@@ -1952,6 +2178,7 @@ def _make_capture_manager(
     num_generations=2,
     retry_policy: RolloutRetryPolicy | None = None,
     instance_configs=None,
+    verify_fields=None,
     recovery_config: RolloutRecoveryConfig | None = None,
 ):
     mgr = object.__new__(RolloutManager)
@@ -2002,6 +2229,11 @@ def _make_capture_manager(
                 if instance_configs is not None
                 else None
             )
+            selected_fields = (
+                [verify_fields[index] for index in indices]
+                if verify_fields is not None
+                else None
+            )
             receipts = [
                 {
                     "rollout_id": rollout_id,
@@ -2014,6 +2246,7 @@ def _make_capture_manager(
                 receipts,
                 instance_configs=selected_configs,
                 loss_multiplier=float(_sample.get("loss_multiplier", 1.0)),
+                verify_fields=selected_fields,
             )
             if on_completion is not None:
                 for generation_index, completion in zip(indices, record.completions):
@@ -2028,16 +2261,27 @@ class TestGenerateForFinalizationFlow:
     def test_request_carries_env_mask_flags(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(
-            buf, instance_configs=[{"mask_sample": True}, {"other": 1}]
+            buf,
+            # One row flagged through the first-class field alone, one through
+            # the nested mapping beside a false first-class field (what a
+            # nested-only environment emits on a Gym that defaults the
+            # first-class field to False), and one unflagged.
+            num_generations=3,
+            verify_fields=[
+                {"mask_sample": True},
+                {"mask_sample": False, "instance_config": {"mask_sample": True}},
+                {"other": 1},
+            ],
         )
 
         request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
 
         # The gym mask flag is read from env_extras exactly like the token
-        # path's _mask_sample_flags. truncated is not part of this request --
-        # the dispatcher has no real tokens to measure it from; the finalizer
-        # computes it from each row's rebuilt length instead.
-        assert request.mask_sample == (True, False)
+        # path's _mask_sample_flags: either form flags the row. truncated is
+        # not part of this request -- the dispatcher has no real tokens to
+        # measure it from; the finalizer computes it from each row's rebuilt
+        # length instead.
+        assert request.mask_sample == (True, True, False)
 
     def test_mints_ids_and_returns_metadata_request(self):
         buf = _FakeCaptureBuffer()
