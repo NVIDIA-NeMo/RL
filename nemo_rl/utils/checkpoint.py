@@ -17,6 +17,7 @@ It handles logic at the algorithm level. Each RL Actor is expected to have its
 own checkpoint saving function (called by the algorithm loop).
 """
 
+import functools
 import glob
 import json
 import os
@@ -44,6 +45,11 @@ import yaml
 from pydantic import BaseModel
 
 PathLike = Union[str, "os.PathLike[Any]"]
+
+# State of the validation run at a checkpoint's step, stored as "val_status" in
+# training_info.json: "pending" while it runs in the background, "finished" once
+# its result is recorded, "skipped" when that step had no validation result.
+ValStatus = Literal["finished", "pending", "skipped"]
 
 
 def _load_megatron_common_state_dict(iteration_dir: Path) -> dict[str, Any]:
@@ -350,14 +356,7 @@ class CheckpointManager:
             print(f"Removed stale {save_dir.name} in {elapsed:.2f}s")
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        # save training info
-        with open(save_dir / "training_info.json", "w") as f:
-            # make any numpy items serializable
-            serializable_training_info = dict(training_info)
-            for k, v in serializable_training_info.items():
-                if isinstance(v, torch.Tensor) or isinstance(v, np.ndarray):
-                    serializable_training_info[k] = v.item()
-            json.dump(serializable_training_info, f)
+        _write_training_info(save_dir / "training_info.json", training_info)
 
         # save config
         if run_config is not None:
@@ -481,6 +480,17 @@ class CheckpointManager:
                 stacklevel=2,
             )
 
+    @staticmethod
+    def _warn_on_val_record_failure(step: int, future: "Future[None]") -> None:
+        """Surface a failed background validation record as a warning."""
+        exc = future.exception()
+        if exc is not None:
+            warnings.warn(
+                f"Failed to record the validation result for the checkpoint at "
+                f"step {step}: {exc!r}.",
+                stacklevel=2,
+            )
+
     def __enter__(self) -> "CheckpointManager":
         """Enter a context that guarantees shutdown() flushes on exit."""
         return self
@@ -532,6 +542,10 @@ class CheckpointManager:
         Applied to all checkpoints regardless of save_period alignment.
         Purely recency-based — metrics are not considered.
 
+        When ranking by a validation metric ("val:..."), periodic checkpoints
+        whose "val_status" is "pending" are retained and do not count toward
+        keep_top_k until their validation result is recorded.
+
         Args:
             exclude_latest (bool): Whether to protect the most recent checkpoint
                 from deletion.
@@ -551,6 +565,22 @@ class CheckpointManager:
         periodic_history = [
             (s, p, m) for s, p, m in checkpoint_history if s % self.save_period == 0
         ]
+
+        if self.metric_name is not None and self.metric_name.startswith("val:"):
+            # A pending checkpoint cannot be ranked until its background
+            # validation finishes (see record_validation()).
+            pending_steps = {
+                s for s, _, m in periodic_history if m.get("val_status") == "pending"
+            }
+            if pending_steps:
+                print(
+                    "Keeping checkpoints awaiting validation at steps "
+                    f"{sorted(pending_steps)}"
+                )
+                protected_steps.update(pending_steps)
+                periodic_history = [
+                    c for c in periodic_history if c[0] not in pending_steps
+                ]
 
         if self.keep_top_k is not None:
             # keep_top_k limits which periodic checkpoints survive
@@ -583,6 +613,67 @@ class CheckpointManager:
             if step not in protected_steps:
                 print(f"Removing checkpoint {path} (step {step})")
                 shutil.rmtree(path)
+
+    def record_validation(
+        self, step: int, end_step: int, val_info: Mapping[str, Any]
+    ) -> None:
+        """Record a finished validation in the checkpoint saved at ``step``.
+
+        Merges ``val_info`` into the checkpoint's training_info.json, sets
+        "val_status" to "finished" and "val_end_step" to ``end_step``, and reruns
+        retention now that the checkpoint can be ranked.
+
+        Args:
+            step (int): Step of the checkpoint the validation was launched at.
+            end_step (int): Training step reached when the validation finished.
+            val_info (Mapping[str, Any]): Keys to add, e.g. the checkpoint metric.
+        """
+        # The checkpoint may still be tmp_step_{step} until its rename lands.
+        self.finalize_pending()
+        info_file = self.checkpoint_dir / f"step_{step}" / "training_info.json"
+        val_info = dict(val_info)
+
+        def _record() -> None:
+            if not info_file.exists():
+                print(
+                    f"Checkpoint at step {step} no longer exists; its validation "
+                    "result is not recorded."
+                )
+                return
+            with open(info_file) as f:
+                info = json.load(f)
+            info.update(val_info)
+            info["val_status"] = "finished"
+            info["val_end_step"] = end_step
+            _write_training_info(info_file, info)
+            print(
+                f"Recorded validation from step {step} (finished at step "
+                f"{end_step}) in checkpoint step_{step}.",
+                flush=True,
+            )
+            self.remove_old_checkpoints()
+
+        # Serialized with background deletions so retention never runs twice
+        # concurrently or deletes the checkpoint mid-update.
+        record_future = self._delete_executor.submit(_record)
+        record_future.add_done_callback(
+            functools.partial(self._warn_on_val_record_failure, step)
+        )
+
+    def clear_stale_pending_validations(self) -> None:
+        """Mark validations that never finished as skipped.
+
+        Call before training starts, when no validation can be in flight: a
+        "pending" status found then belongs to a run that stopped mid-validation,
+        and its checkpoint is ranked as having no validation result from now on.
+        """
+        for _, path, info in _load_checkpoint_history(self.checkpoint_dir):
+            if info.get("val_status") == "pending":
+                info["val_status"] = "skipped"
+                _write_training_info(Path(path) / "training_info.json", info)
+                print(
+                    f"Validation for checkpoint {path} never finished; marked skipped"
+                )
 
     def get_best_checkpoint_path(self) -> Optional[str]:
         """Get the path to the best checkpoint based on the metric.
@@ -667,6 +758,19 @@ class CheckpointManager:
             return None
         with open(Path(checkpoint_path) / "training_info.json", "r") as f:
             return json.load(f)
+
+
+def _write_training_info(info_file: Path, training_info: Mapping[str, Any]) -> None:
+    """Write training info as JSON, replacing ``info_file`` atomically."""
+    # make any numpy items serializable
+    serializable_training_info = dict(training_info)
+    for k, v in serializable_training_info.items():
+        if isinstance(v, torch.Tensor) or isinstance(v, np.ndarray):
+            serializable_training_info[k] = v.item()
+    tmp_file = info_file.with_name(info_file.name + ".tmp")
+    with open(tmp_file, "w") as f:
+        json.dump(serializable_training_info, f)
+    os.replace(tmp_file, info_file)
 
 
 def _load_checkpoint_history(
