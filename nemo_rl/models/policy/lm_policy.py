@@ -61,6 +61,7 @@ from nemo_rl.models.policy.utils import (
     resolve_policy_worker_cls,
     validate_fp32_lm_head_config,
 )
+from nemo_rl.utils.checkpoint_storage import checkpoint_abspath
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     get_hf_config,
@@ -148,9 +149,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             get_actor_python_env(extension_fqn)
 
         if weights_path:
-            weights_path = os.path.abspath(weights_path)
+            weights_path = checkpoint_abspath(weights_path)
         if optimizer_path:
-            optimizer_path = os.path.abspath(optimizer_path)
+            optimizer_path = checkpoint_abspath(optimizer_path)
 
         worker_builder_cls_fqn: str
         tp_size = 1
