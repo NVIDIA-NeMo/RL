@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, call, patch
 import numpy as np
 import pytest
 import torch
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from nemo_rl.utils.logger import (
     TELEMETRY_WALL_TIME_METRIC,
@@ -165,6 +166,26 @@ class TestTensorboardLogger:
         temp_dir = tempfile.mkdtemp()
         yield temp_dir
         shutil.rmtree(temp_dir)
+
+    def test_finish_flushes_final_scalars(self, tmp_path: Path) -> None:
+        """Final-step metrics must survive logger teardown in a Ray actor."""
+        logger = TensorboardLogger(TensorboardConfig(), log_dir=str(tmp_path))
+        for step in (1, 2):
+            logger.log_metrics({"loss": 8.0 - step, "global_valid_toks": 48}, step)
+
+        logger.finish()
+        # Repeated teardown must remain safe.
+        logger.finish()
+
+        events = EventAccumulator(str(tmp_path)).Reload()
+        assert [(e.step, e.value) for e in events.Scalars("loss")] == [
+            (1, 7.0),
+            (2, 6.0),
+        ]
+        assert [(e.step, e.value) for e in events.Scalars("global_valid_toks")] == [
+            (1, 48.0),
+            (2, 48.0),
+        ]
 
     @patch("nemo_rl.utils.logger.SummaryWriter")
     def test_init(self, mock_summary_writer, temp_dir):
