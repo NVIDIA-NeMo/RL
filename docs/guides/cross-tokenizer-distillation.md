@@ -42,7 +42,7 @@ Prepare both directions before launching CSD. The following example uses
   and the model cache available to the preparation process and training workers.
 - Training requires a compatible Linux/CUDA environment, the model backend's
   dependencies, and enough GPU and host memory for the selected models.
-  The example below uses one node with eight GPUs and the Automodel backend.
+  The example below uses one node with eight GPUs and the Megatron backend.
   The teacher and student time-share a colocated GPU pool; CUDA IPC requires
   the producing and consuming ranks to be on the same node.
 
@@ -50,7 +50,7 @@ Prepare the example's environment with:
 
 ```bash
 git submodule update --init --recursive
-uv sync --locked --extra automodel
+uv sync --locked --extra mcore
 ```
 
 Use the same tokenizer assets during preparation and training. Model IDs may
@@ -237,6 +237,8 @@ Keep model revisions or local snapshots consistent with those tokenizers.
 Inspect the resolved configuration and training logs for the intended
 `algorithm`, table paths, finite CE/KD losses, and completed optimizer steps.
 The checkpoint and log directories are set explicitly in the command.
+Checkpoints are saved in Megatron format; convert one to Hugging Face format
+with the Megatron command in [Evaluation](../about/evaluation.md).
 Increase `distillation.max_num_steps` and choose a new checkpoint directory
 for the actual experiment. Table validation establishes preparation correctness;
 it does not replace a GPU smoke run for the selected backend, model pair,
