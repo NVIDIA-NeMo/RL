@@ -50,7 +50,13 @@ from nemo_rl.telemetry.instrumentation import (
     current_trace_carrier,
     remote_trace_context,
 )
-from nemo_rl.utils.checkpoint_storage import enable_msc_for, open_path
+from nemo_rl.utils.checkpoint_storage import (
+    as_checkpoint_path,
+    enable_msc_for,
+    is_msc_path,
+    open_path,
+    path_exists,
+)
 
 PathLike = Union[str, "os.PathLike[Any]"]
 
@@ -298,9 +304,7 @@ class CheckpointManager:
             raise ValueError(
                 "MSC checkpoints do not yet support data-plane snapshots; set save_data_plane=false."
             )
-        self.checkpoint_dir = (self._msc.Path if self._msc else Path)(
-            config["checkpoint_dir"]
-        )
+        self.checkpoint_dir = as_checkpoint_path(config["checkpoint_dir"])
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
@@ -310,7 +314,7 @@ class CheckpointManager:
 
         # Async finalization state
         self._finalize_thread: Optional[threading.Thread] = None
-        self._pending_checkpoint_path: Optional[Path] = None
+        self._pending_checkpoint_path: Optional[PathLike] = None
         self._finalize_error: Optional[Exception] = None
         self._delete_executor = ThreadPoolExecutor(max_workers=1)
 
@@ -332,10 +336,7 @@ class CheckpointManager:
             optimizer_path is None if checkpoint exists but optimizer state was not saved.
         """
         if last_checkpoint_path:
-            storage = enable_msc_for(last_checkpoint_path)
-            component_path = (storage.Path if storage else Path)(
-                last_checkpoint_path
-            ) / model_component
+            component_path = as_checkpoint_path(last_checkpoint_path) / model_component
             weights_path = component_path / "weights"
             optimizer_path = component_path / "optimizer"
 
@@ -401,7 +402,7 @@ class CheckpointManager:
         """
         if self._msc is not None:
             save_dir = self.checkpoint_dir / f"step_{step}"
-            if self._msc.os.path.exists(str(save_dir) + "/_SUCCESS"):
+            if path_exists(save_dir / "_SUCCESS"):
                 raise FileExistsError(
                     f"Refusing to overwrite MSC checkpoint {save_dir}; use a fresh run prefix."
                 )
@@ -422,8 +423,7 @@ class CheckpointManager:
         save_dir.mkdir(parents=True, exist_ok=True)
 
         # save training info
-        open_file = self._msc.open if self._msc else open
-        with open_file(str(save_dir / "training_info.json"), "w") as f:
+        with open_path(save_dir / "training_info.json", "w") as f:
             # make any numpy items serializable
             serializable_training_info = dict(training_info)
             for k, v in serializable_training_info.items():
@@ -433,7 +433,7 @@ class CheckpointManager:
 
         # save config
         if run_config is not None:
-            with open_file(str(save_dir / "config.yaml"), "w") as f:
+            with open_path(save_dir / "config.yaml", "w") as f:
                 # JSON mode converts enums and other Pydantic-supported scalar
                 # types to the primitive values expected by safe YAML.
                 yaml.safe_dump(run_config.model_dump(mode="json"), f)
@@ -449,7 +449,7 @@ class CheckpointManager:
         """
         if self._msc is not None:
             # Publish only after all worker saves (including async completion) succeed.
-            with self._msc.open(str(checkpoint_path) + "/_SUCCESS", "w") as stream:
+            with open_path(str(checkpoint_path) + "/_SUCCESS", "w") as stream:
                 json.dump({"version": 1}, stream)
             return
         checkpoint_path = Path(checkpoint_path)
@@ -497,9 +497,7 @@ class CheckpointManager:
                 For sync saves: None (rename immediately).
         """
         self.finalize_pending()
-        self._pending_checkpoint_path = (self._msc.Path if self._msc else Path)(
-            checkpoint_path
-        )
+        self._pending_checkpoint_path = as_checkpoint_path(checkpoint_path)
         self._finalize_error = None
         # The step is only in the staging dir name (tmp_step_<n>); None if it
         # does not parse, since this only labels a span.
@@ -738,8 +736,8 @@ class CheckpointManager:
         """
         # find checkpoint directory with highest step number
         if self._msc is not None:
-            history = _load_checkpoint_history(self.checkpoint_dir)
-            return str(max(history, key=lambda item: item[0])[1]) if history else None
+            steps = _msc_step_dirs(self.checkpoint_dir)
+            return max(steps)[1] if steps else None
         step_dirs = [
             x
             for x in glob.glob(str(self.checkpoint_dir / "step_*"))
@@ -766,8 +764,19 @@ class CheckpointManager:
         if checkpoint_path is None:
             return None
         with open_path(str(checkpoint_path) + "/training_info.json") as f:
-            info = json.load(f)
-        return info
+            return json.load(f)
+
+
+def _msc_step_dirs(checkpoint_dir: PathLike) -> list[tuple[int, str]]:
+    """List ``(step, path)`` of published (``_SUCCESS``) steps under an MSC prefix."""
+    msc = enable_msc_for(checkpoint_dir)
+    assert msc is not None, f"{checkpoint_dir} is not an msc:// path"
+    steps = []
+    for marker in msc.glob(str(checkpoint_dir) + "/step_*/_SUCCESS"):
+        step_dir = msc.Path(marker).parent
+        if re.fullmatch(r"step_\d+", step_dir.name):
+            steps.append((int(step_dir.name.split("_")[1]), str(step_dir)))
+    return steps
 
 
 def _load_checkpoint_history(
@@ -783,20 +792,17 @@ def _load_checkpoint_history(
             (step_number, checkpoint_path, info) for each checkpoint.
     """
     checkpoint_history: list[tuple[int, PathLike, dict[str, Any]]] = []
-    msc = enable_msc_for(checkpoint_dir)
-    if msc is not None:
-        for marker in msc.glob(str(checkpoint_dir) + "/step_*/_SUCCESS"):
-            step_dir = msc.Path(marker).parent
-            if re.fullmatch(r"step_\d+", step_dir.name):
-                with msc.open(str(step_dir / "training_info.json")) as stream:
-                    checkpoint_history.append(
-                        (
-                            int(step_dir.name.split("_")[1]),
-                            str(step_dir),
-                            json.load(stream),
-                        )
-                    )
-        return checkpoint_history
+    if is_msc_path(checkpoint_dir):
+        steps = _msc_step_dirs(checkpoint_dir)
+
+        def read_info(step_dir: str) -> dict[str, Any]:
+            with open_path(step_dir + "/training_info.json") as f:
+                return json.load(f)
+
+        # One GET per step; read them concurrently instead of one by one.
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            infos = list(pool.map(read_info, [step_dir for _, step_dir in steps]))
+        return [(step, step_dir, info) for (step, step_dir), info in zip(steps, infos)]
 
     # Find all step directories
     step_dirs = [

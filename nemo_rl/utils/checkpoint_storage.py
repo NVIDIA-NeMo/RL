@@ -14,8 +14,11 @@
 """Opt-in MSC checkpoint storage; ordinary filesystem paths remain unchanged."""
 
 import os
+from pathlib import Path
 from types import ModuleType
 from typing import Any
+
+import torch
 
 
 def is_msc_path(path: str | os.PathLike[str]) -> bool:
@@ -66,9 +69,6 @@ def checkpoint_abspath(path: str | os.PathLike[str]) -> str:
 
 def save_checkpoint_object(value: Any, path: str | os.PathLike[str]) -> None:
     """Save controller checkpoint state beside local or MSC model shards."""
-    # Keep torch optional for callers that only normalize paths.
-    import torch
-
     if is_msc_path(path):
         import_msc().torch.save(value, str(path))
     else:
@@ -77,8 +77,6 @@ def save_checkpoint_object(value: Any, path: str | os.PathLike[str]) -> None:
 
 def load_checkpoint_object(path: str | os.PathLike[str], **kwargs: Any) -> Any:
     """Load controller checkpoint state saved by ``save_checkpoint_object``."""
-    import torch
-
     if is_msc_path(path):
         return import_msc().torch.load(str(path), **kwargs)
     return torch.load(path, **kwargs)
@@ -96,3 +94,23 @@ def open_path(path: str | os.PathLike[str], mode: str = "r") -> Any:
     if is_msc_path(path):
         return import_msc().open(str(path), mode)
     return open(path, mode)
+
+
+def as_checkpoint_path(path: str | os.PathLike[str]) -> Path:
+    """``Path(path)``, or the MSC path class for ``msc://`` URLs."""
+    msc = enable_msc_for(path)
+    return (msc.Path if msc else Path)(path)
+
+
+def path_isdir(path: str | os.PathLike[str]) -> bool:
+    """``os.path.isdir`` that also understands ``msc://`` URLs."""
+    if is_msc_path(path):
+        return import_msc().os.path.isdir(str(path))
+    return os.path.isdir(path)
+
+
+def listdir(path: str | os.PathLike[str]) -> list[str]:
+    """``os.listdir`` that also understands ``msc://`` URLs."""
+    if is_msc_path(path):
+        return import_msc().os.listdir(str(path))
+    return os.listdir(path)

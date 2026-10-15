@@ -592,7 +592,9 @@ def test_ft_save_period_triggers_periodic_saves(mock_xtoken_components):
     c.master_config.checkpointing["metric_name"] = None
     c.checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
 
-    with patch("nemo_rl.algorithms.xtoken_off_policy_distillation.save_dataloader_state"):
+    with patch(
+        "nemo_rl.algorithms.xtoken_off_policy_distillation.save_dataloader_state"
+    ):
         _run_train(c)
 
     # ft_save_period=2 -> steps 2, 4; save_period=100 contributes only the last step (5).
@@ -623,7 +625,9 @@ def test_exit_on_timeout(mock_xtoken_components, capsys, tmp_path):
     )
 
     with (
-        patch("nemo_rl.algorithms.xtoken_off_policy_distillation.save_dataloader_state"),
+        patch(
+            "nemo_rl.algorithms.xtoken_off_policy_distillation.save_dataloader_state"
+        ),
         patch.object(xt_mod, "TimeoutChecker") as mock_timeout_class,
     ):
         mock_timeout_instance = MagicMock()
