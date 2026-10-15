@@ -194,6 +194,23 @@ available, the wrapper falls back to the installed `nemo_rl` package.
 `CONTAINER` must provide
 `EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
 
+### Persistent compile caches for NeMo RL workers
+
+The vLLM and Megatron workers can keep their JIT caches the same way, one directory per worker type under `NRL_COMPILE_CACHE_ROOT`. In the driver's environment:
+
+```bash
+NRL_CACHE_SYNC=$TOOLS/cache_sync.sh NRL_COMPILE_CACHE_ROOT=/shared/compile_cache NRL_LOCAL_COMPILE_CACHE=/tmp/nemo_rl_compile_cache
+VLLM_CACHE_ROOT=/tmp/nemo_rl_compile_cache/policy/vllm NRL_VLLM_CACHE_ROOT_PER_ENGINE=0   # one engine per node
+NRL_VLLM_TRITON_CACHE_DIR=/tmp/nemo_rl_compile_cache/policy/triton                        # likewise other NRL_VLLM_* / NRL_MEGATRON_* dirs
+```
+
+The vLLM actor waits for this node's copy of the `policy` cache before it creates its engine; the Megatron worker copies `megatron` in the background (its kernels are compiled at the first training step). Start the policy copy and the write-back in `SETUP_COMMAND`, so the copy overlaps Ray start-up:
+
+```bash
+bash $TOOLS/cache_sync.sh seed-once /shared/compile_cache/policy /tmp/nemo_rl_compile_cache/policy &
+bash $TOOLS/cache_sync.sh sidecar-types /tmp/nemo_rl_compile_cache /shared/compile_cache 60 "$LOG_DIR/ENDED" policy megatron &
+```
+
 ## Slurm submission
 
 The wrapper requires exactly two hetgroups. Submit the NeMo RL nodes first and

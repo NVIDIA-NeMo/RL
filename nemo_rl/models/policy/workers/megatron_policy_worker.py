@@ -159,6 +159,7 @@ from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
 )
+from nemo_rl.utils import compile_cache
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -813,6 +814,8 @@ class MegatronPolicyWorkerImpl(
         del num_gpus_per_node  # not needed; one GPU per worker
         resources: dict[str, Any] = {"num_gpus": num_gpus}
         env_vars: dict[str, str] = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
+        # The trainer's own JIT cache dirs (NRL_MEGATRON_<VAR>).
+        env_vars.update(compile_cache.env_overrides("MEGATRON"))
         init_kwargs: dict[str, Any] = {}
         return resources, env_vars, init_kwargs, {}
 
@@ -838,6 +841,9 @@ class MegatronPolicyWorkerImpl(
         # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
         maybe_enable_msc(weights_path, optimizer_path)
         make_empty_cache_best_effort_under_expandable_segments()
+        # Copy the trainer's persistent compile cache in the background: its
+        # kernels are first compiled at the first logprob/training step.
+        compile_cache.seed("megatron", background=True)
         self.is_refit_destination = is_refit_destination
         self._bulk_refit_conversion_tasks: list[Any] = []
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does

@@ -80,6 +80,7 @@ from nemo_rl.telemetry.setup import (
     vllm_native_tracing_requested,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils import compile_cache
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -332,10 +333,23 @@ class BaseVllmGenerationWorker:
             init_kwargs["seed"] = seed
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
-            env_vars["VLLM_CACHE_ROOT"] = (
-                os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
-                + f"_{seed}"
+            # NRL_VLLM_CACHE_ROOT_PER_ENGINE=0 keeps the path the same in every job,
+            # so a persistent cache is reused (only with one engine per node).
+            vllm_cache_root = os.environ.get(
+                "VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm")
             )
+            if os.environ.get("NRL_VLLM_CACHE_ROOT_PER_ENGINE", "1") != "0":
+                vllm_cache_root += f"_{seed}"
+            env_vars["VLLM_CACHE_ROOT"] = vllm_cache_root
+            # Generation's own JIT cache dirs (NRL_VLLM_<VAR>); vLLM's v1 Ray
+            # executor copies only listed variables to its workers.
+            jit_cache_env = compile_cache.env_overrides("VLLM")
+            if jit_cache_env:
+                env_vars.update(jit_cache_env)
+                extra = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
+                env_vars["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(
+                    [v for v in extra.split(",") if v] + list(jit_cache_env)
+                )
 
             # Give each vLLM engine a deterministic starting VLLM_PORT for the
             # TP/DP rendezvous. vLLM's _get_open_port() reads VLLM_PORT and
@@ -788,6 +802,7 @@ class BaseVllmGenerationWorker:
         _configure_nvfp4_pertoken_engine_kwargs(self.cfg, llm_kwargs)
         llm_kwargs.setdefault("worker_extension_cls", default_worker_extension_cls)
         _maybe_enable_vllm_native_tracing(llm_kwargs)
+        compile_cache.seed("policy")  # wait for this node's copy before compiling
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
