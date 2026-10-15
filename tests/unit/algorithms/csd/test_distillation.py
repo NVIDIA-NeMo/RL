@@ -1449,6 +1449,7 @@ def test_build_teacher_force_ids_respects_position_zero_and_shift():
         "kl_chunk_shift": True,
         "csd_noise_filter_topk": 0,
         "csd_pure_alm": False,
+        "csd_realized_only_mismatch": False,
         "teacher_topk_ipc_k": 8192,
         "teacher_topk_ipc_keep_realized": True,
     }
@@ -1463,6 +1464,35 @@ def test_build_teacher_force_ids_respects_position_zero_and_shift():
     # later and its labels at teacher positions 2,3 are attached to predictors
     # 1,2, with the latter write taking precedence at position 1.
     assert torch.equal(force_ids, torch.tensor([[10, 12, 13, -1, -1]]))
+
+
+@pytest.mark.parametrize("realized_only", [False, True])
+def test_build_teacher_force_ids_follow_realized_only_mismatch(realized_only):
+    """Realized-only mismatch keeps realized labels even without keep_realized."""
+    batch = _make_batch(batch_size=1, t_student=5, t_teacher=5)
+    batch["teacher_0_input_ids"] = torch.tensor([[10, 11, 12, 13, 14]])
+    batch["alignment_0_pair_valid"] = torch.tensor([[True, True, False]])
+    batch["alignment_0_student_chunk_id"] = torch.tensor([[0, 0, -1, 1, 1]])
+    batch["alignment_0_teacher_chunk_id"] = torch.tensor([[0, 0, 1, 1, -1]])
+    loss_config = {
+        "kl_chunk_shift": True,
+        "csd_noise_filter_topk": 0,
+        "csd_pure_alm": False,
+        "csd_realized_only_mismatch": realized_only,
+        "teacher_topk_ipc_k": 8192,
+        "teacher_topk_ipc_keep_realized": False,
+    }
+
+    force_ids = _build_teacher_force_include_token_ids(
+        batch,
+        teacher_idx=0,
+        loss_config=loss_config,
+    )
+
+    if realized_only:
+        assert torch.equal(force_ids, torch.tensor([[10, 12, 13, -1, -1]]))
+    else:
+        assert force_ids is None
 
 
 def test_export_teacher_logits_mixes_sparse_cross_and_dense_same_vocab():

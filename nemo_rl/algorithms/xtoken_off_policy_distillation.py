@@ -521,6 +521,7 @@ def _teacher_topk_ipc_keep_realized(
     topk_k = int(loss_config["teacher_topk_ipc_k"])
     return topk_k > 0 and (
         bool(loss_config["csd_pure_alm"])
+        or bool(loss_config["csd_realized_only_mismatch"])
         or topk_k == 1
         or bool(loss_config["teacher_topk_ipc_keep_realized"])
     )
