@@ -69,7 +69,7 @@ Discover supported algorithms including GRPO, PPO, SFT, DPO, RM, on-policy disti
 :link: about/evaluation
 :link-type: doc
 
-Learn how to evaluate your models using built-in evaluation datasets and custom evaluation pipelines.
+Measure model and agent capabilities with repeatable benchmarks and custom evaluations.
 :::
 
 :::{grid-item-card} {octicon}`server` Cluster Setup
@@ -326,7 +326,6 @@ guides/grpo-audio.md
 guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md
-guides/eval.md
 guides/deepseek.md
 guides/models/index.md
 model-quirks.md
