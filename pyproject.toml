@@ -293,6 +293,7 @@ docs = [
   "sphinx-autodoc2",           # For documenting Python API
   "sphinx-copybutton",         # Adds a copy button for code blocks
   "sphinx-design",             # For design components in docs
+  "sphinx-reredirects",        # Preserves URLs when documentation pages move
   "myst_parser",               # For our markdown docs
   "nvidia-sphinx-theme",       # Our NVIDIA theme
   "gitpython>=3.1.45",         # To git-related information
