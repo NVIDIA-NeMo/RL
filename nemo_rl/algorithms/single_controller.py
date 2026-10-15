@@ -92,6 +92,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     GRPOSaveState,
+    _apply_async_sample_masks,
     _clip_grpo_advantages,
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
@@ -695,6 +696,7 @@ class SingleControllerActor:
             "num_mask_sample_filtered": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
+            "sample_mask_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
         self._opd_stat_sum = 0.0
@@ -5195,11 +5197,22 @@ class SingleControllerActor:
             tensor_field(data, adv_cfg.truncated_field)
         ).bool()
 
-        num_mask_sample_filtered = int(mask_sample.sum().item())
+        # Token-capture rejection placeholders arrive with sample_mask 0 and no
+        # other marker, so on this path num_masked_seqs_by_loss_multiplier also
+        # counts them (they are reported separately as
+        # finalize/capture_failure_reason_*_count).
+        mask_batch = BatchedDataDict(
+            {
+                "loss_multiplier": sample_mask,
+                "truncated": truncated,
+                "mask_sample": mask_sample,
+            }
+        )
+        sample_mask_metrics, num_mask_sample_filtered = _apply_async_sample_masks(
+            mask_batch, overlong_filtering=self._algo_cfg.overlong_filtering
+        )
+        final_sample_mask = mask_batch["loss_multiplier"]
         self._step_log_dict["num_mask_sample_filtered"].append(num_mask_sample_filtered)
-        final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
-        if self._algo_cfg.overlong_filtering:
-            final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
 
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
@@ -5242,6 +5255,14 @@ class SingleControllerActor:
             seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
+            # SingleController rejects seq_logprob_error_in_loss, so this count is
+            # always pre-training and disjoint from the reasons attributed above.
+            sample_mask_metrics["num_masked_seqs_total"] += seq_error_metrics[
+                "num_masked_seqs_by_logprob_error"
+            ]
+        self._step_log_dict.setdefault("sample_mask_metrics", []).append(
+            sample_mask_metrics
+        )
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
