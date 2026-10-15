@@ -94,6 +94,8 @@ def _build_case(name, tmpdir, seed=0):
         common-vocab JSD partition KL, no mismatch/prefix-index path).
       * ``with_mismatch``: adds a 1-to-2 and a 2-to-1 chunk (exercises the
         prefix support index + batched mismatch + position-0 KL).
+      * ``mismatch_only``: a 1-to-2 chunk at the sequence start (never
+        shifted) followed by a shifted 2-to-1 chunk, with no common chunk.
     """
     torch.manual_seed(seed)
     v_s, v_t = 16, 16
@@ -120,6 +122,12 @@ def _build_case(name, tmpdir, seed=0):
             [[0, 8, 3, 0, 5, 0], [1, 8, 4, 0, 6, 0]], dtype=torch.long
         )
         chunks = [(0, 1, 0, 1), (1, 2, 1, 3), (3, 5, 4, 5)]
+        per_sample_chunks = [chunks, chunks]
+    elif name == "mismatch_only":
+        S = T = 3
+        student_ids = torch.tensor([[5, 9, 5], [6, 9, 6]], dtype=torch.long)
+        teacher_ids = torch.tensor([[8, 3, 5], [8, 4, 6]], dtype=torch.long)
+        chunks = [(0, 1, 0, 2), (1, 3, 2, 3)]
         per_sample_chunks = [chunks, chunks]
     else:
         raise ValueError(name)
@@ -167,6 +175,7 @@ def _run_csd(
     teacher_sparse_payload=None,
     sample_mask=None,
     global_valid_chunks=None,
+    cfg_overrides=None,
 ):
     from nemo_rl.algorithms.loss.csd import (
         CSDLossFn,
@@ -207,6 +216,7 @@ def _run_csd(
         # dense and sparse mismatch eligibility identical for this regression.
         "teacher_topk_ipc_keep_realized": False,
     }
+    cfg.update(cfg_overrides or {})
     loss_fn = CSDLossFn(cfg)
     student_logits = fx["student_logits"].clone().requires_grad_(True)
     if sample_mask is None:
@@ -758,3 +768,142 @@ def test_csd_mismatch_partition_aggregation(tmp_path):
     assert loss.item() == pytest.approx(expected)
     assert torch.isfinite(grad).all()
     assert torch.count_nonzero(grad) > 0
+
+
+_REALIZED_ONLY = {
+    "csd_realized_only_mismatch": True,
+    "csd_position_0_kl": False,
+    "csd_mismatch_pos0_alpha": 0.0,
+}
+
+
+def _realized_chain_reference(fx, student_logits):
+    """Independent realized-chain-vs-REST KL for every mismatch chunk."""
+    knobs = fx["knobs"]
+    temperature = knobs["temperature"]
+    student_logp = torch.log_softmax(student_logits / temperature, dim=-1)
+    teacher_logp = torch.log_softmax(fx["teacher_logits"] / temperature, dim=-1)
+
+    def positions(start, end, shift):
+        if shift:
+            return list(range(start - 1, end - 1)), list(range(start, end))
+        return list(range(start, end)), list(range(start, end))
+
+    def chain(logp, ids, b, preds, labels):
+        return sum(logp[b, p, ids[b, lab]] for p, lab in zip(preds, labels))
+
+    def with_rest(chain_logp):
+        rest = (1.0 - chain_logp.exp()).clamp_min(1e-12).log()
+        return torch.stack([chain_logp, rest])
+
+    total = torch.zeros(())
+    for b in range(fx["student_ids"].shape[0]):
+        for k in range(int(fx["num_chunks"][b])):
+            ss, se = fx["s_spans"][b, k].tolist()
+            ts, te = fx["t_spans"][b, k].tolist()
+            shift = knobs["kl_chunk_shift"] and ss > 0 and ts > 0
+            s_pred, s_lab = positions(ss, se, shift)
+            t_pred, t_lab = positions(ts, te, shift)
+            student = with_rest(
+                chain(student_logp, fx["student_ids"], b, s_pred, s_lab)
+            )
+            teacher = with_rest(
+                chain(teacher_logp, fx["teacher_ids"], b, t_pred, t_lab)
+            )
+            total = total + torch.nn.functional.kl_div(
+                student, teacher, reduction="sum", log_target=True
+            )
+    beta = knobs["csd_mismatch_loss_beta"]
+    return beta * total * temperature**2 / fx["global_valid_chunks"]
+
+
+def _realized_rows_payload(fx, k):
+    """Sparse teacher rows holding each position's realized labels plus fillers."""
+    teacher_logits = fx["teacher_logits"]
+    batch, seq_len, vocab = teacher_logits.shape
+    required = [[set() for _ in range(seq_len)] for _ in range(batch)]
+    for b in range(batch):
+        for c in range(int(fx["num_chunks"][b])):
+            ss = int(fx["s_spans"][b, c, 0])
+            ts, te = fx["t_spans"][b, c].tolist()
+            shift = fx["knobs"]["kl_chunk_shift"] and ss > 0 and ts > 0
+            for label in range(ts, te):
+                pred = label - 1 if shift else label
+                required[b][pred].add(int(fx["teacher_ids"][b, label]))
+    ids = torch.empty(batch, seq_len, k, dtype=torch.long)
+    for b in range(batch):
+        for pos in range(seq_len):
+            row = set(required[b][pos])
+            filler = (t for t in range(vocab) if t not in row)
+            while len(row) < k:
+                row.add(next(filler))
+            ids[b, pos] = torch.tensor(sorted(row))
+    temperature = fx["knobs"]["temperature"]
+    return (
+        teacher_logits.gather(-1, ids),
+        ids.to(torch.int32),
+        torch.logsumexp(teacher_logits / temperature, dim=-1),
+        None,
+    )
+
+
+def test_csd_realized_only_mismatch_matches_chain_reference(tmp_path):
+    """Realized-only mismatch loss and gradient match an independent chain KL."""
+    fx = _build_case("mismatch_only", str(tmp_path))
+    fx["knobs"]["temperature"] = 1.7
+    loss, metrics, grad = _run_csd(fx, cfg_overrides=_REALIZED_ONLY)
+
+    student = fx["student_logits"].clone().requires_grad_(True)
+    reference = _realized_chain_reference(fx, student)
+    reference.backward()
+    torch.testing.assert_close(loss, reference, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(grad, student.grad, rtol=1e-5, atol=1e-6)
+    assert metrics["num_common_chunks"] == 0
+    assert metrics["num_mismatch_chunks"] == 4
+
+
+def test_csd_realized_only_mismatch_sparse_rows_match_dense(tmp_path):
+    """Sparse rows holding only the realized labels reproduce the dense loss."""
+    fx = _build_case("mismatch_only", str(tmp_path))
+    fx["knobs"]["temperature"] = 1.7
+    dense_loss, _, dense_grad = _run_csd(fx, cfg_overrides=_REALIZED_ONLY)
+    sparse_loss, sparse_metrics, sparse_grad = _run_csd(
+        fx,
+        teacher_sparse_payload=_realized_rows_payload(fx, k=3),
+        cfg_overrides={**_REALIZED_ONLY, "teacher_topk_ipc_k": 3},
+    )
+    torch.testing.assert_close(sparse_loss, dense_loss, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(sparse_grad, dense_grad, rtol=1e-5, atol=1e-6)
+    assert sparse_metrics["num_mismatch_chunks"] == 4
+
+
+def test_csd_realized_only_mismatch_leaves_common_chunks_unchanged(tmp_path):
+    """The option changes mismatch scoring only; 1-to-1 chunks are untouched."""
+    fx = _build_case("with_mismatch", str(tmp_path))
+    prefix_overrides = {**_REALIZED_ONLY, "csd_realized_only_mismatch": False}
+    _, prefix_metrics, _ = _run_csd(fx, cfg_overrides=prefix_overrides)
+    _, realized_metrics, _ = _run_csd(fx, cfg_overrides=_REALIZED_ONLY)
+    assert realized_metrics["num_common_chunks"] == prefix_metrics["num_common_chunks"]
+    assert realized_metrics["kl_common_per_chunk"] == pytest.approx(
+        prefix_metrics["kl_common_per_chunk"]
+    )
+    assert (
+        realized_metrics["kl_partition_last_per_chunk"]
+        != prefix_metrics["kl_partition_last_per_chunk"]
+    )
+
+
+def test_csd_realized_only_mismatch_rejects_position_zero_term():
+    """Realized-only mismatch has no position-0 term to combine."""
+    from nemo_rl.algorithms.loss.csd import CSDLossFn
+
+    with pytest.raises(ValueError, match="csd_realized_only_mismatch"):
+        CSDLossFn(
+            {
+                "student_vocab_size": 16,
+                "teacher_vocab_sizes": [16],
+                "teacher_weights": [1.0],
+                "csd_realized_only_mismatch": True,
+                "csd_position_0_kl": True,
+            }
+        )
