@@ -176,9 +176,10 @@ from nemo_rl.utils.checkpoint import (
     CheckpointManager,
 )
 from nemo_rl.utils.checkpoint_storage import (
-    is_msc_path,
+    load_checkpoint_object,
     open_path,
     path_exists,
+    save_checkpoint_object,
 )
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import (
@@ -243,7 +244,7 @@ def _maybe_restore_async_replay_buffer_checkpoint(
         return None
 
     replay_buffer_path = os.path.join(checkpoint_path, "replay_buffer.pt")
-    if not os.path.exists(replay_buffer_path):
+    if not path_exists(replay_buffer_path):
         print(
             f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
             "Starting with an empty replay buffer."
@@ -4908,11 +4909,6 @@ def async_grpo_train(
         processor: Optional multimodal processor used to attach compact policy
             media to NeMo Gym prompt rows.
     """
-    if is_msc_path(checkpointer.checkpoint_dir):
-        raise NotImplementedError(
-            "msc:// checkpoint_dir is not supported by async GRPO yet: the replay "
-            "buffer and rollout state are still written with local-file APIs."
-        )
     # Ensure we are running with a compatible async generation backend.
     # Async GRPO supports vLLM, Megatron, TRT-LLM, and Dynamo;
     # SGLang async rollouts do not support the async GRPO replay path.
@@ -5054,9 +5050,9 @@ def async_grpo_train(
         )
 
         rollouts_path = os.path.join(last_checkpoint_path, "rollouts.pt")
-        if os.path.exists(rollouts_path):
+        if path_exists(rollouts_path):
             # weights_only=False: this is a trusted same-job checkpoint artifact.
-            rollouts_state = torch.load(rollouts_path, weights_only=False)
+            rollouts_state = load_checkpoint_object(rollouts_path, weights_only=False)
 
     next_nemo_gym_task_index = max(
         int((rollouts_state or {}).get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0)),
@@ -6199,7 +6195,7 @@ def async_grpo_train(
                             rollouts_state[TRAINED_TASK_INDICES_KEY] = sorted(
                                 recent_trained_task_indices
                             )
-                        torch.save(
+                        save_checkpoint_object(
                             rollouts_state,
                             os.path.join(checkpoint_path, "rollouts.pt"),
                         )

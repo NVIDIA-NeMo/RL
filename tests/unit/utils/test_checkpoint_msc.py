@@ -88,6 +88,10 @@ def test_controller_state_round_trips_through_msc(manager):
     assert load_checkpoint_object(base + "/train_dataloader.pt") == {
         "samples_yielded": 7
     }
+    # Async GRPO restores replay-buffer/rollout pickles with weights_only=False.
+    assert load_checkpoint_object(
+        base + "/train_dataloader.pt", weights_only=False
+    ) == {"samples_yielded": 7}
 
 
 def test_open_path_and_path_exists_through_msc(manager):
