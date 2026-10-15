@@ -15,7 +15,6 @@
 import os
 from typing import Any, Callable, Optional, Union, cast
 
-import torch
 import yaml
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -36,6 +35,11 @@ from nemo_rl.data.interfaces import (
 from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
+from nemo_rl.utils.checkpoint_storage import (
+    enable_msc,
+    is_msc_path,
+    load_checkpoint_object,
+)
 
 
 def get_train_dataset_name(data_config: DataConfig) -> Optional[str]:
@@ -83,13 +87,16 @@ def load_dataloader_state(
     read out of the sibling ``config.yaml`` so every existing checkpoint is
     automatically compatible.
     """
-    saved_state = torch.load(
+    saved_state = load_checkpoint_object(
         os.path.join(checkpoint_path, f"train_dataloader{suffix}.pt")
     )
 
+    msc = enable_msc() if is_msc_path(checkpoint_path) else None
+    path_exists = msc.os.path.exists if msc else os.path.exists
+    open_file = msc.open if msc else open
     config_path = os.path.join(checkpoint_path, "config.yaml")
-    if os.path.exists(config_path):
-        with open(config_path) as f:
+    if path_exists(config_path):
+        with open_file(config_path) as f:
             saved_config = yaml.safe_load(f) or {}
         saved_name = get_train_dataset_name(saved_config.get("data"))
         current_name = get_train_dataset_name(data_config)
