@@ -2160,14 +2160,6 @@ class RolloutManager:
         assert self._tq_buffer is not None, (
             "generate_for_finalization requires tq_buffer to be set at __init__"
         )
-        if (
-            self._multi_segment_rollouts
-            and "loss_multiplier" in input_sample
-            and input_sample["loss_multiplier"] != 1.0
-        ):
-            raise ValueError(
-                "multi-segment rollouts currently require unit dataset loss_multiplier"
-            )
         owns_recovery_group = lineage_group_id is None
         recovery_group_id = lineage_group_id
         if recovery_group_id is None:

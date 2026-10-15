@@ -5377,7 +5377,7 @@ class SingleControllerActor:
                 sample_mask=final_sample_mask,
                 expected_group_size=self._algo_cfg.num_generations_per_prompt,
             )
-            final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
+            final_sample_mask = owner_batch.fanout(owner_batch.loss_weight)
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {

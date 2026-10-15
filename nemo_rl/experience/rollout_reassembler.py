@@ -655,10 +655,6 @@ class RolloutReassembler:
             raise ValueError("execution_row_multiple must be a positive integer")
         if logical_selections is None and execution_row_multiple != 1:
             raise ValueError("execution row padding requires logical segments")
-        if logical_selections is not None and loss_multiplier != 1.0:
-            raise ValueError(
-                "multi-segment rollouts currently require unit dataset loss_multiplier"
-            )
         _group_t0 = time.perf_counter()
         logical = None
         if logical_selections is None:

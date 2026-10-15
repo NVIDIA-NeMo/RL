@@ -45,6 +45,8 @@ class LogicalOwnerBatch:
     group_ids: torch.Tensor
     row_owner: torch.Tensor
     valid_mask: torch.Tensor
+    # The owner's dataset loss weight, zero when any of its rows is invalid.
+    loss_weight: torch.Tensor
 
     def fanout(self, values: torch.Tensor) -> torch.Tensor:
         """Broadcast one scalar per owner, with zero for ownerless padding."""
@@ -152,15 +154,16 @@ def build_logical_owner_batch(
         or rewards.shape != (meta.size,)
         or sample_mask.shape != (meta.size,)
         or not torch.isfinite(rewards).all()
-        or not ((sample_mask == 0) | (sample_mask == 1)).all()
+        or not torch.isfinite(sample_mask).all()
+        or (sample_mask < 0).any()
     ):
         raise ValueError(
-            "Segment advantage inputs must be finite, binary-masked, row-aligned"
+            "Segment advantage inputs must be finite, non-negative-masked, row-aligned"
         )
     groups = validate_logical_owner_metadata(
         meta, expected_group_size=expected_group_size
     )
-    representatives, validity, group_ids = [], [], []
+    representatives, loss_weights, group_ids = [], [], []
     row_owner = torch.full((meta.size,), -1, dtype=torch.long, device=rewards.device)
     for group_index, slots in enumerate(groups.values()):
         for rows in slots.values():
@@ -176,9 +179,10 @@ def build_logical_owner_batch(
             row_owner[rows] = len(representatives)
             representatives.append(first)
             group_ids.append(group_index)
-            validity.append(sample_mask[rows].amin())
+            loss_weights.append(sample_mask[rows].amin())
     if (sample_mask[row_owner < 0] != 0).any():
         raise ValueError("Execution padding must be masked")
+    loss_weight = torch.stack(loss_weights)
     return LogicalOwnerBatch(
         representative_rows=torch.tensor(
             representatives, dtype=torch.long, device=rewards.device
@@ -187,5 +191,6 @@ def build_logical_owner_batch(
             :, None
         ],
         row_owner=row_owner,
-        valid_mask=torch.stack(validity),
+        valid_mask=loss_weight.gt(0).to(loss_weight.dtype),
+        loss_weight=loss_weight,
     )

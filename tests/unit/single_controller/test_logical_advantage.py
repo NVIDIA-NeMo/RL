@@ -368,7 +368,7 @@ def test_failed_owner_single_placeholder_is_excluded_from_baseline_and_loss():
         "prompt_length_disagreement",
         "padding_owner",
         "padding_mask",
-        "nonbinary_mask",
+        "negative_mask",
         "duplicate_row_id",
         "boolean_segment",
         "boolean_group_size",
@@ -412,8 +412,8 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
         meta.tags[-1]["logical_rollout_id"] = "a_g0"
     elif bad_case == "padding_mask":
         data["sample_mask"][-1] = 1
-    elif bad_case == "nonbinary_mask":
-        data["sample_mask"][0] = 0.5
+    elif bad_case == "negative_mask":
+        data["sample_mask"][0] = -0.5
     elif bad_case == "duplicate_row_id":
         meta.sample_ids[1] = meta.sample_ids[0]
     elif bad_case == "boolean_segment":
@@ -475,3 +475,13 @@ def test_logprob_mismatch_in_one_segment_masks_the_whole_owner():
     asyncio.run(ctrl._advantage_stage(meta))
     assert data["sample_mask"].tolist() == [0, 0, 1, 1]
     assert data["advantages"][2:, 0].tolist() == [-1.0, 1.0]
+
+
+def test_dataset_loss_multiplier_weights_every_segment_without_changing_advantages():
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1), (3.0, 1)])])
+    reference = _batch([("a", [(0.0, 2), (1.0, 1), (3.0, 1)])])
+    asyncio.run(_controller(*reference)._advantage_stage(reference[0]))
+    data["sample_mask"][:] = 0.25
+    asyncio.run(_controller(meta, data)._advantage_stage(meta))
+    assert data["sample_mask"].tolist() == [0.25] * 4
+    torch.testing.assert_close(data["advantages"], reference[1]["advantages"])
