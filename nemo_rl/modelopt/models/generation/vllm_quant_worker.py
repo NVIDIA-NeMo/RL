@@ -29,6 +29,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
+from nemo_rl.models.generation.vllm.engine_loop import on_engine_loop
 
 _EXTRA_ENV_VARS = (
     "VLLM_QUANT_CFG",
@@ -126,11 +127,13 @@ class VllmQuantAsyncGenerationWorker(VllmAsyncGenerationWorkerImpl):
         _configure_quant_engine_kwargs(self.cfg, llm_kwargs)
         super()._create_engine(llm_kwargs)
 
+    @on_engine_loop
     async def get_quantizer_stats(self) -> dict[str, Any]:
         """Return quantizer statistics. Mirrors MegatronQuantPolicyWorker.get_quantizer_stats()."""
         results = await self.llm.collective_rpc("get_quantizer_stats", args=tuple())
         return results[0]
 
+    @on_engine_loop
     async def get_weight_snapshot(self, name: str) -> Any:
         """Return a CPU copy of a named parameter for before/after comparison."""
         results = await self.llm.collective_rpc("get_weight_snapshot", args=(name,))

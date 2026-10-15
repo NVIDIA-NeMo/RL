@@ -101,6 +101,11 @@ class VllmSpecificArgs(TypedDict):
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
+    # Run the AsyncLLM engine, the HTTP server, and every engine operation on one
+    # dedicated owner event loop instead of the Ray actor loop. HTTP handlers then
+    # call the engine directly, and long actor-loop work (refit RPCs, validation)
+    # cannot stall in-flight HTTP streams. Requires async_engine=true.
+    engine_owner_loop: NotRequired[bool]
     # Environment variable containing the internal refit API key.
     http_refit_api_key_env_var: NotRequired[str | None]
     # Invalidate weight-dependent multimodal encoder outputs after a successful
