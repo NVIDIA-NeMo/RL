@@ -41,8 +41,8 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     RewardPenaltyConfig,
     RewardScalingConfig,
-    _apply_configured_message_level_advantage_penalties,
     _apply_async_sample_masks,
+    _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
     _get_grpo_save_state,
@@ -414,6 +414,23 @@ class TestAsyncSampleMasks:
         assert torch.equal(repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5]))
         assert metrics["num_masked_seqs_by_overlong_filtering"] == 0
         assert metrics["num_masked_seqs_total"] == 0
+        assert num_mask_sample_filtered == 0
+
+    def test_legacy_count_only_counts_mask_sample(self):
+        # Non-Gym rollouts carry no mask_sample; truncation must not leak into
+        # the legacy num_mask_sample_filtered count.
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "truncated": torch.tensor([True, False]),
+            }
+        )
+
+        metrics, num_mask_sample_filtered = _apply_async_sample_masks(
+            repeated_batch, overlong_filtering=True
+        )
+
+        assert metrics["num_masked_seqs_by_overlong_filtering"] == 1
         assert num_mask_sample_filtered == 0
 
     def test_overlong_filtering_requires_truncated(self):
@@ -2190,6 +2207,58 @@ def test_async_grpo_logs_per_reason_sample_mask_metrics(
     # attributed to overlong filtering but is still counted as mask_sample.
     assert metrics["num_mask_sample_filtered"] == 1
     assert "num_masked_seqs_by_empty_response_output" not in metrics
+
+
+def test_async_grpo_folds_logprob_error_masks_into_sample_mask_total(
+    mock_grpo_components,
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.grpo.overlong_filtering = True
+    master_config.env["should_log_nemo_gym_responses"] = True
+
+    # The row survives every pre-training reason and is then masked for
+    # logprob error.
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["truncated"] = torch.tensor([False])
+    mock_batch["mask_sample"] = torch.tensor([False])
+    seq_logprob_error_result = {
+        **_mock_seq_logprob_error_result(),
+        "num_masked_seqs": 1,
+    }
+
+    with mock_async_grpo_infrastructure(
+        mock_batch,
+        {"mean_gen_tokens_per_sample": 2.0},
+        seq_logprob_error_result=seq_logprob_error_result,
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    metrics = _logged_train_metrics_with_key(
+        mock_grpo_components["logger"], "num_masked_seqs_total"
+    )
+    assert metrics["num_masked_seqs_by_overlong_filtering"] == 0
+    assert metrics["num_masked_seqs_by_rollout"] == 0
+    assert metrics["num_masked_seqs_by_logprob_error"] == 1
+    assert metrics["num_masked_seqs_total"] == 1
 
 
 def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> None:

@@ -5427,8 +5427,9 @@ def async_grpo_train(
                         tracer=_tracer,
                     ),
                 ):
-                    # Mask empty-response, overlong, and rollout-flagged rows,
-                    # attributing each masked row to exactly one reason.
+                    # Mask overlong and rollout-flagged rows, attributing each
+                    # masked row (including rows that arrive with a zero
+                    # loss_multiplier) to exactly one reason.
                     sample_mask_metrics, num_mask_sample_filtered = (
                         _apply_async_sample_masks(
                             repeated_batch,
