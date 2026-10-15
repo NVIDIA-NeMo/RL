@@ -677,6 +677,22 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         with self._lock:
             return len(self.trajectories)
 
+    def peek(self, current_weight_version: int, start: int = 0) -> list[dict[str, Any]]:
+        """Return the arrived groups intended for this step, without removing them.
+
+        Groups are returned in arrival order, the order sample() takes them;
+        ``start`` skips groups an earlier peek already returned. While a step
+        waits, its groups are only appended, so the offset stays valid.
+        """
+        with self._lock:
+            return [
+                trajectory
+                for trajectory, target in zip(
+                    self.trajectories, self.target_weight_versions
+                )
+                if target == current_weight_version
+            ][start:]
+
     def get_held_task_indices(self) -> list[int]:
         """Ordinals of every prompt group currently held in the buffer.
 
