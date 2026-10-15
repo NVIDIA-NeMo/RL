@@ -405,6 +405,23 @@ async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_vllm_worker_gpu_profiling_awaits_collective_rpc(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda.profiler, "start", MagicMock())
+    monkeypatch.setattr(torch.cuda.profiler, "stop", MagicMock())
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.llm = MagicMock(collective_rpc=AsyncMock())
+
+    await worker.start_gpu_profiling()
+    worker.llm.collective_rpc.assert_awaited_once_with("start_gpu_profiling", args=())
+
+    worker.llm.collective_rpc.reset_mock()
+    await worker.stop_gpu_profiling()
+    worker.llm.collective_rpc.assert_awaited_once_with("stop_gpu_profiling", args=())
+
+
+@pytest.mark.asyncio
 async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
     engine_loop = asyncio.get_running_loop()
     engine_thread = threading.get_ident()
@@ -1703,6 +1720,8 @@ def get_basic_megatron_test_config(
         "logprob_batch_size": 2,
         "precision": precision,
         "offload_optimizer_for_logprob": False,
+        "offload_policy_before_refit": False,
+        "offload_optimizer_for_refit": True,
         "automodel_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },

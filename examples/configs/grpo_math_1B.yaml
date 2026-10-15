@@ -152,6 +152,10 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
+  # Run the policy offload lifecycle before non-colocated refit.
+  offload_policy_before_refit: false
+  # Move optimizer state to CPU when the refit offload lifecycle runs.
+  offload_optimizer_for_refit: true
   worker_extension_cls_fqn: null # optional registered policy-worker subclass; mutually exclusive with quant_cfg
 
   automodel_cfg:
@@ -427,6 +431,32 @@ policy:
     val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
+    # Prefill/decode disaggregation: split each rollout replica into context
+    # (prefill) and generation (decode) engines, fronted by servers that expose
+    # the URLs the rollout client talks to.
+    disaggregation:
+      enabled: false
+      # Engines per replica; the two are independent, so the P:D ratio is free.
+      # The replica *count* is not configured -- it follows from the inference
+      # cluster's size, like the DP-shard count does without disaggregation.
+      num_prefill_engines: 1
+      num_decode_engines: 1
+      # Frontend workers per replica. Each is its own CPU-only actor with a
+      # distinct URL, and the rollout client's per-session affinity shards
+      # conversations across them, so one frontend's CPU stops being the
+      # replica's turn-throughput ceiling. replicas * workers must be <= 256.
+      num_frontend_workers: 1
+      # Render the chat template and tokenize on the frontends instead of in
+      # the prefill engine's adapter. Rendering cost grows with conversation
+      # length and the adapter is one thread per prefill engine, which can
+      # only be scaled by adding GPUs; frontends are CPU-only, which is what
+      # makes num_frontend_workers worth raising.
+      frontend_tokenize: false
+      # Base port for the frontends' deterministic ports
+      # (base + replica_idx * num_frontend_workers + frontend_idx). Like every
+      # service port they must stay below 9000, the ephemeral floor on some
+      # DGX/GB200 nodes; [8300, 8556) is their band in virtual_cluster.py.
+      frontend_base_port: 8300
     # null = topology default (IPC colocated, NCCL non-colocated). For
     # non-colocated Megatron generation it selects the packed collective; use
     # mcore for native refit.
@@ -475,7 +505,6 @@ policy:
       refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
       refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
       logprobs_mode: processed_logprobs  # Return log-probs after sampling processors. Use raw_logprobs for parity with policy recomputation.
-      offload_policy_before_refit: false  # Keep policy state on GPU by default. Enable when a non-colocated Megatron refit needs additional GPU headroom for transfer staging.
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
       http_server_num_replicas: 8  # HTTP frontend event loops per model-parallel coordinator.

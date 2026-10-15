@@ -230,6 +230,10 @@ class TensorboardLogger(LoggerInterface):
                 print(f"Warning: Failed to log metric '{name}' to TensorBoard: {e}")
                 continue
 
+    def finish(self) -> None:
+        """Flush queued TensorBoard events before a worker or actor exits."""
+        self.writer.close()
+
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to Tensorboard."""
         if len(histogram) > 0:
