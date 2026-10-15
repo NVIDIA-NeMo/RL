@@ -189,6 +189,9 @@ class CSDLossConfig(BaseModel, extra="allow"):
     csd_noise_filter_topk: Annotated[int, Field(ge=0)] = 0
     # Compare only the realized chain probability and its complementary bucket.
     csd_pure_alm: bool = False
+    # Score 1-to-many and many-to-1 chunks by their realized token chains
+    # against REST instead of prefix-support alternatives.
+    csd_realized_only_mismatch: bool = False
     csd_alm_bce_tau: Annotated[float, Field(gt=0)] = 1.0
     # Zero uses dense IPC; positive k sends row top-k logits plus full-vocab logZ.
     teacher_topk_ipc_k: Annotated[int, Field(ge=0)] = 0
@@ -317,6 +320,12 @@ class CSDLossFn(LossFunction):
                 "teacher_weights must not sum to zero in "
                 "kd_loss_mode='averaged_logits' (they form a convex combination "
                 f"of teacher logits); got teacher_weights={list(_weights)}."
+            )
+        if cfg.csd_realized_only_mismatch and cfg.csd_position_0_kl:
+            raise ValueError(
+                "csd_realized_only_mismatch scores mismatch chunks by their "
+                "realized token chains and has no position-0 term; set "
+                "csd_position_0_kl=false."
             )
         if cfg.student_vocab_size is None:
             raise ValueError("CSD requires the runtime student_vocab_size")
@@ -2551,6 +2560,7 @@ class CSDLossFn(LossFunction):
         csd_alm_bce_tau = float(cfg.csd_alm_bce_tau)
         csd_last_pos_loss_fn_cfg = cfg.csd_last_pos_loss_fn
         pure_alm = bool(cfg.csd_pure_alm)
+        realized_only_mismatch = bool(cfg.csd_realized_only_mismatch)
         if pure_alm:
             # Position-0 is a common-vocab auxiliary partition term. Pure ALM
             # should only compare realized chain probability vs rest bucket.
@@ -2637,6 +2647,7 @@ class CSDLossFn(LossFunction):
         teacher_topk_ipc_k = int(cfg.teacher_topk_ipc_k)
         teacher_topk_keep_realized = teacher_topk_ipc_k > 0 and (
             pure_alm
+            or realized_only_mismatch
             or teacher_topk_ipc_k == 1
             or bool(cfg.teacher_topk_ipc_keep_realized)
         )
@@ -3325,7 +3336,7 @@ class CSDLossFn(LossFunction):
         csd_pos0_records: list[tuple[int, int, int, int, int, frozenset[int]]] = []
         prefix_index = None
         if mismatch_chunks:
-            if pure_alm:
+            if pure_alm or realized_only_mismatch:
                 _prefix_index_prededuped = False
                 max_chain_t = 0
                 max_chain_s = 0
@@ -3351,7 +3362,8 @@ class CSDLossFn(LossFunction):
                 ]
             ] = []
             for b, M, N, s_pred, t_pred, s_labels, t_labels in mismatch_chunks:
-                if pure_alm:
+                if pure_alm or realized_only_mismatch:
+                    # Realized token chains against REST.
                     s_realized_id = int(inp_s_np[b, s_labels[-1]])
                     t_realized_id = int(inp_t_np[b, t_labels[-1]])
                     s_prefix_pred = list(s_pred[:-1])

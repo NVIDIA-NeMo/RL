@@ -24,6 +24,7 @@ loss_fn:
   csd_jsd_beta: 0.5
   csd_position_0_kl: false
   csd_noise_filter_topk: 0
+  csd_realized_only_mismatch: false
   teacher_topk_ipc_k: 0
   teacher_topk_ipc_support_mode: row_topk
   teacher_topk_ipc_keep_realized: true
