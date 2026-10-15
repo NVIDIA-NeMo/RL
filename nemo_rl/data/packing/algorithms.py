@@ -51,7 +51,8 @@ class SequencePacker(ABC):
         """Initialize the sequence packer.
 
         Args:
-            bin_capacity: The maximum capacity of each bin.
+            bin_capacity: The maximum capacity of each bin. A single sequence
+                longer than this is not rejected; ``pack`` places it in a bin of its own.
             collect_metrics: Whether to collect metrics across multiple packing operations.
             min_bin_count: Minimum number of bins to create, even if fewer would suffice.
                           If None, no minimum is enforced.
@@ -185,10 +186,28 @@ class SequencePacker(ABC):
         Returns:
             A list of bins, where each bin is a list of indices into the original
             sequence_lengths list. The number of bins will satisfy min_bin_count
-            and bin_count_multiple constraints if specified.
+            and bin_count_multiple constraints if specified. A sequence longer
+            than bin_capacity is placed alone in its own bin.
         """
-        # Call the implementation
-        bins = self._pack_implementation(sequence_lengths)
+        # A sequence longer than bin_capacity cannot share a bin, so give it a bin
+        # of its own and pack the remaining sequences as usual.
+        oversized = [
+            i for i, length in enumerate(sequence_lengths) if length > self.bin_capacity
+        ]
+        if oversized:
+            oversized_set = set(oversized)
+            kept = [i for i in range(len(sequence_lengths)) if i not in oversized_set]
+            kept_bins = (
+                self._pack_implementation([sequence_lengths[i] for i in kept])
+                if kept
+                else []
+            )
+            bins = [[i] for i in oversized] + [
+                [kept[j] for j in bin_indices] for bin_indices in kept_bins
+            ]
+        else:
+            # Call the implementation
+            bins = self._pack_implementation(sequence_lengths)
 
         # Adjust bin count to meet constraints
         bins = self._adjust_bin_count(bins)
