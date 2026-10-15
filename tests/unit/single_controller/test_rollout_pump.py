@@ -174,8 +174,9 @@ class _RecordingRolloutManager:
         *,
         target_step: int | None = None,
         inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+        replacement_index: int = 0,
     ) -> None:
-        del prompt, inflight_registry
+        del prompt, inflight_registry, replacement_index
         self._buffer.reserve(target_step=target_step)
 
 
@@ -253,8 +254,9 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
             *,
             target_step: int | None = None,
             inflight_registry: dict[str, Any] | None = None,
+            replacement_index: int = 0,
         ) -> RolloutOutcome:
-            del prompt, target_step, inflight_registry
+            del prompt, target_step, inflight_registry, replacement_index
             return outcome
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -344,8 +346,9 @@ class _SkippingRolloutManager:
         *,
         target_step: int | None = None,
         inflight_registry: dict[str, Any] | None = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
-        del prompt, target_step, inflight_registry
+        del prompt, target_step, inflight_registry, replacement_index
         return RolloutOutcome.SKIPPED
 
 
@@ -414,8 +417,9 @@ class _ScriptedRolloutManager:
         *,
         target_step: int | None = None,
         inflight_registry: dict[str, Any] | None = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
-        del target_step, inflight_registry
+        del target_step, inflight_registry, replacement_index
         self.prompts_seen.append(prompt["message_log"][0]["content"])
         if self._outcomes:
             return self._outcomes.pop(0)
@@ -976,8 +980,9 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             *,
             target_step: int | None = None,
             inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+            replacement_index: int = 0,
         ) -> None:
-            del target_step, inflight_registry
+            del target_step, inflight_registry, replacement_index
             self._started += 1
             if self._started == 2:
                 self._both_started.set()
@@ -1052,8 +1057,9 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             *,
             target_step: int | None = None,
             inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+            replacement_index: int = 0,
         ) -> None:
-            del prompt, target_step, inflight_registry
+            del prompt, target_step, inflight_registry, replacement_index
             raise AssertionError("cancelled child unexpectedly started")
 
     class _CancelBeforeStartTaskGroup:
@@ -1132,6 +1138,10 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
             self.generated = 0
             self.two_generated = asyncio.Event()
             self.stats = SimpleNamespace(committed=0)
+            self.filter_zero_variance_groups = False
+
+        def record_group_rewards(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
 
         async def generate_for_finalization(
             self,
@@ -1160,7 +1170,12 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
             del request, target_step
             finalizers_started += 1
             await release_finalizers.wait()
-            return True
+            return SimpleNamespace(
+                valid_row_count=1,
+                total_row_count=1,
+                zero_variance=False,
+                reward_observations=[],
+            )
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
@@ -1222,6 +1237,10 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         def __init__(self) -> None:
             self.recovery_ledger = RolloutRecoveryLedger()
             self.stats = SimpleNamespace(committed=0)
+            self.filter_zero_variance_groups = False
+
+        def record_group_rewards(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
 
         def reserve_prompt_group(
             self,
@@ -1323,7 +1342,12 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
                 manager.recovery_ledger.discard_group(cut, request.group_id)
             if not committed:
                 return None
-            return SimpleNamespace(valid_row_count=1, total_row_count=1)
+            return SimpleNamespace(
+                valid_row_count=1,
+                total_row_count=1,
+                zero_variance=False,
+                reward_observations=[],
+            )
 
         ctrl._finalize_with_actor = _finalize
 

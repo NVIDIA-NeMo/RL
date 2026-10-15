@@ -591,6 +591,12 @@ class _FakeRolloutManager:
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
 
+    filter_zero_variance_groups = False
+
+    def pop_step_reward_metrics(self, step: int) -> dict[str, float]:
+        del step
+        return {}
+
     def reserve_prompt_group(
         self,
         cut: Any,

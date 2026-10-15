@@ -148,6 +148,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
+    align_reward_with_v1,
     reduce_advantage_pump_metrics,
 )
 from nemo_rl.data.interfaces import DatumSpec
@@ -2294,6 +2295,11 @@ class SingleControllerActor:
                                 self._buffer_capacity.release()
                                 self._credit_shortfall(target_step)
                                 return
+                            self._rollout_manager.record_group_rewards(
+                                target_step,
+                                [row.reward for row in finalized.reward_observations],
+                                replacement_index=replacements,
+                            )
                             min_valid_fraction = self._master_config.token_capture.min_valid_fraction_per_group
                             below_threshold = (
                                 min_valid_fraction is not None
@@ -2407,6 +2413,7 @@ class SingleControllerActor:
                                         prompt,
                                         target_step=target_step,
                                         inflight_registry=self._inflight_by_group_id,
+                                        replacement_index=replacements,
                                     )
                                 else:
                                     outcome = await self._rollout_manager.generate_and_push(
@@ -2414,6 +2421,7 @@ class SingleControllerActor:
                                         target_step=target_step,
                                         inflight_registry=self._inflight_by_group_id,
                                         lineage_group_id=lineage_group_id,
+                                        replacement_index=replacements,
                                     )
                         except BaseException:
                             # On success ownership transfers to the train pump, which
@@ -3852,6 +3860,16 @@ class SingleControllerActor:
                         "promoted_prompt_groups": promoted_prompt_groups,
                     }
                 )
+                # Reward over every group generated for this step, kept or dropped by
+                # dynamic sampling, plus how many were uniform. The kept groups alone
+                # all have reward variance, which pins their mean near the middle.
+                reward_metrics = self._rollout_manager.pop_step_reward_metrics(
+                    version_during_step
+                )
+                step_metrics.update(reward_metrics)
+                if self._rollout_manager.filter_zero_variance_groups:
+                    # Same `reward` / `filtered_reward` meaning as the v1 path.
+                    align_reward_with_v1(step_metrics, reward_metrics)
 
                 # Checkpointing (mirrors async_grpo_train's save block).
                 if will_save_checkpoint:
