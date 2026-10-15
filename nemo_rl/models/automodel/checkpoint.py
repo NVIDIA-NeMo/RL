@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Automodel checkpoint utilities for DTensor policy workers.
+"""Automodel checkpoint utilities for the policy workers.
 
 This module provides a wrapper class around the nemo_automodel Checkpointer
-for saving and loading model checkpoints in DTensor-based policy workers.
+for saving and loading model checkpoints in Automodel policy workers.
 """
 
 import logging
@@ -69,10 +69,10 @@ def build_checkpoint_config(
     is_async: bool,
     skip_task_head_prefixes_for_base_model: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """Build the Automodel checkpoint config for a DTensor v2 worker.
+    """Build the Automodel checkpoint config for a worker.
 
     Read NeMo-RL settings from the YAML-backed checkpoint block and forward
-    them to Automodel. This integration boundary is shared by the two DTensor
+    them to Automodel. This integration boundary is shared by the two Automodel
     v2 workers; defaults belong in the exemplar configs.
 
     Args:
@@ -100,7 +100,7 @@ def build_checkpoint_config(
     if model_save_format not in ("torch_save", "safetensors"):
         raise ValueError(
             "automodel_cfg.checkpoint.model_save_format must be 'torch_save' or "
-            "'safetensors' when using DTensor v2."
+            "'safetensors' when using Automodel."
         )
 
     checkpoint_config = {
@@ -189,7 +189,7 @@ except Exception as e:  # pragma: no cover - defensive: never break import
 
 
 class AutomodelCheckpointManager:
-    """Manages checkpointing for DTensor-based models using nemo_automodel's Checkpointer.
+    """Manages checkpointing for Automodel models using nemo_automodel's Checkpointer.
 
     This class provides a clean interface for saving and loading model checkpoints,
     wrapping the nemo_automodel Checkpointer with configuration management.
