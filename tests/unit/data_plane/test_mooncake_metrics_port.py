@@ -103,6 +103,16 @@ def test_master_argv_gains_the_reserved_metrics_port() -> None:
     assert argv.master_launched
 
 
+def test_extra_master_flags_follow_the_metrics_port() -> None:
+    """Offload flags land after TQ's own, so gflags takes ours."""
+    stub, launched = _recording_subprocess()
+    argv = tq_adapter._MooncakeMasterArgv(stub, 1157, ("--eviction_ratio=0.1",))
+
+    argv.Popen(["mooncake_master", "--eviction_ratio=0.0"])
+
+    assert launched[0][-2:] == ["--metrics_port=1157", "--eviction_ratio=0.1"]
+
+
 def test_flag_is_appended_so_gflags_takes_it_last() -> None:
     """gflags honours the last occurrence, so appending survives TQ starting
     to pass a metrics port of its own."""
