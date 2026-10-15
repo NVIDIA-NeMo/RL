@@ -131,8 +131,11 @@ checkpointing:
   the run that wrote the checkpoint; Megatron validates the scheduler state on load.
 - **Support:** Megatron policy backend; dataloader state for all algorithms
   (`save_dataloader_state`); async GRPO, including its replay buffer and rollout
-  state (`replay_buffer.pt`, `rollouts.pt`), as long as `save_data_plane=false`.
-  SingleController does not support `msc://` yet.
+  state (`replay_buffer.pt`, `rollouts.pt`), as long as `save_data_plane=false`;
+  SingleController (async) with `checkpointing.metric_name=null` and
+  `save_data_plane=false`. SingleController cannot snapshot its data plane to
+  `msc://`, so a resume restores weights and the dataloader cursor and regenerates
+  the buffered rollouts (a warning says so at setup).
 - **Trust:** resume deserializes `torch` pickles (`train_dataloader*.pt`) from the
   bucket; only point `msc://` at storage you control.
 
