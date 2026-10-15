@@ -21,6 +21,7 @@ so no actual policy model is needed.
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -35,10 +36,10 @@ from nemo_rl.environments.nemo_gym import (
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
 )
-from nemo_rl.utils.config import load_config
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
-OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+register_omegaconf_resolvers()
 
 
 def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
@@ -166,10 +167,35 @@ Examples:
 """,
     )
     parser.add_argument(
+        "--env-file",
+        type=argparse.FileType("r", encoding="utf-8"),
+        help=(
+            "JSON object of build-only environment variables for recipe interpolation. "
+            "Overrides the prefetch process environment; use dummy values, not secrets."
+        ),
+    )
+    parser.add_argument(
         "configs",
         nargs="+",
         help="One or more NeMo RL config file paths containing an env.nemo_gym section.",
     )
     args = parser.parse_args()
+
+    if args.env_file is not None:
+        with args.env_file:
+            build_env = json.load(args.env_file)
+        if not isinstance(build_env, dict) or not all(
+            isinstance(key, str)
+            and key
+            and "=" not in key
+            and "\0" not in key
+            and isinstance(value, str)
+            and "\0" not in value
+            for key, value in build_env.items()
+        ):
+            parser.error(
+                "--env-file must contain an object of environment names to strings"
+            )
+        os.environ.update(build_env)
 
     prefetch_nemo_gym_venvs(args.configs)

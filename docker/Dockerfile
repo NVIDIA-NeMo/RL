@@ -383,7 +383,8 @@ ARG DYNAMO_PYTHON_VERSION=3.12.11
 ARG ETCD_VERSION=v3.5.21
 ARG NATS_VERSION=v2.11.6
 # Space-separated config paths whose NeMo Gym venvs are prefetched into the image
-# (empty default = skip). Consumed by the gym prefetch RUN below.
+# (empty default = skip). May include prefetch_venvs.py's --env-file option.
+# Consumed by the gym prefetch RUN below.
 ARG NEMO_GYM_PREFETCH_CONFIGS=
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
