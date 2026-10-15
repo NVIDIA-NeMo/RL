@@ -42,7 +42,7 @@ from responses_api_agents.simple_agent_with_compaction.tests.test_client import 
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from tests.unit.experience.common_output_comparison import selected_response_ids
-from tests.unit.experience.test_cc_dispatch import _env
+from tests.unit.experience.test_segment_dispatch import _env
 from tests.unit.experience.test_logical_owner_finalization import (
     PublicationDataPlane,
     decide_capture_input,
@@ -248,7 +248,7 @@ def test_simple_actual_run_returns_common_history(
     result = asyncio.run(run_agent(agent)).model_dump(mode="json")
     assert result["reward"] == 0.75
     ordinary = deepcopy(result)
-    assert "context_compaction_result" not in ordinary
+    assert "multi_segment_rollouts_result" not in ordinary
     manifest = captured.harness.manifest("dispatch_g0")
     # Compare reconstructed membership to independently observed accepted calls.
     selected = selected_response_ids(manifest.records, ordinary["response"])

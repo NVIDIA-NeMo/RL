@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Composed CPU CC flow; generation, storage and learner execution are doubles.
+"""Composed CPU segment flow; generation, storage and learner execution are doubles.
 
 Uses real shared-client policy decisions, HTTP capture/ledger, receipt processing,
 finalization, replay selection and controller advantages. No real tokenizer,
@@ -41,13 +41,13 @@ from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 from nemo_rl.models.generation.capture_context import decide_capture_input
-from tests.unit.experience.test_cc_dispatch import _env
+from tests.unit.experience.test_segment_dispatch import _env
 from tests.unit.experience.test_logical_owner_finalization import (
     capture_segment,
     finalize,
     gym_harness,
 )
-from tests.unit.single_controller.test_cc_optimizer_batch import _setup
+from tests.unit.single_controller.test_segment_optimizer_batch import _setup
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -401,7 +401,7 @@ def test_mixed_failed_owner_padding_replay_and_controller(
             ctrl._trainer.finish_train_step.assert_called_once()
             assert plane.list_sample_ids("train") == []
             assert ctrl._trainer_version == 1 and ctrl._consumed_samples == 1
-        check.assert_called_once_with("validate_cc_execution_padding")
+        check.assert_called_once_with("validate_execution_padding")
 
     asyncio.run(exercise())
 

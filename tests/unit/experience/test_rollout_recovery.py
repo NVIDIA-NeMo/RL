@@ -93,7 +93,9 @@ def _cc_sealed_ledger() -> RolloutRecoveryLedger:
     return ledger
 
 
-def test_cc_recovery_disk_round_trip_retains_completed_evidence(tmp_path: Path) -> None:
+def test_segment_recovery_disk_round_trip_retains_completed_evidence(
+    tmp_path: Path,
+) -> None:
     ledger = _cc_sealed_ledger()
     state = ledger.state_dict()
     path = tmp_path / "recovery.pt"
@@ -172,7 +174,7 @@ def test_empty_cc_selection_requires_poisoned_receipt_on_seal_and_restore() -> N
     owner = group.gate_rollout_id(1)
     state = ledger.state_dict()
     with pytest.raises(
-        ValueError, match="Empty CC selection requires poisoned capture"
+        ValueError, match="Empty segment selection requires poisoned capture"
     ):
         _mutate(
             lambda cut: ledger.mark_sibling_sealed(
@@ -190,7 +192,7 @@ def test_empty_cc_selection_requires_poisoned_receipt_on_seal_and_restore() -> N
     saved = state["groups"][0]["siblings"][0]["attempts"][0]
     saved["logical_selection"] = dataclasses.asdict(RolloutSelection((), ()))
     with pytest.raises(
-        ValueError, match="Empty CC selection requires poisoned capture"
+        ValueError, match="Empty segment selection requires poisoned capture"
     ):
         RolloutRecoveryLedger.from_state_dict(state)
 
@@ -214,7 +216,7 @@ def test_empty_cc_selection_requires_poisoned_receipt_on_seal_and_restore() -> N
         "pending",
     ],
 )
-def test_cc_recovery_rejects_malformed_saved_ownership(damage: str) -> None:
+def test_segment_recovery_rejects_malformed_saved_ownership(damage: str) -> None:
     state = _cc_sealed_ledger().state_dict()
     attempt = state["groups"][0]["siblings"][0]["attempts"][0]
     selection, receipt = attempt["logical_selection"], attempt["receipt"]
@@ -285,7 +287,7 @@ def test_obsolete_cc_snapshot_has_explicit_error() -> None:
             attempt["logical_segments"] = (
                 [{}] if attempt.pop("logical_selection") else None
             )
-    with pytest.raises(ValueError, match="Obsolete CC snapshots"):
+    with pytest.raises(ValueError, match="Obsolete pre-segment snapshots"):
         RolloutRecoveryLedger.from_state_dict(state)
 
 

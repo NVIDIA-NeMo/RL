@@ -120,7 +120,7 @@ from tests.unit.single_controller.test_setup import (
     patched_factories,  # noqa: F401
 )
 from tests.unit.single_controller.test_tq_replay_buffer import (
-    _make_cc_group_entry,
+    _make_segment_group_entry,
     _make_metadata_envelope,
 )
 
@@ -1378,11 +1378,11 @@ class TestSaveTrigger:
 class TestPeriodicRolloutCheckpoint:
     @pytest.mark.parametrize("anchor_step", [0, 1])
     @pytest.mark.parametrize("claimed", [False, True])
-    def test_cc_snapshot_preserves_buffered_and_training_owned_rows(
+    def test_segment_snapshot_preserves_buffered_and_training_owned_rows(
         self, tmp_path: Path, anchor_step: int, claimed: bool
     ) -> None:
         actor = self._actor(tmp_path)
-        actor._master_config.token_capture.context_compaction = True
+        actor._master_config.token_capture.multi_segment_rollouts = True
         actor._master_config.async_rl.sampler = InOrderSamplerConfig(
             max_lookahead_versions=0
         )
@@ -1395,7 +1395,7 @@ class TestPeriodicRolloutCheckpoint:
         actor._buffer.set_data_plane_checkpoint_barrier(
             actor._data_plane_checkpoint_barrier
         )
-        group = _make_cc_group_entry("claimed-group", [2, 1])
+        group = _make_segment_group_entry("claimed-group", [2, 1])
         group.update(
             start_weight=anchor_step, end_weight=anchor_step, target_step=anchor_step
         )
@@ -1960,7 +1960,7 @@ class TestDataPlaneCheckpoint:
             "obsolete_empty",
         ],
     )
-    def test_cc_recovery_validates_before_staging_cleanup(
+    def test_segment_recovery_validates_before_staging_cleanup(
         self, tmp_path: Path, damage: str | None
     ) -> None:
         ledger = _cc_sealed_ledger()
@@ -2000,7 +2000,7 @@ class TestDataPlaneCheckpoint:
             ),
             SetupTimingMetrics(),
         )
-        actor._master_config.token_capture.context_compaction = damage != "mode"
+        actor._master_config.token_capture.multi_segment_rollouts = damage != "mode"
         actor._dataloader = SimpleNamespace(dataset={7: {"idx": 7}})
         try:
             if damage not in {None, "failed_without_row"}:

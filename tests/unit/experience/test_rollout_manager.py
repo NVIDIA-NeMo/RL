@@ -1875,7 +1875,7 @@ def _make_capture_manager(
     recovery_config: RolloutRecoveryConfig | None = None,
 ):
     mgr = object.__new__(RolloutManager)
-    mgr._context_compaction = False
+    mgr._multi_segment_rollouts = False
     mgr._execution_row_multiple = 1
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations

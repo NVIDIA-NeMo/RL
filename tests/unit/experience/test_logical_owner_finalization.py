@@ -372,7 +372,7 @@ def test_gym_adapter_returns_one_real_receipt_and_rl_selection(monkeypatch, tmp_
     )
     captured = capture_segment(harness, "attempt", child=True)
     env = object.__new__(NemoGym.__ray_metadata__.modified_class)
-    env._context_compaction = True
+    env._multi_segment_rollouts = True
     env.cfg = {}
 
     async def control(*args):
@@ -383,7 +383,7 @@ def test_gym_adapter_returns_one_real_receipt_and_rl_selection(monkeypatch, tmp_
         reward=1.0,
         response={"id": captured["ids"][-1], "output": captured["output"]},
         instance_config={"mask_sample": True},
-        context_compaction_result=dict(
+        multi_segment_rollouts_result=dict(
             logical_rollout_id="attempt",
             selected_actions=[
                 dict(response_id=identity, finish_reason="stop", last_output_item=None)
@@ -526,7 +526,7 @@ def test_existing_detectors_mask_only_selected_generation_spans(monkeypatch, tmp
     from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
     from nemo_rl.experience.rollout_reassembler import RolloutReassembler
     from nemo_rl.experience.rollout_reassembler_actor import assert_metadata_only
-    from tests.unit.experience.test_cc_dispatch import _env
+    from tests.unit.experience.test_segment_dispatch import _env
 
     plane = PublicationDataPlane()
     source = TQTokenSource(plane, staging_partition="staged")
@@ -587,7 +587,7 @@ def test_existing_detectors_mask_only_selected_generation_spans(monkeypatch, tmp
                         "id": ids[-1],
                         "output": first["output"] + rewritten["output"],
                     },
-                    context_compaction_result=dict(
+                    multi_segment_rollouts_result=dict(
                         logical_rollout_id="attempt",
                         selected_actions=actions,
                         outcome="completed",

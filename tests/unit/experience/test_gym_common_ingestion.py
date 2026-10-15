@@ -32,7 +32,7 @@ from nemo_rl.environments.gym_selection import (
 from nemo_rl.environments.nemo_gym import _normalize_gym_validity
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from tests.unit.experience.test_agent_output_compatibility import captured  # noqa: F401
-from tests.unit.experience.test_cc_dispatch import _env
+from tests.unit.experience.test_segment_dispatch import _env
 from tests.unit.experience.test_common_output_comparison import message, record
 from tests.unit.experience.test_external_exporter_compatibility import (
     ForkInstanceConfig,
@@ -280,7 +280,7 @@ def test_exact_ids_distinguish_equal_text_across_reset_and_ignore_old_contract()
     records = [call(1, [a]), call(2, [b]), call(3, [c])]
     result = {
         "response": {"id": "response-3", "output": [b, c]},
-        "context_compaction_result": {
+        "multi_segment_rollouts_result": {
             "logical_rollout_id": "wrong",
             "selected_actions": [],
         },

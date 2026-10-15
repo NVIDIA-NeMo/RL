@@ -94,7 +94,7 @@ class FinalizedRollout:
     # the executed route plan; None when the rollout staged no routes.
     routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
-    # Selected chain already proven by Gym; CC compares it to agent selection.
+    # Selected chain already proven by Gym; segment mode compares it to agent selection.
     model_call_ids: tuple[str, ...] = ()
     media: Optional[dict[str, PackedTensor]] = None
     output_masks: dict[str, list[bool]] = field(default_factory=dict)
@@ -124,7 +124,7 @@ class SegmentReceipt:
     capture_rollout_id: str
     receipt: Optional[dict[str, Any]]
     selected_response_ids: tuple[str, ...]
-    # Optional for ordinary slice callers; CC dispatch supplies semantic stops.
+    # Optional for ordinary slice callers; Segment dispatch supplies semantic stops.
     truncated: bool = False
     # Image columns occupy the selected terminal's existing staging key.
     action_flags: tuple[ActionOutputFlags, ...] | None = None
@@ -304,7 +304,7 @@ class RolloutReassembler:
         receipt: Optional[dict[str, Any]],
         *,
         reward: float,
-        context_compaction: bool = False,
+        multi_segment_rollouts: bool = False,
         action_flags: tuple[ActionOutputFlags, ...] | None = None,
     ) -> FinalizedRollout:
         """Verify one receipt against its staged rows and linearize the main chain.
@@ -360,7 +360,7 @@ class RolloutReassembler:
 
         fetch_fragments = (
             self._router_replay_enabled and not self._defer_routed_experts_to_policy
-        ) or (self._capture_media and context_compaction)
+        ) or (self._capture_media and multi_segment_rollouts)
         try:
             fetched = self._source.fetch_for_finalization(
                 staging_keys, include_route_fragments=fetch_fragments
@@ -403,7 +403,7 @@ class RolloutReassembler:
         # terminal-chain calls carry pixels; one batched read pulls them,
         # after token verification so a rejected rollout never moves pixels.
         media, media_failure = self._resolve_media(
-            row, fetched_by_call, verify_occurrences=context_compaction
+            row, fetched_by_call, verify_occurrences=multi_segment_rollouts
         )
         if media_failure is not None:
             return rejected(media_failure, staging_keys)
@@ -471,7 +471,7 @@ class RolloutReassembler:
             route_plan = plan
             if not self._defer_routed_experts_to_policy:
                 routed_experts, failure = self._execute_direct_plan(
-                    plan, fetched, backpatch_predecessor_tail=context_compaction
+                    plan, fetched, backpatch_predecessor_tail=multi_segment_rollouts
                 )
                 if failure is not None:
                     return rejected(f"route_assembly:{failure}", staging_keys)
@@ -654,9 +654,11 @@ class RolloutReassembler:
         if type(execution_row_multiple) is not int or execution_row_multiple < 1:
             raise ValueError("execution_row_multiple must be a positive integer")
         if logical_selections is None and execution_row_multiple != 1:
-            raise ValueError("execution row padding requires logical CC segments")
+            raise ValueError("execution row padding requires logical segments")
         if logical_selections is not None and loss_multiplier != 1.0:
-            raise ValueError("CC currently requires unit dataset loss_multiplier")
+            raise ValueError(
+                "multi-segment rollouts currently require unit dataset loss_multiplier"
+            )
         _group_t0 = time.perf_counter()
         logical = None
         if logical_selections is None:
@@ -834,7 +836,7 @@ class RolloutReassembler:
         canonical_sample_ids: list[str],
         loss_multiplier: float,
     ) -> FinalizedGroup:
-        """Shared ordinary/CC tensorization, single publication, and cleanup."""
+        """Shared ordinary/segment tensorization, single publication, and cleanup."""
         valid_rows = [row for row in rows if row.valid]
         real_row_count = len(rows)
         if logical is not None:
@@ -848,7 +850,7 @@ class RolloutReassembler:
                     staging_keys=[],
                     metrics=metrics,
                     dropped=True,
-                    drop_reason="CC group has no verified input layout for dummy rows",
+                    drop_reason="Segmented group has no verified input layout for dummy rows",
                 )
             padding_count = (-real_row_count) % execution_row_multiple
             dummy_layout = valid_rows[0]
@@ -1245,7 +1247,7 @@ class RolloutReassembler:
                     expected_id,
                     segment.receipt,
                     reward=reward,
-                    context_compaction=True,
+                    multi_segment_rollouts=True,
                     action_flags=segment.action_flags,
                 )
                 selected = segment.selected_response_ids

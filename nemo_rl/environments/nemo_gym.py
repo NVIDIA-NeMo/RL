@@ -495,11 +495,11 @@ class NemoGym(EnvironmentInterface):
             instrument_aiohttp_client()
         self.cfg = cfg
         capture_config = cfg.get("token_capture")
-        self._context_compaction = bool(
-            capture_config and capture_config.get("context_compaction")
+        self._multi_segment_rollouts = bool(
+            capture_config and capture_config.get("multi_segment_rollouts")
         )
-        if self._context_compaction and not capture_config.get("enabled"):
-            raise ValueError("context compaction requires external token capture")
+        if self._multi_segment_rollouts and not capture_config.get("enabled"):
+            raise ValueError("multi-segment rollouts require external token capture")
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -670,7 +670,7 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
                 "external_staging_backend": _external_staging_backend(token_capture),
-                "framework_owned_context": self._context_compaction,
+                "framework_owned_context": self._multi_segment_rollouts,
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
@@ -905,7 +905,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples,
             head_server_config=self.head_server_config,
-            **({"retry_requests": False} if self._context_compaction else {}),
+            **({"retry_requests": False} if self._multi_segment_rollouts else {}),
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
@@ -934,7 +934,7 @@ Depending on your data shape, you may want to change these values."""
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 nemo_gym_result = _normalize_gym_validity(nemo_gym_result)
-                if self._context_compaction or self._token_capture_enabled:
+                if self._multi_segment_rollouts or self._token_capture_enabled:
                     # Receipt mode: fetch the ledger manifest and assemble the
                     # receipt locally; token-free result. The canonical row is
                     # rebuilt by the finalizer, so no message_log walk (and no
@@ -1044,7 +1044,7 @@ Depending on your data shape, you may want to change these values."""
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
         nemo_gym_result = _normalize_gym_validity(nemo_gym_result)
-        if self._context_compaction:
+        if self._multi_segment_rollouts:
             return await self._postprocess_captured_history(
                 nemo_gym_row, nemo_gym_result
             )

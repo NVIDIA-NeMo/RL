@@ -126,7 +126,7 @@ def execute_route_plan(
             direct-mode finalizer supplies dims learned from the fetched
             fragments.
         canonical_len: The published row's token length.
-        backpatch_predecessor_tail: CC requires complete delta routes and the
+        backpatch_predecessor_tail: segment rows require complete delta routes and the
             committed continuation route for the preceding final token. Each
             plan is one segment, so no patch can cross a compaction root.
 

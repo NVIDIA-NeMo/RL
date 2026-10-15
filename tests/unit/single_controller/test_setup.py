@@ -68,6 +68,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
     TokenCaptureConfig,
     _validate_opd_full_config,
+    required_row_multiple,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -343,13 +344,13 @@ def test_build_generation_passes_sglang_config():
     generation.finish_generation.assert_called_once_with()
 
 
-def _make_cc_master_config() -> MasterConfig:
+def _make_segment_master_config() -> MasterConfig:
     mc = _make_master_config(
         megatron_enabled=True,
         env={"should_use_nemo_gym": True},
         sampler_cfg=InOrderSamplerConfig(max_lookahead_versions=0),
     )
-    mc.token_capture.enabled = mc.token_capture.context_compaction = True
+    mc.token_capture.enabled = mc.token_capture.multi_segment_rollouts = True
     mc.async_rl.rollout_failure.min_step_batch_fraction = 1
     mc.policy.update(
         sequence_packing={"enabled": False},
@@ -376,14 +377,14 @@ def _make_cc_master_config() -> MasterConfig:
         (True, 60, "trainer_checkpoint"),
     ],
 )
-def test_cc_restores_discovered_checkpoint(
+def test_segment_restores_discovered_checkpoint(
     tmp_path: Path,
     patched_factories: dict[str, Any],
     saving: bool,
     interval: int | None,
     restore_mode: str,
 ) -> None:
-    mc = _make_cc_master_config()
+    mc = _make_segment_master_config()
     mc.checkpointing.update(
         checkpoint_dir=str(tmp_path),
         enabled=saving,
@@ -451,12 +452,12 @@ def test_cc_restores_discovered_checkpoint(
         ("no_trainer", "requires checkpointing.enabled=true"),
     ],
 )
-def test_cc_retains_shared_checkpoint_requirements(
+def test_segment_retains_shared_checkpoint_requirements(
     patched_factories: dict[str, Any],
     invalid: str,
     reason: str,
 ) -> None:
-    mc = _make_cc_master_config()
+    mc = _make_segment_master_config()
     mc.checkpointing.update(
         enabled=invalid != "no_trainer", save_data_plane=invalid != "no_data"
     )
@@ -1023,7 +1024,7 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    def test_train_all_calls_requires_context_compaction(self):
+    def test_train_all_calls_requires_multi_segment_rollouts(self):
         mc = _make_master_config()
         mc.token_capture = TokenCaptureConfig(enabled=True, train_all_calls=True)
 
@@ -3131,3 +3132,28 @@ def test_load_opd_full_teacher_lm_heads_loads_one_head_per_unique_teacher(monkey
         "Qwen/teacher-a",
         "Qwen/teacher-b",
     ]
+
+
+def _row_policy(*, packing: bool = False, dynamic: bool = False) -> dict:
+    return {
+        "megatron_cfg": {"enabled": True},
+        "sequence_packing": {"enabled": packing},
+        "dynamic_batching": {"enabled": dynamic},
+        "train_micro_batch_size": 4,
+        "logprob_batch_size": 6,
+    }
+
+
+def test_required_row_multiple_depends_on_batching():
+    assert required_row_multiple(_row_policy(), dp_size=2, logprobs_required=True) == 24
+    assert required_row_multiple(_row_policy(), dp_size=2, logprobs_required=False) == 8
+    assert (
+        required_row_multiple(
+            _row_policy(packing=True), dp_size=2, logprobs_required=True
+        )
+        == 2
+    )
+    with pytest.raises(ValueError, match="static or packed batching"):
+        required_row_multiple(
+            _row_policy(dynamic=True), dp_size=2, logprobs_required=True
+        )
