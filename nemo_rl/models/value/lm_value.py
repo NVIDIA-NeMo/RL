@@ -102,6 +102,11 @@ class Value(ValueInterface):
                     "training backend (or value.megatron_cfg.enabled=true for "
                     "Megatron-Core)."
                 )
+            if config["automodel_cfg"].get("deterministic"):
+                raise ValueError(
+                    "value.automodel_cfg.deterministic is not supported; "
+                    "it applies to policy workers only."
+                )
 
             worker_builder_cls = "nemo_rl.models.value.workers.automodel_value_worker.AutomodelValueWorker"
 

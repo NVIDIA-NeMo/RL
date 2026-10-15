@@ -32,9 +32,10 @@ class NemoGymDataset(RawDataset):
         if self.task_name[0] == "-":
             self.task_name = self.task_name[1:]
 
-        # Record a stable source identity for JSONL sources so sharded jobs can
-        # scan agent names from the file once. Pre-converted Arrow, Parquet, and
-        # save_to_disk datasets fall back to scanning the loaded rows.
+        # Record a stable source identity for JSONL sources so the setup-time
+        # agent coverage check can scan agent names from the file once.
+        # Pre-converted Arrow, Parquet, and save_to_disk datasets fall back to
+        # scanning the loaded rows.
         source_path = os.path.realpath(data_path)
         is_jsonl_source = os.path.isfile(source_path) and data_path.lower().endswith(
             ".jsonl"

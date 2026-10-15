@@ -43,12 +43,13 @@ from nemo_rl.environments.nemo_gym import (
 )
 
 
-@pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron"])
+@pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron", "trtllm"])
 def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
     generation = {
         "backend": backend,
         "vllm_cfg": {"async_engine": False, "expose_http_server": False},
         "mcore_generation_config": {"expose_http_server": False},
+        "trtllm_cfg": {"async_engine": False, "expose_http_server": False},
         "stop_strings": ["stop"],
         "stop_token_ids": [1],
     }
@@ -56,12 +57,17 @@ def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
 
     setup_nemo_gym_config(config, tokenizer=None)
 
+    is_vllm_like = backend in ("vllm", "dynamo")
     assert generation["vllm_cfg"] == {
-        "async_engine": backend != "megatron",
-        "expose_http_server": backend != "megatron",
+        "async_engine": is_vllm_like,
+        "expose_http_server": is_vllm_like,
     }
     assert generation["mcore_generation_config"] == {
         "expose_http_server": backend == "megatron"
+    }
+    assert generation["trtllm_cfg"] == {
+        "async_engine": backend == "trtllm",
+        "expose_http_server": backend == "trtllm",
     }
     assert generation["stop_strings"] is None
     assert generation["stop_token_ids"] is None
@@ -1309,17 +1315,61 @@ def test_task_source_is_validated_before_gym_resolves_agent_ref():
     nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
 
 
-def test_an_unsharded_job_is_not_scanned_at_all():
-    """One actor hosts everything, so parsing every row would buy nothing."""
-    dataset = MagicMock()
+def test_an_unsharded_job_is_checked_against_the_actors_entries():
+    """The lone actor is asked which entries it spawned, and rows must name one.
 
-    with patch.object(nemo_gym_mod, "_load_agent_names_from_source") as load_names:
+    A stale name, such as a renamed agent or a typo, would otherwise fail only
+    at its first dispatched batch, after every server has started.
+    """
+    handle = MagicMock()
+    shard_set = nemo_gym_mod.as_nemo_gym_shard_set(handle)
+
+    with patch.object(nemo_gym_mod.ray, "get") as ray_get:
+        ray_get.return_value = {
+            "math_agent": ["responses_api_agents"],
+            "math_tools": ["resources_servers"],
+        }
         nemo_gym_mod.validate_dataset_agent_coverage(
-            nemo_gym_mod.as_nemo_gym_shard_set(MagicMock()), {"train": dataset}
+            shard_set, {"train": _gym_dataset("math_agent"), "validation": None}
         )
+        with pytest.raises(nemo_gym_mod.ShardSetupError) as excinfo:
+            nemo_gym_mod.validate_dataset_agent_coverage(
+                shard_set, {"train": _gym_dataset("search_agent")}
+            )
 
-    load_names.assert_not_called()
-    dataset.__iter__.assert_not_called()
+    ray_get.assert_called_with(handle.list_entries.remote.return_value)
+    assert "['search_agent']" in str(excinfo.value)
+    assert "math_agent" in str(excinfo.value)
+
+
+def test_an_unsharded_job_counts_only_routable_entries_as_hosted():
+    """A model-only entry is not a route on one actor any more than on many.
+
+    ``build_route_shard_map`` maps agents and resources servers only, so on a
+    sharded job a row naming a ``responses_api_models`` entry is rejected at
+    setup. The unsharded check must agree, and must not list the model among
+    the hosted routes in its error message.
+    """
+    handle = MagicMock()
+    shard_set = nemo_gym_mod.as_nemo_gym_shard_set(handle)
+    tool_row = {"extra_env_info": json.dumps({"task_source": "math_tools"})}
+
+    with patch.object(nemo_gym_mod.ray, "get") as ray_get:
+        ray_get.return_value = {
+            "math_agent": ["responses_api_agents"],
+            "math_tools": ["resources_servers"],
+            "policy_model": ["responses_api_models"],
+        }
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            shard_set, {"train": [*_gym_dataset("math_agent"), tool_row]}
+        )
+        with pytest.raises(nemo_gym_mod.ShardSetupError) as excinfo:
+            nemo_gym_mod.validate_dataset_agent_coverage(
+                shard_set, {"train": _gym_dataset("policy_model")}
+            )
+
+    assert "['policy_model']" in str(excinfo.value)
+    assert "Hosted routes: ['math_agent', 'math_tools']." in str(excinfo.value)
 
 
 def test_the_wrapped_dataset_is_unwrapped_before_scanning():
