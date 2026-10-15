@@ -17,7 +17,7 @@ import re
 import socket
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from importlib import import_module
 from typing import Any, Literal, Optional, Protocol
@@ -250,7 +250,13 @@ def _convert_bf16_moe_weights_to_trtllm_block_layout_batched(
 
 @contextmanager
 def _use_batched_bf16_trtllm_layout_conversion() -> Iterator[None]:
-    """Use the batched converter only while vLLM rebuilds TRTLLM MoE state."""
+    """Use the batched converter only while vLLM rebuilds TRTLLM MoE state.
+
+    Verified against vLLM 0.29.0: ``fused_moe/oracle/unquantized.py`` resolves
+    the converter through module globals, so rebinding the attribute reaches
+    it. Conversion runs from the layerwise ``online_process_loader`` during
+    ``load_weights`` and again in ``finalize_layerwise_reload``.
+    """
     from vllm.model_executor.layers.fused_moe.oracle import unquantized
 
     with _BF16_TRTLLM_LAYOUT_PATCH_LOCK:
@@ -1335,9 +1341,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
 
                 added_skip_tensors = deepseek_v4_fp8.SkipNames()
+            layout_patch = (
+                nullcontext
+                if use_deepseek_v4_fp8
+                else _use_batched_bf16_trtllm_layout_conversion
+            )
 
             def finalize() -> None:
-                with _use_batched_bf16_trtllm_layout_conversion():
+                with layout_patch():
                     with torch.device(self.device):
                         finalize_layerwise_reload(model, self.model_config)
                         if use_deepseek_v4_fp8:
@@ -1352,7 +1363,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
             try:
                 with set_current_vllm_config(self.model_runner.vllm_config):
-                    with _use_batched_bf16_trtllm_layout_conversion():
+                    with layout_patch():
                         with torch.device(self.device):
                             if use_deepseek_v4_fp8:
                                 added_skip_tensors = deepseek_v4_fp8.prepare_refit(

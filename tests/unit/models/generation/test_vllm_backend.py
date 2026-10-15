@@ -308,12 +308,12 @@ def test_batched_bf16_trtllm_layout_matches_vllm_expertwise_converter(
     w13_rows = 4
     w2_rows = 3
     cols = 128
-    w13 = torch.arange(num_experts * w13_rows * cols, dtype=torch.bfloat16).view(
-        num_experts, w13_rows, cols
+    # Random data: bf16 arange repeats values above 256, which hides shifts.
+    generator = torch.Generator().manual_seed(0)
+    w13 = torch.randn(num_experts, w13_rows, cols, generator=generator).to(
+        torch.bfloat16
     )
-    w2 = torch.arange(num_experts * w2_rows * cols, dtype=torch.bfloat16).view(
-        num_experts, w2_rows, cols
-    )
+    w2 = torch.randn(num_experts, w2_rows, cols, generator=generator).to(torch.bfloat16)
     w13_perm = torch.tensor([2, 0, 3, 1])
     w2_perm = torch.tensor([1, 2, 0])
 
@@ -343,8 +343,8 @@ def test_batched_bf16_trtllm_layout_matches_vllm_expertwise_converter(
         )
     )
 
-    torch.testing.assert_close(actual_w13, expected_w13)
-    torch.testing.assert_close(actual_w2, expected_w2)
+    assert torch.equal(actual_w13, expected_w13)
+    assert torch.equal(actual_w2, expected_w2)
 
 
 @pytest.mark.vllm
@@ -389,7 +389,12 @@ def test_batched_bf16_trtllm_layout_is_scoped_to_reload_finalize(monkeypatch):
     )
 
     def finalize_layerwise_reload(_model, _model_config):
-        assert unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
+        assert (
+            unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout(
+                {}, object(), object()
+            )
+            == batched_result
+        )
 
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.reload.finalize_layerwise_reload",
@@ -418,8 +423,33 @@ def test_batched_bf16_trtllm_layout_is_scoped_to_reload_finalize(monkeypatch):
         unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
         is original_converter
     )
-    batched_converter.assert_called_once()
+    assert batched_converter.call_count == 2
     original_converter.assert_called_once()
+
+
+@pytest.mark.vllm
+def test_batched_bf16_trtllm_layout_restores_converter_on_exception(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.oracle import unquantized
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    original_converter = MagicMock()
+    monkeypatch.setattr(
+        unquantized,
+        "convert_moe_weights_to_flashinfer_trtllm_block_layout",
+        original_converter,
+    )
+
+    with pytest.raises(RuntimeError, match="reload failed"):
+        with vllm_backend._use_batched_bf16_trtllm_layout_conversion():
+            assert vllm_backend._BF16_TRTLLM_LAYOUT_PATCH_ACTIVE.get() is True
+            raise RuntimeError("reload failed")
+
+    assert (
+        unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout
+        is original_converter
+    )
+    assert vllm_backend._BF16_TRTLLM_LAYOUT_PATCH_ACTIVE.get() is False
 
 
 class _DeferredReloadLayer(torch.nn.Module):
