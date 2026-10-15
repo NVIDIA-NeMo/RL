@@ -89,6 +89,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
 )
+from nemo_rl.utils.checkpoint_storage import enable_msc, is_msc_path
 
 _HF_CONFIG_PATCHED = False
 
@@ -669,9 +670,12 @@ def _resolve_iter_dir_from_root(
     Checks ``latest_checkpointed_iteration.txt`` first; falls back to scanning
     for ``iter_*`` subdirectories and taking the last one (lexicographic order).
     """
+    storage = enable_msc() if is_msc_path(path) else None
+    fs = storage.os if storage else os
+    open_file = storage.open if storage else open
     tracker = os.path.join(path, "latest_checkpointed_iteration.txt")
-    if os.path.exists(tracker):
-        with open(tracker) as f:
+    if fs.path.exists(tracker):
+        with open_file(tracker) as f:
             iteration_str = f.read().strip()
         if iteration_str == "release":
             return os.path.join(path, "release")
@@ -686,8 +690,8 @@ def _resolve_iter_dir_from_root(
     try:
         iter_subdirs = sorted(
             d
-            for d in os.listdir(path)
-            if d.startswith("iter_") and os.path.isdir(os.path.join(path, d))
+            for d in fs.listdir(path)
+            if d.startswith("iter_") and fs.path.isdir(os.path.join(path, d))
         )
     except (FileNotFoundError, NotADirectoryError):
         iter_subdirs = []
@@ -889,6 +893,12 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
           created.
     """
     pretrained_ckpt = config.get("pretrained_checkpoint")
+    storage = (
+        enable_msc()
+        if pretrained_ckpt and is_msc_path(pretrained_ckpt["path"])
+        else None
+    )
+    fs = storage.os if storage else os
 
     if pretrained_ckpt is not None:
         fmt = pretrained_ckpt["format"]
@@ -897,7 +907,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
         if fmt == "megatron_bridge":
             path = pretrained_ckpt["path"]
             # If it's already a specific iter dir (contains run_config.yaml), use it directly.
-            if os.path.exists(os.path.join(path, "run_config.yaml")):
+            if fs.path.exists(os.path.join(path, "run_config.yaml")):
                 return hf_model_name, path, True
 
             resolved = _resolve_iter_dir_from_root(
@@ -909,7 +919,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
                 f"(e.g. /checkpoints/iter_0005000/) or a checkpoint root "
                 f"directory containing iter_* subdirectories.",
             )
-            if not os.path.exists(os.path.join(resolved, "run_config.yaml")):
+            if not fs.path.exists(os.path.join(resolved, "run_config.yaml")):
                 raise FileNotFoundError(
                     f"pretrained_checkpoint.path={path!r}: resolved to iteration "
                     f"directory {resolved!r} but it does not contain "
@@ -920,7 +930,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
 
         elif fmt == "megatron_lm":
             path = pretrained_ckpt["path"]
-            if not os.path.isdir(path):
+            if not fs.path.isdir(path):
                 raise FileNotFoundError(
                     f"pretrained_checkpoint.path={path!r} does not exist or "
                     f"is not a directory.  For megatron_lm format, path must point to "
@@ -933,7 +943,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
             # directly.  Otherwise resolve the latest iteration from the tracker file
             # or by scanning for iter_* subdirectories — the bridge does not read
             # latest_checkpointed_iteration.txt itself and defaults to iter_0000000.
-            if os.path.exists(os.path.join(path, "metadata.json")):
+            if fs.path.exists(os.path.join(path, "metadata.json")):
                 resolved = path
             else:
                 resolved = _resolve_iter_dir_from_root(
@@ -942,7 +952,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
                     f"metadata.json, latest_checkpointed_iteration.txt, or any "
                     f"iter_* subdirectories.  Cannot resolve a megatron_lm checkpoint.",
                 )
-            if not os.path.exists(os.path.join(resolved, "metadata.json")):
+            if not fs.path.exists(os.path.join(resolved, "metadata.json")):
                 raise FileNotFoundError(
                     f"Resolved megatron_lm checkpoint directory {resolved!r} does not "
                     f"contain metadata.json.  The checkpoint must use torch_dist format."
@@ -1044,7 +1054,11 @@ def setup_model_config(
                 pretrained_path, "iter_0000000", "run_config.yaml"
             )
 
-        if not os.path.exists(pretrained_run_config):
+        if not (
+            enable_msc().os.path.exists(pretrained_run_config)
+            if is_msc_path(pretrained_run_config)
+            else os.path.exists(pretrained_run_config)
+        ):
             raise FileNotFoundError(
                 f"Pretrained run config not found at {pretrained_run_config} on rank={rank}. "
                 "This usually means that the checkpoint conversion on rank=0 saved to a "

@@ -156,6 +156,7 @@ from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
 )
+from nemo_rl.utils.checkpoint_storage import enable_msc, is_msc_path
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -5024,6 +5025,9 @@ class MegatronPolicyWorkerImpl(
             raise RuntimeError(
                 "Megatron core state or model is not initialized. Cannot save checkpoint."
             )
+
+        if is_msc_path(weights_path):
+            enable_msc()
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
         is_async = self.mcore_state.cfg.checkpoint.async_save

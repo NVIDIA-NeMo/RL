@@ -50,6 +50,7 @@ from nemo_rl.telemetry.instrumentation import (
     current_trace_carrier,
     remote_trace_context,
 )
+from nemo_rl.utils.checkpoint_storage import enable_msc, is_msc_path
 
 PathLike = Union[str, "os.PathLike[Any]"]
 
@@ -168,7 +169,8 @@ class PretrainedCheckpointConfig(TypedDict):
     only; the Automodel backend continues to use HuggingFace weights via ``model_name``.
 
     Attributes:
-        path: Filesystem path to the checkpoint to load.
+        path: Filesystem path or ``msc://profile/path`` URL to load.
+            MSC profiles and a node-local cache are configured through ``MSC_CONFIG``.
 
             * For ``"megatron_bridge"`` format: may be either a **specific
               iteration directory** that contains a ``run_config.yaml`` file
@@ -209,6 +211,8 @@ class CheckpointingConfig(TypedDict):
     ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
         When set, a checkpoint is saved every ft_save_period steps for crash recovery.
         Requires ft_keep_latest_k to control how many of these are retained.
+    weights_only (bool): SingleController exports weights without optimizer or
+        rollout recovery state. Such checkpoints cannot resume training.
     save_optimizer (bool): Whether to save optimizer state with checkpoints.
     save_data_plane (bool): Whether SingleController checkpoints include the
         native TQ snapshot and replay-buffer metadata. Supported by the simple
@@ -230,6 +234,7 @@ class CheckpointingConfig(TypedDict):
     ft_save_period: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
+    weights_only: NotRequired[bool]
     save_optimizer: NotRequired[bool]  # Default: True
     save_data_plane: NotRequired[bool]
     load_replay_buffer: NotRequired[bool]  # Default: True
@@ -291,13 +296,23 @@ class CheckpointManager:
                 "internally."
             )
 
-        self.checkpoint_dir = Path(config["checkpoint_dir"])
+        self.weights_only = bool(config.get("weights_only"))
+        if self.weights_only and config.get("save_data_plane"):
+            raise ValueError("weights_only requires save_data_plane=false")
+        self._msc = enable_msc() if is_msc_path(config["checkpoint_dir"]) else None
+        if self._msc is not None and config.get("save_data_plane"):
+            raise ValueError(
+                "MSC checkpoints do not yet support data-plane snapshots; set save_data_plane=false."
+            )
+        self.checkpoint_dir = (self._msc.Path if self._msc else Path)(
+            config["checkpoint_dir"]
+        )
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
         self.save_period: int = config["save_period"]
         self.ft_keep_latest_k: int | None = config.get("ft_keep_latest_k", None)
-        self.save_optimizer = config["save_optimizer"]
+        self.save_optimizer = config["save_optimizer"] and not self.weights_only
 
         # Async finalization state
         self._finalize_thread: Optional[threading.Thread] = None
@@ -323,7 +338,10 @@ class CheckpointManager:
             optimizer_path is None if checkpoint exists but optimizer state was not saved.
         """
         if last_checkpoint_path:
-            component_path = Path(last_checkpoint_path) / model_component
+            storage = enable_msc() if is_msc_path(last_checkpoint_path) else None
+            component_path = (storage.Path if storage else Path)(
+                last_checkpoint_path
+            ) / model_component
             weights_path = component_path / "weights"
             optimizer_path = component_path / "optimizer"
 
@@ -374,7 +392,8 @@ class CheckpointManager:
 
         Creates a temporary directory for a new checkpoint and saves training info
         and configuration. The directory is named 'tmp_step_{step}' and will be renamed
-        to 'step_{step}' when the checkpoint is completed.
+        to 'step_{step}' when the checkpoint is completed. MSC writes directly to
+        a fresh step prefix and publishes an ``_SUCCESS`` object on completion.
         We do it this way to allow the algorithm loop to save any files it wants to save
         in a safe, temporary directory.
 
@@ -386,7 +405,14 @@ class CheckpointManager:
         Returns:
             PathLike: Path to the temporary checkpoint directory.
         """
-        save_dir = self.checkpoint_dir / f"tmp_step_{step}"
+        if self._msc is not None:
+            save_dir = self.checkpoint_dir / f"step_{step}"
+            if self._msc.os.path.isdir(str(save_dir), strict=False):
+                raise FileExistsError(
+                    f"Refusing to overwrite MSC checkpoint {save_dir}; use a fresh run prefix."
+                )
+        else:
+            save_dir = self.checkpoint_dir / f"tmp_step_{step}"
         # Remove a stale tmp_step_{step} left behind by an interrupted prior save
         # so the new save starts clean.
         if save_dir.exists():
@@ -397,9 +423,12 @@ class CheckpointManager:
         save_dir.mkdir(parents=True, exist_ok=True)
 
         # save training info
-        with open(save_dir / "training_info.json", "w") as f:
+        open_file = self._msc.open if self._msc else open
+        with open_file(str(save_dir / "training_info.json"), "w") as f:
             # make any numpy items serializable
             serializable_training_info = dict(training_info)
+            if self.weights_only:
+                serializable_training_info["weights_only"] = True
             for k, v in serializable_training_info.items():
                 if isinstance(v, torch.Tensor) or isinstance(v, np.ndarray):
                     serializable_training_info[k] = v.item()
@@ -407,12 +436,12 @@ class CheckpointManager:
 
         # save config
         if run_config is not None:
-            with open(save_dir / "config.yaml", "w") as f:
+            with open_file(str(save_dir / "config.yaml"), "w") as f:
                 # JSON mode converts enums and other Pydantic-supported scalar
                 # types to the primitive values expected by safe YAML.
                 yaml.safe_dump(run_config.model_dump(mode="json"), f)
 
-        return Path(os.path.abspath(save_dir))
+        return str(save_dir) if self._msc else Path(os.path.abspath(save_dir))
 
     def _rename_checkpoint(self, checkpoint_path: PathLike) -> None:
         """Rename tmp_step_N to step_N.
@@ -421,6 +450,11 @@ class CheckpointManager:
         training), performs a pseudo-atomic swap via an intermediate old_step_N
         directory.
         """
+        if self._msc is not None:
+            # Publish only after all worker saves (including async completion) succeed.
+            with self._msc.open(str(checkpoint_path) + "/_SUCCESS", "w") as stream:
+                json.dump({"version": 1}, stream)
+            return
         checkpoint_path = Path(checkpoint_path)
         step = checkpoint_path.name.split("_")[2]
         to_checkpoint_path = checkpoint_path.parent / f"step_{step}"
@@ -466,7 +500,9 @@ class CheckpointManager:
                 For sync saves: None (rename immediately).
         """
         self.finalize_pending()
-        self._pending_checkpoint_path = Path(checkpoint_path)
+        self._pending_checkpoint_path = (self._msc.Path if self._msc else Path)(
+            checkpoint_path
+        )
         self._finalize_error = None
         # The step is only in the staging dir name (tmp_step_<n>); None if it
         # does not parse, since this only labels a span.
@@ -643,7 +679,10 @@ class CheckpointManager:
         for step, path, _ in checkpoint_history:
             if step not in protected_steps:
                 print(f"Removing checkpoint {path} (step {step})")
-                shutil.rmtree(path)
+                if self._msc is not None:
+                    self._msc.delete(str(path), recursive=True)
+                else:
+                    shutil.rmtree(path)
 
     def get_best_checkpoint_path(self) -> Optional[str]:
         """Get the path to the best checkpoint based on the metric.
@@ -701,6 +740,9 @@ class CheckpointManager:
             Optional[str]: Path to the latest checkpoint, or None if no checkpoints exist.
         """
         # find checkpoint directory with highest step number
+        if self._msc is not None:
+            history = _load_checkpoint_history(self.checkpoint_dir)
+            return str(max(history, key=lambda item: item[0])[1]) if history else None
         step_dirs = [
             x
             for x in glob.glob(str(self.checkpoint_dir / "step_*"))
@@ -726,8 +768,16 @@ class CheckpointManager:
         """
         if checkpoint_path is None:
             return None
-        with open(Path(checkpoint_path) / "training_info.json", "r") as f:
-            return json.load(f)
+        open_file = enable_msc().open if is_msc_path(checkpoint_path) else open
+        with open_file(str(checkpoint_path) + "/training_info.json", "r") as f:
+            info = json.load(f)
+        if info.get("weights_only"):
+            raise ValueError(
+                "Cannot resume training from a weights-only checkpoint. Start a "
+                "new run with a fresh checkpoint_dir and use policy.pretrained_checkpoint "
+                "to load its policy/weights as initial weights."
+            )
+        return info
 
 
 def _load_checkpoint_history(
@@ -743,6 +793,20 @@ def _load_checkpoint_history(
             (step_number, checkpoint_path, info) for each checkpoint.
     """
     checkpoint_history: list[tuple[int, PathLike, dict[str, Any]]] = []
+    if is_msc_path(checkpoint_dir):
+        msc = enable_msc()
+        for marker in msc.glob(str(checkpoint_dir) + "/step_*/_SUCCESS"):
+            step_dir = msc.Path(marker).parent
+            if re.fullmatch(r"step_\d+", step_dir.name):
+                with msc.open(str(step_dir / "training_info.json")) as stream:
+                    checkpoint_history.append(
+                        (
+                            int(step_dir.name.split("_")[1]),
+                            str(step_dir),
+                            json.load(stream),
+                        )
+                    )
+        return checkpoint_history
 
     # Find all step directories
     step_dirs = [
