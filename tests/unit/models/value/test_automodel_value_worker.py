@@ -16,7 +16,7 @@
 Worker-level tests use a tiny Qwen2 model on a small Ray cluster, mirroring
 `test_megatron_value_worker.py`. They cover:
 
-  * value head (regression head, `num_labels=1`) on the DTensor V2 backbone
+  * value head (regression head, `num_labels=1`) on the Automodel backbone
   * `get_values` forward pass (shape + finiteness), incl. TP / SP /
     dynamic batching
   * `train` step with `MseValueLossFn` (loss is finite + non-negative)
@@ -24,7 +24,7 @@ Worker-level tests use a tiny Qwen2 model on a small Ray cluster, mirroring
   * Multi-step training drives loss down
   * Checkpoint save+load round-trip preserves the trained value head
 
-DTensor V2 value worker does not support pipeline parallelism (lm_value.py)
+Automodel value worker does not support pipeline parallelism (lm_value.py)
 or sequence packing (setup.validate_and_prepare_config disallows packing for
 reward models), so those parallelism modes are not exercised here.
 """
@@ -123,7 +123,7 @@ def _create_value_test_config(
     cp: int = 1,
     precision: str = "float32",
 ) -> ValueConfig:
-    """Build a minimal valid `ValueConfig` for DTensor V2 tests."""
+    """Build a minimal valid `ValueConfig` for Automodel tests."""
     return {
         "model_name": model_name,
         "tokenizer": {"name": model_name},
@@ -255,7 +255,7 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
 
 @pytest.fixture
 def value_setup(request, tiny_qwen2_model_path, tmp_path):
-    """Spin up a `Value` wrapper around a tiny Qwen2 backbone for DTensor V2 testing.
+    """Spin up a `Value` wrapper around a tiny Qwen2 backbone for Automodel testing.
 
     Parameter format: ``(num_gpus, tp, cp, config_updates)``.
     """
@@ -270,7 +270,7 @@ def value_setup(request, tiny_qwen2_model_path, tmp_path):
     loss_fn = None
 
     try:
-        cluster_name = f"test-dtensor-value-{num_gpus}gpu-tp{tp}-cp{cp}"
+        cluster_name = f"test-automodel-value-{num_gpus}gpu-tp{tp}-cp{cp}"
         if config_updates:
             cluster_name += "-" + "-".join(
                 f"{k}={v}" for k, v in config_updates.items()
@@ -453,7 +453,7 @@ def test_value_worker_parallelism_equivalence(
     try:
         feature_id = next(iter(feature_updates))
         cluster = RayVirtualCluster(
-            name=f"test-dtensor-value-equiv-{feature_id}",
+            name=f"test-automodel-value-equiv-{feature_id}",
             bundle_ct_per_node_list=[2],
             use_gpus=True,
             num_gpus_per_node=2,
@@ -561,7 +561,7 @@ def test_value_worker_train_decreases_loss(value_setup):
     ids=["2gpu_dp2"],
 )
 def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
-    """Round-trip DTensor model, optimizer, and scheduler checkpoint state."""
+    """Round-trip Automodel model, optimizer, and scheduler checkpoint state."""
     value, cluster, data, loss_fn = value_setup
 
     # State 1: fresh — capture get_values output before any training.
@@ -638,7 +638,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
             "initialization instead of loading the trained weights."
         )
 
-        # DTensor weights are deterministic across save/reload — values must
+        # Automodel weights are deterministic across save/reload — values must
         # match what we captured just before save.
         torch.testing.assert_close(values_resumed, values_saved, rtol=1e-4, atol=1e-4)
 
