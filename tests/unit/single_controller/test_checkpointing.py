@@ -100,6 +100,10 @@ from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.environments.gym_checkpoint_coordinator import (
+    GymCheckpointNotReady,
+    GymCheckpointOperationError,
+)
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -556,11 +560,11 @@ class _FakeRolloutManager:
         )
         return f"regenerated-{len(self.reserved_prompts)}"
 
-    def suspend_request_deadlines(self) -> None:
+    def suspend_request_deadlines(self, holder: str = "generation_stand_down") -> None:
         if self._events is not None:
             self._events.append("suspend_deadlines")
 
-    def resume_request_deadlines(self) -> None:
+    def resume_request_deadlines(self, holder: str = "generation_stand_down") -> None:
         if self._events is not None:
             self._events.append("resume_deadlines")
 
@@ -1624,6 +1628,7 @@ class TestPeriodicRolloutCheckpoint:
         outcome_keys = {"completed", "failed", "skipped"}
         reason_keys = {
             "reason_completed",
+            "reason_gym_unavailable",
             "reason_invariant_error",
             "reason_io_error",
             "reason_missing_trainer_anchor",
@@ -1986,6 +1991,39 @@ class TestPeriodicRolloutCheckpoint:
         assert result.reason == "no_data_plane_mutations"
         assert actor._dp_client.save_calls == []
 
+    def test_periodic_pump_wakes_early_for_a_new_trainer_checkpoint(
+        self, tmp_path: Path
+    ):
+        """A turn trainer checkpoint needs a Gym snapshot soon, not an interval later."""
+        actor = self._actor(tmp_path)
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 3600.0
+        actor._train_steps = 1
+
+        async def _main() -> None:
+            attempted = asyncio.Event()
+
+            async def _save(*, force: bool = False) -> Any:
+                del force
+                attempted.set()
+                return SimpleNamespace(saved=False, reason="no_data_plane_mutations")
+
+            actor._save_rollout_checkpoint = _save
+            pump = asyncio.create_task(actor._rollout_checkpoint_pump())
+            await asyncio.sleep(0)
+            actor._rollout_checkpoint_wakeup.set()
+            try:
+                await asyncio.wait_for(attempted.wait(), timeout=1.0)
+            finally:
+                pump.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pump
+            assert not actor._rollout_checkpoint_wakeup.is_set()
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
     def test_periodic_pump_reports_each_consecutive_failure(
         self,
         tmp_path: Path,
@@ -2055,6 +2093,89 @@ class TestPeriodicRolloutCheckpoint:
 
         output = capsys.readouterr().out
         assert output.count("Periodic rollout checkpoint failed") == 2
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            GymCheckpointNotReady({"tools/replica-0": {"agent": ("rollout-1",)}}),
+            GymCheckpointOperationError(
+                "prepare", {"tools/replica-0": TimeoutError("no reply")}
+            ),
+        ],
+        ids=["not-ready", "unanswered"],
+    )
+    def test_periodic_pump_retries_a_gym_checkpoint_that_could_not_run(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        error: Exception,
+    ):
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
+        actor._train_steps = 1
+
+        async def _main() -> None:
+            two_failures = asyncio.Event()
+            calls = 0
+
+            async def _failing_save(*, force: bool = False) -> bool:
+                nonlocal calls
+                del force
+                calls += 1
+                if calls == 2:
+                    two_failures.set()
+                raise error
+
+            actor._save_rollout_checkpoint = _failing_save
+            pump = asyncio.create_task(actor._rollout_checkpoint_pump())
+            await asyncio.wait_for(two_failures.wait(), timeout=1.0)
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
+        output = capsys.readouterr().out
+        assert "retaining the previous committed snapshot" in output
+        assert "consecutive_failures=2" in output
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["reason_gym_unavailable"] == 1.0
+
+    def test_periodic_pump_does_not_retry_a_broken_gym_reply(self, tmp_path: Path):
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
+        actor._train_steps = 1
+        calls = 0
+
+        async def _main() -> None:
+            async def _failing_save(*, force: bool = False) -> bool:
+                nonlocal calls
+                del force
+                calls += 1
+                raise GymCheckpointOperationError(
+                    "commit",
+                    {"tools/replica-0": RuntimeError("unexpected participant set")},
+                )
+
+            actor._save_rollout_checkpoint = _failing_save
+            with pytest.raises(GymCheckpointOperationError, match="participant set"):
+                await asyncio.wait_for(
+                    actor._rollout_checkpoint_pump(),
+                    timeout=1.0,
+                )
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert calls == 1
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["reason_invariant_error"] == 1.0
 
     def test_periodic_pump_does_not_retry_invariant_failure(self, tmp_path: Path):
         actor = self._actor(tmp_path)
@@ -2333,6 +2454,60 @@ class TestDataPlaneCheckpoint:
         assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
         assert sorted(dp_client.sample_ids) == [route_key, "sealed-key"]
 
+    def test_rollout_recovery_inventory_preserves_gym_manifest_staging_keys(self):
+        staging_partition = "rollout_staging"
+        dp_client = _StagingInventoryDPClient(
+            ["sealed-key", "gym-owned-key", "orphan-key"],
+            partition_id=staging_partition,
+        )
+        actor = object.__new__(_ACTOR_CLS)
+        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
+        actor._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(staging_partition=staging_partition)
+        )
+        actor._dp_client = dp_client
+
+        async def validate_inventory() -> int:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                return await actor._validate_rollout_recovery_inventory(
+                    cut,
+                    replay_metadata=None,
+                    clear_unreferenced=True,
+                    additional_expected_staging_keys={"gym-owned-key"},
+                )
+
+        assert asyncio.run(validate_inventory()) == 2
+        assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
+        assert sorted(dp_client.sample_ids) == ["gym-owned-key", "sealed-key"]
+
+    def test_rollout_recovery_inventory_rejects_missing_gym_staging_key(self):
+        staging_partition = "rollout_staging"
+        dp_client = _StagingInventoryDPClient(
+            ["sealed-key"],
+            partition_id=staging_partition,
+        )
+        actor = object.__new__(_ACTOR_CLS)
+        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
+        actor._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(staging_partition=staging_partition)
+        )
+        actor._dp_client = dp_client
+
+        async def validate_inventory() -> None:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                await actor._validate_rollout_recovery_inventory(
+                    cut,
+                    replay_metadata=None,
+                    clear_unreferenced=True,
+                    additional_expected_staging_keys={"missing-gym-key"},
+                )
+
+        with pytest.raises(RuntimeError, match="staging rows missing"):
+            asyncio.run(validate_inventory())
+
+        assert dp_client.clear_calls == []
+        assert dp_client.sample_ids == ["sealed-key"]
+
     def test_gated_sampler_writes_authoritative_tq_checkpoint(self, tmp_path):
         mc = _actor_master_config(
             tmp_path,
@@ -2575,6 +2750,8 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._checkpointer = MagicMock()
     actor._checkpointer.save_optimizer = True
     actor._checkpointer.init_tmp_checkpoint.return_value = str(checkpoint_path)
+    actor._gym_checkpoint_coordinator = None
+    actor._rollout_dispatch_admission_gate = None
     actor._is_ppo = True
     actor._trainer = _OrderRecordingPolicy(calls)
     actor._value = _OrderRecordingCritic(calls)

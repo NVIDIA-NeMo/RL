@@ -38,10 +38,12 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     bootstrap_fingerprint,
     commit_snapshot,
     ensure_bootstrap_anchor,
+    has_gym_restart_fallback,
     prepare_snapshot_paths,
     prune_bootstrap_snapshots,
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
+    write_gym_restart_fallback,
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.models.generation.vllm.config import VllmConfig, VllmSpecificArgs
@@ -213,6 +215,7 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
         },
         "checkpointing": {"checkpoint_dir": "/run/one/checkpoints"},
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 120},
+        "rollout_recovery": {"target_level": "turn", "gym_prepare_timeout_s": 300.0},
         "cluster": {"num_nodes": 2},
         "logger": LoggerConfig(log_dir="/run/one"),
     }
@@ -242,6 +245,10 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
         },
         "checkpointing": {"checkpoint_dir": "/run/two/checkpoints"},
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 300},
+        "rollout_recovery": {
+            **base["rollout_recovery"],
+            "gym_prepare_timeout_s": 900.0,
+        },
         "cluster": {"num_nodes": 8},
         "logger": LoggerConfig(log_dir="/run/two"),
     }
@@ -381,7 +388,7 @@ def test_builtin_fingerprint_exclusions_reference_declared_config_fields() -> No
             "async_rl",
             {"sampler": {"name": "windowed", "max_staleness_versions": 2}},
         ),
-        ("rollout_recovery", {"default_granularity": "prompt_group"}),
+        ("rollout_recovery", {"target_level": "prompt_group"}),
     ],
 )
 def test_bootstrap_fingerprint_rejects_rollout_semantic_changes(
@@ -403,7 +410,7 @@ def test_bootstrap_fingerprint_rejects_rollout_semantic_changes(
             "mixed_weight_version_policy": "allow",
         },
         "async_rl": {"sampler": {"name": "windowed", "max_staleness_versions": 1}},
-        "rollout_recovery": {"default_granularity": "sibling"},
+        "rollout_recovery": {"target_level": "sibling"},
     }
     modified = {**base, section: {**base[section], **changed}}
 
@@ -1006,3 +1013,20 @@ def test_capture_bootstrap_normalizes_disabled_effort() -> None:
     assert bootstrap_fingerprint(
         cast(Any, _DumpedConfig(base))
     ) == bootstrap_fingerprint(cast(Any, _DumpedConfig(changed)))
+
+
+def test_gym_restart_fallback_marks_a_trainer_checkpoint_without_gym_state(
+    tmp_path: Path,
+) -> None:
+    assert not has_gym_restart_fallback(tmp_path, train_step=7, trainer_version=7)
+
+    write_gym_restart_fallback(tmp_path, train_step=7, trainer_version=7)
+
+    assert has_gym_restart_fallback(tmp_path, train_step=7, trainer_version=7)
+
+
+def test_gym_restart_fallback_rejects_another_trainer_state(tmp_path: Path) -> None:
+    write_gym_restart_fallback(tmp_path, train_step=7, trainer_version=7)
+
+    with pytest.raises(ValueError, match="does not match its trainer checkpoint"):
+        has_gym_restart_fallback(tmp_path, train_step=8, trainer_version=8)
