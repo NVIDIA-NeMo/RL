@@ -33,6 +33,7 @@ from nemo_rl.data.captured_media import (
     CapturedMedia,
     CapturedMediaItem,
     MediaCaptureRejected,
+    MediaColumnSpec,
     capture_processed_media,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
@@ -45,10 +46,14 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.experience.route_assembly import boundary_route_rows
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
     verify_right_padding,
+)
+from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
+    CapturedChatLogprobsMixin,
 )
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
@@ -272,6 +277,27 @@ class VllmAsyncGenerationWorkerImpl(
 
         self.llm = None
         self.vllm_device_ids = None
+
+    async def start_gpu_profiling(self) -> None:
+        """Start GPU profiling on the inner TP workers.
+
+        The async engine's collective_rpc is a coroutine; the inherited sync
+        start_gpu_profiling would drop it un-awaited, so the inner TP workers
+        never receive cudaProfilerStart. Await it here so every inner worker starts.
+        This outer actor deliberately does not call cudaProfilerStart itself, so its
+        own nsys session never opens a capture and writes no report.
+        """
+        if self.llm is not None:
+            await self.llm.collective_rpc("start_gpu_profiling", args=tuple())
+
+    async def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling on the inner TP workers.
+
+        Awaits collective_rpc("stop_gpu_profiling") so cudaProfilerStop reaches every
+        inner worker and ends its capture.
+        """
+        if self.llm is not None:
+            await self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
     def _return_routed_experts_enabled(self) -> bool:
         engine_args = getattr(self, "llm_async_engine_args", None)
@@ -529,17 +555,18 @@ class VllmAsyncGenerationWorkerImpl(
         staging_partition: str,
         *,
         capture_media: bool = False,
-    ) -> bool:
+    ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
         Fan-out target (token_capture.enabled only): builds the in-worker
         data-plane client and TQTokenSink, then makes the single
         ``install_capture`` call wiring Gym's engine-blind capture core +
-        vLLM adapter into this worker. Returns whether capture was installed
-        (False on non-model-owner ranks, which serve no HTTP).
+        vLLM adapter into this worker. Returns the media column spec this
+        worker pinned the staging column to (``None`` for text-only capture
+        and on non-model-owner ranks, which serve no HTTP and install nothing).
         """
         if not self.is_model_owner:
-            return False
+            return None
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
         from nemo_gym.token_id_capture.staging import install_capture
@@ -602,7 +629,11 @@ class VllmAsyncGenerationWorkerImpl(
             weight_version_fn=lambda: self._rollout_weight_version,
             adapter=VLLMCaptureAdapter(),
         )
-        return True
+        if not capture_media:
+            return None
+        return MediaColumnSpec(
+            pixel_dtype=pixel_dtype, patch_size=self._capture_patch_size
+        )
 
     async def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """Run owner-local checkpoint I/O without blocking the actor event loop."""
@@ -787,7 +818,7 @@ class VllmAsyncGenerationWorkerImpl(
     def _delta_align_routed_experts(
         payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
     ) -> None:
-        """Normalize optional vLLM routes to the exact staged token delta."""
+        """Normalize optional vLLM routes to the staged token delta (plus boundary row)."""
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
             return
@@ -820,7 +851,8 @@ class VllmAsyncGenerationWorkerImpl(
                     f"route length {experts.shape[0]} does not match engine sequence "
                     f"length {expected_full_len}"
                 )
-            message["routed_experts"] = encode_routed_experts(experts[prev_len:])
+            start = prev_len - boundary_route_rows(prev_len)
+            message["routed_experts"] = encode_routed_experts(experts[start:])
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
@@ -1240,12 +1272,22 @@ class VllmAsyncGenerationWorkerImpl(
                         final_res = res
                         yield res
 
-                response = await super().chat_completion_full_generator(
-                    request,
-                    capture_result_generator(),
-                    *args,
-                    **kwargs,
+                # Capture stages the raw arrays below and strips OpenAI logprobs
+                # after the terminal PUT. Skip only their object construction;
+                # changing request.logprobs would also change engine sampling.
+                bypass_logprobs = bool(
+                    not request.stream
+                    and request.logprobs
+                    and return_as_token_id
+                    and id(request) in worker_self._capture_calls
                 )
+                with self._bypass_chat_logprobs(enabled=bypass_logprobs):
+                    response = await super().chat_completion_full_generator(
+                        request,
+                        capture_result_generator(),
+                        *args,
+                        **kwargs,
+                    )
                 if (
                     not isinstance(response, ChatCompletionResponse)
                     or final_res is None
@@ -1269,7 +1311,11 @@ class VllmAsyncGenerationWorkerImpl(
 
                 return response
 
-        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
+        class NeMoRLOpenAIServingChat(
+            NeMoRLOpenAIServingChatMixin,
+            CapturedChatLogprobsMixin,
+            OpenAIServingChat,
+        ):
             pass
 
         class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):

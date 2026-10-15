@@ -141,6 +141,37 @@ class CapturedMedia:
     tensors: dict[str, torch.Tensor] | None
 
 
+@dataclass(frozen=True)
+class MediaColumnSpec:
+    """The geometry of the pixel column a media-capture run publishes.
+
+    Reported by the serving worker that pins the staging column (it alone
+    knows the vision encoder's weight dtype and the model patch size) and
+    handed to the reassembler, which needs it to mint zero-row media for a
+    group in which no rollout carried media: those rows must land in the
+    trainer partition with the same dtype and patch width as media rows, or
+    TransferQueue sees a second dtype on the field.
+    """
+
+    pixel_dtype: torch.dtype
+    patch_size: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pixel_dtype, torch.dtype):
+            raise TypeError(
+                f"pixel_dtype must be a torch.dtype, got {type(self.pixel_dtype).__name__}"
+            )
+        if type(self.patch_size) is not int or self.patch_size <= 0:
+            raise ValueError(
+                f"patch_size must be a positive int, got {self.patch_size!r}"
+            )
+
+    @property
+    def pixel_feature_dim(self) -> int:
+        """Width of one packed patch row: ``3 * P * P`` (see ``pack_images``)."""
+        return 3 * self.patch_size**2
+
+
 def _geometry_tensor(value: Any) -> torch.Tensor:
     tensor = torch.as_tensor(value)
     if (
