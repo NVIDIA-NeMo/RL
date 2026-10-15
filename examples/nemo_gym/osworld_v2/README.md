@@ -204,10 +204,19 @@ bash examples/nemo_gym/osworld_v2/submit.sh \
 ```
 
 `OSWORLD_RECIPE` accepts `flash-b8n8-dr-grpo`,
-`flash-b8n8-reinforce`, `flash-b17n16-dr-grpo`, or
-`flash-b17n16-reinforce`. Qualify the B=8/N=8 profile first. The B=17/N=16
-profiles satisfy the strict `>16*16` logical-batch target. Qualify B=8/N=8
-end-to-end before spending a full B=17/N=16 optimizer step.
+`flash-b8n8-reinforce`, `flash-b17n16-dr-grpo`,
+`flash-b17n16-reinforce`, `molt-b8n8-checkpoint`, or
+`molt-b8n8-buffer32-checkpoint`. Qualify the B=8/N=8 profile first. The
+B=17/N=16 profiles satisfy the strict `>16*16` logical-batch target. Qualify
+B=8/N=8 end-to-end before spending a full B=17/N=16 optimizer step.
+
+`molt-b8n8-buffer32-checkpoint` is the Current v2 A run-ahead profile. Relative
+to `molt-b8n8-checkpoint`, it keeps eight prompt groups in flight and raises
+the unified rollout capacity from 8 to 32; no model-context or sequence-packing
+limit is changed by that recipe. The measured A job separately used the
+optional 24576-token qualification limits after a 49152-token first-backward
+OOM. Set those three `OSWORLD_*_TOKENS` variables only when reproducing that
+exact qualification environment.
 
 Before calling `sbatch`, the launcher:
 

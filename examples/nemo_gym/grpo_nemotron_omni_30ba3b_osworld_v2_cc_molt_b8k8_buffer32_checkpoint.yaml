@@ -1,0 +1,13 @@
+# Run-ahead profile used by the Current v2 A efficiency experiment.
+#
+# Relative to the checkpoint-parity B=8 profile, only the unified rollout
+# capacity changes. Eight prompt groups may be in flight while the controller
+# retains enough completed/current work to overlap multiple optimizer steps.
+# Sequence length, sampling, and model-context settings deliberately remain
+# inherited; they are not part of the async scheduling change.
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_v2_cc_molt_b8k8_checkpoint.yaml
+
+async_rl:
+  max_inflight_prompts: 8
+  max_buffered_rollouts: 32

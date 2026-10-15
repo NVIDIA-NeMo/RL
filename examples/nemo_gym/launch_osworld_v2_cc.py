@@ -54,6 +54,9 @@ MOLT_CHECKPOINT_CONFIG_PATH = Path(__file__).with_name(
 )
 RECIPE_CONFIG_PATHS = {
     "molt-b8n8-checkpoint": MOLT_CHECKPOINT_CONFIG_PATH,
+    "molt-b8n8-buffer32-checkpoint": Path(__file__).with_name(
+        "grpo_nemotron_omni_30ba3b_osworld_v2_cc_molt_b8k8_buffer32_checkpoint.yaml"
+    ),
     "flash-b8n8-reinforce": Path(__file__).with_name(
         "grpo_nemotron_omni_30ba3b_osworld_v2_cc_flash_b8n8_checkpoint.yaml"
     ),

@@ -41,6 +41,16 @@ if [[ -n "${OSWORLD_TEMPERATURE:-}" ]]; then
     "policy.generation.val_temperature=$OSWORLD_TEMPERATURE"
   )
 fi
+if [[ -n "${OSWORLD_MAX_INFLIGHT_PROMPTS:-}" ]]; then
+  OVERRIDES+=(
+    "async_rl.max_inflight_prompts=$OSWORLD_MAX_INFLIGHT_PROMPTS"
+  )
+fi
+if [[ -n "${OSWORLD_MAX_BUFFERED_ROLLOUTS:-}" ]]; then
+  OVERRIDES+=(
+    "async_rl.max_buffered_rollouts=$OSWORLD_MAX_BUFFERED_ROLLOUTS"
+  )
+fi
 
 exec "$OSWORLD_DRIVER_PYTHON" \
   examples/nemo_gym/launch_osworld_v2_cc.py \
