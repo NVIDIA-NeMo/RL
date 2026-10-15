@@ -3167,7 +3167,9 @@ class MegatronPolicyWorkerImpl(
             and self.fp8_cfg.get("fp8_recipe") == "blockwise"
         )
 
-    def _build_refit_conversion_tasks(self) -> list:
+    def _build_refit_conversion_tasks(
+        self, *, exclude_param_patterns: tuple[str, ...] = ()
+    ) -> list:
         """Build the conversion-task list driving refit (BF16 or FP8 export).
 
         A destination that requests logical weights consumes standard Bridge
@@ -3181,7 +3183,14 @@ class MegatronPolicyWorkerImpl(
                 return self.megatron_bridge.get_export_fp8_tasks(self.model)
             return [
                 task
-                for task in self.megatron_bridge.get_conversion_tasks([self.model])
+                for task in self.megatron_bridge.get_conversion_tasks(
+                    [self.model],
+                    **(
+                        {"exclude_param_patterns": exclude_param_patterns}
+                        if exclude_param_patterns
+                        else {}
+                    ),
+                )
                 if task is not None
             ]
 

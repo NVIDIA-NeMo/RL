@@ -473,9 +473,14 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             generation_cfg.get("real_quant")
         )
 
-    def _build_refit_conversion_tasks(self) -> list:
+    def _build_refit_conversion_tasks(
+        self, *, exclude_param_patterns: tuple[str, ...] = ()
+    ) -> list:
         if not self._use_real_quant_refit():
-            return super()._build_refit_conversion_tasks()
+            # Fake refit folds weights locally; only input/KV amax need HF mappings.
+            return super()._build_refit_conversion_tasks(
+                exclude_param_patterns=("*weight_quantizer*", *exclude_param_patterns)
+            )
 
         return self._get_modelopt_export_plan().conversion_tasks
 

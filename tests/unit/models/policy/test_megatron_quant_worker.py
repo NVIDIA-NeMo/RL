@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import fnmatch
 import os
 import tempfile
 import time
@@ -121,32 +122,33 @@ def _make_real_quant_worker():
 
 
 @requires_weight_folding
-def test_real_quant_conversion_tasks_delegate_discovery_to_bridge(monkeypatch):
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
-
+def test_real_quant_conversion_tasks_delegate_discovery_to_bridge():
     model = nn.Module()
     model.weight = nn.Parameter(torch.ones(1))
-    model.quantizers = GroupedQuantizer(TensorQuantizer(), TensorQuantizer())
-    model.quantizers[0].amax = torch.tensor(1.0)
+    model.weight_quantizer = GroupedQuantizer(TensorQuantizer(), TensorQuantizer())
+    model.weight_quantizer[0].amax = torch.tensor(1.0)
+    model.input_quantizer = TensorQuantizer()
+    model.input_quantizer.amax = torch.tensor(2.0)
     worker = _make_real_quant_worker()
     worker.model = model
+    worker.fp8_cfg = {}
+    worker.refit_payload_mode = "logical_weights"
 
-    def build_conversion_tasks(_self):
+    def build_conversion_tasks(models, *, exclude_param_patterns=()):
+        assert models == [model]
+        assert exclude_param_patterns == ("*weight_quantizer*",)
         return [
             name
             for name, _ in (
                 *worker.model.named_parameters(),
                 *worker.model.named_buffers(),
             )
+            if not any(
+                fnmatch.fnmatchcase(name, pattern) for pattern in exclude_param_patterns
+            )
         ]
 
-    monkeypatch.setattr(
-        MegatronPolicyWorkerImpl,
-        "_build_refit_conversion_tasks",
-        build_conversion_tasks,
-    )
+    worker.megatron_bridge.get_conversion_tasks = build_conversion_tasks
 
     assert (
         worker._build_refit_conversion_tasks()
@@ -154,10 +156,10 @@ def test_real_quant_conversion_tasks_delegate_discovery_to_bridge(monkeypatch):
     )
     assert worker._build_refit_conversion_tasks() is worker.refit_conversion_tasks
     assert worker.megatron_bridge.calls == [("plan", ([model],), {})]
-    assert "quantizers.0._amax" in dict(model.named_buffers())
+    assert "weight_quantizer.0._amax" in dict(model.named_buffers())
 
     worker.cfg["generation"]["real_quant"] = False
-    assert "quantizers.0._amax" in worker._build_refit_conversion_tasks()
+    assert worker._build_refit_conversion_tasks() == ["weight", "input_quantizer._amax"]
 
 
 @requires_weight_folding
@@ -1018,12 +1020,16 @@ if _WORKER_IMPORTABLE:
             nn.Module.__init__(self)
             for i in range(num_weights):
                 setattr(self, f"weight{i}", nn.Parameter(torch.randn(4, 4)))
-            self.weight_quantizer = TensorQuantizer()
+            self.weight_quantizer = GroupedQuantizer(
+                *(TensorQuantizer() for _ in range(num_weights))
+            )
+            for index, quantizer in enumerate(self.weight_quantizer):
+                quantizer.amax = torch.tensor(float(index + 1))
             self._num_weights = num_weights
 
         def iter_weights_for_calibration(self):
             for i in range(self._num_weights):
-                yield getattr(self, f"weight{i}"), self.weight_quantizer
+                yield getattr(self, f"weight{i}"), self.weight_quantizer[i]
 
 
 @requires_weight_folding
@@ -1069,14 +1075,55 @@ class TestFindWeightQuantizer:
         assert _find_wq(module, None) is None
 
     def test_multi_weight_matches_each(self):
-        """Each weight in a multi-weight module should match the shared quantizer."""
+        """Each grouped expert weight must match its own quantizer."""
         module = _MultiWeightQuantModule(num_weights=3)
         for i in range(3):
             w = getattr(module, f"weight{i}")
             result = _find_wq(module, w)
-            assert result is module.weight_quantizer, (
+            assert result is module.weight_quantizer[i], (
                 f"weight{i} should match the quantizer"
             )
+
+    def test_multi_weight_folded_refit(self, monkeypatch):
+        from nemo_rl.models.policy.workers.megatron_policy_worker import (
+            MegatronPolicyWorkerImpl,
+        )
+
+        module = _MultiWeightQuantModule(num_weights=3)
+        for weight, _quantizer in module.iter_weights_for_calibration():
+            weight.data.fill_(1.5)
+        module.weight_quantizer[2].disable()
+        worker = _make_real_quant_worker()
+        worker.cfg["generation"]["real_quant"] = False
+        tasks = [
+            SimpleNamespace(
+                param_name=f"weight{index}",
+                global_param_name=f"experts.weight{index}",
+                param_weight=getattr(module, f"weight{index}"),
+                megatron_module=module,
+            )
+            for index in range(3)
+        ]
+        worker.refit_conversion_tasks = tasks
+
+        def export_weights(self, kv_scales=None):
+            for task in self.refit_conversion_tasks:
+                yield task.param_name, task.param_weight
+
+        monkeypatch.setattr(
+            MegatronPolicyWorkerImpl,
+            "_iter_params_with_optional_kv_scales",
+            export_weights,
+        )
+        exported = dict(worker._iter_params_with_optional_kv_scales())
+        for index in range(2):
+            weight = getattr(module, f"weight{index}")
+            torch.testing.assert_close(
+                exported[f"weight{index}"], module.weight_quantizer[index](weight)
+            )
+        assert not torch.equal(exported["weight0"], exported["weight1"])
+        assert exported["weight2"] is module.weight2
+        assert worker.refit_conversion_tasks is tasks
 
     def test_multi_weight_rejects_unknown(self):
         """A tensor not in the multi-weight module should not match."""
