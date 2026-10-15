@@ -139,7 +139,7 @@ uv venv
 Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file.
 
 ```sh
-# Example: Run GRPO with DTensor backend
+# Example: Run GRPO with Automodel backend
 uv run python examples/run_grpo.py
 
 # Example: Run GRPO with Megatron backend

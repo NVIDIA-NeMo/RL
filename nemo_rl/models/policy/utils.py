@@ -677,7 +677,7 @@ def connect_colocate_topology(
     engine_gpu_offsets: Optional[list[int]] = None,
     worker_state: dict,
 ) -> None:
-    """Generalized colocate rollout-engine connect for FSDP and Megatron.
+    """Generalized colocate rollout-engine connect for Automodel and Megatron.
 
     Builds a Gloo gather subgroup for each engine's GPU rank range and stashes
     rank-only routing state into ``worker_state``:
