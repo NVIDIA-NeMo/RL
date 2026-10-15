@@ -1026,8 +1026,12 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         num_prompts_per_step: int,
         max_age_steps: int | None = None,
     ) -> int:
-        """Return additional trajectories needed for ``target_step``."""
+        """Return additional trajectories needed for an unconsumed ``target_step``."""
         with self._lock:
+            # Training may consume the target after the collector reads the
+            # frontier. An empty consumed target must not become new work.
+            if target_step <= self.last_target_weight_already_generated:
+                return 0
             current_count = self._count_for_target(target_step, max_age_steps)
             return max(0, num_prompts_per_step - current_count)
 

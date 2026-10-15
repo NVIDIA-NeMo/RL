@@ -381,6 +381,7 @@ design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
 design-docs/ppo-colocated-streaming.md
+design-docs/pd-disaggregation-rollout.md
 design-docs/dynamo-integration.md
 design-docs/sparse-delta-refit.md
 design-docs/checkpoint-engines.md
@@ -394,6 +395,7 @@ design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
 design-docs/te-nvfp4-per-token-rollout.md
 design-docs/nccl-reshard-refit.md
+design-docs/dspark-auxiliary-heads.md
 design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
 design-docs/token-capture-ledger.md

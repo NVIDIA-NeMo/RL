@@ -523,3 +523,49 @@ def test_route_fragments_survive_nccl_leader_broadcast(tmp_path):
     _run_two_ranks(
         _route_fragments_broadcast_body, str(tmp_path / "init_routes"), backend="nccl"
     )
+
+
+def _nested_round_trip_body(rank: int):
+    rows = [3, 1, 4]
+    expected = {
+        "input_ids": torch.nested.as_nested_tensor(
+            [torch.arange(n) + 10 * i for i, n in enumerate(rows)], layout=torch.jagged
+        ),
+        "routes_like": torch.nested.as_nested_tensor(
+            [torch.full((n, 2), -i, dtype=torch.int16) for i, n in enumerate(rows)],
+            layout=torch.jagged,
+        ),
+        "hidden": torch.nested.as_nested_tensor(
+            [
+                torch.randn(n, 3, generator=torch.Generator().manual_seed(n))
+                for n in rows
+            ],
+            layout=torch.jagged,
+        ),
+        "input_lengths": torch.tensor(rows),
+    }
+    data = BatchedDataDict(dict(expected)) if rank == 0 else None
+    out = _broadcast_batched_data_dict(
+        data, is_leader=(rank == 0), src=0, group=dist.group.WORLD
+    )
+    for key, value in expected.items():
+        got = out[key]
+        assert got.device == value.device, key
+        if rank == 0:
+            assert got is value, key
+        if value.is_nested:
+            assert got.is_nested and got.layout == value.layout, key
+            for got_row, row in zip(got.unbind(), value.unbind()):
+                assert torch.equal(got_row.cpu(), row), key
+        else:
+            assert torch.equal(got.cpu(), value), key
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="two CUDA devices are required for NCCL broadcast",
+)
+def test_nested_tensors_survive_nccl_leader_broadcast(tmp_path):
+    _run_two_ranks(
+        _nested_round_trip_body, str(tmp_path / "init_nested"), backend="nccl"
+    )
