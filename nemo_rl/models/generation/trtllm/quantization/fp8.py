@@ -32,7 +32,7 @@ MXFP8_BLOCK_SIZE = 32
 UE8M0_BIAS = 127
 E4M3_MAX = 448.0
 
-# Never quantized, whatever the user lists (TRT-LLM's router has no FP8 path).
+# Never quantized, whatever the user lists.
 ALWAYS_BF16_PATTERNS = ("lm_head", "*embed_tokens*", "*.mlp.gate")
 
 # Default scope when ``trtllm_cfg.quantization_ignore_patterns`` is unset: routed
@@ -182,19 +182,6 @@ def _with_always_bf16(patterns: Sequence[str]) -> list[str]:
     return list(dict.fromkeys([*patterns, *ALWAYS_BF16_PATTERNS]))
 
 
-_HF_LANGUAGE_MODEL_PREFIX = "model.language_model."
-
-
-def _is_ignored(module_name: str, patterns: Sequence[str]) -> bool:
-    """Match the HF name or the engine name (``model.language_model.`` dropped)."""
-    if is_module_ignored(module_name, patterns):
-        return True
-    if module_name.startswith(_HF_LANGUAGE_MODEL_PREFIX):
-        engine_name = "model." + module_name.removeprefix(_HF_LANGUAGE_MODEL_PREFIX)
-        return is_module_ignored(engine_name, patterns)
-    return False
-
-
 def _is_quantized_weight(name: str, ndim: int, ignore_patterns: Sequence[str]) -> bool:
     """Whether pattern mode quantizes this weight.
 
@@ -203,10 +190,10 @@ def _is_quantized_weight(name: str, ndim: int, ignore_patterns: Sequence[str]) -
     ignore_patterns = _with_always_bf16(ignore_patterns)
     fused = _FUSED_EXPERT_RE.fullmatch(name)
     if fused is not None:
-        return not _is_ignored(fused.group("prefix"), ignore_patterns)
+        return not is_module_ignored(fused.group("prefix"), ignore_patterns)
     if not name.endswith(".weight") or ndim != 2:
         return False
-    return not _is_ignored(name.removesuffix(".weight"), ignore_patterns)
+    return not is_module_ignored(name.removesuffix(".weight"), ignore_patterns)
 
 
 def validate_routed_experts(

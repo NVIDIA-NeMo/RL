@@ -328,7 +328,7 @@ def test_ipc_zmq_offset_mismatch_aborts_and_raises_without_reload(monkeypatch):
     monkeypatch.setattr(backend, "rebuild_cuda_tensor_from_ipc", lambda h, d: buffer)
     monkeypatch.setattr(backend.torch.cuda, "current_stream", lambda: MagicMock())
 
-    # used_bytes (999) != computed offset (1024) -> assertion -> abort -> re-raised.
+    # used_bytes (999) != computed offset (1024).
     extension.zmq_socket.recv_pyobj.side_effect = [
         ("ipc_handle", ["a", "b"], 999),
         IPCProtocol.COMPLETE,

@@ -101,8 +101,8 @@ Set `quantization_ignore_patterns` under `trtllm_cfg` (the same key as
 module names with `fnmatch` or a `re:` regex, and a module is ignored if it or any
 ancestor matches. A list replaces the default scope: every 2-D linear weight and
 routed expert that is not ignored is quantized. `lm_head`, embeddings, and routers
-(`mlp.gate`) always stay BF16. On Qwen3.5, patterns match either the HF name
-(`model.language_model.layers.*`) or the engine name (`model.layers.*`).
+(`mlp.gate`) always stay BF16. Patterns are HF module names (on Qwen3.5,
+`model.language_model.layers.*`).
 
 ```yaml
 policy:
@@ -110,7 +110,7 @@ policy:
     trtllm_cfg:
       precision: fp8
       quantization_ignore_patterns:
-        - model.layers.*.mlp.gate  # keep the router in BF16
+        - model.language_model.layers.*.mlp.gate  # keep the router in BF16
 ```
 
 Unlike `vllm_cfg.quantization_ignore_patterns`, the default scope is routed experts
