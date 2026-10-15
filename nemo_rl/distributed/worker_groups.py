@@ -59,6 +59,24 @@ def _log_gpu_state_on_bundle(label: str, local_rank: int) -> None:
     )
 
 
+def _check_dp_leader_worker_indices(
+    requested: list[int], tied_group_leaders: list[int]
+) -> None:
+    """Reject DP leaders that are not an ascending subset of the group leaders.
+
+    A DP leader has to be a model owner -- it is the worker every shard-level
+    call is routed to. Checking against the tied group leaders turns a wrong
+    layout into a startup error instead of requests landing on a worker that
+    never built a model.
+    """
+    unknown = set(requested) - set(tied_group_leaders)
+    if unknown or requested != sorted(requested):
+        raise ValueError(
+            f"dp_leader_worker_indices {requested} must be an ascending subset "
+            f"of the tied group leaders {tied_group_leaders}."
+        )
+
+
 def _get_initializer_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
     """Build the environment needed to unpickle worker constructor arguments."""
     initializer_env_vars = {
@@ -376,6 +394,7 @@ class RayWorkerGroup:
         bundle_indices_list: Optional[list[tuple[int, list[int]]]] = None,
         sharding_annotations: Optional[NamedSharding] = None,
         env_vars: dict[str, str] = {},
+        dp_leader_worker_indices: Optional[list[int]] = None,
     ):
         """Initialize a group of distributed Ray workers.
 
@@ -389,6 +408,15 @@ class RayWorkerGroup:
                                Each tuple defines a tied group of workers placed on the same node.
                                If provided, workers_per_node is ignored.
             sharding_annotations: NamedSharding object representing mapping of named axes to ranks (i.e. for TP, PP, etc.)
+            dp_leader_worker_indices: Global rank of the worker that owns each data
+                               parallel shard. Defaults to the leader of every tied
+                               group, i.e. a tied group *is* a DP shard -- true
+                               whenever one model owner serves a whole rollout shard.
+                               Pass it when the caller's DP layout is coarser than
+                               the tied groups, e.g. TRT-LLM PD disaggregation, where
+                               a replica is several engines (context + generation)
+                               and counting tied groups would overcount DP. Must be a
+                               subset of the tied group leaders, in ascending order.
         """
         self._workers: list[ray.actor.ActorHandle] = []
         self._worker_metadata: list[dict[str, Any]] = []
@@ -462,6 +490,12 @@ class RayWorkerGroup:
             env_vars=env_vars,
         )
 
+        if dp_leader_worker_indices is not None:
+            _check_dp_leader_worker_indices(
+                dp_leader_worker_indices, self.dp_leader_worker_indices
+            )
+            self.dp_leader_worker_indices = dp_leader_worker_indices
+
     def get_dp_leader_worker_idx(self, dp_shard_idx: int) -> int:
         """Returns the index of the primary worker for a given data parallel shard."""
         if not 0 <= dp_shard_idx < len(self.dp_leader_worker_indices):
@@ -510,6 +544,10 @@ class RayWorkerGroup:
             )
         else:
             py_executable = actor_python_env
+        # Resolved interpreter for this group's workers, kept so sidecar actors
+        # that must import the same packages (e.g. the TRT-LLM disagg server)
+        # can join the venv instead of landing in the driver's environment.
+        self.py_executable = py_executable
 
         # Count total workers
         self.world_size = sum(len(indices) for _, indices in bundle_indices_list)
