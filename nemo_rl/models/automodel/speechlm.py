@@ -16,24 +16,23 @@
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
-from omegaconf import OmegaConf
-from nemo_automodel.components.utils.parameter_config import ParameterConfig
-from torch.distributed.tensor import DTensor
-from torch.distributed.fsdp import MixedPrecisionPolicy
-from transformers import AutoConfig
-
 from nemo.collections.speechlm2.models.salm_automodel import SALMAutomodel
 from nemo.collections.speechlm2.parts.weight_loading import canonical_parameter_name
 from nemo.collections.speechlm2.vllm.salm.config import NeMoSpeechLMConfig
+from nemo_automodel.components.utils.parameter_config import ParameterConfig
+from omegaconf import OmegaConf
+from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.tensor import DTensor
+from transformers import AutoConfig
+
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.models.automodel.speechlm_logprobs import response_logprobs
-
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy import SpeechLMNativeConfig
@@ -147,10 +146,19 @@ class SpeechLMPolicy(SALMAutomodel):
             )
         if any(
             parameter.dtype != torch.bfloat16
-            for parameter in self.parameters()
-            if not parameter.requires_grad
+            for name, parameter in self.named_parameters()
+            if not parameter.requires_grad and not name.startswith("ctc_timestamp.")
         ):
             raise ValueError("Frozen native parameter storage must remain BF16")
+        if self.ctc_timestamp is not None:
+            artifact_dtypes = self.cfg.ctc_timestamp_artifact.tensor_dtypes
+            for name, parameter in self.ctc_timestamp.named_parameters():
+                if parameter.requires_grad or parameter.dtype != getattr(
+                    torch, artifact_dtypes[name]
+                ):
+                    raise ValueError(
+                        "CTC parameters must remain frozen in their source storage dtype"
+                    )
         if self.llm.mtp is None or any(
             parameter.requires_grad for parameter in self.llm.mtp.parameters()
         ):
