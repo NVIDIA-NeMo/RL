@@ -659,8 +659,8 @@ def _patch_mooncake_master_metrics_port(
 ) -> None:
     """Move mooncake_master's metrics server onto a reserved *port*.
 
-    ``extra_args`` are appended after it, for master flags TQ does not expose
-    (see :func:`_mooncake_ssd_offload_master_args`).
+    Also appends ``extra_args``: master flags TQ does not expose, such as the
+    SSD offload and eviction flags from :func:`_mooncake_ssd_offload_master_args`.
 
     ``MasterAdminServer::Start`` binds the metrics socket before it consults
     ``enable_metric_reporting``, and the master exits non-zero if that bind
@@ -775,10 +775,12 @@ def _install_mooncake_ssd_offload(root: str) -> None:
     segment, so each storage unit runs mooncake's embedded offload itself.
     TQ's client calls ``setup`` with no offload arguments; this swaps the
     store class it builds for one that adds them. Each client holds a lock
-    on its own directory, so every process gets a fresh
-    ``<root>/nemo_rl_mooncake_offload/<ray job>-<pid>``: no run can pick up,
-    or wipe, another's files. Nothing deletes it when the run ends.
+    on its own directory, so every process gets a fresh, owner-only
+    ``<root>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>``: no run can
+    pick up, or wipe, another's files. Nothing deletes it when the run ends.
     """
+    import tempfile
+
     import ray
     from transfer_queue.storage.clients import mooncake_client as _mc
 
@@ -790,7 +792,7 @@ def _install_mooncake_ssd_offload(root: str) -> None:
             "Mooncake SSD offload could not be enabled on the storage units",
             "store class",
         )
-    if getattr(base, "_nrl_ssd_offload_path", None) is not None:
+    if hasattr(base, "_nrl_ssd_offload_path"):
         return
     # Mooncake's default bucket backend writes nothing until a bucket holds
     # 256 MB or 500 keys; until then the queued objects stay pinned in memory,
@@ -806,16 +808,20 @@ def _install_mooncake_ssd_offload(root: str) -> None:
     # 0.3.13 turning it off makes setup fail ("Metadata has not been loaded
     # yet"); it only deletes files once the disk is 90% full.
     os.environ.setdefault("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION", "false")
+    parent = os.path.join(root, "nemo_rl_mooncake_offload")
+    os.makedirs(parent, exist_ok=True)
     job_id = ray.get_runtime_context().get_job_id()
-    path = os.path.join(root, "nemo_rl_mooncake_offload", f"{job_id}-{os.getpid()}")
-    os.makedirs(path)
+    path = tempfile.mkdtemp(prefix=f"{job_id}-{os.getpid()}-", dir=parent)
 
     class _OffloadingStore(base):  # type: ignore[misc, valid-type]
         _nrl_ssd_offload_path = path
 
         def setup(self, *args: Any, **kwargs: Any) -> Any:
             return super().setup(
-                *args, enable_ssd_offload=True, ssd_offload_path=path, **kwargs
+                *args,
+                enable_ssd_offload=True,
+                ssd_offload_path=self._nrl_ssd_offload_path,
+                **kwargs,
             )
 
     _mc.MooncakeDistributedStore = _OffloadingStore
@@ -994,12 +1000,6 @@ def _init_tq(
         # in nemo_rl/data_plane/interfaces.py for the per-node arithmetic.
         mooncake_cfg = backend_config(cfg)
         ssd = mooncake_cfg.ssd_offload
-        if ssd.enabled and checkpointing:
-            raise ValueError(
-                "data_plane.mooncake_cpu.ssd_offload cannot be combined with "
-                "data-plane checkpointing: a checkpoint needs hard-pinned "
-                "memory replicas, and offload needs evictable ones."
-            )
         metadata_port, master_port, metrics_port = _reserve_data_plane_ports(3)
         _patch_mooncake_master_metrics_port(
             metrics_port,
@@ -1221,11 +1221,6 @@ class TQDataPlaneClient(DataPlaneClient):
             # with the controller's conf unchanged.
             _connect_existing()
         else:
-            # Only storage units pass a segment_size; the config validators
-            # guarantee it is > 0 and path is set whenever offload is on.
-            ssd = backend_config(cfg).ssd_offload
-            if ssd.enabled:
-                _install_mooncake_ssd_offload(cast(str, ssd.path))
             _connect_existing_with_segment_size(segment_size)
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False

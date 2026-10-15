@@ -37,6 +37,7 @@ from ray.util.placement_group import placement_group_table
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
+from nemo_rl.data_plane.adapters.transfer_queue import _install_mooncake_ssd_offload
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.interfaces import backend_config, storage_unit_placement
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -53,10 +54,14 @@ class MooncakeStorageUnit:  # pragma: no cover
     """Own a Mooncake segment and serve checkpoint commands; nothing else."""
 
     def __init__(self, dp_config: DataPlaneConfig) -> None:
+        cfg = backend_config(dp_config)
+        if cfg.ssd_offload.enabled:
+            # Must run before the client's store is set up below.
+            _install_mooncake_ssd_offload(cfg.ssd_offload.path)
         self._dp_client = build_data_plane_client(
             dp_config,
             bootstrap=False,
-            segment_size=backend_config(dp_config).storage_unit_segment_size,
+            segment_size=cfg.storage_unit_segment_size,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

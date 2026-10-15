@@ -104,7 +104,7 @@ class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
     owns the segment holding it, so offload runs inside each
     ``MooncakeStorageUnit`` (the only segment owners when
     ``storage_unit_segment_size > 0``), each under its own
-    ``<path>/nemo_rl_mooncake_offload/<ray job>-<pid>``; no shared filesystem
+    ``<path>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>``; no shared filesystem
     is needed. Those directories are left behind when the run ends, so point
     ``path`` at per-job scratch space or clean it up afterwards.
     TQ's own ``MooncakeStore.offload`` is not used: its single offload client
@@ -254,8 +254,12 @@ def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
     checkpointing settings decide whether a run saves data-plane state;
     normal PUTs remain memory-only. An unrecognized future backend defaults to
     unsupported until its storage payload and controller metadata are both
-    known to round-trip through a checkpoint.
+    known to round-trip through a checkpoint. Mooncake SSD offload is not
+    checkpointable: a checkpoint needs hard-pinned memory replicas, and
+    offload needs evictable ones.
     """
+    if cfg["backend"] == "mooncake_cpu" and backend_config(cfg).ssd_offload.enabled:
+        return False
     return cfg["backend"] in _CHECKPOINTABLE_BACKENDS
 
 
