@@ -24,9 +24,21 @@ if [[ $target == */run_sc.sh ]]; then
   printf 'MIN_CHECKPOINT_BUDGET_SECONDS=%s\n' "${MIN_CHECKPOINT_BUDGET_SECONDS:-unset}"
   printf 'REQUIRE_RESUMABLE_JOB_CYCLES=%s\n' "${REQUIRE_RESUMABLE_JOB_CYCLES:-unset}"
   printf 'NUM_NODES=%s\n' "${NUM_NODES:-unset}"
+  printf 'GPUS_PER_NODE=%s\n' "${GPUS_PER_NODE:-unset}"
   printf 'NUM_GEN_NODES=%s\n' "${NUM_GEN_NODES:-unset}"
   printf 'SEGMENT_SIZE=%s\n' "${SEGMENT_SIZE:-unset}"
+  printf 'MODEL_PATH=%s\n' "${MODEL_PATH:-unset}"
+  printf 'CONFIG_IN_CONTAINER=%s\n' "${CONFIG_IN_CONTAINER:-unset}"
+  printf 'SAVE_PERIOD=%s\n' "${SAVE_PERIOD:-unset}"
+  printf 'CHECKPOINT_KEEP_TOP_K=%s\n' "${CHECKPOINT_KEEP_TOP_K:-unset}"
+  printf 'CONTEXT_COMPACTION=%s\n' "${CONTEXT_COMPACTION:-unset}"
+  printf 'AGENTIC_VBENCH_COMPACTION_AUTO=%s\n' "${AGENTIC_VBENCH_COMPACTION_AUTO:-unset}"
+  printf 'AGENTIC_VBENCH_COMPACTION_PRUNE=%s\n' "${AGENTIC_VBENCH_COMPACTION_PRUNE:-unset}"
+  printf 'AGENTIC_VBENCH_TRAINING_MODE=%s\n' "${AGENTIC_VBENCH_TRAINING_MODE:-unset}"
+  printf 'AGENTIC_VBENCH_SUBAGENTS_ENABLED=%s\n' "${AGENTIC_VBENCH_SUBAGENTS_ENABLED:-unset}"
   printf 'WANDB_PROJECT=%s\n' "${WANDB_PROJECT:-unset}"
+  printf 'NEMO_RL_TMPE_OUTLIER_THRESHOLD=%s\n' "${NEMO_RL_TMPE_OUTLIER_THRESHOLD:-unset}"
+  printf 'RUN_TMPE_OUTLIER_TESTS=%s\n' "${RUN_TMPE_OUTLIER_TESTS:-unset}"
   printf 'NRL_ROUTER_REPLAY_VALIDATE=%s\n' "${NRL_ROUTER_REPLAY_VALIDATE:-unset}"
   printf 'NRL_R3_TRACE=%s\n' "${NRL_R3_TRACE:-unset}"
   [[ -n ${AGENTIC_VBENCH_DELEGATION_PROMPT:-} ]] && printf 'DELEGATION_PROMPT_SET=true\n'
@@ -101,6 +113,53 @@ assert_horizon scripts/agentic_vbench/debug_subagents_sync_8n.sh "$tmp/agentic-s
 assert_horizon scripts/agentic_vbench/debug_subagents_async_16n.sh "$tmp/agentic-async.out"
 assert_horizon scripts/claweval/train_subagents_sync_8n.sh "$tmp/claw-sync.out"
 assert_horizon scripts/claweval/train_subagents_async_16n.sh "$tmp/claw-async.out"
+
+super_checkpoint=/lustre/fsw/portfolios/nemotron/users/ehosseiniasl/checkpoints/super35-journey-mopd2-identity-upsampling-from-my-step30-yifuw-001_boosted_mtp
+PATH="$tmp:$PATH" /bin/bash \
+  "$repo_dir/scripts/agentic_vbench/launch_subagents_super_sync20.sh" \
+  >"$tmp/agentic-super-sync20.out"
+for expected in \
+  "MODEL_PATH=$super_checkpoint" \
+  'CONFIG_IN_CONTAINER=examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml' \
+  'NUM_NODES=8' \
+  'GPUS_PER_NODE=8' \
+  'NUM_GEN_NODES=4' \
+  'SEGMENT_SIZE=4' \
+  'MAX_STEPS=1000000' \
+  'SAVE_PERIOD=20' \
+  'CHECKPOINT_KEEP_TOP_K=null' \
+  'CONTEXT_COMPACTION=true' \
+  'AGENTIC_VBENCH_COMPACTION_AUTO=false' \
+  'AGENTIC_VBENCH_COMPACTION_PRUNE=false' \
+  'AGENTIC_VBENCH_TRAINING_MODE=subagent' \
+  'AGENTIC_VBENCH_SUBAGENTS_ENABLED=true' \
+  'WANDB_PROJECT=nemorl-v2-subagent-comapction-debug' \
+  'NEMO_RL_TMPE_OUTLIER_THRESHOLD=1.03' \
+  'RUN_TMPE_OUTLIER_TESTS=1' \
+  'ARG=async_rl.sampler.name=in_order' \
+  'ARG=+env.nemo_gym.training_mode=subagent' \
+  'ARG=+env.nemo_gym.agentic_vbench_agent.responses_api_agents.agentic_vbench_agent.opencode_subagents_enabled=true' \
+  'ARG=+env.nemo_gym.agentic_vbench_agent.responses_api_agents.agentic_vbench_agent.opencode_compaction_auto=false' \
+  'ARG=+env.nemo_gym.agentic_vbench_agent.responses_api_agents.agentic_vbench_agent.opencode_compaction_prune=false' \
+  'ARG=checkpointing.save_period=20' \
+  'ARG=checkpointing.keep_top_k=null' \
+  'ARG=+checkpointing.ft_save_period=1' \
+  'ARG=+checkpointing.ft_keep_latest_k=2' \
+  'ARG=grpo.max_num_steps=1000000' \
+  'ARG=grpo.max_num_epochs=null'; do
+  grep -Fqx "$expected" "$tmp/agentic-super-sync20.out"
+done
+if /bin/bash "$repo_dir/scripts/agentic_vbench/launch_subagents_super_sync20.sh" \
+  grpo.max_num_steps=20 >/dev/null 2>&1; then
+  echo 'Exact Super sync20 launcher accepted a caller Hydra override' >&2
+  exit 1
+fi
+if EXTRA_OVERRIDES='cluster.num_nodes=1' /bin/bash \
+  "$repo_dir/scripts/agentic_vbench/launch_subagents_super_sync20.sh" \
+  >/dev/null 2>&1; then
+  echo 'Exact Super sync20 launcher accepted EXTRA_OVERRIDES injection' >&2
+  exit 1
+fi
 
 if env -u AGENTIC_VBENCH_BACKEND_DIR \
   SYNC_POLICY_CHECKPOINT="$sync_policy_checkpoint" \
