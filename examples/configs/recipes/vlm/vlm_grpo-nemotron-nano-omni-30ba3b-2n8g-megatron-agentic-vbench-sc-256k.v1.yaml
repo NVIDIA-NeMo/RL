@@ -1,0 +1,182 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Two-node synchronous Agentic-VBench diagnostic for Nemotron 3 Nano Omni:
+# one 8-GPU Megatron learner node and one 8-GPU TP8 vLLM generation node.
+# The model/topology base is the Nano Omni recipe already exercised by the
+# AnyTerminal 2-node validation. Agentic objective, capture, scheduling, and
+# masking settings match the Super Agentic subagent gate; only the model and
+# its validated one-node learner parallelism differ.
+defaults: ./vlm_grpo-nemotron-omni-30ba3b-circle-click-2n8g-megatron-tp2ep8.v1.yaml
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 4
+  max_num_epochs: null
+  max_num_steps: 1000000
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  async_grpo: null
+  # Match the Super Agentic gate. These are deliberately diagnostics, not a
+  # sequence filter: raw per-sequence generation/trainer parity stays visible.
+  debug_payload_metrics: true
+  advantage_clip_low: null
+  advantage_clip_high: null
+  seq_logprob_error_threshold: null
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+  calculate_advantages_on_gpu: false
+  use_dynamic_sampling: false
+  zero_variance_prompt_filtering: false
+
+loss_fn:
+  token_level_loss: true
+  sequence_level_importance_ratios: false
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_ratio_min: 0.5
+  use_kl_in_reward: false
+  positive_example_nll_weight: 0
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/agentic-vbench-nano-sync2-sc
+  save_period: 1
+  keep_top_k: 2
+  metric_name: null
+  save_data_plane: true
+
+policy:
+  model_name: ${oc.env:MODEL_PATH}
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # The checkpoint has a native 256k window. Capture admission remains bounded
+  # separately at 65,536 tokens by the subagent launcher, exactly as in Super.
+  max_total_sequence_length: 262144
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  megatron_cfg:
+    # Fixed batching/packing-off requires CP1.  Use the existing validated
+    # one-node Nano Omni mesh: TP8 / EP8 / PP1 / CP1.  TP8 also keeps the
+    # long Agentic rows sharded across every learner GPU.
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    moe_router_bias_update_rate: 0.0
+    fp32_lm_head: true
+    empty_unused_memory_level: 2
+    freeze_vision_model: true
+    freeze_vision_projection: true
+  generation:
+    vllm_cfg:
+      async_engine: true
+      fp32_lm_head: true
+      reasoning_parser_plugin: /opt/nemo-rl/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+    vllm_kwargs:
+      # OpenCode read calls carry inline frame images. Do not profile a 256k
+      # prefill allocation at startup; vLLM uses chunked prefill instead.
+      limit_mm_per_prompt:
+        image: 128
+      mm_processor_cache_gb: 0
+      skip_mm_profiling: true
+      max_num_batched_tokens: 32768
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: false
+  num_workers: 0
+  train:
+    data_path: ${oc.env:TRAIN_PATH}
+  validation:
+    data_path: ${oc.env:VAL_PATH}
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+
+token_capture:
+  enabled: true
+  context_compaction: false
+  capture_dir: null
+  num_reassembler_workers: 2
+  defer_routed_experts_to_policy: false
+
+rollout_recovery:
+  default_granularity: sibling
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0
+  recompute_kv_cache_after_weight_updates: false
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+  rollout_failure:
+    min_step_batch_fraction: 1
+    on_dropped_prompt: replace
+    max_replacement_attempts: 4
+    replacement_reserve_prompts: 1
+    nemo_gym:
+      rollout_timeout_s: 7200
+  stall_watchdog:
+    stall_timeout_s: 10800
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    policy_max_input_tokens: ${policy.max_total_sequence_length}
+    skip_venv_if_present: true
+    pad_dynamic_image_shapes: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/agentic_vbench_agent/configs/agentic_vbench_train.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          sampling_overrides:
+            temperature: ${policy.generation.temperature}
+            top_p: ${policy.generation.top_p}
+          extra_body:
+            mm_processor_kwargs:
+              max_num_tiles: 1
+            chat_template_kwargs:
+              enable_thinking: true
+              truncate_history_thinking: false
+
+logger:
+  log_dir: logs/agentic-vbench-nano-sync2-sc
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    entity: adlr
+    project: nemorl-v2-subagent-comapction-debug
+    name: agentic-vbench-subagents-nano-sync2
+    log_nemo_gym_full_result_tables: true
+
+cluster:
+  num_nodes: 2
+  gpus_per_node: 8
+  segment_size: 1
