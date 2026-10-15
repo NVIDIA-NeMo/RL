@@ -473,6 +473,10 @@ class ClippedPGLossFn(LossFunction):
                     "and is incompatible with sequence_level_importance_ratios=True"
                 )
             if self.truncated_importance_sampling_type == "adaptive-ppo-clip":
+                assert self.force_on_policy_ratio, (
+                    "adaptive-ppo-clip is intended for async RL; set "
+                    "force_on_policy_ratio=True to use it"
+                )
                 assert not self.sequence_level_importance_ratios, (
                     "adaptive-ppo-clip uses token-level advantage-aware filtering "
                     "and is incompatible with sequence_level_importance_ratios=True"

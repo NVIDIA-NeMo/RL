@@ -2712,6 +2712,7 @@ class TestMetricName:
         loss_fn = ClippedPGLossFn(
             ClippedPGLossConfig(
                 use_importance_sampling_correction=True,
+                force_on_policy_ratio=True,
                 truncated_importance_sampling_type="adaptive-ppo-clip",
                 truncated_importance_sampling_ratio=1.0,
                 truncated_importance_sampling_ratio_min=0.5,
