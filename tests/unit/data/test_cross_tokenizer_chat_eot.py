@@ -21,13 +21,13 @@ from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import PreTrainedTokenizerFast
 
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
-from nemo_rl.data.interfaces import TaskDataSpec
-from nemo_rl.data.processors import kd_data_processor
-from nemo_rl.data.xtoken.cross_tokenizer_collate import (
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
-from nemo_rl.data.xtoken.native_chat import _render_and_tokenize_chat
+from nemo_rl.data.cross_tokenizer.native_chat import _render_and_tokenize_chat
+from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.processors import kd_data_processor
 from tests.unit.data.test_cross_tokenizer_collate import (
     _assert_batches_equal,
     _batch_checksums,

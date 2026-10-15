@@ -29,12 +29,12 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     same_tokenizer_topk_kl,
 )
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
-from nemo_rl.data.interfaces import TaskDataSpec
-from nemo_rl.data.processors import kd_data_processor
-from nemo_rl.data.xtoken.cross_tokenizer_collate import (
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
+from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.processors import kd_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import cp_shift_next
 
