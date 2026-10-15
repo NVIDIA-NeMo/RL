@@ -693,8 +693,7 @@ else
 fi
 
 # Alloy log export, sourced by both roles once RAY_NODE_ROLE is set. Kept in its
-# own file so the two generated container commands don't each need a copy, and
-# sourced early in them so it inherits SLURM_* before the scrub.
+# own file so the two generated container commands don't each need a copy.
 ALLOY_SIDECAR_FILE="$LOG_DIR/alloy_sidecar.sh"
 cat > "$ALLOY_SIDECAR_FILE" <<EOF
 [[ -n "\${LOKI_PUSH_URL:-}" ]] || return 0
