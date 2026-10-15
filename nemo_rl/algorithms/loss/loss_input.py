@@ -23,6 +23,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
+from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
 from nemo_rl.algorithms.loss.utils import (
     _pack_input_ids,
     map_teacher_logits_to_draft_vocab,
@@ -244,9 +245,31 @@ def prepare_loss_input(
         loss_input = {"logits": logits}
 
     elif loss_fn.input_type == LossInputType.LOGPROB:
+        score_centering = (
+            isinstance(loss_fn, ClippedPGLossFn) and loss_fn.score_centering_top_k
+        )
+        actor_sampling_params = None if score_centering else sampling_params
+        if score_centering:
+            target_ids = data["input_ids"].roll(shifts=-1, dims=1).unsqueeze(-1)
+            center_ids = data["score_centering_ids"].roll(shifts=-1, dims=1)
+            selected_ids = torch.cat((target_ids, center_ids), dim=-1)
+            policy_selected_logprobs, _, _ = get_distillation_topk_logprobs_from_logits(
+                student_logits=logits,
+                teacher_topk_logits=torch.zeros_like(selected_ids),
+                teacher_topk_indices=selected_ids,
+                zero_outside_topk=True,
+                calculate_entropy=False,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                cp_sharder=cp_sharder,
+                chunk_size=chunk_size,
+            )
+            logprobs = policy_selected_logprobs[..., 0]
+            data["score_centering_policy_logprobs"] = policy_selected_logprobs[..., 1:]
         # Linear CE fusion patch returns precomputed next-token logprobs (2D tensor).
         # Keep normal path unchanged for standard logits (3D tensor).
-        if (
+        elif (
             hasattr(loss_fn, "use_fused_linear_logprobs")
             and loss_fn.use_fused_linear_logprobs
         ):
@@ -260,13 +283,28 @@ def prepare_loss_input(
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
-                sampling_params=sampling_params,
+                sampling_params=actor_sampling_params,
                 chunk_size=chunk_size,
                 cp_sharder=cp_sharder,
             )
 
+        if score_centering and loss_fn.score_centering_support_replay:
+            head_valid = torch.isfinite(data["score_centering_logprobs"][:, 1:])
+            policy_head_logprobs = data["score_centering_policy_logprobs"].masked_fill(
+                ~head_valid, float("-inf")
+            )
+            log_normalizer = torch.logsumexp(policy_head_logprobs, dim=-1)
+            log_normalizer = torch.where(head_valid.any(dim=-1), log_normalizer, 0.0)
+            data["curr_logprobs_unfiltered"] = logprobs
+            data["score_centering_policy_logprobs"] = torch.where(
+                head_valid,
+                policy_head_logprobs - log_normalizer.unsqueeze(-1),
+                0.0,
+            )
+            logprobs = logprobs - log_normalizer
+
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
-        if need_top_k_or_top_p_filtering(sampling_params):
+        if need_top_k_or_top_p_filtering(actor_sampling_params):
             # Preserve support information until the actor loss builds its mask.
             # compute unfiltered logprobs for reference policy KL penalty
             if (
@@ -286,7 +324,7 @@ def prepare_loss_input(
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
-        if need_top_k_or_top_p_filtering(sampling_params):
+        if need_top_k_or_top_p_filtering(actor_sampling_params):
             loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
 
     elif loss_fn.input_type == LossInputType.OPD_FULL:

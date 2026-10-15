@@ -621,10 +621,15 @@ class AutomodelPolicyWorkerImpl(
         self.model.eval()
 
         # Create logprobs post-processor
+        sampling_params = (
+            None
+            if self.cfg["generation"].get("score_centering_top_k", 0)
+            else self.sampling_params
+        )
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
             enable_seq_packing=self.enable_seq_packing,
-            sampling_params=self.sampling_params,
+            sampling_params=sampling_params,
         )
 
         with torch.no_grad():
@@ -657,7 +662,7 @@ class AutomodelPolicyWorkerImpl(
                         prepared=prepared,
                         post_processing_fn=logprobs_post_processor,
                         processed_mb=processed_mb,
-                        sampling_params=self.sampling_params,
+                        sampling_params=sampling_params,
                         sequence_dim=sequence_dim,
                     )
 

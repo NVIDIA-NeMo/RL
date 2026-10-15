@@ -864,13 +864,70 @@ class BaseVllmGenerationWorker:
             top_p=self.cfg["top_p"],
             top_k=top_k_val,
             max_tokens=max_tokens,
-            logprobs=0,
+            logprobs=self.cfg.get("score_centering_top_k", 0),
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,
             bad_words=self.cfg.get("bad_words"),
             ignore_eos=self.cfg.get("ignore_eos", False),
         )
+
+    @staticmethod
+    def _score_centering_head(
+        token_logprobs: list[dict],
+        num_tokens: int,
+        top_k: int,
+        *,
+        device: torch.device,
+        sampling_mask: list[list[int]] | None = None,
+        sampled_tokens: list[int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Collect the sampler's top-k probabilities for each generated token."""
+        ids = torch.zeros((num_tokens, top_k), dtype=torch.long, device=device)
+        logprobs = torch.full(
+            (num_tokens, top_k), float("-inf"), dtype=torch.float32, device=device
+        )
+        if len(token_logprobs) != num_tokens:
+            raise RuntimeError(
+                "vLLM did not return score-centering logprobs for every token"
+            )
+        if sampling_mask is not None and len(sampling_mask) != num_tokens:
+            raise RuntimeError(
+                "vLLM sampling mask is not aligned with generated tokens"
+            )
+        for position, token_head in enumerate(token_logprobs):
+            if not token_head:
+                raise RuntimeError("vLLM returned an empty score-centering head")
+            if sampling_mask is None:
+                top_tokens = sorted(
+                    token_head.items(), key=lambda item: item[1].logprob, reverse=True
+                )[:top_k]
+            else:
+                support = sampling_mask[position]
+                if (
+                    not support
+                    or len(support) > top_k
+                    or len(set(support)) != len(support)
+                ):
+                    raise RuntimeError(
+                        "vLLM returned an invalid or oversized sampling support"
+                    )
+                if (
+                    sampled_tokens is not None
+                    and sampled_tokens[position] not in support
+                ):
+                    raise RuntimeError(
+                        "vLLM sampling support excludes the sampled token"
+                    )
+                if any(token_id not in token_head for token_id in support):
+                    raise RuntimeError(
+                        "vLLM did not return logprobs for the full sampling support"
+                    )
+                top_tokens = [(token_id, token_head[token_id]) for token_id in support]
+            for column, (token_id, value) in enumerate(top_tokens):
+                ids[position, column] = token_id
+                logprobs[position, column] = value.logprob
+        return ids, logprobs
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
@@ -1171,6 +1228,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
         logprobs_list = []
+        score_centering_ids_list = []
+        score_centering_logprobs_list = []
         routed_experts_list = []
         r3_missing_routes = []
         r3_expected_routes = []
@@ -1229,6 +1288,37 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                     traceback.print_exc()
 
             logprobs_list.append(full_logprobs)
+            top_k = self.cfg.get("score_centering_top_k", 0)
+            if top_k:
+                sampling_mask = None
+                if self.cfg.get("score_centering_support_replay", False):
+                    if generation.sampling_mask is None:
+                        raise RuntimeError("vLLM did not return the sampling support")
+                    sampling_mask = generation.sampling_mask.token_ids
+                head_ids, head_logprobs = self._score_centering_head(
+                    generation.logprobs,
+                    len(generated_tokens),
+                    top_k,
+                    device=full_output.device,
+                    sampling_mask=sampling_mask,
+                    sampled_tokens=generated_tokens,
+                )
+                full_head_ids = torch.zeros(
+                    (total_length, top_k), dtype=torch.long, device=full_output.device
+                )
+                full_head_logprobs = torch.full(
+                    (total_length, top_k),
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=full_output.device,
+                )
+                token_slice = slice(
+                    sequence_length, sequence_length + len(generated_tokens)
+                )
+                full_head_ids[token_slice] = head_ids
+                full_head_logprobs[token_slice] = head_logprobs
+                score_centering_ids_list.append(full_head_ids)
+                score_centering_logprobs_list.append(full_head_logprobs)
 
             response_length = sequence_length + len(generated_tokens)
             full_routed_experts, r3_stats = pad_and_align_routed_expert_indices(
@@ -1300,6 +1390,11 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         )
         if routed_experts_list:
             return_data["routed_experts"] = torch.stack(routed_experts_list)
+        if score_centering_ids_list:
+            return_data["score_centering_ids"] = torch.stack(score_centering_ids_list)
+            return_data["score_centering_logprobs"] = torch.stack(
+                score_centering_logprobs_list
+            )
         if r3_missing_routes:
             return_data["r3_routed_experts_missing_routes"] = torch.tensor(
                 r3_missing_routes, dtype=torch.long

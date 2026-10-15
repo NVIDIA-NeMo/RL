@@ -2375,9 +2375,14 @@ class MegatronPolicyWorkerImpl(
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
             "use_fused_linear_logprobs", False
         )
+        sampling_params = (
+            None
+            if self.cfg["generation"].get("score_centering_top_k", 0)
+            else self.sampling_params
+        )
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
-            sampling_params=self.sampling_params,
+            sampling_params=sampling_params,
             use_fused_linear_logprobs=use_fused_linear_logprobs,
         )
         use_router_replay = _should_use_router_replay(
@@ -2397,7 +2402,7 @@ class MegatronPolicyWorkerImpl(
                 post_processing_fn=logprobs_post_processor,
                 forward_only=True,
                 defer_fp32_logits=self.defer_fp32_logits,
-                sampling_params=self.sampling_params,
+                sampling_params=sampling_params,
                 straggler_timer=self.mcore_state.straggler_timer,
                 model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,

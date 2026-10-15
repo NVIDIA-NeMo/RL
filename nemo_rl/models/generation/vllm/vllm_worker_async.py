@@ -1865,15 +1865,27 @@ class VllmAsyncGenerationWorkerImpl(
                     [False], dtype=torch.bool, device=input_ids_single_row.device
                 )
 
-                result_batch = BatchedDataDict[GenerationOutputSpec](
-                    {
-                        "output_ids": output_ids_single_item_batched,
-                        "logprobs": logprobs_single_item,
-                        "generation_lengths": generation_lengths_tensor,
-                        "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
-                        "truncated": truncated_tensor,
-                    }
-                )
+                result_dict = {
+                    "output_ids": output_ids_single_item_batched,
+                    "logprobs": logprobs_single_item,
+                    "generation_lengths": generation_lengths_tensor,
+                    "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                    "truncated": truncated_tensor,
+                }
+                top_k = self.cfg.get("score_centering_top_k", 0)
+                if top_k:
+                    result_dict["score_centering_ids"] = torch.zeros(
+                        (1, current_input_actual_length, top_k),
+                        dtype=torch.long,
+                        device=input_ids_single_row.device,
+                    )
+                    result_dict["score_centering_logprobs"] = torch.full(
+                        (1, current_input_actual_length, top_k),
+                        float("-inf"),
+                        dtype=torch.float32,
+                        device=input_ids_single_row.device,
+                    )
+                result_batch = BatchedDataDict[GenerationOutputSpec](result_dict)
 
                 return (sample_idx, result_batch)
 
@@ -1992,6 +2004,39 @@ class VllmAsyncGenerationWorkerImpl(
                 "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
                 "truncated": truncated_tensor,
             }
+            top_k = self.cfg.get("score_centering_top_k", 0)
+            if top_k:
+                sampling_mask = None
+                if self.cfg.get("score_centering_support_replay", False):
+                    if generation_details.sampling_mask is None:
+                        raise RuntimeError("vLLM did not return the sampling support")
+                    sampling_mask = generation_details.sampling_mask.token_ids
+                head_ids, head_logprobs = self._score_centering_head(
+                    generation_details.logprobs,
+                    num_generated_tokens,
+                    top_k,
+                    device=original_input_ids_single_row.device,
+                    sampling_mask=sampling_mask,
+                    sampled_tokens=generated_token_ids,
+                )
+                full_head_ids = torch.zeros(
+                    (1, final_output_tensor_len, top_k),
+                    dtype=torch.long,
+                    device=head_ids.device,
+                )
+                full_head_logprobs = torch.full(
+                    (1, final_output_tensor_len, top_k),
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=head_ids.device,
+                )
+                token_slice = slice(
+                    current_input_actual_length, final_output_tensor_len
+                )
+                full_head_ids[0, token_slice] = head_ids
+                full_head_logprobs[0, token_slice] = head_logprobs
+                result_dict["score_centering_ids"] = full_head_ids
+                result_dict["score_centering_logprobs"] = full_head_logprobs
             routed_experts, r3_stats = pad_and_align_routed_expert_indices(
                 final_request_output,
                 generation_details,
