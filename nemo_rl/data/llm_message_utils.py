@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
+from collections.abc import Mapping, Sequence
 from typing import Any, Optional, Union, cast
 
 import numpy as np
@@ -197,6 +198,36 @@ def add_loss_mask_to_message_log(
                     message["token_loss_mask"] = torch.zeros_like(
                         cast(Tensor, message["token_ids"])
                     )
+
+
+def validate_precomputed_loss_masks(
+    message_logs: Sequence[Sequence[Mapping[str, Any]]],
+) -> None:
+    """Validate binary loss-mask vectors without changing the messages.
+
+    Args:
+        message_logs: Tokenized conversations with a loss mask on each message.
+
+    Raises:
+        ValueError: A mask or token vector is missing, not one-dimensional, has
+            a mismatched shape, or contains a mask value other than zero or one.
+    """
+    for message_log in message_logs:
+        for message in message_log:
+            tokens = message.get("token_ids")
+            mask = message.get("token_loss_mask")
+            if (
+                not isinstance(tokens, torch.Tensor)
+                or not isinstance(mask, torch.Tensor)
+                or tokens.ndim != 1
+                or mask.ndim != 1
+                or tokens.shape != mask.shape
+                or bool(((mask != 0) & (mask != 1)).any())
+            ):
+                raise ValueError(
+                    "Precomputed SFT masks must be binary vectors matching "
+                    "each token vector."
+                )
 
 
 def _pad_tensor(
@@ -765,14 +796,14 @@ def remap_dataset_keys(
 # *underlying storage* of view-aliased tensor slices — for a vllm batched
 # output arena that's ~100 MB per row instead of the slice's ~10 KB.
 #
-# The helpers below split `message_log` into per-field arrays at the
-# wire boundary (token tensors flat in `bulk_batch`, role/content
+# The helpers below split `message_log` into per-field arrays (role/content
 # strings as object arrays, per-turn lengths as one slim tensor) and
-# rebuild the list-of-dicts shape on the consumer from local-arena
-# views. No tensor ever reaches per-row pickle.
+# rebuild the list-of-dicts shape on the consumer from local-arena views.
+# No tensor ever reaches per-row pickle. `SyncRolloutActor` does not write
+# these fields to the data plane; they reach the driver via `driver_carry`.
 
-# Fields ridden by `bulk_batch` and consumed by
-# :func:`reconstruct_message_log` to rebuild the list-of-dicts view.
+# Fields consumed by :func:`reconstruct_message_log` to rebuild the
+# list-of-dicts view, when a batch carries them.
 MESSAGE_LOG_BULK_FIELDS = ("turn_lengths", "turn_roles", "turn_contents")
 
 

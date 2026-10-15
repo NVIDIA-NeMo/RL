@@ -38,6 +38,25 @@ from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
 
+# Environment for bitwise-reproducible policy workers. These are read when the
+# worker creates its cuBLAS handles and selects Transformer Engine kernels, so
+# they are set in the worker's runtime environment, before the process starts.
+DETERMINISTIC_ENV_VARS = {
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+}
+
+
+def enable_deterministic_algorithms() -> None:
+    """Switch torch to deterministic algorithms in this process.
+
+    ``warn_only=True`` keeps ops without a deterministic implementation running
+    (torch warns instead of raising), so enabling this never breaks a model.
+    """
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 class IPCProtocol(Enum):
     """IPC protocol constants for ZMQ weight streaming."""
@@ -52,7 +71,7 @@ class IPCProtocol(Enum):
 # worker classes.
 POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
-    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
+    "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": "nemo_rl.modelopt.models.policy.workers.automodel_quant_policy_worker.AutomodelQuantPolicyWorker",
 }
 
 _NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})

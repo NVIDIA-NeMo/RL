@@ -217,6 +217,9 @@ class AutomodelConfig(TypedDict):
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
     checkpoint: NotRequired[AutomodelCheckpointConfig]
+    # Bitwise-reproducible forward/backward via deterministic kernels, at some
+    # step-time cost. Applies to policy workers only.
+    deterministic: NotRequired[bool]
 
 
 class SequencePackingConfigDisabled(TypedDict):
@@ -453,6 +456,14 @@ class MegatronConfig(TypedDict):
     # Backend for grouped-GEMM during inference-optimized MoE forward.
     # Options: 'flashinfer', 'torch', 'vllm' (mcore default).
     inference_grouped_gemm_backend: NotRequired[str]
+    # Fixed decode row capacity for the FlashInfer routed-MXFP8 MoE path. Without it
+    # every decode step processes the full NVLS dispatcher buffer
+    # (round_up(max_tokens) / TP * EP rows). MCore applies it only to decode-only
+    # steps when max_requests * (num_speculative_tokens + 1) * EP <= capacity.
+    # FlashInfer's TRT-LLM MXFP8 MoE also needs enough
+    # rows for the local expert count (Nano-30B: >=256 rows at 16 local experts,
+    # >=1024 at 64); smaller capacities fail CUDA-graph capture.
+    inference_flashinfer_mxfp8_token_capacity: NotRequired[int | None]
     # InferenceTopKRouter requires moe_router_num_groups=None
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]
@@ -566,6 +577,17 @@ class MegatronConfig(TypedDict):
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.
     freeze_config: NotRequired[dict[str, Any]]
+    # Megatron-Core batch-invariant kernels (bitwise train/generation parity).
+    batch_invariant_mode: NotRequired[bool]
+    batch_invariant_backend: NotRequired[Literal["deepgemm", "te_native", "triton"]]
+    # Cross-rank EP combine: "ordered" is portable, "multimem" uses NVLS.
+    batch_invariant_collective: NotRequired[Literal["multimem", "ordered"]]
+    # FlashAttention generation. Defaults to 2 when unset (flash-attn-4 is installed,
+    # so TE's auto choice would be FA4); batch-invariant / zero-KL recipes set 4
+    # (3 or 4 are accepted under batch_invariant_mode).
+    flash_attention_version: NotRequired[Literal[2, 3, 4] | None]
+    # flag to enable zero train/gen KL with generation.backend='megatron'.
+    zero_train_gen_mismatch: NotRequired[bool]
 
 
 class TokenizerConfig(TypedDict):
@@ -679,9 +701,13 @@ class PolicyConfig(TypedDict):
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
-    # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
+    # This sets the clipping norm for the AutomodelPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float | int]
+    # Run the policy offload lifecycle before non-colocated refit.
+    offload_policy_before_refit: bool
+    # Move optimizer state to CPU when offload_before_refit runs.
+    offload_optimizer_for_refit: bool
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
         list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]

@@ -118,6 +118,8 @@ linkcheck_ignore = [
     ".*github\\.com.*",
     ".*githubusercontent\\.com.*",
     "https://huggingface\\.co/datasets/nvidia/Nemotron-RL-Lightning-Training-Blend",
+    # Gated until the Nemotron 3.5 Super VL GA release; linkcheck gets 401.
+    "https://huggingface\\.co/nvidia/NVIDIA-Nemotron-3\\.5-Super-VL-120B-A12B-BF16",
 ]
 
 

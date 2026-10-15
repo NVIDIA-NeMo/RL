@@ -3,6 +3,7 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout
 policy:
   generation:
+    refit_transport: nccl_reshard
     vllm_cfg:
       tensor_parallel_size: 4
       precision: "fp8"
