@@ -110,6 +110,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         self,
         config: ValueConfig,
         tokenizer: AutoTokenizer,
+        seed: int,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
@@ -192,10 +193,10 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         # Value workers run in separate Ray processes, so the controller's PPO
         # seed does not cover model construction here. Seed before creating the
         # model so a missing HF regression head is initialized reproducibly.
-        set_seed(config["seed"])
+        set_seed(seed)
         print(
-            f"[Rank {self.rank}] Set DTensor value-model initialization seed "
-            f"to {config['seed']}"
+            f"[Rank {self.rank}] Set Automodel value-model initialization seed "
+            f"to {seed}"
         )
 
         # Initialize checkpoint manager
