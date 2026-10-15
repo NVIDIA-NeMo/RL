@@ -67,7 +67,7 @@ class TestGetMicrobatchIterator:
         cfg = {
             "dynamic_batching": {"enabled": False},
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
         mbs = 4
         mock_dp_mesh = MagicMock()
@@ -130,7 +130,7 @@ class TestGetMicrobatchIterator:
         cfg = {
             "dynamic_batching": {"enabled": True},
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
         mbs = 4
         mock_dp_mesh = MagicMock()
@@ -191,7 +191,7 @@ class TestGetMicrobatchIterator:
 
         cfg = {
             "dynamic_batching": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
             "sequence_packing": {"enabled": True, "train_mb_tokens": 512},
         }
         mbs = 4
@@ -255,7 +255,7 @@ class TestGetMicrobatchIterator:
 
         cfg = {
             "dynamic_batching": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
             "sequence_packing": {"enabled": True, "train_mb_tokens": 512},
         }
         mbs = 4
@@ -296,7 +296,7 @@ class TestProcessMicrobatch:
         )
 
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
         enable_seq_packing = False
         result = process_microbatch(
@@ -334,7 +334,7 @@ class TestProcessMicrobatch:
         )
 
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
             "sequence_packing": {"train_mb_tokens": 256},
         }
         enable_seq_packing = True
@@ -385,7 +385,7 @@ class TestProcessMicrobatch:
         assert len(pixel_values) == 2
 
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
         enable_seq_packing = False
         result = process_microbatch(
@@ -408,6 +408,26 @@ class TestProcessMicrobatch:
         # When multimodal inputs are present, position_ids should be None
         assert result.position_ids is None
 
+    def test_media_token_validity_mask_kept_in_vlm_kwargs(self, mock_tokenizer):
+        result = process_microbatch(
+            mb=BatchedDataDict(
+                {
+                    "input_ids": torch.randint(0, 1000, (2, 64)),
+                    "sample_mask": torch.ones(2, dtype=torch.bool),
+                    "pixel_values": PackedTensor(
+                        torch.randn(2, 3, 224, 224), dim_to_pack=0
+                    ),
+                    "media_token_validity_mask": torch.zeros(2, 64, dtype=torch.bool),
+                }
+            ),
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=False,
+            cfg={"automodel_cfg": {"sequence_parallel": False}},
+        )
+
+        assert "pixel_values" in result.vlm_kwargs
+        assert "media_token_validity_mask" in result.vlm_kwargs
+
     def test_sequence_packing_with_multimodal_raises_error(self, mock_tokenizer):
         # Create test microbatch with multimodal data
         mb = BatchedDataDict(
@@ -424,7 +444,7 @@ class TestProcessMicrobatch:
         mb.get_multimodal_dict = MagicMock(return_value=mock_multimodal_dict)
 
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
             "sequence_packing": {"train_mb_tokens": 128},
         }
         enable_seq_packing = True
@@ -454,7 +474,7 @@ class TestProcessMicrobatch:
         mb.get_multimodal_dict = MagicMock(return_value=mock_multimodal_dict)
 
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": True},
+            "automodel_cfg": {"sequence_parallel": True},
         }
         enable_seq_packing = False
         with pytest.raises(
@@ -628,7 +648,7 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([batch1, batch2])
         cfg = {
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
@@ -664,7 +684,7 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([batch])
         cfg = {
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
@@ -693,7 +713,7 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([batch])
         cfg = {
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
@@ -719,7 +739,7 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([])
         cfg = {
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
@@ -755,7 +775,7 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([batch1, batch2, batch3])
         cfg = {
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
@@ -794,7 +814,7 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([batch])
         cfg = {
             "sequence_packing": {"enabled": True, "train_mb_tokens": 256},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         # Mock pack_sequences to return packed inputs
@@ -838,7 +858,7 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([batch])
         cfg = {
             # No "sequence_packing" key
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
@@ -1194,7 +1214,7 @@ class TestIntegrationScenarios:
         cfg = {
             "dynamic_batching": {"enabled": False},
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
         mbs = 4
 

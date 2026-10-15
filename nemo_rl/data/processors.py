@@ -19,6 +19,7 @@ import logging
 from copy import deepcopy
 from typing import Any, Dict, cast
 
+import numpy as np
 import torch
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
@@ -500,40 +501,28 @@ def math_data_processor(
     solution = str(datum_dict["expected_answer"])
     extra_env_info = {"ground_truth": solution}
 
-    message_log: LLMMessageLogType = []
-
-    # system prompt
+    # Render the full conversation together, as in math_hf_data_processor.
+    message_list = []
     if task_data_spec.system_prompt:
-        sys_prompt: dict[str, str | torch.Tensor] = {
-            "role": "system",
-            "content": task_data_spec.system_prompt,
-        }
-        sys = tokenizer.apply_chat_template(
-            [cast(dict[str, str], sys_prompt)],
-            tokenize=False,
-            add_generation_prompt=False,
-            add_special_tokens=False,
-        )
-        sys_prompt["token_ids"] = tokenizer(
-            sys, return_tensors="pt", add_special_tokens=False
-        )["input_ids"][0]
-        message_log.append(sys_prompt)
+        message_list.append({"role": "system", "content": task_data_spec.system_prompt})
 
     # user prompt
     if task_data_spec.prompt:
         problem = task_data_spec.prompt.format(problem)
     user_message = {"role": "user", "content": problem}
+    message_list.append(user_message)
     message = tokenizer.apply_chat_template(
-        [user_message],
+        message_list,
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    user_message["token_ids"] = tokenizer(
-        message, return_tensors="pt", add_special_tokens=False
-    )["input_ids"][0]
-    user_message["content"] = message
-    message_log.append(user_message)
+    token_ids = tokenizer(message, return_tensors="pt", add_special_tokens=False)[
+        "input_ids"
+    ][0]
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
 
     length = sum(len(m["token_ids"]) for m in message_log)
 
@@ -702,12 +691,17 @@ def vlm_hf_data_processor(
                 user_message["content"].append(content)
                 vllm_value = resolve_to_image(content["image"])
             elif content_type == "audio":
-                user_message["content"].append(content)
+                audio = content["audio"]
+                if task_data_spec.pad_audio_to_hop_length:
+                    # Match vLLM models (e.g. Qwen3-Omni) that pre-pad audio before
+                    # feature extraction, so learner and vLLM count the same frames.
+                    hop_length = processor.feature_extractor.hop_length
+                    audio = np.pad(audio, (0, -len(audio) % hop_length))
+                    user_message["content"].append({**content, "audio": audio})
+                else:
+                    user_message["content"].append(content)
                 # Store as (audio_array, sample_rate) tuple for vLLM
-                vllm_value = (
-                    content["audio"],
-                    processor.feature_extractor.sampling_rate,
-                )
+                vllm_value = (audio, processor.feature_extractor.sampling_rate)
             elif content_type == "video":
                 from transformers.video_utils import load_video
 
@@ -870,24 +864,10 @@ def multichoice_qa_processor(
     if "subject" in datum_dict:
         extra_env_info.update({"subject": datum_dict["subject"]})
 
-    message_log: LLMMessageLogType = []
-
-    # system prompt
+    # Render the full conversation together, as in math_hf_data_processor.
+    message_list = []
     if task_data_spec.system_prompt:
-        sys_prompt: dict[str, str | torch.Tensor] = {
-            "role": "system",
-            "content": task_data_spec.system_prompt,
-        }
-        sys = tokenizer.apply_chat_template(
-            [cast(dict[str, str], sys_prompt)],
-            tokenize=False,
-            add_generation_prompt=False,
-            add_special_tokens=False,
-        )
-        sys_prompt["token_ids"] = tokenizer(
-            sys, return_tensors="pt", add_special_tokens=False
-        )["input_ids"][0]
-        message_log.append(sys_prompt)
+        message_list.append({"role": "system", "content": task_data_spec.system_prompt})
 
     # user prompt
     if task_data_spec.prompt:
@@ -895,17 +875,19 @@ def multichoice_qa_processor(
             task_data_spec.prompt, question, options
         )
     user_message = {"role": "user", "content": question}
+    message_list.append(user_message)
     message = tokenizer.apply_chat_template(
-        [user_message],
+        message_list,
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    user_message["token_ids"] = tokenizer(
-        message, return_tensors="pt", add_special_tokens=False
-    )["input_ids"][0]
-    user_message["content"] = message
-    message_log.append(user_message)
+    token_ids = tokenizer(message, return_tensors="pt", add_special_tokens=False)[
+        "input_ids"
+    ][0]
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
 
     length = sum(len(m["token_ids"]) for m in message_log)
     output: DatumSpec = {
@@ -931,7 +913,9 @@ def nemo_gym_data_processor(
 
     NeMo-Gym builds the real cumulative prompt server-side. Both LLM and VLM
     rows therefore use a placeholder here; VLM inputs are processed once after
-    the complete rollout has been collected.
+    the complete rollout has been collected. A configured video sampling style
+    enables specialized handling for rows that contain one recognized static
+    video; heterogeneous non-video rows retain the generic Gym representation.
     """
     extra_env_info = json.loads(datum_dict["extra_env_info"])
     if task_data_spec is not None and task_data_spec.video_sampling_style is not None:

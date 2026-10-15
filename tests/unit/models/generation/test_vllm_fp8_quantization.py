@@ -2666,6 +2666,118 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(
             _assert_dequant_close(weight, scale, source[eid])
 
 
+@GROUPED_EXPERT_KEY_SHAPES
+@pytest.mark.parametrize(
+    "refit_with_reload_api,scale_suffix",
+    [(False, "_scale_from_checkpoint"), (True, "_scale")],
+    ids=["legacy", "reload-api"],
+)
+def test_load_weights_expands_grouped_experts_for_mxfp8(
+    fp8_module,
+    monkeypatch,
+    layers_prefix,
+    wrap_language_model,
+    refit_with_reload_api,
+    scale_suffix,
+):
+    """MXFP8 grouped slabs emit per-expert values and E8M0 scales."""
+    import torch
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = types.SimpleNamespace(
+        use_weight_pow2_scale=False, is_mx=True
+    )
+    model = _grouped_expert_model(
+        fp8, monkeypatch, torch.float8_e4m3fn, wrap_language_model
+    )
+
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    quantized_inputs = []
+
+    def fake_mxfp8_quantize(weight):
+        quantized_inputs.append(weight.clone())
+        rows, cols = weight.shape
+        value = weight.to(torch.float8_e4m3fn)
+        scale = torch.full(
+            (rows, cols // 32, 1),
+            0,
+            dtype=torch.uint8,
+        )
+        return value, scale
+
+    monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", fake_mxfp8_quantize)
+
+    intermediate, hidden = 32, 64
+    gate_up = (
+        torch.arange(2 * 2 * intermediate * hidden, dtype=torch.float32)
+        .remainder(128)
+        .reshape(2, 2 * intermediate, hidden)
+    )
+    down = (
+        torch.arange(2 * hidden * intermediate, dtype=torch.float32)
+        .remainder(128)
+        .reshape(2, hidden, intermediate)
+    )
+    loaded = list(
+        fp8.get_quantized_weight_iterator(
+            [
+                (
+                    f"{layers_prefix}.0.mlp.experts.gate_up_proj",
+                    gate_up.to(torch.bfloat16),
+                ),
+                (
+                    f"{layers_prefix}.0.mlp.experts.down_proj",
+                    down.to(torch.bfloat16),
+                ),
+            ],
+            types.SimpleNamespace(model=model),
+            refit_with_reload_api=refit_with_reload_api,
+        )
+    )
+
+    base = f"{layers_prefix}.0.mlp.experts"
+    expected_names = [
+        f"{base}.{eid}.{proj}.weight{suffix}"
+        for proj in ("gate_proj", "up_proj")
+        for eid in (0, 1)
+        for suffix in ("", scale_suffix)
+    ] + [
+        f"{base}.{eid}.down_proj.weight{suffix}"
+        for eid in (0, 1)
+        for suffix in ("", scale_suffix)
+    ]
+    assert [name for name, _ in loaded] == expected_names
+
+    entries = dict(loaded)
+    source_shards = {
+        "gate_proj": gate_up[:, :intermediate, :],
+        "up_proj": gate_up[:, intermediate:, :],
+        "down_proj": down,
+    }
+    quantize_call = 0
+    for proj, source in source_shards.items():
+        for expert_id in (0, 1):
+            quantize_call += 1
+            name = f"{base}.{expert_id}.{proj}.weight"
+            value = entries[name]
+            scale = entries[name + scale_suffix]
+            assert value.dtype == torch.float8_e4m3fn
+            # The refit path receives bf16 slabs, so expectations must follow
+            # the same fp32 -> bf16 -> e4m3 rounding chain as production.
+            expected = source[expert_id].to(torch.bfloat16).to(torch.float8_e4m3fn)
+            assert torch.equal(value.float(), expected.float())
+            assert scale.dtype == torch.uint8
+            assert scale.shape == (*value.shape[:-1], value.shape[-1] // 32)
+            assert torch.all(scale == 1)
+            assert torch.equal(
+                quantized_inputs[quantize_call - 1],
+                source[expert_id].to(torch.bfloat16),
+            )
+
+    assert len(quantized_inputs) == 6
+
+
 def _deepseek_v4_lookup_model():
     """A DeepSeek V4-shaped model with vLLM 0.29's ambiguous packed mapping."""
     from vllm.model_executor.models.utils import WeightsMapper
@@ -2766,3 +2878,103 @@ def test_get_module_still_uses_unambiguous_packed_mapping(fp8_module):
         model, "model.layers.0.self_attn.k_proj.weight"
     )
     assert module is model.model.layers[0].self_attn.qkv_proj
+
+
+def test_deepseek_parameter_names_fall_back_on_legacy_rope_type(
+    fp8_module, monkeypatch
+):
+    from transformers import PretrainedConfig
+
+    # Moonlight's remote model expects rope_scaling["type"], while Transformers
+    # 5 normalizes it to "rope_type". Only the failed construction falls back.
+    class RemoteDeepseekV3Config(PretrainedConfig):
+        model_type = "deepseek_v3"
+
+    config = RemoteDeepseekV3Config(
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        q_lora_rank=16,
+        kv_lora_rank=16,
+        qk_nope_head_dim=16,
+        qk_rope_head_dim=16,
+        v_head_dim=16,
+        vocab_size=128,
+        first_k_dense_replace=1,
+        auto_map={"AutoModel": "missing_legacy_module.DeepseekV3Model"},
+    )
+    from_config = fp8_module.AutoModel.from_config
+    calls = []
+
+    def build_model(model_config, *, trust_remote_code):
+        calls.append((model_config, trust_remote_code))
+        if trust_remote_code:
+            raise KeyError("type")
+        return from_config(model_config, trust_remote_code=False)
+
+    monkeypatch.setattr(fp8_module.AutoModel, "from_config", build_model)
+    names = fp8_module._get_fp8_parameter_names(config)
+    assert calls[0] == (config, True)
+    assert len(calls) == 2
+    assert type(calls[1][0]) is fp8_module.DeepseekV3Config
+    assert calls[1][1] is False
+    for layer in range(2):
+        for projection in ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]:
+            assert f"layers.{layer}.self_attn.{projection}.weight" in names
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v3", "llama"])
+def test_fp8_parameter_names_preserve_working_remote_model(
+    fp8_module, monkeypatch, model_type
+):
+    config = types.SimpleNamespace(model_type=model_type)
+    # Native DeepSeek V3 fuses these weights; keep the working remote model's
+    # names so expert exclusions and first/last BF16 layers still match vLLM.
+    expected = [
+        "layers.0.self_attn.q_a_proj.weight",
+        "layers.1.mlp.experts.0.gate_proj.weight",
+        "layers.1.mlp.experts.0.up_proj.weight",
+        "layers.1.mlp.experts.0.down_proj.weight",
+    ]
+
+    def build_model(model_config, *, trust_remote_code):
+        assert model_config is config
+        assert trust_remote_code is True
+        return types.SimpleNamespace(
+            named_parameters=lambda: [(name, None) for name in expected]
+        )
+
+    monkeypatch.setattr(fp8_module.AutoModel, "from_config", build_model)
+    assert fp8_module._get_fp8_parameter_names(config) == expected
+
+
+@pytest.mark.parametrize(
+    "model_type, error",
+    [
+        ("llama", KeyError("type")),
+        ("deepseek_v3", KeyError("unrelated_key")),
+        ("deepseek_v3", ValueError("invalid configuration")),
+        ("deepseek_v3", ImportError("missing dependency")),
+        ("deepseek_v3", RuntimeError("construction failed")),
+    ],
+)
+def test_fp8_parameter_names_propagate_unrelated_errors(
+    fp8_module, monkeypatch, model_type, error
+):
+    config = types.SimpleNamespace(model_type=model_type)
+
+    def build_model(model_config, *, trust_remote_code):
+        assert model_config is config
+        assert trust_remote_code is True
+        raise error
+
+    monkeypatch.setattr(fp8_module.AutoModel, "from_config", build_model)
+    with pytest.raises(type(error)) as exc_info:
+        fp8_module._get_fp8_parameter_names(config)
+    assert exc_info.value is error

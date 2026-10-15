@@ -26,7 +26,7 @@ To implement the custom parallel plan, either update the value of `custom_parall
 
 ```bash
 uv run examples/run_grpo.py \
-    policy.dtensor_cfg.custom_parallel_plan=examples.custom_parallel.custom_parallel.custom_parallel_plan
+    policy.automodel_cfg.custom_parallel_plan=examples.custom_parallel.custom_parallel.custom_parallel_plan
 ```
 
 ## HSDP (`dp_replicate_size`)
@@ -58,7 +58,7 @@ Each step: FSDP2 collectives run within a node; only a gradient all-reduce cross
 
 ```yaml
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     dp_replicate_size: 2  # number of replicas; 1 disables HSDP
 ```
 

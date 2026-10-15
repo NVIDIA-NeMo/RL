@@ -11,6 +11,9 @@
 
 ## 📣 News
 
+* [10/07/2026] We shared the [NeMo-DCR preprint](https://huggingface.co/papers/2610.08430), which presents the delta-compressed refit method used in NeMo RL for fast, bitwise-exact sparse weight synchronization between training and rollout clusters.
+* [09/21/2026] DeepSeek V4.1 Flash RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/deepseek-v4.1-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/deepseek-v4.1-support/docs/guides/models/deepseek/deepseek-v4.1-flash.md).
+* [08/26/2026] Qwen3.8-Flash-Next RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/qwen3-8-flash-next-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/qwen3-8-flash-next-support/docs/guides/models/qwen/qwen3-8-flash-next.md).
 * [08/12/2026] MuseGlimmer RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/muse-glimmer-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/muse-glimmer-support/docs/guides/models/muse-glimmer.md).
 * [08/11/2026] Nemotron-3.5-lightning is released. Trained natively using NeMo RL. Check out [reproducible recipes](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/nemo_gym/nemotron-3.5-lightning).
 * [07/25/2026] [Release v0.7.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.7.0): PPO, MOPD, Cross-tokenizer, Router-replay, CISPO, model support for Qwen3-Omni, Nemotron Nano v3 Omni, Gemma 4, GLM 5.1 and many more!
@@ -24,7 +27,7 @@
 * [04/06/2026] New Model Support
     * Added support for [Qwen3.5](https://huggingface.co/collections/Qwen/qwen35) dense and MoE models (LLM and VLM) for GRPO training.
     * Added support for [GLM-4.7-Flash](https://huggingface.co/zai-org/GLM-4.7-Flash) for GRPO training.
-    * Recipes: [grpo-qwen3.5-9b-1n8g-megatron.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron.yaml), [grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml), [grpo-glm47-flash-4n8g-automodel.yaml](/examples/configs/recipes/llm/grpo-glm47-flash-4n8g-automodel.yaml)
+    * Recipes: [grpo-qwen3.5-9b-1n8g-megatron.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron.yaml), [grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml), [grpo-glm47-flash-4n8g-automodel-ep32.yaml](/examples/configs/recipes/llm/grpo-glm47-flash-4n8g-automodel-ep32.yaml)
 * [03/12/2026] GDPO Support
     * Enabling [Group reward-Decoupled Normalization Policy Optimization](https://arxiv.org/abs/2601.05242) (GDPO) for multi-reward RL training is now supported.
     * Example: [gdpo_math_1B.yaml](/examples/configs/gdpo_math_1B.yaml)
@@ -40,8 +43,8 @@
     * LoRA GRPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1889) backends.
     * LoRA DPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1826) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/2125) backends.
     * Nano v3 LoRA recipes:
-        * [sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
-        * [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
+        * [sft-nanov3-30BA3B-2n8g-automodel-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-lora.yaml)
+        * [grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml)
         * [grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml)
    
 * [01/30/2026] [Release v0.5.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.5.0)
@@ -137,8 +140,9 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **GB200** - container support for GB200.
 
 ## Table of Contents
-  - [Prerequisites](#prerequisites)
   - [Quick Start](#quick-start)
+    - [Bare-Metal Quick Start](#bare-metal-quick-start)
+  - [Prerequisites](#prerequisites)
   - Support Matrix
 
     <p></p>
@@ -160,7 +164,7 @@ For detailed information on backend selection, configuration, and examples, see 
   - [Set Up Clusters](#set-up-clusters)
   - [Tips and Tricks](#tips-and-tricks)
   - [Citation](#citation)
-  - [Contributing](#contributing)
+  - [Acknowledgement and Contribution Guide](#acknowledgement-and-contribution-guide)
   - [Licenses](#licenses)
 
 ## Quick Start
@@ -301,7 +305,7 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 > ```sh
 > export CUDNN_HOME=.venv/lib/python3.13/site-packages/nvidia/cudnn
 > export LD_LIBRARY_PATH=".venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
-> # Verify (should match nvidia-cudnn-cu13 version in pyproject.toml, currently 9.20.0):
+> # Verify (should match the nvidia-cudnn-cu13 pin in pyproject.toml):
 > # uv run --extra mcore python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 > ```
 > See [docs/about/installation.md](docs/about/installation.md#configure-cudnn-for-transformer-engine-bare-metal-only) for details.
@@ -397,7 +401,7 @@ HF_HOME=/path/to/hf_home huggingface-cli download Qwen/Qwen2.5-32B
 
 # Ensure HF_HOME is included in your MOUNTS
 HF_HOME=/path/to/hf_home \
-COMMAND="uv run ./examples/run_grpo.py --config examples/configs/grpo_math_8B.yaml policy.model_name='Qwen/Qwen2.5-32B' policy.generation.vllm_cfg.tensor_parallel_size=4 policy.max_total_sequence_length=16384 cluster.num_nodes=${NUM_ACTOR_NODES} policy.dtensor_cfg.enabled=True policy.dtensor_cfg.tensor_parallel_size=8 policy.dtensor_cfg.sequence_parallel=True policy.dtensor_cfg.activation_checkpointing=True checkpointing.checkpoint_dir='results/qwen2.5-32b' logger.wandb_enabled=True logger.wandb.name='qwen2.5-32b'" \
+COMMAND="uv run ./examples/run_grpo.py --config examples/configs/grpo_math_8B.yaml policy.model_name='Qwen/Qwen2.5-32B' policy.generation.vllm_cfg.tensor_parallel_size=4 policy.max_total_sequence_length=16384 cluster.num_nodes=${NUM_ACTOR_NODES} policy.automodel_cfg.enabled=True policy.automodel_cfg.tensor_parallel_size=8 policy.automodel_cfg.sequence_parallel=True policy.automodel_cfg.activation_checkpointing=True checkpointing.checkpoint_dir='results/qwen2.5-32b' logger.wandb_enabled=True logger.wandb.name='qwen2.5-32b'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
@@ -792,7 +796,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
   ```yaml
   policy:
     # ...
-    dtensor_cfg:
+    automodel_cfg:
       env_vars:
         PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
   ```

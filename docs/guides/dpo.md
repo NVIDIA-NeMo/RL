@@ -199,7 +199,7 @@ parent directory to `PYTHONPATH` before launching training.
 
 Please note:
 - If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
-- If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.
+- If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `val:validation-<NameOfValidationDataset1>_loss`.
 
 ## DPO-Specific Parameters
 
@@ -218,7 +218,7 @@ These parameters can be adjusted in the config file or via command-line override
 DPO supports LoRA on both the DTensor and Megatron backends. To enable LoRA on the default DTensor backend:
 
 ```bash
-uv run examples/run_dpo.py policy.dtensor_cfg.lora_cfg.enabled=true
+uv run examples/run_dpo.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
 For the full reference — backend support, the DTensor vs Megatron schema comparison, config examples, parameter details, and example recipes — see the dedicated [LoRA guide](lora.md).

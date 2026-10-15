@@ -30,7 +30,7 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 16384
-  dtensor_cfg:
+  automodel_cfg:
     context_parallel_size: 4
   megatron_cfg:
     tensor_model_parallel_size: 4
@@ -47,8 +47,8 @@ policy:
       lr_warmup_init: 1.0e-07
   sequence_packing:
     enabled: false
-  make_sequence_length_divisible_by: ${mul:${policy.dtensor_cfg.tensor_parallel_size},
-    ${mul:2, ${policy.dtensor_cfg.context_parallel_size}}}
+  make_sequence_length_divisible_by: ${mul:${policy.automodel_cfg.tensor_parallel_size},
+    ${mul:2, ${policy.automodel_cfg.context_parallel_size}}}
   optimizer:
     kwargs:
       lr: 1.0e-06
