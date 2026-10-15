@@ -129,9 +129,10 @@ checkpointing:
   fresh `checkpoint_dir` prefix for a new run.
 - **Resuming:** use the same `max_num_steps` (or compatible LR-scheduler settings) as
   the run that wrote the checkpoint; Megatron validates the scheduler state on load.
-- **Support:** Megatron policy backend, and the sync algorithms' dataloader state
-  (`save_dataloader_state`). Async GRPO and SingleController do not support `msc://`
-  yet (async GRPO fails fast with `NotImplementedError`).
+- **Support:** Megatron policy backend; dataloader state for all algorithms
+  (`save_dataloader_state`); async GRPO, including its replay buffer and rollout
+  state (`replay_buffer.pt`, `rollouts.pt`), as long as `save_data_plane=false`.
+  SingleController does not support `msc://` yet.
 - **Trust:** resume deserializes `torch` pickles (`train_dataloader*.pt`) from the
   bucket; only point `msc://` at storage you control.
 
