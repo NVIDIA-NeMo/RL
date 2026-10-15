@@ -1911,7 +1911,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             manifest = _IPCWeightManifest(self.state_dict_info)
             noop_finalize: WeightUpdateFinalizer = lambda: None
             lifecycle = (
-                nullcontext(noop_finalize)
+                nullcontext[WeightUpdateFinalizer](noop_finalize)
                 if native_lora_refit
                 else self._weight_update_lifecycle("ipc")
             )
