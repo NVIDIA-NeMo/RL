@@ -85,26 +85,48 @@ enroot import -o nemo-rl-super35.sqsh docker://<your-registry>/nemo-rl:super35
 
 Slurm submission requires Pyxis/enroot.
 
+## Build the sandbox container
+
 RLVR, reasoning, and MOPD also use a
-[NeMo Skills sandbox](https://github.com/NVIDIA-NeMo/Skills/blob/main/dockerfiles/Dockerfile.sandbox)
-for code/tool environments. Provide a compatible sandbox image through
-`SANDBOX_CONTAINER`.
+[NeMo Skills sandbox](https://github.com/NVIDIA-NeMo/Skills/blob/b620e79/dockerfiles/Dockerfile.sandbox)
+for code/tool environments. Build it and convert it to a `.sqsh`:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Skills.git
+cd Skills
+git checkout b620e79
+docker build -t nemo-skills-sandbox:latest -f dockerfiles/Dockerfile.sandbox .
+enroot import -o nemo-skills-sandbox.sqsh dockerd://nemo-skills-sandbox:latest
+cd ..
+```
+
+Place `Skills/nemo-skills-sandbox.sqsh` on the shared filesystem and use its
+path for `SANDBOX_CONTAINER` in the launch commands below.
 
 ## Judge services
 
 All judges and reward models run in **external vLLM pools** on dedicated
-nodes in the same Slurm allocation. The launcher starts them and connects Gym
+nodes in the same Slurm allocation, using the same NeMo-RL image as training
+and its bundled vLLM environment. The launcher starts them and connects Gym
 automatically.
 
-Set `JUDGE_CONTAINER` to a vLLM/Ray image supporting the judges used by your stage:
+The recipes use these judges:
 [Nemotron Ultra GenRM](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM),
-Qwen3-235B-A22B-Instruct-2507-FP8, the content-safety reasoning model, or
-DeepSeek-V4-Flash. Pass their Hugging Face model IDs or local checkpoint paths
+[Qwen3-235B-A22B-Instruct-2507-FP8](https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8),
+[Nemotron Content Safety Reasoning 4B](https://huggingface.co/nvidia/Nemotron-Content-Safety-Reasoning-4B), or
+[DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash).
+Pass their Hugging Face model IDs or local checkpoint paths
 in the launch commands below.
 Serving settings and per-model container overrides are in
 [`judge_pools.sh`](../../../../examples/nemo_gym/nemotron-3.5-super/judge_pools.sh).
 See [External Gym vLLM pools](../../../../tools/external_gym_vllm/README.md)
 for serving-image requirements.
+
+## Training data
+
+> [!NOTE]
+> The training data for this recipe is not yet ready for release and will be
+> released at a later date.
 
 ## Launch configuration
 
@@ -114,7 +136,7 @@ Training and serving settings are specified in the linked configs.
 | Stage / config | Training nodes | Inference nodes | Judge nodes | Total nodes |
 |---|---:|---:|---:|---:|
 | [Student RLVR](../../../../examples/nemo_gym/nemotron-3.5-super/student_rlvr.yaml) | 32 | 112 | 26 | 170 |
-| [RLHF teacher](../../../../examples/nemo_gym/nemotron-3.5-super/rlhf_teacher.yaml) | 16 | 16 | 32 | 64 |
+| [RLHF teacher](../../../../examples/nemo_gym/nemotron-3.5-super/rlhf_teacher.yaml) | 16 | 16 | 36 | 68 |
 | [Reasoning teacher](../../../../examples/nemo_gym/nemotron-3.5-super/reasoning_teacher.yaml) | 16 | 44 | 4 | 64 |
 | [Vision teacher](../../../../examples/nemo_gym/nemotron-3.5-super/vision_teacher.yaml) | 8 | 8 | 0 | 16 |
 | [MOPD](../../../../examples/nemo_gym/nemotron-3.5-super/mopd.yaml) | 64 | 48 | 0 | 112 |
@@ -124,7 +146,7 @@ MOPD inference comprises 30 rollout nodes and 18 teacher nodes.
 Run the commands below from the repository root, replacing the paths, Slurm
 account, and partition for your cluster.
 
-The checkout, checkpoints, datasets, and result directories must all be under
+The checkout, local checkpoints, datasets, and result directories must all be under
 `SHARED_ROOT`, which is mounted at the same path on every node and in sandboxes.
 Use `EXTRA_MOUNTS` for image stores outside it. Optionally set `SLURM_QOS` or
 `SLURM_RESERVATION` for your cluster.
@@ -140,17 +162,16 @@ Start from the SFT checkpoint and specify the three judge checkpoints:
 ```bash
 SHARED_ROOT=/shared \
 CONTAINER=/shared/images/nemo-rl-super35.sqsh \
-JUDGE_CONTAINER=/shared/images/vllm-judges.sqsh \
 SANDBOX_CONTAINER=/shared/images/nemo-skills-sandbox.sqsh \
 DATA_ROOT=/shared/data/super35 \
 SLURM_ACCOUNT=<your-account> \
 SLURM_PARTITION=<your-partition> \
 WALLTIME=4:00:00 \
 GENRM_CHECKPOINT=nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM \
-NL2BASH_CHECKPOINT=/shared/checkpoints/qwen3-235b-a22b-instruct-2507-fp8 \
-SAFETY_CHECKPOINT=/shared/checkpoints/content-safety-reasoning \
+NL2BASH_CHECKPOINT=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
+SAFETY_CHECKPOINT=nvidia/Nemotron-Content-Safety-Reasoning-4B \
 MODEL_PATH=/shared/checkpoints/super35-sft \
-TRAIN_PATH=/shared/data/super35/rlvr.train.jsonl \
+TRAIN_PATH=/shared/data/super35/rlvr.jsonl \
 EXP_NAME=super35-student-rlvr \
 bash examples/nemo_gym/nemotron-3.5-super/super35_launch.sh student_rlvr
 ```
@@ -162,16 +183,18 @@ independently.
 
 ### RLHF teacher
 
+GenRM judges the preference rows; Qwen judges the abstention rows.
+
 ```bash
 SHARED_ROOT=/shared \
 CONTAINER=/shared/images/nemo-rl-super35.sqsh \
-JUDGE_CONTAINER=/shared/images/vllm-judges.sqsh \
 SLURM_ACCOUNT=<your-account> \
 SLURM_PARTITION=<your-partition> \
 WALLTIME=4:00:00 \
 RLVR_CHECKPOINT=/shared/checkpoints/super35-rlvr-hf \
 GENRM_CHECKPOINT=nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-GenRM \
-TRAIN_PATH=/shared/data/super35/rlhf.train.jsonl \
+NL2BASH_CHECKPOINT=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
+TRAIN_PATH=/shared/data/super35/rlhf.jsonl \
 EXP_NAME=super35-rlhf-teacher \
 bash examples/nemo_gym/nemotron-3.5-super/super35_launch.sh rlhf_teacher
 ```
@@ -181,15 +204,14 @@ bash examples/nemo_gym/nemotron-3.5-super/super35_launch.sh rlhf_teacher
 ```bash
 SHARED_ROOT=/shared \
 CONTAINER=/shared/images/nemo-rl-super35.sqsh \
-JUDGE_CONTAINER=/shared/images/vllm-judges.sqsh \
 SANDBOX_CONTAINER=/shared/images/nemo-skills-sandbox.sqsh \
 DATA_ROOT=/shared/data/super35 \
 SLURM_ACCOUNT=<your-account> \
 SLURM_PARTITION=<your-partition> \
 WALLTIME=4:00:00 \
 RLVR_CHECKPOINT=/shared/checkpoints/super35-rlvr-hf \
-REASONING_JUDGE_CHECKPOINT=/shared/checkpoints/deepseek-v4-flash \
-TRAIN_PATH=/shared/data/super35/reasoning.train.jsonl \
+REASONING_JUDGE_CHECKPOINT=deepseek-ai/DeepSeek-V4-Flash \
+TRAIN_PATH=/shared/data/super35/reasoning.jsonl \
 EXP_NAME=super35-reasoning-teacher \
 bash examples/nemo_gym/nemotron-3.5-super/super35_launch.sh reasoning_teacher
 ```
@@ -203,7 +225,7 @@ SLURM_ACCOUNT=<your-account> \
 SLURM_PARTITION=<your-partition> \
 WALLTIME=4:00:00 \
 RLVR_CHECKPOINT=/shared/checkpoints/super35-rlvr-hf \
-TRAIN_PATH=/shared/data/super35/vision.train.jsonl \
+TRAIN_PATH=/shared/data/super35/vision.jsonl \
 EXP_NAME=super35-vision-teacher \
 bash examples/nemo_gym/nemotron-3.5-super/super35_launch.sh vision_teacher
 ```
@@ -225,7 +247,7 @@ RLVR_CHECKPOINT=/shared/checkpoints/super35-rlvr-hf \
 RLHF_TEACHER_PATH=/shared/checkpoints/super35-rlhf-hf \
 REASONING_TEACHER_PATH=/shared/checkpoints/super35-reasoning-hf \
 VISION_TEACHER_PATH=/shared/checkpoints/super35-vision-hf \
-TRAIN_PATH=/shared/data/super35/mopd.train.jsonl \
+TRAIN_PATH=/shared/data/super35/mopd.jsonl \
 EXP_NAME=super35-mopd \
 bash examples/nemo_gym/nemotron-3.5-super/super35_launch.sh mopd
 ```

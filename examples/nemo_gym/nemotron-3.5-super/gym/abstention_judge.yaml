@@ -1,0 +1,14 @@
+# Use the same external Qwen judge client as Student RLVR.
+nl2bash_judge_model:
+  responses_api_models:
+    local_vllm_model:
+      entrypoint: app.py
+      base_url: ${oc.env:NL2BASH_BASE_URL}
+      api_key: ${oc.env:NL2BASH_API_KEY,EMPTY}
+      model: ${oc.env:NL2BASH_MODEL}
+      # Required by the client schema; unused with external base_url.
+      vllm_serve_kwargs: {}
+      vllm_serve_env_vars: {}
+      return_token_id_information: false
+      uses_reasoning_parser: false
+      debug: false

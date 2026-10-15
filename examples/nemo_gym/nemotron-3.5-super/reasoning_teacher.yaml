@@ -249,7 +249,6 @@ policy:
         reasoning_parser: nano_v3
       env_vars:
         NRL_VLLM_FP32_LM_HEAD: '1'
-        HF_MODULES_CACHE: /tmp/nemo_rl_hf_modules
     vllm_kwargs:
       moe_backend: flashinfer_trtllm
       enable_chunked_prefill: true

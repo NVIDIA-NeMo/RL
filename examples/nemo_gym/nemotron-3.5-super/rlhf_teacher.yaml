@@ -48,10 +48,25 @@ data_plane: null
 env:
   nemo_gym:
     nemo_gym_log_dir: ${logger.log_dir}/nemo_gym
+    abstention:
+      resources_servers:
+        abstention:
+          abstention_reward: 0.2
+          judge_model_server:
+            name: nl2bash_judge_model
+            type: responses_api_models
+          judge_responses_create_params:
+            max_output_tokens: 8192
+    abstention_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
     config_paths:
     - /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-super/gym/genrm_auth.yaml
+    - /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-super/gym/abstention_judge.yaml
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/genrm_compare/configs/genrm_compare.yaml
+    - resources_servers/abstention/configs/abstention.yaml
     effort_levels:
       low_penalty: 1
       low_string: '{reasoning effort: efficient}'
