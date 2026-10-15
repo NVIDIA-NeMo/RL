@@ -309,11 +309,23 @@ env:
       low_ub: 15000
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
-    - /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-super/gym/reasoning_judge.yaml
     - resources_servers/math_with_judge/configs/math_with_judge.yaml
     - resources_servers/equivalence_llm_judge/configs/equivalence_llm_judge.yaml
     - resources_servers/competitive_coding_challenges/configs/competitive_coding_challenges.yaml
     - responses_api_agents/simple_agent/configs/simple_agent.yaml
+    deepseek_v4_flash_judge_model:
+      responses_api_models:
+        inference_provider:
+          entrypoint: app.py
+          base_url: ${oc.env:REASONING_JUDGE_BASE_URL}
+          api_key: EMPTY
+          model: ${oc.env:REASONING_JUDGE_MODEL}
+          uses_reasoning_parser: true
+          num_concurrent_requests: 256
+          extra_body:
+            chat_template_kwargs:
+              thinking: true
+              reasoning_effort: high
     policy_model:
       responses_api_models:
         vllm_model:

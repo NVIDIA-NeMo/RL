@@ -93,8 +93,6 @@ env:
           test_file: ${oc.env:DATA_ROOT}/ccc/metadata.jsonl
           shared_dir: ${checkpointing.checkpoint_dir}/../ccc_shared_tmp
     config_paths:
-    - /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-super/gym/genrm_auth.yaml
-    - /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-super/gym/aux_judge_auth.yaml
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/math_with_judge/configs/math_with_judge.yaml
     - resources_servers/code_gen/configs/code_gen.yaml
@@ -233,6 +231,7 @@ env:
     genrm_model:
       responses_api_models:
         genrm_model:
+          api_key: EMPTY
           base_url: ${oc.env:GENRM_BASE_URL}
           entrypoint: app.py
           model: ${oc.env:GENRM_MODEL}
@@ -320,6 +319,7 @@ env:
     nl2bash_judge_model:
       responses_api_models:
         local_vllm_model:
+          api_key: EMPTY
           # Required by the client schema; unused with external base_url.
           vllm_serve_kwargs: {}
           vllm_serve_env_vars: {}
@@ -372,6 +372,7 @@ env:
     safety_judge_model:
       responses_api_models:
         local_vllm_model:
+          api_key: EMPTY
           vllm_serve_kwargs: {}
           vllm_serve_env_vars: {}
           base_url: ${oc.env:SAFETY_BASE_URL}

@@ -62,8 +62,6 @@ env:
         simple_agent:
           max_steps: 1
     config_paths:
-    - /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-super/gym/genrm_auth.yaml
-    - /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-super/gym/abstention_judge.yaml
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/genrm_compare/configs/genrm_compare.yaml
     - resources_servers/abstention/configs/abstention.yaml
@@ -121,6 +119,7 @@ env:
     genrm_model:
       responses_api_models:
         genrm_model:
+          api_key: EMPTY
           base_url: ${oc.env:GENRM_BASE_URL}
           debug: false
           entrypoint: app.py
@@ -141,6 +140,19 @@ env:
     - </tool_call>
     - <function_call>
     - </function_call>
+    nl2bash_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          entrypoint: app.py
+          base_url: ${oc.env:NL2BASH_BASE_URL}
+          api_key: EMPTY
+          model: ${oc.env:NL2BASH_MODEL}
+          # Required by the client schema; unused with external base_url.
+          vllm_serve_kwargs: {}
+          vllm_serve_env_vars: {}
+          return_token_id_information: false
+          uses_reasoning_parser: false
+          debug: false
     num_gpu_nodes: 0
     policy_model:
       responses_api_models:
