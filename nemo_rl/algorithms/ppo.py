@@ -852,6 +852,7 @@ def setup(
             cluster=train_cluster,
             config=value_config,
             tokenizer=tokenizer,
+            seed=ppo_config.seed,
             name_prefix="lm_value",
             weights_path=value_weights_path,
             optimizer_path=value_optimizer_path,
