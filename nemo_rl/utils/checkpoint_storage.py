@@ -23,12 +23,25 @@ def is_msc_path(path: str | os.PathLike[str]) -> bool:
     return str(path).startswith("msc://")
 
 
-def enable_msc() -> ModuleType:
-    """Enable the optional Megatron storage backend in the calling process."""
-    # MSC and Megatron are optional for the other policy backends.
+def import_msc() -> ModuleType:
+    """Import ``multistorageclient`` without touching Megatron.
+
+    Plain file helpers (``open_path``, ``save_checkpoint_object``, ...) use this so
+    actors whose venv has no Megatron, e.g. the async replay buffer, can read
+    and write ``msc://`` URLs.
+    """
+    # MSC is optional: only runs that use msc:// need it installed.
     import multistorageclient as msc
+
+    return msc
+
+
+def enable_msc() -> ModuleType:
+    """Enable MSC in Megatron(-Bridge) for the calling process and return MSC."""
+    # Megatron is optional for the other policy backends.
     from megatron.core.msc_utils import MultiStorageClientFeature
 
+    msc = import_msc()
     MultiStorageClientFeature.enable()
     return msc
 
@@ -57,7 +70,7 @@ def save_checkpoint_object(value: Any, path: str | os.PathLike[str]) -> None:
     import torch
 
     if is_msc_path(path):
-        enable_msc().torch.save(value, str(path))
+        import_msc().torch.save(value, str(path))
     else:
         torch.save(value, path)
 
@@ -67,19 +80,19 @@ def load_checkpoint_object(path: str | os.PathLike[str], **kwargs: Any) -> Any:
     import torch
 
     if is_msc_path(path):
-        return enable_msc().torch.load(str(path), **kwargs)
+        return import_msc().torch.load(str(path), **kwargs)
     return torch.load(path, **kwargs)
 
 
 def path_exists(path: str | os.PathLike[str]) -> bool:
     """``os.path.exists`` that also understands ``msc://`` URLs."""
     if is_msc_path(path):
-        return enable_msc().os.path.exists(str(path))
+        return import_msc().os.path.exists(str(path))
     return os.path.exists(path)
 
 
 def open_path(path: str | os.PathLike[str], mode: str = "r") -> Any:
     """``open`` that also understands ``msc://`` URLs."""
     if is_msc_path(path):
-        return enable_msc().open(str(path), mode)
+        return import_msc().open(str(path), mode)
     return open(path, mode)
