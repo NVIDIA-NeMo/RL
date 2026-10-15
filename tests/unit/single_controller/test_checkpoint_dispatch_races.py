@@ -327,8 +327,9 @@ class _BlockingRolloutManager:
         target_step: int | None = None,
         inflight_registry: dict[str, Any] | None = None,
         lineage_group_id: str | None = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
-        del inflight_registry
+        del inflight_registry, replacement_index
         if lineage_group_id is None:
             lineage_group_id = self.reserve_prompt_group(
                 None,
