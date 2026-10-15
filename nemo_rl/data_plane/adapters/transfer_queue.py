@@ -752,7 +752,9 @@ def _mooncake_ssd_offload_master_args(
 ) -> tuple[str, ...]:
     """mooncake_master flags for ``mooncake_cpu.ssd_offload``.
 
-    They replace the no-eviction flags TQ passes (gflags keeps the last
+    In Mooncake, offload happens on eviction: past the high watermark the
+    master moves objects to SSD and frees ``eviction_ratio`` of the memory.
+    These replace the no-eviction flags TQ passes (gflags keeps the last
     occurrence). ``offload_force_evict=false``: an object whose SSD write
     failed stays in memory rather than being dropped. TQ's 999999 ms lease
     would keep every object written in the last ~17 min from being evicted,
@@ -762,8 +764,8 @@ def _mooncake_ssd_offload_master_args(
         "--enable_offload=true",
         "--offload_on_evict=true",
         "--offload_force_evict=false",
-        f"--eviction_high_watermark_ratio={ssd.eviction_high_watermark_ratio}",
-        f"--eviction_ratio={ssd.eviction_ratio}",
+        f"--eviction_high_watermark_ratio={ssd.offload_threshold}",
+        "--eviction_ratio=0.1",
         "--default_kv_lease_ttl=10000",
     )
 

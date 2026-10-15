@@ -54,8 +54,7 @@ def _spill_and_read_back(ssd_root: str) -> None:  # pragma: no cover
             "ssd_offload": {
                 "enabled": True,
                 "path": ssd_root,
-                "eviction_high_watermark_ratio": 0.5,
-                "eviction_ratio": 0.2,
+                "offload_threshold": 0.5,
             },
         },
     }

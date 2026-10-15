@@ -110,9 +110,10 @@ class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
     TQ's own ``MooncakeStore.offload`` is not used: its single offload client
     on the driver owns none of the data, so nothing could be evicted.
 
-    When cluster-wide segment usage passes ``eviction_high_watermark_ratio``,
-    the master writes objects to their owner's SSD and then frees
-    ``eviction_ratio`` of the memory. Reads of an offloaded object go through
+    When usage across all units passes ``offload_threshold`` (a share of
+    their memory), the master writes objects to their owner's SSD and drops
+    them from memory, 10% of the memory per round. Reads of an offloaded
+    object go through
     its owner transparently. An object is only dropped from memory once its
     SSD copy exists; if SSD writes fail, puts fail once memory is full.
     Mooncake's disk watermark eviction is turned off, since it would delete
@@ -126,8 +127,7 @@ class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
 
     enabled: bool = False
     path: str | None = None  # absolute; required when enabled
-    eviction_high_watermark_ratio: float = Field(default=0.9, gt=0.0, le=1.0)
-    eviction_ratio: float = Field(default=0.1, gt=0.0, le=1.0)
+    offload_threshold: float = Field(default=0.9, gt=0.0, le=1.0)
 
     @model_validator(mode="after")
     def _require_absolute_path_when_enabled(self) -> "MooncakeSsdOffloadConfig":

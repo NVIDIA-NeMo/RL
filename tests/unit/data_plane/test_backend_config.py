@@ -186,7 +186,7 @@ def test_mooncake_ssd_offload_makes_units_evictable(monkeypatch) -> None:
         monkeypatch,
         {
             "storage_unit_segment_size": 1 << 30,
-            "ssd_offload": {**_MC_SSD, "eviction_ratio": 0.2},
+            "ssd_offload": {**_MC_SSD, "offload_threshold": 0.2},
         },
     )
     assert storage["hard_pin"] is False
@@ -195,7 +195,7 @@ def test_mooncake_ssd_offload_makes_units_evictable(monkeypatch) -> None:
     extra = mooncake_bootstrap.subprocess.extra_args
     assert "--offload_on_evict=true" in extra
     assert "--offload_force_evict=false" in extra
-    assert "--eviction_ratio=0.2" in extra
+    assert "--eviction_high_watermark_ratio=0.2" in extra
     assert "--default_kv_lease_ttl=10000" in extra
 
 
@@ -231,9 +231,9 @@ def test_mooncake_ssd_offload_is_not_checkpointable() -> None:
         (
             {
                 "storage_unit_segment_size": 1,
-                "ssd_offload": {**_MC_SSD, "eviction_ratio": 0},
+                "ssd_offload": {**_MC_SSD, "offload_threshold": 0},
             },
-            "eviction_ratio",
+            "offload_threshold",
         ),
     ],
 )

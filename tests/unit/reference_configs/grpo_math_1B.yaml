@@ -629,8 +629,7 @@ data_plane:
     ssd_offload:
       enabled: false
       path: null                     # node-local SSD dir; required when enabled
-      eviction_high_watermark_ratio: 0.9  # start offloading above this share of memory
-      eviction_ratio: 0.1            # share of memory freed per eviction cycle
+      offload_threshold: 0.9         # offload above this share of unit memory
     use_gdr: false                   # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024      # HBM reserved per active GDR client;
                                      # 8 clients/node is ~8 GiB off the training
