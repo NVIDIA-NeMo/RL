@@ -1,0 +1,72 @@
+# =============================================================================
+# ppo_nano_v3_5_swe_sandbox_capture_priv.yaml + five more SWE servers, for training on a mix
+# of swe_rebench, swe_internal_v1, swemer_v1, swemer_v2, swemer_oml, scale_swe and swe_next
+# tasks (rows carry the agent they run under in `agent_ref`).
+#
+# Everything else (PPO, critic, agent prompt, masking, sandbox shape) is the parent recipe;
+# this file only wires the extra servers. Use it as the --config of the run in place of the
+# parent recipe.
+#
+# The new agents and servers take their settings from the swe_rebench blocks by
+# interpolation, so one place decides them and command-line overrides on the swe_rebench
+# blocks (agent timeout, OpenCode install paths, ...) reach every server. YAML anchors do
+# not cross files, hence the interpolation.
+#
+# What is shared with swe_rebench: the whole OpenCode agent block; the agent egress block
+# (enforce_agent_no_network + sandbox_model_server; needs the servers' egress patch, Gym
+# resources_servers/<server>/app.py); the sandbox memory.
+# What is NOT: evaluation_timeout (each server's own: swemer 1800 s, swemer_oml 3000 s, ...;
+# swe_rebench's 900 s is legacy parity for its own data) and legacy_container_setup (only
+# swe_rebench / swe_internal_v1 implement it; the swemer servers mirror Maven/Gradle
+# themselves). apply_anti_cheating stays at each server's default (true).
+# =============================================================================
+defaults: ppo_nano_v3_5_swe_sandbox_capture_priv.yaml
+env:
+  nemo_gym:
+    # Lists are replaced, not merged: the parent's list plus the five new servers.
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/swe_rebench/configs/swe_rebench_opencode.yaml
+    - resources_servers/swe_internal_v1/configs/swe_internal_v1_opencode.yaml
+    - resources_servers/swemer_v1/configs/swemer_v1_opencode.yaml
+    - resources_servers/swemer_v2/configs/swemer_v2_opencode.yaml
+    - resources_servers/swemer_oml/configs/swemer_oml_opencode.yaml
+    - resources_servers/scale_swe/configs/scale_swe_opencode.yaml
+    - resources_servers/swe_next/configs/swe_next_opencode.yaml
+    - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+    swemer_v1_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent: ${env.nemo_gym.swe_rebench_opencode_sandboxed_agent.responses_api_agents.opencode_sandboxed_agent}
+    swemer_v2_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent: ${env.nemo_gym.swe_rebench_opencode_sandboxed_agent.responses_api_agents.opencode_sandboxed_agent}
+    swemer_oml_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent: ${env.nemo_gym.swe_rebench_opencode_sandboxed_agent.responses_api_agents.opencode_sandboxed_agent}
+    scale_swe_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent: ${env.nemo_gym.swe_rebench_opencode_sandboxed_agent.responses_api_agents.opencode_sandboxed_agent}
+    swe_next_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent: ${env.nemo_gym.swe_rebench_opencode_sandboxed_agent.responses_api_agents.opencode_sandboxed_agent}
+    swemer_v1_resources_server:
+      resources_servers:
+        swemer_v1: &allswe_resources
+          # Agent sandbox egress allowlist = the policy model server only (see the parent recipe).
+          enforce_agent_no_network: ${env.nemo_gym.swe_rebench_resources_server.resources_servers.swe_rebench.enforce_agent_no_network}
+          sandbox_model_server: ${env.nemo_gym.swe_rebench_resources_server.resources_servers.swe_rebench.sandbox_model_server}
+          sandbox_config:
+            resources:
+              memory_mib: ${env.nemo_gym.swe_rebench_resources_server.resources_servers.swe_rebench.sandbox_config.resources.memory_mib}
+    swemer_v2_resources_server:
+      resources_servers:
+        swemer_v2: *allswe_resources
+    swemer_oml_resources_server:
+      resources_servers:
+        swemer_oml: *allswe_resources
+    scale_swe_resources_server:
+      resources_servers:
+        scale_swe: *allswe_resources
+    swe_next_resources_server:
+      resources_servers:
+        swe_next: *allswe_resources
