@@ -133,3 +133,16 @@ def test_save_dataloader_state_uses_shared_path_for_local_and_msc(tmp_path, mana
 def test_enable_msc_for_only_enables_for_msc_urls(tmp_path, manager):
     assert enable_msc_for(None, str(tmp_path), "") is None
     assert enable_msc_for(str(tmp_path), str(manager.checkpoint_dir)) is not None
+
+
+def test_interrupted_step_can_be_saved_again_after_resume(manager):
+    first = manager.init_tmp_checkpoint(1, {"step": 1})
+    stale = first + "/policy/weights/shard.bin"
+    with enable_msc().open(stale, "w") as f:
+        f.write("partial write from a preempted run")
+    # No _SUCCESS was published, so a resumed run may re-save the same step.
+    again = manager.init_tmp_checkpoint(1, {"step": 1})
+    assert again == first
+    assert not enable_msc().os.path.exists(stale)
+    manager.finalize_checkpoint(again)
+    assert manager.get_latest_checkpoint_path() == again
