@@ -338,6 +338,32 @@ rm -rf /var/lib/apt/lists/*
 # The ray install will include the older aiohttp version in its cache
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 
+# Remove setuptools < 80.10.2 from the uv cache. Megatron-Bridge's [build-system] requires
+# setuptools<80, and [tool.uv] override-dependencies does not apply to isolated build
+# environments, so its build caches setuptools 79.x. That release vendors wheel 0.45.1 and
+# jaraco.context 5.3.0 (flagged CVEs); 80.10.2+ vendors wheel 0.46.3 and jaraco.context 6.1.0.
+# No venv uses the old copy (every venv resolves setuptools from uv.lock), so it is only
+# cache residue. The wheels-v6 index entries are removed too so uv has no dangling pointer
+# and simply re-downloads if it ever needs that version.
+prune_stale_setuptools_cache() {
+    local cache="$1" min=80.10.2 path ver
+    for path in "${cache}"/archive-v0/*/setuptools-*.dist-info; do
+        [[ -d "${path}" ]] || continue
+        ver="${path##*/setuptools-}"; ver="${ver%.dist-info}"
+        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
+            rm -rf "${path%/*}"
+        fi
+    done
+    for path in "${cache}"/wheels-v6/pypi/setuptools/*-py3-none-any*; do
+        [[ -e "${path}" || -L "${path}" ]] || continue
+        ver="${path##*/}"; ver="${ver%%-py3-none-any*}"
+        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
+            rm -rf "${path}"
+        fi
+    done
+}
+prune_stale_setuptools_cache /root/.cache/uv
+
 echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
 EOF
 
@@ -448,6 +474,26 @@ rm -rf /tmp/trtllm-build-venv
 # The syncs above can repopulate the shared uv cache, so repeat the security
 # cleanup performed in the preceding dependency layer.
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+
+# Same for stale setuptools (see the comment in the preceding dependency layer).
+prune_stale_setuptools_cache() {
+    local cache="$1" min=80.10.2 path ver
+    for path in "${cache}"/archive-v0/*/setuptools-*.dist-info; do
+        [[ -d "${path}" ]] || continue
+        ver="${path##*/setuptools-}"; ver="${ver%.dist-info}"
+        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
+            rm -rf "${path%/*}"
+        fi
+    done
+    for path in "${cache}"/wheels-v6/pypi/setuptools/*-py3-none-any*; do
+        [[ -e "${path}" || -L "${path}" ]] || continue
+        ver="${path##*/}"; ver="${ver%%-py3-none-any*}"
+        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
+            rm -rf "${path}"
+        fi
+    done
+}
+prune_stale_setuptools_cache /root/.cache/uv
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
