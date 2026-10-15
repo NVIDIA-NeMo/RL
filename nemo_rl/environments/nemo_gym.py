@@ -22,7 +22,8 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
-from dataclasses import dataclass, field
+from contextlib import AsyncExitStack
+from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from time import monotonic, sleep
@@ -30,6 +31,7 @@ from typing import (
     Any,
     Dict,
     List,
+    Literal,
     NoReturn,
     NotRequired,
     Optional,
@@ -346,7 +348,7 @@ def _typed_gym_failure(error: Exception) -> Optional[Exception]:
 # absolute cap. A cut rollout comes back as a masked, zero-reward placeholder.
 
 # Marks a placeholder result's ``full_result`` for a rollout the cutoff cancelled.
-STRAGGLER_CUT_KEY = "_ng_straggler_cut"
+STRAGGLER_CUT_KEY = "_nrl_straggler_cut"
 
 _STRAGGLER_CUTOFF_KEYS = frozenset(
     {"enabled", "done_fraction", "grace_s", "min_elapsed_s", "max_wall_s"}
@@ -361,6 +363,17 @@ class StragglerCutoffConfig:
     grace_s: float = 300.0
     min_elapsed_s: float = 0.0
     max_wall_s: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class StragglerCutoffEvent:
+    """Trainer deadline observed for a batch, distinct from a Gym rollout failure."""
+
+    deadline: Literal["done_fraction_grace", "max_wall_s"]
+    deadline_s: float
+    elapsed_s: float
+    armed_at_s: Optional[float]
+    config: StragglerCutoffConfig
 
 
 def _finite_straggler_cutoff_value(key: str, value: Any) -> float:
@@ -505,7 +518,7 @@ def _raise_typed_gym_failure(error: Exception) -> NoReturn:
 
 async def _iter_gym_results(
     completions: Any, timer: Timer, timer_prefix: str
-) -> AsyncGenerator[tuple[dict, Optional[dict], bool], None]:
+) -> AsyncGenerator[tuple[dict, Optional[dict], Optional[StragglerCutoffEvent]], None]:
     """Await Gym's completion-ordered awaitables one by one; nothing is ever cut."""
     for task in completions:
         with timer.time(label=f"{timer_prefix}/await_results"):
@@ -513,7 +526,7 @@ async def _iter_gym_results(
                 row, result = await task
             except Exception as error:
                 _raise_typed_gym_failure(error)
-        yield row, result, False
+        yield row, result, None
 
 
 async def _iter_gym_results_with_straggler_cutoff(
@@ -523,8 +536,8 @@ async def _iter_gym_results_with_straggler_cutoff(
     timer: Timer,
     timer_prefix: str,
     stats: dict[str, float],
-) -> AsyncGenerator[tuple[dict, Optional[dict], bool], None]:
-    """Yield ``(row, result, was_cut)`` as rollouts finish; cancel the tail when the cutoff fires.
+) -> AsyncGenerator[tuple[dict, Optional[dict], Optional[StragglerCutoffEvent]], None]:
+    """Yield ``(row, result, cutoff_event)``; the event is None for completed rollouts.
 
     ``completions`` is what Gym's ``run_examples`` returned and must have ``aclose()``.
     Cut rows are yielded after every finished one, in input order, with ``result=None``.
@@ -562,7 +575,7 @@ async def _iter_gym_results_with_straggler_cutoff(
                 except Exception as error:
                     _raise_typed_gym_failure(error)
                 finished_ids.add(row["_rowidx"])
-                yield row, result, False
+                yield row, result, None
                 if len(finished_ids) == total:
                     break
 
@@ -589,7 +602,7 @@ async def _iter_gym_results_with_straggler_cutoff(
 
             if next_completion is not None:
                 next_completion.cancel()
-            # Cancels every rollout still running, which closes its /run request.
+            # Wait for the actor's client tasks, not server-side agent cleanup.
             await completions.aclose()
             if next_completion is not None:
                 await asyncio.gather(next_completion, return_exceptions=True)
@@ -604,12 +617,34 @@ async def _iter_gym_results_with_straggler_cutoff(
                 f"{total} rollouts after {elapsed_s:.0f}s",
                 flush=True,
             )
+            if reason == "max_wall":
+                assert cutoff.max_wall_s is not None
+                deadline: Literal["done_fraction_grace", "max_wall_s"] = "max_wall_s"
+                deadline_s = cutoff.max_wall_s
+            else:
+                assert armed_at_s is not None
+                deadline = "done_fraction_grace"
+                deadline_s = armed_at_s + cutoff.grace_s
+            cutoff_event = StragglerCutoffEvent(
+                deadline=deadline,
+                deadline_s=deadline_s,
+                elapsed_s=elapsed_s,
+                armed_at_s=armed_at_s,
+                config=cutoff,
+            )
             for row in cut_rows:
-                yield row, None, True
+                yield row, None, cutoff_event
             return
     finally:
         if next_completion is not None:
             next_completion.cancel()
+        try:
+            # Gym's close is idempotent, including after a cutoff. Also close on
+            # normal exhaustion, failures, consumer closure and task cancellation.
+            await completions.aclose()
+        finally:
+            if next_completion is not None:
+                await asyncio.gather(next_completion, return_exceptions=True)
 
 
 def _text_only_messages(input_messages: Any) -> list[dict[str, str]]:
@@ -632,7 +667,9 @@ def _text_only_messages(input_messages: Any) -> list[dict[str, str]]:
     return messages
 
 
-def _straggler_cut_placeholder(row: dict, tokenizer: PreTrainedTokenizerBase) -> dict:
+def _straggler_cut_placeholder(
+    row: dict, tokenizer: PreTrainedTokenizerBase, cutoff_event: StragglerCutoffEvent
+) -> dict:
     """A masked, zero-reward result standing in for a rollout the cutoff cancelled.
 
     The prompt is the row's input rendered as text (media dropped, so no image
@@ -685,6 +722,13 @@ def _straggler_cut_placeholder(row: dict, tokenizer: PreTrainedTokenizerBase) ->
         "full_result": {
             "reward": 0.0,
             STRAGGLER_CUT_KEY: True,
+            "failure_kind": "trainer_cutoff",
+            "failure_reason": (
+                f"Trainer straggler cutoff: {cutoff_event.deadline} deadline "
+                f"{cutoff_event.deadline_s:.3f}s reached after "
+                f"{cutoff_event.elapsed_s:.3f}s"
+            ),
+            "_nrl_straggler_cutoff": asdict(cutoff_event),
             "responses_create_params": responses_create_params,
             "response": {"output": []},
         },
@@ -1440,110 +1484,119 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
         )
-        # Gym resolves task_source to agent_ref synchronously in run_examples().
-        # Build the counter afterward so completion rows use the resolved identity.
-        _require_resolved_agent_refs(nemo_gym_examples)
-        counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
+        async with AsyncExitStack() as cleanup:
+            # Register ownership immediately: validation and postprocessing can
+            # fail too. Older Gym iterators have no close operation.
+            if hasattr(nemo_gym_result_iterator, "aclose"):
+                cleanup.push_async_callback(nemo_gym_result_iterator.aclose)
+            # Gym resolves task_source to agent_ref synchronously in run_examples().
+            # Build the counter afterward so completion rows use the resolved identity.
+            _require_resolved_agent_refs(nemo_gym_examples)
+            counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
-        cutoff = self._straggler_cutoff if allow_straggler_cutoff else None
-        if cutoff is not None and self._token_capture_enabled:
-            # Receipt mode returns token-free receipts that the finalizer rebuilds
-            # from the capture ledger; a cancelled rollout has no receipt, so a
-            # placeholder row has no place in that pipeline.
-            self._warn_straggler_cutoff_unavailable(
-                "token capture (receipt mode) is on and a cancelled rollout has "
-                "no receipt"
-            )
-            cutoff = None
-        if cutoff is not None and not hasattr(nemo_gym_result_iterator, "aclose"):
-            # Gym releases whose run_examples cannot cancel in-flight rollouts
-            # (the pinned 17abf2dd returns a plain map; Gym#4029 adds aclose()).
-            self._warn_straggler_cutoff_unavailable(
-                "this NeMo-Gym's run_examples cannot cancel in-flight rollouts "
-                "(no aclose())"
-            )
-            cutoff = None
-        cutoff_stats: dict[str, float] = {}
-        if cutoff is not None:
-            result_stream = _iter_gym_results_with_straggler_cutoff(
-                nemo_gym_result_iterator,
-                nemo_gym_examples,
-                cutoff,
-                timer,
-                timer_prefix,
-                cutoff_stats,
-            )
-        else:
-            result_stream = _iter_gym_results(
-                nemo_gym_result_iterator, timer, timer_prefix
-            )
+            cutoff = self._straggler_cutoff if allow_straggler_cutoff else None
+            if cutoff is not None and self._token_capture_enabled:
+                # Receipt mode returns token-free receipts that the finalizer rebuilds
+                # from the capture ledger; a cancelled rollout has no receipt, so a
+                # placeholder row has no place in that pipeline.
+                self._warn_straggler_cutoff_unavailable(
+                    "token capture (receipt mode) is on and a cancelled rollout has "
+                    "no receipt"
+                )
+                cutoff = None
+            if cutoff is not None and not hasattr(nemo_gym_result_iterator, "aclose"):
+                # Gym releases whose run_examples cannot cancel in-flight rollouts
+                # (the pinned 17abf2dd returns a plain map; Gym#4029 adds aclose()).
+                self._warn_straggler_cutoff_unavailable(
+                    "this NeMo-Gym's run_examples cannot cancel in-flight rollouts "
+                    "(no aclose())"
+                )
+                cutoff = None
+            cutoff_stats: dict[str, float] = {}
+            if cutoff is not None:
+                result_stream = _iter_gym_results_with_straggler_cutoff(
+                    nemo_gym_result_iterator,
+                    nemo_gym_examples,
+                    cutoff,
+                    timer,
+                    timer_prefix,
+                    cutoff_stats,
+                )
+            else:
+                result_stream = _iter_gym_results(
+                    nemo_gym_result_iterator, timer, timer_prefix
+                )
 
-        num_results = 0
-        async for nemo_gym_row, nemo_gym_result, was_cut in result_stream:
-            with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                if was_cut:
-                    nemo_rl_result = _straggler_cut_placeholder(nemo_gym_row, tokenizer)
-                else:
-                    # Only a cut row carries no result; a finished rollout always
-                    # resolves to Gym's ``(row, result)`` pair.
-                    assert nemo_gym_result is not None, (
-                        "NeMo-Gym returned no result for a finished rollout"
-                    )
-                    if self._token_capture_enabled:
-                        # Receipt mode: fetch the ledger manifest and assemble the
-                        # receipt locally; token-free result. The canonical row is
-                        # rebuilt by the finalizer, so no message_log walk (and no
-                        # NaN check) applies here.
-                        nemo_rl_result = await self._postprocess_receipt_mode(
-                            nemo_gym_row, nemo_gym_result
+            cleanup.push_async_callback(result_stream.aclose)
+
+            num_results = 0
+            async for nemo_gym_row, nemo_gym_result, cutoff_event in result_stream:
+                with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                    if cutoff_event is not None:
+                        nemo_rl_result = _straggler_cut_placeholder(
+                            nemo_gym_row, tokenizer, cutoff_event
                         )
                     else:
-                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                            nemo_gym_row,
-                            nemo_gym_result,
-                            tokenizer,
-                            include_initial_multimodal_data=not deduplicate_multimodal_data,
+                        # Only a cut row carries no result; a finished rollout always
+                        # resolves to Gym's ``(row, result)`` pair.
+                        assert nemo_gym_result is not None, (
+                            "NeMo-Gym returned no result for a finished rollout"
                         )
-                        if _has_nan_generation_logprobs(nemo_rl_result):
-                            raise RuntimeError("Generation logprobs contain NaN")
-            num_results += 1
-            timing_metrics = None
-            if num_results == len(nemo_gym_examples):
-                timer.stop("_run_rollouts_total")
-                timing_metrics = timer.get_timing_metrics("sum")
-                total_time = timing_metrics.pop("_run_rollouts_total")
-                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-                    100
-                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
-                    / total_time
-                )
-                timing_metrics.update(cutoff_stats)
+                        if self._token_capture_enabled:
+                            # Receipt mode: fetch the ledger manifest and assemble the
+                            # receipt locally; token-free result. The canonical row is
+                            # rebuilt by the finalizer, so no message_log walk (and no
+                            # NaN check) applies here.
+                            nemo_rl_result = await self._postprocess_receipt_mode(
+                                nemo_gym_row, nemo_gym_result
+                            )
+                        else:
+                            nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                                nemo_gym_row,
+                                nemo_gym_result,
+                                tokenizer,
+                                include_initial_multimodal_data=not deduplicate_multimodal_data,
+                            )
+                            if _has_nan_generation_logprobs(nemo_rl_result):
+                                raise RuntimeError("Generation logprobs contain NaN")
+                num_results += 1
+                timing_metrics = None
+                if num_results == len(nemo_gym_examples):
+                    timer.stop("_run_rollouts_total")
+                    timing_metrics = timer.get_timing_metrics("sum")
+                    total_time = timing_metrics.pop("_run_rollouts_total")
+                    timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+                        100
+                        * timing_metrics[f"{timer_prefix}/postprocess_results"]
+                        / total_time
+                    )
+                    timing_metrics.update(cutoff_stats)
 
-            agent_name = nemo_gym_row["agent_ref"]["name"]
-            counts_left[agent_name] -= 1
-            if counts_left[agent_name] <= 0:
-                counts_left.pop(agent_name)
-            if num_results % 10 == 0 and counts_left:
-                top_left = counts_left.most_common(5)
-                top_left_str = "\n".join(
-                    f"{index + 1}. {name}: {count}"
-                    for index, (name, count) in enumerate(top_left)
-                )
-                print(
-                    "Top 5 NeMo Gym agent refs left in this rollout batch: "
-                    f"{top_left_str}",
-                    file=sys.stderr,
-                )
+                agent_name = nemo_gym_row["agent_ref"]["name"]
+                counts_left[agent_name] -= 1
+                if counts_left[agent_name] <= 0:
+                    counts_left.pop(agent_name)
+                if num_results % 10 == 0 and counts_left:
+                    top_left = counts_left.most_common(5)
+                    top_left_str = "\n".join(
+                        f"{index + 1}. {name}: {count}"
+                        for index, (name, count) in enumerate(top_left)
+                    )
+                    print(
+                        "Top 5 NeMo Gym agent refs left in this rollout batch: "
+                        f"{top_left_str}",
+                        file=sys.stderr,
+                    )
 
-            # task_source is resolved to agent_ref inside this Ray actor, after
-            # the caller's row was serialized. Return the resolved ref explicitly
-            # so the caller can hydrate its own row copy before postprocessing.
-            yield (
-                nemo_gym_row["_rowidx"],
-                nemo_gym_row["agent_ref"],
-                nemo_rl_result,
-                timing_metrics,
-            )
+                # task_source is resolved to agent_ref inside this Ray actor, after
+                # the caller's row was serialized. Return the resolved ref explicitly
+                # so the caller can hydrate its own row copy before postprocessing.
+                yield (
+                    nemo_gym_row["_rowidx"],
+                    nemo_gym_row["agent_ref"],
+                    nemo_rl_result,
+                    timing_metrics,
+                )
 
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict

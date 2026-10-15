@@ -256,3 +256,55 @@ def test_the_cutoff_cancels_gyms_in_flight_rollouts(scenario, fake_run_transport
         assert stats["straggler_cutoff/cut_at_s"] >= (
             stats["straggler_cutoff/armed_at_s"] + scenario.cutoff.grace_s
         )
+
+
+@pytest.mark.parametrize("max_resident_tasks", [None, 2])
+@pytest.mark.parametrize("exit_path", ["early_close", "cancellation"])
+def test_non_cutoff_exit_closes_real_gym_tasks(
+    max_resident_tasks, exit_path, fake_run_transport
+):
+    servers = _FakeRunServers({0: 0.01, 1: None, 2: None, 3: None})
+    rows = _rows(4)
+    kwargs = {}
+    if max_resident_tasks is not None:
+        if (
+            "max_resident_tasks"
+            not in inspect.signature(RolloutCollectionHelper.run_examples).parameters
+        ):
+            pytest.skip("this NeMo Gym's run_examples has no max_resident_tasks")
+        kwargs["max_resident_tasks"] = max_resident_tasks
+
+    async def collect():
+        completions = _helper(servers).run_examples(rows, **kwargs)
+        _skip_unless_cancellable(completions)
+        stats: dict[str, float] = {}
+        stream = _iter_gym_results_with_straggler_cutoff(
+            completions, rows, StragglerCutoffConfig(), Timer(), "timing/interop", stats
+        )
+        try:
+            row, _, event = await anext(stream)
+            assert row["_rowidx"] == 0
+            assert event is None
+            if exit_path == "cancellation":
+                pending = asyncio.create_task(anext(stream))
+                await asyncio.sleep(0)
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            else:
+                await stream.aclose()
+            # Check before event-loop shutdown, which would cancel leaked tasks.
+            assert asyncio.all_tasks() == {asyncio.current_task()}
+            assert set(servers.cancelled) == set(servers.started) - {0}
+            assert stats["straggler_cutoff/num_cut"] == 0
+            with pytest.raises(StopIteration):
+                next(completions)
+            started_at_close = list(servers.started)
+            await asyncio.sleep(LATE_WRITE_WATCH_S)
+            assert servers.started == started_at_close
+            assert servers.finished == [0]
+        finally:
+            await stream.aclose()
+            await completions.aclose()
+
+    asyncio.run(collect())

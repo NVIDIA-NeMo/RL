@@ -27,6 +27,7 @@ from nemo_rl.environments.nemo_gym import (
     STRAGGLER_CUT_KEY,
     NemoGym,
     StragglerCutoffConfig,
+    StragglerCutoffEvent,
     _build_gym_actor_config,
     _iter_gym_results_with_straggler_cutoff,
     _parse_straggler_cutoff,
@@ -241,7 +242,7 @@ async def _collect(rows, delays, cutoff):
     completions = _FakeCompletions(rows, delays)
     stats: dict[str, float] = {}
     out = [
-        (row["_rowidx"], result, was_cut)
+        (row["_rowidx"], result, bool(was_cut))
         async for row, result, was_cut in _iter_gym_results_with_straggler_cutoff(
             completions, rows, cutoff, Timer(), "timing/test", stats
         )
@@ -281,7 +282,7 @@ def test_no_cut_when_everything_finishes():
 
     assert sorted(idx for idx, _, _ in out) == [0, 1, 2]
     assert not any(was_cut for _, _, was_cut in out)
-    assert not completions.closed
+    assert completions.closed
     assert stats["straggler_cutoff/num_cut"] == 0.0
 
 
@@ -315,11 +316,64 @@ def test_a_failed_rollout_still_raises_typed():
 
     rows = _rows(2)
     cutoff = StragglerCutoffConfig(done_fraction=0.5, grace_s=5.0)
-    with pytest.raises(GymTransportError, match="HTTP 503"):
-        asyncio.run(_collect(rows, {0: _HttpError("down"), 1: None}, cutoff))
+
+    async def collect():
+        completions = _FakeCompletions(rows, {0: _HttpError("down"), 1: None})
+        try:
+            with pytest.raises(GymTransportError, match="HTTP 503"):
+                async for _ in _iter_gym_results_with_straggler_cutoff(
+                    completions, rows, cutoff, Timer(), "timing/test", {}
+                ):
+                    pytest.fail("a transport failure must not become a cut row")
+            # Assert before asyncio.run's shutdown can hide leaked tasks.
+            assert completions.closed
+            assert completions.cancelled == [1]
+            assert all(task.done() for task in completions._tasks)
+        finally:
+            await completions.aclose()
+
+    asyncio.run(collect())
+
+
+@pytest.mark.parametrize("exit_path", ["early_close", "cancellation"])
+def test_cutoff_iterator_closes_on_non_cutoff_exit(exit_path):
+    async def collect():
+        rows = _rows(2)
+        completions = _FakeCompletions(rows, {0: 0.0, 1: None})
+        stream = _iter_gym_results_with_straggler_cutoff(
+            completions, rows, StragglerCutoffConfig(), Timer(), "timing/test", {}
+        )
+        try:
+            await anext(stream)
+            if exit_path == "cancellation":
+                pending = asyncio.create_task(anext(stream))
+                await asyncio.sleep(0)
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            else:
+                await stream.aclose()
+            assert completions.closed
+            assert completions.cancelled == [1]
+            assert all(task.done() for task in completions._tasks)
+            assert asyncio.all_tasks() == {asyncio.current_task()}
+        finally:
+            await stream.aclose()
+            await completions.aclose()
+
+    asyncio.run(collect())
 
 
 # ── placeholder ───────────────────────────────────────────────────────────
+
+
+PLACEHOLDER_EVENT = StragglerCutoffEvent(
+    deadline="max_wall_s",
+    deadline_s=1.0,
+    elapsed_s=1.1,
+    armed_at_s=None,
+    config=StragglerCutoffConfig(max_wall_s=1.0),
+)
 
 
 class _FakeTokenizer:
@@ -357,7 +411,7 @@ def test_placeholder_is_a_text_only_one_token_sample():
         }
     }
     tokenizer = _FakeTokenizer()
-    result = _straggler_cut_placeholder(row, tokenizer)
+    result = _straggler_cut_placeholder(row, tokenizer, PLACEHOLDER_EVENT)
 
     assert tokenizer.templated == [
         [{"role": "system", "content": "sys"}, {"role": "user", "content": "fix it"}]
@@ -373,10 +427,12 @@ def test_placeholder_is_a_text_only_one_token_sample():
 
 def test_placeholder_falls_back_to_plain_text_and_never_empty():
     row = {"responses_create_params": {"input": "hi"}}
-    result = _straggler_cut_placeholder(row, _FakeTokenizer(template_fails=True))
+    result = _straggler_cut_placeholder(
+        row, _FakeTokenizer(template_fails=True), PLACEHOLDER_EVENT
+    )
     assert result["message_log"][0]["token_ids"].tolist() == [ord("h"), ord("i")]
 
-    empty = _straggler_cut_placeholder({}, _FakeTokenizer())
+    empty = _straggler_cut_placeholder({}, _FakeTokenizer(), PLACEHOLDER_EVENT)
     assert empty["message_log"][0]["token_ids"].tolist() == [2]
 
 
@@ -429,6 +485,106 @@ def _run(env, rows, allow):
 
 
 ENABLED = {"enabled": True, "done_fraction": 0.5, "grace_s": 0.05}
+
+
+@pytest.mark.parametrize("allow", [False, True])
+@pytest.mark.parametrize(
+    "exit_path", ["early_close", "postprocess_error", "cancellation"]
+)
+def test_actor_closes_completions_on_every_exit(allow, exit_path):
+    async def collect():
+        helper = _FakeRolloutHelper({0: 0.0, 1: None})
+        env = _actor(ENABLED, helper)
+        if exit_path == "postprocess_error":
+
+            def fail(*args, **kwargs):
+                raise ValueError("bad response")
+
+            env._postprocess_nemo_gym_to_nemo_rl_result = fail
+        stream = env.run_rollouts(_rows(2), "timing/test", allow_straggler_cutoff=allow)
+        try:
+            if exit_path == "postprocess_error":
+                with pytest.raises(ValueError, match="bad response"):
+                    await anext(stream)
+            else:
+                await anext(stream)
+                if exit_path == "cancellation":
+                    pending = asyncio.create_task(anext(stream))
+                    await asyncio.sleep(0)
+                    pending.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await pending
+                else:
+                    await stream.aclose()
+            assert helper.completions.closed
+            assert helper.completions.cancelled == [1]
+            assert all(task.done() for task in helper.completions._tasks)
+            assert asyncio.all_tasks() == {asyncio.current_task()}
+        finally:
+            await stream.aclose()
+            await helper.completions.aclose()
+
+    asyncio.run(collect())
+
+
+@pytest.mark.parametrize("deadline", ["done_fraction_grace", "max_wall_s"])
+def test_cut_rows_record_trainer_deadline_separately_from_failures(deadline):
+    cutoff = dict(ENABLED)
+    if deadline == "max_wall_s":
+        cutoff.update(done_fraction=1.0, max_wall_s=0.02)
+    helper = _FakeRolloutHelper({0: 0.0, 1: None})
+    streamed = _run(_actor(cutoff, helper), _rows(2), allow=True)
+    finished = streamed[0][2]["full_result"]
+    cut = streamed[1][2]["full_result"]
+    assert "failure_kind" not in finished
+    assert cut["_nrl_straggler_cut"] is True
+    assert not any(key.startswith("_ng_") for key in cut)
+    assert cut["failure_kind"] == "trainer_cutoff"
+    event = cut["_nrl_straggler_cutoff"]
+    assert event["deadline"] == deadline
+    assert event["elapsed_s"] == streamed[-1][3]["straggler_cutoff/cut_at_s"]
+    assert event["elapsed_s"] >= event["deadline_s"]
+    assert deadline in cut["failure_reason"]
+    if deadline == "max_wall_s":
+        assert event["deadline_s"] == cutoff["max_wall_s"]
+        assert event["armed_at_s"] is None
+    else:
+        assert event["deadline_s"] == event["armed_at_s"] + cutoff["grace_s"]
+        assert event["config"]["done_fraction"] == cutoff["done_fraction"]
+        assert event["config"]["grace_s"] == cutoff["grace_s"]
+
+
+def test_actor_closes_completions_when_resolved_identity_is_invalid():
+    async def collect():
+        helper = _FakeRolloutHelper({0: None})
+        env = _actor(ENABLED, helper)
+        stream = env.run_rollouts(
+            [{"_rowidx": 0}], "timing/test", allow_straggler_cutoff=True
+        )
+        try:
+            with pytest.raises(RuntimeError, match="agent_ref"):
+                await anext(stream)
+            assert helper.completions.closed
+            assert all(task.done() for task in helper.completions._tasks)
+        finally:
+            await stream.aclose()
+            await helper.completions.aclose()
+
+    asyncio.run(collect())
+
+
+@pytest.mark.parametrize("kind", ["cancelled", "agent_timeout", "verifier_error"])
+def test_genuine_gym_failure_kind_is_preserved(kind):
+    helper = _FakeRolloutHelper({0: 0.0, 1: None})
+    env = _actor(ENABLED, helper)
+
+    def postprocess(row, result, *args, **kwargs):
+        return {"message_log": [], "full_result": {"reward": 0.0, "failure_kind": kind}}
+
+    env._postprocess_nemo_gym_to_nemo_rl_result = postprocess
+    streamed = _run(env, _rows(2), allow=True)
+    assert streamed[0][2]["full_result"] == {"reward": 0.0, "failure_kind": kind}
+    assert streamed[1][2]["full_result"]["failure_kind"] == "trainer_cutoff"
 
 
 def test_run_rollouts_cuts_and_reports_on_the_last_row():
@@ -610,7 +766,9 @@ def test_driver_gives_cut_rows_no_media_back(monkeypatch):
         def remote(self, rows, timer_prefix, deduplicate_multimodal_data, **kwargs):
             assert deduplicate_multimodal_data is True
             assert kwargs == {"allow_straggler_cutoff": True}
-            cut = _straggler_cut_placeholder(rows[1], _FakeTokenizer())
+            cut = _straggler_cut_placeholder(
+                rows[1], _FakeTokenizer(), PLACEHOLDER_EVENT
+            )
             return _AsyncOnlyStream(
                 [
                     _ReadyRef((0, {"name": "agent"}, _finished_result(0), None)),
@@ -693,7 +851,7 @@ def _finished(reward: float) -> dict:
 def test_cut_rows_never_train_and_stay_out_of_agent_metrics(mask_env_flagged_samples):
     results = [
         _finished(1.0),
-        _straggler_cut_placeholder({}, _FakeTokenizer()),
+        _straggler_cut_placeholder({}, _FakeTokenizer(), PLACEHOLDER_EVENT),
         _finished(0.0),
     ]
     rollout_result = _postprocess_single_nemo_gym_group(
@@ -722,7 +880,7 @@ def test_cut_rows_never_train_and_stay_out_of_agent_metrics(mask_env_flagged_sam
 def test_cut_rows_take_no_part_in_reward_penalties():
     results = [
         _finished(1.0),
-        _straggler_cut_placeholder({}, _FakeTokenizer()),
+        _straggler_cut_placeholder({}, _FakeTokenizer(), PLACEHOLDER_EVENT),
         _finished(0.0),
     ]
     rollout_result = _postprocess_single_nemo_gym_group(
