@@ -168,6 +168,10 @@ async_rl:
 env:
   should_log_nemo_gym_responses: true
   nemo_gym:
+    # Model loading and first-use kernel initialization can exceed Gym's 600 s
+    # endpoint-readiness default. Keep cold starts alive without changing any
+    # rollout, reward, optimizer, or loss behavior.
+    model_endpoint_readiness_timeout_seconds: 1800
     pad_dynamic_image_shapes: true
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml

@@ -159,6 +159,10 @@ env:
   should_log_nemo_gym_responses: true
   should_mask_flagged_samples: true
   nemo_gym:
+    # A cold B200 FlashInfer/vLLM initialization took 724 s in the Nano
+    # diagnostic. Gym's 600 s default killed otherwise healthy servers before
+    # the endpoint opened; 1800 s gives cold starts safe diagnostic headroom.
+    model_endpoint_readiness_timeout_seconds: 1800
     policy_max_input_tokens: ${policy.max_total_sequence_length}
     skip_venv_if_present: true
     pad_dynamic_image_shapes: true

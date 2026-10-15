@@ -115,6 +115,7 @@ def test_nano_sync2_recipe_preserves_agentic_subagent_gate_contract() -> None:
     assert cfg["env"]["nemo_gym"]["config_paths"][-1].endswith(
         "agentic_vbench_train.yaml"
     )
+    assert cfg["env"]["nemo_gym"]["model_endpoint_readiness_timeout_seconds"] == 1800
     assert cfg["logger"]["wandb"]["project"] == ("nemorl-v2-subagent-comapction-debug")
 
 
@@ -130,6 +131,10 @@ def test_nano_and_super_agentic_recipes_resolve_to_nemogym_jsonl() -> None:
         for recipe in (RECIPE, SUPER_RECIPE):
             cfg = OmegaConf.to_container(load_config(recipe), resolve=True)
             assert isinstance(cfg, dict)
+            assert (
+                cfg["env"]["nemo_gym"]["model_endpoint_readiness_timeout_seconds"]
+                == 1800
+            )
             default = cfg["data"]["default"]
             for split, expected_path in (
                 ("train", env["TRAIN_PATH"]),
