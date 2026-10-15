@@ -594,6 +594,10 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        # Resume loads from weights_path/optimizer_path during setup, before any
+        # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
+        if any(p and is_msc_path(p) for p in (weights_path, optimizer_path)):
+            enable_msc()
         self.is_refit_destination = is_refit_destination
         self.refit_payload_mode: RefitPayloadMode = "hf_export"
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
