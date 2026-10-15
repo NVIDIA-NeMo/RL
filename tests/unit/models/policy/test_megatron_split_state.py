@@ -1026,7 +1026,9 @@ class TestFinish:
         w.optimizer.step.return_value = (update_successful, 0.5, 0)
 
         with patch(f"{WORKER_MOD}.get_model_config", return_value=w.model.config):
-            w.finish_train_step()
+            result = w.finish_train_step()
+
+        assert result["optimizer_update_successful"] is update_successful
 
         if update_successful:
             w.enable_forward_pre_hook.assert_called_once_with()

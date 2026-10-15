@@ -69,6 +69,11 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
         metrics["grad_norm"] = grad_norm.detach().mean().item()
     elif grad_norm is not None:
         metrics["grad_norm"] = float(grad_norm)
+    optimizer_update_successful = train_result.get("optimizer_update_successful")
+    if optimizer_update_successful is not None:
+        metrics["optimizer_update_successful"] = float(
+            bool(optimizer_update_successful)
+        )
     draft_grad_norm = train_result.get("draft_grad_norm")
     if isinstance(draft_grad_norm, torch.Tensor):
         metrics["draft_grad_norm"] = draft_grad_norm.detach().mean().item()
@@ -118,6 +123,8 @@ def reduce_advantage_pump_metrics(
     sample_masks: list[torch.Tensor] | None = None,
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
     num_mask_sample_filtered: list[int] | None = None,
+    num_overlong_filtered: list[int] | None = None,
+    num_owner_fanout_filtered: list[int] | None = None,
     num_invalid_tool_calls: list[int] | None = None,
     num_malformed_thinking: list[int] | None = None,
     num_assistant_messages: list[int] | None = None,
@@ -138,6 +145,10 @@ def reduce_advantage_pump_metrics(
             counts, one record per streaming chunk.
         num_mask_sample_filtered: Environment-flagged sample counts, one per
             streaming chunk.
+        num_overlong_filtered: Rows removed by configured truncation/overlong
+            filtering, one count per streaming chunk.
+        num_owner_fanout_filtered: Physical session rows removed when final
+            logical-owner validity is fanned back to every owner segment.
         num_invalid_tool_calls: Per-sample invalid tool-call counts.
         num_malformed_thinking: Per-sample malformed-thinking counts.
         num_assistant_messages: Per-sample assistant message counts (rate denominator).
@@ -175,6 +186,12 @@ def reduce_advantage_pump_metrics(
         out["total_num_tokens"] = float(sum(sequence_lengths))
     if num_mask_sample_filtered is not None:
         out["num_mask_sample_filtered"] = float(sum(num_mask_sample_filtered))
+    if num_overlong_filtered is not None:
+        out["num_overlong_filtered"] = float(sum(num_overlong_filtered))
+    if num_owner_fanout_filtered is not None:
+        out["num_owner_fanout_filtered"] = float(
+            sum(num_owner_fanout_filtered)
+        )
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     n_asst = sum(num_assistant_messages or [])
@@ -224,6 +241,9 @@ def _reduce_seq_logprob_error_metrics(
         mean_key="mean_seq_mult_prob_error",
         min_key="min_seq_mult_prob_error",
     )
+    reduced["raw_tmpe_evaluated_seq_count"] = float(
+        sum(record["_num_valid_seqs_before"] for record in records)
+    )
     reduced.update(
         reduce_range(
             count_key="_num_valid_seqs_after",
@@ -231,6 +251,9 @@ def _reduce_seq_logprob_error_metrics(
             mean_key="mean_seq_mult_prob_error_after_mask",
             min_key="min_seq_mult_prob_error_after_mask",
         )
+    )
+    reduced["post_tmpe_mask_seq_count"] = float(
+        sum(record["_num_valid_seqs_after"] for record in records)
     )
 
     masked_count = sum(record["num_masked_seqs_by_logprob_error"] for record in records)

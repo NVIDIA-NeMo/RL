@@ -347,7 +347,27 @@ def test_post_admission_role_counts_exclude_an_owner_with_an_invalid_child():
 
     assert valid
     assert data["sample_mask"].tolist() == [1, 1, 0, 0, 1]
-    assert role_counts == [{"trace": 3, "parent": 2, "child": 1}]
+    assert role_counts == [
+        {"trace": 3, "parent": 2, "child": 1, "untagged": 0}
+    ]
+
+
+def test_post_admission_role_counts_include_an_entirely_untagged_chunk():
+    meta, data = _batch([("a", [(0.0, 2), (2.0, 1)])])
+    assert meta.tags is not None
+    for tag in meta.tags:
+        tag.pop("session_role", None)
+    ctrl = _controller(meta, data)
+    role_counts = []
+
+    _, valid = asyncio.run(
+        ctrl._advantage_stage(meta, role_count_accumulator=role_counts)
+    )
+
+    assert valid
+    assert role_counts == [
+        {"trace": 3, "parent": 0, "child": 0, "untagged": 3}
+    ]
 
 
 def test_all_invalid_owners_take_existing_no_training_path():

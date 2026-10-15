@@ -255,6 +255,46 @@ class TestTQPolicySplitFanout:
 
         assert out["draft_grad_norm"] == 0.25
 
+    @pytest.mark.parametrize("successful", [True, False])
+    def test_finish_surfaces_optimizer_update_success(self, successful):
+        p, _ = _make_tq_policy()
+        with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:
+            mock_ray.get.return_value = [
+                {
+                    "global_loss": 1.0,
+                    "grad_norm": 0.5,
+                    "optimizer_update_successful": successful,
+                    "all_mb_metrics": {"loss": [0.1]},
+                    "is_replica_leader": True,
+                }
+            ]
+            out = p.finish_train_step()
+
+        assert out["optimizer_update_successful"] is successful
+
+    def test_finish_ands_optimizer_update_success_across_replica_leaders(self):
+        p, _ = _make_tq_policy()
+        with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:
+            mock_ray.get.return_value = [
+                {
+                    "global_loss": 1.0,
+                    "grad_norm": 0.5,
+                    "optimizer_update_successful": True,
+                    "all_mb_metrics": {"loss": [0.1]},
+                    "is_replica_leader": True,
+                },
+                {
+                    "global_loss": 1.0,
+                    "grad_norm": 0.5,
+                    "optimizer_update_successful": False,
+                    "all_mb_metrics": {"loss": [0.1]},
+                    "is_replica_leader": True,
+                },
+            ]
+            out = p.finish_train_step()
+
+        assert out["optimizer_update_successful"] is False
+
     def test_finish_propagates_mtp_metrics(self):
         """Worker-reduced MTP metrics survive the TQPolicy aggregation layer."""
         p, _ = _make_tq_policy()

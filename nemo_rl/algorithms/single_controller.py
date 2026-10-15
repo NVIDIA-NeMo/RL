@@ -229,6 +229,9 @@ _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
 _POST_ADMISSION_TRACE_COUNT_METRIC = "session_traces/post_admission_trace_count"
 _POST_ADMISSION_PARENT_COUNT_METRIC = "session_traces/post_admission_parent_trace_count"
 _POST_ADMISSION_CHILD_COUNT_METRIC = "session_traces/post_admission_child_trace_count"
+_POST_ADMISSION_UNTAGGED_COUNT_METRIC = (
+    "session_traces/post_admission_untagged_trace_count"
+)
 
 
 @dataclass(frozen=True)
@@ -300,7 +303,7 @@ def _pooled_opd_metrics(
 
 def _post_admission_session_role_counts(
     meta: KVBatchMeta, admitted_sample_mask: torch.Tensor
-) -> Optional[dict[str, int]]:
+) -> dict[str, int]:
     """Count parent/child trace rows admitted to the learner step.
 
     ``admitted_sample_mask`` is the sample mask *after* final logical-owner
@@ -312,23 +315,26 @@ def _post_admission_session_role_counts(
     sums into ``global_valid_seqs``; it does not claim that a retained row has a
     nonzero advantage or gradient.
 
-    This helper is deliberately telemetry-only and fail-open. Session metadata
-    is already validated before publication; if a corrupted batch nevertheless
-    contains an unrecognized/missing role, ``trace_count`` still records the
-    admitted row while the parent+child sum exposes the mismatch.
+    This helper is deliberately telemetry-only and fail-open. Every admitted
+    mask row contributes to ``trace`` even when the tags list is absent, short,
+    or carries an unrecognized role. Such a row also contributes to
+    ``untagged``, so an entirely untagged chunk cannot disappear from the
+    per-step telemetry and the role sum can be reconciled with
+    ``global_valid_seqs``.
     """
     tags = meta.tags
-    if tags is None or not any("session_role" in tag for tag in tags):
-        return None
     admitted_rows = admitted_sample_mask.bool().tolist()
-    counts = {"trace": 0, "parent": 0, "child": 0}
-    for admitted, tag in zip(admitted_rows, tags, strict=False):
+    counts = {"trace": 0, "parent": 0, "child": 0, "untagged": 0}
+    for row_index, admitted in enumerate(admitted_rows):
         if not admitted:
             continue
         counts["trace"] += 1
+        tag = tags[row_index] if tags is not None and row_index < len(tags) else {}
         role = tag.get("session_role")
         if role in ("parent", "child"):
             counts[role] += 1
+        else:
+            counts["untagged"] += 1
     return counts
 
 
@@ -741,6 +747,8 @@ class SingleControllerActor:
             "sample_masks": [],
             "masked_advantages": [],
             "num_mask_sample_filtered": [],
+            "num_overlong_filtered": [],
+            "num_owner_fanout_filtered": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
@@ -3374,13 +3382,13 @@ class SingleControllerActor:
                 # after the matching rows were cleaned up for the completed
                 # controller step.
                 if policy_result is not None and post_admission_role_counts:
+                    admitted_trace_count = sum(
+                        record["trace"] for record in post_admission_role_counts
+                    )
                     step_metrics.update(
                         {
                             _POST_ADMISSION_TRACE_COUNT_METRIC: float(
-                                sum(
-                                    record["trace"]
-                                    for record in post_admission_role_counts
-                                )
+                                admitted_trace_count
                             ),
                             _POST_ADMISSION_PARENT_COUNT_METRIC: float(
                                 sum(
@@ -3391,6 +3399,12 @@ class SingleControllerActor:
                             _POST_ADMISSION_CHILD_COUNT_METRIC: float(
                                 sum(
                                     record["child"]
+                                    for record in post_admission_role_counts
+                                )
+                            ),
+                            _POST_ADMISSION_UNTAGGED_COUNT_METRIC: float(
+                                sum(
+                                    record["untagged"]
                                     for record in post_admission_role_counts
                                 )
                             ),
@@ -5429,11 +5443,21 @@ class SingleControllerActor:
             tensor_field(data, adv_cfg.truncated_field)
         ).bool()
 
-        num_mask_sample_filtered = int(mask_sample.sum().item())
+        candidate_sample_mask = sample_mask.bool()
+        num_mask_sample_filtered = int(
+            (candidate_sample_mask & mask_sample).sum().item()
+        )
         self._step_log_dict["num_mask_sample_filtered"].append(num_mask_sample_filtered)
         final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
+        num_overlong_filtered = 0
         if self._algo_cfg.overlong_filtering:
+            num_overlong_filtered = int(
+                (final_sample_mask.bool() & truncated).sum().item()
+            )
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
+        self._step_log_dict["num_overlong_filtered"].append(
+            num_overlong_filtered
+        )
 
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
@@ -5536,6 +5560,8 @@ class SingleControllerActor:
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
 
         owner_batch = None
+        pre_owner_sample_mask = final_sample_mask
+        num_owner_fanout_filtered = 0
         if logical:
             owner_batch = build_logical_owner_batch(
                 meta,
@@ -5545,6 +5571,15 @@ class SingleControllerActor:
                 expected_group_size=self._algo_cfg.num_generations_per_prompt,
             )
             final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
+            num_owner_fanout_filtered = int(
+                (
+                    pre_owner_sample_mask.bool()
+                    & ~final_sample_mask.bool()
+                ).sum().item()
+            )
+        self._step_log_dict["num_owner_fanout_filtered"].append(
+            num_owner_fanout_filtered
+        )
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
@@ -5682,8 +5717,7 @@ class SingleControllerActor:
             )
         if owner_batch is not None and role_count_accumulator is not None:
             role_counts = _post_admission_session_role_counts(meta, final_sample_mask)
-            if role_counts is not None:
-                role_count_accumulator.append(role_counts)
+            role_count_accumulator.append(role_counts)
         return (
             meta.with_fields(new_fields),
             has_valid_training_tokens,

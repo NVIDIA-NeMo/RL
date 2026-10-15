@@ -97,6 +97,14 @@ class TestAggregateStepMetrics:
         assert out["num_ranks"] == 4
         assert "grad_norm" not in out
 
+    @pytest.mark.parametrize("successful, expected", [(True, 1.0), (False, 0.0)])
+    def test_optimizer_update_success_is_preserved(
+        self, successful: bool, expected: float
+    ) -> None:
+        out = aggregate_step_metrics({"optimizer_update_successful": successful})
+
+        assert out["optimizer_update_successful"] == expected
+
     def test_draft_grad_norm_tensor_is_preserved(self) -> None:
         out = aggregate_step_metrics({"draft_grad_norm": torch.tensor([1.0, 3.0])})
 
@@ -150,6 +158,8 @@ class TestReduceAdvantagePumpMetrics:
             masked_advantages=[torch.tensor([-1.0, 0.0, 2.0])],
             sequence_lengths=[4, 6],
             num_mask_sample_filtered=[1, 2],
+            num_overlong_filtered=[0, 1],
+            num_owner_fanout_filtered=[2, 0],
         )
         assert out["reward"] == pytest.approx(2.0)
         assert out["advantages/mean"] == pytest.approx(1.0 / 3.0)
@@ -157,6 +167,8 @@ class TestReduceAdvantagePumpMetrics:
         assert out["advantages/min"] == pytest.approx(-1.0)
         assert out["total_num_tokens"] == pytest.approx(10.0)
         assert out["num_mask_sample_filtered"] == pytest.approx(3.0)
+        assert out["num_overlong_filtered"] == pytest.approx(1.0)
+        assert out["num_owner_fanout_filtered"] == pytest.approx(2.0)
 
     def test_empty_advantages_tensor_yields_zeros(self) -> None:
         out = reduce_advantage_pump_metrics(
@@ -214,6 +226,8 @@ class TestReduceAdvantagePumpMetrics:
         assert out["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.8)
         assert out["mean_seq_mult_prob_error_after_mask"] == pytest.approx(9.2 / 7)
         assert out["min_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
+        assert out["raw_tmpe_evaluated_seq_count"] == pytest.approx(10.0)
+        assert out["post_tmpe_mask_seq_count"] == pytest.approx(7.0)
         assert out["num_masked_seqs_by_logprob_error"] == 3
         assert out["masked_correct_pct"] == pytest.approx(1.0 / 3)
 

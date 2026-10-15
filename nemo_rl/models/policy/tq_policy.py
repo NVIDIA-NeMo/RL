@@ -81,6 +81,10 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "loss": results[0]["global_loss"],
         "grad_norm": results[0]["grad_norm"],
     }
+    if all("optimizer_update_successful" in result for result in results):
+        out["optimizer_update_successful"] = all(
+            bool(result["optimizer_update_successful"]) for result in results
+        )
     if "moe_metrics" in results[0]:
         out["moe_metrics"] = results[0]["moe_metrics"]
     if "mtp_metrics" in results[0]:
