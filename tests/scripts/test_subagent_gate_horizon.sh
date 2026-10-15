@@ -38,10 +38,11 @@ exec /bin/bash "$@"
 FAKE_BASH
 chmod +x "$tmp/bash"
 
-sync_policy_checkpoint=$tmp/sync-policy
+sync_policy_checkpoint=$tmp/step_20/policy/weights
 mkdir -p "$sync_policy_checkpoint/iter_0000000"
 printf '0\n' >"$sync_policy_checkpoint/latest_checkpointed_iteration.txt"
 printf '{}\n' >"$sync_policy_checkpoint/iter_0000000/run_config.yaml"
+sync_policy_checkpoint=$(realpath "$sync_policy_checkpoint")
 
 assert_horizon() {
   local wrapper=$1 output=$2 actual
@@ -115,18 +116,22 @@ assert_rejects_bad_donor() {
   fi
 }
 
-missing_tracker=$tmp/sync-policy-missing-tracker
+wrong_step_donor=$tmp/step_19/policy/weights
+mkdir -p "$wrong_step_donor/iter_0000000"
+printf '0\n' >"$wrong_step_donor/latest_checkpointed_iteration.txt"
+printf '{}\n' >"$wrong_step_donor/iter_0000000/run_config.yaml"
+missing_tracker=$tmp/missing-tracker/step_20/policy/weights
 mkdir -p "$missing_tracker/iter_0000000"
 printf '{}\n' >"$missing_tracker/iter_0000000/run_config.yaml"
-empty_tracker=$tmp/sync-policy-empty-tracker
+empty_tracker=$tmp/empty-tracker/step_20/policy/weights
 mkdir -p "$empty_tracker/iter_0000000"
 : >"$empty_tracker/latest_checkpointed_iteration.txt"
 printf '{}\n' >"$empty_tracker/iter_0000000/run_config.yaml"
-malformed_tracker=$tmp/sync-policy-malformed-tracker
+malformed_tracker=$tmp/malformed-tracker/step_20/policy/weights
 mkdir -p "$malformed_tracker/iter_0000000"
 printf 'not-an-iteration\n' >"$malformed_tracker/latest_checkpointed_iteration.txt"
 printf '{}\n' >"$malformed_tracker/iter_0000000/run_config.yaml"
-missing_tracked_config=$tmp/sync-policy-missing-tracked-config
+missing_tracked_config=$tmp/missing-tracked-config/step_20/policy/weights
 mkdir -p "$missing_tracked_config/iter_0000000"
 printf '7\n' >"$missing_tracked_config/latest_checkpointed_iteration.txt"
 printf '{}\n' >"$missing_tracked_config/iter_0000000/run_config.yaml"
@@ -136,6 +141,7 @@ for wrapper_and_backend in \
   'scripts/claweval/train_subagents_async_16n.sh CLAW_EVAL_BACKEND_DIR=/dedicated-claw-backend'; do
   read -r wrapper backend_assignment <<<"$wrapper_and_backend"
   assert_rejects_bad_donor "$wrapper" "$backend_assignment" "$tmp/does-not-exist"
+  assert_rejects_bad_donor "$wrapper" "$backend_assignment" "$wrong_step_donor"
   assert_rejects_bad_donor "$wrapper" "$backend_assignment" "$missing_tracker"
   assert_rejects_bad_donor "$wrapper" "$backend_assignment" "$empty_tracker"
   assert_rejects_bad_donor "$wrapper" "$backend_assignment" "$malformed_tracker"

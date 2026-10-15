@@ -15,6 +15,15 @@ repo_dir=$(cd "$script_dir/../.." && pwd)
   echo "ERROR: SYNC_POLICY_CHECKPOINT is not a directory: $SYNC_POLICY_CHECKPOINT" >&2
   exit 2
 }
+sync_policy_checkpoint_real=$(realpath "$SYNC_POLICY_CHECKPOINT")
+case $sync_policy_checkpoint_real in
+  */step_20/policy/weights) ;;
+  *)
+    echo "ERROR: async qualification requires the exact sync step_20/policy/weights donor: $sync_policy_checkpoint_real" >&2
+    exit 2
+    ;;
+esac
+SYNC_POLICY_CHECKPOINT=$sync_policy_checkpoint_real
 [[ -s $SYNC_POLICY_CHECKPOINT/latest_checkpointed_iteration.txt ]] || {
   echo "ERROR: sync policy donor lacks latest_checkpointed_iteration.txt: $SYNC_POLICY_CHECKPOINT" >&2
   exit 2
