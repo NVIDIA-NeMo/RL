@@ -31,6 +31,7 @@ import torch
 from tokenizers import Tokenizer
 from tokenizers.models import BPE, WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
+from tokenizers.processors import TemplateProcessing
 from transformers import PreTrainedTokenizerFast
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch, TokenAligner
@@ -166,16 +167,26 @@ def _assert_batches_equal(actual: Any, expected: Any) -> None:
 _WORDS = ("alpha", "beta", "gamma", "delta", "epsilon")
 
 
-def _word_tokenizer() -> PreTrainedTokenizerFast:
-    """Real fast tokenizer with one token per whitespace-separated word."""
-    vocab = {token: i for i, token in enumerate(("[UNK]", "[PAD]", "<eos>", *_WORDS))}
+def _word_tokenizer(*, bos: bool = False) -> PreTrainedTokenizerFast:
+    """Real fast tokenizer with one token per whitespace-separated word.
+
+    With ``bos``, ``add_special_tokens=True`` starts each row with ``<bos>``;
+    word ids are the same either way.
+    """
+    tokens = ("[UNK]", "[PAD]", "<eos>", *_WORDS) + (("<bos>",) if bos else ())
+    vocab = {token: i for i, token in enumerate(tokens)}
     backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
     backend.pre_tokenizer = WhitespaceSplit()
+    if bos:
+        backend.post_processor = TemplateProcessing(
+            single="<bos> $A", special_tokens=[("<bos>", vocab["<bos>"])]
+        )
     return PreTrainedTokenizerFast(
         tokenizer_object=backend,
         unk_token="[UNK]",
         pad_token="[PAD]",
         eos_token="<eos>",
+        bos_token="<bos>" if bos else None,
     )
 
 
@@ -199,10 +210,12 @@ def _text_collator(
     *,
     ctx_length_student: int,
     ctx_length_teachers: list[int],
+    student: PreTrainedTokenizerFast | None = None,
     **options: bool,
 ) -> CrossTokenizerCollator:
     """Word-level student, character-level teacher 0, same-tokenizer teacher 1."""
-    student = _word_tokenizer()
+    if student is None:
+        student = _word_tokenizer()
     teacher = _char_tokenizer()
     return CrossTokenizerCollator(
         config=CrossTokenizerCollatorConfig(),
@@ -466,6 +479,107 @@ class TestRejectOverlengthText:
                 ctx_length_student=8,
                 ctx_length_teachers=[64, 8],
                 ce_covers_assistant_turn=True,
+            )
+
+
+class TestAddSpecialTokensInText:
+    _TEXTS = ("alpha beta gamma", "delta")
+
+    def _batches(self) -> tuple[PreTrainedTokenizerFast, Any, Any]:
+        """Option-off and option-on batches for a student that adds ``<bos>``."""
+        student = _word_tokenizer(bos=True)
+        batch = [_datum(text, idx=i) for i, text in enumerate(self._TEXTS)]
+        off = _text_collator(
+            ctx_length_student=8, ctx_length_teachers=[64, 8], student=student
+        )(batch)
+        on = _text_collator(
+            ctx_length_student=8,
+            ctx_length_teachers=[64, 8],
+            student=student,
+            add_special_tokens_in_text=True,
+        )(batch)
+        return student, off, on
+
+    def test_student_rows_start_with_marker(self):
+        student, off, on = self._batches()
+        assert on["input_ids"][:, 0].eq(student.bos_token_id).all()
+        assert on["token_mask"][:, 0].eq(1).all()
+        assert torch.equal(on["input_lengths"], off["input_lengths"] + 1)
+        for row, n in enumerate(off["input_lengths"].tolist()):
+            assert torch.equal(
+                on["input_ids"][row, 1 : n + 1], off["input_ids"][row, :n]
+            )
+            assert on["token_mask"][row, : n + 1].eq(1).all()
+        _, _, offsets = CrossTokenizerCollator._tokenize_batch(
+            list(self._TEXTS), student, 8, 4, add_special_tokens=True
+        )
+        assert offsets[:, 0].eq(0).all()
+        # The character-level teacher adds no special tokens.
+        for key in (
+            "teacher_0_input_ids",
+            "teacher_0_input_lengths",
+            "teacher_0_token_mask",
+        ):
+            assert torch.equal(on[key], off[key]), key
+
+    def test_marker_forms_its_own_chunk(self):
+        _, off, on = self._batches()
+        for row, n in enumerate(off["input_lengths"].tolist()):
+            on_student = on["alignment_0_student_chunk_id"][row]
+            off_student = off["alignment_0_student_chunk_id"][row]
+            on_teacher = on["alignment_0_teacher_chunk_id"][row]
+            off_teacher = off["alignment_0_teacher_chunk_id"][row]
+            # Pair 0 is the marker alone; no teacher token joins it, so the
+            # KD loss skips it.
+            assert on["alignment_0_pair_valid"][row, 0]
+            assert on_student[0] == 0 and on_student[1:].ne(0).all()
+            assert on_teacher.ne(0).all()
+            # Every other pair is the option-off pair, one student position
+            # and one pair index later.
+            assert off_student[:n].ge(0).all()
+            assert torch.equal(on_student[1 : n + 1], off_student[:n] + 1)
+            real = off["teacher_0_token_mask"][row].bool()
+            assert torch.equal(on_teacher[real], off_teacher[real] + 1)
+            pairs = off_student[:n].unique()
+            for key in ("alignment_0_pair_valid", "alignment_0_pair_is_correct"):
+                assert torch.equal(on[key][row, pairs + 1], off[key][row, pairs]), key
+
+    def test_overlength_rejection_counts_marker(self):
+        # Four words fill the student context; the marker makes a fifth token.
+        batch = [_datum("alpha beta gamma epsilon", idx=9)]
+        student = _word_tokenizer(bos=True)
+
+        def collator(add_special_tokens_in_text: bool) -> CrossTokenizerCollator:
+            return _text_collator(
+                ctx_length_student=4,
+                ctx_length_teachers=[21, 4],
+                student=student,
+                reject_overlength_text=True,
+                add_special_tokens_in_text=add_special_tokens_in_text,
+            )
+
+        assert collator(False)(batch)["input_lengths"].tolist() == [4]
+        with pytest.raises(
+            ValueError,
+            match=r"^student, sample idx=9: text tokenization has 5 tokens, "
+            r"exceeding context length 4; overlength rows are rejected$",
+        ):
+            collator(True)(batch)
+
+    def test_requires_text_mode(self):
+        tok = FakeChatTokenizer({"assistant": ("[A]", "[E]")})
+        with pytest.raises(
+            ValueError, match="add_special_tokens_in_text requires mode='text'"
+        ):
+            CrossTokenizerCollator(
+                config=CrossTokenizerCollatorConfig(mode="chat"),
+                student_tokenizer=tok,
+                teacher_tokenizers=[tok],
+                aligners=[None],
+                ctx_length_student=32,
+                ctx_length_teachers=[32],
+                drop_first_assistant_chunk_kl_by_teacher=[False],
+                add_special_tokens_in_text=True,
             )
 
 

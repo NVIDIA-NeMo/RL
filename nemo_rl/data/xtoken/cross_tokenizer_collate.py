@@ -135,6 +135,15 @@ class CrossTokenizerCollator:
             of the rendering when there are none; that rendering must be a
             prefix of the full rendering. Requires ``mode="chat"`` without
             ``native_thinking_alignment``.
+        add_special_tokens_in_text: Text-mode special tokens. ``False``
+            tokenizes the raw text only. ``True`` tokenizes the student and
+            every cross-tokenizer teacher with each tokenizer's own special
+            tokens (for example a beginning-of-text marker at the start of
+            each row); ``reject_overlength_text`` counts them. Added tokens
+            carry ``(0, 0)`` offsets, so alignment pairs them by role and a
+            marker without a counterpart forms its own chunk with an empty
+            other side. Requires ``mode="text"``; chat templates insert their
+            own markers.
     """
 
     def __init__(
@@ -151,6 +160,7 @@ class CrossTokenizerCollator:
         make_seq_div_by_teachers: Optional[List[int]] = None,
         reject_overlength_text: bool = False,
         ce_covers_assistant_turn: bool = False,
+        add_special_tokens_in_text: bool = False,
     ) -> None:
         n = len(aligners)
         assert len(teacher_tokenizers) == n and len(ctx_length_teachers) == n, (
@@ -213,6 +223,11 @@ class CrossTokenizerCollator:
                 "native_thinking_alignment=true, which defines its own "
                 "supervised regions."
             )
+        if add_special_tokens_in_text and config.mode != "text":
+            raise ValueError(
+                "add_special_tokens_in_text requires mode='text'; chat templates "
+                "insert their own special tokens."
+            )
         self.student_tokenizer = student_tokenizer
         self.teacher_tokenizers = teacher_tokenizers
         self.aligners = aligners
@@ -233,6 +248,7 @@ class CrossTokenizerCollator:
         )
         self.reject_overlength_text = reject_overlength_text
         self.ce_covers_assistant_turn = ce_covers_assistant_turn
+        self.add_special_tokens_in_text = add_special_tokens_in_text
         # Downstream consumers assume real tokens occupy the leading
         # positions: ``input_lengths = attention_mask.sum(-1)`` plus the
         # ``[:length]`` slices in the policy forward and the token-chunk
@@ -271,7 +287,12 @@ class CrossTokenizerCollator:
         idx = [datum["idx"] for datum in batch]
         if self.reject_overlength_text:
             self._reject_overlength_texts(
-                texts, idx, self.student_tokenizer, self.ctx_length_student, "student"
+                texts,
+                idx,
+                self.student_tokenizer,
+                self.ctx_length_student,
+                "student",
+                add_special_tokens=self.add_special_tokens_in_text,
             )
         student_input_ids, student_attention_mask, student_offsets = (
             self._tokenize_batch(
@@ -279,6 +300,7 @@ class CrossTokenizerCollator:
                 self.student_tokenizer,
                 self.ctx_length_student,
                 self.make_seq_div_by_student,
+                add_special_tokens=self.add_special_tokens_in_text,
             )
         )
 
@@ -314,6 +336,7 @@ class CrossTokenizerCollator:
                     self.teacher_tokenizers[i],
                     self.ctx_length_teachers[i],
                     f"teacher {i}",
+                    add_special_tokens=self.add_special_tokens_in_text,
                 )
             teacher_input_ids, teacher_attention_mask, teacher_offsets = (
                 self._tokenize_batch(
@@ -321,6 +344,7 @@ class CrossTokenizerCollator:
                     self.teacher_tokenizers[i],
                     self.ctx_length_teachers[i],
                     self.make_seq_div_by_teachers[i],
+                    add_special_tokens=self.add_special_tokens_in_text,
                 )
             )
             alignment = aligner.align(
@@ -575,9 +599,13 @@ class CrossTokenizerCollator:
         tokenizer: PreTrainedTokenizerBase,
         ctx_length: int,
         side: str,
+        *,
+        add_special_tokens: bool,
     ) -> None:
         """Raise ``ValueError`` if any text tokenizes to more than ``ctx_length`` tokens."""
-        encoded = tokenizer(texts, truncation=False, add_special_tokens=False)
+        encoded = tokenizer(
+            texts, truncation=False, add_special_tokens=add_special_tokens
+        )
         for row_idx, ids in zip(idx, encoded["input_ids"]):
             if len(ids) > ctx_length:
                 raise ValueError(
@@ -590,6 +618,8 @@ class CrossTokenizerCollator:
         tokenizer: PreTrainedTokenizerBase,
         ctx_length: int,
         make_seq_div_by: int,
+        *,
+        add_special_tokens: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Tokenize a batch and pad to a multiple of ``make_seq_div_by``.
 
@@ -605,7 +635,7 @@ class CrossTokenizerCollator:
             max_length=ctx_length,
             return_offsets_mapping=True,
             return_tensors="pt",
-            add_special_tokens=False,
+            add_special_tokens=add_special_tokens,
         )
         input_ids: torch.Tensor = encoded["input_ids"]
         attention_mask: torch.Tensor = encoded["attention_mask"]
