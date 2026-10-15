@@ -74,6 +74,7 @@ class _InstrumentedRolloutManager:
         target_step: int | None = None,
         inflight_registry: Any = None,
         lineage_group_id: str | None = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
         fields = {
             "group_id": lineage_group_id,
