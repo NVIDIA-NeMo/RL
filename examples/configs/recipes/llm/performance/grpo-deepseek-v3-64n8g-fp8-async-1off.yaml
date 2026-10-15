@@ -38,6 +38,7 @@ policy:
       ]
     vllm_kwargs:
       max_num_seqs: 32
+      moe_backend: triton
 logger:
   log_dir: logs/grpo-deepseek-v3-64n8g-fp8-async-1off
   wandb:

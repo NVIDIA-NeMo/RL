@@ -408,6 +408,23 @@ async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_vllm_worker_gpu_profiling_awaits_collective_rpc(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda.profiler, "start", MagicMock())
+    monkeypatch.setattr(torch.cuda.profiler, "stop", MagicMock())
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.llm = MagicMock(collective_rpc=AsyncMock())
+
+    await worker.start_gpu_profiling()
+    worker.llm.collective_rpc.assert_awaited_once_with("start_gpu_profiling", args=())
+
+    worker.llm.collective_rpc.reset_mock()
+    await worker.stop_gpu_profiling()
+    worker.llm.collective_rpc.assert_awaited_once_with("stop_gpu_profiling", args=())
+
+
+@pytest.mark.asyncio
 async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
     engine_loop = asyncio.get_running_loop()
     engine_thread = threading.get_ident()
@@ -1045,6 +1062,7 @@ def _fake_chat_request():
         max_tokens=1,
         max_completion_tokens=None,
         # Read by NeMoRLOpenAIServingChatMixin.chat_completion_full_generator.
+        stream=False,
         return_tokens_as_token_ids=None,
         logprobs=False,
         top_logprobs=None,
@@ -1196,7 +1214,8 @@ async def test_media_capture_rejected_keeps_its_own_code(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch):
+@pytest.mark.parametrize("logprobs", [False, True])
+async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch, logprobs):
     """A client disconnect cancels the chat handler and releases its capture state.
 
     The fake serving layer mirrors vLLM 0.29: it swallows the cancellation and
@@ -1214,6 +1233,9 @@ async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch):
         serving_chat, _stalled_engine_generator(started, cancelled)
     )
     request = _fake_chat_request()
+    request.logprobs = logprobs
+    request.return_tokens_as_token_ids = True
+    request.top_logprobs = 0
     token_capture = _track_request_capture(worker, request)
     task = asyncio.create_task(chat_handler(request, MagicMock()))
     try:
@@ -1293,8 +1315,10 @@ def test_chat_disconnect_releases_capture_queued_for_finalization(
 
 @pytest.mark.vllm
 @pytest.mark.asyncio
+@pytest.mark.parametrize("logprobs", [False, True])
 async def test_pinned_with_cancellation_aborts_chat_completion_on_http_disconnect(
     monkeypatch,
+    logprobs,
 ):
     """A real http.disconnect cancels the route through the pinned serving layer.
 
@@ -1339,6 +1363,9 @@ async def test_pinned_with_cancellation_aborts_chat_completion_on_http_disconnec
         serving_chat, _stalled_engine_generator(started, cancelled)
     )
     request = _fake_chat_request()
+    request.logprobs = logprobs
+    request.return_tokens_as_token_ids = True
+    request.top_logprobs = 0
     token_capture = _track_request_capture(worker, request)
     released = asyncio.Event()
     token_capture.fail_call.side_effect = lambda *_args, **_kwargs: released.set()
