@@ -655,12 +655,18 @@ def test_capture_router_fallback_patch_binds_router_for_unsupported_kernel(
         ({}, False),
         ({"fp32_lm_head": False}, False),
         ({"fp32_lm_head": True}, True),
+        ({"fp32_lm_head": "tf32"}, True),
         ({"env_vars": {VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "1"}}, False),
         ({"env_vars": {VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "0"}}, False),
     ],
 )
 def test_vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg, expected):
     assert vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg) is expected
+
+
+def test_vllm_nemotron_h_fp32_lm_head_rejects_an_invalid_value():
+    with pytest.raises(ValueError, match='must be true, false, or "tf32"'):
+        vllm_nemotron_h_fp32_lm_head_enabled({"fp32_lm_head": "fp16"})
 
 
 @pytest.mark.parametrize("env_value", [None, "0", "1"])

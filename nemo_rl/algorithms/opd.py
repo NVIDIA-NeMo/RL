@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import ray
 import torch
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from nemo_rl.data_plane.column_io import read_columns, write_columns
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
@@ -44,6 +44,7 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.utils.fp32_lm_head import Fp32LmHeadSetting, fp32_lm_head_enabled
 
 if TYPE_CHECKING:
     # Imported for typing only: teacher_worker_group imports this module's
@@ -70,7 +71,24 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
     gpus_per_node: int = 8
     precision: str = "bf16"
     micro_batch_size: int = 4
+    # Run this teacher's LM head with fp32 output (see
+    # policy.megatron_cfg.fp32_lm_head; "tf32" is an alias of true). Set it
+    # explicitly: teachers do not inherit the student's value, and setup rejects
+    # any teacher whose setting differs from the student's.
+    fp32_lm_head: Fp32LmHeadSetting = False
     megatron_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("megatron_cfg_overrides")
+    @classmethod
+    def _reject_fp32_lm_head_override(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if "fp32_lm_head" in value:
+            raise ValueError(
+                "set fp32_lm_head as a teacher field (on_policy_distillation."
+                "non_colocated_teachers.default_teacher_cfg.fp32_lm_head or "
+                "teacher_overrides.<alias>.fp32_lm_head), not inside "
+                "megatron_cfg_overrides."
+            )
+        return value
 
 
 class NonColocatedTeachersConfig(BaseModel, extra="allow"):
@@ -159,7 +177,18 @@ def _opd_cfg(master_config: Any) -> dict[str, Any]:
     if cfg is None:
         return {}
     if isinstance(cfg, BaseModel):
-        return cfg.model_dump(exclude_none=True)
+        dumped = cfg.model_dump(exclude_none=True)
+        # A per-teacher override replaces only the keys it sets. Dumping the
+        # parsed TeacherResourceConfig in full would carry every unset field at
+        # its class default and silently reset what default_teacher_cfg set
+        # (parallelism, fp32_lm_head, ...) for that teacher.
+        non_coloc = getattr(cfg, "non_colocated_teachers", None)
+        if isinstance(non_coloc, NonColocatedTeachersConfig):
+            dumped["non_colocated_teachers"]["teacher_overrides"] = {
+                alias: override.model_dump(exclude_unset=True, exclude_none=True)
+                for alias, override in non_coloc.teacher_overrides.items()
+            }
+        return dumped
     return cfg
 
 
@@ -687,6 +716,109 @@ def _validate_default_teacher_alias(opd_cfg: dict[str, Any]) -> None:
         )
 
 
+def _policy_cfg(master_config: Any) -> dict[str, Any]:
+    """Return the student's policy config as a plain dict (MasterConfig or dict)."""
+    if isinstance(master_config, dict):
+        return dict(master_config.get("policy") or {})
+    return dict(getattr(master_config, "policy", None) or {})
+
+
+def validate_teacher_fp32_lm_head(
+    master_config: Any, teacher_configs: Iterable[TeacherConfig]
+) -> None:
+    """Require every non-colocated teacher's fp32 LM head to match the student's.
+
+    Teachers never inherit ``policy.megatron_cfg.fp32_lm_head``: each sets its
+    own (``non_colocated_teachers.default_teacher_cfg`` or
+    ``teacher_overrides.<alias>``), compared after normalization (``"tf32"`` is an
+    alias of ``true``). A one-sided fp32 head mixes logit precisions in the
+    teacher/student gap (top-k) and leaves a precision-only divergence floor
+    (full vocabulary). With the fp32 head on, two settings that would discard
+    its precision are rejected too:
+
+    - full-vocabulary MOPD with ``teacher_payload: logits`` must ship the fp32
+      logits as ``payload_dtype: float32``;
+    - on the top-k path, ``use_fused_linear_logprobs: true`` (inherited or
+      overridden) bypasses the teacher's ``output_layer`` and with it the head.
+
+    Args:
+        master_config: Full training configuration (MasterConfig or dict).
+        teacher_configs: Resolved teacher configs, see
+            ``create_teacher_configs_from_opd_config``.
+
+    Raises:
+        ValueError: On any of the conditions above, or on an invalid
+            ``fp32_lm_head`` value.
+    """
+    megatron_cfg = _policy_cfg(master_config).get("megatron_cfg") or {}
+    student_value = megatron_cfg.get("fp32_lm_head", False)
+    student_fp32 = fp32_lm_head_enabled(
+        student_value, key="policy.megatron_cfg.fp32_lm_head"
+    )
+    teacher_configs = list(teacher_configs)
+    mismatched = [
+        f"{config.alias}={config.fp32_lm_head!r}"
+        for config in teacher_configs
+        if fp32_lm_head_enabled(
+            config.fp32_lm_head,
+            key=f"fp32_lm_head of OPD teacher {config.alias!r}",
+        )
+        != student_fp32
+    ]
+    if mismatched:
+        raise ValueError(
+            "MOPD teachers must use the same fp32 LM head setting as the student: "
+            f"policy.megatron_cfg.fp32_lm_head={student_value!r}, but teacher "
+            f"fp32_lm_head is {', '.join(mismatched)}. Teachers do not inherit the "
+            "student's value; set on_policy_distillation.non_colocated_teachers."
+            "default_teacher_cfg.fp32_lm_head (or teacher_overrides.<alias>."
+            "fp32_lm_head) to match."
+        )
+    if not student_fp32:
+        return
+
+    full_cfg = get_opd_full_config(master_config)
+    if full_cfg is not None:
+        if full_cfg.teacher_payload == "logits" and full_cfg.payload_dtype != "float32":
+            raise ValueError(
+                "fp32_lm_head with on_policy_distillation.full.teacher_payload="
+                "'logits' requires on_policy_distillation.full.payload_dtype="
+                "'float32'; otherwise the teacher's fp32 logits are rounded to "
+                f"{full_cfg.payload_dtype} in transport."
+            )
+        return
+
+    student_fused = bool(megatron_cfg.get("use_fused_linear_logprobs", False))
+    fused = [
+        config.alias
+        for config in teacher_configs
+        if config.megatron_cfg_overrides.get("use_fused_linear_logprobs", student_fused)
+    ]
+    if fused:
+        raise ValueError(
+            f"OPD teacher(s) {fused}: fp32_lm_head has no effect with "
+            "use_fused_linear_logprobs=true (the fused linear+CE kernel bypasses "
+            "output_layer). Disable one of them."
+        )
+
+
+def resolve_teacher_fp32_lm_head(master_config: Any) -> bool:
+    """Return the validated fp32 LM head setting shared by every teacher.
+
+    Raises:
+        ValueError: If the teachers' settings are invalid or do not match the
+            student's (see :func:`validate_teacher_fp32_lm_head`).
+    """
+    # Imported lazily: teacher_worker_group imports this module's schemas.
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    teacher_configs = create_teacher_configs_from_opd_config(_opd_cfg(master_config))
+    validate_teacher_fp32_lm_head(master_config, teacher_configs)
+    return any(fp32_lm_head_enabled(config.fp32_lm_head) for config in teacher_configs)
+
+
 def reserve_teacher_clusters(
     master_config: Any,
     *,
@@ -826,6 +958,7 @@ def create_teacher_worker_groups(
     _validate_default_teacher_alias(opd_cfg)
 
     teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
+    validate_teacher_fp32_lm_head(master_config, teacher_configs)
     expected_aliases = {teacher_config.alias for teacher_config in teacher_configs}
     if set(teacher_clusters) != expected_aliases:
         raise ValueError(

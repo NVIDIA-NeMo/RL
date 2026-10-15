@@ -591,6 +591,110 @@ def test_reconstruct_uses_the_only_loaded_head_for_a_single_teacher_run(teacher_
     torch.testing.assert_close(teacher_logits, payload @ head.t())
 
 
+# ── fp32 teacher LM head ───────────────────────────────────────────────────
+# A teacher fp32_lm_head emits unrounded fp32 logits from bf16 operands, so the
+# student's rebuild must keep the GEMM output in fp32. The default rounds it to
+# the shard's dtype (bf16), which is what the teacher's own head does without it.
+
+
+def _bf16_hidden_states_and_head(batch=2, seq=6, hidden=64, vocab=512, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    hidden_states = torch.randn(batch, seq, hidden, generator=generator).bfloat16()
+    # Logits of a few units, which bf16 rounds on a 2^-6..2^-5 grid.
+    lm_head = (torch.randn(vocab, hidden, generator=generator) * 0.5).bfloat16()
+    return hidden_states, lm_head
+
+
+def _reconstruct_hidden_states(hidden_states, heads, *, teacher_index=None, **kwargs):
+    vocab = int(next(iter(heads.values())).shape[0])
+    return reconstruct_opd_full_teacher_logits(
+        hidden_states,
+        teacher_payload="hidden_states",
+        student_logits=torch.zeros(
+            *hidden_states.shape[:2], vocab, device=hidden_states.device
+        ),
+        vocab_parallel_rank=0,
+        context_parallel_group=None,
+        teacher_output_layer_weight_by_index=heads,
+        teacher_index=teacher_index,
+        **kwargs,
+    )
+
+
+def test_reconstruct_keeps_the_lm_head_dtype_by_default():
+    """Without an fp32 teacher head the rebuild is the bf16 GEMM it always was."""
+    hidden_states, lm_head = _bf16_hidden_states_and_head()
+
+    teacher_logits = _reconstruct_hidden_states(hidden_states, {0: lm_head})
+
+    assert teacher_logits.dtype == torch.bfloat16
+    assert torch.equal(teacher_logits, torch.matmul(hidden_states, lm_head.t()))
+
+
+@pytest.mark.parametrize("teacher_index", [None, torch.tensor([0, 0])])
+def test_reconstruct_emits_unrounded_fp32_logits_for_an_fp32_teacher_head(
+    teacher_index,
+):
+    """bf16 operands with fp32 output: what Megatron's fp32 head computes."""
+    hidden_states, lm_head = _bf16_hidden_states_and_head()
+    exact = hidden_states.double() @ lm_head.double().t()
+
+    teacher_logits = _reconstruct_hidden_states(
+        hidden_states,
+        {0: lm_head},
+        teacher_index=teacher_index,
+        output_dtype=torch.float32,
+    )
+    rounded = _reconstruct_hidden_states(
+        hidden_states, {0: lm_head}, teacher_index=teacher_index
+    )
+
+    assert teacher_logits.dtype == torch.float32
+    fp32_error = (teacher_logits.double() - exact).abs().max()
+    assert fp32_error < 1e-4
+    # Rounding the output to bf16 misses by far more than fp32 accumulation.
+    assert (rounded.double() - exact).abs().max() > 100 * fp32_error
+
+
+def test_reconstruct_routes_rows_into_an_fp32_buffer_for_an_fp32_teacher_head():
+    """Multi-teacher: the shared scatter buffer must not round rows back to bf16."""
+    hidden_states, head0 = _bf16_hidden_states_and_head(batch=3, seed=1)
+    _, head1 = _bf16_hidden_states_and_head(batch=3, seed=2)
+    heads = {0: head0, 1: head1}
+    teacher_index = torch.tensor([1, 0, 1])
+
+    teacher_logits = _reconstruct_hidden_states(
+        hidden_states, heads, teacher_index=teacher_index, output_dtype=torch.float32
+    )
+
+    expected = torch.stack(
+        [
+            hidden_states[row].float() @ heads[int(teacher_index[row])].float().t()
+            for row in range(3)
+        ]
+    )
+    assert teacher_logits.dtype == torch.float32
+    torch.testing.assert_close(teacher_logits, expected, rtol=0, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_reconstruct_fp32_teacher_head_on_cuda_is_a_bf16_gemm_with_fp32_output():
+    """On GPU: the bf16 GEMM with fp32 output, without fp32 operand copies."""
+    hidden_states, lm_head = (t.cuda() for t in _bf16_hidden_states_and_head())
+
+    teacher_logits = _reconstruct_hidden_states(
+        hidden_states, {0: lm_head}, output_dtype=torch.float32
+    )
+
+    expected = torch.mm(
+        hidden_states.reshape(-1, hidden_states.shape[-1]),
+        lm_head.t(),
+        out_dtype=torch.float32,
+    )
+    assert teacher_logits.dtype == torch.float32
+    assert torch.equal(teacher_logits, expected.view_as(teacher_logits))
+
+
 def test_reconstruct_rejects_a_row_tagged_with_an_unloaded_teacher():
     """A tag with no shard means the routing and the load disagree."""
     with pytest.raises(ValueError, match="no teacher LM"):
@@ -970,6 +1074,50 @@ def test_prepare_loss_input_projects_the_payload_and_drops_the_last_position(
     assert loss_input["opd_full_entropy"] is None
     assert loss_input["opd_full_cross_entropy"] is None
     assert "next_token_logprobs" not in loss_input
+
+
+def test_prepare_loss_input_has_no_precision_floor_with_matched_fp32_heads(
+    _single_rank_collectives,
+):
+    """Self-distillation with an fp32 LM head on both sides diverges by exactly 0.
+
+    The student's fp32 head keeps its logits unrounded. Rebuilding the teacher's
+    with the default bf16 GEMM instead leaves a precision-only divergence, which
+    the self-distillation smoke test would read as a broken payload.
+    """
+    hidden_states, lm_head = _bf16_hidden_states_and_head()
+    batch_size, seq_len, hidden = hidden_states.shape
+    # The student's own fp32 head over the same hidden states (student == teacher).
+    student_logits = (
+        torch.mm(hidden_states.reshape(-1, hidden).float(), lm_head.float().t())
+        .view(batch_size, seq_len, -1)
+        .detach()
+        .requires_grad_(True)
+    )
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(batch_size, seq_len, dtype=torch.long),
+            OPD_FULL_HIDDEN_STATES_FIELD: hidden_states,
+        }
+    )
+
+    def divergence(teacher_logits_dtype):
+        loss_input, _ = prepare_loss_input(
+            student_logits,
+            data,
+            _loss_fn(),
+            vocab_parallel_rank=0,
+            vocab_parallel_group=object(),  # opaque: every collective is neutralized
+            context_parallel_group=None,
+            sampling_params=None,
+            chunk_size=None,
+            teacher_output_layer_weight_by_index={0: lm_head},
+            teacher_logits_dtype=teacher_logits_dtype,
+        )
+        return loss_input["opd_full_divergence"].detach()
+
+    assert torch.count_nonzero(divergence(torch.float32)) == 0
+    assert divergence(None).abs().max() > 1e-6
 
 
 def test_prepare_loss_input_routes_rows_by_the_teacher_index_column(
