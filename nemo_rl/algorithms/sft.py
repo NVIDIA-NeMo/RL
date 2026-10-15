@@ -35,6 +35,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
+    validate_precomputed_loss_masks,
 )
 from nemo_rl.data.multimodal_utils import PER_TOKEN_MULTIMODAL_FIELDS, PackedTensor
 from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
@@ -486,22 +487,7 @@ def prepare_sft_batch(
                 raise ValueError(
                     "only_unmask_final cannot override precomputed SFT loss masks."
                 )
-            for message_log in batch["message_log"]:
-                for message in message_log:
-                    tokens = message.get("token_ids")
-                    mask = message.get("token_loss_mask")
-                    if (
-                        not isinstance(tokens, torch.Tensor)
-                        or not isinstance(mask, torch.Tensor)
-                        or tokens.ndim != 1
-                        or mask.ndim != 1
-                        or tokens.shape != mask.shape
-                        or bool(((mask != 0) & (mask != 1)).any())
-                    ):
-                        raise ValueError(
-                            "Precomputed SFT masks must be binary vectors matching "
-                            "each token vector."
-                        )
+            validate_precomputed_loss_masks(batch["message_log"])
         elif loss_mask_mode is None:
             add_loss_mask_to_message_log(
                 batch["message_log"],
