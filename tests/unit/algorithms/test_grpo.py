@@ -524,6 +524,7 @@ def mock_grpo_components():
                 "precision": "bfloat16",
                 "train_global_batch_size": 1,
                 "train_micro_batch_size": 1,
+                "offload_policy_before_refit": False,
                 "max_total_sequence_length": 2048,
                 "make_sequence_length_divisible_by": 1,
                 "generation": {
@@ -3355,9 +3356,7 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
             )
 
     synchronizer = MagicMock()
-    # is_sharded=False is what an unsharded job returns, and it lets the real
-    # agent-coverage check take its early return instead of scanning a mock dataset.
-    nemo_gym_shard_set = MagicMock(is_sharded=False)
+    nemo_gym_shard_set = MagicMock()
     build_nemo_gym_actors = MagicMock(return_value=nemo_gym_shard_set)
     monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: MagicMock())
     monkeypatch.setattr(
@@ -3382,6 +3381,11 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         grpo_mod, "create_weight_synchronizer", lambda **_kwargs: synchronizer
     )
     monkeypatch.setattr(grpo_mod, "build_nemo_gym_actors", build_nemo_gym_actors)
+    # The agent-coverage check asks an unsharded job's actor for its entries
+    # over Ray, which a mock actor cannot answer; the check has its own tests.
+    monkeypatch.setattr(
+        grpo_mod, "validate_dataset_agent_coverage", lambda *_args, **_kwargs: None
+    )
 
     dataset = MagicMock()
     dataset.__len__.return_value = 2
@@ -3407,7 +3411,148 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         tokenizer=tokenizer,
         enable_router_replay=False,
         use_fastokens=False,
+        # Only the vLLM backend generates a bearer token for its HTTP server.
+        policy_api_key=None,
     )
+
+
+def test_setup_hands_the_vllm_http_server_api_key_to_nemo_gym(monkeypatch) -> None:
+    """The deferred-vLLM branch is the one path that forwards a real key: the
+    workers enforce it, so Gym's model server must send the same one."""
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    repo_root = Path(__file__).resolve().parents[3]
+    register_omegaconf_resolvers()
+    config = OmegaConf.to_container(
+        load_config(repo_root / "examples/configs/grpo_math_1B.yaml"),
+        resolve=True,
+    )
+    config["cluster"].update({"num_nodes": 2, "gpus_per_node": 4})
+    # No validation dataset is handed to setup below.
+    config["grpo"].update({"val_period": 0, "val_at_start": False})
+    generation = config["policy"]["generation"]
+    generation["vllm_cfg"].update(
+        {
+            "async_engine": True,
+            "expose_http_server": True,
+            "http_server_api_key_required": True,
+        }
+    )
+    generation["colocated"] = {
+        "enabled": False,
+        "resources": {"gpus_per_node": 4, "num_nodes": 1},
+    }
+    config["env"]["should_use_nemo_gym"] = True
+    tokenizer = MagicMock()
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    config["policy"]["generation"] = configure_generation_config(generation, tokenizer)
+    master_config = MasterConfig.model_validate(config)
+
+    class DummyCluster:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.num_gpus_per_node = kwargs["num_gpus_per_node"]
+            self.get_placement_groups = MagicMock(return_value=[object()])
+            self.get_master_address_and_port = MagicMock(
+                return_value=("127.0.0.1", 12345)
+            )
+            self.world_size = MagicMock(return_value=4)
+
+    class DummyLoader:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __len__(self):
+            return 1
+
+    class DummyCheckpointer:
+        def get_latest_checkpoint_path(self):
+            return None
+
+        def load_training_info(self, _path):
+            return None
+
+        def get_resume_paths(self, _path):
+            return None, None
+
+    class DummyPolicy:
+        def print_node_ip_and_gpu_id(self):
+            pass
+
+        def init_collective(self, *_args, **_kwargs):
+            return []
+
+        def prepare_refit_info(self, *_args, **_kwargs):
+            return {}
+
+        def offload_after_refit(self):
+            return None
+
+    class DummyVllmGeneration:
+        weight_synchronizer = None
+        dp_openai_server_base_urls = ["http://vllm-worker.example/v1"]
+        # What the real class generates when the recipe requires a key.
+        http_server_api_key = "per-job-key"
+
+        def __init__(self, *, cluster, config, defer_model_load=False):
+            self.cfg = config
+
+        def load_and_start(self):
+            pass
+
+        def finish_generation(self, *_args, **_kwargs):
+            return True
+
+        def init_collective(self, *_args, **_kwargs):
+            return []
+
+        def get_refit_payload_mode(self):
+            return "weights"
+
+        def prepare_refit_info(self, *_args, **_kwargs):
+            return None
+
+    nemo_gym_shard_set = MagicMock(is_sharded=False)
+    build_nemo_gym_actors = MagicMock(return_value=nemo_gym_shard_set)
+    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: MagicMock())
+    monkeypatch.setattr(
+        grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
+    )
+    monkeypatch.setattr(
+        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
+    )
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
+    monkeypatch.setattr(
+        grpo_mod,
+        "get_ray_cluster_topology",
+        lambda: {
+            "train-node": ("nvlink_domain_train", 0),
+            "inference-node": ("nvlink_domain_inference", 1),
+        },
+    )
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
+    monkeypatch.setattr(grpo_mod, "Policy", lambda *_args, **_kwargs: DummyPolicy())
+    monkeypatch.setattr(grpo_mod, "VllmGeneration", DummyVllmGeneration)
+    monkeypatch.setattr(
+        grpo_mod, "create_weight_synchronizer", lambda **_kwargs: MagicMock()
+    )
+    monkeypatch.setattr(grpo_mod, "build_nemo_gym_actors", build_nemo_gym_actors)
+    # The agent-coverage check asks an unsharded job's actor for its entries
+    # over Ray, which a mock actor cannot answer; the check has its own tests.
+    monkeypatch.setattr(
+        grpo_mod, "validate_dataset_agent_coverage", lambda *_args, **_kwargs: None
+    )
+
+    dataset = MagicMock()
+    dataset.__len__.return_value = 2
+    result = setup(master_config, tokenizer, dataset, None)
+
+    assert result[2] is nemo_gym_shard_set
+    build_nemo_gym_actors.assert_called_once()
+    gym_kwargs = build_nemo_gym_actors.call_args.kwargs
+    assert gym_kwargs["base_urls"] == ["http://vllm-worker.example/v1"]
+    assert gym_kwargs["policy_api_key"] == "per-job-key"
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
@@ -3556,6 +3701,9 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
             return "127.0.0.1", 1234
 
     class DummyPolicy:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
         def print_node_ip_and_gpu_id(self):
             pass
 
@@ -3578,7 +3726,6 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
     ):
         del (
             cluster,
-            config,
             tokenizer,
             processor,
             weights_path,
@@ -3586,7 +3733,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
             init_optimizer,
             init_reference_model,
         )
-        return DummyPolicy()
+        return DummyPolicy(config)
 
     class DummySGLangGeneration:
         num_gpus_per_engine = 1
@@ -3720,9 +3867,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         def get_refit_payload_mode(self):
             return "hf_export"
 
-    # is_sharded=False is what an unsharded job returns, and it lets the real
-    # agent-coverage check take its early return instead of scanning a mock dataset.
-    nemo_gym_shard_set = MagicMock(is_sharded=False)
+    nemo_gym_shard_set = MagicMock()
     build_nemo_gym_actors = MagicMock(return_value=nemo_gym_shard_set)
     monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: DummyLogger())
     monkeypatch.setattr(
@@ -3740,6 +3885,11 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         lambda *_args, **_kwargs: DummyTrtllmGeneration(),
     )
     monkeypatch.setattr(grpo_mod, "build_nemo_gym_actors", build_nemo_gym_actors)
+    # The agent-coverage check asks an unsharded job's actor for its entries
+    # over Ray, which a mock actor cannot answer; the check has its own tests.
+    # The mock records the call so the wiring of the splits is asserted below.
+    validate_coverage = MagicMock()
+    monkeypatch.setattr(grpo_mod, "validate_dataset_agent_coverage", validate_coverage)
 
     master_config = mock_grpo_components["master_config"]
     master_config.policy["model_name"] = "test-model"
@@ -3788,6 +3938,11 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         tokenizer=tokenizer,
         enable_router_replay=False,
         use_fastokens=False,
+        # A TensorRT-LLM server checks no bearer token on its OpenAI routes.
+        policy_api_key=None,
+    )
+    validate_coverage.assert_called_once_with(
+        nemo_gym_shard_set, {"train": dataset, "validation": None}
     )
 
 
@@ -3834,7 +3989,7 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
         engine_ready.set()
 
     synchronizer.sync_weights.side_effect = sync_weights
-    nemo_gym_shard_set = MagicMock(is_sharded=False)
+    nemo_gym_shard_set = MagicMock()
 
     def build_nemo_gym_actors(_env_configs, **kwargs):
         assert kwargs["base_urls"] == reserved_urls
@@ -3866,6 +4021,11 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
         grpo_mod, "create_weight_synchronizer", lambda **_kwargs: synchronizer
     )
     monkeypatch.setattr(grpo_mod, "build_nemo_gym_actors", build_nemo_gym_actors)
+    # The agent-coverage check asks an unsharded job's actor for its entries
+    # over Ray, which a mock actor cannot answer; the check has its own tests.
+    monkeypatch.setattr(
+        grpo_mod, "validate_dataset_agent_coverage", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(grpo_mod.ray, "kill", ray_kill)
 
     master_config = mock_grpo_components["master_config"]
@@ -6751,6 +6911,30 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+
+
+@pytest.mark.parametrize(
+    ("backend", "nccl_reshard", "offload_policy", "expected"),
+    [
+        ("vllm", False, False, False),
+        ("vllm", False, True, True),
+        ("vllm", True, False, True),
+        ("dynamo", False, False, True),
+    ],
+)
+def test_noncolocated_refit_synchronizer_selection(
+    backend, nccl_reshard, offload_policy, expected
+):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    assert (
+        grpo_mod._uses_managed_noncolocated_refit(
+            generation_backend=backend,
+            nccl_reshard_refit_enabled=nccl_reshard,
+            offload_policy_before_refit=offload_policy,
+        )
+        is expected
+    )
 
 
 def test_grpo_train_shuts_down_environments_after_failure():
