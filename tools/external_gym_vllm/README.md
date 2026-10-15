@@ -95,6 +95,7 @@ The generated fields are:
 | `POOL_STARTUP_TIMEOUT` | no | `3600` | Seconds allowed for startup. |
 | `POOL_SHARED_PATHS` | no | empty | Newline-separated absolute paths under `EXTERNAL_VLLM_SHARED_ROOT` that the pool container must access. |
 | `POOL_ENV_VARS` | no | empty | Newline-separated `NAME=value` assignments applied before vLLM starts. |
+| `POOL_CACHE_DIR` | no | empty | Persistent JIT compile cache under `EXTERNAL_VLLM_SHARED_ROOT` (vLLM, TorchInductor, Triton, FlashInfer). Each node copies it to local disk before Ray starts and writes new entries back in the background (`cache_sync.sh`), so later jobs skip recompiling. `CACHE_FORCE_FRESH=1` starts empty but still writes back. |
 | `POOL_VLLM_ARGS` | no | empty | Newline-separated vLLM CLI arguments, one argv entry per line. |
 
 Registration validates required fields, positive topology values, TCP port

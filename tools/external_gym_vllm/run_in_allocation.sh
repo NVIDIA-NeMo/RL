@@ -108,7 +108,7 @@ if [[ "${EXTERNAL_VLLM_MODE}" == serve ]]; then
     fi
   done
 fi
-for required_file in vllm_backend_registry.sh vllm_pool_lb.py lb_watchdog.sh serve_vllm_on_ray.py; do
+for required_file in vllm_backend_registry.sh vllm_pool_lb.py lb_watchdog.sh serve_vllm_on_ray.py cache_sync.sh; do
   if [[ ! -f "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/${required_file}" ]]; then
     echo "[FATAL] Missing ${EXTERNAL_VLLM_TOOLS_DIR_HOST}/${required_file}" >&2
     exit 1
@@ -223,6 +223,7 @@ for pool in "${pool_names[@]}"; do
   export "${pool}_SERVED_MODEL_NAME=${served_model_names[${pool}]}"
   export "${pool}_VLLM_PORT=${backend_ports[${pool}]}"
   export "${pool}_ENV_VARS=$(pool_value "${pool}" ENV_VARS)"
+  export "${pool}_CACHE_DIR=$(pool_value "${pool}" CACHE_DIR)"
   export "${pool}_VLLM_ARGS=$(pool_value "${pool}" VLLM_ARGS)"
 
   for numeric_suffix in REPLICAS TENSOR_PARALLEL_SIZE VLLM_PORT LB_PORT STARTUP_TIMEOUT; do
@@ -284,6 +285,8 @@ for pool in "${pool_names[@]}"; do
   while IFS= read -r shared_path; do
     [[ -n "${shared_path}" ]] && shared_paths+=("${shared_path}")
   done <<< "$(pool_value "${pool}" SHARED_PATHS)"
+  cache_dir=$(pool_value "${pool}" CACHE_DIR)
+  [[ -n "${cache_dir}" ]] && shared_paths+=("${cache_dir}")
 done
 for shared_path in "${shared_paths[@]}"; do
   if [[ "${shared_path}" != "${EXTERNAL_VLLM_SHARED_ROOT}" && "${shared_path}" != "${EXTERNAL_VLLM_SHARED_ROOT}"/* ]]; then
@@ -562,6 +565,7 @@ MAX_WORKER_PORT=2999
 VLLM_ENGINE_PORT=7000
 
 cleanup_replica() {
+  [[ -n "${CACHE_SIDECAR_PID:-}" ]] && kill "${CACHE_SIDECAR_PID}" 2>/dev/null
   if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     registry_remove "${REPLICA_ID}" || true
   fi
@@ -569,6 +573,27 @@ cleanup_replica() {
 }
 trap cleanup_replica EXIT
 trap 'trap - EXIT; cleanup_replica; exit 143' TERM INT
+
+# Optional persistent compile cache (<POOL>_CACHE_DIR on the shared filesystem):
+# copied to node-local storage on every node before Ray starts, so the Ray-spawned
+# vLLM workers inherit the paths, and new entries are written back in the
+# background (cache_sync.sh). CACHE_FORCE_FRESH=1 starts empty but still writes back.
+POOL_CACHE_DIR=$(pool_value CACHE_DIR)
+export_cache_env() {
+  local root="/tmp/nemo_rl_compile_cache/${POOL_PREFIX,,}"
+  export VLLM_CACHE_ROOT="${root}/vllm" TORCHINDUCTOR_CACHE_DIR="${root}/inductor"
+  export TRITON_CACHE_DIR="${root}/triton" FLASHINFER_WORKSPACE_BASE="${root}/flashinfer"
+}
+if [[ -n "${POOL_CACHE_DIR}" ]]; then
+  LOCAL_CACHE_ROOT="/tmp/nemo_rl_compile_cache/${POOL_PREFIX,,}"
+  rm -rf "${LOCAL_CACHE_ROOT}" "${LOCAL_CACHE_ROOT}.seeded"
+  if [[ "${CACHE_FORCE_FRESH:-0}" != "1" ]]; then
+    bash "${EXTERNAL_VLLM_TOOLS_DIR}/cache_sync.sh" seed "${POOL_CACHE_DIR}" "${LOCAL_CACHE_ROOT}" || exit 1
+  fi
+  bash "${EXTERNAL_VLLM_TOOLS_DIR}/cache_sync.sh" sidecar "${LOCAL_CACHE_ROOT}" "${POOL_CACHE_DIR}" &
+  CACHE_SIDECAR_PID=$!
+  export_cache_env
+fi
 
 if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
   rm -f "${HEAD_IP_FILE}"
@@ -607,6 +632,8 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     fi
     export "${assignment}"
   done <<< "$(pool_value ENV_VARS)"
+  # The pool's own ENV_VARS (e.g. FLASHINFER_WORKSPACE_BASE=/tmp) must not undo the cache.
+  [[ -n "${POOL_CACHE_DIR}" ]] && export_cache_env
 
   # Keep vLLM's TCPStore and MessageQueue ports inside the reserved
   # 7000-7999 band. serve_vllm_on_ray.py applies the NeMo RL compatibility
