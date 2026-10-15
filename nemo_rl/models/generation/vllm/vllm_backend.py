@@ -1933,14 +1933,15 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     value, scale = cast_tensor_to_fp8_blockwise(ctx.buf, block_size)
                     scale = scale.squeeze(-1)
                 else:  # ndim == 3: grouped experts.
-                    value = torch.empty_like(ctx.buf, dtype=value_param.dtype)
-                    scale = torch.empty_like(ctx.extra["scale_region"])
-                    for expert, weight in enumerate(ctx.buf.unbind(0)):
-                        expert_value, expert_scale = cast_tensor_to_fp8_blockwise(
-                            weight, block_size
-                        )
-                        value[expert].copy_(expert_value)
-                        scale[expert].copy_(expert_scale.squeeze(-1))
+                    # Blocks never straddle experts, so one cast covers the group.
+                    num_experts, rows, cols = ctx.buf.shape
+                    value, scale = cast_tensor_to_fp8_blockwise(
+                        ctx.buf.reshape(num_experts * rows, cols), block_size
+                    )
+                    value = value.reshape(num_experts, rows, cols)
+                    scale = scale.reshape(
+                        num_experts, rows // block_size[0], cols // block_size[1]
+                    )
                 ctx.extra["value_region"].copy_(value)
                 ctx.extra["scale_region"].copy_(scale)
 
