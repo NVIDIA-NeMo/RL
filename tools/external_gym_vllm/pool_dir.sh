@@ -24,22 +24,18 @@ _EXTERNAL_VLLM_LIVE_JOB_STATES=" PENDING CONFIGURING RUNNING COMPLETING REQUEUED
 # longer knows the job. Returns 1 and prints nothing when squeue itself fails,
 # so a transient slurmctld error is never mistaken for a finished job.
 external_vllm_job_state() {
-  local job="$1" output stderr_file status=0
-  stderr_file=$(mktemp)
-  output=$(squeue -h -j "${job}" -o %T 2>"${stderr_file}") || status=$?
+  local job="$1" output status=0
+  output=$(squeue -h -j "${job}" -o %T 2>&1) || status=$?
   if (( status == 0 )); then
-    rm -f "${stderr_file}"
     output="${output%%$'\n'*}"
     printf '%s\n' "${output:-GONE}"
     return 0
   fi
   # squeue exits non-zero for a job id slurmctld has already purged.
-  if grep -q "Invalid job id" "${stderr_file}"; then
-    rm -f "${stderr_file}"
+  if [[ "${output}" == *"Invalid job id"* ]]; then
     printf 'GONE\n'
     return 0
   fi
-  rm -f "${stderr_file}"
   return 1
 }
 
