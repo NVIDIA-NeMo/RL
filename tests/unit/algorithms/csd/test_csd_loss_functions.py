@@ -17,7 +17,10 @@ import torch
 
 from nemo_rl.algorithms.loss import prepare_loss_input
 from nemo_rl.algorithms.loss.csd import CSDLossFn
-from nemo_rl.algorithms.x_token.loss_utils import LocalizedAlignment
+from nemo_rl.algorithms.x_token.loss_utils import (
+    LocalizedAlignment,
+    same_tokenizer_topk_kl,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 _CT_V_STUDENT = 6
@@ -389,7 +392,7 @@ def test_csd_partitioned_cp_ce_matches_cp1_value_and_gradient(tmp_path):
 
 
 def test_csd_same_vocab_topk_ignores_masked_and_padding_rows(tmp_path):
-    """Invalid teacher rows cannot change same-vocab forward loss or gradient."""
+    """Invalid teacher rows below the valid column maxima cannot change same-vocab loss or gradient."""
     cfg = _ct_loss_cfg(str(tmp_path / "unused_projection.pt"))
     cfg["projection_matrix_paths"] = [None]
     cfg["teacher_vocab_sizes"] = [_CT_V_STUDENT]
@@ -421,10 +424,13 @@ def test_csd_same_vocab_topk_ignores_masked_and_padding_rows(tmp_path):
     teacher_clean[0, 0, 0:2] = torch.tensor([8.0, 7.0])
     teacher_clean[0, 1, 0:2] = torch.tensor([7.0, 8.0])
     teacher_corrupt = teacher_clean.clone()
-    # Padding in the valid sample and every predictor in the masked sample
-    # advertise different, overwhelmingly large columns.
-    teacher_corrupt[0, 2:, 2:4] = torch.tensor([100.0, 90.0])
-    teacher_corrupt[1, :, 4:6] = torch.tensor([200.0, 190.0])
+    # The top-K columns come from the per-vocab max over every teacher row, so
+    # the corruption stays below the valid rows' column maxima (8.0) and the
+    # selected columns {0, 1} are unchanged. Padding in the valid sample and
+    # every predictor in the masked sample still get a different distribution
+    # over those columns and over the rest of the vocab.
+    teacher_corrupt[0, 2:, 0:4] = torch.tensor([7.5, -5.0, 6.0, 5.0])
+    teacher_corrupt[1, :, 0:6] = torch.tensor([-5.0, 7.5, -8.0, -9.0, 6.0, 5.0])
 
     def run(teacher_logits):
         student_logits = student_base.clone().requires_grad_(True)
@@ -485,11 +491,16 @@ def test_same_vocab_chat_kd_uses_semantic_mask_and_its_own_denominator(tmp_path)
         student_token_mask=ce_mask,
         student_kd_token_mask=kd_mask,
     )
-    expected_kd = loss_fn._direct_topk_kl(
+    expected_kd = same_tokenizer_topk_kl(
         student,
         teacher,
-        align,
-        torch.tensor(2.0),
+        kd_mask=kd_mask,
+        sample_mask=sample_mask,
+        num_kd_tokens=torch.tensor(2.0),
+        vocab_size=_CT_V_STUDENT,
+        vocab_topk=3,
+        temperature=1.0,
+        reverse_kl=loss_fn.reverse_kl,
         tp_group=None,
         cp_group=None,
     )
