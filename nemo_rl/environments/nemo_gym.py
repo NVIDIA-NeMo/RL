@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import errno
 import json
 import math
 import os
@@ -73,7 +74,10 @@ from nemo_rl.environments.nemo_gym_shards import (
     build_route_shard_map,
     parse_shard_plan,
 )
-from nemo_rl.environments.utils import shutdown_environments
+from nemo_rl.environments.utils import (
+    DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS,
+    shutdown_environments,
+)
 from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
@@ -102,11 +106,13 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
-# How long Gym servers that outlive RunHelper.shutdown() get to exit after
-# SIGINT before they are killed. It has to fit, with RunHelper.shutdown()'s own
-# waits, in NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S, the caller's budget for the
-# whole actor shutdown.
-NEMO_GYM_LEFTOVER_SERVER_TIMEOUT_S = 10
+# How long the Gym servers get to exit, from the SIGINT NemoGym.shutdown() sends
+# them, before whatever is still running is killed. At the end of a run
+# shutdown_environments() gives the whole actor shutdown
+# DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS and then kills the actor. Gym's own
+# shutdown runs inside this window; the rest of the budget is for the kills and
+# the telemetry flush that follow.
+NEMO_GYM_LEFTOVER_SERVER_TIMEOUT_S = DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS / 2
 
 # The three server-type keys Gym nests under a top-level config entry. Gym's
 # constant is private (nemo_gym.discovery._SERVER_GROUP_KEYS), and the literal
@@ -484,22 +490,33 @@ def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
 
 
 def _shut_down_gym_servers(run_helper: Any) -> None:
-    """Run Gym's ``RunHelper.shutdown()``, then stop the servers it left running.
+    """Interrupt Gym's servers, run ``RunHelper.shutdown()``, then stop what is left.
 
     With ``nemo_gym_log_dir`` set, Gym launches each server as
     ``set -o pipefail; (<server command>) 2>&1 | tee -a <log>`` under bash, and
     ``RunHelper.shutdown()`` signals only that bash process. The server never
-    sees the signal and outlives it, reparented away from this process, along
-    with any placement group it created as a Ray driver, such as a local vLLM
-    judge's GPUs. Ray kills only an actor's direct children when the actor
-    exits, so nothing else stops them on a cluster without process-group
-    cleanup.
+    sees the signal, so Gym waits out its one-second grace period on each
+    command in turn, then kills the bash process and leaves the server running.
+    Ten such servers use up the DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS that
+    shutdown_environments() gives this actor at the end of a run, and the actor
+    is killed with its servers still up. Ray's process-group cleanup, on by
+    default since Ray 2.57, then kills them without a graceful shutdown. Where it
+    is off they keep running, along with any placement group they hold as Ray
+    drivers, such as a local vLLM judge's GPUs.
 
-    So each server's process tree is recorded first, and whatever is left after
-    Gym's shutdown is interrupted, as Gym itself would, and killed if it ignores
-    that. ``tee`` is left to exit at EOF so the log keeps the servers' shutdown
-    output. Without ``nemo_gym_log_dir`` Gym's shutdown leaves nothing behind
-    and this adds nothing.
+    So the servers are interrupted first: every process below a command Gym
+    launched, except ``tee``, which exits at EOF and so still logs the servers'
+    shutdown. Each command then exits as soon as its server has, and Gym's
+    waits return at once. The commands themselves are left for Gym to signal:
+    without ``nemo_gym_log_dir`` a command is the server, and a second SIGINT
+    makes uvicorn skip the application's shutdown. Whatever is still running
+    once Gym's shutdown has returned, or failed, is interrupted if Gym did not
+    get to it, given until NEMO_GYM_LEFTOVER_SERVER_TIMEOUT_S after the first
+    SIGINT, and then killed.
+
+    A command that has already exited is skipped. Gym's ``poll()``, which
+    NemoGym.health_check() runs, reaps a command that died, so its pid may have
+    gone to an unrelated process since.
 
     Args:
         run_helper: The Gym ``RunHelper`` that started the servers.
@@ -508,36 +525,64 @@ def _shut_down_gym_servers(run_helper: Any) -> None:
     # guaranteed to have.
     import psutil
 
-    # Recorded before RunHelper.shutdown(), which clears _processes. Gym has no
-    # public accessor for the processes it launched.
+    # Gym has no public accessor for the processes it launched.
     # TODO: switch to a public RunHelper accessor once Gym provides one.
-    gym_processes: list[psutil.Process] = []
+    commands: list[psutil.Process] = []
     for popen in run_helper._processes.values():
+        # Skip a command that has exited: once reaped, its pid may be reused.
+        if popen.poll() is not None:
+            continue
         try:
-            root = psutil.Process(popen.pid)
-            gym_processes += [root, *root.children(recursive=True)]
+            commands.append(psutil.Process(popen.pid))
         except psutil.NoSuchProcess:
             continue
 
+    # Everything below the commands: the servers, their own children, and tee.
+    # One pass over the process table, as Process.children() makes its own on
+    # every call, which adds up to seconds with dozens of servers on a busy node.
+    descendants: list[psutil.Process] = []
+    if commands:
+        children_by_ppid: dict[int, list[psutil.Process]] = {}
+        for process in psutil.process_iter(["ppid"]):
+            children_by_ppid.setdefault(process.info["ppid"], []).append(process)
+        pending = [command.pid for command in commands]
+        while pending:
+            for child in children_by_ppid.get(pending.pop(), []):
+                descendants.append(child)
+                pending.append(child.pid)
+
+    for process in descendants:
+        try:
+            if process.name() != "tee":
+                process.send_signal(signal.SIGINT)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    deadline = monotonic() + NEMO_GYM_LEFTOVER_SERVER_TIMEOUT_S
     try:
         run_helper.shutdown()
     finally:
-        leftover = []
-        for process in gym_processes:
+        # Still running only if RunHelper.shutdown() failed before stopping them.
+        for command in commands:
             try:
-                if process.name() != "tee":
-                    process.send_signal(signal.SIGINT)
-            except psutil.NoSuchProcess:
+                command.send_signal(signal.SIGINT)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
-            leftover.append(process)
-        _, still_alive = psutil.wait_procs(
-            leftover, timeout=NEMO_GYM_LEFTOVER_SERVER_TIMEOUT_S
-        )
-        for process in still_alive:
+        for process in commands + descendants:
             try:
-                process.kill()
-            except psutil.NoSuchProcess:
-                pass
+                if process.is_running():
+                    process.wait(timeout=max(0.0, deadline - monotonic()))
+            except psutil.TimeoutExpired:
+                try:
+                    process.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            except OSError as error:
+                # psutil 7.2.2 waits with pidfd_open(), which fails with EINVAL
+                # rather than ESRCH for a process that is gone while its pid is
+                # still held, e.g. as its session's ID (giampaolo/psutil#2715,
+                # fixed after 7.2.2). A process that is gone needs nothing more.
+                if error.errno != errno.EINVAL:
+                    raise
 
 
 # Fail fast rather than restart. The servers this actor owns are started in
@@ -1510,8 +1555,8 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         it is used. A failure therefore cannot leave a live handle that a later
         cleanup attempt invokes again.
 
-        Servers that RunHelper.shutdown() leaves running are stopped as well;
-        see _shut_down_gym_servers.
+        The servers are interrupted before RunHelper.shutdown() runs, and
+        whatever it leaves running is stopped too; see _shut_down_gym_servers.
         """
         try:
             rh, self.rh = self.rh, None
