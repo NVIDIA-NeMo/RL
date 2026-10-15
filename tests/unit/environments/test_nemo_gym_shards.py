@@ -54,6 +54,7 @@ def test_unsharded_config_returns_no_plan():
         "common_inherited_overlays",
         "common_overrides",
         "allowed_duplicate_entries",
+        "spinup_timeout",
     ],
 )
 def test_unsharded_config_rejects_stray_sharding_keys(key):
@@ -352,6 +353,19 @@ def test_override_layers_cannot_set_config_paths(layer):
         parse_shard_plan(config)
 
 
+@pytest.mark.parametrize("layer", ["common", "shard"])
+def test_override_layers_cannot_set_sharding_keys(layer):
+    """They would be merged into a shard's Gym config and then dropped."""
+    config = _sharded_config()
+    if layer == "common":
+        config["common_overrides"] = {"spinup_timeout": 7200}
+    else:
+        config["shards"][0]["overrides"] = {"spinup_timeout": 7200}
+
+    with pytest.raises(ShardConfigError, match=r"cannot set \['spinup_timeout'\]"):
+        parse_shard_plan(config)
+
+
 def test_override_layers_cannot_override_an_entry_owned_by_another_shard():
     config = _sharded_config(
         shards=[
@@ -448,6 +462,32 @@ def test_relaxed_placement_requires_disjoint_explicit_port_ranges():
 def test_an_unknown_placement_strategy_is_rejected():
     with pytest.raises(ShardConfigError, match="placement_strategy must be one of"):
         parse_shard_plan(_sharded_config(placement_strategy="SPRED"))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, 1800.0),
+        ({"spinup_timeout": None}, 1800.0),
+        ({"spinup_timeout": 7200}, 7200.0),
+    ],
+    ids=["default", "null", "configured"],
+)
+def test_spinup_timeout_is_read_into_the_plan(overrides, expected):
+    plan = parse_shard_plan(_sharded_config(**overrides))
+
+    assert plan.spinup_timeout == expected
+    assert isinstance(plan.spinup_timeout, float)
+
+
+@pytest.mark.parametrize(
+    "spinup_timeout",
+    [0, -1, float("inf"), float("nan"), True, "7200"],
+    ids=["zero", "negative", "inf", "nan", "bool", "string"],
+)
+def test_an_invalid_spinup_timeout_is_rejected(spinup_timeout):
+    with pytest.raises(ShardConfigError, match="spinup_timeout must be a positive"):
+        parse_shard_plan(_sharded_config(spinup_timeout=spinup_timeout))
 
 
 @pytest.mark.parametrize("placement_strategy", ["PACK", "SPREAD", "STRICT_PACK"])
