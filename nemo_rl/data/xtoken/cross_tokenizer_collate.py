@@ -108,8 +108,9 @@ class CrossTokenizerCollator:
         aligners: Per-teacher :class:`TokenAligner`. ``None`` marks a
             same-tokenizer teacher (no projection / no alignment).
         ctx_length_student: Hard tokenization length cap on the student
-            side. Text mode pads to this cap; chat mode pads to the batch's
-            longest tokenization. Sequence-length divisors may add padding.
+            side. Batches pad to their longest tokenization rounded up to
+            ``make_seq_div_by_student``, so the padded width can exceed a
+            cap that is not a multiple of the divisor.
         ctx_length_teachers: Per-teacher tokenization length caps.
         drop_first_assistant_chunk_kl_by_teacher: Per-teacher flags controlling
             whether chat alignment drops the first content pair in each
@@ -121,10 +122,12 @@ class CrossTokenizerCollator:
         reject_overlength_text: Text-mode policy for rows longer than a
             context length. ``False`` truncates each side to its own context
             length. ``True`` raises ``ValueError`` for a row whose student or
-            teacher tokenization exceeds that side's context length, so every
-            side covers the same text; same-tokenizer teachers check the
-            shared student tokenization against their own context length.
-            Chat mode always rejects overlength rows.
+            teacher tokenization, or that length rounded up to the side's
+            sequence-length divisor, exceeds that side's context length, so
+            every side covers the same text and no padded batch is wider
+            than its context; same-tokenizer teachers check the shared
+            student tokenization against their own context length and
+            divisor. Chat mode always rejects overlength rows.
         ce_covers_assistant_turn: Chat-mode CE target. ``False`` supervises
             the final assistant content and end-of-turn token. ``True``
             supervises every token of the final assistant turn (SFT-style),
@@ -292,6 +295,7 @@ class CrossTokenizerCollator:
                 self.student_tokenizer,
                 self.ctx_length_student,
                 "student",
+                make_seq_div_by=self.make_seq_div_by_student,
                 add_special_tokens=self.add_special_tokens_in_text,
             )
         student_input_ids, student_attention_mask, student_offsets = (
@@ -323,10 +327,17 @@ class CrossTokenizerCollator:
                 # Same-tokenizer teacher: no re-tokenization, no projection,
                 # no alignment. Its forward reuses the student tokenization.
                 if self.reject_overlength_text:
+                    ctx_length = self.ctx_length_teachers[i]
+                    make_seq_div_by = self.make_seq_div_by_teachers[i]
                     for row_idx, length in zip(idx, out["input_lengths"].tolist()):
-                        if length > self.ctx_length_teachers[i]:
+                        if length > ctx_length:
                             raise ValueError(
-                                f"teacher {i}, sample idx={row_idx}: shared tokenization exceeds context length {self.ctx_length_teachers[i]}; overlength rows are rejected"
+                                f"teacher {i}, sample idx={row_idx}: shared tokenization exceeds context length {ctx_length}; overlength rows are rejected"
+                            )
+                        padded = self._padded_width(length, make_seq_div_by)
+                        if padded > ctx_length:
+                            raise ValueError(
+                                f"teacher {i}, sample idx={row_idx}: shared tokenization has {length} tokens, padded to {padded} for a sequence-length multiple of {make_seq_div_by}, exceeding context length {ctx_length}; overlength rows are rejected"
                             )
                 continue
             if self.reject_overlength_text:
@@ -336,6 +347,7 @@ class CrossTokenizerCollator:
                     self.teacher_tokenizers[i],
                     self.ctx_length_teachers[i],
                     f"teacher {i}",
+                    make_seq_div_by=self.make_seq_div_by_teachers[i],
                     add_special_tokens=self.add_special_tokens_in_text,
                 )
             teacher_input_ids, teacher_attention_mask, teacher_offsets = (
@@ -560,6 +572,13 @@ class CrossTokenizerCollator:
         return BatchedDataDict(out)
 
     @staticmethod
+    def _padded_width(length: int, make_seq_div_by: int) -> int:
+        """``length`` rounded up to a multiple of ``make_seq_div_by``, and at least ``max(make_seq_div_by, 1)``."""
+        if make_seq_div_by > 1 and length % make_seq_div_by:
+            length += make_seq_div_by - (length % make_seq_div_by)
+        return max(length, make_seq_div_by, 1)
+
+    @staticmethod
     def _pad_chat_batch(
         ids_list: List[List[int]],
         off_list: List[List[tuple[int, int]]],
@@ -574,10 +593,9 @@ class CrossTokenizerCollator:
         ``assistant_mask=0``.
         """
         b = len(ids_list)
-        max_len = max((len(ids) for ids in ids_list), default=0)
-        if make_seq_div_by > 1 and max_len % make_seq_div_by:
-            max_len += make_seq_div_by - (max_len % make_seq_div_by)
-        max_len = max(max_len, make_seq_div_by, 1)
+        max_len = CrossTokenizerCollator._padded_width(
+            max((len(ids) for ids in ids_list), default=0), make_seq_div_by
+        )
 
         input_ids = torch.full((b, max_len), pad_token_id, dtype=torch.long)
         attention_mask = torch.zeros((b, max_len), dtype=torch.long)
@@ -600,9 +618,13 @@ class CrossTokenizerCollator:
         ctx_length: int,
         side: str,
         *,
+        make_seq_div_by: int,
         add_special_tokens: bool,
     ) -> None:
-        """Raise ``ValueError`` if any text tokenizes to more than ``ctx_length`` tokens."""
+        """Raise ``ValueError`` if any text needs more than ``ctx_length`` positions.
+
+        A row needs its token count rounded up to ``make_seq_div_by``.
+        """
         encoded = tokenizer(
             texts, truncation=False, add_special_tokens=add_special_tokens
         )
@@ -610,6 +632,11 @@ class CrossTokenizerCollator:
             if len(ids) > ctx_length:
                 raise ValueError(
                     f"{side}, sample idx={row_idx}: text tokenization has {len(ids)} tokens, exceeding context length {ctx_length}; overlength rows are rejected"
+                )
+            padded = CrossTokenizerCollator._padded_width(len(ids), make_seq_div_by)
+            if padded > ctx_length:
+                raise ValueError(
+                    f"{side}, sample idx={row_idx}: text tokenization has {len(ids)} tokens, padded to {padded} for a sequence-length multiple of {make_seq_div_by}, exceeding context length {ctx_length}; overlength rows are rejected"
                 )
 
     @staticmethod
@@ -621,16 +648,18 @@ class CrossTokenizerCollator:
         *,
         add_special_tokens: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Tokenize a batch and pad to a multiple of ``make_seq_div_by``.
+        """Tokenize a batch, truncating to ``ctx_length``, and pad to its longest row.
 
-        Also returns per-token character offsets (``offset_mapping``), which
+        Rows are right-padded to the longest row rounded up to a multiple of
+        ``make_seq_div_by``, the same width rule as chat mode. Also returns
+        per-token character offsets (``offset_mapping``), which
         :meth:`TokenAligner.align` needs to align the student and teacher
         tokenizations of the same source text. This requires a *fast* HF
         tokenizer; special and padding positions carry ``(0, 0)``.
         """
         encoded = tokenizer(
             texts,
-            padding="max_length",
+            padding="longest",
             truncation=True,
             max_length=ctx_length,
             return_offsets_mapping=True,
@@ -642,7 +671,7 @@ class CrossTokenizerCollator:
         offset_mapping: torch.Tensor = encoded["offset_mapping"]
 
         b, t = input_ids.shape
-        pad = (make_seq_div_by - (t % make_seq_div_by)) % make_seq_div_by
+        pad = CrossTokenizerCollator._padded_width(t, make_seq_div_by) - t
         if pad > 0:
             pad_ids = torch.full(
                 (b, pad),
