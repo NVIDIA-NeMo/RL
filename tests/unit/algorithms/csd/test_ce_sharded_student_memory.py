@@ -32,6 +32,7 @@ def _run_tp2_cp2_ce_memory(
         CSD_STUDENT_LOSS_CHUNK_SIZE,
         CSDLossFn,
     )
+    from nemo_rl.algorithms.x_token import loss_utils as shared_loss_utils
     from nemo_rl.distributed import model_utils
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
     from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
@@ -120,7 +121,7 @@ def _run_tp2_cp2_ce_memory(
         original_cp_contiguous_gather = (
             loss_functions_module.allgather_cp_contiguous_tensor
         )
-        original_full_softmax = loss_functions_module.vocab_parallel_full_log_softmax
+        original_full_softmax = shared_loss_utils.vocab_parallel_full_log_softmax
         original_scalar_cp_gather = model_utils.allgather_cp_sharded_tensor
         had_vocab_gather = hasattr(
             loss_functions_module,
@@ -148,7 +149,7 @@ def _run_tp2_cp2_ce_memory(
         loss_functions_module.allgather_cp_contiguous_tensor = (
             reject_contiguous_rank3_gather
         )
-        loss_functions_module.vocab_parallel_full_log_softmax = reject_vocab_gather
+        shared_loss_utils.vocab_parallel_full_log_softmax = reject_vocab_gather
         loss_functions_module.vocab_parallel_gather_logits = reject_vocab_gather
         model_utils.allgather_cp_sharded_tensor = require_scalar_cp_gather
         try:
@@ -164,9 +165,7 @@ def _run_tp2_cp2_ce_memory(
             loss_functions_module.allgather_cp_contiguous_tensor = (
                 original_cp_contiguous_gather
             )
-            loss_functions_module.vocab_parallel_full_log_softmax = (
-                original_full_softmax
-            )
+            shared_loss_utils.vocab_parallel_full_log_softmax = original_full_softmax
             model_utils.allgather_cp_sharded_tensor = original_scalar_cp_gather
             if had_vocab_gather:
                 loss_functions_module.vocab_parallel_gather_logits = (
