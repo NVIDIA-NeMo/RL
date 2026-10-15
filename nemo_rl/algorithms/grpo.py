@@ -167,14 +167,15 @@ from nemo_rl.telemetry.instrumentation import (
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.telemetry.vocabulary import INIT_TOTAL_CATEGORY, WORKER_GROUP_ENV
-from nemo_rl.utils.checkpoint_storage import (
-    enable_msc,
-    is_msc_path,
-    save_checkpoint_object,
-)
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
+)
+from nemo_rl.utils.checkpoint_storage import (
+    is_msc_path,
+    open_path,
+    path_exists,
+    save_checkpoint_object,
 )
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import (
@@ -2738,16 +2739,13 @@ def _write_latest_checkpoint_status(
     status_path = os.path.join(
         str(checkpointer.checkpoint_dir), "latest_checkpoint_status.json"
     )
-    msc = enable_msc() if is_msc_path(status_path) else None
-    path_exists = msc.os.path.exists if msc else os.path.exists
-    open_file = msc.open if msc else open
     status: dict[str, Any] = {}
     if path_exists(status_path):
-        with open_file(status_path) as f:
+        with open_path(status_path) as f:
             status = json.load(f)
     status["last_successful_ckpt_save_completion"] = time.time()
     status["last_checkpoint_step"] = last_checkpoint_step
-    with open_file(status_path, "w") as f:
+    with open_path(status_path, "w") as f:
         json.dump(status, f)
 
 
@@ -4910,6 +4908,11 @@ def async_grpo_train(
         processor: Optional multimodal processor used to attach compact policy
             media to NeMo Gym prompt rows.
     """
+    if is_msc_path(checkpointer.checkpoint_dir):
+        raise NotImplementedError(
+            "msc:// checkpoint_dir is not supported by async GRPO yet: the replay "
+            "buffer and rollout state are still written with local-file APIs."
+        )
     # Ensure we are running with a compatible async generation backend.
     # Async GRPO supports vLLM, Megatron, TRT-LLM, and Dynamo;
     # SGLang async rollouts do not support the async GRPO replay path.
@@ -6169,7 +6172,7 @@ def async_grpo_train(
                         )
                         dataloader_snapshot = collector_checkpoint["dataloader"]
                         rollouts_state = collector_checkpoint["rollouts"]
-                        save_checkpoint_object(
+                        torch.save(
                             dataloader_snapshot["dataloader_state"],
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )

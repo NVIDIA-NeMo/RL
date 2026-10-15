@@ -6,7 +6,13 @@ import uuid
 import pytest
 
 from nemo_rl.utils.checkpoint import CheckpointManager
-from nemo_rl.utils.checkpoint_storage import enable_msc
+from nemo_rl.utils.checkpoint_storage import (
+    enable_msc,
+    load_checkpoint_object,
+    open_path,
+    path_exists,
+    save_checkpoint_object,
+)
 
 
 @pytest.fixture
@@ -73,3 +79,31 @@ def test_existing_checkpoint_cannot_be_overwritten(manager):
     manager.finalize_checkpoint(checkpoint)
     with pytest.raises(FileExistsError, match="Refusing to overwrite"):
         manager.init_tmp_checkpoint(1, {"step": 100})
+
+
+def test_controller_state_round_trips_through_msc(manager):
+    base = str(manager.checkpoint_dir) + "/step_1"
+    save_checkpoint_object({"samples_yielded": 7}, base + "/train_dataloader.pt")
+    assert load_checkpoint_object(base + "/train_dataloader.pt") == {
+        "samples_yielded": 7
+    }
+
+
+def test_open_path_and_path_exists_through_msc(manager):
+    status = str(manager.checkpoint_dir) + "/latest_checkpoint_status.json"
+    assert not path_exists(status)
+    with open_path(status, "w") as f:
+        json.dump({"last_checkpoint_step": 5}, f)
+    assert path_exists(status)
+    with open_path(status) as f:
+        assert json.load(f) == {"last_checkpoint_step": 5}
+
+
+def test_plain_paths_bypass_msc(tmp_path):
+    state = tmp_path / "train_dataloader.pt"
+    save_checkpoint_object({"samples_yielded": 3}, state)
+    assert load_checkpoint_object(state) == {"samples_yielded": 3}
+    assert path_exists(state)
+    with open_path(tmp_path / "x.json", "w") as f:
+        f.write("{}")
+    assert not path_exists(tmp_path / "missing.json")

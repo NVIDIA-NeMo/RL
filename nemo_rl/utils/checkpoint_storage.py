@@ -56,3 +56,17 @@ def load_checkpoint_object(path: str | os.PathLike[str], **kwargs: Any) -> Any:
     if is_msc_path(path):
         return enable_msc().torch.load(str(path), **kwargs)
     return torch.load(path, **kwargs)
+
+
+def path_exists(path: str | os.PathLike[str]) -> bool:
+    """``os.path.exists`` that also understands ``msc://`` URLs."""
+    if is_msc_path(path):
+        return enable_msc().os.path.exists(str(path))
+    return os.path.exists(path)
+
+
+def open_path(path: str | os.PathLike[str], mode: str = "r") -> Any:
+    """``open`` that also understands ``msc://`` URLs."""
+    if is_msc_path(path):
+        return enable_msc().open(str(path), mode)
+    return open(path, mode)
