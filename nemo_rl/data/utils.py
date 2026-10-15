@@ -68,7 +68,7 @@ def get_train_dataset_name(data_config: DataConfig) -> Optional[str]:
 
 def save_dataloader_state(
     dataloader_state: Any,
-    checkpoint_path: Any,
+    checkpoint_path: str | os.PathLike[str],
     suffix: str = "",
 ) -> None:
     """Save a dataloader state to ``{checkpoint_path}/train_dataloader{suffix}.pt``.

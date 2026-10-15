@@ -5,7 +5,7 @@ import uuid
 
 import pytest
 
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import CheckpointManager, _load_checkpoint_history
 from nemo_rl.utils.checkpoint_storage import (
     enable_msc,
     enable_msc_for,
@@ -146,3 +146,12 @@ def test_interrupted_step_can_be_saved_again_after_resume(manager):
     assert not enable_msc().os.path.exists(stale)
     manager.finalize_checkpoint(again)
     assert manager.get_latest_checkpoint_path() == again
+
+
+def test_history_lists_only_published_steps_with_their_info(manager):
+    for step in (1, 2):
+        manager.finalize_checkpoint(manager.init_tmp_checkpoint(step, {"step": step}))
+    manager.init_tmp_checkpoint(3, {"step": 3})  # never published
+    history = _load_checkpoint_history(manager.checkpoint_dir)
+    assert sorted((step, info["step"]) for step, _, info in history) == [(1, 1), (2, 2)]
+    assert manager.get_latest_checkpoint_path().endswith("/step_2")
