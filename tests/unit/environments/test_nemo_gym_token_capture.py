@@ -243,6 +243,80 @@ def test_receipt_assembly_ignores_uncommitted_call_failures_off_the_terminal_cha
     assert receipt["terminal_model_call_id"] == "c2"
 
 
+def test_receipt_assembly_ignores_every_unserved_call_reason_gym_names(
+    monkeypatch,
+) -> None:
+    """Gym names the ledger reasons of a call that served no completion in
+    ``UNSERVED_CALL_FAILURE_REASONS``; an engine refusal (the prompt no longer
+    fit the context window) joined the uncommitted call there. Neither call can
+    be a lineage parent, so neither row poisons the verified chain."""
+    import nemo_gym.token_id_capture as token_id_capture
+
+    monkeypatch.setattr(
+        token_id_capture,
+        "UNSERVED_CALL_FAILURE_REASONS",
+        frozenset(
+            {"request_finished_without_staged_coordinates", "engine_refused_request"}
+        ),
+        raising=False,
+    )
+    env = _capture_env()
+    manifest = {
+        "rollout_id": "r0",
+        "records": [_manifest_record("c1"), _manifest_record("c2", parent="c1")],
+        "failures": [
+            {"model_call_id": "c3", "reason": "engine_refused_request"},
+            {
+                "model_call_id": "c4",
+                "reason": "request_finished_without_staged_coordinates",
+            },
+        ],
+    }
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_response_id="resp-c2", reward=1.0
+    )
+    assert receipt["capture_poisoned"] is False
+    assert receipt["failure_reason"] is None
+    assert receipt["terminal_model_call_id"] == "c2"
+
+
+def test_receipt_assembly_keeps_the_uncommitted_rule_on_a_gym_without_the_set(
+    monkeypatch,
+) -> None:
+    """A Gym that predates ``UNSERVED_CALL_FAILURE_REASONS`` names only the
+    uncommitted-call reason: that row stays off-chain, and a refusal row such
+    a Gym could not have written poisons like any other failure."""
+    import nemo_gym.token_id_capture as token_id_capture
+
+    monkeypatch.delattr(
+        token_id_capture, "UNSERVED_CALL_FAILURE_REASONS", raising=False
+    )
+    env = _capture_env()
+    records = [_manifest_record("c1"), _manifest_record("c2", parent="c1")]
+    uncommitted = {
+        "model_call_id": "c3",
+        "reason": "request_finished_without_staged_coordinates",
+    }
+    refused = {"model_call_id": "c4", "reason": "engine_refused_request"}
+    kept = env._assemble_receipt(
+        "r0",
+        {"rollout_id": "r0", "records": records, "failures": [uncommitted]},
+        terminal_response_id="resp-c2",
+        reward=1.0,
+    )
+    poisoned = env._assemble_receipt(
+        "r0",
+        {"rollout_id": "r0", "records": records, "failures": [refused]},
+        terminal_response_id="resp-c2",
+        reward=1.0,
+    )
+    assert kept["capture_poisoned"] is False
+    assert (poisoned["capture_poisoned"], poisoned["failure_reason"]) == (
+        True,
+        "engine_refused_request",
+    )
+
+
 def test_receipt_assembly_still_poisons_when_the_terminal_call_died_uncommitted() -> (
     None
 ):
