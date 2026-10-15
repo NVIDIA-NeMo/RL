@@ -38,6 +38,28 @@ exec /bin/bash "$@"
 FAKE_BASH
 chmod +x "$tmp/bash"
 
+# A stale remote backend must fail before dataset construction or the 1,800s
+# Gym endpoint wait. A present client.env without the matching CLI is also not
+# a usable backend.
+if CLAW_EVAL_BACKEND=remote CLAW_EVAL_BACKEND_DIR="$tmp/dead-claw-backend" \
+  /bin/bash "$repo_dir/scripts/claweval/run_sc.sh" \
+  >"$tmp/dead-claw.out" 2>&1; then
+  echo 'ClawEval accepted a missing remote backend client.env' >&2
+  exit 1
+fi
+grep -Fq 'live ClawEval backend missing:' "$tmp/dead-claw.out"
+mkdir -p "$tmp/incomplete-claw-backend" "$tmp/no-docker-cli"
+printf 'DOCKER_HOST=tcp://invalid.example:1\n' >"$tmp/incomplete-claw-backend/client.env"
+if CLAW_EVAL_BACKEND=remote \
+  CLAW_EVAL_BACKEND_DIR="$tmp/incomplete-claw-backend" \
+  CLAW_EVAL_DOCKER_CLI_DIR="$tmp/no-docker-cli" \
+  /bin/bash "$repo_dir/scripts/claweval/run_sc.sh" \
+  >"$tmp/incomplete-claw.out" 2>&1; then
+  echo 'ClawEval accepted a remote backend without its Docker client' >&2
+  exit 1
+fi
+grep -Fq 'ClawEval Docker client missing:' "$tmp/incomplete-claw.out"
+
 sync_policy_checkpoint=$tmp/step_20/policy/weights
 mkdir -p "$sync_policy_checkpoint/iter_0000000"
 printf '0\n' >"$sync_policy_checkpoint/latest_checkpointed_iteration.txt"

@@ -39,6 +39,28 @@ if [[ $subagents == true ]]; then
   }
 fi
 
+case $CLAW_EVAL_BACKEND in
+  remote)
+    [[ -n $CLAW_EVAL_BACKEND_DIR ]] || {
+      echo "ERROR: remote ClawEval requires CLAW_EVAL_BACKEND_DIR" >&2
+      exit 1
+    }
+    [[ -s $CLAW_EVAL_BACKEND_DIR/client.env ]] || {
+      echo "ERROR: live ClawEval backend missing: $CLAW_EVAL_BACKEND_DIR/client.env" >&2
+      exit 1
+    }
+    [[ -x $CLAW_EVAL_DOCKER_CLI_DIR/docker ]] || {
+      echo "ERROR: ClawEval Docker client missing: $CLAW_EVAL_DOCKER_CLI_DIR/docker" >&2
+      exit 1
+    }
+    ;;
+  podman) ;;
+  *)
+    echo "ERROR: CLAW_EVAL_BACKEND must be remote or podman" >&2
+    exit 1
+    ;;
+esac
+
 for required in "$CLAW_EVAL_SOURCE" "$CLAW_EVAL_ORIGINAL_TASK_ROOT" "$CLAW_EVAL_BRIEF_TASK_ROOT" "$CLAW_EVAL_B_TASK_ROOT" "$CLAW_EVAL_SFT"; do
   [[ -e $required ]] || { echo "ERROR: missing ClawEval input: $required" >&2; exit 1; }
 done
