@@ -33,7 +33,7 @@
 #
 # Conflicts against nemorl's own pins, and how they are settled:
 #   - torch>=2.13.0,<=2.14.0a0 (upstream): RESOLVED. The root pyproject.toml's
-#     `trtllm` extra now pins torch==2.13.0 / torchvision==0.28.0 
+#     `trtllm` extra now pins torch==2.13.0 / torchvision==0.28.0
 #   - nvidia-cudnn-frontend>=1.27.0,<1.28 (upstream) vs. nemorl's
 #     override-dependencies pin of nvidia-cudnn-frontend==1.25.0 (root
 #     pyproject.toml). The override is global and wins silently, so this venv

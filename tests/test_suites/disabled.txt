@@ -1,4 +1,10 @@
 # Tests that are temporarily disabled
+# The quick GDPO plumbing check uses one GPU per node, but the recurring suites
+# require either eight or four. The 1n8g convergence run would exceed the
+# nightly GPU-hour cap, which upstream main already consumes in full.
+research/gdpo/tests/test_suites/llm/gdpo-llada-8b-instruct-1n1g-fsdp2tp1-quick.sh
+research/gdpo/tests/test_suites/llm/gdpo-llada-8b-instruct-1n8g-fsdp2tp1.sh
+
 # The full 8-node per-token NVFP4 recipe is too expensive for nightly. Its
 # 4-node quick variant provides nightly coverage; run this driver manually when
 # validating the production topology.

@@ -244,7 +244,8 @@ class TestPrepareModelForward:
 
 
 @pytest.mark.automodel
-def test_grpo_logprobs_follow_automodel_sequence_layout() -> None:
+@pytest.mark.parametrize("shift_targets", [True, False])
+def test_logprobs_follow_automodel_sequence_layout(shift_targets: bool) -> None:
     torch.manual_seed(11)
     order = torch.tensor([0, 3, 1, 2])
     layout = _PermutationTokenLayout(order)
@@ -256,12 +257,15 @@ def test_grpo_logprobs_follow_automodel_sequence_layout() -> None:
         local_logits,
         input_ids,
         layout,
+        shift_targets=shift_targets,
     )
-    expected = (
-        torch.log_softmax(canonical_logits.float(), dim=-1)[:, :-1]
-        .gather(dim=-1, index=input_ids[:, 1:].unsqueeze(-1))
-        .squeeze(-1)
-    )
+    expected = torch.log_softmax(canonical_logits.float(), dim=-1)
+    if shift_targets:
+        expected = expected[:, :-1]
+        targets = input_ids[:, 1:]
+    else:
+        targets = input_ids
+    expected = expected.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
 
     torch.testing.assert_close(actual, expected)
     actual.sum().backward()
