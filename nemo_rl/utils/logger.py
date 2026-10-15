@@ -230,6 +230,10 @@ class TensorboardLogger(LoggerInterface):
                 print(f"Warning: Failed to log metric '{name}' to TensorBoard: {e}")
                 continue
 
+    def finish(self) -> None:
+        """Flush queued TensorBoard events before a worker or actor exits."""
+        self.writer.close()
+
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to Tensorboard."""
         if len(histogram) > 0:
@@ -284,11 +288,45 @@ class WandbLogger(LoggerInterface):
             wandb.save("/tmp/ray/session_latest/logs/raylet.out", policy="live")
             wandb.save("/tmp/ray/session_latest/logs/raylet.err", policy="live")
 
-        self._log_code()
-        self._log_diffs()
+        skip_reason = self._git_artifacts_skip_reason()
+        if skip_reason is None:
+            self._log_code()
+            self._log_diffs()
+        else:
+            print(
+                f"{skip_reason}; skipping the wandb source-code and git-diff artifacts."
+            )
         print(
             f"Initialized WandbLogger for project {cfg.project}, run {cfg.name} at {log_dir}"
         )
+
+    @staticmethod
+    def _git_artifacts_skip_reason() -> Optional[str]:
+        """Why the git-based artifacts cannot be logged, or None when they can.
+
+        A job launched from an uploaded copy of the code tree has no ``.git``
+        directory there, so ``git ls-files`` and ``git diff`` would only fail.
+        The reason is reported as git states it, so a checkout git refuses
+        (``fatal: detected dubious ownership``) or a missing git binary is not
+        reported as "not a work tree".
+        """
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as error:
+            return f"git is not available ({error})"
+        if result.returncode != 0:
+            first_line = result.stderr.strip().splitlines()
+            return (
+                first_line[0] if first_line else f"git exited with {result.returncode}"
+            )
+        if result.stdout.strip() != "true":
+            return "Not inside a git work tree"
+        return None
 
     def _log_diffs(self):
         """Log git diffs to wandb.
