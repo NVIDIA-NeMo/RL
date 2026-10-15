@@ -3231,8 +3231,10 @@ class MegatronPolicyWorkerImpl(
 
         no_grad = torch.no_grad()
         no_grad.__enter__()
-        self.model = self.move_model(self.model, "cpu")
+        # MambaMixer.train(False) refreshes its CUDA decode cache from A_log.
+        # Do that while parameter buffers are still resident on the GPU.
         self.model.eval()
+        self.model = self.move_model(self.model, "cpu")
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
 

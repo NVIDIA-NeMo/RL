@@ -308,8 +308,13 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(monkeypatch):
     )
 
     events = []
+
+    class _Model:
+        def eval(self):
+            events.append("model_eval")
+
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.model = _FakeTrainableModel()
+    worker.model = _Model()
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
     worker.move_model = lambda model, device: events.append("move_model") or model
     worker.offload_before_refit = lambda: events.append("offload_before_refit")
@@ -333,6 +338,7 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(monkeypatch):
     MegatronPolicyWorkerImpl.offload_after_refit(worker)
 
     assert events[0] == "finalize_async_save"
+    assert events.index("model_eval") < events.index("move_model")
     assert events.index("finalize_async_save") < events.index("move_model")
 
 

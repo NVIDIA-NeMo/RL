@@ -187,8 +187,12 @@ avoids importing NeMo RL's policy modules and training dependency stack into a
 purpose-built serving container. If the source checkout is unavailable, the
 wrapper falls back to the installed `nemo_rl` package. The wrapper applies an
 explicit allowlist: OpenAI `NamespaceTool` compatibility plus the RayExecutorV2
-TCPStore and MessageQueue port-race fixes. It does not apply model-, worker-, or
-policy-refit-specific patches because these servers are inference-only.
+TCPStore and MessageQueue port-race fixes. For single-node DeepSeek-V4 judge
+replicas, `NRL_DSV4_TOPK_PADDING_COMPAT=1` also enables a compatibility patch
+for images whose top-k Python wrapper lacks the compiled kernel's optional
+`is_padding` argument. The patch passes `None` by default and verifies the
+wrapper/kernel signatures before loading the model. It does not enable
+training-worker or policy-refit patches.
 `CONTAINER` must provide `EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
 
 ## Slurm submission
