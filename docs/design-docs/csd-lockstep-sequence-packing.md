@@ -148,7 +148,7 @@ as a teacher's input merely because the models received the same raw messages.
 Reuse is valid only when the tokenizer, chat template, and template arguments
 are all identical.
 
-For the current cross-tokenizer path, this means using `csd_data_processor` to preserve
+For the current cross-tokenizer path, this means using `kd_data_processor` to preserve
 raw messages and `CSDCrossTokenizerCollator` with `mode="chat"`. The ordinary
 single-tokenizer `sft_processor` renders and tokenizes earlier in the pipeline;
 feeding its output into the cross-tokenizer chat path would either double-apply a
@@ -222,7 +222,7 @@ likewise a guarded follow-up rather than an implicit consequence of packing.
 Tool support is staged but must fail closed:
 
 1. Extend `DatumSpec` with optional `tools` and preserve a defensive copy in
-   `csd_data_processor`, together with the structured messages and stable sample
+   `kd_data_processor`, together with the structured messages and stable sample
    identity.
 2. Pass the same canonical per-row tool schema to the student and every teacher
    `apply_chat_template` call. Each side still uses its own configured template

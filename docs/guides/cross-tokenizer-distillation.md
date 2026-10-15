@@ -174,14 +174,14 @@ The default dataset is the raw `text` column of
 To use your own corpus, set `data.train.data_files` to a file, glob, or dataset
 identifier and `data.train.text_key` to its text column. Supported local file
 formats include `.arrow`, `.parquet`, `.json`, `.jsonl`, and `.txt`. The
-`arrow_text` dataset and `csd_data_processor` leave tokenization to the shared
+`arrow_text` dataset and `kd_data_processor` leave tokenization to the shared
 collator. `collator.mode=text` tokenizes each text with both tokenizers;
 use the existing [chat-data guidance](xtoken-off-policy-distillation.md#text-and-chat-batches)
-for conversational examples. In ordinary CSD chat mode, CE supervises the complete
-selected assistant-rendered chunk, including its scaffold; cross-tokenizer KD
-uses assistant content and EOT. A per-row `message_loss_mask` selects assistant
-turns for both objectives while keeping every turn in context. Native thinking
-alignment reuses the shared region-based supervision described in that guide.
+for conversational examples. CSD chat mode supervises only the final assistant
+turn; earlier messages are context. In ordinary CSD chat mode, CE covers the
+whole final assistant turn, including its template markers, and KD uses its
+content and EOT. Native thinking alignment reuses the shared region-based
+supervision described in that guide.
 
 Each input row must fit **both** model sequence limits after tokenization.
 The CSD collator rejects overlength examples to preserve a shared text span;
@@ -258,7 +258,4 @@ and parallelism configuration.
 - [X-Token preparation and training](xtoken-off-policy-distillation.md) uses
   the separate projection-matrix toolchain under `tools/x_token/`.
 
-CSD native reasoning/tool alignment reuses the shared native templates. When
-`collator.native_thinking_alignment=true`, leave per-model
-`tokenizer.chat_template_kwargs` empty; overrides are supported only by the
-ordinary CSD chat path.
+CSD native reasoning/tool alignment reuses the shared native templates.

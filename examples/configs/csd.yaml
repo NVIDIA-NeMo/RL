@@ -302,7 +302,7 @@ data:
   num_workers: 4
   train:
     dataset_name: arrow_text
-    processor: csd_data_processor
+    processor: kd_data_processor
     data_files: hf://datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Formal-Logic/*.parquet
     split: train
     text_key: text
