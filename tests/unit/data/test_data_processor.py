@@ -42,7 +42,6 @@ from nemo_rl.data.datasets.response_datasets import (
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import (
     PROCESSOR_REGISTRY,
-    csd_data_processor,
     helpsteer3_data_processor,
     kd_data_processor,
     math_data_processor,
@@ -701,20 +700,6 @@ class TestKdDataProcessor:
         assert out["message_log"][0]["content"] == long_text
         # length is a fake placeholder for the kd pipeline.
         assert out["length"] == 0
-
-    @pytest.mark.parametrize("sample_id", [None, "", "   "])
-    def test_missing_or_empty_sample_id_fails_closed(self, sample_id):
-        with pytest.raises(ValueError, match="durable, non-empty sample_id"):
-            csd_data_processor(
-                datum_dict={
-                    "messages": [{"role": "assistant", "content": "hello"}],
-                    "sample_id": sample_id,
-                },
-                task_data_spec=self._spec(),
-                tokenizer=DummyTokenizer(),
-                max_seq_length=128,
-                idx=19,
-            )
 
     def test_preserves_identity_tools_and_deep_copies_nested_messages(self):
         source = {

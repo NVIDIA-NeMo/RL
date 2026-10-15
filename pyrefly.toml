@@ -27,7 +27,6 @@ replace-imports-with-any = [
 project-includes = [
   "nemo_rl/algorithms/loss/csd.py",
   "nemo_rl/algorithms/loss/csd_packing.py",
-  "nemo_rl/data/csd_collate.py",
   "tools/csd/__init__.py",
   "tools/csd/build_subtoks_table.py",
   "tools/csd/validate_subtoks_tables.py",
@@ -94,6 +93,7 @@ project-includes = [
   "nemo_rl/data/cross_tokenizer/__init__.py",
   "nemo_rl/data/cross_tokenizer/native_chat.py",
   "nemo_rl/data/cross_tokenizer/cross_tokenizer_collate.py",
+  "nemo_rl/data/cross_tokenizer/csd_collate.py",
   "nemo_rl/data/collate_fn.py",
   "nemo_rl/data/dataloader.py",
   "nemo_rl/data/datasets/__init__.py",

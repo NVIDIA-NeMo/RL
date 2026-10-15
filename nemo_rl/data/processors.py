@@ -997,22 +997,6 @@ def kd_data_processor(
     return output
 
 
-def csd_data_processor(
-    datum_dict: dict[str, Any],
-    task_data_spec: TaskDataSpec,
-    tokenizer: TokenizerType,
-    max_seq_length: int | None,
-    idx: int,
-) -> DatumSpec:
-    """Preserve raw text/chat and require source identity for CSD packing."""
-    sample_id = datum_dict.get("sample_id")
-    if sample_id is None or not str(sample_id).strip():
-        raise ValueError(
-            "CSD requires a durable, non-empty sample_id attached by the source dataset before filtering or splitting."
-        )
-    return kd_data_processor(datum_dict, task_data_spec, tokenizer, max_seq_length, idx)
-
-
 def chat_kd_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -1059,7 +1043,6 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "default": math_hf_data_processor,
         "helpsteer3_data_processor": helpsteer3_data_processor,
         "kd_data_processor": kd_data_processor,
-        "csd_data_processor": csd_data_processor,
         "chat_kd_processor": chat_kd_processor,
         "math_data_processor": math_data_processor,
         "math_hf_data_processor": math_hf_data_processor,

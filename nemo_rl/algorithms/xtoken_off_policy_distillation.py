@@ -67,7 +67,7 @@ from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
-from nemo_rl.data.csd_collate import CSDCrossTokenizerCollator
+from nemo_rl.data.cross_tokenizer.csd_collate import CSDCrossTokenizerCollator
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.packing import (
     LockstepPackingItem,
@@ -1519,18 +1519,20 @@ def setup(
         if master_config.algorithm == "csd"
         else CrossTokenizerCollator
     )
-    csd_collator_options = {}
+    csd_collator_options: dict[str, bool] = {}
     if master_config.algorithm == "csd":
+        # CSD never truncates: overlength text rows are rejected. Text rows
+        # carry each tokenizer's special tokens; ordinary chat supervises the
+        # whole final assistant turn with CE and its content + end-of-turn
+        # token with KD.
         csd_collator_options = {
             "require_routed_experts": router_replay_enabled(policy_config),
-            "student_chat_template_kwargs": policy_config["tokenizer"].get(
-                "chat_template_kwargs"
-            ),
-            "teacher_chat_template_kwargs": [
-                tc["tokenizer"].get("chat_template_kwargs") or {}
-                for tc in teacher_configs
-            ],
+            "reject_overlength_text": True,
         }
+        if master_config.collator.mode == "text":
+            csd_collator_options["add_special_tokens_in_text"] = True
+        elif not master_config.collator.native_thinking_alignment:
+            csd_collator_options["ce_covers_assistant_turn"] = True
     collator = collator_cls(
         config=master_config.collator,
         student_tokenizer=student_tokenizer,
