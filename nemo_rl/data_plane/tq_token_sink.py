@@ -515,6 +515,7 @@ class TQTokenSink:
                 chunk_sequence=chunk_sequence,
             ),
             attachments=attachments,
+            generation_cut_chunk=True,
         )
 
     def _stage_at_key(
@@ -523,6 +524,7 @@ class TQTokenSink:
         key: str,
         *,
         attachments: Mapping[str, Any] | None = None,
+        generation_cut_chunk: bool = False,
     ) -> StageResult:
         """Write the token row and its media attachments in one ``put``.
 
@@ -531,6 +533,10 @@ class TQTokenSink:
         no transactional rollback: if the write raises, the attempted key is
         discarded best-effort before the failure is reported (see
         ``_discard_failed_write``).
+
+        A generation-cut chunk carries exactly one route row per token and no
+        boundary row: only the resume path reads it back, and the resumed
+        call's canonical row supplies the boundary route the reassembler uses.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
@@ -652,7 +658,9 @@ class TQTokenSink:
                 else:
                     experts = torch.tensor(routed, dtype=torch.int16)
                     routed_encoding = ROUTE_ENCODING_LIST
-                expected_len = delta_len + boundary_route_rows(record.prev_len)
+                expected_len = delta_len + (
+                    0 if generation_cut_chunk else boundary_route_rows(record.prev_len)
+                )
                 if experts.dim() != 3 or experts.shape[0] != expected_len:
                     raise ValueError(
                         "routed_experts must already be delta-aligned: "

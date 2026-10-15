@@ -1641,9 +1641,15 @@ class VllmAsyncGenerationWorkerImpl(
         payload: dict[str, Any],
         *,
         restored: torch.Tensor | None,
+        prev_len: int,
         generated_len: int,
     ) -> None:
-        """Keep old prefix routes and current-policy boundary/suffix routes."""
+        """Keep old prefix routes and current-policy boundary/suffix routes.
+
+        After a parent call, the delta-aligned routes lead with the parent's
+        last-token row (``boundary_route_rows``); it comes from this call's
+        prefill, exactly as it would without a cut, and is kept.
+        """
         if restored is None:
             return
         choices = payload.get("choices") or []
@@ -1672,12 +1678,13 @@ class VllmAsyncGenerationWorkerImpl(
         restored = restored.to(dtype=dtype)
         if current.dim() != 3 or tuple(current.shape[1:]) != tuple(restored.shape[1:]):
             raise ValueError("restored routed experts changed model dimensions")
-        if current.shape[0] != restored.shape[0] + generated_len:
+        boundary_rows = boundary_route_rows(prev_len)
+        if current.shape[0] != boundary_rows + restored.shape[0] + generated_len:
             raise ValueError(
                 "resumed routed experts do not match prefix plus generated tail"
             )
         replace_len = restored.shape[0] if generated_len == 0 else restored.shape[0] - 1
-        current[:replace_len] = restored[:replace_len]
+        current[boundary_rows : boundary_rows + replace_len] = restored[:replace_len]
         message["routed_experts"] = encode_routed_experts(current)
         choice["message"] = message
         payload["choices"] = [choice]
@@ -1747,6 +1754,7 @@ class VllmAsyncGenerationWorkerImpl(
             self._merge_generation_cut_routed_experts(
                 payload,
                 restored=state.restored_routed_experts,
+                prev_len=call.admission.prev_len,
                 generated_len=len(generated_token_ids),
             )
         coords = self.token_capture.complete_call_from_response(

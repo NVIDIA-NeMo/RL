@@ -68,6 +68,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     ChainPrefixCache,
     FetchedStagedCall,
     StagedPrefix,
+    TQTokenSink,
 )
 from nemo_rl.experience.route_assembly import RouteFragment  # noqa: E402
 from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
@@ -2380,6 +2381,151 @@ def test_router_replay_route_mismatch_fails_only_that_calls_cut() -> None:
     assert receipt.prefixes[0].disposition == "durable_failure"
     assert sink.generation_prefix_records == []
     assert worker._capture_calls[id(request)].frozen_cut is None
+
+
+def test_router_replay_prefix_resume_keeps_the_parent_boundary_route() -> None:
+    """A multi-turn call's cut chunks stage one route per token; its resumed
+    canonical row also carries the parent's last-token route, which the
+    reassembler writes back over the parent's placeholder."""
+    sink = _MemorySink()
+    # A real sink checks every row's route length; only its TQ store is mocked.
+    validating_sink = TQTokenSink(MagicMock(), staging_partition="staging")
+    validating_sink._store = MagicMock()
+    ng_capture = {
+        "rollout_id": "r0",
+        "model_call_id": "c2",
+        "parent_call_id": "c1",
+        "prev_len": 3,
+        "mode": "token_in",
+        "required_prefix_token_ids": [10, 11, 12],
+        "parent_chain_hash": "1" * 64,
+    }
+    original_worker = _worker_with_capture(sink)
+    original_worker._return_routed_experts_enabled = lambda: True
+    original_worker.routed_experts_dtype = torch.int16
+    original_worker._rollout_weight_version = 7
+    original_request = _FakeRequest(ng_capture=ng_capture, stream=False)
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        original_worker, original_request, [10, 11, 12, 20, 21]
+    )
+    original_worker._capture_calls[id(original_request)].effective_output_limit = 128
+    # Engine rows cover positions 0..5; the parent's last token (position 2)
+    # is routed by this call's prefill, but the delta starts at position 3.
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        original_worker,
+        original_request,
+        SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    token_ids=[22, 23],
+                    logprobs=[
+                        {22: SimpleNamespace(logprob=-0.1)},
+                        {23: SimpleNamespace(logprob=-0.2)},
+                    ],
+                )
+            ],
+        ),
+        routed_expert_chunk_count=1,
+        routed_expert_chunks=[torch.arange(1, 7, dtype=torch.int16).view(6, 1, 1)],
+    )
+    prefix = GenerationCutPrefix(
+        ticket_id="ticket-1",
+        rollout_id="r0",
+        attempt=0,
+        model_call_id="c2",
+        admitted_at=1.0,
+    )
+    original_worker._checkpoint_generation_cut(
+        GenerationCutInventory.build(
+            checkpoint_id="checkpoint-1",
+            server_name="policy_model",
+            active_prefixes=[prefix],
+        )
+    )
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        original_worker,
+        original_request,
+        _cumulative_output([22, 23, 24]),
+        routed_expert_chunk_count=2,
+        routed_expert_chunks=[torch.tensor([[[7]]], dtype=torch.int16)],
+    )
+    receipt = original_worker._checkpoint_generation_cut(
+        GenerationCutInventory.build(
+            checkpoint_id="checkpoint-2",
+            server_name="policy_model",
+            active_prefixes=[prefix.model_copy(update={"ticket_id": "ticket-2"})],
+        )
+    )
+    cut_records = [record for _, record in sink.generation_prefix_records]
+    assert [record.prev_len for record in cut_records] == [3, 3]
+    assert [
+        decode_routed_experts(record.extras["routed_experts"], torch.int16)
+        .flatten()
+        .tolist()
+        for record in cut_records
+    ] == [[4, 5, 6, 0], [7]]
+    for sequence, record in enumerate(cut_records):
+        assert validating_sink.stage_generation_prefix(
+            record, checkpoint_id="checkpoint", chunk_sequence=sequence
+        ).ok
+
+    cut_keys = list(receipt.prefixes[0].staging_keys)
+    chunks = [
+        _route_fetched_call(key, record)
+        for key, record in zip(cut_keys, cut_records, strict=True)
+    ]
+    resumed_worker = _worker_with_capture(sink)
+    resumed_worker._return_routed_experts_enabled = lambda: True
+    resumed_worker.routed_experts_dtype = torch.int16
+    resumed_worker._rollout_weight_version = 9
+    request = _FakeRequest(
+        ng_capture={
+            **ng_capture,
+            "rollout_id": "r0-a1",
+            "model_call_id": "c3",
+            "generation_cut": {
+                "source_capture_key": "r0",
+                "source_model_call_id": "c2",
+                "staging_keys": cut_keys,
+                "prefix_token_count": 3,
+                "prefix_digest": receipt.prefixes[0].prefix_digest,
+                "effective_output_limit": 128,
+            },
+        },
+        stream=False,
+    )
+    admission = resumed_worker._capture_admission(request)
+    resolved = resumed_worker._resolve_generation_cut(admission, [10, 11, 12], chunks)
+    assert resolved is not None
+    assert resolved.routed_experts.flatten().tolist() == [4, 5, 6, 7, 0]
+
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        resumed_worker,
+        request,
+        [10, 11, 12, 20, 21, 22, 23, 24],
+        admission=admission,
+        prefix_token_ids=[10, 11, 12],
+        generation_cut=resolved.snapshot,
+        generation_cut_routed_experts=resolved.routed_experts,
+        resumed_generation_token_ids=[22, 23, 24],
+    )
+    content = _served_content([25], [-0.4])
+    # Current-policy routes for positions 0..7 plus the unrouted final token.
+    content["choices"][0]["message"]["routed_experts"] = encode_routed_experts(
+        torch.tensor([90, 91, 92, 93, 94, 95, 96, 97, 0], dtype=torch.int16).view(
+            9, 1, 1
+        )
+    )
+    VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        resumed_worker, request, content
+    )
+    terminal = sink.records[-1]
+    # Parent boundary (position 2) and the generated tail come from this
+    # call; the restored prefix keeps the routes it was sampled under.
+    assert decode_routed_experts(
+        terminal.extras["routed_experts"], torch.int16
+    ).flatten().tolist() == [92, 4, 5, 6, 7, 97, 0]
+    assert validating_sink.stage(terminal).ok
 
 
 def test_request_capture_token_in_prev_len_chains():
