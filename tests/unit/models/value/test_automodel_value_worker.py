@@ -128,7 +128,6 @@ def _create_value_test_config(
     return {
         "model_name": model_name,
         "tokenizer": {"name": model_name},
-        "seed": 42,
         "train_global_batch_size": 8,
         "train_micro_batch_size": 2,
         "logprob_batch_size": 2,
@@ -193,6 +192,7 @@ def test_value_worker_init_rejects_cp_scoring_before_setup(monkeypatch):
         automodel_value_worker.AutomodelValueWorkerImpl(
             config=config,
             tokenizer=MagicMock(),
+            seed=42,
         )
 
     apply_transformer_engine_patch.assert_not_called()
@@ -295,6 +295,7 @@ def value_setup(request, tiny_qwen2_model_path, tmp_path):
             cluster=cluster,
             config=config,
             tokenizer=tokenizer,
+            seed=42,
         )
 
         torch.manual_seed(42)
@@ -486,6 +487,7 @@ def test_value_worker_parallelism_equivalence(
             cluster=cluster,
             config=ref_config,
             tokenizer=tokenizer,
+            seed=42,
         )
         values_ref = ref.get_values(data)["values"].detach().cpu()
 
@@ -505,6 +507,7 @@ def test_value_worker_parallelism_equivalence(
             cluster=cluster,
             config=feat_config,
             tokenizer=tokenizer,
+            seed=42,
             weights_path=Path(weights_path),
             name_prefix="lm_value_feat",
         )
@@ -566,9 +569,11 @@ def test_value_worker_seeded_fresh_initialization_equivalence(
         )
 
         config_off = _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
-        config_off["dtensor_cfg"]["sequence_parallel"] = True
+        config_off["automodel_cfg"]["sequence_parallel"] = True
         tokenizer = get_tokenizer(config_off["tokenizer"])
-        worker = Value(cluster=cluster, config=config_off, tokenizer=tokenizer)
+        worker = Value(
+            cluster=cluster, config=config_off, tokenizer=tokenizer, seed=42
+        )
         values_off = worker.get_values(data)["values"].detach().cpu()
         worker.shutdown()
         worker = None
@@ -582,6 +587,7 @@ def test_value_worker_seeded_fresh_initialization_equivalence(
             cluster=cluster,
             config=config_on,
             tokenizer=tokenizer,
+            seed=42,
             name_prefix="lm_value_db_on",
         )
         values_on = worker.get_values(data)["values"].detach().cpu()
@@ -626,12 +632,12 @@ def test_value_worker_dynamic_batching_train_forward_equivalence(
     ``get_values`` coverage alone cannot detect a bug in the value-loss path.
     This test pins one value-head initialization, reloads it into feature-OFF
     and feature-ON workers, and compares the deterministic train forward,
-    right-shift, loss, reorder, and normalization chain on variable-length
+    right-shift, loss, and normalization chain on variable-length
     samples. ``eval_mode=True`` disables dropout so different microbatch orders
     do not confound the equivalence assertion.
     """
     feature_id = "-".join(key for key, enabled in feature_updates.items() if enabled)
-    equiv_gpus = max(tp, 1)
+    equiv_gpus = 2
     weights_path = os.path.join(str(tmp_path), "value", "weights")
     loss_fn = MseValueLossFn(MseValueLossConfig(scale=1.0, cliprange=0.5))
 
@@ -639,7 +645,7 @@ def test_value_worker_dynamic_batching_train_forward_equivalence(
         return _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
 
     torch.manual_seed(42)
-    batch, max_seq_len = 8, 64
+    batch, max_seq_len = 8, 128
     input_lengths = torch.randint(
         max_seq_len // 2, max_seq_len + 1, (batch,), dtype=torch.int32
     )
@@ -663,6 +669,7 @@ def test_value_worker_dynamic_batching_train_forward_equivalence(
             cluster=cluster,
             config=config,
             tokenizer=tokenizer,
+            seed=42,
             weights_path=Path(weights_path) if load else None,
             name_prefix=f"lm_value_{'test' if load else 'source'}",
         )
@@ -801,6 +808,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
         cluster=cluster,
         config=config,
         tokenizer=tokenizer,
+        seed=42,
         weights_path=resume_weights_path,
         optimizer_path=resume_optimizer_path,
         name_prefix="lm_value_resumed",
