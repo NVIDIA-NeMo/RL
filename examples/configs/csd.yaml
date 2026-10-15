@@ -9,7 +9,7 @@ distillation:
   val_period: 0
   val_at_start: false
   val_at_end: false
-  offload_student_after_step: false
+  offload_student_after_step: true
 loss_fn:
   temperature: 1.0
   vocab_topk: 8192
@@ -55,7 +55,7 @@ policy:
   router_replay:
     enabled: false
   automodel_cfg:
-    enabled: true
+    enabled: false
     checkpoint:
       model_save_format: "safetensors"
       # Canonical Automodel modes: "false", "final", or "every".
@@ -71,7 +71,7 @@ policy:
     load_precision: float32
     shard_before_load: false
   megatron_cfg:
-    enabled: false
+    enabled: true
     empty_unused_memory_level: 0
     activation_checkpointing: false
     recompute_granularity: full
@@ -107,7 +107,7 @@ policy:
     optimizer:
       optimizer: adam
       lr: 5.0e-05
-      min_lr: 5.0e-05
+      min_lr: 0.0
       weight_decay: 0.001
       bf16: true
       fp16: false
@@ -125,10 +125,10 @@ policy:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: constant
-      lr_decay_style: constant
-      lr_decay_iters: 1000
-      lr_warmup_iters: 10
-      lr_warmup_init: 5.0e-06
+      lr_decay_style: cosine
+      lr_decay_iters: 5000
+      lr_warmup_iters: 250
+      lr_warmup_init: 1.0e-06
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: true
@@ -200,7 +200,7 @@ teachers:
   offload_policy_before_refit: false
   offload_optimizer_for_refit: true
   automodel_cfg:
-    enabled: true
+    enabled: false
     checkpoint:
       model_save_format: "safetensors"
       save_consolidated: "false"
@@ -213,7 +213,7 @@ teachers:
     load_precision: float32
     shard_before_load: false
   megatron_cfg:
-    enabled: false
+    enabled: true
     empty_unused_memory_level: 0
     activation_checkpointing: false
     recompute_granularity: full
