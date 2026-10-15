@@ -25,16 +25,16 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
+    CrossTokenizerCollator,
+    CrossTokenizerCollatorConfig,
+)
+from nemo_rl.data.cross_tokenizer.native_chat import _render_and_tokenize_chat
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     OpenAIFormatDataset,
 )
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.processors import chat_kd_processor
-from nemo_rl.data.xtoken.cross_tokenizer_collate import (
-    CrossTokenizerCollator,
-    CrossTokenizerCollatorConfig,
-)
-from nemo_rl.data.xtoken.native_chat import _render_and_tokenize_chat
 
 ROOT = Path(__file__).resolve().parents[3]
 REVISION = "1cfa9a7208912126459214e8b04321603b3df60c"
