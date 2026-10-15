@@ -19,7 +19,7 @@ Gym side: ``RolloutCollectionHelper.run_examples`` from the installed ``nemo_gym
 Gym's own tests for this iterator. RL side: ``_iter_gym_results_with_straggler_cutoff``
 as imported, nothing extracted or copied.
 
-Cancelling needs the iterator ``run_examples`` returns to have ``aclose()``
+Cancelling needs the iterator ``run_examples`` returns to have ``aclose_and_drain()`` and ``aclose()``
 (NVIDIA-NeMo/Gym#4029). With a Gym that returns a plain ``map`` the actor runs uncut
 (covered in ``test_nemo_gym_straggler_cutoff.py``), so these tests skip until the pin
 has it; from then on they run in the ``nemo_gym`` shard. They exercise the RL/Gym
@@ -45,10 +45,12 @@ from nemo_gym.global_config import (
 )
 from nemo_gym.rollout_collection import RolloutCollectionHelper
 
+from nemo_rl.environments import nemo_gym as rl_gym
 from nemo_rl.environments.nemo_gym import (
     StragglerCutoffConfig,
     _iter_gym_results_with_straggler_cutoff,
 )
+from nemo_rl.experience.failures import GymTransportError
 from nemo_rl.utils.timer import Timer
 
 pytestmark = pytest.mark.nemo_gym
@@ -142,10 +144,10 @@ def fake_run_transport(monkeypatch):
 
 
 def _skip_unless_cancellable(completions) -> None:
-    if not hasattr(completions, "aclose"):
+    if not hasattr(completions, "aclose_and_drain"):
         pytest.skip(
             "the installed NeMo Gym's run_examples cannot cancel in-flight rollouts "
-            "(no aclose()); needs a Gym with NVIDIA-NeMo/Gym#4029"
+            "(no aclose_and_drain()); needs a Gym with NVIDIA-NeMo/Gym#4029"
         )
 
 
@@ -306,5 +308,126 @@ def test_non_cutoff_exit_closes_real_gym_tasks(
         finally:
             await stream.aclose()
             await completions.aclose()
+
+    asyncio.run(collect())
+
+
+@pytest.mark.parametrize("max_resident_tasks", [None, 4])
+@pytest.mark.parametrize("deadline", ["zero_grace", "positive_grace", "max_wall"])
+def test_cutoff_preserves_ready_backlog(
+    max_resident_tasks, deadline, fake_run_transport, monkeypatch
+):
+    clock = [0.0]
+    monkeypatch.setattr(rl_gym, "monotonic", lambda: clock[0])
+    cutoff = StragglerCutoffConfig(
+        done_fraction=0.5,
+        grace_s=0 if deadline == "zero_grace" else 1,
+        max_wall_s=1 if deadline == "max_wall" else None,
+    )
+    servers = _FakeRunServers({i: 0.0 for i in range(4)})
+    rows = _rows(4)
+    stats = {}
+
+    async def collect():
+        completions = _helper(servers).run_examples(
+            rows, max_resident_tasks=max_resident_tasks
+        )
+        _skip_unless_cancellable(completions)
+        out = []
+        async for row, result, event in _iter_gym_results_with_straggler_cutoff(
+            completions, rows, cutoff, Timer(), "timing/backlog", stats
+        ):
+            assert sorted(servers.finished) == [0, 1, 2, 3]
+            out.append((row["_rowidx"], result, event))
+            # Model slow consumption deterministically, after arming or before max-wall.
+            if (
+                deadline == "positive_grace" and len(out) == 3
+            ) or deadline == "max_wall":
+                clock[0] = 10.0
+        assert asyncio.all_tasks() == {asyncio.current_task()}
+        return out
+
+    out = asyncio.run(collect())
+    assert sorted(idx for idx, _, _ in out) == [0, 1, 2, 3]
+    assert all(result is not None and event is None for _, result, event in out)
+    assert stats["straggler_cutoff/num_cut"] == 0
+    assert servers.cancelled == []
+
+
+@pytest.mark.parametrize("max_resident_tasks", [None, 4])
+def test_cutoff_preserves_ready_results_with_pending_and_unadmitted_work(
+    max_resident_tasks, fake_run_transport
+):
+    rows = _rows(7)
+    servers = _FakeRunServers({i: 0.0 if i < 3 else None for i in range(7)})
+    stats = {}
+
+    async def collect():
+        completions = _helper(servers).run_examples(
+            rows, max_resident_tasks=max_resident_tasks
+        )
+        _skip_unless_cancellable(completions)
+        out = [
+            (row["_rowidx"], event is not None)
+            async for row, _, event in _iter_gym_results_with_straggler_cutoff(
+                completions,
+                rows,
+                StragglerCutoffConfig(done_fraction=0.1, grace_s=0),
+                Timer(),
+                "timing/mixed",
+                stats,
+            )
+        ]
+        assert asyncio.all_tasks() == {asyncio.current_task()}
+        started = list(servers.started)
+        await asyncio.sleep(0)
+        assert servers.started == started
+        return out
+
+    out = asyncio.run(collect())
+    assert sorted(index for index, cut in out if not cut) == [0, 1, 2]
+    assert [index for index, cut in out if cut] == [3, 4, 5, 6]
+    assert stats["straggler_cutoff/num_cut"] == 4
+    assert set(servers.cancelled) == set(servers.started) - {0, 1, 2}
+    if max_resident_tasks is not None:
+        assert not set(servers.started) & {5, 6}
+
+
+@pytest.mark.parametrize("max_resident_tasks", [None, 4])
+def test_cutoff_propagates_a_queued_failure(max_resident_tasks, fake_run_transport):
+    class HttpError(Exception):
+        status = 503
+
+    async def collect():
+        release_failure = asyncio.Event()
+
+        class FailureServer(_FakeRunServers):
+            async def post(self, server_name, url_path, json):
+                if json[TASK_INDEX_KEY_NAME] == 3:
+                    await release_failure.wait()
+                    raise HttpError("queued server failure")
+                return await super().post(server_name, url_path, json)
+
+        servers = FailureServer({0: 0.0, 1: 0.0, 2: 0.0})
+        rows = _rows(4)
+        completions = _helper(servers).run_examples(
+            rows, max_resident_tasks=max_resident_tasks
+        )
+        _skip_unless_cancellable(completions)
+        stream = _iter_gym_results_with_straggler_cutoff(
+            completions,
+            rows,
+            StragglerCutoffConfig(done_fraction=0.25, grace_s=0),
+            Timer(),
+            "timing/failure",
+            {},
+        )
+        await anext(stream)
+        release_failure.set()
+        await asyncio.sleep(0)
+        with pytest.raises(GymTransportError, match="HTTP 503"):
+            async for _, _, event in stream:
+                assert event is None
+        assert asyncio.all_tasks() == {asyncio.current_task()}
 
     asyncio.run(collect())

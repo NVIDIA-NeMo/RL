@@ -539,7 +539,7 @@ async def _iter_gym_results_with_straggler_cutoff(
 ) -> AsyncGenerator[tuple[dict, Optional[dict], Optional[StragglerCutoffEvent]], None]:
     """Yield ``(row, result, cutoff_event)``; the event is None for completed rollouts.
 
-    ``completions`` is what Gym's ``run_examples`` returned and must have ``aclose()``.
+    ``completions`` is Gym's ``run_examples`` iterator with ``aclose_and_drain()`` and ``aclose()``.
     Cut rows are yielded after every finished one, in input order, with ``result=None``.
     ``stats`` receives the batch-level ``straggler_cutoff/*`` metrics.
     """
@@ -600,13 +600,26 @@ async def _iter_gym_results_with_straggler_cutoff(
             if reason is None:
                 continue
 
+            # Freeze admission before draining. Wait only for local client tasks;
+            # this does not acknowledge server-side agent cleanup.
+            drained = await completions.aclose_and_drain()
             if next_completion is not None:
-                next_completion.cancel()
-            # Wait for the actor's client tasks, not server-side agent cleanup.
-            await completions.aclose()
-            if next_completion is not None:
+                # Gym cancels an unclaimed waiter; an already-claimed outcome
+                # belongs to this waiter and must not be lost or duplicated.
                 await asyncio.gather(next_completion, return_exceptions=True)
+                if not next_completion.cancelled():
+                    drained.insert(0, next_completion)
                 next_completion = None
+            drained.reverse()
+            while drained:
+                completed = drained.pop()
+                try:
+                    row, result = completed.result()
+                except Exception as error:
+                    _raise_typed_gym_failure(error)
+                del completed
+                finished_ids.add(row["_rowidx"])
+                yield row, result, None
             cut_rows = [row for row in rows if row["_rowidx"] not in finished_ids]
             stats["straggler_cutoff/num_cut"] = float(len(cut_rows))
             stats["straggler_cutoff/cut_at_s"] = elapsed_s
@@ -1504,12 +1517,14 @@ Depending on your data shape, you may want to change these values."""
                     "no receipt"
                 )
                 cutoff = None
-            if cutoff is not None and not hasattr(nemo_gym_result_iterator, "aclose"):
-                # Gym releases whose run_examples cannot cancel in-flight rollouts
-                # (the pinned 17abf2dd returns a plain map; Gym#4029 adds aclose()).
+            if cutoff is not None and not hasattr(
+                nemo_gym_result_iterator, "aclose_and_drain"
+            ):
+                # Older Gym (including aclose-only versions) cannot preserve a
+                # completed backlog while stopping bounded admission atomically.
                 self._warn_straggler_cutoff_unavailable(
-                    "this NeMo-Gym's run_examples cannot cancel in-flight rollouts "
-                    "(no aclose())"
+                    "this NeMo-Gym's run_examples cannot stop and preserve completed rollouts "
+                    "(no aclose_and_drain(); requires Gym#4029)"
                 )
                 cutoff = None
             cutoff_stats: dict[str, float] = {}

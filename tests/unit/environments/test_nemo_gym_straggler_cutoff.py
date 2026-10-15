@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 import torch
 
+import nemo_rl.environments.nemo_gym as gym_mod
 import nemo_rl.experience.rollouts as rollouts_mod
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -202,6 +203,7 @@ class _FakeCompletions:
     def __init__(self, rows: list[dict], delays: dict[int, float | None]):
         self.cancelled: list[int] = []
         self.closed = False
+        self._claimed: set[int] = set()
 
         async def run(row):
             delay = delays.get(row["_rowidx"])
@@ -224,14 +226,35 @@ class _FakeCompletions:
         return self
 
     def __next__(self):
-        return next(self._completions)
+        if self.closed:
+            raise StopIteration
+        return self._next_completed(next(self._completions))
+
+    async def _next_completed(self, completion):
+        row, result = await completion
+        if self.closed:
+            raise asyncio.CancelledError
+        self._claimed.add(row["_rowidx"])
+        return row, result
+
+    async def aclose_and_drain(self):
+        if self.closed:
+            return []
+        self.closed = True
+        completed = [
+            task
+            for index, task in enumerate(self._tasks)
+            if task.done() and index not in self._claimed
+        ]
+        await self.aclose()
+        return completed
 
     async def aclose(self):
         self.closed = True
         pending = [task for task in self._tasks if not task.done()]
         for task in pending:
             task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.gather(*self._tasks, return_exceptions=True)
 
 
 def _rows(n: int) -> list[dict]:
@@ -331,6 +354,72 @@ def test_a_failed_rollout_still_raises_typed():
             assert all(task.done() for task in completions._tasks)
         finally:
             await completions.aclose()
+
+    asyncio.run(collect())
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_cutoff_harvests_an_already_claimed_pending_waiter(monkeypatch, fails):
+    class HttpError(Exception):
+        status = 503
+
+    clock = [0.0]
+    monkeypatch.setattr(gym_mod, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(gym_mod, "_straggler_cutoff_wait_s", lambda *args, **kwargs: 0)
+    rows = _rows(3)
+
+    class ClaimedWaiter:
+        def __init__(self):
+            self.release = asyncio.Event()
+            self.claimed = False
+            self.closed = False
+            self.requests = 0
+
+        def __next__(self):
+            self.requests += 1
+            return self.completion()
+
+        async def completion(self):
+            self.claimed = True
+            clock[0] = 2.0
+            await self.release.wait()
+            if fails:
+                raise HttpError("claimed failure")
+            return rows[0], {"reward": 1}
+
+        async def aclose_and_drain(self):
+            assert self.claimed
+            self.closed = True
+            self.release.set()
+            ready = asyncio.get_running_loop().create_future()
+            ready.set_result((rows[1], {"reward": 1}))
+            return [ready]
+
+        async def aclose(self):
+            self.closed = True
+            self.release.set()
+
+    async def collect():
+        completions = ClaimedWaiter()
+        stream = _iter_gym_results_with_straggler_cutoff(
+            completions,
+            rows,
+            StragglerCutoffConfig(done_fraction=1, grace_s=10, max_wall_s=1),
+            Timer(),
+            "timing/race",
+            {},
+        )
+        if fails:
+            with pytest.raises(GymTransportError, match="HTTP 503"):
+                await anext(stream)
+        else:
+            out = [
+                (row["_rowidx"], event is not None) async for row, _, event in stream
+            ]
+            assert out == [(0, False), (1, False), (2, True)]
+        assert completions.requests == 1
+        assert completions.closed
+        assert asyncio.all_tasks() == {asyncio.current_task()}
 
     asyncio.run(collect())
 
@@ -440,16 +529,38 @@ def test_placeholder_falls_back_to_plain_text_and_never_empty():
 
 
 class _FakeRolloutHelper:
-    def __init__(self, delays: dict[int, float | None], closable: bool = True):
+    def __init__(
+        self,
+        delays: dict[int, float | None],
+        closable: bool = True,
+        drainable: bool = True,
+    ):
         self.delays = delays
         self.closable = closable
+        self.drainable = drainable
         self.completions: _FakeCompletions | None = None
 
     def run_examples(self, examples, head_server_config):
         self.completions = _FakeCompletions(examples, self.delays)
         if self.closable:
+            if not self.drainable:
+                return _CloseOnlyCompletions(self.completions)
             return self.completions
         return iter(list(self.completions))
+
+
+class _CloseOnlyCompletions:
+    def __init__(self, completions):
+        self.completions = completions
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.completions)
+
+    async def aclose(self):
+        await self.completions.aclose()
 
 
 def _actor(cutoff: dict | None, rollout_helper: _FakeRolloutHelper) -> NemoGymClass:
@@ -616,8 +727,9 @@ def test_run_rollouts_disabled_never_cuts():
     assert not any(STRAGGLER_CUT_KEY in item[2]["full_result"] for item in streamed)
 
 
-def test_run_rollouts_on_a_gym_without_aclose_runs_uncut(capsys):
-    helper = _FakeRolloutHelper({0: 0.0, 1: 0.2}, closable=False)
+@pytest.mark.parametrize("closable", [False, True])
+def test_run_rollouts_on_a_gym_without_drain_runs_uncut(capsys, closable):
+    helper = _FakeRolloutHelper({0: 0.0, 1: 0.2}, closable=closable, drainable=False)
     env = _actor(ENABLED, helper)
     streamed = _run(env, _rows(2), allow=True)
     _run(env, _rows(2), allow=True)
