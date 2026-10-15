@@ -39,6 +39,7 @@ import logging
 import os
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -60,6 +61,9 @@ _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
 _RADIO_MARKER = "ls_param.data.fill_(initializer_factor)"
+_DYNAMIC_IMAGE_SOURCE = "model_executor/models/nano_nemotron_vl.py"
+_DYNAMIC_IMAGE_PATCH_FN = "_patch_vllm_dynamic_image_vision_per_media"
+_DYNAMIC_IMAGE_MARKER = "NeMo-RL patch: preserve each scheduler media item's complete"
 _GLM_DSA_SOURCE = "model_executor/models/deepseek_v2.py"
 _GLM_DSA_PATCH_FN = "_patch_vllm_glm_decoder_sequence_parallel_moe"
 _GLM_DSA_MARKER = 'getattr(config, "model_type", None) != "glm_moe_dsa"'
@@ -325,6 +329,24 @@ def patched_radio_source(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def patched_dynamic_image_source(tmp_path, monkeypatch):
+    """The installed Nano VL model, unpatched then patched in tmp."""
+    old_snippet, new_snippet = patch_snippets(_DYNAMIC_IMAGE_PATCH_FN)
+    source = Path(patches._get_vllm_file(_DYNAMIC_IMAGE_SOURCE)).read_text()
+    if new_snippet in source:
+        source = source.replace(new_snippet, old_snippet, 1)
+    source, _ = patches._radio_final_layernorm_source(source)
+    assert old_snippet in source
+    copied = tmp_path / "nano_nemotron_vl.py"
+    copied.write_text(source)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    assert patches._patch_vllm_dynamic_image_vision_per_media(
+        logging.getLogger(__name__)
+    )
+    return copied
+
+
+@pytest.fixture
 def patched_glm_dsa_source(tmp_path, monkeypatch):
     """The installed GLM/DeepSeek model source, unpatched then patched in tmp."""
     copied = write_unpatched_copy(
@@ -448,6 +470,139 @@ def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, c
 
     assert radio_source.read_text() == "class RadioModel:\n    pass\n"
     assert "load_weights tail anchor was not found" in caplog.text
+
+
+@pytest.mark.vllm
+def test_dynamic_image_vision_patch_anchor_still_matches_installed_vllm(
+    patched_dynamic_image_source,
+):
+    content = patched_dynamic_image_source.read_text()
+    assert _DYNAMIC_IMAGE_MARKER in content
+    ast.parse(content)
+
+
+@pytest.mark.vllm
+def test_dynamic_image_vision_patch_preserves_complete_per_image_boundary(
+    patched_dynamic_image_source,
+):
+    tree = ast.parse(patched_dynamic_image_source.read_text())
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "extract_feature_dynamic"
+    )
+    namespace = {
+        "torch": torch,
+        "calc_seq_lens": lambda sizes, patch_size: [
+            (height // patch_size) * (width // patch_size) for height, width in sizes
+        ],
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
+            "<patched-extract-feature-dynamic>",
+            "exec",
+        ),
+        namespace,
+    )
+
+    class BatchSensitiveRecordingStage(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.row_counts = []
+
+        def forward(self, features):
+            rows = features.shape[-2]
+            self.row_counts.append(rows)
+            # Make a packed call observably different from per-image calls on
+            # CPU, where the real BF16 GEMMs may happen to be invariant.
+            return features + features.new_tensor(rows)
+
+    class RecordingVision:
+        def __init__(self, stage):
+            self.stage = stage
+
+        def __call__(self, pixels, *, imgs_sizes):
+            assert len(imgs_sizes) == 1
+            return None, self.stage(pixels)
+
+    # Exact media geometry from the v17 five-image TMPE outlier. The RADIO
+    # inputs have 1088, 1088, 1088, 1088, and 1180 patch rows; 2x pixel
+    # shuffle leaves 272, 272, 272, 272, and 295 projector rows.
+    image_sizes = [(256, 1088)] * 4 + [(160, 1888)]
+    patch_lengths = [1088, 1088, 1088, 1088, 1180]
+    projected_lengths = [272, 272, 272, 272, 295]
+    pixels = torch.zeros(1, sum(patch_lengths), 4, dtype=torch.bfloat16)
+    vision_stage = BatchSensitiveRecordingStage()
+    projector_stage = BatchSensitiveRecordingStage()
+    model = SimpleNamespace(
+        patch_size=16,
+        vision_model=RecordingVision(vision_stage),
+        _apply_vision_final_layernorm=lambda features: features,
+        pixel_shuffle_dynamic_res=lambda features, *, imgs_sizes: features[:, ::4],
+        mlp1=projector_stage,
+    )
+    extract_feature_dynamic = namespace["extract_feature_dynamic"]
+    projected_by_image = []
+    for prefix_length in range(1, len(image_sizes) + 1):
+        prefix_patch_rows = sum(patch_lengths[:prefix_length])
+        prefix_projected_rows = sum(projected_lengths[:prefix_length])
+        vision_stage.row_counts.clear()
+        projector_stage.row_counts.clear()
+        output = extract_feature_dynamic(
+            model,
+            pixels[:, :prefix_patch_rows],
+            image_sizes[:prefix_length],
+        )
+
+        assert vision_stage.row_counts == patch_lengths[:prefix_length]
+        assert projector_stage.row_counts == projected_lengths[:prefix_length]
+        assert output.shape == (1, prefix_projected_rows, 4)
+        output_chunks = output.split(projected_lengths[:prefix_length], dim=-2)
+        for image_index, output_chunk in enumerate(output_chunks):
+            if image_index == len(projected_by_image):
+                projected_by_image.append(output_chunk.clone())
+            else:
+                # Adding later images must not change the projector result for
+                # any image that was already present in the rollout prefix.
+                torch.testing.assert_close(
+                    output_chunk,
+                    projected_by_image[image_index],
+                    rtol=0,
+                    atol=0,
+                )
+
+
+@pytest.mark.vllm
+def test_dynamic_image_vision_patch_is_idempotent(
+    patched_dynamic_image_source, monkeypatch
+):
+    before = patched_dynamic_image_source.read_text()
+    monkeypatch.setattr(
+        patches,
+        "_get_vllm_file",
+        lambda _relative: str(patched_dynamic_image_source),
+    )
+    assert patches._patch_vllm_dynamic_image_vision_per_media(
+        logging.getLogger(__name__)
+    )
+    assert patched_dynamic_image_source.read_text() == before
+
+
+def test_dynamic_image_vision_patch_warns_on_unknown_source(
+    monkeypatch, tmp_path, caplog
+):
+    source = tmp_path / "nano_nemotron_vl.py"
+    source.write_text("class NanoNemotronVLModel:\n    pass\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+
+    with caplog.at_level(logging.WARNING):
+        assert not patches._patch_vllm_dynamic_image_vision_per_media(
+            logging.getLogger(__name__)
+        )
+
+    assert source.read_text() == "class NanoNemotronVLModel:\n    pass\n"
+    assert "anchor was not found exactly once" in caplog.text
 
 
 @pytest.mark.vllm
@@ -781,6 +936,7 @@ def _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars):
         "_patch_vllm_shm_broadcast_bind_retry",
         "_patch_vllm_radio_layerscale_loader",
         "_patch_vllm_radio_final_layernorm",
+        "_patch_vllm_dynamic_image_vision_per_media",
         "_patch_vllm_glm_decoder_sequence_parallel_moe",
     ):
         monkeypatch.setattr(patches, patch_name, lambda _logger: None)

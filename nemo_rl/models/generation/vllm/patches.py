@@ -772,6 +772,86 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
             logger.info("Super VL RADIO final LayerNorm source already present.")
 
 
+def _patch_vllm_dynamic_image_vision_per_media(logger) -> bool:
+    """Encode each dynamic-resolution image in its own vision-model call.
+
+    Megatron trains a trajectory containing the cumulative media set, while
+    vLLM observes that set growing one tool-return image at a time. A shared
+    vision-tower or projector GEMM is therefore batch-shape dependent: an
+    image first encoded alone during rollout is encoded beside later images
+    when Megatron replays the full trajectory. The resulting BF16 rounding
+    difference can break on-policy logprob parity even when pixels and MoE
+    routes are identical.
+
+    vLLM's fixed-resolution temporal path already processes each original
+    video separately. This patch gives dynamic still images the same boundary
+    through the complete RADIO + pixel-shuffle + projector path and mirrors
+    Megatron-Bridge's per-media dynamic path.
+    """
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate nano_nemotron_vl.py for per-media dynamic image "
+            "vision execution."
+        )
+        return False
+
+    # The final-LayerNorm compatibility patch must run first. Keep its hook in
+    # the per-image loop so both source patches remain independently verifiable.
+    old_snippet = """        _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
+        vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
+        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+        vit_embeds = self.pixel_shuffle_dynamic_res(vit_embeds, imgs_sizes=imgs_sizes)
+        vit_embeds = self.mlp1(vit_embeds)
+        return vit_embeds
+"""
+    new_snippet = """        # NeMo-RL patch: preserve each scheduler media item's complete
+        # vision-compute boundary. During an agent rollout the image prefix
+        # grows one tool return at a time; replaying all images in shared BF16
+        # RADIO/projector GEMMs changes embeddings encoded in earlier calls.
+        patch_lengths = calc_seq_lens(imgs_sizes, self.patch_size)
+        if not patch_lengths or sum(patch_lengths) != pixel_values.shape[-2]:
+            raise ValueError(
+                \"Dynamic image geometry does not partition RADIO input: \"
+                f\"lengths={patch_lengths}, pixels={pixel_values.shape[-2]}.\"
+            )
+        image_embeddings = []
+        pixel_chunks = torch.split(pixel_values, patch_lengths, dim=-2)
+        for image_pixels, image_size in zip(pixel_chunks, imgs_sizes, strict=True):
+            single_size = [tuple(int(value) for value in image_size)]
+            _, vit_embeds = self.vision_model(image_pixels, imgs_sizes=single_size)
+            vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
+            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+            vit_embeds = self.pixel_shuffle_dynamic_res(
+                vit_embeds, imgs_sizes=single_size
+            )
+            image_embeddings.append(self.mlp1(vit_embeds))
+        return torch.cat(image_embeddings, dim=-2)
+"""
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        marker = "NeMo-RL patch: preserve each scheduler media item's complete"
+        if marker in content:
+            logger.info(
+                "vLLM per-media dynamic image vision execution already present."
+            )
+            return True
+        if content.count(old_snippet) != 1:
+            logger.warning(
+                "Could not apply vLLM per-media dynamic image vision execution: "
+                "the extract_feature_dynamic anchor was not found exactly once in %s.",
+                file_to_patch,
+            )
+            return False
+        updated = content.replace(old_snippet, new_snippet, 1)
+        compile(updated, file_to_patch, "exec")
+        write_back(updated)
+
+    logger.info("Patched vLLM to encode dynamic images once per media item.")
+    return True
+
+
 def _patch_vllm_radio_layerscale_loader(logger) -> None:
     """Load explicit RADIO LayerScale weights and initialize folded weights.
 
@@ -1274,6 +1354,7 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
+    _patch_vllm_dynamic_image_vision_per_media(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
 
 
@@ -1341,6 +1422,7 @@ def _apply_vllm_patches(
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
+    _patch_vllm_dynamic_image_vision_per_media(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
     if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
         patch_logger

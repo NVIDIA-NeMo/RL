@@ -34,6 +34,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.radio import calc_seq_lens
 
 from nemo_rl.models.generation.vllm import patches
+from tests.unit.models.generation.vllm_patch_source_utils import patch_snippets
 
 
 def _model_methods():
@@ -90,6 +91,36 @@ def test_radio_final_layernorm_source_idempotent():
     source, _ = patches._radio_final_layernorm_source(source_path.read_text())
     assert patches._radio_final_layernorm_source(source) == (source, False)
     compile(source, str(source_path), "exec")
+
+
+def test_radio_final_layernorm_composes_with_per_media_vision(tmp_path, monkeypatch):
+    """Both source patches must compose even if another worker applies LN first."""
+    source_path = Path(
+        patches._get_vllm_file("model_executor/models/nano_nemotron_vl.py")
+    )
+    source = source_path.read_text()
+    old_projection, new_projection = patch_snippets(
+        "_patch_vllm_dynamic_image_vision_per_media"
+    )
+    if new_projection in source:
+        source = source.replace(new_projection, old_projection, 1)
+
+    source, _ = patches._radio_final_layernorm_source(source)
+    assert old_projection in source
+    composed = tmp_path / "nano_nemotron_vl.py"
+    composed.write_text(source)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(composed))
+
+    assert patches._patch_vllm_dynamic_image_vision_per_media(
+        SimpleNamespace(
+            info=lambda *args, **kwargs: None, warning=lambda *args, **kwargs: None
+        )
+    )
+    content = composed.read_text()
+    assert "self._apply_vision_final_layernorm(vit_embeds)" in content
+    assert "NeMo-RL patch: preserve each scheduler media item's complete" in content
+    assert patches._radio_final_layernorm_source(content) == (content, False)
+    compile(content, str(composed), "exec")
 
 
 def test_radio_final_layernorm_incomplete_patch_rejected():
