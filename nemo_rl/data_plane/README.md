@@ -469,8 +469,7 @@ data_plane:
     ssd_offload:                       # needs storage_unit_segment_size > 0; no checkpointing
       enabled: false                   # true: units spill memory to local SSD
       path: null                       # absolute node-local dir; required if enabled
-      eviction_high_watermark_ratio: 0.9  # offload above this share of unit memory
-      eviction_ratio: 0.1              # share freed per eviction cycle
+      offload_threshold: 0.9           # offload above this share of unit memory
   observability:                       # NotRequired
     enabled: true                      # per-op timing / latency percentiles / volume
     verify_tensor_hash: false          # debug: wire-in vs wire-out tensor check
