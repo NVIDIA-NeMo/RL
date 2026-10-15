@@ -68,6 +68,7 @@ def _run_tp2_cp2_csd_student_memory(
     from nemo_rl.algorithms.loss.csd import (
         CSDLossFn,
     )
+    from nemo_rl.algorithms.x_token import loss_utils as shared_loss_utils
     from nemo_rl.algorithms.x_token.loss_utils import LocalizedAlignment
 
     torch.set_num_threads(1)
@@ -154,7 +155,7 @@ def _run_tp2_cp2_csd_student_memory(
         ].clone()
 
         original_cp_gather = loss_functions_module.allgather_cp_contiguous_tensor
-        original_full_softmax = loss_functions_module.vocab_parallel_full_log_softmax
+        original_full_softmax = shared_loss_utils.vocab_parallel_full_log_softmax
         had_vocab_gather = hasattr(
             loss_functions_module,
             "vocab_parallel_gather_logits",
@@ -177,7 +178,7 @@ def _run_tp2_cp2_csd_student_memory(
             raise AssertionError("CSD attempted a rank-3 TP vocabulary gather")
 
         loss_functions_module.allgather_cp_contiguous_tensor = reject_rank3_cp_gather
-        loss_functions_module.vocab_parallel_full_log_softmax = reject_vocab_gather
+        shared_loss_utils.vocab_parallel_full_log_softmax = reject_vocab_gather
         loss_functions_module.vocab_parallel_gather_logits = reject_vocab_gather
         try:
             sharded_loss, sharded_metrics = loss_fn._compute_csd_loss(
@@ -199,9 +200,7 @@ def _run_tp2_cp2_csd_student_memory(
             )
         finally:
             loss_functions_module.allgather_cp_contiguous_tensor = original_cp_gather
-            loss_functions_module.vocab_parallel_full_log_softmax = (
-                original_full_softmax
-            )
+            shared_loss_utils.vocab_parallel_full_log_softmax = original_full_softmax
             if had_vocab_gather:
                 loss_functions_module.vocab_parallel_gather_logits = (
                     original_vocab_gather
