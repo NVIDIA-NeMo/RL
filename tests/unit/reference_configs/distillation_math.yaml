@@ -53,6 +53,7 @@ policy: &POLICY_BASE
         cpu_offload: False
         sequence_parallel: false
         activation_checkpointing: true
+        deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
         tensor_parallel_size: 2
         context_parallel_size: 2
         custom_parallel_plan: null
