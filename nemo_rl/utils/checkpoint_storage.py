@@ -33,6 +33,19 @@ def enable_msc() -> ModuleType:
     return msc
 
 
+def enable_msc_for(*paths: str | os.PathLike[str] | None) -> ModuleType | None:
+    """Enable MSC in this process if any of ``paths`` is an ``msc://`` URL.
+
+    Megatron(-Bridge) only treats ``msc://`` as remote once its process-global
+    MSC flag is on, so call this at every entry point that is handed a
+    checkpoint path (load or save). Returns the ``multistorageclient`` module
+    when enabled, else ``None``; local-path runs never import it.
+    """
+    if any(path and is_msc_path(path) for path in paths):
+        return enable_msc()
+    return None
+
+
 def checkpoint_abspath(path: str | os.PathLike[str]) -> str:
     """Preserve MSC URLs when normalizing a checkpoint location."""
     return str(path) if is_msc_path(path) else os.path.abspath(path)
