@@ -165,10 +165,19 @@ class SpeechLMPolicy(SALMAutomodel):
             )
         if any(
             parameter.dtype != torch.bfloat16
-            for parameter in self.parameters()
-            if not parameter.requires_grad
+            for name, parameter in self.named_parameters()
+            if not parameter.requires_grad and not name.startswith("ctc_timestamp.")
         ):
             raise ValueError("Frozen native parameter storage must remain BF16")
+        if self.ctc_timestamp is not None:
+            artifact_dtypes = self.cfg.ctc_timestamp_artifact.tensor_dtypes
+            for name, parameter in self.ctc_timestamp.named_parameters():
+                if parameter.requires_grad or parameter.dtype != getattr(
+                    torch, artifact_dtypes[name]
+                ):
+                    raise ValueError(
+                        "CTC parameters must remain frozen in their source storage dtype"
+                    )
         if self.llm.mtp is None or any(
             parameter.requires_grad for parameter in self.llm.mtp.parameters()
         ):

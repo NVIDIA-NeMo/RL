@@ -1,381 +1,266 @@
-# SpeechLM Post-training with GSPO
+# SpeechLM post-training with GSPO
 
-This guide documents the **`nvcr.io/nvidia/nemo-rl:v0.7.0` image workflow**.
-The documentation is maintained on `main`; execution uses the compatible source
-revisions listed below. For a current-source installation, see
-[SpeechLM GSPO from current source](gspo-speechlm-source.md).
+This guide describes the full-scale ASR post-training recipe exercised for 400
+updates on an internal 20,000-recording dataset. It accepts a user-supplied
+Parquet manifest with the same public schema; the internal dataset is not
+distributed. The code and installation instructions here target current public
+source checkouts and independently prepared policy and generation environments.
 
-This guide describes how to post-train Nemotron-3.5-Transcribe-30B-A4B for automatic
-speech recognition with Group Sequence Policy Optimization (GSPO), resume a run,
-and export the trained checkpoint for inference. The recipe uses the
-DTensor/Automodel training backend, vLLM rollouts, and transcript error-rate rewards.
+This recipe trains a SpeechLM from its full Hugging Face seed directory using
+fractional WER/CER rewards and sequence-level GSPO. The native policy preserves
+its audio encoder, frozen MTP head and checkpoint names. An explicit parameter
+surface keeps selected optimizer masters in FP32 while frozen weights stay in
+their declared storage dtype. Generation loads the seed before applying selected
+weight refits, so frozen weights are never replaced by dummy initialization.
 
-| Component | Configuration |
-| --- | --- |
-| Model | [nvidia/Nemotron-3.5-Transcribe-30B-A4B](https://huggingface.co/nvidia/Nemotron-3.5-Transcribe-30B-A4B) |
-| Training resources | 4 nodes, 8 GPUs per node |
-| Dataset | User-provided Parquet manifest and shared audio files |
-| Reward | Word error rate; character error rate for Mandarin ASR |
-| Recipe | `examples/configs/recipes/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml` in the pinned RL checkout |
+## Requirements
 
-## 1. Prepare the code and environment
+Use compatible NeMo RL, NeMo Speech and NeMo Automodel checkouts. Speech must
+provide `SALMAutomodel(parameter_config=...)`, strict native checkpoint loading
+and validated partial perception refits. Automodel must provide `ParameterConfig`,
+`preserve_parameter_dtypes`, `compute_logits=False` and `compute_mtp=False`.
+These companion contributions must land before this recipe can use an upstream
+release; installing unrelated public-main revisions is not sufficient.
 
-Use `nvcr.io/nvidia/nemo-rl:v0.7.0` with the compatible SpeechLM revisions of
-[NeMo RL](https://github.com/NVIDIA-NeMo/RL),
-[NeMo Speech](https://github.com/NVIDIA-NeMo/Speech),
-[NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel), and
-[NeMo Skills](https://github.com/NVIDIA-NeMo/Skills).
-
-### Compatible source revisions
-
-Use the coordinated image-compatible revisions below. The current `main`
-recipe uses different worker APIs and dependency versions; do not mix it with
-these image instructions.
-
-| Repository | Image-compatible revision |
-| --- | --- |
-| NeMo RL | `a3f4de738101245382c40a5413cd7294d92e71b4` |
-| NeMo Speech | `a9630f8d1006f418b2318fdec114149048ef3891` |
-| NeMo Automodel | `e81556184cb192160cb0cf96dee72d8e20dfbc45` |
-| NeMo Skills | `c4f807aa9ce51196b5e821c2943baf0f9b95f486` |
-
-These contribution revisions are not yet published upstream. The public
-checkout commands below require them to be published first; the base image or
-an arbitrary upstream checkout alone does not contain this integration.
+Use a CUDA environment matching the current RL installation guide (Python
+3.13.14 and Torch 2.13). Set `RL`, `SPEECH`, `AUTOMODEL` and `SKILLS` to public
+source checkouts containing the companion contributions. Before they merge,
+use the companion PR heads. Obtain the four packages from their public repositories:
 
 ```bash
-export NEMO_RL_REF=a3f4de738101245382c40a5413cd7294d92e71b4
-export SPEECH_REF=a9630f8d1006f418b2318fdec114149048ef3891
-export AUTOMODEL_REF=e81556184cb192160cb0cf96dee72d8e20dfbc45
-export SKILLS_REF=c4f807aa9ce51196b5e821c2943baf0f9b95f486
+git clone https://github.com/NVIDIA-NeMo/RL.git
+git clone https://github.com/NVIDIA-NeMo/Speech.git
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+git clone https://github.com/NVIDIA-NeMo/Skills.git
+export RL="$PWD/RL" SPEECH="$PWD/Speech" AUTOMODEL="$PWD/Automodel" SKILLS="$PWD/Skills"
 ```
 
-From a shared source directory, check out those revisions:
+Record each resolved commit in the run artifacts. Image-compatible branches are
+maintained separately; their package versions are not interchangeable with this
+current-source installation.
+
+Native policy workers use the driver's prepared interpreter. Existing Automodel
+workers keep their pinned extra and submodule; vLLM keeps its own environment.
+Prepare packages once at paths visible on every Ray node:
 
 ```bash
-: "${NEMO_RL_REF:?Set the SpeechLM-enabled NeMo RL revision}"
-: "${SPEECH_REF:?Set the matching Speech revision}"
-: "${AUTOMODEL_REF:?Set the matching Automodel revision}"
-: "${SKILLS_REF:?Set the matching Skills revision}"
+export SPEECHLM_GSPO_VENV=/path/to/venvs/speechlm-policy
+export SPEECHLM_GSPO_PYTHON="$SPEECHLM_GSPO_VENV/bin/python"
+export NEMO_RL_VENV_DIR=/path/to/venvs/rl-actors
 
-git clone https://github.com/NVIDIA-NeMo/RL.git nemo-rl
-git -C nemo-rl checkout "$NEMO_RL_REF"
-git -C nemo-rl submodule update --init --recursive
-git clone https://github.com/NVIDIA-NeMo/Speech.git speech
-git -C speech checkout "$SPEECH_REF"
-git clone https://github.com/NVIDIA-NeMo/Skills.git skills
-git -C skills checkout "$SKILLS_REF"
+# Install Automodel's declared native CUDA/MoE dependencies from its checkout.
+UV_PROJECT_ENVIRONMENT="$SPEECHLM_GSPO_VENV" uv sync \
+  --project "$AUTOMODEL" --python 3.13.14 --extra moe --extra fa
+uv pip install --python "$SPEECHLM_GSPO_PYTHON" \
+  -e "$RL" -e "$SPEECH[speechlm2]" -e "$SKILLS[core]" \
+  -r "$SKILLS/requirements/audio.txt"
 
-export RL_REPO="$(realpath nemo-rl)"
-export SPEECH_REPO="$(realpath speech)"
-export SKILLS_REPO="$(realpath skills)"
-export AUTOMODEL_REPO="$RL_REPO/3rdparty/Automodel-workspace/Automodel"
-git -C "$AUTOMODEL_REPO" fetch origin "$AUTOMODEL_REF"
-git -C "$AUTOMODEL_REPO" checkout "$AUTOMODEL_REF"
+# Keep generation on RL's independently locked vLLM stack.
+GENERATION_ENV="$NEMO_RL_VENV_DIR/nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
+UV_PROJECT_ENVIRONMENT="$GENERATION_ENV" uv sync --locked \
+  --project "$RL" --extra vllm --extra nemo_gym
+uv pip install --python "$GENERATION_ENV/bin/python" \
+  -e "$SPEECH[asr]" 'transformers==5.12.1' 'torch==2.13.0' 'torchvision==0.28.0'
 ```
 
-Install these packages in the container's **separate policy and generation
-environments** using [SpeechLM environment setup](../recipes/speechlm-environment-v070.md).
-Run the setup on every node before starting Ray, or bake the same installation
-into a reusable image. Installing packages only in the driver environment does
-not configure the Ray actors. Keep the image's compiled Torch, CUDA,
-Transformer Engine, DeepEP, and vLLM packages.
+Use the CUDA/compiler prerequisites in the [installation guide](../about/installation.md)
+and each dependency's build instructions. The policy and generation processes
+must have matching Torch/CUDA ABIs for colocated refits. Check the resulting
+package set with `uv pip check --python <interpreter>` for each interpreter.
+Do not enable the global `NEMO_RL_PY_EXECUTABLES_SYSTEM` override: it would also
+move generation into the policy environment. The ASR reward worker runs CPU
+text alignment in the driver environment; it needs no judging model or API.
 
-The [cluster guide](../cluster.md) describes the standard multi-node launcher.
-Make source checkouts, the model, and audio available at the same absolute paths
-on all nodes. Mount model and dataset inputs read-only and give the run its own
-writable checkpoint, log, and dataset-cache directories. Audio stays on shared
-storage; the manifest contains paths to it.
+These are source-install instructions for the main contribution. Fresh installation
+and the full distributed recipe need the GPU qualification below; the focused
+local tests do not establish a complete CUDA dependency installation.
 
-## 2. Prepare the model and dataset
+## Data and seed
 
-### Model
-
-Download the following Hugging Face snapshot once to shared storage. It contains
-the complete model configuration, tokenizer, backbone configuration, and weights.
-Authenticate with Hugging Face before downloading if the repository requires
-access. The recipe starts a new RL run from these weights; it does not restore
-the model's earlier optimizer or training history.
+Use the **full Hugging Face snapshot** of
+`nvidia/Nemotron-3.5-Transcribe-30B-A4B`, including config, tokenizer, backbone
+configuration and safetensors. Pin the model revision when downloading:
 
 ```bash
-export SPEECHLM_GSPO_MODEL_ID=nvidia/Nemotron-3.5-Transcribe-30B-A4B
-export SPEECHLM_GSPO_MODEL_REVISION=471d3b578578edef8c1ed919190140ef7c1f6d8d
 export SPEECHLM_GSPO_MODEL=/shared/models/Nemotron-3.5-Transcribe-30B-A4B
-hf download "$SPEECHLM_GSPO_MODEL_ID" \
-  --revision "$SPEECHLM_GSPO_MODEL_REVISION" --local-dir "$SPEECHLM_GSPO_MODEL"
-
-export SPEECHLM_GSPO_DATA=/shared/data/asr/train.parquet
-export SPEECHLM_GSPO_OUTPUT_DIR=/shared/results/speechlm-gspo
-export HF_DATASETS_CACHE="$SPEECHLM_GSPO_OUTPUT_DIR/dataset-cache"
-mkdir -p "$SPEECHLM_GSPO_OUTPUT_DIR" "$HF_DATASETS_CACHE"
+HF_HUB_DISABLE_XET=0 hf download nvidia/Nemotron-3.5-Transcribe-30B-A4B \
+  --revision 471d3b578578edef8c1ed919190140ef7c1f6d8d \
+  --local-dir "$SPEECHLM_GSPO_MODEL"
 ```
 
-All 269 configured trainable tensor names occur in this snapshot's safetensors
-header, and their shapes match the expected 1,074,318,400 parameters. However,
-the snapshot also contains 38 `ctc_timestamp.*` tensors that the prepared Speech
-integration does not yet handle. Its strict loader rejects these extra tensors.
-Loading and export support for this auxiliary timestamp artifact is required
-before this snapshot can run through the recipe unchanged.
+Authenticate using your approved Hugging Face credentials if access is required.
+The same recipe also accepts compatible full HF seeds without a CTC head, as in
+the original internal-data campaign. The optional bundled CTC timestamp decoder
+remains frozen. Its original floating
+storage, serialized tokenizer buffer and safetensors metadata survive native
+resume and canonical HF export; checkpoints without this artifact retain their
+ordinary strict core-loading path.
+Freezing the head does not guarantee unchanged timestamp accuracy: the selected
+audio-encoder layers still change. Timestamp quality needs its own evaluation.
+Native DCP resume outputs are a separate format.
+Use one recording per row in a local Parquet file. Keep the selected dataset's
+row order, task balance, reference text, and user-prompt variation. The processor
+uses each row's instruction, including task-specific SOT instructions; it does
+not substitute one global ASR prompt.
 
-The earlier training validation below used an internal SpeechLM seed without
-that artifact. The Hub snapshot has not been loaded or trained with this recipe.
-Native distributed checkpoints are used for **resuming RL**.
-
-### Manifest format
-
-Each Parquet row describes one utterance. The audio must be nonempty, sampled at
-16 kHz, and readable by SoundFile. Multichannel audio is averaged to mono. The
-processor does not resample or crop the recording.
-
-| Field | Requirement | Purpose |
-| --- | --- | --- |
-| `id` or `cut_id` | Recommended | Stable utterance identifier |
-| `audio_filepath` or `audio_path` | Required | Audio file path visible to every worker |
-| `prompt` or `instruction` | Required, nonempty string | User instruction |
-| `expected_answer` or `reference` | Required string | Reference transcript; may be empty for nonspeech |
-| `messages` | Required column | Preserves metadata through `ResponseDataset`; use a user-message list |
-| `language` | Recommended; required for Mandarin CER | Language identifier, such as `en`, `hi`, `nl`, or `zh` |
-| `task` | Required for Mandarin CER | Use `ordinary_asr` for ordinary transcription |
-| `reward_metric` | Optional, defaults to `wer` | `wer`, or `cer` for Mandarin ordinary ASR |
-| `cer_whitespace_mode` | Required for Mandarin CER | `han_adjacent` |
-| `responses_create_params` | Optional | Per-row `max_output_tokens`; null uses the global cap |
-
-For example, the following creates a manifest illustrating the schema. Replace
-the examples with a training corpus before launching a run:
+A minimal row is:
 
 ```python
-import pandas as pd
-
-prompt = "Transcribe the audio into text."
-rows = [
-    {
-        "id": "en-0001",
-        "audio_filepath": "/shared/audio/en-0001.wav",
-        "prompt": prompt,
-        "expected_answer": "the next train arrives at nine",
-        "messages": [{"role": "user", "content": prompt}],
-        "language": "en",
-        "task": "ordinary_asr",
-        "reward_metric": "wer",
-        "cer_whitespace_mode": None,
-        "responses_create_params": {"max_output_tokens": None},
-    },
-    {
-        "id": "zh-0001",
-        "audio_filepath": "/shared/audio/zh-0001.wav",
-        "prompt": prompt,
-        "expected_answer": "下一班火车九点到达",
-        "messages": [{"role": "user", "content": prompt}],
-        "language": "zh",
-        "task": "ordinary_asr",
-        "reward_metric": "cer",
-        "cer_whitespace_mode": "han_adjacent",
-        "responses_create_params": {"max_output_tokens": None},
-    },
-]
-pd.DataFrame(rows).to_parquet("train.parquet", index=False)
+{
+    "messages": [{"role": "user", "content": "Transcribe the audio."}],
+    "audio_filepath": "/data/audio/example.wav",
+    "instruction": "Transcribe the audio.",
+    "expected_answer": "The reference transcript.",
+    "language": "en",
+    "task": "ordinary_asr",
+    "reward_metric": "wer",
+    "responses_create_params": {"max_output_tokens": None},
+}
 ```
 
-Run manifest preparation in a CPU environment with pandas and a Parquet engine.
-Keep `messages` in the saved table: without it, `ResponseDataset` reformats the
-rows and removes the audio/reward columns. The ASR processor builds the actual
-model request from `prompt` and the waveform, independently of stored messages:
-one user message, **instruction before audio**, no system message. References
-are used only for reward calculation. A supplied `system_prompt` must be empty;
-`input_order`, if supplied, must be `text_before_audio`.
+Preserve the `messages` column for `ResponseDataset` passthrough. The ASR
+processor builds the actual request with text before audio, no system prompt
+and no reference leakage. Audio must be nonempty 16-kHz WAV; channels are averaged.
+For Mandarin ordinary ASR, set `language="zh"`, `task="ordinary_asr"`,
+`reward_metric="cer"` and `cer_whitespace_mode="han_adjacent"`. This route requires
+a nonempty normalized reference. Other tasks use `reward_metric="wer"`; empty
+references are valid for nonspeech. Rewards are fractional `1 - error_rate`, not percentages and not clipped to
+zero. WER rewards use case/punctuation normalization that preserves Indic
+combining marks; they are not interchangeable with downstream benchmark scores.
+For an empty WER reference, the error is the number of normalized hypothesis
+words, so an empty hypothesis earns 1 and extra words reduce the reward.
 
-Prompt variation is configured per row. For serialized multi-speaker
-transcription, use the matching speaker-tag instruction and reference format;
-its training reward is WER on the serialized text. Nonspeech uses an empty
-reference and WER metadata, not the Mandarin ordinary-ASR CER path. Keep genuine
-speech examples in the dataset so suppressing all output is not rewarded
-throughout the corpus.
+A positive per-row output cap limits generation; a null cap retains the global
+limit. Dataset preparation must establish any benchmark exclusion policy;
+this recipe does not verify audio-level disjointness.
 
-The recipe uses the manifest's row order, with shuffling disabled and seed 42.
-It does not mine data, create a validation split, or exclude evaluation audio
-automatically. Prepare the training/evaluation separation before training.
+## Train and resume
 
-### Reward and group selection
+Set the three paths below, then launch from the RL checkout inside a four-node,
+32-GPU Ray allocation (eight GPUs per node), with shared model/data/output paths.
+Start the Ray cluster through your scheduler using the normal
+[cluster setup](../cluster.md) instructions. The recipe's complete selected-name list describes the intended
+Nemotron SpeechLM topology; setup rejects missing, extra or mismatched tensors.
 
-For nonempty references, the reward is `1 - error_rate`, with error rates
-expressed as fractions. A WER of 0.1 gives reward 0.9; insertions can produce
-negative rewards. WER normalization casefolds and separates punctuation while
-preserving combining marks, apostrophes, and underscores. It does not expand
-numbers or apply benchmark-specific normalization. Mandarin ordinary ASR uses
-NeMo Skills CER with standard normalization and Han-adjacent whitespace handling.
-For an empty WER reference, reward is `1 - number_of_hypothesis_words`.
+```bash
+export SPEECHLM_GSPO_MODEL=/shared/models/Nemotron-3.5-Transcribe-30B-A4B
+export SPEECHLM_GSPO_DATA=/path/to/consumer.parquet
+export SPEECHLM_GSPO_OUTPUT_DIR=/path/to/fresh/output
+cd "$RL"
+uv run --no-project "$SPEECHLM_GSPO_PYTHON" examples/run_vlm_grpo.py \
+  --config examples/configs/recipes/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml
+```
 
-Each update initially offers **40 utterances and generates 64 responses per
-utterance**. Groups with identical rewards are discarded. The first 20 remaining
-groups, in input order, form the training batch: 1,280 responses per update.
-Groups are not ranked by reward spread. The standard dynamic-sampling loop
-draws additional batches when needed and fails if its refill allowance cannot
-produce a complete batch. Its configuration is
-`grpo.dynamic_sampling_max_gen_batches: 2`.
-
-Advantages use a leave-one-out mean and the full group's sample standard
-deviation. GSPO uses sequence-level importance ratios and sequence-level loss
-reduction. A group needs varying rewards to contribute learning signal; a
-perfect transcript is not required in every group.
-
-## 3. Train
-
-The principal settings are defined in the recipe YAML:
+The full configuration is
+[`vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml).
+Its inherited defaults and overrides resolve the following settings:
 
 | Setting | Value |
 | --- | --- |
-| Optimizer updates | 400 |
-| Selected utterances / responses per utterance | 20 / 64 |
-| AdamW peak LR / weight decay | `1e-6` / `0.01` |
-| LR schedule | 5-update linear warmup from 0.1×, then constant |
-| GSPO clipping / reference KL penalty | 0.2 / 0 |
-| Microbatch / policy expert parallelism | 1 / 8 |
-| vLLM tensor / expert parallelism | 8 / 8 |
-| Sampling temperature | 0.8 |
-| Total sequence limit / maximum generated tokens | 62,464 / 17,278 |
-| Checkpoint cadence / retained checkpoints | Every 20 updates / 20 |
+| Updates | 400, with at most 2 passes through the ordered dataset |
+| Offered recordings / retained groups | 40 / 20, with at most 2 generation batches per update |
+| Responses per recording | 64; temperature 0.8 |
+| Learning rate | 1e-6 after a 5-update linear warmup from 0.1 of the target LR |
+| Update surface | 269 named tensors, 1,074,318,400 scalars; FP32 storage |
+| Frozen components | Remaining backbone/perception weights, MTP, and optional CTC head |
+| Training / generation parallelism | Policy TP=CP=1, EP=8; generation TP=8, EP=8 |
+| Context / global output limits | 62,464 / 17,278 tokens, further bounded by per-row caps and remaining context |
+| Checkpoint cadence / retention | Every 20 updates / 20 native checkpoints |
 
-The output cap is a ceiling, not a target. A positive row cap can lower it;
-generation is also bounded by the available context. Audio-expanded sequence
-length must fit the model's total sequence limit.
+The update surface is configured by `policy.native_model.trainable_names`,
+`expected_trainable_tensors`, and `expected_trainable_scalars`; the complete list
+is in the recipe. No CTC parameter is selected. Keep the tested list when changing
+only the dataset or substituting a checkpoint of the same architecture.
 
-### Trainable parameters
+Each offered batch has 40 recordings and 64 responses per recording. Dynamic
+sampling retains the first 20 nonconstant groups in order. It does not rank
+valid groups by reward spread. At 400 completed updates, 8,000 groups and 512,000
+responses contribute to training, with possible repetition of dataset rows;
+additional offered groups can be discarded or trigger a refill. Advantages use a
+leave-one-out mean and **full valid-group sample standard deviation**, with
+`1e-6` stabilization. The new estimator option defaults off for existing recipes.
+Native SpeechLM requires unpacked sequences, policy TP=CP=1 and synchronous
+MTP-off generation. Router projection caching remains enabled during activation
+checkpoint recomputation; auxiliary MTP computation is disabled without deleting
+its frozen checkpoint state.
 
-`policy.native_model.trainable_names` selects the update surface **before
-optimizer construction**. The supplied list contains 269 tensors
-(1,074,318,400 parameters), whose master weights are FP32. All other tensors
-remain frozen. The configured tensor/scalar counts detect unintended changes
-to that selection. Perception dropout and augmentation are disabled for
-consistent policy/rollout conditioning. MTP weights remain frozen; MTP auxiliary
-loss and speculative decoding are disabled in this recipe.
+When auditing retained rows in `train_data_step*.jsonl`, use `filtered_rewards`.
+With dynamic sampling enabled, raw `rewards` contains the unfiltered batch and
+is not aligned with retained `source_idx` or content.
 
-Run the following **once on the head of an initialized four-node Ray cluster**,
-using the generation environment configured in step 1:
+The recipe saves every 20 updates. Reusing its output directory restores the
+latest finalized native optimizer, scheduler and dataloader state. Use a fresh
+output directory for an independent run. For the separate 20-plus-fresh-2
+qualification, run the [nightly shell driver](../../tests/test_suites/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.sh); it verifies saved state
+before and after restarting the training process.
+
+## Export and evaluate
+
+First generate the export configuration from the original local HF seed. This
+includes the CTC construction metadata when present; no private experiment YAML
+is needed. Keep this seed available for its tokenizer and backbone config.
 
 ```bash
-export NEMO_RL_VENV_DIR=/opt/ray_venvs
-export NRL_FORCE_REBUILD_VENVS=false
-export NRL_IGNORE_VERSION_MISMATCH=1
-export NRL_DISABLE_QWENVL_VISION_PATCH=1
-export NRL_NSYS_WORKER_PATTERNS=
-export VLLM_USE_DEEP_GEMM=0
-export PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 NO_VCS_VERSION=1
-unset PYTHONPATH
-
-cd "$RL_REPO"
-uv run --no-project --python "$GENERATION_PYTHON" \
-  examples/run_vlm_grpo.py \
-  --config examples/configs/recipes/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml \
-  ++policy.dtensor_cfg.moe_parallelizer.ignore_router_for_ac=true
+export MODEL_CONFIG=/shared/results/speechlm-export-config.json
+export EXPORT_OUTPUT=/shared/results/speechlm-hf
+"$SPEECHLM_GSPO_PYTHON" "$SPEECH/examples/speechlm2/prepare_rl_export_config.py" \
+  --seed "$SPEECHLM_GSPO_MODEL" --output "$MODEL_CONFIG"
 ```
 
-The explicit override caches the MoE router projection during activation
-checkpointing. Recomputing the projection can change expert routing and cause a
-tensor-shape mismatch during backward. Automodel defaults vary by revision;
-retain this override when resuming.
-
-The image actor environments are reused intentionally; the environment setup
-pins their packages independently of the source-checkout fingerprint. A generic
-`uv run` that resolves a new project environment is a different setup.
-
-For Slurm, save the driver block above as `/shared/scripts/train-speechlm.sh`
-and the environment page's shell blocks as
-`/shared/scripts/setup-speechlm-env.sh`, both starting with `set -euo pipefail`.
-Export the model/data/output and repository variables from the preceding steps
-and submit through the [standard `ray.sub` launcher](../cluster.md):
+In an eight-GPU allocation with the prepared policy environment, run Speech's
+canonical converter:
 
 ```bash
-cd "$RL_REPO"
-export CONTAINER=/shared/containers/nemo-rl-v0.7.0.sqsh
-export MOUNTS=/shared:/shared
-export SETUP_COMMAND='bash /shared/scripts/setup-speechlm-env.sh'
-export COMMAND='bash /shared/scripts/train-speechlm.sh'
-sbatch --nodes=4 --gres=gpu:8 --account=YOUR_ACCOUNT \
-  --partition=YOUR_PARTITION --time=4:00:00 \
-  --job-name=speechlm-gspo ray.sub
-```
-
-This example assumes the checkouts and all inputs/outputs are under `/shared`;
-adjust mounts for your filesystem. The setup script runs separately on every
-node. Define `GENERATION_PYTHON` in the submission environment as on the
-environment page; variables exported by a child setup script are not inherited
-by the later driver script. The recipe's checkpoint time budget is 3 hours
-20 minutes and may stop a segment before all 400 updates complete.
-
-### Resume and monitor
-
-Run the same command with the same output directory to resume the latest valid
-native checkpoint, including optimizer, scheduler, and dataloader state.
-`grpo.max_num_steps` is the **global** update target, not the number of additional
-updates. Use a fresh output directory for an independent experiment.
-
-TensorBoard logs are under `$SPEECHLM_GSPO_OUTPUT_DIR/logs`; checkpoints are under
-`checkpoints/step_<N>`. Monitor error-rate rewards, valid groups, generated-token
-lengths, gradient norm, LR, and rollout/update timing. Compare throughput together
-with token workload; long rollouts can dominate step time.
-
-An optional 20-update plus two-update resume test in the pinned RL checkout,
-`tests/test_suites/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.sh`,
-checks continuation mechanics. Set `SPEECHLM_GSPO_PYTHON` to
-`$GENERATION_PYTHON` when using that test. It is a separate test, with its own
-output directory; the training command above runs the 400-update recipe directly.
-
-## 4. Export a checkpoint
-
-Use the canonical exporter in NeMo Speech with an eight-GPU allocation and the
-policy environment. `SPEECH_EXPORT_CONFIG` must be the compatible Speech
-experiment YAML/JSON containing `model` and `trainer.strategy`; it is not the
-HF `config.json`. Any model asset paths referenced by that configuration must
-be available during conversion.
-
-```bash
-export SPEECH_EXPORT_CONFIG=/shared/configs/speechlm-export.yaml
-export SPEECH_HF_OUTPUT=/shared/results/speechlm-gspo-hf-step400
-
-cd "$AUTOMODEL_REPO"
-uv run --no-project --python "$POLICY_PYTHON" \
-  python -m torch.distributed.run --standalone --nproc-per-node=8 \
-  "$SPEECH_REPO/examples/speechlm2/to_hf.py" \
+uv run --no-project "$SPEECHLM_GSPO_PYTHON" -m torch.distributed.run --standalone --nproc-per-node=8 \
+  "$SPEECH/examples/speechlm2/to_hf.py" \
   class_path=nemo.collections.speechlm2.models.SALMAutomodel \
   checkpoint_format=nemo_rl \
   ckpt_path="$SPEECHLM_GSPO_OUTPUT_DIR/checkpoints/step_400/policy/weights/model" \
-  ckpt_config="$SPEECH_EXPORT_CONFIG" output_dir="$SPEECH_HF_OUTPUT"
+  ckpt_config="$MODEL_CONFIG" output_dir="$EXPORT_OUTPUT"
 ```
 
-Native checkpoints preserve training and optimizer precision. HF export and
-vLLM serving apply their supported dtype conversions; FP32 training masters do
-not imply every serving tensor remains FP32. Keep the native checkpoint for
-further RL and the HF export for inference.
+`MODEL_CONFIG` is the compatible Speech configuration file containing `model` and
+`trainer.strategy`; the YAML loader also accepts the helper's JSON output. It is
+not the HF `config.json`. The exporter preserves intrinsic
+FP32 storage through the owning adapter, the CTC artifact's original storage and
+metadata, and applies canonical casts elsewhere;
+FP32 optimizer masters do not imply lossless FP32 serving.
 
-## 5. Evaluate
+Evaluate the exported HF directory using the public NeMo Skills SpeechLM
+serving path and unchanged benchmark manifests, prompts, decoder limits and
+scorers. FullHF combines its SPGI/non-SPGI profiles; SOT uses cpWER, and MUSAN
+requires all four RNG seeds. Preserve raw finish reasons and speech empty-output
+checks alongside headline scores. Nonempty/character-rate MUSAN proxies do not
+establish semantic hallucination quality.
 
-Evaluate the seed and exported checkpoints with the same inference and scoring
-configuration, using [NeMo Skills](https://github.com/NVIDIA-NeMo/Skills) and the
-SpeechLM vLLM plugin. Pin the evaluator revision, prompts, text/audio ordering,
-decoding settings, length limits, and text normalization for both models.
+## Validation and measured scope
 
-Use held-out English and multilingual ASR, multi-speaker transcription, and
-nonspeech audio. Report WER/CER for speech, a speaker-aware metric for
-multi-speaker transcription, and nonempty-output rates for nonspeech. Inspect
-empty speech outputs and truncation as well as aggregate error rates. Training
-reward WER and benchmark WER can use different normalization; report which
-scorer produced each result.
+The completed internal-data campaign reproduced the original recipe closely on
+its matched evaluations:
 
-The recipe disables in-training validation (`grpo.val_period: 0`), so run these
-evaluations on saved checkpoints. Compare the seed, intermediate checkpoints,
-and final checkpoint to detect regressions as well as improvements.
+| Metric (lower is better) | Original 400-update model | Reproduced 400-update model |
+| --- | ---: | ---: |
+| FullHF macro WER | 4.040% | 4.042% |
+| ML7 equal-language mean WER | 4.902% | 4.910% |
+| SOT cpWER | 12.828% | 12.828% |
+| Monsoon WER | 3.542% | 3.548% |
 
-## Validation scope
+These measurements use the internal seed/data and separately pinned runtime,
+not the public HF seed with arbitrary replacement data. Noise suppression was
+weaker in the reproduction (MUSAN noise nonempty rate 40.134% to 43.952%); matched
+regression evaluation remains necessary. The run used a supported router
+activation-checkpoint caching correction for updates 281–400; the final recipe
+sets it explicitly from the start. It was not independently rerun for 400 updates
+with that setting throughout.
 
-The image-based implementation was exercised with 20 updates followed by a
-fresh-process two-update resume, checkpoint export and evaluation, and a
-400-update campaign. The 400-update campaign enabled router-projection caching
-from update 281 after an activation-recomputation failure; the instructions
-above enable it from the start. A fresh, uninterrupted 400-update run with that
-setting throughout was not separately executed.
+Optional CTC persistence was additionally exercised through 20 real updates,
+fresh-process resume, and HF export: all 38 CTC state entries and metadata were
+preserved, with the same 269-tensor update surface. That checks preservation,
+not post-RL timestamp accuracy.
 
-The revision table includes the subsequent documentation and explicit router
-setting. The portable fresh-checkout installation is documented but has not
-been separately qualified; the executed campaign used a fixed source snapshot
-and prepared actor environments. These results do not qualify the separate
-current-source installation.
+
+The main-based contribution has focused CPU tests for rewards, group statistics,
+audio transport, native input expansion/logprobs, precision selection, checkpoint
+loading, refits and export. Earlier distributed campaigns used separate immutable source/package pins.
+They do not qualify a fresh current-main distributed CUDA/EP installation. GPU CI and the normal nightly
+20-plus-fresh-2 test remain required for that environment.

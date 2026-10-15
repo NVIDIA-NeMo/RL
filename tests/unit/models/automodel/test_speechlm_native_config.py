@@ -405,3 +405,60 @@ def test_native_loader_preserves_frozen_frontend_and_fp32_selected_weights(monke
             length=torch.tensor([64]),
         )
         assert features.dtype == torch.bfloat16
+
+
+@pytest.fixture
+def update_surface_model():
+    """Small registered model for the real policy's update-surface validation."""
+    model = torch.nn.Module()
+    model.llm = torch.nn.Module()
+    model.llm.proj = torch.nn.Linear(1, 1, bias=False, dtype=torch.float32)
+    model.llm.mtp = torch.nn.Linear(1, 1, bias=False, dtype=torch.bfloat16)
+    model.llm.mtp.requires_grad_(False)
+    model.ctc_timestamp = torch.nn.Module()
+    model.ctc_timestamp.decoder = torch.nn.Linear(1, 1, bias=False, dtype=torch.float32)
+    model.ctc_timestamp.requires_grad_(False)
+    model.cfg = DictConfig(
+        {"ctc_timestamp_artifact": {"tensor_dtypes": {"decoder.weight": "float32"}}}
+    )
+    model.native_model = native_config()
+    return model
+
+
+@pytest.mark.parametrize(
+    "ctc_dtype", [None, torch.float32, torch.float16, torch.bfloat16]
+)
+def test_update_surface_accepts_optional_frozen_ctc(update_surface_model, ctc_dtype):
+    model = update_surface_model
+    if ctc_dtype is None:
+        model.ctc_timestamp = None
+    else:
+        model.ctc_timestamp.to(dtype=ctc_dtype)
+        model.cfg.ctc_timestamp_artifact.tensor_dtypes["decoder.weight"] = str(
+            ctc_dtype
+        ).removeprefix("torch.")
+    SpeechLMPolicy.validate_update_surface(model)
+    assert SpeechLMPolicy.refit_parameter_names(model) == ("llm.proj.weight",)
+
+
+@pytest.mark.parametrize(
+    "defect", ["ctc_dtype", "ctc_unfrozen", "ctc_selected", "core_dtype"]
+)
+def test_update_surface_rejects_ctc_or_core_mutation(update_surface_model, defect):
+    model = update_surface_model
+    if defect == "ctc_dtype":
+        model.ctc_timestamp.to(dtype=torch.bfloat16)
+        message = "CTC parameters"
+    elif defect in ("ctc_unfrozen", "ctc_selected"):
+        model.ctc_timestamp.requires_grad_(True)
+        message = "surface mismatch"
+        if defect == "ctc_selected":
+            model.native_model["trainable_names"].append("ctc_timestamp.decoder.weight")
+            model.native_model["expected_trainable_tensors"] = 2
+            model.native_model["expected_trainable_scalars"] = 2
+            message = "CTC parameters"
+    else:
+        model.llm.mtp.to(dtype=torch.float32)
+        message = "Frozen native parameter storage"
+    with pytest.raises(ValueError, match=message):
+        SpeechLMPolicy.validate_update_surface(model)
