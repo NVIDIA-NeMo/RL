@@ -1,5 +1,5 @@
 # Nemotron 3.5 Super — vision teacher
-# Standalone recipe. See docs/guides/models/nemotron/nemotron-3.5-super.md.
+# Standalone recipe. See docs/guides/models/nemotron/nemotron-3.5-super-vl.md.
 # Supply checkpoint/data paths through the documented environment variables.
 checkpointing:
   load_replay_buffer: false

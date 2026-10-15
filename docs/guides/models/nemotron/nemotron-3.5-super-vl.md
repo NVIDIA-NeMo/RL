@@ -1,6 +1,6 @@
-# Nemotron 3.5 Super
+# Nemotron 3.5 Super VL
 
-This guide describes post-training Nemotron 3.5 Super with NeMo RL and
+This guide describes post-training Nemotron 3.5 Super VL with NeMo RL and
 [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) on **GB200 NVL72** hardware.
 Training uses Megatron; policy generation uses vLLM.
 
