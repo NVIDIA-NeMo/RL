@@ -69,6 +69,7 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    enable_deterministic_algorithms,
     ensure_teacher_ipc_buffer,
     get_runtime_env_for_policy_worker,
 )
@@ -229,6 +230,8 @@ class AutomodelPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the AutomodelPolicyWorker."""
+        if config["automodel_cfg"].get("deterministic"):
+            enable_deterministic_algorithms()
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
 
