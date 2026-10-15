@@ -1794,7 +1794,7 @@ def get_basic_megatron_test_config(
             },
         },
         "draft": Eagle3DraftConfig(enabled=False),
-        "optimizer": None,  # Remove default FSDP optimizer
+        "optimizer": None,  # Remove default Automodel optimizer
         "scheduler": None,  # Remove default scheduler
         "max_grad_norm": 1.0,
         "generation": deepcopy(basic_vllm_test_config),
@@ -2549,7 +2549,7 @@ async def run_hf_train_process(
 async def test_vllm_generation_with_hf_training_colocated(
     cluster, tokenizer, async_engine, cpu_offload, vllm_precision, enable_lora
 ):
-    """This test validates that DTensor policy can work together with colocated vLLM policy."""
+    """This test validates that Automodel policy can work together with colocated vLLM policy."""
     if vllm_precision == "fp8":
         skip_fp8_known_failures()
 
@@ -2566,7 +2566,7 @@ async def test_vllm_generation_with_hf_training_colocated(
     vllm_policy.finish_generation()
 
     # Create Policy
-    print("Creating DTensor policy...")
+    print("Creating Automodel policy...")
     automodel_config = deepcopy(basic_automodel_test_config)
     automodel_config["automodel_cfg"]["cpu_offload"] = cpu_offload
     automodel_config["automodel_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
@@ -2620,7 +2620,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     if vllm_precision == "fp8":
         skip_fp8_known_failures()
 
-    """This test validates that DTensor policy can work together with non-colocated vLLM policy."""
+    """This test validates that Automodel policy can work together with non-colocated vLLM policy."""
     generation_cluster_separate = get_generation_cluster_separate(1)
 
     # Create VllmGeneration Policy
@@ -2641,7 +2641,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
         "LoRA is not supported with FP8"
     )
     # Create Policy
-    print("Creating DTensor policy...")
+    print("Creating Automodel policy...")
     automodel_config = deepcopy(basic_automodel_test_config)
     automodel_config["generation"]["colocated"]["enabled"] = False
     automodel_config["automodel_cfg"]["cpu_offload"] = cpu_offload
@@ -3317,7 +3317,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
     vllm_policy = None
     lm_policy = None
     try:
-        print(f"Creating DTensor policy for TP={tensor_parallel_size}...")
+        print(f"Creating Automodel policy for TP={tensor_parallel_size}...")
         lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print(f"Creating vLLM policy for TP={tensor_parallel_size}...")
@@ -3403,9 +3403,9 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         torch.cuda.empty_cache()
 
 
-# megatron still holds little memory after refit, so we only test dtensor now
+# megatron still holds little memory after refit, so we only test automodel now
 @pytest.mark.automodel
-@pytest.mark.parametrize("train_backend", ["dtensor"])
+@pytest.mark.parametrize("train_backend", ["automodel"])
 def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     """Test that vLLM streaming weight update and can save memory."""
     from nemo_rl.models.policy.lm_policy import Policy
@@ -3428,7 +3428,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     vllm_policy.finish_generation()
 
     print("Creating Training Policy...")
-    if train_backend == "dtensor":
+    if train_backend == "automodel":
         train_config = deepcopy(basic_automodel_test_config)
     elif train_backend == "megatron":
         train_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
@@ -3506,7 +3506,7 @@ def test_vllm_generation_with_stop(cluster, test_input_data, tokenizer, is_eval)
         # set to sleep first if not in eval mode
         vllm_generation.finish_generation()
 
-        print("Creating DTensor policy...")
+        print("Creating Automodel policy...")
         automodel_config = basic_automodel_test_config
         lm_policy = Policy(cluster, automodel_config, tokenizer)
 
@@ -3580,7 +3580,7 @@ def test_vllm_non_divisible_batch_handling(policy):
 @pytest.mark.parametrize("async_engine", [True, False])
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize(
-    "policy_type", ["dtensor", pytest.param("megatron", marks=[pytest.mark.mcore])]
+    "policy_type", ["automodel", pytest.param("megatron", marks=[pytest.mark.mcore])]
 )
 async def test_vllm_refit_non_colocated_update_weights(
     policy_cluster_separate,
@@ -3607,7 +3607,7 @@ async def test_vllm_refit_non_colocated_update_weights(
         )
 
     # Get policy config
-    if policy_type == "dtensor":
+    if policy_type == "automodel":
         lm_config = deepcopy(basic_automodel_test_config)
     else:
         assert policy_type == "megatron"
@@ -3667,7 +3667,7 @@ async def test_vllm_refit_non_colocated_update_weights(
     output_ids = outputs["output_ids"]
     generated_texts = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
 
-    if policy_type == "dtensor":
+    if policy_type == "automodel":
         expected_texts = [
             "Hello, my name is Lina. I'm",
             "The capital of France is Paris. The capital of",

@@ -3039,7 +3039,7 @@ class TestOPDFullValidation:
         _validate_opd_full_config(config, config.on_policy_distillation)
 
     def test_rejects_a_non_megatron_backend(self):
-        """DTensor has no vocabulary-parallel logit path for the kernels."""
+        """Automodel has no vocabulary-parallel logit path for the kernels."""
         config = _load_fullvocab_master_config()
         config.policy["megatron_cfg"]["enabled"] = False
         with pytest.raises(ValueError, match="requires the Megatron backend"):
