@@ -247,3 +247,48 @@ def select_captured_calls(
     if declared and declared != selected[-1].response_id:
         raise ValueError("Declared terminal differs from accepted history")
     return selected
+
+
+def scored_terminal_id(result: dict[str, Any]) -> str | None:
+    return result.get("terminal_response_id") or (result.get("response") or {}).get(
+        "id"
+    )
+
+
+def select_all_calls(
+    records: list[CallRecord], result: dict[str, Any]
+) -> list[CallRecord]:
+    """Select the scored conversation, then every other conversation's chain.
+
+    Subagent conversations are separate roots. Within a conversation the latest
+    captured continuation wins at a branch. Failed calls end their chain and
+    never invalidate the rollout.
+    """
+    by_call = {r.model_call_id: r for r in records}
+    by_response = {r.response_id: r for r in records}
+    if len(by_call) != len(records) or len(by_response) != len(records):
+        raise ValueError("Capture contains reused call or response identities")
+
+    selected: list[CallRecord] = []
+    record = by_response.get(scored_terminal_id(result) or "")
+    while record is not None and record.response_status != "failed":
+        selected.append(record)
+        if record.parent_call_id is None:
+            break
+        record = by_call.get(record.parent_call_id)
+    else:
+        raise ValueError("Scored response is absent from the captured calls")
+    selected.reverse()
+
+    children: dict[str | None, list[CallRecord]] = {}
+    for r in records:
+        if r.response_status != "failed":
+            children.setdefault(r.parent_call_id, []).append(r)
+    for root in children.get(None, []):
+        if root.model_call_id == selected[0].model_call_id:
+            continue
+        chain: CallRecord | None = root
+        while chain is not None:
+            selected.append(chain)
+            chain = children.get(chain.model_call_id, [None])[-1]
+    return selected

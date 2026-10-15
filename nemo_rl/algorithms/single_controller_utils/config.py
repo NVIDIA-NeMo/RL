@@ -656,6 +656,10 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # rollout checkpointing; ordinary capture retains those capabilities.
     context_compaction: bool = False
 
+    # Train every captured call, including subagent conversations, not only the
+    # accepted history. Failed calls are skipped instead of masking the rollout.
+    train_all_calls: bool = False
+
 
 @dataclass(frozen=True)
 class TaskSourceRecoveryGranularity:
@@ -1415,6 +1419,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "non-default rollout_recovery policies require "
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
+        )
+    if (
+        token_capture_config.train_all_calls
+        and not token_capture_config.context_compaction
+    ):
+        raise ValueError(
+            "token_capture.train_all_calls requires token_capture.context_compaction=true"
         )
     if token_capture_config.context_compaction:
         if master_config.grpo is None:

@@ -25,7 +25,10 @@ from nemo_gym.token_id_capture.staging.records import (
     RolloutManifest,
 )
 
-from nemo_rl.environments.gym_selection import select_captured_calls
+from nemo_rl.environments.gym_selection import (
+    select_all_calls,
+    select_captured_calls,
+)
 from nemo_rl.environments.nemo_gym import _normalize_gym_validity
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from tests.unit.experience.test_agent_output_compatibility import captured  # noqa: F401
@@ -67,6 +70,33 @@ def test_accepted_earlier_call_after_rejected_attempt_needs_no_parent_hint(
     )
     assert result["logical_selection"].response_ids == (first["id"], third["id"])
     assert second["id"] not in result["logical_selection"].response_ids
+
+
+def test_train_all_calls_keeps_subagent_chains_despite_a_failed_call(
+    captured: Any,  # noqa: F811
+) -> None:  # noqa: F811
+    captured.queue.extend(
+        {"role": "assistant", "content": text, "reasoning": None}
+        for text in ("main", "subagent")
+    )
+    main = captured.harness.post("owner", [{"role": "user", "content": "task"}]).json()
+    sub = captured.harness.post("owner", [{"role": "user", "content": "side"}]).json()
+    manifest = captured.harness.manifest("owner").model_dump(mode="json")
+    manifest["failures"] = [{"model_call_id": "lost-call", "reason": "capture_lost"}]
+    result = {"response": main, "reward": 1.0}
+
+    env = _env(captured.harness)
+    env._control = AsyncMock(return_value=manifest)
+    masked = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "owner"}, result)
+    )
+    assert masked["logical_selection"].response_ids == ()
+
+    env.cfg = {"token_capture": {"train_all_calls": True}}
+    trained = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "owner"}, result)
+    )
+    assert trained["logical_selection"].response_ids == (main["id"], sub["id"])
 
 
 @pytest.mark.parametrize(
@@ -114,6 +144,60 @@ def call(index: int, items: list[dict], *, parent: int | None = None) -> CallRec
             "last_output_item": items[-1],
         }
     )
+
+
+def test_select_all_calls_puts_the_scored_chain_first_then_subagent_chains() -> None:
+    # The subagent conversation (3 -> 4) is captured between the main calls.
+    records = [
+        call(1, [message("M1")]),
+        call(3, [message("S1")]),
+        call(4, [message("S2")], parent=3),
+        call(2, [message("M2")], parent=1),
+    ]
+    selected = select_all_calls(records, {"response": {"id": "response-2"}})
+    assert [r.response_id for r in selected] == [
+        "response-1",
+        "response-2",
+        "response-3",
+        "response-4",
+    ]
+
+
+def test_select_all_calls_ends_chains_at_failures_and_keeps_one_branch() -> None:
+    failed = call(4, [message("S2")], parent=3).model_copy(
+        update={"response_status": "failed"}
+    )
+    records = [
+        call(1, [message("M1")]),
+        call(2, [message("M2")], parent=1),
+        call(3, [message("S1")]),
+        failed,
+        call(5, [message("T1")]),
+        call(6, [message("T2")], parent=5),
+        call(7, [message("T2 retry")], parent=5),
+        call(9, [message("orphan")], parent=8),
+    ]
+    selected = select_all_calls(records, {"terminal_response_id": "response-2"})
+    assert [r.response_id for r in selected] == [
+        "response-1",
+        "response-2",
+        "response-3",
+        "response-5",
+        "response-7",
+    ]
+
+
+def test_select_all_calls_requires_a_trainable_terminal() -> None:
+    failed = call(2, [message("M2")], parent=1).model_copy(
+        update={"response_status": "failed"}
+    )
+    records = [call(1, [message("M1")]), failed]
+    with pytest.raises(ValueError, match="Scored response is absent"):
+        select_all_calls(records, {"response": {"id": "response-9"}})
+    with pytest.raises(ValueError, match="Scored response is absent"):
+        select_all_calls(records, {"response": {"id": "response-2"}})
+    with pytest.raises(ValueError, match="reused call or response"):
+        select_all_calls(records + records[:1], {"response": {"id": "response-1"}})
 
 
 @pytest.mark.parametrize(

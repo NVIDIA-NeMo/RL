@@ -223,6 +223,30 @@ def test_terminus_real_transcript_and_existing_decision_references(
     )
 
 
+def test_interleaved_conversations_become_one_segment_each() -> None:
+    records = [
+        record(1, [message("m1")]),
+        record(2, [message("s1")]),
+        record(3, [message("s2")], parent=2),
+        record(4, [message("m2")], parent=1),
+    ]
+    selected = ("response-1", "response-4", "response-2", "response-3")
+    receipt = {
+        "rollout_id": "owner",
+        "manifest": [r.model_dump(mode="json") for r in records],
+        "terminal_model_call_id": "call-4",
+        "terminal_selection": "declared",
+    }
+    selection = RolloutSelection(
+        selected, tuple(ActionOutputFlags(False, False) for _ in selected)
+    )
+    plan = RolloutReassembler._plan_selected_calls(["owner"], [receipt], [selection])[0]
+    assert [s.selected_response_ids for s in plan] == [
+        ("response-1", "response-4"),
+        ("response-2", "response-3"),
+    ]
+
+
 @pytest.mark.parametrize("compact", [False, True])
 def test_gym_opencode_real_sqlite_export_and_episode(
     tmp_path: Path, compact: bool

@@ -1023,6 +1023,13 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_train_all_calls_requires_context_compaction(self):
+        mc = _make_master_config()
+        mc.token_capture = TokenCaptureConfig(enabled=True, train_all_calls=True)
+
+        with pytest.raises(ValueError, match="train_all_calls requires"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
     def test_periodic_checkpointing_requires_token_capture(self):
         mc = _make_master_config()
         mc.checkpointing["enabled"] = True

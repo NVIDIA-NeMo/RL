@@ -1134,15 +1134,9 @@ class RolloutReassembler:
                 raise ValueError(
                     "Selected response is missing or ambiguous in the capture manifest"
                 )
-            positions = {
-                record.response_id: index
-                for index, record in enumerate(parsed.manifest)
-            }
-            if [positions[item] for item in selected] != sorted(
-                positions[item] for item in selected
-            ):
-                raise ValueError("Selected responses must preserve capture order")
-            if by_response[selected[-1]].model_call_id != parsed.terminal_model_call_id:
+            if parsed.terminal_model_call_id not in {
+                by_response[item].model_call_id for item in selected
+            }:
                 raise ValueError("Selected terminal differs from the scored receipt")
             chains: list[list[CallRecord]] = []
             chain_flags: list[list[ActionOutputFlags]] = []
