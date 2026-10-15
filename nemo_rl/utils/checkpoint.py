@@ -401,19 +401,24 @@ class CheckpointManager:
         """
         if self._msc is not None:
             save_dir = self.checkpoint_dir / f"step_{step}"
-            if self._msc.os.path.isdir(str(save_dir), strict=False):
+            if self._msc.os.path.exists(str(save_dir) + "/_SUCCESS"):
                 raise FileExistsError(
                     f"Refusing to overwrite MSC checkpoint {save_dir}; use a fresh run prefix."
                 )
+            # A step without _SUCCESS is an interrupted save (never discoverable
+            # for resume); clear it so the resumed run can save the same step.
+            if self._msc.os.path.isdir(str(save_dir), strict=False):
+                self._msc.delete(str(save_dir), recursive=True)
+                print(f"Removed unpublished {save_dir.name}")
         else:
             save_dir = self.checkpoint_dir / f"tmp_step_{step}"
-        # Remove a stale tmp_step_{step} left behind by an interrupted prior save
-        # so the new save starts clean.
-        if save_dir.exists():
-            t0 = time.monotonic()
-            shutil.rmtree(save_dir)
-            elapsed = time.monotonic() - t0
-            print(f"Removed stale {save_dir.name} in {elapsed:.2f}s")
+            # Remove a stale tmp_step_{step} left behind by an interrupted prior
+            # save so the new save starts clean.
+            if save_dir.exists():
+                t0 = time.monotonic()
+                shutil.rmtree(save_dir)
+                elapsed = time.monotonic() - t0
+                print(f"Removed stale {save_dir.name} in {elapsed:.2f}s")
         save_dir.mkdir(parents=True, exist_ok=True)
 
         # save training info
