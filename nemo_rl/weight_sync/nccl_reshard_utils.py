@@ -721,6 +721,20 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                     f"policy.generation.vllm_cfg.precision={gen_precision!r} is not "
                     "supported by nccl_reshard_refit."
                 )
+            # FlashInfer's MXFP8 quantizer accepts BF16/FP16 inputs. Quantized
+            # sources use BF16 on the wire; unquantized sources keep their dtype.
+            if (
+                gen_precision == "fp8"
+                and vllm_cfg.get("is_mx", False)
+                and not fp8_param
+                and policy.get("precision") not in ("bfloat16", "float16")
+            ):
+                violations.append(
+                    "policy.generation.vllm_cfg.is_mx=True with unquantized training "
+                    "storage requires policy.precision='bfloat16' or 'float16' "
+                    f"(got {policy.get('precision')!r}); vLLM's MXFP8 quantizer "
+                    "rejects FP32 wire buffers."
+                )
             if (
                 fp8_param
                 and fp8_cfg.get("fp8_recipe") == "blockwise"
@@ -804,12 +818,15 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                 and not gen_fp8_cfg.get("fp8_param")
                 and mcore_generation_cfg.get("transformer_impl")
                 != "inference_optimized"
-                and not mcore_generation_cfg.get("disable_parameter_transpose_cache")
+                and not (mcore_generation_cfg.get("model_overrides") or {}).get(
+                    "disable_parameter_transpose_cache"
+                )
             ):
                 violations.append(
                     "FP8 Megatron generation with Transformer Engine layers requires "
-                    "fp8_cfg.fp8_param=True or disable_parameter_transpose_cache=True "
-                    "in policy.generation.mcore_generation_config for nccl_reshard "
+                    "fp8_cfg.fp8_param=True or "
+                    "model_overrides.disable_parameter_transpose_cache=True in "
+                    "policy.generation.mcore_generation_config for nccl_reshard "
                     "refit, so inference does not reuse stale cached FP8 weights."
                 )
 

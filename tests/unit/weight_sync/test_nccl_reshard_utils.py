@@ -150,7 +150,7 @@ def test_check_nccl_reshard_refit_support_collects_without_vllm_cfg() -> None:
 @pytest.mark.parametrize("gen_precision", ["float16", "float32", "bfloat16", "fp8"])
 @pytest.mark.parametrize("source_recipe", [None, "mxfp8"])
 @pytest.mark.parametrize("is_mx", [False, True])
-def test_check_nccl_reshard_accepts_independent_storage_precisions(
+def test_check_nccl_reshard_checks_independent_storage_precisions(
     trainer_precision, gen_precision, source_recipe, is_mx
 ) -> None:
     config = _valid_nccl_reshard_config()
@@ -163,6 +163,15 @@ def test_check_nccl_reshard_accepts_independent_storage_precisions(
         "fp8_param": source_recipe is not None,
         "fp8_recipe": source_recipe,
     }
+    if (
+        trainer_precision == "float32"
+        and gen_precision == "fp8"
+        and is_mx
+        and source_recipe is None
+    ):
+        with pytest.raises(ValueError, match="rejects FP32 wire buffers"):
+            check_nccl_reshard_refit_support(config)
+        return
     check_nccl_reshard_refit_support(config)
 
 
@@ -438,15 +447,20 @@ def test_check_nccl_reshard_rejects_unsupported_megatron_generation(
 
 @pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
 @pytest.mark.parametrize("inherited", [False, True])
+@pytest.mark.parametrize("disable_parameter_transpose_cache", [False, True])
 def test_check_nccl_reshard_rejects_cached_te_fp8_compute(
-    recipe: str, inherited: bool
+    recipe: str, inherited: bool, disable_parameter_transpose_cache: bool
 ) -> None:
-    fp8_cfg = {"enabled": True, "fp8_recipe": recipe, "fp8_param": False}
+    megatron_cfg = {
+        "fp8_cfg": {"enabled": True, "fp8_recipe": recipe, "fp8_param": False},
+        # This top-level key is not applied to the inference provider.
+        "disable_parameter_transpose_cache": disable_parameter_transpose_cache,
+    }
     config = _megatron_gen_config(
-        policy_updates={"megatron_cfg": {"enabled": True, "fp8_cfg": fp8_cfg}}
+        policy_updates={"megatron_cfg": {"enabled": True, **megatron_cfg}}
         if inherited
         else None,
-        **({} if inherited else {"fp8_cfg": fp8_cfg}),
+        **({} if inherited else megatron_cfg),
     )
 
     with pytest.raises(ValueError, match="reuse stale cached FP8 weights"):
@@ -454,13 +468,29 @@ def test_check_nccl_reshard_rejects_cached_te_fp8_compute(
 
 
 @pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
-@pytest.mark.parametrize("fp8_param", [False, True])
-def test_check_nccl_reshard_accepts_te_fp8_without_stale_cache(
-    recipe: str, fp8_param: bool
-) -> None:
+def test_check_nccl_reshard_accepts_te_quantized_megatron_destination(recipe):
     config = _megatron_gen_config(
-        fp8_cfg={"enabled": True, "fp8_recipe": recipe, "fp8_param": fp8_param},
-        disable_parameter_transpose_cache=not fp8_param,
+        transformer_impl="transformer_engine",
+        fp8_cfg={"enabled": True, "fp8_recipe": recipe, "fp8_param": True},
+    )
+
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
+@pytest.mark.parametrize("inherited", [False, True])
+def test_check_nccl_reshard_accepts_te_fp8_with_cache_disabled(
+    recipe: str, inherited: bool
+) -> None:
+    model_overrides = {"disable_parameter_transpose_cache": True}
+    config = _megatron_gen_config(
+        fp8_cfg={"enabled": True, "fp8_recipe": recipe, "fp8_param": False},
+        policy_updates={
+            "megatron_cfg": {"enabled": True, "model_overrides": model_overrides}
+        }
+        if inherited
+        else None,
+        **({} if inherited else {"model_overrides": model_overrides}),
     )
 
     check_nccl_reshard_refit_support(config)
@@ -1086,12 +1116,3 @@ def test_wire_safe_pickle_is_independent_of_a_patched_storage_loader(monkeypatch
 
     assert b"dummy_unpickler_module" in pickle.dumps(info)
     assert b"dummy_unpickler_module" not in pickle.dumps(wire)
-
-
-@pytest.mark.parametrize("recipe", ["mxfp8", "blockwise"])
-def test_check_nccl_reshard_accepts_te_quantized_megatron_destination(recipe):
-    config = _megatron_gen_config(
-        transformer_impl="transformer_engine",
-        fp8_cfg={"enabled": True, "fp8_recipe": recipe, "fp8_param": True},
-    )
-    check_nccl_reshard_refit_support(config)

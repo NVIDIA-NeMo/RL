@@ -1711,8 +1711,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
         Wraps the ``(vllm_param, merged_slice)`` resolution from
         ``_build_hf_to_gen_backend_mapping`` into ``LocalParamSpec``s:
-        - ordinary storage: ``pre`` allocates a receive buffer in the wire dtype,
-          and ``post`` casts it into the live destination region.
+        - ordinary storage: unmerged params matching the wire dtype receive in
+          place; otherwise ``pre`` stages a buffer and ``post`` copies it back.
         - FP8 storage: ``post`` quantizes the received component and commits its value
           and scale together before the backend's final layout conversion.
         - TRTLLM grouped experts: ``pre`` allocates canonical EP-local wire storage,
@@ -2080,9 +2080,15 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         f"Unsupported refit destination dtype {vllm_param.dtype} "
                         f"for {hf_name!r}"
                     )
-                specs[hf_name] = _default_param_spec(
-                    vllm_param, merged_slice, wire_dtype
-                )
+                if merged_slice is None and vllm_param.dtype == wire_dtype:
+                    # Canonical storage in the wire dtype receives in place.
+                    specs[hf_name] = LocalParamSpec(
+                        base=vllm_param.data, wire_dtype=wire_dtype
+                    )
+                else:
+                    specs[hf_name] = _default_param_spec(
+                        vllm_param, merged_slice, wire_dtype
+                    )
         return HFToLocalParamMap(specs=specs)
 
     def _build_hf_to_gen_backend_mapping(self, refit_info):
@@ -2242,8 +2248,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         sequence and a hang can be in either.
         Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``, built
         during prepare or after PP communicator setup for TRTLLM experts) provides
-        a canonical receive buffer in the advertised wire dtype. Its ``post``
-        hook casts or quantizes the received shard into the live destination.
+        a canonical receive buffer in the advertised wire dtype. When needed,
+        its ``post`` hook casts or quantizes into the live destination.
         """
         from nemo_rl.distributed.refit_watchdog import (
             RefitAborted,
@@ -2271,9 +2277,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """Receive weights from training workers via xferdtensor.
 
         Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``,
-        built once in ``prepare_nccl_reshard_refit_info``) stages the canonical
-        shard in the advertised wire dtype and commits it in ``post``. TRTLLM
-        grouped experts load the received tensors through vLLM's native path.
+        built once in ``prepare_nccl_reshard_refit_info``) receives the canonical
+        shard in the advertised wire dtype, staging and committing in ``post``
+        when needed. TRTLLM grouped experts use vLLM's native weight loader.
         """
         import os
         from collections import OrderedDict

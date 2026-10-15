@@ -96,14 +96,17 @@ shard-layout requirements in this document.
 | TE MXFP8 (`fp8_param=true`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 * `*` vLLM's MXFP8 quantizer accepts BF16/FP16 input. Unquantized FP32 sources
-  retain FP32 on the wire and are not supported by this destination hook.
+  retain FP32 on the wire, so `check_nccl_reshard_refit_support` rejects
+  `policy.precision='float32'` with `vllm_cfg.is_mx=true`.
 * Blockwise FP8 training storage with vLLM requires `precision='fp8'`, `is_mx=false`
   because the unchanged misc path exports physical FP8 weights and inverse scales.
 * Megatron blockwise FP8 destinations require Transformer Engine layers.
   `inference_optimized` supports MXFP8 with `inference_grouped_gemm_backend` set to
   `torch` or `flashinfer`.
 * TE FP8 generation over unquantized parameters requires
-  `disable_parameter_transpose_cache=true` so refits refresh its compute weights.
+  `model_overrides: {disable_parameter_transpose_cache: true}` under
+  `policy.generation.mcore_generation_config` so refits refresh its compute
+  weights (a generation-side `model_overrides` replaces the training one).
 
 ### Operational knobs
 

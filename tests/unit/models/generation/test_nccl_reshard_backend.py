@@ -160,25 +160,37 @@ def test_build_mapping_non_gated_expert_up_is_direct():
                 {
                     "name": "model.layers.0.mlp.experts.up_proj.weight",
                     "global_shape": [E, 64, H],
+                    "dtype": "torch.bfloat16",
                     "grouped_expert_proj": "up_proj",
                 },
                 {
                     "name": "model.layers.0.mlp.experts.down_proj.weight",
                     "global_shape": [E, H, 64],
+                    "dtype": "torch.bfloat16",
                     "grouped_expert_proj": "down_proj",
                 },
             ]
         },
     }
-    w13 = _param(E, 64, H)
-    w2 = _param(E, H, 64)
+    w13 = torch.empty(E, 64, H, dtype=torch.bfloat16)
+    w2 = torch.empty(E, H, 64, dtype=torch.bfloat16)
     vllm_params = {
         "model.layers.0.mlp.experts.w13_weight": w13,
         "model.layers.0.mlp.experts.w2_weight": w2,
     }
-    mapping = _make_ext(vllm_params)._build_hf_to_gen_backend_mapping(refit_info)
+    ext = _make_ext(vllm_params)
+    mapping = ext._build_hf_to_gen_backend_mapping(refit_info)
     assert mapping["model.layers.0.mlp.experts.up_proj.weight"] == (w13, None)
     assert mapping["model.layers.0.mlp.experts.down_proj.weight"] == (w2, None)
+    specs = ext.build_hf_to_local_param_map(refit_info)
+    for projection, param in (("up_proj", w13), ("down_proj", w2)):
+        spec = specs.get(f"model.layers.0.mlp.experts.{projection}.weight")
+        assert spec.pre is None and spec.post is None
+        for value in (2.0, 3.0):
+            ctx = spec.materialize()
+            assert ctx.buf.data_ptr() == param.data_ptr()
+            ctx.buf.fill_(value)
+            torch.testing.assert_close(param, torch.full_like(param, value))
 
 
 def test_build_mapping_resolves_routed_experts_submodule():
@@ -315,16 +327,17 @@ def test_build_hf_to_local_param_map_specs_and_roundtrip(wire_dtype):
     assert isinstance(pmap, HFToLocalParamMap)
     assert pmap.get("does.not.exist") is None
 
-    # FP32 storage receives the advertised wire dtype and casts on commit.
+    # Matching FP32 storage receives in place; other wire dtypes stage a cast.
+    staged = wire_dtype != down.dtype
     dn = pmap.get("model.layers.0.mlp.down_proj.weight")
     assert dn.base.data_ptr() == down.data_ptr()
-    assert dn.pre is not None and dn.post is not None
+    assert (dn.pre is not None) == (dn.post is not None) == staged
     assert dn.wire_dtype == dn.materialize().buf.dtype == wire_dtype
 
     # Grouped expert down_proj -> w2 is also direct.
     edn = pmap.get("model.layers.0.mlp.experts.down_proj.weight")
     assert edn.base.data_ptr() == w2.data_ptr()
-    assert edn.pre is not None and edn.post is not None
+    assert (edn.pre is not None) == (edn.post is not None) == staged
     assert edn.wire_dtype == edn.materialize().buf.dtype == wire_dtype
 
     # Merged dense gate_proj: pre allocates a recv buffer for gate's region of
@@ -334,6 +347,7 @@ def test_build_hf_to_local_param_map_specs_and_roundtrip(wire_dtype):
     ctx = g.materialize()
     assert ctx.buf.shape == gate_up[0:64].shape
     assert ctx.extra["region"].shape == ctx.buf.shape
+    assert ctx.buf.data_ptr() != ctx.extra["region"].data_ptr()
     ctx.buf.fill_(3.0)
     g.post(ctx)
     assert torch.equal(gate_up[0:64], torch.full_like(gate_up[0:64], 3.0))
@@ -343,6 +357,7 @@ def test_build_hf_to_local_param_map_specs_and_roundtrip(wire_dtype):
     assert eg.pre is not None and eg.post is not None
     egctx = eg.materialize()
     assert egctx.buf.shape == w13[:, 0:Pl, :].shape
+    assert egctx.buf.data_ptr() != egctx.extra["region"].data_ptr()
     egctx.buf.fill_(5.0)
     eg.post(egctx)
     assert torch.equal(w13[:, 0:Pl, :], torch.full_like(w13[:, 0:Pl, :], 5.0))
@@ -1264,14 +1279,24 @@ def test_receiver_commits_wire_dtype_to_live_nonquantized_storage(dtype, wire_dt
         },
     }
     spec = _make_ext({name: param}).build_hf_to_local_param_map(info).get(name)
-    old_storage = param.data
-    param.data = torch.full_like(param, -2)
-    ctx = spec.materialize()
-    assert spec.wire_dtype == ctx.buf.dtype == wire_dtype
     # Preserve values that would be rounded by an intermediate BF16 conversion.
     expected = (torch.arange(32, dtype=torch.float32).reshape(4, 8) / 1000 + 1).to(
         wire_dtype
     )
+    if dtype == wire_dtype:
+        assert spec.pre is None and spec.post is None
+        for received in (expected, -expected):
+            ctx = spec.materialize()
+            assert ctx.buf.data_ptr() == param.data_ptr()
+            assert spec.wire_dtype == ctx.buf.dtype == wire_dtype
+            ctx.buf.copy_(received)
+            torch.testing.assert_close(param, received, rtol=0, atol=0)
+        return
+    old_storage = param.data
+    param.data = torch.full_like(param, -2)
+    ctx = spec.materialize()
+    assert spec.pre is not None and spec.post is not None
+    assert spec.wire_dtype == ctx.buf.dtype == wire_dtype
     ctx.buf.copy_(expected)
     assert torch.all(param == -2)
     spec.post(ctx)
