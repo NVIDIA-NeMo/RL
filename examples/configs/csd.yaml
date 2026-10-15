@@ -56,6 +56,12 @@ policy:
     enabled: false
   automodel_cfg:
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
@@ -193,6 +199,9 @@ teachers:
   offload_optimizer_for_logprob: false
   automodel_cfg:
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
