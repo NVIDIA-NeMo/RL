@@ -18,7 +18,9 @@ This optional Gym integration selects calls, not segments. Captured storage
 parents and the existing finalizer continue to determine physical rows.
 """
 
+import importlib
 from collections import defaultdict
+from collections.abc import Callable
 from typing import Any
 
 from nemo_gym.responses_converter import _RESPONSE_OUTPUT_BOUNDARY_TYPES
@@ -255,6 +257,38 @@ def scored_terminal_id(result: dict[str, Any]) -> str | None:
     )
 
 
+def _scored_chain(
+    records: list[CallRecord], result: dict[str, Any]
+) -> tuple[list[CallRecord], dict[str | None, list[CallRecord]]]:
+    """The scored conversation, root to terminal, and the usable calls by parent."""
+    by_call = {r.model_call_id: r for r in records}
+    by_response = {r.response_id: r for r in records}
+    if len(by_call) != len(records) or len(by_response) != len(records):
+        raise ValueError("Capture contains reused call or response identities")
+    chain: list[CallRecord] = []
+    record = by_response.get(scored_terminal_id(result) or "")
+    while record is not None and record.response_status != "failed":
+        chain.append(record)
+        if record.parent_call_id is None:
+            break
+        record = by_call.get(record.parent_call_id)
+    else:
+        raise ValueError("Scored response is absent from the captured calls")
+    chain.reverse()
+    children: dict[str | None, list[CallRecord]] = {}
+    for r in records:
+        if r.response_status != "failed":
+            children.setdefault(r.parent_call_id, []).append(r)
+    return chain, children
+
+
+def select_main_chain(
+    records: list[CallRecord], result: dict[str, Any]
+) -> list[CallRecord]:
+    """Select only the scored conversation. Other conversations and failures are ignored."""
+    return _scored_chain(records, result)[0]
+
+
 def select_all_calls(
     records: list[CallRecord], result: dict[str, Any]
 ) -> list[CallRecord]:
@@ -264,26 +298,7 @@ def select_all_calls(
     captured continuation wins at a branch. Failed calls end their chain and
     never invalidate the rollout.
     """
-    by_call = {r.model_call_id: r for r in records}
-    by_response = {r.response_id: r for r in records}
-    if len(by_call) != len(records) or len(by_response) != len(records):
-        raise ValueError("Capture contains reused call or response identities")
-
-    selected: list[CallRecord] = []
-    record = by_response.get(scored_terminal_id(result) or "")
-    while record is not None and record.response_status != "failed":
-        selected.append(record)
-        if record.parent_call_id is None:
-            break
-        record = by_call.get(record.parent_call_id)
-    else:
-        raise ValueError("Scored response is absent from the captured calls")
-    selected.reverse()
-
-    children: dict[str | None, list[CallRecord]] = {}
-    for r in records:
-        if r.response_status != "failed":
-            children.setdefault(r.parent_call_id, []).append(r)
+    selected, children = _scored_chain(records, result)
     for root in children.get(None, []):
         if root.model_call_id == selected[0].model_call_id:
             continue
@@ -292,3 +307,31 @@ def select_all_calls(
             selected.append(chain)
             chain = children.get(chain.model_call_id, [None])[-1]
     return selected
+
+
+CALL_SELECTIONS: dict[
+    str, Callable[[list[CallRecord], dict[str, Any]], list[CallRecord]]
+] = {
+    "accepted_history": select_captured_calls,
+    "main_chain": select_main_chain,
+    "all": select_all_calls,
+}
+
+
+def resolve_call_selection(
+    name: str,
+) -> Callable[[list[CallRecord], dict[str, Any]], list[CallRecord]]:
+    """A built-in selection, or ``package.module:function`` for a custom one.
+
+    A selection takes the captured calls and the harness result and returns the
+    calls to train as contiguous parent-linked chains, the scored conversation
+    among them. Capture records every call, so the selection decides what trains.
+    """
+    if name in CALL_SELECTIONS:
+        return CALL_SELECTIONS[name]
+    module, _, attribute = name.partition(":")
+    if not module or not attribute:
+        raise ValueError(
+            f"call_selection must be one of {sorted(CALL_SELECTIONS)} or 'module:function', got {name!r}"
+        )
+    return getattr(importlib.import_module(module), attribute)

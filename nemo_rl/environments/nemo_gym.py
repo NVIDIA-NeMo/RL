@@ -1089,9 +1089,8 @@ Depending on your data shape, you may want to change these values."""
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
         from nemo_rl.environments.gym_selection import (
+            resolve_call_selection,
             scored_terminal_id,
-            select_all_calls,
-            select_captured_calls,
         )
         from nemo_rl.experience.rollout_reassembler import (
             ActionOutputFlags,
@@ -1115,15 +1114,16 @@ Depending on your data shape, you may want to change these values."""
         # A finished agent may have cancelled or lost its final model call. Its
         # attempt is untrainable, not a controller failure. Keep pending IDs in
         # the receipt: their writes may still arrive and must not be cleaned here.
-        train_all_calls = bool(
-            (self.cfg.get("token_capture") or {}).get("train_all_calls")
+        call_selection = (self.cfg.get("token_capture") or {}).get(
+            "call_selection", "accepted_history"
         )
+        accepted_history = call_selection == "accepted_history"
         capture_failed = bool(
-            parsed.pending_call_ids or (parsed.failures and not train_all_calls)
+            parsed.pending_call_ids or (parsed.failures and accepted_history)
         )
         selected = []
         if not capture_failed:
-            select = select_all_calls if train_all_calls else select_captured_calls
+            select = resolve_call_selection(call_selection)
             try:
                 selected = select(parsed.records, result)
             except ValueError as error:
@@ -1146,9 +1146,9 @@ Depending on your data shape, you may want to change these values."""
         terminal_response_id = None
         if selected:
             terminal_response_id = (
-                scored_terminal_id(result)
-                if train_all_calls
-                else selected[-1].response_id
+                selected[-1].response_id
+                if accepted_history
+                else scored_terminal_id(result)
             )
         receipt = self._assemble_receipt(
             owner,

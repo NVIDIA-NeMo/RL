@@ -656,9 +656,13 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # weights are required.
     multi_segment_rollouts: bool = False
 
-    # Train every captured call, including subagent conversations, not only the
-    # accepted history. Failed calls are skipped instead of masking the rollout.
-    train_all_calls: bool = False
+    # Which captured calls become training rows. Capture records every call, so
+    # this is the reassembler: "accepted_history" matches the harness output to
+    # calls, "all" trains every conversation (subagents included), "main_chain"
+    # trains only the scored conversation, and "package.module:function" plugs in
+    # a custom selection. Anything but "accepted_history" skips failed calls
+    # instead of masking the rollout.
+    call_selection: str = "accepted_history"
 
 
 @dataclass(frozen=True)
@@ -1421,11 +1425,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "siblings have no durable receipts to recover"
         )
     if (
-        token_capture_config.train_all_calls
+        token_capture_config.call_selection != "accepted_history"
         and not token_capture_config.multi_segment_rollouts
     ):
         raise ValueError(
-            "token_capture.train_all_calls requires token_capture.multi_segment_rollouts=true"
+            "token_capture.call_selection other than accepted_history requires "
+            "token_capture.multi_segment_rollouts=true"
         )
     if token_capture_config.multi_segment_rollouts:
         if master_config.grpo is None:

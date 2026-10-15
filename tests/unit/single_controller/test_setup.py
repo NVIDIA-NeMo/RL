@@ -1024,11 +1024,13 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    def test_train_all_calls_requires_multi_segment_rollouts(self):
+    def test_call_selection_requires_multi_segment_rollouts(self):
         mc = _make_master_config()
-        mc.token_capture = TokenCaptureConfig(enabled=True, train_all_calls=True)
+        mc.token_capture = TokenCaptureConfig(enabled=True, call_selection="all")
 
-        with pytest.raises(ValueError, match="train_all_calls requires"):
+        with pytest.raises(
+            ValueError, match="call_selection other than accepted_history requires"
+        ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_periodic_checkpointing_requires_token_capture(self):

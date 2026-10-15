@@ -26,8 +26,10 @@ from nemo_gym.token_id_capture.staging.records import (
 )
 
 from nemo_rl.environments.gym_selection import (
+    resolve_call_selection,
     select_all_calls,
     select_captured_calls,
+    select_main_chain,
 )
 from nemo_rl.environments.nemo_gym import _normalize_gym_validity
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
@@ -72,7 +74,7 @@ def test_accepted_earlier_call_after_rejected_attempt_needs_no_parent_hint(
     assert second["id"] not in result["logical_selection"].response_ids
 
 
-def test_train_all_calls_keeps_subagent_chains_despite_a_failed_call(
+def test_all_selection_keeps_subagent_chains_despite_a_failed_call(
     captured: Any,  # noqa: F811
 ) -> None:  # noqa: F811
     captured.queue.extend(
@@ -92,7 +94,7 @@ def test_train_all_calls_keeps_subagent_chains_despite_a_failed_call(
     )
     assert masked["logical_selection"].response_ids == ()
 
-    env.cfg = {"token_capture": {"train_all_calls": True}}
+    env.cfg = {"token_capture": {"call_selection": "all"}}
     trained = asyncio.run(
         env._postprocess_receipt_mode({"_ng_rollout_id": "owner"}, result)
     )
@@ -185,6 +187,27 @@ def test_select_all_calls_ends_chains_at_failures_and_keeps_one_branch() -> None
         "response-5",
         "response-7",
     ]
+
+
+def test_main_chain_selection_ignores_other_conversations() -> None:
+    records = [
+        call(1, [message("M1")]),
+        call(3, [message("S1")]),
+        call(2, [message("M2")], parent=1),
+        call(4, [message("S2")], parent=3),
+    ]
+    selected = select_main_chain(records, {"response": {"id": "response-2"}})
+    assert [r.response_id for r in selected] == ["response-1", "response-2"]
+
+
+def test_call_selection_resolves_built_ins_and_custom_functions() -> None:
+    assert resolve_call_selection("all") is select_all_calls
+    assert resolve_call_selection("main_chain") is select_main_chain
+    assert resolve_call_selection("accepted_history") is select_captured_calls
+    custom = resolve_call_selection(f"{__name__}:select_main_chain")
+    assert custom is select_main_chain
+    with pytest.raises(ValueError, match="call_selection must be one of"):
+        resolve_call_selection("everything")
 
 
 def test_select_all_calls_requires_a_trainable_terminal() -> None:
