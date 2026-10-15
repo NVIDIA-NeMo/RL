@@ -32,7 +32,7 @@ Standard GRPO will train on all generated responses, even when a prompt's `num_g
 - **Config**: enable with `grpo.use_dynamic_sampling: true` and tune:
   - `grpo.batch_multiplier`: how many extra prompts to generate to compensate filtering
   - `grpo.dynamic_sampling_max_gen_batches`: upper bound before raising an error
-- **Implementation**: see `dynamic_sampling()` in [`nemo_rl/algorithms/grpo.py`](../../nemo_rl/algorithms/grpo.py).
+- **Implementation**: see `dynamic_sampling()` in [`nemo_rl/algorithms/grpo.py`](../../nemo_rl/algorithms/grpo.py). On the single-controller path, `batch_multiplier` and `dynamic_sampling_max_gen_batches` do not apply; see [Dynamic sampling](single-controller.md#dynamic-sampling).
 
 ## Decoupled local/global advantage normalization
 
