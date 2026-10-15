@@ -51,10 +51,12 @@ from nemo_rl.algorithms.utils import (
 )
 
 
-class PositiveLengthReweightConfig(BaseModel, extra="allow"):
+class PositiveLengthReweightConfig(BaseModel, extra="forbid"):
     """Length-aware reweighting of positive GRPO advantages within each prompt group.
 
-    See ``reweight_positive_advantages_by_length`` for the algorithm.
+    See ``reweight_positive_advantages_by_length`` for the algorithm. Unknown keys are rejected
+    (``extra="forbid"``): a new block has no older configs to stay compatible with, and a typo
+    such as ``rank_sprad`` would otherwise run silently at the default.
     """
 
     # Off by default; disabled, the GRPO advantages are bit-identical to not having this block.

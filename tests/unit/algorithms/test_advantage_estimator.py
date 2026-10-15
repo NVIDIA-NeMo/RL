@@ -564,6 +564,8 @@ def test_length_reweight_stats_without_reweighted_groups():
         dict(positive_length_reweight={"rank_spread": 1.0}),
         dict(positive_length_reweight={"rank_spread": -0.1}),
         dict(positive_length_reweight={"alpha": -0.5}),
+        # Unknown keys are rejected, so a typo cannot silently fall back to the default.
+        dict(positive_length_reweight={"enabled": True, "rank_sprad": 0.25}),
     ],
 )
 def test_length_reweight_config_validation(kwargs):
