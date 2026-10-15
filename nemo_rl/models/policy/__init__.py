@@ -239,6 +239,9 @@ class SequencePackingConfig(TypedDict):
     fuse_loss: NotRequired[bool]
     pair_grouping_key: NotRequired[Literal["pair_index"]]
     max_sequences_per_bin: NotRequired[int]
+    # Run each Megatron microbatch once over the token tree of its rows' shared
+    # prefixes (e.g. GRPO siblings, subagent call chains) instead of per row.
+    share_prefixes: NotRequired[bool]
 
 
 class RewardModelConfig(TypedDict):
