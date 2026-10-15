@@ -825,6 +825,7 @@ class TestValueWarmStart:
         setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
 
         value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
+        assert value_kwargs["seed"] == 42
         assert value_kwargs["weights_path"] is None
         assert value_kwargs["optimizer_path"] is None
 
