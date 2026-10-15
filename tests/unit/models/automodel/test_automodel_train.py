@@ -1369,7 +1369,6 @@ class TestAutomodelForwardBackward:
     def test_forward_backward_multiple_microbatches(
         self,
         mock_model,
-        mock_loss_fn,
         base_cfg,
         mock_device_mesh,
         mock_cp_mesh,
@@ -1410,9 +1409,16 @@ class TestAutomodelForwardBackward:
                 )
             )
 
+        from nemo_rl.algorithms.loss.csd import CSDLossFn
+
+        # Only CSD losses receive the global alignment-chunk counts.
+        csd_loss_fn = MagicMock(spec=CSDLossFn)
+        csd_loss_fn.return_value = (torch.tensor(0.5), {"loss": 0.5})
+        csd_loss_fn.input_type = LossInputType.LOGIT
+
         # Create loss post-processor
         loss_post_processor = LossPostProcessor(
-            loss_fn=mock_loss_fn,
+            loss_fn=csd_loss_fn,
             cfg=base_cfg,
             cp_mesh=mock_cp_mesh,
             cp_size=1,
@@ -1441,10 +1447,10 @@ class TestAutomodelForwardBackward:
         assert mock_model.call_count == num_microbatches
 
         # Verify loss function was called num_microbatches times
-        assert mock_loss_fn.call_count == num_microbatches
+        assert csd_loss_fn.call_count == num_microbatches
         assert all(
             call.kwargs["global_valid_chunks_by_idx"] is global_valid_chunks_by_idx
-            for call in mock_loss_fn.call_args_list
+            for call in csd_loss_fn.call_args_list
         )
 
     @patch("nemo_rl.models.automodel.train.prepare_model_forward")

@@ -1556,9 +1556,13 @@ class TestLossPostProcessor:
         self, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
     ):
         """Test LossPostProcessor without sequence packing."""
+        from nemo_rl.algorithms.loss.csd import CSDLossFn
         from nemo_rl.models.megatron.train import LossPostProcessor
 
-        mock_loss_fn = MagicMock(return_value=(torch.tensor(0.5), {"loss": 0.5}))
+        # Only CSD losses receive the global alignment-chunk counts.
+        mock_loss_fn = MagicMock(
+            spec=CSDLossFn, return_value=(torch.tensor(0.5), {"loss": 0.5})
+        )
         mock_loss_fn.input_type = LossInputType.LOGIT
         cfg = {"sequence_packing": {"enabled": False}}
 
