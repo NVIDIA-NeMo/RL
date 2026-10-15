@@ -120,7 +120,7 @@ A minimal row is:
 
 Preserve the `messages` column for `ResponseDataset` passthrough. The ASR
 processor builds the actual request with text before audio, no system prompt
-and no reference leakage. Audio must be nonempty 16-kHz WAV; channels are averaged.
+and no reference leakage. Audio must be nonempty, sampled at 16 kHz, and readable by SoundFile; channels are averaged.
 For Mandarin ordinary ASR, set `language="zh"`, `task="ordinary_asr"`,
 `reward_metric="cer"` and `cer_whitespace_mode="han_adjacent"`. This route requires
 a nonempty normalized reference. Other tasks use `reward_metric="wer"`; empty
@@ -152,13 +152,13 @@ uv run --no-project "$SPEECHLM_GSPO_PYTHON" examples/run_vlm_grpo.py \
 ```
 
 The full configuration is
-[`vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml).
+[`vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml`](https://github.com/NVIDIA-NeMo/RL/blob/main/examples/configs/recipes/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml).
 Its inherited defaults and overrides resolve the following settings:
 
 | Setting | Value |
 | --- | --- |
 | Updates | 400, with at most 2 passes through the ordered dataset |
-| Offered recordings / retained groups | 40 / 20, with at most 2 generation batches per update |
+| Offered recordings / retained groups | 40 / 20; dynamic-sampling refill threshold 2 |
 | Responses per recording | 64; temperature 0.8 |
 | Learning rate | 1e-6 after a 5-update linear warmup from 0.1 of the target LR |
 | Update surface | 269 named tensors, 1,074,318,400 scalars; FP32 storage |
@@ -176,7 +176,10 @@ Each offered batch has 40 recordings and 64 responses per recording. Dynamic
 sampling retains the first 20 nonconstant groups in order. It does not rank
 valid groups by reward spread. At 400 completed updates, 8,000 groups and 512,000
 responses contribute to training, with possible repetition of dataset rows;
-additional offered groups can be discarded or trigger a refill. Advantages use a
+additional offered groups can be discarded or trigger a refill. With the current
+loop's threshold of 2, an insufficient initial batch can trigger two refills
+(three offered batches total); training fails if those cannot supply 20 valid
+groups. This threshold is unchanged from the tested recipe. Advantages use a
 leave-one-out mean and **full valid-group sample standard deviation**, with
 `1e-6` stabilization. The new estimator option defaults off for existing recipes.
 Native SpeechLM requires unpacked sequences, policy TP=CP=1 and synchronous
@@ -191,7 +194,7 @@ is not aligned with retained `source_idx` or content.
 The recipe saves every 20 updates. Reusing its output directory restores the
 latest finalized native optimizer, scheduler and dataloader state. Use a fresh
 output directory for an independent run. For the separate 20-plus-fresh-2
-qualification, run the [nightly shell driver](../../tests/test_suites/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.sh); it verifies saved state
+qualification, run the [nightly shell driver](https://github.com/NVIDIA-NeMo/RL/blob/main/tests/test_suites/vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.sh); it verifies saved state
 before and after restarting the training process.
 
 ## Export and evaluate
