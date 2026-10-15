@@ -36,9 +36,9 @@ from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
 from nemo_rl.utils.checkpoint_storage import (
-    enable_msc,
-    is_msc_path,
     load_checkpoint_object,
+    open_path,
+    path_exists,
 )
 
 
@@ -91,12 +91,9 @@ def load_dataloader_state(
         os.path.join(checkpoint_path, f"train_dataloader{suffix}.pt")
     )
 
-    msc = enable_msc() if is_msc_path(checkpoint_path) else None
-    path_exists = msc.os.path.exists if msc else os.path.exists
-    open_file = msc.open if msc else open
     config_path = os.path.join(checkpoint_path, "config.yaml")
     if path_exists(config_path):
-        with open_file(config_path) as f:
+        with open_path(config_path) as f:
             saved_config = yaml.safe_load(f) or {}
         saved_name = get_train_dataset_name(saved_config.get("data"))
         current_name = get_train_dataset_name(data_config)
