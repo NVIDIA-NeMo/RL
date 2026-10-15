@@ -182,6 +182,12 @@ build_wrapper() {
 
 mapfile -t libs < <(find "$@" -xdev -type f -name 'libetcd_wrapper*.so' | sort)
 if ((${#libs[@]} == 0)); then
+    # The upstream aarch64 wheels do not bundle libetcd_wrapper.so (and none of
+    # their binaries embed Go), so there is nothing to patch there.
+    if [[ "${GO_ARCH}" == arm64 ]]; then
+        echo "no libetcd_wrapper*.so found under: $*; nothing to patch on arm64"
+        exit 0
+    fi
     echo "no libetcd_wrapper*.so found under: $*" >&2
     exit 1
 fi
