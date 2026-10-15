@@ -248,7 +248,8 @@ COPY --from=nemo-rl --link \
     3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh \
-    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
+    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
+    --mount=type=bind,source=docker/install_mooncake.sh,target=/tmp/install_mooncake.sh <<"EOF" bash -exu
 CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}" | md5sum | cut -c1-12)
 SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
 if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
@@ -340,6 +341,15 @@ while IFS=$'\t' read -r venv_name stage extras; do
     uv venv --allow-existing "$venv_path"
     UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen $extras --no-install-project
 done < /opt/actor_venvs.tsv
+
+# Rebuild the Go library bundled in the mooncake-transfer-engine wheel (libetcd_wrapper.so)
+# with a patched Go toolchain and patched etcd/grpc/x-net/x-text; the upstream wheel ships
+# it built with versions that carry known CVEs. This must run HERE, in the layer that created
+# the venvs: the script overwrites each file in place, so the venvs that hardlink the uv cache
+# all share the patched inode, whereas patching in a later layer would make overlayfs copy
+# every path up separately. Venvs created later (release stage) hardlink/symlink the patched
+# file from the cache. See docker/install_mooncake.sh.
+bash /tmp/install_mooncake.sh "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" /root/.cache/uv
 
 apt-get purge -y libnvidia-ml-dev
 apt-get autoremove -y
