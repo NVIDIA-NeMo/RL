@@ -558,11 +558,12 @@ To enable the importance sampling correction, set the config `use_importance_sam
 
 ##### Adaptive PPO clip
 
-`truncated_importance_sampling_type: adaptive-ppo-clip` filters tokens by importance weight $w$ according to the sign of their advantage, with an upper bound that adapts to policy entropy:
+`truncated_importance_sampling_type: adaptive-ppo-clip` filters tokens by importance weight $w$ according to the sign of their advantage, with an upper bound that adapts to policy entropy. It is intended for async RL and requires `force_on_policy_ratio: true`:
 
 ```yaml
 loss_fn:
   use_importance_sampling_correction: true
+  force_on_policy_ratio: true
   truncated_importance_sampling_type: adaptive-ppo-clip
   truncated_importance_sampling_ratio: 2.5      # base upper bound for A > 0
   truncated_importance_sampling_ratio_min: 0.4  # lower bound for A < 0

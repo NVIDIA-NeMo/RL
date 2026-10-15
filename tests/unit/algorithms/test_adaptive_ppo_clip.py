@@ -36,6 +36,7 @@ def _adaptive_loss(**overrides: Any) -> ClippedPGLossFn:
         "reference_policy_kl_penalty": 0.0,
         "token_level_loss": True,
         "use_importance_sampling_correction": True,
+        "force_on_policy_ratio": True,
         "truncated_importance_sampling_type": "adaptive-ppo-clip",
         "truncated_importance_sampling_ratio": 1.0,
         "truncated_importance_sampling_ratio_min": 0.5,
@@ -74,14 +75,11 @@ def _loss_inputs(weights: list[float], advantages: list[float]) -> dict[str, Any
     }
 
 
-@pytest.mark.parametrize("force_on_policy_ratio", [False, True])
 @pytest.mark.parametrize("token_level_loss", [False, True])
 def test_filters_by_advantage_sign_and_hard_outer_bound(
-    force_on_policy_ratio: bool, token_level_loss: bool
+    token_level_loss: bool,
 ) -> None:
-    loss_fn = _adaptive_loss(
-        force_on_policy_ratio=force_on_policy_ratio, token_level_loss=token_level_loss
-    )
+    loss_fn = _adaptive_loss(token_level_loss=token_level_loss)
     inputs = _loss_inputs(
         weights=[0.2, 0.2, 3.0, 3.0, 51.0, 51.0, 1.2, 49.0, 51.0],
         advantages=[-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, 1.0, 0.0, 0.0],
@@ -194,6 +192,11 @@ def test_other_tis_types_do_not_acquire_adaptive_state() -> None:
 def test_rejects_incompatible_configuration(overrides: dict) -> None:
     with pytest.raises(AssertionError):
         _adaptive_loss(**overrides)
+
+
+def test_requires_force_on_policy_ratio() -> None:
+    with pytest.raises(AssertionError, match="intended for async RL"):
+        _adaptive_loss(force_on_policy_ratio=False)
 
 
 def test_rejects_negative_target_entropy() -> None:
