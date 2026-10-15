@@ -110,19 +110,6 @@ def test_filter_metric_respects_token_mask_and_global_denominator() -> None:
     assert metrics["is_oob_ratio"] == pytest.approx(2.0 / 8.0)
 
 
-def test_minimal_metrics_still_report_entropy() -> None:
-    full_loss = _adaptive_loss()
-    minimal_loss = _adaptive_loss(metrics_level="minimal")
-    assert "approx_entropy" in minimal_loss.metric_normalizations
-    inputs = _loss_inputs([0.8, 1.0, 1.2], [1.0, -1.0, 1.0])
-    _, full_metrics = full_loss(**inputs)
-    _, minimal_metrics = minimal_loss(**_loss_inputs([0.8, 1.0, 1.2], [1.0, -1.0, 1.0]))
-    assert minimal_metrics["approx_entropy"] == pytest.approx(
-        full_metrics["approx_entropy"]
-    )
-    assert "gen_kl_error" not in minimal_metrics
-
-
 def test_entropy_changes_next_step_filter_after_serialization() -> None:
     loss_fn = _adaptive_loss()
     initial_loss, _ = loss_fn(**_loss_inputs([1.2], [1.0]))
@@ -187,6 +174,7 @@ def test_other_tis_types_do_not_acquire_adaptive_state() -> None:
         {"truncated_importance_sampling_ratio_min": None},
         {"truncated_importance_sampling_ratio_min": 2.0},
         {"sequence_level_importance_ratios": True, "token_level_loss": False},
+        {"metrics_level": "minimal"},
     ],
 )
 def test_rejects_incompatible_configuration(overrides: dict) -> None:

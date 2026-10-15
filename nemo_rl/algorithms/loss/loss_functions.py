@@ -477,6 +477,10 @@ class ClippedPGLossFn(LossFunction):
                     "adaptive-ppo-clip is intended for async RL; set "
                     "force_on_policy_ratio=True to use it"
                 )
+                assert self.metrics_level == "full", (
+                    "adaptive-ppo-clip adapts its upper bound from approx_entropy, "
+                    "which only metrics_level='full' computes"
+                )
                 assert not self.sequence_level_importance_ratios, (
                     "adaptive-ppo-clip uses token-level advantage-aware filtering "
                     "and is incompatible with sequence_level_importance_ratios=True"
@@ -543,9 +547,6 @@ class ClippedPGLossFn(LossFunction):
             }
             if self.use_importance_sampling_correction:
                 minimal_metrics.add("sampling_importance_ratio")
-            if self.has_adaptive_loss_state():
-                # The adaptive-ppo-clip controller is driven by entropy.
-                minimal_metrics.add(APPROX_ENTROPY_KEY)
             if self.seq_logprob_error_in_loss:
                 minimal_metrics.update(
                     {
@@ -1087,15 +1088,6 @@ class ClippedPGLossFn(LossFunction):
                     reference_policy_kl_type=self.reference_policy_kl_type,
                 )
             )
-        elif self.has_adaptive_loss_state():
-            # Same estimate as clipped_pg_diagnostic_metrics; the
-            # adaptive-ppo-clip controller needs it even with minimal metrics.
-            with torch.no_grad():
-                metric_tensors[APPROX_ENTROPY_KEY] = -masked_mean(
-                    torch.exp(curr_logprobs - generation_logprobs) * curr_logprobs,
-                    mask,
-                    global_normalization_factor=global_valid_toks,
-                )
         if need_importance_weights:
             metric_tensors["sampling_importance_ratio"] = sample_importance_ratio
 
