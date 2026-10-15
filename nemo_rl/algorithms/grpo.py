@@ -159,6 +159,7 @@ from nemo_rl.telemetry.instrumentation import (
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils.checkpoint_storage import save_checkpoint_object
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -4145,7 +4146,7 @@ def _grpo_train_impl(
                                 task_name,
                                 task_dataloader,
                             ) in wrapped_dataloader.dataloaders.items():
-                                torch.save(
+                                save_checkpoint_object(
                                     task_dataloader.state_dict(),
                                     os.path.join(
                                         checkpoint_path,
@@ -4153,7 +4154,7 @@ def _grpo_train_impl(
                                     ),
                                 )
                         else:
-                            torch.save(
+                            save_checkpoint_object(
                                 wrapped_dataloader.state_dict(),
                                 os.path.join(checkpoint_path, "train_dataloader.pt"),
                             )
@@ -6042,7 +6043,7 @@ def async_grpo_train(
                         )
                         dataloader_snapshot = collector_checkpoint["dataloader"]
                         rollouts_state = collector_checkpoint["rollouts"]
-                        torch.save(
+                        save_checkpoint_object(
                             dataloader_snapshot["dataloader_state"],
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )

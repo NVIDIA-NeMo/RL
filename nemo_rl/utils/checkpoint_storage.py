@@ -47,3 +47,12 @@ def save_checkpoint_object(value: Any, path: str | os.PathLike[str]) -> None:
         enable_msc().torch.save(value, str(path))
     else:
         torch.save(value, path)
+
+
+def load_checkpoint_object(path: str | os.PathLike[str], **kwargs: Any) -> Any:
+    """Load controller checkpoint state saved by ``save_checkpoint_object``."""
+    import torch
+
+    if is_msc_path(path):
+        return enable_msc().torch.load(str(path), **kwargs)
+    return torch.load(path, **kwargs)
