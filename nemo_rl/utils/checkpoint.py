@@ -211,8 +211,6 @@ class CheckpointingConfig(TypedDict):
     ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
         When set, a checkpoint is saved every ft_save_period steps for crash recovery.
         Requires ft_keep_latest_k to control how many of these are retained.
-    weights_only (bool): SingleController exports weights without optimizer or
-        rollout recovery state. Such checkpoints cannot resume training.
     save_optimizer (bool): Whether to save optimizer state with checkpoints.
     save_data_plane (bool): Whether SingleController checkpoints include the
         native TQ snapshot and replay-buffer metadata. Supported by the simple
@@ -234,7 +232,6 @@ class CheckpointingConfig(TypedDict):
     ft_save_period: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
-    weights_only: NotRequired[bool]
     save_optimizer: NotRequired[bool]  # Default: True
     save_data_plane: NotRequired[bool]
     load_replay_buffer: NotRequired[bool]  # Default: True
@@ -296,9 +293,6 @@ class CheckpointManager:
                 "internally."
             )
 
-        self.weights_only = bool(config.get("weights_only"))
-        if self.weights_only and config.get("save_data_plane"):
-            raise ValueError("weights_only requires save_data_plane=false")
         self._msc = enable_msc_for(config["checkpoint_dir"])
         if self._msc is not None and config.get("save_data_plane"):
             raise ValueError(
@@ -312,7 +306,7 @@ class CheckpointManager:
         self.keep_top_k = config["keep_top_k"]
         self.save_period: int = config["save_period"]
         self.ft_keep_latest_k: int | None = config.get("ft_keep_latest_k", None)
-        self.save_optimizer = config["save_optimizer"] and not self.weights_only
+        self.save_optimizer = config["save_optimizer"]
 
         # Async finalization state
         self._finalize_thread: Optional[threading.Thread] = None
@@ -427,8 +421,6 @@ class CheckpointManager:
         with open_file(str(save_dir / "training_info.json"), "w") as f:
             # make any numpy items serializable
             serializable_training_info = dict(training_info)
-            if self.weights_only:
-                serializable_training_info["weights_only"] = True
             for k, v in serializable_training_info.items():
                 if isinstance(v, torch.Tensor) or isinstance(v, np.ndarray):
                     serializable_training_info[k] = v.item()
@@ -770,12 +762,6 @@ class CheckpointManager:
             return None
         with open_path(str(checkpoint_path) + "/training_info.json") as f:
             info = json.load(f)
-        if info.get("weights_only"):
-            raise ValueError(
-                "Cannot resume training from a weights-only checkpoint. Start a "
-                "new run with a fresh checkpoint_dir and use policy.pretrained_checkpoint "
-                "to load its policy/weights as initial weights."
-            )
         return info
 
 
