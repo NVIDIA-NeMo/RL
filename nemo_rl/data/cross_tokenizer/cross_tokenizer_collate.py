@@ -47,12 +47,12 @@ from pydantic import BaseModel, PositiveInt
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
-from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.data.xtoken.native_chat import (
+from nemo_rl.data.cross_tokenizer.native_chat import (
     RenderedChatDocument,
     _render_and_tokenize_chat,
     _render_chat_text,
 )
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
