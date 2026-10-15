@@ -348,8 +348,11 @@ apt-get autoremove -y
 rm -rf /var/lib/apt/lists/*
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
-# The ray install will include the older aiohttp version in its cache
-find "${UV_CACHE_DIR}" -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+# Ray bundles an older aiohttp and yarl; remove both so the installed aiohttp
+# uses a compatible yarl instead of Ray's bundled copy.
+find "${UV_CACHE_DIR}" -type d \
+    \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
+       -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
 
 echo "${CACHE_KEY}" > "${UV_CACHE_DIR}/.cache-key"
 
@@ -555,7 +558,9 @@ rm -rf /tmp/trtllm-build-venv
 
 # The syncs above can repopulate the shared uv cache, so repeat the security
 # cleanup performed in the preceding dependency layer.
-find "${UV_CACHE_DIR}" -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+find "${UV_CACHE_DIR}" -type d \
+    \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
+       -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
 
 # Hand this layer's new cache and venv entries to the runtime UID. Entries from the dependency
 # layer already belong to it, so only files created here change owner and none is copied up.
@@ -669,10 +674,10 @@ EOF
 # themselves are built in hardlink mode: examples/nemo_gym/prefetch_venvs.py pins
 # UV_LINK_MODE=hardlink in the Gym actor's runtime_env, because Gym's setup scripts shell
 # out to `uv pip install --no-cache`, which uv refuses to combine with symlink installs.
-# Gym pins vllm==0.25.1; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
+# Gym pins vllm==0.29.0; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
 # RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
 ARG NEMO_GYM_CUDA=cu130
-ARG NEMO_GYM_VLLM_VERSION=0.25.1
+ARG NEMO_GYM_VLLM_VERSION=0.29.0
 RUN <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac

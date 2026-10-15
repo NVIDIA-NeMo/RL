@@ -44,6 +44,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    agreed_media_columns,
 )
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
@@ -72,6 +73,7 @@ from nemo_rl.weight_sync.membership import RefitMembership
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data.captured_media import MediaColumnSpec
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 logger = logging.getLogger(__name__)
@@ -639,12 +641,13 @@ class VllmGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
-    ) -> None:
+    ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 
         Called once at setup when ``token_capture.enabled``; each async worker
         builds its in-worker data-plane client + TQTokenSink and makes the
-        single Gym ``install_capture`` call.
+        single Gym ``install_capture`` call. Returns the media column spec the
+        leaders pinned (``None`` for text-only capture).
         """
         assert self.cfg["vllm_cfg"]["async_engine"], (
             "token capture requires the async vLLM engine (the capture host "
@@ -657,7 +660,7 @@ class VllmGeneration(GenerationInterface):
             capture_media=capture_media,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
-        ray.get(futures)
+        return agreed_media_columns(ray.get(futures))
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version workers stamp on captured model calls."""
