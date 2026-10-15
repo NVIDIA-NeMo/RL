@@ -2,8 +2,8 @@
 
 This page collects NeMo RL guidance for text post-training of Nemotron 3.5
 Super VL (`NemotronH_Omni_Reasoning_V3`), a hybrid Mamba + Attention MoE model
-with 512 routed experts (22 active) and a RADIO vision tower, on the AutoModel
-(DTensor) backend. Use it to launch the text DAPO recipe and understand the
+with 512 routed experts (22 active) and a RADIO vision tower, on the Automodel
+backend. Use it to launch the text DAPO recipe and understand the
 settings that are specific to this model.
 
 ## What's Supported

@@ -14,7 +14,7 @@ NUM_MINUTES=180
 exit_if_max_steps_reached
 
 # Run the experiment
-# Nightly smoke: 5 DAPO steps on 16 x 4-GPU GB200 nodes (~20 min/step with
+# Release smoke: 5 DAPO steps on 16 x 4-GPU GB200 nodes (~20 min/step with
 # dynamic sampling, plus ~10 min setup). AIME-2024 validation is skipped
 # (val_at_start=false, val_period > MAX_STEPS) because one validation pass at
 # max_new_tokens=8192 costs ~15 min and 5 steps is too few to move accuracy;
