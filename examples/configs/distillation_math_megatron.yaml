@@ -162,6 +162,8 @@ policy: &POLICY_BASE
         top_k: null
         stop_token_ids: null
         stop_strings: null
+        # LoRA defaults to native refit; Megatron LoRA recipes override this to merged.
+        lora_refit_mode: native
         vllm_cfg:
             async_engine: false
             precision: ${...precision}
