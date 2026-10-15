@@ -19,7 +19,7 @@ policy:
       # weights in a blocked runtime layout that its load_weights path cannot
       # refit. Use TRITON to keep the refit-compatible 3D MoE layout.
       moe_backend: triton
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   sequence_packing:
     enabled: false

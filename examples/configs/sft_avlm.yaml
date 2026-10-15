@@ -8,7 +8,7 @@ sft:
 policy:
   max_total_sequence_length: 32768
   train_global_batch_size: 8
-  dtensor_cfg:
+  automodel_cfg:
     tensor_parallel_size: 1
   dynamic_batching:
     enabled: true

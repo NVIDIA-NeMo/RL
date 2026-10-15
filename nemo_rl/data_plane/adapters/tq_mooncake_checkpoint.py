@@ -1061,7 +1061,7 @@ def _live_participants(
     if local is not None:
         participants[local.info.participant_id] = local.info
     for worker, response in zip(workers, responses, strict=True):
-        # Some generation ranks do not host token capture or a TQ client.
+        # Ranks without a TQ client, or that disowned storage, own nothing.
         if response is None:
             continue
         if not isinstance(response, Mapping) or response.get("ok") is not True:
@@ -1404,11 +1404,15 @@ class _CheckpointManagerMixin:
 
 
 def configure_checkpoint_workers(workers: list[Any]) -> None:
-    """Bind existing actor handles for this process's checkpoint coordinator.
+    """Bind the actors that own checkpointable storage for this coordinator.
 
     Call after all intended owners have attached, before save or restore. Do
     not include the calling actor: its shard is executed directly, including
     when restoring inside SingleController's constructor.
+
+    Candidates that own no segment -- ranks without a TQ client, or a
+    generation worker whose token-capture client disowned storage -- are
+    dropped here, once, so a save never waits on an actor with nothing to save.
     """
     # TransferQueue is optional outside this backend.
     import transfer_queue as tq
@@ -1417,6 +1421,8 @@ def configure_checkpoint_workers(workers: list[Any]) -> None:
     if not isinstance(manager, _CheckpointManagerMixin):
         raise RuntimeError("Mooncake checkpoint manager is not installed")
     manager._checkpoint_workers = list(workers)
+    _, owners = _live_participants(manager)
+    manager._checkpoint_workers = list(owners.values())
 
 
 def run_checkpoint_command(body: Mapping[str, Any]) -> dict[str, Any] | None:
