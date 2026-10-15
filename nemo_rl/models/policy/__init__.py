@@ -217,6 +217,9 @@ class AutomodelConfig(TypedDict):
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
     checkpoint: NotRequired[AutomodelCheckpointConfig]
+    # Bitwise-reproducible forward/backward via deterministic kernels, at some
+    # step-time cost. Applies to policy workers only.
+    deterministic: NotRequired[bool]
 
 
 class SequencePackingConfigDisabled(TypedDict):

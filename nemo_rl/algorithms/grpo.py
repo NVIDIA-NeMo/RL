@@ -132,6 +132,10 @@ from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
+from nemo_rl.models.generation.trtllm.config import (
+    replica_width,
+    resolve_disagg_layout,
+)
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
@@ -651,6 +655,30 @@ def setup(
         )
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
+
+    # generation.disaggregation is written in backend-agnostic terms, but only
+    # the TRT-LLM backend implements it today: every other backend would
+    # silently ignore the block and serve aggregated, so refuse to start.
+    if (
+        resolve_disagg_layout(generation_config).enabled
+        and generation_config["backend"] != "trtllm"
+    ):
+        raise ValueError(
+            "policy.generation.disaggregation.enabled is only supported for "
+            f"backend='trtllm', got '{generation_config['backend']}'. Set it to "
+            "false, or switch the backend."
+        )
+    # The disagg frontends are only reachable over HTTP, so without NeMo-Gym
+    # the whole fleet would come up and fail at the first rollout instead.
+    if resolve_disagg_layout(generation_config).enabled and not should_use_nemo_gym(
+        master_config
+    ):
+        raise ValueError(
+            "policy.generation.disaggregation.enabled requires NeMo-Gym "
+            "rollouts (env.should_use_nemo_gym=true). Set it to false, or run "
+            "through the NeMo-Gym entrypoint."
+        )
+
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
 
@@ -910,11 +938,13 @@ def setup(
     )
     nemo_gym_actor = None
 
-    def _spinup_nemo_gym(base_urls, model_name):
+    def _spinup_nemo_gym(base_urls, model_name, policy_api_key=None):
         """Spin up the NeMo Gym stack against the given generation server URLs.
 
         Returns a shard set, which is the one actor of an unsharded job as much
-        as it is the K of a sharded one.
+        as it is the K of a sharded one. ``policy_api_key`` is the bearer token
+        the generation server requires on its OpenAI routes (the vLLM backend's
+        ``http_server_api_key``), or None when the server checks none.
         """
         t0 = time.perf_counter()
         shard_set = build_nemo_gym_actors(
@@ -924,6 +954,7 @@ def setup(
             tokenizer=tokenizer,
             enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+            policy_api_key=policy_api_key,
         )
         train_splits = (
             {f"train[{name}]": split for name, split in dataset.items()}
@@ -1164,10 +1195,11 @@ def setup(
                         "pipeline_parallel_size", 1
                     )
                 elif generation_config["backend"] == "trtllm":
-                    trtllm_cfg = generation_config.get("trtllm_cfg", {})
-                    gpus_per_instance = trtllm_cfg[
-                        "tensor_parallel_size"
-                    ] * trtllm_cfg.get("pipeline_parallel_size", 1)
+                    # Under PD disaggregation the unit to keep inside one NVLink
+                    # domain is the whole replica, not one engine.
+                    gpus_per_instance = replica_width(
+                        cast(TrtllmConfig, generation_config)
+                    )
                 elif generation_config["backend"] == "dynamo":
                     gpus_per_instance = DynamoConfig.model_validate(
                         generation_config
@@ -1645,7 +1677,7 @@ def setup(
             )
         if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
             assert not (policy_config.get("automodel_cfg") or {}).get("enabled"), (
-                "DTensor backend is not supported with kv cache fp8 enabled."
+                "Automodel backend is not supported with kv cache fp8 enabled."
             )
             assert not should_use_async_rollouts(generation_config), (
                 "Async rollouts is not supported with kv cache fp8 enabled."
@@ -1692,6 +1724,7 @@ def setup(
                 return _spinup_nemo_gym(
                     deferred_vllm.dp_openai_server_base_urls,
                     generation_config["model_name"],
+                    policy_api_key=deferred_vllm.http_server_api_key,
                 )
 
             # Colocated: vLLM + policy share GPUs -> sequential; otherwise parallel.
