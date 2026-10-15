@@ -59,6 +59,9 @@ _VLLM_CFG_UNSUPPORTED = {
     # Applied inside NeMo RL's in-process vLLM worker; it cannot configure the
     # managed ``dynamo.vllm`` subprocess.
     "cap_max_tokens_to_context",
+    # Enforced by NeMo RL's own HTTP server; the managed Dynamo frontend checks
+    # no bearer token, so a truthy value is rejected below rather than warned.
+    "http_server_api_key_required",
     "is_mx",
     "num_first_layers_in_bf16",
     "num_last_layers_in_bf16",
@@ -191,6 +194,12 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
             raise ValueError(
                 "policy.generation.vllm_cfg.is_mx is not supported by "
                 "backend='dynamo'; use backend='vllm' for MXFP8 generation"
+            )
+        if extra.get("http_server_api_key_required"):
+            raise ValueError(
+                "policy.generation.vllm_cfg.http_server_api_key_required is not "
+                "supported by backend='dynamo'; the managed Dynamo frontend checks "
+                "no bearer token, so the exposed server would stay open"
             )
         if (
             int(extra.get("num_first_layers_in_bf16") or 0) != 0

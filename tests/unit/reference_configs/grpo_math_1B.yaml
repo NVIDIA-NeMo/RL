@@ -173,6 +173,7 @@ policy:
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
+    deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
@@ -408,6 +409,13 @@ policy:
     val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
+    disaggregation:
+      enabled: false
+      num_prefill_engines: 1
+      num_decode_engines: 1
+      num_frontend_workers: 1
+      frontend_tokenize: false
+      frontend_base_port: 8300
     # null = topology default (IPC colocated, NCCL non-colocated). For
     # non-colocated Megatron generation it selects the packed collective; use
     # mcore for native refit.
@@ -457,6 +465,7 @@ policy:
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
       http_server_num_replicas: 8  # HTTP frontend event loops per model-parallel coordinator.
     vllm_cfg:
+      http_server_api_key_required: false  # Require a per-job bearer token on the exposed server's /v1/* and /tokenize routes; the token is generated at startup and handed to the NeMo-Gym model server.
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"

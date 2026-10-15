@@ -341,6 +341,13 @@ def _refuse_empty_server_mappings(
     skips (Gym's ``NEMO_GYM_RESERVED_TOP_LEVEL_KEYS``), for which an empty
     mapping such as ``telemetry: {}`` is a valid "all defaults" spelling.
     """
+    from omegaconf import DictConfig, OmegaConf
+
+    if isinstance(global_config_dict, DictConfig):
+        # Reading a DictConfig value resolves interpolations such as
+        # ``${oc.env:NEMO_RL_POLICY_API_KEY}``, which may name variables set
+        # only in the server processes; the structure is all this guard needs.
+        global_config_dict = OmegaConf.to_container(global_config_dict, resolve=False)
     empty_mappings: list[str] = []
     for key, value in global_config_dict.items():
         if key in reserved_keys or not isinstance(value, Mapping):
@@ -387,6 +394,9 @@ def get_nemo_gym_venv_dir() -> str | None:
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
+    # The bearer token the generation server requires on its OpenAI routes, handed
+    # to the Gym model server as policy_api_key. None when the server checks none.
+    policy_api_key: NotRequired[Optional[str]]
     initial_global_config_dict: Dict[str, Any]
     # Port range for Gym HTTP servers (head server + subprocess servers).
     # Defaults to DEFAULT_GYM_PORT_RANGE_LOW/HIGH (5000-5999) from
@@ -434,6 +444,10 @@ _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
+# The generation server's bearer token travels to Gym's servers the same way as
+# the token-capture secret: as an environment interpolation each server
+# resolves in its own process, never as a value in the serialized config.
+_POLICY_API_KEY_ENV = "NEMO_RL_POLICY_API_KEY"
 
 
 def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
@@ -759,9 +773,21 @@ class NemoGym(EnvironmentInterface):
         initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
-        initial_global_config_dict["policy_api_key"] = (
-            "dummy_key"  # No key necessary for training.
-        )
+        # The Gym model server sends this as the bearer token of every request to
+        # the generation server. A server that checks no key accepts any value, and
+        # Gym's client requires a non-empty string, hence the placeholder. A real
+        # key is not written into the config: the head server serves the merged
+        # global config unredacted (GET /global_config_dict_yaml) and server
+        # commands inline the YAML, so the config carries only the variable name
+        # and each Gym server resolves the value from its own environment (a copy
+        # of this actor's).
+        if self.cfg.get("policy_api_key"):
+            os.environ[_POLICY_API_KEY_ENV] = self.cfg["policy_api_key"]
+            initial_global_config_dict["policy_api_key"] = (
+                f"${{oc.env:{_POLICY_API_KEY_ENV}}}"
+            )
+        else:
+            initial_global_config_dict["policy_api_key"] = "dummy_key"
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
         # In multinode runs, Gym-managed service configs must advertise a real node IP
         # rather than falling back to localhost, or remote workers will connect to
@@ -775,8 +801,8 @@ class NemoGym(EnvironmentInterface):
             or _gym_port_high > DEFAULT_GYM_PORT_RANGE_HIGH
         ):
             print(
-                f"WARNING: Gym port range [{_gym_port_low}, {_gym_port_high}) is outside "
-                f"the default [{DEFAULT_GYM_PORT_RANGE_LOW}, {DEFAULT_GYM_PORT_RANGE_HIGH}). "
+                f"WARNING: Gym port range {_gym_port_low}-{_gym_port_high} is outside "
+                f"the default {DEFAULT_GYM_PORT_RANGE_LOW}-{DEFAULT_GYM_PORT_RANGE_HIGH}. "
                 f"Check the port layout in virtual_cluster.py for conflicts."
             )
         initial_global_config_dict["port_range_low"] = _gym_port_low
@@ -969,8 +995,10 @@ Depending on your data shape, you may want to change these values."""
         Gym does not start a process for them.
 
         Callers compare these names across actors to build the agent->shard map
-        and to catch an entry duplicated across shards. Names are all that is
-        interpreted; what an entry *means* is Gym's business.
+        and to catch an entry duplicated across shards; an unsharded job's
+        coverage check (``validate_dataset_agent_coverage``) reads them as the
+        entries a dataset row may name. Names are all that is interpreted; what
+        an entry *means* is Gym's business.
         """
         if self.rh is None:
             raise RuntimeError(
@@ -1752,10 +1780,17 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         # Megatron Inference is always async; should_use_async_rollouts rejects
         # an explicit mcore_generation_config.async_engine key.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
+    elif generation_config["backend"] == "trtllm":
+        # Must stay in sync with should_use_nemo_gym, which reads
+        # trtllm_cfg.expose_http_server to decide Gym owns the rollouts. Under
+        # disaggregation the server is also what the disagg frontend reaches
+        # each engine on, so there is no non-HTTP Gym path for this backend.
+        generation_config["trtllm_cfg"]["async_engine"] = True
+        generation_config["trtllm_cfg"]["expose_http_server"] = True
     else:
         raise ValueError(
-            "NeMo-Gym setup supports vllm, dynamo, or megatron generation; got "
-            f"{generation_config['backend']!r}"
+            "NeMo-Gym setup supports vllm, dynamo, megatron, or trtllm "
+            f"generation; got {generation_config['backend']!r}"
         )
 
     # Stop strings or token ids are not supported
@@ -1778,6 +1813,7 @@ def build_nemo_gym_config(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
     """Build the ``NemoGymConfig`` for a single, unsharded NeMo-Gym actor.
 
@@ -1795,6 +1831,9 @@ def build_nemo_gym_config(
             routed-experts carry dtype ("int8"/"int16"/"int32") for the model.
         use_fastokens: Forwarded from ``policy.tokenizer.use_fastokens`` so the
             actor patches its tokenizer the same way the driver does.
+        policy_api_key: The bearer token the generation server requires on its
+            OpenAI routes (VllmGeneration.http_server_api_key), or None when it
+            checks none.
 
     Returns:
         A ``NemoGymConfig`` with NeMo-RL fields at the top level and the
@@ -1822,6 +1861,7 @@ def build_nemo_gym_config(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        policy_api_key=policy_api_key,
     )
 
 
@@ -1833,6 +1873,7 @@ def _build_gym_actor_config(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
     """Turn one already-resolved Gym config mapping into a ``NemoGymConfig``.
 
@@ -1885,6 +1926,7 @@ def _build_gym_actor_config(
     return NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
+        policy_api_key=policy_api_key,
         invalid_tool_call_patterns=invalid_tool_call_patterns,
         thinking_tags=thinking_tags,
         tokenizer_config=tokenizer_config,
@@ -2095,6 +2137,7 @@ def build_nemo_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    policy_api_key: Optional[str] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
     spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
 ) -> NemoGymShardSet:
@@ -2130,6 +2173,7 @@ def build_nemo_gym_actors(
             enable_router_replay=enable_router_replay,
             use_fastokens=use_fastokens,
             token_capture=token_capture,
+            policy_api_key=policy_api_key,
         )
 
     return _build_sharded_gym_actors(
@@ -2141,6 +2185,7 @@ def build_nemo_gym_actors(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        policy_api_key=policy_api_key,
         pg_ready_timeout=pg_ready_timeout,
         spinup_timeout=spinup_timeout,
     )
@@ -2155,6 +2200,7 @@ def _build_single_gym_actor(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]],
+    policy_api_key: Optional[str] = None,
 ) -> NemoGymShardSet:
     """The pre-sharding path: one actor, no placement group, no discovery.
 
@@ -2168,6 +2214,7 @@ def _build_single_gym_actor(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        policy_api_key=policy_api_key,
     )
 
     actor_options: dict[str, Any] = {
@@ -2203,6 +2250,7 @@ def _build_sharded_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]],
+    policy_api_key: Optional[str] = None,
     pg_ready_timeout: float,
     spinup_timeout: float,
 ) -> NemoGymShardSet:
@@ -2286,6 +2334,7 @@ def _build_sharded_gym_actors(
                     enable_router_replay=enable_router_replay,
                     use_fastokens=use_fastokens,
                     token_capture=token_capture,
+                    policy_api_key=policy_api_key,
                 )
             )
             shard_set.handles.setdefault(shard.name, []).append(actor)
@@ -2401,6 +2450,7 @@ def spinup_nemo_gym_actor(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    policy_api_key: Optional[str] = None,
 ) -> Any:
     """Spin up a single NeMo-Gym actor against the given generation server URLs.
 
@@ -2416,6 +2466,9 @@ def spinup_nemo_gym_actor(
         token_capture: Dumped ``TokenCaptureConfig`` when ledger-authoritative
             token capture is enabled, else ``None``. Forwarded to
             ``build_nemo_gym_config``.
+        policy_api_key: The bearer token the generation server requires on its
+            OpenAI routes (VllmGeneration.http_server_api_key), or None when it
+            checks none.
 
     Returns:
         The spun-up ``NemoGym`` Ray actor handle (``_spinup`` already awaited).
@@ -2441,6 +2494,7 @@ def spinup_nemo_gym_actor(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        policy_api_key=policy_api_key,
     ).sole_handle()
 
 
@@ -2454,21 +2508,28 @@ def validate_dataset_agent_coverage(
     Without this scan, a rare route can sit unseen for hours of training before
     its first dispatch fails.
 
-    Unsharded jobs are skipped: there is one actor, every route resolves to it,
-    and there is nothing a scan could discover.
+    A sharded job checks against the route map built at setup. An unsharded
+    job has one actor and no route map, so it asks that actor which entries
+    its resolved Gym config spawned and keeps the routable ones, agents and
+    resources servers, exactly as the sharded route map does. A model or
+    environment server is never a route, on one actor or on many.
 
     Args:
-        shard_set: The running actors, carrying the route map built at setup.
+        shard_set: The running actors. A sharded set carries the route map
+            built at setup; an unsharded set is asked for its entries here.
         datasets: Split name to dataset, for the error message. ``None`` values
             and datasets without gym rows are skipped.
 
     Raises:
         ShardSetupError: A split references routes no shard hosts.
     """
-    if not shard_set.is_sharded:
-        return
-
-    hosted = shard_set.hosted_routes
+    if shard_set.is_sharded:
+        hosted = shard_set.hosted_routes
+    else:
+        # The same filter the sharded route map applies; with one shard its
+        # duplicate checks are vacuous, so only the routable-type rule remains.
+        entries = ray.get(shard_set.all_handles[0].list_entries.remote())
+        hosted = frozenset(build_route_shard_map({DEFAULT_SHARD_NAME: entries}))
     for split, dataset in datasets.items():
         unhosted = sorted(_iter_dataset_agent_names(dataset) - hosted)
         if unhosted:
@@ -2481,9 +2542,8 @@ def validate_dataset_agent_coverage(
 def _iter_dataset_agent_names(dataset: Any) -> set[str]:
     """Collect the agent or task-source names a dataset's rows reference.
 
-    Sharded jobs lazily scan each stable source file once.
-    Unsharded jobs never call this function.
-    Custom or changed sources retain the row-scan fallback.
+    A stable source file is scanned once and its names cached; a custom or
+    changed source falls back to scanning the loaded rows.
     """
     if dataset is None:
         return set()
