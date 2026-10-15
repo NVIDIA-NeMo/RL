@@ -52,6 +52,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
+    CapturedChatLogprobsMixin,
+)
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
@@ -274,6 +277,27 @@ class VllmAsyncGenerationWorkerImpl(
 
         self.llm = None
         self.vllm_device_ids = None
+
+    async def start_gpu_profiling(self) -> None:
+        """Start GPU profiling on the inner TP workers.
+
+        The async engine's collective_rpc is a coroutine; the inherited sync
+        start_gpu_profiling would drop it un-awaited, so the inner TP workers
+        never receive cudaProfilerStart. Await it here so every inner worker starts.
+        This outer actor deliberately does not call cudaProfilerStart itself, so its
+        own nsys session never opens a capture and writes no report.
+        """
+        if self.llm is not None:
+            await self.llm.collective_rpc("start_gpu_profiling", args=tuple())
+
+    async def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling on the inner TP workers.
+
+        Awaits collective_rpc("stop_gpu_profiling") so cudaProfilerStop reaches every
+        inner worker and ends its capture.
+        """
+        if self.llm is not None:
+            await self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
     def _return_routed_experts_enabled(self) -> bool:
         engine_args = getattr(self, "llm_async_engine_args", None)
@@ -1248,12 +1272,22 @@ class VllmAsyncGenerationWorkerImpl(
                         final_res = res
                         yield res
 
-                response = await super().chat_completion_full_generator(
-                    request,
-                    capture_result_generator(),
-                    *args,
-                    **kwargs,
+                # Capture stages the raw arrays below and strips OpenAI logprobs
+                # after the terminal PUT. Skip only their object construction;
+                # changing request.logprobs would also change engine sampling.
+                bypass_logprobs = bool(
+                    not request.stream
+                    and request.logprobs
+                    and return_as_token_id
+                    and id(request) in worker_self._capture_calls
                 )
+                with self._bypass_chat_logprobs(enabled=bypass_logprobs):
+                    response = await super().chat_completion_full_generator(
+                        request,
+                        capture_result_generator(),
+                        *args,
+                        **kwargs,
+                    )
                 if (
                     not isinstance(response, ChatCompletionResponse)
                     or final_res is None
@@ -1277,7 +1311,11 @@ class VllmAsyncGenerationWorkerImpl(
 
                 return response
 
-        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
+        class NeMoRLOpenAIServingChat(
+            NeMoRLOpenAIServingChatMixin,
+            CapturedChatLogprobsMixin,
+            OpenAIServingChat,
+        ):
             pass
 
         class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
