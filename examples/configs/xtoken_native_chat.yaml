@@ -33,6 +33,7 @@ policy:
     kwargs:
       factor: 1.0
       total_iters: 3
+  - milestones: []
 teachers:
 - model_name: Qwen/Qwen3-1.7B
   aligner:
