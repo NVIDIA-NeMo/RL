@@ -556,6 +556,24 @@ By multiplying the first term of the loss function by the importance weights $\f
 
 To enable the importance sampling correction, set the config `use_importance_sampling_correction=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
+##### Adaptive PPO clip
+
+`truncated_importance_sampling_type: adaptive-ppo-clip` filters tokens by importance weight $w$ according to the sign of their advantage, with an upper bound that adapts to policy entropy:
+
+```yaml
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: adaptive-ppo-clip
+  truncated_importance_sampling_ratio: 2.5      # base upper bound for A > 0
+  truncated_importance_sampling_ratio_min: 0.4  # lower bound for A < 0
+  tis_adaptive_ppo_clip_target_entropy: 0.3
+  sequence_level_importance_ratios: false
+```
+
+The loss zeroes the weight of negative-advantage tokens with $w$ below `truncated_importance_sampling_ratio_min`, positive-advantage tokens with $w$ above `truncated_importance_sampling_ratio + k`, and every token with $w > 50$. `is_oob_ratio` reports the fraction of filtered tokens.
+
+The offset $k$ starts at 0. After each training step, the trainer compares the step's `approx_entropy` with `tis_adaptive_ppo_clip_target_entropy`: entropy above the target lowers $k$ by 0.25, and entropy below the target raises it by 0.25. $k$ is clamped to $[0, 1]$. The legacy GRPO trainers and the single controller log `cur_adaptive_ppo_clip_k` and `last_entropy`, and they save both in checkpoints so a resumed run continues from the same bound. The legacy PPO trainer rejects this mode. Sequence-level importance ratios are not supported.
+
 
 #### Single-forward sequence-logprob filtering
 

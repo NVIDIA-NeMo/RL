@@ -434,6 +434,10 @@ class GRPOSaveState:
     # SingleController only: exact last admitted dispatch batch. None preserves
     # compatibility with checkpoints that only recorded the trainer version.
     sampler_dispatch_index: Optional[int] = None
+    # adaptive-ppo-clip controller state. Omitted from checkpoints when the
+    # loss has no adaptive state.
+    last_entropy: Optional[float] = None
+    cur_adaptive_ppo_clip_k: Optional[float] = None
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:
@@ -447,6 +451,8 @@ def _initial_grpo_save_state() -> GRPOSaveState:
         trainer_version=None,
         sampler_name=None,
         sampler_dispatch_index=None,
+        last_entropy=None,
+        cur_adaptive_ppo_clip_k=None,
     )
 
 
@@ -463,6 +469,64 @@ def _get_grpo_save_state(
         {key: value for key, value in loaded_state.items() if key in known_fields}
     )
     return GRPOSaveState(**state_values)
+
+
+_ADAPTIVE_LOSS_STATE_KEYS = ("last_entropy", "cur_adaptive_ppo_clip_k")
+
+
+def _restore_adaptive_loss_state(
+    loss_fn: LossFunction,
+    grpo_save_state: GRPOSaveState,
+) -> None:
+    """Restore adaptive loss state; checkpoints without it keep initial values."""
+    if isinstance(loss_fn, ClippedPGLossFn):
+        loss_fn.load_adaptive_loss_state_dict(vars(grpo_save_state))
+
+
+def _update_adaptive_loss_state(
+    loss_fn: LossFunction,
+    metrics: dict[str, Any],
+) -> None:
+    """Advance the adaptive loss controller from a step's aggregated metrics.
+
+    Call once per completed training step, after the per-microbatch metrics
+    are reduced, so the controller sees the step's global entropy. The new
+    state is added to ``metrics`` for logging.
+    """
+    if (
+        not isinstance(loss_fn, ClippedPGLossFn)
+        or not loss_fn.has_adaptive_loss_state()
+        or "approx_entropy" not in metrics
+    ):
+        return
+
+    loss_fn.update_adaptive_loss_state(float(metrics["approx_entropy"]))
+    metrics.update(
+        {
+            key: value
+            for key, value in loss_fn.adaptive_loss_state_dict().items()
+            if value is not None
+        }
+    )
+
+
+def _save_adaptive_loss_state(
+    grpo_save_state: GRPOSaveState,
+    loss_fn: LossFunction,
+) -> None:
+    """Copy adaptive loss state into the save state, omitting unset fields."""
+    state_dict = (
+        loss_fn.adaptive_loss_state_dict()
+        if isinstance(loss_fn, ClippedPGLossFn)
+        else {}
+    )
+    save_state_values = vars(grpo_save_state)
+    for key in _ADAPTIVE_LOSS_STATE_KEYS:
+        value = state_dict.get(key)
+        if value is None:
+            save_state_values.pop(key, None)
+        else:
+            save_state_values[key] = float(value)
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -895,6 +959,7 @@ def setup(
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         seq_logprob_error_threshold=grpo_config.seq_logprob_error_threshold,
     )
+    _restore_adaptive_loss_state(loss_fn, grpo_save_state)
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
@@ -4085,6 +4150,7 @@ def _grpo_train_impl(
                         print(f"Skipping aggregation for {k} ({type(v)})")
                 finalize_draft_ratio_metrics(metrics)
 
+                _update_adaptive_loss_state(loss_fn, metrics)
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
@@ -4127,6 +4193,7 @@ def _grpo_train_impl(
                     elif hasattr(grpo_save_state, "val_reward"):
                         delattr(grpo_save_state, "val_reward")
                     grpo_save_state.consumed_samples = consumed_samples
+                    _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
@@ -6003,6 +6070,7 @@ def async_grpo_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 finalize_draft_ratio_metrics(metrics)
+                _update_adaptive_loss_state(loss_fn, metrics)
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
@@ -6028,6 +6096,7 @@ def async_grpo_train(
                     elif hasattr(grpo_save_state, "val_reward"):
                         delattr(grpo_save_state, "val_reward")
                     grpo_save_state.consumed_samples = consumed_samples
+                    _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
