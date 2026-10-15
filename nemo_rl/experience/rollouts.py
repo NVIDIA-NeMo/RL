@@ -3044,7 +3044,9 @@ def _postprocess_single_nemo_gym_group(
                 "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
                 "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
-                == max_total_tokens_per_sample,
+                == max_total_tokens_per_sample
+                # also truncated when a model call hit max_output_tokens (Responses API status)
+                or (r["full_result"].get("response") or {}).get("status") == "incomplete",
                 # max_gen_tokens_per_turn: Diagnostic for long single generations
                 "max_gen_tokens_per_turn": max(
                     (
