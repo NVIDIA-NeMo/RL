@@ -894,10 +894,13 @@ def _distillation_train_impl(
                     student_generation.finish_generation()
 
                 with timer.time("data_processing"):
-                    # Add loss mask and advantages to each message in LLMMessageLogType
+                    # Train on generated assistant turns, excluding prompt history.
                     for message_log in repeated_batch["message_log"]:
                         for message in message_log:
-                            if message["role"] == "assistant":
+                            if (
+                                message["role"] == "assistant"
+                                and "generation_logprobs" in message
+                            ):
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
                                 )

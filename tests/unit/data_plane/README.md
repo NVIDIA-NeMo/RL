@@ -126,11 +126,12 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_bootstrap_that_skips_the_wrapped_popen_is_a_drift_error` — A bootstrap that launches the master by another route fails loudly instead of silently keeping 9003.
 - `test_init_tq_reserves_every_master_port_from_the_band` — Metadata, master RPC and metrics ports all come from the data-plane band, and no `metrics_port` config key is sent.
 
-## `test_message_log_decompose.py` (13 tests)
+## `test_message_log_decompose.py` (14 tests)
 
 - `test_decompose_message_log_basic_shapes` — Basic shapes of decompose output.
 - `test_decompose_message_log_no_assistant_turn` — No-assistant case handled.
-- `test_decompose_message_log_sums_assistant_turns` — Multiple assistant turns → `response_token_lengths` is their total.
+- `test_decompose_message_log_sums_assistant_turns` — Multiple generated assistant turns → `response_token_lengths` is their total.
+- `test_decompose_message_log_excludes_prompt_history` — Prompt history stays in turn metadata but contributes no response tokens, including when generated turns are empty or absent.
 - `test_decompose_message_log_jagged_turn_count` — Different turn counts pad `turn_lengths` with zeros.
 - `test_decompose_message_log_missing_role_raises` — Missing `role` raises KeyError loudly.
 - `test_reconstruct_message_log_roundtrip` — decompose → flatten → reconstruct equivalent message_log.

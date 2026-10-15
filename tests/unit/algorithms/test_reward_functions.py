@@ -329,11 +329,18 @@ def test_reward_shaping_missing_assistant_response():
 
 
 @pytest.mark.parametrize("decomposed", [False, True])
-def test_reward_shaping_counts_all_assistant_turns(decomposed):
-    """Multi-turn logs are measured over every assistant turn, on both input paths."""
+def test_reward_shaping_counts_all_assistant_turns(decomposed: bool) -> None:
+    """Both input paths count every generated assistant turn."""
 
-    def turn(role, n):
-        return {"role": role, "content": "", "token_ids": torch.zeros(n)}
+    def turn(role: str, n: int) -> dict:
+        message = {
+            "role": role,
+            "content": "",
+            "token_ids": torch.zeros(n, dtype=torch.long),
+        }
+        if role == "assistant":
+            message["generation_logprobs"] = torch.zeros(n)
+        return message
 
     message_logs = [
         # Single turn: 15 assistant tokens, within the expected length of 20.
@@ -368,6 +375,46 @@ def test_reward_shaping_counts_all_assistant_turns(decomposed):
     result = apply_reward_shaping(batch, config)
 
     assert torch.allclose(result["total_reward"], torch.tensor([1.0, 0.5]))
+
+
+@pytest.mark.parametrize("decomposed", [False, True])
+@pytest.mark.parametrize("history_length", [0, 100])
+def test_reward_shaping_excludes_prompt_history(
+    decomposed: bool, history_length: int
+) -> None:
+    """A long history or empty assistant placeholder must not penalize 15 new tokens."""
+    batch = create_mock_batch_with_responses(1, [15], [1.0])
+    batch["message_log"][0][1:1] = [
+        {
+            "role": "assistant",
+            "content": "prompt history",
+            "token_ids": torch.zeros(history_length, dtype=torch.long),
+        },
+        {
+            "role": "user",
+            "content": "follow-up",
+            "token_ids": torch.ones(5, dtype=torch.long),
+        },
+    ]
+    if decomposed:
+        batch = BatchedDataDict(
+            {
+                "response_token_lengths": decompose_message_log(batch["message_log"])[
+                    "response_token_lengths"
+                ],
+                "total_reward": batch["total_reward"],
+            }
+        )
+    result = apply_reward_shaping(
+        batch,
+        RewardShapingConfig(
+            enabled=True,
+            max_response_length=30,
+            overlong_buffer_length=10,
+            overlong_buffer_penalty=1.0,
+        ),
+    )
+    torch.testing.assert_close(result["total_reward"], torch.tensor([1.0]))
 
 
 def test_reward_shaping_mismatched_lengths():
