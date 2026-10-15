@@ -1023,6 +1023,36 @@ def modelopt_moe_amax_aliases(model: "torch.nn.Module") -> Iterator[None]:
             delattr(module, alias)
 
 
+def skip_logprob_detokenization() -> None:
+    """Build engine log-probs without decoded token strings in this process.
+
+    Verified against vLLM 0.29.0: ``LogprobsProcessor._update_sample_logprobs``
+    runs ``convert_ids_list_to_tokens`` (one ``tokenizer.decode`` per id) on
+    every log-prob candidate of every generated token, on the front-end thread
+    that also serves HTTP. With ``token_capture.top_logprobs=K`` that is K + 1
+    decodes per token: 150 vs 8 us/token at K=32 on GB300, enough to queue the
+    engine's requests behind Python work. Generation workers only read ids and
+    log-prob values, and their chat server returns tokens as ids
+    (``return_tokens_as_token_ids``), so the strings go unused. A processor
+    built without a tokenizer leaves ``Logprob.decoded_token`` None; output
+    text is detokenized separately and is unchanged.
+
+    vLLM's output processor runs in the generation worker's own process, so a
+    runtime patch suffices. Idempotent.
+    """
+    from vllm.v1.engine.logprobs import LogprobsProcessor
+
+    if getattr(LogprobsProcessor, "_nemo_rl_skip_detokenization", False):
+        return
+    build = LogprobsProcessor.from_new_request.__func__
+
+    def from_new_request(cls, tokenizer, request):
+        return build(cls, None, request)
+
+    LogprobsProcessor.from_new_request = classmethod(from_new_request)
+    LogprobsProcessor._nemo_rl_skip_detokenization = True
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 

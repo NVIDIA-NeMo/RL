@@ -568,6 +568,14 @@ class VllmAsyncGenerationWorkerImpl(
         )
         self._staging_sink = sink
         self._capture_top_logprobs = int(top_logprobs)
+        if self._capture_top_logprobs:
+            # K + 1 log-prob candidates per generated token: skip vLLM's
+            # per-candidate detokenization, which only builds unused strings.
+            from nemo_rl.models.generation.vllm.patches import (
+                skip_logprob_detokenization,
+            )
+
+            skip_logprob_detokenization()
         if capture_media:
             # Omni-only: a new processor family must also change setup.py (driver
             # checks), captured_media.py (_processed_omni_tensors, pack_images,

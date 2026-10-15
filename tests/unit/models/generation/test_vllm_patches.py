@@ -40,7 +40,9 @@ import os
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
@@ -1052,3 +1054,47 @@ def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_pat
 
     assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
     assert ray_executor.read_text() == once
+
+
+@pytest.mark.vllm
+def test_skip_logprob_detokenization_keeps_values_and_drops_strings(monkeypatch):
+    """Top-k capture builds log-probs without decoding a single candidate."""
+    pytest.importorskip("vllm")
+    from vllm import SamplingParams
+    from vllm.v1.engine.logprobs import LogprobsProcessor
+
+    # The patch is process-wide: hand vLLM's classmethod back after the test.
+    monkeypatch.setattr(
+        LogprobsProcessor,
+        "from_new_request",
+        LogprobsProcessor.__dict__["from_new_request"],
+    )
+    monkeypatch.setattr(
+        LogprobsProcessor, "_nemo_rl_skip_detokenization", False, raising=False
+    )
+    patches.skip_logprob_detokenization()
+    patched = LogprobsProcessor.__dict__["from_new_request"]
+    patches.skip_logprob_detokenization()
+    assert LogprobsProcessor.__dict__["from_new_request"] is patched
+
+    tokenizer = MagicMock(name="tokenizer")
+    request = SimpleNamespace(sampling_params=SamplingParams(logprobs=2))
+    processor = LogprobsProcessor.from_new_request(tokenizer=tokenizer, request=request)
+    assert processor.tokenizer is None
+
+    # One generated position: the sampled token (rank 3) first, then the top 2.
+    processor._update_sample_logprobs(
+        (
+            [np.array([7, 3, 9])],
+            [np.array([-2.5, -0.5, -1.5], dtype=np.float32)],
+            [np.array(3)],
+            None,
+        )
+    )
+    (position,) = processor.logprobs
+    assert {
+        token_id: (entry.logprob, entry.rank, entry.decoded_token)
+        for token_id, entry in position.items()
+    } == {7: (-2.5, 3, None), 3: (-0.5, 1, None), 9: (-1.5, 2, None)}
+    assert processor.cumulative_logprob == -2.5
+    assert not tokenizer.method_calls

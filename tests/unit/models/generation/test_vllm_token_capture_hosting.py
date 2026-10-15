@@ -84,8 +84,16 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
     return worker
 
 
-def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
+@pytest.mark.parametrize("top_logprobs", [0, 4])
+def test_setup_token_capture_installs_capture_with_vllm_adapter(
+    monkeypatch, top_logprobs
+):
     sink = _MemorySink()
+    skipped = []
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.patches.skip_logprob_detokenization",
+        lambda: skipped.append(True),
+    )
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client",
         lambda dp_cfg, bootstrap: MagicMock(name="dp_client"),
@@ -105,7 +113,7 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
             worker,
             dp_cfg={"backend": "simple"},
             staging_partition="rollout_staging",
-            top_logprobs=4,
+            top_logprobs=top_logprobs,
         )
     )
 
@@ -114,7 +122,9 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     assert worker.token_capture.adapter is not None
     # The sink and top-k count stay on the worker for the request path.
     assert worker._staging_sink is sink
-    assert worker._capture_top_logprobs == 4
+    assert worker._capture_top_logprobs == top_logprobs
+    # Only top-k capture turns off vLLM's per-candidate detokenization.
+    assert skipped == ([True] if top_logprobs else [])
     # The adapter is the vLLM one (prefix ids enter via the worker's field).
     payload = worker.token_capture.adapter.enter_prefix({}, [1, 2])
     assert payload["required_prefix_token_ids"] == [1, 2]
