@@ -1,6 +1,8 @@
 defaults: ./dpo-nanov3-30B3AB-1n8g-automodel-ep8.v2.yaml
 policy:
   automodel_cfg:
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: ""
     expert_parallel_size: 4
     automodel_kwargs:
       backend:
