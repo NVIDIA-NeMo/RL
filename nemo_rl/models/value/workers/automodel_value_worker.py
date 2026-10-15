@@ -152,7 +152,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
             config["reward_model_cfg"]["enabled"]
             and config["reward_model_cfg"]["reward_model_type"] == "regression"
         ), (
-            "DTensor value models require reward_model_cfg.enabled=true and reward_model_cfg.reward_model_type='regression'."
+            "Automodel value models require reward_model_cfg.enabled=true and reward_model_cfg.reward_model_type='regression'."
         )
 
         print("Initializing AutomodelValueWorker")

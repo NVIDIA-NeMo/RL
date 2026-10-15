@@ -50,6 +50,7 @@ from nemo_rl.models.policy.interfaces import (
     TopkLogitsOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    DETERMINISTIC_ENV_VARS,
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
     validate_fp32_lm_head_config,
@@ -170,7 +171,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enabled:
             raise ValueError(
                 "generation.nvfp4_pertoken_rollout requires the Megatron "
-                "training backend (policy.megatron_cfg.enabled=true); DTensor "
+                "training backend (policy.megatron_cfg.enabled=true); Automodel "
                 "does not implement TE NVFP4 training."
             )
         validate_fp32_lm_head_config(
@@ -281,6 +282,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["automodel_cfg"]["context_parallel_size"]
 
             env_vars = config["automodel_cfg"].get("env_vars", {})
+            if config["automodel_cfg"].get("deterministic"):
+                env_vars = {**(env_vars or {}), **DETERMINISTIC_ENV_VARS}
 
         # If a worker extension class is provided, use it instead of the default worker builder class
         if extension_fqn is not None:
@@ -301,11 +304,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             sep_line = "\n" + ("-" * 80)
             assert config["train_micro_batch_size"] == config["logprob_batch_size"], (
                 f"{sep_line}\n"
-                "There is a known batch-variant accuracy issue with TP>=4 for both DTensor and Megatron backend.\n"
-                "See https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause for more details.\n"
+                "There is a known batch-variant accuracy issue with TP>=4 for both Automodel and Megatron backend.\n"
+                "See https://docs.nvidia.com/nemo/rl/latest/guides/automodel-tp-accuracy.html#root-cause for more details.\n"
                 "\n"
                 "Please choose either of the following solutions to avoid this issue:\n"
-                "1. Set tp_size to 1 or 2. (tensor_parallel_size for DTensor, or tensor_model_parallel_size for Megatron)\n"
+                "1. Set tp_size to 1 or 2. (tensor_parallel_size for Automodel, or tensor_model_parallel_size for Megatron)\n"
                 "2. Set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value.\n"
                 "3. Set loss_fn.force_on_policy_ratio=true to force ratio=1.0, this requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt.\n"
                 "4. Set NRL_IGNORE_TP_ACCURACY_CHECK=1 to bypass this check. (not recommended)"
@@ -364,7 +367,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             worker_kwargs["reserved_http_server_ports"] = reserved_http_server_ports
 
         if automodel_enabled:
-            # DTensor workers reconstruct tokenizer/processor locally to avoid
+            # Automodel workers reconstruct tokenizer/processor locally to avoid
             # pickling across incompatible transformers versions (v4 head → v5 worker).
             config["tokenizer"]["use_processor"] = processor is not None
         else:
@@ -1209,7 +1212,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     ) -> None:
         """Set up the colocate Gloo gather topology for SGLang weight refit.
 
-        Called by the SGLang colocated refit drivers (Megatron and FSDP)
+        Called by the SGLang colocated refit drivers (Megatron and Automodel)
         whenever engines are added or recovered.
         """
         futures = self.worker_group.run_all_workers_single_data(
@@ -1382,7 +1385,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         With Megatron async_save=True, this returns after D2H staging. The caller
         must call finalize_async_save() before renaming the checkpoint directory.
 
-        DTensor checkpoint resources are configured when the Policy is
+        Automodel checkpoint resources are configured when the Policy is
         constructed. ``weights_path`` selects the destination for each save.
         """
         if bool(self.cfg.get("automodel_cfg", {}).get("enabled", False)):

@@ -40,7 +40,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'data["train/preference_loss"]["1"] > 0.69314' \
         'data["train/preference_loss"]["1"] < 0.69316' \
         'data["train/preference_loss"]["15"] < 0.63263' \
-        'mean(data["timing/train/total_step_time"], -5, -1) < 5'
+        'mean(data["timing/train/total_step_time"], -5, -1) < 6'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

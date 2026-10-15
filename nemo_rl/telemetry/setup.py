@@ -203,7 +203,7 @@ def _build_resource_attributes(
     if precision:
         attrs["nemo.precision"] = precision
 
-    # Parallelism lives under the active policy backend (megatron vs dtensor).
+    # Parallelism lives under the active policy backend (megatron vs automodel).
     tp = _dig(
         master_config, "policy", "megatron_cfg", "tensor_model_parallel_size"
     ) or _dig(master_config, "policy", "automodel_cfg", "tensor_parallel_size")

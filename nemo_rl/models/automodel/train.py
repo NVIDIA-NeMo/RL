@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Training utilities for automodel (DTensor-based) policy workers.
+"""Training utilities for Automodel policy workers.
 
 This module provides post-processor classes and forward/backward functions
 that follow the same pattern as nemo_rl/models/megatron/train.py.
