@@ -39,6 +39,7 @@ from nemo_rl.utils.checkpoint_storage import (
     load_checkpoint_object,
     open_path,
     path_exists,
+    save_checkpoint_object,
 )
 
 
@@ -63,6 +64,22 @@ def get_train_dataset_name(data_config: DataConfig) -> Optional[str]:
     if isinstance(train, dict):
         return train.get("dataset_name")
     return None
+
+
+def save_dataloader_state(
+    dataloader_state: Any,
+    checkpoint_path: Any,
+    suffix: str = "",
+) -> None:
+    """Save a dataloader state to ``{checkpoint_path}/train_dataloader{suffix}.pt``.
+
+    Counterpart of :func:`load_dataloader_state`; works for local paths and
+    ``msc://`` checkpoint locations, so algorithms share one save path.
+    """
+    save_checkpoint_object(
+        dataloader_state,
+        os.path.join(checkpoint_path, f"train_dataloader{suffix}.pt"),
+    )
 
 
 def load_dataloader_state(

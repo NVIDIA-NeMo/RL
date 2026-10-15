@@ -69,7 +69,11 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
+from nemo_rl.data.utils import (
+    extract_necessary_env_names,
+    load_dataloader_state,
+    save_dataloader_state,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     TOPO_RANK_UNKNOWN,
@@ -2115,10 +2119,7 @@ def ppo_train(
                         )
                         value_model.finish_training()
 
-                        torch.save(
-                            dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
+                        save_dataloader_state(dataloader.state_dict(), checkpoint_path)
                         # The value worker finalizes its own write synchronously
                         # (blocking=True) inside save_checkpoint, so only the
                         # policy's async write needs to be awaited before rename.
@@ -3093,10 +3094,7 @@ def async_ppo_train(
                         dataloader_state = ray.get(
                             trajectory_collector.get_dataloader_state.remote()
                         )
-                        torch.save(
-                            dataloader_state,
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
+                        save_dataloader_state(dataloader_state, checkpoint_path)
                         print("📦 Saving replay buffer state...")
                         num_buffered_trajectories = ray.get(
                             replay_buffer.save_to_path.remote(

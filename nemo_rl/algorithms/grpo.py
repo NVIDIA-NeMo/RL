@@ -83,7 +83,11 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
-from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
+from nemo_rl.data.utils import (
+    extract_necessary_env_names,
+    load_dataloader_state,
+    save_dataloader_state,
+)
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -175,7 +179,6 @@ from nemo_rl.utils.checkpoint_storage import (
     is_msc_path,
     open_path,
     path_exists,
-    save_checkpoint_object,
 )
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import (
@@ -4259,17 +4262,14 @@ def _grpo_train_impl(
                                 task_name,
                                 task_dataloader,
                             ) in wrapped_dataloader.dataloaders.items():
-                                save_checkpoint_object(
+                                save_dataloader_state(
                                     task_dataloader.state_dict(),
-                                    os.path.join(
-                                        checkpoint_path,
-                                        f"train_dataloader_{task_name}.pt",
-                                    ),
+                                    checkpoint_path,
+                                    suffix=f"_{task_name}",
                                 )
                         else:
-                            save_checkpoint_object(
-                                wrapped_dataloader.state_dict(),
-                                os.path.join(checkpoint_path, "train_dataloader.pt"),
+                            save_dataloader_state(
+                                wrapped_dataloader.state_dict(), checkpoint_path
                             )
                         # Finalize in the background. The directory rename is
                         # deferred until any async write completes (via wait_fn);
@@ -6172,9 +6172,8 @@ def async_grpo_train(
                         )
                         dataloader_snapshot = collector_checkpoint["dataloader"]
                         rollouts_state = collector_checkpoint["rollouts"]
-                        torch.save(
-                            dataloader_snapshot["dataloader_state"],
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        save_dataloader_state(
+                            dataloader_snapshot["dataloader_state"], checkpoint_path
                         )
                         _save_async_replay_buffer_checkpoint(
                             replay_buffer,
