@@ -19,3 +19,14 @@ def test_subagent_launchers_require_and_validate_solution_schema() -> None:
             "use Python to assert solution.json parses as a top-level JSON object "
             "with a segments list containing only objects"
         ) in text
+
+
+def test_subagent_launchers_bound_observations_without_changing_training_horizon() -> None:
+    for launcher in LAUNCHERS:
+        text = launcher.read_text()
+        assert "AGENTIC_VBENCH_TOOL_OUTPUT_MAX_LINES:-400" in text
+        assert "AGENTIC_VBENCH_TOOL_OUTPUT_MAX_BYTES:-8192" in text
+        assert "exactly two labeled overview JPEGs total" in text
+        assert "at most 1280 by 720 pixels" in text
+        assert "ffmpeg -hide_banner -loglevel error -nostats" in text
+        assert "MAX_STEPS:-1000000" in text

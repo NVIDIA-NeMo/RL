@@ -405,7 +405,7 @@ echo "context_compaction=${context_compaction}"
 if [[ -n ${CLAW_EVAL_SOURCE:-} ]]; then
   echo "claweval_compaction_auto=${CLAW_EVAL_COMPACTION_AUTO:-null} claweval_prune=${CLAW_EVAL_COMPACTION_PRUNE:-null} training_mode=${CLAW_EVAL_TRAINING_MODE:-null} subagents=${CLAW_EVAL_SUBAGENTS_ENABLED:-false} max_turns=${CLAW_EVAL_MAX_TURNS:-40} context_tokens=${CLAW_EVAL_CONTEXT_TOKENS:-49152} output_tokens=${CLAW_EVAL_OUTPUT_TOKENS:-8192}"
 else
-  echo "agentic_vbench_compaction_auto=${AGENTIC_VBENCH_COMPACTION_AUTO} agentic_vbench_prune=${AGENTIC_VBENCH_COMPACTION_PRUNE} max_turns=${AGENTIC_VBENCH_MAX_TURNS:-32} context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS:-49152} output_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS:-8192} tasks=${AGENTIC_VBENCH_TASKS:-all}"
+  echo "agentic_vbench_compaction_auto=${AGENTIC_VBENCH_COMPACTION_AUTO} agentic_vbench_prune=${AGENTIC_VBENCH_COMPACTION_PRUNE} max_turns=${AGENTIC_VBENCH_MAX_TURNS:-32} context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS:-49152} output_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS:-8192} tool_output_max_lines=${AGENTIC_VBENCH_TOOL_OUTPUT_MAX_LINES:-native} tool_output_max_bytes=${AGENTIC_VBENCH_TOOL_OUTPUT_MAX_BYTES:-native} tasks=${AGENTIC_VBENCH_TASKS:-all}"
 fi
 echo "episodes=${AGENTIC_VBENCH_OUTPUT_ROOT}"
 echo "container=${container}"

@@ -70,19 +70,23 @@ export MIN_SLURM_TIME_SECONDS=${MIN_SLURM_TIME_SECONDS:-86400}
 export MIN_CHECKPOINT_BUDGET_SECONDS=${MIN_CHECKPOINT_BUDGET_SECONDS:-82800}
 export REQUIRE_RESUMABLE_JOB_CYCLES=${REQUIRE_RESUMABLE_JOB_CYCLES:-true}
 export AGENTIC_VBENCH_MAX_TURNS=${AGENTIC_VBENCH_MAX_TURNS:-32}
+# Match the qualified sync gate's native OpenCode observation bounds. Full tool
+# output remains on disk and verifier semantics are unchanged.
+export AGENTIC_VBENCH_TOOL_OUTPUT_MAX_LINES=${AGENTIC_VBENCH_TOOL_OUTPUT_MAX_LINES:-400}
+export AGENTIC_VBENCH_TOOL_OUTPUT_MAX_BYTES=${AGENTIC_VBENCH_TOOL_OUTPUT_MAX_BYTES:-8192}
 # Keep the first async gate behaviorally identical to the qualified sync gate.
 # Only the sampler topology and dispatch-ahead window change below.
 debug_delegation_prompt="Your first action must be exactly one task tool call before bash read or any other tool. "
-debug_delegation_prompt+="Delegate only mechanical media preparation to the general subagent. Ask it to write a duration table at /workspace/work/subagent_durations.tsv and labeled contact sheets under /workspace/work/subagent_contact_sheets. "
+debug_delegation_prompt+="Delegate only mechanical media preparation to the general subagent. Ask it to write a duration table at /workspace/work/subagent_durations.tsv and exactly two labeled overview JPEGs total under /workspace/work/subagent_contact_sheets. Each overview must be at most 1280 by 720 pixels and together they must show every candidate with three chronological thumbnails and its numeric clip ID. "
 debug_delegation_prompt+="Also ask it to write and syntax check /workspace/work/build_solution.py which accepts one chosen clip ID per storyboard slot and mechanically creates solution.mp4 plus a truthful solution.json from the full clips. Require solution.json to be a top-level JSON object with a segments list and never a bare JSON list. Tell the child not to inspect or choose clips and not to create either deliverable itself. "
-debug_delegation_prompt+="When the child returns read its duration table and inspect every prepared contact sheet exactly once in at most two parallel read batches. Choose the best clip for every slot once without revisiting decisions. "
+debug_delegation_prompt+="When the child returns read its duration table and inspect the two overview JPEGs exactly once in one parallel read batch. Choose the best clip for every slot once without revisiting decisions. "
 debug_delegation_prompt+="Hard transition rule: after the tool results containing the final contact sheets your very next response must contain a bash tool call invoking python /workspace/work/build_solution.py followed by the chosen clip IDs in slot order. Do not write clip by clip analysis or comparison before that tool call and keep private selection reasoning under 200 words. "
 debug_delegation_prompt+="Then use one bash tool call to verify both output files exist and use Python to assert solution.json parses as a top-level JSON object with a segments list containing only objects. Keep every response short. "
 debug_delegation_prompt+="Never end while a required deliverable is missing. After verification succeeds return one brief final sentence."
 export AGENTIC_VBENCH_DELEGATION_PROMPT=${AGENTIC_VBENCH_DELEGATION_PROMPT:-"${debug_delegation_prompt}"}
 debug_subagent_prompt="Complete only mechanical media preparation and never choose candidate clips. Never create solution.mp4 or solution.json. "
-debug_subagent_prompt+="Use ffprobe in one shell workflow to write /workspace/work/subagent_durations.tsv with one clip and duration per line. "
-debug_subagent_prompt+="Use one batched frame extraction workflow to create clearly labeled compact contact sheets for every candidate under /workspace/work/subagent_contact_sheets. "
+debug_subagent_prompt+="Use ffprobe with -v error in one shell workflow to write /workspace/work/subagent_durations.tsv with one clip and duration per line. "
+debug_subagent_prompt+="Use one batched frame extraction workflow to create exactly two overview JPEGs total under /workspace/work/subagent_contact_sheets. Each JPEG must be at most 1280 by 720 pixels and together they must show every candidate with three chronological thumbnails and its numeric clip ID. Use ffmpeg -hide_banner -loglevel error -nostats and suppress routine stdout and stderr. Do not create per-candidate contact sheets. "
 debug_subagent_prompt+="Write /workspace/work/build_solution.py which accepts exactly one numeric clip ID per storyboard slot. It must concatenate those full clips in order into /workspace/output/solution.mp4 and write the required contiguous full-duration segments to /workspace/output/solution.json as a top-level JSON object with a segments list and never a bare JSON list. Syntax check the script but do not run it. "
 debug_subagent_prompt+="Do not view or analyze any extracted image and do not discuss the storyboard. Verify the duration table contact sheets and builder exist. "
 debug_subagent_prompt+="Return only their paths and counts in at most four short lines then stop."
