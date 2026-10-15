@@ -33,8 +33,8 @@ teachers:
 - model_name: Qwen/Qwen3-4B
   aligner:
     projection_matrix_path: null
-    student_to_teacher_table_path: ${oc.env:CSD_STUDENT_TO_TEACHER_TABLE}
-    teacher_to_student_table_path: ${oc.env:CSD_TEACHER_TO_STUDENT_TABLE}
+    student_to_teacher_table_path: null
+    teacher_to_student_table_path: null
   weight: 1.0
   tokenizer:
     name: Qwen/Qwen3-4B
@@ -86,7 +86,7 @@ data:
   max_input_seq_length: 4096
   train:
     dataset_name: openai_format
-    data_path: ${oc.env:CSD_ROUTED_ROLLOUTS}
+    data_path: ???
     chat_key: messages
     use_preserving_dataset: true
 checkpointing:

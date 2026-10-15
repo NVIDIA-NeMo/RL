@@ -4,7 +4,9 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
+STEPS_PER_RUN=100
 MAX_STEPS=100
+NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=30
 STUDENT_MODEL=meta-llama/Llama-3.2-1B
 TEACHER0_MODEL=Qwen/Qwen3-4B            # cross-tokenizer (P-KL via projection)
@@ -19,8 +21,8 @@ cd $PROJECT_ROOT
 : "${CSD_TRAIN_DATA:?Set CSD_TRAIN_DATA to a text JSONL corpus fitting both tokenizers}"
 TABLE_DIR="$EXP_DIR/csd_tables"
 mkdir -p "$TABLE_DIR"
-export CSD_STUDENT_TO_TEACHER_TABLE="$TABLE_DIR/student_to_teacher.pt"
-export CSD_TEACHER_TO_STUDENT_TABLE="$TABLE_DIR/teacher_to_student.pt"
+CSD_STUDENT_TO_TEACHER_TABLE="$TABLE_DIR/student_to_teacher.pt"
+CSD_TEACHER_TO_STUDENT_TABLE="$TABLE_DIR/teacher_to_student.pt"
 uv run python -m tools.csd.build_subtoks_table \
     --source-tokenizer "$STUDENT_MODEL" --destination-tokenizer "$TEACHER0_MODEL" \
     --output "$CSD_STUDENT_TO_TEACHER_TABLE" --overwrite
@@ -31,6 +33,8 @@ uv run python -m tools.csd.build_subtoks_table \
 uv run examples/run_csd.py \
     --config $CONFIG_PATH \
     distillation.max_num_steps=$MAX_STEPS \
+    teachers.0.aligner.student_to_teacher_table_path="$CSD_STUDENT_TO_TEACHER_TABLE" \
+    teachers.0.aligner.teacher_to_student_table_path="$CSD_TEACHER_TO_STUDENT_TABLE" \
     data.train.data_files="$CSD_TRAIN_DATA" \
     data.train.characters_per_sample=null \
     logger.log_dir=$LOG_DIR \
