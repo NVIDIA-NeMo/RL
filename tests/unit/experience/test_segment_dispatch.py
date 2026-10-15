@@ -52,7 +52,7 @@ pytestmark = pytest.mark.nemo_gym
 def _env(harness):
     env = object.__new__(NemoGym.__ray_metadata__.modified_class)
     env._multi_segment_rollouts = True
-    env.cfg = {}
+    env.cfg = {"token_capture": {"call_selection": "accepted_history"}}
 
     async def control(method, path):
         assert method == "GET"

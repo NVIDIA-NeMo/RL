@@ -759,7 +759,8 @@ def test_segment_failed_pending_was_already_masked() -> None:
     from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 
     env = _capture_env()
-    env._multi_segment_rollouts, env.cfg = True, {}
+    env._multi_segment_rollouts = True
+    env.cfg = {"token_capture": {"call_selection": "all"}}
     pending = {
         "rollout_id": "r0",
         "records": [],

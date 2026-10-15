@@ -373,7 +373,7 @@ def test_gym_adapter_returns_one_real_receipt_and_rl_selection(monkeypatch, tmp_
     captured = capture_segment(harness, "attempt", child=True)
     env = object.__new__(NemoGym.__ray_metadata__.modified_class)
     env._multi_segment_rollouts = True
-    env.cfg = {}
+    env.cfg = {"token_capture": {"call_selection": "accepted_history"}}
 
     async def control(*args):
         return await harness.ledger.manifest("attempt")
@@ -564,6 +564,7 @@ def test_existing_detectors_mask_only_selected_generation_spans(monkeypatch, tmp
         env.cfg = {
             "invalid_tool_call_patterns": ["[[BAD]]"],
             "thinking_tags": ["<badthink>"],
+            "token_capture": {"call_selection": "accepted_history"},
         }
 
         # Detector fixture metadata now comes from shared capture, rather than

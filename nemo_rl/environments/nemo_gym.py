@@ -1114,9 +1114,7 @@ Depending on your data shape, you may want to change these values."""
         # A finished agent may have cancelled or lost its final model call. Its
         # attempt is untrainable, not a controller failure. Keep pending IDs in
         # the receipt: their writes may still arrive and must not be cleaned here.
-        call_selection = (self.cfg.get("token_capture") or {}).get(
-            "call_selection", "accepted_history"
-        )
+        call_selection = self.cfg["token_capture"]["call_selection"]
         accepted_history = call_selection == "accepted_history"
         capture_failed = bool(
             parsed.pending_call_ids or (parsed.failures and accepted_history)

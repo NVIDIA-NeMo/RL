@@ -656,13 +656,13 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # weights are required.
     multi_segment_rollouts: bool = False
 
-    # Which captured calls become training rows. Capture records every call, so
-    # this is the reassembler: "accepted_history" matches the harness output to
-    # calls, "all" trains every conversation (subagents included), "main_chain"
-    # trains only the scored conversation, and "package.module:function" plugs in
-    # a custom selection. Anything but "accepted_history" skips failed calls
-    # instead of masking the rollout.
-    call_selection: str = "accepted_history"
+    # Which captured calls become training rows when multi_segment_rollouts is on.
+    # Capture records every call, so this is the reassembler: "all" trains every
+    # conversation (subagents included), "main_chain" only the scored one,
+    # "accepted_history" matches the harness output to calls, and
+    # "package.module:function" plugs in a custom selection. Failed calls are
+    # skipped instead of masking the rollout, except for "accepted_history".
+    call_selection: str = "all"
 
 
 @dataclass(frozen=True)
@@ -1425,12 +1425,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "siblings have no durable receipts to recover"
         )
     if (
-        token_capture_config.call_selection != "accepted_history"
-        and not token_capture_config.multi_segment_rollouts
+        token_capture_config.call_selection
+        not in (
+            "all",
+            "main_chain",
+            "accepted_history",
+        )
+        and ":" not in token_capture_config.call_selection
     ):
         raise ValueError(
-            "token_capture.call_selection other than accepted_history requires "
-            "token_capture.multi_segment_rollouts=true"
+            "token_capture.call_selection must be all, main_chain, accepted_history "
+            f"or package.module:function, got {token_capture_config.call_selection!r}"
         )
     if token_capture_config.multi_segment_rollouts:
         if master_config.grpo is None:
