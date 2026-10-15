@@ -571,9 +571,7 @@ def test_value_worker_seeded_fresh_initialization_equivalence(
         config_off = _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
         config_off["automodel_cfg"]["sequence_parallel"] = True
         tokenizer = get_tokenizer(config_off["tokenizer"])
-        worker = Value(
-            cluster=cluster, config=config_off, tokenizer=tokenizer, seed=42
-        )
+        worker = Value(cluster=cluster, config=config_off, tokenizer=tokenizer, seed=42)
         values_off = worker.get_values(data)["values"].detach().cpu()
         worker.shutdown()
         worker = None
@@ -678,7 +676,7 @@ def test_value_worker_dynamic_batching_train_forward_equivalence(
                 worker.prepare_for_inference()
                 worker.save_checkpoint(
                     weights_path=weights_path,
-                    checkpointing_cfg=_make_checkpointing_cfg(tmp_path),
+                    is_final_checkpoint=False,
                 )
                 return None
             worker.prepare_for_training()
