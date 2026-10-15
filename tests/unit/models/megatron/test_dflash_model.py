@@ -22,6 +22,7 @@ import torch
 from megatron.core.model_parallel_config import ModelParallelConfig
 from torch import Tensor
 
+from nemo_rl.models.megatron.draft import dflash as dflash_module
 from nemo_rl.models.megatron.draft.block_plan import (
     DFlashBatchPlan,
     build_dflash_batch_plan,
@@ -435,7 +436,7 @@ def test_forward_rejects_device_dtype_and_index_type_mismatches() -> None:
             block_embeddings=block_embeddings.to("meta"),
             plan=plan,
         )
-    with pytest.raises(ValueError, match="inputs must share a device"):
+    with pytest.raises(ValueError, match="^DFlash inputs must share a device$"):
         body(
             target_taps=target_taps,
             block_embeddings=block_embeddings.to("meta"),
@@ -513,6 +514,16 @@ def test_tensor_parallel_input_metadata_uses_rank_ordered_all_gather(
 
     assert len(calls) == 1
     assert calls[0][0] != calls[0][1]
+
+
+def test_default_config_rejects_initialized_context_parallelism(monkeypatch) -> None:
+    monkeypatch.setattr(dflash_module, "_live_context_parallel_size", lambda: 2)
+
+    with pytest.raises(
+        ValueError,
+        match="DFlashBody does not support context_parallel_size > 1",
+    ):
+        DFlashBody(_tiny_config(num_hidden_layers=1))
 
 
 def test_constructor_rejects_context_parallel_config_without_mutating_it() -> None:

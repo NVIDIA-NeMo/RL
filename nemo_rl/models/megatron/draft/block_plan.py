@@ -66,7 +66,19 @@ def build_dflash_batch_plan(
     optimizer_step: int,
     seed: int,
 ) -> DFlashBatchPlan:
-    """Build a deterministic, device-resident DFlash anchor schedule."""
+    """Build a deterministic, device-resident DFlash anchor schedule.
+
+    The schedule for a row depends only on ``sample_ids[row]``,
+    ``optimizer_step``, ``seed`` and the anchor slot. It does not depend on the
+    row position, the microbatch split or the data-parallel rank. Thus, a
+    permuted or sliced batch keeps the same anchors for each sample.
+
+    Rows with the same ``sample_id`` get the same schedule. This is intentional.
+    Give each rollout row a unique ID, for example from the group ID and the
+    index in the group. Do not use one ID for all rollouts of a prompt. This
+    function does not check uniqueness, because a check needs a host
+    synchronization.
+    """
     if token_valid_mask.ndim != 2:
         raise ValueError("token_valid_mask must have shape [batch, sequence]")
     if token_valid_mask.dtype != torch.bool:

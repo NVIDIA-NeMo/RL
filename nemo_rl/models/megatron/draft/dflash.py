@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
+from megatron.core import parallel_state
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
@@ -410,6 +411,12 @@ def _apply_rope(
     return hidden_states * cosine + _rotate_half(hidden_states) * sine
 
 
+def _live_context_parallel_size() -> int:
+    if parallel_state.model_parallel_is_initialized():
+        return parallel_state.get_context_parallel_world_size()
+    return 1
+
+
 class DFlashBody(_ShardedModule):
     """DFlash decoder body with caller-provided embeddings and no output head."""
 
@@ -425,6 +432,11 @@ class DFlashBody(_ShardedModule):
         self.config = DFlashBodyConfig() if config is None else config
         self.tensor_parallel_size = get_pg_size(tp_group)
         if parallel_config is None:
+            # The default config assumes CP=1, so check the live topology instead.
+            if _live_context_parallel_size() > 1:
+                raise ValueError(
+                    "DFlashBody does not support context_parallel_size > 1"
+                )
             parallel_config = ModelParallelConfig(
                 tensor_model_parallel_size=self.tensor_parallel_size,
                 use_cpu_initialization=True,

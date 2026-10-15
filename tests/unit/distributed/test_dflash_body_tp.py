@@ -14,8 +14,7 @@
 
 from __future__ import annotations
 
-import os
-from collections.abc import Iterator
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -39,35 +38,6 @@ _COLUMN_SHARDS = (
     "mlp.up_proj.weight",
 )
 _ROW_SHARDS = ("self_attn.o_proj.weight", "mlp.down_proj.weight")
-
-
-def _distributed_world(expected_world_size: int) -> Iterator[None]:
-    created_process_group = False
-    if not torch.distributed.is_initialized():
-        if int(os.environ.get("WORLD_SIZE", "1")) != expected_world_size:
-            pytest.skip(f"run with torchrun --nproc-per-node={expected_world_size}")
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        if backend == "nccl":
-            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
-        created_process_group = True
-    if torch.distributed.get_world_size() != expected_world_size:
-        pytest.skip(f"run with torchrun --nproc-per-node={expected_world_size}")
-    try:
-        yield
-    finally:
-        if created_process_group:
-            torch.distributed.destroy_process_group()
-
-
-@pytest.fixture
-def _tp2_world() -> Iterator[None]:
-    yield from _distributed_world(2)
-
-
-@pytest.fixture
-def _four_rank_world() -> Iterator[None]:
-    yield from _distributed_world(4)
 
 
 def _config() -> DFlashBodyConfig:
@@ -253,15 +223,10 @@ def _assert_forward_gradient_parity(
         )
 
 
-def test_tp4_forward_and_gradient_parity(_four_rank_world: None) -> None:
-    rank = torch.distributed.get_rank()
+def _run_tp4_forward_and_gradient_parity(rank: int, world_size: int) -> None:
     tp_group = torch.distributed.group.WORLD
     singleton_groups = _singleton_groups(4)
-    device = (
-        torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-        if torch.cuda.is_available()
-        else torch.device("cpu")
-    )
+    device = torch.device("cuda", rank)
 
     torch.manual_seed(47)
     body = DFlashBody(
@@ -284,19 +249,16 @@ def test_tp4_forward_and_gradient_parity(_four_rank_world: None) -> None:
     )
 
 
-def test_tp2_projection_forward_gradient_and_checkpoint_parity(
-    tmp_path: Path,
-    _tp2_world: None,
+def _run_tp2_projection_forward_gradient_and_checkpoint_parity(
+    rank: int,
+    world_size: int,
+    *,
+    tmp_path: str,
 ) -> None:
-    rank = torch.distributed.get_rank()
     tp_group = torch.distributed.group.WORLD
     singleton_groups = _singleton_groups(2)
     dp_group = singleton_groups[rank]
-    device = (
-        torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-        if torch.cuda.is_available()
-        else torch.device("cpu")
-    )
+    device = torch.device("cuda", rank)
 
     torch.manual_seed(31)
     body = DFlashBody(
@@ -362,7 +324,7 @@ def test_tp2_projection_forward_gradient_and_checkpoint_parity(
         assert tuple(sharded[f"draft.{name}"].global_shape) == tuple(tensor.shape)
 
     dist_checkpointing = pytest.importorskip("megatron.core.dist_checkpointing")
-    checkpoint_paths = [str(tmp_path / "dflash_tp2") if rank == 0 else ""]
+    checkpoint_paths = [str(Path(tmp_path) / "dflash_tp2") if rank == 0 else ""]
     torch.distributed.broadcast_object_list(checkpoint_paths, src=0)
     checkpoint_dir = checkpoint_paths[0]
     if rank == 0:
@@ -387,15 +349,10 @@ def test_tp2_projection_forward_gradient_and_checkpoint_parity(
         torch.testing.assert_close(restored.state_dict()[name], parameter)
 
 
-def test_tp2_rank_local_malformed_input_fails_synchronously(
-    _tp2_world: None,
+def _run_tp2_rank_local_malformed_input_fails_synchronously(
+    rank: int, world_size: int
 ) -> None:
-    rank = torch.distributed.get_rank()
-    device = (
-        torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-        if torch.cuda.is_available()
-        else torch.device("cpu")
-    )
+    device = torch.device("cuda", rank)
     body = DFlashBody(
         _config(),
         tp_group=torch.distributed.group.WORLD,
@@ -435,15 +392,11 @@ def test_tp2_rank_local_malformed_input_fails_synchronously(
     ]
 
 
-def test_tp2_rank_local_valid_shapes_fail_before_first_projection(
-    _tp2_world: None,
+def _run_tp2_rank_local_valid_shapes_fail_before_first_projection(
+    rank: int,
+    world_size: int,
 ) -> None:
-    rank = torch.distributed.get_rank()
-    device = (
-        torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-        if torch.cuda.is_available()
-        else torch.device("cpu")
-    )
+    device = torch.device("cuda", rank)
     body = DFlashBody(
         _config(),
         tp_group=torch.distributed.group.WORLD,
@@ -489,7 +442,7 @@ def test_tp2_rank_local_valid_shapes_fail_before_first_projection(
     ]
 
 
-def test_tp2_rejects_sequence_parallel_config(_tp2_world: None) -> None:
+def _run_tp2_rejects_sequence_parallel_config(rank: int, world_size: int) -> None:
     parallel_config = _fp32_parallel_config(2, sequence_parallel=True)
 
     with pytest.raises(
@@ -505,10 +458,9 @@ def test_tp2_rejects_sequence_parallel_config(_tp2_world: None) -> None:
     assert parallel_config.sequence_parallel is True
 
 
-def test_tp2_subgroup_forward_gradient_and_replica_ids(
-    _four_rank_world: None,
+def _run_tp2_subgroup_forward_gradient_and_replica_ids(
+    rank: int, world_size: int
 ) -> None:
-    rank = torch.distributed.get_rank()
     tp_groups = [
         torch.distributed.new_group([0, 1]),
         torch.distributed.new_group([2, 3]),
@@ -516,11 +468,7 @@ def test_tp2_subgroup_forward_gradient_and_replica_ids(
     singleton_groups = _singleton_groups(4)
     if rank >= 2:
         tp_group = tp_groups[1]
-        device = (
-            torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-            if torch.cuda.is_available()
-            else torch.device("cpu")
-        )
+        device = torch.device("cuda", rank)
         torch.manual_seed(53)
         body = DFlashBody(
             _config(),
@@ -554,8 +502,9 @@ def test_tp2_subgroup_forward_gradient_and_replica_ids(
     torch.distributed.barrier()
 
 
-def test_tp2_subgroup_rejects_context_parallel_config(_four_rank_world: None) -> None:
-    rank = torch.distributed.get_rank()
+def _run_tp2_subgroup_rejects_context_parallel_config(
+    rank: int, world_size: int
+) -> None:
     tp_groups = [
         torch.distributed.new_group([0, 1]),
         torch.distributed.new_group([2, 3]),
@@ -575,3 +524,52 @@ def test_tp2_subgroup_rejects_context_parallel_config(_four_rank_world: None) ->
                 parallel_config=parallel_config,
             )
     torch.distributed.barrier()
+
+
+def test_tp4_forward_and_gradient_parity(distributed_test_runner) -> None:
+    distributed_test_runner(_run_tp4_forward_and_gradient_parity, world_size=4)
+
+
+def test_tp2_projection_forward_gradient_and_checkpoint_parity(
+    distributed_test_runner,
+    tmp_path: Path,
+) -> None:
+    distributed_test_runner(
+        partial(
+            _run_tp2_projection_forward_gradient_and_checkpoint_parity,
+            tmp_path=str(tmp_path),
+        ),
+        world_size=2,
+    )
+
+
+def test_tp2_rank_local_malformed_input_fails_synchronously(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(
+        _run_tp2_rank_local_malformed_input_fails_synchronously, world_size=2
+    )
+
+
+def test_tp2_rank_local_valid_shapes_fail_before_first_projection(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(
+        _run_tp2_rank_local_valid_shapes_fail_before_first_projection, world_size=2
+    )
+
+
+def test_tp2_rejects_sequence_parallel_config(distributed_test_runner) -> None:
+    distributed_test_runner(_run_tp2_rejects_sequence_parallel_config, world_size=2)
+
+
+def test_tp2_subgroup_forward_gradient_and_replica_ids(distributed_test_runner) -> None:
+    distributed_test_runner(
+        _run_tp2_subgroup_forward_gradient_and_replica_ids, world_size=4
+    )
+
+
+def test_tp2_subgroup_rejects_context_parallel_config(distributed_test_runner) -> None:
+    distributed_test_runner(
+        _run_tp2_subgroup_rejects_context_parallel_config, world_size=4
+    )
