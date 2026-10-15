@@ -100,6 +100,17 @@ apt install -y --only-upgrade gnupg
 # Upgrade rsync to address security vulnerabilities
 apt-get install -y --only-upgrade rsync
 
+# Upgrade openssl and libssl3t64 to address security vulnerabilities. --only-upgrade never
+# installs a package that is not already present, but a newer version can still declare new
+# dependencies, so simulate first and fail the build if apt would install or remove anything
+# other than these two packages.
+if apt-get install -s --only-upgrade --no-install-recommends openssl libssl3t64 \
+    | grep -E '^(Inst|Remv) ' | grep -vE '^Inst (openssl|libssl3t64) '; then
+    echo "[ERROR] upgrading openssl/libssl3t64 would change additional packages" >&2
+    exit 1
+fi
+apt-get install -y --only-upgrade --no-install-recommends openssl libssl3t64
+
 # Remove ffmpeg (from base image) to reduce attack surface
 apt-get remove -y --purge ffmpeg || true
 apt-get autoremove -y
