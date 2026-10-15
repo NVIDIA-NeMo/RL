@@ -106,6 +106,7 @@ jobs:
           PR_INFO_JSON: ${{ steps.get-pr-info.outputs.pr-info }}
         run: |
           cache_scope=""
+          test_platform="all"
           if [[ "$IS_PULL_REQUEST_REF" == "true" && -n "$PR_INFO_JSON" ]]; then
             base_ref=$(echo "$PR_INFO_JSON" | jq -r '.base.ref')
             base_sha=$(echo "$PR_INFO_JSON" | jq -r '.base.sha')
@@ -115,6 +116,16 @@ jobs:
             head_label=$(echo "$PR_INFO_JSON" | jq -r '.head.label // empty')
             ci_label=$(echo "$PR_INFO_JSON" | jq -r '[.labels[]? | (if type == "string" then . else .name end) | select(startswith("CI:"))] | first // empty')
             has_skip_cicd=$(echo "$PR_INFO_JSON" | jq -r '[.labels[]? | (if type == "string" then . else .name end) | select(. == "Skip CICD")] | length > 0')
+            # Push-triggered PR checks must support platform selection too:
+            # workflow_dispatch results do not satisfy required PR checks.
+            test_platform=$(jq -er '
+              [.labels[]? | (if type == "string" then . else .name end)
+                | select(startswith("CI-platform:")) | ltrimstr("CI-platform:")]
+              | if length == 0 then "all"
+                elif length == 1 and (.[0] == "all" or .[0] == "h100" or .[0] == "gb200") then .[0]
+                else error("Use at most one CI-platform:all, CI-platform:h100, or CI-platform:gb200 label")
+                end
+            ' <<< "$PR_INFO_JSON")
             # PRs targeting a release branch (e.g. r0.8.0) pin different submodule/TRT-LLM refs than main,
             # so they must not share main's TRT-LLM caches or its prebuilt container.
             if [[ "$base_ref" =~ ^r[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -144,6 +155,7 @@ jobs:
           echo "head_label=$head_label" >> "$GITHUB_OUTPUT"
           echo "ci_label=$ci_label" >> "$GITHUB_OUTPUT"
           echo "has_skip_cicd=$has_skip_cicd" >> "$GITHUB_OUTPUT"
+          echo "test_platform=$test_platform" >> "$GITHUB_OUTPUT"
 
       - name: Get changed files
         id: changed-files
@@ -172,7 +184,7 @@ jobs:
           DISPATCH_TEST_LEVEL: ${{ inputs.test_to_run }}
           DISPATCH_IMAGE_TAG: ${{ inputs.image_tag }}
           TEST_SCRIPT_PATTERN: ${{ inputs.test_script_pattern }}
-          TEST_PLATFORM: ${{ inputs.test_platform || 'all' }}
+          TEST_PLATFORM: ${{ inputs.test_platform || steps.base-head-ref.outputs.test_platform || 'all' }}
           MEGATRON_LM_COMMIT: ${{ inputs.megatron_lm_commit }}
         run: |
           # Some output that's helpful for debugging
