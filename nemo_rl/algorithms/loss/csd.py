@@ -173,7 +173,7 @@ class CSDLossConfig(BaseModel, extra="allow"):
     common_indices_from_subtoks: bool = False
     # Include the common-vocabulary partition at each mismatch chunk's start.
     csd_position_0_kl: bool = False
-    csd_loss_fn: Literal["kl", "jsd", "bce"] = "kl"
+    csd_loss_fn: Literal["kl", "jsd", "bce"] = "jsd"
     csd_jsd_beta: Annotated[float, Field(ge=0, le=1)] = 0.5
     # None inherits csd_loss_fn for the last-position partition.
     csd_last_pos_loss_fn: Optional[Literal["kl", "jsd", "bce"]] = None
