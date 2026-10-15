@@ -3075,10 +3075,14 @@ def test_disable_draft_module_sharing_forces_ownership():
         disable_draft_module_sharing,
     )
 
+    # The pinned vLLM's dspark utils module doesn't define _should_share at
+    # all (unlike eagle/dflash, which import it from eagle's utils module);
+    # disable_draft_module_sharing() assigns it unconditionally regardless,
+    # so the "original" to restore may be absence, not a prior value.
+    _missing = object()
     originals = [
-        (eagle_utils, eagle_utils._should_share),
-        (dspark_utils, dspark_utils._should_share),
-        (dflash_utils, dflash_utils._should_share),
+        (module, getattr(module, "_should_share", _missing))
+        for module in (eagle_utils, dspark_utils, dflash_utils)
     ]
     try:
         disable_draft_module_sharing()
@@ -3088,7 +3092,10 @@ def test_disable_draft_module_sharing_forces_ownership():
             )
     finally:
         for module, original in originals:
-            module._should_share = original
+            if original is _missing:
+                del module._should_share
+            else:
+                module._should_share = original
 
 
 class _FakeHfToVllmMapper:
