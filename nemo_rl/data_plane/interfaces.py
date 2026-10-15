@@ -97,6 +97,49 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
     ssd_offload: SsdOffloadConfig = Field(default_factory=SsdOffloadConfig)
 
 
+class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
+    """Mooncake SSD offload: storage units spill DRAM to node-local SSD.
+
+    Mooncake's master offloads an object only to the SSD of the client that
+    owns the segment holding it, so offload runs inside each
+    ``MooncakeStorageUnit`` (the only segment owners when
+    ``storage_unit_segment_size > 0``), each under its own
+    ``<path>/nemo_rl_mooncake_offload/<ray job>-<pid>``; no shared filesystem
+    is needed. Those directories are left behind when the run ends, so point
+    ``path`` at per-job scratch space or clean it up afterwards.
+    TQ's own ``MooncakeStore.offload`` is not used: its single offload client
+    on the driver owns none of the data, so nothing could be evicted.
+
+    When cluster-wide segment usage passes ``eviction_high_watermark_ratio``,
+    the master writes objects to their owner's SSD and then frees
+    ``eviction_ratio`` of the memory. Reads of an offloaded object go through
+    its owner transparently. An object is only dropped from memory once its
+    SSD copy exists; if SSD writes fail, puts fail once memory is full.
+    Mooncake's disk watermark eviction is turned off, since it would delete
+    the only copy, so SSD files are not reclaimed during a run. Size the disk
+    for the run: Mooncake's per-key backend still deletes the oldest files
+    once the disk is 90% full, and reading those objects then fails.
+
+    Not checkpointable: a data-plane checkpoint needs hard-pinned memory
+    replicas, which this mode turns off.
+    """
+
+    enabled: bool = False
+    path: str | None = None  # absolute; required when enabled
+    eviction_high_watermark_ratio: float = Field(default=0.9, gt=0.0, le=1.0)
+    eviction_ratio: float = Field(default=0.1, gt=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _require_absolute_path_when_enabled(self) -> "MooncakeSsdOffloadConfig":
+        if self.enabled and not (self.path and Path(self.path).is_absolute()):
+            raise ValueError(
+                "data_plane.mooncake_cpu.ssd_offload.enabled=true requires "
+                "data_plane.mooncake_cpu.ssd_offload.path to be an absolute "
+                f"node-local SSD directory, got {self.path!r}."
+            )
+        return self
+
+
 class MooncakeCpuConfig(BaseModel, extra="allow"):
     """Sizing and RDMA knobs for ``backend="mooncake_cpu"``. Ignored otherwise.
 
@@ -147,6 +190,20 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     # Clusters whose nodes host units: "all" or a list of names (train,
     # inference, teacher:<name>).
     storage_unit_placement: list[str] | Literal["all"] = "all"
+    ssd_offload: MooncakeSsdOffloadConfig = Field(
+        default_factory=MooncakeSsdOffloadConfig
+    )
+
+    @model_validator(mode="after")
+    def _ssd_offload_needs_storage_units(self) -> "MooncakeCpuConfig":
+        # Offload runs inside the storage units; without them every GPU
+        # process owns a segment that nothing could spill.
+        if self.ssd_offload.enabled and not self.storage_unit_segment_size:
+            raise ValueError(
+                "data_plane.mooncake_cpu.ssd_offload.enabled=true requires "
+                "data_plane.mooncake_cpu.storage_unit_segment_size > 0."
+            )
+        return self
 
 
 class DataPlaneConfig(TypedDict):
