@@ -1440,6 +1440,17 @@ def test_native_taskset_without_route_fails_even_if_agent_ref_is_present():
         )
 
 
+@pytest.mark.parametrize(
+    "task_id", [{}, {"taskset": ""}, {"taskset": ["workplace:train"]}]
+)
+def test_malformed_taskset_does_not_fall_back_to_legacy_agent(task_id):
+    with pytest.raises(ValueError, match="non-empty task_id.taskset"):
+        nemo_gym_mod.get_nemo_gym_route_name(
+            {"task_id": task_id, "task_input": {}, "agent_ref": {"name": "legacy"}},
+            {"workplace:train": "workplace_environment"},
+        )
+
+
 @pytest.mark.parametrize("cached_source", [False, True])
 def test_native_dataset_coverage_resolves_tasksets_before_matching_shards(
     tmp_path, cached_source

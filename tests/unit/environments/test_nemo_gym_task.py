@@ -30,7 +30,6 @@ from nemo_rl.environments.nemo_gym_task import (
     [
         {"responses_create_params": {}},
         {"task_id": "legacy-id", "task_input": {"custom": True}},
-        {"task_id": {"taskset": ""}, "task_input": {}},
         {"task_id": {"taskset": "workplace:train"}},
     ],
 )
@@ -39,9 +38,10 @@ def test_legacy_task_fields_do_not_change_wire_format(row):
     assert get_nemo_gym_task_input(row) is row
 
 
-def test_native_task_input_returns_nested_object():
+@pytest.mark.parametrize("taskset", ["workplace:train", "", None])
+def test_native_task_input_returns_nested_object(taskset):
     row = {
-        "task_id": {"taskset": "workplace:train", "task_id": "17"},
+        "task_id": {"taskset": taskset, "task_id": "17"},
         "task_input": {
             "responses_create_params": {"input": "Find the next meeting."},
         },

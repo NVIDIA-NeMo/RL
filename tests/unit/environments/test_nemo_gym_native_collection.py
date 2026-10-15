@@ -28,7 +28,6 @@ from omegaconf import OmegaConf
 
 from nemo_rl.environments.nemo_gym import NemoGym
 
-# The draft can run against the old Gym pin until its native dependency merges.
 pytest.importorskip("nemo_gym.episode_types")
 gym_config = pytest.importorskip("nemo_gym.global_config")
 gym_resources = pytest.importorskip("nemo_gym.base_resources_server")

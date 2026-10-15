@@ -605,7 +605,7 @@ def _apply_effort_shaping(
         length = lengths[i]
         if length is None:
             continue
-        if is_low_effort(get_nemo_gym_task_input(nemo_gym_rows[i]), effort_config):
+        if is_low_effort(nemo_gym_rows[i], effort_config):
             new_reward, length_reward = shape_effort_reward(
                 orig_rewards[i], length=length, config=effort_config
             )
@@ -3269,12 +3269,17 @@ def _postprocess_single_nemo_gym_group(
     if length_penalty_config is not None:
         # Copy the per-row fields the length adjustments consume.
         for nemo_gym_row, result in zip(nemo_gym_rows, results):
+            task_input = get_nemo_gym_task_input(nemo_gym_row)
+            if is_nemo_gym_task(nemo_gym_row):
+                task_data = task_input.get("task_data")
+                if isinstance(task_data, dict):
+                    task_input = {**task_data, **task_input}
             result["agent_ref"] = nemo_gym_row["agent_ref"]
-            result["profiled_rewards"] = nemo_gym_row.get("profiled_rewards")
-            result["profiled_output_lengths"] = nemo_gym_row.get(
+            result["profiled_rewards"] = task_input.get("profiled_rewards")
+            result["profiled_output_lengths"] = task_input.get(
                 "profiled_output_lengths"
             )
-            result["profile_band"] = nemo_gym_row.get("profile_band")
+            result["profile_band"] = task_input.get("profile_band")
         env_rewards = torch.tensor([r["full_result"]["reward"] for r in results])
         length_penalty_metrics = apply_group_length_penalties(
             results,

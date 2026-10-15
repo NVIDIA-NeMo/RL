@@ -289,12 +289,12 @@ def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
         return reply
 
     # Gym is only installed in the rollout worker's optional environment.
-    from nemo_gym.episode_types import BaseEpisodeResponse
+    from nemo_gym.episode_types import BaseEpisodeResponse, EpisodeFailure
     from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
 
     # Environment protocols may extend EpisodeFailure (single_agent_turn adds
-    # stage and partial_response). Validate the common contract without rejecting
-    # those protocol-specific diagnostics.
+    # partial_response). Validate the common contract without rejecting those
+    # protocol-specific diagnostics.
     failure_payload = reply.get("failure") if isinstance(reply, Mapping) else None
     envelope = reply
     if isinstance(failure_payload, Mapping):
@@ -303,7 +303,7 @@ def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
             "failure": {
                 key: value
                 for key, value in failure_payload.items()
-                if key in ("message", "terminal")
+                if key in EpisodeFailure.model_fields
             },
         }
     response = BaseEpisodeResponse[dict[str, Any]].model_validate(envelope)
@@ -316,10 +316,10 @@ def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
         failure = response.failure
         detail = (
             f"NeMo-Gym episode {response.episode_id.model_dump()} for task "
-            f"{row['task_id']} failed: {failure.message}"
+            f"{row['task_id']} failed: {failure.failure_reason}"
         )
-        if isinstance(failure_payload, Mapping) and failure_payload.get("stage"):
-            detail += f" (stage={failure_payload['stage']})"
+        if failure.stage:
+            detail += f" (stage={failure.stage})"
         if failure.terminal:
             raise GymTerminalEpisodeFailure(detail)
         raise RuntimeError(detail)
@@ -2216,7 +2216,11 @@ def get_nemo_gym_route_name(
 ) -> str:
     """Resolve a native taskset or legacy row to its Gym server entry name."""
     if is_nemo_gym_task(row):
-        taskset = row["task_id"]["taskset"]
+        taskset = row["task_id"].get("taskset")
+        if not isinstance(taskset, str) or not taskset:
+            raise ValueError(
+                "A NeMo-Gym materialized task must have a non-empty task_id.taskset"
+            )
         if (
             environment_server_routes is None
             or taskset not in environment_server_routes
@@ -2815,9 +2819,9 @@ def validate_dataset_agent_coverage(
 
     A sharded job checks against the route map built at setup. An unsharded
     job has one actor and no route map, so it asks that actor which entries
-    its resolved Gym config spawned and keeps the routable ones, agents and
-    resources servers, exactly as the sharded route map does. A model or
-    environment server is never a route, on one actor or on many.
+    its resolved Gym config spawned and keeps the routable ones: agents,
+    resources servers, and environment servers, as the sharded route map does.
+    Model servers are not routes.
 
     Args:
         shard_set: The running actors. A sharded set carries the route map

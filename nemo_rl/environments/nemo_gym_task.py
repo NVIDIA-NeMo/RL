@@ -21,15 +21,11 @@ from typing import Any
 def is_nemo_gym_task(row: Mapping[str, Any]) -> bool:
     """Match Gym's materialized-task routing discriminator.
 
-    Legacy rows may also contain a ``task_id`` field. Only a structured identity
-    with a nonempty taskset and a ``task_input`` field uses the native protocol.
-    Full protocol validation remains Gym's responsibility.
+    Legacy rows may also contain a ``task_id`` field. A structured identity
+    together with ``task_input`` selects the episode protocol, even when the
+    identity is invalid. Full protocol validation remains Gym's responsibility.
     """
-    task_id = row.get("task_id")
-    if not isinstance(task_id, Mapping) or "task_input" not in row:
-        return False
-    taskset = task_id.get("taskset")
-    return isinstance(taskset, str) and bool(taskset)
+    return isinstance(row.get("task_id"), Mapping) and "task_input" in row
 
 
 def get_nemo_gym_task_input(row: dict[str, Any]) -> dict[str, Any]:
