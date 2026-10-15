@@ -74,8 +74,11 @@ def make_policy_factory(
 
     from nemo_rl.models.policy.tq_policy import TQPolicy
 
+    # Preserve the non-optional type when captured by the deferred constructor.
+    dp_cfg: DataPlaneConfig = cfg
+
     def _make_policy(**kwargs: Any) -> TQPolicy:
-        return TQPolicy(**kwargs, dp_cfg=cfg)
+        return TQPolicy(**kwargs, dp_cfg=dp_cfg)
 
     return _make_policy
 
