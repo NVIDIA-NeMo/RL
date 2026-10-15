@@ -97,13 +97,26 @@ policy:
         num_nodes: 1
 
 data:
+  # Replace the complete CLEVR data block inherited through vlm_grpo_3B.yaml.
+  # Overriding only data_path leaves its explicit clevr-cogent selector active;
+  # data.default fills missing fields and never replaces an existing selector.
+  _override_: true
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: false
   num_workers: 0
+  use_multiple_dataloader: false
   train:
+    dataset_name: NemoGymDataset
     data_path: ${oc.env:TRAIN_PATH}
   validation:
+    dataset_name: NemoGymDataset
     data_path: ${oc.env:VAL_PATH}
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
 
 data_plane:
   enabled: true

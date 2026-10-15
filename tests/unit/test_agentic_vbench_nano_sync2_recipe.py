@@ -11,6 +11,7 @@ from nemo_rl.algorithms.single_controller_utils import MasterConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
+from nemo_rl.data.datasets import update_single_dataset_config
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -99,6 +100,14 @@ def test_nano_sync2_recipe_preserves_agentic_subagent_gate_contract() -> None:
     assert cfg["grpo"]["advantage_clip_high"] is None
     assert cfg["grpo"]["use_dynamic_sampling"] is False
     assert cfg["grpo"]["zero_variance_prompt_filtering"] is False
+    assert cfg["data"]["train"]["dataset_name"] == "NemoGymDataset"
+    assert cfg["data"]["train"]["data_path"] == ("/tmp/agentic-vbench-train.jsonl")
+    assert "split" not in cfg["data"]["train"]
+    assert "split_validation_size" not in cfg["data"]["train"]
+    assert "seed" not in cfg["data"]["train"]
+    assert cfg["data"]["validation"]["dataset_name"] == "NemoGymDataset"
+    assert cfg["data"]["validation"]["data_path"] == ("/tmp/agentic-vbench-train.jsonl")
+    assert "split" not in cfg["data"]["validation"]
     assert cfg["async_rl"]["sampler"] == {
         "name": "in_order",
         "max_lookahead_versions": 0,
@@ -107,6 +116,31 @@ def test_nano_sync2_recipe_preserves_agentic_subagent_gate_contract() -> None:
         "agentic_vbench_train.yaml"
     )
     assert cfg["logger"]["wandb"]["project"] == ("nemorl-v2-subagent-comapction-debug")
+
+
+def test_nano_and_super_agentic_recipes_resolve_to_nemogym_jsonl() -> None:
+    register_omegaconf_resolvers()
+    env = {
+        "MODEL_PATH": "/tmp/omni-model",
+        "TRAIN_PATH": "/tmp/agentic-vbench-train.jsonl",
+        "VAL_PATH": "/tmp/agentic-vbench-validation.jsonl",
+    }
+
+    with patch.dict(os.environ, env, clear=False):
+        for recipe in (RECIPE, SUPER_RECIPE):
+            cfg = OmegaConf.to_container(load_config(recipe), resolve=True)
+            assert isinstance(cfg, dict)
+            default = cfg["data"]["default"]
+            for split, expected_path in (
+                ("train", env["TRAIN_PATH"]),
+                ("validation", env["VAL_PATH"]),
+            ):
+                split_cfg = cfg["data"][split].copy()
+                update_single_dataset_config(split_cfg, default)
+                assert split_cfg["dataset_name"] == "NemoGymDataset"
+                assert split_cfg["data_path"] == expected_path
+                assert split_cfg["env_name"] == "nemo_gym"
+                assert split_cfg["processor"] == "nemo_gym_data_processor"
 
 
 def test_nano_sync2_launcher_reuses_exact_subagent_prompt_and_r3_wrapper() -> None:
