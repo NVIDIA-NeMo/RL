@@ -793,8 +793,8 @@ class TestApplyParallelismConfig:
         assert model_cfg.sequence_parallel is True
         assert model_cfg.context_parallel_size == 1
 
-    def test_context_parallel_requires_sequence_packing(self):
-        """Test that context parallelism > 1 requires sequence packing."""
+    def test_context_parallel_without_sequence_packing(self):
+        """Context parallelism > 1 is accepted with sequence packing disabled."""
         from nemo_rl.models.megatron.setup import _apply_parallelism_config
 
         model_cfg = MagicMock()
@@ -810,10 +810,9 @@ class TestApplyParallelismConfig:
             "sequence_packing": {"enabled": False},
         }
 
-        with pytest.raises(AssertionError) as exc_info:
-            _apply_parallelism_config(model_cfg, config)
+        _apply_parallelism_config(model_cfg, config)
 
-        assert "Sequence Packing must be enabled" in str(exc_info.value)
+        assert model_cfg.context_parallel_size == 2
 
     def test_context_parallel_with_sequence_packing(self):
         """Test context parallelism with sequence packing enabled."""
@@ -3506,7 +3505,11 @@ class TestCreateMegatronConfigOptimizerFp8Recipe:
         }
         if fp8_cfg is not None:
             megatron_cfg["fp8_cfg"] = fp8_cfg
-        return {"megatron_cfg": megatron_cfg, "train_global_batch_size": 8}
+        return {
+            "megatron_cfg": megatron_cfg,
+            "tokenizer": {"name": "pinned-tokenizer-snapshot"},
+            "train_global_batch_size": 8,
+        }
 
     @staticmethod
     def _optimizer_passed_to_container(
@@ -3598,6 +3601,7 @@ class TestCreateMegatronConfigFP8Buffers:
                 },
                 "train_iters": 10,
             },
+            "tokenizer": {"name": "pinned-tokenizer-snapshot"},
             "train_global_batch_size": 8,
         }
         with (
@@ -3660,6 +3664,7 @@ class TestCreateMegatronConfigOptimizerOffload:
                 },
                 "train_iters": 10,
             },
+            "tokenizer": {"name": "pinned-tokenizer-snapshot"},
             "train_global_batch_size": 8,
         }
 
