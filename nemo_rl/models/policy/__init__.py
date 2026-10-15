@@ -45,6 +45,11 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
+    # The pinned Transformers fork handles explicit remote tokenizers natively.
+    # Verified at huggingface/new-model-addition-reflection@8ff92cc164e93fd8461cb0c2b65b7a3a68051575.
+    if PkgVersion(transformers.__version__) == PkgVersion("5.16.0.dev0"):
+        return
+
     # Transformers 5.12.1 still ships both registry entries, so the patch remains
     # load-bearing across the currently supported backend environments.
     # TODO: remove this patch (and the assert below) once the deepseek_v3

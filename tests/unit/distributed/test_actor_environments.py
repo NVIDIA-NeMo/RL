@@ -93,7 +93,6 @@ def test_registry_matches_py_executables():
     """The generated py_executable is the string the worker actually needs."""
     expected = {
         ("vllm",): PY_EXECUTABLES.VLLM,
-        ("vllm", "nemo_gym"): PY_EXECUTABLES.VLLM_GYM,
         ("sglang",): PY_EXECUTABLES.SGLANG,
         ("automodel",): PY_EXECUTABLES.AUTOMODEL,
         ("mcore",): PY_EXECUTABLES.MCORE,

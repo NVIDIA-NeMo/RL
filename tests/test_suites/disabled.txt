@@ -94,3 +94,7 @@ research/template_project/tests/test_suites/llm/single_update_1n8g.sh
 
 # Full Flow-GRPO recipe requires an externally served GenRM OCR judge.
 research/flow_grpo/tests/test_suites/flow_grpo_qwen_image_ocr.sh
+
+# BEAM Megatron and GRPO smoke drivers: run manually until GPU qualification.
+tests/test_suites/llm/sft-beam-501b-8n8g-tp2ep64-megatron-cpuoffload.sh
+tests/test_suites/llm/grpo-beam-501b-16n8g-fsdp2ep128-automodel-sglang.sh

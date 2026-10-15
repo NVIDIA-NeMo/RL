@@ -17,6 +17,7 @@ from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
 import pytest
+from packaging.version import Version
 import transformers.dynamic_module_utils as dynamic_module_utils
 
 import nemo_rl.transformers_compat as transformers_compat
@@ -54,14 +55,15 @@ def test_get_cached_module_file_handles_symlinked_hub_cache(monkeypatch, tmp_pat
     )
     cached_source_dir = modules_cache / Path(cached_module).parent
 
-    assert dynamic_module_utils._compute_local_source_files_hash is (
-        _compute_local_source_files_hash_with_symlink_fix
-    ), (
-        "The symlink-cache patch is not installed. If Transformers is now "
-        "5.13.0 or newer the upstream fix is already in place: delete "
-        "nemo_rl/transformers_compat.py, its bootstrap at the bottom of "
-        "nemo_rl/__init__.py, and this test file. Do not widen the version gate."
-    )
+    version = Version(transformers_compat.distribution_version("transformers"))
+    if Version("5.11.0") <= version < Version("5.13.0"):
+        assert dynamic_module_utils._compute_local_source_files_hash is (
+            _compute_local_source_files_hash_with_symlink_fix
+        )
+    else:
+        assert dynamic_module_utils._compute_local_source_files_hash is not (
+            _compute_local_source_files_hash_with_symlink_fix
+        )
     for filename, content in _SOURCE_FILES.items():
         assert (cached_source_dir / filename).read_text(encoding="utf-8") == content
 

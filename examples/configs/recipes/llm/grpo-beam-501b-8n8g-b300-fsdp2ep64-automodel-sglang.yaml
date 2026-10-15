@@ -1,0 +1,123 @@
+# GRPO performance run: 200 optimizer updates on 8 nodes x 8 B300 GPUs.
+# Adapted from PR #1; keep the reference batch and token limits.
+# Evaluate every 5 updates; report evaluation separately from step timings.
+# Build the pinned BEAM environment described in docs/guides/models/reflection/beam.md.
+# BEAM_CHECKPOINT: path to the initial BEAM model checkpoint.
+# DAPOMath17K and AIME2025 are downloaded and formatted by the built-in loaders.
+# Export local logs before releasing the cluster; checkpoint saving is disabled.
+defaults: ../../grpo_math_1B_sglang.yaml
+grpo:
+  max_num_steps: 200
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  use_leave_one_out_baseline: false
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  val_at_start: false
+  val_period: 5
+  max_val_samples: 30
+  val_batch_size: 30
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 819
+    max_response_length: 4096
+  val_num_generations_per_prompt: 8
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+policy:
+  model_name: ${oc.env:BEAM_CHECKPOINT}
+  tokenizer:
+    chat_template: default
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 5120
+  dtensor_cfg:
+    enabled: true
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    expert_parallel_size: 64
+    automodel_kwargs:
+      force_hf: false
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: torch
+        rms_norm: torch
+        experts: torch_mm
+        dispatcher: torch
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: backend:native
+      CUDA_LOG_FILE: stderr
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  generation:
+    backend: sglang
+    max_new_tokens: 4096
+    colocated:
+      enabled: true
+    sglang_cfg:
+      tp_size: 16
+      context_length: 5120
+      mem_fraction_static: 0.85
+      disable_cuda_graph: false
+      sglang_server_config:
+        num_gpus: 64
+        num_gpus_per_engine: 16
+        cpu_weight_backup: false
+      disable_overlap_schedule: false
+  refit_buffer_size_gb: 1
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.0
+  scheduler:
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones: []
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: DAPOMath17K
+    split_validation_size: 0
+  validation:
+    dataset_name: AIME2025
+    split_validation_size: 0
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: hf_math_verify
+checkpointing:
+  enabled: false
+logger:
+  log_dir: ${oc.env:BEAM_LOG_DIR,/tmp/grpo-beam-501b-8n8g-b300-fsdp2ep64-automodel-sglang}
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: beam-nemo-rl
+    name: grpo-beam-501b-8n8g-b300-fsdp2ep64-automodel-sglang
+cluster:
+  num_nodes: 8
+  gpus_per_node: 8

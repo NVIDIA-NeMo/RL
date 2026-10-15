@@ -1,0 +1,48 @@
+defaults: ../../sft.yaml
+# Validated for 100 SFT steps on 64 H200 GPUs; convergence is not evaluated.
+# Requires BEAM-compatible Megatron Bridge (PR #4) and Transformers.
+sft:
+  max_num_steps: 100
+  val_at_start: false
+  val_period: 10
+  val_batches: 1
+  val_global_batch_size: 128
+policy:
+  model_name: ${oc.env:BEAM_CHECKPOINT}
+  hf_config_overrides:
+    dtype: bfloat16
+  tokenizer:
+    chat_template: default
+  train_global_batch_size: 128
+  max_total_sequence_length: 512
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 64
+    expert_tensor_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    optimizer:
+      # HybridDeviceOptimizer uses FP32 master parameters and optimizer states.
+      # Half of the optimizer is placed on CPU to reduce the 64-GPU step peak.
+      use_precision_aware_optimizer: false
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 0.5
+      overlap_cpu_optimizer_d2h_h2d: false
+data:
+  add_bos: false
+  add_eos: false
+checkpointing:
+  enabled: false
+logger:
+  log_dir: logs/sft-beam-501b-8n8g-tp2ep64-megatron-cpuoffload
+  wandb_enabled: false
+cluster:
+  num_nodes: 8
+  gpus_per_node: 8

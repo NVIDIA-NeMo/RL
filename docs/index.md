@@ -329,6 +329,7 @@ guides/environments.md
 guides/eval.md
 guides/deepseek.md
 guides/models/index.md
+guides/models/reflection/beam.md
 model-quirks.md
 guides/async-grpo.md
 guides/single-controller.md

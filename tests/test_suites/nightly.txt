@@ -259,6 +259,10 @@ tests/test_suites/llm/grpo-qwen3-30ba3b-2n8g-megatron_fused_linear_logprobs.sh
 # gpt-oss 20b DeepEP test
 tests/test_suites/llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.sh
 
+# BEAM: requires compatible dependencies and BEAM_CHECKPOINT on every worker.
+# Validated on 16 x 8 H200 GPUs; H100 execution remains unvalidated.
+tests/test_suites/llm/sft-beam-501b-16n8g-fsdp2ep128-automodel.sh
+
 # Nemotron 3 Nano 30B A3B Base BF16 tests
 tests/test_suites/llm/grpo-nanov3-30ba3b-3n8g-megatron-dynamo-swe1.sh
 tests/test_suites/llm/sft-nanov3-30BA3B-2n8g-fsdp2.sh

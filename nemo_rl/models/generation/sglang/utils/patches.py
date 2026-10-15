@@ -64,6 +64,27 @@ def _patch_sglang_safe_unpickler() -> None:
     with open(file_to_patch, "r") as f:
         content = f.read()
 
+    # BEAM's SGLang revision uses an exact (module, symbol) allowlist.
+    if "    ALLOWED_GLOBALS = {\n" in content:
+        module = "nemo_rl.models.generation.sglang.utils.train_utils"
+        entries = [
+            f'        ("{module}", "{name}"),\n'
+            for name in (
+                "_rebuild_cuda_tensor_modified",
+                "FlattenedTensorMetadata",
+                "FlattenedTensorBucket",
+            )
+        ]
+        missing = [entry for entry in entries if entry not in content]
+        if missing:
+            content = content.replace(
+                "    ALLOWED_GLOBALS = {\n",
+                "    ALLOWED_GLOBALS = {\n" + "".join(missing),
+                1,
+            )
+            _write_and_verify(file_to_patch, content, tuple(entries))
+        return
+
     sentinel = '"nemo_rl.models.generation.sglang.utils.train_utils."'
     if sentinel in content:
         return

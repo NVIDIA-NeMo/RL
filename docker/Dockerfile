@@ -118,7 +118,7 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 # Install uv and python outside /root so an unprivileged runtime UID (for example
 # 65532) can execute them: /root is not traversable by other users, and the project
 # venv's python is a symlink into uv's managed-Python directory.
-ARG UV_VERSION=0.11.28
+ARG UV_VERSION=0.12.18
 ARG PYTHON_VERSION=3.13.14
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
@@ -146,9 +146,13 @@ WORKDIR /opt/nemo-rl
 # Keep TE source builds bounded to the GPUs supported by this image. TE otherwise
 # compiles six CUDA architectures on CUDA 13. The build knobs remain overridable.
 ARG MAX_JOBS
+# Bound concurrent package builds separately from each compiler's job count.
+# TODO: Remove these temporary limits after validating the build on a larger builder.
+ARG UV_CONCURRENT_BUILDS=1
+ARG NVCC_THREADS=1
 ARG NVTE_BUILD_MAX_JOBS=8
 ARG NVTE_BUILD_THREADS_PER_JOB=2
-ARG NVTE_CUDA_ARCHS=90;100
+ARG NVTE_CUDA_ARCHS=90;100;103
 ARG NVTE_FRAMEWORK=pytorch
 # TE 2.18 enables its experimental NCCL-EP backend by default on Hopper and
 # newer GPUs. Current recipes use Megatron Core's standard token dispatcher,
@@ -179,8 +183,8 @@ ARG TRTLLM_BUILD_JOBS=24
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
-# Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
-ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+# Ensure DeepEP is built for H100, B200, B300, and GB300 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
+ENV TORCH_CUDA_ARCH_LIST="9.0 10.0 10.3"
 
 # Build HybridEP with inter-node transport support.
 ENV HYBRID_EP_MULTINODE=1
@@ -211,7 +215,7 @@ ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/z3/lib:/opt/
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
-COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
+COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py nemo_rl/transformers_compat.py ./nemo_rl/
 # The single source of truth for which extras each Ray actor's venv needs. Run as a
 # script by the prefetch below; imported by nemo_rl.distributed.ray_actor_environment_registry
 # at runtime. Kept dependency-free so it can be copied in without the rest of the source.
@@ -256,7 +260,8 @@ fi
 apt-get update
 # DeepEP's multinode link needs the exact filename libnvidia-ml.so.1; the CUDA base
 # only ships stubs/libnvidia-ml.so. Purged again after the syncs below.
-apt-get install -y --no-install-recommends libnvidia-ml-dev
+# vLLM's bundled DeepGEMM includes elfutils/libdwfl.h through deep_jit.
+apt-get install -y --no-install-recommends libnvidia-ml-dev libdw-dev
 uv cache clean deep-ep
 # Everything is hardlinked against the uv cache; this layer holds exactly one real copy of every wheel.
 UV_LINK_MODE=hardlink uv sync --frozen --no-install-project

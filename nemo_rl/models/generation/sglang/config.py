@@ -203,6 +203,13 @@ class SglangSpecificArgs(TypedDict):
     allow_auto_truncate: NotRequired[bool]
     # Attention backend to use (e.g. "fa3", "triton", "flashinfer", "trtllm_mha"); None = auto.
     attention_backend: NotRequired[str | None]
+    # Speculative decoding options; omitted/None delegates to SGLang.
+    speculative_algorithm: NotRequired[str | None]
+    speculative_draft_model_path: NotRequired[str | None]
+    speculative_num_steps: NotRequired[int | None]
+    speculative_eagle_topk: NotRequired[int | None]
+    speculative_num_draft_tokens: NotRequired[int | None]
+    speculative_dflash_block_size: NotRequired[int | None]
     # Enable multimodal serving for the model (no-op if model is text-only).
     enable_multimodal: NotRequired[bool]
     # Sampling kernel backend (e.g. "flashinfer", "pytorch"); None = auto.

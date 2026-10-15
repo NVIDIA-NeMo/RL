@@ -57,9 +57,8 @@ dependencies = [
   "torchvision>=0.26,<0.29",                                                                             # tracks the torch range above (0.26 <-> 2.11, 0.28 <-> 2.13)
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
-  # Keep the base range compatible with backend-specific pins while selecting 5.12.1
-  # for the base and compatible backend environments in uv.lock.
-  "transformers>=5.5.0,<=5.12.1",
+  # Match the Transformers revision selected by the global source override below.
+  "transformers==5.16.0.dev0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -141,8 +140,8 @@ automodel = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
-  # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
-  "transformers==5.12.1",
+  # Match the pinned Transformers version used by the driver and workers.
+  "transformers==5.16.0.dev0",
   "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
@@ -154,7 +153,7 @@ vllm = [
   # ABI of the vLLM 0.29.0 cu130 wheels.
   "torch==2.13.0",
   "torchvision==0.28.0",
-  "transformers==5.12.1",
+  "transformers==5.16.0.dev0",
   "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-python",
   "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
@@ -162,34 +161,54 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  # PyPI publishes the default cu130 wheels for both supported architectures.
-  # https://github.com/vllm-project/vllm/releases/tag/v0.29.0
-  "vllm==0.29.0",
+  # Build the pinned source against this environment's locked Torch/Triton.
+  "cmake>=3.26.1",
+  "packaging>=24.2",
+  "setuptools>=77.0.3,<81",
+  "setuptools-scm>=8.0",
+  "setuptools-rust>=1.9.0",
+  "wheel>=0.46.2",
+  "jinja2",
+  # Async BEAM fork, pinned below in tool.uv.sources.
+  "vllm",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.18",
-  "flashinfer-cubin==0.6.18",
-  "flashinfer-jit-cache==0.6.18",
-  "nvidia-cutlass-dsl[cu13]==4.6.2",
+  "flashinfer-python==0.7.0.post1",
+  "flashinfer-cubin==0.7.0.post1",
+  "flashinfer-jit-cache==0.7.0.post1",
+  # Direct requirements attach the explicit CUDA index to the cache shards.
+  "flashinfer-jit-cache-sm100a",
+  "flashinfer-jit-cache-sm103a",
+  "flashinfer-jit-cache-sm120f",
+  "flashinfer-jit-cache-sm80",
+  "flashinfer-jit-cache-sm89",
+  "flashinfer-jit-cache-sm110a; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm121a; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm90a",
+  "nvidia-cutlass-dsl[cu13]==4.8.0",
 ]
 sglang = [
-  # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
-  # on 2.13 sgl_kernel fails with `undefined symbol: _ZNK2at10TensorBase14const_data_ptr…`.
-  "torch==2.11.0",
-  "torchvision==0.26.0",
-  # sgl-project/sglang branch `sglang-miles` (based on v0.5.16). Needed for the
+  # The pinned SGLang revision and sglang-kernel 0.4.7 use torch 2.13;
+  # keep training and generation on the same torch ABI for colocated refit.
+  "torch==2.13.0",
+  "torchvision==0.28.0",
+  # The pinned SGLang revision supplies the
   # begin_weight_update / end_weight_update refit session: quantized weights
   # carry derived scales (swizzled blockscales, g1/g2 alphas) that have to be
   # re-materialized once, after the last bucket lands. No tagged release has
   # those endpoints, and re-running the finalize per bucket is not idempotent.
   "sglang",
-  "sglang-kernel==0.4.5",                                                       # Direct dep for explicit version control; required by sglang-miles
+  # Build the pinned source against this environment's locked Torch/Triton.
+  "setuptools-rust>=1.11",
+  "setuptools-scm>=8.0",
+  "wheel>=0.46.2",
+  "sglang-kernel==0.4.7",                                                       # Direct dep for explicit version control; required by the pinned SGLang revision
   "sglang-router",                                                              # Used by nemo_rl.models.generation.sglang.sglang_router for multi-engine routing
   "kernels>=0.14.1,<0.15",
-  "flashinfer-python==0.6.14",
-  "flashinfer-cubin==0.6.14",
-  "flashinfer-jit-cache==0.6.14",
-  "transformers==5.12.1",
-  "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "flashinfer-python==0.6.18",
+  "flashinfer-cubin==0.6.18",
+  "flashinfer-jit-cache==0.6.18",
+  "transformers==5.16.0.dev0",
+  "tilelang==0.1.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -211,7 +230,7 @@ mcore = [
   # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
   "torch==2.13.0",
   "torchvision==0.28.0",
-  "transformers==5.12.1",
+  "transformers==5.16.0.dev0",
   "tilelang==0.1.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
@@ -229,7 +248,8 @@ mcore = [
   "flashinfer-jit-cache==0.6.18.post1",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "nvidia-cutlass-dsl[cu13]==4.6.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  "torch-memory-saver>=0.0.9.post1",
+  # Match Megatron-LM explicitly so lock validation keeps the same source.
+  "torch-memory-saver @ git+https://github.com/fzyzcjy/torch_memory_saver.git@9bc9a442e6d108c7b7903def199896a005143aaf",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
   # megatron-energon already flows in transitively (megatron-core[dev,mlm] declares it), so
@@ -249,7 +269,7 @@ trtllm = [
   "torch==2.11.0",
   "torchvision==0.26.0",
   "tensorrt-llm==1.3.0rc21",
-  "transformers==5.5.4",
+  "transformers==5.16.0.dev0",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
   # tensorrt-llm 1.3.0rc21's _ipc_utils.py reads `cudaIpcMemHandle_t.reserved`,
   # which cuda-bindings 13.4 removed; every TP>1 TRT-LLM engine then dies in
@@ -260,7 +280,7 @@ trtllm = [
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
-  "nvidia-resiliency-ext==0.6.0",
+  "nvidia-resiliency-ext==0.7.0",
 ] # for ft_launcher (fault-tolerant training launcher)
 nemo_gym = ["nemo_gym"]
 
@@ -311,6 +331,7 @@ test = [
 ]
 
 [tool.uv.sources]
+vllm = { git = "https://github.com/Inferact/lin.git", rev = "ed2c0e0a38e69865176f2ad4b1a17e3aea2d5d1a" }
 # tensorrt-llm is built from source via a custom PEP 517 backend in 3rdparty/TensorRT-LLM-workspace/.
 # prepare_metadata_for_build_wheel returns static metadata fast (for `uv lock`);
 # build_wheel triggers the actual ~60-min compilation (during `uv sync --extra trtllm`).
@@ -331,7 +352,7 @@ nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2
 # newest PyPI release so dropping either one fails to resolve instead of
 # falling back to 0.1.0.
 nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "b0f977d414b2f89938604a0b7eaa78ee08bc8700" }
-sglang = { git = "https://github.com/sgl-project/sglang.git", rev = "3003d70f680d41c59d1b7acbf65cb47795dfd19e", subdirectory = "python" }
+sglang = { git = "https://github.com/radixark/sglang-reflection-oss.git", rev = "90c70a5a4927d055f68065f01d8bb55ad885c620", subdirectory = "python" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
   { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },
@@ -361,9 +382,17 @@ flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd545
 # real-quant dist-checkpoint sharding validation (`Invalid access pattern for
 # ShardedTensor(... experts.N.linear_fc1.weight_quantizer._amax`).
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "43fd41a58d52c4e6e5dec1d1ff5989ecc737ae1a" }
-nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
+nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "ebf0352a82ca5699148ea10bec2b8eedd121e382" }
 flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm100a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm103a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm120f = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm80 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm89 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm110a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm121a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm90a = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
 members = [
@@ -407,6 +436,8 @@ environments = [
 ]
 preview = true # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
+  "vllm",  # Reuse locked Torch/Triton instead of resolving an isolated build stack.
+  "sglang",  # Reuse locked Torch/Triton; isolated builds select different index artifacts.
   "transformer-engine-torch",
   "flash-attn",
   "mamba-ssm",
@@ -435,6 +466,12 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
+  # Preserve the shared Mamba source pin when Bridge's SSM extra requests a newer release.
+  # Keep this revision in sync with [tool.uv.sources].
+  "mamba-ssm @ git+https://github.com/state-spaces/mamba.git@a14b1dff0454a3bc27d9eb31355dc01e4b2490ec",
+  # Fixed Transformers source revision shared by the driver and workers.
+  "transformers @ git+https://github.com/huggingface/new-model-addition-reflection.git@8ff92cc164e93fd8461cb0c2b65b7a3a68051575",
+  "tokenizers==0.23.1",
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
@@ -551,6 +588,8 @@ conflicts = [
   [{ extra = "automodel" }, { extra = "sglang" }],
   [{ extra = "mcore" }, { extra = "sglang" }],
   [{ extra = "vllm" }, { extra = "sglang" }],
+  # The async vLLM fork needs MCP 2; NeMo Gym still requires MCP 1.
+  [{ extra = "vllm" }, { extra = "nemo-gym" }],
   [{ extra = "automodel" }, { extra = "mcore" }],
   [{ extra = "automodel" }, { extra = "vllm" }],
   [{ extra = "vllm" }, { extra = "mcore" }],
@@ -585,6 +624,7 @@ flash_mla = [{ requirement = "torch", match-runtime = true }]
 # torch-memory-saver's build backend reads TMS_CUDA_MAJOR at build time. Keep this in
 # sync with docker/Dockerfile's BASE_IMAGE CUDA major version (currently cuda13.x).
 [tool.uv.extra-build-variables]
+vllm = { VLLM_VERSION_OVERRIDE = "0.26.0.dev0", VLLM_USE_PRECOMPILED = "0", MAX_JOBS = "2", NVCC_THREADS = "1" }
 torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
 # flash-attn 2.8.1 has no prebuilt wheel for torch >= 2.11, so it compiles from the sdist.
 # Its setup.py sizes MAX_JOBS from psutil's *host* free memory (not the container cgroup)
@@ -593,6 +633,22 @@ torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
 # `Killed "$CICC_PATH/cicc"`) on both x86 and aarch64. 4 jobs x 4 threads built cleanly on
 # both architectures (2h47m aarch64, ~2h x86 alongside TE/flash-mla).
 flash-attn = { MAX_JOBS = "4" }
+
+# The cache wheels differ by architecture; make the ARM-only shards explicit
+# for uv's universal resolver (the x86_64 wheel does not require these shards).
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache"
+version = "0.7.0.post1+cu130"
+requires-dist = [
+  "flashinfer-jit-cache-sm100a==0.7.0.post1+cu130",
+  "flashinfer-jit-cache-sm103a==0.7.0.post1+cu130",
+  "flashinfer-jit-cache-sm110a==0.7.0.post1+cu130; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm120f==0.7.0.post1+cu130",
+  "flashinfer-jit-cache-sm121a==0.7.0.post1+cu130; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm80==0.7.0.post1+cu130",
+  "flashinfer-jit-cache-sm89==0.7.0.post1+cu130",
+  "flashinfer-jit-cache-sm90a==0.7.0.post1+cu130",
+]
 
 # CUTLASS DSL 4.5.x publishes overlapping base and cu13 wheels. Override the
 # affected metadata so those versions use the self-contained cu13 wheel, while

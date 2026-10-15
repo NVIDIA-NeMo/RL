@@ -27,6 +27,13 @@ policy:
       # memory saver that needs_offload: true enables below.
       cuda_graph_backend_prefill: disabled
       disable_cuda_graph: false
+      # Optional speculative decoding settings (omit to use SGLang defaults):
+      # speculative_algorithm: null  # Algorithm name, e.g. DFLASH or EAGLE.
+      # speculative_draft_model_path: null  # Draft checkpoint path or model ID.
+      # speculative_num_steps: null  # Number of draft steps.
+      # speculative_eagle_topk: null  # EAGLE branching factor.
+      # speculative_num_draft_tokens: null  # Draft token budget.
+      # speculative_dflash_block_size: null  # DFLASH block size.
       sglang_server_config:
         needs_offload: true
         cpu_weight_backup: true

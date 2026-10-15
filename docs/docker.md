@@ -100,3 +100,18 @@ To build without any custom setup commands, set `CUSTOM_SETUP_FNAME` to empty:
 ```sh
 docker buildx build --build-arg CUSTOM_SETUP_FNAME= -f docker/Dockerfile --tag <registry>/nemo-rl:latest .
 ```
+
+## B300 and GB300 builds
+
+The release image compiles CUDA extensions for compute capabilities 9.0, 10.0,
+and 10.3. B300 uses the AMD64 image; GB300 requires an ARM64 image. Build GB300
+on a native ARM64 Docker builder with the repository submodules initialized:
+
+```bash
+docker buildx build --platform linux/arm64 --target release --load \
+  --build-context nemo-rl=. -f docker/Dockerfile \
+  --tag nemo-rl:gb300 .
+```
+
+An AMD64 build does not validate
+the ARM64 dependencies or GPU execution on GB300.

@@ -24,6 +24,8 @@ For the full list of supported models, see
 - **[Qwen](qwen/index.md)** — Qwen3.5 and Qwen3.8 LLM and VLM recipes (dense and
   MoE), with backend availability documented per version and thinking-mode
   generation-length guidance.
+- **[Reflection](reflection/beam.md)** — BEAM 501B SFT with AutoModel training,
+  including validated scope and reference results.
 
 Other model-specific guides currently live directly under
 [Guides](../../index.md) and are migrated into this hub as their guidance grows.
@@ -37,4 +39,5 @@ gemma/index.md
 minimax/index.md
 nemotron/index.md
 qwen/index.md
+reflection/beam.md
 ```

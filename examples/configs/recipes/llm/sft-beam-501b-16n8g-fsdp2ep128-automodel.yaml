@@ -1,0 +1,44 @@
+defaults: ../../sft.yaml
+# Short SFT integration recipe; convergence has not been evaluated.
+# Requires BEAM-compatible AutoModel and Transformers dependencies.
+sft:
+  max_num_steps: 100
+  val_at_start: false
+  val_period: 10
+  val_batches: 1
+  val_global_batch_size: 128
+policy:
+  model_name: ${oc.env:BEAM_CHECKPOINT}
+  tokenizer:
+    chat_template: default
+  train_global_batch_size: 128
+  max_total_sequence_length: 512
+  dtensor_cfg:
+    activation_checkpointing: true
+    expert_parallel_size: 128
+    automodel_kwargs:
+      force_hf: false
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: torch
+        rms_norm: torch
+        experts: torch_mm
+        dispatcher: torch
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+data:
+  # SQuAD is inherited solely to exercise supervised loss with public data.
+  # Harmony supplies its own turn delimiters; do not add BOS/EOS again.
+  add_bos: false
+  add_eos: false
+checkpointing:
+  # This recipe validates training only; checkpoint save/resume needs separate validation.
+  enabled: false
+logger:
+  log_dir: logs/sft-beam-501b-16n8g-fsdp2ep128-automodel
+  wandb_enabled: false
+cluster:
+  num_nodes: 16
+  gpus_per_node: 8

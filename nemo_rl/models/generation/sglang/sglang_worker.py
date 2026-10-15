@@ -524,6 +524,7 @@ class SGLangGenerationWorker:
             "mem_fraction_static",
             "allow_auto_truncate",
             "disable_cuda_graph",
+            "disable_overlap_schedule",
             "disable_cuda_graph_padding",
             "cuda_graph_backend_decode",
             "cuda_graph_backend_prefill",
@@ -531,6 +532,16 @@ class SGLangGenerationWorker:
             "cuda_graph_max_bs_prefill",
             "cuda_graph_bs_decode",
             "cuda_graph_bs_prefill",
+            "attention_backend",
+            "num_continuous_decode_steps",
+            "disable_radix_cache",
+            "sampling_backend",
+            "speculative_algorithm",
+            "speculative_draft_model_path",
+            "speculative_num_steps",
+            "speculative_eagle_topk",
+            "speculative_num_draft_tokens",
+            "speculative_dflash_block_size",
         ]:
             if key in sglang_cfg_inner:
                 kwargs[key] = sglang_cfg_inner[key]
