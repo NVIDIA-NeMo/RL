@@ -203,11 +203,13 @@ def _in_process_gym(ledger_dir: Path):
             async with httpx.AsyncClient(
                 transport=transport, base_url=f"http://{server_name}"
             ) as client:
+                # Gym's coordination sends each control body pre-encoded as data.
                 return _Reply(
                     await client.request(
                         method,
                         url_path,
                         json=kwargs.get("json"),
+                        content=kwargs.get("data"),
                         headers=kwargs.get("headers"),
                     )
                 )
