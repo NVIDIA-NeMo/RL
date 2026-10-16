@@ -348,14 +348,23 @@ def _add_r3_fallback_metrics(
 
 
 def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
-    """Return True for samples the environment asks GRPO to mask from loss."""
-    return torch.tensor(
-        [
-            bool(((extra or {}).get("instance_config") or {}).get(MASK_SAMPLE, False))
-            for extra in extras
-        ],
-        dtype=torch.bool,
-    )
+    """Return True for samples the environment asks GRPO to mask from loss.
+
+    The flag is read from the verify response's first-class ``mask_sample``
+    field (NeMo-Gym ``BaseVerifyResponse``) or from the response-extras mapping
+    ``instance_config.mask_sample``. Both reads are consulted because Gym
+    serializes ``mask_sample: false`` on every response, so an environment that
+    flags only ``instance_config.mask_sample`` carries a false first-class
+    field beside the true nested one.
+    """
+
+    def flagged(extra: dict[str, Any] | None) -> bool:
+        extra = extra or {}
+        if extra.get(MASK_SAMPLE):
+            return True
+        return bool((extra.get("instance_config") or {}).get(MASK_SAMPLE, False))
+
+    return torch.tensor([flagged(extra) for extra in extras], dtype=torch.bool)
 
 
 def _attach_routed_experts_to_message_log_prefix(
@@ -2962,6 +2971,66 @@ def run_nemo_gym_rollout_sync(
     return asyncio.run(_consume_rollout())
 
 
+# Responses ``incomplete_details.reason`` values that mean the final model call
+# ran out of tokens. NeMo-Gym normalizes every length stop to
+# ``max_output_tokens``: a chat ``finish_reason="length"`` (including the empty
+# completion it returns when the prompt overflows the context window) and the
+# Anthropic ``max_tokens`` / ``model_context_window_exceeded`` stop reasons. The
+# Responses schema admits no other length reason, so ``length`` and
+# ``max_tokens`` are defensive aliases for non-Gym producers; the pinned Gym
+# cannot emit them.
+_LENGTH_LIMIT_INCOMPLETE_REASONS = frozenset(
+    {"max_output_tokens", "length", "max_tokens"}
+)
+
+
+def nemo_gym_rollout_hit_max_tokens(
+    full_result: dict[str, Any] | None,
+    *,
+    total_tokens: int,
+    max_total_tokens_per_sample: int,
+) -> bool:
+    """Return whether a NeMo-Gym rollout was cut off by the token budget.
+
+    An exact ``total_tokens == max_total_tokens_per_sample`` match almost never
+    fires for multi-turn rollouts: when the next prompt no longer fits, Gym's
+    vLLM model returns an empty ``finish_reason="length"`` completion that adds
+    no tokens, so the chain stops short of the limit. Count the rollout as
+    truncated if it reached the limit, or if the final response is incomplete
+    for a length reason.
+
+    The length reason is deliberately not restricted to context exhaustion: a
+    final response stopped by its per-turn ``max_output_tokens`` cap carries the
+    same ``incomplete_details.reason`` and also counts as truncated, even when
+    the accumulated token count is below ``max_total_tokens_per_sample``. Its
+    final generation was length-cut, so it belongs in ``truncation_rate`` and is
+    a valid ``overlong_filtering`` target. Responses that are incomplete for
+    another reason (e.g. ``content_filter``), responses without
+    ``incomplete_details``, and absent or malformed metadata are not truncation.
+
+    Args:
+        full_result: The Gym rollout result; its ``response`` key holds the
+            final Responses object when the agent produced one. Agents that
+            return the model's final Responses object carry
+            ``incomplete_details``; agents that synthesize their terminal
+            response do not, and fall back to the token-count check.
+        total_tokens: Token count of the rollout's full message log.
+        max_total_tokens_per_sample: The generation backend's context limit.
+
+    Returns:
+        True if the rollout was cut off by a token limit.
+    """
+    if total_tokens >= max_total_tokens_per_sample:
+        return True
+    response = (full_result or {}).get("response")
+    if not isinstance(response, dict):
+        return False
+    incomplete_details = response.get("incomplete_details")
+    if not isinstance(incomplete_details, dict):
+        return False
+    return incomplete_details.get("reason") in _LENGTH_LIMIT_INCOMPLETE_REASONS
+
+
 def _postprocess_single_nemo_gym_group(
     nemo_gym_rows: list[dict],
     results: list[dict],
@@ -3043,8 +3112,11 @@ def _postprocess_single_nemo_gym_group(
                 ),
                 "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
-                == max_total_tokens_per_sample,
+                "hit_max_tokens": nemo_gym_rollout_hit_max_tokens(
+                    r["full_result"],
+                    total_tokens=sum(len(m["token_ids"]) for m in r["message_log"]),
+                    max_total_tokens_per_sample=max_total_tokens_per_sample,
+                ),
                 # max_gen_tokens_per_turn: Diagnostic for long single generations
                 "max_gen_tokens_per_turn": max(
                     (

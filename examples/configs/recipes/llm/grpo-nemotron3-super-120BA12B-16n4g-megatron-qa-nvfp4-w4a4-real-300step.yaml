@@ -11,7 +11,6 @@ policy:
   quant_batch_size: 1
   quant_sequence_length: 1024
   generation:
-    quant_cfg: null
     real_quant: true
     vllm_kwargs:
       moe_backend: auto

@@ -62,7 +62,6 @@ policy:
       tensor_parallel_size: 2
       max_model_len: 30720
       gpu_memory_utilization: 0.5
-      enforce_eager: false
 
 data:
   max_input_seq_length: 2048

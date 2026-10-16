@@ -7,7 +7,6 @@ policy:
   disable_modelopt_layer_spec: true
   quant_cfg: examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml
   generation:
-    quant_cfg: null
     real_quant: true
     vllm_kwargs:
       moe_backend: auto
