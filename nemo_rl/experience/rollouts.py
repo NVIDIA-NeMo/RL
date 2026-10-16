@@ -2058,6 +2058,14 @@ def get_nemo_gym_max_infra_attempts(env_config: dict[str, Any]) -> int:
     return value
 
 
+# A Gym actor answers rollout_config from its event loop, so an actor whose loop
+# is blocked never answers. The read is the first thing a rollout awaits, before
+# the health check polls, and the asynchronous trajectory collector retries a
+# failed batch against the same actors, so without a bound a probe timeout would
+# be followed by a retry that hangs in this read.
+NEMO_GYM_ROLLOUT_CONFIG_TIMEOUT_SECONDS = 60.0
+
+
 async def _nemo_gym_rollout_config(nemo_gym_environment: Any) -> dict[str, Any]:
     """Fetch the ``env.nemo_gym`` keys the rollout loop reads from the Gym actors.
 
@@ -2070,9 +2078,23 @@ async def _nemo_gym_rollout_config(nemo_gym_environment: Any) -> dict[str, Any]:
     is returned in the ``master_config.env`` layout the ``get_nemo_gym_*``
     readers take, so every caller of the rollout function, synchronous or not,
     applies the same configured values without forwarding them.
+
+    The call is bounded by ``NEMO_GYM_ROLLOUT_CONFIG_TIMEOUT_SECONDS`` and a
+    missed bound is ``GymTransportError``, the class the rest of the rollout
+    raises for an actor that stopped answering.
     """
     handle = as_nemo_gym_shard_set(nemo_gym_environment).all_handles[0]
-    return {"nemo_gym": dict(await handle.rollout_config.remote())}
+    try:
+        settings = await asyncio.wait_for(
+            handle.rollout_config.remote(),
+            timeout=NEMO_GYM_ROLLOUT_CONFIG_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as error:
+        raise GymTransportError(
+            "NeMo-Gym actor did not answer rollout_config within "
+            f"{NEMO_GYM_ROLLOUT_CONFIG_TIMEOUT_SECONDS}s; its event loop may be blocked"
+        ) from error
+    return {"nemo_gym": dict(settings)}
 
 
 def should_mask_flagged_samples(env_config: dict[str, Any]) -> bool:
@@ -2914,7 +2936,9 @@ async def run_async_nemo_gym_rollout(
         health_check_interval_seconds: Seconds between health checks of the Gym
             actors while no row has arrived. None applies the environment's
             configured ``env.nemo_gym.health_check_interval_seconds``, whose
-            absence turns the polling off.
+            absence turns the polling off. The polling belongs to this driver
+            loop; the single-controller rollout manager bounds a rollout with
+            its own ``rollout_timeout_s`` and does not read the setting.
         max_infra_attempts_per_rollout: Total dispatches one row may use before
             an infrastructure failure ends the rollout; 1 disables re-dispatch.
             None applies the configured ``env.nemo_gym.max_infra_attempts_per_rollout``.
@@ -3206,7 +3230,9 @@ def run_nemo_gym_rollout_sync(
         health_check_interval_seconds: Seconds between health checks of the Gym
             actor while no row has arrived. None applies the environment's
             configured ``env.nemo_gym.health_check_interval_seconds``, whose
-            absence turns the polling off.
+            absence turns the polling off. The polling belongs to this driver
+            loop; the single-controller rollout manager bounds a rollout with
+            its own ``rollout_timeout_s`` and does not read the setting.
         max_infra_attempts_per_rollout: Total dispatches one row may use before
             an infrastructure failure ends the rollout; 1 disables re-dispatch.
             None applies the configured ``env.nemo_gym.max_infra_attempts_per_rollout``.

@@ -3634,7 +3634,8 @@ def test_run_async_nemo_gym_rollout_polls_gym_health_while_waiting(monkeypatch):
     )
     assert len(results) == 1
     assert actor.health_calls == 2
-    assert "nemo_gym_infra_redispatches" not in results[0].rollout_metrics
+    # Reported on every rollout, zero when nothing was dispatched again.
+    assert results[0].rollout_metrics["nemo_gym_infra_redispatches"] == 0
 
 
 def test_run_async_nemo_gym_rollout_dead_gym_server_ends_the_step(monkeypatch):
@@ -3711,3 +3712,26 @@ def test_gym_rollout_reads_both_reliability_knobs_from_the_actor_config(monkeypa
     assert actor.health_calls == 2
     assert actor.dispatched_rows == [rows, [rows[1]]]
     assert results[0].rollout_metrics["nemo_gym_infra_redispatches"] == 1
+
+
+def test_gym_rollout_bounds_the_actor_config_read(monkeypatch):
+    """The rollout's first await asks one actor for the driver keys, before any
+    health polling starts, and the asynchronous collector retries a batch against
+    the same actors after a probe timeout. An actor whose event loop is blocked
+    never answers, so the read is bounded and fails as a transport error instead
+    of turning the retry into the hang the probe had just ended."""
+    rows = [_gym_row()]
+    actor = _FakeGymActor(scripts=[[(0, {"name": "agent"}, _gym_result(0), None)]])
+
+    class _ParkedRolloutConfig:
+        async def remote(self):
+            await asyncio.Event().wait()
+
+    actor.rollout_config = _ParkedRolloutConfig()
+    monkeypatch.setattr(rollouts_mod, "NEMO_GYM_ROLLOUT_CONFIG_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    with pytest.raises(GymTransportError, match="did not answer rollout_config"):
+        asyncio.run(_collect_gym_rollout(actor, rows))
+    assert actor.dispatched_rows == []

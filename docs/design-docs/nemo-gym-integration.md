@@ -34,8 +34,11 @@ env:
       - resources_servers/math/configs/math.yaml
       - responses_api_agents/simple_agent/configs/simple_agent.yaml
     # Driver-side reliability knobs, read by the rollout loop in
-    # nemo_rl/experience/rollouts.py and never forwarded to Gym. Both are off
-    # by default: no polling, one dispatch per row.
+    # nemo_rl/experience/rollouts.py (synchronous GRPO, the asynchronous
+    # trajectory collector, PPO, distillation) and never forwarded to Gym. The
+    # single-controller rollout manager does not read them: it bounds a rollout
+    # with rollout_timeout_s and re-dispatches rows under max_row_attempts.
+    # Both are off by default: no polling, one dispatch per row.
     health_check_interval_seconds: null  # poll Gym's servers after this long without a completed row
     max_infra_attempts_per_rollout: 1    # dispatches one row may use after a /run infrastructure failure
 
@@ -59,6 +62,16 @@ engine that refuses connections produces no failure marker at all: NeMo Gym's
 internal client retries a refused connection without bound unless an
 `endpoint_file` is configured, and its session sets no total deadline, so such a
 row never arrives and the rollout's deadline, not this budget, ends the step.
+`health_check_interval_seconds` ends it sooner: after that long without a
+completed row, every Gym actor's `health_check` runs with a bounded probe, and a
+dead or unresponsive actor fails the rollout with a transport error.
+
+Both settings belong to the rollout loop in `nemo_rl/experience/rollouts.py`,
+which synchronous GRPO, the asynchronous trajectory collector, PPO and
+distillation share. The single-controller rollout manager
+(`AsyncNemoGymRolloutImpl`) reads neither: it bounds a prompt group with
+`rollout_timeout_s` and re-dispatches failed rows under `max_row_attempts`, both
+under its own `rollout_failure` configuration.
 
 When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct
 the per-agent `full_result` Tables. This prevents those payloads from entering
