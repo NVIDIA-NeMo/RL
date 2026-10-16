@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -223,6 +224,272 @@ class DistributedLogprob(torch.autograd.Function):
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
+
+
+class DistributedSelectedLogprobs(torch.autograd.Function):
+    """Exact selected-token log-probs without gathering a TP vocab shard.
+
+    ``batch_indices`` / ``seq_indices`` select ``N`` local (possibly CP
+    sharded) rows and ``token_ids`` supplies ``K`` global vocabulary ids per
+    row.  Forward communicates only row-wise normalization scalars and the
+    selected values.  Backward rematerializes the familiar
+    ``one_hot(target)-softmax`` gradient on each local vocabulary shard, summed
+    over the selected supports, and scatters it back into the original rows.
+
+    Columns at or beyond ``real_vocab_size`` are excluded from both logZ and
+    gradients.  This matters for TP-divisibility padding (for example a
+    Megatron LM head with 248320 columns for a 248077-token tokenizer).
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        vocab_parallel_logits: torch.Tensor,
+        batch_indices: torch.Tensor,
+        seq_indices: torch.Tensor,
+        token_ids: torch.Tensor,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        real_vocab_size: int,
+        temperature: float,
+        group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        if temperature <= 0:
+            raise ValueError(f"temperature must be > 0, got {temperature}")
+        if batch_indices.dim() != 1 or seq_indices.dim() != 1:
+            raise ValueError("batch_indices and seq_indices must be one-dimensional")
+        if batch_indices.shape != seq_indices.shape:
+            raise ValueError(
+                "batch_indices and seq_indices must have the same shape; got "
+                f"{tuple(batch_indices.shape)} and {tuple(seq_indices.shape)}"
+            )
+        squeeze = token_ids.dim() == 1
+        if squeeze:
+            token_ids = token_ids.unsqueeze(-1)
+        if token_ids.dim() != 2 or token_ids.shape[0] != batch_indices.shape[0]:
+            raise ValueError(
+                "token_ids must have shape [N] or [N, K] matching the selected "
+                f"rows; got {tuple(token_ids.shape)} for N={batch_indices.shape[0]}"
+            )
+
+        rows = vocab_parallel_logits[batch_indices, seq_indices].float()
+        rows.div_(float(temperature))
+        local_vocab = rows.shape[-1]
+        valid_local = max(
+            0,
+            min(int(vocab_end_index), int(real_vocab_size)) - int(vocab_start_index),
+        )
+        valid_local = min(valid_local, local_vocab)
+        if valid_local < local_vocab:
+            rows[:, valid_local:] = -torch.inf
+
+        tp_world = (
+            torch.distributed.get_world_size(group)
+            if group is not None and torch.distributed.is_initialized()
+            else 1
+        )
+
+        target_valid = (token_ids >= 0) & (token_ids < int(real_vocab_size))
+        target_owned = (
+            target_valid
+            & (token_ids >= int(vocab_start_index))
+            & (token_ids < int(vocab_start_index) + valid_local)
+        )
+        local_target = (
+            (token_ids - int(vocab_start_index))
+            .clamp(min=0, max=max(local_vocab - 1, 0))
+            .long()
+        )
+        selected = torch.gather(rows, dim=-1, index=local_target)
+        selected = torch.where(target_owned, selected, torch.zeros_like(selected))
+
+        row_max = rows.max(dim=-1, keepdim=True).values
+        if tp_world > 1:
+            torch.distributed.all_reduce(
+                row_max, op=torch.distributed.ReduceOp.MAX, group=group
+            )
+        rows.sub_(row_max).exp_()
+        row_sum = rows.sum(dim=-1, keepdim=True)
+        if tp_world > 1:
+            torch.distributed.all_reduce(
+                row_sum, op=torch.distributed.ReduceOp.SUM, group=group
+            )
+        log_z = row_max + row_sum.log()
+
+        if tp_world > 1:
+            torch.distributed.all_reduce(
+                selected, op=torch.distributed.ReduceOp.SUM, group=group
+            )
+        selected = selected - log_z
+        selected = torch.where(
+            target_valid, selected, torch.full_like(selected, -torch.inf)
+        )
+
+        ctx.save_for_backward(
+            vocab_parallel_logits,
+            target_owned,
+            local_target,
+            batch_indices,
+            seq_indices,
+        )
+        ctx.input_shape = tuple(vocab_parallel_logits.shape)
+        ctx.input_dtype = vocab_parallel_logits.dtype
+        ctx.temperature = float(temperature)
+        ctx.valid_local = int(valid_local)
+        ctx.group = group
+        ctx.tp_world = int(tp_world)
+        ctx.squeeze = squeeze
+        return selected.squeeze(-1) if squeeze else selected
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]:
+        logits, target_owned, local_target, batch_indices, seq_indices = (
+            ctx.saved_tensors
+        )
+        if ctx.squeeze:
+            grad_output = grad_output.unsqueeze(-1)
+        grad_output = grad_output.float()
+
+        # Recompute the local softmax shard instead of saving an fp32
+        # ``[N, V_local]`` tensor from forward. Saving ``logits`` above retains
+        # only a reference to the model output that autograd already owns;
+        # these temporaries are released as soon as this backward returns.
+        rows = logits[batch_indices, seq_indices].float()
+        rows.div_(ctx.temperature)
+        local_vocab = int(rows.shape[-1])
+        if ctx.valid_local < local_vocab:
+            rows[:, ctx.valid_local :] = -torch.inf
+        row_max = rows.max(dim=-1, keepdim=True).values
+        if ctx.tp_world > 1:
+            torch.distributed.all_reduce(
+                row_max,
+                op=torch.distributed.ReduceOp.MAX,
+                group=ctx.group,
+            )
+        rows.sub_(row_max).exp_()
+        row_sum = rows.sum(dim=-1, keepdim=True)
+        if ctx.tp_world > 1:
+            torch.distributed.all_reduce(
+                row_sum,
+                op=torch.distributed.ReduceOp.SUM,
+                group=ctx.group,
+            )
+        softmax = rows.div_(row_sum)
+        grad_rows = -softmax * grad_output.sum(dim=-1, keepdim=True)
+
+        n_rows = int(softmax.shape[0])
+        if n_rows:
+            row_offsets = (
+                torch.arange(n_rows, device=softmax.device, dtype=torch.long)
+                * local_vocab
+            ).unsqueeze(-1)
+            flat_selected = row_offsets + local_target
+            owned_grad = torch.where(
+                target_owned, grad_output, torch.zeros_like(grad_output)
+            )
+            grad_rows.view(-1).scatter_add_(
+                0, flat_selected.reshape(-1), owned_grad.reshape(-1)
+            )
+        grad_rows.div_(ctx.temperature)
+
+        grad_input = torch.zeros(
+            ctx.input_shape, device=softmax.device, dtype=ctx.input_dtype
+        )
+        flat_rows = batch_indices * ctx.input_shape[1] + seq_indices
+        grad_input.view(-1, ctx.input_shape[-1]).index_add_(
+            0, flat_rows, grad_rows.to(ctx.input_dtype)
+        )
+        return (
+            grad_input,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def distributed_selected_logprobs(
+    vocab_parallel_logits: torch.Tensor,
+    batch_indices: torch.Tensor,
+    seq_indices: torch.Tensor,
+    token_ids: torch.Tensor,
+    *,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    real_vocab_size: int,
+    temperature: float,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    row_chunk_size: Optional[int] = None,
+) -> torch.Tensor:
+    """Selected-token log-probs over a TP-sharded vocabulary.
+
+    Functional wrapper around :class:`DistributedSelectedLogprobs` that tiles
+    the selected rows into chunks of ``row_chunk_size`` to bound the fp32
+    ``[rows, V_local]`` working set.
+
+    Args:
+        vocab_parallel_logits: Local logits ``[B, S_local, V_local]``.
+        batch_indices: Row batch indices ``[N]``.
+        seq_indices: Row sequence indices ``[N]`` into ``S_local``.
+        token_ids: Global vocabulary ids ``[N]`` or ``[N, K]``; ids outside
+            ``[0, real_vocab_size)`` return ``-inf``.
+        vocab_start_index: First global vocabulary id held by this TP rank.
+        vocab_end_index: One past the last global vocabulary id held here.
+        real_vocab_size: Tokenizer vocabulary size; padded columns are ignored.
+        temperature: Softmax temperature applied to the logits.
+        tp_group: Tensor-parallel group, or None for an unsharded vocabulary.
+        row_chunk_size: Rows per tile; None or <= 0 evaluates all rows at once.
+
+    Returns:
+        Log-probabilities with the shape of ``token_ids``.
+    """
+    n_rows = int(batch_indices.shape[0])
+    if row_chunk_size is None or row_chunk_size <= 0 or n_rows <= row_chunk_size:
+        return DistributedSelectedLogprobs.apply(
+            vocab_parallel_logits,
+            batch_indices,
+            seq_indices,
+            token_ids,
+            vocab_start_index,
+            vocab_end_index,
+            real_vocab_size,
+            temperature,
+            tp_group,
+        )
+    chunks: list[torch.Tensor] = []
+    for start in range(0, n_rows, int(row_chunk_size)):
+        end = min(start + int(row_chunk_size), n_rows)
+        chunks.append(
+            DistributedSelectedLogprobs.apply(
+                vocab_parallel_logits,
+                batch_indices[start:end],
+                seq_indices[start:end],
+                token_ids[start:end],
+                vocab_start_index,
+                vocab_end_index,
+                real_vocab_size,
+                temperature,
+                tp_group,
+            )
+        )
+    return torch.cat(chunks, dim=0)
 
 
 class ChunkedDistributedLogprob(torch.autograd.Function):
@@ -1352,6 +1619,38 @@ def _get_tokens_on_this_cp_rank(
     return ids
 
 
+def cp_load_balanced_segments(
+    full_seq_len: int,
+    cp_rank: int,
+    cp_size: int,
+) -> list[tuple[int, int, int]]:
+    """Describe a CP rank's load-balanced rows as ``(local_start, global_start, length)``.
+
+    With context parallelism, rank ``r`` holds blocks ``r`` and ``2*cp-1-r`` of
+    a ``2*cp`` partition of the global sequence, in that order (the layout of
+    :func:`_get_tokens_on_this_cp_rank`). The compact interval metadata is safe
+    to place in an IPC handle and avoids treating a CP shard as one contiguous
+    global sequence range.
+    """
+    if cp_size < 1:
+        raise ValueError(f"cp_size must be >= 1, got {cp_size}")
+    if not 0 <= cp_rank < cp_size:
+        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}")
+    if cp_size == 1:
+        return [(0, 0, full_seq_len)]
+    if full_seq_len % (2 * cp_size) != 0:
+        raise ValueError(
+            "Load-balanced context-parallel rows require full_seq_len to be "
+            f"divisible by 2*cp_size={2 * cp_size}; got {full_seq_len}."
+        )
+    block = full_seq_len // (2 * cp_size)
+    mirrored = 2 * cp_size - cp_rank - 1
+    return [
+        (0, cp_rank * block, block),
+        (block, mirrored * block, block),
+    ]
+
+
 def allgather_cp_sharded_tensor(
     tensor, cp_group, seq_dim=1
 ):  # , unpadded_seqlen=None):
@@ -2139,6 +2438,324 @@ def distributed_vocab_topk(
     )
 
     return topk_vals, topk_global_indices
+
+
+def _canonical_topk_by_value_then_lowest_id(
+    values: torch.Tensor,
+    global_ids: torch.Tensor,
+    k: int,
+    *,
+    id_ceiling: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select top-k by value with the lowest global token ID as tie-breaker.
+
+    ``torch.topk`` does not specify which equal-valued entries it returns, and
+    its candidate order changes when the vocabulary is partitioned across TP.
+    Build an exact integer lexicographic key from the fp32 IEEE-754 ordering and
+    the global token ID instead. This preserves every non-tied comparison while
+    making exact cutoff ties topology-independent. ``global_ids`` may be a
+    one-dimensional vocabulary vector or have the same shape as ``values``.
+    """
+    if values.is_complex() or not values.is_floating_point():
+        raise TypeError("canonical top-k values must be floating point")
+    if global_ids.dtype == torch.bool or global_ids.is_floating_point():
+        raise TypeError("canonical top-k token ids must have an integer dtype")
+    if k <= 0 or k > values.shape[-1]:
+        raise ValueError(
+            f"canonical top-k requires 0 < k <= {values.shape[-1]}, got {k}"
+        )
+    if id_ceiling < 0 or id_ceiling >= (1 << 31):
+        raise ValueError(
+            f"canonical top-k requires id_ceiling in [0, 2**31), got {id_ceiling}"
+        )
+
+    scores = values.float()
+    ids = global_ids.to(device=values.device, dtype=torch.int64)
+    try:
+        scores, ids = torch.broadcast_tensors(scores, ids)
+    except RuntimeError as exc:
+        raise ValueError(
+            "canonical top-k values and token ids are not broadcastable: "
+            f"{tuple(values.shape)} vs {tuple(global_ids.shape)}"
+        ) from exc
+    if bool(torch.isnan(scores).any().item()):
+        raise ValueError("canonical top-k does not accept NaN logits")
+    if bool(((ids < 0) | (ids > int(id_ceiling))).any().item()):
+        raise ValueError(f"canonical top-k token ids must be in [0, {id_ceiling}]")
+
+    # Normalize negative zero so numerically equal +/-0 values use only the ID
+    # tie-break. BF16/FP16 values are represented exactly after the fp32 cast.
+    scores = torch.where(scores == 0, torch.zeros_like(scores), scores).contiguous()
+    raw_bits = scores.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    sign_set = (raw_bits & 0x80000000) != 0
+    ordered_score = torch.where(
+        sign_set,
+        (~raw_bits) & 0xFFFFFFFF,
+        raw_bits ^ 0x80000000,
+    )
+    id_bits = max(1, int(id_ceiling).bit_length())
+    secondary = int(id_ceiling) - ids
+    keys = (ordered_score << id_bits) + secondary
+    positions = torch.topk(keys, k, dim=-1, largest=True, sorted=True).indices
+    return (
+        torch.gather(scores, dim=-1, index=positions),
+        torch.gather(ids, dim=-1, index=positions),
+    )
+
+
+@torch.no_grad()
+def distributed_vocab_topk_logz_force(
+    vocab_parallel_logits: torch.Tensor,
+    force_token_ids: torch.Tensor,
+    k: int,
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    *,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    real_vocab_size: int,
+    temperature: float,
+    noise_filter_k: int = 0,
+    chunk_size: Optional[int] = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Teacher sparse transport primitive: natural top-k plus forced sidecars.
+
+    The vocabulary remains TP-sharded.  Each rank contributes at most
+    ``max(k, noise_filter_k)`` local candidates and row-wise MAX/SUM scalars;
+    no full vocabulary tensor is gathered. ``force_token_ids`` has shape
+    ``[B, S, F]`` and uses ``-1`` for unused sidecar slots. Every valid forced
+    label is resolved across TP without modifying the natural top-k.
+
+    Returns, in order:
+
+    * raw (unscaled) natural top-k logits sorted by token id;
+    * their global int32 token ids;
+    * exact ``logsumexp(logits / temperature)``;
+    * the natural score-rank-k token id, used to reproduce exact cutoff-tie
+      eviction after the natural row has been sorted by id;
+    * raw forced-label logits;
+    * forced global int32 ids (including ``-1`` padding); and
+    * per-forced-label membership in natural top-``noise_filter_k`` (or natural
+      top-k when the noise filter is disabled).
+
+    The consumer constructs each loss request independently as natural K when
+    its required label is already present, otherwise natural K-1 plus that
+    request's forced label. Keeping the sidecar separate is necessary when two
+    aligned chunks request different labels from the same teacher row.
+    """
+    if vocab_parallel_logits.dim() != 3:
+        raise ValueError(
+            "vocab_parallel_logits must have shape [B, S, V_local], got "
+            f"{tuple(vocab_parallel_logits.shape)}"
+        )
+    if (
+        force_token_ids.dim() != 3
+        or force_token_ids.shape[:2] != vocab_parallel_logits.shape[:2]
+    ):
+        raise ValueError(
+            "force_token_ids must have shape [B, S, F] matching logits, got "
+            f"{tuple(force_token_ids.shape)} vs "
+            f"{tuple(vocab_parallel_logits.shape[:2])}"
+        )
+    force_width = int(force_token_ids.shape[-1])
+    if force_width <= 0:
+        raise ValueError("force_token_ids sidecar width F must be positive")
+    if force_token_ids.dtype == torch.bool or force_token_ids.is_floating_point():
+        raise TypeError("force_token_ids must have an integer dtype")
+    if not math.isfinite(float(temperature)) or temperature <= 0:
+        raise ValueError(f"temperature must be finite and > 0, got {temperature}")
+    if k <= 0:
+        raise ValueError(f"k must be > 0, got {k}")
+    if noise_filter_k < 0:
+        raise ValueError(f"noise_filter_k must be >= 0, got {noise_filter_k}")
+    k_compute = max(int(k), int(noise_filter_k))
+    if k_compute > int(real_vocab_size):
+        raise ValueError(
+            f"max(k, noise_filter_k)={k_compute} exceeds real_vocab_size="
+            f"{real_vocab_size}"
+        )
+    invalid_force = (force_token_ids < -1) | (force_token_ids >= int(real_vocab_size))
+    if bool(invalid_force.any().item()):
+        bad_id = int(force_token_ids[invalid_force][0].item())
+        raise ValueError(
+            "force_token_ids entries must be -1 or real-vocabulary ids in "
+            f"[0, {real_vocab_size}); got {bad_id}."
+        )
+    for left in range(force_width):
+        for right in range(left + 1, force_width):
+            duplicate = (force_token_ids[..., left] >= 0) & (
+                force_token_ids[..., left] == force_token_ids[..., right]
+            )
+            if bool(duplicate.any().item()):
+                raise ValueError(
+                    "force_token_ids contains duplicate valid labels in one row"
+                )
+
+    tp_world = (
+        torch.distributed.get_world_size(tp_group)
+        if tp_group is not None and torch.distributed.is_initialized()
+        else 1
+    )
+    B, S, V_local = vocab_parallel_logits.shape
+    local_real_count = max(
+        0,
+        min(int(vocab_end_index), int(real_vocab_size)) - int(vocab_start_index),
+    )
+    local_real_count = min(local_real_count, V_local)
+    if chunk_size is None or chunk_size <= 0:
+        chunk_size = S
+
+    out_values: list[torch.Tensor] = []
+    out_indices: list[torch.Tensor] = []
+    out_log_z: list[torch.Tensor] = []
+    out_natural_tail_indices: list[torch.Tensor] = []
+    out_forced_values: list[torch.Tensor] = []
+    out_forced_indices: list[torch.Tensor] = []
+    out_forced_in_topk: list[torch.Tensor] = []
+    sentinel = int(real_vocab_size)
+    membership_k = int(noise_filter_k) if noise_filter_k > 0 else int(k)
+
+    for s0 in range(0, S, chunk_size):
+        s1 = min(S, s0 + chunk_size)
+        raw = vocab_parallel_logits[:, s0:s1, :].float()
+        rows_shape = raw.shape[:2]
+
+        # Exact real-vocabulary logZ.  Padded LM-head columns never enter the
+        # local MAX or SUM; a rank with no real columns contributes (-inf, 0).
+        if local_real_count > 0:
+            scaled_real = raw[..., :local_real_count] / float(temperature)
+            local_max = scaled_real.max(dim=-1).values
+        else:
+            scaled_real = raw[..., :0]
+            local_max = torch.full(
+                rows_shape, -torch.inf, dtype=torch.float32, device=raw.device
+            )
+        if tp_world > 1:
+            torch.distributed.all_reduce(
+                local_max, op=torch.distributed.ReduceOp.MAX, group=tp_group
+            )
+        if local_real_count > 0:
+            local_sum = torch.exp(scaled_real - local_max.unsqueeze(-1)).sum(dim=-1)
+        else:
+            local_sum = torch.zeros(rows_shape, dtype=torch.float32, device=raw.device)
+        if tp_world > 1:
+            torch.distributed.all_reduce(
+                local_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+        log_z = local_max + local_sum.log()
+
+        # Fixed-width candidate buffers avoid selecting padded/sentinel ids on
+        # a TP rank that owns fewer than k_compute real tokens.
+        local_vals = torch.full(
+            (*rows_shape, k_compute),
+            -torch.inf,
+            dtype=torch.float32,
+            device=raw.device,
+        )
+        local_ids = torch.full(
+            (*rows_shape, k_compute),
+            sentinel,
+            dtype=torch.long,
+            device=raw.device,
+        )
+        local_k = min(k_compute, local_real_count)
+        if local_k > 0:
+            local_global_ids = torch.arange(
+                int(vocab_start_index),
+                int(vocab_start_index) + local_real_count,
+                dtype=torch.long,
+                device=raw.device,
+            )
+            vals, ids = _canonical_topk_by_value_then_lowest_id(
+                raw[..., :local_real_count],
+                local_global_ids,
+                local_k,
+                id_ceiling=int(real_vocab_size),
+            )
+            local_vals[..., :local_k] = vals
+            local_ids[..., :local_k] = ids
+
+        if tp_world > 1:
+            gathered_vals = [torch.empty_like(local_vals) for _ in range(tp_world)]
+            gathered_ids = [torch.empty_like(local_ids) for _ in range(tp_world)]
+            torch.distributed.all_gather(gathered_vals, local_vals, group=tp_group)
+            torch.distributed.all_gather(gathered_ids, local_ids, group=tp_group)
+            candidate_vals = torch.cat(gathered_vals, dim=-1)
+            candidate_ids = torch.cat(gathered_ids, dim=-1)
+        else:
+            candidate_vals = local_vals
+            candidate_ids = local_ids
+        natural_vals, natural_ids = _canonical_topk_by_value_then_lowest_id(
+            candidate_vals,
+            candidate_ids,
+            k_compute,
+            id_ceiling=int(real_vocab_size),
+        )
+        if bool((natural_ids >= int(real_vocab_size)).any().item()):
+            raise RuntimeError(
+                "Distributed top-k selected a padded/sentinel vocabulary id; "
+                "check the real-vocabulary candidate accounting."
+            )
+
+        force = force_token_ids[:, s0:s1, :].long()
+        force_valid = (force >= 0) & (force < int(real_vocab_size))
+        forced_in_topk = (
+            natural_ids[..., :membership_k].unsqueeze(-2) == force.unsqueeze(-1)
+        ).any(dim=-1) & force_valid
+
+        owned = (
+            force_valid
+            & (force >= int(vocab_start_index))
+            & (force < int(vocab_start_index) + local_real_count)
+        )
+        local_force_id = (force - int(vocab_start_index)).clamp(
+            min=0, max=max(V_local - 1, 0)
+        )
+        forced_values = torch.gather(raw, -1, local_force_id)
+        forced_values = torch.where(
+            owned, forced_values, torch.zeros_like(forced_values)
+        )
+        if tp_world > 1:
+            torch.distributed.all_reduce(
+                forced_values, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+        forced_values = torch.where(
+            force_valid, forced_values, torch.zeros_like(forced_values)
+        )
+
+        top_vals = natural_vals[..., :k]
+        top_ids = natural_ids[..., :k]
+        natural_tail_ids = top_ids[..., -1:].clone()
+
+        # The sparse lookup uses searchsorted, so canonicalize by token id
+        # after the score-ranked natural selection. The pre-sort tail id is
+        # transported separately so cutoff-logit ties keep score-ranked eviction.
+        sorted_ids, order = torch.sort(top_ids, dim=-1)
+        sorted_vals = torch.gather(top_vals, dim=-1, index=order)
+        out_values.append(sorted_vals)
+        out_indices.append(sorted_ids.to(torch.int32))
+        out_log_z.append(log_z)
+        out_natural_tail_indices.append(natural_tail_ids.to(torch.int32))
+        out_forced_values.append(forced_values)
+        out_forced_indices.append(force.to(torch.int32))
+        out_forced_in_topk.append(forced_in_topk)
+
+    return (
+        torch.cat(out_values, dim=1),
+        torch.cat(out_indices, dim=1),
+        torch.cat(out_log_z, dim=1),
+        torch.cat(out_natural_tail_indices, dim=1),
+        torch.cat(out_forced_values, dim=1),
+        torch.cat(out_forced_indices, dim=1),
+        torch.cat(out_forced_in_topk, dim=1),
+    )
 
 
 def gather_logits_at_global_indices(
