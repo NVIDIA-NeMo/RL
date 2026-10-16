@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Real worker capture -> Gym extras -> TQ codecs -> CC canonical publication.
+"""Real worker capture -> Gym extras -> TQ codecs -> Forest canonical publication.
 
 Generation and storage are doubles; route extraction, commitments, verification,
 owner collapse, publication and cleanup execute their production code.
@@ -138,7 +138,7 @@ def routes() -> tuple:
     return data_plane, sink, worker, finalizer
 
 
-def test_cc_routes_patch_only_predecessor_tail_within_each_segment(
+def test_forest_routes_patch_only_predecessor_tail_within_each_segment(
     routes: tuple,
 ) -> None:
     data_plane, sink, worker, finalizer = routes
@@ -197,7 +197,7 @@ def test_bad_committed_routes_invalidate_whole_owner(
     assert not any(partition == "staged" for partition, _ in data_plane.rows)
 
 
-def test_cc_still_rejects_deferred_route_assembly(routes: tuple) -> None:
+def test_forest_still_rejects_deferred_route_assembly(routes: tuple) -> None:
     _, sink, worker, finalizer = routes
     owner = _segment(worker, sink, "group_g0")
     finalizer._defer_routed_experts_to_policy = True

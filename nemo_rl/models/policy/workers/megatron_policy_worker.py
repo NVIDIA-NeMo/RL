@@ -495,7 +495,7 @@ class MegatronPolicyWorkerImpl(
         """Return route dimensions from the initialized Megatron model config."""
         return router_replay_dimensions(self._get_model_config())
 
-    def validate_cc_execution_padding(self) -> None:
+    def validate_forest_execution_padding(self) -> None:
         """Reject unqualified dummy-sensitive routers in the actual loaded model.
 
         Policy/reference logprobs and training use this same model (reference
@@ -522,7 +522,7 @@ class MegatronPolicyWorkerImpl(
                     )
                 ):
                     raise ValueError(
-                        "CC execution padding requires dropless per-token MoE routing "
+                        "Forest execution padding requires dropless per-token MoE routing "
                         "without auxiliary losses or router-bias updates"
                     )
 

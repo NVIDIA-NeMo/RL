@@ -34,7 +34,7 @@ from tests.unit.experience.test_logical_owner_finalization import (
     finalize,
     gym_harness,
 )
-from tests.unit.single_controller.test_logical_advantage import _controller
+from tests.unit.single_controller.test_logical_advantage import _batch, _controller
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -95,6 +95,77 @@ def _loss_gradient(
     assert torch.isfinite(loss) and torch.isfinite(gradients).all()
     assert gradients.norm() > 1e-8, "zero gradients cannot establish conservation"
     return loss.detach(), gradients
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("filter_owner", [False, True])
+def test_packing_bins_preserve_forest_loss_accounting(
+    dp_size: int, filter_owner: bool
+) -> None:
+    """Real bin planner + row loss; packed attention requires the GPU gate."""
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 2), (3.0, 1)])], padding=True)
+    lengths = torch.tensor([3, 3, 2, 3, 2, 3])
+    data["token_mask"][lengths == 2, 2] = 0
+    if filter_owner:
+        data["mask_sample"][1] = True
+    ctrl = _controller(meta, data)
+    asyncio.run(ctrl._advantage_stage(meta))
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(10, 28).reshape(6, 3),
+            "input_lengths": lengths,
+            "generation_logprobs": torch.full((6, 3), -2.0),
+            "advantages": data["advantages"],
+            "token_mask": data["token_mask"],
+            "sample_mask": data["sample_mask"],
+            "row_index": torch.arange(6),
+        }
+    )
+    shards, _ = batch.shard_by_batch_size(
+        dp_size,
+        batch_size=6,
+        sequence_packing_args={
+            "algorithm": "modified_first_fit_decreasing",
+            "input_key": "input_ids",
+            "input_lengths_key": "input_lengths",
+            "sequence_length_pad_multiple": 1,
+            "max_tokens_per_microbatch": 8,
+        },
+    )
+    microbatches = [
+        mb
+        for shard in shards
+        for mb in shard.make_microbatch_iterator_for_packable_sequences()
+    ]
+    seen = []
+    for mb in microbatches:
+        indices = mb["row_index"]
+        seen.extend(indices.tolist())
+        for field in batch:
+            torch.testing.assert_close(mb[field], batch[field][indices])
+    assert sorted(seen) == list(range(6)), "packing must retain each row exactly once"
+    assert any(mb.size > 1 for mb in microbatches)
+    denominator = int(
+        (batch["token_mask"][:, 1:] * batch["sample_mask"][:, None]).sum()
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(11)
+        model = _CausalModel().double()
+    reference_loss, reference_grad = _loss_gradient(
+        model, batch, denominator=denominator
+    )
+    packed_loss, packed_grad = (
+        torch.zeros_like(reference_loss),
+        torch.zeros_like(reference_grad),
+    )
+    for mb in microbatches:
+        if not (mb["token_mask"][:, 1:] * mb["sample_mask"][:, None]).any():
+            continue
+        loss, grad = _loss_gradient(model, mb, denominator=denominator)
+        packed_loss += loss
+        packed_grad += grad
+    torch.testing.assert_close(packed_loss, reference_loss)
+    torch.testing.assert_close(packed_grad, reference_grad)
 
 
 @pytest.mark.parametrize(

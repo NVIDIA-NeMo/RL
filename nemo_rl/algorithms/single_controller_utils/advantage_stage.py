@@ -337,7 +337,9 @@ class AdvantageComputer:
             or cfg.algo.adv_estimator.name != "grpo"
             or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
         ):
-            raise ValueError("CC logical owners require the standard GRPO estimator")
+            raise ValueError(
+                "Forest logical owners require the standard GRPO estimator"
+            )
         input_fields = cfg.input_fields()
         if logical and adv_cfg.prompt_ids_field not in input_fields:
             input_fields.append(adv_cfg.prompt_ids_field)
@@ -363,7 +365,7 @@ class AdvantageComputer:
                 for group_id, tag in zip(group_ids, meta.tags, strict=True)
             ):
                 raise ValueError(
-                    "CC dispatch identity disagrees with the prompt-group tag"
+                    "Forest dispatch identity disagrees with the prompt-group tag"
                 )
         prompt_ids = group_index_column(group_ids)
         rewards = squeeze_trailing_unit_dim(
@@ -452,6 +454,8 @@ class AdvantageComputer:
                 .unique()
                 .numel()
             )
+            # Includes sequence-logprob filtering: one failing segment masks
+            # every row of its owner, not just that physical sequence.
             final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
@@ -501,7 +505,14 @@ class AdvantageComputer:
                 owner_advantages.shape != (len(rows), 1)
                 or not torch.isfinite(owner_advantages).all()
             ):
-                raise ValueError("GRPO must return one finite advantage per CC owner")
+                raise ValueError(
+                    "GRPO must return one finite advantage per Forest owner"
+                )
+            # Clip one value per rollout before fanout, preserving zero values
+            # for filtered owners and ownerless execution padding.
+            assert isinstance(cfg.algo, GRPOConfig)
+            owner_advantages = _clip_grpo_advantages(owner_advantages, cfg.algo)
+            owner_advantages = owner_advantages * owner_batch.valid_mask.unsqueeze(-1)
             advantages = (
                 owner_batch.fanout(owner_advantages[:, 0]).unsqueeze(-1).expand_as(mask)
             )
@@ -571,7 +582,7 @@ class AdvantageComputer:
         # OPD accumulates its statistics from the estimator output above. The
         # ordinary advantage metrics and policy training use the clipped values,
         # matching the legacy paths.
-        if not cfg.is_ppo:
+        if not cfg.is_ppo and owner_batch is None:
             assert isinstance(cfg.algo, GRPOConfig)
             advantages = _clip_grpo_advantages(advantages, cfg.algo)
             response_advantages = torch.masked_select(advantages, mask.bool())

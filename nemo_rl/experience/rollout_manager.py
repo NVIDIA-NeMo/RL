@@ -950,7 +950,7 @@ class AsyncNemoGymRolloutImpl:
         # Length-based reward shaping for low-effort prompts; None disables it.
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
-        context_compaction: bool = False,
+        forest_training: bool = False,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -962,7 +962,7 @@ class AsyncNemoGymRolloutImpl:
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._log_full_result_tables = log_full_result_tables
         self._reward_penalty_config = reward_penalty_config
-        self._context_compaction = context_compaction
+        self._forest_training = forest_training
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._deadline_registry = deadline_registry
         self._max_gym_row_attempts = (
@@ -1163,9 +1163,9 @@ class AsyncNemoGymRolloutImpl:
         env_timing_metrics: Optional[dict[str, Any]] = None
 
         options: dict[str, Any] = {"num_returns": "streaming"}
-        if self._context_compaction:
+        if self._forest_training:
             options["max_task_retries"] = 0
-        # Keep upstream telemetry dispatch while CC retries remain controller-owned.
+        # Preserve upstream telemetry dispatch; forest groups are single-attempt.
         async for result_ref in dispatch_with_trace_context(
             nemo_gym_env.run_rollouts.options(**options),
             pending,
@@ -1284,7 +1284,7 @@ class AsyncNemoGymRolloutImpl:
             last_error: Optional[Exception] = None
             max_row_attempts = (
                 1
-                if self._context_compaction
+                if self._forest_training
                 or recovery_granularity is RecoveryGranularity.PROMPT_GROUP
                 else self._max_gym_row_attempts
             )
@@ -1443,10 +1443,10 @@ class AsyncNemoGymRolloutImpl:
                 env_extras = dict(result["full_result"])
                 env_extras["ng_receipt"] = result["receipt"]
                 env_extras["ng_rollout_id"] = result["rollout_id"]
-                if self._context_compaction:
+                if self._forest_training:
                     if "logical_selection" not in result:
                         raise ValueError(
-                            "CC dispatch requires an ordered response selection for every owner"
+                            "Forest dispatch requires an ordered response selection for every owner"
                         )
                     env_extras["ng_logical_selection"] = result["logical_selection"]
                 env_extras["ng_reward_checks"] = result.get("reward_checks")
@@ -1502,7 +1502,7 @@ class AsyncNemoGymRolloutImpl:
             # Token-free receipts: token accounting comes from the manifest
             # (cum_len of the deepest chain; delta sums as the generation
             # proxy) instead of a message_log walk.
-            if self._context_compaction:
+            if self._forest_training:
                 manifests = [
                     [
                         record
@@ -1529,7 +1529,7 @@ class AsyncNemoGymRolloutImpl:
             turn_count = [len(m) for m in manifests]
             total_tokens = [
                 sum(entry.get("delta_len", 0) for entry in m)
-                if self._context_compaction
+                if self._forest_training
                 else max((entry.get("cum_len", 0) for entry in m), default=0)
                 for m in manifests
             ]
@@ -1673,7 +1673,7 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
-        context_compaction: bool = False,
+        forest_training: bool = False,
         execution_row_multiple: int = 1,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
@@ -1691,10 +1691,10 @@ class RolloutManager:
         # Shared with the impl's request deadlines so the controller can pause their clocks
         # while a colocated engine is in training mode.
         self._request_deadlines = RequestDeadlineRegistry()
-        self._context_compaction = context_compaction
+        self._forest_training = forest_training
         self._execution_row_multiple = execution_row_multiple
-        if context_compaction and not use_nemo_gym:
-            raise ValueError("context compaction requires the NeMo-Gym rollout path")
+        if forest_training and not use_nemo_gym:
+            raise ValueError("forest training requires the NeMo-Gym rollout path")
 
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
@@ -1727,7 +1727,7 @@ class RolloutManager:
             retry_policy=self._retry_policy,
             stats=self._stats,
             effort_config=effort_config,
-            context_compaction=context_compaction,
+            forest_training=forest_training,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
@@ -2203,11 +2203,11 @@ class RolloutManager:
             "generate_for_finalization requires tq_buffer to be set at __init__"
         )
         if (
-            self._context_compaction
+            self._forest_training
             and "loss_multiplier" in input_sample
             and input_sample["loss_multiplier"] != 1.0
         ):
-            raise ValueError("CC currently requires unit dataset loss_multiplier")
+            raise ValueError("Forest currently requires unit dataset loss_multiplier")
         owns_recovery_group = lineage_group_id is None
         recovery_group_id = lineage_group_id
         if recovery_group_id is None:
@@ -2242,7 +2242,7 @@ class RolloutManager:
                 )
             except Exception as error:
                 if (
-                    self._context_compaction
+                    self._forest_training
                     and classify_rollout_failure(error) is not FailureClass.INFRA
                 ):
                     raise
@@ -2250,10 +2250,10 @@ class RolloutManager:
                 if classify_rollout_failure(error) is FailureClass.INFRA:
                     infra_attempts += 1
                     last_infra_error = error
-                    # CC selections are request-local until checkpoint recovery
+                    # Forest selections are request-local until checkpoint recovery
                     # persists them. Drop this abandoned group through the usual
                     # bounded policy; do not redispatch and lose sealed selections.
-                    if self._context_compaction:
+                    if self._forest_training:
                         break
                     if infra_attempts >= policy.max_infra_attempts:
                         break
@@ -2340,9 +2340,9 @@ class RolloutManager:
             rollout_ids=list(rollout_ids),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
-        # CC does not retry or checkpoint; keep selected-response metadata in this request
+        # Forest does not retry or checkpoint; keep selected-response metadata in this request
         # while the existing ledger tracks sibling completion and publication.
-        cc_selections = {}
+        rollout_selections = {}
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -2355,16 +2355,18 @@ class RolloutManager:
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
-            if self._context_compaction:
+            if self._forest_training:
                 selection = env_extras.get("ng_logical_selection")
                 if not selection:
-                    raise ValueError("CC completion must contain selected responses")
+                    raise ValueError(
+                        "Forest completion must contain selected responses"
+                    )
                 if (
-                    generation_index in cc_selections
-                    and cc_selections[generation_index] != selection
+                    generation_index in rollout_selections
+                    and rollout_selections[generation_index] != selection
                 ):
-                    raise ValueError("conflicting duplicate CC completion")
-                cc_selections[generation_index] = selection
+                    raise ValueError("conflicting duplicate Forest completion")
+                rollout_selections[generation_index] = selection
             gate_rollout_id = env_extras.get("ng_rollout_id")
             if receipt is not None and not isinstance(receipt, dict):
                 raise ValueError(
@@ -2486,8 +2488,8 @@ class RolloutManager:
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
                 logical_selections=(
-                    tuple(cc_selections[i] for i in range(len(rollout_ids)))
-                    if self._context_compaction
+                    tuple(rollout_selections[i] for i in range(len(rollout_ids)))
+                    if self._forest_training
                     else None
                 ),
                 execution_row_multiple=self._execution_row_multiple,

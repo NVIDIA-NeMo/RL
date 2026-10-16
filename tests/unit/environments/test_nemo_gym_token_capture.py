@@ -30,7 +30,7 @@ pytestmark = pytest.mark.nemo_gym
 def _capture_env() -> NemoGym:
     env_cls = NemoGym.__ray_metadata__.modified_class
     env = object.__new__(env_cls)
-    env._context_compaction = False
+    env._forest_training = False
     return env
 
 
@@ -301,7 +301,7 @@ def test_the_terminal_manifest_read_drains_an_in_flight_call(
     import nemo_rl.environments.nemo_gym as env_module
 
     env = _capture_env()
-    env._context_compaction = compaction
+    env._forest_training = compaction
     pending = {
         "rollout_id": "r0",
         "records": [],
@@ -791,11 +791,13 @@ def test_public_postprocess_timeout_masks_without_taking_pending_write(
     assert keys == ["r0/c1"]
 
 
-def test_cc_failed_pending_was_already_masked() -> None:
+@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+def test_forest_failed_pending_was_already_masked(policy: str) -> None:
     from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 
     env = _capture_env()
-    env._context_compaction, env.cfg = True, {}
+    env._forest_training, env.cfg = True, {}
+    env._selection_policy = policy
     pending = {
         "rollout_id": "r0",
         "records": [],

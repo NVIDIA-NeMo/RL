@@ -23,7 +23,7 @@ from responses_api_agents.simple_agent_with_compaction.tests.test_client import 
 )
 
 from tests.unit.experience.test_cc_cpu_pipeline import pipeline  # noqa: F401
-from tests.unit.experience.test_cc_dispatch import _env
+from tests.unit.experience.test_forest_dispatch import _env
 from tests.unit.experience.test_logical_owner_finalization import gym_harness
 
 pytestmark = pytest.mark.nemo_gym

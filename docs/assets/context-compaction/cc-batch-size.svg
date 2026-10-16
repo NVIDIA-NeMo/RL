@@ -54,7 +54,7 @@ svg .ok{fill:var(--green);fill-opacity:.1;stroke:var(--green);stroke-width:1.5}<
 <rect class="gc" x="326" y="34" width="56" height="24" rx="4"/>
 <text class="mono" x="332" y="50">g2·r1</text>
 <text class="lbl" x="396" y="51">3 prompts × 2 generations = 6 rollouts = 6 rows = <tspan class="mono">train_global_batch_size</tspan></text>
-<text class="hdr" x="16" y="96">CC reconstruction: one rollout can produce several rows; the logical count is unchanged</text>
+<text class="hdr" x="16" y="96">Forest reconstruction: one rollout can produce several rows; the logical count is unchanged</text>
 <text class="cid" x="16" y="124">g0</text>
 <rect class="ga" x="50" y="108" width="56" height="24" rx="4"/>
 <text class="mono" x="56" y="124">r0·s0</text>

@@ -51,7 +51,7 @@ from tests.unit.experience.common_output_comparison import (
     selected_response_ids,
     selection_with_observed_metadata,
 )
-from tests.unit.experience.test_cc_dispatch import _env
+from tests.unit.experience.test_forest_dispatch import _env
 from tests.unit.experience.test_logical_owner_finalization import (
     PublicationDataPlane,
     decide_capture_input,

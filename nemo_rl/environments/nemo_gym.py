@@ -151,7 +151,7 @@ DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
 
 def _normalize_gym_validity(result: dict) -> dict:
-    """Project CC verifier masks into the existing downstream masking contract."""
+    """Project Forest verifier masks into the existing downstream masking contract."""
     normalized = dict(result)
     config = dict(result.get("instance_config") or {})
     config["mask_sample"] = bool(result.get("mask_sample") or config.get("mask_sample"))
@@ -661,11 +661,15 @@ class NemoGym(EnvironmentInterface):
             instrument_aiohttp_client()
         self.cfg = cfg
         capture_config = cfg.get("token_capture")
-        self._context_compaction = bool(
-            capture_config and capture_config.get("context_compaction")
+        self._forest_training = bool(
+            capture_config and capture_config.get("forest_training")
         )
-        if self._context_compaction and not capture_config.get("enabled"):
-            raise ValueError("context compaction requires external token capture")
+        if self._forest_training and not capture_config.get("enabled"):
+            raise ValueError("forest training requires external token capture")
+        # Setup passes the schema-resolved config; defaults live on that schema.
+        self._selection_policy = (
+            capture_config["selection_policy"] if self._forest_training else None
+        )
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -836,7 +840,7 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
                 "external_staging_backend": _external_staging_backend(token_capture),
-                "framework_owned_context": self._context_compaction,
+                "framework_owned_context": self._forest_training,
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
@@ -1082,7 +1086,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples,
             head_server_config=self.head_server_config,
-            **({"retry_requests": False} if self._context_compaction else {}),
+            **({"retry_requests": False} if self._forest_training else {}),
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
@@ -1110,7 +1114,7 @@ Depending on your data shape, you may want to change these values."""
                     raise
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                if self._context_compaction or self._token_capture_enabled:
+                if self._forest_training or self._token_capture_enabled:
                     # Receipt mode: fetch the ledger manifest and assemble the
                     # receipt locally; token-free result. The canonical row is
                     # rebuilt by the finalizer, so no message_log walk (and no
@@ -1183,7 +1187,7 @@ Depending on your data shape, you may want to change these values."""
         # Close before the first snapshot: an empty pending set alone does not
         # prevent a queued request from starting after finalization/cleanup.
         method, operation = (
-            ("POST", "close") if self._context_compaction else ("GET", "manifest")
+            ("POST", "close") if self._forest_training else ("GET", "manifest")
         )
         while True:
             manifest = await self._control(
@@ -1225,7 +1229,7 @@ Depending on your data shape, you may want to change these values."""
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
-        if self._context_compaction:
+        if self._forest_training:
             return await self._postprocess_captured_history(
                 nemo_gym_row, _normalize_gym_validity(nemo_gym_result)
             )
@@ -1265,8 +1269,9 @@ Depending on your data shape, you may want to change these values."""
         }
 
     async def _postprocess_captured_history(self, row: dict, result: dict) -> dict:
-        """Recover accepted chains from common output and shared capture evidence."""
+        """Select capture paths while retaining the scored terminal's identity."""
         # Optional Gym dependencies remain confined to the Gym adapter.
+        from nemo_gym.token_id_capture.staging import resolve_terminal
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
         from nemo_rl.environments.gym_selection import select_captured_calls
@@ -1294,9 +1299,34 @@ Depending on your data shape, you may want to change these values."""
         # the receipt: their writes may still arrive and must not be cleaned here.
         capture_failed = bool(parsed.pending_call_ids or parsed.failures)
         selected = []
+        terminal_response_id = None
         if not capture_failed:
             try:
-                selected = select_captured_calls(parsed.records, result)
+                if self._selection_policy == "all_captured":
+                    selected = list(parsed.records)
+                    # Admission/completion order cannot identify the scored call.
+                    # Reuse shared witness attribution, without graph fallback.
+                    attribution = resolve_terminal(
+                        selected,
+                        result.get("response"),
+                        declared_response_id=result.get("terminal_response_id"),
+                    )
+                    if not attribution.attributed:
+                        raise ValueError(
+                            "all_captured requires an identifiable scored terminal: "
+                            + attribution.reason
+                        )
+                    terminal_response_id = next(
+                        record.response_id
+                        for record in selected
+                        if record.model_call_id == attribution.model_call_id
+                    )
+                elif self._selection_policy == "returned_history":
+                    selected = select_captured_calls(parsed.records, result)
+                else:
+                    raise ValueError(
+                        f"Unknown selection policy: {self._selection_policy}"
+                    )
             except ValueError as error:
                 raise ValueError(f"Rollout {owner!r}: {error}") from error
         if any(
@@ -1314,8 +1344,7 @@ Depending on your data shape, you may want to change these values."""
             r.finish_reason in ("length", "max_tokens", "max_output_tokens")
             for r in selected
         )
-        terminal_response_id = None
-        if selected:
+        if selected and terminal_response_id is None:
             terminal_response_id = result.get("terminal_response_id") or (
                 result.get("response") or {}
             ).get("id")

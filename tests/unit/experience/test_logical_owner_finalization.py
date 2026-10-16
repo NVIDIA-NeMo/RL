@@ -377,7 +377,8 @@ def test_gym_adapter_returns_one_real_receipt_and_rl_selection(monkeypatch, tmp_
     )
     captured = capture_segment(harness, "attempt", child=True)
     env = object.__new__(NemoGym.__ray_metadata__.modified_class)
-    env._context_compaction = True
+    env._forest_training = True
+    env._selection_policy = "returned_history"
     env.cfg = {}
 
     async def control(method, path):
@@ -534,7 +535,7 @@ def test_existing_detectors_mask_only_selected_generation_spans(monkeypatch, tmp
     from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
     from nemo_rl.experience.rollout_reassembler import RolloutReassembler
     from nemo_rl.experience.rollout_reassembler_actor import assert_metadata_only
-    from tests.unit.experience.test_cc_dispatch import _env
+    from tests.unit.experience.test_forest_dispatch import _env
 
     plane = PublicationDataPlane()
     source = TQTokenSource(plane, staging_partition="staged")

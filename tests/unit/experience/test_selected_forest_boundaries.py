@@ -5,6 +5,7 @@
 Strict xfails document deferred provider shapes, not required forest behavior.
 """
 
+import asyncio
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
@@ -27,6 +28,7 @@ from nemo_rl.experience.rollout_reassembler import (
 )
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.capture_context import decide_capture_input
+from tests.unit.experience.test_forest_dispatch import _env
 from tests.unit.experience.test_logical_owner_finalization import PublicationDataPlane
 
 pytestmark = pytest.mark.nemo_gym
@@ -135,6 +137,137 @@ def assert_loss_once(forest: ForestCapture, selected: list, all_records: list) -
     assert counts == expected
 
 
+@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+@pytest.mark.parametrize("reverse_manifest", [False, True])
+def test_selection_policy_reuses_forest_publication(forest, policy, reverse_manifest):
+    # A -> abandoned B; A -> scored C; independent D -> E.
+    records, replies = forest.capture([None, 0, 0, None, 3])
+    accepted = [records[i] for i in (0, 2, 3, 4)]
+    env = _env(forest.harness)
+    env._selection_policy = policy
+    original = env._drained_manifest
+
+    async def drained(owner):
+        manifest = await original(owner)
+        if reverse_manifest:
+            manifest["records"].reverse()
+        return manifest
+
+    env._drained_manifest = drained
+    output = ordinary([replies[i] for i in (0, 2, 3, 4)], terminal=replies[2]["id"])
+    output["reward"] = 1.0
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, output)
+    )
+    assert processed["receipt"]["terminal_model_call_id"] == records[2].model_call_id
+    selected = records if policy == "all_captured" else accepted
+    assert set(processed["logical_selection"].response_ids) == {
+        r.response_id for r in selected
+    }
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [processed["receipt"]],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[processed["logical_selection"]],
+    )
+    assert result.meta is not None
+    assert_loss_once(forest, selected, records)
+
+
+def test_all_captured_does_not_require_returned_execution_history(forest):
+    records, replies = forest.capture([None, 0, None])
+    env = _env(forest.harness)
+    env._selection_policy = "all_captured"
+    # Explicit scored identity suffices; no output history is supplied.
+    result = {"terminal_response_id": replies[1]["id"], "reward": 1.0}
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+    )
+    assert set(processed["logical_selection"].response_ids) == {
+        r.response_id for r in records
+    }
+    assert processed["receipt"]["terminal_model_call_id"] == records[1].model_call_id
+
+
+@pytest.mark.parametrize("response_id", [None, "exporter-local-response"])
+@pytest.mark.parametrize("cumulative", [False, True])
+@pytest.mark.parametrize("unique_output", [False, True])
+def test_all_captured_attributes_exported_content(
+    forest, monkeypatch, response_id, cumulative, unique_output
+):
+    # The scored conversation ends before an independent worker completes.
+    # Exporter-local identities must not force selection of that later leaf.
+    if unique_output:
+        worker = gym.NeMoGymAsyncOpenAI.create_chat_completion
+
+        async def distinct_worker(client, **body):
+            payload = await worker(client, **body)
+            payload["choices"][0]["message"]["content"] += payload["id"]
+            return payload
+
+        monkeypatch.setattr(
+            gym.NeMoGymAsyncOpenAI, "create_chat_completion", distinct_worker
+        )
+    records, replies = forest.capture([None, 0, None])
+    env = _env(forest.harness)
+    env._selection_policy = "all_captured"
+    result = ordinary(replies[:2] if cumulative else [replies[1]])
+    result["response"]["id"] = response_id
+    result["response"]["output"] = [
+        {**item, "id": f"exporter-local-item-{index}"}
+        for index, item in enumerate(result["response"]["output"])
+    ]
+    result["reward"] = 1.0
+    if not cumulative and not unique_output:
+        # This fixture otherwise returns the same "answer" on every call.
+        # Its final text alone cannot identify which call was scored.
+        with pytest.raises(ValueError, match="content_ambiguous"):
+            asyncio.run(
+                env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+            )
+        assert not any(partition == "canonical" for partition, _ in forest.plane.rows)
+        return
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+    )
+    assert processed["receipt"]["terminal_model_call_id"] == records[1].model_call_id
+    assert set(processed["logical_selection"].response_ids) == {
+        record.response_id for record in records
+    }
+    finalized = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [processed["receipt"]],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[processed["logical_selection"]],
+    )
+    assert finalized.valid_row_count == 2
+    assert_loss_once(forest, records, records)
+
+
+@pytest.mark.parametrize("contradictory", [False, True])
+def test_all_captured_never_guesses_scored_terminal(forest, contradictory):
+    records, replies = forest.capture([None, None])
+    env = _env(forest.harness)
+    env._selection_policy = "all_captured"
+    result = {"reward": 1.0}
+    if contradictory:
+        result.update(response=replies[0], terminal_response_id=replies[1]["id"])
+    with pytest.raises(ValueError, match="identifiable scored terminal"):
+        asyncio.run(
+            env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+        )
+
+
 @pytest.mark.parametrize("compact", [False, True])
 def test_twenty_calls_keep_baseline_rows(forest: ForestCapture, compact: bool) -> None:
     parents = [None] + list(range(19))
@@ -233,7 +366,7 @@ def test_shared_forest_loss_and_gradient_match_independent_calls(
             "attempt",
             receipt([records[i] for i in indices], terminal=records[indices[-1]]),
             reward=1.0,
-            context_compaction=True,
+            forest_training=True,
         )
         for indices in ([0], [0, 1], [0, 2])
     ]
@@ -331,7 +464,7 @@ def test_shared_paths_need_loss_ownership_beyond_planning(
             "attempt",
             row_receipt,
             reward=1.0,
-            context_compaction=True,
+            forest_training=True,
             action_flags=flags,
         )
         assert row.valid

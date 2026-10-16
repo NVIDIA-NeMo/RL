@@ -24,7 +24,7 @@ This module provides different advantage estimation strategies:
 
 Every group-relative estimator (GRPO, GDPO, Reinforce++) accepts ``valid_mask``
 and must honor it: masked rollouts do not contribute to group baselines.
-CC deduplicates segments before estimation so each logical rollout contributes
+Forest deduplicates segments before estimation so each logical rollout contributes
 at most one reward, using the same validity rule as ordinary rollouts.
 
 Reference papers:

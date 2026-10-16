@@ -107,7 +107,7 @@ class FinalizedRollout:
     # the executed route plan; None when the rollout staged no routes.
     routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
-    # Selected chain already proven by Gym; CC compares it to agent selection.
+    # Gym validates the receipt chain; RL validates selected-call membership.
     model_call_ids: tuple[str, ...] = ()
     media: Optional[dict[str, PackedTensor]] = None
     penalty_counts: dict[str, int] = field(default_factory=dict)
@@ -144,7 +144,7 @@ class SegmentReceipt:
     capture_rollout_id: str
     receipt: Optional[dict[str, Any]]
     selected_response_ids: tuple[str, ...]
-    # Optional for ordinary slice callers; CC dispatch supplies semantic stops.
+    # Optional for ordinary slice callers; Forest dispatch supplies semantic stops.
     truncated: bool = False
     # Image columns occupy the selected terminal's existing staging key.
     action_flags: tuple[ActionOutputFlags, ...] | None = None
@@ -329,7 +329,7 @@ class RolloutReassembler:
         receipt: Optional[dict[str, Any]],
         *,
         reward: float,
-        context_compaction: bool = False,
+        forest_training: bool = False,
         action_flags: tuple[ActionOutputFlags, ...] | None = None,
         loss_excluded_call_ids: frozenset[str] = frozenset(),
         reward_checks: RewardChecks | None = None,
@@ -388,7 +388,7 @@ class RolloutReassembler:
 
         fetch_fragments = (
             self._router_replay_enabled and not self._defer_routed_experts_to_policy
-        ) or (self._capture_media and context_compaction)
+        ) or (self._capture_media and forest_training)
         try:
             fetched = self._source.fetch_for_finalization(
                 staging_keys, include_route_fragments=fetch_fragments
@@ -426,9 +426,9 @@ class RolloutReassembler:
             return rejected(f"rebuild_failed:{error}", staging_keys)
         penalty_counts: dict[str, int] = {}
         reward_metrics: dict[str, float] = {}
-        # CC applies shaping once, using the scored call rather than an arbitrary
+        # Forest applies shaping once, using the scored call rather than an arbitrary
         # graph endpoint. Other segments retain the same logical rollout reward.
-        if not context_compaction or reward_call_id is not None:
+        if not forest_training or reward_call_id is not None:
             reward_spans = row.link_spans
             if reward_call_id is not None:
                 call_ids = [span[0] for span in reward_spans]
@@ -453,7 +453,7 @@ class RolloutReassembler:
         # terminal-chain calls carry pixels; one batched read pulls them,
         # after token verification so a rejected rollout never moves pixels.
         media, media_failure = self._resolve_media(
-            row, fetched_by_call, verify_occurrences=context_compaction
+            row, fetched_by_call, verify_occurrences=forest_training
         )
         if media_failure is not None:
             return rejected(media_failure, staging_keys)
@@ -483,7 +483,7 @@ class RolloutReassembler:
                 expected_routed_len = record.delta_len + boundary_route_rows(
                     record.prev_len
                 )
-                if context_compaction and item.routed_len == 0:
+                if forest_training and item.routed_len == 0:
                     return rejected("route_assembly:missing_fragment", staging_keys)
                 if item.routed_len not in (0, expected_routed_len):
                     return rejected(f"routed_len_mismatch:{call_id}", staging_keys)
@@ -734,9 +734,9 @@ class RolloutReassembler:
         if type(execution_row_multiple) is not int or execution_row_multiple < 1:
             raise ValueError("execution_row_multiple must be a positive integer")
         if logical_selections is None and execution_row_multiple != 1:
-            raise ValueError("execution row padding requires logical CC segments")
+            raise ValueError("execution row padding requires logical Forest segments")
         if logical_selections is not None and loss_multiplier != 1.0:
-            raise ValueError("CC currently requires unit dataset loss_multiplier")
+            raise ValueError("Forest currently requires unit dataset loss_multiplier")
         _group_t0 = time.perf_counter()
         logical = None
         if logical_selections is None:
@@ -954,7 +954,7 @@ class RolloutReassembler:
         canonical_sample_ids: list[str],
         loss_multiplier: float,
     ) -> FinalizedGroup:
-        """Shared ordinary/CC tensorization, single publication, and cleanup."""
+        """Shared ordinary/Forest tensorization, single publication, and cleanup."""
         valid_rows = [row for row in rows if row.valid]
         real_row_count = len(rows)
         if logical is not None:
@@ -968,7 +968,7 @@ class RolloutReassembler:
                     staging_keys=[],
                     metrics=metrics,
                     dropped=True,
-                    drop_reason="CC group has no verified input layout for dummy rows",
+                    drop_reason="Forest group has no verified input layout for dummy rows",
                 )
             padding_count = (-real_row_count) % execution_row_multiple
             dummy_layout = valid_rows[0]
@@ -1033,7 +1033,7 @@ class RolloutReassembler:
         if logical is None:
             prompt_ids_for_adv = torch.tensor([sibling_prompt] * n, dtype=torch.int64)
         else:
-            # Original per-owner prompts, never a later compacted segment prompt.
+            # Original per-owner prompts, never a later segment prompt.
             prompt_ids_for_adv = torch.nested.as_nested_tensor(
                 [
                     torch.tensor(prompt, dtype=torch.int64)
@@ -1428,7 +1428,7 @@ class RolloutReassembler:
                     expected_id,
                     segment.receipt,
                     reward=reward,
-                    context_compaction=True,
+                    forest_training=True,
                     action_flags=segment.action_flags,
                     loss_excluded_call_ids=frozenset(owner_records),
                     reward_checks=reward_checks[slot],
@@ -1520,7 +1520,7 @@ class RolloutReassembler:
                     segments[0].capture_rollout_id,
                     root_receipt.model_dump(),
                     reward=reward,
-                    context_compaction=True,
+                    forest_training=True,
                 )
                 if not root.valid:
                     raise ValueError(

@@ -2,7 +2,7 @@
 <!-- Adapted from https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-dropped-group.html
      Behavior checked against NVIDIA-NeMo/RL e81d5438148683a663dc405d301ed078c18abc7e and NVIDIA-NeMo/Gym b27e0db8faefee7e4760b5b1bfbfed713f528360.
      Editable SVG source; examples are illustrative, not measurements. -->
-<title id="title">Native recency policy: scheduling, guards and failure outcomes</title><desc id="desc">The native client prepares context, measures enabled guards, and may close a chunk and remeasure. An uncaught guard rejection currently drops a group and stops CC training. This is not a universal harness policy.</desc>
+<title id="title">Native recency policy: scheduling, guards and failure outcomes</title><desc id="desc">The native client prepares context, measures enabled guards, and may close a chunk and remeasure. An uncaught guard rejection currently drops a group and stops forest training. This is not a universal harness policy.</desc>
 <style>:root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2128;--border:#30363d;--text:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--orange:#d29922;--red:#f85149;--purple:#bc8cff;}
 svg .box{fill:var(--surface);stroke:var(--border);stroke-width:1.3}
 svg .ok{fill:var(--green);fill-opacity:.12;stroke:var(--green);stroke-width:1.5}
@@ -83,6 +83,6 @@ svg a text{text-decoration:underline;fill:var(--accent);font:11px ui-monospace,M
   <text class="note" x="16" y="490">Recency removal can be insufficient: retained text, tool outputs or user messages can still exceed the budget.</text>
   <text class="note" x="16" y="508">Early retry requires a closable turn-chunked schedule; otherwise the guard rejects immediately.</text>
   <text class="note" x="16" y="526">Other harnesses own their policies, including summarization; they must preserve accepted output and use supported capture.</text>
-  <text class="note" x="16" y="546">Current behavior: no CC group redispatch or partial step. Proposed recovery fixes are not shown as implemented.</text></g>
+  <text class="note" x="16" y="546">Current behavior: no forest group redispatch or partial step. Proposed recovery fixes are not shown as implemented.</text></g>
 <text x="16" y="636" fill="#8b949e" font-family="Arial, sans-serif" font-size="10">Adapted from Terry Kong’s PR #4124 review figures; updated for the current context-compaction implementation.</text>
 </svg>

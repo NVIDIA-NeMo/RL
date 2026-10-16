@@ -1558,7 +1558,7 @@ def test_shared_image_ancestry_keeps_pixels_and_routes_but_owns_loss_once(dp, ro
     assembler = finalizer(dp, router_replay_enabled=routes)
     reference = [
         assembler.finalize_rollout(
-            "r0", receipt(root, leaf), reward=1.0, context_compaction=True
+            "r0", receipt(root, leaf), reward=1.0, forest_training=True
         )
         for leaf in (left, right)
     ]
@@ -1648,7 +1648,9 @@ def test_non_gym_adapter_selects_calls_without_defining_segments(dp):
 
 @pytest.mark.parametrize("routes", [False, True])
 @pytest.mark.parametrize("damage", ["geometry", "presence", "extras"])
-def test_cc_authenticates_media_layout_even_without_route_replay(dp, routes, damage):
+def test_forest_authenticates_media_layout_even_without_route_replay(
+    dp, routes, damage
+):
     from nemo_rl.data_plane.tq_token_sink import ROUTED_EXTRAS_METADATA_FIELD
 
     root, _ = stage(
@@ -1667,7 +1669,7 @@ def test_cc_authenticates_media_layout_even_without_route_replay(dp, routes, dam
         )
     # Routes may be captured even when learner replay is disabled.
     row = finalizer(dp).finalize_rollout(
-        "r0", receipt(root), reward=1, context_compaction=True
+        "r0", receipt(root), reward=1, forest_training=True
     )
     assert not row.valid, damage
     assert row.rejection_reason.startswith(
@@ -1680,7 +1682,7 @@ def test_cc_authenticates_media_layout_even_without_route_replay(dp, routes, dam
 @pytest.mark.parametrize(
     "damage", ["missing", "output_span", "overlap", "token", "frames"]
 )
-def test_cc_rejects_invalid_committed_media_occurrences(dp, monkeypatch, damage):
+def test_forest_rejects_invalid_committed_media_occurrences(dp, monkeypatch, damage):
     extract = VLLMCaptureAdapter.extract_extras
 
     def corrupt(self, payload):
@@ -1704,7 +1706,7 @@ def test_cc_rejects_invalid_committed_media_occurrences(dp, monkeypatch, damage)
         dp, engine_prompt([10, 18, 18, 11], [(Span(1, 2), torch.ones(3, 2, 3))])
     )
     row = finalizer(dp).finalize_rollout(
-        "r0", receipt(root), reward=1, context_compaction=True
+        "r0", receipt(root), reward=1, forest_training=True
     )
     assert not row.valid
     assert row.rejection_reason.startswith("invalid_media_evidence:")
@@ -1813,7 +1815,7 @@ def test_bad_media_masks_all_segments_of_owner_and_keeps_healthy_sibling(dp, dam
     assert not dp.list_sample_ids("staging")
 
 
-def test_cc_rejects_shape_valid_video_frame_partition_change(dp):
+def test_forest_rejects_shape_valid_video_frame_partition_change(dp):
     root, _ = stage(
         dp,
         video_prompt(
@@ -1826,7 +1828,7 @@ def test_cc_rejects_shape_valid_video_frame_partition_change(dp):
     stored = dp._partitions["staging"].rows[root.staging_key]
     stored[MEDIA_NUM_FRAMES_FIELD] = torch.tensor([2, 2], dtype=torch.int32)
     row = finalizer(dp).finalize_rollout(
-        "r0", receipt(root), reward=1, context_compaction=True
+        "r0", receipt(root), reward=1, forest_training=True
     )
     assert not row.valid
     assert "frame counts disagree" in row.rejection_reason

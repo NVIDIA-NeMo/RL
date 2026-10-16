@@ -70,7 +70,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
-    cc_execution_row_multiple,
+    forest_execution_row_multiple,
     is_ppo_run,
     validate_single_controller_config,
 )
@@ -335,7 +335,7 @@ def _register_single_controller_partitions(
 
         partition_fields = fields_with_optional_routed_experts(
             SC_ROLLOUT_SCHEMA_FIELDS
-            if token_capture_cfg.context_compaction
+            if token_capture_cfg.forest_training
             else DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
@@ -1346,8 +1346,8 @@ def setup_single_controller(
     # ==========================
     checkpointer = CheckpointManager(master_config.checkpointing)
     trainer_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    if token_capture_cfg.context_compaction and trainer_checkpoint_path is not None:
-        raise ValueError("CC checkpoint/resume is not supported initially")
+    if token_capture_cfg.forest_training and trainer_checkpoint_path is not None:
+        raise ValueError("Forest checkpoint/resume is not supported initially")
     loaded_state = cast(
         Optional[dict[str, Any]],
         checkpointer.load_training_info(trainer_checkpoint_path),
@@ -2063,12 +2063,12 @@ def setup_single_controller(
             advantage_estimator,
             num_workers=master_config.async_rl.num_advantage_workers,
         )
-    if token_capture_cfg.context_compaction:
+    if token_capture_cfg.forest_training:
         # Padding or borrowed inputs may appear in any step. Validate the loaded
         # model before admitting rollouts, even if the first batch needs neither.
         ray.get(
             trainer.worker_group.run_all_workers_single_data(
-                "validate_cc_execution_padding"
+                "validate_forest_execution_padding"
             )
         )
     rollout_manager = RolloutManager(
@@ -2094,9 +2094,9 @@ def setup_single_controller(
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
-        context_compaction=token_capture_cfg.context_compaction,
+        forest_training=token_capture_cfg.forest_training,
         execution_row_multiple=(
-            cc_execution_row_multiple(
+            forest_execution_row_multiple(
                 trainer.cfg,
                 dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
                 logprobs_required=(
@@ -2110,7 +2110,7 @@ def setup_single_controller(
                     )
                 ),
             )
-            if token_capture_cfg.context_compaction
+            if token_capture_cfg.forest_training
             else 1
         ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),

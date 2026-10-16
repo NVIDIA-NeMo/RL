@@ -118,7 +118,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
     is_ppo_run,
-    validate_cc_objective,
+    validate_forest_objective,
 )
 from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
     has_logical_owners,
@@ -2929,7 +2929,7 @@ class SingleControllerActor:
         policy_training_start_step = (
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
         )
-        context_compaction = self._master_config.token_capture.context_compaction
+        forest_training = self._master_config.token_capture.forest_training
         selection_kwargs = self._streaming_ppo_selection_kwargs()
 
         while self._train_steps < self._algo_cfg.max_num_steps:
@@ -3116,7 +3116,7 @@ class SingleControllerActor:
                         consumed_metas.append(train_meta)
                         consumed_training_claim_ids.extend(selected_training_claim_ids)
                         consumed_group_count += num_groups
-                        if context_compaction:
+                        if forest_training:
                             if (
                                 not has_logical_owners(train_meta)
                                 or len(train_meta.tags or []) != train_meta.size
@@ -3128,7 +3128,7 @@ class SingleControllerActor:
                                 )
                             ):
                                 raise ValueError(
-                                    "CC optimizer batch requires logical rows with padding flags, borrowed-input flags, and integer generation versions"
+                                    "Forest optimizer batch requires logical rows with padding flags, borrowed-input flags, and integer generation versions"
                                 )
 
                         for group_id in selected_group_ids:
@@ -3266,7 +3266,7 @@ class SingleControllerActor:
                             train_meta,
                             has_valid_training_tokens,
                         ) = await self._advantage_stage(train_meta)
-                    if context_compaction:
+                    if forest_training:
                         # The advantage stage has verified every owner/segment.
                         # Count those owners, not the physical rows or sampler tally.
                         assert train_meta.tags is not None
@@ -3282,7 +3282,7 @@ class SingleControllerActor:
                             or logical_owners.intersection(chunk_owners)
                         ):
                             raise ValueError(
-                                "CC sampler chunk must contain new, complete logical groups"
+                                "Forest sampler chunk must contain new, complete logical groups"
                             )
                         logical_owners.update(chunk_owners)
 
@@ -3581,13 +3581,13 @@ class SingleControllerActor:
                             num_epochs=self._critic_ppo_epochs,
                         )
                 else:
-                    if context_compaction and (
+                    if forest_training and (
                         groups_dispatched != self._algo_cfg.num_prompts_per_step
                         or len(logical_owners)
                         != self._master_config.policy["train_global_batch_size"]
                     ):
                         raise ValueError(
-                            "CC optimizer step requires the full logical sample count"
+                            "Forest optimizer step requires the full logical sample count"
                         )
                     if not step_open:
                         raise RuntimeError(
@@ -5683,9 +5683,9 @@ class SingleControllerActor:
                 or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
             ):
                 raise ValueError(
-                    "CC logical owners require the standard GRPO estimator"
+                    "Forest logical owners require the standard GRPO estimator"
                 )
-            validate_cc_objective(self._algo_cfg, self._master_config.loss_fn)
+            validate_forest_objective(self._algo_cfg, self._master_config.loss_fn)
         if self._advantage_estimator is None:
             return meta, True
 

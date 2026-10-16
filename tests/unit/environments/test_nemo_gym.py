@@ -112,7 +112,7 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
             rch = _RolloutCollectionHelper()
             head_server_config = object()
             _token_capture_enabled = False
-            _context_compaction = False
+            _forest_training = False
             _tokenizer = object()
             # run_rollouts is a thin span-opening wrapper that delegates the
             # streaming to _stream_rollouts, so the mock has to supply the real
@@ -1817,7 +1817,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             # streaming to _stream_rollouts, so the mock has to supply the real
             # one for the generator below to produce anything.
             _stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
-            _context_compaction = False
+            _forest_training = False
 
             def _require_spinup(self):
                 pass
@@ -1944,7 +1944,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             _tokenizer = _Tokenizer()
             _processor = None
             _token_capture_enabled = False
-            _context_compaction = False
+            _forest_training = False
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.
             _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result

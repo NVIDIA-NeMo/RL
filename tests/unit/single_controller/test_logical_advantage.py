@@ -34,7 +34,11 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
     AdvantageStageConfig,
 )
-from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AdvantageConfig,
+    TokenCaptureConfig,
+    validate_forest_objective,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from tests.unit.single_controller.test_advantage_stage import _InlineActor, _RowStore
@@ -112,7 +116,20 @@ def _batch(
     return KVBatchMeta("train", "train", ids, fields=list(data.keys()), tags=tags), data
 
 
-def _controller(meta, data, *, grpo=None, loss=None):
+@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+def test_forest_selection_config(policy):
+    config = TokenCaptureConfig(forest_training=True, selection_policy=policy)
+    assert config.selection_policy == policy
+    assert TokenCaptureConfig().selection_policy == "returned_history"
+    with pytest.raises(ValueError, match="requires forest_training"):
+        TokenCaptureConfig(selection_policy="all_captured")
+    with pytest.raises(ValueError, match="selection_policy"):
+        TokenCaptureConfig(forest_training=True, selection_policy="guess")
+
+
+def _controller(
+    meta, data, *, grpo=None, loss=None, policy_logprobs_required: bool = False
+):
     settings = dict(
         num_generations_per_prompt=2,
         adv_estimator=AdvEstimatorConfig(
@@ -138,7 +155,7 @@ def _controller(meta, data, *, grpo=None, loss=None):
     )
     ctrl._algo_cfg = config
     ctrl._master_config = SimpleNamespace(loss_fn=ClippedPGLossConfig(**(loss or {})))
-    ctrl._policy_logprobs_required = False
+    ctrl._policy_logprobs_required = policy_logprobs_required
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
@@ -151,7 +168,7 @@ def _controller(meta, data, *, grpo=None, loss=None):
         advantage=ctrl._advantage_cfg,
         algo=config,
         is_ppo=False,
-        policy_logprobs_required=False,
+        policy_logprobs_required=policy_logprobs_required,
         reference_logprobs_required=False,
         teacher_logprobs_required=False,
         message_level_advantage_penalties_enabled=ctrl._message_level_advantage_penalties_enabled,
@@ -169,6 +186,76 @@ def _controller(meta, data, *, grpo=None, loss=None):
     ctrl._opd_stat_sum = ctrl._opd_stat_sumsq = ctrl._opd_gap_sum = 0.0
     ctrl._opd_stat_count = 0
     return ctrl
+
+
+@pytest.mark.parametrize("threshold", [None, 2.0])
+@pytest.mark.parametrize("bad_rows", [[], [1], [0, 1, 2, 3]])
+@pytest.mark.parametrize("reorder", [False, True])
+def test_logprob_error_masks_whole_owner(
+    threshold: float | None, bad_rows: list[int], reorder: bool
+) -> None:
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1), (3.0, 1)])], padding=True)
+    data["prev_logprobs"] = torch.zeros(5, 3)
+    data["generation_logprobs"] = torch.zeros(5, 3)
+    data["generation_logprobs"][bad_rows, 2] = -5.0
+    # Neither replayed context nor ownerless padding may trigger filtering.
+    data["token_mask"][0, 1] = 0
+    data["generation_logprobs"][0, 1] = -1000.0
+    data["generation_logprobs"][-1] = -1000.0
+    if reorder:
+        order = [4, 2, 1, 3, 0]
+        meta, data = meta.subset(order), data[order]
+    ctrl = _controller(
+        meta,
+        data,
+        grpo={"seq_logprob_error_threshold": threshold},
+        policy_logprobs_required=True,
+    )
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    rejected = set() if threshold is None else ({0} if bad_rows == [1] else set())
+    if threshold is not None and len(bad_rows) == 4:
+        rejected = {0, 1, 2}
+    retained = [slot for slot in range(3) if slot not in rejected]
+    rewards = torch.tensor([0.0, 1.0, 3.0])
+    baseline = rewards[retained].mean() if retained else 0.0
+    for row, tag in enumerate(meta.tags):
+        slot = tag["logical_slot"]
+        keep = slot is not None and slot in retained
+        assert data["sample_mask"][row].item() == float(keep)
+        expected = float(rewards[slot] - baseline) if keep else 0.0
+        torch.testing.assert_close(data["advantages"][row], torch.full((3,), expected))
+    assert valid == bool(retained)
+    assert ctrl._step_log_dict["reward_partials"][0].weight == len(retained)
+
+
+@pytest.mark.parametrize("bounds", [(-0.2, 0.3), (0.2, 0.4), (-0.4, -0.2)])
+@pytest.mark.parametrize("reorder", [False, True])
+def test_clips_owner_advantages_once_without_activating_padding(bounds, reorder):
+    meta, data = _batch([("a", [(0.0, 3), (1.0, 1)])], padding=True)
+    if reorder:
+        order = [4, 3, 1, 0, 2]
+        meta, data = meta.subset(order), data[order]
+    grpo = dict(advantage_clip_low=bounds[0], advantage_clip_high=bounds[1])
+    validate_forest_objective(GRPOConfig(**grpo), ClippedPGLossConfig())
+    ctrl = _controller(meta, data, grpo=grpo)
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    expected = torch.tensor([-0.5, 0.5]).clamp(*bounds)
+    for i, tag in enumerate(meta.tags):
+        value = 0.0 if tag["is_execution_padding"] else expected[tag["logical_slot"]]
+        torch.testing.assert_close(
+            data["advantages"][i], torch.full((3,), float(value))
+        )
+    assert ctrl._step_log_dict["reward_partials"][0].weight == 2
+
+
+def test_clipping_does_not_reactivate_filtered_logical_owners():
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True)
+    data["mask_sample"][0] = True
+    ctrl = _controller(meta, data, grpo={"advantage_clip_low": 0.2})
+    asyncio.run(ctrl._advantage_stage(meta))
+    assert data["advantages"][[0, 1, 3]].count_nonzero() == 0
+    assert data["sample_mask"].tolist() == [0, 0, 1, 0]
 
 
 @pytest.mark.parametrize("reorder", [False, True])
@@ -270,7 +357,7 @@ def test_dispatch_identity_must_match_sharding_identity() -> None:
     for tag in meta.tags:
         tag[GROUP_ID_TAG] = "foreign"
     ctrl = _controller(meta, data)
-    with pytest.raises(ValueError, match="CC dispatch identity"):
+    with pytest.raises(ValueError, match="Forest dispatch identity"):
         asyncio.run(ctrl._advantage_stage(meta))
     assert not ctrl._dp_client.puts
 
@@ -539,7 +626,7 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
     elif bad_case == "padding_only":
         meta, data = meta.subset([3]), data[[3]]
     ctrl = _controller(meta, data)
-    with pytest.raises(ValueError, match="CC"):
+    with pytest.raises(ValueError, match="Forest"):
         asyncio.run(ctrl._advantage_stage(meta))
     assert not ctrl._dp_client.puts
 
@@ -548,8 +635,6 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
     "grpo,loss",
     [
         ({"adv_estimator": {"name": "gdpo"}}, {}),
-        ({"advantage_clip_low": -1}, {}),
-        ({"seq_logprob_error_threshold": 2}, {}),
         ({"use_dynamic_sampling": True}, {}),
         ({"reward_scaling": {"enabled": True}}, {}),
         ({"reward_shaping": {"enabled": True}}, {}),
@@ -563,9 +648,9 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
         ({}, {"positive_example_nll_weight": 1}),
     ],
 )
-def test_unsupported_cc_estimator_or_objective_is_rejected(grpo, loss):
+def test_unsupported_forest_estimator_or_objective_is_rejected(grpo, loss):
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])])
     ctrl = _controller(meta, data, grpo=grpo, loss=loss)
-    with pytest.raises(ValueError, match="CC"):
+    with pytest.raises(ValueError, match="Forest"):
         asyncio.run(ctrl._advantage_stage(meta))
     assert not ctrl._dp_client.puts

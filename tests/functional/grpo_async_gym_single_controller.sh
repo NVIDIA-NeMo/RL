@@ -59,7 +59,7 @@ if [[ "${SC_TEST_CONTEXT_COMPACTION:-0}" == "1" ]]; then
     DATA_FILTER='del(.task_source) | .agent_ref = {type: "responses_api_agents", name: "simple_agent_with_compaction"}'
     CC_OVERRIDES=(
         ++token_capture.enabled=true
-        ++token_capture.context_compaction=true
+        ++token_capture.forest_training=true
         ++async_rl.rollout_failure.min_step_batch_fraction=1
         policy.sequence_packing.enabled=false
         policy.dynamic_batching.enabled=false
