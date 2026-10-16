@@ -81,6 +81,7 @@ from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
+    finalize_draft_ratio_metrics,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_performance_metrics,
@@ -1253,6 +1254,7 @@ def grpo_train_sync(
                         )
                     elif k in {
                         "lr",
+                        "draft_lr",
                         "wd",
                         "reward",
                         "filtered_reward",
@@ -1265,6 +1267,7 @@ def grpo_train_sync(
                         metrics[k] = np.sum(v).item()
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
+                finalize_draft_ratio_metrics(metrics)
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
