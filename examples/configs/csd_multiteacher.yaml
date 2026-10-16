@@ -14,9 +14,9 @@ loss_fn:
   temperature: 1.0
   vocab_topk: 8192
   reverse_kl: false
-  kl_loss_weight: 1.0
-  ce_loss_scale: 0.1
-  dynamic_loss_scaling: true
+  kl_loss_weight: 1.0          # used only when dynamic_loss_scaling is false
+  ce_loss_scale: 0.1           # used only when dynamic_loss_scaling is false
+  dynamic_loss_scaling: true   # rescale KD to CE's size each step; the weights above are ignored
   common_indices_from_subtoks: true
   kl_chunk_shift: true
   csd_loss_fn: jsd
