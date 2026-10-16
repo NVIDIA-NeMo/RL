@@ -12,13 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import shlex
 from pathlib import Path
 
 import pytest
 
-from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 
 RECIPE_ROOT = Path(__file__).parents[2] / "examples/configs/recipes"
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    [
+        "grpo_megatron_generation_gym_single_controller.sh",
+        "grpo_megatron_generation_colocated_reshard_gym_single_controller.sh",
+    ],
+)
+def test_megatron_single_controller_gym_scripts_recompute_kv(script_name: str) -> None:
+    register_omegaconf_resolvers()
+    project_root = Path(__file__).parents[2]
+    script = (project_root / "tests/functional" / script_name).read_text()
+    command = next(
+        line
+        for line in script.replace("\\\n", " ").splitlines()
+        if line.startswith("uv run coverage run ")
+    )
+    arguments = shlex.split(command)
+    config_path = arguments[arguments.index("--config") + 1].replace(
+        "$PROJECT_ROOT", str(project_root)
+    )
+    overrides = [
+        argument
+        for argument in arguments
+        if argument.lstrip("+").startswith(("policy.generation.", "async_rl."))
+    ]
+    config = parse_hydra_overrides(load_config(config_path), overrides)
+    assert config.policy.generation.backend == "megatron"
+    assert (
+        config.policy.generation.mcore_generation_config.kv_cache_management_mode
+        == "recompute"
+    )
 
 
 @pytest.mark.parametrize(
