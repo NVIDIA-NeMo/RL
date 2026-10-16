@@ -1321,6 +1321,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            # Stop the HTTP server first so no new requests reach an engine that is about to be
+            # torn down. Workers that never created a server have no server_thread attribute.
+            server_thread = getattr(self, "server_thread", None)
+            if server_thread is not None:
+                self.http_server.should_exit = True
+                await asyncio.get_running_loop().run_in_executor(
+                    None, server_thread.join, 30
+                )
+                if server_thread.is_alive():
+                    print("vLLM HTTP server did not stop within 30s; continuing shutdown")
+
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
                 await self.llm.collective_rpc("cleanup", args=tuple())
@@ -1338,17 +1349,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             # Force garbage collection
             gc.collect()
             torch.cuda.empty_cache()
-
-            if self.server_thread is not None:
-                from threading import Thread
-
-                from uvicorn import Server
-
-                self.http_server: Server
-                self.server_thread: Thread
-
-                self.http_server.should_exit = True
-                self.server_thread.join()
 
             return True
         except Exception as e:
