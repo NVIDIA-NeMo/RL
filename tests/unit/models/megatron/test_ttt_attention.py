@@ -27,6 +27,7 @@ import pytest
 import torch
 
 from nemo_rl.models.megatron.draft.eagle import (
+    EagleModel,
     TTTDraftCoreAttention,
     TwoPartTTTAttention,
 )
@@ -352,3 +353,19 @@ def test_module_rejects_attention_dropout():
                 attention_dropout=0.1, context_parallel_size=1, softmax_scale=None
             )
         )
+
+
+@pytest.mark.parametrize("ttt_pass", [1, 2, 3])
+def test_ttt_rotary_puts_pass_d_anchor_i_at_position_i_plus_d_minus_1(ttt_pass):
+    # vLLM advances the draft position by one per speculative token, so the
+    # pass-d query at anchor i must sit at i + d - 1. An off-by-one here still
+    # trains to a low loss and only shows up as acceptance decay at depth d.
+    seq_len = 5
+    model = SimpleNamespace(eagle_module=SimpleNamespace(rotary_pos_emb=torch.arange))
+
+    rotary = EagleModel._ttt_rotary_pos_emb(model, ttt_pass, seq_len)
+
+    if ttt_pass == 1:
+        assert rotary is None  # EagleModule's own table, positions 0..S-1
+    else:
+        assert torch.equal(rotary, torch.arange(seq_len) + ttt_pass - 1)
