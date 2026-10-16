@@ -14,7 +14,7 @@ NUM_MINUTES=180
 exit_if_max_steps_reached
 
 # Run the experiment
-# Nightly smoke: 5 image GRPO steps on 16 x 4-GPU GB200 nodes (~10 min/step
+# Release smoke: 5 image GRPO steps on 16 x 4-GPU GB200 nodes (~10 min/step
 # plus ~10 min setup). CLEVR-CoGenT validation is skipped (val_at_start=false,
 # val_period > MAX_STEPS): 5 steps is too few to move accuracy; the refit-health
 # metrics below are what this test guards, including the vision-weight loading
