@@ -23,12 +23,6 @@ Notes:
 - **Generation** uses the pinned stock vLLM, which registers
   `NemotronH_Omni_Reasoning_V3` and loads the checkpoint's RADIO weights from
   disk (`load_format=auto`). The policy is refit from the trainer every step.
-  Two NeMo RL source patches on vLLM's Nemotron VL model apply automatically
-  when the generation workers start: one adds the checkpoint's final vision
-  LayerNorm (`vision_projector.vision_final_layernorm.*`, present on
-  MTP-trained checkpoints and otherwise dropped by vLLM), the other lets the
-  RADIO loader accept the transformers-native weight names the Automodel policy
-  streams at refit.
 - The DAPO recipe drives the model text-only: the tokenizer path (no processor)
   is used, so the DTensor worker runs with `is_vlm=false` and vLLM never
   receives images. The image GRPO recipe uses the checkpoint's processor and
@@ -228,8 +222,7 @@ same order as the drift documented for other models; the isolated
 4-hour Slurm jobs that resumed from the latest checkpoint.
 
 **Image GRPO, CLEVR-CoGenT** — 63 steps, `max_new_tokens: 4096`, starting from
-`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16` on stock vLLM 0.29 with
-the RADIO source patches described above.
+`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`.
 
 ![Nemotron 3.5 Super VL image GRPO training curves](../../../assets/nemotron/nemotron-3.5-super-vl-image-grpo-clevr-16n4g.png)
 
