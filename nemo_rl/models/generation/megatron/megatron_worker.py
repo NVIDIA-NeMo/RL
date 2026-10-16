@@ -704,6 +704,25 @@ class MegatronGenerationMixin:
         self.inference_context = DynamicInferenceContext(
             engine_model.config, inference_config
         )
+        token_capacity = model_config.inference_flashinfer_mxfp8_token_capacity
+        if token_capacity is not None:
+            decode_rows = (
+                self.inference_context.max_requests
+                * (num_speculative_tokens + 1)
+                * model_config.expert_model_parallel_size
+            )
+            if decode_rows > token_capacity:
+                raise ValueError(
+                    "policy.generation.mcore_generation_config."
+                    f"inference_flashinfer_mxfp8_token_capacity={token_capacity} can never "
+                    "engage: MCore applies it only when max_requests * "
+                    "(num_speculative_tokens + 1) * expert_model_parallel_size <= capacity, "
+                    f"and this engine derived max_requests="
+                    f"{self.inference_context.max_requests} with EP="
+                    f"{model_config.expert_model_parallel_size}, i.e. {decode_rows} decode "
+                    "rows. Raise the capacity (it may go up to the full dispatcher buffer) "
+                    "or lower buffer_size_gb / max_requests."
+                )
         if media_model is None:
             self.inference_wrapped_model = GPTInferenceWrapper(
                 engine_model, self.inference_context

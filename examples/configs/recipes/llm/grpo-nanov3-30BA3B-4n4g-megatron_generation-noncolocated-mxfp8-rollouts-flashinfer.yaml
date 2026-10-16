@@ -2,7 +2,6 @@ defaults: ./grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-mxfp8-rollo
 policy:
   generation:
     mcore_generation_config:
-      inference_grouped_gemm_backend: flashinfer
       # Bound decode MoE rows instead of the full 65,536-row NVLS buffer
       # (max_tokens / TP * EP). MCore uses the bound only for decode-only steps when
       # max_requests * (num_speculative_tokens + 1) * EP <= capacity (64 * 1 * 8 here).

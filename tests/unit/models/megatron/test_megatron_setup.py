@@ -959,6 +959,31 @@ class TestApplyMoeConfig:
 
         assert model_cfg.inference_flashinfer_mxfp8_token_capacity == 512
 
+    @pytest.mark.parametrize(
+        ("transformer_impl", "num_moe_experts", "moe_router_dtype", "expected"),
+        [
+            ("inference_optimized", 128, "fp64", "fp32"),
+            ("inference_optimized", 128, None, "fp32"),
+            ("inference_optimized", None, "fp64", "fp64"),
+            ("transformer_engine", 128, "fp64", "fp64"),
+        ],
+    )
+    def test_inference_optimized_moe_forces_fp32_router(
+        self, transformer_impl, num_moe_experts, moe_router_dtype, expected
+    ):
+        """MCore's inference-optimized MoE layers accept only an fp32 router, so it is derived."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        model_cfg.num_moe_experts = num_moe_experts
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["transformer_impl"] = transformer_impl
+        megatron_cfg["moe_router_dtype"] = moe_router_dtype
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+        assert model_cfg.moe_router_dtype == expected
+
     def test_hybridep_input_prepadding_wins_after_bridge_validation(self):
         from nemo_rl.models.megatron import setup
 
