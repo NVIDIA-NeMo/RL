@@ -24,10 +24,11 @@ consumer-driven metric registry: NeMo-RL owns the ``rl.*`` metric names, so a
 new series needs no lens release and no negotiation over field names. Five
 families are teed — the async ``efficiency/*`` phase durations, the training
 scalars, the ``vllm/*`` engine deltas, the ``timing/setup`` startup phases, and
-the completed rollout save/restore dicts under ``timing/rollout_checkpoint`` and
-``timing/rollout_recovery``. The first three ride the per-step ``train`` dicts;
-the setup dict arrives once, at step 0; the checkpoint dicts arrive once per
-completed save or restore on the wall-clock axis.
+the rollout checkpoint dicts -- completed saves and restores under
+``timing/rollout_checkpoint`` / ``timing/rollout_recovery``, and every snapshot
+attempt under ``rollout/checkpoint_outcome``. The first three ride the per-step
+``train`` dicts; the setup dict arrives once, at step 0; the checkpoint dicts
+arrive once per save, restore or attempt on the wall-clock axis.
 
 The checkpoint mapping explicitly enumerates the controller's completed phase
 keys, and a source-drift test holds it to the keys the controller logs under
@@ -163,6 +164,19 @@ TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
 # ``end - total`` would not place them.
 RL_CHECKPOINT_SAVE_SPAN = "rl.sc.rollout_checkpoint.save"
 
+# Every periodic snapshot attempt, logged under ``rollout/checkpoint_outcome``
+# whether it saved, skipped or failed. Without these, a run whose snapshots are
+# all skipped (say, ``missing_trainer_anchor`` because training keeps moving
+# past each durable trainer checkpoint) emits no ``rl.checkpoint.*`` point at
+# all -- the same output as telemetry being off.
+RL_CHECKPOINT_ATTEMPTS_METRIC = "rl.checkpoint.attempts"
+RL_CHECKPOINT_ATTEMPT_DURATION_METRIC = "rl.checkpoint.attempt_duration"
+RL_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_METRIC = (
+    "rl.checkpoint.seconds_since_last_success"
+)
+RL_CHECKPOINT_OUTCOME_ATTR = "rl.checkpoint.outcome"
+RL_CHECKPOINT_REASON_ATTR = "rl.checkpoint.reason"
+
 # Keys that ``print_efficiency_summary`` puts in the Logger dict.
 _EFFICIENCY_KEY_PREFIX = "efficiency/"
 _EFFICIENCY_SECONDS_SUFFIX = "_s"
@@ -190,9 +204,33 @@ _CHECKPOINT_ROWS_KEY = registry_key(RL_CHECKPOINT_ROWS_METRIC)
 _CHECKPOINT_GROUPS_KEY = registry_key(RL_CHECKPOINT_GROUPS_METRIC)
 _CHECKPOINT_SIBLINGS_KEY = registry_key(RL_CHECKPOINT_SIBLINGS_METRIC)
 _CHECKPOINT_SIDECAR_BYTES_KEY = registry_key(RL_CHECKPOINT_SIDECAR_BYTES_METRIC)
+_CHECKPOINT_ATTEMPTS_KEY = registry_key(RL_CHECKPOINT_ATTEMPTS_METRIC)
+_CHECKPOINT_ATTEMPT_DURATION_KEY = registry_key(RL_CHECKPOINT_ATTEMPT_DURATION_METRIC)
+_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_KEY = registry_key(
+    RL_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_METRIC
+)
 
 # Fixed instruments and bounded labels: snapshot/step/rollout IDs never become
 # metric dimensions. Phase timings overlap; they carry no goodput bucket.
+_CHECKPOINT_OUTCOME_PREFIX = "rollout/checkpoint_outcome"
+# Copies of ``RolloutCheckpointAttemptOutcome`` / ``RolloutCheckpointAttemptReason``
+# in ``single_controller_utils/rollout_checkpoint.py``, which imports the GRPO
+# stack this module must stay importable without. A source-drift test keeps
+# them equal. The controller logs each as a one-hot flag (``skipped: 1.0``,
+# ``reason_missing_trainer_anchor: 1.0``); both are fixed sets, so they are
+# safe metric labels.
+_CHECKPOINT_ATTEMPT_OUTCOMES = ("completed", "failed", "skipped")
+_CHECKPOINT_ATTEMPT_REASONS = (
+    "completed",
+    "invariant_error",
+    "io_error",
+    "missing_trainer_anchor",
+    "no_data_plane_mutations",
+    "optimizer_commit_in_progress",
+    "timeout",
+    "trainer_state_changed",
+)
+_CHECKPOINT_COMPLETED = "completed"
 _CHECKPOINT_SAVE = "save"
 _CHECKPOINT_PREFIXES = {
     "timing/rollout_checkpoint": _CHECKPOINT_SAVE,
@@ -329,6 +367,25 @@ def _metric_specs() -> list[MetricSpec]:
                 "gauge",
                 "By",
                 "Controller sidecar bytes in the latest completed snapshot.",
+            ),
+            (
+                RL_CHECKPOINT_ATTEMPTS_METRIC,
+                "counter",
+                "{attempt}",
+                "Periodic rollout snapshot attempts, by outcome and reason.",
+            ),
+            (
+                RL_CHECKPOINT_ATTEMPT_DURATION_METRIC,
+                "histogram",
+                "s",
+                "Duration of one periodic rollout snapshot attempt, by outcome.",
+            ),
+            (
+                RL_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_METRIC,
+                "gauge",
+                "s",
+                "Age of the newest completed rollout snapshot at each attempt; "
+                "absent until the first one completes.",
             ),
         )
     )
@@ -585,6 +642,48 @@ def _tee_checkpoint_metrics(
             )
 
 
+def _one_hot(metrics: dict[str, Any], flags: dict[str, str]) -> Optional[str]:
+    """The single label whose flag key is set to 1, or None if not exactly one."""
+    hot = [label for key, label in flags.items() if as_scalar(metrics.get(key)) == 1]
+    return hot[0] if len(hot) == 1 else None
+
+
+def _tee_checkpoint_outcome(meter: Meter, metrics: dict[str, Any]) -> None:
+    """Emit one periodic rollout snapshot attempt.
+
+    Counted whatever its outcome, so a run whose snapshots never complete shows
+    a climbing ``outcome=skipped`` count with its reason rather than nothing.
+    The outcome and reason are decoded from the controller's one-hot flags; a
+    dict that does not set exactly one of each is not counted, rather than
+    guessed at.
+    """
+    outcome = _one_hot(metrics, {o: o for o in _CHECKPOINT_ATTEMPT_OUTCOMES})
+    reason = _one_hot(metrics, {f"reason_{r}": r for r in _CHECKPOINT_ATTEMPT_REASONS})
+    if outcome is None or reason is None:
+        return
+    _record(
+        meter,
+        {_CHECKPOINT_ATTEMPTS_KEY: 1.0},
+        {RL_CHECKPOINT_OUTCOME_ATTR: outcome, RL_CHECKPOINT_REASON_ATTR: reason},
+    )
+    duration = _checkpoint_value(metrics, "attempt_duration_seconds")
+    if duration is not None:
+        _record(
+            meter,
+            {_CHECKPOINT_ATTEMPT_DURATION_KEY: duration},
+            {RL_CHECKPOINT_OUTCOME_ATTR: outcome},
+        )
+    # A completed attempt is itself the newest snapshot; otherwise the
+    # controller reports the age of the last one, once there has been one.
+    staleness = (
+        0.0
+        if outcome == _CHECKPOINT_COMPLETED
+        else _checkpoint_value(metrics, "seconds_since_last_success")
+    )
+    if staleness is not None:
+        _record(meter, {_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_KEY: staleness})
+
+
 def map_teed_scalars(metrics: dict[str, Any]) -> dict[str, float]:
     """Extract ``{registry key: value}`` for every declared scalar present.
 
@@ -668,8 +767,14 @@ def tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> No
 def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> None:
     """Body of :func:`tee_rl_metrics_to_otel`, inside its exception guard."""
     is_setup = prefix == SETUP_TIMING_PREFIX
+    is_checkpoint_outcome = prefix == _CHECKPOINT_OUTCOME_PREFIX
     checkpoint_operation = _CHECKPOINT_PREFIXES.get(prefix) if prefix else None
-    if not is_setup and checkpoint_operation is None and prefix not in _TRAIN_PREFIXES:
+    if (
+        not is_setup
+        and not is_checkpoint_outcome
+        and checkpoint_operation is None
+        and prefix not in _TRAIN_PREFIXES
+    ):
         return
     telemetry = get_telemetry_handle()
     if telemetry is None or not telemetry.is_exporting:
@@ -693,6 +798,13 @@ def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> N
             )
         except Exception:
             warn_once("checkpoint", "failed to tee rollout checkpoint metrics")
+        return
+
+    if is_checkpoint_outcome:
+        try:
+            _tee_checkpoint_outcome(telemetry.meter, metrics)
+        except Exception:
+            warn_once("checkpoint_outcome", "failed to tee rollout checkpoint outcome")
         return
 
     if is_setup:

@@ -8,7 +8,7 @@ Every `rl.*` series is **declared by NeMo-RL**, not by lens. lens provides a con
 
 ## The tee
 
-The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — the prefixes read include the driver's per-step `train` dicts (`prefix in ("train", "")`) and the one-off `timing/setup` dict at step 0, plus completed `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries. Other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting. The numbers you already see in W&B are therefore the same series you get in your OTLP backend, with no double bookkeeping.
+The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — the prefixes read include the driver's per-step `train` dicts (`prefix in ("train", "")`) and the one-off `timing/setup` dict at step 0, plus completed `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries and the per-attempt `rollout/checkpoint_outcome` dictionary. Other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting. The numbers you already see in W&B are therefore the same series you get in your OTLP backend, with no double bookkeeping.
 
 Each family has its own exception handler, so a bad value in one cannot silence the others.
 
@@ -186,6 +186,25 @@ To find *which* save was slow, each completed save also emits one trace-only
 `rl.sc.rollout_checkpoint.save` span carrying the same fields plus the snapshot
 sequence and trainer step. See
 [Span groups — trace-only rollout checkpoint save](span-groups.md#trace-only-the-rollout-checkpoint-save).
+
+### Snapshot attempts
+
+The series above report completed operations only. Every periodic snapshot
+attempt, including skipped and failed ones, is also exported from the
+`rollout/checkpoint_outcome` dictionary:
+
+| Metric | Kind / unit | Dimensions and meaning |
+|---|---|---|
+| `rl.checkpoint.attempts` | Counter / attempts | `rl.checkpoint.outcome` (`completed`, `skipped`, `failed`) and `rl.checkpoint.reason` (`completed`, `missing_trainer_anchor`, `no_data_plane_mutations`, `optimizer_commit_in_progress`, `trainer_state_changed`, `timeout`, `io_error`, `invariant_error`) |
+| `rl.checkpoint.attempt_duration` | Histogram / seconds | `rl.checkpoint.outcome`; skips return quickly, so read completed attempts separately |
+| `rl.checkpoint.seconds_since_last_success` | Gauge / seconds | Age of the newest completed snapshot at each attempt; `0` on success, absent until the first success |
+
+Skipping is expected: a snapshot is only valid while the trainer is at a durable
+checkpoint step, so attempts after the next optimizer commit skip with
+`missing_trainer_anchor` until the following trainer checkpoint. If
+`outcome=skipped` climbs while `outcome=completed` stays at zero, snapshots are
+not completing; compare the snapshot interval with the trainer checkpoint
+cadence and step time. No attempts at all means the pump or telemetry is off.
 
 ## Async efficiency metrics (`rl.efficiency.*`)
 

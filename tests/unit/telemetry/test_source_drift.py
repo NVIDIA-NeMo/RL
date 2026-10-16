@@ -833,6 +833,61 @@ def test_rollout_checkpoint_mapping_matches_logged_keys():
     )
 
 
+def _literal_values(source: Path, name: str) -> tuple[str, ...]:
+    """The string values of ``name = Literal[...]`` at module level."""
+    for node in ast.parse(source.read_text()).body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(_leaf_name(target) == name for target in node.targets)
+            and isinstance(node.value, ast.Subscript)
+        ):
+            values = node.value.slice
+            elements = values.elts if isinstance(values, ast.Tuple) else [values]
+            return tuple(
+                element.value
+                for element in elements
+                if isinstance(element, ast.Constant)
+            )
+    raise AssertionError(f"{name} = Literal[...] not found in {source}")
+
+
+def _module_tuple(source: Path, name: str) -> tuple[str, ...]:
+    """The string values of ``name = (...)`` at module level."""
+    for node in ast.parse(source.read_text()).body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(_leaf_name(target) == name for target in node.targets)
+            and isinstance(node.value, ast.Tuple)
+        ):
+            return tuple(
+                element.value
+                for element in node.value.elts
+                if isinstance(element, ast.Constant)
+            )
+    raise AssertionError(f"{name} = (...) not found in {source}")
+
+
+def test_checkpoint_attempt_labels_match_the_controller_literals():
+    """An outcome or reason the tee does not know is never counted.
+
+    The tee decodes one-hot flags, so a new controller reason would make the
+    attempt look malformed and drop it from ``rl.checkpoint.attempts`` -- the
+    very series meant to show why snapshots are not completing.
+    """
+    controller = _ALGORITHMS / "single_controller_utils" / "rollout_checkpoint.py"
+    metrics = _REPO / "nemo_rl" / "telemetry" / "metrics.py"
+    for copied, literal in (
+        ("CHECKPOINT_ATTEMPT_OUTCOMES", "RolloutCheckpointAttemptOutcome"),
+        ("CHECKPOINT_ATTEMPT_REASONS", "RolloutCheckpointAttemptReason"),
+    ):
+        tee = _module_tuple(metrics, copied)
+        logged = _literal_values(controller, literal)
+        assert tee == logged, (
+            f"nemo_rl/telemetry/metrics.py _{copied} {tee} differs from "
+            f"{literal} {logged}; attempts with the missing values are dropped"
+        )
+
+
 def _span_names_in(markdown: str) -> set[str]:
     """Every ``rl.*`` name in backticks, which is how the doc tables list them."""
     return set(re.findall(r"`(rl\.[a-z0-9_.]+)`", markdown))
