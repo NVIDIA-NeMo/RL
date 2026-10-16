@@ -451,7 +451,7 @@ Do not carry `max_num_epochs: -1` across either. [ppo.md](./ppo.md#asynchronous-
 | `enabled: true` | Implicit — SC is always async; use `sampler.max_lookahead_versions: 0` for sync semantics, `>= 1` for async |
 | `max_trajectory_age_steps: N` | `sampler.name: in_order` with `sampler.max_lookahead_versions: N` |
 | `warmup_generation_lead_steps` (PPO) | `sampler.warmup_lookahead_versions` — the lookahead to use while critic warmup is in progress |
-| `recompute_kv_cache_after_weight_updates` | `recompute_kv_cache_after_weight_updates` (same); when vLLM pauses natively, the preserved requests recompute their KV cache after refit |
+| `recompute_kv_cache_after_weight_updates` | `recompute_kv_cache_after_weight_updates` (same, defaults to `true` in both loops); when vLLM pauses natively, preserved requests recompute their KV cache after refit, repeating prefill. Set `false` to retain pre-update KV. For Megatron generation, pair `true` with `kv_cache_management_mode: recompute`, or `false` with `persist`/`offload`. |
 | `in_flight_weight_updates` | Always effectively true; `false`-equivalent behavior is not yet supported (drain-gate tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625)) |
 | *(no legacy equivalent — matches legacy full-batch train semantics)* | `min_groups_for_streaming_train: ${grpo.num_prompts_per_step}`, or `${ppo.num_prompts_per_step}` on a PPO run |
 | *(no legacy equivalent — matches legacy `max_trajectory_age + 1` batches in flight)* | `max_inflight_prompts: num_prompts_per_step × (max_lookahead_versions + 1)` |

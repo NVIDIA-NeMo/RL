@@ -276,7 +276,7 @@ ppo:
     max_trajectory_age_steps: 1
     warmup_generation_lead_steps: null
     in_flight_weight_updates: false
-    recompute_kv_cache_after_weight_updates: false
+    recompute_kv_cache_after_weight_updates: true  # Default; false avoids repeated prefill but retains old KV.
     drop_incomplete_targets_on_restore: false
 
   adv_estimator:
