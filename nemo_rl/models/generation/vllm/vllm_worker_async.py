@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import asyncio
+from collections.abc import Callable
+import contextvars
 import copy
 import functools
 import gc
@@ -35,6 +37,9 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from packaging.version import Version
+
+from nemo_rl.telemetry.instrumentation import accepts_trace_context
+from nemo_rl.telemetry.rollout_checkpoint import checkpoint_phase_async
 
 from nemo_rl.data.captured_media import (
     MEDIA_TENSOR_DIGESTS_FIELD,
@@ -3695,6 +3700,8 @@ class VllmAsyncGenerationWorkerImpl(
         await self.llm.pause_generation(mode="keep", clear_cache=clear_cache)
         return True
 
+    @accepts_trace_context
+    @checkpoint_phase_async("generation_fence")
     async def begin_token_capture_snapshot_fence_async(self) -> bool:
         """Fence terminal staging without pausing vLLM decoding."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
@@ -3705,8 +3712,13 @@ class VllmAsyncGenerationWorkerImpl(
         # Take the epoch on the loop, in call order with the matching end: if
         # the driver times out and releases first, the late close is a no-op.
         epoch = gate.begin_epoch()
+        context = contextvars.copy_context()
+
+        def drain() -> None:
+            context.run(gate.close_and_wait, epoch)
+
         await asyncio.get_running_loop().run_in_executor(
-            self._token_capture_fence_executor, gate.close_and_wait, epoch
+            self._token_capture_fence_executor, cast(Callable[..., None], drain)
         )
         return True
 
@@ -3724,6 +3736,8 @@ class VllmAsyncGenerationWorkerImpl(
         await self.llm.resume_generation()
         return True
 
+    @accepts_trace_context
+    @checkpoint_phase_async("generation_release")
     async def end_token_capture_snapshot_fence_async(self) -> bool:
         """Release terminal token staging after the TQ snapshot is durable."""
         if not self.cfg["vllm_cfg"]["async_engine"]:

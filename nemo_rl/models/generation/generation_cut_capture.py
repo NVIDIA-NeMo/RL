@@ -15,13 +15,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import logging
 import threading
 import time
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import torch
 
@@ -30,6 +31,7 @@ from nemo_rl.experience.route_assembly import (
     verify_route_fragment_integrity,
 )
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+from nemo_rl.telemetry.rollout_checkpoint import checkpoint_phase, checkpoint_phase_sync
 
 LOGGER = logging.getLogger(__name__)
 
@@ -471,6 +473,7 @@ class GenerationCutCaptureMixin:
             raise RuntimeError("generation-cut continuation has no staged chunks")
         return chunks
 
+    @checkpoint_phase_sync("prefix_restore_fetch", detail=True)
     def _fetch_generation_cut_rows(self, staging_keys: list[str]) -> list[Any]:
         """Fetch cut rows with their extras and routes, in the requested order.
 
@@ -551,6 +554,7 @@ class GenerationCutCaptureMixin:
             )
         return {"routed_experts": encode_routed_experts(routes)}, routes
 
+    @checkpoint_phase_sync("prefix_restore_reconstruct", detail=True)
     def _rebuild_generation_cut_snapshot(
         self, admission: Any, prefix_token_ids: list[int], chunks: list[Any]
     ) -> _ResolvedGenerationCut:
@@ -863,11 +867,15 @@ class GenerationCutCaptureMixin:
         *args: Any,
     ) -> Any:
         """Run cut control independently of blocked terminal capture writes."""
-        return await asyncio.get_running_loop().run_in_executor(
-            self._generation_cut_control_executor,
-            operation,
-            *args,
-        )
+        with checkpoint_phase("prefix_control"):
+            context = contextvars.copy_context()
+
+            def execute() -> Any:
+                return context.run(operation, *args)
+
+            return await asyncio.get_running_loop().run_in_executor(
+                self._generation_cut_control_executor, cast(Callable[..., Any], execute)
+            )
 
     def _completed_generation_cut_ack(self, prefix: Any, checkpoint_id: str) -> Any:
         """Describe a call whose terminal path won the cut/abort race."""
@@ -1260,7 +1268,10 @@ class GenerationCutCaptureMixin:
             keys: list[str | None] = []
             handed = 0
             try:
-                keys = stage(batch)
+                with checkpoint_phase(
+                    "prefix_batch_put", attributes={"rl.checkpoint.rows": len(batch)}
+                ):
+                    keys = stage(batch)
                 ready = []
                 for (transaction, _, _, prefix), key in zip(batch, keys, strict=True):
                     handed += 1
@@ -1368,6 +1379,7 @@ class GenerationCutCaptureMixin:
         by_ticket = {ack.ticket_id: ack for ack in acknowledgements}
         return [by_ticket[prefix.ticket_id] for prefix in inventory.active_prefixes]
 
+    @checkpoint_phase_sync("prefix_cut")
     def _checkpoint_generation_cut(
         self, inventory: Any, *, deadline: float | None = None
     ) -> Any:
