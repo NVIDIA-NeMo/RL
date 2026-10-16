@@ -163,11 +163,12 @@ Useful CSD controls in the `loss_fn` block include:
 | `csd_jsd_beta` | JSD mixture coefficient; `0.5` is symmetric |
 | `csd_mismatch_loss_beta` | Multiplier on each 1-to-many, many-to-1, and many-to-many chunk loss relative to a 1-to-1 chunk loss |
 | `csd_realized_only_mismatch` | Score 1-to-many and many-to-1 chunks by their realized token chains against REST instead of prefix-support alternatives |
-| `teacher_topk_ipc_k` | `0` sends dense teacher logits; a positive value sends sparse top-k support with exact normalization |
+| `teacher_topk_ipc_k` | Teacher logits sent per row: the top `k` (default `128`) with exact normalization, or `0` for dense full-vocabulary logits |
 | `dynamic_loss_scaling` | Rescale KD using CE magnitude; when `false`, use the explicit `kl_loss_weight` and `ce_loss_scale` coefficients |
 
-The exemplar uses dense transport and dynamic loss scaling. These are training
-settings: they do not change how the static tokenizer tables are constructed.
+The exemplar uses sparse top-128 transport and dynamic loss scaling. These are
+training settings: they do not change how the static tokenizer tables are
+constructed.
 
 The default dataset is the raw `text` column of
 `nvidia/Nemotron-Pretraining-Specialized-v1.1`, subset

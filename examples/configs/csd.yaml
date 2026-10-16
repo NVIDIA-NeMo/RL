@@ -25,7 +25,7 @@ loss_fn:
   csd_mismatch_loss_beta: 5.0
   csd_noise_filter_topk: 0
   csd_realized_only_mismatch: false
-  teacher_topk_ipc_k: 0
+  teacher_topk_ipc_k: 128             # 0 sends dense teacher logits
   teacher_topk_ipc_support_mode: row_topk
   teacher_topk_ipc_keep_realized: true
   csd_selected_row_chunk_size: 128   # owner-local Megatron path: student/teacher rows per tile
