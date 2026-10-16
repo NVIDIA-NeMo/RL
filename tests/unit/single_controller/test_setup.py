@@ -2002,6 +2002,45 @@ class TestSetup:
 
         fake_gym_shards.shutdown.assert_called_once()
 
+    def test_gym_vllm_resume_builds_trainer_once_with_clamped_train_iters(
+        self, tmp_path, patched_factories
+    ):
+        """A resume restores Megatron's LR scheduler, which asserts that its saved
+        horizon equals train_iters, so the trainer is built only with the clamped value."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+        checkpointer = MagicMock()
+        checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
+        checkpointer.load_training_info.return_value = vars(_save_state())
+        # The trainer resumes from this checkpoint's weights and optimizer.
+        checkpointer.get_resume_paths.return_value = (
+            checkpoint_path / "policy" / "weights",
+            checkpoint_path / "policy" / "optimizer",
+        )
+        train_iters_at_build: list[int] = []
+        fake_policy = patched_factories["fake_policy"]
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            return fake_policy, 0.0
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+
+        with (
+            self._gym_patches(),
+            patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer),
+            patch.object(sc_setup_mod, "load_dataloader_state"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
+        assert train_iters_at_build == [8]
+        fake_policy.shutdown.assert_not_called()
+
     def test_nemo_gym_wires_env_handle(self, patched_factories):
         """When enabled, the NeMo-Gym shard set is spun up and stored."""
         mc = _make_master_config(backend="vllm")

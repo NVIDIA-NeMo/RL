@@ -1566,11 +1566,15 @@ def setup_single_controller(
     # len(dataloader), and the clamp only binds when a run asks for more steps than
     # its data holds. So on that path the trainer is built with the unclamped value,
     # the dataset loads while all three build, and the trainer is rebuilt if the
-    # clamp changed train_iters. Every other path keeps the original order.
+    # clamp changed train_iters. Every other path, and every resume, keeps the
+    # original order.
     overlap_dataset_load = (
         use_nemo_gym
         and generation_config["backend"] == "vllm"
         and not generation_config["colocated"]["enabled"]
+        # A resume restores Megatron's LR scheduler, which asserts that its saved
+        # horizon equals train_iters; only the clamped value is known to match.
+        and trainer_checkpoint_path is None
     )
     preloaded_training_data: Optional[
         tuple[Any, Any, dict[str, EnvironmentInterface], StatefulDataLoader]
