@@ -65,10 +65,18 @@ def is_gemma_model(model_name: str) -> bool:
 
 
 def is_nano_nemotron_vl_model(model_name: str) -> bool:
+    """Whether the model is a Nemotron VL/Omni checkpoint (Nano and 3.5 Super).
+
+    These models build their vision tower on the vLLM side even for text-only
+    rollouts, so vLLM must load the vision weights from the checkpoint
+    (``load_format=auto``) instead of using dummy initialization.
+    """
     hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     return hasattr(hf_config, "model_type") and hf_config.model_type in [
         "NemotronH_Nano_VL_V2",
         "NemotronH_Nano_Omni_Reasoning_V3",
+        # Nemotron 3.5 Super VL (config.model_type is "nemotron_h_omni").
+        "nemotron_h_omni",
     ]
 
 

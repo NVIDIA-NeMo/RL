@@ -56,6 +56,8 @@ policy:
       env_vars:
         NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
         NRL_REFIT_NUM_BUFFERS: "1"
+    vllm_kwargs:
+      moe_backend: flashinfer_trtllm
 
 logger:
   wandb_enabled: true

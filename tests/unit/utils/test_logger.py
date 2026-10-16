@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, call, patch
 import numpy as np
 import pytest
 import torch
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from nemo_rl.utils.logger import (
     TELEMETRY_WALL_TIME_METRIC,
@@ -165,6 +166,26 @@ class TestTensorboardLogger:
         temp_dir = tempfile.mkdtemp()
         yield temp_dir
         shutil.rmtree(temp_dir)
+
+    def test_finish_flushes_final_scalars(self, tmp_path: Path) -> None:
+        """Final-step metrics must survive logger teardown in a Ray actor."""
+        logger = TensorboardLogger(TensorboardConfig(), log_dir=str(tmp_path))
+        for step in (1, 2):
+            logger.log_metrics({"loss": 8.0 - step, "global_valid_toks": 48}, step)
+
+        logger.finish()
+        # Repeated teardown must remain safe.
+        logger.finish()
+
+        events = EventAccumulator(str(tmp_path)).Reload()
+        assert [(e.step, e.value) for e in events.Scalars("loss")] == [
+            (1, 7.0),
+            (2, 6.0),
+        ]
+        assert [(e.step, e.value) for e in events.Scalars("global_valid_toks")] == [
+            (1, 48.0),
+            (2, 48.0),
+        ]
 
     @patch("nemo_rl.utils.logger.SummaryWriter")
     def test_init(self, mock_summary_writer, temp_dir):
@@ -439,6 +460,69 @@ class TestWandbLogger:
             ),
             call(columns=["step", "op", "ms"], data=[[2, "put", 3.0]]),
         ]
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_init_outside_a_git_work_tree_skips_the_git_artifacts(
+        self, mock_wandb, capsys
+    ):
+        """The code tree a job runs from is uploaded without .git, so the
+        source-code and git-diff artifacts are skipped with one line instead
+        of running `git ls-files` and `git diff` into errors."""
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(
+                cmd, returncode=128, stdout="", stderr="fatal: not a git repository"
+            )
+
+        with patch("nemo_rl.utils.logger.subprocess.run", side_effect=fake_run):
+            WandbLogger(WandbConfig(project="p", name="n"))
+        assert calls == [["git", "rev-parse", "--is-inside-work-tree"]]
+        out = capsys.readouterr().out
+        # git's own reason is printed, not a guess.
+        assert (
+            "fatal: not a git repository; skipping the wandb source-code and "
+            "git-diff artifacts" in out
+        )
+        mock_wandb.Artifact.assert_not_called()
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_init_inside_a_git_work_tree_logs_the_git_artifacts(self, mock_wandb):
+        """Inside a work tree the gate lets both artifacts through: a gate that
+        reported False everywhere would pass every other test in this module."""
+        answers = {
+            ("git", "rev-parse", "--is-inside-work-tree"): "true\n",
+            ("git", "ls-files"): "pyproject.toml\n",
+            ("git", "rev-parse", "--abbrev-ref", "HEAD"): "main\n",
+            ("git", "diff", "HEAD"): "",
+        }
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, returncode=0, stdout=answers[tuple(cmd)], stderr=""
+            )
+
+        with patch("nemo_rl.utils.logger.subprocess.run", side_effect=fake_run):
+            WandbLogger(WandbConfig(project="p", name="n"))
+        assert [c.kwargs["type"] for c in mock_wandb.Artifact.call_args_list] == [
+            "code",
+            "git-diffs",
+        ]
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_init_without_a_git_binary_skips_the_git_artifacts(
+        self, mock_wandb, capsys
+    ):
+        with patch(
+            "nemo_rl.utils.logger.subprocess.run",
+            side_effect=FileNotFoundError("No such file or directory: 'git'"),
+        ):
+            WandbLogger(WandbConfig(project="p", name="n"))
+        out = capsys.readouterr().out
+        assert "git is not available" in out
+        assert "skipping the wandb source-code and git-diff artifacts" in out
+        mock_wandb.Artifact.assert_not_called()
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics(self, mock_wandb):
@@ -2461,3 +2545,48 @@ def test_print_message_log_samples(capsys):
     assert "What is 2+2?" in captured.out
     assert "2+2 = 4" in captured.out
     assert "Sample 1 | Reward: 1.0000" in captured.out
+
+
+@pytest.mark.parametrize("all_excluded", [False, True])
+def test_filtered_plot_ignores_unsupported_and_masked_rows(all_excluded):
+    logger = object.__new__(Logger)
+    logger.gpu_monitor = None
+    logger.log_plot = MagicMock()
+    data = {
+        "token_mask": torch.ones(3, 3),
+        "sample_mask": torch.tensor([1, 1, 0]),
+        "generation_logprobs": torch.zeros(3, 3),
+        "prev_logprobs": torch.tensor(
+            [[0.0, -torch.inf, -torch.inf], [0.0, -1.0, -2.0], [0.0, -99.0, -99.0]]
+        ),
+        "prompt_lengths": torch.ones(3, dtype=torch.long),
+        "full_lengths": torch.full((3,), 3),
+    }
+    if all_excluded:
+        data["sample_mask"][1] = 0
+    logger.log_plot_token_mult_prob_error(data, 1, "support", filtering_on=True)
+    if all_excluded:
+        logger.log_plot.assert_not_called()
+    else:
+        logger.log_plot.assert_called_once()
+        figure = logger.log_plot.call_args.args[0]
+        assert list(figure.axes[0].lines[1].get_ydata()) == [-1.0, -2.0]
+
+
+def test_legacy_train_dump_serializes_unsupported_logprobs_as_null(tmp_path):
+    import json
+
+    logger = object.__new__(Logger)
+    logger.gpu_monitor = None
+    logger.base_log_dir = str(tmp_path)
+    values = torch.tensor([[0.0, -torch.inf]])
+    logger.log_batched_dict_as_jsonl({"prev_logprobs": values}, "train.jsonl")
+
+    def reject_nonfinite(value):
+        raise AssertionError(value)
+
+    row = json.loads(
+        (tmp_path / "train.jsonl").read_text(), parse_constant=reject_nonfinite
+    )
+    assert row["prev_logprobs"] == [[0.0, None]]
+    assert torch.isneginf(values[0, 1])
