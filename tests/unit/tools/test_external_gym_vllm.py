@@ -1095,6 +1095,8 @@ exit 0
 """
 
 _STUB_SQUEUE = r"""#!/bin/bash
+# Some Slurm configurations make every client call print a non-fatal error.
+[[ -n "${STUB_SQUEUE_WARN:-}" ]] && echo "${STUB_SQUEUE_WARN}" >&2
 if [[ -n "${STUB_SQUEUE_FAIL:-}" ]]; then
   echo "slurm_load_jobs error: ${STUB_SQUEUE_FAIL}" >&2
   exit 1
@@ -1358,21 +1360,46 @@ def test_serve_mode_waits_for_every_load_balancer_to_count_every_replica(tmp_pat
         _stop(process)
 
 
-def test_serve_mode_refuses_a_pool_dir_owned_by_a_live_job(tmp_path):
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ({}, "is owned by live pool job 444 (RUNNING)"),
+        # squeue succeeds but prints a config error on stderr first.
+        (
+            {
+                "STUB_SQUEUE_WARN": "squeue: error: Ignoring ControlMachine since SlurmctldHost is set."
+            },
+            "is owned by live pool job 444 (RUNNING)",
+        ),
+        # squeue fails: the owner's state is unknown, so the directory is not taken.
+        (
+            {"STUB_SQUEUE_FAIL": "Socket timed out on send/recv operation"},
+            "Could not query pool job 444",
+        ),
+    ],
+)
+def test_serve_mode_refuses_a_pool_dir_owned_by_a_live_job(tmp_path, extra, message):
     pool_dir = tmp_path / "pool"
     pool_dir.mkdir()
     (pool_dir / "owner").write_text("444-0\n")
     (pool_dir / "READY").write_text("444-0 then\n")
-    env = _serve_env(tmp_path)
+    env = _serve_env(tmp_path, **extra)
     result = subprocess.run(
         ["bash", str(_WRAPPER)], env=env, capture_output=True, text=True, timeout=60
     )
     assert result.returncode != 0
-    assert "is owned by live pool job 444 (RUNNING)" in result.stderr
+    assert message in result.stderr
     # The other job's state is left alone.
     assert (pool_dir / "owner").read_text().strip() == "444-0"
     assert (pool_dir / "READY").exists()
     assert not (pool_dir / "STOPPED").exists()
+
+
+def test_replica_log_survives_a_relaunch():
+    """A relaunched replica reuses vllm_<i>.log; appending keeps the crash it replaces."""
+    source = _WRAPPER.read_text()
+    assert '>> "${LOG_FILE}" 2>&1 &' in source
+    assert '> "${LOG_FILE}" 2>&1 &' not in source.replace('>> "${LOG_FILE}"', "")
 
 
 @pytest.mark.parametrize(

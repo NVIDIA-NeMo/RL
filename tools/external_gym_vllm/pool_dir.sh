@@ -27,7 +27,9 @@ external_vllm_job_state() {
   local job="$1" output status=0
   output=$(squeue -h -j "${job}" -o %T 2>&1) || status=$?
   if (( status == 0 )); then
-    output="${output%%$'\n'*}"
+    # stderr is merged in, and squeue can print an error there (e.g. about
+    # slurm.conf) yet succeed; the state is the line that is a bare state name.
+    output=$(grep -m 1 -xE '[A-Z_]+' <<< "${output}" || true)
     printf '%s\n' "${output:-GONE}"
     return 0
   fi
