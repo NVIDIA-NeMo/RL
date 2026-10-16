@@ -1,5 +1,8 @@
 # Metrics
 
+For live prefix-checkpoint spans, pending-phase diagnostics, and their timing
+boundaries, see [Prefix rollout checkpoint telemetry](rollout-checkpoint.md).
+
 NeMo-RL emits six namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), and per-host memory (`rl.host.memory.*`).
 
 Metrics are emitted **only when telemetry is exporting**. All of them are produced on the driver, which always exports: most pass through the driver's metrics logger, while `rl.host.memory.*` is scraped from every node by a driver-side monitor on its own timer.

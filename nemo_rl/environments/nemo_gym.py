@@ -1041,6 +1041,7 @@ Depending on your data shape, you may want to change these values."""
             raise RuntimeError("Gym checkpoint adapter has not been initialized")
         return self._checkpoint_adapter
 
+    @accepts_trace_context
     async def checkpoint_prepare(
         self,
         checkpoint_id: str,
@@ -1054,6 +1055,7 @@ Depending on your data shape, you may want to change these values."""
         )
         return GymCheckpointPrepareSummary.from_result(result)
 
+    @accepts_trace_context
     async def checkpoint_renew(
         self,
         checkpoint_id: str,
@@ -1066,6 +1068,7 @@ Depending on your data shape, you may want to change these values."""
             deadline_ts=deadline_ts,
         )
 
+    @accepts_trace_context
     async def checkpoint_retire(
         self,
         checkpoint_id: str,
@@ -1080,6 +1083,7 @@ Depending on your data shape, you may want to change these values."""
             deadline_ts=deadline_ts,
         )
 
+    @accepts_trace_context
     async def checkpoint_forget(
         self,
         checkpoint_id: str,
@@ -1094,6 +1098,7 @@ Depending on your data shape, you may want to change these values."""
             deadline_ts=deadline_ts,
         )
 
+    @accepts_trace_context
     async def checkpoint_commit(
         self,
         checkpoint_id: str,
@@ -1110,6 +1115,7 @@ Depending on your data shape, you may want to change these values."""
             deadline_ts=deadline_ts,
         )
 
+    @accepts_trace_context
     async def checkpoint_restore(
         self,
         checkpoint_id: str,
@@ -1130,6 +1136,7 @@ Depending on your data shape, you may want to change these values."""
             deadline_ts=deadline_ts,
         )
 
+    @accepts_trace_context
     async def checkpoint_resume(
         self,
         checkpoint_id: str,
