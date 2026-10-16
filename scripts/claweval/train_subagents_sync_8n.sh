@@ -40,6 +40,12 @@ export CLAW_EVAL_SUBAGENTS_ENABLED=true
 export CLAW_EVAL_CONTEXT_TOKENS=${CLAW_EVAL_CONTEXT_TOKENS:-262144}
 export CLAW_EVAL_OUTPUT_TOKENS=${CLAW_EVAL_OUTPUT_TOKENS:-8192}
 export CLAW_EVAL_MAX_TURNS=${CLAW_EVAL_MAX_TURNS:-40}
+# Keep complete tool output in the sandbox while bounding only the preview that
+# OpenCode replays into later model calls.  Prior ClawEval rollouts accumulated
+# 92k--154k-token contexts and OOM'd the TP8 learner; these are the same native
+# OpenCode preview limits used by the AgenticVBench qualification gate.
+export CLAW_EVAL_TOOL_OUTPUT_MAX_LINES=${CLAW_EVAL_TOOL_OUTPUT_MAX_LINES:-400}
+export CLAW_EVAL_TOOL_OUTPUT_MAX_BYTES=${CLAW_EVAL_TOOL_OUTPUT_MAX_BYTES:-8192}
 # The uncapped first debug step admitted a 92,902-token row and OOM'd the
 # 8-node TP8/EP16/CP1 learner after its first successful optimizer update.
 # Match the production-tested Agentic VBench envelope; overlong rows become
