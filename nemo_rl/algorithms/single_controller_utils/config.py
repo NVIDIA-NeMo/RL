@@ -669,9 +669,8 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     num_reassembler_workers: PositiveInt = 2
 
     # Reconstruct selected capture paths as rows of one logical rollout.
-    # Forest groups are single-attempt; ordinary capture keeps its retry policy.
-    # Initially requires unit dataset loss weights and disables both trainer and
-    # rollout checkpointing; support is in https://github.com/NVIDIA-NeMo/RL/pull/4200.
+    # Recovery persists selections across retries and trainer/rollout checkpoints.
+    # Requires unit dataset loss weights.
     forest_training: bool = False
     # returned_history preserves the harness-selected trajectory (default).
     # all_captured includes every captured call, including abandoned attempts.
@@ -1540,14 +1539,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         if token_capture_config.defer_routed_experts_to_policy:
             raise ValueError("forest training requires direct routed-expert assembly")
         validate_forest_objective(master_config.grpo, master_config.loss_fn)
-        if master_config.checkpointing["enabled"]:
-            raise ValueError(
-                "Forest checkpoint/resume is not supported initially; accepted-call recovery is in https://github.com/NVIDIA-NeMo/RL/pull/4200"
-            )
-        if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
-            raise ValueError(
-                "Forest rollout checkpoint/resume is not supported initially; accepted-call recovery is in https://github.com/NVIDIA-NeMo/RL/pull/4200"
-            )
         if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
             raise ValueError(
                 "Forest does not support reward penalties or on-policy distillation"
