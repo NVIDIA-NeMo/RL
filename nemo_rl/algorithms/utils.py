@@ -31,6 +31,7 @@ from nemo_rl.data.deepseek_v4_tokenizer import (
     get_deepseek_v4_tokenizer,
     should_use_deepseek_v4_chat_template,
 )
+from nemo_rl.data.multimodal_utils import uses_image_placeholder
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.telemetry.vocabulary import RUN_WINDOW_WALL_CLOCK_CATEGORIES
 from nemo_rl.utils.fastokens import maybe_patch_fastokens
@@ -450,9 +451,9 @@ def get_tokenizer(
         tokenizer.pad_token = tokenizer.eos_token
 
     def set_chat_template(chat_template: str) -> None:
-        """Keep processor and tokenizer rendering behavior synchronized."""
+        """Keep placeholder-style processors synchronized with their tokenizer."""
         tokenizer.chat_template = chat_template
-        if processor is not None:
+        if processor is not None and uses_image_placeholder(processor):
             processor.chat_template = chat_template
 
     use_deepseek_v4_tokenizer = should_use_deepseek_v4_chat_template(tokenizer_config)
