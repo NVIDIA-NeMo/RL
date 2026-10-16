@@ -272,8 +272,9 @@ log = logging.getLogger(__name__)
 # cleaner exit. Not configurable for the same reason.
 _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
 
-# Prompts drawn from the dataloader but not yet trained (in flight or buffered)
-# at a checkpoint whose replay buffer is dropped (checkpoint_replay_buffer=false).
+# Prompts drawn from the dataloader but not yet trained (waiting for admission, in
+# flight, or buffered) at a checkpoint whose replay buffer is dropped
+# (checkpoint_replay_buffer=false).
 # The restored dataloader resumes past them, so they are re-dispatched on resume.
 PENDING_PROMPTS_FILENAME = "pending_prompts.pt"
 # SWE privileged critic prefix cache, saved with a checkpointed replay buffer so the
@@ -820,8 +821,8 @@ class SingleControllerActor:
         # hole with a later step's finished group counts a promotion, and the step it
         # borrowed from counts the replacement that repaid it.
         self._replacement_reserve: deque[DatumSpec] = deque()
-        # Dataset idx of every dispatched prompt not yet consumed by a train step,
-        # and the restored ones to re-dispatch (see PENDING_PROMPTS_FILENAME).
+        # Dataset idx of every drawn prompt not yet consumed by a train step, and
+        # the restored ones to re-dispatch (see PENDING_PROMPTS_FILENAME).
         self._pending_prompt_idx = set()
         self._resume_pending_prompts = []
         self._batch_replacements: dict[int, int] = {}
@@ -1789,6 +1790,15 @@ class SingleControllerActor:
             flush=True,
         )
 
+    def _mark_prompt_pending(self, prompt_dataset_idx: Any) -> None:
+        """Track a drawn prompt until a train step consumes it."""
+        if (
+            self._pending_prompt_idx is not None
+            and isinstance(prompt_dataset_idx, int)
+            and not isinstance(prompt_dataset_idx, bool)
+        ):
+            self._pending_prompt_idx.add(prompt_dataset_idx)
+
     async def _maybe_restore_pending_prompts(self) -> None:
         """Load prompts the previous run drew but never trained (buffer dropped).
 
@@ -2654,13 +2664,7 @@ class SingleControllerActor:
                     "recovery-enabled rollout dispatch requires a pre-reserved "
                     "prompt-group ID"
                 )
-            prompt_dataset_idx = prompt.get("idx")
-            if (
-                self._pending_prompt_idx is not None
-                and isinstance(prompt_dataset_idx, int)
-                and not isinstance(prompt_dataset_idx, bool)
-            ):
-                self._pending_prompt_idx.add(prompt_dataset_idx)
+            self._mark_prompt_pending(prompt.get("idx"))
             work_started = time.monotonic()
             # check if buffer is full
             self._buffer_capacity_waiters += 1
@@ -2713,6 +2717,12 @@ class SingleControllerActor:
                     for prompt_batch in self._dataloader:
                         if self._divert_batch_to_reserve(prompt_batch):
                             continue
+                        # Pending from the draw, not from _launch: a checkpoint taken
+                        # while admit() waits has the dataloader past this batch
+                        # already, so a resume would skip it. (Diverted spares are
+                        # saved with the reserve instead.)
+                        for prompt_dataset_idx in prompt_batch.get("idx", ()):
+                            self._mark_prompt_pending(prompt_dataset_idx)
                         target_step = await self._sampler.admit(
                             trainer_version_fn=lambda: self._trainer_version
                         )
@@ -5297,8 +5307,8 @@ class SingleControllerActor:
             # The spare pool and dataloader advance together under the same mutation
             # cut in recovery-enabled dispatch, so preserve them in this cut too.
             reserve_state = list(self._replacement_reserve)
-            # Dataset idx of the in-flight plus buffered prompts a dropped replay
-            # buffer loses; a kept one carries the privileged-critic prefixes.
+            # Dataset idx of the waiting, in-flight and buffered prompts a dropped
+            # replay buffer loses; a kept one carries the privileged-critic prefixes.
             checkpoint_replay_buffer = self._async_cfg.checkpoint_replay_buffer
             pending_prompt_indices = (
                 []
