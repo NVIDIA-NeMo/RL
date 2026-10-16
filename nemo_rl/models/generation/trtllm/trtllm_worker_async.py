@@ -42,6 +42,11 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.trtllm.config import TrtllmConfig
+from nemo_rl.utils.gc_freeze import freeze_initialised_heap
+
+# Seconds between a refit's acknowledgement and the re-freeze it schedules, so the
+# collection before the freeze never lands inside the refit bubble.
+_GC_FREEZE_AFTER_REFIT_DELAY_S = 5.0
 
 
 def _tag_nsys_output(output_spec: str, tag: str) -> str:
@@ -172,6 +177,11 @@ class TrtllmAsyncGenerationWorkerImpl:
         self._http_base_url: Optional[str] = None
         self._http_addr: Optional[tuple[str, int]] = None
         self._http_server = None
+        # Refits after which the heap is frozen again (see _freeze_heap).
+        self._gc_freeze_refits_left = int(
+            os.environ.get("NRL_TRTLLM_GC_FREEZE_REFITS", "2")
+        )
+        self._refits_done = 0
 
         if not self.is_model_owner:
             return
@@ -431,6 +441,48 @@ class TrtllmAsyncGenerationWorkerImpl:
             # reach one.
             self.start_http_server()
 
+        self._freeze_heap("after setup")
+
+    def _freeze_heap(self, when: str) -> None:
+        """``gc.freeze()`` this actor's long-lived heap (nemo_rl/utils/gc_freeze.py).
+
+        The actor that serves HTTP holds the AsyncLLM client, the tokenizer and
+        the web stack. CPython's automatic full collections walked all of it every
+        30-60 s on the disagg generation adapter, stopping the process (GIL held)
+        for 0.65-2.4 s while every in-flight call waited. Freezing it after setup,
+        and again once the first refits have grown the heap to its steady size,
+        leaves those collections only the objects that come and go with requests.
+        NRL_TRTLLM_GC_FREEZE=0 turns this off.
+        """
+        if os.environ.get("NRL_TRTLLM_GC_FREEZE", "1") == "0":
+            return
+        stats = freeze_initialised_heap()
+        print(
+            f"[TrtllmAsyncWorker] gc-freeze {when}: {stats['frozen']} objects frozen "
+            f"(collected {stats['collected']}, {stats['seconds']:.2f}s)",
+            flush=True,
+        )
+
+    def _after_refit(self) -> None:
+        """Re-freeze after each of the first NRL_TRTLLM_GC_FREEZE_REFITS refits (default 2).
+
+        The heap keeps growing through the first rollout wave and the first refits.
+        The re-freeze runs on the actor's loop a few seconds after the refit has
+        been acknowledged, so its collection never stretches the refit bubble.
+        """
+        try:
+            self._refits_done = getattr(self, "_refits_done", 0) + 1
+            if getattr(self, "_gc_freeze_refits_left", 0) <= 0:
+                return
+            self._gc_freeze_refits_left -= 1
+            asyncio.get_running_loop().call_later(
+                _GC_FREEZE_AFTER_REFIT_DELAY_S,
+                self._freeze_heap,
+                f"after refit {self._refits_done}",
+            )
+        except Exception as e:  # noqa: BLE001 - a GC tweak must never fail a refit
+            print(f"[TrtllmAsyncWorker] gc-freeze not scheduled: {e!r}", flush=True)
+
     def shutdown(self) -> bool:
         try:
             self.stop_http_server()
@@ -609,6 +661,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                     f"Results: {failed_workers}"
                 )
                 return False
+            self._after_refit()
             return True
         except Exception as e:
             print(f"Exception during TRT-LLM async collective weight update: {e}")
@@ -635,6 +688,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                     f"Results: {failed_workers}"
                 )
                 return False
+            self._after_refit()
             return True
         except Exception as e:
             print(f"Exception during TRT-LLM async IPC weight update: {e}")
@@ -702,6 +756,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                     f"Results: {failed_workers}"
                 )
                 return False
+            self._after_refit()
             return True
         except Exception as e:
             print(f"Exception during TRT-LLM nccl_reshard refit: {e}")

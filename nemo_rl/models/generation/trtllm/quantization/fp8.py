@@ -17,7 +17,7 @@
 import math
 import re
 from collections.abc import Iterable, Sequence
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -97,9 +97,7 @@ _SPLIT_LINEAR_ATTN_RE = re.compile(
 _EXPERT_PREFIX_LAYER_RE = re.compile(
     r"^(?:(?:model\.)?(?:language_model\.)?)layers\.(?P<layer>\d+)\.mlp\.experts$"
 )
-_MTP_EXPERT_PREFIX_LAYER_RE = re.compile(
-    r"^mtp\.layers\.(?P<layer>\d+)\.mlp\.experts$"
-)
+_MTP_EXPERT_PREFIX_LAYER_RE = re.compile(r"^mtp\.layers\.(?P<layer>\d+)\.mlp\.experts$")
 
 # Returns the expert ids this rank holds for a routed-expert checkpoint prefix,
 # or None when every expert must be converted.
@@ -146,15 +144,27 @@ def build_local_expert_lookup(model: Any) -> Optional[LocalExpertLookup]:
     num_hidden_layers = getattr(pretrained_config, "num_hidden_layers", None)
 
     def lookup(prefix: str) -> Optional[Sequence[int]]:
-        match = _EXPERT_PREFIX_LAYER_RE.fullmatch(prefix)
-        if match is not None:
-            return by_layer.get(int(match.group("layer")))
-        match = _MTP_EXPERT_PREFIX_LAYER_RE.fullmatch(prefix)
-        if match is not None and num_hidden_layers is not None:
-            return by_layer.get(int(num_hidden_layers) + int(match.group("layer")))
-        return None
+        layer_idx = expert_prefix_layer_idx(prefix, num_hidden_layers)
+        return None if layer_idx is None else by_layer.get(layer_idx)
 
     return lookup
+
+
+def expert_prefix_layer_idx(
+    prefix: str, num_hidden_layers: Optional[int] = None
+) -> Optional[int]:
+    """Runtime ``layer_idx`` of a routed-expert checkpoint prefix, or None.
+
+    Decoder layers map directly; the MTP layer's experts (``mtp.layers.<i>``)
+    carry ``layer_idx = num_hidden_layers + i`` and need that count.
+    """
+    match = _EXPERT_PREFIX_LAYER_RE.fullmatch(prefix)
+    if match is not None:
+        return int(match.group("layer"))
+    match = _MTP_EXPERT_PREFIX_LAYER_RE.fullmatch(prefix)
+    if match is not None and num_hidden_layers is not None:
+        return int(num_hidden_layers) + int(match.group("layer"))
+    return None
 
 
 def validate_fused_expert_layout(
@@ -220,10 +230,7 @@ def configure_fp8_llm_kwargs(
 
     model_kwargs = dict(llm_kwargs.get("model_kwargs") or {})
     existing_quant_config = model_kwargs.get("quantization_config")
-    if (
-        existing_quant_config is not None
-        and dict(existing_quant_config) != base_kwargs
-    ):
+    if existing_quant_config is not None and dict(existing_quant_config) != base_kwargs:
         raise ValueError(
             "precision='fp8' requires NeMo-RL's Qwen3.5 routed-experts-only "
             f"{label} quantization_config"
@@ -640,7 +647,8 @@ def load_weights(
                 ),
             )
         elif (
-            split_match := _SPLIT_EXPERT_RE.fullmatch(  # pyrefly: ignore[no-matching-overload]
+            split_match
+            := _SPLIT_EXPERT_RE.fullmatch(  # pyrefly: ignore[no-matching-overload]
                 weight_name
             )
         ) is not None:

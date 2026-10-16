@@ -119,14 +119,73 @@ _TOKENIZE_SHADOW_RATE = float(
 )
 
 
+def _decode_prompt_b64(prompt_token_ids_b64: str) -> Any:
+    """The prompt ids of a base64 int32 buffer, as an int32 array.
+
+    TRT-LLM's GenerationRequest takes a flat int32 array as the prompt and puts
+    its bytes on the RPC wire as they are, so a leg that receives the buffer
+    never needs a list of ~20k Python ints. Building that list, copying it,
+    packing it back into int32 for the RPC, echoing it as JSON and freeing it
+    cost close to half of the generation adapter's GIL time per call, and every
+    in-flight list also lengthened each garbage collection.
+    """
+    import base64
+
+    import numpy as np
+
+    return np.frombuffer(base64.b64decode(prompt_token_ids_b64), dtype=np.int32)
+
+
+def _engine_takes_int32_prompts() -> bool:
+    """Whether this TRT-LLM accepts a flat int32 array as the prompt.
+
+    NVIDIA/TensorRT-LLM#19658 (in main): GenerationRequest keeps the array as
+    its int32 wire buffer and GenerationExecutor.generate_async admits it.
+    Older builds (feat/rl_rc, the image's baked wheel) assert a list of ints,
+    so the adapter hands those a list.
+    """
+    try:
+        import numpy as np
+        from tensorrt_llm.executor.request import GenerationRequest
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        request = GenerationRequest(
+            np.zeros(1, dtype=np.int32), sampling_params=SamplingParams()
+        )
+        return getattr(request, "_prompt_token_ids_i32", None) is not None
+    except Exception:  # noqa: BLE001 - any doubt means the list path
+        return False
+
+
+def _as_int_list(prompt_token_ids: Any) -> list[int]:
+    """``prompt_token_ids`` as a list; an int32 array from :func:`_decode_prompt_b64` included."""
+    if hasattr(prompt_token_ids, "tolist"):
+        return prompt_token_ids.tolist()
+    return prompt_token_ids
+
+
+def _leg_json_response(content: dict[str, Any]) -> Any:
+    """JSON reply to the disagg orchestrator, rendered by msgspec.
+
+    A leg's reply carries the prompt ids as one ~100 KB base64 string, which
+    ``json.dumps`` (behind FastAPI's JSONResponse) scans and escapes at ~0.5 ms
+    per call; msgspec copies it.
+    """
+    from fastapi.responses import Response
+
+    return Response(content=msgspec.json.encode(content), media_type="application/json")
+
+
 def _context_leg_response(
     model_name: str,
-    prompt_token_ids: list[int],
+    prompt_token_ids: Any,
     gen: Any,
     disagg_params: Any,
     arrival_ts_us: "int | None" = None,
     tokens_per_block: "int | None" = None,
     request_output: Any = None,
+    return_prompt_token_ids_b64: bool = False,
+    prompt_token_ids_b64: "str | None" = None,
 ) -> Any:
     """Reply to a ``context_only`` request.
 
@@ -134,8 +193,12 @@ def _context_leg_response(
     the handshake back off this response (plus the prompt token ids, so the
     generation server need not re-tokenize). Nothing here is user-visible, so
     the reasoning/tool/stop-token post-processing is skipped entirely.
+
+    ``return_prompt_token_ids_b64`` is the request's wire flag asking for the
+    ids as a base64 int32 buffer; ``prompt_token_ids_b64`` is the buffer the
+    request itself carried, relayed as is (the context leg never changes the
+    ids).
     """
-    from fastapi.responses import JSONResponse
     from tensorrt_llm.serve.openai_protocol import to_disaggregated_params
 
     ctx_out = getattr(gen, "disaggregated_params", None)
@@ -165,18 +228,26 @@ def _context_leg_response(
         },
     }
 
-    # The orchestrator asks for the base64 int32 buffer when it wants to relay a
-    # string instead of materialising the int list on its event loop.
-    if getattr(disagg_params, "return_prompt_token_ids_b64", False):
-        import base64
+    # The orchestrator asks for the base64 int32 buffer (DisaggServerConfig
+    # gen_tokids_ctxbytes) when it wants to relay a string instead of
+    # materialising the int list on its event loop. The caller reads that flag
+    # off the wire body: TRT-LLM's to_llm_disaggregated_params() does not carry
+    # it onto the engine-side params, so checking those alone never asked for
+    # the buffer and the ids crossed every hop as a JSON int array.
+    if return_prompt_token_ids_b64 or getattr(
+        disagg_params, "return_prompt_token_ids_b64", False
+    ):
+        if prompt_token_ids_b64 is None:
+            import base64
 
-        import numpy as np
+            import numpy as np
 
-        response["prompt_token_ids_b64"] = base64.b64encode(
-            np.asarray(prompt_token_ids, dtype=np.int32).tobytes()
-        ).decode("ascii")
+            prompt_token_ids_b64 = base64.b64encode(
+                np.asarray(prompt_token_ids, dtype=np.int32).tobytes()
+            ).decode("ascii")
+        response["prompt_token_ids_b64"] = prompt_token_ids_b64
     else:
-        response["prompt_token_ids"] = prompt_token_ids
+        response["prompt_token_ids"] = _as_int_list(prompt_token_ids)
 
     if _TL_EMIT_TIMELINE_FIELDS:
         # Context-leg timing stamps. The disagg service relays these onto the
@@ -214,7 +285,7 @@ def _context_leg_response(
         if isinstance(num_chunks, int) and num_chunks > 0:
             response["nemo_ctx_num_chunks"] = num_chunks
 
-    return JSONResponse(content=response)
+    return _leg_json_response(response)
 
 
 def _request_matches_profile(body: dict[str, Any], profile: dict[str, Any]) -> bool:
@@ -460,6 +531,11 @@ def create_app(
 
     # Block size is fixed for the engine's lifetime; resolve it once.
     _tl_tpb = _tl_tokens_per_block(llm)
+    _int32_prompts = _engine_takes_int32_prompts()
+    logger.info(
+        "TRT-LLM HTTP adapter: base64 prompts go to the engine as %s",
+        "int32 arrays" if _int32_prompts else "int lists (engine predates #19658)",
+    )
 
     # Per-request template kwargs override these defaults.
     _server_template_kwargs: dict[str, Any] = {
@@ -590,18 +666,16 @@ def create_app(
         # generation leg rendered two full 30k-token templates per request and
         # then discarded them.)
         supplied = body.get("prompt_token_ids")
+        # The base64 int32 buffer (same encoding openai_server.py uses on this
+        # hop) stays an int32 array all the way into the engine, and its string
+        # is relayed as is -- see _decode_prompt_b64.
+        supplied_b64 = None
         if supplied is None and body.get("prompt_token_ids_b64"):
-            # Same int32 buffer encoding openai_server.py uses on this hop.
-            import base64
+            supplied_b64 = body["prompt_token_ids_b64"]
+            supplied = _decode_prompt_b64(supplied_b64)
 
-            import numpy as np
-
-            supplied = np.frombuffer(
-                base64.b64decode(body["prompt_token_ids_b64"]), dtype=np.int32
-            ).tolist()
-
-        if supplied:
-            adj_prompt = list(supplied)
+        if supplied is not None and len(supplied) > 0:
+            adj_prompt = supplied if supplied_b64 is not None else list(supplied)
             # Shadow validation for frontend-tokenized ids (context leg only:
             # the generation leg's ids legitimately extend past the messages).
             if (
@@ -618,14 +692,17 @@ def create_app(
                         model_config,
                         effective_template_kwargs,
                     )
-                    if recomputed != adj_prompt:
+                    supplied_ids = _as_int_list(adj_prompt)
+                    if recomputed != supplied_ids:
                         diff = next(
                             (
                                 i
-                                for i, (a, b) in enumerate(zip(adj_prompt, recomputed))
+                                for i, (a, b) in enumerate(
+                                    zip(supplied_ids, recomputed)
+                                )
                                 if a != b
                             ),
-                            min(len(adj_prompt), len(recomputed)),
+                            min(len(supplied_ids), len(recomputed)),
                         )
                         lo, hi = max(0, diff - 8), diff + 8
                         logger.error(
@@ -633,13 +710,13 @@ def create_app(
                             "recomputed %d, first divergence at %d; "
                             "supplied[%d:%d]=%s (%r) vs recomputed=%s (%r); "
                             "template_kwargs=%r first_msg_role=%r",
-                            len(adj_prompt),
+                            len(supplied_ids),
                             len(recomputed),
                             diff,
                             lo,
                             hi,
-                            adj_prompt[lo:hi],
-                            tokenizer.decode(adj_prompt[lo:hi]),
+                            supplied_ids[lo:hi],
+                            tokenizer.decode(supplied_ids[lo:hi]),
                             recomputed[lo:hi],
                             tokenizer.decode(recomputed[lo:hi]),
                             effective_template_kwargs,
@@ -702,7 +779,11 @@ def create_app(
 
                 _conv_params = ConversationParams(conversation_id=str(_conv_id))
             output = await llm.generate_async(
-                {"prompt_token_ids": adj_prompt},
+                {
+                    "prompt_token_ids": (
+                        adj_prompt if _int32_prompts else _as_int_list(adj_prompt)
+                    )
+                },
                 sampling_params=sampling,
                 disaggregated_params=disagg_params,
                 conversation_params=_conv_params,
@@ -724,10 +805,19 @@ def create_app(
             # the completed generation, so skip it and hand the disagg server
             # just what it needs to build the generation leg.
             return _context_leg_response(
-                model_name, adj_prompt, gen, disagg_params,
+                model_name,
+                adj_prompt,
+                gen,
+                disagg_params,
                 arrival_ts_us=_tl_arrival_ts_us,
                 tokens_per_block=_tl_tpb,
                 request_output=output,
+                return_prompt_token_ids_b64=bool(
+                    (body.get("disaggregated_params") or {}).get(
+                        "return_prompt_token_ids_b64"
+                    )
+                ),
+                prompt_token_ids_b64=supplied_b64,
             )
 
         gen_token_ids = list(gen.token_ids)
@@ -800,7 +890,7 @@ def create_app(
         # server's outbound adaptor re-attaches them to the message before Gym
         # ever sees it -- see trtllm_disagg_server._attach_rollout_fields.
         if disagg_params is None:
-            msg_dict["prompt_token_ids"] = adj_prompt
+            msg_dict["prompt_token_ids"] = _as_int_list(adj_prompt)
             msg_dict["generation_token_ids"] = gen_token_ids
             msg_dict["generation_log_probs"] = gen_logprobs
 
@@ -820,15 +910,21 @@ def create_app(
                     "token_ids": gen_token_ids,
                 }
             ],
-            # Declared on ChatCompletionResponse precisely so a generation
-            # server need not re-tokenize the prompt.
-            "prompt_token_ids": adj_prompt,
             "usage": {
                 "prompt_tokens": len(adj_prompt),
                 "completion_tokens": len(gen_token_ids),
                 "total_tokens": len(adj_prompt) + len(gen_token_ids),
             },
         }
+        # Declared on ChatCompletionResponse precisely so a generation server
+        # need not re-tokenize the prompt. A disagg leg that was handed the
+        # base64 int32 buffer relays that string instead (also declared there);
+        # trtllm_disagg_server._attach_rollout_fields turns it back into the
+        # list Gym reads.
+        if supplied_b64 is not None and disagg_params is not None:
+            response["prompt_token_ids_b64"] = supplied_b64
+        else:
+            response["prompt_token_ids"] = _as_int_list(adj_prompt)
 
         # Timeline fields (skill: collect-training-timeline). Declared on
         # NeMoGymChatCompletion in nemo_gym/openai_utils.py; anything not
@@ -885,6 +981,8 @@ def create_app(
 
         if _TL_EMIT_TIMELINE_FIELDS:
             response["nemo_vllm_response_ready_ts_us"] = time.time_ns() // 1_000
+        if disagg_params is not None:
+            return _leg_json_response(response)
         return JSONResponse(content=response)
 
     return app

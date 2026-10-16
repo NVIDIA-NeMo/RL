@@ -148,7 +148,9 @@ class NcclExtension(WorkerExtension):
             _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
             # Every rank receives the full expert stacks but loads only its
             # own slots; convert just those (EP16: 32 of 512 experts).
-            self._local_expert_lookup = fp8_quantization.build_local_expert_lookup(model)
+            self._local_expert_lookup = fp8_quantization.build_local_expert_lookup(
+                model
+            )
 
     def _unwrap_compiled_model_for_refit(self) -> bool:
         """Unwrap torch.compile before weights are loaded.
@@ -169,9 +171,9 @@ class NcclExtension(WorkerExtension):
         """
         model_engine = self.engine.model_engine
         # Renamed in TRT-LLM; the old name remains as an alias, so try both.
-        unwrap = getattr(model_engine, "unwrap_compiled_model_for_refit", None) or getattr(
-            model_engine, "release_piecewise_cuda_graphs_for_refit", None
-        )
+        unwrap = getattr(
+            model_engine, "unwrap_compiled_model_for_refit", None
+        ) or getattr(model_engine, "release_piecewise_cuda_graphs_for_refit", None)
         if unwrap is None:
             return False
         unwrap()
@@ -191,9 +193,9 @@ class NcclExtension(WorkerExtension):
         speedup until the next refit.
         """
         model_engine = self.engine.model_engine
-        restore = getattr(model_engine, "restore_compiled_model_after_refit", None) or getattr(
-            model_engine, "recapture_piecewise_cuda_graphs_after_refit", None
-        )
+        restore = getattr(
+            model_engine, "restore_compiled_model_after_refit", None
+        ) or getattr(model_engine, "recapture_piecewise_cuda_graphs_after_refit", None)
         if restore is None:
             return False
         restore(self.engine.resource_manager)
@@ -423,7 +425,9 @@ class NcclExtension(WorkerExtension):
                     "Likely stale state_dict_info (wrong shape/dtype for some key)."
                 )
 
-                if fp8_quantization.is_quantized_expert_refit(model.model_config.quant_config):
+                if fp8_quantization.is_quantized_expert_refit(
+                    model.model_config.quant_config
+                ):
                     weights = fp8_quantization.load_weights(
                         weights.items(),
                         is_mx=fp8_quantization.is_mxfp8_model(
@@ -458,9 +462,7 @@ class NcclExtension(WorkerExtension):
             self._restore_compiled_model_after_refit()
             return True
         except Exception as e:
-            self._abort_weight_update_after_failure(
-                model, model_engine.model_loader, e
-            )
+            self._abort_weight_update_after_failure(model, model_engine.model_loader, e)
             print(
                 f"Error in NcclExtension.update_weights_via_ipc_zmq: {e}\n"
                 f"{traceback.format_exc()}"
@@ -532,6 +534,8 @@ class NcclExtension(WorkerExtension):
             "bulk_convert_s": 0.0,
             "bulk_reload_s": 0.0,
             "bulk_reload_calls": 0,
+            "bulk_stack_s": 0.0,
+            "bulk_stack_calls": 0,
             "buckets": 0,
             "tensors": 0,
         }
@@ -548,6 +552,7 @@ class NcclExtension(WorkerExtension):
             f"convert={stats['convert_s']:.2f}s reload={stats['reload_s']:.2f}s "
             f"bulk_convert={stats['bulk_convert_s']:.2f}s bulk_reload={stats['bulk_reload_s']:.2f}s "
             f"bulk_reload_calls={stats['bulk_reload_calls']} "
+            f"bulk_stack={stats['bulk_stack_s']:.2f}s bulk_stack_calls={stats['bulk_stack_calls']} "
             f"buckets={stats['buckets']} tensors={stats['tensors']}",
             flush=True,
         )
@@ -638,7 +643,11 @@ class NcclExtension(WorkerExtension):
                 shape, dtype = meta["shape"], meta["dtype"]
             else:
                 shape, dtype = meta[0], meta[1]
-            dtype = _STR_TO_DTYPE[str(dtype)] if not isinstance(dtype, torch.dtype) else dtype
+            dtype = (
+                _STR_TO_DTYPE[str(dtype)]
+                if not isinstance(dtype, torch.dtype)
+                else dtype
+            )
             misc_state_dict_info[name] = (torch.Size(shape), dtype)
         self.misc_state_dict_info = misc_state_dict_info
         # The misc consumer reuses the collective path's per-bucket reload.
@@ -751,7 +760,9 @@ class NcclExtension(WorkerExtension):
                     else _STR_TO_DTYPE.get(str(dtype_value))
                 )
                 if dtype is None:
-                    raise ValueError(f"{name!r}: unsupported wire dtype {dtype_value!r}")
+                    raise ValueError(
+                        f"{name!r}: unsupported wire dtype {dtype_value!r}"
+                    )
 
                 def pre(_base, shape=local_shape, dtype=dtype):
                     return RefitCtx(buf=torch.empty(shape, dtype=dtype, device=device))
@@ -759,7 +770,9 @@ class NcclExtension(WorkerExtension):
                 def post(
                     ctx, prefix=prefix, projection=projection, expert_ids=expert_ids
                 ):
-                    self._queue_received_experts(prefix, projection, expert_ids, ctx.buf)
+                    self._queue_received_experts(
+                        prefix, projection, expert_ids, ctx.buf
+                    )
 
                 specs[name] = LocalParamSpec(base=None, pre=pre, post=post)
         return HFToLocalParamMap(specs=specs)
@@ -803,9 +816,19 @@ class NcclExtension(WorkerExtension):
     def _queue_received_experts(
         self, prefix: str, projection: str, expert_ids: list[int], stack: torch.Tensor
     ) -> None:
-        """Convert one received stack and reload it, batched under the byte budget."""
+        """Load one received stack, whole or through the per-expert path.
+
+        Whole-stack into its MoE module when TRT-LLM takes stacks; otherwise
+        convert to per-expert entries and reload, batched under the byte
+        budget.
+        """
         import time
 
+        if self._stack_load_applicable():
+            module = self._expert_stack_loader(prefix)
+            if module is not None:
+                self._load_received_stack(module, projection, expert_ids, stack)
+                return
         stats = self._refit_stats
         t0 = time.perf_counter()
         weights = self._convert_received_experts(prefix, projection, expert_ids, stack)
@@ -814,9 +837,7 @@ class NcclExtension(WorkerExtension):
         if pending is None:
             pending = self._pending_bulk_reload = {"weights": {}, "bytes": 0}
         pending["weights"].update(weights)
-        pending["bytes"] += sum(
-            t.numel() * t.element_size() for t in weights.values()
-        )
+        pending["bytes"] += sum(t.numel() * t.element_size() for t in weights.values())
         if pending["bytes"] >= self._bulk_reload_batch_bytes():
             self._flush_received_experts()
 
@@ -832,6 +853,182 @@ class NcclExtension(WorkerExtension):
         falls back to the loader.
         """
         return os.environ.get("NRL_TRTLLM_REFIT_DIRECT_EXPERT_LOAD", "1") != "0"
+
+    @staticmethod
+    def _stack_load_enabled() -> bool:
+        """Hand received expert stacks to TRT-LLM's ``load_expert_stacks``.
+
+        One copy per projection into the slot range instead of the per-expert
+        loader walk (``load_expert_weights_to_dst`` + ``load_quant_scales``,
+        a dozen or two host ops per expert: seconds per refit on a 397B
+        model). Needs a TRT-LLM whose MoE modules expose the method; modules
+        without it, or whose quant method does not support it, keep the
+        per-expert path. NRL_TRTLLM_REFIT_STACK_LOAD=0 disables it.
+        """
+        return os.environ.get("NRL_TRTLLM_REFIT_STACK_LOAD", "1") != "0"
+
+    def _stack_load_applicable(self) -> bool:
+        """Stack loading is on and this engine's expert format has a stack path."""
+        if not self._stack_load_enabled():
+            return False
+        quant_config = self.engine.model_engine.model.model_config.quant_config
+        if not fp8_quantization.is_quantized_expert_refit(quant_config):
+            return True
+        # Block-FP8 (DeepSeek-style 128x128 scales) has no stack loader in
+        # TRT-LLM; MXFP8's UE8M0 1x32 scales do.
+        return fp8_quantization.is_mxfp8_model(quant_config)
+
+    def _expert_stack_loader(self, prefix: str):
+        """The MoE module taking ``load_expert_stacks`` for ``prefix``, or None."""
+        cache = getattr(self, "_expert_stack_loader_map", None)
+        if cache is None:
+            cache = self._expert_stack_loader_map = {}
+        if prefix in cache:
+            return cache[prefix]
+        owners = self._moe_weight_owners()
+        module = owners.get(prefix)
+        if module is None:
+            # The trainer names experts the HF way; TRT-LLM's mapper renames
+            # them to its module paths (Qwen3.5: ``model.language_model.`` ->
+            # ``model.``). The per-expert path gets that for free from
+            # preprocess_weights, so normalize the prefix the same way.
+            module = owners.get(self._module_prefix_for(prefix))
+        if module is None:
+            # Name-agnostic: the MoE modules carry their layer_idx, and the
+            # prefix carries the layer number (the local-expert lookup already
+            # relies on exactly this pairing).
+            module = self._moe_modules_by_layer().get(self._expert_prefix_layer(prefix))
+        loader = None
+        reason = None
+        if module is None:
+            reason = "no MoE module for this prefix"
+        elif not callable(getattr(module, "load_expert_stacks", None)):
+            reason = (
+                f"{type(module).__name__} has no load_expert_stacks (older TRT-LLM)"
+            )
+        else:
+            supports = getattr(module, "supports_expert_stack_loading", None)
+            if supports is None or supports():
+                loader = module
+            else:
+                reason = (
+                    f"{type(getattr(module, 'quant_method', None)).__name__} does not "
+                    "support stack loading"
+                )
+        if not getattr(self, "_stack_loader_reported", False):
+            # One line per engine rank, first prefix only: says which path the
+            # refit takes and why, so a silent fallback shows up in the log.
+            self._stack_loader_reported = True
+            sample = sorted(owners)[:2]
+            if loader is not None:
+                print(
+                    f"[nccl_reshard_refit] expert stack loading ON: {prefix!r} -> "
+                    f"{type(loader).__name__} (owners e.g. {sample})",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[nccl_reshard_refit] expert stack loading OFF for {prefix!r}: "
+                    f"{reason}; per-expert loader path instead (owners e.g. {sample}, "
+                    f"normalized {self._module_prefix_for(prefix)!r}, layer "
+                    f"{self._expert_prefix_layer(prefix)!r})",
+                    flush=True,
+                )
+        cache[prefix] = loader
+        return loader
+
+    def _expert_prefix_layer(self, prefix: str):
+        pretrained_config = getattr(
+            getattr(self.engine.model_engine.model, "model_config", None),
+            "pretrained_config",
+            None,
+        )
+        num_hidden_layers = getattr(pretrained_config, "num_hidden_layers", None)
+        return fp8_quantization.expert_prefix_layer_idx(prefix, num_hidden_layers)
+
+    def _moe_modules_by_layer(self) -> dict:
+        """``layer_idx -> MoE weight owner`` (built once from the owner map)."""
+        by_layer = getattr(self, "_moe_module_by_layer_map", None)
+        if by_layer is None:
+            by_layer = {}
+            for module in self._moe_weight_owners().values():
+                layer_idx = getattr(module, "layer_idx", None)
+                if layer_idx is not None:
+                    by_layer[int(layer_idx)] = module
+            self._moe_module_by_layer_map = by_layer
+        return by_layer
+
+    def _module_prefix_for(self, prefix: str) -> str:
+        """TRT-LLM module path of an HF routed-expert prefix (mapper-normalized)."""
+        probe = f"{prefix}.0.down_proj.weight"
+        suffix = ".0.down_proj.weight"
+        mapper = getattr(self.engine.model_engine.model_loader, "weight_mapper", None)
+        if mapper is not None:
+            try:
+                renamed = mapper.preprocess_weights(
+                    {probe: torch.empty(0)}, allow_partial_loading=True
+                )
+                for key in list(renamed):
+                    if isinstance(key, str) and key.endswith(suffix):
+                        return key[: -len(suffix)]
+            except Exception:  # noqa: BLE001 - mapper probing is best effort
+                pass
+        # Generic fallback: drop a ``language_model`` path segment.
+        return ".".join(part for part in prefix.split(".") if part != "language_model")
+
+    def _load_received_stack(
+        self, module, projection: str, expert_ids: list[int], stack: torch.Tensor
+    ) -> None:
+        """Quantize (when the engine is FP8) and load one received stack into its slots.
+
+        gate_proj / up_proj / down_proj stacks become TRT-LLM's w1 / w3 / w2
+        (a fused gate_up stack is split into its halves). Quantized engines
+        convert in ``FP8_EXPERT_CHUNK_SIZE`` expert chunks (bounds the fp32
+        upcast) and load each chunk; bf16 engines hand the staging views over
+        directly. Everything stays on the receive stream, so the copies are
+        ordered before the staging buffer is released.
+        """
+        import time
+
+        quant_config = self.engine.model_engine.model.model_config.quant_config
+        quantized = fp8_quantization.is_quantized_expert_refit(quant_config)
+        if quantized and not fp8_quantization.is_mxfp8_model(quant_config):
+            raise NotImplementedError(
+                "expert stack loading needs MXFP8 or bf16 experts"
+            )
+        # The reshard plan moves one HF projection per stack (gate_proj /
+        # up_proj / down_proj, as convert_expert_projection_stack takes them);
+        # a fused gate_up stack splits into its two halves along dim 1.
+        if projection == "gate_proj":
+            parts = {"w1": stack}
+        elif projection == "up_proj":
+            parts = {"w3": stack}
+        elif projection == "down_proj":
+            parts = {"w2": stack}
+        elif projection == "gate_up_proj":
+            intermediate = stack.shape[1] // 2
+            parts = {"w1": stack[:, :intermediate], "w3": stack[:, intermediate:]}
+        else:
+            raise ValueError(f"unsupported routed-expert projection {projection!r}")
+        chunk = fp8_quantization.FP8_EXPERT_CHUNK_SIZE if quantized else len(expert_ids)
+        stats = self._refit_stats
+        for start in range(0, len(expert_ids), max(1, chunk)):
+            end = min(start + max(1, chunk), len(expert_ids))
+            kwargs = {}
+            t0 = time.perf_counter()
+            for key, part in parts.items():
+                piece = part[start:end]
+                if quantized:
+                    data, scale = fp8_quantization.cast_tensor_to_mxfp8_blockwise(piece)
+                    kwargs[key] = data
+                    kwargs[f"{key}_scale"] = scale
+                else:
+                    kwargs[key] = piece
+            stats["bulk_convert_s"] += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            module.load_expert_stacks(list(expert_ids[start:end]), **kwargs)
+            stats["bulk_stack_s"] += time.perf_counter() - t0
+            stats["bulk_stack_calls"] += 1
 
     def _moe_weight_owners(self) -> dict:
         """``expert prefix -> module`` for every MoE weight owner, built once."""
@@ -891,7 +1088,9 @@ class NcclExtension(WorkerExtension):
                     module, module_name, module_weights, allow_partial_loading=True
                 )
             else:
-                module.load_weights(weights=[module_weights], allow_partial_loading=True)
+                module.load_weights(
+                    weights=[module_weights], allow_partial_loading=True
+                )
             for key in list(leftover):
                 if key.startswith(prefix + "."):
                     del leftover[key]
@@ -960,7 +1159,11 @@ class NcclExtension(WorkerExtension):
                         f"nccl_reshard_refit: {param_info['name']!r} has no local spec "
                         "(its weights would be discarded)"
                     )
-                    ctx = spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
+                    ctx = (
+                        spec.pre(spec.base)
+                        if spec.pre is not None
+                        else RefitCtx(buf=spec.base)
+                    )
                     xferdtensor(
                         None,
                         param_info["src_mesh_info"],
@@ -1008,7 +1211,9 @@ class NcclExtension(WorkerExtension):
         """
         refit_info = getattr(self, "nccl_reshard_refit_info", None)
         if refit_info is None:
-            raise RuntimeError("prepare_nccl_reshard_refit_info must run before the refit")
+            raise RuntimeError(
+                "prepare_nccl_reshard_refit_info must run before the refit"
+            )
         if not getattr(self, "pp_comm_groups", None):
             raise RuntimeError("init_nccl_reshard_comm_group must run before the refit")
         if getattr(self, "hf_to_local_param_map", None) is None:

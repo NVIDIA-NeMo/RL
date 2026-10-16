@@ -134,3 +134,71 @@ def test_non_adapted_paths_pass_through_untouched():
 
     assert app.body == body
     assert app.scope is scope
+
+
+def _attach(payload: dict) -> dict:
+    """Run the outbound adaptor's _attach_rollout_fields on *payload*."""
+    import pytest
+
+    pytest.importorskip("tensorrt_llm")
+    from types import SimpleNamespace
+
+    from fastapi.responses import JSONResponse
+
+    from nemo_rl.models.generation.trtllm.trtllm_disagg_server import (
+        _build_adaptor_class,
+    )
+
+    cls = _build_adaptor_class()
+    self = SimpleNamespace(_generation_token_ids=cls._generation_token_ids)
+    out = cls._attach_rollout_fields(self, JSONResponse(content=payload), None)
+    return json.loads(out.body)
+
+
+def _final_payload(**prompt_fields) -> dict:
+    return {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "qwen",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop",
+                "token_ids": [7, 8],
+                "logprobs": {
+                    "content": [
+                        {"token": "token_id:7", "logprob": -0.25},
+                        {"token": "token_id:8", "logprob": -0.5},
+                    ]
+                },
+            }
+        ],
+        **prompt_fields,
+    }
+
+
+def test_rollout_fields_decode_a_relayed_b64_prompt():
+    import base64
+
+    import numpy as np
+
+    ids = [101, 202, 303, 150_000]
+    b64 = base64.b64encode(np.asarray(ids, dtype=np.int32).tobytes()).decode()
+
+    got = _attach(_final_payload(prompt_token_ids_b64=b64))
+
+    # Gym sees exactly what the int-array path produced: a list, top level and
+    # on the message, and no base64 field.
+    assert got["prompt_token_ids"] == ids
+    assert got["choices"][0]["message"]["prompt_token_ids"] == ids
+    assert "prompt_token_ids_b64" not in got
+    assert got["choices"][0]["message"]["generation_token_ids"] == [7, 8]
+    assert got["choices"][0]["message"]["generation_log_probs"] == [-0.25, -0.5]
+
+
+def test_rollout_fields_keep_an_int_list_prompt():
+    got = _attach(_final_payload(prompt_token_ids=[1, 2, 3]))
+
+    assert got["choices"][0]["message"]["prompt_token_ids"] == [1, 2, 3]
+    assert got["prompt_token_ids"] == [1, 2, 3]

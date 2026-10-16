@@ -424,8 +424,22 @@ def _build_adaptor_class() -> type:
                     content=payload, status_code=response.status_code
                 )
 
-            if payload.get("prompt_token_ids") is not None:
-                message["prompt_token_ids"] = payload["prompt_token_ids"]
+            prompt_token_ids = payload.get("prompt_token_ids")
+            if prompt_token_ids is None and payload.get("prompt_token_ids_b64"):
+                # Under gen_tokids_ctxbytes the generation adapter relays the
+                # base64 int32 buffer it was handed instead of a ~20k-int JSON
+                # array. Gym reads a list, top level and on the message, as before.
+                import base64
+
+                import numpy as np
+
+                prompt_token_ids = np.frombuffer(
+                    base64.b64decode(payload.pop("prompt_token_ids_b64")),
+                    dtype=np.int32,
+                ).tolist()
+                payload["prompt_token_ids"] = prompt_token_ids
+            if prompt_token_ids is not None:
+                message["prompt_token_ids"] = prompt_token_ids
 
             token_ids = self._generation_token_ids(choice)
             if token_ids is not None:

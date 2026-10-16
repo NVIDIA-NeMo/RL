@@ -262,3 +262,67 @@ async def test_async_ipc_refit_checks_every_worker_result(result):
     worker.llm.collective_rpc.return_value = result
 
     assert await worker.update_weights_via_ipc_zmq_async() is False
+
+
+@pytest.mark.asyncio
+async def test_first_refits_schedule_a_heap_freeze_outside_the_refit(monkeypatch):
+    import asyncio
+
+    from nemo_rl.models.generation.trtllm import trtllm_worker_async as mod
+
+    worker = _worker()
+    worker._gc_freeze_refits_left = 2
+    worker._refits_done = 0
+    worker.llm.collective_rpc.return_value = [True, True]
+    scheduled = []
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(
+        loop, "call_later", lambda delay, fn, *args: scheduled.append((delay, fn, args))
+    )
+
+    for _ in range(3):
+        assert await worker.nccl_reshard_refit_async() is True
+
+    # Only the first two refits re-freeze, each deferred past the refit's ack.
+    assert [args for _, _, args in scheduled] == [
+        ("after refit 1",),
+        ("after refit 2",),
+    ]
+    assert all(delay == mod._GC_FREEZE_AFTER_REFIT_DELAY_S for delay, _, _ in scheduled)
+    assert all(fn == worker._freeze_heap for _, fn, _ in scheduled)
+
+
+@pytest.mark.asyncio
+async def test_failed_refit_schedules_no_heap_freeze(monkeypatch):
+    import asyncio
+
+    worker = _worker()
+    worker._gc_freeze_refits_left = 2
+    worker._refits_done = 0
+    worker.llm.collective_rpc.return_value = [True, False]
+    scheduled = []
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "call_later", lambda *a: scheduled.append(a))
+
+    assert await worker.nccl_reshard_refit_async() is False
+    assert scheduled == []
+
+
+@pytest.mark.parametrize("env, expect_freeze", [(None, True), ("0", False)])
+def test_freeze_heap_honours_the_switch(monkeypatch, env, expect_freeze):
+    from nemo_rl.models.generation.trtllm import trtllm_worker_async as mod
+
+    if env is None:
+        monkeypatch.delenv("NRL_TRTLLM_GC_FREEZE", raising=False)
+    else:
+        monkeypatch.setenv("NRL_TRTLLM_GC_FREEZE", env)
+    calls = []
+    monkeypatch.setattr(
+        mod,
+        "freeze_initialised_heap",
+        lambda: calls.append(1) or {"frozen": 5, "collected": 0, "seconds": 0.0},
+    )
+
+    _worker()._freeze_heap("after setup")
+
+    assert calls == ([1] if expect_freeze else [])
