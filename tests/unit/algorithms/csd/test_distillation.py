@@ -1219,6 +1219,7 @@ class _FakeLossFn(CSDLossFn):
         *,
         teacher_topk_ipc_k=0,
         teacher_vocab_sizes=None,
+        owner_local=False,
     ):
         self.num_teachers = len(projection_matrix_paths)
         self.projection_matrix_paths = projection_matrix_paths
@@ -1232,6 +1233,7 @@ class _FakeLossFn(CSDLossFn):
                 "teacher_topk_ipc_k": teacher_topk_ipc_k,
                 "teacher_topk_ipc_support_mode": "row_topk",
                 "teacher_topk_ipc_keep_realized": True,
+                "owner_local": owner_local,
             }
         )
 
@@ -1539,6 +1541,183 @@ def test_build_teacher_force_ids_follow_realized_only_mismatch(realized_only):
         assert torch.equal(force_ids, torch.tensor([[10, 12, 13, -1, -1]]))
     else:
         assert force_ids is None
+
+
+def test_owner_local_export_routes_sparse_teachers_to_the_megatron_sender():
+    loss_fn = _FakeLossFn(
+        projection_matrix_paths=["/p0.pt", None],
+        teacher_topk_ipc_k=4,
+        teacher_vocab_sizes=[151669, 128256],
+        owner_local=True,
+    )
+    t0 = MagicMock()
+    t1 = MagicMock()
+    t0.get_sparse_logits_ipc.return_value = [{"teacher_shards": ["sparse"]}]
+    t1.get_full_logits_ipc.return_value = [{"teacher_shards": ["dense"]}]
+    batch = _make_batch(batch_size=2, num_teachers=1)
+    batch["teacher_0_input_ids"] = torch.tensor([[3, 4, 5, 6], [7, 8, 9, 10]])
+
+    train_data = export_teacher_logits_and_pack(
+        [t0, t1], loss_fn, batch, teacher_mbs=[1, 2]
+    )
+
+    assert train_data["teacher_0_sparse_logits_ipc"] == [{"teacher_shards": ["sparse"]}]
+    assert train_data["teacher_1_full_logits_ipc"] == [{"teacher_shards": ["dense"]}]
+    t0.get_topk_logits_ipc.assert_not_called()
+    call = t0.get_sparse_logits_ipc.call_args
+    assert call.kwargs == {
+        "k": 4,
+        "temperature": 1.0,
+        "real_vocab_size": 151669,
+        "noise_filter_k": 0,
+        "micro_batch_size": 1,
+        "timer": None,
+    }
+    force = call.args[0]["force_include_token_ids"]
+    expected = _build_teacher_force_include_token_id_slots(
+        batch, teacher_idx=0, kl_chunk_shift=False
+    )
+    assert force.shape == (2, 4, csd_mod.SPARSE_TEACHER_FORCE_WIDTH)
+    assert torch.equal(force, expected)
+    assert force[0, 0].tolist() == [3, -1]
+
+
+def test_owner_local_dense_export_keeps_full_logits():
+    loss_fn = _FakeLossFn(
+        projection_matrix_paths=["/p0.pt"], teacher_topk_ipc_k=0, owner_local=True
+    )
+    teacher = MagicMock()
+    teacher.get_full_logits_ipc.return_value = [{"teacher_shards": ["dense"]}]
+
+    train_data = export_teacher_logits_and_pack(
+        [teacher], loss_fn, _make_batch(), teacher_mbs=[1]
+    )
+
+    assert train_data["teacher_0_full_logits_ipc"] == [{"teacher_shards": ["dense"]}]
+    teacher.get_sparse_logits_ipc.assert_not_called()
+    teacher.get_topk_logits_ipc.assert_not_called()
+
+
+def _owner_local_master_config(*, k: int = 0, teacher_backend: str = "megatron"):
+    cfg = _make_master_config()
+    cfg.policy["automodel_cfg"]["enabled"] = False
+    cfg.policy["megatron_cfg"] = _megatron_cfg(tp=2, cp=2)
+    if teacher_backend == "megatron":
+        cfg.teachers[0].automodel_cfg["enabled"] = False
+        cfg.teachers[0].megatron_cfg = {
+            **_megatron_cfg(tp=2, cp=2),
+            "sequence_parallel": False,
+        }
+    cfg.loss_fn.teacher_topk_ipc_k = k
+    return cfg
+
+
+@pytest.mark.parametrize(
+    "change,expected",
+    [
+        (None, []),
+        ("automodel_student", ["the student policy is not Megatron"]),
+        ("pp2", ["policy pipeline_model_parallel_size=2 (needs 1)"]),
+        ("packing", ["policy sequence packing is enabled"]),
+        ("dynamic_batching", ["policy dynamic batching is enabled"]),
+        ("pure_alm", ["csd_pure_alm=true"]),
+        ("averaged_logits", ["kd_loss_mode='averaged_logits' (needs 'sum')"]),
+        ("sparse", []),
+        ("sparse_automodel_teacher", ["teachers[0] is not Megatron"]),
+        ("sparse_odd_divisor", ["is not a multiple of 4"]),
+        ("sparse_sequence_parallel", ["is not a multiple of 12"]),
+    ],
+)
+def test_owner_local_eligibility_truth_table(change, expected):
+    cfg = _owner_local_master_config()
+    if change == "automodel_student":
+        cfg.policy["automodel_cfg"]["enabled"] = True
+        cfg.policy["megatron_cfg"]["enabled"] = False
+    elif change == "pp2":
+        cfg.policy["megatron_cfg"]["pipeline_model_parallel_size"] = 2
+    elif change == "packing":
+        cfg.policy["sequence_packing"] = {"enabled": True}
+    elif change == "dynamic_batching":
+        cfg.policy["dynamic_batching"] = {"enabled": True}
+    elif change == "pure_alm":
+        cfg.loss_fn.csd_pure_alm = True
+    elif change == "averaged_logits":
+        cfg.loss_fn.kd_loss_mode = "averaged_logits"
+    elif change is not None and change.startswith("sparse"):
+        cfg.loss_fn.teacher_topk_ipc_k = 128
+        if change == "sparse_automodel_teacher":
+            cfg.teachers[0].automodel_cfg["enabled"] = True
+            cfg.teachers[0].megatron_cfg = _megatron_cfg(enabled=False)
+        elif change == "sparse_odd_divisor":
+            cfg.teachers[0].make_sequence_length_divisible_by = 6
+        elif change == "sparse_sequence_parallel":
+            cfg.teachers[0].megatron_cfg = {
+                **_megatron_cfg(tp=3, cp=2),
+                "sequence_parallel": True,
+            }
+
+    reasons = csd_mod.csd_owner_local_ineligibility(cfg, cfg.loss_fn)
+
+    assert len(reasons) == len(expected)
+    for reason, fragment in zip(reasons, expected):
+        assert fragment in reason
+
+
+def test_owner_local_ignores_same_tokenizer_teachers_for_sparse_checks():
+    cfg = _owner_local_master_config(k=128, teacher_backend="automodel")
+    cfg.teachers[0].aligner.student_to_teacher_table_path = None
+    cfg.teachers[0].aligner.teacher_to_student_table_path = None
+    assert csd_mod.csd_owner_local_ineligibility(cfg, cfg.loss_fn) == []
+
+
+@pytest.mark.parametrize(
+    "k,teacher_backend,pure_alm,expected_owner_local",
+    [
+        (0, "megatron", False, True),
+        (0, "automodel", False, True),
+        (128, "megatron", False, True),
+        (0, "megatron", True, False),
+    ],
+)
+def test_setup_injects_owner_local_for_eligible_megatron_students(
+    k, teacher_backend, pure_alm, expected_owner_local
+):
+    cfg = _owner_local_master_config(k=k, teacher_backend=teacher_backend)
+    cfg.loss_fn.csd_pure_alm = pure_alm
+
+    _, mocks = _patched_setup_call(cfg)
+
+    assert mocks["loss"].call_args.args[0]["owner_local"] is expected_owner_local
+
+
+def test_setup_keeps_automodel_students_replicated():
+    _, mocks = _patched_setup_call(_make_master_config())
+    assert mocks["loss"].call_args.args[0]["owner_local"] is False
+
+
+def test_setup_rejects_sparse_ipc_a_megatron_student_cannot_own():
+    cfg = _owner_local_master_config(k=128, teacher_backend="automodel")
+    with pytest.raises(
+        ValueError,
+        match=r"needs owner-local CSD evaluation.*teachers\[0\] is not Megatron"
+        r".*teacher_topk_ipc_k=0",
+    ):
+        _patched_setup_call(cfg)
+    cfg = _owner_local_master_config(k=128)
+    cfg.loss_fn.csd_pure_alm = True
+    with pytest.raises(ValueError, match="csd_pure_alm=true"):
+        _patched_setup_call(cfg)
+
+
+def test_setup_rejects_megatron_sparse_teachers_for_automodel_students():
+    cfg = _make_master_config()
+    cfg.loss_fn.teacher_topk_ipc_k = 128
+    cfg.teachers[0].automodel_cfg["enabled"] = False
+    cfg.teachers[0].megatron_cfg = _megatron_cfg()
+    with pytest.raises(
+        ValueError, match="Automodel student requires Automodel cross-tokenizer"
+    ):
+        _patched_setup_call(cfg)
 
 
 def test_export_teacher_logits_mixes_sparse_cross_and_dense_same_vocab():
