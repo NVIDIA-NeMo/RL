@@ -30,7 +30,7 @@ from typing import Any, Dict, List, NotRequired, Optional, Protocol, Self, Typed
 
 import ray
 import torch
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
@@ -192,6 +192,16 @@ def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
             "dataset was prepared without routing information."
         )
     )
+
+
+class NemoGymPostprocessConfig(BaseModel):
+    """NeMo-RL postprocessing options nested under ``env.nemo_gym``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    invalid_tool_call_patterns: list[str] | None = None
+    thinking_tags: list[str] | None = None
+    truncate_noncontiguous_episodes: bool = False
 
 
 class NemoGymCompatibleConfig(Protocol):
@@ -385,6 +395,9 @@ class NemoGymConfig(TypedDict):
     pad_dynamic_image_shapes: NotRequired[
         bool
     ]  # Preserve heterogeneous shapes for native-resolution patchification
+    # Opt-in recovery for token-prefix discontinuities in multi-turn rollouts.
+    # The default is supplied by NemoGymPostprocessConfig.
+    truncate_noncontiguous_episodes: bool
     # Ledger-authoritative token capture (token_capture.enabled): the dumped
     # TokenCaptureConfig. Turns on external staging in Gym's policy model
     # server, switches run_rollouts to receipt mode, and assembles receipts
@@ -1410,6 +1423,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
+        nemo_gym_result["noncontiguous_truncated"] = False
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -1420,10 +1434,19 @@ Depending on your data shape, you may want to change these values."""
             if not _is_trainable_output_item(output_item_dict):
                 continue
 
-            assert (
+            is_contiguous = (
                 seen_token_ids
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+            )
+            if not is_contiguous and self.cfg["truncate_noncontiguous_episodes"]:
+                print(
+                    "[nemo_gym] WARNING: non-contiguous turn; truncating episode "
+                    f"at {len(nemo_rl_message_log)} messages "
+                    f"(seen={len(seen_token_ids)} tokens); dropping corrupted tail."
+                )
+                nemo_gym_result["noncontiguous_truncated"] = True
+                break
+            assert is_contiguous, f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
@@ -1766,7 +1789,7 @@ def build_nemo_gym_config(
     Args:
         env_configs: The master_config.env mapping; env_configs["nemo_gym"] supplies
             the Gym global config plus NeMo-RL detection knobs (invalid_tool_call_patterns,
-            thinking_tags, num_gpu_nodes).
+            thinking_tags, truncate_noncontiguous_episodes, num_gpu_nodes).
         base_urls: Per-DP-rank OpenAI-compatible server base URLs from the generation backend.
         model_name: Served model name the Gym rollouts should target.
         enable_router_replay: Sets ``require_routed_experts`` and selects the
@@ -1822,7 +1845,25 @@ def _build_gym_actor_config(
     Shared by the unsharded path and by each shard, so every actor gets the
     same treatment of NeMo-RL-side keys regardless of how it was composed.
     """
-    nemo_gym_dict = dict(nemo_gym_dict)
+    postprocess_cfg = NemoGymPostprocessConfig.model_validate(nemo_gym_dict)
+    nemo_gym_dict = {
+        key: value
+        for key, value in nemo_gym_dict.items()
+        if key not in NemoGymPostprocessConfig.model_fields
+    }
+    if postprocess_cfg.truncate_noncontiguous_episodes:
+        if enable_router_replay:
+            raise ValueError(
+                "truncate_noncontiguous_episodes is not compatible with router replay: "
+                "the next contiguous prompt is required to repair the retained prefix's "
+                "final route."
+            )
+        if token_capture and token_capture.get("enabled"):
+            raise ValueError(
+                "truncate_noncontiguous_episodes is not compatible with "
+                "token_capture.enabled: receipt mode bypasses the legacy token-prefix "
+                "check, so it cannot truncate non-contiguous episodes."
+            )
 
     # NeMo-RL-only keys are consumed here and must never reach Gym: the merged
     # config is serialized into every Gym child process, and unrecognized
@@ -1832,8 +1873,6 @@ def _build_gym_actor_config(
 
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
-    invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
-    thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
@@ -1869,12 +1908,13 @@ def _build_gym_actor_config(
         model_name=model_name,
         base_urls=base_urls,
         policy_api_key=policy_api_key,
-        invalid_tool_call_patterns=invalid_tool_call_patterns,
-        thinking_tags=thinking_tags,
+        invalid_tool_call_patterns=postprocess_cfg.invalid_tool_call_patterns,
+        thinking_tags=postprocess_cfg.thinking_tags,
         tokenizer_config=tokenizer_config,
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        truncate_noncontiguous_episodes=postprocess_cfg.truncate_noncontiguous_episodes,
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
