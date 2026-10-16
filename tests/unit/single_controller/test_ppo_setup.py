@@ -607,10 +607,14 @@ def _dynamic_sampling_config(
     mc.policy["train_global_batch_size"] = (
         _NUM_PROMPTS_PER_STEP * num_generations_per_prompt
     )
+    sampler_cfg = {"name": sampler}
+    if sampler == "custom":
+        # A custom sampler config requires a target; the validator does not import it.
+        sampler_cfg["target"] = "my_pkg.samplers:MySampler"
     mc.async_rl = AsyncRLConfig(
         min_groups_for_streaming_train=_NUM_PROMPTS_PER_STEP,
         max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
-        sampler={"name": sampler},
+        sampler=sampler_cfg,
         rollout_failure={"on_dropped_prompt": on_dropped_prompt},
     )
     return mc
@@ -621,6 +625,11 @@ class TestDynamicSamplingValidation:
 
     def test_accepts_replace_with_a_stamping_sampler(self):
         validate_single_controller_config(_dynamic_sampling_config())
+
+    def test_accepts_a_custom_sampler(self):
+        # `custom` is permitted alongside `in_order`; stamping is the sampler's
+        # responsibility and cannot be checked here.
+        validate_single_controller_config(_dynamic_sampling_config(sampler="custom"))
 
     def test_rejects_shrink_since_a_filtered_group_is_never_substituted(self):
         mc = _dynamic_sampling_config(on_dropped_prompt="shrink")
