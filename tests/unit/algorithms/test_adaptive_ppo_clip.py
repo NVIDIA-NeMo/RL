@@ -40,7 +40,7 @@ def _adaptive_loss(**overrides: Any) -> ClippedPGLossFn:
         "truncated_importance_sampling_type": "adaptive-ppo-clip",
         "truncated_importance_sampling_ratio": 1.0,
         "truncated_importance_sampling_ratio_min": 0.5,
-        "tis_adaptive_ppo_clip_target_entropy": 0.3,
+        "truncated_importance_sampling_adaptive_target_entropy": 0.3,
     }
     config.update(overrides)
     return ClippedPGLossFn(ClippedPGLossConfig(**config))
@@ -130,40 +130,53 @@ def test_entropy_controller_clamps_and_holds_at_target() -> None:
     assert loss_fn.cur_adaptive_ppo_clip_k == 1.0
     loss_fn.update_adaptive_loss_state(0.3)
     assert loss_fn.cur_adaptive_ppo_clip_k == 1.0
+    loss_fn.update_adaptive_loss_state(0.5)
+    assert loss_fn.cur_adaptive_ppo_clip_k == 0.75
     for _ in range(6):
         loss_fn.update_adaptive_loss_state(0.5)
-    assert loss_fn.adaptive_loss_state_dict() == {
-        "last_entropy": 0.5,
-        "cur_adaptive_ppo_clip_k": 0.0,
-    }
+    assert loss_fn.cur_adaptive_ppo_clip_k == 0.0
 
 
-def test_adaptive_state_round_trip_and_clamped_restore() -> None:
+def test_controller_and_outer_bound_follow_config() -> None:
+    # Non-default values show that every knob comes from the config.
+    loss_fn = _adaptive_loss(
+        truncated_importance_sampling_adaptive_target_entropy=0.5,
+        truncated_importance_sampling_adaptive_k_step=0.5,
+        truncated_importance_sampling_adaptive_k_max=2.5,
+        truncated_importance_sampling_adaptive_outer_bound=3.0,
+    )
+    loss_fn.update_adaptive_loss_state(0.4)
+    assert loss_fn.cur_adaptive_ppo_clip_k == 0.5
+    for _ in range(6):
+        loss_fn.update_adaptive_loss_state(0.4)
+    assert loss_fn.cur_adaptive_ppo_clip_k == 2.5
+    # Upper bound is 1.0 + 2.5 = 3.5, but the outer bound of 3.0 drops 3.2.
+    loss, metrics = loss_fn(**_loss_inputs([2.8, 3.2], [1.0, 1.0]))
+    torch.testing.assert_close(loss, torch.tensor(-1.4, dtype=torch.float64))
+    assert metrics["is_oob_ratio"] == pytest.approx(0.5)
+    # Entropy above the target narrows the bound by the configured step.
+    loss_fn.update_adaptive_loss_state(0.6)
+    assert loss_fn.cur_adaptive_ppo_clip_k == 2.0
+
+
+def test_set_k_clamps_to_configured_range() -> None:
     loss_fn = _adaptive_loss()
-    loss_fn.update_adaptive_loss_state(0.1)
-    resumed = _adaptive_loss()
-    resumed.load_adaptive_loss_state_dict(loss_fn.adaptive_loss_state_dict())
-    assert resumed.adaptive_loss_state_dict() == loss_fn.adaptive_loss_state_dict()
-    resumed.load_adaptive_loss_state_dict({"cur_adaptive_ppo_clip_k": 5.0})
-    assert resumed.cur_adaptive_ppo_clip_k == 1.0
-    resumed.load_adaptive_loss_state_dict({"cur_adaptive_ppo_clip_k": -5.0})
-    assert resumed.cur_adaptive_ppo_clip_k == 0.0
-    fresh = _adaptive_loss()
-    fresh.load_adaptive_loss_state_dict({})
-    assert fresh.adaptive_loss_state_dict() == {
-        "last_entropy": None,
-        "cur_adaptive_ppo_clip_k": 0.0,
-    }
+    loss_fn.set_adaptive_ppo_clip_k(0.5)
+    assert loss_fn.cur_adaptive_ppo_clip_k == 0.5
+    loss_fn.set_adaptive_ppo_clip_k(5.0)
+    assert loss_fn.cur_adaptive_ppo_clip_k == 1.0
+    loss_fn.set_adaptive_ppo_clip_k(-5.0)
+    assert loss_fn.cur_adaptive_ppo_clip_k == 0.0
+    wide = _adaptive_loss(truncated_importance_sampling_adaptive_k_max=2.5)
+    wide.set_adaptive_ppo_clip_k(5.0)
+    assert wide.cur_adaptive_ppo_clip_k == 2.5
 
 
 def test_other_tis_types_do_not_acquire_adaptive_state() -> None:
     loss_fn = _adaptive_loss(truncated_importance_sampling_type="icepop")
-    loss_fn.load_adaptive_loss_state_dict(
-        {"last_entropy": 0.1, "cur_adaptive_ppo_clip_k": 0.75}
-    )
+    loss_fn.set_adaptive_ppo_clip_k(0.75)
     loss_fn.update_adaptive_loss_state(0.1)
     assert not loss_fn.has_adaptive_loss_state()
-    assert loss_fn.adaptive_loss_state_dict() == {}
     assert loss_fn.cur_adaptive_ppo_clip_k is None
 
 
@@ -187,55 +200,56 @@ def test_requires_force_on_policy_ratio() -> None:
         _adaptive_loss(force_on_policy_ratio=False)
 
 
-def test_rejects_negative_target_entropy() -> None:
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"truncated_importance_sampling_adaptive_target_entropy": -0.1},
+        {"truncated_importance_sampling_adaptive_k_step": 0.0},
+        {"truncated_importance_sampling_adaptive_k_max": -0.1},
+        {"truncated_importance_sampling_adaptive_outer_bound": 0.0},
+    ],
+)
+def test_rejects_invalid_controller_settings(overrides: dict) -> None:
     with pytest.raises(ValueError):
-        ClippedPGLossConfig(tis_adaptive_ppo_clip_target_entropy=-0.1)
+        ClippedPGLossConfig(**overrides)
 
 
 # ── GRPO save-state helpers shared by the legacy trainers and SingleController ──
 
 
-def test_inactive_adaptive_state_is_omitted_from_checkpoints() -> None:
-    state = _initial_grpo_save_state()
+def test_inactive_adaptive_state_is_saved_as_none() -> None:
     for loss_fn in (ClippedPGLossFn(ClippedPGLossConfig()), object()):
-        for _ in range(2):
-            _save_adaptive_loss_state(state, loss_fn)  # type: ignore[arg-type]
-            assert "last_entropy" not in vars(state)
-            assert "cur_adaptive_ppo_clip_k" not in vars(state)
+        # Start from a k left by an earlier adaptive-ppo-clip run.
+        state = _initial_grpo_save_state()
+        state.cur_adaptive_ppo_clip_k = 0.5
+        _save_adaptive_loss_state(state, loss_fn)  # type: ignore[arg-type]
+        assert state.cur_adaptive_ppo_clip_k is None
 
 
 def test_step_state_survives_checkpoint_and_restore() -> None:
     state = _initial_grpo_save_state()
     loss_fn = _adaptive_loss()
-    for _ in range(2):
-        _save_adaptive_loss_state(state, loss_fn)
-        assert "last_entropy" not in vars(state)
-        assert state.cur_adaptive_ppo_clip_k == 0.0
+    _save_adaptive_loss_state(state, loss_fn)
+    assert state.cur_adaptive_ppo_clip_k == 0.0
 
+    # The logged k is the one this step trained with; the update applies next step.
     metrics = {"approx_entropy": 0.1}
     _update_adaptive_loss_state(loss_fn, metrics)
-    assert metrics == {
-        "approx_entropy": 0.1,
-        "last_entropy": 0.1,
-        "cur_adaptive_ppo_clip_k": 0.25,
-    }
+    assert metrics == {"approx_entropy": 0.1, "cur_adaptive_ppo_clip_k": 0.0}
+    assert loss_fn.cur_adaptive_ppo_clip_k == 0.25
     _save_adaptive_loss_state(state, loss_fn)
     resumed = _adaptive_loss()
     _restore_adaptive_loss_state(resumed, _get_grpo_save_state(vars(state)))
-    assert resumed.adaptive_loss_state_dict() == loss_fn.adaptive_loss_state_dict()
+    assert resumed.cur_adaptive_ppo_clip_k == 0.25
 
     # Checkpoints written before adaptive-ppo-clip was enabled start from k=0.
     legacy = _adaptive_loss()
     _restore_adaptive_loss_state(legacy, _get_grpo_save_state({"total_steps": 8}))
-    assert legacy.adaptive_loss_state_dict() == {
-        "last_entropy": None,
-        "cur_adaptive_ppo_clip_k": 0.0,
-    }
+    assert legacy.cur_adaptive_ppo_clip_k == 0.0
 
 
-def test_missing_entropy_does_not_advance_controller() -> None:
+def test_missing_entropy_raises() -> None:
     loss_fn = _adaptive_loss()
-    metrics = {"loss": 1.0}
-    _update_adaptive_loss_state(loss_fn, metrics)
+    with pytest.raises(KeyError, match="approx_entropy"):
+        _update_adaptive_loss_state(loss_fn, {"loss": 1.0})
     assert loss_fn.cur_adaptive_ppo_clip_k == 0.0
-    assert metrics == {"loss": 1.0}

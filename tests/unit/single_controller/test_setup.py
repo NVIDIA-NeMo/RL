@@ -2752,6 +2752,36 @@ class TestSetup:
             sc_setup_mod._maybe_attach_fleet_health(generation, mc)
 
 
+class TestAdaptiveLossRestore:
+    def test_resume_restores_adaptive_ppo_clip_state(self, tmp_path, patched_factories):
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+        torch.save({}, checkpoint_path / "train_dataloader.pt")
+        save_state = _save_state()
+        save_state.cur_adaptive_ppo_clip_k = 0.5
+        checkpointer = MagicMock()
+        checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
+        checkpointer.load_training_info.return_value = vars(save_state)
+        checkpointer.get_resume_paths.return_value = (None, None)
+        patched_factories["ClippedPGLossFn"].side_effect = (
+            lambda cfg, **kwargs: ClippedPGLossFn(cfg, **kwargs)
+        )
+        mc = _make_master_config(
+            loss_cfg=ClippedPGLossConfig(
+                use_importance_sampling_correction=True,
+                force_on_policy_ratio=True,
+                truncated_importance_sampling_type="adaptive-ppo-clip",
+                truncated_importance_sampling_ratio=1.0,
+                truncated_importance_sampling_ratio_min=0.5,
+            )
+        )
+
+        with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.loss_fn.cur_adaptive_ppo_clip_k == 0.5
+
+
 class TestNativeTQRecoverySetup:
     def test_simple_storage_setup_loads_tq_before_creating_controller_client(
         self, tmp_path, patched_factories

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import warnings
-from collections.abc import Mapping
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -211,9 +210,20 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # Lower bound for TIS clipping, or ICE-POP / adaptive-ppo-clip /
     # seq-mask-tis filtering
     truncated_importance_sampling_ratio_min: Optional[float] = None
-    # Entropy target that adapts adaptive-ppo-clip's positive-advantage upper
-    # bound; ignored by the other truncated importance sampling types.
-    tis_adaptive_ppo_clip_target_entropy: float = Field(default=0.3, ge=0.0)
+    # adaptive-ppo-clip only; ignored by the other truncated importance
+    # sampling types. The positive-advantage upper bound is
+    # truncated_importance_sampling_ratio + k. After each training step, k rises
+    # by k_step if approx_entropy is below the target entropy and falls by k_step
+    # if it is above, clamped to [0, k_max]. Tokens with IS weight above
+    # outer_bound are dropped regardless of advantage sign.
+    truncated_importance_sampling_adaptive_target_entropy: float = Field(
+        default=0.3, ge=0.0
+    )
+    truncated_importance_sampling_adaptive_k_step: float = Field(default=0.25, gt=0.0)
+    truncated_importance_sampling_adaptive_k_max: float = Field(default=1.0, ge=0.0)
+    truncated_importance_sampling_adaptive_outer_bound: float = Field(
+        default=50.0, gt=0.0
+    )
 
     # --- On-policy ---
     # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
@@ -303,13 +313,6 @@ class ClippedPGLossFn(LossFunction):
     """
 
     input_type = LossInputType.LOGPROB
-    # adaptive-ppo-clip widens the positive-advantage upper bound by k, which
-    # moves one step per training step toward the entropy target.
-    ADAPTIVE_PPO_CLIP_K_STEP = 0.25
-    ADAPTIVE_PPO_CLIP_K_MIN = 0.0
-    ADAPTIVE_PPO_CLIP_K_MAX = 1.0
-    # Tokens above this IS weight are dropped regardless of advantage sign.
-    ADAPTIVE_PPO_CLIP_OUTER_BOUND = 50.0
 
     def __init__(
         self,
@@ -387,8 +390,18 @@ class ClippedPGLossFn(LossFunction):
         self.truncated_importance_sampling_ratio_min = (
             cfg.truncated_importance_sampling_ratio_min
         )
-        self.tis_adaptive_ppo_clip_target_entropy = (
-            cfg.tis_adaptive_ppo_clip_target_entropy
+        # adaptive-ppo-clip controller settings
+        self.truncated_importance_sampling_adaptive_target_entropy = (
+            cfg.truncated_importance_sampling_adaptive_target_entropy
+        )
+        self.truncated_importance_sampling_adaptive_k_step = (
+            cfg.truncated_importance_sampling_adaptive_k_step
+        )
+        self.truncated_importance_sampling_adaptive_k_max = (
+            cfg.truncated_importance_sampling_adaptive_k_max
+        )
+        self.truncated_importance_sampling_adaptive_outer_bound = (
+            cfg.truncated_importance_sampling_adaptive_outer_bound
         )
         self.use_on_policy_kl_approximation = cfg.use_on_policy_kl_approximation
         self.force_on_policy_ratio = cfg.force_on_policy_ratio  # Force ratio to 1.0
@@ -489,9 +502,8 @@ class ClippedPGLossFn(LossFunction):
 
         # adaptive-ppo-clip controller state. The driver advances it once per
         # training step; workers receive it with the serialized loss function.
-        self.last_entropy: float | None = None
         self.cur_adaptive_ppo_clip_k: float | None = (
-            self.ADAPTIVE_PPO_CLIP_K_MIN if self.has_adaptive_loss_state() else None
+            0.0 if self.has_adaptive_loss_state() else None
         )
 
         # Advertise, per returned metric, the global denominator it was
@@ -594,50 +606,33 @@ class ClippedPGLossFn(LossFunction):
         """Whether this loss carries controller state across training steps."""
         return self.truncated_importance_sampling_type == "adaptive-ppo-clip"
 
-    def adaptive_loss_state_dict(self) -> dict[str, float | None]:
-        """Controller state to checkpoint; empty when no controller is active."""
-        if not self.has_adaptive_loss_state():
-            return {}
-        return {
-            "last_entropy": self.last_entropy,
-            "cur_adaptive_ppo_clip_k": self.cur_adaptive_ppo_clip_k,
-        }
-
-    def load_adaptive_loss_state_dict(self, state_dict: Mapping[str, Any]) -> None:
-        """Restore controller state; missing keys keep their initial values."""
+    def set_adaptive_ppo_clip_k(self, k: float) -> None:
+        """Set k, clamped to [0, k_max]; no-op without adaptive-ppo-clip."""
         if not self.has_adaptive_loss_state():
             return
 
-        last_entropy = state_dict.get("last_entropy")
-        self.last_entropy = float(last_entropy) if last_entropy is not None else None
-
-        cur_k = state_dict.get("cur_adaptive_ppo_clip_k")
-        if cur_k is not None:
-            self.cur_adaptive_ppo_clip_k = min(
-                self.ADAPTIVE_PPO_CLIP_K_MAX,
-                max(self.ADAPTIVE_PPO_CLIP_K_MIN, float(cur_k)),
-            )
+        self.cur_adaptive_ppo_clip_k = min(
+            self.truncated_importance_sampling_adaptive_k_max,
+            max(0.0, float(k)),
+        )
 
     def update_adaptive_loss_state(self, entropy: float) -> None:
-        """Move k one step toward the entropy target after a training step.
+        """Step k once after a training step to steer entropy toward the target.
 
         Entropy above the target narrows the positive-advantage upper bound;
-        entropy below it widens the bound. k is clamped to [K_MIN, K_MAX].
+        entropy below it widens the bound. k is clamped to [0, k_max].
         """
         if not self.has_adaptive_loss_state():
             return
 
-        self.last_entropy = float(entropy)
         cur_k = self.cur_adaptive_ppo_clip_k
         assert cur_k is not None
-        if entropy > self.tis_adaptive_ppo_clip_target_entropy:
-            cur_k -= self.ADAPTIVE_PPO_CLIP_K_STEP
-        elif entropy < self.tis_adaptive_ppo_clip_target_entropy:
-            cur_k += self.ADAPTIVE_PPO_CLIP_K_STEP
-        self.cur_adaptive_ppo_clip_k = min(
-            self.ADAPTIVE_PPO_CLIP_K_MAX,
-            max(self.ADAPTIVE_PPO_CLIP_K_MIN, cur_k),
-        )
+        target_entropy = self.truncated_importance_sampling_adaptive_target_entropy
+        if entropy > target_entropy:
+            cur_k -= self.truncated_importance_sampling_adaptive_k_step
+        elif entropy < target_entropy:
+            cur_k += self.truncated_importance_sampling_adaptive_k_step
+        self.set_adaptive_ppo_clip_k(cur_k)
 
     @property
     def requires_survivor_normalization(self) -> bool:
@@ -844,7 +839,7 @@ class ClippedPGLossFn(LossFunction):
         # -------------------------------------------------------------
         # Off-policy (actor) importance-sampling correction
         # -------------------------------------------------------------
-        _is_filter_metrics: dict = {}  # populated for icepop / seq-mask-tis
+        _is_filter_metrics: dict = {}  # populated for tis / icepop / adaptive-ppo-clip / seq-mask-tis
         # See: docs/guides/grpo.md#importance-sampling-correction
         if not need_importance_weights:
             # No objective or emitted metric needs the actor/generation
@@ -933,7 +928,7 @@ class ClippedPGLossFn(LossFunction):
 
                 within_outer_bound = (
                     actor_importance_weights_expanded
-                    <= self.ADAPTIVE_PPO_CLIP_OUTER_BOUND
+                    <= self.truncated_importance_sampling_adaptive_outer_bound
                 )
                 negative_adv_kept = (advantages >= 0) | (
                     actor_importance_weights_expanded >= tis_min
