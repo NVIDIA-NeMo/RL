@@ -45,11 +45,9 @@ def _loss_config(fx):
         "student_to_teacher_table_paths": [knobs["student_to_teacher_table_path"]],
         "teacher_to_student_table_paths": [knobs["teacher_to_student_table_path"]],
         "kl_chunk_shift": knobs["kl_chunk_shift"],
-        "csd_position_0_kl": knobs["csd_position_0_kl"],
         "csd_loss_fn": knobs["csd_loss_fn"],
         "csd_last_pos_loss_fn": knobs["csd_last_pos_loss_fn"],
         "csd_jsd_beta": knobs["csd_jsd_beta"],
-        "csd_mismatch_pos0_alpha": knobs["csd_mismatch_pos0_alpha"],
         "csd_mismatch_loss_beta": knobs["csd_mismatch_loss_beta"],
         "csd_noise_filter_topk": knobs["csd_noise_filter_topk"],
         "teacher_topk_ipc_k": 0,
@@ -236,9 +234,7 @@ def _run_tp2_cp2_csd_student_memory(
 
         for metric_name in (
             "kl_common_per_chunk",
-            "kl_partition_first_per_chunk",
             "kl_partition_last_per_chunk",
-            "kl_mismatch_combined_per_chunk",
             "kl_mismatch_scaled_per_chunk",
             "top1_acc_per_chunk",
         ):

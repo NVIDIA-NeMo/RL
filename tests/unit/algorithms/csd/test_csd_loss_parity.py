@@ -75,11 +75,9 @@ def _csd_knobs(fwd_path, rev_path, v_t):
         "student_to_teacher_table_path": fwd_path,
         "teacher_to_student_table_path": rev_path,
         "kl_chunk_shift": True,
-        "csd_position_0_kl": True,
         "csd_loss_fn": "jsd",
         "csd_last_pos_loss_fn": "kl",
         "csd_jsd_beta": 0.5,
-        "csd_mismatch_pos0_alpha": 0.2,
         "csd_mismatch_loss_beta": 2.0,
         "csd_noise_filter_topk": 0,
         "reverse_kl": False,
@@ -93,7 +91,7 @@ def _build_case(name, tmpdir, seed=0):
       * ``common_only``: three 1-to-1 common chunks per sample (exercises the
         common-vocab JSD partition KL, no mismatch/prefix-index path).
       * ``with_mismatch``: adds a 1-to-2 and a 2-to-1 chunk (exercises the
-        prefix support index + batched mismatch + position-0 KL).
+        prefix support index + batched mismatch partition KL).
       * ``mismatch_only``: a 1-to-2 chunk at the sequence start (never
         shifted) followed by a shifted 2-to-1 chunk, with no common chunk.
     """
@@ -203,11 +201,9 @@ def _run_csd(
         "student_to_teacher_table_paths": [knobs["student_to_teacher_table_path"]],
         "teacher_to_student_table_paths": [knobs["teacher_to_student_table_path"]],
         "kl_chunk_shift": knobs["kl_chunk_shift"],
-        "csd_position_0_kl": knobs["csd_position_0_kl"],
         "csd_loss_fn": knobs["csd_loss_fn"],
         "csd_last_pos_loss_fn": knobs["csd_last_pos_loss_fn"],
         "csd_jsd_beta": knobs["csd_jsd_beta"],
-        "csd_mismatch_pos0_alpha": knobs["csd_mismatch_pos0_alpha"],
         "csd_mismatch_loss_beta": knobs["csd_mismatch_loss_beta"],
         "csd_noise_filter_topk": knobs["csd_noise_filter_topk"],
         "teacher_topk_ipc_k": v_t if teacher_sparse_payload is not None else 0,
@@ -315,9 +311,7 @@ def test_csd_dense_teacher_stays_cp_local_and_slices_padded_vocab(monkeypatch):
     torch.testing.assert_close(padded_grad, baseline_grad, rtol=1e-5, atol=1e-6)
     for key in (
         "kl_common_per_chunk",
-        "kl_partition_first_per_chunk",
         "kl_partition_last_per_chunk",
-        "kl_mismatch_combined_per_chunk",
         "kl_mismatch_scaled_per_chunk",
         "top1_acc_per_chunk",
         "num_common_chunks",
@@ -605,7 +599,6 @@ def test_csd_student_logits_never_enter_rank3_gathers(monkeypatch):
     torch.testing.assert_close(grad, baseline_grad, rtol=1e-5, atol=1e-6)
     for key in (
         "kl_common_per_chunk",
-        "kl_partition_first_per_chunk",
         "kl_partition_last_per_chunk",
         "top1_acc_per_chunk",
         "num_common_chunks",
@@ -679,7 +672,6 @@ def test_csd_sample_mask_matches_single_sample_and_zeroes_masked_grad(case_name)
     for key in (
         "kl_common_per_chunk",
         "kl_partition_last_per_chunk",
-        "kl_partition_first_per_chunk",
         "top1_acc_per_chunk",
         "num_common_chunks",
         "num_mismatch_chunks",
@@ -708,7 +700,6 @@ def test_csd_all_samples_masked_is_zero_safe(case_name):
     for key in (
         "kl_common_per_chunk",
         "kl_partition_last_per_chunk",
-        "kl_partition_first_per_chunk",
         "top1_acc_per_chunk",
         "num_common_chunks",
         "num_mismatch_chunks",
@@ -753,15 +744,13 @@ def test_csd_common_partition_matches_probability_reference(tmp_path):
 
 
 def test_csd_mismatch_partition_aggregation(tmp_path):
-    """Forward/reverse mismatch cohorts retain additive weighting and global counts."""
+    """Forward/reverse mismatch cohorts keep their beta weight and global counts."""
     fx = _build_case("with_mismatch", str(tmp_path))
     loss, metrics, grad = _run_csd(fx)
     assert metrics["num_common_chunks"] == 2
     assert metrics["num_mismatch_chunks"] == 4
-    weighted_mismatch = 2 * (
-        metrics["kl_partition_last_per_chunk"]
-        + 0.2 * metrics["kl_partition_first_per_chunk"]
-    )
+    weighted_mismatch = 2 * metrics["kl_partition_last_per_chunk"]
+    assert metrics["kl_mismatch_scaled_per_chunk"] == pytest.approx(weighted_mismatch)
     expected = (2 * metrics["kl_common_per_chunk"] + 4 * weighted_mismatch) / fx[
         "global_valid_chunks"
     ]
@@ -770,11 +759,7 @@ def test_csd_mismatch_partition_aggregation(tmp_path):
     assert torch.count_nonzero(grad) > 0
 
 
-_REALIZED_ONLY = {
-    "csd_realized_only_mismatch": True,
-    "csd_position_0_kl": False,
-    "csd_mismatch_pos0_alpha": 0.0,
-}
+_REALIZED_ONLY = {"csd_realized_only_mismatch": True}
 
 
 def _realized_chain_reference(fx, student_logits):
@@ -893,17 +878,18 @@ def test_csd_realized_only_mismatch_leaves_common_chunks_unchanged(tmp_path):
     )
 
 
-def test_csd_realized_only_mismatch_rejects_position_zero_term():
-    """Realized-only mismatch has no position-0 term to combine."""
-    from nemo_rl.algorithms.loss.csd import CSDLossFn
+@pytest.mark.parametrize(
+    "removed_key",
+    [
+        "csd_position_0_kl",
+        "csd_mismatch_pos0_alpha",
+        "csd_mismatch_pos0_weight",
+        "csd_mismatch_loss_scale",
+    ],
+)
+def test_csd_rejects_removed_position_0_keys(removed_key):
+    """Configs written for the removed position-0 term fail instead of being ignored."""
+    from nemo_rl.algorithms.loss.csd import CSDLossConfig
 
-    with pytest.raises(ValueError, match="csd_realized_only_mismatch"):
-        CSDLossFn(
-            {
-                "student_vocab_size": 16,
-                "teacher_vocab_sizes": [16],
-                "teacher_weights": [1.0],
-                "csd_realized_only_mismatch": True,
-                "csd_position_0_kl": True,
-            }
-        )
+    with pytest.raises(ValueError, match=f"loss_fn.{removed_key} was removed"):
+        CSDLossConfig.model_validate({removed_key: 0.0})
