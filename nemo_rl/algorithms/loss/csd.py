@@ -172,8 +172,9 @@ class CSDLossConfig(BaseModel, extra="allow"):
     # against REST instead of prefix-support alternatives.
     csd_realized_only_mismatch: bool = False
     csd_alm_bce_tau: Annotated[float, Field(gt=0)] = 1.0
-    # Zero uses dense IPC; positive k sends row top-k logits plus full-vocab logZ.
-    teacher_topk_ipc_k: Annotated[int, Field(ge=0)] = 0
+    # Positive k sends each teacher row's top-k logits plus its full-vocab logZ
+    # (the KD then compares top-k plus a REST bucket); zero sends dense logits.
+    teacher_topk_ipc_k: Annotated[int, Field(ge=0)] = 128
     teacher_topk_ipc_support_mode: Literal["row_topk"] = "row_topk"
     teacher_topk_ipc_keep_realized: bool = True
     # Owner-local evaluation (eligible Megatron students): selected student or
