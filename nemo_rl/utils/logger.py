@@ -45,6 +45,9 @@ from torch.utils.tensorboard import SummaryWriter
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.metric_utils import is_histogram_metric
+from nemo_rl.telemetry.metrics import (
+    TELEMETRY_WALL_TIME_METRIC as TELEMETRY_WALL_TIME_METRIC,
+)
 from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
 
 # Flag to track if rich logging has been configured
@@ -57,7 +60,6 @@ _rich_logging_configured = False
 # catch-all ``*`` definition is intentionally avoided because wandb-core does
 # not deterministically resolve overlapping glob definitions.
 WANDB_CALLER_STEP_METRIC = "nemo_rl/step"
-TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
 
 
 class WandbConfig(BaseModel, extra="allow"):
