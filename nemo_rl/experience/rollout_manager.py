@@ -92,6 +92,7 @@ from nemo_rl.experience.rollouts import (
     calculate_rewards,
     compute_reward_penalty_metrics,
     get_nemo_gym_rollout_metrics_hook,
+    nemo_gym_rollout_hit_max_tokens,
     per_agent_result_metrics,
 )
 from nemo_rl.models.generation.interfaces import (
@@ -1568,9 +1569,10 @@ class AsyncNemoGymRolloutImpl:
                     )
                 )
                 continue
-            truncated = (
-                sum(len(m["token_ids"]) for m in result["message_log"])
-                == self._max_seq_len
+            truncated = nemo_gym_rollout_hit_max_tokens(
+                result["full_result"],
+                total_tokens=sum(len(m["token_ids"]) for m in result["message_log"]),
+                max_total_tokens_per_sample=self._max_seq_len,
             )
             completions.append(
                 Completion(

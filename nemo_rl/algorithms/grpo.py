@@ -1676,7 +1676,7 @@ def setup(
             )
         if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
             assert not (policy_config.get("automodel_cfg") or {}).get("enabled"), (
-                "DTensor backend is not supported with kv cache fp8 enabled."
+                "Automodel backend is not supported with kv cache fp8 enabled."
             )
             assert not should_use_async_rollouts(generation_config), (
                 "Async rollouts is not supported with kv cache fp8 enabled."

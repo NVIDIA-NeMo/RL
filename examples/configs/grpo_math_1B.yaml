@@ -647,6 +647,12 @@ data_plane:
     storage_capacity: 1000000        # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
     storage_unit_placement: null     # all, or cluster names like [inference]; null = TQ SPREAD
+    # Keep large field values on node-local SSD instead of host memory. Needs
+    # no shared filesystem; data is temporary (removed on tq.close()).
+    ssd_offload:
+      enabled: false
+      path: null                     # node-local SSD dir; required when enabled
+      threshold_bytes: 1048576       # values >= this encoded size go to SSD
   mooncake_cpu:
     # Per client process — see MooncakeCpuConfig before raising these.
     global_segment_size: 68719476736 # 64 GiB/process
