@@ -145,6 +145,29 @@ Bulk tensors live in TQ; the driver only holds `meta` + the small
 
 ---
 
+## Inside one DP rank — fetch, broadcast, padding, packing
+
+```
+replica group = all TP×CP×PP ranks of one DP rank; leader = its rank 0
+leader      TQ ─get─► CPU batch, unpadded rows (+ route fragments)
+                  │ _broadcast_batched_data_dict: one field at a time,
+                  │ each field staged whole on GPU (CPU → GPU → NCCL)
+every rank  ◄─────┘ full DP batch on CPU (leader keeps its GPU copies)
+every rank  pad rows to GLOBAL_FORWARD_PAD_SEQLEN, except MICROBATCH_PADDED_FIELDS
+every rank  per microbatch (bins = driver's micro_batch_indices):
+              pad MICROBATCH_PADDED_FIELDS ─.to("cuda")─► pack [1, T]
+              ─► keep this CP rank's slice ─► forward / backward
+```
+
+Only the replica-group leader reads from TQ; it broadcasts the batch unpadded,
+one field at a time, and every rank pads it afterwards to
+`GLOBAL_FORWARD_PAD_SEQLEN`. Fields in `schema.MICROBATCH_PADDED_FIELDS`
+(today: routes) stay per-row and are padded one microbatch at a time, right
+before the move to GPU; `NRL_ROUTE_BCAST=dense` instead builds and broadcasts
+the padded routes table on the leader.
+
+---
+
 ## `KVBatchMeta`
 
 The receipt for a put. `meta.fields` is only what was written by *this*
@@ -429,6 +452,10 @@ data_plane:
     storage_capacity: 1000000          # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
     storage_unit_placement: null       # all, or cluster names like [inference]; null = TQ SPREAD
+    ssd_offload:                       # simple backend only (not mooncake_cpu)
+      enabled: false                   # true: large field values go to local SSD
+      path: null                       # absolute node-local dir; required if enabled
+      threshold_bytes: 1048576         # encoded size >= this goes to SSD
   mooncake_cpu:
     global_segment_size: 68719476736   # 64 GiB/process (ignored when storage units are on)
     local_buffer_size:   2147483648    # 2 GiB/process = 4 TQ transfer threads x 512 MiB slot
@@ -1024,7 +1051,9 @@ exercise save, process restart, load, and read on the intended training topology
 The adapter internally enables hard-pinned memory replicas and disables Mooncake
 offload for runs that save or resume checkpoints; these are not additional user
 configuration knobs. Workers inherit this storage mode from TQ's controller.
-Other jobs keep TQ's storage defaults. This version supports NeMo-RL's HTTP
+Other jobs keep TQ's storage defaults. A checkpoint saved with
+`simple.ssd_offload.enabled: true` must be resumed with it enabled (TQ raises
+at load otherwise); `path` and `threshold_bytes` may change. This version supports NeMo-RL's HTTP
 metadata mode and rejects `P2PHANDSHAKE`,
 whose public Mooncake API does not expose the local transfer endpoint needed for
 exact storage-process matching.

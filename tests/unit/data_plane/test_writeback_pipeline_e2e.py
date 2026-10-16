@@ -122,7 +122,7 @@ def test_writeback_single_worker_default_is_leader(filtering_on):
     meta = _seed_partition_with_one_sample(client)
     result = {"logprobs": torch.full((1, 4), 7.5)}
     if filtering_on:
-        result["token_mask"] = torch.tensor([[1, 1, 0, 1]])
+        result["logprobs"][0, 2] = -torch.inf
 
     _SingleWorker(client, result).get_logprobs_presharded(meta)
 
@@ -131,11 +131,7 @@ def test_writeback_single_worker_default_is_leader(filtering_on):
         partition_id="train",
         select_fields=["prev_logprobs", "token_mask"],
     )
-    assert torch.allclose(fetched["prev_logprobs"], torch.full((1, 4), 7.5))
-    expected_mask = (
-        torch.tensor([[1, 1, 0, 1]])
-        if filtering_on
-        else torch.ones(1, 4, dtype=torch.long)
-    )
+    torch.testing.assert_close(fetched["prev_logprobs"], result["logprobs"])
+    expected_mask = torch.ones(1, 4, dtype=torch.long)
     assert torch.equal(fetched["token_mask"], expected_mask)
     assert fetched["token_mask"].dtype == torch.long
