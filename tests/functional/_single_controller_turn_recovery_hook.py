@@ -16,10 +16,12 @@
 
 The wrapper does not alter scheduling or checkpoint timing. It records the
 structured recovery identity once each Gym submission is marked dispatched,
-when Gym refuses one at checkpoint admission, and after each completion has
-been sealed in the RL ledger. A two-process functional test can
-therefore prove that a restored episode returns to the same Gym instance under
-``gym_attempt + 1`` without depending on log wording.
+when Gym refuses one at checkpoint admission, after each completion has been
+sealed in the RL ledger (with the model calls its receipt names), and which
+episodes a Gym restore installed. A two-process functional test can therefore
+prove that a restored episode returns to the same Gym instance under
+``gym_attempt + 1`` and continues from its saved turn, without depending on log
+wording.
 """
 
 from __future__ import annotations
@@ -110,11 +112,18 @@ class _InstrumentedNemoGymRolloutImpl:
         async def _record_completion(generation_index: int, completion: Any) -> None:
             await on_completion(generation_index, completion)
             refreshed = find_group(self._recovery_ledger, rollout_ids, hook="turn")
+            receipt = (completion.env_extras or {}).get("ng_receipt") or {}
             append_event(
                 self._events_path,
                 "completion",
                 **common,
                 sibling=self._sibling_fields(refreshed, generation_index),
+                # A continued episode keeps the calls it made before the cut.
+                receipt_model_call_ids=[
+                    str(record["model_call_id"])
+                    for record in receipt.get("manifest") or []
+                    if "model_call_id" in record
+                ],
             )
 
         result = await self._delegate_run_rollout(
@@ -164,6 +173,35 @@ class _RecordingDispatchRecorder:
         self._record("refused", [generation_index])
 
 
+class _RecordingRestartLedger:
+    """Record which episodes a Gym restore installed, as restart sees them.
+
+    ``prepare_for_restart`` receives exactly the episodes Gym restored, after
+    the restore succeeded, so a restored episode is distinguishable from one
+    that started over under a fresh Gym session.
+    """
+
+    def __init__(self, ledger: Any, *, events_path: Path) -> None:
+        self._prepare_for_restart = ledger.prepare_for_restart
+        self._events_path = events_path
+
+    def prepare_for_restart(self, cut: Any, **kwargs: Any) -> Any:
+        restored = kwargs.get("restored_gym_episodes") or set()
+        append_event(
+            self._events_path,
+            "gym_restore",
+            episodes=[
+                {
+                    "gym_instance_id": instance,
+                    "gym_rollout_id": rollout,
+                    "gym_attempt": attempt,
+                }
+                for instance, rollout, attempt in sorted(restored)
+            ],
+        )
+        return self._prepare_for_restart(cut, **kwargs)
+
+
 _original_setup_single_controller = run_grpo_single_controller.setup_single_controller
 
 
@@ -171,11 +209,16 @@ def _setup_with_turn_recovery_hook(*args: Any, **kwargs: Any) -> Any:
     actor_args, timing_metrics = _original_setup_single_controller(*args, **kwargs)
     manager = actor_args.rollout_manager
     impl = manager._impl
+    events_path = Path(os.environ["SC_TURN_RECOVERY_TEST_EVENTS"])
     instrumented = _InstrumentedNemoGymRolloutImpl(
         impl,
         recovery_ledger=manager.recovery_ledger,
-        events_path=Path(os.environ["SC_TURN_RECOVERY_TEST_EVENTS"]),
+        events_path=events_path,
     )
+    ledger = manager.recovery_ledger
+    ledger.prepare_for_restart = _RecordingRestartLedger(
+        ledger, events_path=events_path
+    ).prepare_for_restart
     # Patch the instance method rather than replacing ``_impl``: RolloutManager
     # gates checkpoint admission and turn recovery on
     # ``isinstance(self._impl, AsyncNemoGymRolloutImpl)``.

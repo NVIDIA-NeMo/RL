@@ -71,6 +71,8 @@ CheckpointMutationKind = Literal[
     "advantage_writeback",
     "group_commits",
     "group_removals",
+    # A Gym /run submission, on the barrier that pauses dispatch for a Gym checkpoint.
+    "gym_dispatch",
     "other",
     "prompt_reservations",
     "recovery_restore",

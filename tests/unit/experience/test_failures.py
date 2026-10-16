@@ -330,6 +330,22 @@ class TestGymFailureRowsKeepTheirRow:
         # A raise without a dispatch recorder is retried, never charged as data.
         assert classify_rollout_failure(restored) is FailureClass.INFRA
 
+    def test_gym_owns_which_failure_classes_mean_no_result(self, monkeypatch):
+        """A class Gym adds to its no-result set is not mistaken for a row that ran."""
+        from nemo_gym import rollout_collection
+
+        row = {**_gym_failure_row(status=503), "_ng_failure_class": "new_gym_class"}
+        assert _gym_failure_row_error({"_rowidx": 0}, row) is None
+
+        monkeypatch.setattr(
+            rollout_collection,
+            "_NO_RESULT_FAILURE_CLASSES",
+            rollout_collection._NO_RESULT_FAILURE_CLASSES | {"new_gym_class"},
+        )
+        assert isinstance(
+            _gym_failure_row_error({"_rowidx": 0}, row), GymTransportError
+        )
+
     def test_another_409_stays_a_data_failure(self):
         body = '{"error":{"code":"stale_attempt","detail":"older attempt"}}'
         failure = _gym_failure_row_error(
@@ -357,6 +373,39 @@ class TestGymFailureRowsKeepTheirRow:
         )
         assert isinstance(transport, GymTransportError)
         assert type(undecodable) is RolloutDataFailure
+
+    @pytest.mark.parametrize(
+        ("status", "body", "expected"),
+        [
+            (409, _ADMISSION_CLOSED_BODY.encode(), GymAdmissionClosed),
+            (400, b"bad request", RolloutDataFailure),
+            (503, b"unavailable", GymTransportError),
+            (None, None, GymTransportError),
+        ],
+        ids=["admission-closed", "bad-request", "unavailable", "no-reply"],
+    )
+    def test_rows_built_by_gym_map_like_the_hand_built_ones(
+        self, status, body, expected
+    ):
+        """Fail if Gym renames a ``_ng_failure_*`` key this mapping reads."""
+        from nemo_gym.rollout_collection import _agent_request_failure_row
+
+        if status is None:
+            error: BaseException = aiohttp.ServerDisconnectedError()
+        else:
+            request_info = aiohttp.RequestInfo(
+                URL("http://gym/run"), "POST", CIMultiDictProxy(CIMultiDict())
+            )
+            error = aiohttp.ClientResponseError(
+                request_info, (), status=status, message="synthetic"
+            )
+            error.response_content = body
+
+        failure = _gym_failure_row_error(
+            {"_rowidx": 0}, _agent_request_failure_row(error, status)
+        )
+
+        assert type(failure) is expected
 
     def test_a_reply_whose_body_broke_off_after_200_is_re_sent(self):
         """Gym stamps the reply's own 200 when only reading its body failed."""

@@ -15,9 +15,9 @@
 from __future__ import annotations
 
 import asyncio
+import pickle
 import time
 from pathlib import Path
-from typing import Any
 
 import pytest
 import ray.exceptions
@@ -25,7 +25,6 @@ import ray.exceptions
 from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointCommitSummary,
     GymCheckpointEpisode,
-    GymCheckpointPrepareSummary,
     GymCheckpointUnavailable,
 )
 from nemo_rl.environments.gym_checkpoint_coordinator import (
@@ -38,91 +37,44 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     load_gym_checkpoint_manifest,
 )
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from tests.unit.environments.gym_checkpoint_fakes import FakeGymActor, gym_coordinator
 
 pytestmark = pytest.mark.nemo_gym
 
 
-class _RemoteMethod:
-    def __init__(self, function) -> None:
-        self._function = function
-
-    def remote(self, *args, **kwargs):
-        return self._function(*args, **kwargs)
+_FakeGymActor = FakeGymActor
 
 
-class _FakeGymActor:
-    def __init__(
-        self,
-        *,
-        prepared: bool = True,
-        restore_error: BaseException | None = None,
-        exported_episodes: tuple[GymCheckpointEpisode, ...] | None = None,
-        staging_keys_by_episode: dict[GymCheckpointEpisode, tuple[str, ...]]
-        | None = None,
-        hang: frozenset[str] = frozenset(),
-    ) -> None:
-        self.prepared = prepared
-        # Operations whose call is accepted but never answered, like an actor
-        # whose event loop is stuck.
-        self.hang = hang
-        self.restore_error = restore_error
-        self.exported_episodes = exported_episodes
-        self.staging_keys_by_episode = staging_keys_by_episode or {}
-        self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
-        self.checkpoint_prepare = _RemoteMethod(self._prepare)
-        self.checkpoint_renew = _RemoteMethod(self._renew)
-        self.checkpoint_retire = _RemoteMethod(self._retire)
-        self.checkpoint_commit = _RemoteMethod(self._commit)
-        self.checkpoint_restore = _RemoteMethod(self._restore)
-        self.checkpoint_resume = _RemoteMethod(self._resume)
-
-    async def _record(self, operation: str, args, kwargs) -> None:
-        self.calls.append((operation, args, kwargs))
-        if operation in self.hang:
-            await asyncio.Event().wait()
-
-    async def _prepare(self, *args, **kwargs) -> GymCheckpointPrepareSummary:
-        await self._record("prepare", args, kwargs)
-        return GymCheckpointPrepareSummary(
-            prepared=self.prepared,
-            blockers={} if self.prepared else {"agent": ("rollout-1",)},
-        )
-
-    async def _renew(self, *args, **kwargs) -> None:
-        await self._record("renew", args, kwargs)
-
-    async def _commit(self, *args, **kwargs) -> GymCheckpointCommitSummary:
-        await self._record("commit", args, kwargs)
-        episodes = args[2] if self.exported_episodes is None else self.exported_episodes
-        return GymCheckpointCommitSummary(
-            exported_episodes=episodes,
-            staging_keys=tuple(
-                sorted(
-                    {k for keys in self.staging_keys_by_episode.values() for k in keys}
-                )
-            ),
-            participants=(),
-            staging_keys_by_episode=self.staging_keys_by_episode,
-        )
-
-    async def _retire(self, *args, **kwargs) -> None:
-        await self._record("retire", args, kwargs)
-
-    async def _restore(self, *args, **kwargs) -> None:
-        await self._record("restore", args, kwargs)
-        if self.restore_error is not None:
-            raise self.restore_error
-
-    async def _resume(self, *args, **kwargs) -> None:
-        await self._record("resume", args, kwargs)
+def _coordinator(*actors: FakeGymActor) -> GymCheckpointCoordinator:
+    return gym_coordinator(*actors)
 
 
-def _coordinator(*actors: _FakeGymActor) -> GymCheckpointCoordinator:
-    return GymCheckpointCoordinator(
-        NemoGymShardSet(handles={"tools": list(actors)}),
-        control_timeout_s=30.0,
-        prepare_timeout_s=30.0,
-    )
+@pytest.mark.parametrize(
+    "error",
+    [
+        GymCheckpointOperationError(
+            "prepare", {"tools/replica-0": TimeoutError("no reply")}
+        ),
+        GymCheckpointNotReady({"tools/replica-0": {"agent": ("rollout-1",)}}),
+    ],
+    ids=["operation-error", "not-ready"],
+)
+def test_checkpoint_errors_survive_a_ray_boundary(error: RuntimeError) -> None:
+    """Pickled across Ray, an error keeps its type, fields, message and notes."""
+    error.add_note("Gym checkpoint cleanup also failed: lost")
+
+    restored = pickle.loads(pickle.dumps(error))
+
+    assert type(restored) is type(error)
+    assert str(restored) == str(error)
+    assert restored.__notes__ == error.__notes__
+    assert is_transient_gym_checkpoint_failure(restored)
+    if isinstance(error, GymCheckpointOperationError):
+        assert restored.operation == "prepare"
+        assert set(restored.failures) == {"tools/replica-0"}
+        assert isinstance(restored.failures["tools/replica-0"], TimeoutError)
+    else:
+        assert restored.blockers == error.blockers
 
 
 def test_manifest_rejects_duplicate_episode_identity() -> None:
@@ -314,7 +266,6 @@ def test_a_summary_must_attribute_every_staging_key() -> None:
         GymCheckpointCommitSummary(
             exported_episodes=(),
             staging_keys=("orphan/call-0",),
-            participants=(),
         )
 
 
@@ -375,12 +326,8 @@ def _run_guarded(exercise) -> None:
     asyncio.run(guarded())
 
 
-def _fast_coordinator(*actors: _FakeGymActor) -> GymCheckpointCoordinator:
-    return GymCheckpointCoordinator(
-        NemoGymShardSet(handles={"tools": list(actors)}),
-        control_timeout_s=0.05,
-        prepare_timeout_s=0.05,
-    )
+def _fast_coordinator(*actors: FakeGymActor) -> GymCheckpointCoordinator:
+    return gym_coordinator(*actors, control_timeout_s=0.05, prepare_timeout_s=0.05)
 
 
 def test_an_actor_that_never_answers_prepare_fails_the_checkpoint() -> None:
@@ -420,7 +367,7 @@ def test_a_renewal_that_never_answers_does_not_hang_the_checkpoint() -> None:
 
 
 def test_a_resume_that_never_answers_keeps_the_original_failure() -> None:
-    """Cleanup is best effort: Gym's lease reopens admission if resume is lost."""
+    """Cleanup retries once, then gives up: Gym's lease reopens admission."""
     actor = _FakeGymActor(prepared=False, hang=frozenset({"resume"}))
     coordinator = _fast_coordinator(actor)
 
@@ -432,7 +379,84 @@ def test_a_resume_that_never_answers_keeps_the_original_failure() -> None:
 
     _run_guarded(exercise)
 
-    assert [call[0] for call in actor.calls] == ["prepare", "resume"]
+    assert [call[0] for call in actor.calls] == ["prepare", "resume", "resume"]
+
+
+def _restore_manifest() -> GymCheckpointManifest:
+    return GymCheckpointManifest(
+        schema_version=GYM_CHECKPOINT_SCHEMA_VERSION,
+        checkpoint_id="save-1",
+        instances={"tools/replica-0": (GymCheckpointEpisode("rollout-0", 0),)},
+        staging_keys={"tools/replica-0": ()},
+    )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "operations"),
+    [
+        ("body-succeeds", ["restore", "resume"]),
+        # The controller could not take over the replacements: retire them first.
+        ("body-fails", ["restore", "retire", "resume"]),
+        # The restore cleans up its own failure, and the body never runs.
+        ("restore-fails", ["restore", "retire", "resume"]),
+    ],
+)
+def test_restored_reopens_gym_exactly_once(outcome: str, operations: list[str]) -> None:
+    actor = _FakeGymActor(
+        restore_error=RuntimeError("bad state") if outcome == "restore-fails" else None
+    )
+    coordinator = _coordinator(actor)
+    manifest = _restore_manifest()
+    entered = []
+
+    async def exercise() -> None:
+        async with coordinator.restored("restore-1", "/unused", manifest):
+            entered.append(True)
+            if outcome == "body-fails":
+                raise ValueError("ledger rejected the restore")
+
+    if outcome == "body-succeeds":
+        _run_guarded(exercise)
+    else:
+        with pytest.raises((ValueError, GymCheckpointOperationError)):
+            _run_guarded(exercise)
+
+    assert [call[0] for call in actor.calls] == operations
+    assert entered == ([] if outcome == "restore-fails" else [True])
+    retired = [call for call in actor.calls if call[0] == "retire"]
+    for call in retired:
+        assert call[1][1] == (GymCheckpointEpisode("rollout-0", 1),)
+
+
+def test_a_lost_resume_is_retried_on_only_the_actor_that_lost_it() -> None:
+    """A transient resume failure would otherwise leave Gym closed until its lease."""
+    healthy = _FakeGymActor()
+    lost = _FakeGymActor(resume_errors=(ConnectionError("reply lost"),))
+    coordinator = _coordinator(healthy, lost)
+
+    async def exercise() -> None:
+        async with coordinator.prepared("save-1"):
+            pass
+
+    _run_guarded(exercise)
+
+    assert [call[0] for call in healthy.calls].count("resume") == 1
+    assert [call[0] for call in lost.calls].count("resume") == 2
+    assert all(call[1] == ("save-1",) for call in lost.calls if call[0] == "resume")
+
+
+def test_a_resume_that_breaks_an_invariant_is_not_retried() -> None:
+    actor = _FakeGymActor(resume_errors=(ValueError("malformed reply"),))
+    coordinator = _coordinator(actor)
+
+    async def exercise() -> None:
+        with pytest.raises(GymCheckpointOperationError) as raised:
+            await coordinator.resume("save-1")
+        assert isinstance(raised.value.failures["tools/replica-0"], ValueError)
+
+    _run_guarded(exercise)
+
+    assert [call[0] for call in actor.calls] == ["resume"]
 
 
 @pytest.mark.parametrize("operation", ["commit", "restore", "retire"])

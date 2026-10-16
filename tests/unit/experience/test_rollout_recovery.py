@@ -190,6 +190,30 @@ def test_ledger_restore_rejects_unknown_fields(
         RolloutRecoveryLedger.from_state_dict(state)
 
 
+@pytest.mark.parametrize("field", ["gym_instance_id", "gym_attempt"])
+def test_ledger_restore_rejects_an_attempt_missing_a_gym_field(field: str) -> None:
+    """None and 0 are valid values, so a missing field must not default to them."""
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+    state = ledger.state_dict()
+    del state["groups"][0]["siblings"][0]["attempts"][0][field]
+
+    with pytest.raises(
+        ValueError, match=rf"rollout-recovery attempt is missing {field}"
+    ):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
 def _sealed_attempt_state() -> dict[str, Any]:
     ledger = RolloutRecoveryLedger()
     group = _reserve(
@@ -534,17 +558,6 @@ def test_turn_recovery_rejects_target_overrides(overrides: dict[str, Any]) -> No
     """A coarser route on a checkpointing Gym would fall outside the commit scope."""
     with pytest.raises(ValueError, match="not supported with target_level='turn'"):
         RolloutRecoveryConfig(target_level=RecoveryTargetLevel.TURN, **overrides)
-
-
-def test_recovery_config_rejects_removed_task_name_override() -> None:
-    with pytest.raises(ValueError, match="target_level"):
-        RolloutRecoveryConfig(
-            **{
-                "task_granularity_overrides": {
-                    "legacy": RecoveryGranularity.PROMPT_GROUP
-                }
-            }
-        )
 
 
 @pytest.mark.parametrize("timeout_s", [0.0, -1.0])

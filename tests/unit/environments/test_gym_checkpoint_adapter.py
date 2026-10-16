@@ -16,8 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import pickle
+import time
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -26,7 +29,6 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointAdapter,
     GymCheckpointEpisode,
     GymCheckpointInstance,
-    GymCheckpointParticipantManifest,
     GymCheckpointUnavailable,
 )
 from nemo_rl.experience.rollout_recovery import (
@@ -166,137 +168,159 @@ def test_checkpoint_instance_rejects_unsafe_identity(
         )
 
 
-def test_adapter_delegates_the_complete_gym_v2_lifecycle(monkeypatch) -> None:
-    from nemo_gym._checkpoint import coordination
+_CONTROL_TOKEN = "control-token"
 
-    client = object()
-    participants = _participants(client, "actor-a")
-    prepare_result = object()
-    commit_result = {
-        "actor-a-environment": _commit_reply(
-            "actor-a", "environment", ["rollout-1-a2"]
-        ),
-        "actor-a-model": _commit_reply(
-            "actor-a",
-            "model",
-            ["rollout-1-a2"],
-            staging_keys=["stage-2", "stage-1"],
-            staging_keys_by_episode={"rollout-1-a2": ["stage-2", "stage-1"]},
-        ),
+
+def _in_process_gym(ledger_dir: Path):
+    """A policy model and an agent running Gym's real checkpoint participants.
+
+    Control calls go to in-process ASGI apps through Gym's own control routes,
+    so the adapter sees exactly the replies Gym's participants build. Server
+    names are fixed, as a restarted deployment keeps them.
+    """
+    import httpx
+    from fastapi import FastAPI
+    from nemo_gym._checkpoint.agent import AgentSessionParticipant
+    from nemo_gym._checkpoint.control import install_participant
+    from nemo_gym._checkpoint.model import PolicyModelParticipant
+    from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from nemo_gym.token_id_capture.lineage import FileLineageStore
+    from omegaconf import OmegaConf
+
+    class _Reply:
+        def __init__(self, response: httpx.Response) -> None:
+            self.status = response.status_code
+            self._content = response.content
+
+        async def read(self) -> bytes:
+            return self._content
+
+    class _InProcessClient(ServerClient):
+        apps: dict[str, Any]
+
+        async def request(self, server_name, url_path, method, **kwargs):
+            transport = httpx.ASGITransport(app=self.apps[server_name])
+            async with httpx.AsyncClient(
+                transport=transport, base_url=f"http://{server_name}"
+            ) as client:
+                return _Reply(
+                    await client.request(
+                        method,
+                        url_path,
+                        json=kwargs.get("json"),
+                        headers=kwargs.get("headers"),
+                    )
+                )
+
+    class _AgentHooks:
+        def __init__(self) -> None:
+            self.restored: list[Any] = []
+
+        async def export_agent_sessions(self, session_keys):
+            return {key: {"turns": 1} for key in session_keys}
+
+        async def restore_agent_sessions(self, sessions):
+            self.restored.extend(sessions)
+
+        async def retire_agent_session(self, session_key):
+            return None
+
+    hooks = _AgentHooks()
+    agent = AgentSessionParticipant(hooks)
+    participants = {
+        "policy": PolicyModelParticipant(FileLineageStore(ledger_dir)),
+        "agent": agent,
     }
-    restore_result = {
-        "actor-a-environment": {"source_checkpoint_id": "save-1"},
-        "actor-a-model": {"source_checkpoint_id": "save-1"},
-    }
-
-    discover = AsyncMock(return_value=participants)
-    prepare = AsyncMock(return_value=prepare_result)
-    renew = AsyncMock()
-    retire = AsyncMock()
-    commit = AsyncMock(return_value=commit_result)
-    restore = AsyncMock(return_value=restore_result)
-    resume = AsyncMock()
-    for name, operation in (
-        ("discover", discover),
-        ("prepare", prepare),
-        ("renew", renew),
-        ("retire", retire),
-        ("commit", commit),
-        ("restore", restore),
-        ("resume", resume),
-    ):
-        monkeypatch.setattr(coordination, name, operation)
-
-    instance = GymCheckpointInstance(shard_name="actor-a", replica_index=0)
-    adapter = GymCheckpointAdapter(
-        instance=instance,
-        client=client,
-        auth_token="secret",
+    apps = {}
+    for name, participant in participants.items():
+        apps[name] = FastAPI()
+        install_participant(
+            apps[name],
+            participant,
+            auth_token=_CONTROL_TOKEN,
+            instance_name=name,
+            lease_grace_seconds=60,
+        )
+    client = _InProcessClient(
+        head_server_config=BaseServerConfig(host="head", port=1),
+        global_config_dict=OmegaConf.create(
+            {
+                "policy": {"responses_api_models": {"policy": {}}},
+                "agent": {"responses_api_agents": {"agent": {}}},
+            }
+        ),
+        apps=apps,
     )
-    episodes = [GymCheckpointEpisode("rollout-1", 2)]
+    adapter = GymCheckpointAdapter(
+        instance=GymCheckpointInstance(shard_name="nemo_gym", replica_index=0),
+        client=client,
+        auth_token=_CONTROL_TOKEN,
+    )
+    return adapter, agent, hooks
+
+
+def test_adapter_drives_gyms_real_participants_through_save_and_restore(
+    tmp_path: Path,
+) -> None:
+    """Fail if a reply Gym's participants build stops matching what RL reads."""
+    from nemo_gym.episode_types import EpisodeId
+
+    episode = GymCheckpointEpisode("rollout-1", 0)
+    checkpoint_root = tmp_path / "checkpoint"
 
     async def exercise() -> None:
-        summary = await adapter.discover()
-        assert summary.instance_id == "actor-a/replica-0"
-        assert summary.members == (
-            ("actor-a-environment", "environment"),
-            ("actor-a-model", "model"),
+        source, agent, _ = _in_process_gym(tmp_path / "ledger-before")
+        await source.discover()
+
+        # A legacy /run inside a replayable verify step: parked for the checkpoint.
+        in_verify = asyncio.Event()
+        release = asyncio.Event()
+
+        async def legacy_run() -> None:
+            async with agent.legacy_run(
+                "run:rollout-1", EpisodeId(rollout_id="rollout-1")
+            ) as run:
+                await run.boundary({"next": "verify", "response": {}})
+                async with run.step("replay"):
+                    in_verify.set()
+                    await release.wait()
+
+        run = asyncio.create_task(legacy_run())
+        await asyncio.wait_for(in_verify.wait(), timeout=5)
+
+        prepared = await source.prepare("save-1", deadline_ts=time.time() + 5)
+        assert prepared.prepared, prepared.blockers()
+        summary = await source.commit(
+            "save-1", checkpoint_root, [episode], deadline_ts=time.time() + 5
         )
-        # Discovery is cached inside the actor-local adapter.
-        assert await adapter.discover() == summary
-        assert await adapter.prepare("save-1", deadline_ts=10.0) is prepare_result
-        await adapter.renew("save-1", deadline_ts=11.0)
-        await adapter.retire("save-1", episodes, deadline_ts=12.0)
-        commit_summary = await adapter.commit(
-            "save-1",
-            "/checkpoints/step-1",
-            episodes,
-            deadline_ts=13.0,
-        )
-        assert commit_summary.exported_episodes == (
-            GymCheckpointEpisode("rollout-1", 2),
-        )
-        assert commit_summary.staging_keys == ("stage-1", "stage-2")
-        assert commit_summary.staging_keys_by_episode == {
-            GymCheckpointEpisode("rollout-1", 2): ("stage-1", "stage-2")
-        }
-        assert [
-            participant.server_name for participant in commit_summary.participants
-        ] == ["actor-a-environment", "actor-a-model"]
-        assert commit_summary.participants[0].manifest == (
-            GymCheckpointParticipantManifest(
-                schema_version=1,
-                kind="environment",
-                instance="actor-a-environment",
-                checkpoint_id="save-1",
-                records_file="records.jsonl",
-                records_sha256="0" * 64,
-                record_count=1,
-            )
-        )
-        await adapter.restore(
+        await source.resume("save-1", deadline_ts=time.time() + 5)
+        release.set()
+        await asyncio.wait_for(run, timeout=5)
+
+        # The agent's legacy session owns the episode; nothing else is live.
+        assert summary.exported_episodes == (episode,)
+        assert summary.unowned_live_episodes == ()
+        assert summary.staging_keys == ()
+
+        # A fresh deployment, as after a crash.
+        restored, restored_agent, hooks = _in_process_gym(tmp_path / "ledger-after")
+        await restored.discover()
+        await restored.restore(
             "restore-1",
-            "/checkpoints/step-1",
-            episodes,
+            checkpoint_root,
+            [episode],
             source_checkpoint_id="save-1",
-            deadline_ts=14.0,
+            deadline_ts=time.time() + 5,
         )
-        await adapter.resume("save-1", deadline_ts=15.0)
+        await restored.resume("restore-1", deadline_ts=time.time() + 5)
+
+        replacement = EpisodeId(rollout_id="rollout-1", attempt=1)
+        assert await restored_agent.restored_pending() == [replacement]
+        assert [(s.session_key, s.episode_id, s.session) for s in hooks.restored] == [
+            ("run:rollout-1", replacement, {"turns": 1})
+        ]
 
     asyncio.run(exercise())
-
-    discover.assert_awaited_once_with(client, auth_token="secret")
-    prepare.assert_awaited_once_with(participants, "save-1", deadline_ts=10.0)
-    renew.assert_awaited_once_with(participants, "save-1", deadline_ts=11.0)
-    (retire_episode,) = retire.await_args.args[2]
-    assert retire_episode.rollout_id == "rollout-1"
-    assert retire_episode.attempt == 2
-    retire.assert_awaited_once_with(
-        participants,
-        "save-1",
-        retire.await_args.args[2],
-        deadline_ts=12.0,
-    )
-    instance_dir = "/checkpoints/step-1/gym-instances/actor-a/replica-0"
-    (commit_episode,) = commit.await_args.args[3]
-    assert commit_episode == retire_episode
-    commit.assert_awaited_once_with(
-        participants,
-        "save-1",
-        instance_dir,
-        commit.await_args.args[3],
-        deadline_ts=13.0,
-    )
-    (restore_episode,) = restore.await_args.args[3]
-    assert restore_episode == retire_episode
-    restore.assert_awaited_once_with(
-        participants,
-        "restore-1",
-        instance_dir,
-        restore.await_args.args[3],
-        deadline_ts=14.0,
-    )
-    resume.assert_awaited_once_with(participants, "save-1", deadline_ts=15.0)
 
 
 def test_two_adapters_keep_their_clients_and_participants_isolated(monkeypatch) -> None:
@@ -439,15 +463,6 @@ def test_adapter_does_not_require_optional_agent_or_resource_episode_state(
         )
         assert summary.exported_episodes == (GymCheckpointEpisode("rollout-1", 0),)
         assert summary.staging_keys == ("rollout-1/call-1",)
-        assert {
-            participant.kind: participant.capture_keys
-            for participant in summary.participants
-        } == {
-            "environment": ("rollout-1",),
-            "model": ("rollout-1",),
-            "agent": (),
-            "resources": (),
-        }
 
     asyncio.run(exercise())
 
@@ -524,7 +539,6 @@ def test_staging_keys_are_attributed_to_their_episodes_by_gym(monkeypatch) -> No
 @pytest.mark.parametrize(
     "staging_keys_by_episode",
     [
-        pytest.param(None, id="missing"),
         pytest.param({"rollout-1": ["rollout-1/c1"]}, id="a-key-with-no-episode"),
         pytest.param(
             {"rollout-1": ["rollout-1/c1"], "rollout-2-a1": ["rollout-2/c1", "extra"]},
@@ -536,7 +550,7 @@ def test_staging_keys_gym_does_not_attribute_fail_the_commit(
     monkeypatch, staging_keys_by_episode
 ) -> None:
     """Keeping or dropping a row whose owner is unknown would both be a guess."""
-    with pytest.raises(RuntimeError, match="staging_keys_by_episode"):
+    with pytest.raises(ValueError, match="attribute exactly the committed staging"):
         _commit_model_reply(
             monkeypatch,
             _commit_reply(
@@ -747,9 +761,10 @@ def test_adapter_rejects_operations_before_discovery() -> None:
 
 
 @pytest.mark.parametrize(
-    "operation", ["prepare", "renew", "retire", "commit", "resume"]
+    "operation",
+    ["discover", "prepare", "renew", "retire", "commit", "restore", "resume"],
 )
-def test_a_failed_live_checkpoint_call_crosses_ray_typed(
+def test_a_failed_checkpoint_control_call_crosses_ray_typed(
     monkeypatch, operation: str
 ) -> None:
     """Gym's CoordinationError cannot be pickled and reaches RL untyped."""
@@ -764,9 +779,18 @@ def test_a_failed_live_checkpoint_call_crosses_ray_typed(
         client=object(),
         auth_token="secret",
     )
-    adapter._participants = _participants(object(), "actor-a")
+    if operation != "discover":
+        adapter._participants = _participants(object(), "actor-a")
     episodes = [GymCheckpointEpisode("rollout-1", 0)]
     calls = {
+        "discover": lambda: adapter.discover(),
+        "restore": lambda: adapter.restore(
+            "restore-1",
+            "/unused",
+            episodes,
+            source_checkpoint_id="save-1",
+            deadline_ts=1.0,
+        ),
         "prepare": lambda: adapter.prepare("save-1", deadline_ts=1.0),
         "renew": lambda: adapter.renew("save-1", deadline_ts=1.0),
         "retire": lambda: adapter.retire("save-1", episodes, deadline_ts=1.0),
