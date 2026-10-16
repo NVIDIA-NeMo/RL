@@ -18,7 +18,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from nemo_rl.algorithms.single_controller_utils.utils import align_reward_with_v1
 from nemo_rl.experience.rollout_manager import RolloutManager, rewards_carry_no_signal
 
 
@@ -125,31 +124,3 @@ def test_pop_forgets_the_closed_step_and_older_ones_only():
 
 def test_step_with_nothing_generated_reports_nothing():
     assert _manager().pop_step_reward_metrics(5) == {}
-
-
-def test_reward_is_reported_pre_filter_like_v1_when_dynamic_sampling_is_on():
-    step_metrics = {"reward": 0.75, "loss": 0.1}
-    pre_filter = {"first_attempt_reward": 0.5, "unfiltered_reward": 0.4}
-
-    align_reward_with_v1(step_metrics, pre_filter)
-
-    assert step_metrics["reward"] == 0.5
-    assert step_metrics["filtered_reward"] == 0.75
-    assert step_metrics["loss"] == 0.1
-
-
-def test_reward_is_left_alone_without_a_first_attempt_tally():
-    # No stamped step to report against, so renaming would only relabel the same value.
-    step_metrics = {"reward": 0.75}
-
-    align_reward_with_v1(step_metrics, {})
-
-    assert step_metrics == {"reward": 0.75}
-
-
-def test_reward_alignment_needs_a_trained_reward_to_move():
-    step_metrics = {"loss": 0.1}
-
-    align_reward_with_v1(step_metrics, {"first_attempt_reward": 0.5})
-
-    assert step_metrics == {"loss": 0.1}

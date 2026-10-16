@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -176,31 +175,6 @@ class AdvantagePartial:
             minimum=float(values.min()),
             maximum=float(values.max()),
         )
-
-
-def align_reward_with_v1(
-    step_metrics: dict[str, Any], pre_filter_metrics: Mapping[str, float]
-) -> None:
-    """Make ``reward`` mean what it means on the v1 path when dynamic sampling is on.
-
-    v1 logs ``reward`` before filtering and ``filtered_reward`` over the groups it
-    trained on. SC's own ``reward`` is the trained-rows mean (see
-    ``reduce_advantage_pump_metrics``), so move that value to ``filtered_reward`` and
-    put the first-attempt reward in its place. First attempts are the closest SC match;
-    replacement prompts are not included.
-
-    Does nothing when the step has no first-attempt tally (a sampler that does not
-    stamp steps), since renaming would only relabel the same value.
-
-    Args:
-        step_metrics: The step's metrics, edited in place.
-        pre_filter_metrics: ``RolloutManager.pop_step_reward_metrics`` for the step.
-    """
-    first_attempt = pre_filter_metrics.get("first_attempt_reward")
-    if first_attempt is None or REWARD_KEY not in step_metrics:
-        return
-    step_metrics["filtered_reward"] = step_metrics[REWARD_KEY]
-    step_metrics[REWARD_KEY] = first_attempt
 
 
 def reduce_advantage_pump_metrics(
