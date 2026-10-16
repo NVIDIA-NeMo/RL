@@ -625,7 +625,7 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     --port "${VLLM_HTTP_PORT}" \
     --served-model-name "${SERVED_MODEL_NAME}" \
     "${vllm_args[@]}" \
-    > "${LOG_FILE}" 2>&1 &
+    >> "${LOG_FILE}" 2>&1 &
   VLLM_PID=$!
 
   while ! "${VLLM_PYTHON}" -c \
