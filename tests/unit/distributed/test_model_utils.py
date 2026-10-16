@@ -17,6 +17,9 @@ import os
 import pytest
 import ray
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn.functional as F
 
 from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
 from nemo_rl.distributed.model_utils import (
@@ -32,7 +35,10 @@ from nemo_rl.distributed.model_utils import (
     _compute_distributed_selected_logprobs,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
+    cp_load_balanced_segments,
+    distributed_selected_logprobs,
     distributed_vocab_topk,
+    distributed_vocab_topk_logz_force,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
     gather_logits_at_global_indices,
@@ -1997,3 +2003,428 @@ def test_student_teacher_kernels_normalize_bf16_logits_in_fp32(
 
     expected_kl, _, _ = _student_teacher_reference(student, teacher)
     torch.testing.assert_close(reverse_kl, expected_kl, rtol=1e-5, atol=1e-5)
+
+
+# ── Vocab-parallel selected log-probs and sparse top-k primitives ───────────
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+def test_cp_load_balanced_segments_match_cp_rank_tokens(cp_size):
+    """The segments describe exactly the rows ``_get_tokens_on_this_cp_rank`` keeps."""
+    full_seq_len = 5 * 2 * cp_size
+    tokens = torch.arange(full_seq_len).unsqueeze(0)
+    for cp_rank in range(cp_size):
+        reconstructed = []
+        expected_local_start = 0
+        for local_start, global_start, length in cp_load_balanced_segments(
+            full_seq_len, cp_rank, cp_size
+        ):
+            assert local_start == expected_local_start
+            reconstructed.extend(range(global_start, global_start + length))
+            expected_local_start += length
+        sharded = _get_tokens_on_this_cp_rank(tokens, cp_rank, cp_size, seq_dim=1)
+        assert reconstructed == sharded.squeeze(0).tolist()
+
+
+def test_cp_load_balanced_segments_validate_partition():
+    with pytest.raises(ValueError, match=r"divisible by 2\*cp_size"):
+        cp_load_balanced_segments(10, 0, 2)
+    with pytest.raises(ValueError, match="cp_rank must be"):
+        cp_load_balanced_segments(8, 2, 2)
+
+
+def test_distributed_selected_logprobs_tp1_matches_dense_value_and_gradient():
+    """TP1 exercises the real-vocab normalization and the custom backward."""
+    torch.manual_seed(1234)
+    real_vocab_size = 5
+    temperature = 0.7
+    base = torch.randn(2, 3, 7, dtype=torch.float32)
+    # Padded LM-head columns would dominate if they leaked into logZ.
+    base[..., real_vocab_size:] += 100.0
+    actual_logits = base.clone().requires_grad_(True)
+    reference_logits = base.clone().requires_grad_(True)
+    batch_indices = torch.tensor([0, 0, 1], dtype=torch.long)
+    seq_indices = torch.tensor([1, 1, 2], dtype=torch.long)
+    token_ids = torch.tensor([[0, 4], [4, 2], [1, 1]], dtype=torch.long)
+    weights = torch.tensor([[0.5, -0.25], [1.25, 0.75], [-0.5, 2.0]])
+
+    actual = distributed_selected_logprobs(
+        actual_logits,
+        batch_indices,
+        seq_indices,
+        token_ids,
+        vocab_start_index=0,
+        vocab_end_index=actual_logits.shape[-1],
+        real_vocab_size=real_vocab_size,
+        temperature=temperature,
+        tp_group=None,
+        row_chunk_size=1,
+    )
+    dense_rows = reference_logits[batch_indices, seq_indices, :real_vocab_size]
+    expected = torch.gather(
+        F.log_softmax(dense_rows / temperature, dim=-1), dim=-1, index=token_ids
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+    (actual * weights).sum().backward()
+    (expected * weights).sum().backward()
+    torch.testing.assert_close(
+        actual_logits.grad, reference_logits.grad, rtol=2e-6, atol=2e-6
+    )
+    assert torch.equal(
+        actual_logits.grad[..., real_vocab_size:],
+        torch.zeros_like(actual_logits.grad[..., real_vocab_size:]),
+    )
+
+
+def test_distributed_selected_logprobs_marks_out_of_vocab_ids_minus_inf():
+    logits = torch.randn(1, 2, 6)
+    actual = distributed_selected_logprobs(
+        logits,
+        torch.tensor([0, 0]),
+        torch.tensor([0, 1]),
+        torch.tensor([[-1, 2], [5, 4]]),
+        vocab_start_index=0,
+        vocab_end_index=6,
+        real_vocab_size=5,
+        temperature=1.0,
+    )
+    assert actual[0, 0].item() == float("-inf")
+    assert actual[1, 0].item() == float("-inf")
+    assert torch.isfinite(actual[0, 1]) and torch.isfinite(actual[1, 1])
+
+
+def test_distributed_vocab_topk_logz_force_tp1_exports_natural_and_sidecars():
+    """Natural K is unchanged while every forced label gets an exact sidecar."""
+    logits = torch.tensor(
+        [
+            [
+                [9.0, 8.0, 7.0, 6.0, 5.0, 100.0, 90.0],
+                [9.0, 8.0, 7.0, 6.0, 5.0, 110.0, 80.0],
+                [1.0, 5.0, 4.0, 3.0, 2.0, 120.0, 70.0],
+            ]
+        ]
+    )
+    force = torch.tensor([[[1, 4], [4, -1], [-1, -1]]], dtype=torch.long)
+    temperature = 2.0
+
+    (
+        values,
+        indices,
+        log_z,
+        natural_tail_indices,
+        forced_values,
+        forced_indices,
+        forced_was_natural,
+    ) = distributed_vocab_topk_logz_force(
+        logits,
+        force,
+        2,
+        None,
+        vocab_start_index=0,
+        vocab_end_index=logits.shape[-1],
+        real_vocab_size=5,
+        temperature=temperature,
+        chunk_size=2,
+    )
+
+    assert indices.tolist() == [[[0, 1], [0, 1], [1, 2]]]
+    torch.testing.assert_close(
+        values,
+        torch.tensor([[[9.0, 8.0], [9.0, 8.0], [5.0, 4.0]]]),
+        rtol=0,
+        atol=0,
+    )
+    # Values stay raw; only the exact denominator is temperature scaled.
+    torch.testing.assert_close(
+        log_z,
+        torch.logsumexp(logits[..., :5] / temperature, dim=-1),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert natural_tail_indices.tolist() == [[[1], [1], [2]]]
+    assert forced_indices.tolist() == force.tolist()
+    assert forced_values.tolist() == [[[8.0, 5.0], [5.0, 0.0], [0.0, 0.0]]]
+    assert forced_was_natural.tolist() == [
+        [[True, False], [False, False], [False, False]]
+    ]
+    assert bool((indices < 5).all())
+
+
+def test_distributed_vocab_topk_logz_force_supports_k_one():
+    logits = torch.tensor([[[4.0, 3.0, 2.0, 1.0, 0.0, 999.0]]])
+    (
+        values,
+        indices,
+        log_z,
+        natural_tail_indices,
+        forced_values,
+        forced_indices,
+        forced_was_natural,
+    ) = distributed_vocab_topk_logz_force(
+        logits,
+        torch.tensor([[[4, -1]]], dtype=torch.long),
+        1,
+        None,
+        vocab_start_index=0,
+        vocab_end_index=6,
+        real_vocab_size=5,
+        temperature=0.5,
+    )
+
+    assert indices.tolist() == [[[0]]]
+    assert values.tolist() == [[[4.0]]]
+    assert natural_tail_indices.tolist() == [[[0]]]
+    assert forced_indices.tolist() == [[[4, -1]]]
+    assert forced_values.tolist() == [[[0.0, 0.0]]]
+    assert forced_was_natural.tolist() == [[[False, False]]]
+    torch.testing.assert_close(
+        log_z,
+        torch.logsumexp(logits[..., :5] / 0.5, dim=-1),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_distributed_vocab_topk_logz_force_membership_can_exceed_transport_k():
+    logits = torch.tensor([[[5.0, 4.0, 3.0, 2.0, 1.0]]])
+    outputs = distributed_vocab_topk_logz_force(
+        logits,
+        torch.tensor([[[2, 4]]], dtype=torch.long),
+        2,
+        None,
+        vocab_start_index=0,
+        vocab_end_index=5,
+        real_vocab_size=5,
+        temperature=1.0,
+        noise_filter_k=3,
+    )
+
+    assert outputs[-1].tolist() == [[[True, False]]]
+
+
+def test_distributed_vocab_topk_logz_force_canonicalizes_cutoff_ties():
+    logits = torch.tensor([[[5.0, 4.0, 4.0, 1.0]]])
+    outputs = distributed_vocab_topk_logz_force(
+        logits,
+        torch.tensor([[[3, -1]]], dtype=torch.long),
+        2,
+        None,
+        vocab_start_index=0,
+        vocab_end_index=4,
+        real_vocab_size=4,
+        temperature=1.0,
+    )
+
+    # Equal cutoff logits keep the lowest global token id, independent of the
+    # candidate order a TP partition presents to torch.topk.
+    assert outputs[1].tolist() == [[[0, 1]]]
+    assert outputs[3].tolist() == [[[1]]]
+
+
+def test_distributed_vocab_topk_logz_force_rejects_nan_temperature():
+    with pytest.raises(ValueError, match="finite and > 0"):
+        distributed_vocab_topk_logz_force(
+            torch.tensor([[[5.0, 4.0, 3.0]]]),
+            torch.tensor([[[2, -1]]]),
+            2,
+            None,
+            vocab_start_index=0,
+            vocab_end_index=3,
+            real_vocab_size=3,
+            temperature=float("nan"),
+        )
+
+
+@pytest.mark.parametrize(
+    "force,match",
+    [
+        (torch.tensor([[[5, -1]]]), "real-vocabulary ids"),
+        (torch.tensor([[[2, 2]]]), "duplicate valid labels"),
+    ],
+)
+def test_distributed_vocab_topk_logz_force_rejects_invalid_sidecars(force, match):
+    with pytest.raises(ValueError, match=match):
+        distributed_vocab_topk_logz_force(
+            torch.tensor([[[5.0, 4.0, 3.0, 2.0, 1.0]]]),
+            force,
+            2,
+            None,
+            vocab_start_index=0,
+            vocab_end_index=5,
+            real_vocab_size=5,
+            temperature=1.0,
+        )
+
+
+def _run_sparse_primitives_tp(rank: int, tp_size: int, init_file: str) -> None:
+    """Selected log-probs and sparse top-k on a gloo TP group match a dense view."""
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=tp_size,
+    )
+    try:
+        tp_group = dist.new_group(ranks=list(range(tp_size)))
+        batch_size, seq_len = 2, 5
+        padded_vocab_size, real_vocab_size = 8, 7
+        local_vocab_size = padded_vocab_size // tp_size
+        vocab_start_index = rank * local_vocab_size
+        vocab_end_index = vocab_start_index + local_vocab_size
+        temperature = 0.7
+
+        torch.manual_seed(20260805)
+        full_logits = torch.randn(batch_size, seq_len, padded_vocab_size)
+        # Column 7 is TP-divisibility padding. It would dominate both top-k
+        # and logZ if the real-vocabulary boundary leaked.
+        full_logits[..., real_vocab_size] += 100.0
+        local_logits = (
+            full_logits[..., vocab_start_index:vocab_end_index]
+            .detach()
+            .clone()
+            .requires_grad_(True)
+        )
+
+        batch_indices = torch.tensor([0, 0, 1, 1])
+        seq_indices = torch.tensor([1, 1, 2, 4])
+        token_ids = torch.tensor([[0, 6], [5, 2], [3, 3], [6, 1]])
+        weights = torch.tensor([[0.5, -0.25], [1.25, 0.75], [-0.5, 2.0], [0.3, -1.1]])
+        selected = distributed_selected_logprobs(
+            local_logits,
+            batch_indices,
+            seq_indices,
+            token_ids,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+            real_vocab_size=real_vocab_size,
+            temperature=temperature,
+            tp_group=tp_group,
+            row_chunk_size=2,
+        )
+        dense_for_grad = full_logits.detach().clone().requires_grad_(True)
+        dense_rows = dense_for_grad[batch_indices, seq_indices, :real_vocab_size]
+        expected_selected = torch.gather(
+            torch.log_softmax(dense_rows / temperature, dim=-1),
+            dim=-1,
+            index=token_ids,
+        )
+        torch.testing.assert_close(selected, expected_selected, rtol=2e-6, atol=2e-6)
+        (selected * weights).sum().backward()
+        (expected_selected * weights).sum().backward()
+
+        gathered_grads = [torch.empty_like(local_logits.grad) for _ in range(tp_size)]
+        dist.all_gather(gathered_grads, local_logits.grad, group=tp_group)
+        reconstructed_grad = torch.cat(gathered_grads, dim=-1)
+        torch.testing.assert_close(
+            reconstructed_grad, dense_for_grad.grad, rtol=3e-6, atol=3e-6
+        )
+        assert torch.equal(
+            reconstructed_grad[..., real_vocab_size],
+            torch.zeros_like(reconstructed_grad[..., real_vocab_size]),
+        )
+
+        # Rows request a natural top-3 label, a deliberately absent
+        # (minimum-logit) label, or no label. A second distinct sidecar entry
+        # exercises forced logits owned by different TP ranks.
+        real_logits = full_logits[..., :real_vocab_size]
+        natural_top3 = torch.topk(real_logits, 3, dim=-1).indices
+        primary_force_ids = natural_top3[..., 0].clone()
+        absent_rows = torch.zeros_like(primary_force_ids, dtype=torch.bool)
+        absent_rows[0, 1] = True
+        absent_rows[1, 3] = True
+        primary_force_ids[absent_rows] = real_logits.argmin(dim=-1)[absent_rows]
+        secondary_force_ids = (primary_force_ids + 4) % real_vocab_size
+        # One row spans the two TP vocabulary shards.
+        primary_force_ids[0, 0] = 0
+        secondary_force_ids[0, 0] = 6
+        primary_force_ids[0, 4] = -1
+        secondary_force_ids[0, 4] = -1
+        force_ids = torch.stack([primary_force_ids, secondary_force_ids], dim=-1)
+
+        (
+            topk_values,
+            topk_ids,
+            log_z,
+            natural_tail_ids,
+            forced_values,
+            transported_force_ids,
+            forced_was_natural,
+        ) = distributed_vocab_topk_logz_force(
+            local_logits.detach(),
+            force_ids,
+            2,
+            tp_group,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+            real_vocab_size=real_vocab_size,
+            temperature=temperature,
+            noise_filter_k=3,
+            chunk_size=3,
+        )
+        expected_values, expected_ids = torch.topk(real_logits, 2, dim=-1)
+        expected_tail_ids = expected_ids[..., -1:].clone()
+        force_valid = force_ids >= 0
+        expected_membership = (
+            natural_top3.unsqueeze(-2) == force_ids.unsqueeze(-1)
+        ).any(dim=-1) & force_valid
+        expected_forced_values = torch.where(
+            force_valid,
+            torch.gather(real_logits, -1, force_ids.clamp_min(0)),
+            torch.zeros(force_ids.shape),
+        )
+        expected_ids, order = torch.sort(expected_ids, dim=-1)
+        expected_values = torch.gather(expected_values, -1, order)
+
+        torch.testing.assert_close(topk_values, expected_values, rtol=0, atol=0)
+        assert torch.equal(topk_ids.long(), expected_ids)
+        assert torch.equal(natural_tail_ids.long(), expected_tail_ids)
+        torch.testing.assert_close(
+            forced_values, expected_forced_values, rtol=0, atol=0
+        )
+        assert torch.equal(transported_force_ids.long(), force_ids)
+        torch.testing.assert_close(
+            log_z,
+            torch.logsumexp(real_logits / temperature, dim=-1),
+            rtol=2e-6,
+            atol=2e-6,
+        )
+        assert torch.equal(forced_was_natural, expected_membership)
+        assert bool((topk_ids < real_vocab_size).all())
+
+        # Exact cutoff ties select the same lowest global token ids at every
+        # TP size, although each shard presents its own candidates.
+        tie_full_logits = torch.tensor([[[9.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0, 999.0]]])
+        tie_outputs = distributed_vocab_topk_logz_force(
+            tie_full_logits[..., vocab_start_index:vocab_end_index],
+            torch.tensor([[[6, -1]]], dtype=torch.long),
+            3,
+            tp_group,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+            real_vocab_size=real_vocab_size,
+            temperature=1.0,
+            chunk_size=1,
+        )
+        assert tie_outputs[1].long().tolist() == [[[0, 1, 2]]]
+        assert tie_outputs[3].long().tolist() == [[[2]]]
+        torch.testing.assert_close(
+            tie_outputs[0], torch.tensor([[[9.0, 8.0, 8.0]]]), rtol=0, atol=0
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="gloo backend unavailable",
+)
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_sparse_primitives_match_dense_on_gloo_tp(tmp_path, tp_size):
+    mp.spawn(
+        _run_sparse_primitives_tp,
+        args=(tp_size, os.fspath(tmp_path / "gloo_init")),
+        nprocs=tp_size,
+        join=True,
+    )

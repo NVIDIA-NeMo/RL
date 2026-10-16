@@ -320,6 +320,15 @@ tests/test_suites/llm/distillation-xtoken-off-policy-qwen3-4b-to-llama3.2-1b-1n8
 # Multi-teacher cross-tokenizer off-policy distillation (xtoken): Qwen3-4B (cross-tok P-KL) + Llama-3.2-3B (same-vocab direct KL) -> Llama-3.2-1B, kd_loss_mode=sum, student TP4xCP2 <- teachers TP2xCP2, guards multi-teacher aggregation + per-teacher CP-buffer sharding.
 tests/test_suites/llm/distillation-xtoken-off-policy-multiteacher-qwen3-4b-llama3.2-3b-to-llama3.2-1b-1n8g-automodel-tp4cp2.sh
 
+# CSD cross-tokenizer distillation: Qwen3-4B -> Llama-3.2-1B on raw text, student TP4xCP2 <- teacher TP2xCP2, builds both sub-token tables and guards finite training.
+tests/test_suites/llm/csd-qwen3-4b-to-llama3.2-1b-1n8g-dtensor-tp4cp2.sh
+
+# CSD on Megatron: Qwen3-4B -> Llama-3.2-1B on raw text, student and teacher TP2xCP2, guards finite training.
+tests/test_suites/llm/csd-qwen3-4b-to-llama3.2-1b-1n8g-megatron-tp2cp2.sh
+
+# Multi-teacher CSD: Qwen3-4B (cross-tokenizer CSD) + Llama-3.2-3B (same-vocab direct KL) -> Llama-3.2-1B, kd_loss_mode=sum, student TP4xCP2 <- teachers TP2xCP2, guards finite training.
+tests/test_suites/llm/csd-multiteacher-qwen3-4b-llama3.2-3b-to-llama3.2-1b-1n8g-dtensor-tp4cp2.sh
+
 #######
 # PPO #
 #######

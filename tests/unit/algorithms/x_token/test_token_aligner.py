@@ -288,6 +288,43 @@ def test_align_padding_positions_receive_sentinel_chunk_id():
     assert bool((t_sizes[chunk_mask] > 0).all())
 
 
+def test_align_pair_valid_drops_padding_pairs():
+    """In a right-padded batch with rows of different lengths, the pairs over
+    padding are invalid, while real two-sided pairs and the student-only
+    start-of-text pair (one-sided by alignment) stay valid.
+    """
+    vocab = {0: "<pad>", 7: "<bos>", 1: "Hello", 2: "Ġworld", 3: "!"}
+    aligner = _make_aligner(vocab, vocab, bos_token_id=7, pad_token_id=0)
+
+    # Only the student starts with <bos>; row 1 is two tokens shorter.
+    student_ids = torch.tensor([[7, 1, 2, 3], [7, 1, 0, 0]], dtype=torch.long)
+    teacher_ids = torch.tensor([[1, 2, 3], [1, 0, 0]], dtype=torch.long)
+    student_offsets = torch.tensor(
+        [[[0, 0], [0, 5], [5, 11], [11, 12]], [[0, 0], [0, 5], [0, 0], [0, 0]]],
+        dtype=torch.long,
+    )
+    teacher_offsets = torch.tensor(
+        [[[0, 5], [5, 11], [11, 12]], [[0, 5], [0, 0], [0, 0]]], dtype=torch.long
+    )
+
+    batch = aligner.align(
+        student_ids,
+        teacher_ids,
+        student_offsets=student_offsets,
+        teacher_offsets=teacher_offsets,
+        student_attention_mask=student_ids.ne(0),
+        teacher_attention_mask=teacher_ids.ne(0),
+    )
+
+    # Pair 0 is <bos> alone; row 1's pairs 2-3 pair padding with padding.
+    assert batch.student_chunk_id.tolist() == [[0, 1, 2, 3], [0, 1, -1, -1]]
+    assert batch.teacher_chunk_id.tolist() == [[1, 2, 3], [1, -1, -1]]
+    assert batch.pair_valid.tolist() == [
+        [True, True, True, True],
+        [True, True, False, False],
+    ]
+
+
 def test_module_exposes_alignment_kernel():
     """The offset kernel is reachable from the package namespace (callers use
     it directly instead of poking at name-mangled internals).

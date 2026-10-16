@@ -992,6 +992,8 @@ def kd_data_processor(
                 "kd_data_processor expected 'tools' to be a list of objects or None"
             )
         output["tools"] = deepcopy(tools)
+    if "sample_id" in datum_dict:
+        output["sample_id"] = datum_dict["sample_id"]
     return output
 
 
