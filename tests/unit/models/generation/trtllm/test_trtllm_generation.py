@@ -354,6 +354,25 @@ def test_prepare_refit_info_skips_missing_metadata_and_dispatches_present_metada
     ray_get.assert_called_once_with(futures)
 
 
+@pytest.mark.parametrize("colocated", [True, False])
+def test_invalidate_kv_cache_resets_prefix_cache_on_every_engine(
+    monkeypatch, colocated
+):
+    generation = _bare_generation(colocated=colocated, dp_size=2)
+    run_one = generation.worker_group.run_single_worker_single_data
+    run_one.side_effect = lambda **_: True
+    monkeypatch.setattr(trtllm_generation.ray, "get", lambda values: values)
+
+    assert generation.invalidate_kv_cache() is True
+    assert [c.kwargs["method_name"] for c in run_one.call_args_list] == [
+        "reset_prefix_cache_async"
+    ] * 2
+    assert [c.kwargs["worker_idx"] for c in run_one.call_args_list] == [0, 1]
+
+    run_one.side_effect = lambda **_: False
+    assert generation.invalidate_kv_cache() is False
+
+
 @pytest.mark.parametrize(
     ("in_flight", "recompute_kv", "expected_drain"),
     [(False, False, True), (True, False, False), (True, True, False)],
