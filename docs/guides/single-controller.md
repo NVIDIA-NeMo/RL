@@ -381,26 +381,26 @@ Field definitions:
 
 ## Dynamic sampling
 
-Set `grpo.use_dynamic_sampling: true` to drop prompt groups whose generations all received the same reward (zero within-group variance, so no advantage signal) and resample a substitute, as in [DAPO](dapo.md). Filtering applies on both the token-capture path and the non-capture path. A filtered group counts as a dropped prompt, so setup requires that something substitutes it, otherwise every filtered group would silently shrink its training step:
+Set `grpo.use_dynamic_sampling: true` to drop prompt groups whose generations all received the same reward (zero within-group variance, so no advantage signal) and resample a substitute, as in [DAPO](dapo.md). Filtering works on both the token-capture and non-capture paths. Each dropped group needs a replacement prompt, otherwise it would silently shrink its training step, so setup requires:
 
 - `async_rl.rollout_failure.on_dropped_prompt: replace`.
-- `async_rl.rollout_failure.max_replacement_attempts >= 1`. A slot whose substitute is also filtered, once this budget is spent, closes its step short; if too many slots do, the step falls below `min_step_batch_fraction` and the run raises. At high filter rates, raise `max_replacement_attempts` (or lower `min_step_batch_fraction`).
-- A sampler that stamps a target step (`in_order`, or a `custom` sampler that does so). Without a stamped step a filtered group can be neither replaced nor credited short.
+- `async_rl.rollout_failure.max_replacement_attempts >= 1`. Each slot gets at most this many replacements. If the last one is also dropped, that step closes one group short, and if too many groups are lost the step falls below `min_step_batch_fraction` and the run raises. At high drop rates, raise `max_replacement_attempts` or lower `min_step_batch_fraction`.
+- A sampler that stamps a target step: `in_order`, or a `custom` sampler that does. The other built-in samplers (`weight_fifo`, `ready_first`, `windowed`) are rejected, because without a stamped step a dropped group can be neither replaced nor counted as missing.
 - `grpo.num_generations_per_prompt >= 2`.
 
-The v1 knobs `grpo.dynamic_sampling_max_gen_batches` and `grpo.batch_multiplier` have no effect on this path; the replacement budget is `max_replacement_attempts`. Filtered groups are counted separately from rollout failures and do not spend the `max_skipped_prompts` or `max_consecutive_dropped_prompts` budgets. PPO keeps its zero-drop-budget requirement (see [Known Missing Features](#known-missing-features)).
+The v1 knobs `grpo.dynamic_sampling_max_gen_batches` and `grpo.batch_multiplier` have no effect here; `max_replacement_attempts` is the budget instead. Dropped groups are counted separately from rollout failures and do not use up `max_skipped_prompts` or `max_consecutive_dropped_prompts`. This section covers GRPO only: PPO needs full-size steps (see [Known Missing Features](#known-missing-features)), and a dropped group that cannot be replaced shortens the step.
 
-Because the trained batch only contains surviving groups, `train/reward` can stay flat while the policy still improves. To keep the v1 meaning, `reward` is reported over each slot's first attempt (before filtering) and the trained-rows value moves to `filtered_reward`. Additional per-step metrics:
+The trained batch only holds groups with reward spread, so `reward` computed over it can stay flat while the policy still improves. To match v1, which reports `reward` before filtering, `reward` here is the mean over each slot's first attempt (replacements excluded), and the trained-rows mean moves to `filtered_reward`. These per-step metrics are also reported, and all of them need a sampler that stamps target steps:
 
 | Metric | Meaning |
 | --- | --- |
 | `unfiltered_reward` | Mean reward over every generated group, kept or dropped. |
-| `first_attempt_reward` | Mean reward over each slot's first attempt only (the v1 `reward`). Absent under a sampler that stamps no target step. |
+| `first_attempt_reward` | Mean reward over each slot's first attempt only; this is what `reward` reports. |
 | `generated_prompt_groups` | Groups generated for the step, including dropped ones. |
-| `zero_variance_prompt_groups` / `zero_variance_fraction` | Count and fraction of generated groups filtered for zero variance. |
-| `rollout/zero_variance_groups_total` | Running total of filtered groups. |
+| `zero_variance_prompt_groups` / `zero_variance_fraction` | Count and fraction of generated groups whose rewards were all equal. |
+| `rollout/zero_variance_groups_total` | Running total of dropped groups. |
 
-The reward tally is held in memory, so after a checkpoint resume the in-flight step's reward metrics cover only post-resume groups.
+The reward totals are kept in memory only, so after a checkpoint resume the in-flight step's reward metrics cover just the groups generated after the resume.
 
 ## Implementation Structure
 

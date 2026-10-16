@@ -51,7 +51,6 @@ from nemo_rl.algorithms.single_controller_utils import (
     setup_single_controller,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
-    RolloutFailureConfig,
     algo_config,
     validate_single_controller_config,
 )
@@ -599,7 +598,6 @@ def _dynamic_sampling_config(
     *,
     on_dropped_prompt: str = "replace",
     sampler: str = "in_order",
-    max_replacement_attempts: int = 1,
     num_generations_per_prompt: int = _NUM_GENERATIONS_PER_PROMPT,
 ) -> MasterConfig:
     """A GRPO SC config with dynamic sampling on and the knobs it validates."""
@@ -609,16 +607,11 @@ def _dynamic_sampling_config(
     mc.policy["train_global_batch_size"] = (
         _NUM_PROMPTS_PER_STEP * num_generations_per_prompt
     )
-    # model_construct: with on_dropped_prompt="replace" the model itself rejects
-    # max_replacement_attempts < 1, which would hide the validator's own branch.
     mc.async_rl = AsyncRLConfig(
         min_groups_for_streaming_train=_NUM_PROMPTS_PER_STEP,
         max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
         sampler={"name": sampler},
-        rollout_failure=RolloutFailureConfig.model_construct(
-            on_dropped_prompt=on_dropped_prompt,
-            max_replacement_attempts=max_replacement_attempts,
-        ),
+        rollout_failure={"on_dropped_prompt": on_dropped_prompt},
     )
     return mc
 
@@ -628,10 +621,6 @@ class TestDynamicSamplingValidation:
 
     def test_accepts_replace_with_a_stamping_sampler(self):
         validate_single_controller_config(_dynamic_sampling_config())
-
-    @pytest.mark.parametrize("sampler", ["in_order", "custom"])
-    def test_accepts_the_samplers_that_can_stamp_a_step(self, sampler):
-        validate_single_controller_config(_dynamic_sampling_config(sampler=sampler))
 
     def test_rejects_shrink_since_a_filtered_group_is_never_substituted(self):
         mc = _dynamic_sampling_config(on_dropped_prompt="shrink")
@@ -643,12 +632,6 @@ class TestDynamicSamplingValidation:
         mc = _dynamic_sampling_config(sampler="ready_first")
 
         with pytest.raises(ValueError, match="stamps a target step"):
-            validate_single_controller_config(mc)
-
-    def test_rejects_zero_replacement_attempts(self):
-        mc = _dynamic_sampling_config(max_replacement_attempts=0)
-
-        with pytest.raises(ValueError, match="max_replacement_attempts >= 1"):
             validate_single_controller_config(mc)
 
     def test_rejects_a_single_generation_per_prompt(self):

@@ -216,33 +216,29 @@ class RolloutRetryPolicy:
 
 
 def rewards_carry_no_signal(rewards: Sequence[float]) -> bool:
-    """Whether one group's rewards give every row zero advantage.
+    """Whether a group has no reward spread, so every row gets zero advantage.
 
-    A group is trivial when it holds at most one reward or when all of them are
-    exactly equal. Exact equality rather than a standard-deviation threshold because
-    roundoff can leave a uniform group with a positive std. Same predicate as
-    ``calculate_trivial_reward_distributions`` in ``nemo_rl.algorithms.utils``, which
-    the v1 path applies across a whole batch; keep the two in step.
+    True for at most one reward, or when all rewards are exactly equal. Exact
+    equality is used because float roundoff can give a uniform group a tiny std.
+    Same rule as v1's ``calculate_trivial_reward_distributions``; keep them in sync.
     """
     return len(rewards) <= 1 or max(rewards) == min(rewards)
 
 
 @dataclass
 class StepRewardStats:
-    """Reward tallies for the prompt groups generated for one training step.
+    """Reward totals for the groups generated for one training step.
 
-    Counts every group that finished generating, whether dynamic sampling then kept it
-    or dropped it, so the reward here is not conditioned on the filter. The kept groups
-    alone all have reward variance, which pins their mean near the middle of the range
-    however well the policy is doing.
+    Counts every group that finished generating, whether dynamic sampling kept or
+    dropped it. The kept groups all have reward spread, so their mean alone says
+    little about how well the policy is doing.
     """
 
     groups: int = 0
     zero_variance_groups: int = 0
     reward_sum: float = 0.0
     samples: int = 0
-    # Only each slot's first attempt: the prompts the step was originally scheduled
-    # with, before any replacement. The v1 path's logged ``reward`` is the same thing.
+    # First attempts only: the prompts originally scheduled, not their replacements.
     first_attempt_reward_sum: float = 0.0
     first_attempt_samples: int = 0
 
@@ -258,10 +254,9 @@ class RolloutStats:
 
     committed: int = 0
     skipped: int = 0
-    # Groups discarded by dynamic sampling because every generation scored the same,
-    # so the group carries no advantage signal. Counted apart from the failure
-    # budgets above: this is a deliberate policy drop of a healthy rollout, and
-    # conflating it with a data or infra failure would make the fleet look sick.
+    # Groups dropped by dynamic sampling because all generations got the same reward.
+    # Kept apart from the failure counts: the rollout was healthy, so counting it as a
+    # failure would make the fleet look sick.
     zero_variance_groups: int = 0
     # Infra re-dispatches: the fleet is degrading. Kept apart from data retries because
     # conflating them defeats the whole point of the two-budget split -- an operator
@@ -1735,9 +1730,8 @@ class RolloutManager:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
-        # Dynamic sampling (DAPO): a group whose generations all scored the same gives
-        # every one of its rows zero advantage, so generate_and_push reports it as
-        # SKIPPED and the caller substitutes a spare.
+        # Dynamic sampling (DAPO): groups whose generations all got the same reward have
+        # zero advantage, so they are dropped and the caller replaces them with a spare.
         self._filter_zero_variance_groups = filter_zero_variance_groups
         # Resolved before the impl is built: the NeMo-Gym impl reads its row-retry
         # budget out of it at construction time, and shares the counters so its
@@ -1748,8 +1742,8 @@ class RolloutManager:
             else RolloutRetryPolicy.single_attempt()
         )
         self._stats = RolloutStats()
-        # Per training step, keyed by the step a group was generated for. Popped by the
-        # controller when that step closes, the same way its shortfall counters are.
+        # Keyed by the step a group was generated for; the controller pops a step's
+        # entry when that step closes.
         self._step_rewards: dict[int, StepRewardStats] = {}
         # Shared with the impl's request deadlines so the controller can pause their clocks
         # while a colocated engine is in training mode.
@@ -1975,11 +1969,7 @@ class RolloutManager:
 
     @staticmethod
     def _is_zero_variance_group(record: PromptGroupRecord) -> bool:
-        """Whether this group's rewards carry no advantage signal.
-
-        Restated on a list of floats (``rewards_carry_no_signal``) because this runs
-        on one group, before any of it is batched into tensors.
-        """
+        """Whether this group has no reward spread (see ``rewards_carry_no_signal``)."""
         return rewards_carry_no_signal(
             [completion.reward for completion in record.completions]
         )
@@ -1991,14 +1981,14 @@ class RolloutManager:
         *,
         replacement_index: int,
     ) -> None:
-        """Tally one finished group's rewards against the step it was generated for.
+        """Add one finished group's rewards to the tally of the step it was made for.
 
         Args:
-            target_step: Step the group was stamped for. ``None`` under a sampler that
-                does not stamp: there is no step to report against, so nothing is kept.
+            target_step: Step the group was stamped for. ``None`` (sampler does not
+                stamp steps) means there is nothing to report against, so skip.
             rewards: One reward per row of the group.
-            replacement_index: 0 for a slot's originally scheduled prompt, N for its
-                N-th replacement.
+            replacement_index: 0 for the originally scheduled prompt, N for its N-th
+                replacement.
         """
         if target_step is None or not rewards:
             return
@@ -2013,19 +2003,17 @@ class RolloutManager:
             tally.first_attempt_samples += len(rewards)
 
     def pop_step_reward_metrics(self, step: int) -> dict[str, float]:
-        """Metrics for the groups generated for ``step``, forgetting that step and older.
+        """Return the reward metrics for ``step`` and forget that step and older ones.
 
-        Attribution is by the step a group was generated for. A finished group that a
-        later step lends to a dropped one (``promote_ready_group``) is still counted
-        under the step it was generated for, so the two differ whenever lookahead is
-        above zero.
+        Groups count toward the step they were generated for, even if a later step
+        borrowed them (``promote_ready_group``). With lookahead above zero that can
+        differ from the step that trained on them.
 
         Returns:
             ``unfiltered_reward`` (mean over every generated group, kept or dropped),
-            ``first_attempt_reward`` (the same over each slot's first attempt only; the
-            v1 path's ``reward``), ``generated_prompt_groups``,
-            ``zero_variance_prompt_groups`` and ``zero_variance_fraction``. Empty when
-            nothing was generated for the step.
+            ``first_attempt_reward`` (same, but first attempts only),
+            ``generated_prompt_groups``, ``zero_variance_prompt_groups`` and
+            ``zero_variance_fraction``. Empty if nothing was generated for the step.
         """
         tally = self._step_rewards.get(step)
         self._step_rewards = {s: t for s, t in self._step_rewards.items() if s > step}
@@ -2074,10 +2062,9 @@ class RolloutManager:
             lineage_group_id: Stable group minted by the rollout ledger before
                 dataloader dispatch. TQ records this same ID rather than minting one.
                 ``None`` preserves the ordinary non-checkpointed fresh-ID retry path.
-            replacement_index: 0 when this is the prompt the slot was scheduled with,
-                N for its N-th replacement after dynamic sampling dropped a group.
-                Only used to tell the first attempt apart in the per-step reward
-                metrics.
+            replacement_index: 0 for the originally scheduled prompt, N for its N-th
+                replacement after a group was dropped. Only used to separate first
+                attempts in the per-step reward metrics.
 
         Returns:
             ``COMMITTED`` when the group reached the buffer, or ``SKIPPED`` when the
@@ -2174,12 +2161,10 @@ class RolloutManager:
                 if self._filter_zero_variance_groups and self._is_zero_variance_group(
                     record
                 ):
-                    # Checked before commit so no rows are written, but the slot was
-                    # already reserved above and must be released the same way a
-                    # failed attempt releases it. Unlike the failure paths below this
-                    # spends no retry budget: the rollout was healthy, it just has
-                    # nothing to teach, so re-running this prompt would most likely
-                    # produce another uniform group.
+                    # Checked before commit, so no rows were written; just free the
+                    # reserved slot, as a failed attempt does. No retry budget is
+                    # spent: the rollout was fine, it just has nothing to learn from,
+                    # and retrying the same prompt would likely be uniform again.
                     await self._tq_buffer.remove_group(tq_group_id)
                     self._stats.zero_variance_groups += 1
                     rewards = [c.reward for c in record.completions]
@@ -2201,8 +2186,8 @@ class RolloutManager:
                     start_weight_version=start_version,
                     end_weight_version=end_version,
                 )
-                # After the commit rather than before: a commit that fails re-runs the
-                # rollout, and the same prompt must not be counted twice.
+                # After the commit: a failed commit re-runs the rollout, and the same
+                # prompt must not be counted twice.
                 self.record_group_rewards(
                     target_step,
                     [c.reward for c in record.completions],

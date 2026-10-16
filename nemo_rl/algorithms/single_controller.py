@@ -1936,6 +1936,9 @@ class SingleControllerActor:
 
     async def _discard_committed_group(self, request: "ReassemblyRequest") -> None:
         """Release a committed group the controller declines to train on."""
+        # The slot is already ready, and abort() ignores ready slots, so remove it
+        # first; otherwise the sampler could pick it after its rows are cleared.
+        await self._buffer.remove_group(request.group_id)
         await self._cleanup_known_finalization_request(request)
         # The group left the buffer unconsumed, so the post-step release for
         # consumed groups never reaches its pending metrics and observations.
@@ -2316,12 +2319,10 @@ class SingleControllerActor:
                                 self._rollout_manager.stats.committed += 1
                                 ownership_transferred = True
                                 break
-                            # Enough rows verified to publish, but too few to
-                            # be worth training on, or (dynamic sampling) all
-                            # scored the same. Unlike the finalizer's own
-                            # structural drops above, this is a policy call
-                            # only the controller can act on: it is the one
-                            # component that can source a replacement.
+                            # The group was published but is not worth training on:
+                            # too few valid rows, or (dynamic sampling) all rewards
+                            # equal. Only the controller can supply a replacement,
+                            # so it makes this call, not the finalizer.
                             try:
                                 await self._discard_committed_group(request)
                             except BaseException as cleanup_error:
@@ -3860,15 +3861,15 @@ class SingleControllerActor:
                         "promoted_prompt_groups": promoted_prompt_groups,
                     }
                 )
-                # Reward over every group generated for this step, kept or dropped by
-                # dynamic sampling, plus how many were uniform. The kept groups alone
-                # all have reward variance, which pins their mean near the middle.
+                # Reward over every group generated for this step (kept or dropped by
+                # dynamic sampling) and how many were uniform. Kept groups alone all
+                # have reward spread, so their mean is a poor progress signal.
                 reward_metrics = self._rollout_manager.pop_step_reward_metrics(
                     version_during_step
                 )
                 step_metrics.update(reward_metrics)
                 if self._rollout_manager.filter_zero_variance_groups:
-                    # Same `reward` / `filtered_reward` meaning as the v1 path.
+                    # Use v1's meaning of `reward` / `filtered_reward`.
                     align_reward_with_v1(step_metrics, reward_metrics)
 
                 # Checkpointing (mirrors async_grpo_train's save block).

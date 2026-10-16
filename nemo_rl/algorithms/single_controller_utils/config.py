@@ -1226,9 +1226,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "Remove it, or add a `ppo` block with policy_training_start_step > 0."
         )
 
-    # Filtering reports a zero-variance group as a dropped prompt, so the dropped-prompt
-    # knobs decide what it costs. Neither default substitutes one, which would silently
-    # shrink steps instead of resampling.
+    # Dynamic sampling drops uniform groups, and each drop needs a replacement prompt.
+    # The default on_dropped_prompt="shrink" would silently shrink the step instead.
     if algo_cfg.use_dynamic_sampling:
         rollout_failure = async_config.rollout_failure
         if rollout_failure.on_dropped_prompt != "replace":
@@ -1246,12 +1245,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 f"'{async_config.sampler.name}': without a stamped step a filtered "
                 "group cannot be credited short or replaced, so every filtered group "
                 "silently shrinks the batch."
-            )
-        if rollout_failure.max_replacement_attempts < 1:
-            raise ValueError(
-                "grpo.use_dynamic_sampling requires "
-                "async_rl.rollout_failure.max_replacement_attempts >= 1; at 0 no "
-                "replacement is ever attempted for a filtered group."
             )
         if algo_cfg.num_generations_per_prompt < 2:
             raise ValueError(
