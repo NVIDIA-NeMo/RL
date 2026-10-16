@@ -1,0 +1,50 @@
+# =============================================================================
+# ppo_nano_v3_5_swe_allswe_sandbox_capture_priv.yaml + the Terminal-Bench 2.1 server, for collecting and
+# training on the six-set SWE mix plus Terminal-Bench tasks (rows carry their agent in `agent_ref`; TB rows
+# use terminal_bench_2_1_opencode_sandboxed_agent).
+#
+# Everything else (PPO, critic, agent prompt, masking, SWE servers) is the all-SWE recipe; this file only
+# wires the TB server, as ppo_nano_v3_5_tbswe_sandbox_capture_priv.yaml does for the two-server SWE recipe.
+#
+# - The TB agent takes the whole OpenCode agent block from swe_rebench by interpolation, so command-line
+#   overrides on swe_rebench's agent (concurrency, timeout, OpenCode install paths) reach it too.
+# - TB rows carry task_folder under /terminal-bench-tasks: the launcher mounts the task root there.
+# - TB settings follow tkonuk's tuned TB config (pipelines multi-harness/configs/swe_tb_opencode_sc_16x16.yaml):
+#   one-hour verification, 3-hour sandbox TTL, scheduling requests 1 CPU / 4 GiB / 30 GiB (the Gym default
+#   0.5 CPU / 512 MiB over-packs and ~1 in 10 TB rollouts is OOM-killed).
+# - TB sandboxes keep the cell's default egress (user, 2026-10-16): grading runs tests/test.sh in the agent's
+#   own sandbox and task setup and tests install packages. SWE stays network-off.
+# - The /logs/verifier fix (Gym fa5b6eee) is required: without it every rollout of a task whose test.sh does
+#   not create /logs/verifier (most of afterquery-v2-5k) comes back with no reward.
+# =============================================================================
+defaults: ppo_nano_v3_5_swe_allswe_sandbox_capture_priv.yaml
+env:
+  nemo_gym:
+    # Lists are replaced, not merged: the all-SWE list plus the TB benchmark config.
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/swe_rebench/configs/swe_rebench_opencode.yaml
+    - resources_servers/swe_internal_v1/configs/swe_internal_v1_opencode.yaml
+    - resources_servers/swemer_v1/configs/swemer_v1_opencode.yaml
+    - resources_servers/swemer_v2/configs/swemer_v2_opencode.yaml
+    - resources_servers/swemer_oml/configs/swemer_oml_opencode.yaml
+    - resources_servers/scale_swe/configs/scale_swe_opencode.yaml
+    - resources_servers/swe_next/configs/swe_next_opencode.yaml
+    - benchmarks/terminal_bench_2_1/opencode.yaml
+    - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+    terminal_bench_2_1_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent: ${env.nemo_gym.swe_rebench_opencode_sandboxed_agent.responses_api_agents.opencode_sandboxed_agent}
+    terminal_bench_2_1_opencode_resources_server:
+      resources_servers:
+        terminal_bench_2_1:
+          evaluation_timeout: 3600
+          sandbox_config:
+            ttl_s: 10800
+            provider_options:
+              resource_requests:
+                cpu: 1
+                memory_mib: 4096
+                disk_gib: 30
+            metadata:
+              nemo.nvidia.com/resources: custom
