@@ -16,6 +16,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import msgspec
 import pytest
 
 from nemo_rl.models.generation.trtllm.trtllm_http_server import (
@@ -249,3 +250,222 @@ def test_trtllm_parser_rejects_invalid_tool_arguments():
 
     with pytest.raises(ValueError, match="function.arguments"):
         _parse_with_trtllm(messages)
+
+
+# --------------------------------------------------------------------------- #
+#  Disagg legs: prompt ids as a base64 int32 buffer
+# --------------------------------------------------------------------------- #
+
+_PROMPT_IDS = [101, 202, 303, 404, 150_000]
+
+
+def _prompt_b64(ids=_PROMPT_IDS) -> str:
+    import base64
+
+    import numpy as np
+
+    return base64.b64encode(np.asarray(ids, dtype=np.int32).tobytes()).decode("ascii")
+
+
+def _leg_client(monkeypatch, *, int32_prompts: bool, ctx_out=None):
+    """A TestClient on create_app() over a recording fake engine."""
+    pytest.importorskip("tensorrt_llm")
+    from fastapi.testclient import TestClient
+
+    from nemo_rl.models.generation.trtllm import trtllm_http_server as srv
+
+    monkeypatch.setattr(srv, "_engine_takes_int32_prompts", lambda: int32_prompts)
+    calls = []
+
+    class _Engine:
+        _hf_model_config = SimpleNamespace()
+        _generation_config = None
+
+        async def generate_async(self, inputs, **kwargs):
+            calls.append((inputs, kwargs))
+            gen = SimpleNamespace(
+                token_ids=[7, 8, 9],
+                logprobs=[-0.25, -0.5, -0.75],
+                finish_reason="length" if ctx_out is not None else "stop",
+                disaggregated_params=ctx_out,
+            )
+            return SimpleNamespace(outputs=[gen])
+
+    tokenizer = SimpleNamespace(
+        eos_token_id=9, decode=lambda ids, **_: " ".join(str(i) for i in ids)
+    )
+    app = srv.create_app(
+        _Engine(),
+        tokenizer,
+        "model",
+        max_seq_len=4096,
+        sampling_config={"temperature": 1.0, "top_p": 1.0, "top_k": None},
+        tool_parser="qwen3_coder",
+    )
+    return TestClient(app), calls
+
+
+def _post_msgpack(client, body: dict):
+    return client.post(
+        "/v1/chat/completions",
+        content=msgspec.msgpack.encode(body),
+        headers={"content-type": "application/json", "x-trtllm-msgpack": "1"},
+    )
+
+
+def _gen_leg_body() -> dict:
+    return {
+        "model": "model",
+        "messages": [{"role": "tool", "content": "ok", "tool_call_id": "call_1"}],
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "logprobs": True,
+        "prompt_token_ids_b64": _prompt_b64(),
+        "disaggregated_params": {
+            "request_type": "generation_only",
+            "ctx_request_id": 11,
+            "first_gen_tokens": [7],
+        },
+    }
+
+
+@pytest.mark.parametrize("int32_prompts", [True, False])
+def test_generation_leg_keeps_b64_prompt_as_int32_and_relays_the_string(
+    monkeypatch, int32_prompts
+):
+    import numpy as np
+
+    client, calls = _leg_client(monkeypatch, int32_prompts=int32_prompts)
+
+    resp = _post_msgpack(client, _gen_leg_body())
+
+    assert resp.status_code == 200, resp.text
+    ((inputs, _kwargs),) = calls
+    sent = inputs["prompt_token_ids"]
+    if int32_prompts:
+        # TRT-LLM >= #19658 takes the array as its int32 wire buffer.
+        assert isinstance(sent, np.ndarray) and sent.dtype == np.int32
+        assert sent.tolist() == _PROMPT_IDS
+    else:
+        assert isinstance(sent, list) and sent == _PROMPT_IDS
+    out = resp.json()
+    # The base64 string is relayed as is, never re-expanded into an int array.
+    assert out["prompt_token_ids_b64"] == _gen_leg_body()["prompt_token_ids_b64"]
+    assert "prompt_token_ids" not in out
+    assert out["usage"]["prompt_tokens"] == len(_PROMPT_IDS)
+    assert out["choices"][0]["token_ids"] == [7, 8]  # trailing EOS trimmed
+    assert [e["token"] for e in out["choices"][0]["logprobs"]["content"]] == [
+        "token_id:7",
+        "token_id:8",
+    ]
+
+
+def test_generation_leg_with_an_int_list_prompt_answers_with_the_list(monkeypatch):
+    client, calls = _leg_client(monkeypatch, int32_prompts=True)
+    body = _gen_leg_body()
+    del body["prompt_token_ids_b64"]
+    body["prompt_token_ids"] = list(_PROMPT_IDS)
+
+    resp = _post_msgpack(client, body)
+
+    assert resp.status_code == 200, resp.text
+    assert calls[0][0]["prompt_token_ids"] == _PROMPT_IDS
+    out = resp.json()
+    assert out["prompt_token_ids"] == _PROMPT_IDS
+    assert "prompt_token_ids_b64" not in out
+
+
+def _ctx_out():
+    from tensorrt_llm.disaggregated_params import DisaggregatedParams
+
+    return DisaggregatedParams(
+        request_type="context_only",
+        first_gen_tokens=[7],
+        ctx_request_id=11,
+        opaque_state=b"state",
+    )
+
+
+def _ctx_leg_body(*, b64_requested: bool) -> dict:
+    return {
+        "model": "model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "prompt_token_ids_b64": _prompt_b64(),
+        "disaggregated_params": {
+            "request_type": "context_only",
+            "return_prompt_token_ids_b64": b64_requested,
+        },
+    }
+
+
+def test_context_leg_answers_b64_when_the_wire_flag_asks(monkeypatch):
+    # The flag rides the wire DisaggregatedParams; TRT-LLM's
+    # to_llm_disaggregated_params() does not copy it onto the engine-side
+    # params, which is where this adapter used to look for it.
+    pytest.importorskip("tensorrt_llm")
+    client, calls = _leg_client(monkeypatch, int32_prompts=True, ctx_out=_ctx_out())
+
+    resp = _post_msgpack(client, _ctx_leg_body(b64_requested=True))
+
+    assert resp.status_code == 200, resp.text
+    out = resp.json()
+    assert out["prompt_token_ids_b64"] == _prompt_b64()
+    assert "prompt_token_ids" not in out
+    assert out["usage"]["prompt_tokens"] == len(_PROMPT_IDS)
+    assert out["choices"][0]["disaggregated_params"]["ctx_request_id"] == 11
+    assert calls[0][0]["prompt_token_ids"].tolist() == _PROMPT_IDS
+
+
+def test_context_leg_answers_an_int_list_without_the_flag(monkeypatch):
+    pytest.importorskip("tensorrt_llm")
+    client, _calls = _leg_client(monkeypatch, int32_prompts=True, ctx_out=_ctx_out())
+
+    resp = _post_msgpack(client, _ctx_leg_body(b64_requested=False))
+
+    assert resp.status_code == 200, resp.text
+    out = resp.json()
+    assert out["prompt_token_ids"] == _PROMPT_IDS
+    assert "prompt_token_ids_b64" not in out
+
+
+def test_context_leg_response_encodes_ids_it_built_itself():
+    pytest.importorskip("tensorrt_llm")
+    import json
+
+    from nemo_rl.models.generation.trtllm.trtllm_http_server import (
+        _context_leg_response,
+    )
+
+    gen = SimpleNamespace(disaggregated_params=_ctx_out(), finish_reason="length")
+    resp = _context_leg_response(
+        "model", list(_PROMPT_IDS), gen, None, return_prompt_token_ids_b64=True
+    )
+
+    assert json.loads(resp.body)["prompt_token_ids_b64"] == _prompt_b64()
+
+
+def test_aggregated_reply_carries_int_lists_for_gym(monkeypatch):
+    # Without disaggregation Gym reads this reply directly: ids are lists even
+    # when the request carried the base64 buffer.
+    client, _calls = _leg_client(monkeypatch, int32_prompts=True)
+    body = _gen_leg_body()
+    del body["disaggregated_params"]
+
+    resp = client.post("/v1/chat/completions", json=body)
+
+    assert resp.status_code == 200, resp.text
+    out = resp.json()
+    assert out["prompt_token_ids"] == _PROMPT_IDS
+    assert out["choices"][0]["message"]["prompt_token_ids"] == _PROMPT_IDS
+    assert "prompt_token_ids_b64" not in out
+
+
+def test_engine_int32_prompt_probe_returns_a_bool():
+    pytest.importorskip("tensorrt_llm")
+    from nemo_rl.models.generation.trtllm.trtllm_http_server import (
+        _engine_takes_int32_prompts,
+    )
+
+    assert isinstance(_engine_takes_int32_prompts(), bool)
