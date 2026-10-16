@@ -48,7 +48,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
 )
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY, NemoGymShardSet
-from nemo_rl.experience.failures import GymTransportError
+from nemo_rl.experience.failures import GymTransportError, RolloutDataFailure
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -65,6 +65,7 @@ from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
     async_generate_response_for_sample_turn,
     generate_responses_async,
+    nemo_gym_rollout_hit_max_tokens,
     run_async_multi_turn_rollout,
     run_async_multi_turn_rollout_groups,
     run_async_nemo_gym_rollout,
@@ -2286,6 +2287,131 @@ def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     assert rollout_result.final_batch["truncated"].tolist() == is_truncated
 
 
+def _incomplete_response(reason):
+    return {
+        "response": {
+            "status": "incomplete",
+            "incomplete_details": {"reason": reason},
+            "output": [],
+        }
+    }
+
+
+def test_nemo_gym_rollout_hit_max_tokens_token_budget():
+    assert nemo_gym_rollout_hit_max_tokens(
+        {}, total_tokens=128, max_total_tokens_per_sample=128
+    )
+    assert nemo_gym_rollout_hit_max_tokens(
+        {}, total_tokens=130, max_total_tokens_per_sample=128
+    )
+    assert not nemo_gym_rollout_hit_max_tokens(
+        {}, total_tokens=127, max_total_tokens_per_sample=128
+    )
+    assert nemo_gym_rollout_hit_max_tokens(
+        None, total_tokens=128, max_total_tokens_per_sample=128
+    )
+    assert not nemo_gym_rollout_hit_max_tokens(
+        None, total_tokens=10, max_total_tokens_per_sample=128
+    )
+
+
+@pytest.mark.parametrize("reason", ["max_output_tokens", "length", "max_tokens"])
+def test_nemo_gym_rollout_hit_max_tokens_length_incomplete_response(reason):
+    # A context overflow comes back as an empty length-cut completion, so the
+    # chain stops well short of the token limit.
+    assert nemo_gym_rollout_hit_max_tokens(
+        _incomplete_response(reason), total_tokens=10, max_total_tokens_per_sample=128
+    )
+
+
+def test_nemo_gym_rollout_hit_max_tokens_per_turn_cap_counts_as_truncated():
+    # A final turn stopped by its per-turn max_output_tokens cap reports the
+    # same reason as a context overflow, but with generated output. The final
+    # generation was length-cut, so it deliberately counts as truncated even
+    # though the context (10 of 128 tokens) was not exhausted.
+    full_result = _incomplete_response("max_output_tokens")
+    full_result["response"]["output"] = [
+        {"type": "message", "role": "assistant", "content": "partial answer"}
+    ]
+    assert nemo_gym_rollout_hit_max_tokens(
+        full_result, total_tokens=10, max_total_tokens_per_sample=128
+    )
+
+
+@pytest.mark.parametrize(
+    "full_result",
+    [
+        pytest.param(_incomplete_response("content_filter"), id="content_filter"),
+        # An agent can end a rollout as incomplete without a length cut (e.g. an
+        # empty or reasoning-only turn); that is not truncation.
+        pytest.param(
+            {"response": {"status": "incomplete", "incomplete_details": None}},
+            id="incomplete_without_details",
+        ),
+        pytest.param(
+            {"response": {"status": "completed", "incomplete_details": None}},
+            id="completed",
+        ),
+        pytest.param({"response": "not-a-dict"}, id="malformed_response"),
+        pytest.param({"reward": 0.0}, id="no_response"),
+    ],
+)
+def test_nemo_gym_rollout_hit_max_tokens_other_endings(full_result):
+    assert not nemo_gym_rollout_hit_max_tokens(
+        full_result, total_tokens=10, max_total_tokens_per_sample=128
+    )
+
+
+def test_postprocess_nemo_gym_group_marks_context_overflow_truncated():
+    rows = [{"agent_ref": {"name": "agent"}}, {"agent_ref": {"name": "agent"}}]
+    results = []
+    for response in (
+        _incomplete_response("max_output_tokens")["response"],
+        {"status": "completed", "incomplete_details": None, "output": []},
+    ):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1, 2]),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([3, 4, 5]),
+                        "generation_logprobs": torch.tensor([-0.1, -0.1, -0.1]),
+                    },
+                ],
+                "full_result": {"reward": 0.0, "response": response},
+            }
+        )
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+    )
+
+    # Both rollouts are 5 tokens, far below the limit: only the length-cut one
+    # counts as truncated.
+    assert rollout_result.final_batch["truncated"].tolist() == [True, False]
+    assert rollout_result.rollout_metrics["truncation_rate"] == 0.5
+    assert rollout_result.rollout_metrics["natural_termination_rate"] == 0.5
+
+
 def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(
     monkeypatch,
 ):
@@ -2663,8 +2789,10 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
         *,
         on_completion,
         infra_failures=None,
+        stop_on_infra_failure=False,
     ):
         del total_rows, timer_prefix, on_completion, infra_failures
+        del stop_on_infra_failure
         selected.append(environment)
         for row in pending:
             rowidx = row["_rowidx"]
@@ -3039,7 +3167,13 @@ class _SetEvent:
 
 
 class _ScriptedStream:
-    """A run_rollouts stream that yields scripted items, pausing on asyncio.Events."""
+    """A run_rollouts stream that yields scripted items.
+
+    Besides result tuples, an item may be an ``asyncio.Event`` the stream waits
+    on, a ``_SetEvent`` that sets one, a number of seconds the stream sleeps for
+    (0 yields to the event loop once), or an exception the stream raises as the
+    actor would.
+    """
 
     def __init__(self, items):
         self.items = list(items)
@@ -3056,6 +3190,11 @@ class _ScriptedStream:
             if isinstance(item, asyncio.Event):
                 await item.wait()
                 continue
+            if isinstance(item, (int, float)):
+                await asyncio.sleep(item)
+                continue
+            if isinstance(item, BaseException):
+                raise item
             return _ReadyValue(item)
         raise StopAsyncIteration
 
@@ -3285,6 +3424,84 @@ def test_redispatched_row_stays_on_its_own_replica(monkeypatch):
     assert replica_b.dispatched_rows == []
 
 
+def test_a_data_failure_is_not_hidden_by_a_sibling_markers_exhausted_budget(
+    monkeypatch,
+):
+    """Once one instance's stream has ended with a data failure, the merge keeps
+    draining the other streams but no longer re-dispatches their failure
+    markers: with the default budget a re-dispatch would raise the transport
+    error and hide the 400 that actually ended the rollout."""
+    rows = [_gym_row() for _ in range(4)]
+    failed = asyncio.Event()
+    replica_a = _FakeGymActor(
+        scripts=[
+            [
+                _SetEvent(failed),
+                RolloutDataFailure(
+                    "NeMo-Gym /run failed with HTTP 400 (ClientResponseError): bad request"
+                ),
+            ]
+        ]
+    )
+    replica_b = _FakeGymActor(
+        scripts=[
+            [
+                # The marker lands only after the merge has recorded replica A's
+                # failure: wait for it, then yield to the loop twice so A's
+                # completed task is processed first.
+                failed,
+                0,
+                0,
+                (
+                    2,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                ),
+                (3, {"name": "agent"}, _gym_result(3), None),
+            ]
+        ]
+    )
+    shard_set = NemoGymShardSet(
+        handles={"tools": [replica_a, replica_b]},
+        route_to_shard={"agent": "tools"},
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    input_batch = BatchedDataDict(
+        {"extra_env_info": rows, "loss_multiplier": torch.ones(len(rows))}
+    )
+
+    async def _collect():
+        return [
+            result
+            async for result in run_async_nemo_gym_rollout(
+                policy_generation=type(
+                    "_PolicyGeneration",
+                    (),
+                    {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+                )(),
+                input_batch=input_batch,
+                tokenizer=None,
+                task_to_env={"nemo_gym": shard_set},
+                generation_config=_GYM_GENERATION_CONFIG,
+                num_generations=2,
+                log_full_result_tables=False,
+            )
+        ]
+
+    with pytest.raises(
+        RuntimeError,
+        match="failed during rollout collection: NeMo-Gym /run failed with HTTP 400",
+    ) as raised:
+        asyncio.run(_collect())
+    assert isinstance(raised.value.__cause__, RolloutDataFailure)
+    # Replica B's marker was neither dispatched again nor turned into a transport error.
+    assert replica_a.dispatched_rows == [rows[:2]]
+    assert replica_b.dispatched_rows == [rows[2:]]
+
+
 def test_run_async_nemo_gym_rollout_retries_a_failed_retry_under_its_own_label(
     monkeypatch,
 ):
@@ -3355,6 +3572,11 @@ def test_nemo_gym_max_infra_attempts_accessor():
     assert attempts({"nemo_gym": {"max_infra_attempts_per_rollout": 3}}) == 3
     with pytest.raises(ValueError, match="at least 1"):
         attempts({"nemo_gym": {"max_infra_attempts_per_rollout": 0}})
+    # bool is an int subclass and int() would truncate a float: both are refused
+    # rather than read as a budget the operator never wrote.
+    for not_a_budget in (True, 2.5, "3"):
+        with pytest.raises(ValueError, match="integer of at least 1"):
+            attempts({"nemo_gym": {"max_infra_attempts_per_rollout": not_a_budget}})
 
 
 def test_gym_rollout_reads_the_dispatch_budget_from_the_actor_config(monkeypatch):

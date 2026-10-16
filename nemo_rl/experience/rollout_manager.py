@@ -88,6 +88,7 @@ from nemo_rl.experience.rollouts import (
     attach_static_multimodal_payload,
     calculate_rewards,
     compute_reward_penalty_metrics,
+    nemo_gym_rollout_hit_max_tokens,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -1142,6 +1143,7 @@ class AsyncNemoGymRolloutImpl:
         timer_prefix: str,
         on_completion: Optional[RolloutCompletionCallback] = None,
         infra_failures: Optional[dict[int, str]] = None,
+        stop_on_infra_failure: bool = False,
     ) -> Optional[dict[str, Any]]:
         """Dispatch ``pending`` rows and fill their slots in ``results`` as they land.
 
@@ -1157,6 +1159,13 @@ class AsyncNemoGymRolloutImpl:
             infra_failures: Mutated in place: each failure marker's detail is
                 recorded under its row index, so the caller can name the actual
                 failure when a row never lands within its attempt budget.
+            stop_on_infra_failure: End the attempt with ``GymTransportError`` at
+                the first failure marker instead of draining the stream. The
+                caller passes True on the last attempt, when nothing would
+                dispatch the marked row again: a group-buffering verifier (one
+                that waits in ``/verify`` for every sibling of a prompt group)
+                would otherwise hold the stream open for a row that never
+                comes, until its own cohort timeout.
 
         Returns:
             The environment's timing metrics, or None if the stream ended without them.
@@ -1196,9 +1205,16 @@ class AsyncNemoGymRolloutImpl:
                 # The actor reports a row whose /run failed at the infrastructure
                 # level as a marker instead of ending the stream. Its slot stays
                 # None so the attempt loop dispatches it again, and the stream
-                # keeps delivering the other rows.
+                # keeps delivering the other rows; on the last attempt the marker
+                # ends the attempt instead, because no re-dispatch follows.
                 if infra_failures is not None:
                     infra_failures[rowidx] = result[GYM_INFRA_FAILURE_KEY]
+                if stop_on_infra_failure:
+                    raise GymTransportError(
+                        f"NeMo-Gym row {rowidx} of {total_rows} failed at the "
+                        f"infrastructure level on the last attempt: "
+                        f"{result[GYM_INFRA_FAILURE_KEY]}"
+                    )
                 continue
             inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
             if "receipt" in result:
@@ -1336,6 +1352,9 @@ class AsyncNemoGymRolloutImpl:
                             instance_timer_prefix,
                             on_completion=on_completion,
                             infra_failures=infra_failures,
+                            # Nothing re-dispatches a marked row after the last
+                            # attempt, so a marker ends it at once (see _stream_rows).
+                            stop_on_infra_failure=attempt == max_row_attempts,
                         )
                     except Exception as error:
                         last_error = error
@@ -1519,9 +1538,10 @@ class AsyncNemoGymRolloutImpl:
                     )
                 )
                 continue
-            truncated = (
-                sum(len(m["token_ids"]) for m in result["message_log"])
-                == self._max_seq_len
+            truncated = nemo_gym_rollout_hit_max_tokens(
+                result["full_result"],
+                total_tokens=sum(len(m["token_ids"]) for m in result["message_log"]),
+                max_total_tokens_per_sample=self._max_seq_len,
             )
             completions.append(
                 Completion(

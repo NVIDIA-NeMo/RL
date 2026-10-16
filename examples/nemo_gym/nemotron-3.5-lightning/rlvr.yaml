@@ -21,6 +21,8 @@
 # Effective policy generation parallelism is TP=4, EP=1.
 # =============================================================================
 
+defaults: ../legacy_environment_servers/ultra_rlvr.yaml
+
 # =============================================================================
 # Cluster (training + generation actors; Gym nodes are allocated separately)
 # =============================================================================
