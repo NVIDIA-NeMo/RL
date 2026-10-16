@@ -234,7 +234,7 @@ def prepare_loss_input(
     Notes:
         vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
         sampling_params is only used for LossInputType.LOGPROB, and currently only supported for ClippedPGLossFn.
-        d2t is only used for LossInputType.DRAFT.
+        d2t is only used for LossInputType.DRAFT and LossInputType.DRAFT_TTT.
         teacher_output_layer_weight_by_index is only used for LossInputType.OPD_FULL.
 
     Returns:
@@ -425,6 +425,25 @@ def prepare_loss_input(
             "teacher_logits": teacher_logits,
             "student_logits": data["student_logits"],
             "token_mask": token_mask,
+        }
+
+    elif loss_fn.input_type == LossInputType.DRAFT_TTT:
+        # Multi-pass convention: pass-d student logits z^d_i predict x_{i+d+1},
+        # so the matching teacher is the policy's logits at position i+d. The
+        # teacher stays UNSHIFTED here — DraftTTTCrossEntropyLossFn slices it
+        # per pass (pure views) and builds the shifted masks with
+        # draft_pass_token_mask. Slicing replaces the CP-aware roll, which is
+        # fine because drafts reject context parallelism.
+        teacher_logits = map_teacher_logits_to_draft_vocab(
+            logits.detach(),
+            d2t,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            token_chunk_size=loss_fn.token_chunk_size,
+        )
+        loss_input = {
+            "teacher_logits": teacher_logits,
+            "student_logits_by_pass": list(data["student_logits_by_pass"]),
         }
 
     else:

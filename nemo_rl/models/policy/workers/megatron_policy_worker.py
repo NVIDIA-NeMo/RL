@@ -56,7 +56,10 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
-from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
+from nemo_rl.algorithms.loss.utils import (
+    compute_draft_pass_valid_counts,
+    rescale_loss_metrics,
+)
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
@@ -94,6 +97,7 @@ from nemo_rl.models.megatron.draft.step_state import (
     DraftStepPayload,
     DraftStepState,
 )
+from nemo_rl.models.megatron.draft.utils import resolve_draft_aux_layer_ids
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -812,6 +816,17 @@ class MegatronPolicyWorkerImpl(
         )
         mtp_num_layers = self._get_model_config().mtp_num_layers
         self.mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
+        # Aux-layer ids for the draft hidden-state capture, resolved
+        # rank-independently: under PP only the last stage owns the draft
+        # model, but every stage's capture must post the same P2P schedule
+        # (one send/recv per id).
+        self.draft_aux_layer_ids = (
+            resolve_draft_aux_layer_ids(
+                self.cfg["draft"], self._get_model_config().num_layers
+            )
+            if "draft" in self.cfg and self.cfg["draft"].enabled
+            else None
+        )
         # A media placeholder is an ordinary vocabulary entry, so text that
         # legitimately contains it must not be read as an anchor demanding a
         # projected feature. Only models that accept the mask are sent one.
@@ -1150,6 +1165,30 @@ class MegatronPolicyWorkerImpl(
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
+                # Draft (TTT) loss normalization: the draft's valid-token
+                # counts differ from the policy's (per-pass masks shift by
+                # d+1), so it gets its own global per-pass counts, all-reduced
+                # over DP only. The loss derives its gradient denominator
+                # (sum_d alpha_d * count_d) and the per-pass metric
+                # denominators from this vector.
+                draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
+                draft_ttt_steps = self.cfg["draft"].ttt_steps if draft_enabled else 1
+                global_draft_pass_counts = None
+                if (
+                    draft_ttt_steps > 1
+                    and "token_mask" in batch
+                    and "sample_mask" in batch
+                ):
+                    global_draft_pass_counts = compute_draft_pass_valid_counts(
+                        batch["token_mask"],
+                        batch["sample_mask"],
+                        ttt_steps=draft_ttt_steps,
+                    ).to(device=global_valid_toks.device)
+                    torch.distributed.all_reduce(
+                        global_draft_pass_counts,
+                        group=parallel_state.get_data_parallel_group(),
+                    )
+
                 # Pre-compute the MTP loss mask, only when MTP is enabled, so
                 # process_microbatch can pack it.
                 if (
@@ -1221,7 +1260,6 @@ class MegatronPolicyWorkerImpl(
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
                     # Forward pass.
-                    draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
                     use_router_replay = _should_use_router_replay(
                         enabled=self._router_replay_enabled,
                         data=batch,
@@ -1240,11 +1278,14 @@ class MegatronPolicyWorkerImpl(
                             defer_fp32_logits=self.defer_fp32_logits,
                             global_valid_seqs=global_valid_seqs,
                             global_valid_toks=global_valid_toks,
+                            global_draft_pass_counts=global_draft_pass_counts,
                             sampling_params=self.sampling_params,
                             straggler_timer=self.mcore_state.straggler_timer,
                             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                             draft_model=self.draft_model,
                             enable_hidden_capture=draft_enabled,
+                            draft_ttt_steps=draft_ttt_steps,
+                            draft_aux_layer_indices=self.draft_aux_layer_ids,
                             use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
                                 "use_fused_linear_logprobs", False
                             ),
@@ -1679,6 +1720,15 @@ class MegatronPolicyWorkerImpl(
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
     ) -> None:
+        draft_cfg = self.cfg.get("draft")
+        if draft_cfg is not None and draft_cfg.enabled and draft_cfg.ttt_steps > 1:
+            # DraftStepState, this path's deferred draft normalization, takes a
+            # single loss bin; the multi-pass loss has one bin per pass.
+            raise NotImplementedError(
+                "policy.draft.ttt_steps > 1 is not supported on the split "
+                "train-step path (single controller); use the batched train() "
+                "path."
+            )
         existing = getattr(self, "_train_step_state", None)
         if existing is not None:
             raise RuntimeError(
@@ -1927,6 +1977,7 @@ class MegatronPolicyWorkerImpl(
                     model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                     draft_model=self.draft_model,
                     enable_hidden_capture=draft_enabled,
+                    draft_aux_layer_indices=self.draft_aux_layer_ids,
                     use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
                         "use_fused_linear_logprobs", False
                     ),
