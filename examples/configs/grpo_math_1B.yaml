@@ -169,6 +169,7 @@ policy:
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
+    deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
@@ -509,6 +510,7 @@ policy:
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
       http_server_num_replicas: 8  # HTTP frontend event loops per model-parallel coordinator.
     vllm_cfg:
+      http_server_api_key_required: false  # Require a per-job bearer token on the exposed server's /v1/* and /tokenize routes; the token is generated at startup and handed to the NeMo-Gym model server.
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
@@ -645,6 +647,12 @@ data_plane:
     storage_capacity: 1000000        # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
     storage_unit_placement: null     # all, or cluster names like [inference]; null = TQ SPREAD
+    # Keep large field values on node-local SSD instead of host memory. Needs
+    # no shared filesystem; data is temporary (removed on tq.close()).
+    ssd_offload:
+      enabled: false
+      path: null                     # node-local SSD dir; required when enabled
+      threshold_bytes: 1048576       # values >= this encoded size go to SSD
   mooncake_cpu:
     # Per client process — see MooncakeCpuConfig before raising these.
     global_segment_size: 68719476736 # 64 GiB/process
