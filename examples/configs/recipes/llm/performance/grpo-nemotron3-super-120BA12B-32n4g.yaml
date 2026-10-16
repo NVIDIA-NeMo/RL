@@ -3,6 +3,7 @@ defaults: ../../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 8
+  val_period: 5
 
 loss_fn:
   use_importance_sampling_correction: true
@@ -10,6 +11,7 @@ loss_fn:
 
 checkpointing:
   checkpoint_dir: results/grpo-nemotron3-super-120BA12B-32n4g
+  save_period: 5
 
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16

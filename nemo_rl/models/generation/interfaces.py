@@ -476,7 +476,6 @@ class GenerationInterface(ABC):
         usable with no intervening prepare_for_generation.
         Only the colocated Megatron backend honors the flag today; other backends
         ignore it, as do engines on dedicated GPUs.
-
         """
         pass
 
