@@ -3,19 +3,13 @@
 
 """Runtime diagnostics with actual executors and an in-memory OTel reader."""
 
-import ast
 import asyncio
 import contextvars
-import logging
 import threading
 import time
-from collections.abc import AsyncIterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
-from unittest.mock import Mock
 
 import pytest
 
@@ -80,6 +74,7 @@ def test_queue_wait_is_separate_from_execution_and_counts_balance(reader):
     queue = points(reader, "rl.executor.queue_wait")
     execution = points(reader, "rl.executor.execution")
     assert queue[0].count == execution[0].count == 1
+    assert queue[0].attributes == {"rl.executor.site": "terminal"}
     assert queue[0].sum >= 30
     assert execution[0].sum < queue[0].sum
     assert all(point.value == 0 for point in points(reader, "rl.executor.pending"))
@@ -241,14 +236,20 @@ def test_telemetry_failure_does_not_change_result(reader, monkeypatch):
 def test_disabled_diagnostics_delegate_and_create_no_probe(
     monkeypatch, metrics_only_off
 ):
-    from nemo_rl.telemetry import setup
+    from nemo_rl.telemetry.config import TelemetryConfig
+    from nemo_rl.telemetry.setup import get_telemetry_handle, init_telemetry_driver
 
     if metrics_only_off:
-        from nemo.lens import NemoLensConfig, setup_telemetry
-
-        setup._TELEMETRY_HANDLE = setup_telemetry(
-            NemoLensConfig(enabled=True, metrics_enabled=False, exporter="console")
+        # Through the real initialiser, so the resolved switch -- not the
+        # fixture's default -- is what gates the helpers.
+        master_config = SimpleNamespace(
+            telemetry=TelemetryConfig(
+                enabled=True, metrics_enabled=False, exporter="console"
+            ),
+            policy={"model_name": "org/Model-1B", "precision": "bfloat16"},
         )
+        assert init_telemetry_driver(master_config, "grpo") is not None
+        assert get_telemetry_handle().is_exporting
     calls = []
 
     async def delegated(function, *args, **kwargs):
@@ -285,6 +286,20 @@ def test_probe_detects_blocked_loop_and_stops_on_exit(reader, monkeypatch):
     assert lag[0].sum >= 30
 
 
+def test_probe_reports_near_zero_lag_on_an_idle_loop(reader, monkeypatch):
+    interval = 0.1
+    monkeypatch.setattr(runtime, "_EVENT_LOOP_PROBE_INTERVAL_S", interval)
+
+    async def scenario():
+        async with runtime.monitor_event_loop("controller"):
+            await asyncio.sleep(interval * 2.5)
+
+    asyncio.run(scenario())
+    lag = points(reader, "rl.event_loop.lag")
+    assert lag[0].count >= 2
+    assert lag[0].max < interval * 1000 / 2
+
+
 def test_probe_is_cleaned_up_when_owner_is_cancelled(reader):
     async def scenario():
         entered = asyncio.Event()
@@ -306,41 +321,38 @@ def test_probe_is_cleaned_up_when_owner_is_cancelled(reader):
     asyncio.run(scenario())
 
 
+def test_cancel_during_probe_shutdown_reaches_the_owner(reader):
+    """A cancel landing while exit awaits the probe must not read as success."""
+
+    async def scenario():
+        exiting = asyncio.Event()
+
+        async def owner():
+            async with runtime.monitor_event_loop("controller"):
+                exiting.set()
+            return "owner completed normally"
+
+        task = asyncio.create_task(owner())
+        # The owner set the event and went straight into the context manager's
+        # exit, so it is now parked waiting for the cancelled probe to finish.
+        await exiting.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not any(
+            t.get_name().startswith("rl-loop-probe-") and not t.done()
+            for t in asyncio.all_tasks()
+        )
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("enabled", [False, True])
-def test_vllm_http_lifespan_owns_probe_on_serving_loop(reader, monkeypatch, enabled):
-    """Exercise the real server setup without importing a vLLM engine or GPU stack."""
-    pytest.importorskip("fastapi")
-    uvicorn = pytest.importorskip("uvicorn")
+def test_app_lifespan_owns_probe_on_serving_loop(reader, enabled):
+    fastapi = pytest.importorskip("fastapi")
     from nemo_rl.telemetry import setup
 
     setup._METRICS_ENABLED = enabled
-    path = (
-        Path(__file__).resolve().parents[3]
-        / "nemo_rl/models/generation/vllm/vllm_worker_async.py"
-    )
-    node = next(
-        n
-        for n in ast.walk(ast.parse(path.read_text()))
-        if isinstance(n, ast.FunctionDef) and n.name == "_setup_vllm_server"
-    )
-    # Compile the production setup method with its lightweight dependencies;
-    # constructors for networking/thread launch are replaced, not its lifespan.
-    namespace = {
-        "monitor_event_loop": runtime.monitor_event_loop,
-        "asynccontextmanager": asynccontextmanager,
-        "AsyncIterator": AsyncIterator,
-        "Mapping": Mapping,
-        "Any": Any,
-        "cast": cast,
-        "asyncio": asyncio,
-        "_get_node_ip_local": lambda: "127.0.0.1",
-        "_get_free_port_local": lambda *_: 9000,
-        "DEFAULT_GENERATION_PORT_RANGE_LOW": 9000,
-        "DEFAULT_GENERATION_PORT_RANGE_HIGH": 9010,
-    }
-    exec(
-        compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace
-    )
     lifecycle = []
     original_state = {"api_state": object()}
 
@@ -352,25 +364,8 @@ def test_vllm_http_lifespan_owns_probe_on_serving_loop(reader, monkeypatch, enab
         finally:
             lifecycle.append("shutdown")
 
-    def configure_app(app):
-        app.router.lifespan_context = api_lifespan
-        return app
-
-    worker = SimpleNamespace(
-        _reserved_socket=None,
-        _sparse_refit_receiver=None,
-        _setup_vllm_openai_api_server=configure_app,
-        cfg={"port_range_low": 9000, "port_range_high": 9010},
-    )
-    server_factory = Mock(
-        side_effect=lambda *, config: SimpleNamespace(config=config, run=lambda: None)
-    )
-    monkeypatch.setattr(uvicorn, "Server", server_factory)
-    monkeypatch.setattr(logging.getLogger("uvicorn.access"), "filters", [])
-    with monkeypatch.context() as patch:
-        patch.setattr(threading, "Thread", Mock())
-        _, _, server = namespace["_setup_vllm_server"](worker)
-    app = server.config.app
+    app = fastapi.FastAPI(lifespan=api_lifespan)
+    runtime.monitor_app_event_loop(app, "vllm_http")
 
     async def scenario():
         async with app.router.lifespan_context(app) as state:

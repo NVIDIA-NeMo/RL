@@ -265,6 +265,17 @@ _CHECKPOINT_LEVELS = {
     "controller_sidecar_bytes": (_CHECKPOINT_SIDECAR_BYTES_KEY, "controller"),
 }
 
+RL_EXECUTOR_QUEUE_WAIT_METRIC = "rl.executor.queue_wait"
+RL_EXECUTOR_EXECUTION_METRIC = "rl.executor.execution"
+RL_EXECUTOR_RESULT_DELIVERY_METRIC = "rl.executor.result_delivery"
+RL_EXECUTOR_PENDING_METRIC = "rl.executor.pending"
+RL_EVENT_LOOP_LAG_METRIC = "rl.event_loop.lag"
+EXECUTOR_QUEUE_WAIT_KEY = registry_key(RL_EXECUTOR_QUEUE_WAIT_METRIC)
+EXECUTOR_EXECUTION_KEY = registry_key(RL_EXECUTOR_EXECUTION_METRIC)
+EXECUTOR_RESULT_DELIVERY_KEY = registry_key(RL_EXECUTOR_RESULT_DELIVERY_METRIC)
+EXECUTOR_PENDING_KEY = registry_key(RL_EXECUTOR_PENDING_METRIC)
+EVENT_LOOP_LAG_KEY = registry_key(RL_EVENT_LOOP_LAG_METRIC)
+
 # Registration is process-global in lens, so it has to happen once per process
 # and in every process that records -- driver and workers alike. Doing it lazily
 # on the first tee rather than at import keeps this module importable when the
@@ -414,39 +425,34 @@ def _metric_specs() -> list[MetricSpec]:
         for row in recorded_metrics()
     )
     specs.extend(
-        MetricSpec(key, name, kind, unit=unit, description=description)
-        for key, name, kind, unit, description in (
+        MetricSpec(registry_key(name), name, kind, unit=unit, description=description)
+        for name, kind, unit, description in (
             (
-                "executor_queue_wait",
-                "rl.executor.queue_wait",
+                RL_EXECUTOR_QUEUE_WAIT_METRIC,
                 "histogram",
                 "ms",
                 "Offload submission to thread start, by bounded call site.",
             ),
             (
-                "executor_execution",
-                "rl.executor.execution",
+                RL_EXECUTOR_EXECUTION_METRIC,
                 "histogram",
                 "ms",
                 "Thread execution wall time, including any blocking I/O.",
             ),
             (
-                "executor_result_delivery",
-                "rl.executor.result_delivery",
+                RL_EXECUTOR_RESULT_DELIVERY_METRIC,
                 "histogram",
                 "ms",
                 "Successful thread completion to awaiting coroutine resumption.",
             ),
             (
-                "executor_pending",
-                "rl.executor.pending",
+                RL_EXECUTOR_PENDING_METRIC,
                 "up_down_counter",
                 "{task}",
                 "Instrumented offloads queued or running; not total executor occupancy.",
             ),
             (
-                "event_loop_lag",
-                "rl.event_loop.lag",
+                RL_EVENT_LOOP_LAG_METRIC,
                 "histogram",
                 "ms",
                 "Scheduling lateness of a one-second event-loop probe.",
