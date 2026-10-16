@@ -582,6 +582,71 @@ def _build_teacher_force_include_token_ids(
     return force_ids
 
 
+# Ordered, non-overlapping alignment chunks request at most two distinct
+# realized labels from one teacher row (see the builder below).
+SPARSE_TEACHER_FORCE_WIDTH = 2
+
+
+def _build_teacher_force_include_token_id_slots(
+    batch: BatchedDataDict[Any],
+    *,
+    teacher_idx: int,
+    kl_chunk_shift: bool,
+) -> torch.Tensor:
+    """Map every CSD teacher predictor row to the realized labels it must keep.
+
+    Returns ``[B, T_t, SPARSE_TEACHER_FORCE_WIDTH]`` teacher label ids with
+    ``-1`` in unused slots. A chunk takes next-token predictors only when both
+    of its spans start after position zero (the CSD ``kl_chunk_shift`` rule),
+    so the last predictor of an unshifted chunk at the sequence start can also
+    be the first predictor of the following shifted chunk; those two requests
+    need different labels (row ``r`` is only ever asked for the token at ``r``
+    or ``r + 1``). Chunks whose ``pair_valid`` or ``sample_mask`` is off, or
+    with an empty side (``[0, 0)`` span), request no label.
+    """
+    teacher_input_ids = batch[f"teacher_{teacher_idx}_input_ids"]
+    pair_valid = batch[f"alignment_{teacher_idx}_pair_valid"].to(torch.bool)
+    pair_valid = pair_valid & batch["sample_mask"].to(torch.bool).unsqueeze(-1)
+    max_pairs = int(pair_valid.shape[1])
+    student_spans = _chunk_ids_to_spans(
+        batch[f"alignment_{teacher_idx}_student_chunk_id"], max_pairs
+    )
+    teacher_spans = _chunk_ids_to_spans(
+        batch[f"alignment_{teacher_idx}_teacher_chunk_id"], max_pairs
+    )
+    batch_size, teacher_seq_len = teacher_input_ids.shape
+    force = torch.full(
+        (batch_size, teacher_seq_len, SPARSE_TEACHER_FORCE_WIDTH),
+        -1,
+        dtype=teacher_input_ids.dtype,
+        device=teacher_input_ids.device,
+    )
+    # Driver-side and small: explicit loops keep the conflict errors precise.
+    for batch_idx, pair_idx in pair_valid.nonzero().tolist():
+        student_start, student_end = student_spans[batch_idx, pair_idx].tolist()
+        teacher_start, teacher_end = teacher_spans[batch_idx, pair_idx].tolist()
+        if student_end <= student_start or teacher_end <= teacher_start:
+            continue
+        shift = 1 if kl_chunk_shift and student_start > 0 and teacher_start > 0 else 0
+        for label_pos in range(teacher_start, teacher_end):
+            predictor_pos = label_pos - shift
+            label_id = int(teacher_input_ids[batch_idx, label_pos])
+            row = force[batch_idx, predictor_pos]
+            if bool((row == label_id).any()):
+                continue
+            free_slots = (row == -1).nonzero()
+            if free_slots.numel() == 0:
+                raise ValueError(
+                    "CSD alignment requests more than "
+                    f"{SPARSE_TEACHER_FORCE_WIDTH} distinct realized labels from "
+                    f"one teacher row; chunks must be ordered and non-overlapping. "
+                    f"teacher={teacher_idx}, batch={batch_idx}, "
+                    f"pos={predictor_pos}, existing={row.tolist()}, new={label_id}."
+                )
+            row[int(free_slots[0, 0])] = label_id
+    return force
+
+
 def _get_teacher_logits_ipc(
     teacher_policy: Policy,
     teacher_data: BatchedDataDict[Any],

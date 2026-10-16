@@ -45,6 +45,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     CSDMasterConfig,
     TeacherAlignerConfig,
     TeacherConfig,
+    _build_teacher_force_include_token_id_slots,
     _build_teacher_force_include_token_ids,
     _default_off_policy_distillation_save_state,
     _packing_batch_uids_from_state,
@@ -1465,6 +1466,50 @@ def test_build_teacher_force_ids_respects_position_zero_and_shift():
     # later and its labels at teacher positions 2,3 are attached to predictors
     # 1,2, with the latter write taking precedence at position 1.
     assert torch.equal(force_ids, torch.tensor([[10, 12, 13, -1, -1]]))
+
+
+@pytest.mark.parametrize(
+    "kl_chunk_shift,expected",
+    [
+        # Chunk 0 starts at position zero and stays unshifted; chunk 1's labels
+        # at teacher positions 2,3 attach to predictors 1,2, so row 1 keeps
+        # both its unshifted label 11 and its shifted label 12.
+        (True, [[10, -1], [11, 12], [13, -1], [-1, -1], [-1, -1]]),
+        (False, [[10, -1], [11, -1], [12, -1], [13, -1], [-1, -1]]),
+    ],
+)
+def test_build_teacher_force_id_slots_keep_both_labels_of_a_shared_row(
+    kl_chunk_shift, expected
+):
+    batch = _make_batch(batch_size=1, t_student=5, t_teacher=5)
+    batch["teacher_0_input_ids"] = torch.tensor([[10, 11, 12, 13, 14]])
+    batch["alignment_0_pair_valid"] = torch.tensor([[True, True, False]])
+    batch["alignment_0_student_chunk_id"] = torch.tensor([[0, 0, -1, 1, 1]])
+    batch["alignment_0_teacher_chunk_id"] = torch.tensor([[0, 0, 1, 1, -1]])
+
+    force_ids = _build_teacher_force_include_token_id_slots(
+        batch, teacher_idx=0, kl_chunk_shift=kl_chunk_shift
+    )
+
+    assert force_ids.shape == (1, 5, csd_mod.SPARSE_TEACHER_FORCE_WIDTH)
+    assert force_ids.tolist() == [expected]
+
+
+def test_build_teacher_force_id_slots_skip_masked_and_one_sided_chunks():
+    batch = _make_batch(batch_size=2, t_student=4, t_teacher=4)
+    batch["teacher_0_input_ids"] = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
+    batch["sample_mask"] = torch.tensor([1, 0])
+    batch["alignment_0_pair_valid"] = torch.tensor([[True, True], [True, True]])
+    # Chunk 1 of sample 0 has no student positions, so its span is [0, 0).
+    batch["alignment_0_student_chunk_id"] = torch.tensor([[0, 0, -1, -1], [0, 1, 1, 1]])
+    batch["alignment_0_teacher_chunk_id"] = torch.tensor([[0, 1, 1, -1], [0, 1, 1, 1]])
+
+    force_ids = _build_teacher_force_include_token_id_slots(
+        batch, teacher_idx=0, kl_chunk_shift=True
+    )
+
+    assert force_ids[0].tolist() == [[10, -1], [-1, -1], [-1, -1], [-1, -1]]
+    assert bool((force_ids[1] == -1).all())
 
 
 @pytest.mark.parametrize("realized_only", [False, True])
