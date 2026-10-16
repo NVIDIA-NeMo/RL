@@ -390,12 +390,12 @@ Set `grpo.use_dynamic_sampling: true` to drop prompt groups whose generations al
 
 The v1 knobs `grpo.dynamic_sampling_max_gen_batches` and `grpo.batch_multiplier` have no effect here; `max_replacement_attempts` is the budget instead. Dropped groups are counted separately from rollout failures and do not use up `max_skipped_prompts` or `max_consecutive_dropped_prompts`. This section covers GRPO only: PPO needs full-size steps (see [Known Missing Features](#known-missing-features)), and a dropped group that cannot be replaced shortens the step.
 
-The trained batch only holds groups with reward spread, so `reward` computed over it can stay flat while the policy still improves. To match v1, which reports `reward` before filtering, `reward` here is the mean over each slot's first attempt (replacements excluded), and the trained-rows mean moves to `filtered_reward`. These per-step metrics are also reported, and all of them need a sampler that stamps target steps:
+`reward` stays the mean over the trained rows, which only hold groups with reward spread, so it can stay flat while the policy still improves. Watch `unfiltered_reward` (or `first_attempt_reward`) for the pre-filter progress signal instead. These per-step metrics are also reported, and all of them need a sampler that stamps target steps:
 
 | Metric | Meaning |
 | --- | --- |
-| `unfiltered_reward` | Mean reward over every generated group, kept or dropped. |
-| `first_attempt_reward` | Mean reward over each slot's first attempt only; this is what `reward` reports. |
+| `unfiltered_reward` | Mean reward over every generated group, kept or dropped; the progress signal to watch under dynamic sampling. |
+| `first_attempt_reward` | Mean reward over each slot's first attempt only (replacements excluded). |
 | `generated_prompt_groups` | Groups generated for the step, including dropped ones. |
 | `zero_variance_prompt_groups` / `zero_variance_fraction` | Count and fraction of generated groups whose rewards were all equal. |
 | `rollout/zero_variance_groups_total` | Running total of dropped groups. |

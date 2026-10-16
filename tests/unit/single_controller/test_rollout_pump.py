@@ -691,6 +691,7 @@ class TestTakeReplacement:
         on_dropped_prompt: str = "replace",
         max_replacement_attempts: int = 1,
         spares: int = 0,
+        stamps_target_steps: bool = True,
     ):
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
@@ -701,6 +702,7 @@ class TestTakeReplacement:
             )
         )
         ctrl._replacement_reserve = deque(_batch(f"spare{i}") for i in range(spares))
+        ctrl._sampler_stamps_target_steps = stamps_target_steps
         return ctrl
 
     def test_a_spare_is_handed_out_and_leaves_the_pool(self):
@@ -713,9 +715,12 @@ class TestTakeReplacement:
         assert ctrl._take_replacement(0, 0) is None
         assert len(ctrl._replacement_reserve) == 2, "pool left untouched"
 
-    def test_an_unstamped_prompt_has_no_short_step_to_repair(self):
-        ctrl = self._controller(spares=2)
-        assert ctrl._take_replacement(None, 0) is None
+    def test_a_non_stamping_sampler_has_no_short_step_to_repair(self):
+        # The sampler's capability decides, not this call's target_step: a sampler
+        # that stamps no steps has nothing waiting on a replacement, so even a valid
+        # target_step with spares on hand still shrinks.
+        ctrl = self._controller(spares=2, stamps_target_steps=False)
+        assert ctrl._take_replacement(0, 0) is None
 
     def test_the_per_slot_budget_stops_substituting(self):
         ctrl = self._controller(max_replacement_attempts=2, spares=5)

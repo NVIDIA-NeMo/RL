@@ -148,7 +148,6 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
-    align_reward_with_v1,
     reduce_advantage_pump_metrics,
 )
 from nemo_rl.data.interfaces import DatumSpec
@@ -2785,15 +2784,20 @@ class SingleControllerActor:
         """A spare prompt to stand in for a dropped group, or None to shrink instead.
 
         None covers the four ways a replacement can be unavailable: it was not asked
-        for, the sampler did not stamp this prompt so no step is waiting on it, the
-        per-slot budget is spent, or the pool is empty because the dataloader is
-        exhausted. Every one of them falls back to ``on_dropped_prompt="shrink"`` rather
-        than waiting, because a step whose replacements keep failing still has to close.
+        for, the sampler does not stamp target steps so no step is ever waiting on a
+        replacement, the per-slot budget is spent, or the pool is empty because the
+        dataloader is exhausted. Every one of them falls back to
+        ``on_dropped_prompt="shrink"`` rather than waiting, because a step whose
+        replacements keep failing still has to close.
+
+        Whether a step can be waiting on a replacement is the sampler's capability,
+        read from ``_sampler_stamps_target_steps`` -- not inferred from this prompt's
+        ``target_step`` being None, which would couple the decision to a per-call value.
         """
         failure_cfg = self._async_cfg.rollout_failure
         if failure_cfg.on_dropped_prompt != "replace":
             return None
-        if target_step is None:
+        if not self._sampler_stamps_target_steps:
             return None
         if replacements_used >= failure_cfg.max_replacement_attempts:
             return None
@@ -3862,15 +3866,14 @@ class SingleControllerActor:
                     }
                 )
                 # Reward over every group generated for this step (kept or dropped by
-                # dynamic sampling) and how many were uniform. Kept groups alone all
-                # have reward spread, so their mean is a poor progress signal.
+                # dynamic sampling) and how many were uniform. `reward` itself stays the
+                # trained-rows mean; `unfiltered_reward`/`first_attempt_reward` are the
+                # pre-filter progress signals, since the kept rows all have reward spread
+                # and their mean alone is a poor progress signal under dynamic sampling.
                 reward_metrics = self._rollout_manager.pop_step_reward_metrics(
                     version_during_step
                 )
                 step_metrics.update(reward_metrics)
-                if self._rollout_manager.filter_zero_variance_groups:
-                    # Use v1's meaning of `reward` / `filtered_reward`.
-                    align_reward_with_v1(step_metrics, reward_metrics)
 
                 # Checkpointing (mirrors async_grpo_train's save block).
                 if will_save_checkpoint:
