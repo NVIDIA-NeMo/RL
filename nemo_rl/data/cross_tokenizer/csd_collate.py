@@ -43,6 +43,14 @@ class CSDCrossTokenizerCollator(CrossTokenizerCollator):
         require_routed_experts: Emit ``routed_experts`` from each message's
             rollout-recorded ``token_ids`` and ``routed_experts``, which must
             reproduce the student tokenization exactly.
+        clip_overlength_text: Text-mode policy for rows that do not fit. A
+            row fits when, on the student and on every teacher, its
+            tokenization rounded up to that side's sequence-length divisor
+            is within that side's context length; same-tokenizer teachers
+            use the student tokenization. ``True`` replaces the text of each
+            row that does not fit with a prefix that fits every side, so the
+            student and every teacher still cover the same text. Requires
+            ``mode="text"``.
         All other arguments are those of :class:`CrossTokenizerCollator`.
     """
 
@@ -62,7 +70,12 @@ class CSDCrossTokenizerCollator(CrossTokenizerCollator):
         reject_overlength_text: bool = False,
         ce_covers_assistant_turn: bool = False,
         add_special_tokens_in_text: bool = False,
+        clip_overlength_text: bool = False,
     ) -> None:
+        if clip_overlength_text and config.mode != "text":
+            raise ValueError(
+                "clip_overlength_text requires mode='text'; chat rows are not clipped."
+            )
         super().__init__(
             config=config,
             student_tokenizer=student_tokenizer,
@@ -78,9 +91,12 @@ class CSDCrossTokenizerCollator(CrossTokenizerCollator):
             add_special_tokens_in_text=add_special_tokens_in_text,
         )
         self.require_routed_experts = require_routed_experts
+        self.clip_overlength_text = clip_overlength_text
 
     def __call__(self, batch: List[DatumSpec]) -> BatchedDataDict[Any]:
         sample_ids = self._required_sample_ids(batch)
+        if self.clip_overlength_text:
+            batch = self._clip_overlength_rows(batch)
         out = super().__call__(batch)
         out["sample_id"] = sample_ids
         self._add_router_replay_metadata(
@@ -90,6 +106,98 @@ class CSDCrossTokenizerCollator(CrossTokenizerCollator):
             student_input_lengths=out["input_lengths"],
         )
         return out
+
+    def _clip_overlength_rows(self, batch: List[DatumSpec]) -> List[DatumSpec]:
+        """``batch`` with each text row that does not fit every side clipped.
+
+        Rows that fit are returned as is; clipped rows are copies whose text is
+        a prefix that fits every side. Non-string content is left for the
+        shared collator to reject.
+        """
+        texts = [datum["message_log"][0]["content"] for datum in batch]
+        if not all(isinstance(text, str) for text in texts):
+            return batch
+        texts = cast(List[str], texts)
+        clipped: List[DatumSpec] = []
+        for datum, text, fits in zip(batch, texts, self._fits_every_side(texts)):
+            if fits:
+                clipped.append(datum)
+                continue
+            message_log = cast(List[dict[str, Any]], datum["message_log"])
+            prefix = self._fitting_text_prefix(text, datum["idx"])
+            clipped.append(
+                cast(
+                    DatumSpec,
+                    {
+                        **datum,
+                        "message_log": [
+                            {**message_log[0], "content": prefix},
+                            *message_log[1:],
+                        ],
+                    },
+                )
+            )
+        return clipped
+
+    def _fits_every_side(self, texts: List[str]) -> List[bool]:
+        """Whether each text fits the student and every teacher."""
+
+        def lengths(tokenizer: PreTrainedTokenizerBase) -> List[int]:
+            encoded = tokenizer(
+                texts,
+                truncation=False,
+                add_special_tokens=self.add_special_tokens_in_text,
+            )
+            return [len(ids) for ids in encoded["input_ids"]]
+
+        student_lengths = lengths(self.student_tokenizer)
+        sides = [
+            (student_lengths, self.ctx_length_student, self.make_seq_div_by_student)
+        ]
+        for i, aligner in enumerate(self.aligners):
+            teacher_tokenizer = self.teacher_tokenizers[i]
+            if aligner is None or teacher_tokenizer is None:
+                # Same-tokenizer teachers reuse the student tokenization.
+                teacher_lengths = student_lengths
+            else:
+                teacher_lengths = lengths(teacher_tokenizer)
+            sides.append(
+                (
+                    teacher_lengths,
+                    self.ctx_length_teachers[i],
+                    self.make_seq_div_by_teachers[i],
+                )
+            )
+        return [
+            all(
+                self._padded_width(side_lengths[row], make_seq_div_by) <= ctx_length
+                for side_lengths, ctx_length, make_seq_div_by in sides
+            )
+            for row in range(len(texts))
+        ]
+
+    def _fitting_text_prefix(self, text: str, row_idx: int) -> str:
+        """A non-empty prefix of ``text`` that fits every side.
+
+        Binary search over the prefix length. Token counts need not grow
+        monotonically with the prefix length, so the search keeps only
+        prefixes whose encodings fit: the result always fits but need not be
+        the longest prefix that does.
+        """
+        low, high, best = 1, len(text) - 1, ""
+        while low <= high:
+            middle = (low + high) // 2
+            if self._fits_every_side([text[:middle]])[0]:
+                best = text[:middle]
+                low = middle + 1
+            else:
+                high = middle - 1
+        if not best:
+            raise ValueError(
+                f"sample idx={row_idx}: no non-empty prefix of the text fits "
+                "every context length"
+            )
+        return best
 
     def _add_router_replay_metadata(
         self,
