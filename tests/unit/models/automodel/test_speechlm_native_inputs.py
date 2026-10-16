@@ -19,14 +19,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from lightning import LightningModule
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
-from omegaconf import DictConfig
-from transformers import PretrainedConfig
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
-from nemo_rl.models.automodel.speechlm import SpeechLMPolicy
+pytest.importorskip("nemo.collections.speechlm2")
+pytest.importorskip("nemo_automodel.components.utils.parameter_config")
+
+from lightning import LightningModule  # noqa: E402
+from nemo_automodel.components.models.common import BackendConfig  # noqa: E402
+from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM  # noqa: E402
+from omegaconf import DictConfig  # noqa: E402
+from transformers import PretrainedConfig  # noqa: E402
+
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams  # noqa: E402
+from nemo_rl.models.automodel.speechlm import SpeechLMPolicy  # noqa: E402
 
 
 class Perception(torch.nn.Module):

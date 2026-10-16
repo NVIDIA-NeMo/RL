@@ -20,11 +20,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from nemo.collections.speechlm2.models.salm_automodel import SALMAutomodel
 from omegaconf import DictConfig
 from transformers import AutoConfig, NemotronHConfig
 
-from nemo_rl.models.automodel.speechlm import SpeechLMPolicy
+pytest.importorskip("nemo.collections.speechlm2")
+pytest.importorskip("nemo_automodel.components.utils.parameter_config")
+
+from nemo.collections.speechlm2.models.salm_automodel import SALMAutomodel  # noqa: E402
+
+from nemo_rl.models.automodel.speechlm import SpeechLMPolicy  # noqa: E402
 
 
 def native_config(**kwargs):
