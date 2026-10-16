@@ -124,54 +124,6 @@ def _contains_post_write_enrichment_error(error: BaseException) -> bool:
     return False
 
 
-class RolloutDispatchAdmissionGate:
-    """Pause new Gym ``/run`` submissions without blocking live completions.
-
-    An admission is held only while the Ray streaming RPC is submitted. The
-    returned stream is consumed after the admission is released, so closing
-    this gate does not wait for generation, completion callbacks, finalization,
-    or TQ writes.
-    """
-
-    def __init__(self) -> None:
-        self._condition = asyncio.Condition()
-        self._closed = False
-        self._active_submissions = 0
-
-    @asynccontextmanager
-    async def admission(self) -> AsyncIterator[None]:
-        """Admit one Gym RPC submission after any checkpoint pause exits."""
-        async with self._condition:
-            await self._condition.wait_for(lambda: not self._closed)
-            self._active_submissions += 1
-        try:
-            yield
-        finally:
-            async with self._condition:
-                self._active_submissions -= 1
-                if self._active_submissions == 0:
-                    self._condition.notify_all()
-
-    @asynccontextmanager
-    async def closed(self) -> AsyncIterator[None]:
-        """Block new submissions after every admitted submission has crossed."""
-        async with self._condition:
-            await self._condition.wait_for(lambda: not self._closed)
-            self._closed = True
-            try:
-                await self._condition.wait_for(lambda: self._active_submissions == 0)
-            except BaseException:
-                self._closed = False
-                self._condition.notify_all()
-                raise
-        try:
-            yield
-        finally:
-            async with self._condition:
-                self._closed = False
-                self._condition.notify_all()
-
-
 class RolloutDispatchRecorder(Protocol):
     """Recovery-ledger hooks around one physical Gym ``/run`` submission.
 
@@ -1085,14 +1037,20 @@ class AsyncNemoGymRolloutImpl:
         ).max_gym_row_attempts
         self._stats = stats
         self._effort_config = effort_config
-        self._dispatch_admission_gate: RolloutDispatchAdmissionGate | None = None
+        self._dispatch_admission_gate: DataPlaneCheckpointBarrier | None = None
 
         self._validate_init_params()
 
     def set_rollout_dispatch_admission_gate(
-        self, gate: RolloutDispatchAdmissionGate
+        self, gate: DataPlaneCheckpointBarrier
     ) -> None:
-        """Bind the controller-owned gate used by Gym checkpoint coordination."""
+        """Bind the controller-owned dispatch barrier of Gym checkpoint coordination.
+
+        A ``gym_dispatch`` section is held only while the Ray streaming RPC is
+        submitted. The returned stream is consumed after it is released, so a
+        checkpoint of this barrier does not wait for generation, completion
+        callbacks, finalization, or TQ writes.
+        """
         if self._dispatch_admission_gate is not None:
             raise RuntimeError("Gym rollout dispatch admission gate is already bound")
         self._dispatch_admission_gate = gate
@@ -1319,7 +1277,7 @@ class AsyncNemoGymRolloutImpl:
         # ``dispatch_with_trace_context`` calls ``.remote`` synchronously.
         # Release admission immediately after Ray accepts the streaming RPC;
         # consuming the returned stream must remain live during Gym prepare.
-        async with gate.admission() if gate is not None else nullcontext():
+        async with gate.mutation("gym_dispatch") if gate is not None else nullcontext():
             if dispatch_recorder is None:
                 result_refs = dispatch_with_trace_context(
                     remote_method,
@@ -2081,9 +2039,9 @@ class RolloutManager:
         self._data_plane_checkpoint_barrier = barrier
 
     def set_rollout_dispatch_admission_gate(
-        self, gate: RolloutDispatchAdmissionGate
+        self, gate: DataPlaneCheckpointBarrier
     ) -> None:
-        """Bind the narrow Gym RPC gate used while a checkpoint is prepared."""
+        """Bind the narrow Gym RPC barrier used while a checkpoint is prepared."""
         if not isinstance(self._impl, AsyncNemoGymRolloutImpl):
             raise RuntimeError(
                 "rollout dispatch admission is only supported on the NeMo-Gym path"

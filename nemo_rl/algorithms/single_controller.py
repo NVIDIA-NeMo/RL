@@ -69,7 +69,6 @@ from typing import (
     cast,
 )
 
-import numpy as np
 import ray
 import torch
 from ray.exceptions import RayActorError
@@ -129,17 +128,14 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     is_ppo_run,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
-    GYM_RESTART_FALLBACK_FILENAME,
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
     BootstrapCompatibilityIdentity,
     RolloutSnapshotManifest,
     commit_snapshot,
     ensure_bootstrap_anchor,
-    has_gym_restart_fallback,
     prepare_snapshot_paths,
     prune_bootstrap_snapshots,
-    write_gym_restart_fallback,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
@@ -177,7 +173,6 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
 from nemo_rl.environments.gym_checkpoint_coordinator import (
-    GYM_CHECKPOINT_MANIFEST_FILENAME,
     GymCheckpointCommitResult,
     GymCheckpointCoordinator,
     is_transient_gym_checkpoint_failure,
@@ -198,7 +193,6 @@ from nemo_rl.experience.reward_penalties import (
     capture_reward_result_tables,
 )
 from nemo_rl.experience.rollout_manager import (
-    RolloutDispatchAdmissionGate,
     RolloutOutcome,
 )
 from nemo_rl.experience.rollout_recovery import (
@@ -302,20 +296,6 @@ class _RolloutCheckpointCut:
     rolled_back_train_group_count: int
     mutation_version: int
     tq_save_seconds: float
-
-
-def _write_training_info(
-    checkpoint_path: PathLike, training_info: dict[str, Any]
-) -> None:
-    """Atomically refresh training metadata after the final checkpoint cut."""
-    serializable = dict(training_info)
-    for key, value in serializable.items():
-        if isinstance(value, (torch.Tensor, np.ndarray)):
-            serializable[key] = value.item()
-    path = Path(checkpoint_path) / "training_info.json"
-    tmp_path = path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(serializable))
-    os.replace(tmp_path, path)
 
 
 def _latest_generation_values(
@@ -577,9 +557,11 @@ class SingleControllerActor:
         # it costs five minutes, not quietly at hour three of a run.
         self._env_handles = actor_args.env_handles
         self._gym_checkpoint_coordinator: Optional[GymCheckpointCoordinator] = None
-        self._rollout_dispatch_admission_gate: Optional[
-            RolloutDispatchAdmissionGate
-        ] = None
+        # Separate from the data-plane barrier: it pauses only Gym /run
+        # submissions while a Gym checkpoint is prepared.
+        self._rollout_dispatch_admission_gate: Optional[DataPlaneCheckpointBarrier] = (
+            None
+        )
         if self._master_config.rollout_recovery.turn_checkpointing_enabled:
             self._gym_checkpoint_coordinator = GymCheckpointCoordinator(
                 as_nemo_gym_shard_set(self._env_handles["nemo_gym"]),
@@ -588,7 +570,7 @@ class SingleControllerActor:
                     self._master_config.rollout_recovery.gym_prepare_timeout_s
                 ),
             )
-            self._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
+            self._rollout_dispatch_admission_gate = DataPlaneCheckpointBarrier()
             self._rollout_manager.set_rollout_dispatch_admission_gate(
                 self._rollout_dispatch_admission_gate
             )
@@ -671,6 +653,7 @@ class SingleControllerActor:
         # already defaulted any fields missing from older checkpoints.
         self._save_state: GRPOSaveState = actor_args.save_state
         self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
+        self._restored_from_rollout_snapshot = actor_args.restored_from_rollout_snapshot
         self._data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = (
             data_plane_checkpoint_metadata
         )
@@ -769,6 +752,10 @@ class SingleControllerActor:
         # accumulation remains snapshot-safe because selected rows stay owned by
         # the replay buffer and are re-indexed in periodic snapshots.
         self._optimizer_commit_in_progress = False
+        # Set whenever a step starts committing. A rollout snapshot clears it when
+        # it starts and stops its Gym phase once it is set, since the snapshot
+        # can no longer be kept.
+        self._optimizer_commit_started = asyncio.Event()
 
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
@@ -1300,28 +1287,14 @@ class SingleControllerActor:
                 for group in recovery_ledger.groups()
                 if group.restore_level is RecoveryTargetLevel.TURN
             ]
-            restore_id: Optional[str] = None
-            restore_coordinator: Optional[GymCheckpointCoordinator] = None
-            restore_manifest = None
-            gym_restore_completed = False
             restored_gym_episodes: set[tuple[str, str, int]] = set()
             restored_gym_staging_keys: set[str] = set()
-            try:
-                checkpoint_root = Path(self._last_checkpoint_path)
-                manifest_path = checkpoint_root / GYM_CHECKPOINT_MANIFEST_FILENAME
-                if turn_groups and not manifest_path.is_file():
+            # Gym stays restored until the rest of this restore succeeds; on any
+            # failure its replacement attempts are retired before it reopens.
+            async with contextlib.AsyncExitStack() as gym_restore:
+                if turn_groups and not self._restored_from_rollout_snapshot:
                     # A trainer checkpoint never holds Gym state; with no later
                     # rollout snapshot, its unfinished turns start over below.
-                    if not has_gym_restart_fallback(
-                        checkpoint_root,
-                        train_step=self._train_steps,
-                        trainer_version=self._trainer_version,
-                    ):
-                        raise FileNotFoundError(
-                            "turn-level rollout recovery requires the matching Gym "
-                            f"manifest at {manifest_path}, or a trainer checkpoint "
-                            f"marked with {GYM_RESTART_FALLBACK_FILENAME}"
-                        )
                     print(
                         "📦 Restoring a trainer checkpoint without Gym state: "
                         f"{len(turn_groups)} unfinished turn-level group(s) "
@@ -1341,19 +1314,24 @@ class SingleControllerActor:
                     )
                     expected_inventory = self._gym_checkpoint_inventory(coordinator)
                     if manifest.instances != expected_inventory:
+                        differing = sorted(
+                            instance_id
+                            for instance_id in manifest.instances.keys()
+                            | expected_inventory.keys()
+                            if manifest.instances.get(instance_id)
+                            != expected_inventory.get(instance_id)
+                        )
                         raise ValueError(
                             "Gym checkpoint manifest does not match the rollout "
-                            "recovery ledger"
+                            f"recovery ledger for Gym instances {differing!r}"
                         )
-                    restore_id = f"restore-{uuid.uuid4().hex}"
-                    restore_coordinator = coordinator
-                    restore_manifest = manifest
-                    await coordinator.restore(
-                        restore_id,
-                        self._last_checkpoint_path,
-                        manifest,
+                    await gym_restore.enter_async_context(
+                        coordinator.restored(
+                            f"restore-{uuid.uuid4().hex}",
+                            self._last_checkpoint_path,
+                            manifest,
+                        )
                     )
-                    gym_restore_completed = True
                     restored_gym_episodes = {
                         (instance_id, episode.rollout_id, episode.attempt)
                         for instance_id, episodes in manifest.instances.items()
@@ -1394,30 +1372,6 @@ class SingleControllerActor:
                     )
                 await self._rehydrate_rollout_recovery_prompts(cut)
                 await self._queue_restored_replay_groups_for_regeneration(cut)
-            except BaseException as error:
-                if restore_id is not None and restore_coordinator is not None:
-                    if gym_restore_completed and restore_manifest is not None:
-                        try:
-                            await restore_coordinator.retire_restored(
-                                restore_id,
-                                restore_manifest,
-                            )
-                        except Exception as retire_error:
-                            error.add_note(
-                                "Gym retire of restored attempts also failed: "
-                                f"{type(retire_error).__name__}: {retire_error}"
-                            )
-                    try:
-                        await restore_coordinator.resume(restore_id)
-                    except Exception as resume_error:
-                        error.add_note(
-                            "Gym restore cleanup also failed: "
-                            f"{type(resume_error).__name__}: {resume_error}"
-                        )
-                raise
-            else:
-                if restore_id is not None and restore_coordinator is not None:
-                    await restore_coordinator.resume(restore_id)
         self._sampler_stamps_target_steps = (
             parsed_state.sampler_stamps_target_steps
             if parsed_state.sampler_stamps_target_steps is not None
@@ -1692,6 +1646,7 @@ class SingleControllerActor:
         recovery_started = time.monotonic()
         reused_siblings = 0
         redispatched_siblings = 0
+        continued_siblings = 0
 
         recognized_phases = (
             PromptGroupPhase.ADMITTED,
@@ -1720,6 +1675,7 @@ class SingleControllerActor:
                 reused = len(group.sealed_generation_indices)
                 reused_siblings += reused
                 redispatched_siblings += group.expected_generations - reused
+                continued_siblings += len(group.continued_generation_indices)
 
         # A checkpoint may land after dataloader ownership is recorded but before
         # sampler admission commits. Re-admit each original dataloader batch once and
@@ -1742,6 +1698,7 @@ class SingleControllerActor:
                 reused = len(group.sealed_generation_indices)
                 reused_siblings += reused
                 redispatched_siblings += group.expected_generations - reused
+                continued_siblings += len(group.continued_generation_indices)
 
         self._rollout_manager.record_recovery_siblings(
             reused=reused_siblings,
@@ -1753,6 +1710,10 @@ class SingleControllerActor:
                 "groups_unfinished_found": float(len(groups_to_recover)),
                 "siblings_reused": float(reused_siblings),
                 "siblings_rerun": float(redispatched_siblings),
+                # The re-run siblings split by where they resume: restored Gym
+                # state (turn level) or their prompt.
+                "siblings_continued": float(continued_siblings),
+                "siblings_restarted": float(redispatched_siblings - continued_siblings),
             },
             step=self._train_steps,
             prefix="timing/rollout_recovery",
@@ -1760,7 +1721,9 @@ class SingleControllerActor:
 
         print(
             f"📦 Redispatched {len(groups_to_recover)} unfinished rollout "
-            "group(s) before new dataloader work",
+            f"group(s) before new dataloader work: {reused_siblings} sibling(s) "
+            f"reused, {continued_siblings} continued from Gym state, "
+            f"{redispatched_siblings - continued_siblings} restarted from their prompt",
             flush=True,
         )
 
@@ -3523,7 +3486,7 @@ class SingleControllerActor:
                                         # identity before the first irreversible
                                         # optimizer update, as on the streaming path.
                                         async with self._checkpoint_save_lock:
-                                            self._optimizer_commit_in_progress = True
+                                            self._begin_optimizer_commit()
                                         policy_result = await asyncio.to_thread(
                                             self._trainer.finish_train_step
                                         )
@@ -3658,7 +3621,7 @@ class SingleControllerActor:
                     # Future snapshots see the flag under this same lock and
                     # skip until the critic and batch consumption finish.
                     async with self._checkpoint_save_lock:
-                        self._optimizer_commit_in_progress = True
+                        self._begin_optimizer_commit()
                     if is_policy_training_step and self._streaming_ppo:
                         assert step_open
                         with (
@@ -3755,7 +3718,7 @@ class SingleControllerActor:
                         policy_result = await asyncio.to_thread(
                             self._trainer.finish_train_step
                         )
-                    self._optimizer_commit_in_progress = True
+                    self._begin_optimizer_commit()
 
                 # Aggregate step metrics
                 step_metrics = {}
@@ -4801,20 +4764,6 @@ class SingleControllerActor:
             tq_save_seconds=tq_save_seconds,
         )
 
-    async def _capture_coordinated_rollout_checkpoint_cut(
-        self,
-        cut: DataPlaneMutationCut,
-        checkpoint_path: PathLike,
-        *,
-        gym_commit: GymCheckpointCommitResult | None,
-    ) -> _RolloutCheckpointCut:
-        """Validate the prepared Gym cut, then capture matching TQ state."""
-        if gym_commit is not None:
-            await self._validate_gym_checkpoint_cut(
-                cut, gym_commit, checkpoint_path=checkpoint_path
-            )
-        return await self._capture_rollout_checkpoint_cut(cut, checkpoint_path)
-
     def _gym_checkpoint_inventory(
         self, coordinator: GymCheckpointCoordinator
     ) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
@@ -4991,7 +4940,7 @@ class SingleControllerActor:
                 "Gym checkpoint coordinator has no dispatch admission gate"
             )
 
-        async with gate.closed():
+        async with gate.checkpoint():
             # Gym parks every live rollout until resume, so the wait must not
             # count against their deadlines. A separate holder keeps a
             # colocated engine's own pause intact when this one ends.
@@ -5083,6 +5032,42 @@ class SingleControllerActor:
             lambda: sum(path.stat().st_size for path in written_paths)
         )
 
+    def _begin_optimizer_commit(self) -> None:
+        """Mark the step's optimizer update as applied until its counters publish."""
+        self._optimizer_commit_in_progress = True
+        self._optimizer_commit_started.set()
+
+    async def _enter_gym_phase_unless_a_step_commits(
+        self,
+        stack: contextlib.AsyncExitStack,
+        gym_phase: contextlib.AbstractAsyncContextManager[
+            GymCheckpointCommitResult | None
+        ],
+    ) -> tuple[bool, GymCheckpointCommitResult | None]:
+        """Enter the Gym phase on ``stack``, or stop it once a train step commits.
+
+        The snapshot would be thrown away at the trainer-state check anyway, so
+        Gym is not kept parked through prepare, commit and drain for it.
+        Cancelling the entry leaves no cleanup: the phase resumes Gym and reopens
+        dispatch on any exception. Returns whether the phase was entered; a phase
+        that finished entering is on ``stack``, and the trainer-state check
+        decides whether its snapshot is kept.
+        """
+        enter = asyncio.ensure_future(stack.enter_async_context(gym_phase))
+        commit_started = asyncio.ensure_future(self._optimizer_commit_started.wait())
+        try:
+            await asyncio.wait(
+                {enter, commit_started}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            commit_started.cancel()
+            if not enter.done():
+                enter.cancel()
+                await asyncio.gather(enter, return_exceptions=True)
+        if enter.cancelled():
+            return False, None
+        return True, enter.result()
+
     async def _save_rollout_checkpoint(
         self, *, force: bool = False
     ) -> _RolloutCheckpointSaveResult:
@@ -5093,6 +5078,8 @@ class SingleControllerActor:
                     saved=False,
                     reason="optimizer_commit_in_progress",
                 )
+            # Only a step that starts committing during this attempt stops it.
+            self._optimizer_commit_started.clear()
             if (
                 not force
                 and self._last_rollout_snapshot_mutation_version
@@ -5161,10 +5148,24 @@ class SingleControllerActor:
                 prepare_snapshot_paths, anchor
             )
             try:
-                async with self._prepared_gym_checkpoint(
-                    tmp_path,
-                    checkpoint_id=f"rollout-{uuid.uuid4().hex}",
-                ) as gym_commit:
+                gym_park_started = time.monotonic()
+                async with contextlib.AsyncExitStack() as gym_phase:
+                    (
+                        entered,
+                        gym_commit,
+                    ) = await self._enter_gym_phase_unless_a_step_commits(
+                        gym_phase,
+                        self._prepared_gym_checkpoint(
+                            tmp_path,
+                            checkpoint_id=f"rollout-{uuid.uuid4().hex}",
+                        ),
+                    )
+                    if not entered:
+                        await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
+                        return _RolloutCheckpointSaveResult(
+                            saved=False,
+                            reason="trainer_state_changed",
+                        )
                     barrier_requested = time.monotonic()
                     async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
                         barrier_acquired = time.monotonic()
@@ -5179,14 +5180,17 @@ class SingleControllerActor:
                                 reason="trainer_state_changed",
                             )
                         snapshot_epoch = self._current_epoch
-                        snapshot_cut = (
-                            await self._capture_coordinated_rollout_checkpoint_cut(
-                                cut,
-                                tmp_path,
-                                gym_commit=gym_commit,
+                        if gym_commit is not None:
+                            await self._validate_gym_checkpoint_cut(
+                                cut, gym_commit, checkpoint_path=tmp_path
                             )
+                        snapshot_cut = await self._capture_rollout_checkpoint_cut(
+                            cut, tmp_path
                         )
                     barrier_released = time.monotonic()
+                # Dispatch reopens and Gym resumes when that block exits, so this
+                # spans every second new rollouts could not start.
+                gym_parked_seconds = time.monotonic() - gym_park_started
 
                 sidecar_save_started = time.monotonic()
                 controller_sidecar_bytes = (
@@ -5255,6 +5259,9 @@ class SingleControllerActor:
                 ),
                 "controller_sidecar_bytes": float(controller_sidecar_bytes),
             }
+            if gym_commit is not None:
+                checkpoint_metrics["gym_parked_seconds"] = gym_parked_seconds
+                self._warn_if_gym_parked_past_interval(gym_parked_seconds)
             self._log_telemetry_metrics(
                 checkpoint_metrics,
                 step=expected_train_step,
@@ -5271,6 +5278,42 @@ class SingleControllerActor:
                 flush=True,
             )
             return _RolloutCheckpointSaveResult(saved=True, reason="completed")
+
+    def _warn_if_gym_snapshots_keep_losing_to_train_steps(
+        self, consecutive_discards: int
+    ) -> None:
+        """Warn once per streak when train steps keep discarding Gym snapshots."""
+        if self._gym_checkpoint_coordinator is None:
+            return
+        limit = self._master_config.rollout_checkpointing.max_consecutive_failures
+        if consecutive_discards != limit:
+            return
+        warnings.warn(
+            f"{consecutive_discards} turn snapshots in a row were thrown away "
+            "because a train step finished during the Gym phase; turn-level "
+            "recovery is saving no Gym state. Shorten Gym steps or use "
+            "rollout_recovery.target_level: sibling.",
+            stacklevel=2,
+        )
+
+    def _warn_if_gym_parked_past_interval(self, gym_parked_seconds: float) -> None:
+        """Warn when a snapshot held rollouts longer than the snapshot interval.
+
+        Rollouts then spend more time parked than running between snapshots.
+        """
+        interval_s = (
+            self._master_config.rollout_checkpointing.snapshot_attempt_interval_s
+        )
+        if interval_s is None or gym_parked_seconds <= interval_s:
+            return
+        warnings.warn(
+            f"Gym rollout snapshot held new rollout dispatch for "
+            f"{gym_parked_seconds:.1f}s, longer than "
+            f"rollout_checkpointing.snapshot_attempt_interval_s={interval_s:g}s; "
+            "rollouts spend more time parked than running between snapshots. "
+            "Raise the interval or check timing/rollout_checkpoint/gym_parked_seconds.",
+            stacklevel=2,
+        )
 
     def _log_rollout_checkpoint_outcome(
         self,
@@ -5321,6 +5364,7 @@ class SingleControllerActor:
         if snapshot_attempt_interval_s is None:
             raise RuntimeError("rollout checkpoint pump started while disabled")
         consecutive_failures = 0
+        consecutive_discards = 0
         while True:
             try:
                 await asyncio.wait_for(
@@ -5379,6 +5423,12 @@ class SingleControllerActor:
                 reason=result.reason,
                 attempt_duration_seconds=time.monotonic() - attempt_started,
             )
+            consecutive_discards = (
+                consecutive_discards + 1
+                if result.reason == "trainer_state_changed"
+                else 0
+            )
+            self._warn_if_gym_snapshots_keep_losing_to_train_steps(consecutive_discards)
             if deadline_due and result.saved and self._timeout.check_save():
                 print(
                     "Checkpoint deadline reached before the first train step; "
@@ -5571,18 +5621,6 @@ class SingleControllerActor:
                 is_final_checkpoint=is_final_checkpoint,
             )
 
-    def _fill_save_state(self, save_state: Any) -> None:
-        """Copy the controller counters a trainer checkpoint records."""
-        save_state.current_step = self._train_steps
-        save_state.total_steps = self._train_steps
-        save_state.trainer_version = self._trainer_version
-        save_state.current_epoch = self._current_epoch
-        save_state.consumed_samples = self._consumed_samples
-        save_state.total_valid_tokens = self._total_valid_tokens
-        _save_adaptive_loss_state(save_state, self._loss_fn)
-        save_state.sampler_name = self._async_cfg.sampler.name
-        save_state.sampler_dispatch_index = self._sampler.dispatch_index
-
     async def _save_checkpoint_impl(
         self,
         step_metrics: dict[str, Any],
@@ -5632,34 +5670,35 @@ class SingleControllerActor:
         rollout_recovery_payload: Optional[bytes] = None
         rollout_recovery_payload_sha256: Optional[str] = None
 
-        # Seed the temporary trainer directory before the data-plane cut, then
-        # atomically refresh its training_info.json with the exact controller
-        # values captured below.
-        self._fill_save_state(save_state)
-        checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
-            self._checkpointer.init_tmp_checkpoint,
-            self._train_steps,
-            vars(save_state),
-            self._master_config,
-        )
-
-        save_data_plane = bool(self._master_config.checkpointing.get("save_data_plane"))
-        # Admission, dataloader movement, replay mutations, and canonical TQ
-        # writes all take the mutation side of this barrier. Gym keeps running:
-        # its state lives only in rollout snapshots taken after this checkpoint.
+        # Admission, dataloader movement, replay mutations, and canonical TQ writes
+        # all take the mutation side of this barrier. Capture every restart-facing
+        # controller artifact under the exclusive side so the checkpoint cannot
+        # contain a cursor without its prompt owner, or two durable owners for one
+        # canonical group. Gym keeps running: its state lives only in rollout
+        # snapshots taken after this checkpoint.
         async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
-            self._fill_save_state(save_state)
-            await asyncio.to_thread(
-                _write_training_info,
-                checkpoint_path,
-                vars(save_state),
-            )
+            save_state.current_step = self._train_steps
+            save_state.total_steps = self._train_steps
+            save_state.trainer_version = self._trainer_version
+            save_state.current_epoch = self._current_epoch
+            save_state.consumed_samples = self._consumed_samples
+            save_state.total_valid_tokens = self._total_valid_tokens
+            _save_adaptive_loss_state(save_state, self._loss_fn)
+            save_state.sampler_name = self._async_cfg.sampler.name
+            save_state.sampler_dispatch_index = self._sampler.dispatch_index
             dataloader_state = self._dataloader.state_dict()
             # The spare pool and dataloader advance together under the same mutation
             # cut in recovery-enabled dispatch, so preserve them in this cut too.
             reserve_state = list(self._replacement_reserve)
 
-            if save_data_plane:
+            checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
+                self._checkpointer.init_tmp_checkpoint,
+                self._train_steps,
+                vars(save_state),
+                self._master_config,
+            )
+
+            if self._master_config.checkpointing.get("save_data_plane"):
                 training_owned_groups = self._buffer.training_owned_replay_groups()
                 if training_owned_groups:
                     raise RuntimeError(
@@ -5789,13 +5828,6 @@ class SingleControllerActor:
                 ).write_bytes,
                 rollout_recovery_payload,
             )
-            if self._gym_checkpoint_coordinator is not None:
-                await asyncio.to_thread(
-                    write_gym_restart_fallback,
-                    Path(checkpoint_path),
-                    train_step=save_state.current_step,
-                    trainer_version=self._trainer_version,
-                )
         # Rename happens in the background once the async weight writes
         # finish; flushed at the next save or on exit.
         self._checkpointer.begin_finalization(

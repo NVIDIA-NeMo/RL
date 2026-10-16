@@ -380,3 +380,48 @@ def test_dynamo_frontend_args_without_router_reset_states_pass():
 
 def test_generation_without_dynamo_cfg_passes():
     check_outdated_config({"policy": {"generation": {"backend": "vllm"}}})
+
+
+# ============================================================================
+# reject_outdated_rollout_recovery_granularity
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "removed_key,replacement",
+    [
+        ("default_granularity", "rollout_recovery.target_level"),
+        ("task_granularity_overrides", "task_source_target_level_overrides"),
+        ("task_source_granularity_overrides", "task_source_target_level_overrides"),
+        ("agent_granularity_overrides", "agent_target_level_overrides"),
+    ],
+)
+def test_removed_rollout_recovery_granularity_key_is_rejected(removed_key, replacement):
+    value = "prompt_group" if removed_key == "default_granularity" else {}
+    with pytest.raises(
+        ValueError, match=rf"rollout_recovery\.{removed_key} -> \S*{replacement}"
+    ):
+        check_outdated_config({"rollout_recovery": {removed_key: value}})
+
+
+def test_task_name_override_names_the_new_key():
+    with pytest.raises(ValueError, match="keyed by extra_env_info.task_source"):
+        check_outdated_config(
+            {"rollout_recovery": {"task_granularity_overrides": {"legacy": "sibling"}}}
+        )
+
+
+def test_current_rollout_recovery_keys_pass():
+    check_outdated_config(
+        {
+            "rollout_recovery": {
+                "target_level": "prompt_group",
+                "task_source_target_level_overrides": {"genrm": "prompt_group"},
+                "agent_target_level_overrides": {},
+            }
+        }
+    )
+
+
+def test_absent_rollout_recovery_passes():
+    check_outdated_config({"policy": {}})
