@@ -66,6 +66,8 @@ class SpeechLMPolicy(SALMAutomodel):
         cfg["packed_encoder_sequences"] = False
         cfg["packed_encoder_cp"] = False
         cfg["cross_entropy_backend"] = "eager"
+        # pyrefly resolves super() of the Any-typed nemo base to object.
+        # pyrefly: ignore[bad-argument-count, unexpected-keyword]
         super().__init__(cfg, parameter_config=parameter_config)
 
     @classmethod
