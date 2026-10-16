@@ -161,7 +161,6 @@ Useful CSD controls in the `loss_fn` block include:
 | `csd_loss_fn` | Common-event divergence: `kl`, `jsd`, or `bce` |
 | `csd_last_pos_loss_fn` | Last-position mismatch divergence; `null` inherits `csd_loss_fn` |
 | `csd_jsd_beta` | JSD mixture coefficient; `0.5` is symmetric |
-| `csd_position_0_kl` | Include the optional position-zero mismatch term |
 | `csd_realized_only_mismatch` | Score 1-to-many and many-to-1 chunks by their realized token chains against REST instead of prefix-support alternatives |
 | `teacher_topk_ipc_k` | `0` sends dense teacher logits; a positive value sends sparse top-k support with exact normalization |
 | `dynamic_loss_scaling` | Rescale KD using CE magnitude; when `false`, use the explicit `kl_loss_weight` and `ce_loss_scale` coefficients |

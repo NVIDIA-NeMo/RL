@@ -1271,7 +1271,6 @@ def test_reduce_mb_metric_means_per_chunk_diagnostics_and_sums_shares():
     for key in (
         "top1_acc_per_chunk",
         "kl_common_per_chunk",
-        "kl_partition_first_per_chunk",
         "kl_partition_last_per_chunk",
     ):
         assert reduce_mb_metric(key, acc) == pytest.approx(0.8)

@@ -18,7 +18,7 @@ from typing import Annotated, Any, Literal, Mapping, NotRequired, Optional, Type
 
 import numpy as np
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
@@ -120,26 +120,6 @@ def _generalized_jsd(
     return out.to(in_dtype)
 
 
-def _combine_csd_mismatch_terms(
-    last_loss: torch.Tensor,
-    pos0_loss: torch.Tensor,
-    *,
-    pos0_coefficient: float,
-    loss_multiplier: float,
-    convex: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Combine the two non-1-to-1 CSD loss terms.
-
-    New configs use ``beta * (L_last + alpha * L_pos0)``. ``convex=True``
-    retains the historical formula for configs using the legacy lambda key.
-    """
-    if convex:
-        combined = (1.0 - pos0_coefficient) * last_loss + pos0_coefficient * pos0_loss
-    else:
-        combined = last_loss + pos0_coefficient * pos0_loss
-    return combined, combined * loss_multiplier
-
-
 class CSDLossConfig(BaseModel, extra="allow"):
     """CSD loss options and runtime-injected per-teacher metadata.
 
@@ -171,20 +151,13 @@ class CSDLossConfig(BaseModel, extra="allow"):
     kl_chunk_shift: bool = True
     # Build exact common-token pairs from forward tables instead of projections.
     common_indices_from_subtoks: bool = False
-    # Include the common-vocabulary partition at each mismatch chunk's start.
-    csd_position_0_kl: bool = False
     csd_loss_fn: Literal["kl", "jsd", "bce"] = "jsd"
     csd_jsd_beta: Annotated[float, Field(ge=0, le=1)] = 0.5
     # None inherits csd_loss_fn for the last-position partition.
     csd_last_pos_loss_fn: Optional[Literal["kl", "jsd", "bce"]] = None
-    # Additive mismatch weighting: beta * (last_position + alpha * position_0).
-    # None uses a unit coefficient; explicit alpha requires position-0 support.
-    csd_mismatch_pos0_alpha: Annotated[Optional[float], Field(ge=0)] = None
-    csd_mismatch_loss_beta: Annotated[Optional[float], Field(ge=0)] = None
-    # Optional convex weighting: scale * ((1-weight)*last + weight*position_0).
-    # Mutually exclusive with the additive coefficients above.
-    csd_mismatch_pos0_weight: Annotated[Optional[float], Field(ge=0, le=1)] = None
-    csd_mismatch_loss_scale: Annotated[Optional[float], Field(ge=0)] = None
+    # Multiplier on each mismatch (non-1-to-1) chunk loss relative to a
+    # 1-to-1 chunk loss.
+    csd_mismatch_loss_beta: Annotated[float, Field(ge=0)] = 1.0
     # Zero disables filtering; otherwise retain realized labels in teacher top-k.
     csd_noise_filter_topk: Annotated[int, Field(ge=0)] = 0
     # Compare only the realized chain probability and its complementary bucket.
@@ -197,6 +170,24 @@ class CSDLossConfig(BaseModel, extra="allow"):
     teacher_topk_ipc_k: Annotated[int, Field(ge=0)] = 0
     teacher_topk_ipc_support_mode: Literal["row_topk"] = "row_topk"
     teacher_topk_ipc_keep_realized: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_position_0_keys(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            for key in (
+                "csd_position_0_kl",
+                "csd_mismatch_pos0_alpha",
+                "csd_mismatch_pos0_weight",
+                "csd_mismatch_loss_scale",
+            ):
+                if key in value:
+                    raise ValueError(
+                        f"loss_fn.{key} was removed: there is no position-0 "
+                        "term, and mismatch chunks are weighted by "
+                        "csd_mismatch_loss_beta alone."
+                    )
+        return value
 
 
 class CSDLossDataDict(TypedDict):
@@ -235,7 +226,7 @@ class CSDLossFn(LossFunction):
     A cross-tokenizer teacher's KD term is computed by ``_compute_csd_loss``: a common-vocab partition KL/JSD
     on the exact 1-to-1 token map plus, for non-1-to-1 chunks, a batched
     mismatch partition KL over prefix-support alternatives (MtoM-as-ALM + rest
-    bucket) and an optional position-0 partition KL. It is combined with a
+    bucket) weighted by ``csd_mismatch_loss_beta``. It is combined with a
     next-token student CE term as ``kl_loss_weight * kd + ce_loss_scale * ce`` —
     or, when ``dynamic_loss_scaling`` is set, with the KD term rescaled each
     step to match the detached CE magnitude.
@@ -320,12 +311,6 @@ class CSDLossFn(LossFunction):
                 "teacher_weights must not sum to zero in "
                 "kd_loss_mode='averaged_logits' (they form a convex combination "
                 f"of teacher logits); got teacher_weights={list(_weights)}."
-            )
-        if cfg.csd_realized_only_mismatch and cfg.csd_position_0_kl:
-            raise ValueError(
-                "csd_realized_only_mismatch scores mismatch chunks by their "
-                "realized token chains and has no position-0 term; set "
-                "csd_position_0_kl=false."
             )
         if cfg.student_vocab_size is None:
             raise ValueError("CSD requires the runtime student_vocab_size")
@@ -696,7 +681,6 @@ class CSDLossFn(LossFunction):
         for key in (
             "kl_common_per_chunk",
             "kl_partition_last_per_chunk",
-            "kl_partition_first_per_chunk",
             "top1_acc_per_chunk",
             "num_common_chunks",
             "num_mismatch_chunks",
@@ -1399,7 +1383,6 @@ class CSDLossFn(LossFunction):
             "num_valid_pairs",
             "kl_common",
             "kl_common_per_chunk",
-            "kl_partition_first_per_chunk",
             "kl_partition_last_per_chunk",
             "l1_uncommon",
             "num_valid_chunks",
@@ -2498,9 +2481,9 @@ class CSDLossFn(LossFunction):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """CSD KD term for cross-tokenizer teacher ``i``.
 
-        Prefix-bidir partition KL with MtoM-as-ALM + rest bucket and optional
-        position-0 partition KL. ``mtom_as_alm``/``rest_bucket`` are baked in
-        for CSD.
+        Prefix-bidir partition KL with MtoM-as-ALM + rest bucket; mismatch
+        chunks are weighted by ``csd_mismatch_loss_beta``.
+        ``mtom_as_alm``/``rest_bucket`` are baked in for CSD.
 
         Per-teacher contract (mirrors ``_compute_same_vocab_kl``):
         ``student_logits`` is this rank's CP-contiguous window,
@@ -2554,17 +2537,12 @@ class CSDLossFn(LossFunction):
         kl_chunk_shift = bool(cfg.kl_chunk_shift)
         temperature = float(cfg.temperature)
         reverse_kl = bool(cfg.reverse_kl)
-        csd_position_0_kl = bool(cfg.csd_position_0_kl)
         csd_loss_fn = str(cfg.csd_loss_fn or "kl")
         csd_jsd_beta = float(cfg.csd_jsd_beta)
         csd_alm_bce_tau = float(cfg.csd_alm_bce_tau)
         csd_last_pos_loss_fn_cfg = cfg.csd_last_pos_loss_fn
         pure_alm = bool(cfg.csd_pure_alm)
         realized_only_mismatch = bool(cfg.csd_realized_only_mismatch)
-        if pure_alm:
-            # Position-0 is a common-vocab auxiliary partition term. Pure ALM
-            # should only compare realized chain probability vs rest bucket.
-            csd_position_0_kl = False
         # CSD hybrid: None means "inherit csd_loss_fn"; "kl"/"jsd" overrides
         # only the position-N-1 (last-position) partition KL.
         effective_last_pos_loss_fn = (
@@ -2572,73 +2550,7 @@ class CSDLossFn(LossFunction):
             if csd_last_pos_loss_fn_cfg is not None
             else csd_loss_fn
         )
-        mismatch_pos0_alpha_raw = cfg.csd_mismatch_pos0_alpha
-        mismatch_loss_beta_raw = cfg.csd_mismatch_loss_beta
-        mismatch_pos0_weight_raw = cfg.csd_mismatch_pos0_weight
-        mismatch_loss_scale_raw = cfg.csd_mismatch_loss_scale
-        uses_additive_coefficients = (
-            mismatch_pos0_alpha_raw is not None or mismatch_loss_beta_raw is not None
-        )
-        if uses_additive_coefficients and (
-            mismatch_pos0_weight_raw is not None or mismatch_loss_scale_raw is not None
-        ):
-            raise ValueError(
-                "New mismatch alpha/beta keys cannot be combined with the "
-                "deprecated mismatch weight/scale keys."
-            )
-
-        mismatch_pos0_alpha: Optional[float] = None
-        mismatch_loss_beta: Optional[float] = None
-        mismatch_pos0_weight: Optional[float] = None
-        mismatch_loss_scale = 1.0
-        requires_pos0_support = False
-        if uses_additive_coefficients:
-            mismatch_pos0_alpha = float(
-                1.0 if mismatch_pos0_alpha_raw is None else mismatch_pos0_alpha_raw
-            )
-            mismatch_loss_beta = float(
-                1.0 if mismatch_loss_beta_raw is None else mismatch_loss_beta_raw
-            )
-            if mismatch_pos0_alpha < 0.0:
-                raise ValueError(
-                    f"csd_mismatch_pos0_alpha must be >= 0, got {mismatch_pos0_alpha}"
-                )
-            if mismatch_loss_beta < 0.0:
-                raise ValueError(
-                    f"csd_mismatch_loss_beta must be >= 0, got {mismatch_loss_beta}"
-                )
-            requires_pos0_support = mismatch_pos0_alpha > 0.0
-            mismatch_pos0_coefficient = mismatch_pos0_alpha
-            mismatch_loss_multiplier = mismatch_loss_beta
-            mismatch_combination_is_convex = False
-        else:
-            if mismatch_pos0_weight_raw is not None:
-                mismatch_pos0_weight = float(mismatch_pos0_weight_raw)
-                if not 0.0 <= mismatch_pos0_weight <= 1.0:
-                    raise ValueError(
-                        "csd_mismatch_pos0_weight must be in "
-                        f"[0, 1], got {mismatch_pos0_weight}"
-                    )
-                requires_pos0_support = mismatch_pos0_weight > 0.0
-            mismatch_loss_scale = float(
-                1.0 if mismatch_loss_scale_raw is None else mismatch_loss_scale_raw
-            )
-            if mismatch_loss_scale < 0.0:
-                raise ValueError(
-                    f"csd_mismatch_loss_scale must be >= 0, got {mismatch_loss_scale}"
-                )
-            mismatch_pos0_coefficient = (
-                1.0 if mismatch_pos0_weight is None else mismatch_pos0_weight
-            )
-            mismatch_loss_multiplier = mismatch_loss_scale
-            mismatch_combination_is_convex = mismatch_pos0_weight is not None
-        if requires_pos0_support and not csd_position_0_kl:
-            coefficient_name = (
-                "csd_mismatch_pos0_alpha"
-                if uses_additive_coefficients
-                else "csd_mismatch_pos0_weight"
-            )
-            raise ValueError(f"{coefficient_name} > 0 requires csd_position_0_kl=true.")
+        mismatch_loss_beta = float(cfg.csd_mismatch_loss_beta)
         noise_filter_topk = int(cfg.csd_noise_filter_topk or 0)
         if noise_filter_topk < 0:
             raise ValueError(
@@ -2653,7 +2565,6 @@ class CSDLossFn(LossFunction):
         )
         # Multi-token chunks use realized-chain probabilities and a rest bucket.
         mtom_as_alm = True
-        rest_bucket = True
 
         v_t = int(teacher_vocab_size)
         teacher_gt_in_topk: Optional[torch.Tensor] = None
@@ -2708,7 +2619,7 @@ class CSDLossFn(LossFunction):
             has_common_support = common_student_idx_t.numel() > 0
             if not has_common_support:
                 # Every 1-to-1 chunk would silently fall through to the mismatch
-                # path, zeroing KL/common and KL/partition_first and making
+                # path, zeroing KL/common and making
                 # top1_acc_per_chunk meaningless (it is normalized by a common
                 # count of 0). That looks like a converging run, so fail loudly
                 # instead: an empty common vocab means the projection matrix or
@@ -2725,16 +2636,6 @@ class CSDLossFn(LossFunction):
                     f"{self.common_indices_from_subtoks}). Check that this table "
                     f"was built for this student/teacher tokenizer pair."
                 )
-        if requires_pos0_support and not has_common_support:
-            coefficient_name = (
-                "csd_mismatch_pos0_alpha"
-                if uses_additive_coefficients
-                else "csd_mismatch_pos0_weight"
-            )
-            raise ValueError(
-                f"{coefficient_name} > 0 requires non-empty common-vocab support."
-            )
-
         # ----- Single-shot host pull of input_ids ------------------------
         # One .detach().cpu().numpy() per tensor, then per-chunk numpy indexing
         # inside the classify/collect loop. The ids ride on the localized
@@ -3333,7 +3234,6 @@ class CSDLossFn(LossFunction):
         # ----- Mismatch loss ------------------
         skipped_no_support = 0
         support_sizes: list[int] = []
-        csd_pos0_records: list[tuple[int, int, int, int, int, frozenset[int]]] = []
         prefix_index = None
         if mismatch_chunks:
             if pure_alm or realized_only_mismatch:
@@ -3437,17 +3337,6 @@ class CSDLossFn(LossFunction):
                             t_realized_id,
                         )
                     )
-                    if csd_position_0_kl:
-                        csd_pos0_records.append(
-                            (
-                                int(b),
-                                int(s_pred[0]),
-                                int(t_pred[0]),
-                                int(inp_s_np[b, s_labels[0]]),
-                                int(inp_t_np[b, t_labels[0]]),
-                                frozenset(int(x) for x in s_list),
-                            )
-                        )
                 elif M > 1 and N == 1:
                     # Many-to-1
                     s_realized_id = int(inp_s_np[b, s_labels[-1]])
@@ -3500,17 +3389,6 @@ class CSDLossFn(LossFunction):
                             t_realized_id,
                         )
                     )
-                    if csd_position_0_kl:
-                        csd_pos0_records.append(
-                            (
-                                int(b),
-                                int(s_pred[0]),
-                                int(t_pred[0]),
-                                int(inp_s_np[b, s_labels[0]]),
-                                int(inp_t_np[b, t_labels[0]]),
-                                frozenset(int(x) for x in s_list),
-                            )
-                        )
                 else:
                     # Many-to-many chunks use the two realized token chains.
                     assert mtom_as_alm, "CSD requires realized-chain support"
@@ -3537,17 +3415,6 @@ class CSDLossFn(LossFunction):
                             t_realized_id,
                         )
                     )
-                    if csd_position_0_kl:
-                        csd_pos0_records.append(
-                            (
-                                int(b),
-                                int(s_pred[0]),
-                                int(t_pred[0]),
-                                int(inp_s_np[b, s_labels[0]]),
-                                int(inp_t_np[b, t_labels[0]]),
-                                frozenset(int(x) for x in s_list),
-                            )
-                        )
 
             if chunk_records:
                 (
@@ -3555,7 +3422,7 @@ class CSDLossFn(LossFunction):
                     used_b,
                     matches_b,
                     support_sizes_b,
-                    valid_flags_b,
+                    _valid_flags_b,
                 ) = self._partition_kl_mismatch_batched(
                     chunk_records,
                     student_logits,
@@ -3579,270 +3446,10 @@ class CSDLossFn(LossFunction):
                     tp_group=tp_group,
                     cp_group=cp_group,
                 )
-                if csd_position_0_kl:
-                    csd_pos0_records = [
-                        rec
-                        for rec, is_valid in zip(csd_pos0_records, valid_flags_b)
-                        if is_valid
-                    ]
                 if used_b > 0:
                     mismatch_loss = loss_sum_b / float(used_b)
                     mismatch_matches += matches_b
                     support_sizes = support_sizes_b
-
-        # ----- CSD position-0 partition KL -----
-        csd_pos0_loss_term = torch.tensor(
-            0.0,
-            device=device,
-            dtype=accum_dtype,
-        )
-        if (
-            csd_position_0_kl
-            and has_common_support
-            and len(csd_pos0_records) > 0
-            and rest_bucket
-        ):
-            K = len(csd_pos0_records)
-            b_idx_np = np.zeros((K,), dtype=np.int64)
-            s_first_np = np.zeros((K,), dtype=np.int64)
-            t_first_np = np.zeros((K,), dtype=np.int64)
-
-            for k, rec in enumerate(csd_pos0_records):
-                b_i, s_first_pred, t_first_pred, *_ = rec
-                b_idx_np[k] = b_i
-                s_first_np[k] = s_first_pred
-                t_first_np[k] = t_first_pred
-            b_idx_csd = torch.from_numpy(b_idx_np).to(device, non_blocking=True)
-            s_first = torch.from_numpy(s_first_np).to(device, non_blocking=True)
-            t_first = torch.from_numpy(t_first_np).to(device, non_blocking=True)
-
-            NEG_INF = -1.0e30
-
-            def _position_0_partition_sum(
-                s_logp: torch.Tensor,
-                t_logp: torch.Tensor,
-                excluded: torch.Tensor,
-                valid_rows: torch.Tensor,
-            ) -> torch.Tensor:
-                s_logp_with_rest = self._append_rest_bucket_logp(s_logp)
-                t_logp_with_rest = self._append_rest_bucket_logp(t_logp)
-                if csd_loss_fn == "bce":
-                    per_pos = self._binary_power_bce_from_logp(
-                        s_logp_with_rest,
-                        t_logp_with_rest,
-                        tau=csd_alm_bce_tau,
-                    )
-                elif csd_loss_fn == "jsd":
-                    per_pos = _generalized_jsd(
-                        s_logp_with_rest,
-                        t_logp_with_rest,
-                        csd_jsd_beta,
-                    )
-                elif not reverse_kl:
-                    per_pos = torch.nn.functional.kl_div(
-                        s_logp_with_rest,
-                        t_logp_with_rest,
-                        reduction="none",
-                        log_target=True,
-                    )
-                else:
-                    per_pos = torch.nn.functional.kl_div(
-                        t_logp_with_rest,
-                        s_logp_with_rest,
-                        reduction="none",
-                        log_target=True,
-                    )
-
-                keep_mask_support = (~excluded).to(per_pos.dtype)
-                rest_keep = torch.ones(
-                    (s_logp.shape[0], 1),
-                    device=device,
-                    dtype=per_pos.dtype,
-                )
-                full_keep_mask = torch.cat(
-                    [keep_mask_support, rest_keep],
-                    dim=-1,
-                )
-                per_chunk_sum = (per_pos * full_keep_mask).sum(dim=-1)
-                return (
-                    (per_chunk_sum * valid_rows.to(per_chunk_sum.dtype))
-                    .sum()
-                    .to(accum_dtype)
-                )
-
-            if teacher_sparse_payload is None:
-                assert teacher_logits is not None
-                common_t_cpu = common_teacher_idx_t.detach().cpu().tolist()
-                common_s_cpu = common_student_idx_t.detach().cpu().tolist()
-                V_common = len(common_s_cpu)
-                t_to_pair_slot = {int(t): i for i, t in enumerate(common_t_cpu)}
-                s_to_pair_slot = {int(s): i for i, s in enumerate(common_s_cpu)}
-                # Large common-vocabulary supports require bounded row batches.
-                # Bound every intermediate and every TP/CP owner reduction by
-                # a fixed row cap; TP1/CP1 retains its original arithmetic.
-                pos0_mb = 8 if student_tp_size > 1 or student_cp_size > 1 else K
-                pos0_sum = torch.tensor(0.0, device=device, dtype=accum_dtype)
-                for mb_start in range(0, K, pos0_mb):
-                    mb_end = min(mb_start + pos0_mb, K)
-                    mb_records = csd_pos0_records[mb_start:mb_end]
-                    mb_size = mb_end - mb_start
-                    exclude_mask_np = np.zeros((mb_size, V_common), dtype=bool)
-                    valid_row_mb_np = np.zeros((mb_size,), dtype=bool)
-                    for row, rec in enumerate(mb_records):
-                        (
-                            _b_i,
-                            _s_first_pred,
-                            _t_first_pred,
-                            r_s_id,
-                            r_t_id,
-                            slast_set,
-                        ) = rec
-                        n_excluded = 0
-                        slot = s_to_pair_slot.get(int(r_s_id))
-                        if slot is not None and not exclude_mask_np[row, slot]:
-                            exclude_mask_np[row, slot] = True
-                            n_excluded += 1
-                        slot = t_to_pair_slot.get(int(r_t_id))
-                        if slot is not None and not exclude_mask_np[row, slot]:
-                            exclude_mask_np[row, slot] = True
-                            n_excluded += 1
-                        for sid in slast_set:
-                            slot = s_to_pair_slot.get(int(sid))
-                            if slot is not None and not exclude_mask_np[row, slot]:
-                                exclude_mask_np[row, slot] = True
-                                n_excluded += 1
-                        valid_row_mb_np[row] = (V_common - n_excluded) >= 1
-
-                    exclude_mask = torch.from_numpy(exclude_mask_np).to(
-                        device,
-                        non_blocking=True,
-                    )
-                    valid_row_csd = torch.from_numpy(valid_row_mb_np).to(
-                        device,
-                        non_blocking=True,
-                    )
-                    b_mb = b_idx_csd[mb_start:mb_end]
-                    s_first_mb = s_first[mb_start:mb_end]
-                    t_first_mb = t_first[mb_start:mb_end]
-                    s_full_logits = (
-                        self._lookup_tp_cp_sharded_student_logits(
-                            student_logits,
-                            b_mb[:, None],
-                            s_first_mb[:, None],
-                            common_student_idx_t[None, :],
-                            tp_group=tp_group,
-                            cp_group=cp_group,
-                        ).to(accum_dtype)
-                        / temperature
-                    )
-                    s_logp_csd = s_full_logits - student_log_z[
-                        b_mb, s_first_mb
-                    ].unsqueeze(-1)
-                    s_logp_csd = torch.where(
-                        exclude_mask,
-                        torch.full_like(s_logp_csd, NEG_INF),
-                        s_logp_csd,
-                    )
-                    with torch.no_grad():
-                        t_full_logits = (
-                            self._lookup_cp_sharded_teacher_logits(
-                                teacher_logits,
-                                b_mb[:, None],
-                                t_first_mb[:, None],
-                                common_teacher_idx_t[None, :],
-                                cp_group,
-                            ).to(accum_dtype)
-                            / temperature
-                        )
-                        t_logp_csd = t_full_logits - teacher_log_z[
-                            b_mb, t_first_mb
-                        ].unsqueeze(-1)
-                        t_logp_csd = torch.where(
-                            exclude_mask,
-                            torch.full_like(t_logp_csd, NEG_INF),
-                            t_logp_csd,
-                        )
-                    pos0_sum = pos0_sum + _position_0_partition_sum(
-                        s_logp_csd,
-                        t_logp_csd,
-                        exclude_mask,
-                        valid_row_csd,
-                    )
-                denom = max(len(support_sizes), 1)
-                csd_pos0_loss_term = pos0_sum / float(denom)
-            else:
-                teacher_topk_logits, teacher_topk_indices, _, _ = teacher_sparse_payload
-                teacher_to_common_student = self._get_csd_teacher_to_common_student(
-                    device,
-                    i,
-                    v_t,
-                    common_student_idx_t,
-                    common_teacher_idx_t,
-                )
-                topk_ids = teacher_topk_indices[b_idx_csd, t_first]
-                topk_vals = teacher_topk_logits[b_idx_csd, t_first]
-                mapped_student = teacher_to_common_student[topk_ids.long()]
-                support_mask = mapped_student >= 0
-
-                for k, rec in enumerate(csd_pos0_records):
-                    (
-                        _b_i,
-                        _s_first_pred,
-                        _t_first_pred,
-                        r_s_id,
-                        r_t_id,
-                        slast_set,
-                    ) = rec
-                    exclude_s_ids = [int(r_s_id), *(int(x) for x in slast_set)]
-                    if exclude_s_ids:
-                        exclude_s_t = torch.tensor(
-                            exclude_s_ids,
-                            device=device,
-                            dtype=torch.long,
-                        )
-                        support_mask[k] = support_mask[k] & ~torch.isin(
-                            mapped_student[k],
-                            exclude_s_t,
-                        )
-                    support_mask[k] = support_mask[k] & (topk_ids[k] != int(r_t_id))
-
-                valid_row_csd = support_mask.any(dim=-1)
-                exclude_mask = ~support_mask
-                safe_student_ids = mapped_student.clamp_min(0)
-                s_full_logits = (
-                    self._lookup_tp_cp_sharded_student_logits(
-                        student_logits,
-                        b_idx_csd[:, None],
-                        s_first[:, None],
-                        safe_student_ids,
-                        tp_group=tp_group,
-                        cp_group=cp_group,
-                    ).to(accum_dtype)
-                    / temperature
-                )
-                s_logp_csd = s_full_logits - student_log_z[
-                    b_idx_csd, s_first
-                ].unsqueeze(-1)
-                t_logp_csd = topk_vals.to(accum_dtype) / temperature - teacher_log_z[
-                    b_idx_csd, t_first
-                ].unsqueeze(-1)
-                s_logp_csd = torch.where(
-                    support_mask,
-                    s_logp_csd,
-                    torch.full_like(s_logp_csd, NEG_INF),
-                )
-                t_logp_csd = torch.where(
-                    support_mask,
-                    t_logp_csd,
-                    torch.full_like(t_logp_csd, NEG_INF),
-                )
-                denom = max(len(support_sizes), 1)
-                csd_pos0_loss_term = _position_0_partition_sum(
-                    s_logp_csd,
-                    t_logp_csd,
-                    exclude_mask,
-                    valid_row_csd,
-                ) / float(denom)
 
         # ----- Combine + T^2 scale -----------
         effective_mismatch_count = len(support_sizes)
@@ -3883,13 +3490,7 @@ class CSDLossFn(LossFunction):
                 if tp_world > 1:
                     global_valid_chunks = global_valid_chunks / float(tp_world)
         mismatch_last_loss = mismatch_loss
-        mismatch_combined_loss, mismatch_loss = _combine_csd_mismatch_terms(
-            mismatch_last_loss,
-            csd_pos0_loss_term,
-            pos0_coefficient=mismatch_pos0_coefficient,
-            loss_multiplier=mismatch_loss_multiplier,
-            convex=mismatch_combination_is_convex,
-        )
+        mismatch_loss = mismatch_last_loss * mismatch_loss_beta
         # The mismatch objective retains its full coefficient after aggregation.
         if effective_count > 0:
             # Sum of all chunk-level KLs for this microbatch. common_loss /
@@ -3940,7 +3541,6 @@ class CSDLossFn(LossFunction):
             "train:loss": final_loss.item(),
             "kl_common_per_chunk": common_loss.item(),
             "kl_partition_last_per_chunk": mismatch_last_loss.item(),
-            "kl_mismatch_combined_per_chunk": mismatch_combined_loss.item(),
             "kl_mismatch_scaled_per_chunk": mismatch_loss.item(),
             "num_common_chunks": len(common_chunks),
             "num_mismatch_chunks": effective_mismatch_count,
@@ -3949,17 +3549,7 @@ class CSDLossFn(LossFunction):
             "top1_acc_per_chunk": float(top1_accuracy),
             "num_valid_samples": sample_mask.sum().item(),
         }
-        if uses_additive_coefficients:
-            assert mismatch_pos0_alpha is not None
-            assert mismatch_loss_beta is not None
-            metrics["csd_mismatch_pos0_alpha"] = mismatch_pos0_alpha
-            metrics["csd_mismatch_loss_beta"] = mismatch_loss_beta
-        else:
-            metrics["csd_mismatch_loss_scale"] = mismatch_loss_scale
-        if not uses_additive_coefficients and mismatch_pos0_weight is not None:
-            metrics["csd_mismatch_pos0_weight"] = mismatch_pos0_weight
+        metrics["csd_mismatch_loss_beta"] = mismatch_loss_beta
         if noise_filter_topk > 0:
             metrics["csd_noise_filter_topk"] = noise_filter_topk
-        if csd_position_0_kl:
-            metrics["kl_partition_first_per_chunk"] = csd_pos0_loss_term.item()
         return final_loss, metrics
