@@ -305,7 +305,7 @@ def test_every_engine_rpc_the_driver_sends_binds_to_the_extension(monkeypatch) -
         monkeypatch.setattr(task, "remote", task._function)
     monkeypatch.setattr(refit.ray, "get", lambda refs: refs)
     channel = refit.DynamoRefitChannel(
-        [{"instance_id": "a", "system_url": "http://w:4000"}],
+        [{"instance_id": "a", "system_url": "http://w:4000", "role": "aggregated"}],
         engine_world_size=1,
         control_timeout_s=10,
     )

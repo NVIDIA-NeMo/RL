@@ -3362,7 +3362,10 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
     assert master_config.policy["generation"]["vllm_kwargs"]["hf_overrides"] == {}
 
 
-def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> None:
+@pytest.mark.parametrize("disaggregation", [False, True])
+def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(
+    monkeypatch, disaggregation
+) -> None:
     from nemo_rl.algorithms import grpo as grpo_mod
 
     repo_root = Path(__file__).resolve().parents[3]
@@ -3385,6 +3388,8 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         "gpus_per_node": 4,
         "num_nodes": 1,
     }
+    # The shared disaggregation block is accepted for Dynamo, not just TRT-LLM.
+    generation["disaggregation"]["enabled"] = disaggregation
     config["env"]["should_use_nemo_gym"] = True
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
@@ -3487,7 +3492,9 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     assert result[2] is nemo_gym_shard_set
     dynamo_config = dynamo_init.call_args.kwargs["config"]
     assert dynamo_init.call_args.kwargs["cluster"] is inference_cluster
-    assert DynamoConfig.model_validate(dynamo_config).engine_world_size == 4
+    validated = DynamoConfig.model_validate(dynamo_config)
+    assert validated.engine_world_size == 4
+    assert validated.disaggregation.enabled is disaggregation
     synchronizer.init_communicator.assert_called_once_with()
     # The trainers abort at the engines' deadline instead of hanging in NCCL.
     deadline_s = master_config.policy["generation"]["dynamo_cfg"]["control_timeout_s"]

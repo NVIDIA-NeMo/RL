@@ -518,7 +518,7 @@ def _build_clusters(
             elif backend == "dynamo":
                 gpus_per_instance = DynamoConfig.model_validate(
                     generation_config_dict
-                ).engine_world_size
+                ).replica_width
             elif backend == "sglang":
                 gpus_per_instance = generation_config_dict["sglang_cfg"].get(
                     "gpus_per_server", 1

@@ -40,6 +40,9 @@ from nemo_rl.models.generation.dynamo.worker_pool import (
 class _Cluster:
     num_gpus_per_node = 4
 
+    def world_size(self) -> int:
+        return 4
+
 
 def test_dynamo_package_directory_does_not_shadow_stdlib_http() -> None:
     package_dir = (
@@ -442,10 +445,15 @@ def test_worker_argument_validation_has_startup_timeout(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("precision", "fp32_lm_head"), [("bfloat16", True), ("fp8", False)]
+    ("precision", "role", "fp32_lm_head"),
+    [
+        ("bfloat16", "aggregated", True),
+        ("fp8", "aggregated", False),
+        ("bfloat16", "prefill", False),
+    ],
 )
 def test_worker_registers_process_group_immediately_after_launch(
-    monkeypatch, precision, fp32_lm_head
+    monkeypatch, precision, role, fp32_lm_head
 ) -> None:
     class FakeSocket:
         def __enter__(self):
@@ -513,6 +521,9 @@ def test_worker_registers_process_group_immediately_after_launch(
         cuda_devices=[0],
         system_port=4000,
         vllm_port=7000,
+        worker_role=role,
+        nixl_port=None if role == "aggregated" else 4100,
+        kv_event_port=4200 if role == "prefill" else None,
         manager_env={},
         startup_timeout_s=5,
         seed=0,
@@ -529,6 +540,14 @@ def test_worker_registers_process_group_immediately_after_launch(
     else:
         assert "--quantization" not in command
         assert "NRL_VLLM_FP8_CONFIG" not in env
+    if role == "prefill":
+        assert command[command.index("--disaggregation-mode") + 1] == "prefill"
+        assert "tcp://*:4200" in command[command.index("--kv-events-config") + 1]
+        assert env["VLLM_NIXL_SIDE_CHANNEL_HOST"] == "10.0.0.1"
+        assert env["VLLM_NIXL_SIDE_CHANNEL_PORT"] == "4100"
+    else:
+        assert "--disaggregation-mode" not in command
+        assert "VLLM_NIXL_SIDE_CHANNEL_PORT" not in env
     # The Nemotron-H fp32 LM head: source patch in this venv, enabled per engine.
     assert fp32_patch.called is fp32_lm_head
     assert env["NRL_VLLM_FP32_LM_HEAD"] == ("1" if fp32_lm_head else "0")
@@ -649,6 +668,8 @@ def test_fixed_pool_tracks_worker_before_metadata_failure(monkeypatch) -> None:
         config=_config(),
         namespace="nemo-rl-test",
         engine_world_size=1,
+        worker_roles=["aggregated"],
+        prefill_kv_events=False,
         manager_env={},
         startup_timeout_s=5,
     )
@@ -735,14 +756,21 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
         def get_placement_groups():
             return [SimpleNamespace(bundle_count=2)]
 
-    pool = FixedDynamoWorkerPool(
-        cluster=Cluster(),
-        config=_config(),
-        namespace="nemo-rl-test",
-        engine_world_size=1,
-        manager_env={},
-        startup_timeout_s=5,
-    )
+    def make_pool(worker_roles):
+        return FixedDynamoWorkerPool(
+            cluster=Cluster(),
+            config=_config(),
+            namespace="nemo-rl-test",
+            engine_world_size=1,
+            worker_roles=worker_roles,
+            prefill_kv_events=True,
+            manager_env={},
+            startup_timeout_s=5,
+        )
+
+    with pytest.raises(ValueError, match="2 engine groups but 1 worker roles"):
+        make_pool(["prefill"]).start()
+    pool = make_pool(["prefill", "decode"])
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.worker_pool.DynamoGpuReservation",
         ReservationFactory,
@@ -780,6 +808,14 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
     ]
     assert [kwargs["system_port"] for kwargs in launch_kwargs] == [4001, 4002]
     assert [kwargs["vllm_port"] for kwargs in launch_kwargs] == [7000, 7100]
+    assert [kwargs["group_name"] for kwargs in launch_kwargs] == [
+        "nemo-rl-test-dynamo-vllm-prefill-0",
+        "nemo-rl-test-dynamo-vllm-decode-0",
+    ]
+    assert [kwargs["worker_role"] for kwargs in launch_kwargs] == ["prefill", "decode"]
+    # Node-local bands: every P/D engine gets a NIXL port, prefill a KV-event port.
+    assert [kwargs["nixl_port"] for kwargs in launch_kwargs] == [4100, 4101]
+    assert [kwargs["kv_event_port"] for kwargs in launch_kwargs] == [4200, None]
     assert [kwargs["cleanup_reservation"] for kwargs in launch_kwargs] == (
         reservation_objects
     )
@@ -864,22 +900,28 @@ def test_frontend_waits_for_model_after_endpoint_registration(monkeypatch) -> No
     runtime._frontend_process = _FakeProcess()
     runtime._namespace = "nemo-rl-test"
     runtime._pool = SimpleNamespace(is_alive=lambda: True)
-    health = {
-        "instances": [
-            {
-                "namespace": "nemo-rl-test",
-                "component": "backend",
-                "endpoint": endpoint,
-                "instance_id": "worker-0",
-            }
-            for endpoint in ("generate", "rl")
-        ]
-    }
+
+    def health(*components):
+        return {
+            "instances": [
+                {
+                    "namespace": "nemo-rl-test",
+                    "component": component,
+                    "endpoint": endpoint,
+                    "instance_id": f"{component}-0",
+                }
+                for component in components
+                for endpoint in ("generate", "rl")
+            ]
+        }
+
+    # Decode registers first; the frontend serves nothing until prefill does too.
     responses = iter(
         [
-            health,
+            health("backend"),
+            health("backend", "prefill"),
             {"data": []},
-            health,
+            health("backend", "prefill"),
             {"data": [{"id": "model"}]},
         ]
     )
@@ -896,8 +938,9 @@ def test_frontend_waits_for_model_after_endpoint_registration(monkeypatch) -> No
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.managed_runtime.time.sleep", lambda _: None
     )
-    runtime._wait_for_frontend(expected_workers=1)
+    runtime._wait_for_frontend({"backend": 1, "prefill": 1})
     assert urls == [
+        "http://127.0.0.1:3000/health",
         "http://127.0.0.1:3000/health",
         "http://127.0.0.1:3000/v1/models",
         "http://127.0.0.1:3000/health",
@@ -912,7 +955,7 @@ def test_frontend_wait_fails_immediately_when_worker_exits(monkeypatch) -> None:
     runtime._pool = SimpleNamespace(is_alive=lambda: False)
 
     with pytest.raises(RuntimeError, match="worker exited while the frontend"):
-        runtime._wait_for_frontend(expected_workers=1)
+        runtime._wait_for_frontend({"backend": 1})
 
 
 def test_frontend_logs_resolved_tokenizer_environment(monkeypatch, capsys) -> None:
