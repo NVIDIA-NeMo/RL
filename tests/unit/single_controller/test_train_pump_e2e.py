@@ -372,9 +372,12 @@ def test_train_pump_drives_mcore_training_step(
 
         actor_args = SingleControllerActorArgs(
             # Continuous-serving stub: the pump asks blocks_training() before
-            # every step's trainer GPU work.
+            # every step's trainer GPU work, and _sync_weights drains and
+            # resumes it around every refit.
             gen_handle=SimpleNamespace(
                 blocks_training=lambda: False,
+                drain_for_weight_update=lambda: None,
+                resume_after_weight_update=lambda: None,
                 snapshot_step_metrics=lambda: None,
                 get_step_metrics=lambda: {},
             ),  # type: ignore[arg-type]
