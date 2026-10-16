@@ -674,6 +674,15 @@ def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> N
     telemetry = get_telemetry_handle()
     if telemetry is None or not telemetry.is_exporting:
         return
+
+    # Before the registry check: the span needs only the tracer, so a lens
+    # without the metric registry, or a failed registration, must not cost it.
+    if checkpoint_operation == _CHECKPOINT_SAVE:
+        try:
+            _emit_checkpoint_save_span(telemetry.tracer, metrics)
+        except Exception:
+            warn_once("checkpoint_span", "failed to emit rollout save span")
+
     if not ensure_metric_group_registered():
         return
 
@@ -684,11 +693,6 @@ def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> N
             )
         except Exception:
             warn_once("checkpoint", "failed to tee rollout checkpoint metrics")
-        if checkpoint_operation == _CHECKPOINT_SAVE:
-            try:
-                _emit_checkpoint_save_span(telemetry.tracer, metrics)
-            except Exception:
-                warn_once("checkpoint_span", "failed to emit rollout save span")
         return
 
     if is_setup:

@@ -300,6 +300,30 @@ def test_checkpoint_save_span_follows_the_checkpoint_group():
     assert _finished_spans(exporter, handle) == ()
 
 
+def test_checkpoint_save_span_survives_a_failed_metric_registration(monkeypatch):
+    import nemo_rl.telemetry.metrics as metrics_mod
+
+    reader, exporter, handle = _start_exporting_telemetry_with_spans()
+    monkeypatch.setattr(metrics_mod, "ensure_metric_group_registered", lambda: False)
+    _tee_completed_save()
+    assert _gauge_points(reader.get_metrics_data(), "rl.checkpoint.duration") == []
+    (span,) = _finished_spans(exporter, handle)
+    assert span.name == metrics_mod.RL_CHECKPOINT_SAVE_SPAN
+
+
+def test_checkpoint_save_span_parents_to_the_current_span():
+    # In the controller the snapshot pump task is created inside rl.sc.job, so
+    # the save span joins the run's trace rather than starting its own.
+    _, exporter, handle = _start_exporting_telemetry_with_spans()
+    with handle.tracer.start_as_current_span("rl.sc.job") as parent:
+        _tee_completed_save()
+    spans = {span.name: span for span in _finished_spans(exporter, handle)}
+    save = spans["rl.sc.rollout_checkpoint.save"]
+    assert save.context.trace_id == parent.get_span_context().trace_id
+    assert save.parent is not None
+    assert save.parent.span_id == parent.get_span_context().span_id
+
+
 def test_checkpoint_restore_emits_no_span():
     from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
 
