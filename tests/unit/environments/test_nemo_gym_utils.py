@@ -452,6 +452,7 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
             _env_configs(num_gpu_nodes=num_gpu_nodes),
             base_urls=["http://vllm-0"],
             model_name="test-model",
+            generation_backend="vllm",
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=True,
@@ -516,6 +517,7 @@ def test_spinup_nemo_gym_actor_cleans_up_after_startup_failure(
                 _env_configs(num_gpu_nodes=0),
                 base_urls=["http://vllm-0"],
                 model_name="test-model",
+                generation_backend="vllm",
                 tokenizer=MagicMock(),
                 enable_router_replay=False,
                 use_fastokens=False,
@@ -561,6 +563,7 @@ def test_spinup_nemo_gym_actor_preserves_startup_error_when_cleanup_fails(
                 _env_configs(num_gpu_nodes=0),
                 base_urls=["http://vllm-0"],
                 model_name="test-model",
+                generation_backend="vllm",
                 tokenizer=MagicMock(),
                 enable_router_replay=False,
                 use_fastokens=False,
@@ -931,6 +934,66 @@ def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
 
     assert cluster.actor_configs
     assert all(cfg["policy_api_key"] == "per-job-key" for cfg in cluster.actor_configs)
+
+
+@pytest.mark.parametrize(
+    "generation_backend", [None, "vllm", "dynamo", "megatron", "sglang", "trtllm"]
+)
+@pytest.mark.parametrize("sharded", [False, True])
+def test_gym_factory_normalizes_sglang_urls_for_every_actor(
+    detected_uv_dirs, generation_backend, sharded
+):
+    cluster = _FakeGymCluster()
+    readiness = {
+        "services": [
+            {
+                "name": "judge",
+                "url": "http://judge/health",
+                "expected_backends": 1,
+            }
+        ],
+        "timeout_seconds": 10,
+        "poll_interval_seconds": 1,
+        "request_timeout_seconds": 2,
+    }
+    env_configs = (_shard_env_configs if sharded else _env_configs)(
+        external_service_readiness=readiness
+    )
+    original_config = copy.deepcopy(env_configs)
+    base_urls = ["http://engine-0/", "http://engine-1/v1/", "http://engine-2/v1"]
+    original_urls = list(base_urls)
+    backend_args = (
+        {} if generation_backend is None else {"generation_backend": generation_backend}
+    )
+
+    with _patched_cluster(cluster):
+        shard_set = build_nemo_gym_actors(
+            env_configs,
+            base_urls=base_urls,
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            policy_api_key="per-job-key",
+            **backend_args,
+        )
+
+    expected_urls = (
+        ["http://engine-0/v1", "http://engine-1/v1", "http://engine-2/v1"]
+        if generation_backend == "sglang"
+        else original_urls
+    )
+    assert len(shard_set.all_handles) == (3 if sharded else 1)
+    assert [config["base_urls"] for config in cluster.actor_configs] == [
+        expected_urls
+    ] * len(shard_set.all_handles)
+    for config in cluster.actor_configs:
+        assert config["policy_api_key"] == "per-job-key"
+        assert config["external_service_readiness"].model_dump() == readiness
+        assert "policy_api_key" not in config["initial_global_config_dict"]
+        assert "external_service_readiness" not in config["initial_global_config_dict"]
+    assert base_urls == original_urls
+    assert env_configs == original_config
 
 
 def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(
