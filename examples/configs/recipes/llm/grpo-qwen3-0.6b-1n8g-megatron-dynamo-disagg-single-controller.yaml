@@ -1,0 +1,20 @@
+defaults: ../../grpo_math_1B_dynamo_single_controller.yaml
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  tokenizer:
+    name: Qwen/Qwen3-0.6B
+  generation:
+    refit_transport: nccl_reshard
+    disaggregation:
+      enabled: true
+    colocated:
+      resources:
+        gpus_per_node: 4
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-0.6b-1n8g-megatron-dynamo-disagg-single-controller
+logger:
+  log_dir: logs/grpo-qwen3-0.6b-1n8g-megatron-dynamo-disagg-single-controller
+  wandb:
+    name: grpo-qwen3-0.6b-1n8g-megatron-dynamo-disagg-single-controller
+cluster:
+  gpus_per_node: 8

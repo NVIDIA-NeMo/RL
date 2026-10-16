@@ -28,6 +28,7 @@ from typing import Any
 import ray
 
 from nemo_rl.distributed.refit_watchdog import REFIT_ABORTED_TOKEN, RefitAborted
+from nemo_rl.models.generation.dynamo.config import DynamoWorkerRole
 from nemo_rl.models.generation.dynamo.http_client import (
     format_dynamo_error,
     http_post_json,
@@ -53,12 +54,14 @@ class DynamoWorkerEndpoint:
 
     instance_id: str
     system_url: str
+    role: DynamoWorkerRole
 
     @classmethod
     def from_metadata(cls, metadata: dict[str, Any]) -> "DynamoWorkerEndpoint":
         return cls(
             instance_id=str(metadata["instance_id"]),
             system_url=str(metadata["system_url"]),
+            role=metadata["role"],
         )
 
 
@@ -388,7 +391,21 @@ class DynamoRefitChannel:
         """Receive one nccl_reshard refit on every engine."""
         return self._refit_every_engine("nrl_nccl_reshard_refit", refit_timeout_s, {})
 
-    def _pause_workers(self) -> tuple[list[DynamoWorkerEndpoint], list[str]]:
+    def _drain_phases(self) -> tuple[tuple[DynamoWorkerEndpoint, ...], ...]:
+        """Workers in pause order: prefill engines, then everything else.
+
+        A prefill engine's drain ends only once decode engines have pulled every
+        prompt KV it handed off, so decode must still be running then. Pausing
+        decode first would strand such a handoff until the prefill engine's KV
+        lease expires, and after resume decode would read the freed blocks.
+        """
+        prefill = tuple(worker for worker in self._workers if worker.role == "prefill")
+        rest = tuple(worker for worker in self._workers if worker.role != "prefill")
+        return tuple(phase for phase in (prefill, rest) if phase)
+
+    def _pause_workers(
+        self, workers: Sequence[DynamoWorkerEndpoint]
+    ) -> tuple[list[DynamoWorkerEndpoint], list[str]]:
         """Drain in-flight requests and clear caches; new requests wait for resume."""
         pause_futures = [
             _post_worker_route.remote(
@@ -397,11 +414,11 @@ class DynamoRefitChannel:
                 payload={"mode": "wait", "clear_cache": True},
                 timeout_s=self._control_timeout_s,
             )
-            for worker in self._workers
+            for worker in workers
         ]
         paused_workers: list[DynamoWorkerEndpoint] = []
         pause_errors: list[str] = []
-        for worker, future in zip(self._workers, pause_futures, strict=True):
+        for worker, future in zip(workers, pause_futures, strict=True):
             try:
                 ray.get(future)
             except Exception as error:
@@ -409,6 +426,16 @@ class DynamoRefitChannel:
             else:
                 paused_workers.append(worker)
         return paused_workers, pause_errors
+
+    def _pause_in_order(self) -> tuple[list[DynamoWorkerEndpoint], list[str]]:
+        """Pause phase by phase, stopping at the first phase that fails."""
+        paused_workers: list[DynamoWorkerEndpoint] = []
+        for phase in self._drain_phases():
+            phase_paused, pause_errors = self._pause_workers(phase)
+            paused_workers.extend(phase_paused)
+            if pause_errors:
+                return paused_workers, pause_errors
+        return paused_workers, []
 
     def _resume_workers(self, workers: Sequence[DynamoWorkerEndpoint]) -> list[str]:
         resume_futures = [
@@ -431,14 +458,23 @@ class DynamoRefitChannel:
                 resume_errors.append(f"{worker.system_url}: {error}")
         return resume_errors
 
+    def _resume_in_order(self, workers: Sequence[DynamoWorkerEndpoint]) -> list[str]:
+        """Resume in reverse pause order, so no handoff waits on a paused decode."""
+        resume_errors: list[str] = []
+        for phase in reversed(self._drain_phases()):
+            resume_errors += self._resume_workers(
+                [worker for worker in phase if worker in workers]
+            )
+        return resume_errors
+
     def pause(self) -> None:
         """Drain and pause every worker ahead of a weight update.
 
         Workers that confirmed the pause are resumed if any peer fails.
         """
-        paused_workers, pause_errors = self._pause_workers()
+        paused_workers, pause_errors = self._pause_in_order()
         if pause_errors:
-            resume_errors = self._resume_workers(paused_workers)
+            resume_errors = self._resume_in_order(paused_workers)
             details = "pause/clear failed for " + "; ".join(pause_errors)
             if resume_errors:
                 details += "; resume failed for " + "; ".join(resume_errors)
@@ -446,7 +482,7 @@ class DynamoRefitChannel:
 
     def resume(self) -> None:
         """Resume every worker after a weight update."""
-        resume_errors = self._resume_workers(self._workers)
+        resume_errors = self._resume_in_order(self._workers)
         if resume_errors:
             raise RuntimeError(
                 "Dynamo resume after weight update failed for "
@@ -455,8 +491,8 @@ class DynamoRefitChannel:
 
     def flush_cache(self) -> bool:
         """Drain, clear, and resume every worker using immutable endpoints."""
-        paused_workers, pause_errors = self._pause_workers()
-        resume_errors = self._resume_workers(paused_workers)
+        paused_workers, pause_errors = self._pause_in_order()
+        resume_errors = self._resume_in_order(paused_workers)
 
         if pause_errors or resume_errors:
             details = []

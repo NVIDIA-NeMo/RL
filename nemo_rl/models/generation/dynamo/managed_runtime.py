@@ -27,6 +27,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from typing import Any
 
 from nemo_rl.distributed.virtual_cluster import (
@@ -81,6 +82,15 @@ class ManagedDynamoRuntime:
                 f"node: tp*pp={self._engine_world_size} exceeds "
                 f"cluster.num_gpus_per_node={cluster.num_gpus_per_node}"
             )
+        self._worker_roles = validated_config.worker_roles(cluster.world_size())
+        # Dynamo component names: aggregated and decode workers register as
+        # "backend", prefill workers as "prefill".
+        self._expected_components = dict(
+            Counter(
+                "prefill" if role == "prefill" else "backend"
+                for role in self._worker_roles
+            )
+        )
         self._namespace = _managed_namespace()
         self._host = ""
         self._etcd_port = 0
@@ -172,12 +182,15 @@ class ManagedDynamoRuntime:
                 config=self._config,
                 namespace=self._namespace,
                 engine_world_size=self._engine_world_size,
+                worker_roles=self._worker_roles,
+                # Only the prefill hop is KV-routed under disaggregation.
+                prefill_kv_events=self._dynamo_cfg.frontend_args.router_mode == "kv",
                 manager_env=self._manager_env,
                 startup_timeout_s=self._dynamo_cfg.startup_timeout_s,
             )
             self._pool.start()
             self._start_frontend()
-            self._wait_for_frontend(self._pool.size)
+            self._wait_for_frontend(self._expected_components)
             self._started = True
         except Exception:
             self.shutdown()
@@ -327,12 +340,19 @@ class ManagedDynamoRuntime:
             command, env=frontend_env, start_new_session=True
         )
 
-    def _wait_for_frontend(self, expected_workers: int) -> None:
+    def _wait_for_frontend(self, expected_components: dict[str, int]) -> None:
+        """Wait until every component's workers serve generate and rl.
+
+        The frontend answers 503 until both prefill and decode are live, and
+        never falls back to aggregated serving, so all of them must register.
+        """
         health_url = f"http://127.0.0.1:{self._frontend_port}/health"
         models_url = f"http://127.0.0.1:{self._frontend_port}/v1/models"
         expected_model = str(self._config["model_name"])
         deadline = time.monotonic() + self._dynamo_cfg.startup_timeout_s
-        last_counts = (0, 0)
+        last_counts: dict[str, tuple[int, int]] = {
+            component: (0, 0) for component in expected_components
+        }
         last_models: set[str] = set()
         while time.monotonic() < deadline:
             if self._pool is None or not self._pool.is_alive():
@@ -353,26 +373,34 @@ class ManagedDynamoRuntime:
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
                 time.sleep(1)
                 continue
-            generate_ids: set[str] = set()
-            rl_ids: set[str] = set()
+            # component -> endpoint ("generate" or "rl") -> instance ids
+            observed: dict[str, dict[str, set[str]]] = {
+                component: {"generate": set(), "rl": set()}
+                for component in expected_components
+            }
             for instance in payload.get("instances", []):
                 if not isinstance(instance, dict):
                     continue
                 if instance.get("namespace") != self._namespace:
                     continue
-                if instance.get("component") != "backend":
-                    continue
+                component = instance.get("component")
+                endpoint = instance.get("endpoint")
                 instance_id = instance.get("instance_id")
-                if instance_id is None:
-                    continue
-                if instance.get("endpoint") == "generate":
-                    generate_ids.add(str(instance_id))
-                elif instance.get("endpoint") == "rl":
-                    rl_ids.add(str(instance_id))
-            last_counts = (len(generate_ids), len(rl_ids))
-            if (
-                last_counts == (expected_workers, expected_workers)
-                and generate_ids == rl_ids
+                if (
+                    isinstance(component, str)
+                    and component in observed
+                    and endpoint in ("generate", "rl")
+                    and instance_id is not None
+                ):
+                    observed[component][str(endpoint)].add(str(instance_id))
+            last_counts = {
+                component: (len(ids["generate"]), len(ids["rl"]))
+                for component, ids in observed.items()
+            }
+            if all(
+                last_counts[component] == (count, count)
+                and observed[component]["generate"] == observed[component]["rl"]
+                for component, count in expected_components.items()
             ):
                 # /health reflects discovery registrations before the frontend's
                 # model watcher has necessarily installed its OpenAI routes. Do
@@ -398,16 +426,16 @@ class ManagedDynamoRuntime:
                     time.sleep(1)
                     continue
                 print(
-                    f"  [Dynamo] frontend ready with {expected_workers} generation "
-                    "and RL workers",
+                    "  [Dynamo] frontend ready with generation and RL workers "
+                    f"{expected_components}",
                     flush=True,
                 )
                 return
             time.sleep(1)
         raise RuntimeError(
             "Dynamo frontend did not observe the fixed worker fleet within "
-            f"{self._dynamo_cfg.startup_timeout_s}s: expected={expected_workers}, "
-            f"last_generate={last_counts[0]}, last_rl={last_counts[1]}, "
+            f"{self._dynamo_cfg.startup_timeout_s}s: expected={expected_components}, "
+            f"last (generate, rl) counts={last_counts}, "
             f"expected_model={expected_model!r}, last_models={sorted(last_models)!r}."
         )
 
