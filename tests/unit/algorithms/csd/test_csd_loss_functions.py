@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from nemo_rl.algorithms.loss import prepare_loss_input
 from nemo_rl.algorithms.loss.csd import CSDLossFn
@@ -22,6 +26,10 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     same_tokenizer_topk_kl,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import (
+    _get_tokens_on_this_cp_rank,
+    cp_load_balanced_to_contiguous,
+)
 
 _CT_V_STUDENT = 6
 _CT_V_TEACHER = 5
@@ -648,3 +656,142 @@ def test_csd_runtime_table_lists_must_match_teachers(tmp_path):
     cfg["student_to_teacher_table_paths"] = [None, None]
     with pytest.raises(ValueError, match="one entry per teacher"):
         CSDLossFn(cfg)
+
+
+def _same_vocab_megatron_case():
+    torch.manual_seed(5)
+    cfg = _ct_loss_cfg(None)
+    cfg.update(
+        projection_matrix_paths=[None],
+        teacher_vocab_sizes=[_CT_V_STUDENT],
+        vocab_topk=4,
+        dynamic_loss_scaling=True,
+    )
+    input_ids = torch.randint(0, _CT_V_STUDENT, (2, 8))
+    token_mask = torch.ones((2, 8), dtype=torch.long)
+    token_mask[1, 6:] = 0
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([8, 6]),
+            "token_mask": token_mask,
+            "kd_token_mask": token_mask,
+            "sample_mask": torch.tensor([1, 1]),
+        }
+    )
+    valid_toks = (token_mask[:, 1:]).sum().float()
+    return (
+        cfg,
+        data,
+        valid_toks,
+        torch.randn(2, 8, _CT_V_STUDENT),
+        torch.randn(2, 8, _CT_V_STUDENT),
+    )
+
+
+def _replicated_same_vocab_loss(
+    loss_fn, data, valid_toks, student, teacher, *, cp_group, tp_group, window
+):
+    contiguous = cp_load_balanced_to_contiguous(student, cp_group=cp_group)
+    align = LocalizedAlignment(
+        sample_mask=data["sample_mask"],
+        student_input_ids=data["input_ids"][:, window],
+        student_token_mask=data["token_mask"][:, window],
+        student_kd_token_mask=data["kd_token_mask"][:, window],
+    )
+    return loss_fn(
+        data,
+        data["sample_mask"].sum(),
+        valid_toks,
+        student,
+        contiguous,
+        {0: teacher[:, window]},
+        {0: align},
+        global_valid_kd_toks=valid_toks,
+        tp_group=tp_group,
+        cp_group=cp_group,
+        cp_normalized_by_caller=True,
+    )
+
+
+def _run_same_vocab_megatron_cp(rank: int, world_size: int, init_file: str) -> None:
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        cp_group = dist.new_group(ranks=list(range(world_size)))
+        tp_groups = [dist.new_group(ranks=[r]) for r in range(world_size)]
+        cfg, data, valid_toks, student_full, teacher = _same_vocab_megatron_case()
+        loss_fn = CSDLossFn(cfg)
+
+        reference = student_full.clone().requires_grad_(True)
+        ref_loss, ref_metrics = loss_fn(
+            data,
+            data["sample_mask"].sum(),
+            valid_toks,
+            reference,
+            reference,
+            {0: teacher},
+            {
+                0: LocalizedAlignment(
+                    sample_mask=data["sample_mask"],
+                    student_input_ids=data["input_ids"],
+                    student_token_mask=data["token_mask"],
+                    student_kd_token_mask=data["kd_token_mask"],
+                )
+            },
+            global_valid_kd_toks=valid_toks,
+        )
+        ref_loss.backward()
+
+        positions = _get_tokens_on_this_cp_rank(
+            torch.arange(8), rank, world_size, seq_dim=0
+        )
+        local = student_full[:, positions].clone().requires_grad_(True)
+        width = 8 // world_size
+        loss, metrics = _replicated_same_vocab_loss(
+            loss_fn,
+            data,
+            valid_toks,
+            local,
+            teacher,
+            cp_group=cp_group,
+            tp_group=tp_groups[rank],
+            window=slice(rank * width, (rank + 1) * width),
+        )
+        # Megatron's replicated path divides the loss by the CP size.
+        (loss / world_size).backward()
+
+        torch.testing.assert_close(
+            loss.detach(), ref_loss.detach(), rtol=1e-5, atol=1e-6
+        )
+        for key in ("kl_loss", "ce_loss", "kl_loss_scale"):
+            assert metrics[key] == pytest.approx(ref_metrics[key], rel=1e-5), key
+        gathered = [torch.empty_like(local.grad) for _ in range(world_size)]
+        dist.all_gather(gathered, local.grad)
+        full_grad = torch.zeros_like(student_full)
+        for cp_rank, shard in enumerate(gathered):
+            full_grad[
+                :,
+                _get_tokens_on_this_cp_rank(
+                    torch.arange(8), cp_rank, world_size, seq_dim=0
+                ),
+            ] = shard
+        torch.testing.assert_close(full_grad, reference.grad, rtol=1e-5, atol=1e-6)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo backend unavailable")
+def test_same_vocab_kd_on_megatron_cp2_matches_cp1(tmp_path):
+    """The per-window same-tokenizer KD keeps full weight under Megatron's /CP."""
+    mp.spawn(
+        _run_same_vocab_megatron_cp,
+        args=(2, os.fspath(tmp_path / "gloo_init")),
+        nprocs=2,
+        join=True,
+    )
