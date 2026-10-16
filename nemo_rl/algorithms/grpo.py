@@ -3394,6 +3394,8 @@ def async_grpo_train(
                         timer=timer,
                     )
 
+                is_last_step = step + 1 == master_config["grpo"]["max_num_steps"]
+
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
                 if NEED_REFIT:
@@ -3418,9 +3420,13 @@ def async_grpo_train(
                         POLICY_GENERATION_STALE = False
 
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
-                        weight_version += 1
-                        trajectory_collector.set_weight_version.remote(weight_version)
-                        trajectory_collector.resume_after_refit.remote()
+                        # On the last step keep the collector paused so it does not start a batch for a step that will never be trained
+                        if not is_last_step:
+                            weight_version += 1
+                            trajectory_collector.set_weight_version.remote(
+                                weight_version
+                            )
+                            trajectory_collector.resume_after_refit.remote()
 
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:
@@ -3428,7 +3434,6 @@ def async_grpo_train(
 
                 # Validation
                 val_metrics, validation_timings = None, None
-                is_last_step = step + 1 == master_config["grpo"]["max_num_steps"]
 
                 # Run validation if it's a validation step or last step with val_at_end
                 if (val_period > 0 and (step + 1) % val_period == 0) or (
@@ -3757,5 +3762,17 @@ def async_grpo_train(
             ray.kill(replay_buffer)
         except Exception as e:
             print(f"Error stopping replay buffer: {e}")
+
+        # Stop NemoGym so its in-flight rollouts stop calling vLLM before vLLM is torn down.
+        # shutdown() sends SIGINT to the Gym servers; fall back to killing the actor.
+        for env in {id(e): e for e in task_to_env.values()}.values():
+            try:
+                ray.get(env.shutdown.remote(), timeout=60)
+            except Exception as e:
+                print(f"NemoGym graceful shutdown failed ({e}); killing actor", flush=True)
+            try:
+                ray.kill(env)
+            except Exception as e:
+                print(f"Error stopping environment: {e}", flush=True)
 
         print("Async GRPO training complete!")
