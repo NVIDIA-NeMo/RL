@@ -1034,7 +1034,7 @@ def run_multi_turn_rollout(
             # Tokenize the raw content from the environment
             # TODO @sahilj: handle if we want these subsequent messages to have a chat template
             tokenized_obs = tokenizer(
-                env_obs_content, return_tensors="pt", add_special_tokens=False
+                text=env_obs_content, return_tensors="pt", add_special_tokens=False
             ).input_ids[0]
             # tokenizer returns torch.float32 when env_obs_content is empty
             tokenized_obs = tokenized_obs.to(dtype=torch.int64)
@@ -1368,7 +1368,7 @@ async def run_sample_multi_turn_rollout(
         env_obs_content = env_output.observations[0]["content"]
         # Tokenize environment response
         tokenized_obs = tokenizer(
-            env_obs_content, return_tensors="pt", add_special_tokens=False
+            text=env_obs_content, return_tensors="pt", add_special_tokens=False
         ).input_ids[0]
 
         # Check for sequence length overflow

@@ -587,7 +587,8 @@ class HelpSteer3LocalDataset(torch.utils.data.Dataset):
         if max_number != -1:
             data = data[:max_number]
             
-        self.data = Dataset.from_list(data)
+        #self.data = Dataset.from_list(data)
+        self.data = data
         self.formatted_ds = self.data
         self.task_name = task_name
 

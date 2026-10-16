@@ -6,7 +6,7 @@ grpo:
   max_rollout_turns: 1
   max_num_epochs: 1
   max_num_steps: 1000000
-  normalize_rewards: true
+  normalize_rewards: true   # for pairwise, always keep this set to true
   use_leave_one_out_baseline: true
   val_period: 5
   val_start_at: -1  # First step eligible for periodic validation; -1 disables the delay

@@ -2012,7 +2012,7 @@ def dwrl_train(
                     px = {"role": "user", "content": master_config.grpo.dwrl["bt_prompt"]}
                     npx = tokenizer.apply_chat_template([px], tokenize=False, add_generation_prompt=True, add_special_tokens=False, enable_thinking=False)
                     px['content'] = npx.replace("<|im_start|>system\n<|im_end|>\n", "").replace("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n", "")# + "\n\n</think>\n\n"
-                    px["token_ids"] = tokenizer(px['content'], return_tensors="pt")["input_ids"][0]
+                    px["token_ids"] = tokenizer(text=px['content'], return_tensors="pt")["input_ids"][0]
                     p.append(px)
                     new_msg_log.append(p)
 
@@ -2076,8 +2076,8 @@ def dwrl_train(
                             "make_sequence_length_divisible_by"
                         ],
                     )
-                    yes_position = tokenizer.encode(master_config.grpo.dwrl["score_token"])[0]
-                    no_position = tokenizer.encode(master_config.grpo.dwrl["opposite_token"])[0]
+                    yes_position = (tokenizer if hasattr(tokenizer, "encode") else tokenizer.tokenizer).encode(master_config.grpo.dwrl["score_token"])[0]
+                    no_position = (tokenizer if hasattr(tokenizer, "encode") else tokenizer.tokenizer).encode(master_config.grpo.dwrl["opposite_token"])[0]
                     yes_tensor = torch.tensor([yes_position], device=flat_messages["token_ids"].device).long()
                     list_with_yes = [torch.cat([flat_messages["token_ids"][idx][:input_lengths[idx]], yes_tensor, flat_messages["token_ids"][idx][input_lengths[idx]:]], dim=-1) for idx in range(len(input_lengths))]
                     input_ids_with_yes = torch.stack(list_with_yes, dim=0)
@@ -3027,7 +3027,7 @@ def validate(
                 px = {"role": "user", "content": master_config.grpo.dwrl["bt_prompt"]}
                 npx = tokenizer.apply_chat_template([px], tokenize=False, add_generation_prompt=True, add_special_tokens=False, enable_thinking=False)
                 px['content'] = npx.replace("<|im_start|>system\n<|im_end|>\n", "").replace("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n", "")# + "\n\n</think>\n\n"
-                px["token_ids"] = tokenizer(px['content'], return_tensors="pt")["input_ids"][0]
+                px["token_ids"] = tokenizer(text=px['content'], return_tensors="pt")["input_ids"][0]
                 p.append(px)
                 new_msg_log.append(p)
 
@@ -3044,7 +3044,7 @@ def validate(
                     pad_value_dict={"token_ids": tokenizer.pad_token_id},
                 )
             )
-            yes_position = tokenizer.encode(master_config.grpo.dwrl["score_token"])[0]
+            yes_position = (tokenizer if hasattr(tokenizer, "encode") else tokenizer.tokenizer).encode(master_config.grpo.dwrl["score_token"])[0]
             yes_tensor = torch.tensor([yes_position], device=flat_messages["token_ids"].device).long()
             
             policy.prepare_for_lp_inference()

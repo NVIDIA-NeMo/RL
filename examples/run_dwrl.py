@@ -342,7 +342,7 @@ def main() -> None:
     init_ray()
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config.policy["tokenizer"])
+    tokenizer = get_tokenizer(config.policy["tokenizer"], get_processor=config.policy.get("use_hf_processor", False))
     if "Qwen3" in config.policy["tokenizer"]["name"]:
         print("****** Qwen3 tokenizer detected! Swapping in fixed jinja template! ******", flush=True)
         #import requests
@@ -350,10 +350,10 @@ def main() -> None:
         #tokenizer.chat_template = response.text
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "qwen3_fixed_template.jinja"), "r", encoding="utf_8") as fr:
             qwen3_fixed_template = fr.read()
-        tokenizer.chat_template = qwen3_fixed_template
+        (tokenizer if hasattr(tokenizer, "chat_template") else tokenizer.tokenizer).chat_template = qwen3_fixed_template
     
-    assert len(tokenizer.encode(config.grpo.dwrl["score_token"])) == 1, f'`grpo.dwrl.score_token` of [ {config["grpo"]["dwrl"]["score_token"]} ] does not tokenize to a single token, so DWRL will not work correctly. Pick a different token.'
-    assert len(tokenizer.encode(config.grpo.dwrl["opposite_token"])) == 1, f'`grpo.dwrl.opposite_token` of [ {config["grpo"]["dwrl"]["opposite_token"]} ] does not tokenize to a single token, so DWRL will not work correctly. Pick a different token.'
+    assert len((tokenizer if hasattr(tokenizer, "encode") else tokenizer.tokenizer).encode(config.grpo.dwrl["score_token"])) == 1, f'`grpo.dwrl.score_token` of [ {config["grpo"]["dwrl"]["score_token"]} ] does not tokenize to a single token, so DWRL will not work correctly. Pick a different token.'
+    assert len((tokenizer if hasattr(tokenizer, "encode") else tokenizer.tokenizer).encode(config.grpo.dwrl["opposite_token"])) == 1, f'`grpo.dwrl.opposite_token` of [ {config["grpo"]["dwrl"]["opposite_token"]} ] does not tokenize to a single token, so DWRL will not work correctly. Pick a different token.'
     
     assert config.policy["generation"] is not None, (
         "A generation config is required for DWRL"
