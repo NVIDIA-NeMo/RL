@@ -241,6 +241,18 @@ def test_forbidden_keys_cover_gym_staging_fields() -> None:
     assert per_token and per_token <= FORBIDDEN_RPC_KEYS
 
 
+def test_local_actor_names_match_their_definitions() -> None:
+    from nemo_rl.environments.nemo_gym import NEMO_GYM_ACTOR_FQN
+
+    assert actor_module._GYM_ACTOR_FQN == NEMO_GYM_ACTOR_FQN
+    # Ray's modified class keeps __module__ and __name__ but not __qualname__.
+    actor_class = RolloutReassemblerActor.__ray_metadata__.modified_class
+    assert (
+        actor_module._REASSEMBLER_ACTOR_FQN
+        == f"{actor_class.__module__}.{actor_class.__name__}"
+    )
+
+
 @pytest.mark.parametrize(
     "gym_is_setup", [False, True], ids=["gym-not-prepared", "gym-prepared"]
 )
@@ -310,9 +322,8 @@ def test_factory_selects_compatible_environment_and_waits_for_dependencies(
         patch.object(
             actor_module, "ACTOR_ENVIRONMENTS", wraps=ACTOR_ENVIRONMENTS
         ) as dependency_registry,
-        patch.object(
-            actor_module,
-            "ACTOR_ENVIRONMENT_REGISTRY",
+        patch(
+            "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
             wraps=ACTOR_ENVIRONMENT_REGISTRY,
         ) as python_registry,
         patch.object(
