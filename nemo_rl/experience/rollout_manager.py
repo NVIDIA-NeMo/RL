@@ -1821,6 +1821,7 @@ class RolloutManager:
 
     @property
     def filter_zero_variance_groups(self) -> bool:
+        """Whether dynamic sampling drops zero-variance groups (DAPO-style)."""
         return self._filter_zero_variance_groups
 
     def record_finalizer_dropped_prompt(self) -> None:

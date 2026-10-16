@@ -1229,10 +1229,13 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     # Dynamic sampling drops uniform groups, and each drop needs a replacement prompt.
     # The default on_dropped_prompt="shrink" would silently shrink the step instead.
     if algo_cfg.use_dynamic_sampling:
+        # The block keys on algo_cfg, so it governs whichever algorithm is configured;
+        # name the offending key accordingly instead of always saying `grpo`.
+        algo_prefix = "ppo" if is_ppo_run(master_config) else "grpo"
         rollout_failure = async_config.rollout_failure
         if rollout_failure.on_dropped_prompt != "replace":
             raise ValueError(
-                "grpo.use_dynamic_sampling requires "
+                f"{algo_prefix}.use_dynamic_sampling requires "
                 'async_rl.rollout_failure.on_dropped_prompt="replace"; with '
                 f'"{rollout_failure.on_dropped_prompt}" a filtered group is never '
                 "substituted, so each zero-variance group silently shrinks its "
@@ -1240,17 +1243,18 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             )
         if async_config.sampler.name not in ("in_order", "custom"):
             raise ValueError(
-                "grpo.use_dynamic_sampling requires a sampler that stamps a target "
-                f"step (async_rl.sampler.name='in_order'), but got "
-                f"'{async_config.sampler.name}': without a stamped step a filtered "
-                "group cannot be credited short or replaced, so every filtered group "
-                "silently shrinks the batch."
+                f"{algo_prefix}.use_dynamic_sampling requires a sampler that stamps a "
+                "target step (async_rl.sampler.name must be 'in_order', or a 'custom' "
+                f"sampler that stamps one), but got '{async_config.sampler.name}': "
+                "without a stamped step a filtered group cannot be credited short or "
+                "replaced, so every filtered group silently shrinks the batch."
             )
         if algo_cfg.num_generations_per_prompt < 2:
             raise ValueError(
-                "grpo.use_dynamic_sampling requires num_generations_per_prompt >= 2: "
-                "a single generation has no within-group spread, so every group "
-                f"would be filtered (got {algo_cfg.num_generations_per_prompt})."
+                f"{algo_prefix}.use_dynamic_sampling requires "
+                "num_generations_per_prompt >= 2: a single generation has no "
+                "within-group spread, so every group would be filtered "
+                f"(got {algo_cfg.num_generations_per_prompt})."
             )
 
     if not is_ppo_run(master_config):
