@@ -27,7 +27,13 @@ def _import_teed_metric_owners() -> None:
 
 
 @pytest.mark.parametrize(
-    "prefix", ["train", "timing/rollout_checkpoint", "timing/rollout_recovery"]
+    "prefix",
+    [
+        "train",
+        "timing/rollout_checkpoint",
+        "timing/rollout_recovery",
+        "rollout/checkpoint_outcome",
+    ],
 )
 def test_tee_noop_when_not_exporting(prefix):
     # No telemetry handle set -> must be a silent no-op (no exception).
@@ -336,6 +342,96 @@ def test_checkpoint_restore_emits_no_span():
         "timing/rollout_recovery",
     )
     assert _finished_spans(exporter, handle) == ()
+
+
+def _attempt_outcome(outcome, reason, **extra):
+    """An attempt dict shaped like ``_log_rollout_checkpoint_outcome``'s."""
+    from nemo_rl.telemetry.metrics import (
+        _CHECKPOINT_ATTEMPT_OUTCOMES,
+        _CHECKPOINT_ATTEMPT_REASONS,
+    )
+
+    return {
+        "attempt": 1.0,
+        "configured_interval_seconds": 60.0,
+        **{f"reason_{r}": float(r == reason) for r in _CHECKPOINT_ATTEMPT_REASONS},
+        **{o: float(o == outcome) for o in _CHECKPOINT_ATTEMPT_OUTCOMES},
+        **extra,
+    }
+
+
+def test_skipped_snapshot_attempts_are_counted_with_their_reason():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    for _ in range(3):
+        tee_rl_metrics_to_otel(
+            _attempt_outcome(
+                "skipped",
+                "missing_trainer_anchor",
+                attempt_duration_seconds=0.02,
+                seconds_since_last_success=840.0,
+            ),
+            "rollout/checkpoint_outcome",
+        )
+    data = reader.get_metrics_data()
+    (attempts,) = _gauge_points(data, "rl.checkpoint.attempts")
+    assert dict(attempts.attributes) == {
+        "rl.checkpoint.outcome": "skipped",
+        "rl.checkpoint.reason": "missing_trainer_anchor",
+    }
+    assert attempts.value == 3
+    (duration,) = _gauge_points(data, "rl.checkpoint.attempt_duration")
+    assert dict(duration.attributes) == {"rl.checkpoint.outcome": "skipped"}
+    assert duration.count == 3
+    (staleness,) = _gauge_points(data, "rl.checkpoint.seconds_since_last_success")
+    assert staleness.value == 840.0
+
+
+def test_snapshot_staleness_is_zero_on_success_and_absent_before_one():
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    # No success yet: the controller logs no staleness, so neither does Lens.
+    tee_rl_metrics_to_otel(
+        _attempt_outcome("skipped", "no_data_plane_mutations"),
+        "rollout/checkpoint_outcome",
+    )
+    assert (
+        _gauge_points(
+            reader.get_metrics_data(), "rl.checkpoint.seconds_since_last_success"
+        )
+        == []
+    )
+    tee_rl_metrics_to_otel(
+        _attempt_outcome("completed", "completed", seconds_since_previous_success=90),
+        "rollout/checkpoint_outcome",
+    )
+    (staleness,) = _gauge_points(
+        reader.get_metrics_data(), "rl.checkpoint.seconds_since_last_success"
+    )
+    assert staleness.value == 0.0
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        pytest.param(
+            {**_attempt_outcome("skipped", "timeout"), "failed": 1.0},
+            id="two-outcomes",
+        ),
+        pytest.param(
+            {**_attempt_outcome("failed", "timeout"), "reason_timeout": 0.0},
+            id="no-reason",
+        ),
+    ],
+)
+def test_malformed_snapshot_attempt_is_not_counted(metrics):
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    tee_rl_metrics_to_otel(metrics, "rollout/checkpoint_outcome")
+    assert _gauge_points(reader.get_metrics_data(), "rl.checkpoint.attempts") == []
 
 
 def test_checkpoint_mapping_skips_invalid_values_and_unknown_keys():
