@@ -318,20 +318,23 @@ def test_packed_broadcast_producer_carries_export_dependency_across_streams(
     buffers still overlap. The old code only synchronized the reused buffer's
     own stream and fails this test.
     """
-    events: list = []  # ("record", event_id, stream_id) / ("wait", stream_id, event_id) / ("broadcast",)
+    # Streams are identified by their CUDA handle: torch.cuda.current_stream()
+    # returns a fresh Python wrapper on every call, so object identity would
+    # never match the Stream objects the packer holds.
+    events: list = []  # ("record", event_id, cuda_stream) / ("wait", cuda_stream, event_id) / ("broadcast", cuda_stream)
 
     real_event_cls = torch.cuda.Event
 
     class _Event(real_event_cls):
         def record(self, stream=None):
             stream = stream if stream is not None else torch.cuda.current_stream()
-            events.append(("record", id(self), id(stream)))
+            events.append(("record", id(self), stream.cuda_stream))
             return super().record(stream)
 
     real_wait_event = torch.cuda.Stream.wait_event
 
     def wait_event(self, event):
-        events.append(("wait", id(self), id(event)))
+        events.append(("wait", self.cuda_stream, id(event)))
         return real_wait_event(self, event)
 
     monkeypatch.setattr(torch.cuda, "Event", _Event)
@@ -341,7 +344,7 @@ def test_packed_broadcast_producer_carries_export_dependency_across_streams(
 
     class _Group:
         def broadcast(self, tensor, src):
-            events.append(("broadcast", id(torch.cuda.current_stream())))
+            events.append(("broadcast", torch.cuda.current_stream().cuda_stream))
 
     with patch(
         "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size",
