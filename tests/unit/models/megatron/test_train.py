@@ -2297,6 +2297,245 @@ class TestTopkLogitsPostProcessor:
             torch.testing.assert_close(result[key], expected)
 
 
+class TestSparseTeacherLogitsPostProcessor:
+    """Tests for the CP-local sparse teacher row export."""
+
+    @staticmethod
+    def _sparse_outputs(local_seq_len: int, k: int, force_width: int = 2):
+        return (
+            torch.randn(1, local_seq_len, k),
+            torch.randint(0, 32, (1, local_seq_len, k)),
+            torch.randn(1, local_seq_len),
+            torch.randint(0, 32, (1, local_seq_len, 1)),
+            torch.randn(1, local_seq_len, force_width),
+            torch.randint(0, 32, (1, local_seq_len, force_width)),
+            torch.zeros(1, local_seq_len, force_width, dtype=torch.bool),
+        )
+
+    @patch("nemo_rl.models.megatron.train.allgather_cp_sharded_tensor")
+    @patch("nemo_rl.models.megatron.train.distributed_vocab_topk_logz_force")
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
+        return_value=1,
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("torch.distributed.get_rank")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_world_size")
+    def test_force_ids_follow_load_balanced_cp_rows_without_gather(
+        self,
+        mock_cp_world,
+        mock_cp_group,
+        mock_dist_rank,
+        mock_tp_group,
+        mock_tp_rank,
+        mock_sparse_topk,
+        mock_cp_allgather,
+    ):
+        """Forced-label rows use the logits' load-balanced CP row order."""
+        from nemo_rl.models.megatron.train import SparseTeacherLogitsPostProcessor
+
+        mock_cp_group.return_value = MagicMock()
+        tp_group = MagicMock()
+        mock_tp_group.return_value = tp_group
+        local_seq_len = 4
+        k = 3
+        for cp_size, cp_rank, full_seq_len, expected_positions in (
+            (2, 1, 8, [2, 3, 4, 5]),
+            (4, 2, 16, [4, 5, 10, 11]),
+        ):
+            mock_cp_world.return_value = cp_size
+            mock_dist_rank.return_value = cp_rank
+            full_force_ids = torch.arange(full_seq_len * 2).reshape(1, full_seq_len, 2)
+            mock_sparse_topk.return_value = self._sparse_outputs(local_seq_len, k)
+            processor = SparseTeacherLogitsPostProcessor(
+                cfg={
+                    "sequence_packing": {"enabled": False},
+                    "logprob_chunk_size": 2,
+                },
+                k=k,
+                temperature=0.5,
+                real_vocab_size=30,
+                noise_filter_k=5,
+            )
+
+            wrapped = processor(
+                data_dict={"force_include_token_ids": full_force_ids},
+                cu_seqlens_padded=None,
+            )
+            loss, result = wrapped(torch.randn(1, local_seq_len, 16))
+
+            call = mock_sparse_topk.call_args
+            assert torch.equal(call.args[1], full_force_ids[:, expected_positions])
+            assert call.args[2] == k
+            assert call.args[3] is tp_group
+            assert call.kwargs == {
+                "vocab_start_index": 16,
+                "vocab_end_index": 32,
+                "real_vocab_size": 30,
+                "temperature": 0.5,
+                "noise_filter_k": 5,
+                "chunk_size": 2,
+            }
+            mock_cp_allgather.assert_not_called()
+            assert loss.item() == 0.0
+            assert set(result) == {
+                "sparse_topk_logits",
+                "sparse_topk_indices",
+                "sparse_log_z",
+                "sparse_natural_tail_indices",
+                "sparse_forced_logits",
+                "sparse_forced_indices",
+                "sparse_forced_in_topk",
+            }
+            assert result["sparse_topk_logits"].shape == (1, local_seq_len, k)
+
+    @patch("nemo_rl.models.megatron.train.distributed_vocab_topk_logz_force")
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
+        return_value=0,
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+        return_value=1,
+    )
+    def test_unset_logprob_chunk_size_uses_bounded_row_tiles(
+        self, _mock_cp_world, _mock_tp_group, _mock_tp_rank, mock_sparse_topk
+    ):
+        from nemo_rl.models.megatron import train as megatron_train
+
+        mock_sparse_topk.return_value = self._sparse_outputs(4, 2)
+        processor = megatron_train.SparseTeacherLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}},
+            k=2,
+            temperature=1.0,
+            real_vocab_size=8,
+            noise_filter_k=0,
+        )
+        wrapped = processor(
+            data_dict={"force_include_token_ids": torch.full((1, 4, 2), -1)},
+            cu_seqlens_padded=None,
+        )
+        wrapped(torch.randn(1, 4, 8))
+
+        assert (
+            mock_sparse_topk.call_args.kwargs["chunk_size"]
+            == megatron_train.SPARSE_TEACHER_ROW_CHUNK_SIZE
+        )
+
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+        return_value=2,
+    )
+    @patch("torch.distributed.get_rank", return_value=0)
+    def test_force_ids_not_divisible_by_twice_cp_raise(
+        self, _mock_rank, _mock_cp_world, _mock_cp_group
+    ):
+        from nemo_rl.models.megatron.train import SparseTeacherLogitsPostProcessor
+
+        processor = SparseTeacherLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}},
+            k=2,
+            temperature=1.0,
+            real_vocab_size=8,
+            noise_filter_k=0,
+        )
+        with pytest.raises(ValueError, match="multiple of 2\\*cp_size=4"):
+            processor(
+                data_dict={"force_include_token_ids": torch.full((1, 6, 2), -1)},
+                cu_seqlens_padded=None,
+            )
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+        return_value=1,
+    )
+    def test_force_rows_must_match_logit_rows(self, _mock_cp_world):
+        from nemo_rl.models.megatron.train import SparseTeacherLogitsPostProcessor
+
+        processor = SparseTeacherLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}},
+            k=2,
+            temperature=1.0,
+            real_vocab_size=8,
+            noise_filter_k=0,
+        )
+        wrapped = processor(
+            data_dict={"force_include_token_ids": torch.full((1, 6, 2), -1)},
+            cu_seqlens_padded=None,
+        )
+        with pytest.raises(ValueError, match="force=6, logits=8"):
+            wrapped(torch.randn(1, 8, 8))
+
+    def test_packing_and_missing_force_ids_raise(self):
+        from nemo_rl.models.megatron.train import SparseTeacherLogitsPostProcessor
+
+        packed = SparseTeacherLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": True}},
+            k=2,
+            temperature=1.0,
+            real_vocab_size=8,
+            noise_filter_k=0,
+        )
+        with pytest.raises(NotImplementedError, match="sequence packing"):
+            packed(data_dict={}, cu_seqlens_padded=None)
+        unpacked = SparseTeacherLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}},
+            k=2,
+            temperature=1.0,
+            real_vocab_size=8,
+            noise_filter_k=0,
+        )
+        with pytest.raises(KeyError, match="force_include_token_ids"):
+            unpacked(data_dict={}, cu_seqlens_padded=None)
+
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    @patch("nemo_rl.models.megatron.train.apply_temperature_scaling")
+    def test_forward_dispatch_keeps_logits_unscaled(
+        self, mock_temp_scaling, mock_model_forward
+    ):
+        """The exporter applies the CSD temperature itself, never the sampler's."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            SparseTeacherLogitsPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        mock_model_forward.return_value = torch.randn(1, 4, 8)
+        data_dict = MagicMock()
+        processed_mb = ProcessedMicrobatch(
+            data_dict=data_dict,
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3, 4]]),
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+            original_seq_length=4,
+        )
+        post_processor = SparseTeacherLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}},
+            k=2,
+            temperature=1.0,
+            real_vocab_size=8,
+            noise_filter_k=0,
+        )
+        with patch.object(
+            SparseTeacherLogitsPostProcessor, "__call__", return_value=MagicMock()
+        ) as mock_call:
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=post_processor,
+                sampling_params=TrainingSamplingParams(temperature=2.0),
+            )
+
+        mock_temp_scaling.assert_not_called()
+        mock_call.assert_called_once_with(data_dict=data_dict, cu_seqlens_padded=None)
+
+
 class TestFullLogitsPostProcessor:
     """Tests for CP-aware full-vocabulary teacher-logit export."""
 

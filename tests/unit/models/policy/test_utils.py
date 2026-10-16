@@ -919,6 +919,31 @@ class TestEnsureTeacherIpcBuffer:
             assert next_storage is storage
             assert next_handle is handle
 
+    def test_capacity_seq_len_reserves_a_sequence_high_water_mark(self):
+        dev = torch.device("cpu")
+        storage, handle = ensure_teacher_ipc_buffer(
+            None, None, 2, 1, 4, 8, torch.float32, dev, capacity_seq_len=10
+        )
+        assert storage.shape == (2, 1, 10, 8)
+        for longer_seq_len in (5, 10):
+            next_storage, next_handle = ensure_teacher_ipc_buffer(
+                storage,
+                handle,
+                2,
+                1,
+                longer_seq_len,
+                8,
+                torch.float32,
+                dev,
+                capacity_seq_len=10,
+            )
+            assert next_storage is storage
+            assert next_handle is handle
+        grown, _ = ensure_teacher_ipc_buffer(
+            storage, handle, 2, 1, 12, 8, torch.float32, dev, capacity_seq_len=10
+        )
+        assert grown.shape == (2, 1, 12, 8)
+
 
 class TestCompactTeacherIpcRowBuffer:
     def test_variable_cardinality_bins_use_only_logical_rows(self):

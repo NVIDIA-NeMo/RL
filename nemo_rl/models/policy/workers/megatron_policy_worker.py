@@ -69,6 +69,7 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import cp_load_balanced_segments
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
@@ -126,6 +127,7 @@ from nemo_rl.models.megatron.train import (
     FullLogitsPostProcessor,
     LogprobsPostProcessor,
     LossPostProcessor,
+    SparseTeacherLogitsPostProcessor,
     StreamedFullLogitsMetadata,
     TeacherFullPayloadPostProcessor,
     TopkLogitsPostProcessor,
@@ -147,6 +149,7 @@ from nemo_rl.models.policy.utils import (
     can_reuse_teacher_ipc_token_buffer,
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
+    ensure_teacher_ipc_buffer,
     ensure_teacher_ipc_token_buffer,
     extract_batch_item_ids,
     extract_teacher_ipc_valid_lengths,
@@ -849,6 +852,12 @@ class MegatronPolicyWorkerImpl(
         # handle while zero padding is omitted from the physical allocation.
         self._teacher_ipc_storage: Optional[torch.Tensor] = None
         self._teacher_ipc_handles: list[tuple[Any, ...]] = []
+        # Persistent ``[N_mb, B, T_local, width]`` slabs for sparse teacher
+        # rows, one per exported field, with their IPC handles cached across
+        # calls; allocated by ``get_sparse_logits_ipc`` and freed by
+        # ``release_ipc_buffer``.
+        self._teacher_sparse_ipc_storage: dict[str, torch.Tensor] = {}
+        self._teacher_sparse_ipc_handles: dict[str, tuple[Any, ...]] = {}
         self._router_replay_enabled = router_replay_enabled(config)
         # HF param names to MXFP8-quantize on the trainer during refit; set via
         # enable_refit_prequantize() when vllm_cfg.refit_prequantize is on.
@@ -3676,6 +3685,228 @@ class MegatronPolicyWorkerImpl(
         torch.cuda.synchronize()
         return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
 
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/get_sparse_logits_ipc")
+    def get_sparse_logits_ipc(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        *,
+        k: int,
+        temperature: float,
+        real_vocab_size: int,
+        noise_filter_k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Teacher forward; sparse rows of each CP shard via persistent CUDA IPC.
+
+        Every TP rank joins the exact top-k / log Z collectives, but the result
+        is TP-replicated, so only TP rank 0 on the last pipeline stage exports
+        storage. Rows stay in their CP shard: one record is emitted per teacher
+        CP rank and sample, and ``sequence_segments`` lists the global
+        intervals its rows cover (see :func:`cp_load_balanced_segments`).
+
+        ``data`` must carry ``force_include_token_ids`` ``[B, T_t, F]``. Each
+        record holds seven IPC handles (natural top-k logits and ids sorted by
+        id, log Z, the score-ranked k-th id, and the forced-label logits, ids
+        and top-k membership) into slabs that are reused across calls and freed
+        by :meth:`release_ipc_buffer`.
+
+        Returns:
+            ``{"per_sample_handles": list, "dp_rank": int}``.
+        """
+        if (
+            self.delegate_pack_to_model
+            and parallel_state.get_context_parallel_world_size() > 1
+        ):
+            raise NotImplementedError(
+                "get_sparse_logits_ipc does not support context parallelism for "
+                "models that pack and context-shard inside their own forward. "
+                "Set context_parallel_size=1 for this teacher."
+            )
+        forward_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+        self.model.eval()
+        (
+            mb_iterator,
+            num_microbatches,
+            forward_mbs,
+            _seq_length,
+            padded_seq_length,
+        ) = get_microbatch_iterator(
+            data,
+            self.cfg,
+            forward_batch_size,
+            straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
+            skip_keys={"force_include_token_ids"},
+        )
+        list_of_outputs = megatron_forward_backward(
+            model=self.model,
+            data_iterator=mb_iterator,
+            seq_length=padded_seq_length,
+            mbs=forward_mbs,
+            num_microbatches=num_microbatches,
+            post_processing_fn=SparseTeacherLogitsPostProcessor(
+                cfg=self.cfg,
+                k=k,
+                temperature=temperature,
+                real_vocab_size=real_vocab_size,
+                noise_filter_k=noise_filter_k,
+            ),
+            forward_only=True,
+            defer_fp32_logits=self.defer_fp32_logits,
+            sampling_params=None,
+            straggler_timer=self.mcore_state.straggler_timer,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+        )
+
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        dp_rank = parallel_state.get_data_parallel_rank()
+        if (
+            not parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+            or tp_rank != 0
+        ):
+            return {"per_sample_handles": [], "dp_rank": dp_rank}
+
+        cp_rank = parallel_state.get_context_parallel_rank()
+        cp_size = parallel_state.get_context_parallel_world_size()
+        world_rank = torch.distributed.get_rank()
+        target_local_seq = padded_seq_length // cp_size
+        # Reserve the configured maximum length on first allocation so a later,
+        # longer batch reuses the slabs instead of reallocating next to them.
+        ipc_full_seq_capacity = max(
+            padded_seq_length, int(self.cfg["max_total_sequence_length"])
+        )
+        ipc_local_seq_capacity = (ipc_full_seq_capacity + cp_size - 1) // cp_size
+        if not self._teacher_sparse_ipc_storage:
+            print(
+                "Sparse teacher IPC capacity: "
+                f"local_seq={target_local_seq} "
+                f"capacity_local_seq={ipc_local_seq_capacity} "
+                f"num_microbatches={num_microbatches} k={k}",
+                flush=True,
+            )
+        sequence_segments = cp_load_balanced_segments(
+            padded_seq_length, cp_rank, cp_size
+        )
+
+        def _ensure_field(
+            name: str,
+            tensor: torch.Tensor,
+            *,
+            batch_size: int,
+            width: int,
+        ) -> tuple[torch.Tensor, tuple[Any, ...]]:
+            storage, handle = ensure_teacher_ipc_buffer(
+                self._teacher_sparse_ipc_storage.get(name),
+                self._teacher_sparse_ipc_handles.get(name),
+                num_microbatches,
+                batch_size,
+                target_local_seq,
+                width,
+                tensor.dtype,
+                tensor.device,
+                capacity_seq_len=ipc_local_seq_capacity,
+            )
+            self._teacher_sparse_ipc_storage[name] = storage
+            self._teacher_sparse_ipc_handles[name] = handle
+            return storage, handle
+
+        # Megatron pads the vocabulary uniformly across TP; the sparse result
+        # does not carry the local vocab width, so read it from the model.
+        padded_global_vocab = int(self.final_padded_vocab_size)
+        per_sample_handles: list[dict[str, Any]] = []
+        for buf_idx, out in enumerate(list_of_outputs):
+            topk_logits = out["sparse_topk_logits"]
+            topk_indices = out["sparse_topk_indices"]
+            log_z = out["sparse_log_z"].unsqueeze(-1)
+            natural_tail_indices = out["sparse_natural_tail_indices"]
+            forced_logits = out["sparse_forced_logits"]
+            forced_indices = out["sparse_forced_indices"]
+            forced_in_topk = out["sparse_forced_in_topk"]
+            batch_size_mb, seq_len_mb, topk_width = topk_logits.shape
+            force_width = int(forced_logits.shape[-1])
+            if (
+                natural_tail_indices.shape != (batch_size_mb, seq_len_mb, 1)
+                or forced_indices.shape != forced_logits.shape
+                or forced_in_topk.shape != forced_logits.shape
+                or forced_logits.shape[:2] != (batch_size_mb, seq_len_mb)
+                or force_width <= 0
+            ):
+                raise ValueError(
+                    "Sparse teacher natural/forced sidecar shapes disagree: "
+                    f"topk={tuple(topk_logits.shape)}, "
+                    f"tail={tuple(natural_tail_indices.shape)}, "
+                    f"forced_logits={tuple(forced_logits.shape)}, "
+                    f"forced_indices={tuple(forced_indices.shape)}, "
+                    f"forced_in_topk={tuple(forced_in_topk.shape)}."
+                )
+            if seq_len_mb != target_local_seq:
+                raise ValueError(
+                    f"Sparse teacher local sequence {seq_len_mb} does not match "
+                    f"the padded CP length {target_local_seq}."
+                )
+
+            fields = {
+                "topk_logits": (topk_logits, topk_width),
+                "topk_indices": (topk_indices, topk_width),
+                "log_z": (log_z, 1),
+                "natural_tail_indices": (natural_tail_indices, 1),
+                "forced_logits": (forced_logits, force_width),
+                "forced_indices": (forced_indices, force_width),
+                "forced_in_topk": (forced_in_topk, force_width),
+            }
+            ipc_handles: dict[str, tuple[Any, ...]] = {}
+            for name, (value, width) in fields.items():
+                storage, handle = _ensure_field(
+                    name, value, batch_size=batch_size_mb, width=width
+                )
+                storage[buf_idx, :batch_size_mb, :target_local_seq, :width].copy_(value)
+                ipc_handles[name] = handle
+
+            for sample_index_in_buf in range(batch_size_mb):
+                per_sample_handles.append(
+                    {
+                        "transport": "sparse_topk",
+                        "topk_logits_ipc": ipc_handles["topk_logits"],
+                        "topk_indices_ipc": ipc_handles["topk_indices"],
+                        "log_z_ipc": ipc_handles["log_z"],
+                        "natural_tail_indices_ipc": ipc_handles["natural_tail_indices"],
+                        "forced_logits_ipc": ipc_handles["forced_logits"],
+                        "forced_indices_ipc": ipc_handles["forced_indices"],
+                        "forced_in_topk_ipc": ipc_handles["forced_in_topk"],
+                        "buf_idx": buf_idx,
+                        "sample_index_in_buf": sample_index_in_buf,
+                        "topk_shape": (target_local_seq, topk_width),
+                        "forced_shape": (target_local_seq, force_width),
+                        "scalar_shape": (target_local_seq,),
+                        "k": int(k),
+                        "force_width": force_width,
+                        "temperature": float(temperature),
+                        "real_vocab_size": int(real_vocab_size),
+                        "padded_vocab_size": padded_global_vocab,
+                        "forced_in_topk_k": int(noise_filter_k or k),
+                        "tp_rank": tp_rank,
+                        "tp_size": tp_size,
+                        "cp_rank": cp_rank,
+                        "cp_size": cp_size,
+                        "world_rank": world_rank,
+                        "full_seq_len": padded_seq_length,
+                        "sequence_segments": sequence_segments,
+                    }
+                )
+        # The student imports these slabs as soon as this call returns; finish
+        # every copy first so it cannot observe a partially written row.
+        torch.cuda.synchronize()
+        return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
+
     def release_ipc_buffer(self) -> None:
         """Free the persistent teacher-logit IPC storage.
 
@@ -3684,6 +3915,8 @@ class MegatronPolicyWorkerImpl(
         """
         self._teacher_ipc_storage = None
         self._teacher_ipc_handles = []
+        self._teacher_sparse_ipc_storage = {}
+        self._teacher_sparse_ipc_handles = {}
         gc.collect()
         torch.cuda.empty_cache()
 

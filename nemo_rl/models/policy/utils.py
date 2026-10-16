@@ -365,14 +365,24 @@ def ensure_teacher_ipc_buffer(
     vocab_size: int,
     dtype: torch.dtype,
     device: torch.device,
+    capacity_seq_len: Optional[int] = None,
 ) -> tuple[torch.Tensor, tuple[Any, ...]]:
     """Lazy-alloc / grow ``[N_mb, B, T, V]`` teacher-logits IPC storage.
+
+    ``capacity_seq_len`` reserves a sequence high-water mark when the storage
+    is (re)allocated, so a later, slightly longer batch does not allocate a
+    replacement while the previous CUDA-IPC backing and the current forward
+    outputs are both live. The exported metadata still describes ``seq_len``;
+    the unused capacity is never read by the loss.
 
     Returns the (possibly reallocated) ``(storage, handle)``. Reallocates and
     re-exports the IPC handle whenever any dim of the requested shape exceeds
     the current storage, or dtype/device changed; otherwise the existing
     storage and cached handle are returned unchanged.
     """
+    allocation_seq_len = max(
+        seq_len, capacity_seq_len if capacity_seq_len is not None else seq_len
+    )
     needs_realloc = (
         storage is None
         or storage.shape[0] < num_microbatches
@@ -384,7 +394,7 @@ def ensure_teacher_ipc_buffer(
     )
     if needs_realloc:
         storage = torch.empty(
-            (num_microbatches, batch_size, seq_len, vocab_size),
+            (num_microbatches, batch_size, allocation_seq_len, vocab_size),
             dtype=dtype,
             device=device,
         )
