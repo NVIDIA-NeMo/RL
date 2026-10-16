@@ -18,7 +18,7 @@ CSD batches are built by the shared ``CrossTokenizerCollator`` (tested in
 ``test_cross_tokenizer_native_chat.py``). These tests cover what CSD adds,
 row ``sample_id`` values and MoE router-replay routes, and the batches the
 shared collator builds with the options CSD's trainer turns on: special tokens
-and overlength rejection in text mode, and whole-final-turn CE in chat mode.
+and overlength clipping in text mode, and whole-final-turn CE in chat mode.
 Tokenizers are small local fast tokenizers; nothing is downloaded.
 """
 
@@ -114,6 +114,7 @@ def _csd_collator(
     return CSDCrossTokenizerCollator(
         **_collator_args(config, student, teachers, **sizes),
         require_routed_experts=require_routed_experts,
+        clip_overlength_text=config.mode == "text",
         **_shared_options(config),
     )
 
@@ -462,7 +463,7 @@ def test_router_replay_chat_concatenates_per_message_routes():
 
 
 # ---------------------------------------------------------------------------
-# Text mode: special tokens, pad-to-longest, overlength rejection
+# Text mode: special tokens, pad-to-longest, overlength clipping
 # ---------------------------------------------------------------------------
 
 
@@ -494,55 +495,79 @@ def test_text_rows_carry_special_tokens_and_pad_to_the_longest_row():
 
 
 @pytest.mark.parametrize(
-    "sizes,text,message",
+    "sizes,text,prefix",
     [
         pytest.param(
             {"ctx_length_student": 4},
             "alpha beta gamma delta",
-            r"^student, sample idx=1: text tokenization has 5 tokens, exceeding "
-            r"context length 4; overlength rows are rejected$",
+            "alpha beta gamma ",
             id="student",
         ),
         pytest.param(
             {"ctx_length_student": 6, "make_seq_div_by_student": 4},
             "alpha beta gamma delta",
-            r"^student, sample idx=1: text tokenization has 5 tokens, padded to 8 "
-            r"for a sequence-length multiple of 4, exceeding context length 6; "
-            r"overlength rows are rejected$",
+            "alpha beta gamma ",
             id="student-after-rounding",
         ),
         pytest.param(
             {"ctx_length_teachers": [10, 64]},
             "alpha beta gamma",
-            r"^teacher 0, sample idx=1: text tokenization has 15 tokens, exceeding "
-            r"context length 10; overlength rows are rejected$",
+            "alpha beta ",
             id="cross-tokenizer-teacher",
         ),
         pytest.param(
             {"ctx_length_teachers": [64, 4]},
             "alpha beta gamma delta",
-            r"^teacher 1, sample idx=1: shared tokenization exceeds context length "
-            r"4; overlength rows are rejected$",
+            "alpha beta gamma ",
             id="same-tokenizer-teacher",
         ),
         pytest.param(
             {"ctx_length_teachers": [64, 6], "make_seq_div_by_teachers": [1, 4]},
             "alpha beta gamma delta",
-            r"^teacher 1, sample idx=1: shared tokenization has 5 tokens, padded to "
-            r"8 for a sequence-length multiple of 4, exceeding context length 6; "
-            r"overlength rows are rejected$",
+            "alpha beta gamma ",
             id="same-tokenizer-teacher-after-rounding",
         ),
     ],
 )
-def test_text_overlength_rows_are_rejected_not_truncated(sizes, text, message):
+def test_text_overlength_rows_are_clipped_to_a_shared_prefix(sizes, text, prefix):
     # Token counts include each tokenizer's marker: "alpha beta gamma delta"
     # is 5 student tokens, "alpha beta gamma" 15 teacher tokens. Teacher 1
     # shares the student tokenization but has its own context and divisor.
     student, teacher = _text_pair()
-    collator = _csd_collator(_TEXT, student, [teacher, None], **sizes)
-    with pytest.raises(ValueError, match=message):
-        collator([_text_row("beta", 0), _text_row(text, 1)])
+    teachers = [teacher, None]
+    out = _csd_collator(_TEXT, student, teachers, **sizes)(
+        [_text_row("beta", 0), _text_row(text, 1)]
+    )
+
+    # The clipped batch is the one the shared collator builds from the prefix,
+    # for the student and every teacher, and one more character does not fit.
+    shared = _shared_collator(_TEXT, student, teachers, **sizes)
+    expected = shared([_text_row("beta", 0), _text_row(prefix, 1)])
+    _assert_batches_equal({k: v for k, v in out.items() if k != "sample_id"}, expected)
+    with pytest.raises(ValueError, match="overlength rows are rejected$"):
+        shared([_text_row(text[: len(prefix) + 1], 1)])
+
+
+def test_text_row_without_a_fitting_prefix_raises():
+    student, teacher = _text_pair()
+    # Even one character tokenizes to the marker plus one token.
+    collator = _csd_collator(_TEXT, student, [teacher], ctx_length_student=1)
+    with pytest.raises(
+        ValueError,
+        match=r"^sample idx=0: no non-empty prefix of the text fits every "
+        r"context length$",
+    ):
+        collator([_text_row("beta", 0)])
+
+
+def test_clip_overlength_text_requires_text_mode():
+    student, teacher = _chat_pair()
+    with pytest.raises(ValueError, match="clip_overlength_text requires mode='text'"):
+        CSDCrossTokenizerCollator(
+            **_collator_args(_CHAT, student, [teacher]),
+            require_routed_experts=False,
+            clip_overlength_text=True,
+        )
 
 
 # ---------------------------------------------------------------------------
