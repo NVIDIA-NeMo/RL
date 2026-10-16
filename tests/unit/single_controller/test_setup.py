@@ -1357,6 +1357,41 @@ class TestSetup:
         with pytest.raises(error, match=match):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    @pytest.mark.parametrize(
+        ("prepare_s", "control_s", "stall_s", "rejected"),
+        [
+            (300.0, 60.0, 600.0, False),  # defaults: 600 > 300 + 2 * 60
+            (600.0, 60.0, 600.0, True),  # a raised prepare timeout outlasts it
+            (300.0, 150.0, 600.0, True),  # equal is still a false stall
+            (600.0, 60.0, 900.0, False),
+        ],
+    )
+    def test_turn_recovery_stall_timeout_must_outlast_a_gym_park(
+        self, prepare_s, control_s, stall_s, rejected
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.token_capture.enabled = True
+        mc.token_capture.control_timeout_s = control_s
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        mc.rollout_recovery.gym_prepare_timeout_s = prepare_s
+        mc.async_rl.stall_watchdog.stall_timeout_s = stall_s
+
+        if rejected:
+            with pytest.raises(
+                ValueError, match=r"stall_timeout_s \(.*\) must be > .*gym_prepare"
+            ):
+                validate_single_controller_config(mc)
+        else:
+            validate_single_controller_config(mc)
+
+    def test_stall_timeout_is_not_tied_to_gym_without_turn_recovery(self):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.token_capture.enabled = True
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.SIBLING
+        mc.rollout_recovery.gym_prepare_timeout_s = 900.0
+
+        validate_single_controller_config(mc)
+
     def test_periodic_checkpointing_warns_without_per_step_trainer_anchors(
         self,
         tmp_path: Path,
@@ -3518,6 +3553,7 @@ class TestNativeTQRecoverySetup:
         policy.load_data_plane_checkpoint.assert_not_called()
         dp_client.register_partition.assert_not_called()
         assert actor_args.last_checkpoint_path == str(checkpoint_path)
+        assert not actor_args.restored_from_rollout_snapshot
         assert actor_args.data_plane_checkpoint_metadata is None
         assert "tq_load_seconds" not in actor_args.rollout_checkpoint_load_metrics
 
@@ -3613,6 +3649,7 @@ class TestNativeTQRecoverySetup:
         patched_factories["fake_policy"].load_data_plane_checkpoint.assert_not_called()
         actor_args.dp_client.register_partition.assert_not_called()
         assert actor_args.last_checkpoint_path == str(snapshot_path)
+        assert actor_args.restored_from_rollout_snapshot
         assert actor_args.data_plane_checkpoint_metadata is None
         assert actor_args.save_state.current_epoch == 2
         assert actor_args.save_state.sampler_dispatch_index == 7

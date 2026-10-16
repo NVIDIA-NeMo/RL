@@ -27,6 +27,7 @@ from PIL import Image
 from transformers import AutoTokenizer
 
 import nemo_rl.experience.rollouts as rollouts_mod
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
@@ -46,8 +47,8 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
-from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
+from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -57,7 +58,6 @@ from nemo_rl.experience.interfaces import (
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
-    RolloutDispatchAdmissionGate,
     RolloutTimeouts,
 )
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
@@ -2747,7 +2747,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             return _Stream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
-    manager._dispatch_admission_gate = RolloutDispatchAdmissionGate()
+    manager._dispatch_admission_gate = DataPlaneCheckpointBarrier()
     manager._num_generations_per_prompt = 2
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()

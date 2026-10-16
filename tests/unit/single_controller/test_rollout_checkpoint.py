@@ -38,12 +38,10 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     bootstrap_fingerprint,
     commit_snapshot,
     ensure_bootstrap_anchor,
-    has_gym_restart_fallback,
     prepare_snapshot_paths,
     prune_bootstrap_snapshots,
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
-    write_gym_restart_fallback,
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.models.generation.vllm.config import VllmConfig, VllmSpecificArgs
@@ -1051,20 +1049,3 @@ def test_manifest_rejects_invalid_gym_counter(counter: object) -> None:
         ValueError, match="next_nemo_gym_task_index.*non-negative integer"
     ):
         RolloutSnapshotManifest.from_mapping(raw)
-
-
-def test_gym_restart_fallback_marks_a_trainer_checkpoint_without_gym_state(
-    tmp_path: Path,
-) -> None:
-    assert not has_gym_restart_fallback(tmp_path, train_step=7, trainer_version=7)
-
-    write_gym_restart_fallback(tmp_path, train_step=7, trainer_version=7)
-
-    assert has_gym_restart_fallback(tmp_path, train_step=7, trainer_version=7)
-
-
-def test_gym_restart_fallback_rejects_another_trainer_state(tmp_path: Path) -> None:
-    write_gym_restart_fallback(tmp_path, train_step=7, trainer_version=7)
-
-    with pytest.raises(ValueError, match="does not match its trainer checkpoint"):
-        has_gym_restart_fallback(tmp_path, train_step=8, trainer_version=8)

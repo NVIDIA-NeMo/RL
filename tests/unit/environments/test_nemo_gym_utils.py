@@ -1116,6 +1116,8 @@ def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs
     assert checkpoint["enabled"] is True
     # Gym serves its global config unauthenticated: never the capture secret.
     assert checkpoint["control_auth_token"] not in {"", "secret"}
+    # A lost resume reopens Gym after three control timeouts, not Gym's 600s.
+    assert checkpoint["lease_grace_seconds"] == 180.0
     assert (
         config["initial_global_config_dict"]["policy_model"]["responses_api_models"][
             "vllm_model"
@@ -1123,6 +1125,34 @@ def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs
         is True
     )
     assert token_capture["capture_dir"] == "/capture"
+
+
+@pytest.mark.nemo_gym
+def test_checkpoint_lease_grace_follows_the_control_timeout(detected_uv_dirs):
+    """A lost resume reopens Gym after three control timeouts; Gym accepts it."""
+    from nemo_gym._checkpoint.settings import CheckpointSettings
+
+    cluster = _FakeGymCluster()
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            _env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=True,
+            token_capture={
+                "enabled": True,
+                "capture_dir": "/capture",
+                "control_auth_token": "secret",
+                "control_timeout_s": 20.0,
+            },
+        )
+
+    checkpoint = cluster.actor_configs[0]["initial_global_config_dict"]["checkpoint"]
+    assert checkpoint["lease_grace_seconds"] == 60.0
+    assert CheckpointSettings.model_validate(checkpoint).lease_grace_seconds == 60.0
 
 
 def test_checkpointing_leaves_the_callers_policy_model_untouched(detected_uv_dirs):
@@ -1423,6 +1453,53 @@ def test_shard_spinup_timeout_is_one_global_deadline():
     ]
 
 
+def test_checkpoint_discovery_shares_the_startup_deadline():
+    """Discovery is part of the second pass: no fresh budget of its own."""
+    actors = []
+    for name in ("first", "second"):
+        actor = MagicMock(name=name)
+        actor._spinup.remote.return_value = f"{name}-ref"
+        actor.set_tokenizer.remote.return_value = f"{name}-tokenizer-ref"
+        actor.initialize_checkpoint_adapter.remote.return_value = f"{name}-discover-ref"
+        actors.append(actor)
+    shard_set = nemo_gym_mod.NemoGymShardSet(
+        handles={"first": [actors[0]], "second": [actors[1]]}
+    )
+
+    with (
+        patch.object(
+            nemo_gym_mod,
+            "monotonic",
+            side_effect=[100.0, 101.0, 102.0, 103.0, 103.5, 104.0, 104.5],
+        ),
+        patch.object(nemo_gym_mod.ray, "get") as ray_get,
+    ):
+        nemo_gym_mod._spinup_shards_concurrently(
+            shard_set,
+            spinup_timeout=5.0,
+            tokenizer=_TOKENIZER,
+            turn_checkpointing_enabled=True,
+        )
+
+    # Each replica discovers its deployment after its own tokenizer install.
+    assert [invocation.args[0] for invocation in ray_get.call_args_list] == [
+        "first-ref",
+        "second-ref",
+        "first-tokenizer-ref",
+        "first-discover-ref",
+        "second-tokenizer-ref",
+        "second-discover-ref",
+    ]
+    assert [invocation.kwargs["timeout"] for invocation in ray_get.call_args_list] == [
+        4.0,
+        3.0,
+        2.0,
+        1.5,
+        1.0,
+        0.5,
+    ]
+
+
 def test_a_shard_that_fails_to_start_names_itself_and_tears_everything_down(
     detected_uv_dirs,
 ):
@@ -1535,7 +1612,7 @@ def test_tokenizer_timeout_reports_exhausted_shared_startup_budget(
     with _patched_cluster(cluster):
         with pytest.raises(
             nemo_gym_mod.ShardSetupError,
-            match="used the whole 1.0s startup budget before the tokenizer",
+            match="used the whole 1.0s startup budget before every replica finished",
         ):
             nemo_gym_mod.build_nemo_gym_actors(
                 _shard_env_configs(),
