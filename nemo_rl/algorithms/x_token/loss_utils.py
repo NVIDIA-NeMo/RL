@@ -421,6 +421,7 @@ def same_tokenizer_full_vocab_kl(
     kd_mask: torch.Tensor,
     sample_mask: torch.Tensor,
     num_kd_tokens: torch.Tensor,
+    vocab_size: int,
     temperature: float,
     reverse_kl: bool,
     tp_group: Optional[torch.distributed.ProcessGroup],
@@ -429,20 +430,24 @@ def same_tokenizer_full_vocab_kl(
     """Full-vocab per-position KL between student and teacher on a shared tokenizer vocab.
 
     Student and teacher share a tokenizer, so positions align 1:1. The student
-    log-probs are gathered to the full vocab across TP; the teacher is sliced to
-    the student width (drops lm_head padding). The result is the KD-position
-    mean (global denominator ``num_kd_tokens``) scaled by ``temperature**2``.
+    log-probs are gathered to the full vocab across TP. Both sides are cut to the
+    shared tokenizer vocab ``vocab_size``, dropping lm_head padding columns, and
+    the student is renormalized over it. The result is the KD-position mean
+    (global denominator ``num_kd_tokens``) scaled by ``temperature**2``.
 
     Args:
-        student_logits: ``[B, T, V]`` student logits on this CP rank's
-            contiguous window (``[B, T, V/TP]`` when vocab-sharded across TP).
+        student_logits: ``[B, T, V_s]`` student logits on this CP rank's
+            contiguous window (``[B, T, V_s/TP]`` when vocab-sharded across
+            TP), ``V_s >= vocab_size``.
         teacher_logits: ``[B, T, V_t]`` full-vocab teacher logits on the same
-            positions, ``V_t >= V``.
+            positions, ``V_t >= vocab_size``.
         kd_mask: ``[B, T]`` mask of target tokens that receive KD; the
             predictor at ``t`` is supervised when ``kd_mask[:, t + 1]`` is set.
         sample_mask: ``[B]`` per-sample mask.
         num_kd_tokens: Global (DP/CP) count of KD positions, the mean's
             denominator.
+        vocab_size: Shared tokenizer vocab size; student and teacher columns
+            past it (lm_head padding) are dropped.
         temperature: Softmax temperature.
         reverse_kl: If True, ``KL(student || teacher)``; otherwise
             ``KL(teacher || student)``.
@@ -455,10 +460,14 @@ def same_tokenizer_full_vocab_kl(
     student_log_probs = vocab_parallel_full_log_softmax(
         student_logits, temperature, tp_group=tp_group
     )
-    student_vocab_size = student_log_probs.shape[-1]
+    if student_log_probs.shape[-1] > vocab_size:
+        # Renormalize over the shared vocab without the lm_head padding columns.
+        student_log_probs = torch.log_softmax(
+            student_log_probs[..., :vocab_size], dim=-1
+        )
     teacher = teacher_logits.float()
-    if teacher.shape[-1] > student_vocab_size:
-        teacher = teacher[..., :student_vocab_size]
+    if teacher.shape[-1] > vocab_size:
+        teacher = teacher[..., :vocab_size]
     teacher_log_probs = torch.log_softmax(teacher / temperature, dim=-1)
     per_position_kl = _per_position_kl(
         student_log_probs, teacher_log_probs, reverse_kl=reverse_kl
