@@ -198,6 +198,20 @@ def preference_collate_fn(
         extra_env_info=extra_env_infos,
         batch_max_length=batch_max_length,
     )
+    
+    if any(datum.get("vllm_content_chosen") is not None for datum in data_batch):
+        content, images, videos, audios = [], [], [], []
+        for datum in data_batch:  # chosen row, then rejected row (same order as preference_collate_fn)
+            content.append(datum.get("vllm_content_chosen"))
+            content.append(datum.get("vllm_content_rejected"))
+            images.extend([datum.get("vllm_images", [])] * 2)
+            videos.extend([datum.get("vllm_videos", [])] * 2)
+            audios.extend([datum.get("vllm_audios", [])] * 2)
+        batch["vllm_content"] = content
+        batch["vllm_images"] = images
+        batch["vllm_videos"] = videos
+        batch["vllm_audios"] = audios
+    
     if return_batch_only:
         return batch
 
