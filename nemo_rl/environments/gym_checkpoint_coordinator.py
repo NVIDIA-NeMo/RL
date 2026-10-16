@@ -43,6 +43,11 @@ GYM_CHECKPOINT_SCHEMA_VERSION = 2
 # answers by the deadline once it runs the call, so this only covers the reply
 # crossing Ray; a call still unanswered after it was never run.
 _MAX_REPLY_GRACE_S = 5.0
+# A lost resume leaves its deployment closed until the checkpoint lease expires,
+# so a transient failure is retried once. Gym answers a repeated resume
+# idempotently.
+_RESUME_ATTEMPTS = 2
+_RESUME_RETRY_PAUSE_S = 1.0
 
 
 class GymCheckpointOperationError(RuntimeError):
@@ -60,6 +65,11 @@ class GymCheckpointOperationError(RuntimeError):
             f"{len(self.failures)} instance(s): {detail}"
         )
 
+    def __reduce__(self):
+        # Rebuild from the constructor arguments, not the formatted message, and
+        # keep attributes such as notes added after construction.
+        return (type(self), (self.operation, self.failures), self.__dict__)
+
 
 class GymCheckpointNotReady(RuntimeError):
     """Gym participants could not all park before the checkpoint deadline."""
@@ -75,6 +85,9 @@ class GymCheckpointNotReady(RuntimeError):
         super().__init__(
             f"Gym checkpoint participants are not ready: {self.blockers!r}"
         )
+
+    def __reduce__(self):
+        return (type(self), (self.blockers,), self.__dict__)
 
 
 def is_transient_gym_checkpoint_failure(error: BaseException) -> bool:
@@ -574,19 +587,70 @@ class GymCheckpointCoordinator:
                 )
             raise
 
+    @asynccontextmanager
+    async def restored(
+        self,
+        restore_id: str,
+        checkpoint_root: str | Path,
+        manifest: GymCheckpointManifest,
+    ) -> AsyncIterator[None]:
+        """Restore every deployment for the body, then always reopen it once.
+
+        A failed restore cleans up and reopens Gym itself. A body that fails
+        could not take over the restored attempts, so they are retired before
+        Gym reopens and never continue.
+        """
+        await self.restore(restore_id, checkpoint_root, manifest)
+        try:
+            yield
+        except BaseException as error:
+            try:
+                await self.retire_restored(restore_id, manifest)
+            except Exception as retire_error:
+                error.add_note(
+                    "Gym retire of restored attempts also failed: "
+                    f"{type(retire_error).__name__}: {retire_error}"
+                )
+            try:
+                await self.resume(restore_id)
+            except Exception as resume_error:
+                error.add_note(
+                    "Gym restore cleanup also failed: "
+                    f"{type(resume_error).__name__}: {resume_error}"
+                )
+            raise
+        else:
+            await self.resume(restore_id)
+
     async def resume(self, checkpoint_id: str) -> None:
-        deadline_ts = self._deadline()
-        await self._collect(
-            "resume",
-            {
-                instance_id: handle.checkpoint_resume.remote(
-                    checkpoint_id,
+        """Reopen every deployment, retrying the ones a transient failure left closed."""
+        handles = dict(self._handles)
+        for attempt in range(1, _RESUME_ATTEMPTS + 1):
+            deadline_ts = self._deadline()
+            try:
+                await self._collect(
+                    "resume",
+                    {
+                        instance_id: handle.checkpoint_resume.remote(
+                            checkpoint_id,
+                            deadline_ts=deadline_ts,
+                        )
+                        for instance_id, handle in handles.items()
+                    },
                     deadline_ts=deadline_ts,
                 )
-                for instance_id, handle in self._handles.items()
-            },
-            deadline_ts=deadline_ts,
-        )
+                return
+            except GymCheckpointOperationError as error:
+                if (
+                    attempt == _RESUME_ATTEMPTS
+                    or not is_transient_gym_checkpoint_failure(error)
+                ):
+                    raise
+                handles = {
+                    instance_id: self._handles[instance_id]
+                    for instance_id in error.failures
+                }
+            await asyncio.sleep(_RESUME_RETRY_PAUSE_S)
 
     async def _renew_until_stopped(
         self,

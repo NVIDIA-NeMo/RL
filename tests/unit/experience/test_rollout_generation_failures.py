@@ -34,6 +34,7 @@ import pytest
 import ray.exceptions
 import torch
 
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.failures import (
     FailureClass,
@@ -50,7 +51,6 @@ from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollout_manager import (
     AsyncRolloutImpl,
     RequestDeadlineRegistry,
-    RolloutDispatchAdmissionGate,
     RolloutManager,
     RolloutRetryPolicy,
     RolloutStats,
@@ -1017,7 +1017,7 @@ class TestGymAdmissionClosedRows:
         stats = RolloutStats()
         # One row attempt: a refusal must not consume it.
         impl = _make_gym_impl(method, num_generations=2, row_attempts=1, stats=stats)
-        impl._dispatch_admission_gate = RolloutDispatchAdmissionGate()
+        impl._dispatch_admission_gate = DataPlaneCheckpointBarrier()
 
         completions, _, _ = asyncio.run(
             impl._run_rollouts(
@@ -1049,11 +1049,11 @@ class TestGymAdmissionClosedRows:
         events: list[tuple] = []
         method = _AdmissionClosedGymMethod(parked=set(), events=events)
         impl = _make_gym_impl(method, num_generations=2)
-        gate = RolloutDispatchAdmissionGate()
+        gate = DataPlaneCheckpointBarrier()
         impl._dispatch_admission_gate = gate
 
         async def exercise() -> None:
-            async with gate.closed():
+            async with gate.checkpoint():
                 task = asyncio.create_task(
                     impl._run_rollouts(
                         _gym_rows(2),
@@ -1096,7 +1096,7 @@ class TestGymAdmissionClosedRows:
         method = _AdmissionClosedGymMethod(parked={1}, events=events)
         method.release_admitted.clear()
         impl = _make_gym_impl(method, num_generations=2, row_attempts=1)
-        gate = RolloutDispatchAdmissionGate()
+        gate = DataPlaneCheckpointBarrier()
         impl._dispatch_admission_gate = gate
 
         async def exercise() -> None:
@@ -1147,7 +1147,7 @@ class TestGymAdmissionClosedRows:
             await asyncio.wait_for(refusal_unwound(), timeout=5.0)
 
             async def checkpoint() -> tuple:
-                async with gate.closed():
+                async with gate.checkpoint():
                     async with barrier.checkpoint():
                         inventory = ledger.gym_checkpoint_inventory(
                             {"tools/replica-0"}
