@@ -325,6 +325,9 @@ class CSDLossFn(LossFunction):
     # the legacy WORLD reduce; see loss_replica_group for why WORLD deadlocks
     # under pipeline parallelism.
     _dp_cp_group: Optional[torch.distributed.ProcessGroup] = None
+    # Whether per-window same-tokenizer KD terms are summed across CP; set per
+    # call by __call__ (see ``cp_normalized_by_caller``) like ``_dp_cp_group``.
+    _sum_window_kd_over_cp: bool = False
 
     loss_type = LossType.TOKEN_LEVEL
     input_type = LossInputType.DISTILLATION_CROSS_TOKENIZER
@@ -511,6 +514,7 @@ class CSDLossFn(LossFunction):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
         dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_normalized_by_caller: bool = False,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the (multi-teacher) cross-tokenizer distillation loss.
 
@@ -534,6 +538,12 @@ class CSDLossFn(LossFunction):
         ``None`` keeps the legacy ``WORLD`` behaviour (single-process tests, and
         the DTensor path, which has no pipeline axis to deadlock on).
 
+        ``cp_normalized_by_caller`` is set when the caller divides the returned
+        loss by the CP size (the replicated Megatron path). A same-tokenizer KD
+        term covers only this rank's contiguous window, so it is then summed
+        across CP (with a SUM backward) to keep its full weight after the
+        division.
+
         With ``owner_local`` (eligible Megatron students), cross-tokenizer
         teachers arrive as ``teacher_row_payloads_by_idx`` and ``logits`` stays
         in its CP shard. CE and every KD term are then CP-partial: each CP rank
@@ -541,6 +551,7 @@ class CSDLossFn(LossFunction):
         dynamic scaling and the reported metrics use detached CP sums.
         """
         self._dp_cp_group = dp_cp_group
+        self._sum_window_kd_over_cp = cp_normalized_by_caller
         teacher_sparse_logits_by_idx = teacher_sparse_logits_by_idx or {}
         dense_reconstruction_fallbacks_by_idx = (
             dense_reconstruction_fallbacks_by_idx or {}
@@ -873,6 +884,8 @@ class CSDLossFn(LossFunction):
             tp_group=tp_group,
             cp_group=cp_group,
         )
+        if self._sum_window_kd_over_cp:
+            kd = group_all_reduce_sum_with_grad_backward_sum(kd, cp_group)
         return kd, {"kl_loss": kd.item()}
 
     def _sum_kd(
@@ -1030,6 +1043,8 @@ class CSDLossFn(LossFunction):
             tp_group=tp_group,
             cp_group=cp_group,
         )
+        if self._sum_window_kd_over_cp:
+            kd = group_all_reduce_sum_with_grad_backward_sum(kd, cp_group)
         per_metrics: dict[str, Any] = {"kl_loss": kd.item()}
         for i, weight in enumerate(self.teacher_weights):
             per_metrics[f"teacher_{i}/weighted_kl"] = float(
