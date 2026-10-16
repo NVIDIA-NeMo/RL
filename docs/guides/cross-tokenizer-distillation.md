@@ -248,6 +248,79 @@ for the actual experiment. Table validation establishes preparation correctness;
 it does not replace a GPU smoke run for the selected backend, model pair,
 and parallelism configuration.
 
+## Teacher transport and context parallelism
+
+Each cross-tokenizer teacher sends its logits to the student through CUDA IPC,
+in one of two forms:
+
+- **Sparse** (`loss_fn.teacher_topk_ipc_k > 0`, default `128`): for each teacher
+  row, the top-k logits, the exact log-normalizer, and the realized teacher
+  labels the loss needs. The KD then compares the top-k tokens plus a REST
+  bucket that holds the remaining probability mass.
+- **Dense** (`teacher_topk_ipc_k: 0`): the full-vocabulary logits.
+
+Same-tokenizer teachers always send dense logits.
+
+A Megatron student evaluates cross-tokenizer KD **owner-local** when the run
+allows it. Each context-parallel rank keeps its own share of the student
+logits, evaluates only the alignment chunks whose final student predictor row
+it holds, and reads only the teacher rows those chunks need. The student
+prefix of a many-to-1 or many-to-many chunk may sit on other CP ranks; those
+ranks add their share to one small vector that is summed across CP. Each rank
+returns its share of the loss, so the shares add up to the full loss and
+Megatron does not divide it by the CP size. Logged losses are complete sums.
+Otherwise the loss is evaluated **replicated**: every CP rank rebuilds its
+contiguous sequence window of the student and teacher logits.
+
+| Student | Cross-tokenizer teacher | `teacher_topk_ipc_k` | Teacher transport | KD evaluation |
+|---|---|---|---|---|
+| Megatron, owner-local eligible | Megatron | `> 0` | Sparse rows of each teacher CP shard | Owner-local |
+| Megatron, owner-local eligible | Megatron or Automodel | `0` | Dense | Owner-local |
+| Megatron, not eligible | Megatron or Automodel | `0` | Dense | Replicated |
+| Automodel | Automodel | `> 0` | Sparse | Replicated |
+| Automodel | Megatron or Automodel | `0` | Dense | Replicated |
+
+Setup rejects the remaining combinations: sparse transport with a Megatron
+student that is not owner-local eligible or with an Automodel cross-tokenizer
+teacher, and sparse transport with an Automodel student and a Megatron
+cross-tokenizer teacher. Set `teacher_topk_ipc_k: 0` for those runs. Setup
+prints which evaluation a run uses and why.
+
+Owner-local evaluation requires:
+
+- a Megatron student with `pipeline_model_parallel_size: 1`, no sequence
+  packing, and no dynamic batching;
+- `kd_loss_mode: sum` with static teacher weights (`sum_weights_metric: null`);
+- `csd_pure_alm: false` and a `csd_loss_fn` other than `bce`;
+  `csd_last_pos_loss_fn: bce` only with `csd_realized_only_mismatch: true`;
+- with sparse transport, `teacher_topk_ipc_keep_realized: true` (or realized-only
+  mismatch), Megatron cross-tokenizer teachers, and a teacher
+  `make_sequence_length_divisible_by` that is a multiple of 2 x CP (and of TP
+  when the teacher uses sequence parallelism).
+
+CSD lockstep packing supports dense transport only, and therefore the
+replicated evaluation.
+
+Memory notes for owner-local evaluation:
+
+- The student logits are never gathered across CP; only per-row scalars and
+  the selected token values cross ranks. A same-tokenizer teacher is the
+  exception: it keeps the replicated contiguous-window KL, which gathers the
+  student logits.
+- A sparse teacher payload is read row by row instead of being copied as a
+  full-sequence `[B, T, k]` tensor on every GPU. A dense teacher payload is read
+  as the full-vocabulary rows the rank's chunks need, never as a sequence
+  window.
+- `csd_selected_row_chunk_size` (student and teacher rows per tile) and
+  `csd_support_chunk_batch_size` (chunks per batch) bound the temporary memory
+  of this evaluation; they do not change the loss.
+- The Megatron sparse sender keeps persistent IPC buffers on the teacher GPUs,
+  sized once for `max_total_sequence_length`, until training ends. Their handles
+  are reused across steps; the student reopens them every step, which drives
+  PyTorch's IPC reference count for these buffers below zero. Values are
+  unaffected, but the buffers may not be released after an error or at
+  shutdown.
+
 ## Implementation and further configuration
 
 - [CSD loss and configuration](../../nemo_rl/algorithms/loss/csd.py) define the
