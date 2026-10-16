@@ -2026,12 +2026,14 @@ def get_nemo_gym_max_infra_attempts(env_config: dict[str, Any]) -> int:
     )
     if value is None:
         return DEFAULT_MAX_INFRA_ATTEMPTS_PER_ROLLOUT
-    attempts = int(value)
-    if attempts < 1:
+    # bool is an int subclass and int() truncates a float silently; both would
+    # hide a misconfiguration behind a budget the operator never wrote.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(
-            f"env.nemo_gym.max_infra_attempts_per_rollout must be at least 1, got {value}"
+            "env.nemo_gym.max_infra_attempts_per_rollout must be an integer of "
+            f"at least 1, got {value!r}"
         )
-    return attempts
+    return value
 
 
 async def _nemo_gym_rollout_config(nemo_gym_environment: Any) -> dict[str, Any]:
@@ -2658,6 +2660,13 @@ async def _merge_nemo_gym_instance_streams(
                 if timing_metrics is not None:
                     record_timing(timing_labels_by_iterator[iterator], timing_metrics)
                 if GYM_INFRA_FAILURE_KEY in result:
+                    if first_failure is not None:
+                        # The rollout already ends with first_failure once the
+                        # streams drain: a retry would be wasted work, and an
+                        # exhausted budget here would raise a transport error
+                        # that hides the data failure that actually ended it.
+                        pending[asyncio.ensure_future(anext(iterator))] = iterator
+                        continue
                     # Raises GymTransportError once the row's attempts are used up.
                     row = record_infra_failure(row_index, result[GYM_INFRA_FAILURE_KEY])
                     print(
@@ -3035,10 +3044,11 @@ async def run_async_nemo_gym_rollout(
     final_rollout_result.rollout_metrics.update(
         _merge_nemo_gym_timing_metrics(actor_timing_by_instance, timer_prefix)
     )
-    if accumulator.infra_redispatches:
-        final_rollout_result.rollout_metrics["nemo_gym_infra_redispatches"] = (
-            accumulator.infra_redispatches
-        )
+    # Reported on every rollout, zero included, so a mean over steps is a rate
+    # and not an average over the steps that happened to re-dispatch.
+    final_rollout_result.rollout_metrics["nemo_gym_infra_redispatches"] = (
+        accumulator.infra_redispatches
+    )
     final_rollout_result.rollout_metrics.update(timer.get_timing_metrics("sum"))
     yield final_rollout_result
 

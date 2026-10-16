@@ -1209,9 +1209,84 @@ def test_nemo_gym_stream_rows_leaves_the_infra_marker_slot_empty():
     assert failures == {1: "NeMo-Gym /run failed with HTTP 503: down"}
 
 
+def test_nemo_gym_stream_rows_ends_the_last_attempt_at_the_first_marker():
+    """On the last attempt nothing would dispatch a marked row again, so the
+    marker ends the attempt with the transport error at once instead of
+    draining the stream. A verifier that scores a prompt group together holds
+    the siblings in /verify waiting for the failed row, so the drain would
+    last until that verifier's cohort timeout."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+    from nemo_rl.experience.failures import GymTransportError
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            del pending, timer_prefix, per_prompt
+
+            async def marker_ref():
+                return (
+                    1,
+                    {"name": "resolved-agent"},
+                    {
+                        GYM_INFRA_FAILURE_KEY: (
+                            "NeMo-Gym /run failed with HTTP 503: down"
+                        )
+                    },
+                    None,
+                )
+
+            async def held_ref():
+                # Row 0 waits in the verifier for its failed sibling and never lands.
+                await asyncio.Event().wait()
+
+            async def stream():
+                yield marker_ref()
+                yield held_ref()
+
+            return stream()
+
+    impl = _nemo_gym_impl(False)
+    env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    pending = [{"_rowidx": 0}, {"_rowidx": 1}]
+    results = [None, None]
+    shaping = [None, None]
+    failures: dict[int, str] = {}
+
+    with pytest.raises(
+        GymTransportError,
+        match=(
+            r"row 1 of 2 failed at the infrastructure level on the last attempt: "
+            r"NeMo-Gym /run failed with HTTP 503: down"
+        ),
+    ):
+        # The bound turns a regression into a failure instead of a hang.
+        _run(
+            asyncio.wait_for(
+                impl._stream_rows(
+                    env,
+                    pending,
+                    results,
+                    shaping,
+                    2,
+                    "timing/test",
+                    infra_failures=failures,
+                    stop_on_infra_failure=True,
+                ),
+                timeout=5.0,
+            )
+        )
+
+    assert results == [None, None]
+    assert failures == {1: "NeMo-Gym /run failed with HTTP 503: down"}
+
+
 class _ScriptedGymEnv:
     """A NemoGym environment whose run_rollouts yields one scripted item list
-    per dispatch and records the dispatched row indices."""
+    per dispatch, pausing on an asyncio.Event item until it is set, and records
+    the dispatched row indices."""
 
     def __init__(self, scripts):
         self.scripts = list(scripts)
@@ -1230,6 +1305,9 @@ class _ScriptedGymEnv:
 
                 async def stream():
                     for item in items:
+                        if isinstance(item, asyncio.Event):
+                            await item.wait()
+                            continue
 
                         async def ref(item=item):
                             return item
@@ -1299,9 +1377,11 @@ def test_nemo_gym_run_rollouts_redispatches_only_the_infra_failed_row():
 
 
 def test_nemo_gym_run_rollouts_names_the_infra_failure_when_attempts_run_out():
-    """When the budget is one attempt, a marker row's slot stays empty and the
-    final error carries the marker's detail instead of claiming the stream
-    ended early: the stream ended normally, one row short."""
+    """When the budget is one attempt, nothing would dispatch a marked row
+    again, so the marker ends the attempt at once with its own detail and the
+    rest of the stream is never awaited: here the other row is held by a
+    verifier that waits for the failed sibling, and the error names the row
+    that failed instead of waiting for the one that cannot arrive."""
     from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
     from nemo_rl.experience.failures import GymTransportError
     from nemo_rl.experience.rollouts import Timer
@@ -1309,13 +1389,15 @@ def test_nemo_gym_run_rollouts_names_the_infra_failure_when_attempts_run_out():
     env = _ScriptedGymEnv(
         scripts=[
             [
-                (0, {"name": "agent"}, _streamed_gym_result(), None),
                 (
                     1,
                     {"name": "agent"},
                     {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
                     None,
                 ),
+                # Never set: row 0 sits in /verify waiting for row 1.
+                asyncio.Event(),
+                (0, {"name": "agent"}, _streamed_gym_result(), None),
             ]
         ]
     )
@@ -1324,33 +1406,40 @@ def test_nemo_gym_run_rollouts_names_the_infra_failure_when_attempts_run_out():
     with pytest.raises(
         GymTransportError,
         match=(
-            r"rows \[1\] of 2 failed at the infrastructure level on every "
-            r"attempt \(1\): row 1: NeMo-Gym /run failed with HTTP 503: down"
+            r"row 1 of 2 failed at the infrastructure level on the last attempt: "
+            r"NeMo-Gym /run failed with HTTP 503: down"
         ),
     ):
+        # The bound turns a regression into a failure instead of a hang.
         _run(
-            impl._run_rollouts(
-                inputs=[
-                    {"_rowidx": 0, "agent_ref": {"name": "agent"}},
-                    {"_rowidx": 1, "agent_ref": {"name": "agent"}},
-                ],
-                timer=Timer(),
-                timer_prefix="timing/test",
+            asyncio.wait_for(
+                impl._run_rollouts(
+                    inputs=[
+                        {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                        {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+                    ],
+                    timer=Timer(),
+                    timer_prefix="timing/test",
+                ),
+                timeout=5.0,
             )
         )
     assert env.dispatched == [[0, 1]]
 
 
 def test_nemo_gym_run_rollouts_names_marked_and_unmarked_missing_rows():
-    """A group can end one attempt with a marked row and a row that simply never
-    arrived. The final error names the marker's detail for the first and says
-    the second never arrived, so neither is misreported."""
+    """A group can run out of attempts with a row marked on an earlier attempt
+    and a row that simply never arrived. The final error names the marker's
+    detail for the first and says the second never arrived, so neither is
+    misreported."""
     from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
     from nemo_rl.experience.failures import GymTransportError
     from nemo_rl.experience.rollouts import Timer
 
     env = _ScriptedGymEnv(
         scripts=[
+            # Attempt 1: row 0 fails at the infrastructure level, row 1 never
+            # arrives. Attempt 2 re-dispatches both and delivers nothing.
             [
                 (
                     0,
@@ -1358,16 +1447,17 @@ def test_nemo_gym_run_rollouts_names_marked_and_unmarked_missing_rows():
                     {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
                     None,
                 )
-            ]
+            ],
+            [],
         ]
     )
-    impl = _run_rollouts_impl(env, max_attempts=1)
+    impl = _run_rollouts_impl(env, max_attempts=2)
 
     with pytest.raises(
         GymTransportError,
         match=(
             r"rows \[0\] of 2 failed at the infrastructure level on every "
-            r"attempt \(1\): row 0: NeMo-Gym /run failed with HTTP 503: down; "
+            r"attempt \(2\): row 0: NeMo-Gym /run failed with HTTP 503: down; "
             r"rows \[1\] never arrived"
         ),
     ):
@@ -1381,7 +1471,7 @@ def test_nemo_gym_run_rollouts_names_marked_and_unmarked_missing_rows():
                 timer_prefix="timing/test",
             )
         )
-    assert env.dispatched == [[0, 1]]
+    assert env.dispatched == [[0, 1], [0, 1]]
 
 
 def test_nemo_gym_run_rollouts_keeps_the_group_timing_across_a_redispatch():

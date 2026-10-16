@@ -320,7 +320,12 @@ def _typed_gym_failure(failure_row: dict) -> GymTransportError | RolloutDataFail
     below 400 on a request that still failed, which means the reply broke after its
     status line) becomes ``GymTransportError``, as does a row without a status (a
     connection failure or a timeout before any reply); such a row is re-dispatched
-    instead of ending the step. Only a non-retriable 4xx describes the request itself
+    instead of ending the step. A status-less row is rarer than it sounds: Gym's
+    own client retries a refused connection without bound unless an
+    ``endpoint_file`` is configured, and its session sets no total deadline, so an
+    engine that refuses connections usually shows up as a row that never arrives,
+    which the rollout's deadline, not this classification, has to end. Only a
+    non-retriable 4xx describes the request itself
     and becomes ``RolloutDataFailure``. Both take a single str, so they pickle cleanly
     across the actor boundary and ``classify_rollout_failure``'s explicit-class fast
     path wins on the far side. The detail names the failure type, because the type
@@ -1130,11 +1135,13 @@ Depending on your data shape, you may want to change these values."""
             with timer.time(label=f"{timer_prefix}/await_results"):
                 nemo_gym_row, nemo_gym_result = await task
 
-            # Only ``_agent_request_failure_row`` sets the failure TYPE; a
-            # scoreable result row may carry ``_ng_failure_class`` alone (Gym's
-            # judge failsafe scores reward 0 and annotates the class), and such
-            # a row is postprocessed like any other result.
-            if GYM_FAILURE_TYPE_KEY in nemo_gym_result:
+            # Only Gym's ``_agent_request_failure_row`` writes the HTTP-status key
+            # (None when no reply arrived), so that key alone says the ``/run``
+            # failed. A verifier may echo ``_ng_failure_class`` or
+            # ``_ng_failure_type`` on a row it scored (Gym's judge failsafe
+            # annotates the class; Terminal-Bench's verify stamps the type on a
+            # reward-0 row), and such a row is postprocessed like any other result.
+            if GYM_FAILURE_STATUS_KEY in nemo_gym_result:
                 failure = _typed_gym_failure(nemo_gym_result)
                 if isinstance(failure, RolloutDataFailure):
                     # Prompt-specific: another attempt fails identically, so the
