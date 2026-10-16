@@ -108,9 +108,11 @@ responsibility, as with `asyncio.to_thread`.
 Wrap an async owner's lifetime in
 `async with nemo_rl.telemetry.runtime.monitor_event_loop("bounded_loop_name"):`
 to observe scheduling lag. Exit the context **before** flushing/shutting down
-telemetry. For HTTP serving, use the app lifespan so the probe runs on the HTTP
-loop rather than the Ray actor loop. These helpers are inactive when metric export
-is disabled; see [Runtime diagnostics](metrics.md#async-runtime-diagnostics).
+telemetry. For a FastAPI server, call
+`nemo_rl.telemetry.runtime.monitor_app_event_loop(app, "bounded_loop_name")` after
+every other lifespan registration, so the probe runs on the HTTP loop rather than
+the Ray actor loop. These helpers are inactive when metric export is disabled; see
+[Runtime diagnostics](metrics.md#async-runtime-diagnostics).
 
 ## Instrumenting inside a Ray actor
 

@@ -1,46 +1,5 @@
 # Metrics
 
-## Async runtime diagnostics
-
-When telemetry and metric export are enabled, selected thread offloads and event
-loops publish these diagnostics through the existing Lens providers.
-
-| Metric | Kind / unit | Dimensions and meaning |
-|---|---|---|
-| `rl.executor.queue_wait` | Histogram / milliseconds | Submission to thread start |
-| `rl.executor.execution` | Histogram / milliseconds | Thread execution wall time, including blocking I/O |
-| `rl.executor.result_delivery` | Histogram / milliseconds | Successful function completion to coroutine resumption |
-| `rl.executor.pending` | Up-down counter / tasks | Instrumented work currently `queued` or `running` |
-| `rl.event_loop.lag` | Histogram / milliseconds | Scheduling lateness of a one-second loop probe |
-
-Executor dimensions are `rl.executor` (a bounded call-site label) and, where
-applicable, `rl.executor.state` or `rl.executor.status` (`success`, `error`). Sites
-currently observed are non-streaming vLLM terminal capture, controller replay-index
-load, and synchronous local data-plane calls explicitly offloaded through
-`call_data_plane`. They share the **existing default executor**; the labels do not
-name separate pools. Pending counts cover only those instrumented calls. A
-cancelled caller does not stop an already-running thread: that work remains counted
-until it finishes. A cancelled queued call or failed submission retires its count.
-
-Loop labels are `controller` and `vllm_http`. The HTTP probe lives in the FastAPI
-lifespan; the controller probe lives around its pump execution. Both are cancelled
-and awaited on exit. No probe task or offload bookkeeping is created when telemetry
-or metric export is disabled, including trace-only runs.
-
-For example, high terminal queue wait with low execution time indicates executor
-backlog. High execution time requires further CPU/I/O attribution. High result
-delivery delay together with loop lag suggests delayed coroutine scheduling; it
-does not prove storage was slow or identify a GIL holder. The probe can emit only
-after the loop runs again, so it is **not an independent hang watchdog**.
-
-Histograms retain distributions that can be aggregated across processes. Do not
-average worker p95s. Percentile resolution depends on the SDK/exporter's histogram
-aggregation and bucket boundaries; these helpers do not configure SDK views.
-Runtime durations use milliseconds so the default histogram bounds are useful
-for typical thread/loop delays. No step, checkpoint, rollout, or model-call IDs
-are metric labels. These helpers add no per-request file writes, global executor
-patch, or new thread pool.
-
 NeMo-RL emits async efficiency (`rl.efficiency.*`), startup (`rl.setup.duration`), training (`rl.reward.*`, `rl.policy.*`, …), vLLM engine (`rl.vllm.*`), driver-side generation (`gen_ai.*`), and async runtime (`rl.executor.*`, `rl.event_loop.*`) metrics. The `gen_ai.*` series follows the OTel GenAI semantic conventions.
 
 Metrics are emitted **only when telemetry is exporting**. The metrics logger forwards training/setup series; runtime diagnostics are emitted by the instrumented controller and generation processes, identified by their resource attributes.
@@ -101,6 +60,48 @@ Representative phases: `generation_init` (and its `generation_init_reserve` / `g
 Unlike `rl.efficiency.seconds`, these phases overlap each other by construction: `total_setup` contains the rest, `parallel_wall` covers the generation and policy builds running concurrently, and `generation_init_reserve` / `generation_init_load` are parts of `generation_init`. Anything summing them by bucket would count startup several times over.
 
 Read one phase at a time. For "what did startup cost", use `phase=total_setup` — that is the one value that cannot double-count. The `rl.setup.*` spans give the same phases their shape in a trace; see [Span groups — Startup](span-groups.md#startup-what-happens-before-the-first-step).
+
+## Async runtime diagnostics
+
+When telemetry and metric export are enabled, selected thread offloads and event
+loops publish these diagnostics through the existing Lens providers.
+
+| Metric | Kind / unit | Dimensions and meaning |
+|---|---|---|
+| `rl.executor.queue_wait` | Histogram / milliseconds | Submission to thread start |
+| `rl.executor.execution` | Histogram / milliseconds | Thread execution wall time, including blocking I/O |
+| `rl.executor.result_delivery` | Histogram / milliseconds | Successful function completion to coroutine resumption |
+| `rl.executor.pending` | Up-down counter / tasks | Instrumented work currently `queued` or `running` |
+| `rl.event_loop.lag` | Histogram / milliseconds | Scheduling lateness of a one-second loop probe |
+
+Executor dimensions: every series carries `rl.executor.site` (a bounded call-site
+label); `rl.executor.pending` adds `rl.executor.state` (`queued`, `running`) and
+`rl.executor.execution` adds `rl.executor.status` (`success`, `error`). Sites
+currently observed are non-streaming vLLM terminal capture, controller replay-index
+load, and synchronous local data-plane calls explicitly offloaded through
+`call_data_plane`. They share the **existing default executor**; the labels do not
+name separate pools. Pending counts cover only those instrumented calls. A
+cancelled caller does not stop an already-running thread: that work remains counted
+until it finishes. A cancelled queued call or failed submission retires its count.
+
+Loop labels are `controller` and `vllm_http`. The HTTP probe lives in the FastAPI
+lifespan; the controller probe lives around its pump execution. Both are cancelled
+and awaited on exit. No probe task or offload bookkeeping is created when telemetry
+or metric export is disabled, including trace-only runs.
+
+For example, high terminal queue wait with low execution time indicates executor
+backlog. High execution time requires further CPU/I/O attribution. High result
+delivery delay together with loop lag suggests delayed coroutine scheduling; it
+does not prove storage was slow or identify a GIL holder. The probe can emit only
+after the loop runs again, so it is **not an independent hang watchdog**.
+
+Histograms retain distributions that can be aggregated across processes. Do not
+average worker p95s. Percentile resolution depends on the SDK/exporter's histogram
+aggregation and bucket boundaries; these helpers do not configure SDK views.
+Runtime durations use milliseconds so the default histogram bounds are useful
+for typical thread/loop delays. No step, checkpoint, rollout, or model-call IDs
+are metric labels. These helpers add no per-request file writes, global executor
+patch, or new thread pool.
 
 ## W&B history step axes
 

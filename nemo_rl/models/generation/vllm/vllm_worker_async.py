@@ -20,10 +20,9 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
@@ -71,14 +70,13 @@ from nemo_rl.models.generation.openai_server_utils import (
     PrefixSplice,
     splice_prefix_tokens,
 )
-from nemo_rl.telemetry.runtime import monitor_event_loop, run_in_thread
+from nemo_rl.telemetry.runtime import monitor_app_event_loop, run_in_thread
 from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from nemo_gym.token_id_capture.staging.capture import ActiveCall
-    from starlette.types import Lifespan
 
 
 @dataclass
@@ -1597,19 +1595,8 @@ class VllmAsyncGenerationWorkerImpl(
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.setup_api_server(app)
 
-        # Wrap the final lifespan, preserving startup/shutdown handlers and any
-        # state supplied by API/refit setup instead of replacing their lifecycle.
-        server_lifespan = app.router.lifespan_context
-
-        @asynccontextmanager
-        async def lifespan(
-            server_app: FastAPI,
-        ) -> AsyncIterator[Mapping[str, Any] | None]:
-            async with monitor_event_loop("vllm_http"):
-                async with server_lifespan(server_app) as state:
-                    yield state
-
-        app.router.lifespan_context = cast("Lifespan[FastAPI]", lifespan)
+        # Last, so the probe wraps the lifespan that API/refit setup installed.
+        monitor_app_event_loop(app, "vllm_http")
 
         ########################################
         # Server spinup

@@ -26,15 +26,36 @@ import functools
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
-from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
+from nemo_rl.telemetry.metrics import (
+    EVENT_LOOP_LAG_KEY,
+    EXECUTOR_EXECUTION_KEY,
+    EXECUTOR_PENDING_KEY,
+    EXECUTOR_QUEUE_WAIT_KEY,
+    EXECUTOR_RESULT_DELIVERY_KEY,
+    record_rl_metrics,
+    warn_once,
+)
 from nemo_rl.telemetry.setup import telemetry_metrics_exporting
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+    from starlette.types import Lifespan
 
 _T = TypeVar("_T")
 _EVENT_LOOP_PROBE_INTERVAL_S = 1.0
+
+# Bounded call-site label carried by every ``rl.executor.*`` series.
+RL_EXECUTOR_SITE_ATTR = "rl.executor.site"
+# ``queued`` or ``running``; only on ``rl.executor.pending``.
+RL_EXECUTOR_STATE_ATTR = "rl.executor.state"
+# ``success`` or ``error``; only on ``rl.executor.execution``.
+RL_EXECUTOR_STATUS_ATTR = "rl.executor.status"
+# Bounded loop label carried by ``rl.event_loop.lag``.
+RL_EVENT_LOOP_ATTR = "rl.event_loop"
 
 
 def _emit(values: Mapping[str, float], attributes: Mapping[str, str]) -> None:
@@ -48,7 +69,7 @@ def _emit(values: Mapping[str, float], attributes: Mapping[str, str]) -> None:
 
 @dataclass
 class _Submission:
-    executor: str
+    site: str
     submitted_at: float
     state: str = "queued"
     finished_at: float | None = None
@@ -64,17 +85,20 @@ class _Submission:
             # without decrementing the already-retired queued count again.
             if self.state == "queued":
                 _emit(
-                    {"executor_pending": -1.0},
-                    {"rl.executor": self.executor, "rl.executor.state": "queued"},
+                    {EXECUTOR_PENDING_KEY: -1.0},
+                    {
+                        RL_EXECUTOR_SITE_ATTR: self.site,
+                        RL_EXECUTOR_STATE_ATTR: "queued",
+                    },
                 )
             self.state = "running"
             _emit(
-                {"executor_pending": 1.0},
-                {"rl.executor": self.executor, "rl.executor.state": "running"},
+                {EXECUTOR_PENDING_KEY: 1.0},
+                {RL_EXECUTOR_SITE_ATTR: self.site, RL_EXECUTOR_STATE_ATTR: "running"},
             )
             _emit(
-                {"executor_queue_wait": (started_at - self.submitted_at) * 1000},
-                {"rl.executor": self.executor},
+                {EXECUTOR_QUEUE_WAIT_KEY: (started_at - self.submitted_at) * 1000},
+                {RL_EXECUTOR_SITE_ATTR: self.site},
             )
             return True
 
@@ -83,12 +107,12 @@ class _Submission:
             self.state = "finished"
             self.finished_at = time.perf_counter()
             _emit(
-                {"executor_execution": (self.finished_at - started_at) * 1000},
-                {"rl.executor": self.executor, "rl.executor.status": status},
+                {EXECUTOR_EXECUTION_KEY: (self.finished_at - started_at) * 1000},
+                {RL_EXECUTOR_SITE_ATTR: self.site, RL_EXECUTOR_STATUS_ATTR: status},
             )
             _emit(
-                {"executor_pending": -1.0},
-                {"rl.executor": self.executor, "rl.executor.state": "running"},
+                {EXECUTOR_PENDING_KEY: -1.0},
+                {RL_EXECUTOR_SITE_ATTR: self.site, RL_EXECUTOR_STATE_ATTR: "running"},
             )
 
     def retire_queued(self) -> None:
@@ -97,35 +121,38 @@ class _Submission:
                 return
             self.state = "retired"
             _emit(
-                {"executor_pending": -1.0},
-                {"rl.executor": self.executor, "rl.executor.state": "queued"},
+                {EXECUTOR_PENDING_KEY: -1.0},
+                {RL_EXECUTOR_SITE_ATTR: self.site, RL_EXECUTOR_STATE_ATTR: "queued"},
             )
 
 
 async def run_in_thread(
-    executor: str, function: Callable[..., _T], /, *args: Any, **kwargs: Any
+    site: str, function: Callable[..., _T], /, *args: Any, **kwargs: Any
 ) -> _T:
     """Observe one default-executor call without changing asyncio semantics.
-
-    Args:
-        executor: A bounded call-site label, such as ``generation_terminal``.
-            It identifies work sharing an executor, not a dedicated thread pool.
-        function: Synchronous function to offload.
-        *args: Positional arguments forwarded to the function.
-        **kwargs: Keyword arguments forwarded to the function.
 
     Records queue wait, execution time and queued/running counts. Successful
     calls also record completion-to-coroutine-resumption delay. Cancellation
     does not pretend to stop an already-running thread: it remains counted
     until the function exits. With metrics off, delegates to ``asyncio.to_thread``.
+
+    Args:
+        site: A bounded call-site label, such as ``generation_terminal``. It
+            identifies work sharing the default executor, not a dedicated pool.
+        function: Synchronous function to offload.
+        *args: Positional arguments forwarded to the function.
+        **kwargs: Keyword arguments forwarded to the function.
+
+    Returns:
+        The function's return value.
     """
     if not telemetry_metrics_exporting():
         return await asyncio.to_thread(function, *args, **kwargs)
 
-    submission = _Submission(executor, 0.0)
+    submission = _Submission(site, 0.0)
     _emit(
-        {"executor_pending": 1.0},
-        {"rl.executor": executor, "rl.executor.state": "queued"},
+        {EXECUTOR_PENDING_KEY: 1.0},
+        {RL_EXECUTOR_SITE_ATTR: site, RL_EXECUTOR_STATE_ATTR: "queued"},
     )
     call = functools.partial(function, *args, **kwargs)
 
@@ -165,12 +192,12 @@ async def run_in_thread(
     if submission.finished_at is not None:
         _emit(
             {
-                "executor_result_delivery": (
+                EXECUTOR_RESULT_DELIVERY_KEY: (
                     time.perf_counter() - submission.finished_at
                 )
                 * 1000
             },
-            {"rl.executor": executor},
+            {RL_EXECUTOR_SITE_ATTR: site},
         )
     return result
 
@@ -181,8 +208,8 @@ async def _probe_event_loop(name: str) -> None:
         expected_at = loop.time() + _EVENT_LOOP_PROBE_INTERVAL_S
         await asyncio.sleep(_EVENT_LOOP_PROBE_INTERVAL_S)
         _emit(
-            {"event_loop_lag": max(0.0, loop.time() - expected_at) * 1000},
-            {"rl.event_loop": name},
+            {EVENT_LOOP_LAG_KEY: max(0.0, loop.time() - expected_at) * 1000},
+            {RL_EVENT_LOOP_ATTR: name},
         )
 
 
@@ -193,6 +220,9 @@ async def monitor_event_loop(name: str) -> AsyncIterator[None]:
     Creates one probe task only while metrics export is enabled. The task is
     cancelled and awaited on exit, including failure and cancellation paths.
     A blocked loop cannot emit until it runs again; this is not a watchdog.
+
+    Args:
+        name: Bounded loop label, such as ``controller`` or ``vllm_http``.
     """
     if not telemetry_metrics_exporting():
         yield
@@ -202,5 +232,29 @@ async def monitor_event_loop(name: str) -> AsyncIterator[None]:
         yield
     finally:
         probe.cancel()
-        with suppress(asyncio.CancelledError):
-            await probe
+        # wait() rather than awaiting the probe: a cancel aimed at the owner
+        # while it waits here must propagate, not be absorbed as the probe's
+        # own CancelledError.
+        await asyncio.wait({probe})
+
+
+def monitor_app_event_loop(app: FastAPI, name: str) -> None:
+    """Run a loop probe for the lifetime of ``app``'s serving loop.
+
+    Wraps the app's current lifespan, so call it after every other lifespan or
+    startup/shutdown registration. Their lifecycle and any yielded state are
+    preserved.
+
+    Args:
+        app: FastAPI app whose lifespan should own the probe.
+        name: Bounded loop label, such as ``vllm_http``.
+    """
+    inner = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(server_app: FastAPI) -> AsyncIterator[Mapping[str, Any] | None]:
+        async with monitor_event_loop(name):
+            async with inner(server_app) as state:
+                yield state
+
+    app.router.lifespan_context = cast("Lifespan[FastAPI]", lifespan)
