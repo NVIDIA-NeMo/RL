@@ -42,7 +42,7 @@ This enables Eagle3 in vLLM, but the trainer does not own or update the draft mo
 policy:
   megatron_cfg:
     enabled: true
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
 
   draft:
@@ -64,7 +64,7 @@ policy:
 ```
 
 > [!NOTE]
-> Online draft training currently requires the Megatron backend and does not support context parallelism yet. Set `policy.megatron_cfg.enabled=true`, `policy.dtensor_cfg.enabled=false`, and `policy.megatron_cfg.context_parallel_size=1`. Sequence packing (`policy.sequence_packing.enabled=true`) is supported.
+> Online draft training currently requires the Megatron backend and does not support context parallelism yet. Set `policy.megatron_cfg.enabled=true`, `policy.automodel_cfg.enabled=false`, and `policy.megatron_cfg.context_parallel_size=1`. Sequence packing (`policy.sequence_packing.enabled=true`) is supported.
 
 ## How It Works
 
@@ -165,7 +165,10 @@ where `lambda` is `policy.draft.loss_weight`.
 
 ## Notes
 
-- When online draft training is enabled, NeMo RL logs `draft_loss`.
+- When online draft training is enabled, `train/loss` remains the policy-training
+  objective, `train/draft_loss` reports the unweighted auxiliary draft loss, and
+  `train/total_loss` reports `loss + policy.draft.loss_weight * draft_loss`.
+  `total_loss` is only emitted when the draft loss wrapper is active.
 - Resume checkpoints include the nested draft model state when `policy.draft.enabled=true`.
 - If speculative decoding is enabled without trainer-owned draft weights, vLLM must load real draft weights at startup. When the trainer owns the draft model, the first refit pushes both policy and draft parameters.
 - Online draft training supports `policy.sequence_packing.enabled=true`; it does not currently support `policy.megatron_cfg.context_parallel_size > 1`, and the packed path additionally requires `policy.megatron_cfg.pipeline_model_parallel_size = 1`.

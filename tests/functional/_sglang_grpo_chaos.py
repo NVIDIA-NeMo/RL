@@ -14,7 +14,7 @@
 
 """Real GRPO fault injection; no replacement of the trainer or production methods.
 
-Two colocated GPUs host two TP=1 SGLang engines and the DTensor trainer. The
+Two colocated GPUs host two TP=1 SGLang engines and the Automodel trainer. The
 observer attaches to whichever Ray cluster the training joined or started.
 The six engine-only fault-tolerance pytest cases remain in L0.
 """

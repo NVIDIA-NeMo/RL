@@ -27,14 +27,35 @@ from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.vllm.config import (
-    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
     VllmSpecificArgs,
     vllm_nemotron_h_fp32_lm_head_enabled,
+)
+from nemo_rl.models.generation.vllm.patches import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
 )
 from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
+
+# Environment for bitwise-reproducible policy workers. These are read when the
+# worker creates its cuBLAS handles and selects Transformer Engine kernels, so
+# they are set in the worker's runtime environment, before the process starts.
+DETERMINISTIC_ENV_VARS = {
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+}
+
+
+def enable_deterministic_algorithms() -> None:
+    """Switch torch to deterministic algorithms in this process.
+
+    ``warn_only=True`` keeps ops without a deterministic implementation running
+    (torch warns instead of raising), so enabling this never breaks a model.
+    """
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class IPCProtocol(Enum):
@@ -50,28 +71,11 @@ class IPCProtocol(Enum):
 # worker classes.
 POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
-    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
+    "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": "nemo_rl.modelopt.models.policy.workers.automodel_quant_policy_worker.AutomodelQuantPolicyWorker",
 }
 
 _NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
 _NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
-
-
-def reject_legacy_dtensor_key(dtensor_cfg: dict[str, Any], config_path: str) -> None:
-    """Fail at setup when a config still carries the removed dtensor_cfg._v2 key.
-
-    Args:
-        dtensor_cfg: The resolved dtensor_cfg mapping to inspect.
-        config_path: Dotted path used in the error message, e.g. policy.dtensor_cfg.
-    """
-    if "_v2" not in dtensor_cfg:
-        return
-
-    raise ValueError(
-        f"DTensor v1 ({config_path}._v2=false) and the _v2 key itself have been removed. "
-        f"DTensor is always the Automodel backend now, which is what _v2=true selected, "
-        f"so delete the key."
-    )
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
@@ -138,7 +142,7 @@ def validate_fp32_lm_head_config(
     config: "PolicyConfig",
     *,
     megatron_enabled: bool,
-    dtensor_enabled: bool,
+    automodel_enabled: bool,
     model_config: object | None = None,
 ) -> None:
     """Reject fp32 LM-head settings that the selected backends cannot match."""
@@ -186,11 +190,11 @@ def validate_fp32_lm_head_config(
         )
 
     vllm_fp32 = vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg)
-    if dtensor_enabled and vllm_fp32:
+    if automodel_enabled and vllm_fp32:
         raise ValueError(
             "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
-            "with the Megatron trainer because DTensor has no matching "
-            "policy.dtensor_cfg fp32 LM-head implementation."
+            "with the Megatron trainer because Automodel has no matching "
+            "policy.automodel_cfg fp32 LM-head implementation."
         )
     if megatron_enabled and megatron_fp32 != vllm_fp32:
         raise ValueError(

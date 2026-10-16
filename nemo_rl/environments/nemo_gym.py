@@ -18,16 +18,19 @@ import os
 import subprocess
 import sys
 import threading
+import urllib.parse
+import urllib.request
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from time import monotonic
-from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
+from time import monotonic, sleep
+from typing import Any, Dict, List, NotRequired, Optional, Protocol, Self, TypedDict
 
 import ray
 import torch
+from pydantic import BaseModel, Field, field_validator, model_validator
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
@@ -201,6 +204,45 @@ class NemoGymCompatibleConfig(Protocol):
     def policy(self) -> PolicyConfig: ...
 
 
+class ExternalServiceReadinessTargetConfig(BaseModel, extra="allow"):
+    """Health endpoint and required backend count for one external service.
+
+    ``url`` must be a ``vllm_pool_lb`` ``/health`` endpoint; see
+    ``_probe_external_service`` for the reply it expects. A plain vLLM
+    ``/health`` returns no backend counts and never reads as ready.
+    """
+
+    name: str = Field(min_length=1)
+    url: str
+    expected_backends: int = Field(gt=0)
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, url: str) -> str:
+        """Require an absolute HTTP(S) health endpoint."""
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("url must be an absolute HTTP(S) URL")
+        return url
+
+
+class ExternalServiceReadinessConfig(BaseModel, extra="allow"):
+    """Startup gate for external services used by NeMo Gym rollouts."""
+
+    services: list[ExternalServiceReadinessTargetConfig] = Field(min_length=1)
+    timeout_seconds: float = Field(gt=0)
+    poll_interval_seconds: float = Field(gt=0)
+    request_timeout_seconds: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_unique_service_names(self) -> Self:
+        """Reject ambiguous duplicate service labels in diagnostics."""
+        names = [service.name for service in self.services]
+        if len(names) != len(set(names)):
+            raise ValueError("external readiness service names must be unique")
+        return self
+
+
 def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
     """Determine whether NeMo Gym should handle rollouts and validation."""
     should_use_gym = bool(master_config.env.get("should_use_nemo_gym"))
@@ -312,6 +354,9 @@ def get_nemo_gym_venv_dir() -> str | None:
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
+    # The bearer token the generation server requires on its OpenAI routes, handed
+    # to the Gym model server as policy_api_key. None when the server checks none.
+    policy_api_key: NotRequired[Optional[str]]
     initial_global_config_dict: Dict[str, Any]
     # Port range for Gym HTTP servers (head server + subprocess servers).
     # Defaults to DEFAULT_GYM_PORT_RANGE_LOW/HIGH (5000-5999) from
@@ -333,6 +378,10 @@ class NemoGymConfig(TypedDict):
     # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
     # tokenizer consistently with the driver. Defaults to off when absent.
     use_fastokens: NotRequired[bool]
+    # Optional startup gate for externally served Gym dependencies. The actor
+    # starts local Gym services first, then waits for every target before it
+    # exposes its rollout collection helper to the training driver.
+    external_service_readiness: NotRequired[ExternalServiceReadinessConfig | None]
     # Multimodal fields (populated by `setup_nemo_gym_config` when VLM is enabled).
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
@@ -355,6 +404,10 @@ _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
+# The generation server's bearer token travels to Gym's servers the same way as
+# the token-capture secret: as an environment interpolation each server
+# resolves in its own process, never as a value in the serialized config.
+_POLICY_API_KEY_ENV = "NEMO_RL_POLICY_API_KEY"
 
 
 def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
@@ -368,6 +421,126 @@ def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
         "token_capture.enabled requires setup-derived generation_backend to be "
         f"'vllm' or 'megatron'; got {generation_backend!r}"
     )
+
+
+def extract_external_service_readiness(
+    nemo_gym_dict: dict[str, Any],
+) -> ExternalServiceReadinessConfig | None:
+    """Remove and validate NeMo-RL's external readiness block from Gym config."""
+    readiness_dict = nemo_gym_dict.pop("external_service_readiness", None)
+    if readiness_dict is None:
+        return None
+    return ExternalServiceReadinessConfig.model_validate(readiness_dict)
+
+
+def _probe_external_service(
+    service: ExternalServiceReadinessTargetConfig,
+    *,
+    request_timeout_seconds: float,
+) -> str | None:
+    """Return a readiness problem for one service, or None when it is ready.
+
+    The URL must be a ``vllm_pool_lb`` ``/health`` endpoint. This reads the
+    ``status``, ``healthy_backends`` and ``total_backends`` fields returned by
+    ``LoadBalancer.handle_health`` in ``tools/external_gym_vllm/vllm_pool_lb.py``.
+    """
+    try:
+        with urllib.request.urlopen(
+            service.url, timeout=request_timeout_seconds
+        ) as response:
+            status_code = response.status
+            response_body = response.read()
+    except OSError as error:
+        return f"request failed: {error}"
+
+    if status_code != 200:
+        return f"HTTP {status_code}"
+
+    try:
+        payload = json.loads(response_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return f"invalid JSON response: {error}"
+    if not isinstance(payload, dict):
+        return f"expected a JSON object, got {type(payload).__name__}"
+
+    status = payload.get("status")
+    healthy_backends = payload.get("healthy_backends")
+    total_backends = payload.get("total_backends")
+    if (
+        not isinstance(healthy_backends, int)
+        or isinstance(healthy_backends, bool)
+        or not isinstance(total_backends, int)
+        or isinstance(total_backends, bool)
+    ):
+        return (
+            "health response must contain integer healthy_backends and total_backends"
+        )
+    if (
+        status != "ok"
+        or healthy_backends < service.expected_backends
+        or total_backends < service.expected_backends
+    ):
+        return (
+            f"status={status!r}, healthy_backends={healthy_backends}, "
+            f"total_backends={total_backends}, "
+            f"expected_backends={service.expected_backends}"
+        )
+    return None
+
+
+def _wait_for_external_services(
+    config: ExternalServiceReadinessConfig | None,
+) -> None:
+    """Wait for all external Gym dependencies under one shared deadline."""
+    if config is None:
+        return
+
+    deadline = monotonic() + config.timeout_seconds
+    previous_problems: dict[str, str] = {}
+    while True:
+        problems: dict[str, str] = {}
+        for service in config.services:
+            remaining_seconds = deadline - monotonic()
+            if remaining_seconds <= 0:
+                problems[service.name] = "startup deadline expired before probe"
+                continue
+            problem = _probe_external_service(
+                service,
+                request_timeout_seconds=min(
+                    config.request_timeout_seconds, remaining_seconds
+                ),
+            )
+            if problem is not None:
+                problems[service.name] = problem
+
+        if not problems:
+            print(
+                "All external NeMo-Gym services are ready: "
+                + ", ".join(service.name for service in config.services)
+            )
+            return
+
+        if problems != previous_problems:
+            print(
+                "Waiting for external NeMo-Gym services: "
+                + "; ".join(f"{name}: {problem}" for name, problem in problems.items())
+            )
+            previous_problems = problems
+
+        remaining_seconds = deadline - monotonic()
+        if remaining_seconds > 0:
+            sleep(min(config.poll_interval_seconds, remaining_seconds))
+            remaining_seconds = deadline - monotonic()
+        # Raise now rather than next round: a round that starts at the
+        # deadline cannot probe, and would overwrite these observations.
+        if remaining_seconds <= 0:
+            details = "; ".join(
+                f"{name}: {problem}" for name, problem in problems.items()
+            )
+            raise TimeoutError(
+                "Timed out waiting for external NeMo-Gym services after "
+                f"{config.timeout_seconds:g}s. Last observations: {details}"
+            )
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -560,9 +733,21 @@ class NemoGym(EnvironmentInterface):
         initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
-        initial_global_config_dict["policy_api_key"] = (
-            "dummy_key"  # No key necessary for training.
-        )
+        # The Gym model server sends this as the bearer token of every request to
+        # the generation server. A server that checks no key accepts any value, and
+        # Gym's client requires a non-empty string, hence the placeholder. A real
+        # key is not written into the config: the head server serves the merged
+        # global config unredacted (GET /global_config_dict_yaml) and server
+        # commands inline the YAML, so the config carries only the variable name
+        # and each Gym server resolves the value from its own environment (a copy
+        # of this actor's).
+        if self.cfg.get("policy_api_key"):
+            os.environ[_POLICY_API_KEY_ENV] = self.cfg["policy_api_key"]
+            initial_global_config_dict["policy_api_key"] = (
+                f"${{oc.env:{_POLICY_API_KEY_ENV}}}"
+            )
+        else:
+            initial_global_config_dict["policy_api_key"] = "dummy_key"
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
         # In multinode runs, Gym-managed service configs must advertise a real node IP
         # rather than falling back to localhost, or remote workers will connect to
@@ -576,8 +761,8 @@ class NemoGym(EnvironmentInterface):
             or _gym_port_high > DEFAULT_GYM_PORT_RANGE_HIGH
         ):
             print(
-                f"WARNING: Gym port range [{_gym_port_low}, {_gym_port_high}) is outside "
-                f"the default [{DEFAULT_GYM_PORT_RANGE_LOW}, {DEFAULT_GYM_PORT_RANGE_HIGH}). "
+                f"WARNING: Gym port range {_gym_port_low}-{_gym_port_high} is outside "
+                f"the default {DEFAULT_GYM_PORT_RANGE_LOW}-{DEFAULT_GYM_PORT_RANGE_HIGH}. "
                 f"Check the port layout in virtual_cluster.py for conflicts."
             )
         initial_global_config_dict["port_range_low"] = _gym_port_low
@@ -663,6 +848,17 @@ Depending on your data shape, you may want to change these values."""
             )
         )
 
+        try:
+            _wait_for_external_services(self.cfg.get("external_service_readiness"))
+        except TimeoutError:
+            # RunHelper.start() has already spawned local Gym services. Do not
+            # leave them behind when an external dependency misses its deadline.
+            # Clear the handle first, as shutdown() does: the caller's teardown
+            # calls shutdown() next, and RunHelper.shutdown() is not idempotent.
+            rh, self.rh = self.rh, None
+            rh.shutdown()
+            raise
+
         # Setup for rollout collection
         self.head_server_config = BaseServerConfig(
             host=self.node_ip,
@@ -745,8 +941,10 @@ Depending on your data shape, you may want to change these values."""
         Gym does not start a process for them.
 
         Callers compare these names across actors to build the agent->shard map
-        and to catch an entry duplicated across shards. Names are all that is
-        interpreted; what an entry *means* is Gym's business.
+        and to catch an entry duplicated across shards; an unsharded job's
+        coverage check (``validate_dataset_agent_coverage``) reads them as the
+        entries a dataset row may name. Names are all that is interpreted; what
+        an entry *means* is Gym's business.
         """
         if self.rh is None:
             raise RuntimeError(
@@ -1520,7 +1718,8 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
     # Enable the backend's OpenAI-compatible server.
-    if generation_config["backend"] == "vllm":
+    if generation_config["backend"] in ("vllm", "dynamo"):
+        # Dynamo uses these flags to expose its token wrapper to Gym.
         generation_config["vllm_cfg"]["async_engine"] = True
         generation_config["vllm_cfg"]["expose_http_server"] = True
     elif generation_config["backend"] == "megatron":
@@ -1536,10 +1735,17 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         # SGLang is always an HTTP server. This switch selects its asynchronous
         # rollout control flow without mutating an inherited inactive vLLM block.
         generation_config["use_async_rollouts"] = True
+    elif generation_config["backend"] == "trtllm":
+        # Must stay in sync with should_use_nemo_gym, which reads
+        # trtllm_cfg.expose_http_server to decide Gym owns the rollouts. Under
+        # disaggregation the server is also what the disagg frontend reaches
+        # each engine on, so there is no non-HTTP Gym path for this backend.
+        generation_config["trtllm_cfg"]["async_engine"] = True
+        generation_config["trtllm_cfg"]["expose_http_server"] = True
     else:
         raise ValueError(
-            "NeMo-Gym setup supports vllm, megatron or sglang generation; got "
-            f"{generation_config['backend']!r}"
+            "NeMo-Gym setup supports vllm, dynamo, megatron, sglang, or trtllm "
+            f"generation; got {generation_config['backend']!r}"
         )
 
     # Stop strings or token ids are not supported
@@ -1578,6 +1784,7 @@ def build_nemo_gym_config(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
     """Build the ``NemoGymConfig`` for a single, unsharded NeMo-Gym actor.
 
@@ -1595,6 +1802,9 @@ def build_nemo_gym_config(
             routed-experts carry dtype ("int8"/"int16"/"int32") for the model.
         use_fastokens: Forwarded from ``policy.tokenizer.use_fastokens`` so the
             actor patches its tokenizer the same way the driver does.
+        policy_api_key: The bearer token the generation server requires on its
+            OpenAI routes (VllmGeneration.http_server_api_key), or None when it
+            checks none.
 
     Returns:
         A ``NemoGymConfig`` with NeMo-RL fields at the top level and the
@@ -1622,6 +1832,7 @@ def build_nemo_gym_config(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        policy_api_key=policy_api_key,
     )
 
 
@@ -1633,6 +1844,7 @@ def _build_gym_actor_config(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
     """Turn one already-resolved Gym config mapping into a ``NemoGymConfig``.
 
@@ -1652,6 +1864,7 @@ def _build_gym_actor_config(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
         key: value
         for key in ("port_range_low", "port_range_high")
@@ -1684,12 +1897,14 @@ def _build_gym_actor_config(
     return NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
+        policy_api_key=policy_api_key,
         invalid_tool_call_patterns=invalid_tool_call_patterns,
         thinking_tags=thinking_tags,
         tokenizer_config=tokenizer_config,
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
         **port_range,
@@ -1894,6 +2109,7 @@ def build_nemo_gym_actors(
     use_fastokens: bool,
     generation_backend: str = "vllm",
     token_capture: Optional[dict[str, Any]] = None,
+    policy_api_key: Optional[str] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
     spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
 ) -> NemoGymShardSet:
@@ -1933,6 +2149,7 @@ def build_nemo_gym_actors(
             enable_router_replay=enable_router_replay,
             use_fastokens=use_fastokens,
             token_capture=token_capture,
+            policy_api_key=policy_api_key,
         )
 
     return _build_sharded_gym_actors(
@@ -1944,6 +2161,7 @@ def build_nemo_gym_actors(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        policy_api_key=policy_api_key,
         pg_ready_timeout=pg_ready_timeout,
         spinup_timeout=spinup_timeout,
     )
@@ -1958,6 +2176,7 @@ def _build_single_gym_actor(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]],
+    policy_api_key: Optional[str] = None,
 ) -> NemoGymShardSet:
     """The pre-sharding path: one actor, no placement group, no discovery.
 
@@ -1971,6 +2190,7 @@ def _build_single_gym_actor(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        policy_api_key=policy_api_key,
     )
 
     actor_options: dict[str, Any] = {
@@ -2006,6 +2226,7 @@ def _build_sharded_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]],
+    policy_api_key: Optional[str] = None,
     pg_ready_timeout: float,
     spinup_timeout: float,
 ) -> NemoGymShardSet:
@@ -2089,6 +2310,7 @@ def _build_sharded_gym_actors(
                     enable_router_replay=enable_router_replay,
                     use_fastokens=use_fastokens,
                     token_capture=token_capture,
+                    policy_api_key=policy_api_key,
                 )
             )
             shard_set.handles.setdefault(shard.name, []).append(actor)
@@ -2205,6 +2427,7 @@ def spinup_nemo_gym_actor(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    policy_api_key: Optional[str] = None,
 ) -> Any:
     """Spin up a single NeMo-Gym actor against the given generation server URLs.
 
@@ -2221,6 +2444,9 @@ def spinup_nemo_gym_actor(
         token_capture: Dumped ``TokenCaptureConfig`` when ledger-authoritative
             token capture is enabled, else ``None``. Forwarded to
             ``build_nemo_gym_config``.
+        policy_api_key: The bearer token the generation server requires on its
+            OpenAI routes (VllmGeneration.http_server_api_key), or None when it
+            checks none.
 
     Returns:
         The spun-up ``NemoGym`` Ray actor handle (``_spinup`` already awaited).
@@ -2247,6 +2473,7 @@ def spinup_nemo_gym_actor(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        policy_api_key=policy_api_key,
     ).sole_handle()
 
 
@@ -2260,21 +2487,28 @@ def validate_dataset_agent_coverage(
     Without this scan, a rare route can sit unseen for hours of training before
     its first dispatch fails.
 
-    Unsharded jobs are skipped: there is one actor, every route resolves to it,
-    and there is nothing a scan could discover.
+    A sharded job checks against the route map built at setup. An unsharded
+    job has one actor and no route map, so it asks that actor which entries
+    its resolved Gym config spawned and keeps the routable ones, agents and
+    resources servers, exactly as the sharded route map does. A model or
+    environment server is never a route, on one actor or on many.
 
     Args:
-        shard_set: The running actors, carrying the route map built at setup.
+        shard_set: The running actors. A sharded set carries the route map
+            built at setup; an unsharded set is asked for its entries here.
         datasets: Split name to dataset, for the error message. ``None`` values
             and datasets without gym rows are skipped.
 
     Raises:
         ShardSetupError: A split references routes no shard hosts.
     """
-    if not shard_set.is_sharded:
-        return
-
-    hosted = shard_set.hosted_routes
+    if shard_set.is_sharded:
+        hosted = shard_set.hosted_routes
+    else:
+        # The same filter the sharded route map applies; with one shard its
+        # duplicate checks are vacuous, so only the routable-type rule remains.
+        entries = ray.get(shard_set.all_handles[0].list_entries.remote())
+        hosted = frozenset(build_route_shard_map({DEFAULT_SHARD_NAME: entries}))
     for split, dataset in datasets.items():
         unhosted = sorted(_iter_dataset_agent_names(dataset) - hosted)
         if unhosted:
@@ -2287,9 +2521,8 @@ def validate_dataset_agent_coverage(
 def _iter_dataset_agent_names(dataset: Any) -> set[str]:
     """Collect the agent or task-source names a dataset's rows reference.
 
-    Sharded jobs lazily scan each stable source file once.
-    Unsharded jobs never call this function.
-    Custom or changed sources retain the row-scan fallback.
+    A stable source file is scanned once and its names cached; a custom or
+    changed source falls back to scanning the loaded rows.
     """
     if dataset is None:
         return set()

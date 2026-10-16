@@ -94,7 +94,10 @@ class ReplayBufferProtocol(Protocol):  # pragma: no cover
         num_prompts_per_step: int,
         max_age_steps: int | None = None,
     ) -> int:
-        """Return additional trajectories needed for ``target_step``."""
+        """Return additional trajectories needed for ``target_step``.
+
+        Return zero when the target has a complete batch or is already consumed.
+        """
         ...
 
     def has_complete_batch(

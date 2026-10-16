@@ -124,6 +124,10 @@ all returned vLLM routes are still replayed exactly.
 The fallback is intentionally route-local: it does not disable Router Replay for
 the whole batch or sample.
 
+The final token of every sequence also uses the sentinel: vLLM never runs a
+sequence's last sampled token through the model, so it has no route to replay.
+This is expected and is not counted as a missing route.
+
 When fallback is used, the vLLM worker emits a `R3 router replay fallback:` warning
 to the run log naming the affected sample count and missing token-route count.
 Fallback should normally be absent or rare; frequent warnings mean a meaningful

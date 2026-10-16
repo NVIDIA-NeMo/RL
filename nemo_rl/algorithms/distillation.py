@@ -74,7 +74,9 @@ from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
     evaluate_span,
+    iteration_scope,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
@@ -96,7 +98,10 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
-from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    validate_offload_policy_before_refit,
+)
 
 # ===============================================================================
 # Configuration
@@ -264,6 +269,17 @@ def setup(
             )
         checkpoint_engine_config = checkpoint_engine_refit_config(vllm_config)
 
+    offload_policy_before_refit = policy_config["offload_policy_before_refit"]
+    validate_offload_policy_before_refit(
+        enabled=offload_policy_before_refit,
+        megatron_enabled=bool(
+            (policy_config.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=generation_config["backend"],
+        colocated=generation_config["colocated"]["enabled"],
+        refit_transport=generation_config.get("refit_transport"),
+    )
+
     # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
         # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
@@ -271,16 +287,14 @@ def setup(
         # Additionally, SP may not be compatible with sequence packing for some models.
         # Refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details.
         # Therefore, we disable SP + packing for distillation.
-        dtensor_enabled = cfg["dtensor_cfg"]["enabled"]
+        automodel_cfg = cfg.get("automodel_cfg") or {}
+        automodel_enabled = automodel_cfg.get("enabled", False)
         sequence_packing_enabled = (
             "sequence_packing" in cfg and cfg["sequence_packing"]["enabled"]
         )
-        sequence_parallel_enabled = (
-            "sequence_parallel" in cfg["dtensor_cfg"]
-            and cfg["dtensor_cfg"]["sequence_parallel"]
-        )
+        sequence_parallel_enabled = bool(automodel_cfg.get("sequence_parallel"))
 
-        if dtensor_enabled and sequence_packing_enabled and sequence_parallel_enabled:
+        if automodel_enabled and sequence_packing_enabled and sequence_parallel_enabled:
             raise AssertionError(
                 f"Distillation does not support DTensor sequence parallel + sequence packing ({who} policy). "
                 "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details."
@@ -541,6 +555,9 @@ def setup(
                     # Distillation does not configure vLLM for router replay.
                     enable_router_replay=False,
                     use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+                    # The workers enforce this key whenever the recipe asks for
+                    # one, so Gym's model server must send the same key.
+                    policy_api_key=deferred_vllm.http_server_api_key,
                 )
                 try:
                     validate_dataset_agent_coverage(
@@ -615,7 +632,8 @@ def setup(
         init_reference_model=False,
     )
 
-    if checkpoint_engine_config is not None:
+    managed_refit = checkpoint_engine_config is not None or offload_policy_before_refit
+    if managed_refit:
         assert isinstance(student_generation, VllmGeneration)
         student_generation.weight_synchronizer = create_weight_synchronizer(
             policy=student_policy,
@@ -633,7 +651,7 @@ def setup(
         student_generation.prepare_refit_info(state_dict_info)
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference and checkpoint_engine_config is None:
+    if not colocated_inference and not managed_refit:
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
         train_world_size = train_cluster.world_size()
@@ -777,12 +795,13 @@ def _distillation_train_impl(
             val_metrics, validation_timings = None, None
 
             with (
+                iteration_scope(total_steps + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.distillation.step",
                     tracer=_tracer,
-                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                    **{"rl.epoch": current_epoch + 1},
                 ),
             ):
                 # Prepare batch
@@ -841,8 +860,8 @@ def _distillation_train_impl(
                                 master_config.distillation.num_generations_per_prompt
                             ),
                             log_full_result_tables=should_log_nemo_gym_full_result_tables(
-                                wandb_enabled=master_config.logger["wandb_enabled"],
-                                wandb_config=master_config.logger["wandb"],
+                                wandb_enabled=master_config.logger.wandb_enabled,
+                                wandb_config=master_config.logger.wandb,
                             ),
                             max_rollout_turns=None,
                             greedy=False,
@@ -921,12 +940,10 @@ def _distillation_train_impl(
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
                     if not colocated_inference:
-                        # The non-colocated refit path doesn't offload the student
-                        # optimizer (offload_before_refit only runs in the
-                        # colocated/Megatron path), so it's still on the train GPUs
-                        # from the previous training step. Offload it so the teacher
-                        # fits for top-k inference; prepare_for_training() below
-                        # reloads it.
+                        # Unless policy offload was requested for refit, optimizer
+                        # state may still be on the train GPUs from the previous
+                        # step. Offload it so the teacher fits for top-k inference;
+                        # prepare_for_training() below reloads it.
                         student_policy.offload_before_refit()
                     teacher_policy.prepare_for_lp_inference()
 
@@ -960,7 +977,6 @@ def _distillation_train_impl(
                         RLSpanGroup.POLICY_UPDATE,
                         "rl.distillation.policy_training",
                         tracer=_tracer,
-                        **{"rl.iteration": total_steps + 1},
                     ),
                 ):
                     train_results = student_policy.train(
@@ -1057,14 +1073,6 @@ def _distillation_train_impl(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_reward --> 'val:accuracy'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -1289,7 +1297,7 @@ def validate(
     timer = Timer()
     with (
         timer.time("total_validation_time"),
-        evaluate_span("distillation", **{"rl.step": step}),
+        evaluate_span("distillation", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
@@ -1320,8 +1328,8 @@ def validate(
                     generation_config=generation_config,
                     num_generations_per_prompt=1,
                     log_full_result_tables=should_log_nemo_gym_full_result_tables(
-                        wandb_enabled=master_config.logger["wandb_enabled"],
-                        wandb_config=master_config.logger["wandb"],
+                        wandb_enabled=master_config.logger.wandb_enabled,
+                        wandb_config=master_config.logger.wandb,
                     ),
                     max_rollout_turns=None,
                     greedy=False,
@@ -1386,7 +1394,7 @@ def validate(
                 all_message_logs,
                 total_rewards,
                 num_samples=min(
-                    master_config.logger["num_val_samples_to_print"],
+                    master_config.logger.num_val_samples_to_print,
                     len(all_message_logs),
                 ),
                 step=step,
