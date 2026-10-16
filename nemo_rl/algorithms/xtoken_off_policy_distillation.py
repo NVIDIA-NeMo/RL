@@ -158,7 +158,6 @@ MEAN_REDUCED_MB_METRICS = frozenset(
         # with the microbatch count instead of staying per-chunk (which is
         # how top1_acc_per_chunk reached an impossible 110.60).
         "kl_common_per_chunk",
-        "kl_partition_first_per_chunk",
         "kl_partition_last_per_chunk",
         "top1_acc_per_chunk",
     }

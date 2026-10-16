@@ -1396,9 +1396,9 @@ class XtokenShardTestActor:
 
             # ---- Fixture (identical on every rank; sharded below) ----------
             # Qualification-shaped CSD fixture with repeated common, 1-to-2, and
-            # 2-to-1 chunks. Counts cross both fixed streaming caps (64 common,
-            # 8 position-0 rows); shifted teacher predictors live on both CP
-            # owners. Position-0 uses JSD and mismatch-last uses KL.
+            # 2-to-1 chunks. Counts cross the fixed common streaming cap (64
+            # rows); shifted teacher predictors live on both CP owners. Common
+            # chunks use JSD and mismatch-last uses KL.
             torch.manual_seed(0)
             B, S, T, v_s, v_t = 2, 6, 6, 16, 16
             temp = 1.0
@@ -1491,7 +1491,6 @@ class XtokenShardTestActor:
                 "student_to_teacher_table_paths": [fwd_path],
                 "teacher_to_student_table_paths": [rev_path],
                 "kl_chunk_shift": True,
-                "csd_position_0_kl": True,
                 "csd_loss_fn": "jsd",
                 "csd_last_pos_loss_fn": "kl",
                 "csd_jsd_beta": 0.5,
@@ -1651,14 +1650,9 @@ class XtokenShardTestActor:
             sh_metrics = explicit_metrics
             assert sh_metrics["num_common_chunks"] > 0
             assert sh_metrics["num_mismatch_chunks"] > 0
-            assert torch.isfinite(
-                torch.tensor(sh_metrics["kl_partition_first_per_chunk"])
-            )
             for metric_name in (
                 "kl_common_per_chunk",
                 "kl_partition_last_per_chunk",
-                "kl_partition_first_per_chunk",
-                "kl_mismatch_combined_per_chunk",
                 "kl_mismatch_scaled_per_chunk",
                 "top1_acc_per_chunk",
             ):
