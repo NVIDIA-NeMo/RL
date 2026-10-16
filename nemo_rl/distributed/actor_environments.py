@@ -41,9 +41,8 @@ import sys
 # ``None`` means the actor runs on the driver's interpreter and gets no venv.
 # Every extra must exist in ``[project.optional-dependencies]`` of pyproject.toml.
 ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
-    # This vLLM fork requires MCP 2, while NeMo Gym requires MCP 1.
-    # Gym token capture cannot run inside these workers with the pinned versions.
-    # Keep Gym in its separate environment for environment actors.
+    # vLLM requires MCP 2, while the pinned NeMo Gym requires MCP 1.
+    # Gym token capture is unavailable in these workers until upstream aligns MCP.
     "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": ["vllm"],
     "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": [
         "vllm"

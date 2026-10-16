@@ -21,6 +21,7 @@ Megatron-Bridge submodule moves the Megatron-LM pointer underneath us, so these 
 fail the moment upstream's own pin changes and the floor needs a second look.
 """
 
+import runpy
 import tomllib
 from pathlib import Path
 
@@ -144,3 +145,21 @@ def test_torch_split_shims_are_still_needed() -> None:
         "(nemo_rl/data_plane/adapters/tq_mooncake_checkpoint.py) - drop the "
         "check outright; the pre-2.13 `names` comparison cannot be restored"
     )
+
+
+def test_actor_extras_do_not_combine_conflicting_dependencies() -> None:
+    """Every cached worker environment must be a supported uv extra combination."""
+    actors = runpy.run_path(
+        str(REPO_ROOT / "nemo_rl/distributed/actor_environments.py")
+    )["ACTOR_ENVIRONMENTS"]
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    conflicts = [
+        {canonicalize_name(item["extra"]) for item in group}
+        for group in config["tool"]["uv"]["conflicts"]
+    ]
+    for actor, extras in actors.items():
+        selected = {canonicalize_name(extra) for extra in extras or []}
+        for conflict in conflicts:
+            assert len(selected & conflict) < 2, (
+                f"{actor} combines conflicting extras: {sorted(selected & conflict)}"
+            )

@@ -506,13 +506,12 @@ class VllmAsyncGenerationWorkerImpl(
         """
         if not self.is_model_owner:
             return False
-        # The pinned vLLM fork and Gym require incompatible MCP versions.
         from importlib.util import find_spec
 
         if find_spec("nemo_gym") is None:
             raise RuntimeError(
                 "Gym token capture is unavailable in this vLLM environment: "
-                "the pinned vLLM fork requires MCP 2 and NeMo Gym requires MCP 1."
+                "the pinned vLLM requires MCP 2 and NeMo Gym requires MCP 1."
             )
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
         from nemo_gym.token_id_capture.staging import install_capture

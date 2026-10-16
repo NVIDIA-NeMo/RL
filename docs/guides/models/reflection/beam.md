@@ -41,17 +41,28 @@ git submodule update --init --recursive
 uv lock --check
 ```
 
-| Dependency | Pinned source revision |
-| --- | --- |
-| AutoModel | `reflection-oss/automodel@8bc07340559e8dca78650c2e3f7b8055bad7243e` |
-| Transformers | `huggingface/new-model-addition-reflection@8ff92cc164e93fd8461cb0c2b65b7a3a68051575` |
-| Megatron Bridge | `reflection-oss/Megatron-Bridge@31591deba7cdb95d2ba01754b464a296b6eeb5a4` |
-| NVIDIA Resiliency Extension | `NVIDIA/nvidia-resiliency-ext@ebf0352a82ca5699148ea10bec2b8eedd121e382` |
-| Megatron Core | `07147d6942dfd4e6d1566b64bb1730f478a1bc32` (nested Bridge submodule) |
+AutoModel is pinned to upstream `NVIDIA-NeMo/Automodel` commit
+`d3f503d462dfba1003a299a4bdfb94a73aa1f5bd`, which includes BEAM support.
+The dependency lockfile has been regenerated for Linux x86_64 and aarch64.
+Image builds and training validation with these pins are still pending.
 
-The Transformers source override supplies BEAM registration to both the driver
-and worker virtual environments. Tokenizers is pinned to `0.23.1` for this
-Transformers revision; other model families are not validated by the BEAM runs.
+| Dependency | Upstream source revision |
+| --- | --- |
+| SGLang | `sgl-project/sglang@f7473673ddf6175f301782af57e684d33d3e3f96` (PR #44747) |
+| vLLM | `vllm-project/vllm@00fe254cd01b1d6b9f69370750f113cffb90e474` (PR #61978) |
+| Megatron Bridge | `NVIDIA-NeMo/Megatron-Bridge@7740a3b88845507606662ac8f42cb231cd681a5f` (PR #6498) |
+
+These three PRs are still open. Backend environments resolve separately:
+
+| Backend | PyTorch | Transformers |
+| --- | --- | --- |
+| AutoModel | 2.14.1 | 5.18.0 |
+| SGLang | 2.14.1 | 5.19.0 |
+| Megatron Bridge | 2.14.0 | 5.18.0 |
+| vLLM | 2.14.0 | 5.18.0 |
+
+Gym token capture is unavailable in the vLLM worker environment: the pinned
+vLLM requires MCP 2, while the pinned NeMo Gym requires MCP 1.
 
 Build on a Linux CUDA host using the repository Dockerfile:
 
