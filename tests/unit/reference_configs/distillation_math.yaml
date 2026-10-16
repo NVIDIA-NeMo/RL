@@ -42,6 +42,10 @@ policy: &POLICY_BASE
     logprob_chunk_size: null
 
     offload_optimizer_for_logprob: false
+    # Run the policy offload lifecycle before non-colocated refit.
+    offload_policy_before_refit: false
+    # Move optimizer state to CPU when the refit offload lifecycle runs.
+    offload_optimizer_for_refit: true
 
     automodel_cfg: &AUTOMODEL_BASE
         enabled: true
@@ -53,6 +57,7 @@ policy: &POLICY_BASE
         cpu_offload: False
         sequence_parallel: false
         activation_checkpointing: true
+        deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
         tensor_parallel_size: 2
         context_parallel_size: 2
         custom_parallel_plan: null
