@@ -202,6 +202,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         partition_includes_multimodal_fields=False,
         bootstrap_identity=None,
         rollout_checkpoint_load_metrics=None,
+        restored_from_rollout_snapshot=False,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -2275,6 +2276,8 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._buffer = _EmptyBuffer()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._optimizer_commit_in_progress = False
+    ctrl._optimizer_commit_started = asyncio.Event()
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
     ctrl._is_ppo = False

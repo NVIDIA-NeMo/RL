@@ -67,7 +67,6 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointCommitSummary,
     GymCheckpointEpisode,
     GymCheckpointInstance,
-    GymCheckpointParticipantSummary,
     GymCheckpointPrepareSummary,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -405,19 +404,17 @@ def _gym_failure_row_error(
     if "_ng_failure_class" not in result:
         return None
     from nemo_gym._checkpoint.errors import AdmissionClosedError
+
+    # Gym's own set, private but part of the row format this already reads, so a
+    # class Gym adds there is not mistaken for a row that ran.
     from nemo_gym.rollout_collection import (
-        AGENT_REQUEST_FAILED_FAILURE_CLASS,
-        AGENT_RUN_ERROR_FAILURE_CLASS,
+        _NO_RESULT_FAILURE_CLASSES,
         ENVIRONMENT_SERVER_FAILURE_CLASS,
         NG_FAILURE_CLASS_KEY,
         NG_TERMINAL_KEY,
     )
 
-    if result[NG_FAILURE_CLASS_KEY] not in {
-        AGENT_REQUEST_FAILED_FAILURE_CLASS,
-        AGENT_RUN_ERROR_FAILURE_CLASS,
-        ENVIRONMENT_SERVER_FAILURE_CLASS,
-    }:
+    if result[NG_FAILURE_CLASS_KEY] not in _NO_RESULT_FAILURE_CLASSES:
         return None
     status = result.get("_ng_failure_http_status")
     body = result.get("_ng_failure_response_body")
@@ -1055,9 +1052,7 @@ Depending on your data shape, you may want to change these values."""
             )
         return self._server_client
 
-    async def initialize_checkpoint_adapter(
-        self,
-    ) -> GymCheckpointParticipantSummary:
+    async def initialize_checkpoint_adapter(self) -> None:
         """Discover this actor's Gym v2 checkpoint participants once."""
         self._require_spinup()
         if not self.cfg["turn_checkpointing_enabled"]:
@@ -1071,7 +1066,7 @@ Depending on your data shape, you may want to change these values."""
                     "control_auth_token"
                 ],
             )
-        return await self._checkpoint_adapter.discover()
+        await self._checkpoint_adapter.discover()
 
     def _require_checkpoint_adapter(self) -> GymCheckpointAdapter:
         """Return the discovered actor-local adapter or fail before coordination."""
@@ -2326,6 +2321,11 @@ def _build_gym_actor_config(
         nemo_gym_dict["checkpoint"] = {
             "enabled": True,
             "control_auth_token": secrets.token_hex(32),
+            # RL renews the lease at least every 10s while Gym is parked, so a
+            # lost resume should reopen Gym after a few missed renewals, not
+            # after Gym's 600s default.
+            "lease_grace_seconds": 3.0
+            * float(instance_token_capture.get("control_timeout_s") or 60.0),
         }
         # The copy above is shallow; keep the caller's policy_model untouched.
         nemo_gym_dict["policy_model"] = copy.deepcopy(
@@ -2802,12 +2802,12 @@ def _build_sharded_gym_actors(
             )
             shard_set.handles.setdefault(shard.name, []).append(actor)
 
-        _spinup_shards_concurrently(shard_set, spinup_timeout, tokenizer=tokenizer)
-        if turn_checkpointing_enabled:
-            _initialize_checkpoint_adapters_concurrently(
-                shard_set,
-                timeout=spinup_timeout,
-            )
+        _spinup_shards_concurrently(
+            shard_set,
+            spinup_timeout,
+            tokenizer=tokenizer,
+            turn_checkpointing_enabled=turn_checkpointing_enabled,
+        )
         shard_set.route_to_shard = _discover_route_shard_map(shard_set, plan)
     except BaseException:
         # A ray.get timeout does not cancel the actor-side work, so a
@@ -2827,6 +2827,7 @@ def _spinup_shards_concurrently(
     spinup_timeout: float,
     *,
     tokenizer: PreTrainedTokenizerBase,
+    turn_checkpointing_enabled: bool = False,
 ) -> None:
     """Start every shard at once, naming the shard behind any failure.
 
@@ -2835,9 +2836,11 @@ def _spinup_shards_concurrently(
     ``ServerRefNotFoundError`` there. Gym names the entry and field but has no
     concept of a shard, so the shard name is added here.
 
-    The tokenizer install is a second pass rather than a call queued behind
-    each ``_spinup``. Queuing both up front would mean waiting on the install
-    to learn the spinup failed, which loses the message above.
+    The tokenizer install, and with turn checkpointing each replica's
+    discovery of its own Gym checkpoint deployment, are a second pass rather
+    than calls queued behind each ``_spinup``. Queuing them up front would mean
+    waiting on them to learn the spinup failed, which loses the message above.
+    Both passes share the one startup deadline.
     """
     instance_handles = [
         (shard_name, replica, handle)
@@ -2872,11 +2875,27 @@ def _spinup_shards_concurrently(
                 f"config_paths is the usual cause: {error}"
             ) from error
 
-    installs = [
-        (shard_name, replica, handle.set_tokenizer.remote(tokenizer))
-        for shard_name, replica, handle in instance_handles
-    ]
-    for shard_name, replica, reference in installs:
+    # Each actor runs its calls in order, so discovery follows its own install.
+    setup_calls = []
+    for shard_name, replica, handle in instance_handles:
+        setup_calls.append(
+            (
+                shard_name,
+                replica,
+                "did not accept the tokenizer",
+                handle.set_tokenizer.remote(tokenizer),
+            )
+        )
+        if turn_checkpointing_enabled:
+            setup_calls.append(
+                (
+                    shard_name,
+                    replica,
+                    "could not discover its Gym v2 checkpoint participants",
+                    handle.initialize_checkpoint_adapter.remote(),
+                )
+            )
+    for shard_name, replica, failure, reference in setup_calls:
         remaining = max(0.0, deadline - monotonic())
         try:
             ray.get(reference, timeout=remaining)
@@ -2884,35 +2903,12 @@ def _spinup_shards_concurrently(
             if remaining <= 0.0:
                 raise ShardSetupError(
                     f"NeMo-Gym shards used the whole {spinup_timeout}s startup "
-                    f"budget before the tokenizer reached every replica. Raise "
+                    f"budget before every replica finished setting up. Raise "
                     f"env.nemo_gym.spinup_timeout, or bake the Gym venvs into "
                     f"the image so a cold node starts faster."
                 ) from error
             raise ShardSetupError(
-                f"NeMo-Gym shard '{shard_name}' (replica {replica}) did not "
-                f"accept the tokenizer: {error}"
-            ) from error
-
-
-def _initialize_checkpoint_adapters_concurrently(
-    shard_set: NemoGymShardSet,
-    *,
-    timeout: float,
-) -> None:
-    """Discover each actor's independent Gym checkpoint deployment."""
-    deadline = monotonic() + timeout
-    pending = [
-        (shard_name, replica, handle.initialize_checkpoint_adapter.remote())
-        for shard_name, replicas in shard_set.handles.items()
-        for replica, handle in enumerate(replicas)
-    ]
-    for shard_name, replica, reference in pending:
-        try:
-            ray.get(reference, timeout=max(0.0, deadline - monotonic()))
-        except BaseException as error:
-            raise ShardSetupError(
-                f"NeMo-Gym shard '{shard_name}' (replica {replica}) could not "
-                f"discover its Gym v2 checkpoint participants: {error}"
+                f"NeMo-Gym shard '{shard_name}' (replica {replica}) {failure}: {error}"
             ) from error
 
 

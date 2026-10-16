@@ -137,6 +137,11 @@ class RecoveryTargetLevel(StrEnum):
             else RecoveryGranularity.SIBLING
         )
 
+    @property
+    def rank(self) -> int:
+        """0 for ``turn``; a larger rank restarts more work. Follows declaration order."""
+        return list(RecoveryTargetLevel.__members__.values()).index(self)
+
 
 class RolloutAttemptStatus(StrEnum):
     """Lifecycle of one physical Gate execution attempt."""
@@ -319,6 +324,16 @@ class PromptGroupRecoveryRecord:
             sibling.generation_index
             for sibling in self.siblings
             if sibling.current_attempt.status == RolloutAttemptStatus.SEALED
+        ]
+
+    @property
+    def continued_generation_indices(self) -> list[int]:
+        """Siblings a restart continues from Gym state rather than their prompt."""
+        return [
+            sibling.generation_index
+            for sibling in self.siblings
+            if sibling.current_attempt.status is RolloutAttemptStatus.RESERVED
+            and sibling.current_attempt.gym_attempt > 0
         ]
 
 
@@ -1341,8 +1356,13 @@ class RolloutRecoveryLedger:
                     attempt_state.get("reward_log_context")
                 )
                 staging_keys = attempt_state.get("staging_keys")
-                gym_instance_id = attempt_state.get("gym_instance_id")
-                gym_attempt = attempt_state.get("gym_attempt", 0)
+                # The writer always records both, and None/0 are valid values,
+                # so a missing field means a damaged ledger, not a non-Gym attempt.
+                for name in ("gym_instance_id", "gym_attempt"):
+                    if name not in attempt_state:
+                        raise ValueError(f"rollout-recovery attempt is missing {name}")
+                gym_instance_id = attempt_state["gym_instance_id"]
+                gym_attempt = attempt_state["gym_attempt"]
                 if gym_instance_id is not None and (
                     not isinstance(gym_instance_id, str) or not gym_instance_id
                 ):
