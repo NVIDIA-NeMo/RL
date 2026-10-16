@@ -124,6 +124,9 @@ COMMON_OVERRIDES=(
     ++checkpointing.save_data_plane=true
     ++token_capture.enabled=true
     ++rollout_recovery.target_level=turn
+    # stall_timeout_s below must outlast a Gym park:
+    # gym_prepare_timeout_s + 2 * token_capture.control_timeout_s (60s).
+    ++rollout_recovery.gym_prepare_timeout_s=120
     ++rollout_checkpointing.snapshot_attempt_interval_s="$SNAPSHOT_INTERVAL_S"
     ++rollout_checkpointing.keep_latest_k=8
     ++rollout_checkpointing.restore_mode=latest
@@ -266,7 +269,10 @@ while time.monotonic() < deadline:
             if record.get("state")
         }
         model_index = {
-            (record["episode_id"]["rollout_id"], record["episode_id"]["attempt"]): path
+            (record["episode_id"]["rollout_id"], record["episode_id"]["attempt"]): (
+                path,
+                [str(row["model_call_id"]) for row in record["rows"]],
+            )
             for path, record in model
             if record.get("rows")
         }
@@ -277,13 +283,14 @@ while time.monotonic() < deadline:
                 key = (episode["rollout_id"], episode["attempt"])
                 recovery = ledger.get(key)
                 resources_entry = resource_index.get(key)
-                model_manifest = model_index.get(key)
+                model_entry = model_index.get(key)
                 if (
                     recovery is None
                     or resources_entry is None
-                    or model_manifest is None
+                    or model_entry is None
                 ):
                     continue
+                model_manifest, pre_cut_model_call_ids = model_entry
                 resources_manifest, resources_state = resources_entry
                 # The held turn applied its calendar write exactly once.
                 if sentinel_count(resources_state) != 1:
@@ -312,6 +319,8 @@ while time.monotonic() < deadline:
                             "target_step": recovery["target_step"],
                             "resources_manifest": str(resources_manifest.relative_to(snapshot)),
                             "model_manifest": str(model_manifest.relative_to(snapshot)),
+                            # Calls delivered before the cut; a continued episode keeps them.
+                            "pre_cut_model_call_ids": pre_cut_model_call_ids,
                         },
                         sort_keys=True,
                         indent=2,
@@ -413,6 +422,16 @@ assert all(
     for sibling in phase1_dispatch
 ), phase1_dispatch
 
+# Gym installed the selected episode's saved state; without it, Gym would
+# open a fresh session and the episode would start over from its prompt.
+restores = [event for event in phase2 if event["event"] == "gym_restore"]
+assert len(restores) == 1, restores
+assert {
+    "gym_instance_id": selection["gym_instance_id"],
+    "gym_rollout_id": selection["gym_rollout_id"],
+    "gym_attempt": selection["gym_attempt"],
+} in restores[0]["episodes"], (selection, restores)
+
 phase2_dispatch = matching_siblings(phase2, "dispatch")
 # A submission Gym refused at checkpoint admission never ran; it is re-sent.
 phase2_refused = matching_siblings(phase2, "refused")
@@ -430,6 +449,22 @@ assert any(
     and sibling["status"] == "sealed"
     for sibling in phase2_completion
 ), phase2_completion
+
+# Continued, not restarted: the sealed receipt keeps every model call the
+# episode made before the cut. A restart from the prompt makes only new calls.
+restored_completions = [
+    event
+    for event in phase2
+    if event["event"] == "completion"
+    and event["group_id"] == selection["group_id"]
+    and event["sibling"]["gym_rollout_id"] == selection["gym_rollout_id"]
+    and event["sibling"]["status"] == "sealed"
+]
+assert len(restored_completions) == 1, restored_completions
+pre_cut_calls = selection["pre_cut_model_call_ids"]
+assert pre_cut_calls, selection
+missing_calls = set(pre_cut_calls) - set(restored_completions[0]["receipt_model_call_ids"])
+assert not missing_calls, (missing_calls, restored_completions[0])
 
 assert training_info["current_step"] == max_steps, training_info
 assert training_info["trainer_version"] == max_steps, training_info

@@ -185,6 +185,10 @@ class SingleControllerActorArgs:
     partition_includes_multimodal_fields: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
+    # Whether last_checkpoint_path is a rollout snapshot rather than a trainer
+    # checkpoint. Only a snapshot holds Gym state; a trainer checkpoint never
+    # pauses Gym, so its unfinished turn-level rollouts restart from their tasks.
+    restored_from_rollout_snapshot: bool = False
     # MooncakeStorageUnit actors; empty unless storage_unit_segment_size > 0.
     storage_units: tuple[Any, ...] = ()
     # None when async_rl.generation_fleet_health is disabled; the SingleController
@@ -2319,6 +2323,7 @@ def setup_single_controller(
         partition_includes_multimodal_fields=processor is not None,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
+        restored_from_rollout_snapshot=resolved_snapshot is not None,
         finalizer_actors=finalizer_actors,
         storage_units=storage_units,
         advantage_actors=advantage_actors,

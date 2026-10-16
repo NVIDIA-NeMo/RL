@@ -693,13 +693,6 @@ class TaskSourceRecoveryGranularity:
         return self.restore_level.granularity
 
 
-_RECOVERY_TARGET_RANK = {
-    RecoveryTargetLevel.TURN: 0,
-    RecoveryTargetLevel.SIBLING: 1,
-    RecoveryTargetLevel.PROMPT_GROUP: 2,
-}
-
-
 class RolloutRecoveryConfig(BaseModel, extra="allow"):
     """Retry and restore policy for unfinished token-capture prompt groups.
 
@@ -725,18 +718,7 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
 
     @model_validator(mode="after")
     def _validate_target_overrides(self) -> "RolloutRecoveryConfig":
-        """Reject removed keys and overrides finer than the global target."""
-        removed = {
-            "default_granularity",
-            "task_granularity_overrides",
-            "task_source_granularity_overrides",
-            "agent_granularity_overrides",
-        }.intersection(self.model_extra or {})
-        if removed:
-            raise ValueError(
-                f"rollout_recovery fields {sorted(removed)!r} were replaced by "
-                "target_level and *_target_level_overrides"
-            )
+        """Reject overrides finer than the global target."""
         for mapping_name, overrides in (
             (
                 "task_source_target_level_overrides",
@@ -747,8 +729,7 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
             finer = sorted(
                 name
                 for name, level in overrides.items()
-                if _RECOVERY_TARGET_RANK[level]
-                < _RECOVERY_TARGET_RANK[self.target_level]
+                if level.rank < self.target_level.rank
             )
             if finer:
                 raise ValueError(
@@ -1499,6 +1480,21 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
         )
+    if recovery_config.turn_checkpointing_enabled:
+        # A turn snapshot holds rollout dispatch through Gym's prepare, commit and
+        # drain, and the stall watchdog keeps counting meanwhile.
+        gym_park_s = (
+            recovery_config.gym_prepare_timeout_s
+            + 2 * token_capture_config.control_timeout_s
+        )
+        stall_s = async_config.stall_watchdog.stall_timeout_s
+        if stall_s <= gym_park_s:
+            raise ValueError(
+                f"async_rl.stall_watchdog.stall_timeout_s ({stall_s}) must be > "
+                "rollout_recovery.gym_prepare_timeout_s + 2 * "
+                f"token_capture.control_timeout_s ({gym_park_s}); a turn snapshot "
+                "can hold rollout dispatch that long."
+            )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled
     ):

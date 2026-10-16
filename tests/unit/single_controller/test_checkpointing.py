@@ -35,10 +35,12 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
 import threading
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -74,7 +76,10 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
-from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller import (
+    SingleControllerActor,
+    _RolloutCheckpointSaveResult,
+)
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -1608,11 +1613,171 @@ class TestPeriodicRolloutCheckpoint:
         )
         assert logged[TELEMETRY_WALL_TIME_METRIC] == 1_750_000_000.0
         assert "sample_index" not in logged
+        # No Gym coordination, so nothing was parked.
+        assert "gym_parked_seconds" not in logged
         assert actor._logger.log_metrics.call_args.kwargs == {
             "step": wall_time_ns,
             "prefix": "timing/rollout_checkpoint",
             "step_metric": TELEMETRY_WALL_TIME_METRIC,
         }
+
+    @pytest.mark.parametrize("interval_s, warns", [(120.0, False), (0.5, True)])
+    def test_logs_how_long_gym_held_rollout_dispatch(
+        self, tmp_path: Path, interval_s: float, warns: bool
+    ) -> None:
+        """The Gym window spans the barrier hold and is flagged past the interval."""
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = (
+            interval_s
+        )
+        gym_commit = object()
+        validated_commits: list[object] = []
+
+        @contextlib.asynccontextmanager
+        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
+            assert checkpoint_id.startswith("rollout-")
+            yield gym_commit
+
+        async def validate_gym_checkpoint_cut(cut, commit, *, checkpoint_path):
+            validated_commits.append(commit)
+
+        actor._prepared_gym_checkpoint = prepared_gym_checkpoint
+        actor._validate_gym_checkpoint_cut = validate_gym_checkpoint_cut
+        try:
+            with (
+                patch(
+                    "nemo_rl.algorithms.single_controller.time.monotonic",
+                    new=_SteppingClock(),
+                ),
+                warnings.catch_warnings(record=True) as caught,
+            ):
+                warnings.simplefilter("always")
+                result = asyncio.run(actor._save_rollout_checkpoint(force=True))
+                assert result.saved
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert validated_commits == [gym_commit]
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert (
+            logged["exclusive_hold_seconds"]
+            < logged["gym_parked_seconds"]
+            < logged["total_save_seconds"]
+        )
+        parked_warnings = [
+            str(warning.message)
+            for warning in caught
+            if "held new rollout dispatch" in str(warning.message)
+        ]
+        assert bool(parked_warnings) is warns
+        if warns:
+            assert "snapshot_attempt_interval_s=0.5s" in parked_warnings[0]
+
+    @pytest.mark.parametrize("stale_commit_event", [False, True])
+    def test_a_train_step_committing_stops_the_gym_phase(
+        self, tmp_path: Path, stale_commit_event: bool
+    ) -> None:
+        """The snapshot would be discarded, so Gym is not kept parked for it.
+
+        Only a step that starts committing during the attempt stops it.
+        """
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        gym_phase_events: list[str] = []
+        gym_parked = asyncio.Event()
+
+        @contextlib.asynccontextmanager
+        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
+            gym_phase_events.append("park")
+            try:
+                gym_parked.set()
+                await asyncio.Event().wait()  # prepare/commit/drain never finish
+                yield object()
+            finally:
+                gym_phase_events.append("resume")
+
+        actor._prepared_gym_checkpoint = prepared_gym_checkpoint
+
+        async def exercise() -> _RolloutCheckpointSaveResult:
+            if stale_commit_event:
+                # A step that committed before this attempt does not stop it.
+                actor._optimizer_commit_started.set()
+            save = asyncio.create_task(actor._save_rollout_checkpoint(force=True))
+            await asyncio.wait_for(gym_parked.wait(), timeout=5.0)
+            # Gym stays parked until a step commits during this attempt.
+            await asyncio.sleep(0.05)
+            assert not save.done()
+            assert gym_phase_events == ["park"]
+            actor._begin_optimizer_commit()
+            return await asyncio.wait_for(save, timeout=5.0)
+
+        try:
+            result = asyncio.run(exercise())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert result == _RolloutCheckpointSaveResult(
+            saved=False, reason="trainer_state_changed"
+        )
+        assert gym_phase_events == ["park", "resume"]
+        snapshots = tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        assert not snapshots.exists() or not any(snapshots.iterdir())
+
+    @pytest.mark.parametrize("gym_coordinated", [True, False])
+    def test_pump_warns_once_per_streak_of_discarded_gym_snapshots(
+        self, tmp_path: Path, gym_coordinated: bool
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
+        actor._master_config.rollout_checkpointing.max_consecutive_failures = 2
+        actor._gym_checkpoint_coordinator = object() if gym_coordinated else None
+        actor._train_steps = 1
+        # Two streaks of discards (2, then 3) split by a saved snapshot.
+        reasons = [
+            "trainer_state_changed",
+            "trainer_state_changed",
+            "completed",
+            "trainer_state_changed",
+            "trainer_state_changed",
+            "trainer_state_changed",
+        ]
+
+        async def _main() -> None:
+            done = asyncio.Event()
+            calls = 0
+
+            async def _save(*, force: bool = False) -> _RolloutCheckpointSaveResult:
+                nonlocal calls
+                del force
+                reason = reasons[min(calls, len(reasons) - 1)]
+                calls += 1
+                if calls == len(reasons):
+                    done.set()
+                return _RolloutCheckpointSaveResult(
+                    saved=reason == "completed", reason=reason
+                )
+
+            actor._save_rollout_checkpoint = _save
+            pump = asyncio.create_task(actor._rollout_checkpoint_pump())
+            await asyncio.wait_for(done.wait(), timeout=5.0)
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
+        discard_warnings = [
+            str(warning.message)
+            for warning in caught
+            if "turn snapshots in a row were thrown away" in str(warning.message)
+        ]
+        assert len(discard_warnings) == (2 if gym_coordinated else 0)
 
     def test_logs_checkpoint_outcome_reason_and_effective_cadence(
         self, tmp_path: Path
@@ -3128,6 +3293,7 @@ class TestSetupResumeWiring:
         # (missing fields backfilled with the GRPOSaveState defaults).
         assert actor_args.save_state == _get_grpo_save_state(dict(_STEP_3_SAVE_STATE))
         assert actor_args.last_checkpoint_path == str(step_3)
+        assert not actor_args.restored_from_rollout_snapshot
 
     def test_periodic_snapshot_restores_exact_dispatch_cursor(
         self,
@@ -3192,6 +3358,7 @@ class TestSetupResumeWiring:
         assert actor_args.save_state.current_epoch == 4
         assert actor_args.save_state.sampler_dispatch_index == 6
         assert actor_args.last_checkpoint_path == str(final_snapshot)
+        assert actor_args.restored_from_rollout_snapshot
         assert actor_args.rollout_checkpoint_load_metrics is not None
         assert {
             "snapshot_resolution_seconds",
@@ -3223,6 +3390,7 @@ class TestSetupResumeWiring:
         assert actor_args.save_state.current_epoch == 1
         assert actor_args.save_state.sampler_dispatch_index is None
         assert actor_args.last_checkpoint_path == str(step_3)
+        assert not actor_args.restored_from_rollout_snapshot
 
     def test_setup_fresh_start_passes_none_paths(
         self,
