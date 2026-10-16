@@ -24,10 +24,14 @@ from torch.distributed.tensor import DTensor
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
 from nemo_rl.algorithms.utils import masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
+    DenseTeacherRowReader,
     LocalizedAlignment,
     SparseTeacherLogits,
+    SparseTeacherRowReader,
+    TeacherRowPayload,
     build_exact_token_map,
     ce_label_mask,
+    cp_load_balanced_global_positions,
     next_token_accuracy,
     same_tokenizer_full_vocab_kl,
     same_tokenizer_topk_kl,
@@ -37,11 +41,13 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_contiguous_tensor,
     chunked_vocab_parallel_logsumexp,
+    distributed_selected_logprobs,
     get_next_token_logprobs_from_logits,
     group_all_reduce_sum,
     group_all_reduce_sum_with_grad,
     group_all_reduce_sum_with_grad_backward_sum,
     to_local_if_dtensor,
+    vocab_parallel_argmax,
 )
 
 CSD_STUDENT_LOSS_CHUNK_SIZE = 256
@@ -170,6 +176,15 @@ class CSDLossConfig(BaseModel, extra="allow"):
     teacher_topk_ipc_k: Annotated[int, Field(ge=0)] = 0
     teacher_topk_ipc_support_mode: Literal["row_topk"] = "row_topk"
     teacher_topk_ipc_keep_realized: bool = True
+    # Owner-local evaluation (eligible Megatron students): selected student or
+    # teacher rows per tile, and alignment chunks evaluated per batch. Both
+    # bound memory only; they do not change the loss.
+    csd_selected_row_chunk_size: Annotated[int, Field(gt=0)] = 128
+    csd_support_chunk_batch_size: Annotated[int, Field(gt=0)] = 16
+
+    # Runtime-injected by setup: evaluate cross-tokenizer KD on the context-
+    # parallel rank that owns each chunk and return a CP-partial loss.
+    owner_local: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -188,6 +203,41 @@ class CSDLossConfig(BaseModel, extra="allow"):
                         "csd_mismatch_loss_beta alone."
                     )
         return value
+
+
+def owner_local_config_violations(cfg: CSDLossConfig) -> list[str]:
+    """CSD loss settings that owner-local evaluation does not support.
+
+    An empty list means the loss can run owner-local. Owner-local KD keeps a
+    static-weight sum of per-teacher terms, evaluates common chunks over a
+    multi-token support (so BCE, which needs a binary partition, is allowed
+    only for realized-only mismatch chunks), and with sparse teacher IPC
+    requires every request's realized label to be kept.
+    """
+    violations: list[str] = []
+    if cfg.kd_loss_mode != "sum":
+        violations.append(f"kd_loss_mode={cfg.kd_loss_mode!r} (needs 'sum')")
+    if cfg.sum_weights_metric is not None:
+        violations.append(
+            f"sum_weights_metric={cfg.sum_weights_metric!r} (needs static weights)"
+        )
+    if cfg.csd_pure_alm:
+        violations.append("csd_pure_alm=true")
+    if cfg.csd_loss_fn == "bce":
+        violations.append("csd_loss_fn='bce' (common chunks are not binary)")
+    if cfg.csd_last_pos_loss_fn == "bce" and not cfg.csd_realized_only_mismatch:
+        violations.append(
+            "csd_last_pos_loss_fn='bce' without csd_realized_only_mismatch=true"
+        )
+    if (
+        cfg.teacher_topk_ipc_k > 1
+        and not cfg.teacher_topk_ipc_keep_realized
+        and not cfg.csd_realized_only_mismatch
+    ):
+        violations.append(
+            "teacher_topk_ipc_keep_realized=false with teacher_topk_ipc_k > 1"
+        )
+    return violations
 
 
 class CSDLossDataDict(TypedDict):
@@ -314,6 +364,16 @@ class CSDLossFn(LossFunction):
             )
         if cfg.student_vocab_size is None:
             raise ValueError("CSD requires the runtime student_vocab_size")
+        if cfg.owner_local:
+            violations = owner_local_config_violations(cfg)
+            if violations:
+                raise ValueError(
+                    "Owner-local CSD evaluation does not support "
+                    + "; ".join(violations)
+                    + "."
+                )
+        # Evaluate cross-tokenizer KD on CP owner ranks (CP-partial loss).
+        self.owner_local = cfg.owner_local
         # Global loss knobs (shared across all teachers).
         self.temperature = cfg.temperature
         # vocab_topk / reverse_kl are consumed by the same-vocab direct-KL path
@@ -437,13 +497,14 @@ class CSDLossFn(LossFunction):
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
         logits: torch.Tensor,
-        student_logits_contig: torch.Tensor,
+        student_logits_contig: Optional[torch.Tensor],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
         *,
         student_next_token_logprobs: Optional[torch.Tensor] = None,
         student_next_token_mask: Optional[torch.Tensor] = None,
         teacher_sparse_logits_by_idx: Optional[dict[int, SparseTeacherLogits]] = None,
+        teacher_row_payloads_by_idx: Optional[dict[int, TeacherRowPayload]] = None,
         dense_reconstruction_fallbacks_by_idx: Optional[dict[int, int]] = None,
         global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
         global_valid_kd_toks: Optional[torch.Tensor] = None,
@@ -472,6 +533,12 @@ class CSDLossFn(LossFunction):
         not re-entrant, so the value is always the one for the call in flight.
         ``None`` keeps the legacy ``WORLD`` behaviour (single-process tests, and
         the DTensor path, which has no pipeline axis to deadlock on).
+
+        With ``owner_local`` (eligible Megatron students), cross-tokenizer
+        teachers arrive as ``teacher_row_payloads_by_idx`` and ``logits`` stays
+        in its CP shard. CE and every KD term are then CP-partial: each CP rank
+        returns its own share, the caller must not divide by the CP size, and
+        dynamic scaling and the reported metrics use detached CP sums.
         """
         self._dp_cp_group = dp_cp_group
         teacher_sparse_logits_by_idx = teacher_sparse_logits_by_idx or {}
@@ -481,6 +548,44 @@ class CSDLossFn(LossFunction):
         kd_normalizer = (
             global_valid_toks if global_valid_kd_toks is None else global_valid_kd_toks
         )
+        if self.owner_local:
+            ce_loss = self._compute_owner_local_ce(
+                logits, data, global_valid_toks, tp_group=tp_group, cp_group=cp_group
+            )
+            total_kd, per_teacher_metrics = self._owner_local_sum_kd(
+                logits,
+                student_logits_contig,
+                teacher_full_logits_by_idx,
+                teacher_row_payloads_by_idx or {},
+                aligns_by_idx,
+                kd_normalizer,
+                global_valid_chunks_by_idx,
+                tp_group=tp_group,
+                cp_group=cp_group,
+            )
+            reported_kd = self._detached_cp_sum(total_kd, cp_group)
+            reported_ce = self._detached_cp_sum(ce_loss, cp_group)
+            loss, reported_loss, kl_scale = self._combine_kd_and_ce(
+                total_kd, ce_loss, reported_kd, reported_ce
+            )
+            accuracy = self._owner_local_next_token_accuracy(
+                logits, data, tp_group=tp_group, cp_group=cp_group
+            )
+            metrics = self._loss_metrics(
+                data,
+                loss=reported_loss,
+                kd=reported_kd,
+                ce=reported_ce,
+                kl_scale=kl_scale,
+                accuracy=accuracy,
+                dense_reconstruction_fallbacks_by_idx=dense_reconstruction_fallbacks_by_idx,
+            )
+            metrics.update(per_teacher_metrics)
+            metrics.update(self._teacher_routing_metrics(data))
+            return loss, metrics
+
+        if student_logits_contig is None:
+            raise ValueError("Replicated CSD evaluation needs the student window.")
         ce_loss = self._compute_ce(
             logits,
             data,
@@ -532,20 +637,9 @@ class CSDLossFn(LossFunction):
             raise ValueError(f"Unknown kd_loss_mode: {self.kd_loss_mode!r}")
 
         # Combine the aggregated KD term with the single student CE term.
-        if self.dynamic_loss_scaling:
-            # loss = sg(ce/kd) * kd + ce; user kl_loss_weight / ce_loss_scale
-            # are intentionally ignored in this branch.
-            kd_detached = total_kd.detach().abs()
-            ce_detached = ce_loss.detach().abs()
-            kl_scale = torch.where(
-                kd_detached > 0,
-                ce_detached / kd_detached,
-                torch.ones_like(kd_detached),
-            )
-            loss = kl_scale * total_kd + ce_loss
-        else:
-            kl_scale = torch.tensor(1.0, device=total_kd.device, dtype=total_kd.dtype)
-            loss = self.kl_loss_weight * total_kd + self.ce_loss_scale * ce_loss
+        loss, _, kl_scale = self._combine_kd_and_ce(
+            total_kd, ce_loss, total_kd.detach(), ce_loss.detach()
+        )
 
         # Next-token accuracy on the student side (quick per-step signal), masked
         # to valid tokens. Computed once on the student from the shared CP-relaid
@@ -563,13 +657,73 @@ class CSDLossFn(LossFunction):
             cp_group=cp_group,
         )
 
+        metrics = self._loss_metrics(
+            data,
+            loss=loss,
+            kd=total_kd,
+            ce=ce_loss,
+            kl_scale=kl_scale,
+            accuracy=accuracy,
+            dense_reconstruction_fallbacks_by_idx=dense_reconstruction_fallbacks_by_idx,
+        )
+        metrics.update(per_teacher_metrics)
+        metrics.update(self._teacher_routing_metrics(data))
+        return loss, metrics
+
+    def _combine_kd_and_ce(
+        self,
+        total_kd: torch.Tensor,
+        ce_loss: torch.Tensor,
+        reported_kd: torch.Tensor,
+        reported_ce: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(loss, reported_loss, kl_scale)``.
+
+        ``reported_kd`` / ``reported_ce`` are the detached complete-batch terms
+        (CP sums when the terms are CP-partial); the dynamic KD scale is taken
+        from them so every CP rank applies the same ratio.
+        """
+        if self.dynamic_loss_scaling:
+            # loss = sg(ce/kd) * kd + ce; user kl_loss_weight / ce_loss_scale
+            # are intentionally ignored in this branch.
+            kd_detached = reported_kd.abs()
+            ce_detached = reported_ce.abs()
+            kl_scale = torch.where(
+                kd_detached > 0,
+                ce_detached / kd_detached,
+                torch.ones_like(kd_detached),
+            )
+            return (
+                kl_scale * total_kd + ce_loss,
+                kl_scale * reported_kd + reported_ce,
+                kl_scale,
+            )
+        kl_scale = torch.tensor(1.0, device=total_kd.device, dtype=total_kd.dtype)
+        return (
+            self.kl_loss_weight * total_kd + self.ce_loss_scale * ce_loss,
+            self.kl_loss_weight * reported_kd + self.ce_loss_scale * reported_ce,
+            kl_scale,
+        )
+
+    @staticmethod
+    def _loss_metrics(
+        data: BatchedDataDict[CSDLossDataDict],
+        *,
+        loss: torch.Tensor,
+        kd: torch.Tensor,
+        ce: torch.Tensor,
+        kl_scale: torch.Tensor,
+        accuracy: torch.Tensor,
+        dense_reconstruction_fallbacks_by_idx: dict[int, int],
+    ) -> dict[str, Any]:
+        """Aggregate loss metrics shared by the replicated and owner-local paths."""
         metrics: dict[str, Any] = {
             "loss": loss.item(),
             # Aggregate KD term (kept under ``kl_loss`` so existing trainer
             # metric handling continues to work); per-teacher terms are suffixed
             # ``_t{i}``.
-            "kl_loss": total_kd.item(),
-            "ce_loss": ce_loss.item(),
+            "kl_loss": kd.item(),
+            "ce_loss": ce.item(),
             "kl_loss_scale": kl_scale.item(),
             "accuracy": accuracy.item(),
             "num_valid_samples": to_local_if_dtensor(data["sample_mask"]).sum().item(),
@@ -581,9 +735,7 @@ class CSDLossFn(LossFunction):
             dense_reconstruction_fallbacks_by_idx.items()
         ):
             metrics[f"ipc_reconstruction_fallbacks_t{teacher_idx}"] = fallback_count
-        metrics.update(per_teacher_metrics)
-        metrics.update(self._teacher_routing_metrics(data))
-        return loss, metrics
+        return metrics
 
     def _teacher_routing_metrics(
         self,
@@ -3550,6 +3702,984 @@ class CSDLossFn(LossFunction):
             "num_valid_samples": sample_mask.sum().item(),
         }
         metrics["csd_mismatch_loss_beta"] = mismatch_loss_beta
+        if noise_filter_topk > 0:
+            metrics["csd_noise_filter_topk"] = noise_filter_topk
+        return final_loss, metrics
+
+    # ------------------------------------------------------------------ #
+    # Owner-local evaluation (Megatron students)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _detached_cp_sum(
+        value: torch.Tensor, cp_group: Optional[torch.distributed.ProcessGroup]
+    ) -> torch.Tensor:
+        """Detached SUM of a CP-partial scalar, identical on every CP rank."""
+        reported = value.detach().clone()
+        if (
+            cp_group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(cp_group) > 1
+        ):
+            torch.distributed.all_reduce(
+                reported, op=torch.distributed.ReduceOp.SUM, group=cp_group
+            )
+        return reported
+
+    @staticmethod
+    def _raise_if_any_rank_failed(
+        error: Optional[Exception],
+        *,
+        device: torch.device,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> None:
+        """Make every TP x CP rank raise together when one rank's setup failed.
+
+        Reducing an ok flag with MIN over the TP group and then the CP group
+        reaches every rank of the TP x CP grid, so a failure on one rank cannot
+        leave the others waiting in the next collective.
+        """
+        ok = torch.tensor([0 if error is not None else 1], device=device)
+        for group in (tp_group, cp_group):
+            if (
+                group is not None
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_world_size(group) > 1
+            ):
+                torch.distributed.all_reduce(
+                    ok, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+        if error is not None:
+            raise error
+        if int(ok.item()) == 0:
+            raise RuntimeError(
+                "Owner-local CSD evaluation failed on another tensor- or "
+                "context-parallel rank; see that rank's error."
+            )
+
+    def _compute_owner_local_ce(
+        self,
+        logits: torch.Tensor,
+        data: BatchedDataDict[CSDLossDataDict],
+        global_valid_toks: torch.Tensor,
+        *,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        """CP-partial next-token CE over this rank's own student rows.
+
+        Each CP rank sums ``-log p(label)`` over the predictor rows it holds and
+        divides by the global token count, so the CP sum of the partials is the
+        full CE. Only selected log-probabilities cross TP; nothing is gathered
+        across CP.
+        """
+        full_ids = to_local_if_dtensor(data["input_ids"])
+        full_mask = to_local_if_dtensor(data["token_mask"])
+        sample_mask = to_local_if_dtensor(data["sample_mask"])
+        positions = cp_load_balanced_global_positions(
+            int(logits.shape[1]), cp_group, device=logits.device
+        )
+        predictor = positions < int(full_ids.shape[1]) - 1
+        local_rows = torch.arange(
+            positions.numel(), device=logits.device, dtype=torch.long
+        )[predictor]
+        batch_size = int(full_ids.shape[0])
+        batch_indices = torch.arange(
+            batch_size, device=logits.device
+        ).repeat_interleave(local_rows.numel())
+        seq_indices = local_rows.repeat(batch_size)
+        label_positions = (positions[predictor] + 1).repeat(batch_size)
+        tp_rank = (
+            torch.distributed.get_rank(tp_group)
+            if tp_group is not None and torch.distributed.is_initialized()
+            else 0
+        )
+        local_vocab = int(logits.shape[-1])
+        logp = distributed_selected_logprobs(
+            logits,
+            batch_indices,
+            seq_indices,
+            full_ids.to(logits.device)[batch_indices, label_positions],
+            vocab_start_index=tp_rank * local_vocab,
+            vocab_end_index=(tp_rank + 1) * local_vocab,
+            real_vocab_size=int(self.student_vocab_size),
+            temperature=1.0,
+            tp_group=tp_group,
+            row_chunk_size=self.cfg.csd_selected_row_chunk_size,
+        )
+        mask = full_mask.to(logits.device)[batch_indices, label_positions].to(
+            logp.dtype
+        ) * sample_mask.to(logits.device)[batch_indices].to(logp.dtype)
+        return -(logp * mask).sum() / global_valid_toks.to(logp.dtype)
+
+    @staticmethod
+    def _owner_local_next_token_accuracy(
+        logits: torch.Tensor,
+        data: BatchedDataDict[CSDLossDataDict],
+        *,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        """Next-token top-1 accuracy over CP-local rows (scalar collectives only)."""
+        with torch.no_grad():
+            full_ids = to_local_if_dtensor(data["input_ids"]).to(logits.device)
+            full_mask = to_local_if_dtensor(data["token_mask"]).to(logits.device)
+            sample_mask = to_local_if_dtensor(data["sample_mask"]).to(logits.device)
+            positions = cp_load_balanced_global_positions(
+                int(logits.shape[1]), cp_group, device=logits.device
+            )
+            predictor = positions < int(full_ids.shape[1]) - 1
+            local_rows = torch.arange(
+                positions.numel(), device=logits.device, dtype=torch.long
+            )[predictor]
+            label_positions = positions[predictor] + 1
+            prediction = vocab_parallel_argmax(logits, tp_group=tp_group)
+            mask = (
+                full_mask[:, label_positions].float()
+                * sample_mask.unsqueeze(-1).float()
+            )
+            correct = (
+                (prediction[:, local_rows] == full_ids[:, label_positions]).float()
+                * mask
+            ).sum()
+            stats = torch.stack((correct, mask.sum()))
+            if (
+                cp_group is not None
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_world_size(cp_group) > 1
+            ):
+                torch.distributed.all_reduce(stats, group=cp_group)
+            return stats[0] / stats[1].clamp(min=1.0)
+
+    def _owner_local_sum_kd(
+        self,
+        logits: torch.Tensor,
+        student_logits_contig: Optional[torch.Tensor],
+        teacher_full_logits_by_idx: dict[int, torch.Tensor],
+        teacher_row_payloads_by_idx: dict[int, TeacherRowPayload],
+        aligns_by_idx: dict[int, LocalizedAlignment],
+        kd_normalizer: torch.Tensor,
+        global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]],
+        *,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Static-weight sum of CP-partial per-teacher KD terms.
+
+        Cross-tokenizer teachers run :meth:`_compute_csd_loss_owner_local`. A
+        same-tokenizer teacher keeps the contiguous-window KL, which is already
+        a per-window partial over the global token count. Reported per-teacher
+        values are CP sums.
+        """
+        device = logits.device
+        if self.normalize_teacher_by_vocab:
+            min_log_vocab = torch.log(
+                torch.tensor(float(min(self.teacher_vocab_sizes)), device=device)
+            )
+        total_kd: Optional[torch.Tensor] = None
+        per_metrics: dict[str, Any] = {}
+        # Deterministic teacher order: each KD term issues its own collectives.
+        for i in range(self.num_teachers):
+            if self._teacher_is_same_vocab(i):
+                if student_logits_contig is None or i not in teacher_full_logits_by_idx:
+                    raise ValueError(
+                        f"Same-vocab teacher {i} requires full teacher logits and "
+                        "the contiguous student window."
+                    )
+                kd_i = same_tokenizer_topk_kl(
+                    student_logits_contig,
+                    teacher_full_logits_by_idx[i],
+                    kd_mask=self._student_kd_mask(aligns_by_idx[i]),
+                    sample_mask=aligns_by_idx[i].sample_mask,
+                    num_kd_tokens=kd_normalizer,
+                    vocab_size=self.student_vocab_size,
+                    vocab_topk=self.vocab_topk,
+                    temperature=self.temperature,
+                    reverse_kl=self.reverse_kl,
+                    tp_group=tp_group,
+                    cp_group=cp_group,
+                )
+                m_i: dict[str, Any] = {
+                    "kl_loss": self._detached_cp_sum(kd_i, cp_group).item()
+                }
+            else:
+                if (
+                    global_valid_chunks_by_idx is None
+                    or i not in global_valid_chunks_by_idx
+                ):
+                    raise ValueError(
+                        "Owner-local CSD needs the step-global valid-chunk count "
+                        f"for teacher {i}."
+                    )
+                if i not in teacher_row_payloads_by_idx:
+                    raise ValueError(
+                        f"Cross-tokenizer teacher {i} has no IPC row payload."
+                    )
+                kd_i, m_i = self._compute_csd_loss_owner_local(
+                    i,
+                    logits,
+                    teacher_row_payloads_by_idx[i],
+                    aligns_by_idx[i],
+                    teacher_vocab_size=self.teacher_vocab_sizes[i],
+                    global_valid_chunks=global_valid_chunks_by_idx[i],
+                    tp_group=tp_group,
+                    cp_group=cp_group,
+                )
+            weight = self.teacher_weights[i]
+            if self.normalize_teacher_by_vocab:
+                weight = weight * float(
+                    torch.log(
+                        torch.tensor(float(self.teacher_vocab_sizes[i]), device=device)
+                    )
+                    / min_log_vocab
+                )
+            weighted = kd_i * weight
+            total_kd = weighted if total_kd is None else total_kd + weighted
+            per_metrics[f"teacher_{i}/weighted_kl"] = float(m_i["kl_loss"] * weight)
+            for key in (
+                "kl_loss",
+                "kl_common_per_chunk",
+                "kl_partition_last_per_chunk",
+                "top1_acc_per_chunk",
+                "num_common_chunks",
+                "num_mismatch_chunks",
+            ):
+                if key in m_i:
+                    per_metrics[f"{key}_t{i}"] = m_i[key]
+            per_metrics[f"weight_t{i}"] = float(self.teacher_weights[i])
+        assert total_kd is not None
+        return total_kd, per_metrics
+
+    def _partition_divergence(
+        self,
+        student_logp: torch.Tensor,
+        teacher_logp: torch.Tensor,
+        loss_fn_name: str,
+    ) -> torch.Tensor:
+        """Per-element partition divergence for one CSD loss setting."""
+        if loss_fn_name == "bce":
+            return self._binary_power_bce_from_logp(
+                student_logp, teacher_logp, tau=float(self.cfg.csd_alm_bce_tau)
+            )
+        if loss_fn_name == "jsd":
+            return _generalized_jsd(
+                student_logp, teacher_logp, float(self.cfg.csd_jsd_beta)
+            )
+        if not self.reverse_kl:
+            return torch.nn.functional.kl_div(
+                student_logp, teacher_logp, reduction="none", log_target=True
+            )
+        return torch.nn.functional.kl_div(
+            teacher_logp, student_logp, reduction="none", log_target=True
+        )
+
+    def _owner_local_mismatch_support(
+        self,
+        record: tuple[int, int, int, list[int], list[int], list[int], list[int], bool],
+        *,
+        inp_s_np: np.ndarray,
+        inp_t_np: np.ndarray,
+        prefix_index: Optional[dict[str, Any]],
+        keep_realized: bool,
+    ) -> Optional[tuple[list[int], list[int], int, int]]:
+        """``(s_ids, t_ids, realized_s, realized_t)`` for one mismatch chunk.
+
+        Mirrors the replicated CSD rules: realized-only chunks and many-to-many
+        chunks use the realized pair; 1-to-many and many-to-1 chunks use the
+        prefix-support alternatives, plus the realized pair when the sparse
+        teacher keeps realized labels. Returns None for an unsupported chunk.
+        """
+        b, M, N, _s_pred, s_labels, _t_pred, t_labels, _owned = record
+        realized_s = int(inp_s_np[b, s_labels[-1]])
+        realized_t = int(inp_t_np[b, t_labels[-1]])
+        if (
+            self.cfg.csd_realized_only_mismatch
+            or prefix_index is None
+            or (M > 1 and N > 1)
+        ):
+            return [realized_s], [realized_t], realized_s, realized_t
+        if M == 1:
+            max_chain = int(prefix_index.get("max_chain_t", 0))
+            length, side, swap = N, "forward", False
+            prefix = tuple(int(inp_t_np[b, pos]) for pos in t_labels[: N - 1])
+        else:
+            max_chain = int(prefix_index.get("max_chain_s", 0))
+            length, side, swap = M, "reverse", True
+            prefix = tuple(int(inp_s_np[b, pos]) for pos in s_labels[: M - 1])
+        if length > max_chain and not keep_realized:
+            return None
+        pairs = (
+            prefix_index[side].get((length, prefix), ()) if length <= max_chain else ()
+        )
+        if not pairs and not keep_realized:
+            return None
+        s_list, t_list = self._unique_bidir_pairs_cpu(
+            pairs,
+            swap=swap,
+            assume_unique=bool(prefix_index.get("_prededuped", False)),
+        )
+        if keep_realized and (realized_s, realized_t) not in set(zip(s_list, t_list)):
+            s_list.append(realized_s)
+            t_list.append(realized_t)
+        if len(s_list) < (1 if keep_realized else 2):
+            return None
+        return s_list, t_list, realized_s, realized_t
+
+    def _compute_csd_loss_owner_local(
+        self,
+        i: int,
+        student_logits: torch.Tensor,
+        payload: TeacherRowPayload,
+        align: LocalizedAlignment,
+        *,
+        teacher_vocab_size: int,
+        global_valid_chunks: torch.Tensor,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """CP-partial CSD KD term for cross-tokenizer teacher ``i``.
+
+        The student logits stay ``[B, S_pad/CP, V/TP]`` in their load-balanced
+        CP layout. Every rank classifies all chunks the same way, but only the
+        rank holding a chunk's final student predictor row evaluates it; its
+        teacher rows are read from the IPC records (:class:`SparseTeacherRowReader`
+        or :class:`DenseTeacherRowReader`) and its student values come from
+        :func:`distributed_selected_logprobs`. A mismatch chunk's student prefix
+        rows may sit on other CP ranks: each rank adds its share to one
+        fixed-length vector that is summed across CP with a SUM backward.
+
+        The result is this rank's partial ``T**2 * (common + beta * mismatch)
+        / global_valid_chunks``; summed over CP ranks it equals the replicated
+        CSD KD term. Dense teachers follow the replicated support rules; sparse
+        teachers use each request's top-k with its realized label kept.
+        Returned metrics are CP sums.
+        """
+        cfg = self.cfg
+        device = student_logits.device
+        accum_dtype = torch.float32
+        temperature = float(cfg.temperature)
+        loss_fn_name = str(cfg.csd_loss_fn)
+        last_loss_fn_name = str(cfg.csd_last_pos_loss_fn or loss_fn_name)
+        mismatch_beta = float(cfg.csd_mismatch_loss_beta)
+        noise_filter_topk = int(cfg.csd_noise_filter_topk)
+        realized_only = bool(cfg.csd_realized_only_mismatch)
+        sparse = payload.transport == "sparse"
+        # Sparse owner-local transport always forces realized labels.
+        keep_realized = sparse
+        row_tile = int(cfg.csd_selected_row_chunk_size)
+        chunk_batch = int(cfg.csd_support_chunk_batch_size)
+        v_t = int(teacher_vocab_size)
+        tp_rank = (
+            torch.distributed.get_rank(tp_group)
+            if tp_group is not None and torch.distributed.is_initialized()
+            else 0
+        )
+        cp_size = (
+            torch.distributed.get_world_size(cp_group)
+            if cp_group is not None and torch.distributed.is_initialized()
+            else 1
+        )
+        local_vocab = int(student_logits.shape[-1])
+        vocab_start = tp_rank * local_vocab
+
+        def student_logp(
+            batch_rows: torch.Tensor, local_rows: torch.Tensor, token_ids: torch.Tensor
+        ) -> torch.Tensor:
+            return distributed_selected_logprobs(
+                student_logits,
+                batch_rows,
+                local_rows,
+                token_ids,
+                vocab_start_index=vocab_start,
+                vocab_end_index=vocab_start + local_vocab,
+                real_vocab_size=int(self.student_vocab_size),
+                temperature=temperature,
+                tp_group=tp_group,
+                row_chunk_size=row_tile,
+            ).to(accum_dtype)
+
+        def as_long(values: list[int]) -> torch.Tensor:
+            return torch.tensor(values, device=device, dtype=torch.long)
+
+        # A graph-connected zero: every rank's loss must reach the student logits
+        # (and the CP collectives below) even when it owns no chunk.
+        connected_zero = student_logits.reshape(-1)[0].to(accum_dtype) * 0.0
+
+        reader: Optional[SparseTeacherRowReader | DenseTeacherRowReader] = None
+        try:
+            setup_error: Optional[Exception] = None
+            # Collective-free setup: any failure here is agreed on below, before
+            # the first TP or CP collective.
+            try:
+                if align.student_global_positions is None:
+                    raise ValueError("Owner-local CSD requires student positions.")
+                assert align.student_spans is not None
+                assert align.teacher_spans is not None
+                assert align.pair_valid is not None
+                assert align.student_input_ids is not None
+                assert align.teacher_input_ids is not None
+                sample_mask = to_local_if_dtensor(align.sample_mask).bool()
+                pair_valid = to_local_if_dtensor(align.pair_valid).bool()
+                batch_size = int(pair_valid.shape[0])
+                if sample_mask.shape != (batch_size,):
+                    raise ValueError(
+                        "CSD sample_mask must have shape [B]: expected "
+                        f"({batch_size},), got {tuple(sample_mask.shape)}."
+                    )
+                if len(payload.entries) != batch_size:
+                    raise ValueError(
+                        f"Teacher {i} IPC payload has {len(payload.entries)} "
+                        f"samples for a microbatch of {batch_size}."
+                    )
+                pair_valid_np = (
+                    (pair_valid & sample_mask.unsqueeze(-1)).cpu().numpy().astype(bool)
+                )
+                s_spans_np = align.student_spans.detach().cpu().numpy()
+                t_spans_np = align.teacher_spans.detach().cpu().numpy()
+                inp_s_np = align.student_input_ids.detach().cpu().numpy()
+                inp_t_np = align.teacher_input_ids.detach().cpu().numpy()
+                positions = align.student_global_positions.detach().cpu().tolist()
+                local_of_global = {int(g): j for j, g in enumerate(positions)}
+                student_seq_len = len(positions) * cp_size
+
+                if sparse:
+                    reader = SparseTeacherRowReader(payload.entries, device=device)
+                    expected_membership = noise_filter_topk or int(
+                        cfg.teacher_topk_ipc_k
+                    )
+                    if (
+                        reader.k != int(cfg.teacher_topk_ipc_k)
+                        or reader.temperature != temperature
+                        or reader.real_vocab_size != v_t
+                        or reader.membership_k != expected_membership
+                    ):
+                        raise ValueError(
+                            f"Teacher {i} sparse IPC metadata (k={reader.k}, "
+                            f"temperature={reader.temperature}, vocab="
+                            f"{reader.real_vocab_size}, membership_k="
+                            f"{reader.membership_k}) disagrees with the loss."
+                        )
+                else:
+                    reader = DenseTeacherRowReader(payload.entries, device=device)
+                    if reader.full_vocab_size < v_t:
+                        raise ValueError(
+                            f"Teacher {i} dense IPC vocabulary {reader.full_vocab_size} "
+                            f"is narrower than the tokenizer vocabulary {v_t}."
+                        )
+                teacher_seq_len = reader.full_seq_len
+                common_s, common_t = self._get_common_indices_csd(device, i)
+                if common_s.numel() == 0:
+                    raise ValueError(
+                        f"Teacher {i}: the exact 1-to-1 common-vocab map is empty."
+                    )
+
+                # Classify every chunk identically on every rank; keep the
+                # common chunks this rank owns and all mismatch chunks (their
+                # student prefixes may live here).
+                common_records: list[tuple[int, int, int, int, int]] = []
+                mismatch_records: list[
+                    tuple[
+                        int, int, int, list[int], list[int], list[int], list[int], bool
+                    ]
+                ] = []
+                for b, k in zip(*np.nonzero(pair_valid_np)):
+                    s_start, s_end = (int(x) for x in s_spans_np[b, k])
+                    t_start, t_end = (int(x) for x in t_spans_np[b, k])
+                    M, N = s_end - s_start, t_end - t_start
+                    if M <= 0 or N <= 0:
+                        continue
+                    shift = (
+                        1 if cfg.kl_chunk_shift and s_start > 0 and t_start > 0 else 0
+                    )
+                    s_labels = list(range(s_start, s_end))
+                    t_labels = list(range(t_start, t_end))
+                    s_pred = [pos - shift for pos in s_labels]
+                    t_pred = [pos - shift for pos in t_labels]
+                    if (
+                        s_pred[0] < 0
+                        or s_pred[-1] >= student_seq_len
+                        or t_pred[0] < 0
+                        or t_pred[-1] >= teacher_seq_len
+                        or s_labels[-1] >= inp_s_np.shape[1]
+                        or t_labels[-1] >= inp_t_np.shape[1]
+                    ):
+                        continue
+                    owned = s_pred[-1] in local_of_global
+                    if M == 1 and N == 1:
+                        if owned:
+                            common_records.append(
+                                (
+                                    int(b),
+                                    local_of_global[s_pred[0]],
+                                    t_pred[0],
+                                    int(inp_s_np[b, s_labels[0]]),
+                                    int(inp_t_np[b, t_labels[0]]),
+                                )
+                            )
+                    else:
+                        mismatch_records.append(
+                            (int(b), M, N, s_pred, s_labels, t_pred, t_labels, owned)
+                        )
+
+                prefix_index = None
+                if not realized_only and any(r[-1] for r in mismatch_records):
+                    prefix_index = self._ensure_bidir_prefix_support_index(device, i)
+                owned_mismatch: list[
+                    tuple[int, tuple[list[int], list[int], int, int]]
+                ] = []
+                for record_idx, record in enumerate(mismatch_records):
+                    if not record[-1]:
+                        continue
+                    support = self._owner_local_mismatch_support(
+                        record,
+                        inp_s_np=inp_s_np,
+                        inp_t_np=inp_t_np,
+                        prefix_index=prefix_index,
+                        keep_realized=keep_realized,
+                    )
+                    if support is not None:
+                        owned_mismatch.append((record_idx, support))
+
+                # Sparse teacher rows are small (K values per request), so read
+                # every one this rank needs up front; this also validates the
+                # forced labels before any collective.
+                sparse_row_of: dict[tuple[int, int, int], int] = {}
+                sparse_rows: Optional[tuple[torch.Tensor, ...]] = None
+                if sparse:
+                    assert isinstance(reader, SparseTeacherRowReader)
+                    for b, _sl, t_pos, _rs, rt in common_records:
+                        sparse_row_of.setdefault((b, t_pos, rt), len(sparse_row_of))
+                    for record_idx, _support in owned_mismatch:
+                        b, _M, _N, _sp, _sl, t_pred, t_labels, _ow = mismatch_records[
+                            record_idx
+                        ]
+                        for t_pos, t_lab in zip(t_pred, t_labels):
+                            key = (b, t_pos, int(inp_t_np[b, t_lab]))
+                            sparse_row_of.setdefault(key, len(sparse_row_of))
+                    if sparse_row_of:
+                        keys = list(sparse_row_of)
+                        tiles = [
+                            reader.gather_rows(
+                                as_long(
+                                    [key[0] for key in keys[start : start + row_tile]]
+                                ),
+                                as_long(
+                                    [key[1] for key in keys[start : start + row_tile]]
+                                ),
+                                as_long(
+                                    [key[2] for key in keys[start : start + row_tile]]
+                                ),
+                            )
+                            for start in range(0, len(keys), row_tile)
+                        ]
+                        sparse_rows = tuple(
+                            torch.cat([tile[field] for tile in tiles])
+                            for field in range(4)
+                        )
+            except (
+                AssertionError,
+                IndexError,
+                KeyError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                setup_error = exc
+            self._raise_if_any_rank_failed(
+                setup_error, device=device, tp_group=tp_group, cp_group=cp_group
+            )
+
+            def sparse_label_logp(
+                keys: list[tuple[int, int, int]],
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                """Teacher log-prob of each request's own label, and its membership."""
+                assert sparse_rows is not None
+                rows = as_long([sparse_row_of[key] for key in keys])
+                values, ids, log_z, in_topk = (field[rows] for field in sparse_rows)
+                match = ids.long() == as_long([key[2] for key in keys]).unsqueeze(-1)
+                raw = torch.where(match, values, torch.full_like(values, -torch.inf))
+                return raw.max(dim=-1).values / temperature - log_z, in_topk
+
+            def dense_rows(
+                batch_rows: list[int], teacher_rows: list[int]
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                """Real-vocabulary teacher logits ``[n, V_t]`` and their log Z."""
+                assert isinstance(reader, DenseTeacherRowReader)
+                rows = reader.gather_rows(as_long(batch_rows), as_long(teacher_rows))
+                rows = rows[:, :v_t]
+                return rows, torch.logsumexp(rows / temperature, dim=-1)
+
+            def dense_label_in_topk(
+                rows: torch.Tensor, labels: torch.Tensor
+            ) -> torch.Tensor:
+                filter_k = min(noise_filter_topk, int(rows.shape[-1]))
+                topk_ids = torch.topk(rows, k=filter_k, dim=-1).indices
+                return (topk_ids == labels.unsqueeze(-1)).any(dim=-1)
+
+            # ----- Common chunks owned by this rank -----------------------
+            common_sum = connected_zero
+            common_count = 0
+            common_matches = 0
+            noise_filtered_common = 0
+            teacher_to_common_student = (
+                self._get_csd_teacher_to_common_student(
+                    device, i, v_t, common_s, common_t
+                )
+                if sparse
+                else None
+            )
+            for start in range(0, len(common_records), chunk_batch):
+                batch = common_records[start : start + chunk_batch]
+                cb = as_long([r[0] for r in batch])
+                cs = as_long([r[1] for r in batch])
+                crs = as_long([r[3] for r in batch])
+                crt = as_long([r[4] for r in batch])
+                if sparse:
+                    assert (
+                        sparse_rows is not None
+                        and teacher_to_common_student is not None
+                    )
+                    rows = as_long([sparse_row_of[(r[0], r[2], r[4])] for r in batch])
+                    topk_logits, topk_ids, teacher_log_z, in_topk = (
+                        field[rows] for field in sparse_rows
+                    )
+                    mapped = teacher_to_common_student[topk_ids.long()]
+                    # One of the K columns is reserved for the realized pair:
+                    # keep the best K-1 other common alternatives by score and
+                    # append the realized pair when it maps 1-to-1.
+                    support = self._topk_mask_by_score(
+                        (mapped >= 0)
+                        & (mapped != crs.unsqueeze(-1))
+                        & (topk_ids.long() != crt.unsqueeze(-1)),
+                        topk_logits.to(accum_dtype),
+                        max(int(topk_ids.shape[-1]) - 1, 0),
+                    )
+                    realized_raw = (
+                        torch.where(
+                            topk_ids.long() == crt.unsqueeze(-1),
+                            topk_logits,
+                            torch.full_like(topk_logits, -torch.inf),
+                        )
+                        .max(dim=-1)
+                        .values
+                    )
+                    realized_common = teacher_to_common_student[crt] == crs
+                    queried = student_logp(
+                        cb,
+                        cs,
+                        torch.cat([mapped.clamp_min(0), crs.unsqueeze(-1)], dim=-1),
+                    )
+                    teacher_logp = torch.cat(
+                        [
+                            topk_logits.to(accum_dtype) / temperature
+                            - teacher_log_z.unsqueeze(-1),
+                            (realized_raw / temperature - teacher_log_z).unsqueeze(-1),
+                        ],
+                        dim=-1,
+                    )
+                    support = torch.cat(
+                        [support, realized_common.unsqueeze(-1)], dim=-1
+                    )
+                    s_logp = torch.where(support, queried, -1.0e30)
+                    t_logp = torch.where(support, teacher_logp, -1.0e30)
+                    valid = support.any(dim=-1)
+                    noise_ok = (
+                        in_topk if noise_filter_topk > 0 else torch.ones_like(valid)
+                    )
+                else:
+                    rows, teacher_log_z = dense_rows(
+                        [r[0] for r in batch], [r[2] for r in batch]
+                    )
+                    support = None
+                    s_logp = student_logp(
+                        cb, cs, common_s.unsqueeze(0).expand(len(batch), -1)
+                    )
+                    t_logp = rows[:, common_t] / temperature - teacher_log_z.unsqueeze(
+                        -1
+                    )
+                    valid = torch.ones((len(batch),), device=device, dtype=torch.bool)
+                    noise_ok = (
+                        dense_label_in_topk(rows, crt)
+                        if noise_filter_topk > 0
+                        else torch.ones_like(valid)
+                    )
+                per_elem = self._partition_divergence(
+                    self._append_rest_bucket_logp(s_logp),
+                    self._append_rest_bucket_logp(t_logp),
+                    loss_fn_name,
+                )
+                if support is not None:
+                    per_elem = per_elem * torch.cat(
+                        [support.to(per_elem.dtype), torch.ones_like(per_elem[:, :1])],
+                        dim=-1,
+                    )
+                keep = valid & noise_ok
+                common_sum = (
+                    common_sum + (per_elem.sum(dim=-1) * keep.to(accum_dtype)).sum()
+                )
+                common_count += int(noise_ok.sum().item())
+                noise_filtered_common += int((~noise_ok).sum().item())
+                with torch.no_grad():
+                    common_matches += int(
+                        ((s_logp.argmax(dim=-1) == t_logp.argmax(dim=-1)) & keep)
+                        .sum()
+                        .item()
+                    )
+
+            # ----- Mismatch chunks ------------------------------------------
+            mismatch_sum = connected_zero
+            mismatch_count = 0
+            mismatch_matches = 0
+            noise_filtered_mismatch = 0
+            if mismatch_records:
+                # Each rank adds the realized student prefix log-probs of the
+                # rows it holds; the CP SUM gives every owner its complete prefix
+                # (realized-only chunks: the complete chain).
+                term_chunks: list[int] = []
+                term_b: list[int] = []
+                term_rows: list[int] = []
+                term_labels: list[int] = []
+                for record_idx, (b, _M, _N, s_pred, s_labels, *_rest) in enumerate(
+                    mismatch_records
+                ):
+                    terms = (
+                        zip(s_pred, s_labels)
+                        if realized_only
+                        else zip(s_pred[:-1], s_labels[:-1])
+                    )
+                    for pred_pos, label_pos in terms:
+                        local_row = local_of_global.get(pred_pos)
+                        if local_row is not None:
+                            term_chunks.append(record_idx)
+                            term_b.append(b)
+                            term_rows.append(local_row)
+                            term_labels.append(int(inp_s_np[b, label_pos]))
+                # Keep the vector in every rank's graph: a rank may own no final
+                # rows yet hold prefix rows, and must join the backward SUM.
+                local_terms = connected_zero + torch.zeros(
+                    (len(mismatch_records),), device=device, dtype=accum_dtype
+                )
+                if term_b:
+                    local_terms = local_terms.index_add(
+                        0,
+                        as_long(term_chunks),
+                        student_logp(
+                            as_long(term_b), as_long(term_rows), as_long(term_labels)
+                        ),
+                    )
+                shared_terms = group_all_reduce_sum_with_grad_backward_sum(
+                    local_terms, cp_group
+                )
+                mismatch_sum = mismatch_sum + shared_terms.sum() * 0.0
+
+                for start in range(0, len(owned_mismatch), chunk_batch):
+                    batch = owned_mismatch[start : start + chunk_batch]
+                    records = [mismatch_records[idx] for idx, _ in batch]
+                    n = len(batch)
+                    student_prefix = shared_terms[as_long([idx for idx, _ in batch])]
+                    # Teacher log-probs of every realized label in each chunk:
+                    # the final row's label is needed only for noise filtering
+                    # and realized-only chains.
+                    requests = [
+                        (row, (r[0], t_pos, int(inp_t_np[r[0], t_lab])), j == r[2] - 1)
+                        for row, r in enumerate(records)
+                        for j, (t_pos, t_lab) in enumerate(zip(r[5], r[6]))
+                    ]
+                    owner = as_long([req[0] for req in requests])
+                    is_final = torch.tensor(
+                        [req[2] for req in requests], device=device, dtype=torch.bool
+                    )
+                    if sparse:
+                        label_logp, label_ok = sparse_label_logp(
+                            [req[1] for req in requests]
+                        )
+                    else:
+                        label_logp_parts, label_ok_parts = [], []
+                        for tile in range(0, len(requests), row_tile):
+                            part = requests[tile : tile + row_tile]
+                            rows, log_z = dense_rows(
+                                [req[1][0] for req in part], [req[1][1] for req in part]
+                            )
+                            labels = as_long([req[1][2] for req in part])
+                            label_logp_parts.append(
+                                rows.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+                                / temperature
+                                - log_z
+                            )
+                            label_ok_parts.append(
+                                dense_label_in_topk(rows, labels)
+                                if noise_filter_topk > 0
+                                else torch.ones_like(labels, dtype=torch.bool)
+                            )
+                        label_logp = torch.cat(label_logp_parts)
+                        label_ok = torch.cat(label_ok_parts)
+                    chain_or_prefix_terms = (
+                        label_logp
+                        if realized_only
+                        else torch.where(is_final, 0.0, label_logp.to(accum_dtype))
+                    )
+                    teacher_prefix = torch.zeros(
+                        (n,), device=device, dtype=accum_dtype
+                    ).index_add(0, owner, chain_or_prefix_terms.to(accum_dtype))
+                    noise_ok = (
+                        torch.ones((n,), device=device, dtype=torch.int32)
+                        .index_reduce(0, owner, label_ok.to(torch.int32), "amin")
+                        .bool()
+                        if noise_filter_topk > 0
+                        else torch.ones((n,), device=device, dtype=torch.bool)
+                    )
+
+                    if realized_only:
+                        s_scores = student_prefix.unsqueeze(-1)
+                        t_scores = teacher_prefix.unsqueeze(-1)
+                        support = torch.ones((n, 1), device=device, dtype=torch.bool)
+                    else:
+                        width = max(len(sup[0]) for _, sup in batch)
+                        s_ids = torch.zeros((n, width), device=device, dtype=torch.long)
+                        t_ids = torch.zeros_like(s_ids)
+                        candidate = torch.zeros(
+                            (n, width), device=device, dtype=torch.bool
+                        )
+                        realized_pair = torch.zeros_like(candidate)
+                        for row, (_, (s_list, t_list, rs, rt)) in enumerate(batch):
+                            count = len(s_list)
+                            s_ids[row, :count] = as_long(s_list)
+                            t_ids[row, :count] = as_long(t_list)
+                            candidate[row, :count] = True
+                            realized_pair[row, :count] = (s_ids[row, :count] == rs) & (
+                                t_ids[row, :count] == rt
+                            )
+                        final_b = [r[0] for r in records]
+                        final_t = [r[5][-1] for r in records]
+                        if sparse:
+                            assert sparse_rows is not None
+                            final_rows = as_long(
+                                [
+                                    sparse_row_of[
+                                        (b, t_pos, int(inp_t_np[b, r[6][-1]]))
+                                    ]
+                                    for b, t_pos, r in zip(final_b, final_t, records)
+                                ]
+                            )
+                            topk_logits, topk_ids, final_log_z, _ = (
+                                field[final_rows] for field in sparse_rows
+                            )
+                            slot_match = t_ids.unsqueeze(
+                                -1
+                            ) == topk_ids.long().unsqueeze(1)
+                            found = slot_match.any(dim=-1)
+                            t_raw = (
+                                torch.where(
+                                    slot_match,
+                                    topk_logits.unsqueeze(1),
+                                    torch.full_like(
+                                        topk_logits.unsqueeze(1), -torch.inf
+                                    ),
+                                )
+                                .max(dim=-1)
+                                .values
+                            )
+                            t_final = t_raw.to(
+                                accum_dtype
+                            ) / temperature - final_log_z.unsqueeze(-1)
+                            alternatives = self._topk_mask_by_score(
+                                candidate & found & ~realized_pair,
+                                torch.where(found, t_final, -1.0e30),
+                                max(int(topk_ids.shape[-1]) - 1, 0),
+                            )
+                            support = (realized_pair & found) | alternatives
+                        else:
+                            rows, final_log_z = dense_rows(final_b, final_t)
+                            t_final = rows.gather(
+                                -1, t_ids
+                            ) / temperature - final_log_z.unsqueeze(-1)
+                            support = candidate
+                        final_s = as_long([local_of_global[r[3][-1]] for r in records])
+                        s_scores = student_logp(as_long(final_b), final_s, s_ids) + (
+                            student_prefix.unsqueeze(-1)
+                        )
+                        t_scores = t_final + teacher_prefix.unsqueeze(-1)
+                    s_scores = torch.where(support, s_scores, -1.0e30)
+                    t_scores = torch.where(support, t_scores.to(accum_dtype), -1.0e30)
+                    per_elem = self._partition_divergence(
+                        self._append_rest_bucket_logp(s_scores),
+                        self._append_rest_bucket_logp(t_scores),
+                        last_loss_fn_name,
+                    )
+                    per_elem = per_elem * torch.cat(
+                        [support.to(per_elem.dtype), torch.ones_like(per_elem[:, :1])],
+                        dim=-1,
+                    )
+                    keep = support.any(dim=-1) & noise_ok
+                    mismatch_sum = (
+                        mismatch_sum
+                        + (per_elem.sum(dim=-1) * keep.to(accum_dtype)).sum()
+                    )
+                    mismatch_count += int(keep.sum().item())
+                    noise_filtered_mismatch += int((~noise_ok).sum().item())
+                    with torch.no_grad():
+                        mismatch_matches += int(
+                            (
+                                (s_scores.argmax(dim=-1) == t_scores.argmax(dim=-1))
+                                & keep
+                            )
+                            .sum()
+                            .item()
+                        )
+        finally:
+            if reader is not None:
+                reader.close()
+
+        local_chunk_sum = common_sum + mismatch_beta * mismatch_sum
+        final_loss = (
+            local_chunk_sum
+            / global_valid_chunks.to(device=device, dtype=accum_dtype).clamp(min=1.0)
+            * (temperature**2)
+        )
+        stats = torch.tensor(
+            [
+                float(common_sum.detach()),
+                float(mismatch_sum.detach()),
+                float(final_loss.detach()),
+                common_count,
+                mismatch_count,
+                common_matches,
+                mismatch_matches,
+                noise_filtered_common,
+                noise_filtered_mismatch,
+            ],
+            device=device,
+            dtype=torch.float64,
+        )
+        if cp_size > 1:
+            torch.distributed.all_reduce(stats, group=cp_group)
+        (
+            common_total,
+            mismatch_total,
+            kd_total,
+            common_total_count,
+            mismatch_total_count,
+            common_total_matches,
+            mismatch_total_matches,
+            noise_common_total,
+            noise_mismatch_total,
+        ) = stats.tolist()
+        mismatch_mean = mismatch_total / max(mismatch_total_count, 1.0)
+        metrics: dict[str, Any] = {
+            "loss": kd_total,
+            "train:loss": kd_total,
+            "kl_loss": kd_total,
+            "kl_common_per_chunk": common_total / max(common_total_count, 1.0),
+            "kl_partition_last_per_chunk": mismatch_mean,
+            "kl_mismatch_scaled_per_chunk": mismatch_mean * mismatch_beta,
+            "num_common_chunks": int(common_total_count),
+            "num_mismatch_chunks": int(mismatch_total_count),
+            "num_noise_filtered_common_chunks": int(noise_common_total),
+            "num_noise_filtered_mismatch_chunks": int(noise_mismatch_total),
+            "top1_acc_per_chunk": (common_total_matches + mismatch_total_matches)
+            / max(common_total_count + mismatch_total_count, 1.0),
+            "csd_mismatch_loss_beta": mismatch_beta,
+        }
         if noise_filter_topk > 0:
             metrics["csd_noise_filter_topk"] = noise_filter_topk
         return final_loss, metrics

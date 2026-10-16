@@ -28,6 +28,8 @@ loss_fn:
   teacher_topk_ipc_k: 0
   teacher_topk_ipc_support_mode: row_topk
   teacher_topk_ipc_keep_realized: true
+  csd_selected_row_chunk_size: 128   # owner-local Megatron path: student/teacher rows per tile
+  csd_support_chunk_batch_size: 16   # owner-local Megatron path: alignment chunks per batch
   kd_loss_mode: sum
   sum_weights_metric: null
   alpha: 1.0
