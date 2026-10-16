@@ -92,6 +92,7 @@ The generated fields are:
 | `POOL_STARTUP_TIMEOUT` | no | `3600` | Seconds allowed for startup. |
 | `POOL_SHARED_PATHS` | no | empty | Newline-separated absolute paths under `EXTERNAL_VLLM_SHARED_ROOT` that the pool container must access. |
 | `POOL_ENV_VARS` | no | empty | Newline-separated `NAME=value` assignments applied before vLLM starts. |
+| `POOL_CACHE_DIR` | no | empty | Persistent JIT compile cache under `EXTERNAL_VLLM_SHARED_ROOT` (vLLM, TorchInductor, Triton, FlashInfer). Each node copies it to local disk before Ray starts and writes new entries back in the background (`cache_sync.sh`), so later jobs skip recompiling. `CACHE_FORCE_FRESH=1` starts empty but still writes back. |
 | `POOL_VLLM_ARGS` | no | empty | Newline-separated vLLM CLI arguments, one argv entry per line. |
 
 Registration validates required fields, positive topology values, TCP port
@@ -189,6 +190,23 @@ stack into a purpose-built serving container. If the source checkout is not
 available, the wrapper falls back to the installed `nemo_rl` package.
 `CONTAINER` must provide
 `EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
+
+### Persistent compile caches for NeMo RL workers
+
+The vLLM and Megatron workers can keep their JIT caches the same way, one directory per worker type under `NRL_COMPILE_CACHE_ROOT`. In the driver's environment:
+
+```bash
+NRL_CACHE_SYNC=$TOOLS/cache_sync.sh NRL_COMPILE_CACHE_ROOT=/shared/compile_cache NRL_LOCAL_COMPILE_CACHE=/tmp/nemo_rl_compile_cache
+VLLM_CACHE_ROOT=/tmp/nemo_rl_compile_cache/policy/vllm NRL_VLLM_CACHE_ROOT_PER_ENGINE=0   # one engine per node
+NRL_VLLM_TRITON_CACHE_DIR=/tmp/nemo_rl_compile_cache/policy/triton                        # likewise other NRL_VLLM_* / NRL_MEGATRON_* dirs
+```
+
+The vLLM actor waits for this node's copy of the `policy` cache before it creates its engine; the Megatron worker copies `megatron` in the background (its kernels are compiled at the first training step). Start the policy copy and the write-back in `SETUP_COMMAND`, so the copy overlaps Ray start-up:
+
+```bash
+bash $TOOLS/cache_sync.sh seed-once /shared/compile_cache/policy /tmp/nemo_rl_compile_cache/policy &
+bash $TOOLS/cache_sync.sh sidecar-types /tmp/nemo_rl_compile_cache /shared/compile_cache 60 "$LOG_DIR/ENDED" policy megatron &
+```
 
 ## Slurm submission
 
