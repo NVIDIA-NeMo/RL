@@ -55,6 +55,7 @@ from torch.distributed.tensor import DTensor
 from nemo_rl.algorithms.utils import masked_mean
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 from nemo_rl.distributed.model_utils import (
+    _get_tokens_on_this_cp_rank,
     allgather_cp_contiguous_tensor,
     cp_load_balanced_to_contiguous,
     cp_shift_next,
@@ -544,6 +545,39 @@ class LocalizedAlignment:
     student_spans: Optional[torch.Tensor] = None
     teacher_spans: Optional[torch.Tensor] = None
     num_chunks: Optional[torch.Tensor] = None
+    # Owner-local CSD only: the global student position of each local logit row
+    # (the load-balanced CP layout). Ids, masks and spans then stay global.
+    student_global_positions: Optional[torch.Tensor] = None
+
+
+@dataclass(frozen=True)
+class TeacherRowPayload:
+    """One cross-tokenizer teacher's per-sample IPC records, read row by row.
+
+    ``transport`` is ``"sparse"`` (records from ``get_sparse_logits_ipc``, read
+    with :class:`SparseTeacherRowReader`) or ``"dense"`` (full-logit records,
+    read with :class:`DenseTeacherRowReader`).
+    """
+
+    transport: str
+    entries: list[dict[str, Any]]
+
+
+def cp_load_balanced_global_positions(
+    local_seq_len: int,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Global positions ``[local_seq_len]`` of this CP rank's load-balanced rows."""
+    cp_size = (
+        torch.distributed.get_world_size(cp_group)
+        if cp_group is not None and torch.distributed.is_initialized()
+        else 1
+    )
+    cp_rank = torch.distributed.get_rank(cp_group) if cp_size > 1 else 0
+    full = torch.arange(local_seq_len * cp_size, device=device, dtype=torch.long)
+    return _get_tokens_on_this_cp_rank(full, cp_rank, cp_size, seq_dim=0)
 
 
 def localize_alignment(
@@ -1087,7 +1121,7 @@ class _SparseTeacherRoute:
     global_start: int
     global_end: int
     local_start: int
-    shard: Mapping[str, Any]
+    shard: dict[str, Any]
 
 
 def _normalize_reader_device(
@@ -1141,7 +1175,7 @@ def _open_reader_backing(
 
 def _sample_teacher_shards(
     entry: Mapping[str, Any], sample_idx: int
-) -> list[Mapping[str, Any]]:
+) -> list[dict[str, Any]]:
     shards = entry.get("teacher_shards", [entry])
     if not isinstance(shards, (list, tuple)):
         raise TypeError(
@@ -1150,13 +1184,13 @@ def _sample_teacher_shards(
         )
     if not shards:
         raise ValueError(f"Teacher sample {sample_idx} contains no IPC shards")
-    if not all(isinstance(shard, Mapping) for shard in shards):
+    if not all(isinstance(shard, dict) for shard in shards):
         raise TypeError(f"Teacher sample {sample_idx} contains a non-dict shard")
     return list(shards)
 
 
 def _required_shard_int(
-    shard: Mapping[str, Any], field: str, *, sample_idx: int, shard_idx: int
+    shard: dict[str, Any], field: str, *, sample_idx: int, shard_idx: int
 ) -> int:
     try:
         return int(shard[field])
@@ -1201,13 +1235,15 @@ class SparseTeacherRowReader:
 
     def __init__(
         self,
-        per_sample_entries: Sequence[Mapping[str, Any]],
+        per_sample_entries: Sequence[dict[str, Any]],
         *,
         device: torch.device | int,
     ) -> None:
         if not per_sample_entries:
             raise ValueError("Sparse teacher payload contains no samples")
-        self.device, self._device_id = _normalize_reader_device(device)
+        consumer_device, consumer_device_id = _normalize_reader_device(device)
+        self.device: torch.device = consumer_device
+        self._device_id: Optional[int] = consumer_device_id
         self._backing_tensors: dict[Any, torch.Tensor] = {}
         self._routes: list[list[_SparseTeacherRoute]] = []
         self._route_starts: list[list[int]] = []
@@ -1220,14 +1256,14 @@ class SparseTeacherRowReader:
         self._build_routing_index(per_sample_entries)
 
     def _build_routing_index(
-        self, per_sample_entries: Sequence[Mapping[str, Any]]
+        self, per_sample_entries: Sequence[dict[str, Any]]
     ) -> None:
         expected_meta: Optional[tuple[int, float, int, int]] = None
         expected_full_seq_len: Optional[int] = None
         expected_force_width: Optional[int] = None
 
         for sample_idx, entry in enumerate(per_sample_entries):
-            if not isinstance(entry, Mapping):
+            if not isinstance(entry, dict):
                 raise TypeError(
                     "Sparse teacher samples must be dictionaries; "
                     f"sample={sample_idx}, got {type(entry).__name__}."
@@ -1502,7 +1538,7 @@ class SparseTeacherRowReader:
         self.force_width = expected_force_width
         self.full_seq_len = expected_full_seq_len
 
-    def _backing(self, shard: Mapping[str, Any], field: str) -> torch.Tensor:
+    def _backing(self, shard: dict[str, Any], field: str) -> torch.Tensor:
         value = shard[field]
         key = _reader_backing_key(field, value)
         tensor = self._backing_tensors.get(key)
@@ -1657,7 +1693,7 @@ class SparseTeacherRowReader:
                 f"[0, {self.real_vocab_size}); got {bad_id}."
             )
 
-        grouped: dict[int, tuple[Mapping[str, Any], list[int], list[int]]] = {}
+        grouped: dict[int, tuple[dict[str, Any], list[int], list[int]]] = {}
         for out_idx, (batch_idx, global_position) in enumerate(requests):
             route = self._route(int(batch_idx), int(global_position))
             # Each sample/shard record identifies one backing slot; group its
@@ -1775,7 +1811,7 @@ class SparseTeacherRowReader:
 
 
 def gather_sparse_teacher_rows_from_ipc(
-    per_sample_entries: Sequence[Mapping[str, Any]],
+    per_sample_entries: Sequence[dict[str, Any]],
     batch_indices: torch.Tensor,
     global_positions: torch.Tensor,
     required_token_ids: torch.Tensor,
@@ -1791,9 +1827,10 @@ def gather_sparse_teacher_rows_from_ipc(
     """
     reader = SparseTeacherRowReader(per_sample_entries, device=device)
     try:
-        return reader.gather_rows(batch_indices, global_positions, required_token_ids)
+        rows = reader.gather_rows(batch_indices, global_positions, required_token_ids)
     finally:
         reader.close()
+    return rows
 
 
 def _teacher_ipc_row_view(
@@ -1863,7 +1900,7 @@ class _DenseTeacherRoute:
 
     seq_start: int
     seq_end: int
-    shards: tuple[Mapping[str, Any], ...]
+    shards: tuple[dict[str, Any], ...]
 
 
 class DenseTeacherRowReader:
@@ -1879,7 +1916,7 @@ class DenseTeacherRowReader:
 
     def __init__(
         self,
-        per_sample_entries: Sequence[Mapping[str, Any]],
+        per_sample_entries: Sequence[dict[str, Any]],
         *,
         device: torch.device | int,
     ) -> None:
@@ -1887,7 +1924,9 @@ class DenseTeacherRowReader:
 
         if not per_sample_entries:
             raise ValueError("Dense teacher payload contains no samples")
-        self.device, self._device_id = _normalize_reader_device(device)
+        consumer_device, consumer_device_id = _normalize_reader_device(device)
+        self.device: torch.device = consumer_device
+        self._device_id: Optional[int] = consumer_device_id
         self._storage: dict[Any, torch.Tensor] = {}
         self._routes: list[list[_DenseTeacherRoute]] = []
         self._route_starts: list[list[int]] = []
@@ -1906,7 +1945,7 @@ class DenseTeacherRowReader:
                     f"expected {(full_seq_len, full_vocab_size)}, got "
                     f"{(sample_seq_len, sample_vocab_size)}."
                 )
-            by_window: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
+            by_window: dict[tuple[int, int], list[dict[str, Any]]] = {}
             for shard in shards:
                 seq_start = int(shard["global_seq_start"])
                 seq_end = seq_start + int(shard["actual_shape"][0])
@@ -1927,7 +1966,7 @@ class DenseTeacherRowReader:
         self.full_seq_len = full_seq_len
         self.full_vocab_size = full_vocab_size
 
-    def _row_view(self, handle: Mapping[str, Any]) -> torch.Tensor:
+    def _row_view(self, handle: dict[str, Any]) -> torch.Tensor:
         payload = handle["payload_ipc"]
         key = _reader_backing_key("payload_ipc", payload)
         src_full = self._storage.get(key)
@@ -2792,6 +2831,156 @@ def prepare_csd_cross_tokenizer_loss_input(
         teacher_sparse_logits_by_idx,
         aligns_by_idx,
         dense_reconstruction_fallbacks_by_idx,
+        tp_group,
+        cp_group,
+        loss_replica_group(cp_group),
+    )
+
+
+def prepare_csd_owner_local_loss_input(
+    logits: torch.Tensor,
+    data: Mapping[str, Any],
+    *,
+    cross_tokenizer_teacher_mask: list[bool],
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup],
+    context_parallel_group: Optional[torch.distributed.ProcessGroup],
+) -> tuple[
+    Optional[torch.Tensor],
+    Dict[int, torch.Tensor],
+    Dict[int, TeacherRowPayload],
+    Dict[int, LocalizedAlignment],
+    Optional[torch.distributed.ProcessGroup],
+    Optional[torch.distributed.ProcessGroup],
+    Optional[torch.distributed.ProcessGroup],
+]:
+    """Build CSD loss pieces that keep the Megatron student logits in their CP shard.
+
+    Cross-tokenizer teachers are not reassembled: each gets a
+    :class:`TeacherRowPayload` holding its IPC records, so the loss reads only
+    the teacher rows of the chunks this CP rank owns. Their alignments carry
+    global spans, the full student/teacher ids and the global position of every
+    local logit row. The student logits are never gathered across CP, except
+    for a same-tokenizer teacher, which keeps today's contiguous-window
+    reconstruction (the window is built only when such a teacher exists).
+
+    Args:
+        logits: Megatron student logits ``[B, S_pad/CP, V/TP]`` in the
+            load-balanced CP layout.
+        data: Microbatch dict holding full ``[B, S]`` student tensors.
+        cross_tokenizer_teacher_mask: Per-teacher cross-tokenizer flags.
+        vocab_parallel_group: Student tensor-parallel group.
+        context_parallel_group: Student context-parallel group.
+
+    Returns:
+        ``(student_logits_contig, teacher_full_logits_by_idx,
+        teacher_row_payloads_by_idx, aligns_by_idx, tp_group, cp_group,
+        dp_cp_group)``. ``student_logits_contig`` and
+        ``teacher_full_logits_by_idx`` are set only for same-tokenizer teachers.
+    """
+    if isinstance(logits, DTensor):
+        raise NotImplementedError(
+            "Owner-local CSD evaluation supports Megatron students only."
+        )
+    tp_group = vocab_parallel_group
+    cp_group = context_parallel_group
+    device = logits.device
+    student_positions = cp_load_balanced_global_positions(
+        int(logits.shape[1]), cp_group, device=device
+    )
+    full_student_ids = to_local_if_dtensor(data["input_ids"])
+    cp_size = (
+        torch.distributed.get_world_size(cp_group)
+        if cp_group is not None and torch.distributed.is_initialized()
+        else 1
+    )
+    padded_seq_len = int(logits.shape[1]) * cp_size
+    if full_student_ids.shape[1] > padded_seq_len:
+        raise ValueError(
+            "Owner-local CSD student logits cover fewer positions than the "
+            f"microbatch: {padded_seq_len} logit positions for "
+            f"{full_student_ids.shape[1]} input ids."
+        )
+    full_token_mask = to_local_if_dtensor(data["token_mask"])
+    full_kd_token_mask = to_local_if_dtensor(
+        data.get("kd_token_mask", data["token_mask"])
+    )
+    sample_mask = to_local_if_dtensor(data["sample_mask"])
+
+    student_logits_contig: Optional[torch.Tensor] = None
+    contiguous_fields: Optional[tuple[torch.Tensor, ...]] = None
+    teacher_full_logits_by_idx: Dict[int, torch.Tensor] = {}
+    teacher_row_payloads_by_idx: Dict[int, TeacherRowPayload] = {}
+    aligns_by_idx: Dict[int, LocalizedAlignment] = {}
+    for i, is_cross_tokenizer in enumerate(cross_tokenizer_teacher_mask):
+        sparse_key = f"teacher_{i}_sparse_logits_ipc"
+        full_key = f"teacher_{i}_full_logits_ipc"
+        has_sparse_logits = sparse_key in data
+        if has_sparse_logits == (full_key in data):
+            raise ValueError(
+                f"Teacher {i} must provide exactly one dense or sparse logits "
+                f"IPC payload; dense={full_key in data}, sparse={has_sparse_logits}."
+            )
+        if not is_cross_tokenizer:
+            if has_sparse_logits:
+                raise ValueError(f"Same-vocab teacher {i} cannot use sparse CSD IPC.")
+            if contiguous_fields is None:
+                student_logits_contig = cp_load_balanced_to_contiguous(
+                    logits, cp_group=cp_group
+                )
+                contiguous_fields = tuple(
+                    _student_seq_to_contiguous_window(
+                        value, cp_group, data_is_cp_sharded=False
+                    )
+                    for value in (full_student_ids, full_token_mask, full_kd_token_mask)
+                )
+            teacher_full_logits_by_idx[i], _ = rebuild_teacher_full_logits_from_ipc(
+                data[full_key], cp_group=cp_group, device=logits.get_device()
+            )
+            aligns_by_idx[i] = LocalizedAlignment(
+                sample_mask=sample_mask,
+                student_input_ids=contiguous_fields[0],
+                student_token_mask=contiguous_fields[1],
+                student_kd_token_mask=contiguous_fields[2],
+            )
+            continue
+
+        teacher_row_payloads_by_idx[i] = TeacherRowPayload(
+            transport="sparse" if has_sparse_logits else "dense",
+            entries=list(data[sparse_key if has_sparse_logits else full_key]),
+        )
+        pair_valid = to_local_if_dtensor(data[f"alignment_{i}_pair_valid"])
+        max_pairs = int(pair_valid.shape[1])
+        aligns_by_idx[i] = LocalizedAlignment(
+            sample_mask=sample_mask,
+            pair_valid=pair_valid,
+            pair_is_correct=to_local_if_dtensor(data[f"alignment_{i}_pair_is_correct"]),
+            student_input_ids=full_student_ids,
+            student_token_mask=full_token_mask,
+            student_kd_token_mask=full_kd_token_mask,
+            teacher_input_ids=to_local_if_dtensor(data[f"teacher_{i}_input_ids"]),
+            # The Megatron microbatch holds full alignment tensors, so global
+            # spans need no sequence collective.
+            student_spans=_chunk_ids_to_spans(
+                to_local_if_dtensor(data[f"alignment_{i}_student_chunk_id"]),
+                max_pairs,
+            ),
+            teacher_spans=_chunk_ids_to_spans(
+                to_local_if_dtensor(data[f"alignment_{i}_teacher_chunk_id"]),
+                max_pairs,
+            ),
+            num_chunks=torch.full(
+                (pair_valid.shape[0],),
+                max_pairs,
+                dtype=torch.long,
+                device=pair_valid.device,
+            ),
+            student_global_positions=student_positions,
+        )
+    return (
+        student_logits_contig,
+        teacher_full_logits_by_idx,
+        teacher_row_payloads_by_idx,
+        aligns_by_idx,
         tp_group,
         cp_group,
         loss_replica_group(cp_group),
