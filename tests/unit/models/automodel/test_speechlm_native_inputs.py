@@ -25,11 +25,15 @@ pytest.importorskip("nemo_automodel.components.utils.parameter_config")
 
 from lightning import LightningModule  # noqa: E402
 from nemo_automodel.components.models.common import BackendConfig  # noqa: E402
-from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM  # noqa: E402
+from nemo_automodel.components.models.nemotron_v3.model import (  # noqa: E402
+    NemotronHForCausalLM,
+)
 from omegaconf import DictConfig  # noqa: E402
 from transformers import PretrainedConfig  # noqa: E402
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams  # noqa: E402
+from nemo_rl.algorithms.logits_sampling_utils import (  # noqa: E402
+    TrainingSamplingParams,
+)
 from nemo_rl.models.automodel.speechlm import SpeechLMPolicy  # noqa: E402
 
 
