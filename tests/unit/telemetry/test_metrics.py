@@ -278,7 +278,7 @@ def test_checkpoint_save_emits_one_unbucketed_span_from_logged_timings():
         # Identity is fine on a span -- it is what ties a slow save to its
         # snapshot -- though it must never become a metric label.
         "rl.checkpoint.snapshot_sequence": 99,
-        "rl.step": 7,
+        "rl.iteration": 7,
     }
     # CHECKPOINT is an overhead group, but the pump runs beside training.
     assert RL_BUCKET_ATTR not in span.attributes

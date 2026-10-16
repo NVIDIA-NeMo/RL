@@ -389,7 +389,7 @@ starts `total_save_seconds` earlier. Only the phase durations are known, not
 their offsets, so they are attributes rather than child spans:
 `rl.checkpoint.<logger key>` for each phase and volume field (for example
 `rl.checkpoint.barrier_wait_seconds`, `rl.checkpoint.replay_rows`), plus
-`rl.checkpoint.snapshot_sequence` and `rl.step` to tie a slow save to its
+`rl.checkpoint.snapshot_sequence` and `rl.iteration` to tie a slow save to its
 snapshot. Restore emits no span: its phases run at different times in driver
 setup and in the controller. The `rl.checkpoint.*` metrics cover every save and
 restore regardless of span groups; see

@@ -52,6 +52,7 @@ from nemo_rl.telemetry.instrumentation import (
     COLLECTOR_LOOP_CATEGORIES,
     RL_BUCKET_ATTR,
     RL_EFFICIENCY_CATEGORY_ATTR,
+    RL_ITERATION_ATTR,
     bucket_for_efficiency_category,
     is_span_group_enabled,
     safe_set_span_attributes,
@@ -628,9 +629,12 @@ def _emit_checkpoint_save_span(
             attributes[f"rl.checkpoint.{key}"] = (
                 int(value) if value.is_integer() else value
             )
+    # Set explicitly, as checkpoint_finalize_span does: the pump runs beside
+    # training, so an inherited iteration_scope value would name whichever
+    # step happened to be running, not the one the snapshot is anchored to.
     step = _checkpoint_value(metrics, "train_step")
     if step is not None:
-        attributes["rl.step"] = int(step)
+        attributes[RL_ITERATION_ATTR] = int(step)
 
     if tracer is None:
         from opentelemetry import trace as otel_trace
