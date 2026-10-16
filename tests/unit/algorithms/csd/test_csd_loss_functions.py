@@ -523,6 +523,115 @@ def test_same_vocab_chat_kd_uses_semantic_mask_and_its_own_denominator(tmp_path)
     assert torch.count_nonzero(student.grad[0, 4]).item() == 0
 
 
+def _run_kd_ce_combination(tmp_path, cfg_overrides, *, kd_mask=None):
+    """Run the full loss on a fixed same-vocab batch; return loss, metrics, grad.
+
+    The KD/CE combination does not depend on how the KD term was computed, so a
+    same-vocab teacher keeps the batch small.
+    """
+    cfg = _ct_loss_cfg(str(tmp_path / "unused_projection.pt"))
+    cfg["projection_matrix_paths"] = [None]
+    cfg["teacher_vocab_sizes"] = [_CT_V_STUDENT]
+    cfg["vocab_topk"] = 3
+    cfg["temperature"] = 1.0
+    cfg.update(cfg_overrides)
+    loss_fn = CSDLossFn(cfg)
+
+    torch.manual_seed(23)
+    student = torch.randn(1, 5, _CT_V_STUDENT, requires_grad=True)
+    teacher = torch.randn(1, 5, _CT_V_STUDENT)
+    input_ids = torch.tensor([[0, 1, 2, 3, 4]])
+    token_mask = torch.ones(1, 5, dtype=torch.long)
+    if kd_mask is None:
+        kd_mask = token_mask
+    sample_mask = torch.ones(1)
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([5]),
+            "token_mask": token_mask,
+            "kd_token_mask": kd_mask,
+            "sample_mask": sample_mask,
+        }
+    )
+    align = LocalizedAlignment(
+        sample_mask=sample_mask,
+        student_input_ids=input_ids,
+        student_token_mask=token_mask,
+        student_kd_token_mask=kd_mask,
+    )
+    loss, metrics = loss_fn(
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(4.0),
+        global_valid_kd_toks=torch.tensor(4.0),
+        logits=student,
+        student_logits_contig=student,
+        teacher_full_logits_by_idx={0: teacher},
+        aligns_by_idx={0: align},
+    )
+    loss.backward()
+    return loss.detach(), metrics, student.grad.detach()
+
+
+_KD_ONLY = {"dynamic_loss_scaling": False, "kl_loss_weight": 1.0, "ce_loss_scale": 0.0}
+_CE_ONLY = {"dynamic_loss_scaling": False, "kl_loss_weight": 0.0, "ce_loss_scale": 1.0}
+
+
+def test_csd_fixed_weighting_scales_kd_and_ce(tmp_path):
+    """Fixed weighting is kl_loss_weight * KD + ce_loss_scale * CE in value and gradient."""
+    _, _, kd_grad = _run_kd_ce_combination(tmp_path, _KD_ONLY)
+    _, _, ce_grad = _run_kd_ce_combination(tmp_path, _CE_ONLY)
+    loss, metrics, grad = _run_kd_ce_combination(
+        tmp_path,
+        {"dynamic_loss_scaling": False, "kl_loss_weight": 5.0, "ce_loss_scale": 0.3},
+    )
+
+    kd, ce = metrics["kl_loss"], metrics["ce_loss"]
+    assert kd > 0 and ce > 0
+    assert loss.item() == pytest.approx(5.0 * kd + 0.3 * ce)
+    assert metrics["kl_loss_scale"] == 1.0
+    torch.testing.assert_close(grad, 5.0 * kd_grad + 0.3 * ce_grad)
+
+
+def test_csd_dynamic_scaling_matches_kd_to_ce_and_ignores_weights(tmp_path):
+    """Dynamic scaling is sg(CE / KD) * KD + CE; the fixed weights have no effect."""
+    _, _, kd_grad = _run_kd_ce_combination(tmp_path, _KD_ONLY)
+    _, _, ce_grad = _run_kd_ce_combination(tmp_path, _CE_ONLY)
+    loss, metrics, grad = _run_kd_ce_combination(
+        tmp_path,
+        {"dynamic_loss_scaling": True, "kl_loss_weight": 1.0, "ce_loss_scale": 0.1},
+    )
+    reweighted_loss, _, reweighted_grad = _run_kd_ce_combination(
+        tmp_path,
+        {"dynamic_loss_scaling": True, "kl_loss_weight": 5.0, "ce_loss_scale": 1.0},
+    )
+
+    kd, ce = metrics["kl_loss"], metrics["ce_loss"]
+    assert kd > 0 and ce > 0
+    assert metrics["kl_loss_scale"] == pytest.approx(ce / kd)
+    # The rescaled KD term equals CE in value, so the loss reads as 2 * CE.
+    assert loss.item() == pytest.approx(2 * ce)
+    torch.testing.assert_close(grad, (ce / kd) * kd_grad + ce_grad)
+    torch.testing.assert_close(reweighted_loss, loss)
+    torch.testing.assert_close(reweighted_grad, grad)
+
+
+def test_csd_dynamic_scaling_keeps_unit_scale_when_kd_is_zero(tmp_path):
+    """A microbatch without KD positions keeps scale 1, so the loss is CE alone."""
+    loss, metrics, grad = _run_kd_ce_combination(
+        tmp_path,
+        {"dynamic_loss_scaling": True},
+        kd_mask=torch.zeros(1, 5, dtype=torch.long),
+    )
+    _, _, ce_grad = _run_kd_ce_combination(tmp_path, _CE_ONLY)
+
+    assert metrics["kl_loss"] == 0.0
+    assert metrics["kl_loss_scale"] == 1.0
+    assert loss.item() == pytest.approx(metrics["ce_loss"])
+    torch.testing.assert_close(grad, ce_grad)
+
+
 def test_csd_table_paths_identify_cross_tokenizer_without_projection(tmp_path):
     """CSD table artifacts select the cross-tokenizer path without dummy matrices."""
     cfg = _ct_loss_cfg(None)
