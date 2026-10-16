@@ -17,7 +17,8 @@ exit_if_max_steps_reached
 
 cd $PROJECT_ROOT
 
-# Prepare the NeMo Gym workplace_assistant dataset (mirrors the nanov3 async-gym tests).
+# Prepare the NeMo Gym workplace_assistant dataset (mirrors the nanov3 async-gym tests;
+# no tool trimming is needed at 16K context).
 cd 3rdparty/Gym-workspace/Gym
 if [[ ! -f env.yaml ]]; then
     if [[ -z "${HF_TOKEN:-}" ]]; then
@@ -52,7 +53,6 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
-    checkpointing.save_period=$MAX_STEPS \
     data.train.data_path=$TRAIN_PATH \
     data.validation.data_path=$VALIDATION_PATH \
     "$@" \
@@ -66,8 +66,9 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
         "data['train/token_mult_prob_error']['$MAX_STEPS'] < 1.1" \
-        'mean(data["train/gen_kl_error"]) < 0.01' \
-        'max(data["train/reward"]) > 0.5'
+        'mean(data["train/gen_kl_error"]) < 0.005' \
+        'max(data["train/reward"]) > 0.5' \
+        "data['train/reward']['$MAX_STEPS'] > 0.4"
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

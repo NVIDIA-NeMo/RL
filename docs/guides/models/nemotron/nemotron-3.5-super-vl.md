@@ -34,7 +34,7 @@ Notes:
 Use the standard NeMo RL environment described in the
 [installation guide](../../../about/installation.md). The Automodel submodule
 pinned on `main` (`r0.6.0` at `b916107a5` or later) registers
-`NemotronH_Omni_Reasoning_V3` and includes the fixes this recipe depends on
+`NemotronH_Omni_Reasoning_V3` and includes the fixes these recipes depend on
 (Automodel [#3874](https://github.com/NVIDIA-NeMo/Automodel/pull/3874) and
 [#4211](https://github.com/NVIDIA-NeMo/Automodel/pull/4211)); the stock vLLM
 pin registers the same architecture for generation. No custom source checkouts
@@ -101,16 +101,18 @@ These are set in the recipes and are required for this model:
 | `policy.generation.vllm_kwargs.limit_mm_per_prompt.image` | `1` (text) / `2` (image) | vLLM sizes the encoder budget from this limit, and an unset modality defaults to 999 images per prompt. |
 | `policy.generation.bad_words` (image recipe) | `<image>`, `<img>`, `</img>`, `<so_embedding>`, `<so_start>`, `<so_end>` | Keep the policy from emitting image placeholder tokens in its responses. |
 | `policy.generation.vllm_kwargs.mamba_ssm_cache_dtype` | `float32` | Matches the checkpoint's `mamba_ssm_cache_dtype`. |
-| `policy.generation.vllm_cfg.skip_tokenizer_init` | (automatic) / `false` | vLLM's multimodal encoder budget calls the tokenizer during engine init for this architecture. `NemotronH_Omni_Reasoning_V3` is listed in `TOKENIZER_REQUIRED_ARCHITECTURES`, so NeMo RL keeps the tokenizer regardless of the text-only default; the image recipe inherits `false` from `vlm_grpo_3B.yaml`. |
+| `policy.generation.vllm_cfg.skip_tokenizer_init` | (automatic) / `false` | vLLM's multimodal encoder budget calls the tokenizer during engine init for this architecture. `NemotronH_Omni_Reasoning_V3` is listed in `TOKENIZER_REQUIRED_ARCHITECTURES`, so NeMo RL keeps the tokenizer regardless of the text-only default; the image recipe inherits `false` from `vlm_grpo_3B.yaml` and the agentic recipe sets it explicitly (the Gym HTTP server needs the tokenizer). |
 | `policy.automodel_cfg.automodel_kwargs.force_hf` | unset | The custom AutoModel implementation and its state-dict adapter are required for EP and per-tensor refit. |
 | `policy.automodel_cfg.env_vars.PYTORCH_CUDA_ALLOC_CONF` | unset | With `expandable_segments:True` PyTorch exports CUDA IPC handles as file descriptors fetched via `pidfd_getfd`; on clusters where that syscall path is unavailable the colocated trainer-to-vLLM refit fails with `pidfd_getfd: Bad file descriptor`. The default allocator uses legacy `cudaIpcMemHandle` sharing. |
 
 ### Parallelism
 
-- **Training EP stays within a node.** The recipe uses `expert_parallel_size: 4`
+- **Training EP stays within a node.** All three recipes use `expert_parallel_size: 4`
   on 4-GPU GB200 nodes with the HybridEP dispatcher
-  (`policy.automodel_cfg.automodel_kwargs.backend.dispatcher: hybridep`), which
-  requires `make_sequence_length_divisible_by: 64`. The DeepEP dispatcher also
+  (`policy.automodel_cfg.automodel_kwargs.backend.dispatcher: hybridep`), whose
+  kernels require the per-rank token count to be a multiple of 64
+  (`make_sequence_length_divisible_by: 64` in the colocated recipes, `256` with
+  CP2 in the agentic recipe). The DeepEP dispatcher also
   works at EP=4 but its V1 `Buffer` API assumes an expert-parallel group of up to
   8 ranks is intranode; EP=8 on 4-GPU nodes fails with
   `CUDA error ... deep_ep.cpp 'invalid resource handle'`.
@@ -149,7 +151,7 @@ Settings specific to this recipe, on top of the model-specific settings above:
 |---|---|---|
 | `policy.automodel_cfg.context_parallel_size` | `2` | At 16K context the 120B trainer on 32 GPUs is memory-bound; CP2 gives the headroom the backward needs. |
 | `policy.automodel_cfg.moe_parallelizer.reshard_after_forward` | `true` | Automodel keeps every block's gathered weights resident through the backward by default; re-sharding after each forward is what fits the optimizer states on 184 GB GPUs (same as the Nemotron 3 Super 120B automodel recipe). |
-| `policy.make_sequence_length_divisible_by` | `256` | The HybridEP dispatcher sizes its buffers from the per-rank token count, which must be a multiple of 128; with CP2 each rank sees half the padded sequence. |
+| `policy.make_sequence_length_divisible_by` | `256` | HybridEP's kernels are specialised on the per-rank token count and require it to be a multiple of their 64-token chunk; with CP2 each rank sees half the padded sequence, so the padding multiple must be a multiple of 64 x CP = 128 (256 is used). |
 | `policy.generation.vllm_cfg.enable_prefix_caching` | `false` | Multi-step tool-use trajectories re-prefill the growing conversation every agent step; with prefix caching on, the cached Mamba state of the earlier steps made `token_mult_prob_error` jump from 1.02 to 1.45. |
 | `policy.generation.vllm_kwargs.max_num_batched_tokens` | `16384` | vLLM's default 2,048-token chunked-prefill budget throttles the repeated 4-20K-token prefills of the agent loop. |
 | `env.nemo_gym.policy_model...uses_reasoning_parser` / `enable_thinking` | `true` | The checkpoint thinks before every tool call; Gym needs the reasoning parser on to strip `<think>` blocks from the tool-call messages. |
@@ -170,9 +172,10 @@ uvx --from huggingface-hub hf download nvidia/Nemotron-RL-agent-workplace_assist
 The text and image recipes default to 16 nodes x 4 GPUs; the agentic recipe to
 8 training + 8 generation nodes (`cluster.num_nodes` is the sum,
 `policy.generation.colocated.resources.num_nodes` the generation share). The NeMo
-Gym venvs for the `workplace_assistant` resource server are built on first launch
-(or prebaked into the container, see the
-[Nemotron 3.5 Lightning guide](nemotron-3.5-lightning.md#container)).
+Gym venvs for the `workplace_assistant` resource server are built on first launch,
+or prebaked into the container as in the
+[Nemotron 3.5 Lightning guide](nemotron-3.5-lightning.md#container) with
+`--build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/nemotron-3.5-super-vl/workplace_assistant_automodel.yaml"`.
 
 ```bash
 # Text DAPO (DAPO-Math-17K / AIME-2024)
@@ -202,7 +205,8 @@ details.
 ### Training curves
 
 The runs use the recipe defaults (16 x 4-GPU GB200 nodes, train EP4, vLLM
-TP4/EP4) with the Automodel backend and colocated vLLM generation,
+TP4/EP4) with the Automodel backend: colocated vLLM generation for the text and
+image recipes, async non-colocated generation for the agentic recipe. All were
 chained as 4-hour Slurm jobs that resume from the latest checkpoint. Curves are
 wandb exports; the x axis is the training step.
 
@@ -229,8 +233,9 @@ same order as the drift documented for other models; the isolated
 
 CLEVR-CoGenT (valA, 256 samples) accuracy rises from 0.78 at step 0 to **0.90
 at step 50** (0.82 at step 10, 0.88 at step 20, 0.90 at steps 30 and 40, 0.90
-at step 60) while the mean validation response length falls from ~1,120 to
-~800 tokens. Training reward moves from a 0.71-0.87 band in the first ten
+at step 60) while the mean validation response length falls from ~1,120 to a
+minimum of ~770 tokens at step 30 and settles around 800-840 afterwards.
+Training reward moves from a 0.71-0.87 band in the first ten
 steps to 0.86-0.95 after step 30. `gen_kl_error` stays flat at 0.0024-0.0031,
 `token_mult_prob_error` at 1.02-1.04 and `truncation_rate` below 0.09 and
 mostly under 0.03 after step 20: trainer and vLLM stay in agreement across
@@ -247,7 +252,7 @@ generation on 8 training + 8 generation nodes, starting from
 Validation accuracy on the 545 held-out tasks rises from 0.80 at step 0 to
 **0.92 at step 40** (0.86 at step 10, 0.89 at steps 20 and 30) while the mean
 validation response length falls from ~910 to ~860 generated tokens. Training
-reward moves from a 0.76-0.86 band in the first ten steps to 0.87-0.97 after
+reward moves from a 0.76-0.92 band in the first ten steps to 0.82-0.97 after
 step 20. The number of agent turns per trajectory (tool calls plus the final
 answer) stays at 4.0 on both train and validation: the policy learns to call
 the right tools with the right arguments rather than to call more or fewer of

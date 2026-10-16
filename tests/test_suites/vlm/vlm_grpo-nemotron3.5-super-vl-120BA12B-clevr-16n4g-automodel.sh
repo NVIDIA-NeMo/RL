@@ -43,8 +43,9 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
         "data['train/token_mult_prob_error']['$MAX_STEPS'] < 1.1" \
-        'mean(data["train/gen_kl_error"]) < 0.02' \
-        'max(data["train/reward"]) > 0.4'
+        'mean(data["train/gen_kl_error"]) < 0.005' \
+        'max(data["train/reward"]) > 0.4' \
+        "data['train/reward']['$MAX_STEPS'] > 0.3"
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

@@ -68,8 +68,10 @@ grpo:
     recompute_kv_cache_after_weight_updates: false
 
 loss_fn:
-  # Async GRPO trains on trajectories up to max_trajectory_age_steps old, so correct
-  # for the generation/trainer mismatch (same settings as the SWE1 pivot recipe).
+  # Async GRPO trains on trajectories up to max_trajectory_age_steps old; truncated
+  # importance sampling corrects for the generation/trainer mismatch.
+  # use_on_policy_kl_approximation only takes effect with a non-zero
+  # reference_policy_kl_penalty (0 here, inherited).
   use_on_policy_kl_approximation: true
   use_importance_sampling_correction: true
   truncated_importance_sampling_ratio: 5.0
@@ -92,10 +94,12 @@ policy:
   logprob_batch_size: 1
   logprob_chunk_size: 2048
   max_total_sequence_length: 16384
-  # HybridEP sizes its buffer from the per-rank token count of the first dispatch and
-  # JIT-compiles kernels that require it to be a multiple of its token chunk (128):
-  # each CP rank sees 1/CP of the padded sequence, so pad to 128 x CP = 256 (with CP2
-  # and 64 a 4864-token batch -> 2432 per rank failed the kernel's static_assert).
+  # HybridEP's dispatch/combine kernels are JIT-specialised on the per-rank token count
+  # (the 16-aligned running max of tokens each EP rank dispatches) and static_assert
+  # that it is a multiple of their 64-token chunk (NUM_OF_TOKENS_PER_CHUNK_*_API). With
+  # CP2 each rank sees half of the padded sequence, so the padding multiple must be a
+  # multiple of 64 x CP = 128: with 64, a 10304-token batch gave a 5152-token shard
+  # (5152 % 64 = 32) and the kernel failed to compile. 256 is used here.
   make_sequence_length_divisible_by: 256
   precision: bfloat16
   offload_optimizer_for_logprob: true
@@ -205,7 +209,6 @@ data:
     prompt_file: null
     system_prompt_file: null
     processor: nemo_gym_data_processor
-  _override_: true
 
 env:
   should_use_nemo_gym: true
@@ -225,6 +228,8 @@ env:
           chat_template_kwargs:
             enable_thinking: true
             truncate_history_thinking: false
+  # Replace (not merge) the base env block: it carries extra_body.chat_template_kwargs
+  # with enable_thinking: false and a code_gen section this recipe does not use.
   _override_: true
 
 logger:

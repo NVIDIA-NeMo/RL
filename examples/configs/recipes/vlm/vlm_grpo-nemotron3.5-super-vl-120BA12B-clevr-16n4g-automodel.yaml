@@ -47,7 +47,6 @@ policy:
   # Must be a multiple of the data-parallel size (64 GPUs at 16n4g, EP does not
   # reduce DP for batch sharding); 512 samples per step -> 8 optimizer steps.
   train_global_batch_size: 64
-  train_micro_batch_size: 1
   logprob_batch_size: 1
   logprob_chunk_size: 2048
   max_total_sequence_length: 8192
@@ -62,8 +61,6 @@ policy:
       exp_avg_dtype: torch.bfloat16
       exp_avg_sq_dtype: torch.bfloat16
   dynamic_batching:
-    enabled: false
-  sequence_packing:
     enabled: false
   automodel_cfg:
     expert_parallel_size: 4
@@ -103,21 +100,18 @@ policy:
       logprobs_mode: raw_logprobs
       gpu_memory_utilization: 0.5
       enable_prefix_caching: false
-      skip_tokenizer_init: false
     vllm_kwargs:
       moe_backend: triton
       mamba_ssm_cache_dtype: float32
       limit_mm_per_prompt:
         image: 2
       max_num_batched_tokens: 16384
-      mm_processor_cache_gb: 0
       skip_mm_profiling: true
 data:
   default:
     prompt_file: examples/prompts/clevr_cogent_cot_nemotron_omni.txt
 logger:
   wandb_enabled: true
-  tensorboard_enabled: true
   wandb:
     project: nemo-rl-super-3.5
     name: vlm_grpo-nemotron3.5-super-vl-120BA12B-clevr-16n4g-automodel
