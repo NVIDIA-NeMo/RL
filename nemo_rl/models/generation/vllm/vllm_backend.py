@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import logging
+import os
 import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -370,7 +371,6 @@ def _read_mtp_layer_weights_from_checkpoint(
         tensors on CPU.
     """
     import json
-    import os
 
     from safetensors import safe_open
 
@@ -436,7 +436,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         return params
 
     def _load_full_hf_weights(
-        self, policy_weights: Iterable[tuple[str, torch.Tensor]]
+        self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> set[str] | None:
         """Load HF weights and detach any deferred reload tensors from transport storage.
 
@@ -444,12 +444,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         when the model's ``load_weights`` does not report one.
         """
         if not getattr(self, "_nrl_layerwise_reload_active", False):
-            return self.model_runner.model.load_weights(weights=policy_weights)
+            return self.model_runner.model.load_weights(weights=weights)
 
         source_storage_ptrs: set[int] = set()
 
         def track_source_storage() -> Iterator[tuple[str, torch.Tensor]]:
-            for name, tensor in policy_weights:
+            for name, tensor in weights:
                 source_storage_ptrs.add(tensor.untyped_storage().data_ptr())
                 yield name, tensor
 
@@ -712,12 +712,23 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self,
+        state_dict_info: dict[str, Any],
+        serialized_fp8_config: Optional[dict[str, Any]] = None,
+    ) -> Optional[list[str]]:
         """Prepare state dict metadata for weight refitting and IPC streaming.
 
         Args:
             state_dict_info (dict): A dictionary containing the info for refit.
                 e.g. {tensor_name: (shape, dtype)}
+
+        Returns:
+            When MXFP8 trainer-side pre-quantization is enabled
+            (vllm_cfg.refit_prequantize), the list of parameter names this
+            worker will quantize at load time; the trainer quantizes exactly
+            these and streams E4M3 data plus *_scale_from_checkpoint scales.
+            None otherwise.
 
         Raises:
             RuntimeError: If the model realizes the unquantized FlashInfer TRTLLM
@@ -726,6 +737,29 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """
         self._validate_native_layerwise_refit()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+
+        # Non-FP8 runs serialize no FP8 config; skip the fp8 module (and its
+        # heavyweight vLLM imports) entirely so quant backends stubbed without
+        # the full vLLM surface can still prepare refit info.
+        if serialized_fp8_config is None:
+            return None
+
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        fp8.install_fp8_config(serialized_fp8_config)
+        fp8.set_refit_manifest_names(set(state_dict_info))
+        if not (
+            fp8.global_fp8_config is not None
+            and fp8.global_fp8_config.is_mx
+            and fp8.global_fp8_config.refit_prequantize
+            and fp8.is_fp8_model(self.model_runner.vllm_config)
+        ):
+            return None
+        return [
+            name
+            for name in state_dict_info
+            if fp8._is_fp8_weight(name, self.model_runner.model)
+        ]
 
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
@@ -744,28 +778,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             return False
         kv_cache_dtype = str(kv_cache_dtype).lower()
         return kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES
-
-    def _maybe_process_fp8_kv_cache(self) -> None:
-        """Process weights after loading for FP8 KV cache (static scales)."""
-        if not self._uses_fp8_kv_cache():
-            return
-
-        # FP8 KV cache: process KV scales after weight loading
-        from vllm.config import set_current_vllm_config
-        from vllm.model_executor.model_loader.utils import (
-            process_weights_after_loading,
-        )
-
-        # Get target device for processing
-        target_device = next(self.model_runner.model.parameters()).device
-
-        # Call process_weights_after_loading to handle KV scales
-        with set_current_vllm_config(self.model_runner.vllm_config):
-            process_weights_after_loading(
-                self.model_runner.model,
-                self.model_runner.model_config,
-                target_device,
-            )
 
     @staticmethod
     def _split_policy_and_draft_weights(
@@ -1269,9 +1281,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             self._maybe_process_mtp_drafter_after_loading()
 
         yield finalize
-        # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
-        # this optional second pass, just as it was before lifecycle hooks.
-        self._maybe_process_fp8_kv_cache()
+        # KV-cache scales are covered by the full process_weights_after_loading
+        # pass in finalize(); no second pass is needed.
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
