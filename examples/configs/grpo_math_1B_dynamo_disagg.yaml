@@ -1,0 +1,21 @@
+# Two-step, three-GPU smoke for managed Dynamo prefill/decode disaggregation:
+# one training GPU, one prefill engine and one decode engine.
+defaults: grpo_math_1B_dynamo.yaml
+
+policy:
+  generation:
+    disaggregation:
+      enabled: true
+      num_prefill_engines: 1
+      num_decode_engines: 1
+    colocated:
+      resources:
+        gpus_per_node: 2
+        num_nodes: 1
+
+logger:
+  log_dir: results/grpo-math-1b-dynamo-disagg
+
+cluster:
+  gpus_per_node: 3
+  num_nodes: 1

@@ -14,18 +14,24 @@
 
 """Fixed Ray-managed pool of Dynamo vLLM subprocess owners."""
 
+from collections.abc import Sequence
 from typing import Any
 
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_DYNAMO_KV_EVENT_PORT_RANGE_HIGH,
+    DEFAULT_DYNAMO_KV_EVENT_PORT_RANGE_LOW,
+    DEFAULT_DYNAMO_NIXL_PORT_RANGE_HIGH,
+    DEFAULT_DYNAMO_NIXL_PORT_RANGE_LOW,
     DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH,
     DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORTS_PER_ENGINE,
     RayVirtualCluster,
 )
+from nemo_rl.models.generation.dynamo.config import DynamoWorkerRole
 from nemo_rl.models.generation.dynamo.dynamo_worker import (
     DynamoGpuReservation,
     DynamoVllmWorker,
@@ -39,8 +45,28 @@ def _vllm_port_for_node_slot(node_slot: int) -> int:
     return DEFAULT_VLLM_PORT_RANGE_LOW + node_slot * DEFAULT_VLLM_PORTS_PER_ENGINE
 
 
+def _node_slot_port(band_low: int, band_high: int, node_slot: int, name: str) -> int:
+    """Return a node slot's port in a band of one port per engine on a node.
+
+    One NIXL side-channel port per engine is enough: vLLM 0.29 serves every TP
+    rank's handshake from one listener on ``port + data_parallel_index``, and
+    managed engines run with DP=1.
+    """
+    port = band_low + node_slot
+    if port >= band_high:
+        raise ValueError(
+            f"Managed Dynamo has more engines on one node than its {name} port "
+            f"band [{band_low}, {band_high}) holds: node slot {node_slot}."
+        )
+    return port
+
+
 class FixedDynamoWorkerPool:
-    """Reserve inference GPUs and launch one worker per model-parallel group."""
+    """Reserve inference GPUs and launch one worker per model-parallel group.
+
+    ``worker_roles`` is positional: role ``i`` goes to the ``i``-th engine group
+    in placement-group order, which is also its refit rank order.
+    """
 
     def __init__(
         self,
@@ -49,6 +75,8 @@ class FixedDynamoWorkerPool:
         config: dict[str, Any],
         namespace: str,
         engine_world_size: int,
+        worker_roles: Sequence[DynamoWorkerRole],
+        prefill_kv_events: bool,
         manager_env: dict[str, str],
         startup_timeout_s: float,
     ) -> None:
@@ -56,6 +84,8 @@ class FixedDynamoWorkerPool:
         self._config = config
         self._namespace = namespace
         self._engine_world_size = engine_world_size
+        self._worker_roles = tuple(worker_roles)
+        self._prefill_kv_events = prefill_kv_events
         self._manager_env = manager_env
         self._startup_timeout_s = startup_timeout_s
         self._workers: list[ray.actor.ActorHandle] = []
@@ -78,6 +108,14 @@ class FixedDynamoWorkerPool:
         if self._workers:
             raise RuntimeError("Managed Dynamo worker pool is already started.")
         placement_groups = self._cluster.get_placement_groups()
+        num_engine_groups = sum(
+            pg.bundle_count // self._engine_world_size for pg in placement_groups
+        )
+        if num_engine_groups != len(self._worker_roles):
+            raise ValueError(
+                f"Inference placement groups hold {num_engine_groups} engine groups "
+                f"but {len(self._worker_roles)} worker roles were configured."
+            )
         # Builds the dynamo extra's venv on every node when uv-managed; the worker
         # actor launches dynamo.vllm with that venv's interpreter.
         runtime_env: dict[str, Any] = make_actor_runtime_env(DYNAMO_WORKER_FQN)
@@ -135,7 +173,29 @@ class FixedDynamoWorkerPool:
                 )
                 system_ports.add(system_port)
                 vllm_port = _vllm_port_for_node_slot(node_slot)
-                group_name = f"{self._namespace}-dynamo-vllm-{pg_index}-{group_index}"
+                worker_role = self._worker_roles[group_index]
+                nixl_port = (
+                    None
+                    if worker_role == "aggregated"
+                    else _node_slot_port(
+                        DEFAULT_DYNAMO_NIXL_PORT_RANGE_LOW,
+                        DEFAULT_DYNAMO_NIXL_PORT_RANGE_HIGH,
+                        node_slot,
+                        "NIXL side-channel",
+                    )
+                )
+                kv_event_port = (
+                    _node_slot_port(
+                        DEFAULT_DYNAMO_KV_EVENT_PORT_RANGE_LOW,
+                        DEFAULT_DYNAMO_KV_EVENT_PORT_RANGE_HIGH,
+                        node_slot,
+                        "KV-event",
+                    )
+                    if worker_role == "prefill" and self._prefill_kv_events
+                    else None
+                )
+                role_index = self._worker_roles[:group_index].count(worker_role)
+                group_name = f"{self._namespace}-dynamo-vllm-{worker_role}-{role_index}"
                 leader_strategy = PlacementGroupSchedulingStrategy(
                     placement_group=placement_group,
                     placement_group_bundle_index=bundle_indices[0],
@@ -159,6 +219,9 @@ class FixedDynamoWorkerPool:
                     cuda_devices=cuda_devices,
                     system_port=system_port,
                     vllm_port=vllm_port,
+                    worker_role=worker_role,
+                    nixl_port=nixl_port,
+                    kv_event_port=kv_event_port,
                     manager_env=self._manager_env,
                     startup_timeout_s=self._startup_timeout_s,
                     seed=pg_index * 1024 + group_index,

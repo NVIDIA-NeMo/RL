@@ -736,21 +736,23 @@ def setup(
         policy_config["generation"] = generation_config
 
     # generation.disaggregation is written in backend-agnostic terms, but only
-    # the TRT-LLM backend implements it today: every other backend would
-    # silently ignore the block and serve aggregated, so refuse to start.
-    if (
-        resolve_disagg_layout(generation_config).enabled
-        and generation_config["backend"] != "trtllm"
-    ):
+    # the TRT-LLM and Dynamo backends implement it today: every other backend
+    # would silently ignore the block and serve aggregated, so refuse to start.
+    if resolve_disagg_layout(generation_config).enabled and generation_config[
+        "backend"
+    ] not in ("trtllm", "dynamo"):
         raise ValueError(
             "policy.generation.disaggregation.enabled is only supported for "
-            f"backend='trtllm', got '{generation_config['backend']}'. Set it to "
-            "false, or switch the backend."
+            f"backend='trtllm' or 'dynamo', got '{generation_config['backend']}'. "
+            "Set it to false, or switch the backend."
         )
-    # The disagg frontends are only reachable over HTTP, so without NeMo-Gym
-    # the whole fleet would come up and fail at the first rollout instead.
-    if resolve_disagg_layout(generation_config).enabled and not should_use_nemo_gym(
-        master_config
+    # The TRT-LLM disagg frontends are only reachable over HTTP, so without
+    # NeMo-Gym the whole fleet would come up and fail at the first rollout
+    # instead. Dynamo's driver-side generate already goes through its frontend.
+    if (
+        resolve_disagg_layout(generation_config).enabled
+        and generation_config["backend"] == "trtllm"
+        and not should_use_nemo_gym(master_config)
     ):
         raise ValueError(
             "policy.generation.disaggregation.enabled requires NeMo-Gym "
@@ -1281,9 +1283,11 @@ def setup(
                         cast(TrtllmConfig, generation_config)
                     )
                 elif generation_config["backend"] == "dynamo":
+                    # Under PD disaggregation, a replica's prefill and decode
+                    # engines, as for TRT-LLM.
                     gpus_per_instance = DynamoConfig.model_validate(
                         generation_config
-                    ).engine_world_size
+                    ).replica_width
                 else:
                     sglang_cfg = generation_config.get("sglang_cfg", {})
                     gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)

@@ -160,6 +160,45 @@ backend's rules, because the same worker extension receives every refit:
 Request budgets stop `num_speculative_tokens + 1` tokens short of
 `max_model_len`, so the drafter never reads past the context.
 
+## Prefill/decode disaggregation
+
+Set the shared `policy.generation.disaggregation` block, the same one the
+TRT-LLM backend reads, to split the fleet into prefill and decode engines:
+
+```yaml
+policy:
+  generation:
+    backend: dynamo
+    disaggregation:
+      enabled: true
+      num_prefill_engines: 1  # per replica
+      num_decode_engines: 1   # per replica, independent of prefill
+```
+
+A replica is `num_prefill_engines + num_decode_engines` engines of `TP x PP`
+GPUs each, and the inference GPUs must hold a whole number of replicas. Every
+engine uses the same `vllm_cfg` and `vllm_kwargs`; per-role settings are not
+supported yet. The managed frontend discovers both roles and routes each
+request through a prefill engine and then a decode engine across the whole
+fleet, so replicas only fix the ratio and keep each group's engines together.
+`num_frontend_workers` must stay 1 and `frontend_tokenize` false, and
+speculative decoding is rejected.
+
+NeMo RL manages each engine's `--disaggregation-mode`, its NIXL
+`--kv-transfer-config`, and the NIXL side-channel host and port. With
+`router_mode: kv`, prefill engines also publish KV events; only the prefill hop
+is KV-routed, because decode engines receive their KV from prefill. Engines on
+one node exchange KV over CUDA; across nodes NIXL needs a working UCX/RDMA
+path, which you can tune through `vllm_cfg.env_vars` (`UCX_TLS`,
+`UCX_NET_DEVICES`).
+
+Refit gives every engine of both roles the full weights. The drain before each
+refit pauses prefill engines first, so the decode engines are still running
+when they pull the KV for requests that prefill already finished. Decode
+engines are paused next, and resume runs in reverse order. Run the three-GPU
+smoke (one training GPU, one prefill engine, one decode engine) with
+`examples/configs/grpo_math_1B_dynamo_disagg.yaml`.
+
 ## Weight refit
 
 Every managed engine loads NeMo RL's vLLM worker extension
@@ -178,6 +217,8 @@ The fixed port layout is:
 - `1313-1399`: driver-local etcd and NATS control plane
 - `3000-3999`: frontend and token-wrapper HTTP endpoints
 - `4000-4099`: node-local `DYN_SYSTEM_PORT`
+- `4100 + slot`: node-local NIXL side channel of each prefill or decode engine
+- `4200 + slot`: node-local KV-event stream of each prefill engine
 - `7000 + slot * 100`: node-local vLLM rendezvous ports
 
 ## Run the two-GPU smoke

@@ -101,7 +101,11 @@ def _patch_runtime(
     calls: list[str] | None = None,
 ) -> None:
     endpoints = workers or [
-        {"instance_id": "worker-0", "system_url": "http://10.0.0.2:4000"}
+        {
+            "instance_id": "worker-0",
+            "system_url": "http://10.0.0.2:4000",
+            "role": "aggregated",
+        }
     ]
     events = calls if calls is not None else []
 
@@ -155,8 +159,16 @@ def test_runtime_start_world_size_sender_geometry_and_shutdown(monkeypatch) -> N
     _patch_runtime(
         monkeypatch,
         workers=[
-            {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
-            {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+            {
+                "instance_id": "a",
+                "system_url": "http://10.0.0.2:4000",
+                "role": "aggregated",
+            },
+            {
+                "instance_id": "b",
+                "system_url": "http://10.0.0.3:4000",
+                "role": "aggregated",
+            },
         ],
         calls=calls,
     )
@@ -418,8 +430,16 @@ def test_cache_invalidation_resumes_workers_that_paused_before_peer_failure(
     monkeypatch.setattr(refit_module.ray, "get", get)
     channel = DynamoRefitChannel(
         [
-            {"instance_id": "a", "system_url": "http://worker-a:4000"},
-            {"instance_id": "b", "system_url": "http://worker-b:4000"},
+            {
+                "instance_id": "a",
+                "system_url": "http://worker-a:4000",
+                "role": "aggregated",
+            },
+            {
+                "instance_id": "b",
+                "system_url": "http://worker-b:4000",
+                "role": "aggregated",
+            },
         ],
         engine_world_size=1,
         control_timeout_s=10,
@@ -440,8 +460,16 @@ def test_refit_pause_freezes_every_worker_and_resume_restores_them(
     monkeypatch, clear_cache: bool
 ) -> None:
     workers = [
-        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
-        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+        {
+            "instance_id": "a",
+            "system_url": "http://10.0.0.2:4000",
+            "role": "aggregated",
+        },
+        {
+            "instance_id": "b",
+            "system_url": "http://10.0.0.3:4000",
+            "role": "aggregated",
+        },
     ]
     _patch_runtime(monkeypatch, workers=workers)
     calls = []
@@ -489,8 +517,16 @@ def test_failed_pause_resumes_the_workers_that_paused(monkeypatch) -> None:
     monkeypatch.setattr(refit_module.ray, "get", get)
     channel = DynamoRefitChannel(
         [
-            {"instance_id": "a", "system_url": "http://worker-a:4000"},
-            {"instance_id": "b", "system_url": "http://worker-b:4000"},
+            {
+                "instance_id": "a",
+                "system_url": "http://worker-a:4000",
+                "role": "aggregated",
+            },
+            {
+                "instance_id": "b",
+                "system_url": "http://worker-b:4000",
+                "role": "aggregated",
+            },
         ],
         engine_world_size=1,
         control_timeout_s=10,
@@ -506,9 +542,72 @@ def test_failed_pause_resumes_the_workers_that_paused(monkeypatch) -> None:
     ]
 
 
+def test_disaggregated_fleet_pauses_prefill_first_and_resumes_decode_first(
+    monkeypatch,
+) -> None:
+    calls = []
+    failing_pause: set[str] = set()
+
+    def remote(**kwargs):
+        calls.append((kwargs["route"], kwargs["system_url"]))
+        return (kwargs["route"], kwargs["system_url"])
+
+    def get(ref):
+        if ref[0] == "pause_generation" and ref[1] in failing_pause:
+            raise RuntimeError("pause refused")
+        return True
+
+    monkeypatch.setattr(refit_module._post_worker_route, "remote", remote)
+    monkeypatch.setattr(refit_module.ray, "get", get)
+    # Launch order tiles replicas prefill first: [p0, d0, p1, d1].
+    channel = DynamoRefitChannel(
+        [
+            {"instance_id": name, "system_url": name, "role": role}
+            for name, role in (
+                ("p0", "prefill"),
+                ("d0", "decode"),
+                ("p1", "prefill"),
+                ("d1", "decode"),
+            )
+        ],
+        engine_world_size=1,
+        control_timeout_s=10,
+    )
+
+    channel.pause()
+    channel.resume()
+    assert calls == [
+        ("pause_generation", "p0"),
+        ("pause_generation", "p1"),
+        ("pause_generation", "d0"),
+        ("pause_generation", "d1"),
+        ("resume_generation", "d0"),
+        ("resume_generation", "d1"),
+        ("resume_generation", "p0"),
+        ("resume_generation", "p1"),
+    ]
+
+    # A failed decode pause rolls back decode first, then prefill.
+    calls.clear()
+    failing_pause.add("d1")
+    with pytest.raises(RuntimeError, match="pause/clear failed for d1"):
+        channel.pause()
+    assert calls[4:] == [
+        ("resume_generation", "d0"),
+        ("resume_generation", "p0"),
+        ("resume_generation", "p1"),
+    ]
+
+
 def test_metrics_parser_and_sampler_aliases() -> None:
     sampler = DynamoMetricsSampler(
-        [{"instance_id": "a", "system_url": "http://worker:4000"}],
+        [
+            {
+                "instance_id": "a",
+                "system_url": "http://worker:4000",
+                "role": "aggregated",
+            }
+        ],
         interval_s=1,
         include_prefixes=None,
         exclude_prefixes=None,
@@ -679,10 +778,14 @@ def test_direct_completions_are_not_limited_by_default_thread_pool(
 
 
 def _reshard_generation(monkeypatch, *, refit_transport="nccl_reshard"):
-    """A two-engine, TP=2 DynamoGeneration whose engine RPCs are recorded, not sent."""
+    """A one-prefill, one-decode TP=2 DynamoGeneration whose engine RPCs are recorded.
+
+    Every engine is a full replica under disaggregation, so refit gives both
+    roles rank prefixes exactly as it would two aggregated engines.
+    """
     workers = [
-        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
-        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+        {"instance_id": "a", "system_url": "http://10.0.0.2:4000", "role": "prefill"},
+        {"instance_id": "b", "system_url": "http://10.0.0.3:4000", "role": "decode"},
     ]
     _patch_runtime(monkeypatch, workers=workers)
     posts: list[dict[str, Any]] = []
@@ -980,8 +1083,16 @@ def test_mtp_drafter_is_configured_on_every_engine(
     monkeypatch, mtp_from_refit, load_format, expected_rpcs
 ) -> None:
     workers = [
-        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
-        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+        {
+            "instance_id": "a",
+            "system_url": "http://10.0.0.2:4000",
+            "role": "aggregated",
+        },
+        {
+            "instance_id": "b",
+            "system_url": "http://10.0.0.3:4000",
+            "role": "aggregated",
+        },
     ]
     _patch_runtime(monkeypatch, workers=workers)
     posts = []

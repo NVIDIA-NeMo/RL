@@ -159,6 +159,8 @@ def uv_py_executable(extras: Sequence[str]) -> str:
 #   [3000, 4999) Shared NeMo RL generation range (policy.generation.port_range_low/high)
 #     [3000, 4000) Dynamo frontend/token-wrapper HTTP endpoints
 #     [4000, 4100) Dynamo worker system endpoints (node-local free-port selection)
+#     [4100, 4200) Dynamo NIXL side channels (node-local engine index)
+#     [4200, 4300) Dynamo prefill KV-event streams (node-local engine index)
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
 #   6000         NeMo-Skills sandbox Nginx       (NEMO_SKILLS_SANDBOX_PORT; ray.sub starts one
 #                                                 sidecar per allocated node, driver included)
@@ -181,6 +183,10 @@ DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW = 3000
 DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH = 4000
 DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW = 4000
 DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH = 4100
+DEFAULT_DYNAMO_NIXL_PORT_RANGE_LOW = 4100
+DEFAULT_DYNAMO_NIXL_PORT_RANGE_HIGH = 4200
+DEFAULT_DYNAMO_KV_EVENT_PORT_RANGE_LOW = 4200
+DEFAULT_DYNAMO_KV_EVENT_PORT_RANGE_HIGH = 4300
 DEFAULT_GYM_PORT_RANGE_LOW = 5000
 DEFAULT_GYM_PORT_RANGE_HIGH = 5999
 # vLLM TP/DP rendezvous ports.  Each engine gets PORTS_PER_ENGINE ports starting

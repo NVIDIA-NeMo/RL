@@ -20,10 +20,17 @@ from typing import Annotated, Any, Literal
 from pydantic import (
     BaseModel,
     BeforeValidator,
+    Field,
     PositiveFloat,
     PositiveInt,
     model_validator,
 )
+
+from nemo_rl.models.generation.interfaces import DisaggConfig
+
+# What one managed engine serves. Under disaggregation every engine is a full
+# TP x PP replica of the policy either way; only the request phase differs.
+DynamoWorkerRole = Literal["aggregated", "prefill", "decode"]
 
 DYNAMO_VLLM_FLAGS: dict[str, str] = {
     "tensor_parallel_size": "--tensor-parallel-size",
@@ -332,11 +339,49 @@ class DynamoConfig(BaseModel, extra="allow"):
         DynamoVllmConfig, BeforeValidator(_require_nonempty_vllm_config)
     ]
     vllm_kwargs: dict[str, Any]
+    disaggregation: DisaggConfig = Field(default_factory=DisaggConfig)
 
     @property
     def engine_world_size(self) -> int:
         """Return the derived ranks in each single-node vLLM engine."""
         return self.vllm_cfg.tensor_parallel_size * self.vllm_cfg.pipeline_parallel_size
+
+    @property
+    def replica_width(self) -> int:
+        """GPUs one rollout replica spans: one engine, or one P/D group.
+
+        The Dynamo frontend routes across the whole fleet, so a replica only
+        fixes the P:D ratio and keeps each group's engines next to each other.
+        """
+        layout = self.disaggregation
+        if not layout.enabled:
+            return self.engine_world_size
+        return (
+            layout.num_prefill_engines + layout.num_decode_engines
+        ) * self.engine_world_size
+
+    def worker_roles(self, inference_world_size: int) -> list[DynamoWorkerRole]:
+        """Return each engine's role, in launch order, for this many GPUs.
+
+        Replicas are tiled prefill engines first, as TRT-LLM disaggregation
+        lays them out. Launch order is also refit rank order.
+        """
+        if inference_world_size % self.replica_width != 0:
+            raise ValueError(
+                f"Managed Dynamo has {inference_world_size} inference GPUs, which "
+                f"is not a multiple of one replica's {self.replica_width} GPUs "
+                "(policy.generation.disaggregation engines x TP x PP)."
+            )
+        layout = self.disaggregation
+        replica: list[DynamoWorkerRole] = ["aggregated"]
+        if layout.enabled:
+            replica = [
+                "prefill" if engine < layout.num_prefill_engines else "decode"
+                for engine in range(
+                    layout.num_prefill_engines + layout.num_decode_engines
+                )
+            ]
+        return replica * (inference_world_size // self.replica_width)
 
     @model_validator(mode="after")
     def _validate_backend_boundary(self) -> "DynamoConfig":
@@ -408,6 +453,8 @@ class DynamoConfig(BaseModel, extra="allow"):
                 "policy.generation.stop_strings supports at most 32 values when "
                 "backend='dynamo'"
             )
+        if self.disaggregation.enabled:
+            self._validate_disaggregation()
         ignored = sorted(
             key
             for key, value in extra.items()
@@ -419,3 +466,27 @@ class DynamoConfig(BaseModel, extra="allow"):
                 stacklevel=2,
             )
         return self
+
+    def _validate_disaggregation(self) -> None:
+        layout = self.disaggregation
+        if layout.num_prefill_engines < 1 or layout.num_decode_engines < 1:
+            raise ValueError(
+                "policy.generation.disaggregation needs at least one prefill and "
+                "one decode engine per replica when backend='dynamo'"
+            )
+        # One managed frontend routes the whole fleet and tokenizes itself.
+        if layout.num_frontend_workers != 1 or layout.frontend_tokenize:
+            raise ValueError(
+                "policy.generation.disaggregation.num_frontend_workers must be 1 "
+                "and frontend_tokenize false when backend='dynamo'; the managed "
+                "Dynamo frontend routes every replica"
+            )
+        speculative_config = self.vllm_kwargs.get("speculative_config")
+        if (
+            speculative_config is not None
+            and speculative_config.get("num_speculative_tokens") != 0
+        ):
+            raise ValueError(
+                "policy.generation.vllm_kwargs.speculative_config is not supported "
+                "with policy.generation.disaggregation when backend='dynamo'"
+            )

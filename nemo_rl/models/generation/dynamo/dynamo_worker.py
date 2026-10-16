@@ -34,7 +34,7 @@ from nemo_rl.models.generation.dynamo.arguments import (
     redact_argv,
     redact_environment,
 )
-from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.dynamo.config import DynamoConfig, DynamoWorkerRole
 from nemo_rl.models.generation.vllm.draft_utils import (
     DRAFT_DISABLE_MODULE_SHARING_ENV,
     draft_module_sharing_disable_required,
@@ -151,6 +151,9 @@ class DynamoVllmWorker:  # pragma: no cover
         cuda_devices: list[int],
         system_port: int,
         vllm_port: int,
+        worker_role: DynamoWorkerRole,
+        nixl_port: int | None,
+        kv_event_port: int | None,
         manager_env: dict[str, str],
         startup_timeout_s: float,
         seed: int,
@@ -160,14 +163,21 @@ class DynamoVllmWorker:  # pragma: no cover
         self._node_ip = _get_node_ip_local()
         self._system_port = system_port
         self._vllm_port = vllm_port
+        self._worker_role = worker_role
         self._process: subprocess.Popen | None = None
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                probe.bind(("0.0.0.0", system_port))
-        except OSError as exc:
-            raise RuntimeError(
-                f"DYN_SYSTEM_PORT {system_port} is unavailable for {group_name}."
-            ) from exc
+        managed_ports = {"DYN_SYSTEM_PORT": system_port}
+        if nixl_port is not None:
+            managed_ports["VLLM_NIXL_SIDE_CHANNEL_PORT"] = nixl_port
+        if kv_event_port is not None:
+            managed_ports["KV-event port"] = kv_event_port
+        for port_name, port in managed_ports.items():
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.bind(("0.0.0.0", port))
+            except OSError as exc:
+                raise RuntimeError(
+                    f"{port_name} {port} is unavailable for {group_name}."
+                ) from exc
 
         validated_config = DynamoConfig.model_validate(config)
         dynamo_cfg = validated_config.dynamo_cfg
@@ -218,6 +228,16 @@ class DynamoVllmWorker:  # pragma: no cover
             else {}
         )
         configured_env = dict(vllm_cfg.get("env_vars") or {})
+        # Decode engines pull prompt KV from prefill engines over NIXL; each
+        # engine's side channel listens on this node's address and NeMo RL's port.
+        nixl_env = (
+            {}
+            if nixl_port is None
+            else {
+                "VLLM_NIXL_SIDE_CHANNEL_HOST": self._node_ip,
+                "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port),
+            }
+        )
         worker_env = build_managed_worker_env(
             base_env={**os.environ, **engine_env_defaults},
             configured_env=configured_env,
@@ -226,6 +246,7 @@ class DynamoVllmWorker:  # pragma: no cover
                 **fp8_env,
                 **draft_env,
                 **fp32_lm_head_env,
+                **nixl_env,
                 "CUDA_VISIBLE_DEVICES": ",".join(str(gpu) for gpu in cuda_devices),
                 "DYN_SYSTEM_PORT": str(system_port),
                 "PYTHONHASHSEED": "0",
@@ -242,6 +263,8 @@ class DynamoVllmWorker:  # pragma: no cover
             vllm_cfg=vllm_cfg,
             vllm_kwargs=vllm_kwargs,
             dynamo_cfg=dynamo_cfg,
+            worker_role=worker_role,
+            kv_event_port=kv_event_port,
         )
         self._validate_argv(
             dynamo_python,
@@ -338,6 +361,7 @@ class DynamoVllmWorker:  # pragma: no cover
             "instance_id": self._group_name,
             "system_url": self.system_url,
             "process_pid": process.pid,
+            "role": self._worker_role,
             "vllm_port": self._vllm_port,
         }
 
