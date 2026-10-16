@@ -1179,7 +1179,9 @@ def _same_tokenizer_kd(
             **kwargs,
         )
     assert path == "full_vocab"
-    return same_tokenizer_full_vocab_kl(student_logits, teacher_logits, **kwargs)
+    return same_tokenizer_full_vocab_kl(
+        student_logits, teacher_logits, vocab_size=_V, **kwargs
+    )
 
 
 def _loss_and_grad(
@@ -1280,8 +1282,9 @@ class TestSameTokenizerKdMatchesPreviousMath:
         teacher_width: int,
         mask_kind: str,
     ):
-        # No top-K choice is involved, so the full-vocab helper must match the
-        # previous math bitwise for any mask.
+        # No top-K choice is involved and the student has no lm_head padding,
+        # so the full-vocab helper must match the previous math bitwise for any
+        # mask.
         batch, seq = 3, 7
         generator = torch.Generator().manual_seed(2)
         student = torch.randn(batch, seq, _V, generator=generator)
@@ -1300,7 +1303,7 @@ class TestSameTokenizerKdMatchesPreviousMath:
         )
 
         new_loss, new_grad = _loss_and_grad(
-            same_tokenizer_full_vocab_kl, student, teacher, **kwargs
+            same_tokenizer_full_vocab_kl, student, teacher, vocab_size=_V, **kwargs
         )
         old_loss, old_grad = _loss_and_grad(
             _old_direct_full_vocab_kl, student, teacher, **kwargs
@@ -1421,6 +1424,7 @@ class TestSameTokenizerKdReduction:
             kd_mask=kd_mask,
             sample_mask=sample_mask,
             num_kd_tokens=weights.sum(),
+            vocab_size=_V,
             temperature=1.0,
             reverse_kl=reverse_kl,
             tp_group=None,
@@ -1452,6 +1456,48 @@ class TestSameTokenizerKdReduction:
             rtol=1e-5,
             atol=1e-6,
         )
+
+    @pytest.mark.parametrize("reverse_kl", [False, True], ids=["fwd", "rev"])
+    def test_full_vocab_drops_student_lm_head_padding(self, reverse_kl: bool):
+        student, teacher, kd_mask, sample_mask = self._inputs(_V + _PAD)
+        # The student's lm_head pads past the shared vocab as well.
+        student = torch.cat([student, torch.full((3, 7, _PAD), 5.0)], dim=-1)
+        teacher[..., _V:] = 50.0
+        kwargs = dict(
+            kd_mask=kd_mask,
+            sample_mask=sample_mask,
+            num_kd_tokens=_manual_kd_weights(kd_mask, sample_mask).sum(),
+            vocab_size=_V,
+            temperature=1.0,
+            reverse_kl=reverse_kl,
+            tp_group=None,
+            cp_group=None,
+        )
+
+        loss, grad = _loss_and_grad(
+            same_tokenizer_full_vocab_kl, student, teacher, **kwargs
+        )
+        unpadded_loss, unpadded_grad = _loss_and_grad(
+            same_tokenizer_full_vocab_kl,
+            student[..., :_V].contiguous(),
+            teacher[..., :_V].contiguous(),
+            **kwargs,
+        )
+
+        torch.testing.assert_close(loss, unpadded_loss, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(grad[..., :_V], unpadded_grad, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            grad[..., _V:], torch.zeros_like(grad[..., _V:]), rtol=0.0, atol=1e-6
+        )
+        # Same vocab support as the top-K helper when K covers the shared vocab.
+        topk_loss = same_tokenizer_topk_kl(student, teacher, vocab_topk=_V, **kwargs)
+        torch.testing.assert_close(loss, topk_loss, rtol=1e-5, atol=1e-6)
+        # The previous math kept the student's padding columns in the softmax.
+        old_kwargs = {
+            key: value for key, value in kwargs.items() if key != "vocab_size"
+        }
+        old_loss = _old_direct_full_vocab_kl(student, teacher, **old_kwargs)
+        assert not torch.allclose(old_loss, loss)
 
 
 # ---------------------------------------------------------------------------

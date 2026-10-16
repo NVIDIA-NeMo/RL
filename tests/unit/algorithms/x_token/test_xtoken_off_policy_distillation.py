@@ -1046,6 +1046,7 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
     fn = _bare_averaged_logits_loss_fn([None, None])
     fn.temperature = 2.0
     fn.reverse_kl = True
+    fn.student_vocab_size = 30
 
     seen = []
 
@@ -1078,6 +1079,7 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
     assert kwargs["kd_mask"] is align.student_token_mask
     assert kwargs["sample_mask"] is align.sample_mask
     assert kwargs["num_kd_tokens"] is global_valid_toks
+    assert kwargs["vocab_size"] == 30
     assert (kwargs["temperature"], kwargs["reverse_kl"]) == (2.0, True)
     assert "kl_loss" in metrics
     assert kd.item() == pytest.approx(1.23)

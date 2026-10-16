@@ -2825,6 +2825,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             kd_mask=align.student_token_mask,
             sample_mask=align.sample_mask,
             num_kd_tokens=global_valid_toks,
+            vocab_size=self.student_vocab_size,
             temperature=self.temperature,
             reverse_kl=self.reverse_kl,
             tp_group=tp_group,
