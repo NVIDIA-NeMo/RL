@@ -37,30 +37,6 @@ _CT_TOPK = 2
 _CT_TEMPERATURE = 2.0
 
 
-def test_csd_rebuild_single_teacher_logits_without_copy(monkeypatch):
-    """MBS=1 must not duplicate the full teacher-logit IPC tensor."""
-    import sys
-    from types import SimpleNamespace
-
-    teacher_logits = torch.randn(4, 7, dtype=torch.float32)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setitem(
-        sys.modules,
-        "nemo_rl.models.policy.utils",
-        SimpleNamespace(
-            rebuild_cuda_tensor_from_ipc=lambda _handle, _device: teacher_logits
-        ),
-    )
-
-    rebuilt = CSDLossFn._rebuild_teacher_full_logits(
-        {"teacher_full_logits_ipc": [{"logits_ipc": object()}]}
-    )
-
-    assert rebuilt.shape == (1, 4, 7)
-    assert rebuilt.dtype == torch.float32
-    assert rebuilt.data_ptr() == teacher_logits.data_ptr()
-
-
 def _write_ct_projection(tmp_path):
     """Dense top-k projection with two strict exact maps (s0->t0, s5->t4).
 

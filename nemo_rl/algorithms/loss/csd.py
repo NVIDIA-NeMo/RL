@@ -303,6 +303,9 @@ class CSDLossFn(LossFunction):
             token ids, exact full-vocabulary log-normalizers, and optional
             realized-label top-k membership, reconstructed for the full
             teacher sequence.
+        teacher_row_payloads_by_idx: Owner-local evaluation only: each
+            cross-tokenizer teacher's IPC records, read row by row by the rank
+            that owns each chunk (see ``owner_local``).
         aligns_by_idx: ``dict[int, LocalizedAlignment]`` per teacher (cross-tok:
             localized chunk alignment; same-tok: thin, student fields only).
 
@@ -1311,120 +1314,7 @@ class CSDLossFn(LossFunction):
             global_normalization_factor=global_valid_toks,
         )
 
-    # CSD transport and partition-loss helpers.
-    @staticmethod
-    def _rebuild_teacher_full_logits(
-        data: BatchedDataDict[CSDLossDataDict],
-    ) -> torch.Tensor:
-        """Unpack ``teacher_full_logits_ipc`` to a ``[B, T_t, V_t]`` CUDA tensor.
-
-        The IPC handles point at views the teacher worker stashed in its
-        ``_teacher_ipc_buffer``; rebuilding does not allocate new memory
-        on the producer side. For the common microbatch-size-one case, add the
-        batch dimension as a view instead of copying the full logits with
-        ``torch.stack``. Casts to ``float32`` to match the loss math (the
-        producer also writes FP32 via :class:`FullLogitsPostProcessor`).
-        """
-        from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
-
-        handles = data["teacher_full_logits_ipc"]
-        consumer_device = torch.cuda.current_device()
-        per_sample = [
-            rebuild_cuda_tensor_from_ipc(h["logits_ipc"], consumer_device)
-            for h in handles
-        ]
-        if len(per_sample) == 1:
-            return per_sample[0].unsqueeze(0).float()
-        return torch.stack(per_sample, dim=0).float()
-
-    @staticmethod
-    def _rebuild_teacher_sparse_logits(
-        data: BatchedDataDict[CSDLossDataDict],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Unpack sparse teacher-logit IPC handles.
-
-        Returns:
-            topk_logits:  ``[B, T_t, k]`` raw teacher logits, fp32
-            topk_indices: ``[B, T_t, k]`` sorted teacher token ids, int32
-            log_z:        ``[B, T_t]`` logsumexp(logits / temperature), fp32
-            gt_in_topk:   optional ``[B, T_t]`` bool mask recording whether
-                          the realized teacher label was in the true teacher
-                          top-k before forced insertion.
-        """
-        from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
-
-        handles = data["teacher_sparse_logits_ipc"]
-        consumer_device = torch.cuda.current_device()
-        per_sample_logits = []
-        per_sample_indices = []
-        per_sample_log_z = []
-        per_sample_gt_in_topk = []
-        first_shards = handles[0].get("teacher_shards", [handles[0]]) if handles else []
-        has_gt_in_topk = bool(first_shards) and "gt_in_topk_ipc" in first_shards[0]
-        for sample_entry in handles:
-            shards = sample_entry.get("teacher_shards", [sample_entry])
-            shards = sorted(shards, key=lambda h: int(h.get("global_seq_start", 0)))
-            if any(("gt_in_topk_ipc" in h) != has_gt_in_topk for h in shards):
-                raise ValueError(
-                    "Sparse teacher IPC handles mix gt_in_topk and "
-                    "non-gt_in_topk payloads."
-                )
-            if len(shards) > 1:
-                expected_start = 0
-                for h in shards:
-                    start = int(h["global_seq_start"])
-                    if start != expected_start:
-                        raise ValueError(
-                            "Sparse teacher CP shards must cover the sequence "
-                            f"contiguously; expected start {expected_start}, got {start}."
-                        )
-                    expected_start += int(h["topk_shape"][0])
-                full_seq_len = int(shards[0]["full_seq_len"])
-                if expected_start != full_seq_len:
-                    raise ValueError(
-                        "Sparse teacher CP shards do not cover the full sequence: "
-                        f"covered={expected_start}, full_seq_len={full_seq_len}."
-                    )
-
-            sample_logits = [
-                rebuild_cuda_tensor_from_ipc(h["topk_logits_ipc"], consumer_device)
-                for h in shards
-            ]
-            sample_indices = [
-                rebuild_cuda_tensor_from_ipc(h["topk_indices_ipc"], consumer_device)
-                for h in shards
-            ]
-            sample_log_z = [
-                rebuild_cuda_tensor_from_ipc(h["log_z_ipc"], consumer_device)
-                for h in shards
-            ]
-            per_sample_logits.append(torch.cat(sample_logits, dim=0))
-            per_sample_indices.append(torch.cat(sample_indices, dim=0))
-            per_sample_log_z.append(torch.cat(sample_log_z, dim=0))
-            if has_gt_in_topk:
-                per_sample_gt_in_topk.append(
-                    torch.cat(
-                        [
-                            rebuild_cuda_tensor_from_ipc(
-                                h["gt_in_topk_ipc"], consumer_device
-                            )
-                            for h in shards
-                        ],
-                        dim=0,
-                    )
-                )
-        gt_in_topk = (
-            torch.stack(per_sample_gt_in_topk, dim=0).to(torch.bool)
-            if has_gt_in_topk
-            else None
-        )
-        return (
-            torch.stack(per_sample_logits, dim=0).float(),
-            torch.stack(per_sample_indices, dim=0).to(torch.int32),
-            torch.stack(per_sample_log_z, dim=0).float(),
-            gt_in_topk,
-        )
-
+    # CSD partition-loss helpers.
     def _get_csd_teacher_to_common_student(
         self,
         device: torch.device,
