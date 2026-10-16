@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "logra"
+version = "0.1.0"
+description = "Low-rank gradient sketches for native NeMo RL GRPO"
+readme = "README.md"
+requires-python = ">=3.13.14"
+dependencies = ["nemo-rl[automodel]"]
+
+[dependency-groups]
+test = ["pytest>=7.0.0", "pytest-timeout", "pytest-cov"]
+
+[tool.uv.sources]
+nemo-rl = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["logra"]
+
+[tool.pytest.ini_options]
+addopts = "--durations=15 -s -rA -x"
+testpaths = ["tests"]
+python_files = "test_*.py"
