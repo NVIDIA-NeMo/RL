@@ -157,7 +157,7 @@ class CSDLossConfig(BaseModel, extra="allow"):
     csd_last_pos_loss_fn: Optional[Literal["kl", "jsd", "bce"]] = None
     # Multiplier on each mismatch (non-1-to-1) chunk loss relative to a
     # 1-to-1 chunk loss.
-    csd_mismatch_loss_beta: Annotated[float, Field(ge=0)] = 1.0
+    csd_mismatch_loss_beta: Annotated[float, Field(ge=0)] = 5.0
     # Zero disables filtering; otherwise retain realized labels in teacher top-k.
     csd_noise_filter_topk: Annotated[int, Field(ge=0)] = 0
     # Compare only the realized chain probability and its complementary bucket.
