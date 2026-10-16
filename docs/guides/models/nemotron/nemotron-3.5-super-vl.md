@@ -3,8 +3,9 @@
 This page collects NeMo RL guidance for text and image post-training of
 Nemotron 3.5 Super VL (`NemotronH_Omni_Reasoning_V3`), a hybrid Mamba +
 Attention MoE model with 512 routed experts (22 active) and a RADIO vision
-tower, on the Automodel backend. Use it to launch the text DAPO and image GRPO
-recipes and understand the settings that are specific to this model.
+tower, on the Automodel backend. Use it to launch the text DAPO, image GRPO and
+NeMo Gym agentic (tool-use) recipes and understand the settings that are
+specific to this model.
 
 ## What's Supported
 
@@ -12,6 +13,7 @@ recipes and understand the settings that are specific to this model.
 | --- | --- | --- | --- | --- | --- |
 | Nemotron 3.5 Super VL (120B-A12B) | LLM (text) | Automodel | FSDP2 + EP | vLLM | BF16 compute, FP32 master |
 | Nemotron 3.5 Super VL (120B-A12B) | VLM (image) | Automodel | FSDP2 + EP | vLLM | BF16 compute, FP32 master |
+| Nemotron 3.5 Super VL (120B-A12B) | Agentic tool use (NeMo Gym, text) | Automodel | FSDP2 + EP + CP | vLLM (async, non-colocated) | BF16 compute, FP32 master |
 
 Notes:
 
@@ -142,6 +144,64 @@ automatically from the latest checkpoint in `checkpointing.checkpoint_dir`.
 See the [GRPO guide](../../grpo.md) for the algorithm and common configuration
 details.
 
+## Agentic RL with NeMo Gym
+
+`examples/nemo_gym/nemotron-3.5-super-vl/workplace_assistant_automodel.yaml`
+trains the model on the NeMo Gym `workplace_assistant` environment: multi-step
+tool use (up to six tool calls and one final answer per task) against simulated
+calendar, e-mail, document and project databases, with no code sandbox. It is
+text-only and runs **async GRPO with non-colocated generation**: training and
+vLLM live on separate node pools and weights are refit through an NCCL
+collective every step.
+
+| Setting | Value |
+|---|---:|
+| Base recipe | `examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml` (task, data layout, GRPO/loss settings) |
+| Rollouts per step | 64 prompts x 16 generations (global batch size 1,024) |
+| Maximum sequence length | 16,384 tokens (8,192 generated) |
+| Training | Automodel FSDP2, EP=4, CP=2, `moe_parallelizer.reshard_after_forward: true`, activation checkpointing, 8 nodes |
+| Generation | vLLM TP=4 / EP=4, one engine per node, 8 nodes; `qwen3_coder` tool parser, `nemotron_v3` reasoning parser, prefix caching off |
+| Async GRPO | `max_trajectory_age_steps: 1`, in-flight weight updates, on-policy KL approximation + truncated importance sampling |
+| Optimizer | TransformerEngine `FusedAdam`, lr 1e-6, wd 0.1, FP32 master weights |
+| Validation | full validation set (545 tasks) at start and every 10 steps |
+
+Settings specific to this recipe, on top of the model-specific settings above:
+
+| Setting | Value | Why |
+|---|---|---|
+| `policy.automodel_cfg.context_parallel_size` | `2` | At 16K context the 120B trainer on 32 GPUs is memory-bound; CP2 gives the headroom the backward needs. |
+| `policy.automodel_cfg.moe_parallelizer.reshard_after_forward` | `true` | Automodel keeps every block's gathered weights resident through the backward by default; re-sharding after each forward is what fits the optimizer states on 184 GB GPUs (same as the Nemotron 3 Super 120B automodel recipe). |
+| `policy.make_sequence_length_divisible_by` | `256` | The HybridEP dispatcher sizes its buffers from the per-rank token count, which must be a multiple of 128; with CP2 each rank sees half the padded sequence. |
+| `policy.generation.vllm_cfg.enable_prefix_caching` | `false` | Multi-step tool-use trajectories re-prefill the growing conversation every agent step; with prefix caching on, the cached Mamba state of the earlier steps made `token_mult_prob_error` jump from 1.02 to 1.45. |
+| `policy.generation.vllm_kwargs.max_num_batched_tokens` | `16384` | vLLM's default 2,048-token chunked-prefill budget throttles the repeated 4-20K-token prefills of the agent loop. |
+| `env.nemo_gym.policy_model...uses_reasoning_parser` / `enable_thinking` | `true` | The checkpoint thinks before every tool call; Gym needs the reasoning parser on to strip `<think>` blocks from the tool-call messages. |
+
+### Data
+
+The environment's tasks are published as
+[`nvidia/Nemotron-RL-agent-workplace_assistant`](https://huggingface.co/datasets/nvidia/Nemotron-RL-agent-workplace_assistant)
+(`train.jsonl`, 1,255 tasks; `validation.jsonl`, 545 tasks):
+
+```bash
+uvx --from huggingface-hub hf download nvidia/Nemotron-RL-agent-workplace_assistant \
+  --repo-type dataset --local-dir $DATA_DIR/workplace_assistant
+```
+
+### Launch
+
+The NeMo Gym venvs for the `workplace_assistant` resource server are built on
+first launch (or prebaked into the container, see the
+[Nemotron 3.5 Lightning guide](nemotron-3.5-lightning.md#container)).
+`cluster.num_nodes` is training plus generation nodes and
+`policy.generation.colocated.resources.num_nodes` is the generation share:
+
+```bash
+uv run examples/nemo_gym/run_grpo_nemo_gym.py \
+  --config examples/nemo_gym/nemotron-3.5-super-vl/workplace_assistant_automodel.yaml \
+  data.train.data_path=$DATA_DIR/workplace_assistant/train.jsonl \
+  data.validation.data_path=$DATA_DIR/workplace_assistant/validation.jsonl
+```
+
 ## Reference Results
 
 ### Training curves
@@ -183,3 +243,21 @@ mostly under 0.03 after step 20: trainer and vLLM stay in agreement across
 every refit. Steps take ~8 minutes (16 to 20 minutes when the batch retries
 generation); the chain ran as three 4-hour Slurm jobs that resumed from the
 latest checkpoint (steps 21 and 43).
+
+**Agentic GRPO, NeMo Gym `workplace_assistant`** — 40 steps, async non-colocated
+generation on 8 training + 8 generation nodes, starting from
+`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`.
+
+![Nemotron 3.5 Super VL workplace_assistant training curves](../../../assets/nemotron/nemotron-3.5-super-vl-workplace-assistant-16n4g.png)
+
+Validation accuracy on the 545 held-out tasks rises from 0.80 at step 0 to
+**0.92 at step 40** (0.86 at step 10, 0.89 at steps 20 and 30) while the mean
+validation response length falls from ~910 to ~860 generated tokens. Training
+reward moves from a 0.76-0.86 band in the first ten steps to 0.87-0.97 after
+step 20. The number of agent turns per trajectory (tool calls plus the final
+answer) stays at 4.0 on both train and validation: the policy learns to call
+the right tools with the right arguments rather than to call more or fewer of
+them. `gen_kl_error` stays flat at 0.0022-0.0024 and `token_mult_prob_error` at
+1.02 across every refit. Steps take ~5.5 minutes (rollout and training
+overlap); the run was two 4-hour Slurm jobs that resumed from the latest
+checkpoint (step 32).
