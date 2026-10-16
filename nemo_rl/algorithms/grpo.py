@@ -154,15 +154,18 @@ from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
     current_trace_carrier,
     efficiency_span,
     evaluate_span,
+    iteration_scope,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.vocabulary import INIT_TOTAL_CATEGORY, WORKER_GROUP_ENV
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -1676,7 +1679,7 @@ def setup(
             )
         if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
             assert not (policy_config.get("automodel_cfg") or {}).get("enabled"), (
-                "DTensor backend is not supported with kv cache fp8 enabled."
+                "Automodel backend is not supported with kv cache fp8 enabled."
             )
             assert not should_use_async_rollouts(generation_config), (
                 "Async rollouts is not supported with kv cache fp8 enabled."
@@ -3301,12 +3304,13 @@ def _grpo_train_impl(
             val_metrics, validation_timings = None, None
 
             with (
+                iteration_scope(total_steps + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.grpo.step",
                     tracer=_tracer,
-                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                    **{"rl.epoch": current_epoch + 1},
                 ),
             ):
                 # Prepare batch
@@ -3907,7 +3911,6 @@ def _grpo_train_impl(
                         RLSpanGroup.POLICY_UPDATE,
                         "rl.grpo.policy_training",
                         tracer=_tracer,
-                        **{"rl.iteration": total_steps + 1},
                     ),
                 ):
                     train_results = policy.train(
@@ -4457,7 +4460,7 @@ def validate(
     timer = Timer(context={"worker": "validator"})
     with (
         timer.time("total_validation_time"),
-        evaluate_span("grpo", **{"rl.step": step}),
+        evaluate_span("grpo", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
         # >= 1 is validated in setup().
@@ -5048,7 +5051,7 @@ def async_grpo_train(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
         extra_env_vars={
             # Names this actor's spans the way RayWorkerGroup names its groups'.
-            "NRL_WORKER_GROUP": "trajectory_collector",
+            WORKER_GROUP_ENV: "trajectory_collector",
         },
     )
 
@@ -5224,8 +5227,8 @@ def async_grpo_train(
     # rather than only as a scalar. Unbucketed by construction (see
     # UNBUCKETED_SPAN_CATEGORIES): the generation fleet is busy for this whole
     # window, and its spans join this trace.
-    with efficiency_span("init/total", tracer=_tracer):
-        timer.start("init/total")
+    with efficiency_span(INIT_TOTAL_CATEGORY, tracer=_tracer):
+        timer.start(INIT_TOTAL_CATEGORY)
         wait_iterations = 0
         while True:
             buffer_size_current = ray.get(replay_buffer.size.remote())
@@ -5289,7 +5292,7 @@ def async_grpo_train(
 
         # Retained because the per-step timer.reset() below discards it; the
         # efficiency snapshot re-supplies it every step.
-        init_total_s = timer.stop("init/total")
+        init_total_s = timer.stop(INIT_TOTAL_CATEGORY)
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
@@ -5306,12 +5309,12 @@ def async_grpo_train(
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
             with (
+                iteration_scope(step + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.grpo.step",
                     tracer=_tracer,
-                    **{"rl.iteration": step + 1},
                 ),
             ):
                 num_mask_sample_filtered = 0
@@ -5738,7 +5741,6 @@ def async_grpo_train(
                         RLSpanGroup.POLICY_UPDATE,
                         "rl.grpo.policy_training",
                         tracer=_tracer,
-                        **{"rl.iteration": step + 1},
                     ),
                 ):
                     train_results = policy.train(
@@ -6250,7 +6252,7 @@ def async_grpo_train(
             # at the end of every step drops it -- so re-supply the captured
             # value, or the series reports the real startup cost at step 1 and
             # zero for the rest of the run.
-            driver_efficiency["init/total"] = init_total_s
+            driver_efficiency[INIT_TOTAL_CATEGORY] = init_total_s
             merged_efficiency = {**driver_efficiency}
             for cat, dur in collector_efficiency.items():
                 merged_efficiency[cat] = merged_efficiency.get(cat, 0.0) + dur
