@@ -294,6 +294,12 @@ policy:
       moe_backend: triton
       mamba_ssm_cache_dtype: float32
       disable_custom_all_reduce: true
+      # Chunked-prefill budget per engine step. Unset, NeMo RL's engine context falls back to 2048, and
+      # this hybrid model's 1056-token attention block (Mamba "align" prefix caching ends prefill chunks
+      # on block boundaries) then admits one block of prefill per step. With the post-refit KV reset
+      # every in-flight context re-prefills, which made agent turns 20-30% slower at 2048; at 32768 the
+      # reset run matches the no-reset controls. Scheduler-only: sampling and semantics are unchanged.
+      max_num_batched_tokens: 32768
       compilation_config:
         cudagraph_mode: PIECEWISE
         cudagraph_capture_sizes:
