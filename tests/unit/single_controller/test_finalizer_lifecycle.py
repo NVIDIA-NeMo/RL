@@ -26,6 +26,7 @@ import pytest
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
+    TQReplayBuffer,
 )
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
@@ -110,6 +111,7 @@ def _controller(actor: object) -> Any:
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
+    ctrl._buffer.remove_group = AsyncMock()
     ctrl._dp_client = _DataPlaneClient()
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
@@ -192,9 +194,46 @@ def test_below_threshold_group_releases_pending_finalizer_state() -> None:
 
     asyncio.run(_below_threshold_branch())
 
+    ctrl._buffer.remove_group.assert_awaited_once_with("group")
     ctrl._buffer.abort.assert_called_once_with("group")
     assert "group" not in ctrl._finalizer_metrics_by_group
     assert "group" not in ctrl._finalizer_rewards_by_group
+
+
+def test_discarded_committed_group_leaves_no_ready_slot_in_the_buffer() -> None:
+    """abort() skips ready slots, so discarding must remove the committed slot itself."""
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize()))
+    buffer = TQReplayBuffer(
+        ctrl._dp_client,
+        partition_id="canonical",
+        pad_value_dict={"token_ids": 0},
+        include_message_violation_fields=False,
+        require_routed_experts=False,
+    )
+    buffer.set_data_plane_checkpoint_barrier(ctrl._data_plane_checkpoint_barrier)
+    ctrl._buffer = buffer
+    request = _request()
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name=None,
+        sample_ids=list(request.canonical_sample_ids),
+        fields=None,
+    )
+
+    async def _commit_then_discard() -> None:
+        buffer.reserve(
+            weight_version=3,
+            group_id=request.group_id,
+            rollout_ids=list(request.rollout_ids),
+        )
+        async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
+            await buffer.commit_finalized(cut, request.group_id, meta, 3, 3)
+        assert buffer.size() == 1
+        await ctrl._discard_committed_group(request)
+
+    asyncio.run(_commit_then_discard())
+
+    assert buffer.size() == 0
 
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:

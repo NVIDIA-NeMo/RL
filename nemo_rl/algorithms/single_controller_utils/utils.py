@@ -181,18 +181,16 @@ class AdvantagePartial:
 def align_reward_with_v1(
     step_metrics: dict[str, Any], pre_filter_metrics: Mapping[str, float]
 ) -> None:
-    """Report ``reward`` the way the v1 path does when dynamic sampling is on.
+    """Make ``reward`` mean what it means on the v1 path when dynamic sampling is on.
 
-    v1 logs ``reward`` over the prompts a step was originally scheduled with, before
-    any zero-variance group is dropped, and ``filtered_reward`` over the groups it
-    trained on. The SC path's own ``reward`` is the latter (it averages trained rows,
-    see ``reduce_advantage_pump_metrics``), so the two paths' ``reward`` curves would
-    otherwise measure different things. Moves the trained-rows value to
-    ``filtered_reward`` and puts the first-attempt reward in its place.
+    v1 logs ``reward`` before filtering and ``filtered_reward`` over the groups it
+    trained on. SC's own ``reward`` is the trained-rows mean (see
+    ``reduce_advantage_pump_metrics``), so move that value to ``filtered_reward`` and
+    put the first-attempt reward in its place. First attempts are the closest SC match;
+    replacement prompts are not included.
 
-    Left untouched when the step has no first-attempt tally, which is the case under a
-    sampler that does not stamp a target step: there is nothing to report against, and
-    renaming would only relabel the trained-rows value.
+    Does nothing when the step has no first-attempt tally (a sampler that does not
+    stamp steps), since renaming would only relabel the same value.
 
     Args:
         step_metrics: The step's metrics, edited in place.
