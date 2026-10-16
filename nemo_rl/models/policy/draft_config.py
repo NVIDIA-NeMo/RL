@@ -49,19 +49,29 @@ class Eagle3DraftConfig(BaseModel, extra="allow"):
     # no sequence packing). Pass-d RoPE positions are offset by d-1, matching
     # modelopt's reference TTT.
     ttt_steps: Annotated[int, Field(ge=1)] = 1
-    # Per-pass loss weights alpha_d (len == ttt_steps); None = uniform 1.0.
-    ttt_pass_weights: list[float] | None = None
+    # Per-pass loss weights alpha_d (len == ttt_steps > 1); None = uniform 1.0.
+    ttt_pass_weights: (
+        list[Annotated[float, Field(ge=0, allow_inf_nan=False)]] | None
+    ) = None
 
     @model_validator(mode="after")
     def _validate_ttt_pass_weights(self) -> Self:
-        if (
-            self.ttt_pass_weights is not None
-            and len(self.ttt_pass_weights) != self.ttt_steps
-        ):
+        if self.ttt_pass_weights is None:
+            return self
+        if self.ttt_steps == 1:
+            # The single-pass loss never reads the weights.
+            raise ValueError(
+                "ttt_pass_weights is only used when ttt_steps > 1; drop it for "
+                "single-pass training."
+            )
+        if len(self.ttt_pass_weights) != self.ttt_steps:
             raise ValueError(
                 f"ttt_pass_weights must have ttt_steps={self.ttt_steps} entries, "
                 f"got {len(self.ttt_pass_weights)}."
             )
+        if sum(self.ttt_pass_weights) == 0:
+            # The weights scale the loss denominator; all zeros trains nothing.
+            raise ValueError("ttt_pass_weights must have a positive sum.")
         return self
 
     @model_validator(mode="after")

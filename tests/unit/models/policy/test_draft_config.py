@@ -102,6 +102,14 @@ def test_eagle3_draft_config_validates_ttt_fields() -> None:
         Eagle3DraftConfig(ttt_steps=0)
     with pytest.raises(ValidationError, match="ttt_pass_weights"):
         Eagle3DraftConfig(ttt_steps=2, ttt_pass_weights=[1.0])
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        Eagle3DraftConfig(ttt_steps=2, ttt_pass_weights=[1.0, -0.5])
+    with pytest.raises(ValidationError, match="finite"):
+        Eagle3DraftConfig(ttt_steps=2, ttt_pass_weights=[1.0, float("nan")])
+    with pytest.raises(ValidationError, match="positive sum"):
+        Eagle3DraftConfig(ttt_steps=3, ttt_pass_weights=[0.0, 0.0, 0.0])
+    with pytest.raises(ValidationError, match="only used when ttt_steps > 1"):
+        Eagle3DraftConfig(ttt_steps=1, ttt_pass_weights=[1.0])
 
 
 def test_eagle3_draft_config_rejects_unknown_speculator_type() -> None:
