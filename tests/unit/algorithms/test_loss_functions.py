@@ -735,7 +735,16 @@ def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_config):
         ClippedPGLossFn(cfg)
 
 
-def test_clipped_pg_loss_single_forward_cispo() -> None:
+@pytest.mark.parametrize(
+    ("ratio_clip_min", "ratio_clip_max"),
+    [
+        pytest.param(0.5, 1.0, id="matching-tis-bounds"),
+        pytest.param(0.2, 0.2, id="independent-tis-bounds"),
+    ],
+)
+def test_clipped_pg_loss_single_forward_cispo(
+    ratio_clip_min: float, ratio_clip_max: float
+) -> None:
     data, _, _, _ = _setup_clipped_pg_test_data(device="cpu")
     del data["prev_logprobs"]
     curr = torch.tensor([[-3.0, -2.0, -1.0]], requires_grad=True)
@@ -751,8 +760,8 @@ def test_clipped_pg_loss_single_forward_cispo() -> None:
             truncated_importance_sampling_type="tis",
             truncated_importance_sampling_ratio_min=0.5,
             truncated_importance_sampling_ratio=2.0,
-            ratio_clip_min=0.5,
-            ratio_clip_max=1.0,
+            ratio_clip_min=ratio_clip_min,
+            ratio_clip_max=ratio_clip_max,
             reference_policy_kl_penalty=0.0,
         )
     )

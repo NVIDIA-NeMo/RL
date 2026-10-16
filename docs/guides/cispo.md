@@ -58,7 +58,7 @@ loss_fn:
 > [!NOTE]
 > When `use_importance_sampling_correction: true`, the shared GRPO loss path additionally multiplies the CISPO token loss by the actor-vs-generation correction `exp(prev_logprobs - generation_logprobs)`. This correction is separate from CISPO's clipped `pi_theta / pi_old` weight.
 
-For single-update training, override these fields in the `loss_fn` example above to reuse the training forward's logprobs. TIS clips the detached current/rollout ratio; its bounds must match the CISPO bounds above (`[0, 6]`).
+For single-update training, override these fields in the `loss_fn` example above to reuse the training forward's logprobs. In this mode the CISPO ratio `pi_theta / pi_old` is always 1, so the loss does not read `ratio_clip_min` / `ratio_clip_max`: the TIS clamp on the detached current/rollout ratio `exp(curr_logprobs - generation_logprobs)` is the only bound on the weight. The gradient is the same as GRPO with `force_on_policy_ratio: true` and the same TIS settings; only the reported loss value differs.
 
 ```yaml
   force_on_policy_ratio: true
@@ -68,7 +68,7 @@ For single-update training, override these fields in the `loss_fn` example above
   truncated_importance_sampling_ratio: 6.0
 ```
 
-SingleController skips the previous-policy forward unless `grpo.seq_logprob_error_threshold` is set. A reference-policy forward is still required when reference KL is enabled.
+Both the GRPO trainer and SingleController skip the previous-policy forward in this mode unless `grpo.seq_logprob_error_threshold` is set (the GRPO trainer also skips it when `loss_fn.seq_logprob_error_in_loss: true`). This mode needs one optimizer update per rollout batch (`policy.train_global_batch_size == grpo.num_prompts_per_step * grpo.num_generations_per_prompt`). A reference-policy forward is still required when reference KL is enabled.
 
 ## References
 
