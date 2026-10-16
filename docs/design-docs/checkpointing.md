@@ -19,6 +19,23 @@ final saves.
 > `policy.automodel_cfg.checkpoint.save_consolidated: "every"`.
 > PPO value models use the corresponding `value.automodel_cfg.checkpoint` fields.
 
+## Megatron consolidated checkpoints
+
+Megatron-backed policies accept
+`policy.megatron_cfg.checkpoint.save_consolidated: "false"` (default) or
+`"final"`. With `"final"`, after the final checkpoint's native Megatron save
+is written and finalized, rank 0 runs an inline CPU conversion (in a
+subprocess, reusing `export_model_from_megatron`) and writes consolidated
+Hugging Face weights plus the tokenizer to
+`<checkpoint_dir>/policy/hf_export/`. The native checkpoint is always
+complete first, so a preemption or conversion failure only costs the HF copy
+and never resumability. Intermediate checkpoints stay Megatron-native; convert
+them offline with the converters below. Only `"final"` is supported inline —
+per-step exports would spend training-cluster time on a CPU conversion that
+scales with model size. LoRA/PEFT runs must use
+`examples/converters/convert_lora_to_hf.py` offline (merged or adapter-only),
+because the Megatron checkpoint then contains only adapter weights.
+
 ## Converting Torch Distributed Checkpoints to Hugging Face Format
 
 A checkpoint converter is provided to convert a Torch distributed checkpoint to Hugging Face format after training:
