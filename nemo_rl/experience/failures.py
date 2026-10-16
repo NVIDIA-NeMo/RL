@@ -117,6 +117,15 @@ class RolloutDataFailure(RolloutFailure):
     """
 
 
+class GymTerminalEpisodeFailure(RolloutDataFailure):
+    """An Environment Server forbids retrying this episode.
+
+    Kept as a plain exception with a message so its type survives the Ray actor
+    boundary. Unlike ordinary data failures, it exhausts the retry budget on the
+    first attempt, following the configured prompt skip or fail policy.
+    """
+
+
 class RolloutRedispatchExhausted(RuntimeError):
     """A prompt exhausted its infrastructure retry budget.
 
@@ -233,6 +242,33 @@ def _is_infra(exc: BaseException) -> bool:
     return any(cls.__name__ in _INFRA_TYPE_NAMES for cls in type(exc).__mro__)
 
 
+def is_terminal_gym_episode_failure(exc: BaseException) -> bool:
+    """Find a terminal episode failure through Ray, cause, and group wrappers.
+
+    A failed sibling prohibits retrying the complete prompt group even when
+    another sibling reports an infrastructure failure. Follow explicit causes
+    only, not incidental exception contexts, and bound traversal of cause chains.
+    """
+    pending = [(exc, 0)]
+    seen: set[int] = set()
+    while pending:
+        current, depth = pending.pop()
+        if id(current) in seen or depth >= _MAX_CAUSE_DEPTH:
+            continue
+        seen.add(id(current))
+        if isinstance(current, GymTerminalEpisodeFailure):
+            return True
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend((nested, depth + 1) for nested in current.exceptions)
+        if isinstance(current, ray.exceptions.RayTaskError) and isinstance(
+            current.cause, BaseException
+        ):
+            pending.append((current.cause, depth + 1))
+        if current.__cause__ is not None:
+            pending.append((current.__cause__, depth + 1))
+    return False
+
+
 def classify_rollout_failure(exc: BaseException) -> FailureClass:
     """Bucket a rollout exception into ``INFRA`` or ``DATA``.
 
@@ -248,7 +284,7 @@ def classify_rollout_failure(exc: BaseException) -> FailureClass:
     Returns:
         The :class:`FailureClass` governing this failure's retry budget.
     """
-    if isinstance(exc, RolloutDataFailure):
+    if isinstance(exc, RolloutDataFailure) or is_terminal_gym_episode_failure(exc):
         return FailureClass.DATA
 
     seen: set[int] = set()
