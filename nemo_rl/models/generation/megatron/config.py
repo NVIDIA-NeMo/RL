@@ -122,8 +122,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     refit_execution_batch_bytes: int | None
     num_speculative_tokens: int
 
-    mamba_inference_ssm_states_dtype: NotRequired[str]
-    mamba_inference_conv_states_dtype: NotRequired[str]
+    # Hybrid (Mamba) inference state dtypes; None keeps the model dtype.
+    mamba_inference_ssm_states_dtype: NotRequired[str | None]
+    mamba_inference_conv_states_dtype: NotRequired[str | None]
     # GPU budget for cached Mamba states; null disables it (MCore default).
     prefix_caching_mamba_gb: NotRequired[float | None]
 

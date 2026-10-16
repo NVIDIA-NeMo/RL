@@ -47,7 +47,6 @@ policy:
     mcore_generation_config:
       refit_backend: nccl
       buffer_size_gb: 8
-      num_cuda_graphs: -1
       use_cuda_graphs_for_non_decode_steps: false
       max_tokens: ${policy.max_total_sequence_length}
       transformer_impl: inference_optimized
@@ -57,7 +56,6 @@ policy:
       expert_tensor_parallel_size: 1
       context_parallel_size: 1
       sequence_parallel: true
-      moe_router_dtype: fp32
       moe_pad_experts_for_cuda_graph_inference: false
       mamba_inference_ssm_states_dtype: float32
       mamba_inference_conv_states_dtype: float32
