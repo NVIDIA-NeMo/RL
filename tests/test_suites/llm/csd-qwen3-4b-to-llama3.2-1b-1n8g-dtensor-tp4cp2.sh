@@ -17,7 +17,6 @@ exit_if_max_steps_reached
 cd $PROJECT_ROOT
 
 # Prepare both complete token-chain directions for the cross-tokenizer teacher.
-: "${CSD_TRAIN_DATA:?Set CSD_TRAIN_DATA to a text JSONL corpus fitting both tokenizers}"
 TABLE_DIR="$EXP_DIR/csd_tables"
 mkdir -p "$TABLE_DIR"
 CSD_STUDENT_TO_TEACHER_TABLE="$TABLE_DIR/student_to_teacher.pt"
@@ -34,8 +33,6 @@ uv run examples/run_csd.py \
     distillation.max_num_steps=$MAX_STEPS \
     teachers.0.aligner.student_to_teacher_table_path="$CSD_STUDENT_TO_TEACHER_TABLE" \
     teachers.0.aligner.teacher_to_student_table_path="$CSD_TEACHER_TO_STUDENT_TABLE" \
-    data.train.data_files="$CSD_TRAIN_DATA" \
-    data.train.characters_per_sample=null \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \

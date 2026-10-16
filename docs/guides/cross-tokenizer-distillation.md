@@ -170,10 +170,12 @@ The exemplar uses dense transport and dynamic loss scaling. These are training
 settings: they do not change how the static tokenizer tables are constructed.
 
 The default dataset is the raw `text` column of
-`nvidia/Nemotron-Pretraining-Specialized-v1.1`, using the
-`Nemotron-Pretraining-Formal-Logic` parquet shards through `hf://`.
+`nvidia/Nemotron-Pretraining-Specialized-v1.1`, subset
+`Nemotron-Pretraining-Formal-Logic`, loaded by dataset identifier so it
+resolves from the Hugging Face cache.
 To use your own corpus, set `data.train.data_files` to a file, glob, or dataset
-identifier and `data.train.text_key` to its text column. Supported local file
+identifier and `data.train.text_key` to its text column; for a file or glob,
+also set `data.train.subset=null`. Supported local file
 formats include `.arrow`, `.parquet`, `.json`, `.jsonl`, and `.txt`. The
 `arrow_text` dataset and `kd_data_processor` leave tokenization to the shared
 collator. `collator.mode=text` tokenizes each text with both tokenizers;
@@ -184,12 +186,11 @@ whole final assistant turn, including its template markers, and KD uses its
 content and EOT. Native thinking alignment reuses the shared region-based
 supervision described in that guide.
 
-Each input row must fit **both** model sequence limits after tokenization.
-The CSD collator rejects overlength examples to preserve a shared text span;
-it does not independently truncate the student and teacher. Keep
-`data.train.characters_per_sample=null` and `collator.num_packed_rows=1`.
-Split or filter a production corpus before training so every retained row
-fits both tokenizers. The default parquet source may contain longer rows.
+A text row that does not fit every model's sequence limit after tokenization
+is clipped to a prefix of its text that fits all of them, so the student and
+every teacher still cover the same text; the collator never truncates one
+side alone. Chat rows are not clipped: an overlength chat row is rejected.
+Keep `data.train.characters_per_sample=null` and `collator.num_packed_rows=1`.
 
 For a self-contained smoke run, first create 128 short arithmetic texts. This
 small fixture exercises training and is not a model-quality benchmark:
@@ -216,6 +217,7 @@ uv run python examples/run_csd.py \
   teachers.0.aligner.student_to_teacher_table_path=cross_tokenizer_data/csd/student_to_teacher.pt \
   teachers.0.aligner.teacher_to_student_table_path=cross_tokenizer_data/csd/teacher_to_student.pt \
   data.train.data_files=cross_tokenizer_data/csd/smoke_train.jsonl \
+  data.train.subset=null \
   data.train.characters_per_sample=null \
   cluster.num_nodes=1 \
   cluster.gpus_per_node=8 \

@@ -613,6 +613,7 @@ _COLLATOR_OPTION_NAMES = (
     "require_routed_experts",
     "reject_overlength_text",
     "add_special_tokens_in_text",
+    "clip_overlength_text",
     "ce_covers_assistant_turn",
 )
 
@@ -627,6 +628,7 @@ _COLLATOR_OPTION_NAMES = (
                 "require_routed_experts": False,
                 "reject_overlength_text": True,
                 "add_special_tokens_in_text": True,
+                "clip_overlength_text": True,
             },
             id="csd-text",
         ),
