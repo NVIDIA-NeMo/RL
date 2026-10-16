@@ -27,7 +27,9 @@ Used by both :mod:`token_aligner` and
   :func:`rebuild_teacher_sparse_logits_from_ipc`,
   :func:`assemble_teacher_logits_from_shards`,
   :func:`collect_overlapping_teacher_shards` reassemble full-vocab teacher
-  logits from per-rank shards across heterogeneous TP/CP.
+  logits from per-rank shards across heterogeneous TP/CP;
+  :class:`SparseTeacherRowReader` / :class:`DenseTeacherRowReader` read only
+  requested teacher rows.
 - Projection: :func:`parse_projection_file`, the
   :func:`get_sparse_projection_matrix` / :func:`get_topk_projection`
   process-local caches, :func:`slice_sparse_projection_rows`, and
@@ -40,7 +42,10 @@ Used by both :mod:`token_aligner` and
 
 from __future__ import annotations
 
+import math
 import os
+from bisect import bisect_right
+from collections.abc import Sequence
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple, Union
 
@@ -742,44 +747,11 @@ def _rebuild_teacher_ipc_row(handle: Mapping[str, Any], device: int) -> torch.Te
         validate_compact_teacher_ipc_handle,
     )
 
-    compact_geometry = validate_compact_teacher_ipc_handle(handle)
-    if compact_geometry is not None:
-        token_offset, stored_seq_len, _used_tokens, local_vocab_size = compact_geometry
-        if stored_seq_len == 0:
-            raise ValueError("A zero-length compact IPC row has no physical view.")
+    if validate_compact_teacher_ipc_handle(handle) is not None:
         src_full, _ = _rebuild_compact_teacher_ipc_storage(handle, device)
-        return src_full[token_offset : token_offset + stored_seq_len, :local_vocab_size]
-
-    src_full = rebuild_cuda_tensor_from_ipc(handle["payload_ipc"], device).detach()
-    actual_shape = handle["actual_shape"]
-    if (
-        not isinstance(actual_shape, (list, tuple, torch.Size))
-        or len(actual_shape) != 2
-    ):
-        raise ValueError(
-            "Dense teacher IPC actual_shape must be two-dimensional, got "
-            f"{actual_shape!r}."
-        )
-    local_seq_len, local_vocab_size = (int(value) for value in actual_shape)
-    buf_idx = int(handle["buf_idx"])
-    sample_idx = int(handle["sample_index_in_buf"])
-    if (
-        src_full.ndim != 4
-        or buf_idx < 0
-        or buf_idx >= src_full.shape[0]
-        or sample_idx < 0
-        or sample_idx >= src_full.shape[1]
-        or local_seq_len <= 0
-        or local_seq_len > src_full.shape[2]
-        or local_vocab_size <= 0
-        or local_vocab_size > src_full.shape[3]
-    ):
-        raise ValueError(
-            "Dense teacher IPC rectangular handle is outside rebuilt storage: "
-            f"storage={tuple(src_full.shape)}, buf_idx={buf_idx}, "
-            f"sample_idx={sample_idx}, actual_shape={tuple(actual_shape)}."
-        )
-    return src_full[buf_idx, sample_idx, :local_seq_len, :local_vocab_size]
+    else:
+        src_full = rebuild_cuda_tensor_from_ipc(handle["payload_ipc"], device).detach()
+    return _teacher_ipc_row_view(handle, src_full)
 
 
 def assemble_teacher_logits_from_shards(
@@ -1106,6 +1078,946 @@ def rebuild_teacher_sparse_logits_from_ipc(
         torch.stack(per_sample_log_z, dim=0).float(),
         gt_in_topk,
     )
+
+
+@dataclass(frozen=True)
+class _SparseTeacherRoute:
+    """One global-sequence interval backed by one teacher CP shard."""
+
+    global_start: int
+    global_end: int
+    local_start: int
+    shard: Mapping[str, Any]
+
+
+def _normalize_reader_device(
+    device: torch.device | int,
+) -> tuple[torch.device, Optional[int]]:
+    """Return ``(device, cuda_index)``; the index is None for a CPU consumer."""
+    if isinstance(device, int):
+        if device < 0:
+            raise ValueError(f"CUDA device id must be non-negative, got {device}")
+        return torch.device("cuda", device), device
+    if not isinstance(device, torch.device):
+        raise TypeError(
+            "device must be a torch.device or CUDA device id, got "
+            f"{type(device).__name__}"
+        )
+    if device.type != "cuda":
+        return device, None
+    device_id = (
+        torch.cuda.current_device() if device.index is None else int(device.index)
+    )
+    return torch.device("cuda", device_id), device_id
+
+
+def _reader_backing_key(field: str, value: Any) -> Any:
+    """Cache key for one IPC (or tensor) backing shared by several records."""
+    if isinstance(value, torch.Tensor):
+        return (field, "tensor", id(value))
+    # CUDA reduction handles are immutable tuples shared by every sample of a
+    # worker slab. Falling back to identity keeps unhashable test handles usable.
+    try:
+        hash(value)
+    except TypeError:
+        return (field, "ipc-id", id(value))
+    return (field, "ipc", value)
+
+
+def _open_reader_backing(
+    value: Any, *, device: torch.device, device_id: Optional[int]
+) -> torch.Tensor:
+    """Map one IPC handle (or move one tensor) onto the consumer device."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device)
+    if device_id is None:
+        raise ValueError(
+            f"CUDA IPC teacher backings require a CUDA consumer device, got {device}."
+        )
+    from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+
+    return rebuild_cuda_tensor_from_ipc(value, device_id).detach()
+
+
+def _sample_teacher_shards(
+    entry: Mapping[str, Any], sample_idx: int
+) -> list[Mapping[str, Any]]:
+    shards = entry.get("teacher_shards", [entry])
+    if not isinstance(shards, (list, tuple)):
+        raise TypeError(
+            "Teacher teacher_shards must be a list or tuple; "
+            f"sample={sample_idx}, got {type(shards).__name__}."
+        )
+    if not shards:
+        raise ValueError(f"Teacher sample {sample_idx} contains no IPC shards")
+    if not all(isinstance(shard, Mapping) for shard in shards):
+        raise TypeError(f"Teacher sample {sample_idx} contains a non-dict shard")
+    return list(shards)
+
+
+def _required_shard_int(
+    shard: Mapping[str, Any], field: str, *, sample_idx: int, shard_idx: int
+) -> int:
+    try:
+        return int(shard[field])
+    except KeyError as exc:
+        raise ValueError(
+            f"Sparse teacher shard is missing {field!r}; "
+            f"sample={sample_idx}, shard={shard_idx}."
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Sparse teacher {field!r} must be an integer; "
+            f"sample={sample_idx}, shard={shard_idx}."
+        ) from exc
+
+
+class SparseTeacherRowReader:
+    """Cached router for sparse teacher rows kept in their teacher CP shards.
+
+    Construct one reader per sparse teacher payload and reuse it for every
+    bounded row batch in a loss call. Construction validates and indexes the
+    compact ``sequence_segments`` metadata once. CUDA IPC tensors are opened
+    lazily and cached, so repeated row batches neither reopen the same backing
+    storage nor scan all CP shards for every row. :meth:`close` drops the
+    cached backings.
+
+    Each shard record carries natural top-k logits and ids sorted by id, the
+    exact log Z, the score-ranked k-th id, and a forced-label sidecar (see
+    :meth:`MegatronPolicyWorker.get_sparse_logits_ipc`). Tensor-backed records
+    use the same path and may target CPU.
+    """
+
+    TRANSPORT = "sparse_topk"
+    _BACKING_FIELDS = (
+        "topk_logits_ipc",
+        "topk_indices_ipc",
+        "log_z_ipc",
+        "natural_tail_indices_ipc",
+        "forced_logits_ipc",
+        "forced_indices_ipc",
+        "forced_in_topk_ipc",
+    )
+
+    def __init__(
+        self,
+        per_sample_entries: Sequence[Mapping[str, Any]],
+        *,
+        device: torch.device | int,
+    ) -> None:
+        if not per_sample_entries:
+            raise ValueError("Sparse teacher payload contains no samples")
+        self.device, self._device_id = _normalize_reader_device(device)
+        self._backing_tensors: dict[Any, torch.Tensor] = {}
+        self._routes: list[list[_SparseTeacherRoute]] = []
+        self._route_starts: list[list[int]] = []
+        self.k: int
+        self.temperature: float
+        self.real_vocab_size: int
+        self.full_seq_len: int
+        self.force_width: int
+        self.membership_k: int
+        self._build_routing_index(per_sample_entries)
+
+    def _build_routing_index(
+        self, per_sample_entries: Sequence[Mapping[str, Any]]
+    ) -> None:
+        expected_meta: Optional[tuple[int, float, int, int]] = None
+        expected_full_seq_len: Optional[int] = None
+        expected_force_width: Optional[int] = None
+
+        for sample_idx, entry in enumerate(per_sample_entries):
+            if not isinstance(entry, Mapping):
+                raise TypeError(
+                    "Sparse teacher samples must be dictionaries; "
+                    f"sample={sample_idx}, got {type(entry).__name__}."
+                )
+            sample_routes: list[_SparseTeacherRoute] = []
+            declared_full_seq_len: Optional[int] = None
+
+            for shard_idx, shard in enumerate(
+                _sample_teacher_shards(entry, sample_idx)
+            ):
+                transport = shard.get("transport")
+                if transport != self.TRANSPORT:
+                    raise ValueError(
+                        "Unsupported sparse teacher transport "
+                        f"{transport!r}; sample={sample_idx}, shard={shard_idx}."
+                    )
+                k = _required_shard_int(
+                    shard, "k", sample_idx=sample_idx, shard_idx=shard_idx
+                )
+                real_vocab_size = _required_shard_int(
+                    shard, "real_vocab_size", sample_idx=sample_idx, shard_idx=shard_idx
+                )
+                try:
+                    temperature = float(shard["temperature"])
+                except KeyError as exc:
+                    raise ValueError(
+                        "Sparse teacher shard is missing 'temperature'; "
+                        f"sample={sample_idx}, shard={shard_idx}."
+                    ) from exc
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Sparse teacher temperature must be numeric; "
+                        f"sample={sample_idx}, shard={shard_idx}."
+                    ) from exc
+                if k <= 0 or k > real_vocab_size:
+                    raise ValueError(
+                        "Sparse teacher k must satisfy 0 < k <= real_vocab_size; "
+                        f"got k={k}, real_vocab_size={real_vocab_size}."
+                    )
+                if not math.isfinite(temperature) or temperature <= 0:
+                    raise ValueError(
+                        "Sparse teacher temperature must be finite and > 0, got "
+                        f"{temperature}."
+                    )
+                membership_k = _required_shard_int(
+                    shard,
+                    "forced_in_topk_k",
+                    sample_idx=sample_idx,
+                    shard_idx=shard_idx,
+                )
+                force_width = _required_shard_int(
+                    shard, "force_width", sample_idx=sample_idx, shard_idx=shard_idx
+                )
+                if force_width <= 0:
+                    raise ValueError(
+                        f"Sparse teacher force_width must be positive; got {force_width}."
+                    )
+                if expected_force_width is None:
+                    expected_force_width = force_width
+                elif force_width != expected_force_width:
+                    raise ValueError(
+                        "Sparse teacher CP shards disagree on force_width."
+                    )
+                if membership_k <= 0 or membership_k > real_vocab_size:
+                    raise ValueError(
+                        "Sparse teacher membership top-k must satisfy "
+                        "0 < membership_k <= real_vocab_size; "
+                        f"got {membership_k}."
+                    )
+                metadata = (k, temperature, real_vocab_size, membership_k)
+                if expected_meta is None:
+                    expected_meta = metadata
+                elif metadata != expected_meta:
+                    raise ValueError(
+                        "Sparse teacher CP shards disagree on "
+                        "k/temperature/vocabulary/membership support."
+                    )
+
+                missing_backings = [
+                    field for field in self._BACKING_FIELDS if field not in shard
+                ]
+                if missing_backings:
+                    raise ValueError(
+                        "Sparse teacher shard is missing backing fields "
+                        f"{missing_backings}; sample={sample_idx}, shard={shard_idx}."
+                    )
+                buf_idx = _required_shard_int(
+                    shard, "buf_idx", sample_idx=sample_idx, shard_idx=shard_idx
+                )
+                sample_index_in_buf = _required_shard_int(
+                    shard,
+                    "sample_index_in_buf",
+                    sample_idx=sample_idx,
+                    shard_idx=shard_idx,
+                )
+                if buf_idx < 0 or sample_index_in_buf < 0:
+                    raise ValueError(
+                        "Sparse teacher buf_idx/sample_index_in_buf must be "
+                        f"non-negative; sample={sample_idx}, shard={shard_idx}."
+                    )
+
+                shape = shard.get("topk_shape")
+                if not isinstance(shape, (list, tuple)) or len(shape) != 2:
+                    raise ValueError(
+                        "Sparse teacher topk_shape must be a two-element sequence; "
+                        f"sample={sample_idx}, shard={shard_idx}."
+                    )
+                try:
+                    local_seq_len, shard_k = (int(x) for x in shape)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Sparse teacher topk_shape entries must be integers; "
+                        f"sample={sample_idx}, shard={shard_idx}."
+                    ) from exc
+                if local_seq_len <= 0 or shard_k != k:
+                    raise ValueError(
+                        "Sparse teacher topk_shape disagrees with shard metadata; "
+                        f"shape={(local_seq_len, shard_k)}, k={k}."
+                    )
+                forced_shape = shard.get("forced_shape")
+                if (
+                    not isinstance(forced_shape, (list, tuple))
+                    or len(forced_shape) != 2
+                ):
+                    raise ValueError(
+                        "Sparse teacher forced_shape must be a two-element sequence; "
+                        f"sample={sample_idx}, shard={shard_idx}."
+                    )
+                try:
+                    forced_seq_len, shape_force_width = (int(x) for x in forced_shape)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Sparse teacher forced_shape entries must be integers; "
+                        f"sample={sample_idx}, shard={shard_idx}."
+                    ) from exc
+                if forced_seq_len != local_seq_len or shape_force_width != force_width:
+                    raise ValueError(
+                        "Sparse teacher forced_shape disagrees with topk "
+                        "sequence/force_width metadata; "
+                        f"forced_shape={(forced_seq_len, shape_force_width)}, "
+                        f"topk_seq={local_seq_len}, force_width={force_width}."
+                    )
+                scalar_shape = shard.get("scalar_shape")
+                if scalar_shape is not None and tuple(scalar_shape) != (local_seq_len,):
+                    raise ValueError(
+                        "Sparse teacher scalar_shape must match topk sequence "
+                        f"length {local_seq_len}, got {scalar_shape}."
+                    )
+
+                shard_full_seq = shard.get("full_seq_len")
+                if shard_full_seq is not None:
+                    shard_full_seq = int(shard_full_seq)
+                    if shard_full_seq <= 0:
+                        raise ValueError(
+                            "Sparse teacher full_seq_len must be positive, got "
+                            f"{shard_full_seq}."
+                        )
+                    if declared_full_seq_len is None:
+                        declared_full_seq_len = shard_full_seq
+                    elif shard_full_seq != declared_full_seq_len:
+                        raise ValueError(
+                            "Sparse teacher shards in one sample disagree on "
+                            "full_seq_len."
+                        )
+
+                raw_segments = shard.get("sequence_segments")
+                if not isinstance(raw_segments, (list, tuple)) or not raw_segments:
+                    raise ValueError(
+                        "Sparse teacher shard must contain non-empty "
+                        f"sequence_segments; sample={sample_idx}, shard={shard_idx}."
+                    )
+                local_intervals: list[tuple[int, int]] = []
+                for segment_idx, segment in enumerate(raw_segments):
+                    if not isinstance(segment, (list, tuple)) or len(segment) != 3:
+                        raise ValueError(
+                            "Sparse teacher sequence segments must be "
+                            "(local_start, global_start, length) triples; "
+                            f"sample={sample_idx}, shard={shard_idx}, "
+                            f"segment={segment_idx}."
+                        )
+                    try:
+                        local_start, global_start, length = (int(x) for x in segment)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            "Sparse teacher sequence segment entries must be "
+                            f"integers; sample={sample_idx}, shard={shard_idx}."
+                        ) from exc
+                    if local_start < 0 or global_start < 0 or length <= 0:
+                        raise ValueError(
+                            "Sparse teacher sequence segments require non-negative "
+                            "starts and positive lengths; "
+                            f"got {(local_start, global_start, length)}."
+                        )
+                    local_end = local_start + length
+                    global_end = global_start + length
+                    if local_end > local_seq_len:
+                        raise ValueError(
+                            "Sparse teacher sequence segment exceeds topk_shape; "
+                            f"local_end={local_end}, sequence={local_seq_len}."
+                        )
+                    if (
+                        declared_full_seq_len is not None
+                        and global_end > declared_full_seq_len
+                    ):
+                        raise ValueError(
+                            "Sparse teacher sequence segment exceeds full_seq_len; "
+                            f"global_end={global_end}, full={declared_full_seq_len}."
+                        )
+                    local_intervals.append((local_start, local_end))
+                    sample_routes.append(
+                        _SparseTeacherRoute(
+                            global_start=global_start,
+                            global_end=global_end,
+                            local_start=local_start,
+                            shard=shard,
+                        )
+                    )
+
+                local_intervals.sort()
+                local_cursor = 0
+                for local_start, local_end in local_intervals:
+                    if local_start != local_cursor:
+                        raise ValueError(
+                            "Sparse teacher shard sequence_segments must cover "
+                            "each local row exactly once; "
+                            f"expected local start {local_cursor}, got {local_start}."
+                        )
+                    local_cursor = local_end
+                if local_cursor != local_seq_len:
+                    raise ValueError(
+                        "Sparse teacher shard sequence_segments do not cover the "
+                        f"local sequence: covered={local_cursor}, "
+                        f"sequence={local_seq_len}."
+                    )
+
+            sample_routes.sort(key=lambda route: route.global_start)
+            global_cursor = 0
+            for route in sample_routes:
+                if route.global_start != global_cursor:
+                    raise ValueError(
+                        "Sparse teacher CP coverage must cover each global "
+                        "position exactly once; "
+                        f"sample={sample_idx}, expected start {global_cursor}, "
+                        f"got {route.global_start}."
+                    )
+                global_cursor = route.global_end
+            sample_full_seq_len = declared_full_seq_len or global_cursor
+            if global_cursor != sample_full_seq_len:
+                raise ValueError(
+                    "Sparse teacher CP shards do not cover the full sequence; "
+                    f"sample={sample_idx}, covered={global_cursor}, "
+                    f"full_seq_len={sample_full_seq_len}."
+                )
+            if expected_full_seq_len is None:
+                expected_full_seq_len = sample_full_seq_len
+            elif sample_full_seq_len != expected_full_seq_len:
+                raise ValueError(
+                    "Sparse teacher samples disagree on full sequence length; "
+                    f"expected {expected_full_seq_len}, got {sample_full_seq_len}."
+                )
+            self._routes.append(sample_routes)
+            self._route_starts.append([route.global_start for route in sample_routes])
+
+        assert (
+            expected_meta is not None
+            and expected_full_seq_len is not None
+            and expected_force_width is not None
+        )
+        self.k, self.temperature, self.real_vocab_size, self.membership_k = (
+            expected_meta
+        )
+        self.force_width = expected_force_width
+        self.full_seq_len = expected_full_seq_len
+
+    def _backing(self, shard: Mapping[str, Any], field: str) -> torch.Tensor:
+        value = shard[field]
+        key = _reader_backing_key(field, value)
+        tensor = self._backing_tensors.get(key)
+        if tensor is None:
+            tensor = _open_reader_backing(
+                value, device=self.device, device_id=self._device_id
+            )
+            self._backing_tensors[key] = tensor
+
+        seq_len, width = (int(x) for x in shard["topk_shape"])
+        if field in ("topk_logits_ipc", "topk_indices_ipc"):
+            expected_width = width
+        elif field in ("forced_logits_ipc", "forced_indices_ipc", "forced_in_topk_ipc"):
+            expected_width = int(shard["force_width"])
+        else:
+            expected_width = 1
+        buf_idx = int(shard["buf_idx"])
+        sample_idx = int(shard["sample_index_in_buf"])
+        if tensor.dim() != 4 or (
+            tensor.shape[0] <= buf_idx
+            or tensor.shape[1] <= sample_idx
+            or tensor.shape[2] < seq_len
+            or tensor.shape[3] < expected_width
+        ):
+            raise ValueError(
+                f"Sparse teacher {field} backing shape {tuple(tensor.shape)} "
+                "does not cover declared slot/shape "
+                f"({buf_idx}, {sample_idx}, {seq_len}, {expected_width})."
+            )
+        if field in (
+            "topk_indices_ipc",
+            "natural_tail_indices_ipc",
+            "forced_indices_ipc",
+        ):
+            if tensor.is_floating_point() or tensor.dtype == torch.bool:
+                raise TypeError(
+                    f"Sparse teacher {field} backing must have an integer "
+                    f"dtype, got {tensor.dtype}."
+                )
+        elif field == "forced_in_topk_ipc":
+            if tensor.dtype != torch.bool:
+                raise TypeError(
+                    f"Sparse teacher {field} backing must have bool dtype, "
+                    f"got {tensor.dtype}."
+                )
+        elif not tensor.is_floating_point():
+            raise TypeError(
+                f"Sparse teacher {field} backing must be floating point, "
+                f"got {tensor.dtype}."
+            )
+        return tensor
+
+    def _route(self, batch_idx: int, global_position: int) -> _SparseTeacherRoute:
+        if not 0 <= batch_idx < len(self._routes):
+            raise IndexError(
+                f"Sparse teacher batch index {batch_idx} outside "
+                f"[0, {len(self._routes)})"
+            )
+        route_idx = bisect_right(self._route_starts[batch_idx], global_position) - 1
+        if (
+            not 0 <= global_position < self.full_seq_len
+            or route_idx < 0
+            or global_position >= self._routes[batch_idx][route_idx].global_end
+        ):
+            raise ValueError(
+                "Sparse teacher CP coverage must resolve each requested position "
+                f"exactly once; batch={batch_idx}, pos={global_position}, matches=0."
+            )
+        return self._routes[batch_idx][route_idx]
+
+    def gather_rows(
+        self,
+        batch_indices: torch.Tensor,
+        global_positions: torch.Tensor,
+        required_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather one exact K-wide support per loss request.
+
+        Every request names the teacher label it needs. When that label is
+        outside the natural top-k, the producer-recorded score-rank-k token is
+        evicted and only the requested sidecar label is inserted, so two
+        requests for the same row may receive different supports without
+        changing the backing row. Requests are grouped by backing shard, so
+        each source is indexed once per call.
+
+        Args:
+            batch_indices: Batch rows ``[N]``.
+            global_positions: Global teacher sequence positions ``[N]``.
+            required_token_ids: Teacher label per request ``[N]``; must be one
+                of the forced labels exported for that row.
+
+        Returns:
+            ``(topk_logits [N, k] fp32, topk_indices [N, k] int32 sorted by id,
+            log_z [N] fp32, requested_in_topk [N] bool)``. ``topk_logits`` are
+            raw (not temperature scaled); ``log_z`` is the temperature-scaled
+            full-vocabulary normalizer; ``requested_in_topk`` is the label's
+            membership in the producer's natural top-``membership_k``.
+        """
+        if (
+            batch_indices.dim() != 1
+            or global_positions.dim() != 1
+            or required_token_ids.dim() != 1
+        ):
+            raise ValueError(
+                "batch_indices, global_positions and required_token_ids must be "
+                "one-dimensional"
+            )
+        if not (
+            batch_indices.shape == global_positions.shape == required_token_ids.shape
+        ):
+            raise ValueError(
+                "batch_indices, global_positions and required_token_ids must have "
+                f"matching shapes; got {tuple(batch_indices.shape)}, "
+                f"{tuple(global_positions.shape)} and {tuple(required_token_ids.shape)}"
+            )
+        for name, tensor in (
+            ("batch_indices", batch_indices),
+            ("global_positions", global_positions),
+            ("required_token_ids", required_token_ids),
+        ):
+            if tensor.dtype == torch.bool or tensor.is_floating_point():
+                raise TypeError(f"{name} must have an integer dtype")
+        requests = list(
+            zip(
+                batch_indices.detach().cpu().tolist(),
+                global_positions.detach().cpu().tolist(),
+            )
+        )
+        if not requests:
+            raise ValueError("At least one sparse teacher row must be requested")
+
+        n = len(requests)
+        topk_logits = torch.empty((n, self.k), device=self.device, dtype=torch.float32)
+        topk_indices = torch.empty((n, self.k), device=self.device, dtype=torch.int32)
+        log_z = torch.empty((n,), device=self.device, dtype=torch.float32)
+        natural_tail_indices = torch.empty((n,), device=self.device, dtype=torch.int32)
+        forced_logits = torch.empty(
+            (n, self.force_width), device=self.device, dtype=torch.float32
+        )
+        forced_indices = torch.empty(
+            (n, self.force_width), device=self.device, dtype=torch.int32
+        )
+        forced_in_topk = torch.empty(
+            (n, self.force_width), device=self.device, dtype=torch.bool
+        )
+        required = required_token_ids.detach().to(device=self.device, dtype=torch.long)
+        invalid_required = (required < 0) | (required >= self.real_vocab_size)
+        if bool(invalid_required.any().item()):
+            bad_id = int(required[invalid_required][0].item())
+            raise ValueError(
+                "required_token_ids must contain real-vocabulary ids in "
+                f"[0, {self.real_vocab_size}); got {bad_id}."
+            )
+
+        grouped: dict[int, tuple[Mapping[str, Any], list[int], list[int]]] = {}
+        for out_idx, (batch_idx, global_position) in enumerate(requests):
+            route = self._route(int(batch_idx), int(global_position))
+            # Each sample/shard record identifies one backing slot; group its
+            # load-balanced segments together without hashing the record.
+            group = grouped.get(id(route.shard))
+            if group is None:
+                group = (route.shard, [], [])
+                grouped[id(route.shard)] = group
+            group[1].append(out_idx)
+            group[2].append(
+                route.local_start + int(global_position) - route.global_start
+            )
+
+        destinations = (
+            ("topk_logits_ipc", topk_logits, self.k),
+            ("topk_indices_ipc", topk_indices, self.k),
+            ("log_z_ipc", log_z, None),
+            ("natural_tail_indices_ipc", natural_tail_indices, None),
+            ("forced_logits_ipc", forced_logits, self.force_width),
+            ("forced_indices_ipc", forced_indices, self.force_width),
+            ("forced_in_topk_ipc", forced_in_topk, self.force_width),
+        )
+        for shard, output_rows, local_rows in grouped.values():
+            buf_idx = int(shard["buf_idx"])
+            sample_idx = int(shard["sample_index_in_buf"])
+            output_index = torch.tensor(
+                output_rows, device=self.device, dtype=torch.long
+            )
+            local_index = torch.tensor(local_rows, device=self.device, dtype=torch.long)
+            for field, destination, width in destinations:
+                source = self._backing(shard, field)[buf_idx, sample_idx].index_select(
+                    0, local_index
+                )
+                source = source[:, :width] if width is not None else source[:, 0]
+                destination.index_copy_(0, output_index, source.to(destination.dtype))
+
+        if bool(((topk_indices < 0) | (topk_indices >= self.real_vocab_size)).any()):
+            raise ValueError("Sparse teacher natural top-k contains an invalid id")
+        if self.k > 1 and bool((topk_indices[:, 1:] <= topk_indices[:, :-1]).any()):
+            raise ValueError("Sparse teacher natural top-k ids must be strictly sorted")
+        if bool(
+            ((forced_indices < -1) | (forced_indices >= self.real_vocab_size)).any()
+        ):
+            raise ValueError("Sparse teacher forced sidecar contains an invalid id")
+        for left in range(self.force_width):
+            for right in range(left + 1, self.force_width):
+                duplicate = (forced_indices[:, left] >= 0) & (
+                    forced_indices[:, left] == forced_indices[:, right]
+                )
+                if bool(duplicate.any().item()):
+                    raise ValueError(
+                        "Sparse teacher forced sidecar contains duplicate labels"
+                    )
+
+        sidecar_match = forced_indices.long() == required.unsqueeze(-1)
+        if bool((sidecar_match.sum(dim=-1) != 1).any().item()):
+            raise ValueError(
+                "Sparse teacher required label must appear exactly once in the "
+                "forced sidecar"
+            )
+        selected_forced_logits = (
+            torch.where(
+                sidecar_match, forced_logits, torch.full_like(forced_logits, -torch.inf)
+            )
+            .max(dim=-1)
+            .values
+        )
+        requested_in_topk = (sidecar_match & forced_in_topk).any(dim=-1)
+
+        natural_match = topk_indices.long() == required.unsqueeze(-1)
+        if bool((natural_match.sum(dim=-1) > 1).any().item()):
+            raise ValueError("Sparse teacher natural top-k contains duplicate ids")
+        natural_requested_logits = torch.where(
+            natural_match, topk_logits, torch.zeros_like(topk_logits)
+        ).sum(dim=-1)
+        inconsistent_duplicate = natural_match.any(dim=-1) & (
+            natural_requested_logits != selected_forced_logits
+        )
+        if bool(inconsistent_duplicate.any().item()):
+            raise ValueError(
+                "Sparse teacher natural and forced copies of a requested label "
+                "have different raw logits"
+            )
+        needs_insert = ~natural_match.any(dim=-1)
+
+        tail_match = topk_indices.long() == natural_tail_indices.long().unsqueeze(-1)
+        if bool((tail_match.sum(dim=-1) != 1).any().item()):
+            raise ValueError(
+                "Sparse teacher natural tail id must appear exactly once in top-k"
+            )
+        evict_slot = tail_match.to(torch.long).argmax(dim=-1)
+        materialized_logits = topk_logits.clone()
+        materialized_indices = topk_indices.clone()
+        insert_rows = needs_insert.nonzero(as_tuple=False).flatten()
+        if insert_rows.numel() > 0:
+            insert_slots = evict_slot.index_select(0, insert_rows)
+            materialized_logits[insert_rows, insert_slots] = (
+                selected_forced_logits.index_select(0, insert_rows)
+            )
+            materialized_indices[insert_rows, insert_slots] = required.index_select(
+                0, insert_rows
+            ).to(materialized_indices.dtype)
+
+        sorted_indices, order = torch.sort(materialized_indices, dim=-1)
+        sorted_logits = torch.gather(materialized_logits, dim=-1, index=order)
+        if self.k > 1 and bool((sorted_indices[:, 1:] <= sorted_indices[:, :-1]).any()):
+            raise ValueError(
+                "Sparse teacher materialized top-k ids must be strictly sorted"
+            )
+        return sorted_logits, sorted_indices, log_z, requested_in_topk
+
+    def close(self) -> None:
+        """Drop the cached backing tensors (and their imported IPC storage)."""
+        self._backing_tensors.clear()
+
+
+def gather_sparse_teacher_rows_from_ipc(
+    per_sample_entries: Sequence[Mapping[str, Any]],
+    batch_indices: torch.Tensor,
+    global_positions: torch.Tensor,
+    required_token_ids: torch.Tensor,
+    *,
+    device: torch.device | int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Read only the requested rows from sparse teacher CP shards.
+
+    One-shot form of :meth:`SparseTeacherRowReader.gather_rows`. Each
+    ``(batch, global_position)`` resolves to exactly one ``sequence_segments``
+    interval; only those rows are copied, and the teacher CP shards are never
+    concatenated into a full sequence.
+    """
+    reader = SparseTeacherRowReader(per_sample_entries, device=device)
+    try:
+        return reader.gather_rows(batch_indices, global_positions, required_token_ids)
+    finally:
+        reader.close()
+
+
+def _teacher_ipc_row_view(
+    handle: Mapping[str, Any], src_full: torch.Tensor
+) -> torch.Tensor:
+    """Return the physically stored ``[T_stored, V_local]`` row of ``handle``.
+
+    ``src_full`` is the handle's opened producer storage: a compact
+    ``[tokens, V_local]`` slab or a rectangular ``[N_mb, B, T, V_local]`` one.
+    """
+    from nemo_rl.models.policy.utils import validate_compact_teacher_ipc_handle
+
+    compact_geometry = validate_compact_teacher_ipc_handle(handle)
+    if compact_geometry is not None:
+        token_offset, stored_seq_len, _used_tokens, local_vocab_size = compact_geometry
+        if stored_seq_len <= 0:
+            raise ValueError("A zero-length compact IPC row has no physical view.")
+        expected_storage_shape = tuple(int(value) for value in handle["storage_shape"])
+        if tuple(src_full.shape) != expected_storage_shape or src_full.ndim != 2:
+            raise ValueError(
+                "Compact dense teacher IPC rebuilt an unexpected storage shape: "
+                f"actual={tuple(src_full.shape)}, expected={expected_storage_shape}."
+            )
+        if not src_full.is_contiguous():
+            raise ValueError("Compact dense teacher IPC storage must be contiguous.")
+        if src_full.dtype != handle["dtype"]:
+            raise ValueError(
+                "Compact dense teacher IPC rebuilt an unexpected dtype: "
+                f"actual={src_full.dtype}, expected={handle['dtype']}."
+            )
+        return src_full[token_offset : token_offset + stored_seq_len, :local_vocab_size]
+
+    actual_shape = handle["actual_shape"]
+    if (
+        not isinstance(actual_shape, (list, tuple, torch.Size))
+        or len(actual_shape) != 2
+    ):
+        raise ValueError(
+            "Dense teacher IPC actual_shape must be two-dimensional, got "
+            f"{actual_shape!r}."
+        )
+    local_seq_len, local_vocab_size = (int(value) for value in actual_shape)
+    buf_idx = int(handle["buf_idx"])
+    sample_idx = int(handle["sample_index_in_buf"])
+    if (
+        src_full.ndim != 4
+        or buf_idx < 0
+        or buf_idx >= src_full.shape[0]
+        or sample_idx < 0
+        or sample_idx >= src_full.shape[1]
+        or local_seq_len <= 0
+        or local_seq_len > src_full.shape[2]
+        or local_vocab_size <= 0
+        or local_vocab_size > src_full.shape[3]
+    ):
+        raise ValueError(
+            "Dense teacher IPC rectangular handle is outside rebuilt storage: "
+            f"storage={tuple(src_full.shape)}, buf_idx={buf_idx}, "
+            f"sample_idx={sample_idx}, actual_shape={tuple(actual_shape)}."
+        )
+    return src_full[buf_idx, sample_idx, :local_seq_len, :local_vocab_size]
+
+
+@dataclass(frozen=True)
+class _DenseTeacherRoute:
+    """One teacher CP sequence window and its TP vocabulary shards."""
+
+    seq_start: int
+    seq_end: int
+    shards: tuple[Mapping[str, Any], ...]
+
+
+class DenseTeacherRowReader:
+    """Read requested full-vocabulary rows from dense teacher IPC shards.
+
+    The dense counterpart of :class:`SparseTeacherRowReader`: instead of
+    assembling a teacher's CP-local ``[B, T/CP, V]`` window, a loss reads only
+    the rows it needs. Each requested row is stitched across the teacher's TP
+    vocabulary shards into ``[N, V]`` fp32. Rows inside a compact handle's
+    omitted (zero) suffix read as zeros, matching dense reassembly. Every
+    payload is opened once and cached until :meth:`close`.
+    """
+
+    def __init__(
+        self,
+        per_sample_entries: Sequence[Mapping[str, Any]],
+        *,
+        device: torch.device | int,
+    ) -> None:
+        from nemo_rl.models.policy.utils import _validate_dense_ipc_shard_coverage
+
+        if not per_sample_entries:
+            raise ValueError("Dense teacher payload contains no samples")
+        self.device, self._device_id = _normalize_reader_device(device)
+        self._storage: dict[Any, torch.Tensor] = {}
+        self._routes: list[list[_DenseTeacherRoute]] = []
+        self._route_starts: list[list[int]] = []
+        full_seq_len: Optional[int] = None
+        full_vocab_size: Optional[int] = None
+        for sample_idx, entry in enumerate(per_sample_entries):
+            shards = _sample_teacher_shards(entry, sample_idx)
+            _validate_dense_ipc_shard_coverage(sample_idx, shards)
+            sample_seq_len = int(shards[0]["full_seq_len"])
+            sample_vocab_size = int(shards[0]["full_vocab_size"])
+            if full_seq_len is None:
+                full_seq_len, full_vocab_size = sample_seq_len, sample_vocab_size
+            elif (sample_seq_len, sample_vocab_size) != (full_seq_len, full_vocab_size):
+                raise ValueError(
+                    "Dense teacher samples disagree on the logical [T, V] shape: "
+                    f"expected {(full_seq_len, full_vocab_size)}, got "
+                    f"{(sample_seq_len, sample_vocab_size)}."
+                )
+            by_window: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
+            for shard in shards:
+                seq_start = int(shard["global_seq_start"])
+                seq_end = seq_start + int(shard["actual_shape"][0])
+                by_window.setdefault((seq_start, seq_end), []).append(shard)
+            routes = [
+                _DenseTeacherRoute(
+                    seq_start=seq_start,
+                    seq_end=seq_end,
+                    shards=tuple(
+                        sorted(window, key=lambda s: int(s["vocab_start_index"]))
+                    ),
+                )
+                for (seq_start, seq_end), window in sorted(by_window.items())
+            ]
+            self._routes.append(routes)
+            self._route_starts.append([route.seq_start for route in routes])
+        assert full_seq_len is not None and full_vocab_size is not None
+        self.full_seq_len = full_seq_len
+        self.full_vocab_size = full_vocab_size
+
+    def _row_view(self, handle: Mapping[str, Any]) -> torch.Tensor:
+        payload = handle["payload_ipc"]
+        key = _reader_backing_key("payload_ipc", payload)
+        src_full = self._storage.get(key)
+        if src_full is None:
+            src_full = _open_reader_backing(
+                payload, device=self.device, device_id=self._device_id
+            )
+            self._storage[key] = src_full
+        return _teacher_ipc_row_view(handle, src_full)
+
+    def gather_rows(
+        self, batch_indices: torch.Tensor, global_positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Return raw teacher logits ``[N, full_vocab_size]`` (fp32) for the requests.
+
+        Args:
+            batch_indices: Batch rows ``[N]``.
+            global_positions: Global teacher sequence positions ``[N]``.
+        """
+        from nemo_rl.models.policy.utils import validate_compact_teacher_ipc_handle
+
+        if batch_indices.dim() != 1 or batch_indices.shape != global_positions.shape:
+            raise ValueError(
+                "batch_indices and global_positions must be matching "
+                f"one-dimensional tensors; got {tuple(batch_indices.shape)} and "
+                f"{tuple(global_positions.shape)}"
+            )
+        requests = list(
+            zip(
+                batch_indices.detach().cpu().tolist(),
+                global_positions.detach().cpu().tolist(),
+            )
+        )
+        out = torch.zeros(
+            (len(requests), self.full_vocab_size),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        grouped: dict[tuple[int, int], tuple[_DenseTeacherRoute, list[int], list[int]]]
+        grouped = {}
+        for out_idx, (batch_idx, position) in enumerate(requests):
+            batch_idx, position = int(batch_idx), int(position)
+            if not 0 <= batch_idx < len(self._routes):
+                raise IndexError(
+                    f"Dense teacher batch index {batch_idx} outside "
+                    f"[0, {len(self._routes)})"
+                )
+            if not 0 <= position < self.full_seq_len:
+                raise IndexError(
+                    f"Dense teacher position {position} outside "
+                    f"[0, {self.full_seq_len})"
+                )
+            route_idx = bisect_right(self._route_starts[batch_idx], position) - 1
+            route = self._routes[batch_idx][route_idx]
+            group = grouped.setdefault((batch_idx, route_idx), (route, [], []))
+            group[1].append(out_idx)
+            group[2].append(position - route.seq_start)
+
+        for route, output_rows, local_rows in grouped.values():
+            for shard in route.shards:
+                compact_geometry = validate_compact_teacher_ipc_handle(shard)
+                stored_seq_len = (
+                    compact_geometry[1]
+                    if compact_geometry is not None
+                    else int(shard["actual_shape"][0])
+                )
+                keep = [
+                    (out_row, local_row)
+                    for out_row, local_row in zip(output_rows, local_rows)
+                    if local_row < stored_seq_len
+                ]
+                if not keep:
+                    continue
+                stored = self._row_view(shard)
+                output_index = torch.tensor(
+                    [row for row, _ in keep], device=self.device, dtype=torch.long
+                )
+                local_index = torch.tensor(
+                    [row for _, row in keep], device=stored.device, dtype=torch.long
+                )
+                vocab_start = int(shard["vocab_start_index"])
+                vocab_end = int(shard["vocab_end_index"])
+                out[output_index, vocab_start:vocab_end] = (
+                    stored.index_select(0, local_index).to(out.device).float()
+                )
+        return out
+
+    def close(self) -> None:
+        """Drop the cached producer storages (and their imported IPC handles)."""
+        self._storage.clear()
 
 
 def valid_chunk_mask(
