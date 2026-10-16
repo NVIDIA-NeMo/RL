@@ -315,7 +315,8 @@ data:
   train:
     dataset_name: arrow_text
     processor: kd_data_processor
-    data_files: hf://datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Formal-Logic/*.parquet
+    data_files: nvidia/Nemotron-Pretraining-Specialized-v1.1
+    subset: Nemotron-Pretraining-Formal-Logic
     split: train
     text_key: text
     characters_per_sample: null
