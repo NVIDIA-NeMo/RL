@@ -31,6 +31,10 @@ from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 REPO_ROOT = Path(__file__).parents[2]
+ROOT_PYPROJECT = REPO_ROOT / "pyproject.toml"
+MEGATRON_BRIDGE_PYPROJECT = (
+    REPO_ROOT / "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/pyproject.toml"
+)
 MEGATRON_LM_PYPROJECT = (
     REPO_ROOT
     / "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM/pyproject.toml"
@@ -53,6 +57,44 @@ def _requirement(pyproject: Path, extra: str, name: str) -> Requirement:
     ]
     assert len(matches) == 1, (
         f"expected exactly one {name} requirement in [{extra}] of {pyproject}, got {matches}"
+    )
+    return matches[0]
+
+
+def _project_requirement(pyproject: Path, name: str) -> Requirement:
+    """The lone root project requirement for ``name``."""
+    project = tomllib.loads(pyproject.read_text())["project"]
+    matches = [
+        req
+        for req in map(Requirement, project["dependencies"])
+        if canonicalize_name(req.name) == canonicalize_name(name)
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one {name} project requirement in {pyproject}, got {matches}"
+    )
+    return matches[0]
+
+
+def _override_requirement(pyproject: Path, name: str) -> Requirement:
+    """The lone uv override requirement for ``name``."""
+    uv = tomllib.loads(pyproject.read_text())["tool"]["uv"]
+    matches = [
+        req
+        for req in map(Requirement, uv["override-dependencies"])
+        if canonicalize_name(req.name) == canonicalize_name(name)
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one {name} override in {pyproject}, got {matches}"
+    )
+    return matches[0]
+
+
+def _index_url(pyproject: Path, name: str) -> str:
+    """Return the URL for one named uv index."""
+    indexes = tomllib.loads(pyproject.read_text())["tool"]["uv"]["index"]
+    matches = [index["url"] for index in indexes if index["name"] == name]
+    assert len(matches) == 1, (
+        f"expected exactly one {name} index in {pyproject}, got {matches}"
     )
     return matches[0]
 
@@ -101,6 +143,67 @@ def test_mcore_energon_floor_is_within_megatron_lm_range(
         f"the floor; widening it past upstream either makes `uv lock` unsatisfiable or "
         f"silently has no effect."
     )
+
+
+@pytest.mark.parametrize("package", ["flashinfer-python", "flashinfer-cubin"])
+def test_mcore_flashinfer_pin_matches_megatron_bridge(package: str) -> None:
+    ours = _requirement(ROOT_PYPROJECT, "mcore", package)
+    upstream = _project_requirement(MEGATRON_BRIDGE_PYPROJECT, package)
+    assert ours.specifier == upstream.specifier
+
+
+def test_mcore_flashinfer_packages_use_megatron_bridge_index() -> None:
+    assert _index_url(ROOT_PYPROJECT, "flashinfer") == _index_url(
+        MEGATRON_BRIDGE_PYPROJECT, "flashinfer"
+    )
+
+    sources = tomllib.loads(ROOT_PYPROJECT.read_text())["tool"]["uv"]["sources"]
+    assert sources["flashinfer-python"] == {"index": "flashinfer"}
+    assert sources["flashinfer-cubin"] == {"index": "flashinfer"}
+
+
+def test_mcore_tilelang_and_cudnn_frontend_match_upstream_overrides() -> None:
+    bridge_tilelang = _override_requirement(MEGATRON_BRIDGE_PYPROJECT, "tilelang")
+    root_tilelang = _requirement(ROOT_PYPROJECT, "mcore", "tilelang")
+    assert root_tilelang.specifier == bridge_tilelang.specifier
+
+    selected_tilelang = Version(next(iter(bridge_tilelang.specifier)).version)
+    base_tilelang = _project_requirement(ROOT_PYPROJECT, "tilelang")
+    assert selected_tilelang in base_tilelang.specifier
+
+    assert (
+        _override_requirement(ROOT_PYPROJECT, "nvidia-cudnn-frontend").specifier
+        == _override_requirement(
+            MEGATRON_BRIDGE_PYPROJECT, "nvidia-cudnn-frontend"
+        ).specifier
+    )
+
+
+def test_transformer_engine_override_matches_megatron_bridge_source() -> None:
+    root_override = _override_requirement(ROOT_PYPROJECT, "transformer-engine")
+    bridge_sources = tomllib.loads(MEGATRON_BRIDGE_PYPROJECT.read_text())["tool"]["uv"][
+        "sources"
+    ]
+    source = bridge_sources["transformer-engine"]
+    expected_url = f"git+{source['git']}@{source['rev']}"
+    assert root_override.url == expected_url
+
+
+def test_transformer_engine_git_build_uses_runtime_torch() -> None:
+    uv = tomllib.loads(ROOT_PYPROJECT.read_text())["tool"]["uv"]
+    assert "transformer-engine" in uv["no-build-isolation-package"]
+    assert uv["extra-build-dependencies"]["transformer-engine"] == [
+        {"requirement": "torch", "match-runtime": True}
+    ]
+
+
+def test_transformer_engine_nonisolated_build_has_wheel() -> None:
+    pyproject = tomllib.loads(ROOT_PYPROJECT.read_text())
+    build_requirements = {
+        canonicalize_name(Requirement(requirement).name)
+        for requirement in pyproject["dependency-groups"]["build"]
+    }
+    assert "wheel" in build_requirements
 
 
 @pytest.mark.parametrize("package", ["av", "opencv-python-headless"])
