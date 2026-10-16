@@ -19,13 +19,16 @@ Use compatible NeMo RL, NeMo Speech and NeMo Automodel checkouts. Speech must
 provide `SALMAutomodel(parameter_config=...)`, strict native checkpoint loading
 and validated partial perception refits. Automodel must provide `ParameterConfig`,
 `preserve_parameter_dtypes`, `compute_logits=False` and `compute_mtp=False`.
-These companion contributions must land before this recipe can use an upstream
-release; installing unrelated public-main revisions is not sufficient.
+These come from companion pull requests
+([Speech #16387](https://github.com/NVIDIA-NeMo/Speech/pull/16387),
+[Automodel #4377](https://github.com/NVIDIA-NeMo/Automodel/pull/4377) and
+[Skills #1539](https://github.com/NVIDIA-NeMo/Skills/pull/1539)); earlier
+revisions and current releases do not provide them.
 
 Use a CUDA environment matching the current RL installation guide (Python
-3.13.14 and Torch 2.13). Set `RL`, `SPEECH`, `AUTOMODEL` and `SKILLS` to public
-source checkouts containing the companion contributions. Before they merge,
-use the companion PR heads. Obtain the four packages from their public repositories:
+3.13.14 and Torch 2.13). Set `RL`, `SPEECH`, `AUTOMODEL` and `SKILLS` to `main`
+checkouts that include the companion pull requests. Obtain the four packages
+from their public repositories:
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/RL.git
