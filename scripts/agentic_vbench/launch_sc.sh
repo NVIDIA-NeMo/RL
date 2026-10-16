@@ -224,6 +224,17 @@ mkdir -p \
 wandb_run_id="${WANDB_RUN_ID:-$(printf '%s' "${base_name}" | sha256sum | cut -c1-16)}"
 wandb_project="${WANDB_PROJECT:-megatron-omni-v3}"
 wandb_run_name="${WANDB_RUN_NAME:-${base_name}}"
+wandb_cluster_name="${WANDB_CLUSTER_NAME:-${SLURM_CLUSTER_NAME:-nsc-svg-slurm-1}}"
+[[ "${wandb_cluster_name}" =~ ^[A-Za-z0-9._-]+$ ]] || {
+  echo "ERROR: WANDB_CLUSTER_NAME must contain only letters, digits, dot, underscore, or dash" >&2
+  exit 1
+}
+case "${wandb_run_name}" in
+  *"_cluster-${wandb_cluster_name}") ;;
+  *) wandb_run_name="${wandb_run_name}_cluster-${wandb_cluster_name}" ;;
+esac
+wandb_group="${WANDB_RUN_GROUP:-cluster-${wandb_cluster_name}}"
+wandb_cluster_tag="cluster-${wandb_cluster_name}"
 
 base_mounts="/lustre:/lustre,/scratch:/scratch"
 selective_mounts="${code_dir}/nemo_rl:/opt/nemo-rl/nemo_rl"
@@ -347,6 +358,9 @@ fi
   ++logger.wandb.entity="${WANDB_ENTITY:-adlr}" \
   ++logger.wandb.id="${wandb_run_id}" \
   ++logger.wandb.resume=allow \
+  ++logger.wandb.group="${wandb_group}" \
+  ++logger.wandb.tags="[${wandb_cluster_tag}]" \
+  ++logger.wandb.config.cluster_name="${wandb_cluster_name}" \
   ++env.nemo_gym.uv_venv_dir="${gym_venv_dir}" \
   env.nemo_gym.skip_venv_if_present=true \
   policy.model_name="${model_path}" \

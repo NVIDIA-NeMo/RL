@@ -65,6 +65,9 @@ class WandbConfig(TypedDict):
     entity: NotRequired[str]
     id: NotRequired[str]
     resume: NotRequired[str]
+    group: NotRequired[str]
+    tags: NotRequired[list[str]]
+    config: NotRequired[dict[str, Any]]
     # Log complete NeMo Gym result payloads as W&B Tables. These payloads can be
     # very large, so the recommended default is false.
     log_nemo_gym_full_result_tables: NotRequired[bool]
