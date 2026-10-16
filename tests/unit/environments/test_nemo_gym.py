@@ -2051,10 +2051,10 @@ def test_nemo_gym_run_rollouts_yields_infra_failure_rows_and_raises_data_failure
 
 
 def test_nemo_gym_run_rollouts_scores_a_class_annotated_result_row():
-    """Only rows carrying the failure TYPE are /run failures. Gym's judge
+    """Only rows carrying the HTTP-status key are /run failures. Gym's judge
     failsafe returns a scoreable result row annotated with ``_ng_failure_class``
-    alone (reward 0, no ``_ng_failure_type``); such a row is postprocessed like
-    any result instead of being raised or re-dispatched."""
+    alone (reward 0, no status key); such a row is postprocessed like any
+    result instead of being raised or re-dispatched."""
 
     judge_row = {
         "_ng_failure_class": "judge_failed",
@@ -2083,6 +2083,67 @@ def test_nemo_gym_run_rollouts_scores_a_class_annotated_result_row():
         def _postprocess_nemo_gym_to_nemo_rl_result(self, row, result, tokenizer, **_):
             assert result is judge_row
             # message_log: the NaN-logprob screen reads it on every scored row.
+            return {"total_reward": result["reward"], "message_log": []}
+
+    stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
+    rows = [
+        {
+            "_rowidx": 0,
+            "agent_ref": {"name": "agent"},
+            "responses_create_params": {"input": []},
+        }
+    ]
+
+    async def _run():
+        mock_self = _MockSelf()
+        mock_self._tokenizer = object()
+        mock_self.rch = _RolloutCollectionHelper()
+        streamed = [item async for item in stream_rollouts(mock_self, rows, "test")]
+        assert len(streamed) == 1
+        rowidx, agent_ref, result, _ = streamed[0]
+        assert rowidx == 0
+        assert agent_ref == {"name": "agent"}
+        assert result == {"total_reward": 0.0, "message_log": []}
+
+    asyncio.run(_run())
+
+
+def test_nemo_gym_run_rollouts_scores_a_verifier_row_that_echoes_a_failure_type():
+    """Gym's collector writes the HTTP-status key on every /run failure row
+    (None when nothing replied) and no verifier does, so that key alone marks
+    a failure row. Terminal-Bench's verify stamps ``_ng_failure_class`` and
+    ``_ng_failure_type`` on a reward-0 row whose evaluation did not complete,
+    and its sandboxed agent returns that verify JSON as the /run result; such a
+    row is a scored result and is postprocessed, not treated as a transport
+    failure that would end the step at the default budget."""
+
+    verifier_row = {
+        "_ng_failure_class": "infrastructure_error",
+        "_ng_failure_type": "TimeoutError",
+        "reward": 0.0,
+        "evaluation_completed": False,
+        "response": {"output": []},
+    }
+
+    class _RolloutCollectionHelper:
+        def run_examples(self, examples, head_server_config, **_):
+            del head_server_config
+
+            async def _completed():
+                return examples[0], verifier_row
+
+            return [_completed()]
+
+    class _MockSelf:
+        cfg = {}
+        head_server_config = object()
+        _token_capture_enabled = False
+
+        def _require_spinup(self):
+            pass
+
+        def _postprocess_nemo_gym_to_nemo_rl_result(self, row, result, tokenizer, **_):
+            assert result is verifier_row
             return {"total_reward": result["reward"], "message_log": []}
 
     stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts

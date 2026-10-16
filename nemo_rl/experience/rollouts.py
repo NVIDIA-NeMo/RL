@@ -2116,12 +2116,22 @@ def get_nemo_gym_max_infra_attempts(env_config: dict[str, Any]) -> int:
     )
     if value is None:
         return DEFAULT_MAX_INFRA_ATTEMPTS_PER_ROLLOUT
-    attempts = int(value)
-    if attempts < 1:
+    # bool is an int subclass and int() truncates a float silently; both would
+    # hide a misconfiguration behind a budget the operator never wrote.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(
-            f"env.nemo_gym.max_infra_attempts_per_rollout must be at least 1, got {value}"
+            "env.nemo_gym.max_infra_attempts_per_rollout must be an integer of "
+            f"at least 1, got {value!r}"
         )
-    return attempts
+    return value
+
+
+# A Gym actor answers rollout_config from its event loop, so an actor whose loop
+# is blocked never answers. The read is the first thing a rollout awaits, before
+# the health check polls, and the asynchronous trajectory collector retries a
+# failed batch against the same actors, so without a bound a probe timeout would
+# be followed by a retry that hangs in this read.
+NEMO_GYM_ROLLOUT_CONFIG_TIMEOUT_SECONDS = 60.0
 
 
 # A step-metrics hook: takes one rollout group's input rows and, aligned with
@@ -2317,9 +2327,23 @@ async def _nemo_gym_rollout_config(nemo_gym_environment: Any) -> dict[str, Any]:
     is returned in the ``master_config.env`` layout the ``get_nemo_gym_*``
     readers take, so every caller of the rollout function, synchronous or not,
     applies the same configured values without forwarding them.
+
+    The call is bounded by ``NEMO_GYM_ROLLOUT_CONFIG_TIMEOUT_SECONDS`` and a
+    missed bound is ``GymTransportError``, the class the rest of the rollout
+    raises for an actor that stopped answering.
     """
     handle = as_nemo_gym_shard_set(nemo_gym_environment).all_handles[0]
-    return {"nemo_gym": dict(await handle.rollout_config.remote())}
+    try:
+        settings = await asyncio.wait_for(
+            handle.rollout_config.remote(),
+            timeout=NEMO_GYM_ROLLOUT_CONFIG_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as error:
+        raise GymTransportError(
+            "NeMo-Gym actor did not answer rollout_config within "
+            f"{NEMO_GYM_ROLLOUT_CONFIG_TIMEOUT_SECONDS}s; its event loop may be blocked"
+        ) from error
+    return {"nemo_gym": dict(settings)}
 
 
 def should_mask_flagged_samples(env_config: dict[str, Any]) -> bool:
@@ -2981,6 +3005,13 @@ async def _merge_nemo_gym_instance_streams(
                 if timing_metrics is not None:
                     record_timing(timing_labels_by_iterator[iterator], timing_metrics)
                 if GYM_INFRA_FAILURE_KEY in result:
+                    if first_failure is not None:
+                        # The rollout already ends with first_failure once the
+                        # streams drain: a retry would be wasted work, and an
+                        # exhausted budget here would raise a transport error
+                        # that hides the data failure that actually ended it.
+                        pending[asyncio.ensure_future(anext(iterator))] = iterator
+                        continue
                     # Raises GymTransportError once the row's attempts are used up.
                     row = record_infra_failure(row_index, result[GYM_INFRA_FAILURE_KEY])
                     print(
@@ -3154,7 +3185,9 @@ async def run_async_nemo_gym_rollout(
         health_check_interval_seconds: Seconds between health checks of the Gym
             actors while no row has arrived. None applies the environment's
             configured ``env.nemo_gym.health_check_interval_seconds``, whose
-            absence turns the polling off.
+            absence turns the polling off. The polling belongs to this driver
+            loop; the single-controller rollout manager bounds a rollout with
+            its own ``rollout_timeout_s`` and does not read the setting.
         max_infra_attempts_per_rollout: Total dispatches one row may use before
             an infrastructure failure ends the rollout; 1 disables re-dispatch.
             None applies the configured ``env.nemo_gym.max_infra_attempts_per_rollout``.
@@ -3376,10 +3409,11 @@ async def run_async_nemo_gym_rollout(
     final_rollout_result.rollout_metrics.update(
         _merge_nemo_gym_timing_metrics(actor_timing_by_instance, timer_prefix)
     )
-    if accumulator.infra_redispatches:
-        final_rollout_result.rollout_metrics["nemo_gym_infra_redispatches"] = (
-            accumulator.infra_redispatches
-        )
+    # Reported on every rollout, zero included, so a mean over steps is a rate
+    # and not an average over the steps that happened to re-dispatch.
+    final_rollout_result.rollout_metrics["nemo_gym_infra_redispatches"] = (
+        accumulator.infra_redispatches
+    )
     final_rollout_result.rollout_metrics.update(timer.get_timing_metrics("sum"))
     yield final_rollout_result
 
@@ -3447,7 +3481,9 @@ def run_nemo_gym_rollout_sync(
         health_check_interval_seconds: Seconds between health checks of the Gym
             actor while no row has arrived. None applies the environment's
             configured ``env.nemo_gym.health_check_interval_seconds``, whose
-            absence turns the polling off.
+            absence turns the polling off. The polling belongs to this driver
+            loop; the single-controller rollout manager bounds a rollout with
+            its own ``rollout_timeout_s`` and does not read the setting.
         max_infra_attempts_per_rollout: Total dispatches one row may use before
             an infrastructure failure ends the rollout; 1 disables re-dispatch.
             None applies the configured ``env.nemo_gym.max_infra_attempts_per_rollout``.

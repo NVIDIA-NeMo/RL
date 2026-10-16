@@ -996,6 +996,7 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.entrypoints.serve.tokenize.serving import (
             ServingTokenization,
         )
+        from vllm.entrypoints.serve.utils.api_utils import with_cancellation
         from vllm.renderers.online_renderer import OnlineRenderer
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
@@ -1305,12 +1306,17 @@ class VllmAsyncGenerationWorkerImpl(
                     )
 
                 final_res = None
+                cancelled = False
 
                 async def capture_result_generator():
-                    nonlocal final_res
-                    async for res in result_generator:
-                        final_res = res
-                        yield res
+                    nonlocal final_res, cancelled
+                    try:
+                        async for res in result_generator:
+                            final_res = res
+                            yield res
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        raise
 
                 # Capture stages the raw arrays below and strips OpenAI logprobs
                 # after the terminal PUT. Skip only their object construction;
@@ -1328,6 +1334,16 @@ class VllmAsyncGenerationWorkerImpl(
                         *args,
                         **kwargs,
                     )
+                if cancelled:
+                    # vLLM's chat_completion_full_generator catches the
+                    # CancelledError that with_cancellation throws into the
+                    # handler task on a client disconnect and returns
+                    # ErrorResponse("Client disconnected") instead of
+                    # re-raising. Nobody reads that response (the wrapper has
+                    # already returned), and letting it through would make the
+                    # route label the capture "error_response". Re-raise so the
+                    # task finishes cancelled and the route sees the disconnect.
+                    raise asyncio.CancelledError()
                 if (
                     not isinstance(response, ChatCompletionResponse)
                     or final_res is None
@@ -1435,6 +1451,9 @@ class VllmAsyncGenerationWorkerImpl(
 
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
+        # Like vLLM's own routes: cancel the handler (and with it the engine
+        # request) when the client disconnects, instead of generating for nobody.
+        @with_cancellation
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
@@ -1546,6 +1565,13 @@ class VllmAsyncGenerationWorkerImpl(
                     },
                     status_code=400,
                 )
+            except asyncio.CancelledError:
+                # Client disconnected (see with_cancellation above). A cancel
+                # before generation starts propagates here directly; one that
+                # lands mid-generation is swallowed by vLLM and re-raised by
+                # NeMoRLOpenAIServingChatMixin.chat_completion_full_generator.
+                worker_self._abort_request_capture(request, reason="client_disconnect")
+                raise
             except BaseException:
                 worker_self._abort_request_capture(request, reason="engine_error")
                 raise
@@ -1564,9 +1590,17 @@ class VllmAsyncGenerationWorkerImpl(
                 # response; strips logprobs/ids (no-op when capture is off).
                 # Off-loop: the sink write inside complete_call is a blocking
                 # TQ round trip (see the staging protocol's serving-host rule).
-                content = await asyncio.to_thread(
-                    worker_self._finish_request_capture, request, content
-                )
+                try:
+                    content = await asyncio.to_thread(
+                        worker_self._finish_request_capture, request, content
+                    )
+                except asyncio.CancelledError:
+                    # Queued executor work may never start after cancellation.
+                    # If staging already claimed the capture, abort is a no-op.
+                    worker_self._abort_request_capture(
+                        request, reason="client_disconnect"
+                    )
+                    raise
                 return JSONResponse(content=content)
 
             worker_self._abort_request_capture(request, reason="streaming_response")
