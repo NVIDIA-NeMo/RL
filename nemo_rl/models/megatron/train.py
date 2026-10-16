@@ -922,6 +922,16 @@ class LossPostProcessor:
         return loss_fn_wrapped
 
 
+def loss_returns_context_parallel_partial(loss_fn: LossFunction) -> bool:
+    """Whether ``loss_fn`` returns a CP-partial loss that must not be divided by CP.
+
+    Owner-local CSD evaluation returns each context-parallel rank's share of the
+    loss; Megatron sums gradients over DP x CP, so the shares already add up to
+    the full loss.
+    """
+    return isinstance(loss_fn, CSDLossFn) and loss_fn.owner_local
+
+
 def should_reduce_loss_across_context_parallel(
     data: BatchedDataDict[Any] | dict[str, Any],
 ) -> bool:
