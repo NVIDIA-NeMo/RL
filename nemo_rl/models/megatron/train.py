@@ -62,9 +62,11 @@ from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.data.megatron_sft_packed import is_direct_packed_row
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     cp_load_balanced_to_contiguous,
     distributed_vocab_topk,
+    distributed_vocab_topk_logz_force,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
 )
@@ -88,8 +90,13 @@ PostProcessingFunction = Union[
     "LogprobsPostProcessor",
     "TeacherFullPayloadPostProcessor",
     "TopkLogitsPostProcessor",
+    "SparseTeacherLogitsPostProcessor",
     "FullLogitsPostProcessor",
 ]
+
+# Teacher rows per sparse top-k/log Z tile when ``logprob_chunk_size`` is unset;
+# bounds the fp32 ``[B, rows, V/TP]`` working set at long context.
+SPARSE_TEACHER_ROW_CHUNK_SIZE = 128
 
 
 def _prepare_padding_mask_for_model(
@@ -526,6 +533,11 @@ def forward_with_post_processing_fn(
             data_dict=data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
             original_seq_length=original_seq_length,
+        )
+    elif isinstance(post_processing_fn, SparseTeacherLogitsPostProcessor):
+        post_processing_fn_wrapped = post_processing_fn(
+            data_dict=data_dict,
+            cu_seqlens_padded=cu_seqlens_padded,
         )
     elif isinstance(post_processing_fn, FullLogitsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
@@ -1350,6 +1362,136 @@ class TopkLogitsPostProcessor:
                     "topk_logits": topk_vals_full[:, :original_seq_length],
                     "topk_indices": topk_idx_full[:, :original_seq_length],
                 }
+
+        return processor_fn_inner
+
+
+class SparseTeacherLogitsPostProcessor:
+    """Build sparse teacher rows while keeping the CP sequence sharding.
+
+    Unlike :class:`TopkLogitsPostProcessor`, this transport-oriented processor
+    never gathers the sequence axis and never copies results through CPU/Ray.
+    It computes the global top-k and exact log Z across TP only, excludes
+    padded LM-head columns, and exports a bounded sidecar holding every
+    realized label the loss requests from each row. The natural top-k stays
+    unchanged so the consumer can build an exact K-wide support per request.
+
+    The teacher data must carry ``force_include_token_ids`` ``[B, T, F]``
+    (``-1`` for unused slots) at the teacher tokenization width.
+    """
+
+    def __init__(
+        self,
+        cfg: PolicyConfig,
+        *,
+        k: int,
+        temperature: float,
+        real_vocab_size: int,
+        noise_filter_k: int,
+    ):
+        self.cfg = cfg
+        self.k = int(k)
+        self.temperature = float(temperature)
+        self.real_vocab_size = int(real_vocab_size)
+        self.noise_filter_k = int(noise_filter_k)
+
+    def __call__(
+        self,
+        data_dict: BatchedDataDict[Any],
+        cu_seqlens_padded: Optional[torch.Tensor],
+    ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        """Create a post-processing function that emits this rank's sparse rows.
+
+        Args:
+            data_dict: Batched data dictionary with ``force_include_token_ids``.
+            cu_seqlens_padded: Unused; sequence packing is not supported.
+
+        Returns:
+            Callable that maps the CP-local model output ``[B, S_local, V/TP]``
+            to ``(dummy_loss, sparse_fields)`` with ``sparse_topk_logits`` /
+            ``sparse_topk_indices`` ``[B, S_local, k]``, ``sparse_log_z``
+            ``[B, S_local]``, ``sparse_natural_tail_indices`` ``[B, S_local, 1]``,
+            and ``sparse_forced_logits`` / ``sparse_forced_indices`` /
+            ``sparse_forced_in_topk`` ``[B, S_local, F]``.
+        """
+        del cu_seqlens_padded
+        if self.cfg["sequence_packing"]["enabled"]:
+            raise NotImplementedError(
+                "SparseTeacherLogitsPostProcessor does not support sequence packing."
+            )
+        if "force_include_token_ids" not in data_dict:
+            raise KeyError(
+                "Sparse teacher IPC requires force_include_token_ids in teacher data."
+            )
+
+        force_ids_full = data_dict["force_include_token_ids"]
+        cp_size = get_context_parallel_world_size()
+        cp_rank = (
+            torch.distributed.get_rank(get_context_parallel_group())
+            if cp_size > 1
+            else 0
+        )
+        # force_include_token_ids rides along at the teacher tokenization width
+        # and is exempt from the sequence-dim validation. Nothing else checks
+        # it, and _get_tokens_on_this_cp_rank floor-divides without asserting,
+        # so a width mismatch would silently misplace rows at CP > 1.
+        if cp_size > 1 and force_ids_full.shape[1] % (2 * cp_size) != 0:
+            raise ValueError(
+                "Sparse teacher force_include_token_ids must be padded to a "
+                f"multiple of 2*cp_size={2 * cp_size} so its load-balanced rows "
+                "match the teacher logits; got sequence length "
+                f"{force_ids_full.shape[1]}."
+            )
+        force_ids_local = _get_tokens_on_this_cp_rank(
+            force_ids_full, cp_rank, cp_size, seq_dim=1
+        )
+        chunk_size = self.cfg.get("logprob_chunk_size")
+        if chunk_size is None:
+            chunk_size = SPARSE_TEACHER_ROW_CHUNK_SIZE
+
+        def processor_fn_inner(output_tensor):
+            # The forced-label rows must line up 1:1 with this rank's logit
+            # rows; otherwise forced labels resolve against the wrong positions.
+            if force_ids_local.shape[1] != output_tensor.shape[1]:
+                raise ValueError(
+                    "Sparse teacher forced-label rows do not match the CP-local "
+                    f"logit rows: force={force_ids_local.shape[1]}, "
+                    f"logits={output_tensor.shape[1]}, cp_size={cp_size}. Set "
+                    "the teacher's make_sequence_length_divisible_by to a "
+                    "multiple of its Megatron sequence padding factor."
+                )
+            tp_grp = get_tensor_model_parallel_group()
+            tp_rank = get_tensor_model_parallel_rank()
+            vocab_shard_size = int(output_tensor.shape[-1])
+            (
+                values,
+                indices,
+                log_z,
+                natural_tail_indices,
+                forced_values,
+                forced_indices,
+                forced_in_topk,
+            ) = distributed_vocab_topk_logz_force(
+                output_tensor,
+                force_ids_local,
+                self.k,
+                tp_grp,
+                vocab_start_index=tp_rank * vocab_shard_size,
+                vocab_end_index=(tp_rank + 1) * vocab_shard_size,
+                real_vocab_size=self.real_vocab_size,
+                temperature=self.temperature,
+                noise_filter_k=self.noise_filter_k,
+                chunk_size=chunk_size,
+            )
+            return output_tensor.new_zeros(()), {
+                "sparse_topk_logits": values,
+                "sparse_topk_indices": indices,
+                "sparse_log_z": log_z,
+                "sparse_natural_tail_indices": natural_tail_indices,
+                "sparse_forced_logits": forced_values,
+                "sparse_forced_indices": forced_indices,
+                "sparse_forced_in_topk": forced_in_topk,
+            }
 
         return processor_fn_inner
 
